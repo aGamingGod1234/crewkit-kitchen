@@ -2,7 +2,9 @@ package dev.agaminggod.arenaagents.verification;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import dev.agaminggod.arenaagents.client.bridge.BridgeConcurrencyVerification;
 import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
+import dev.agaminggod.arenaagents.client.bridge.BridgeSession;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.client.config.AgentConfigLoader;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
@@ -22,8 +24,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
@@ -33,6 +39,10 @@ public final class VerificationMain {
 	private static final String AGENT_ID = "agent-test";
 	private static final int SOCKET_TIMEOUT_MS = 2_000;
 	private static final long ASYNC_TIMEOUT_MS = 3_000L;
+	private static final long AUTHENTICATION_RETRY_DELAY_MS = 10L;
+	private static final long CONCURRENT_CLOSE_OBSERVATION_MS = 100L;
+	private static final int GENERATED_OUTBOUND_EVENT_COUNT = 4_097;
+	private static final int EXPECTED_HANDSHAKE_TIMEOUT_MS = 1_000;
 	private static int passedAssertions;
 
 	private VerificationMain() {
@@ -56,6 +66,15 @@ public final class VerificationMain {
 		verifyAgentConfigFiles();
 		verifyJsonLineFraming(codec);
 		verifyBridgeAuthenticationAndDispatch(codec);
+		verifyClosedSessionDropsQueuedAction(codec);
+		verifyGeneratedErrorIdIsContained(codec);
+		verifyGeneratedOutboundMessageIds(codec);
+		verifyHandshakeTimeoutReleasesSession(codec);
+		verifyAuthenticatedRetryClosesFailedSocket(codec);
+		verifyHelloAcknowledgementPrecedesEvents(codec);
+		verifyCloseLinearizesPendingAdmission(codec);
+		verifyConcurrentCloseWaitsForCallback(codec);
+		verifyQueueOverflowDoesNotInvertCallbackLock(codec);
 		verifyBridgeCallbackFailure(codec);
 		verifyBridgeControlValidation(codec);
 		verifyBridgeSingleSessionAndReconnect(codec);
@@ -425,13 +444,197 @@ public final class VerificationMain {
 				writeMessage(codec, client, actionEnvelope("before-hello"));
 				assertErrorCode(codec, client, "AUTHENTICATION_REQUIRED", "first message must authenticate");
 			}
-			try (Socket client = connectAuthenticated(codec, port, "hello-authenticated")) {
+			try (Socket client = connectAuthenticatedWithRetry(codec, port, "hello-authenticated")) {
 				writeMessage(codec, client, actionEnvelope("action-1"));
 				awaitCondition(() -> executor.pendingCount() == 1, "action callback queued");
 				assertTrue(received.get() == null, "action callback waits for provided executor");
 				executor.runNext();
 				assertEquals(ActionType.WAIT, received.get().type(), "action callback decoded through protocol codec");
 			}
+		}
+	}
+
+	private static void verifyClosedSessionDropsQueuedAction(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		RecordingExecutor executor = new RecordingExecutor();
+		AtomicReference<ActionCommand> received = new AtomicReference<>();
+		BridgeServer server = new BridgeServer(enabledConfig(port), codec, executor, received::set);
+		server.start();
+		try (Socket client = connectAuthenticated(codec, port, "hello-stale-action")) {
+			writeMessage(codec, client, actionEnvelope("action-stale"));
+			awaitCondition(() -> executor.pendingCount() == 1, "stale action callback queued");
+			server.close();
+			executor.runNext();
+			assertTrue(received.get() == null, "closed session drops queued action callback");
+		} finally {
+			server.close();
+		}
+	}
+
+	private static void verifyGeneratedErrorIdIsContained(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		RecordingExecutor executor = new RecordingExecutor();
+		try (BridgeServer server = new BridgeServer(
+				enabledConfig(port),
+				codec,
+				executor,
+				command -> { throw new IllegalStateException("callback failed"); }
+		)) {
+			server.start();
+			try (Socket client = connectAuthenticated(codec, port, "hello-error-id")) {
+				JsonObject payload = new JsonObject();
+				payload.addProperty("event", "reserve-internal-id");
+				String eventId = server.sendEvent("significant_event", payload);
+				assertEquals(eventId, readMessage(codec, client).get("messageId").getAsString(), "generated event id delivered");
+
+				writeMessage(codec, client, actionEnvelope("action-error-id"));
+				awaitCondition(() -> executor.pendingCount() == 1, "failing generated-id callback queued");
+				assertDoesNotThrow(executor::runNext, "generated error id contained");
+				JsonObject error = readMessage(codec, client);
+				assertEquals("error", error.get("type").getAsString(), "generated error reported type");
+				assertEquals("CALLBACK_FAILED", error.get("code").getAsString(), "generated error reported code");
+				assertTrue(!eventId.equals(error.get("messageId").getAsString()), "generated error id is unique");
+			}
+		}
+	}
+
+	private static void verifyGeneratedOutboundMessageIds(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> { })) {
+			server.start();
+			try (Socket client = connectAuthenticated(codec, port, "hello-generated-ids")) {
+				JsonObject payload = new JsonObject();
+				payload.addProperty("event", "generated-id");
+				String previousId = null;
+				for (int index = 0; index < GENERATED_OUTBOUND_EVENT_COUNT; index++) {
+					String generatedId = server.sendEvent("significant_event", payload);
+					JsonObject delivered = readMessage(codec, client);
+					if (generatedId.equals(previousId) || !generatedId.equals(delivered.get("messageId").getAsString())) {
+						throw new AssertionError("generated outbound message IDs must be unique and match the wire envelope");
+					}
+					previousId = generatedId;
+				}
+				pass("generated outbound IDs remain unique beyond the former session cap");
+			}
+		}
+	}
+
+	private static void verifyHandshakeTimeoutReleasesSession(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> { })) {
+			server.start();
+			try (Socket silent = openClient(port)) {
+				silent.setSoTimeout(EXPECTED_HANDSHAKE_TIMEOUT_MS + SOCKET_TIMEOUT_MS);
+				assertErrorCode(codec, silent, "AUTHENTICATION_TIMEOUT", "silent peer handshake timeout");
+			}
+			try (Socket reconnected = connectAuthenticatedWithRetry(codec, port, "hello-after-timeout")) {
+				assertTrue(reconnected.isConnected(), "handshake timeout releases session slot");
+			}
+		}
+	}
+
+	private static void verifyAuthenticatedRetryClosesFailedSocket(ProtocolCodec codec) throws Exception {
+		try (RetryHandshakeServer server = new RetryHandshakeServer(codec)) {
+			try (Socket connected = connectAuthenticatedWithRetry(codec, server.port(), "hello-retry")) {
+				assertTrue(connected.isConnected(), "authentication retries SESSION_ACTIVE response");
+			}
+			awaitCondition(server::firstSocketClosedByClient, "failed authentication socket closed before retry");
+			server.assertHealthy();
+		}
+	}
+
+	private static void verifyHelloAcknowledgementPrecedesEvents(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		BridgeConcurrencyVerification.verifyHelloAcknowledgementPrecedesEvents(enabledConfig(port), codec);
+		pass("hello acknowledgement precedes concurrent event");
+	}
+
+	private static void verifyCloseLinearizesPendingAdmission(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		BridgeConcurrencyVerification.verifyCloseLinearizesPendingAdmission(enabledConfig(port), codec);
+		pass("server close linearizes pending session admission");
+	}
+
+	private static void verifyConcurrentCloseWaitsForCallback(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		CountDownLatch callbackEntered = new CountDownLatch(1);
+		CountDownLatch releaseCallback = new CountDownLatch(1);
+		BridgeServer server = new BridgeServer(enabledConfig(port), codec, Runnable::run, command -> {
+			callbackEntered.countDown();
+			awaitUninterruptibly(releaseCallback);
+		});
+		AtomicBoolean secondCloseReturned = new AtomicBoolean();
+		Thread firstClose = null;
+		Thread secondClose = null;
+		try (Socket client = connectAuthenticatedAfterStart(server, codec, port, "hello-concurrent-close")) {
+			writeMessage(codec, client, actionEnvelope("action-concurrent-close"));
+			awaitCondition(() -> callbackEntered.getCount() == 0L, "blocking callback started");
+
+			firstClose = startCloseThread("first", server, null);
+			awaitCondition(() -> !server.isRunning(), "first close published shutdown state");
+			secondClose = startCloseThread("second", server, secondCloseReturned);
+			secondClose.join(CONCURRENT_CLOSE_OBSERVATION_MS);
+			assertTrue(!secondCloseReturned.get(), "concurrent close waits for callback teardown");
+		} finally {
+			releaseCallback.countDown();
+			server.close();
+			joinCloseThread(firstClose);
+			joinCloseThread(secondClose);
+		}
+	}
+
+	private static void verifyQueueOverflowDoesNotInvertCallbackLock(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		BridgeConcurrencyVerification.verifyQueueOverflowDoesNotInvertCallbackLock(enabledConfig(port), codec);
+		pass("queue overflow avoids lifecycle and callback lock inversion");
+	}
+
+	private static Socket connectAuthenticatedAfterStart(
+			BridgeServer server,
+			ProtocolCodec codec,
+			int port,
+			String messageId
+	) throws IOException {
+		server.start();
+		return connectAuthenticated(codec, port, messageId);
+	}
+
+	private static Thread startCloseThread(String role, BridgeServer server, AtomicBoolean returned) {
+		return Thread.ofPlatform()
+				.name("arenaagents-verification-close-" + role)
+				.daemon(true)
+				.start(() -> {
+					try {
+						server.close();
+					} finally {
+						if (returned != null) {
+							returned.set(true);
+						}
+					}
+				});
+	}
+
+	private static void joinCloseThread(Thread thread) throws InterruptedException {
+		if (thread == null) {
+			return;
+		}
+		thread.join(SOCKET_TIMEOUT_MS);
+		if (thread.isAlive()) {
+			throw new AssertionError("bridge close thread did not stop");
+		}
+	}
+
+	private static void awaitUninterruptibly(CountDownLatch latch) {
+		boolean interrupted = false;
+		while (latch.getCount() != 0L) {
+			try {
+				latch.await();
+			} catch (InterruptedException exception) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			Thread.currentThread().interrupt();
 		}
 	}
 
@@ -492,37 +695,24 @@ public final class VerificationMain {
 			try (Socket client = connectAuthenticated(codec, port, "hello-outbound")) {
 				JsonObject payload = new JsonObject();
 				payload.addProperty("event", "bridge_ready");
-				server.sendEvent("significant_event", "event-1", payload);
+				String generatedId = server.sendEvent("significant_event", payload);
 				JsonObject event = readMessage(codec, client);
 				assertEquals("significant_event", event.get("type").getAsString(), "thread-safe outbound event type");
 				assertEquals(AGENT_ID, event.get("agentId").getAsString(), "outbound event agent identity");
+				assertEquals(generatedId, event.get("messageId").getAsString(), "outbound event generated identity");
+				JsonObject envelopeCollision = payload.deepCopy();
+				envelopeCollision.addProperty("messageId", "caller-controlled");
 				expectProtocolException(
-						() -> server.sendEvent("significant_event", "event-1", payload),
-						"DUPLICATE_MESSAGE_ID",
-						"event-1",
-						"outbound message id uniqueness"
+						() -> server.sendEvent("significant_event", envelopeCollision),
+						ProtocolConstants.ERROR_UNKNOWN_FIELD,
+						"messageId",
+						"outbound payload cannot replace generated id"
 				);
 				expectProtocolException(
-						() -> server.sendEvent("unknown_event", "event-2", payload),
+						() -> server.sendEvent("unknown_event", payload),
 						"UNKNOWN_MESSAGE_TYPE",
 						"unknown_event",
 						"outbound message type allowlist"
-				);
-				expectProtocolException(
-						() -> server.sendEvent("significant_event", null, payload),
-						"INVALID_FIELD",
-						"messageId",
-						"outbound message id type"
-				);
-				expectProtocolException(
-						() -> server.sendEvent(
-								"significant_event",
-								"m".repeat(ProtocolConstants.MAX_COMMAND_ID_LENGTH + 1),
-								payload
-						),
-						"OUT_OF_RANGE",
-						"messageId",
-						"outbound message id bound"
 				);
 			}
 		}
@@ -570,23 +760,53 @@ public final class VerificationMain {
 
 	private static Socket connectAuthenticated(ProtocolCodec codec, int port, String messageId) throws IOException {
 		Socket socket = openClient(port);
-		writeMessage(codec, socket, helloEnvelope(messageId));
-		JsonObject acknowledgement = readMessage(codec, socket);
-		assertEquals("hello_ack", acknowledgement.get("type").getAsString(), "hello acknowledged");
-		return socket;
+		try {
+			writeMessage(codec, socket, helloEnvelope(messageId));
+			String line = codec.readLine(socket.getInputStream());
+			if (line == null) {
+				throw new IOException("Bridge closed before acknowledging hello");
+			}
+			JsonObject response = JsonParser.parseString(line).getAsJsonObject();
+			String type = response.get("type").getAsString();
+			if ("error".equals(type)) {
+				String code = response.get("code").getAsString();
+				String message = response.get("message").getAsString();
+				throw new ProtocolException(code, message);
+			}
+			if (!"hello_ack".equals(type)) {
+				throw new ProtocolException(
+						"UNEXPECTED_HANDSHAKE_RESPONSE",
+						"Expected hello_ack but received '" + type + "'"
+				);
+			}
+			pass("hello acknowledged");
+			return socket;
+		} catch (IOException | RuntimeException | Error exception) {
+			try {
+				socket.close();
+			} catch (IOException closeException) {
+				exception.addSuppressed(closeException);
+			}
+			throw exception;
+		}
 	}
 
 	private static Socket connectAuthenticatedWithRetry(ProtocolCodec codec, int port, String messageId)
 			throws Exception {
-		long deadline = System.currentTimeMillis() + ASYNC_TIMEOUT_MS;
-		IOException lastFailure = null;
-		while (System.currentTimeMillis() < deadline) {
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ASYNC_TIMEOUT_MS);
+		Throwable lastFailure = null;
+		while (System.nanoTime() < deadline) {
 			try {
 				return connectAuthenticated(codec, port, messageId);
 			} catch (IOException exception) {
 				lastFailure = exception;
-				Thread.yield();
+			} catch (ProtocolException exception) {
+				if (!"SESSION_ACTIVE".equals(exception.code())) {
+					throw exception;
+				}
+				lastFailure = exception;
 			}
+			Thread.sleep(AUTHENTICATION_RETRY_DELAY_MS);
 		}
 		throw new AssertionError("session did not reconnect", lastFailure);
 	}
@@ -700,6 +920,93 @@ public final class VerificationMain {
 				task = tasks.removeFirst();
 			}
 			task.run();
+		}
+	}
+
+	private static final class RetryHandshakeServer implements AutoCloseable {
+		private final ProtocolCodec codec;
+		private final ServerSocket serverSocket;
+		private final List<Socket> acceptedSockets = new ArrayList<>();
+		private final AtomicBoolean firstSocketClosedByClient = new AtomicBoolean();
+		private final AtomicReference<Throwable> failure = new AtomicReference<>();
+		private final Thread thread;
+
+		private RetryHandshakeServer(ProtocolCodec codec) throws IOException {
+			this.codec = codec;
+			serverSocket = new ServerSocket();
+			serverSocket.bind(new InetSocketAddress("127.0.0.1", 0));
+			thread = Thread.ofPlatform()
+					.name("arenaagents-retry-handshake-server")
+					.daemon(true)
+					.start(this::serve);
+		}
+
+		private int port() {
+			return serverSocket.getLocalPort();
+		}
+
+		private boolean firstSocketClosedByClient() {
+			return firstSocketClosedByClient.get();
+		}
+
+		private void assertHealthy() {
+			Throwable problem = failure.get();
+			if (problem != null) {
+				throw new AssertionError("retry handshake fixture failed", problem);
+			}
+			pass("retry handshake fixture healthy");
+		}
+
+		private void serve() {
+			try {
+				Socket first = accept();
+				codec.readLine(first.getInputStream());
+				codec.writeLine(
+						first.getOutputStream(),
+						"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
+								+ "\",\"type\":\"error\",\"messageId\":\"retry-error-1\","
+								+ "\"code\":\"SESSION_ACTIVE\",\"message\":\"retry\"}"
+				);
+				first.setSoTimeout(SOCKET_TIMEOUT_MS);
+				firstSocketClosedByClient.set(codec.readLine(first.getInputStream()) == null);
+				first.close();
+
+				Socket second = accept();
+				codec.readLine(second.getInputStream());
+				codec.writeLine(
+						second.getOutputStream(),
+						"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
+								+ "\",\"type\":\"hello_ack\",\"messageId\":\"retry-ack-1\","
+								+ "\"replyTo\":\"hello-retry\"}"
+				);
+			} catch (IOException | RuntimeException exception) {
+				if (!serverSocket.isClosed()) {
+					failure.compareAndSet(null, exception);
+				}
+			}
+		}
+
+		private Socket accept() throws IOException {
+			Socket socket = serverSocket.accept();
+			synchronized (acceptedSockets) {
+				acceptedSockets.add(socket);
+			}
+			return socket;
+		}
+
+		@Override
+		public void close() throws IOException {
+			serverSocket.close();
+			synchronized (acceptedSockets) {
+				for (Socket socket : acceptedSockets) {
+					socket.close();
+				}
+			}
+			try {
+				thread.join(SOCKET_TIMEOUT_MS);
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+			}
 		}
 	}
 

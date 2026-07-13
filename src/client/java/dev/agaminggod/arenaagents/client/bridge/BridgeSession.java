@@ -15,12 +15,15 @@ import java.io.OutputStream;
 import java.math.BigDecimal;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -29,6 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class BridgeSession implements AutoCloseable {
 	public static final int OUTBOUND_QUEUE_CAPACITY = 256;
 	public static final int MAX_MESSAGE_IDS_PER_SESSION = 4_096;
+	public static final int AUTHENTICATION_TIMEOUT_MS = 1_000;
 
 	private static final long WRITER_POLL_MS = 100L;
 	private static final long THREAD_JOIN_MS = 2_000L;
@@ -60,14 +64,17 @@ public final class BridgeSession implements AutoCloseable {
 	private final Runnable closedCallback;
 	private final InputStream input;
 	private final OutputStream output;
-	private final ArrayBlockingQueue<String> outbound = new ArrayBlockingQueue<>(OUTBOUND_QUEUE_CAPACITY);
+	private final BlockingQueue<String> outbound;
 	private final Set<String> inboundMessageIds = new HashSet<>();
-	private final Set<String> outboundMessageIds = ConcurrentHashMap.newKeySet();
-	private final AtomicBoolean authenticated = new AtomicBoolean();
-	private final AtomicBoolean closed = new AtomicBoolean();
+	private final AtomicBoolean closeStarted = new AtomicBoolean();
 	private final AtomicLong outboundSequence = new AtomicLong();
+	private final CountDownLatch closeCompleted = new CountDownLatch(1);
+	private final Object callbackLock = new Object();
+	private final Object lifecycleLock = new Object();
 	private final Object outputLock = new Object();
 
+	private volatile SessionState state = SessionState.AWAITING_HELLO;
+	private boolean started;
 	private volatile Thread readerThread;
 	private volatile Thread writerThread;
 
@@ -79,42 +86,73 @@ public final class BridgeSession implements AutoCloseable {
 			BridgeEventSink eventSink,
 			Runnable closedCallback
 	) throws IOException {
+		this(
+				config,
+				socket,
+				codec,
+				callbackExecutor,
+				eventSink,
+				closedCallback,
+				new ArrayBlockingQueue<>(OUTBOUND_QUEUE_CAPACITY)
+		);
+	}
+
+	BridgeSession(
+			AgentConfig config,
+			Socket socket,
+			ProtocolCodec codec,
+			Executor callbackExecutor,
+			BridgeEventSink eventSink,
+			Runnable closedCallback,
+			BlockingQueue<String> outbound
+	) throws IOException {
 		this.config = Objects.requireNonNull(config, "config must not be null");
 		this.socket = Objects.requireNonNull(socket, "socket must not be null");
 		this.codec = Objects.requireNonNull(codec, "codec must not be null");
 		this.callbackExecutor = Objects.requireNonNull(callbackExecutor, "callbackExecutor must not be null");
 		this.eventSink = Objects.requireNonNull(eventSink, "eventSink must not be null");
 		this.closedCallback = Objects.requireNonNull(closedCallback, "closedCallback must not be null");
+		this.outbound = Objects.requireNonNull(outbound, "outbound must not be null");
 		validateLoopbackPeer(socket);
 		socket.setTcpNoDelay(true);
+		socket.setSoTimeout(AUTHENTICATION_TIMEOUT_MS);
 		this.input = socket.getInputStream();
 		this.output = socket.getOutputStream();
 	}
 
 	void start() {
-		if (closed.get()) {
-			throw new IllegalStateException("Cannot start a closed bridge session");
+		synchronized (lifecycleLock) {
+			if (state == SessionState.CLOSED) {
+				throw new IllegalStateException("Cannot start a closed bridge session");
+			}
+			if (started) {
+				return;
+			}
+			started = true;
+			writerThread = createDaemon("writer", this::writerLoop);
+			readerThread = createDaemon("reader", this::readerLoop);
+			writerThread.start();
+			readerThread.start();
 		}
-		writerThread = startDaemon("writer", this::writerLoop);
-		readerThread = startDaemon("reader", this::readerLoop);
 	}
 
 	boolean isOpen() {
-		return !closed.get();
+		return state != SessionState.CLOSED;
 	}
 
 	boolean isAuthenticated() {
-		return authenticated.get() && isOpen();
+		return state == SessionState.AUTHENTICATED;
 	}
 
-	void sendEvent(String type, String messageId, JsonObject payload) {
+	String sendEvent(String type, JsonObject payload) {
 		if (!isAuthenticated()) {
 			throw new ProtocolException("NO_AUTHENTICATED_SESSION", "No authenticated coordinator session is active");
 		}
 		if (!OUTBOUND_EVENT_TYPES.contains(type)) {
 			throw new ProtocolException("UNKNOWN_MESSAGE_TYPE", "Unknown outbound bridge message type '" + type + "'");
 		}
-		JsonObject event = createEnvelope(type, messageId);
+		JsonObject event = createEnvelope(type);
+		String messageId = event.get(FIELD_MESSAGE_ID).getAsString();
 		if (payload != null) {
 			for (var entry : payload.entrySet()) {
 				if (event.has(entry.getKey())) {
@@ -126,7 +164,22 @@ public final class BridgeSession implements AutoCloseable {
 				event.add(entry.getKey(), entry.getValue().deepCopy());
 			}
 		}
-		enqueue(codec.encode(event));
+		String encoded = codec.encode(event);
+		boolean queued;
+		synchronized (lifecycleLock) {
+			if (state != SessionState.AUTHENTICATED) {
+				throw new ProtocolException(
+						"NO_AUTHENTICATED_SESSION",
+						"No authenticated coordinator session is active"
+				);
+			}
+			queued = outbound.offer(encoded);
+		}
+		if (!queued) {
+			close();
+			throw outboundQueueFull();
+		}
+		return messageId;
 	}
 
 	static void rejectAdditionalSession(Socket socket, AgentConfig config, ProtocolCodec codec) {
@@ -143,17 +196,25 @@ public final class BridgeSession implements AutoCloseable {
 
 	private void readerLoop() {
 		try {
-			while (!closed.get()) {
+			while (isOpen()) {
 				String line = codec.readLine(input);
 				if (line == null) {
 					break;
 				}
 				handleMessage(line);
 			}
+		} catch (SocketTimeoutException exception) {
+			if (!isAuthenticated()) {
+				writeError(new ProtocolException(
+						"AUTHENTICATION_TIMEOUT",
+						"Bridge hello was not received within " + AUTHENTICATION_TIMEOUT_MS + " ms",
+						exception
+				));
+			}
 		} catch (ProtocolException exception) {
 			writeError(exception);
 		} catch (IOException exception) {
-			if (!closed.get()) {
+			if (isOpen()) {
 				writeError(new ProtocolException("BRIDGE_IO", "Bridge input failed: " + exception.getMessage(), exception));
 			}
 		} finally {
@@ -163,7 +224,7 @@ public final class BridgeSession implements AutoCloseable {
 
 	private void writerLoop() {
 		try {
-			while (!closed.get() || !outbound.isEmpty()) {
+			while (isOpen() || !outbound.isEmpty()) {
 				String message = outbound.poll(WRITER_POLL_MS, TimeUnit.MILLISECONDS);
 				if (message != null) {
 					writeNow(message);
@@ -172,7 +233,7 @@ public final class BridgeSession implements AutoCloseable {
 		} catch (InterruptedException exception) {
 			Thread.currentThread().interrupt();
 		} catch (IOException exception) {
-			if (!closed.get()) {
+			if (isOpen()) {
 				close();
 			}
 		}
@@ -189,7 +250,7 @@ public final class BridgeSession implements AutoCloseable {
 		String messageId = requireBoundedString(message, FIELD_MESSAGE_ID, ProtocolConstants.MAX_COMMAND_ID_LENGTH);
 		rememberMessageId(messageId);
 
-		if (!authenticated.get() && !"hello".equals(type)) {
+		if (!isAuthenticated() && !"hello".equals(type)) {
 			throw new ProtocolException("AUTHENTICATION_REQUIRED", "First bridge message must be hello");
 		}
 
@@ -211,12 +272,42 @@ public final class BridgeSession implements AutoCloseable {
 
 	private void handleHello(JsonObject message, String messageId) {
 		validateFields(message, ENVELOPE_FIELDS);
-		if (!authenticated.compareAndSet(false, true)) {
+		synchronized (lifecycleLock) {
+			ensureAwaitingHello();
+		}
+		JsonObject acknowledgement = createEnvelope("hello_ack");
+		acknowledgement.addProperty("replyTo", messageId);
+		String encoded = codec.encode(acknowledgement);
+		resetReadTimeout();
+		boolean queued;
+		synchronized (lifecycleLock) {
+			ensureAwaitingHello();
+			queued = outbound.offer(encoded);
+			if (queued) {
+				state = SessionState.AUTHENTICATED;
+			}
+		}
+		if (!queued) {
+			close();
+			throw outboundQueueFull();
+		}
+	}
+
+	private void ensureAwaitingHello() {
+		if (state == SessionState.CLOSED) {
+			throw new ProtocolException("SESSION_CLOSED", "Bridge session is closed");
+		}
+		if (state != SessionState.AWAITING_HELLO) {
 			throw new ProtocolException("ALREADY_AUTHENTICATED", "hello is only valid as the first message");
 		}
-		JsonObject acknowledgement = createEnvelope("hello_ack", nextOutboundMessageId());
-		acknowledgement.addProperty("replyTo", messageId);
-		enqueue(codec.encode(acknowledgement));
+	}
+
+	private void resetReadTimeout() {
+		try {
+			socket.setSoTimeout(0);
+		} catch (SocketException exception) {
+			throw new ProtocolException("BRIDGE_IO", "Could not reset bridge read timeout", exception);
+		}
 	}
 
 	private void handleActionCommand(JsonObject message) {
@@ -234,11 +325,23 @@ public final class BridgeSession implements AutoCloseable {
 	}
 
 	private void dispatchAction(ActionCommand command) {
-		try {
-			eventSink.onActionCommand(command);
-		} catch (RuntimeException exception) {
-			writeError(new ProtocolException("CALLBACK_FAILED", "Client action callback failed", exception));
-			close();
+		ProtocolException callbackFailure = null;
+		synchronized (callbackLock) {
+			if (!isAuthenticated()) {
+				return;
+			}
+			try {
+				eventSink.onActionCommand(command);
+			} catch (RuntimeException exception) {
+				callbackFailure = new ProtocolException("CALLBACK_FAILED", "Client action callback failed", exception);
+			}
+		}
+		if (callbackFailure != null) {
+			try {
+				writeError(callbackFailure);
+			} finally {
+				close();
+			}
 		}
 	}
 
@@ -251,24 +354,18 @@ public final class BridgeSession implements AutoCloseable {
 		}
 	}
 
-	private void enqueue(String message) {
-		if (closed.get()) {
-			throw new ProtocolException("SESSION_CLOSED", "Bridge session is closed");
-		}
-		if (!outbound.offer(message)) {
-			close();
-			throw new ProtocolException("OUTBOUND_QUEUE_FULL", "Bridge outbound queue is full");
-		}
+	private static ProtocolException outboundQueueFull() {
+		return new ProtocolException("OUTBOUND_QUEUE_FULL", "Bridge outbound queue is full");
 	}
 
 	private void writeError(ProtocolException exception) {
-		if (closed.get()) {
-			return;
-		}
-		JsonObject error = createEnvelope("error", nextOutboundMessageId());
-		error.addProperty("code", exception.code());
-		error.addProperty("message", exception.getMessage());
 		try {
+			if (!isOpen()) {
+				return;
+			}
+			JsonObject error = createEnvelope("error");
+			error.addProperty("code", exception.code());
+			error.addProperty("message", exception.getMessage());
 			writeNow(codec.encode(error));
 		} catch (IOException | RuntimeException ignored) {
 			// Closing the failed socket is the only remaining safe response.
@@ -281,23 +378,28 @@ public final class BridgeSession implements AutoCloseable {
 		}
 	}
 
-	private Thread startDaemon(String role, Runnable task) {
+	private Thread createDaemon(String role, Runnable task) {
 		return Thread.ofPlatform()
 				.name(BridgeServer.THREAD_NAME_PREFIX + role + "-" + config.agentId())
 				.daemon(true)
-				.start(task);
+				.unstarted(task);
 	}
 
 	private String nextOutboundMessageId() {
-		return "server-" + outboundSequence.incrementAndGet();
+		while (true) {
+			long current = outboundSequence.get();
+			if (current == Long.MAX_VALUE) {
+				throw new ProtocolException("MESSAGE_ID_EXHAUSTED", "Bridge outbound message ID space is exhausted");
+			}
+			long next = current + 1L;
+			if (outboundSequence.compareAndSet(current, next)) {
+				return "server-" + next;
+			}
+		}
 	}
 
-	private JsonObject createEnvelope(String type, String messageId) {
-		JsonObject envelope = createEnvelope(config, type, messageId);
-		if (!outboundMessageIds.add(messageId)) {
-			throw new ProtocolException("DUPLICATE_MESSAGE_ID", "Duplicate bridge messageId '" + messageId + "'");
-		}
-		return envelope;
+	private JsonObject createEnvelope(String type) {
+		return createEnvelope(config, type, nextOutboundMessageId());
 	}
 
 	private static JsonObject createEnvelope(AgentConfig config, String type, String messageId) {
@@ -417,8 +519,20 @@ public final class BridgeSession implements AutoCloseable {
 
 	@Override
 	public void close() {
-		if (!closed.compareAndSet(false, true)) {
+		if (!closeStarted.compareAndSet(false, true)) {
+			awaitCloseCompletionWhenSafe();
 			return;
+		}
+		try {
+			closeOwnedResources();
+		} finally {
+			closeCompleted.countDown();
+		}
+	}
+
+	private void closeOwnedResources() {
+		synchronized (lifecycleLock) {
+			state = SessionState.CLOSED;
 		}
 		try {
 			socket.close();
@@ -427,9 +541,38 @@ public final class BridgeSession implements AutoCloseable {
 		}
 		interrupt(writerThread);
 		interrupt(readerThread);
-		closedCallback.run();
+		synchronized (callbackLock) {
+			// Wait for an in-flight callback after closing the socket so blocked I/O can unwind.
+		}
+		try {
+			closedCallback.run();
+		} catch (RuntimeException ignored) {
+			// Session resources must still be joined even if an owner callback is faulty.
+		}
 		join(writerThread);
 		join(readerThread);
+	}
+
+	private void awaitCloseCompletionWhenSafe() {
+		Thread current = Thread.currentThread();
+		if (current == readerThread || current == writerThread || Thread.holdsLock(callbackLock)) {
+			return;
+		}
+		boolean interrupted = false;
+		while (closeCompleted.getCount() != 0L) {
+			try {
+				closeCompleted.await();
+			} catch (InterruptedException exception) {
+				interrupted = true;
+			}
+		}
+		if (interrupted) {
+			current.interrupt();
+		}
+	}
+
+	boolean isDispatchingCallbackOnCurrentThread() {
+		return Thread.holdsLock(callbackLock);
 	}
 
 	private static void interrupt(Thread thread) {
@@ -447,5 +590,11 @@ public final class BridgeSession implements AutoCloseable {
 		} catch (InterruptedException exception) {
 			Thread.currentThread().interrupt();
 		}
+	}
+
+	private enum SessionState {
+		AWAITING_HELLO,
+		AUTHENTICATED,
+		CLOSED
 	}
 }

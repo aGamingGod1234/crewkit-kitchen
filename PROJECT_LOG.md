@@ -1,3 +1,33 @@
+## 2026-07-13 — Task 3 bridge lifecycle review fixes
+
+### What Was Implemented
+- Linearized bridge start, session admission, and shutdown with explicit guarded server states so a candidate accepted during close can never publish or start afterward.
+- Made `hello_ack` queue insertion and authentication publication one ordered session transition, and invalidated queued action callbacks when their originating session closes.
+- Added a one-second pre-authentication timeout that reports `AUTHENTICATION_TIMEOUT` and releases the single-session slot for reconnect.
+- Replaced caller-controlled outbound IDs and unbounded retention with one monotonic per-session generator shared by acknowledgements, events, and errors; `sendEvent` returns the generated ID for correlation without retaining prior IDs.
+- Hardened authenticated test retries to close every failed socket and retry only transport failures or transient `SESSION_ACTIVE` responses.
+- Moved queue-overflow shutdown and callback-error I/O outside conflicting locks, made concurrent close calls wait for teardown completion, and closed sockets before waiting for in-flight callbacks.
+- Added live socket and deterministic concurrency regressions for the review findings, expanding `verifyCore` from 142 to 166 assertions.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeServer.java` — adds guarded lifecycle and admission state plus a package-private session-construction boundary for deterministic verification.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeSession.java` — orders authentication, generates outbound IDs, times out silent peers, contains callback failures, and completion-linearizes close.
+- `src/test/java/dev/agaminggod/arenaagents/client/bridge/BridgeConcurrencyVerification.java` — forces close-versus-admission, acknowledgement-order, and queue-overflow lock interleavings with real loopback sockets and controlled production boundaries.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — adds timeout, retry, sustained generated-ID, stale-callback, acknowledgement-order, queue-overflow, and shutdown-race regressions.
+- `PROJECT_LOG.md` — records the Task 3 review fixes, assumptions, and remaining scope.
+
+### Assumptions Made (flag these for review)
+- A silent coordinator receives a one-second hello deadline; this is long enough for a local loopback handshake while preventing indefinite ownership of the only session slot.
+- All server-originated frames use generated IDs in the form `server-N`; callers receive the generated event ID as the return value and may not replace envelope fields through payload data.
+
+### Known Issues / Deferred
+- The existing 4,096-message inbound session limit remains unchanged; outbound sessions have no event-count cap and retain no historical ID set.
+- Action execution, cancellation effects, observation collection, and coordinator behavior remain in their previously assigned later tasks.
+
+### Suggested Next Steps
+- Implement Task 4 bounded observations through the hardened `BridgeServer.sendEvent` path.
+- Preserve the new session lifecycle and acknowledgement-order invariants when Task 5 adds action execution.
+
 ## 2026-07-13 — Task 3 client configuration and loopback bridge
 
 ### What Was Implemented
