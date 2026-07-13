@@ -19,7 +19,7 @@ foreach ($required in @($Java,$Launcher,$Properties)) {
 }
 $settings = Get-Content -LiteralPath $Properties -Raw
 $expectedMode = if ($OfflineSmoke) { 'online-mode=false' } else { 'online-mode=true' }
-if ($settings -notmatch "(?m)^$([regex]::Escape($expectedMode))$") {
+if ($settings -notmatch "(?m)^$([regex]::Escape($expectedMode))\r?$") {
     throw "Server mode mismatch. Expected $expectedMode in $Properties"
 }
 if ($OfflineSmoke) {

@@ -198,7 +198,7 @@ if (-not (Test-Path -LiteralPath $propertiesPath)) {
 } else {
     $properties = Get-Content -LiteralPath $propertiesPath -Raw
     foreach ($requiredSetting in @('online-mode=true','server-port=25565','level-name=world')) {
-        if ($properties -notmatch "(?m)^$([regex]::Escape($requiredSetting))$") {
+        if ($properties -notmatch "(?m)^$([regex]::Escape($requiredSetting))\r?$") {
             throw "Existing server.properties must contain $requiredSetting"
         }
     }

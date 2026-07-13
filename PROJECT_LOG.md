@@ -512,6 +512,7 @@
 - Added explicit Codex `experimentalApi` capability negotiation while declining attestation requests, preserving deterministic empty `environments` and `dynamicTools` arrays so planner turns cannot inherit a host-default environment or dynamic tools.
 - Added a regression assertion for the exact initialize capability contract after the local Codex 0.144.0 app server rejected unnegotiated experimental fields.
 - Replaced the Windows PowerShell 5.1-incompatible `Path.GetRelativePath` call with a bounded world-root helper and added hash-gated recovery for an interrupted copy that exists without evidence.
+- Made exact server-property checks accept both LF and the CRLF line endings written by the Minecraft server while still rejecting whitespace or value changes.
 - Added an idempotent launcher-profile installer that preserves all existing profiles, writes a local backup, and adds the two exact Fabric 0.19.3 isolated installations.
 - Restored the disposable copied world after preflight startup, then independently verified all 80 source/target files and `level.dat` hashes match with no stale `session.lock`.
 
