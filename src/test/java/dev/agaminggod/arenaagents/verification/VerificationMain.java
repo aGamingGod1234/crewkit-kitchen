@@ -24,6 +24,7 @@ import dev.agaminggod.arenaagents.client.perception.ObservationWireBudgetVerific
 import dev.agaminggod.arenaagents.client.navigation.LocalPathfinderVerification;
 import dev.agaminggod.arenaagents.client.navigation.NavigationMovementVerification;
 import dev.agaminggod.arenaagents.client.navigation.MinecraftWalkabilityViewVerification;
+import dev.agaminggod.arenaagents.client.network.GoalReceiverVerification;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
 import dev.agaminggod.arenaagents.protocol.ActionState;
@@ -31,6 +32,7 @@ import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
+import dev.agaminggod.arenaagents.server.GoalControlVerification;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -87,6 +89,8 @@ public final class VerificationMain {
 		passedAssertions += LocalPathfinderVerification.verify();
 		passedAssertions += NavigationMovementVerification.verify();
 		passedAssertions += MinecraftWalkabilityViewVerification.verify();
+		passedAssertions += GoalControlVerification.verify();
+		passedAssertions += GoalReceiverVerification.verify();
 		verifyObservationContracts(codec);
 		ObservationCollectorVerification.verifyLoadedChunkBoundary();
 		ObservationCollectorVerification.verifyEntityDistanceBoundary();

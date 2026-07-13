@@ -444,3 +444,37 @@
 ### Suggested Next Steps
 - Integrate the coordinator and remaining Java commits, run consolidated verification, then run preparation twice.
 - Create both launcher installations through the official UI and execute the sequential authenticated live-test matrix.
+
+## 2026-07-13 — Task 8 server goal control and client delivery
+
+### What Was Implemented
+- Added operator-only `/arenaagent goal <players> <goal>`, `/arenaagent stop <players>`, and `/arenaagent status <players>` commands using the Minecraft 26.1.2 command API.
+- Added strict goal normalization, a 4,096-character input limit, explicit validation errors, and per-player server-session goal status.
+- Added a typed Fabric clientbound goal payload and bounded codec, with delivery restricted to the selector's supported players and explicit success, unsupported-client, and failure acknowledgements.
+- Added a client-thread goal receiver that cancels and releases the active action before publishing a fixed-shape generated `goal_event`; both replacement goals and stop commands use the existing idempotent lifecycle cleanup.
+- Added RED-first verification for normalization, limits, authorization policy, target filtering, status transitions, strict event fields, and cancellation-before-publication ordering.
+
+### Files Modified
+- `src/main/java/dev/agaminggod/arenaagents/server/GoalControl.java` — validates goals, checks the operator policy, tracks session status, and performs exact selected-target delivery.
+- `src/main/java/dev/agaminggod/arenaagents/server/GoalPayload.java` — defines the typed set/stop payload and bounded Fabric stream codec.
+- `src/main/java/dev/agaminggod/arenaagents/server/ArenaAgentCommands.java` — registers goal, stop, and status commands and reports delivery outcomes.
+- `src/main/java/dev/agaminggod/arenaagents/ArenaAgents.java` — registers the clientbound payload codec and server commands.
+- `src/client/java/dev/agaminggod/arenaagents/client/network/GoalReceiver.java` — dispatches payload handling on the client thread, stops active work, and emits `goal_event`.
+- `src/client/java/dev/agaminggod/arenaagents/client/ArenaAgentsClient.java` — wires the goal receiver to the action runtime and loopback bridge.
+- `src/test/java/dev/agaminggod/arenaagents/server/GoalControlVerification.java` — verifies goal control policy, validation, targeting, and status.
+- `src/test/java/dev/agaminggod/arenaagents/client/network/GoalReceiverVerification.java` — verifies goal/stop ordering and strict bridge payload fields.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — runs the Task 8 verification suites.
+- `PROJECT_LOG.md` — records Task 8 scope, decisions, and deferred work.
+
+### Assumptions Made (flag these for review)
+- Minecraft's vanilla game-master permission check is the intended operator threshold for all three commands.
+- `/arenaagent status` reports the last successfully delivered server-session goal state; detailed client action state remains available through observations rather than a new reverse network payload.
+- A replacement goal cancels the previous macro action immediately, matching the approved combat and action-lifecycle goal-replacement semantics.
+
+### Known Issues / Deferred
+- If no authenticated coordinator bridge session is active when a payload arrives, the client logs the failed `goal_event` publication; coordinator reconnect/replay policy remains Task 11.
+- In-game command and payload negotiation will be exercised in the copied test world during the official-launcher verification task.
+
+### Suggested Next Steps
+- Keep Task 9's `goal_event` validator synchronized with the exact `operation` and `goal` fields introduced here.
+- Have Task 11 treat `operation=set` as a fresh planning trigger and `operation=stop` as terminal until another goal arrives.

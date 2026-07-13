@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.client.bridge.BridgeEventSink;
 import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.client.config.AgentConfigLoader;
+import dev.agaminggod.arenaagents.client.network.GoalReceiver;
 import dev.agaminggod.arenaagents.client.perception.Observation;
 import dev.agaminggod.arenaagents.client.perception.ObservationCollector;
 import dev.agaminggod.arenaagents.client.perception.ObservationWireBudget;
@@ -52,6 +53,7 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 				exception -> LOGGER.warn("Could not publish an Arena Agents action event", exception)
 		);
 		actionRuntime = new ClientActionRuntime(new MinecraftActionContext(minecraft), actionPublisher);
+		GoalReceiver.register(actionRuntime, bridgeServer);
 		observationCollector = new ObservationCollector(
 				minecraft,
 				config.observationRadius(),
