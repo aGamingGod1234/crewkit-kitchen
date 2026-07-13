@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.client.action;
 
+import dev.agaminggod.arenaagents.client.combat.CombatTarget;
+import dev.agaminggod.arenaagents.client.combat.WeaponCandidate;
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
 import dev.agaminggod.arenaagents.client.navigation.MinecraftWalkabilityView;
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
@@ -7,18 +9,31 @@ import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientChunkCache;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 public final class MinecraftActionContext implements ActionContext {
@@ -40,6 +55,13 @@ public final class MinecraftActionContext implements ActionContext {
 	private static final String ITEM_USE_REJECTED_REASON = "ITEM_USE_REJECTED";
 	private static final String ITEM_USE_REJECTED_MESSAGE = "Selected item did not accept the use action";
 	private static final String ITEM_USE_FAILED_REASON = "ITEM_USE_FAILED";
+	private static final String ATTACK_SENT_REASON = "ATTACK_SENT";
+	private static final String ATTACK_UNAVAILABLE_REASON = "ATTACK_UNAVAILABLE";
+	private static final String TARGET_GONE_REASON = "TARGET_GONE";
+	private static final String TARGET_OUT_OF_REACH_REASON = "TARGET_OUT_OF_REACH";
+	private static final String BLOCK_BREAK_REJECTED_REASON = "BLOCK_BREAK_REJECTED";
+	private static final String BLOCK_PLACE_REJECTED_REASON = "BLOCK_PLACE_REJECTED";
+	private static final String BLOCK_ITEM_REQUIRED_REASON = "BLOCK_ITEM_REQUIRED";
 
 	private final Minecraft minecraft;
 	private final WalkabilityView walkabilityView;
@@ -109,6 +131,178 @@ public final class MinecraftActionContext implements ActionContext {
 		minecraft.options.keyRight.setDown(movement.right());
 		minecraft.options.keyJump.setDown(movement.jump());
 		minecraft.options.keySprint.setDown(movement.sprint());
+	}
+
+	@Override
+	public CombatSnapshot combatSnapshot() {
+		requireClientThread();
+		LocalPlayer player = requirePlayer();
+		ClientLevel level = minecraft.level;
+		if (level == null) {
+			return ActionContext.super.combatSnapshot();
+		}
+		List<CombatTarget> targets = new ArrayList<>();
+		for (Entity entity : level.entitiesForRendering()) {
+			if (!(entity instanceof LivingEntity living) || entity == player || entity.isRemoved()) {
+				continue;
+			}
+			targets.add(new CombatTarget(
+					entity.getUUID(),
+					entity.getName().getString(),
+					BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString(),
+					entity instanceof Player,
+					entity instanceof Enemy,
+					living.isAlive(),
+					entity.getX(),
+					entity.getY(),
+					entity.getZ(),
+					entity.getEyeY(),
+					player.distanceToSqr(entity)
+			));
+		}
+		List<WeaponCandidate> hotbarItems = new ArrayList<>();
+		Inventory inventory = player.getInventory();
+		for (int slot = 0; slot < Inventory.getSelectionSize(); slot++) {
+			ItemStack stack = inventory.getItem(slot);
+			if (!stack.isEmpty()) {
+				hotbarItems.add(new WeaponCandidate(
+						BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(),
+						slot
+				));
+			}
+		}
+		return new CombatSnapshot(
+				targets,
+				hotbarItems,
+				player.getAttackStrengthScale(0.0F),
+				player.entityInteractionRange()
+		);
+	}
+
+	@Override
+	public OperationResult attackTarget(UUID targetId) {
+		requireClientThread();
+		Objects.requireNonNull(targetId, "targetId must not be null");
+		LocalPlayer player = minecraft.player;
+		ClientLevel level = minecraft.level;
+		MultiPlayerGameMode gameMode = minecraft.gameMode;
+		if (player == null || level == null || gameMode == null) {
+			return OperationResult.failed(ATTACK_UNAVAILABLE_REASON, "Minecraft attack interaction is unavailable");
+		}
+		Entity target = findEntity(level, targetId);
+		if (!(target instanceof LivingEntity living) || !living.isAlive()) {
+			return OperationResult.failed(TARGET_GONE_REASON, "Selected combat target is unavailable");
+		}
+		if (!player.isWithinEntityInteractionRange(target, 0.0D)) {
+			return OperationResult.failed(TARGET_OUT_OF_REACH_REASON, "Selected combat target is outside survival reach");
+		}
+		try {
+			gameMode.attack(player, target);
+			player.swing(InteractionHand.MAIN_HAND);
+			return OperationResult.succeeded(ATTACK_SENT_REASON, "Attack sent through the client interaction manager");
+		} catch (RuntimeException exception) {
+			return OperationResult.failed(ATTACK_UNAVAILABLE_REASON, safeExceptionMessage(exception));
+		}
+	}
+
+	@Override
+	public BlockInteractionSnapshot inspectBlock(GridPosition position) {
+		requireClientThread();
+		Objects.requireNonNull(position, "position must not be null");
+		LocalPlayer player = minecraft.player;
+		ClientLevel level = minecraft.level;
+		if (player == null || level == null || level.isOutsideBuildHeight(position.y())) {
+			return new BlockInteractionSnapshot(false, false, false, false, BlockFace.UP);
+		}
+		ClientChunkCache chunkCache = level.getChunkSource();
+		boolean chunkLoaded = chunkCache.getChunk(
+				position.x() >> 4,
+				position.z() >> 4,
+				ChunkStatus.FULL,
+				false
+		) != null;
+		if (!chunkLoaded) {
+			return new BlockInteractionSnapshot(false, false, false, false, BlockFace.UP);
+		}
+		BlockPos blockPosition = toBlockPos(position);
+		BlockState state = level.getBlockState(blockPosition);
+		HitResult hit = player.pick(player.blockInteractionRange(), 1.0F, false);
+		boolean visible = hit instanceof BlockHitResult blockHit && blockHit.getBlockPos().equals(blockPosition);
+		BlockFace visibleFace = visible
+				? fromDirection(((BlockHitResult) hit).getDirection())
+				: BlockFace.UP;
+		return new BlockInteractionSnapshot(
+				true,
+				player.isWithinBlockInteractionRange(blockPosition, 0.0D),
+				visible,
+				!state.isAir(),
+				visibleFace
+		);
+	}
+
+	@Override
+	public BlockProgress breakBlock(GridPosition position, BlockFace face) {
+		requireClientThread();
+		Objects.requireNonNull(position, "position must not be null");
+		Objects.requireNonNull(face, "face must not be null");
+		ClientLevel level = minecraft.level;
+		MultiPlayerGameMode gameMode = minecraft.gameMode;
+		if (level == null || gameMode == null) {
+			return BlockProgress.failed(BLOCK_BREAK_REJECTED_REASON, "Minecraft block breaking is unavailable");
+		}
+		BlockPos blockPosition = toBlockPos(position);
+		if (level.getBlockState(blockPosition).isAir()) {
+			return BlockProgress.succeeded("BLOCK_BROKEN", "Target block is absent");
+		}
+		try {
+			boolean accepted = gameMode.isDestroying()
+					? gameMode.continueDestroyBlock(blockPosition, toDirection(face))
+					: gameMode.startDestroyBlock(blockPosition, toDirection(face));
+			return accepted
+					? BlockProgress.running("Breaking target block")
+					: BlockProgress.failed(BLOCK_BREAK_REJECTED_REASON, "Server rules rejected block breaking");
+		} catch (RuntimeException exception) {
+			return BlockProgress.failed(BLOCK_BREAK_REJECTED_REASON, safeExceptionMessage(exception));
+		}
+	}
+
+	@Override
+	public OperationResult placeBlock(GridPosition position, BlockFace face, String itemId) {
+		requireClientThread();
+		Objects.requireNonNull(position, "position must not be null");
+		Objects.requireNonNull(face, "face must not be null");
+		Objects.requireNonNull(itemId, "itemId must not be null");
+		LocalPlayer player = minecraft.player;
+		MultiPlayerGameMode gameMode = minecraft.gameMode;
+		if (player == null || gameMode == null) {
+			return OperationResult.failed(BLOCK_PLACE_REJECTED_REASON, "Minecraft block placement is unavailable");
+		}
+		ItemStack selected = player.getInventory().getSelectedItem();
+		String selectedItemId = BuiltInRegistries.ITEM.getKey(selected.getItem()).toString();
+		if (!itemId.equals(selectedItemId) || !(selected.getItem() instanceof BlockItem)) {
+			return OperationResult.failed(BLOCK_ITEM_REQUIRED_REASON, "Selected hotbar item is not the requested block item");
+		}
+		BlockPos blockPosition = toBlockPos(position);
+		Direction direction = toDirection(face);
+		Vec3 hitLocation = Vec3.atCenterOf(blockPosition).add(
+				direction.getStepX() * 0.5D,
+				direction.getStepY() * 0.5D,
+				direction.getStepZ() * 0.5D
+		);
+		try {
+			InteractionResult result = gameMode.useItemOn(
+					player,
+					InteractionHand.MAIN_HAND,
+					new BlockHitResult(hitLocation, direction, blockPosition, false)
+			);
+			if (!result.consumesAction()) {
+				return OperationResult.failed(BLOCK_PLACE_REJECTED_REASON, "Server rules rejected block placement");
+			}
+			player.swing(InteractionHand.MAIN_HAND);
+			return OperationResult.succeeded("BLOCK_PLACE_SENT", "Block placement sent through the client interaction manager");
+		} catch (RuntimeException exception) {
+			return OperationResult.failed(BLOCK_PLACE_REJECTED_REASON, safeExceptionMessage(exception));
+		}
 	}
 
 	@Override
@@ -255,6 +449,41 @@ public final class MinecraftActionContext implements ActionContext {
 		if (minecraft.gameMode != null) {
 			minecraft.gameMode.stopDestroyBlock();
 		}
+	}
+
+	private static Entity findEntity(ClientLevel level, UUID targetId) {
+		for (Entity entity : level.entitiesForRendering()) {
+			if (entity.getUUID().equals(targetId)) {
+				return entity;
+			}
+		}
+		return null;
+	}
+
+	private static BlockPos toBlockPos(GridPosition position) {
+		return new BlockPos(position.x(), position.y(), position.z());
+	}
+
+	private static Direction toDirection(BlockFace face) {
+		return switch (face) {
+			case DOWN -> Direction.DOWN;
+			case UP -> Direction.UP;
+			case NORTH -> Direction.NORTH;
+			case SOUTH -> Direction.SOUTH;
+			case WEST -> Direction.WEST;
+			case EAST -> Direction.EAST;
+		};
+	}
+
+	private static BlockFace fromDirection(Direction direction) {
+		return switch (direction) {
+			case DOWN -> BlockFace.DOWN;
+			case UP -> BlockFace.UP;
+			case NORTH -> BlockFace.NORTH;
+			case SOUTH -> BlockFace.SOUTH;
+			case WEST -> BlockFace.WEST;
+			case EAST -> BlockFace.EAST;
+		};
 	}
 
 	private LocalPlayer requirePlayer() {

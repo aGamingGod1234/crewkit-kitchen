@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.verification;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.client.action.ActionExecutorVerification;
+import dev.agaminggod.arenaagents.client.action.CombatInteractionVerification;
 import dev.agaminggod.arenaagents.client.action.MinecraftActionContextVerification;
 import dev.agaminggod.arenaagents.client.action.MoveToActionVerification;
 import dev.agaminggod.arenaagents.client.bridge.BridgeConcurrencyVerification;
@@ -81,6 +82,7 @@ public final class VerificationMain {
 		passedAssertions += ActionExecutorVerification.verifyLifecycle();
 		passedAssertions += ActionExecutorVerification.verifyPrimitives();
 		passedAssertions += MoveToActionVerification.verify();
+		passedAssertions += CombatInteractionVerification.verify();
 		passedAssertions += MinecraftActionContextVerification.verifyHelpers();
 		passedAssertions += LocalPathfinderVerification.verify();
 		passedAssertions += NavigationMovementVerification.verify();

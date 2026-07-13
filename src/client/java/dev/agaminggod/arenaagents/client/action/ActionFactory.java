@@ -31,7 +31,23 @@ public final class ActionFactory {
 					arguments.get("tolerance").getAsDouble(),
 					arguments.get("sprint").getAsBoolean()
 			);
-			case ATTACK, BREAK_BLOCK, PLACE_BLOCK -> deferred(command.type(), "Task 7 interaction");
+			case ATTACK -> new AttackAction(
+					arguments.get("targetSelector").getAsString(),
+					arguments.get("timeoutMs").getAsLong()
+			);
+			case BREAK_BLOCK -> new BreakBlockAction(
+					arguments.get("x").getAsInt(),
+					arguments.get("y").getAsInt(),
+					arguments.get("z").getAsInt(),
+					arguments.get("timeoutMs").getAsLong()
+			);
+			case PLACE_BLOCK -> new PlaceBlockAction(
+					arguments.get("x").getAsInt(),
+					arguments.get("y").getAsInt(),
+					arguments.get("z").getAsInt(),
+					arguments.get("face").getAsString(),
+					arguments.get("itemId").getAsString()
+			);
 			case COMPLETE_GOAL -> deferred(command.type(), "coordinator goal completion");
 		};
 	}

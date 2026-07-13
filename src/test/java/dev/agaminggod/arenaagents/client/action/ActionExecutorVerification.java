@@ -588,13 +588,23 @@ public final class ActionExecutorVerification {
 				factory.create(deferredCommand("factory-move", ActionType.MOVE_TO)).getClass(),
 				"factory creates move to"
 		);
+		assertEquals(
+				AttackAction.class,
+				factory.create(deferredCommand("factory-attack", ActionType.ATTACK)).getClass(),
+				"factory creates attack"
+		);
+		assertEquals(
+				BreakBlockAction.class,
+				factory.create(deferredCommand("factory-break", ActionType.BREAK_BLOCK)).getClass(),
+				"factory creates block break"
+		);
+		assertEquals(
+				PlaceBlockAction.class,
+				factory.create(deferredCommand("factory-place", ActionType.PLACE_BLOCK)).getClass(),
+				"factory creates block placement"
+		);
 
-		for (ActionType type : List.of(
-				ActionType.ATTACK,
-				ActionType.BREAK_BLOCK,
-				ActionType.PLACE_BLOCK,
-				ActionType.COMPLETE_GOAL
-		)) {
+		for (ActionType type : List.of(ActionType.COMPLETE_GOAL)) {
 			ActionCommand command = deferredCommand("deferred-" + type.wireName(), type);
 			ActionCreationException exception = expectThrows(
 					ActionCreationException.class,
@@ -603,7 +613,7 @@ public final class ActionExecutorVerification {
 			);
 			assertEquals("ACTION_NOT_IMPLEMENTED", exception.reasonCode(), "deferred action reason code");
 		}
-		return 14;
+		return 11;
 	}
 
 	private static int verifyUnsafeStateReleasesEveryResource() {

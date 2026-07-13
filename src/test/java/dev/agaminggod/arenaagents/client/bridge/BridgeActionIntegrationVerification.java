@@ -142,6 +142,28 @@ public final class BridgeActionIntegrationVerification {
 				assertEquals("action_result", moveCancelled.get("type").getAsString(), "move cancellation returns result");
 				assertEquals("CANCELLED", moveCancelled.get("state").getAsString(), "move cancellation clears executor");
 
+				write(codec, client, actionEnvelope("message-attack", attackCommand("bridge-attack")));
+				awaitPending(callbackExecutor, 1);
+				callbackExecutor.runNext();
+				JsonObject attackAccepted = read(codec, client);
+				assertEquals("action_progress", attackAccepted.get("type").getAsString(), "attack command is accepted");
+				assertEquals("RUNNING", attackAccepted.get("state").getAsString(), "attack starts running");
+				actionExecutor.tick();
+				JsonObject attackFailure = read(codec, client);
+				assertEquals("action_result", attackFailure.get("type").getAsString(), "missing target returns result");
+				assertEquals("FAILED", attackFailure.get("state").getAsString(), "missing target fails explicitly");
+				assertEquals("TARGET_GONE", attackFailure.get("reasonCode").getAsString(), "missing target result code");
+
+				write(codec, client, actionEnvelope("message-after-attack", waitCommand("after-attack", 100L)));
+				awaitPending(callbackExecutor, 1);
+				callbackExecutor.runNext();
+				JsonObject afterAttack = read(codec, client);
+				assertEquals("action_progress", afterAttack.get("type").getAsString(), "combat failure keeps session healthy");
+				write(codec, client, cancelEnvelope("message-after-attack-cancel", "after-attack"));
+				awaitPending(callbackExecutor, 1);
+				callbackExecutor.runNext();
+				read(codec, client);
+
 				write(
 						codec,
 						client,
@@ -174,7 +196,7 @@ public final class BridgeActionIntegrationVerification {
 				read(codec, client);
 			}
 		}
-		return 23;
+		return 29;
 	}
 
 	private static int findAvailablePort() throws IOException {
@@ -221,6 +243,12 @@ public final class BridgeActionIntegrationVerification {
 		return "{\"protocolVersion\":1,\"commandId\":\"" + commandId
 				+ "\",\"type\":\"move_to\",\"issuedAtEpochMs\":1750000000000,"
 				+ "\"x\":0,\"y\":64,\"z\":0,\"tolerance\":0.5,\"sprint\":false}";
+	}
+
+	private static String attackCommand(String commandId) {
+		return "{\"protocolVersion\":1,\"commandId\":\"" + commandId
+				+ "\",\"type\":\"attack\",\"issuedAtEpochMs\":1750000000000,"
+				+ "\"targetSelector\":\"player:Missing\",\"timeoutMs\":5000}";
 	}
 
 	private static void write(ProtocolCodec codec, Socket socket, String json) throws IOException {

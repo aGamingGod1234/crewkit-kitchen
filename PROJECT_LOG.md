@@ -380,3 +380,39 @@
 ### Suggested Next Steps
 - Reuse `MoveToAction` and its safety/recovery boundary when Task 7 needs approach movement.
 - Exercise navigation in the official launcher against a copied world before broader autonomous playtesting.
+
+## 2026-07-13 — Task 7 combat and world interaction actions
+
+### What Was Implemented
+- Added deterministic combat target selection by player name, UUID, entity type, nearest hostile, or nearest player, with distance/UUID tie-breaking and UUID pinning after selection.
+- Added deterministic hotbar melee-weapon selection, cooldown-aware facing/attacking, and ordinary navigation-assisted approach movement without teleportation.
+- Added incremental attack, block-break, and block-placement actions with explicit failure/success codes and the existing centralized timeout, cancellation, unsafe-state, and exactly-once cleanup boundaries.
+- Added cached-chunk, survival-reach, raycast-visible-face, block-presence, and requested block-item checks before calling normal Minecraft interaction-manager methods.
+- Added pure action/controller verification and a live-loopback regression proving combat failure does not close the authenticated bridge or block a follow-up command.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/combat/` — adds immutable target/weapon facts, deterministic selectors, and combat phase decisions.
+- `src/client/java/dev/agaminggod/arenaagents/client/interaction/BlockInteractionPreconditions.java` — centralizes conservative block-action preconditions and reason codes.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/AttackAction.java` — tracks, approaches, faces, equips for, and attacks a selected target incrementally.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/BreakBlockAction.java` — performs bounded incremental block breaking through the client interaction manager.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/PlaceBlockAction.java` — selects the requested block item and submits a visible-face placement through the client interaction manager.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionContext.java` — adds typed combat and block-interaction boundaries with safe unavailable defaults.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionFactory.java` — enables the three Task 7 protocol actions.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/MinecraftActionContext.java` — maps typed operations to cached-world reads and normal Minecraft 26.1.2 interaction APIs.
+- `src/test/java/dev/agaminggod/arenaagents/client/action/CombatInteractionVerification.java` — verifies selectors, weapons, combat phases, preconditions, outcomes, and cleanup.
+- Existing executor, bridge, and verification entrypoint suites — verify factory enablement and healthy authenticated-session reuse.
+- `PROJECT_LOG.md` — records Task 7 scope, assumptions, evidence, and deferred work.
+
+### Assumptions Made (flag these for review)
+- `player:<name>`, `uuid:<uuid>`, `type:<namespaced-id>`, `nearest_hostile`, and `nearest_player` are the supported deterministic selector forms.
+- Placement coordinates identify the visible support block and `face` identifies the clicked face; the requested block is placed adjacent according to normal server rules.
+- An attack-strength scale of at least 0.9 is considered ready, and the fixed weapon ordering prefers swords before comparable axes for predictable behavior.
+
+### Known Issues / Deferred
+- Placement success means the normal `useItemOn` request consumed the action; final server-world confirmation remains part of official-launcher integration evidence.
+- Target approach is limited to Task 6 cardinal walking/jumping/dropping and inherits its conservative unloaded/hazard behavior.
+- Server goal commands/payloads remain Task 8; goal completion remains coordinator-owned.
+
+### Suggested Next Steps
+- Complete Task 8 goal delivery without widening the action protocol.
+- Exercise combat, breaking, and placement against a copied-world server and capture server-confirmed results during official-launcher validation.
