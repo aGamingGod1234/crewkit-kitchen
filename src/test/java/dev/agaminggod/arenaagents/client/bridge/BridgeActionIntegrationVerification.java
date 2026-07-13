@@ -9,6 +9,8 @@ import dev.agaminggod.arenaagents.client.action.ActionFactory;
 import dev.agaminggod.arenaagents.client.action.ActionUpdate;
 import dev.agaminggod.arenaagents.client.action.RunningAction;
 import dev.agaminggod.arenaagents.client.action.SafetyState;
+import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionState;
@@ -127,17 +129,18 @@ public final class BridgeActionIntegrationVerification {
 						"observation sees last terminal result"
 				);
 
-				write(codec, client, actionEnvelope("message-deferred", moveCommand("bridge-deferred")));
+				write(codec, client, actionEnvelope("message-move", moveCommand("bridge-move")));
 				awaitPending(callbackExecutor, 1);
 				callbackExecutor.runNext();
-				JsonObject rejected = read(codec, client);
-				assertEquals("action_result", rejected.get("type").getAsString(), "deferred action returns result");
-				assertEquals("FAILED", rejected.get("state").getAsString(), "deferred action fails explicitly");
-				assertEquals(
-						"ACTION_NOT_IMPLEMENTED",
-						rejected.get("reasonCode").getAsString(),
-						"deferred action result reason"
-				);
+				JsonObject moveAccepted = read(codec, client);
+				assertEquals("action_progress", moveAccepted.get("type").getAsString(), "move action is enabled");
+				assertEquals("RUNNING", moveAccepted.get("state").getAsString(), "move action starts running");
+				write(codec, client, cancelEnvelope("message-move-cancel", "bridge-move"));
+				awaitPending(callbackExecutor, 1);
+				callbackExecutor.runNext();
+				JsonObject moveCancelled = read(codec, client);
+				assertEquals("action_result", moveCancelled.get("type").getAsString(), "move cancellation returns result");
+				assertEquals("CANCELLED", moveCancelled.get("state").getAsString(), "move cancellation clears executor");
 
 				write(
 						codec,
@@ -171,7 +174,7 @@ public final class BridgeActionIntegrationVerification {
 				read(codec, client);
 			}
 		}
-		return 22;
+		return 23;
 	}
 
 	private static int findAvailablePort() throws IOException {
@@ -298,6 +301,22 @@ public final class BridgeActionIntegrationVerification {
 		@Override
 		public SafetyState safetyState() {
 			return SafetyState.READY;
+		}
+
+		@Override
+		public NavigationSnapshot navigationSnapshot() {
+			return new NavigationSnapshot(0.5D, 64.0D, 0.5D, 0.0F, 0.0F, new GridPosition(0, 64, 0));
+		}
+
+		@Override
+		public WalkabilityView walkabilityView() {
+			return position -> position.y() == 63
+					? WalkabilityView.Cell.SAFE_SUPPORT
+					: WalkabilityView.Cell.CLEAR;
+		}
+
+		@Override
+		public void setMovement(MovementInput movement) {
 		}
 
 		@Override

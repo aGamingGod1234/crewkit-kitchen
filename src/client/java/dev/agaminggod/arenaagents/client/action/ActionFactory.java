@@ -24,7 +24,13 @@ public final class ActionFactory {
 					ActionContext.Hand.MAIN_HAND,
 					arguments.get("durationMs").getAsLong()
 			);
-			case MOVE_TO -> deferred(command.type(), "Task 6 navigation");
+			case MOVE_TO -> new MoveToAction(
+					arguments.get("x").getAsDouble(),
+					arguments.get("y").getAsDouble(),
+					arguments.get("z").getAsDouble(),
+					arguments.get("tolerance").getAsDouble(),
+					arguments.get("sprint").getAsBoolean()
+			);
 			case ATTACK, BREAK_BLOCK, PLACE_BLOCK -> deferred(command.type(), "Task 7 interaction");
 			case COMPLETE_GOAL -> deferred(command.type(), "coordinator goal completion");
 		};

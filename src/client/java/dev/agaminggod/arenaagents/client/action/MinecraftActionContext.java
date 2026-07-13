@@ -1,5 +1,8 @@
 package dev.agaminggod.arenaagents.client.action;
 
+import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.MinecraftWalkabilityView;
+import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import java.util.ArrayList;
 import java.util.List;
@@ -9,6 +12,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
@@ -38,9 +42,11 @@ public final class MinecraftActionContext implements ActionContext {
 	private static final String ITEM_USE_FAILED_REASON = "ITEM_USE_FAILED";
 
 	private final Minecraft minecraft;
+	private final WalkabilityView walkabilityView;
 
 	public MinecraftActionContext(Minecraft minecraft) {
 		this.minecraft = Objects.requireNonNull(minecraft, "minecraft must not be null");
+		walkabilityView = new MinecraftWalkabilityView(minecraft);
 	}
 
 	@Override
@@ -70,6 +76,39 @@ public final class MinecraftActionContext implements ActionContext {
 				player != null && player.isAlive(),
 				minecraft.screen != null
 		);
+	}
+
+	@Override
+	public NavigationSnapshot navigationSnapshot() {
+		requireClientThread();
+		LocalPlayer player = requirePlayer();
+		BlockPos feetPosition = player.blockPosition();
+		return new NavigationSnapshot(
+				player.getX(),
+				player.getY(),
+				player.getZ(),
+				player.getYRot(),
+				player.getXRot(),
+				new GridPosition(feetPosition.getX(), feetPosition.getY(), feetPosition.getZ())
+		);
+	}
+
+	@Override
+	public WalkabilityView walkabilityView() {
+		requireClientThread();
+		return walkabilityView;
+	}
+
+	@Override
+	public void setMovement(MovementInput movement) {
+		requireClientThread();
+		Objects.requireNonNull(movement, "movement must not be null");
+		minecraft.options.keyUp.setDown(movement.forward());
+		minecraft.options.keyDown.setDown(movement.backward());
+		minecraft.options.keyLeft.setDown(movement.left());
+		minecraft.options.keyRight.setDown(movement.right());
+		minecraft.options.keyJump.setDown(movement.jump());
+		minecraft.options.keySprint.setDown(movement.sprint());
 	}
 
 	@Override

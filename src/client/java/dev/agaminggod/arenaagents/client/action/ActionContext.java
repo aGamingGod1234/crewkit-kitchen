@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.client.action;
 
+import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import java.util.Objects;
 
@@ -11,6 +13,12 @@ public interface ActionContext {
 	long epochTimeMs();
 
 	SafetyState safetyState();
+
+	NavigationSnapshot navigationSnapshot();
+
+	WalkabilityView walkabilityView();
+
+	void setMovement(MovementInput movement);
 
 	LookResult lookAt(
 			double x,
@@ -44,6 +52,68 @@ public interface ActionContext {
 			if (yawErrorDegrees < 0.0F || pitchErrorDegrees < 0.0F) {
 				throw new IllegalArgumentException("look errors must not be negative");
 			}
+		}
+	}
+
+	record NavigationSnapshot(
+			double x,
+			double y,
+			double z,
+			float yaw,
+			float pitch,
+			GridPosition feetPosition
+	) {
+		public NavigationSnapshot {
+			requireFinite(x, "x");
+			requireFinite(y, "y");
+			requireFinite(z, "z");
+			requireFinite(yaw, "yaw");
+			requireFinite(pitch, "pitch");
+			feetPosition = Objects.requireNonNull(feetPosition, "feetPosition must not be null");
+		}
+
+		private static void requireFinite(double value, String field) {
+			if (!Double.isFinite(value)) {
+				throw new IllegalArgumentException(field + " must be finite");
+			}
+		}
+	}
+
+	record MovementInput(
+			boolean forward,
+			boolean backward,
+			boolean left,
+			boolean right,
+			boolean jump,
+			boolean sprint
+	) {
+		private static final MovementInput STOPPED = new MovementInput(
+				false,
+				false,
+				false,
+				false,
+				false,
+				false
+		);
+
+		public MovementInput {
+			if (forward && backward) {
+				throw new IllegalArgumentException("forward and backward must not both be active");
+			}
+			if (left && right) {
+				throw new IllegalArgumentException("left and right must not both be active");
+			}
+			if (sprint && !forward) {
+				throw new IllegalArgumentException("sprint requires forward movement");
+			}
+		}
+
+		public static MovementInput stopped() {
+			return STOPPED;
+		}
+
+		public boolean active() {
+			return forward || backward || left || right || jump || sprint;
 		}
 	}
 

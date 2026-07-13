@@ -344,3 +344,39 @@
 ### Suggested Next Steps
 - Continue to Task 6 only after this review-fix commit is accepted.
 - Preserve the pinned-ID, cached-timeout, exactly-once terminal, independent-cleanup, and nonnegative-elapsed invariants in later action implementations.
+
+## 2026-07-13 — Task 6 autonomous local navigation
+
+### What Was Implemented
+- Added deterministic cardinal A* pathfinding with explicit success, no-path, node-limit, and time-limit outcomes; same-level walking, one-block jumps, and safe drops of up to three blocks.
+- Added conservative cached-chunk walkability checks that reject unloaded terrain, incomplete support, collisions, fluids, and hazardous blocks without synchronously loading chunks.
+- Added incremental movement steering, node advancement, sprint/jump input, exact destination tolerance, stuck detection, three bounded recovery replans, and exhaustive input release on every terminal path.
+- Enabled `move_to` in the existing action factory and integrated it with cancellation, unsafe-state handling, timeout handling, observations, and healthy bridge-session reuse.
+- Added RED-first pure, Minecraft-adapter, executor, and live-loopback verification for planning, movement, recovery, cleanup, and follow-up command health.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/navigation/` — adds immutable path types, the deterministic local planner, cached-world safety adapter, movement controller, and stuck detector.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/MoveToAction.java` — owns incremental planning, movement, recovery replans, timeout, cancellation, and terminal reason codes.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionContext.java` — adds typed navigation snapshots, walkability access, and synthetic movement input.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionFactory.java` — enables validated `move_to` commands while preserving later-task deferrals.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/MinecraftActionContext.java` — maps navigation state, cached-world queries, and movement keys to Minecraft 26.1.2.
+- `src/test/java/dev/agaminggod/arenaagents/client/navigation/` — verifies deterministic planning, safe traversal, limits, movement, stuck recovery, and cached-chunk classification.
+- `src/test/java/dev/agaminggod/arenaagents/client/action/MoveToActionVerification.java` — verifies success, planner failures, unsafe transitions, recovery exhaustion, timeout, and cancellation.
+- `src/test/java/dev/agaminggod/arenaagents/client/action/ActionExecutorVerification.java` — verifies factory enablement and lifecycle integration for `move_to`.
+- `src/test/java/dev/agaminggod/arenaagents/client/bridge/BridgeActionIntegrationVerification.java` — verifies loopback cancellation/failure followed by a healthy command.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — runs the Task 6 suites through `verifyCore`.
+- `PROJECT_LOG.md` — records Task 6 scope, assumptions, evidence, and deferred work.
+
+### Assumptions Made (flag these for review)
+- Local planning is cardinal-only and deterministic; diagonal movement, parkour, swimming, ladders, doors, mining, and block placement remain outside Task 6.
+- A full solid support surface is required, and fluids plus fire, cactus, magma, campfires, sweet berry bushes, wither roses, and powder snow are treated conservatively as hazards.
+- `move_to` uses a 120-second action timeout, a 0.1-block progress threshold, a 2.5-second stuck window, and exactly three recovery replans before explicit failure.
+
+### Known Issues / Deferred
+- `attack`, `break_block`, and `place_block` remain Task 7; `complete_goal` remains coordinator-owned.
+- Official-launcher validation in a copied world remains a later integration task; Task 6 verifies pure behavior, live loopback behavior, and mapped Minecraft 26.1.2 compilation.
+- Planning intentionally fails when required chunks are not already cached instead of loading terrain synchronously on the client thread.
+
+### Suggested Next Steps
+- Reuse `MoveToAction` and its safety/recovery boundary when Task 7 needs approach movement.
+- Exercise navigation in the official launcher against a copied world before broader autonomous playtesting.

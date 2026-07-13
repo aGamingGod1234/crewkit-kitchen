@@ -5,6 +5,8 @@ import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
 import dev.agaminggod.arenaagents.protocol.ActionState;
 import dev.agaminggod.arenaagents.protocol.ActionType;
+import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -581,9 +583,13 @@ public final class ActionExecutorVerification {
 		assertEquals(ChatAction.class, factory.create(chatCommand("factory-chat", "hello")).getClass(), "factory creates chat");
 		assertEquals(SelectItemAction.class, factory.create(selectItemCommand("factory-select", "minecraft:stone")).getClass(), "factory creates select item");
 		assertEquals(UseItemAction.class, factory.create(useItemCommand("factory-use", 1L)).getClass(), "factory creates use item");
+		assertEquals(
+				MoveToAction.class,
+				factory.create(deferredCommand("factory-move", ActionType.MOVE_TO)).getClass(),
+				"factory creates move to"
+		);
 
 		for (ActionType type : List.of(
-				ActionType.MOVE_TO,
 				ActionType.ATTACK,
 				ActionType.BREAK_BLOCK,
 				ActionType.PLACE_BLOCK,
@@ -597,7 +603,7 @@ public final class ActionExecutorVerification {
 			);
 			assertEquals("ACTION_NOT_IMPLEMENTED", exception.reasonCode(), "deferred action reason code");
 		}
-		return 15;
+		return 14;
 	}
 
 	private static int verifyUnsafeStateReleasesEveryResource() {
@@ -972,6 +978,23 @@ public final class ActionExecutorVerification {
 		@Override
 		public SafetyState safetyState() {
 			return safetyState;
+		}
+
+		@Override
+		public NavigationSnapshot navigationSnapshot() {
+			return new NavigationSnapshot(0.5D, 64.0D, 0.5D, 0.0F, 0.0F, new GridPosition(0, 64, 0));
+		}
+
+		@Override
+		public WalkabilityView walkabilityView() {
+			return position -> position.y() == 63
+					? WalkabilityView.Cell.SAFE_SUPPORT
+					: WalkabilityView.Cell.CLEAR;
+		}
+
+		@Override
+		public void setMovement(MovementInput movement) {
+			syntheticInputsActive = movement.active();
 		}
 
 		@Override
