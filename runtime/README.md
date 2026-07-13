@@ -8,7 +8,7 @@ Everything generated beneath `runtime/` is local evidence or executable state an
 - `server-offline-smoke/`: optional, clearly labeled offline smoke server; never authenticated evidence.
 - `downloads/`: SHA-256-verified Fabric installer.
 - `evidence/`: world-copy, build, log, screenshot, and live-test summaries with credentials excluded.
-- `traces/agent55` and `traces/agent56`: separate append-only coordinator traces.
+- `agent55/traces/agent-55.jsonl` and `agent56/traces/agent-56.jsonl`: separate append-only coordinator traces.
 - `toolchains/temurin-25/jdk-25.0.3+9`: project-local Java runtime.
 
 The isolated client directories are outside the project:

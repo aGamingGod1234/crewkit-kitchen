@@ -478,3 +478,30 @@
 ### Suggested Next Steps
 - Keep Task 9's `goal_event` validator synchronized with the exact `operation` and `goal` fields introduced here.
 - Have Task 11 treat `operation=set` as a fresh planning trigger and `operation=stop` as terminal until another goal arrives.
+
+## 2026-07-13 — Tasks 9–12 autonomous coordinator and integration verification
+
+### What Was Implemented
+- Added a dependency-free Node coordinator with strict versioned JSONL validation, authenticated loopback bridge sessions, bounded observations, action dispatch, cancellation, reconnect backoff, and isolated per-agent traces.
+- Added one persistent Codex app-server thread per agent, exact fixed model profiles, strict structured decision parsing, proactive plan-act-observe scheduling, goal replacement/stop handling, retry behavior, and app-server restart recovery.
+- Added strict `--config`, `--agent`, and `--check-models` CLI handling plus deterministic selection of `agent-55`, `agent-56`, or both.
+- Added integration fixtures covering two concurrent isolated agents, real TCP framing, malformed planner recovery, reconnects, graceful shutdown, and live model-catalog verification.
+
+### Files Modified
+- `coordinator/src/` — implements protocol validation, Codex app-server control, autonomous runtimes, retries, traces, and the CLI.
+- `coordinator/config/agents.json` — fixes GPT-5.5/xhigh/Fast and GPT-5.6-Sol/high/Fast to distinct identities, ports, and runtime paths.
+- `coordinator/test/` — verifies schemas, framing, planner parsing, lifecycle behavior, recovery, and two-agent end-to-end operation.
+- `scripts/run-automated-verification.ps1` — includes the complete coordinator test suite.
+- `scripts/start-coordinator.ps1`, `runtime/README.md` — create and document the actual isolated trace locations.
+
+### Assumptions Made (flag these for review)
+- The local authenticated Codex app server remains the planner boundary; neither Minecraft client receives shell, file, launcher, or credential access.
+- A new goal starts a fresh internal revision, a stop event remains terminal until a later set event, and only the exact Java wire fields `operation` and `goal` are accepted.
+- Both agents intentionally share prompts, validation, action limits, and recovery policy; only model identity, reasoning effort, player identity, bridge port, and runtime directory differ.
+
+### Known Issues / Deferred
+- Simultaneous authenticated online-mode evidence still requires a second licensed Minecraft Java account; one account supports sequential profile validation only.
+- Official-launcher and copied-world evidence remains the final live-test step.
+
+### Suggested Next Steps
+- Prepare the isolated runtimes twice, create both official-launcher installations, and run the sequential authenticated live-test matrix.

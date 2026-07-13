@@ -1,12 +1,13 @@
 [CmdletBinding()]
 param(
-    [string] $ProjectRoot = (Split-Path -Parent $PSScriptRoot),
+    [string] $ProjectRoot,
     [string] $ArchivePath,
     [string] $ArchiveSha256
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 
 $ExpectedVersion = '25.0.3'
 $ToolchainRoot = Join-Path ([IO.Path]::GetFullPath($ProjectRoot)) 'runtime\toolchains\temurin-25'

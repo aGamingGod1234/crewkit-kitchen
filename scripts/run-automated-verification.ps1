@@ -1,8 +1,9 @@
 [CmdletBinding()]
-param([string] $ProjectRoot = (Split-Path -Parent $PSScriptRoot))
+param([string] $ProjectRoot)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 
 $Project = [IO.Path]::GetFullPath($ProjectRoot)
 $JavaHome = Join-Path $Project 'runtime\toolchains\temurin-25\jdk-25.0.3+9'

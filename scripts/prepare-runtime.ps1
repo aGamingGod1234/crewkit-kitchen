@@ -1,12 +1,13 @@
 [CmdletBinding()]
 param(
-    [string] $ProjectRoot = (Split-Path -Parent $PSScriptRoot),
+    [string] $ProjectRoot,
     [string] $SourceWorld = (Join-Path $env:APPDATA '.minecraft\saves\New World (76)'),
     [switch] $SkipBuild
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 
 $MinecraftVersion = '26.1.2'
 $LoaderVersion = '0.19.3'

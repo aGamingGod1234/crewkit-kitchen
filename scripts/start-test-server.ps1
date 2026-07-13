@@ -1,11 +1,12 @@
 [CmdletBinding()]
 param(
-    [string] $ProjectRoot = (Split-Path -Parent $PSScriptRoot),
+    [string] $ProjectRoot,
     [switch] $OfflineSmoke
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 
 $Project = [IO.Path]::GetFullPath($ProjectRoot)
 $Java = Join-Path $Project 'runtime\toolchains\temurin-25\jdk-25.0.3+9\bin\java.exe'
