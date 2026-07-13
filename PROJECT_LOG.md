@@ -312,3 +312,35 @@
 - Implement Task 6 movement against the existing incremental executor and cleanup boundary.
 - Implement Task 7 combat/block actions without weakening the exactly-once terminal and resource-release invariants.
 - Mirror the Task 5 progress/result envelope and cancellation semantics in Task 9's coordinator validators, then exercise them in the official-launcher integration task.
+
+## 2026-07-13 — Task 5 lifecycle invariant review fixes
+
+### What Was Implemented
+- Hardened the bounded command-ID history so a running command remains pinned through more than 4,096 unique busy submissions, replaying it cannot emit a false terminal result, and completion reinserts it while preserving the exact bound.
+- Moved running-action timeout resolution into guarded acceptance, validated it once as positive, cached it in active execution state, and routed factory/timeout/start-time failures through cleanup plus one explicit failed result.
+- Verified that throwing `RunningAction.tick()` and `RunningAction.cancel()` boundaries remain contained, release resources, and emit exactly one failed terminal result.
+- Made all nine synthetic key releases independent so a failing key cannot prevent later keys, item-use stop, or block-breaking abort; cleanup failures remain one aggregated `RESOURCE_RELEASE_FAILED` result.
+- Replaced clock-regression failure with nonnegative elapsed-time clamping, including overflow saturation, so backward monotonic readings cannot emit negative progress or cause an early timeout.
+- Added RED-first pure and live-loopback regressions covering history floods, active replay before/after completion, per-command result counts, throwing/cached/invalid timeouts, factory cleanup, healthy bridge reuse, per-key cleanup fan-out, and actual backward-clock behavior.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionExecutor.java` — pins active IDs, caches guarded timeout/start facts, centralizes rejected-action cleanup, and clamps elapsed time.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/CommandIdHistory.java` — adds protected bounded eviction and bounded terminal reinsertion.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/MinecraftActionContext.java` — releases each synthetic key through the aggregate cleanup boundary independently.
+- `src/test/java/dev/agaminggod/arenaagents/client/action/ActionExecutorVerification.java` — adds flood/replay, timeout, factory, lifecycle-boundary, cleanup-result, and clock-regression coverage.
+- `src/test/java/dev/agaminggod/arenaagents/client/action/MinecraftActionContextVerification.java` — proves later fake keys and resources run after multiple key failures and failures are suppressed once.
+- `src/test/java/dev/agaminggod/arenaagents/client/bridge/BridgeActionIntegrationVerification.java` — proves a throwing timeout emits failure without closing the authenticated bridge and a follow-up command is accepted.
+- `PROJECT_LOG.md` — records the Task 5 review fixes, assumptions, evidence, and deferred work.
+
+### Assumptions Made (flag these for review)
+- The approved 4,096-entry history remains the total bound. When full, the oldest unprotected ID is evicted; the single active ID is protected, and its terminal transition refreshes or reinserts it.
+- A backward monotonic reading clamps that tick's elapsed time to zero; later readings are still measured from the original accepted start, and subtraction overflow saturates to `Long.MAX_VALUE` so it times out safely.
+- `RunningAction.timeoutMs()` is a signed integral duration and therefore requires only a positive-value check; action factories retain ownership of their protocol-specific maximum bounds.
+
+### Known Issues / Deferred
+- The existing Task 5 deferrals remain unchanged: movement belongs to Task 6, combat/block interactions to Task 7, goal completion to the coordinator, and off-hand use to a future validated protocol revision.
+- Official-launcher copied-world validation remains a later integration task; this review fix adds deterministic pure and live-loopback evidence plus Minecraft 26.1.2 compilation.
+
+### Suggested Next Steps
+- Continue to Task 6 only after this review-fix commit is accepted.
+- Preserve the pinned-ID, cached-timeout, exactly-once terminal, independent-cleanup, and nonnegative-elapsed invariants in later action implementations.

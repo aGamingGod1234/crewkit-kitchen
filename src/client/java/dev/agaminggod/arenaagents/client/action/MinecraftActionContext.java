@@ -5,7 +5,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
-import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.MultiPlayerGameMode;
@@ -200,19 +199,17 @@ public final class MinecraftActionContext implements ActionContext {
 	}
 
 	private void releaseSyntheticKeys() {
-		for (KeyMapping key : List.of(
-				minecraft.options.keyUp,
-				minecraft.options.keyLeft,
-				minecraft.options.keyDown,
-				minecraft.options.keyRight,
-				minecraft.options.keyJump,
-				minecraft.options.keyShift,
-				minecraft.options.keySprint,
-				minecraft.options.keyUse,
-				minecraft.options.keyAttack
-		)) {
-			key.setDown(false);
-		}
+		releaseKeys(
+				() -> minecraft.options.keyUp.setDown(false),
+				() -> minecraft.options.keyLeft.setDown(false),
+				() -> minecraft.options.keyDown.setDown(false),
+				() -> minecraft.options.keyRight.setDown(false),
+				() -> minecraft.options.keyJump.setDown(false),
+				() -> minecraft.options.keyShift.setDown(false),
+				() -> minecraft.options.keySprint.setDown(false),
+				() -> minecraft.options.keyUse.setDown(false),
+				() -> minecraft.options.keyAttack.setDown(false)
+		);
 	}
 
 	private void abortBlockBreaking() {
@@ -343,6 +340,10 @@ public final class MinecraftActionContext implements ActionContext {
 		if (failure != null) {
 			throw failure;
 		}
+	}
+
+	static void releaseKeys(Runnable... keyReleases) {
+		releaseResources(keyReleases);
 	}
 
 	private static InteractionHand toMinecraftHand(Hand hand) {

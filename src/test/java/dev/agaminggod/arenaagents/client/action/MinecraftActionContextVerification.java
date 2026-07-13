@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.client.action;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -13,6 +14,7 @@ public final class MinecraftActionContextVerification {
 		assertions += verifyRotationIsBounded();
 		assertions += verifyDeterministicHotbarSelection();
 		assertions += verifyReleaseAttemptsEveryResource();
+		assertions += verifyEachKeyReleaseIsIndependent();
 		return assertions;
 	}
 
@@ -124,6 +126,47 @@ public final class MinecraftActionContextVerification {
 		}
 		assertEquals(3, attempts.get(), "release attempts every resource after a failure");
 		return 2;
+	}
+
+	private static int verifyEachKeyReleaseIsIndependent() {
+		List<String> attempts = new ArrayList<>();
+		IllegalStateException aggregate;
+		try {
+			MinecraftActionContext.releaseResources(
+					() -> MinecraftActionContext.releaseKeys(
+							() -> {
+								attempts.add("key-up");
+								throw new IllegalStateException("key-up failed");
+							},
+							() -> attempts.add("key-left"),
+							() -> {
+								attempts.add("key-down");
+								throw new IllegalStateException("key-down failed");
+							},
+							() -> attempts.add("key-right")
+					),
+					() -> attempts.add("stop-item-use"),
+					() -> attempts.add("abort-block-breaking")
+			);
+			throw new AssertionError("independent key release did not report aggregate failure");
+		} catch (IllegalStateException exception) {
+			aggregate = exception;
+		}
+		assertEquals(
+				List.of(
+						"key-up",
+						"key-left",
+						"key-down",
+						"key-right",
+						"stop-item-use",
+						"abort-block-breaking"
+				),
+				attempts,
+				"later keys and resources run after key release failures"
+		);
+		assertTrue(aggregate.getCause() instanceof IllegalStateException, "cleanup exposes the first aggregate failure");
+		assertEquals(1, aggregate.getCause().getSuppressed().length, "later key failure is suppressed once");
+		return 3;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

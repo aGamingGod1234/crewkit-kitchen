@@ -21,8 +21,6 @@ public final class ActionExecutor {
 	private static final String EXECUTION_FAILED_REASON = "ACTION_EXECUTION_FAILED";
 	private static final String INVALID_ACTION_REASON = "INVALID_RUNNING_ACTION";
 	private static final String INVALID_ACTION_MESSAGE = "Action factory returned an invalid running action";
-	private static final String CLOCK_REGRESSION_REASON = "MONOTONIC_CLOCK_REGRESSION";
-	private static final String CLOCK_REGRESSION_MESSAGE = "Monotonic action clock moved backwards";
 	private static final String RESOURCE_RELEASE_FAILED_REASON = "RESOURCE_RELEASE_FAILED";
 	private static final String DEFAULT_CANCEL_REASON = "ACTION_CANCELLED";
 	private static final String DEFAULT_CANCEL_MESSAGE = "Action was cancelled";
@@ -38,6 +36,7 @@ public final class ActionExecutor {
 	private ActionResult lastResult;
 	private long startedAtMonotonicMs;
 	private long lastProgressAtMonotonicMs;
+	private long activeTimeoutMs;
 	private RuntimeException lastEventFailure;
 
 	public ActionExecutor(
@@ -53,7 +52,11 @@ public final class ActionExecutor {
 	public Acceptance accept(ActionCommand command) {
 		requireClientThread();
 		Objects.requireNonNull(command, "command must not be null");
-		if (!knownCommandIds.remember(command.commandId())) {
+		if (activeCommand != null && activeCommand.commandId().equals(command.commandId())) {
+			return Acceptance.DUPLICATE;
+		}
+		String activeCommandId = activeCommand == null ? null : activeCommand.commandId();
+		if (!knownCommandIds.remember(command.commandId(), activeCommandId)) {
 			return Acceptance.DUPLICATE;
 		}
 		if (activeCommand != null) {
@@ -68,25 +71,34 @@ public final class ActionExecutor {
 		}
 
 		RunningAction created;
+		long resolvedTimeoutMs;
+		long resolvedStartTimeMs;
 		try {
 			created = actionCreator.apply(command);
+			if (created == null) {
+				emitRejectedAfterCleanup(command, INVALID_ACTION_REASON, INVALID_ACTION_MESSAGE);
+				return Acceptance.REJECTED;
+			}
+			resolvedTimeoutMs = created.timeoutMs();
+			if (resolvedTimeoutMs <= 0L) {
+				emitRejectedAfterCleanup(command, INVALID_ACTION_REASON, INVALID_ACTION_MESSAGE);
+				return Acceptance.REJECTED;
+			}
+			resolvedStartTimeMs = context.monotonicTimeMs();
 		} catch (ActionCreationException exception) {
-			emitRejected(command, exception.reasonCode(), safeExceptionMessage(exception));
+			emitRejectedAfterCleanup(command, exception.reasonCode(), safeExceptionMessage(exception));
 			return Acceptance.REJECTED;
 		} catch (RuntimeException exception) {
-			emitRejected(command, EXECUTION_FAILED_REASON, safeExceptionMessage(exception));
-			return Acceptance.REJECTED;
-		}
-		if (created == null || created.timeoutMs() <= 0L) {
-			emitRejected(command, INVALID_ACTION_REASON, INVALID_ACTION_MESSAGE);
+			emitRejectedAfterCleanup(command, EXECUTION_FAILED_REASON, safeExceptionMessage(exception));
 			return Acceptance.REJECTED;
 		}
 
 		activeCommand = command;
 		activeAction = created;
 		state = ActionState.RUNNING;
-		startedAtMonotonicMs = context.monotonicTimeMs();
+		startedAtMonotonicMs = resolvedStartTimeMs;
 		lastProgressAtMonotonicMs = startedAtMonotonicMs;
+		activeTimeoutMs = resolvedTimeoutMs;
 		emitProgress(0L, ACCEPTED_MESSAGE);
 		return Acceptance.ACCEPTED;
 	}
@@ -104,12 +116,8 @@ public final class ActionExecutor {
 		}
 
 		long now = context.monotonicTimeMs();
-		if (now < startedAtMonotonicMs) {
-			finish(ActionState.FAILED, CLOCK_REGRESSION_REASON, CLOCK_REGRESSION_MESSAGE);
-			return;
-		}
-		long elapsedMs = now - startedAtMonotonicMs;
-		if (elapsedMs >= activeAction.timeoutMs()) {
+		long elapsedMs = nonNegativeElapsed(startedAtMonotonicMs, now);
+		if (elapsedMs >= activeTimeoutMs) {
 			finish(ActionState.TIMED_OUT, TIMEOUT_REASON, TIMEOUT_MESSAGE);
 			return;
 		}
@@ -212,21 +220,26 @@ public final class ActionExecutor {
 	}
 
 	private void emitUnsafeRejection(ActionCommand command, SafetyState safetyState) {
-		String reasonCode = safetyState.reasonCode();
-		String message = safetyState.message();
+		emitRejectedAfterCleanup(command, safetyState.reasonCode(), safetyState.message());
+	}
+
+	private void emitRejectedAfterCleanup(ActionCommand command, String reasonCode, String message) {
+		String completedReason = reasonCode;
+		String completedMessage = message;
 		try {
 			context.releaseAll();
 		} catch (RuntimeException exception) {
-			reasonCode = RESOURCE_RELEASE_FAILED_REASON;
-			message = safeExceptionMessage(exception);
+			completedReason = RESOURCE_RELEASE_FAILED_REASON;
+			completedMessage = safeExceptionMessage(exception);
 		}
-		emitRejected(command, reasonCode, message);
+		emitRejected(command, completedReason, completedMessage);
 	}
 
 	private void finish(ActionState terminalState, String reasonCode, String message) {
 		ActionCommand completedCommand = activeCommand;
 		activeCommand = null;
 		activeAction = null;
+		activeTimeoutMs = 0L;
 		knownCommandIds.touch(completedCommand.commandId());
 		ActionState completedState = terminalState;
 		String completedReason = reasonCode;
@@ -306,6 +319,17 @@ public final class ActionExecutor {
 		return nonNull.length() <= ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH
 				? nonNull
 				: nonNull.substring(0, ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH);
+	}
+
+	private static long nonNegativeElapsed(long startedAtMs, long nowMs) {
+		if (nowMs <= startedAtMs) {
+			return 0L;
+		}
+		try {
+			return Math.subtractExact(nowMs, startedAtMs);
+		} catch (ArithmeticException exception) {
+			return Long.MAX_VALUE;
+		}
 	}
 
 	public enum Acceptance {

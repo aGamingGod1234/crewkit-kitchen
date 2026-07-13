@@ -17,23 +17,28 @@ final class CommandIdHistory {
 	}
 
 	boolean remember(String commandId) {
+		return remember(commandId, null);
+	}
+
+	boolean remember(String commandId, String protectedCommandId) {
 		String requiredId = Objects.requireNonNull(commandId, "commandId must not be null");
 		if (commandIds.contains(requiredId)) {
 			return false;
 		}
-		if (commandIds.size() == capacity) {
-			Iterator<String> oldest = commandIds.iterator();
-			oldest.next();
-			oldest.remove();
+		if (commandIds.size() == capacity && !evictOldestExcept(protectedCommandId)) {
+			return true;
 		}
 		commandIds.add(requiredId);
 		return true;
 	}
 
 	void touch(String commandId) {
-		if (commandIds.remove(commandId)) {
-			commandIds.add(commandId);
+		String requiredId = Objects.requireNonNull(commandId, "commandId must not be null");
+		commandIds.remove(requiredId);
+		if (commandIds.size() == capacity) {
+			evictOldestExcept(null);
 		}
+		commandIds.add(requiredId);
 	}
 
 	boolean contains(String commandId) {
@@ -42,5 +47,17 @@ final class CommandIdHistory {
 
 	int size() {
 		return commandIds.size();
+	}
+
+	private boolean evictOldestExcept(String protectedCommandId) {
+		Iterator<String> oldest = commandIds.iterator();
+		while (oldest.hasNext()) {
+			String candidate = oldest.next();
+			if (!candidate.equals(protectedCommandId)) {
+				oldest.remove();
+				return true;
+			}
+		}
+		return false;
 	}
 }

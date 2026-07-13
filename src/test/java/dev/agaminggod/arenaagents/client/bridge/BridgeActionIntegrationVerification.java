@@ -6,6 +6,8 @@ import dev.agaminggod.arenaagents.client.action.ActionContext;
 import dev.agaminggod.arenaagents.client.action.ActionEventPublisher;
 import dev.agaminggod.arenaagents.client.action.ActionExecutor;
 import dev.agaminggod.arenaagents.client.action.ActionFactory;
+import dev.agaminggod.arenaagents.client.action.ActionUpdate;
+import dev.agaminggod.arenaagents.client.action.RunningAction;
 import dev.agaminggod.arenaagents.client.action.SafetyState;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
@@ -53,7 +55,14 @@ public final class BridgeActionIntegrationVerification {
 		AgentConfig config = new AgentConfig(AGENT_ID, port, AgentConfig.DEFAULT_OBSERVATION_RADIUS, true);
 		try (BridgeServer server = new BridgeServer(config, codec, callbackExecutor, bridgeSink)) {
 			ActionEventPublisher publisher = new ActionEventPublisher(server, publishFailures::add);
-			ActionExecutor actionExecutor = new ActionExecutor(context, new ActionFactory()::create, publisher);
+			ActionFactory actionFactory = new ActionFactory();
+			ActionExecutor actionExecutor = new ActionExecutor(
+					context,
+					command -> "bridge-timeout-failure".equals(command.commandId())
+							? new ThrowingTimeoutAction()
+							: actionFactory.create(command),
+					publisher
+			);
 			executorReference.set(actionExecutor);
 			server.start();
 
@@ -130,6 +139,25 @@ public final class BridgeActionIntegrationVerification {
 						"deferred action result reason"
 				);
 
+				write(
+						codec,
+						client,
+						actionEnvelope(
+								"message-timeout-failure",
+								waitCommand("bridge-timeout-failure", 100L)
+						)
+				);
+				awaitPending(callbackExecutor, 1);
+				callbackExecutor.runNext();
+				JsonObject timeoutFailure = read(codec, client);
+				assertEquals("action_result", timeoutFailure.get("type").getAsString(), "timeout exception returns result");
+				assertEquals("FAILED", timeoutFailure.get("state").getAsString(), "timeout exception fails explicitly");
+				assertEquals(
+						"ACTION_EXECUTION_FAILED",
+						timeoutFailure.get("reasonCode").getAsString(),
+						"timeout exception result reason"
+				);
+
 				write(codec, client, actionEnvelope("message-after-failure", waitCommand("after-failure", 100L)));
 				awaitPending(callbackExecutor, 1);
 				callbackExecutor.runNext();
@@ -143,7 +171,7 @@ public final class BridgeActionIntegrationVerification {
 				read(codec, client);
 			}
 		}
-		return 19;
+		return 22;
 	}
 
 	private static int findAvailablePort() throws IOException {
@@ -236,6 +264,18 @@ public final class BridgeActionIntegrationVerification {
 				task = tasks.removeFirst();
 			}
 			task.run();
+		}
+	}
+
+	private static final class ThrowingTimeoutAction implements RunningAction {
+		@Override
+		public long timeoutMs() {
+			throw new IllegalStateException("timeout resolution failed");
+		}
+
+		@Override
+		public ActionUpdate tick(ActionContext context, long elapsedMs) {
+			return ActionUpdate.running("unreachable");
 		}
 	}
 

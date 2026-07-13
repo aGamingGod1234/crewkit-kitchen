@@ -27,6 +27,10 @@ public final class ActionExecutorVerification {
 		assertions += verifyTargetedCancellationIsExplicit();
 		assertions += verifyEventFailuresAreContained();
 		assertions += verifyCommandHistoryIsBoundedAndKeepsTouchedIds();
+		assertions += verifyActiveCommandSurvivesBusyHistoryFlood();
+		assertions += verifyTimeoutResolutionAndFactoryFailuresAreContained();
+		assertions += verifyMonotonicClockRegressionIsClamped();
+		assertions += verifyRunningActionBoundaryFailuresAreContained();
 		return assertions;
 	}
 
@@ -152,7 +156,8 @@ public final class ActionExecutorVerification {
 		assertEquals("RESOURCE_RELEASE_FAILED", sink.results.getFirst().reasonCode(), "release failure reason code");
 		executor.cancel("goal_replaced");
 		assertEquals(1, sink.results.size(), "release failure remains terminal-idempotent");
-		return 4;
+		assertEquals(1L, terminalCount(sink, "release-failure"), "release failure emits one result for its command");
+		return 5;
 	}
 
 	private static int verifyTargetedCancellationIsExplicit() {
@@ -216,7 +221,235 @@ public final class ActionExecutorVerification {
 		assertEquals(true, history.contains("command-a"), "touched command remains protected from immediate eviction");
 		assertEquals(false, history.contains("command-b"), "oldest untouched command is evicted");
 		assertEquals(false, history.remember("command-d"), "recent duplicate is rejected");
-		return 8;
+
+		CommandIdHistory pinnedHistory = new CommandIdHistory(3);
+		pinnedHistory.remember("active-command");
+		pinnedHistory.remember("busy-a");
+		pinnedHistory.remember("busy-b");
+		assertEquals(
+				true,
+				pinnedHistory.remember("busy-c", "active-command"),
+				"history accepts unique command while protecting active id"
+		);
+		assertEquals(3, pinnedHistory.size(), "protected history remains bounded");
+		assertEquals(true, pinnedHistory.contains("active-command"), "active command remains pinned");
+		assertEquals(false, pinnedHistory.contains("busy-a"), "oldest unprotected command is evicted");
+
+		CommandIdHistory terminalHistory = new CommandIdHistory(3);
+		terminalHistory.remember("other-a");
+		terminalHistory.remember("other-b");
+		terminalHistory.remember("other-c");
+		terminalHistory.touch("completed-command");
+		assertEquals(3, terminalHistory.size(), "terminal reinsertion remains bounded");
+		assertEquals(true, terminalHistory.contains("completed-command"), "terminal id is reinserted when absent");
+		return 14;
+	}
+
+	private static int verifyActiveCommandSurvivesBusyHistoryFlood() {
+		FakeActionContext context = new FakeActionContext();
+		RecordingSink sink = new RecordingSink();
+		ActionExecutor executor = new ActionExecutor(
+				context,
+				command -> new NeverEndingAction(Long.MAX_VALUE),
+				sink
+		);
+		ActionCommand activeCommand = waitCommand("history-flood-active");
+		assertEquals(ActionExecutor.Acceptance.ACCEPTED, executor.accept(activeCommand), "flood action accepted");
+		for (int index = 0; index < ActionExecutor.MAX_TRACKED_COMMAND_IDS + 32; index++) {
+			assertEquals(
+					ActionExecutor.Acceptance.BUSY,
+					executor.accept(waitCommand("history-flood-busy-" + index)),
+					"unique flood command remains busy"
+			);
+		}
+
+		assertEquals(
+				ActionExecutor.Acceptance.DUPLICATE,
+				executor.accept(activeCommand),
+				"running command remains duplicate after history flood"
+		);
+		assertEquals(0L, terminalCount(sink, activeCommand.commandId()), "active replay emits no terminal result");
+		assertEquals(
+				ActionExecutor.Cancellation.CANCELLED,
+				executor.cancel(activeCommand.commandId(), "test_complete"),
+				"flood action completes once"
+		);
+		assertEquals(1L, terminalCount(sink, activeCommand.commandId()), "completion emits one terminal result");
+		assertEquals(
+				ActionExecutor.Acceptance.DUPLICATE,
+				executor.accept(activeCommand),
+				"completed command remains duplicate after history flood"
+		);
+		assertEquals(1L, terminalCount(sink, activeCommand.commandId()), "terminal replay emits no second result");
+		return ActionExecutor.MAX_TRACKED_COMMAND_IDS + 39;
+	}
+
+	private static int verifyTimeoutResolutionAndFactoryFailuresAreContained() {
+		FakeActionContext throwingTimeoutContext = new FakeActionContext();
+		RecordingSink throwingTimeoutSink = new RecordingSink();
+		ActionExecutor throwingTimeoutExecutor = new ActionExecutor(
+				throwingTimeoutContext,
+				command -> new ThrowingTimeoutAction(),
+				throwingTimeoutSink
+		);
+		ActionCommand throwingTimeoutCommand = waitCommand("throwing-timeout");
+		ActionExecutor.Acceptance[] throwingTimeoutAcceptance = new ActionExecutor.Acceptance[1];
+		assertDoesNotThrow(
+				() -> throwingTimeoutAcceptance[0] = throwingTimeoutExecutor.accept(throwingTimeoutCommand),
+				"timeout resolution failure is contained during acceptance"
+		);
+		assertEquals(ActionExecutor.Acceptance.REJECTED, throwingTimeoutAcceptance[0], "throwing timeout is rejected");
+		assertEquals(ActionState.FAILED, throwingTimeoutExecutor.state(), "throwing timeout records failed state");
+		assertEquals(false, throwingTimeoutExecutor.currentStatus().present(), "throwing timeout leaves no active action");
+		assertEquals(1, throwingTimeoutSink.results.size(), "throwing timeout emits one terminal result");
+		assertEquals(
+				"ACTION_EXECUTION_FAILED",
+				throwingTimeoutSink.results.getFirst().reasonCode(),
+				"throwing timeout reason code"
+		);
+		assertEquals(1, throwingTimeoutContext.releaseCount, "throwing timeout releases resources");
+		assertDoesNotThrow(throwingTimeoutExecutor::tick, "throwing timeout leaves tick safe");
+		assertEquals(
+				ActionExecutor.Acceptance.DUPLICATE,
+				throwingTimeoutExecutor.accept(throwingTimeoutCommand),
+				"throwing timeout command remains terminal"
+		);
+		assertEquals(
+				1L,
+				terminalCount(throwingTimeoutSink, throwingTimeoutCommand.commandId()),
+				"throwing timeout remains exactly-once"
+		);
+
+		FakeActionContext cachedTimeoutContext = new FakeActionContext();
+		RecordingSink cachedTimeoutSink = new RecordingSink();
+		TimeoutOnceAction cachedTimeoutAction = new TimeoutOnceAction();
+		ActionExecutor cachedTimeoutExecutor = new ActionExecutor(
+				cachedTimeoutContext,
+				command -> cachedTimeoutAction,
+				cachedTimeoutSink
+		);
+		assertEquals(
+				ActionExecutor.Acceptance.ACCEPTED,
+				cachedTimeoutExecutor.accept(waitCommand("cached-timeout")),
+				"one-shot timeout action is accepted"
+		);
+		assertEquals(1, cachedTimeoutAction.timeoutCalls, "timeout is resolved once during acceptance");
+		assertDoesNotThrow(cachedTimeoutExecutor::tick, "tick uses cached timeout without resolving again");
+		assertEquals(ActionState.SUCCEEDED, cachedTimeoutExecutor.state(), "cached-timeout action completes");
+		assertEquals(1, cachedTimeoutAction.timeoutCalls, "tick does not invoke timeout again");
+		assertEquals(1, cachedTimeoutSink.results.size(), "cached-timeout action emits one terminal result");
+		assertEquals(1, cachedTimeoutContext.releaseCount, "cached-timeout completion releases resources");
+
+		FakeActionContext invalidTimeoutContext = new FakeActionContext();
+		RecordingSink invalidTimeoutSink = new RecordingSink();
+		ActionExecutor invalidTimeoutExecutor = new ActionExecutor(
+				invalidTimeoutContext,
+				command -> new NeverEndingAction(0L),
+				invalidTimeoutSink
+		);
+		assertEquals(
+				ActionExecutor.Acceptance.REJECTED,
+				invalidTimeoutExecutor.accept(waitCommand("invalid-timeout")),
+				"nonpositive timeout is rejected"
+		);
+		assertEquals("INVALID_RUNNING_ACTION", invalidTimeoutSink.results.getFirst().reasonCode(), "invalid timeout reason");
+		assertEquals(1, invalidTimeoutContext.releaseCount, "invalid timeout rejection releases resources");
+
+		FakeActionContext factoryFailureContext = new FakeActionContext();
+		RecordingSink factoryFailureSink = new RecordingSink();
+		ActionExecutor factoryFailureExecutor = new ActionExecutor(
+				factoryFailureContext,
+				command -> {
+					throw new IllegalStateException("factory failed");
+				},
+				factoryFailureSink
+		);
+		ActionExecutor.Acceptance[] factoryFailureAcceptance = new ActionExecutor.Acceptance[1];
+		assertDoesNotThrow(
+				() -> factoryFailureAcceptance[0] = factoryFailureExecutor.accept(waitCommand("factory-failure")),
+				"factory failure is contained"
+		);
+		assertEquals(ActionExecutor.Acceptance.REJECTED, factoryFailureAcceptance[0], "factory failure is rejected");
+		assertEquals(1, factoryFailureSink.results.size(), "factory failure emits one terminal result");
+		assertEquals("ACTION_EXECUTION_FAILED", factoryFailureSink.results.getFirst().reasonCode(), "factory failure reason");
+		assertEquals(1, factoryFailureContext.releaseCount, "factory failure releases resources");
+		return 25;
+	}
+
+	private static int verifyMonotonicClockRegressionIsClamped() {
+		FakeActionContext context = new FakeActionContext();
+		context.monotonicTimeMs = 1_000L;
+		RecordingSink sink = new RecordingSink();
+		RecordingElapsedAction action = new RecordingElapsedAction(1_000L);
+		ActionExecutor executor = new ActionExecutor(context, command -> action, sink);
+		assertEquals(
+				ActionExecutor.Acceptance.ACCEPTED,
+				executor.accept(waitCommand("clock-regression")),
+				"clock-regression action is accepted"
+		);
+
+		context.monotonicTimeMs = 1_100L;
+		executor.tick();
+		assertEquals(ActionState.RUNNING, executor.state(), "forward clock keeps action running");
+		assertEquals(100L, action.elapsedValues.getFirst(), "forward tick reports elapsed time");
+
+		context.monotonicTimeMs = 900L;
+		assertDoesNotThrow(executor::tick, "backward clock is contained");
+		assertEquals(ActionState.RUNNING, executor.state(), "backward clock does not fail action");
+		assertEquals(0L, action.elapsedValues.get(1), "backward clock clamps elapsed time to zero");
+		assertEquals(0, sink.results.size(), "backward clock emits no early terminal result");
+		assertEquals(0, context.releaseCount, "backward clock does not release an active action");
+		assertEquals(
+				true,
+				sink.progress.stream().allMatch(progress -> progress.elapsedMs() >= 0L),
+				"clock regression never emits negative progress"
+		);
+
+		context.monotonicTimeMs = 1_999L;
+		executor.tick();
+		assertEquals(ActionState.RUNNING, executor.state(), "action remains running before true timeout");
+		context.monotonicTimeMs = 2_000L;
+		executor.tick();
+		assertEquals(ActionState.TIMED_OUT, executor.state(), "action times out only at true deadline");
+		assertEquals(1, sink.results.size(), "clock-regression action emits one terminal result");
+		assertEquals("ACTION_TIMEOUT", sink.results.getFirst().reasonCode(), "clock-regression timeout reason");
+		return 13;
+	}
+
+	private static int verifyRunningActionBoundaryFailuresAreContained() {
+		FakeActionContext tickContext = new FakeActionContext();
+		RecordingSink tickSink = new RecordingSink();
+		ActionExecutor tickExecutor = new ActionExecutor(
+				tickContext,
+				command -> new ThrowingTickAction(),
+				tickSink
+		);
+		ActionCommand tickCommand = waitCommand("throwing-tick");
+		tickExecutor.accept(tickCommand);
+		assertDoesNotThrow(tickExecutor::tick, "running-action tick failure is contained");
+		assertEquals(ActionState.FAILED, tickExecutor.state(), "tick failure records failed state");
+		assertEquals("ACTION_EXECUTION_FAILED", tickSink.results.getFirst().reasonCode(), "tick failure reason");
+		assertEquals(1, tickContext.releaseCount, "tick failure releases resources");
+		tickExecutor.tick();
+		tickExecutor.cancel("late_cancel");
+		assertEquals(1L, terminalCount(tickSink, tickCommand.commandId()), "tick failure remains exactly-once");
+
+		FakeActionContext cancelContext = new FakeActionContext();
+		RecordingSink cancelSink = new RecordingSink();
+		ActionExecutor cancelExecutor = new ActionExecutor(
+				cancelContext,
+				command -> new ThrowingCancelAction(),
+				cancelSink
+		);
+		ActionCommand cancelCommand = waitCommand("throwing-cancel");
+		cancelExecutor.accept(cancelCommand);
+		assertDoesNotThrow(() -> cancelExecutor.cancel("test_cancel"), "running-action cancel failure is contained");
+		assertEquals(ActionState.FAILED, cancelExecutor.state(), "cancel failure records failed state");
+		assertEquals("ACTION_EXECUTION_FAILED", cancelSink.results.getFirst().reasonCode(), "cancel failure reason");
+		assertEquals(1, cancelContext.releaseCount, "cancel failure releases resources");
+		cancelExecutor.cancel("late_cancel");
+		assertEquals(1L, terminalCount(cancelSink, cancelCommand.commandId()), "cancel failure remains exactly-once");
+		return 10;
 	}
 
 	private static int verifyWaitUsesElapsedMonotonicTime() {
@@ -467,6 +700,12 @@ public final class ActionExecutorVerification {
 		}
 	}
 
+	private static long terminalCount(RecordingSink sink, String commandId) {
+		return sink.results.stream()
+				.filter(result -> result.commandId().equals(commandId))
+				.count();
+	}
+
 	private static ActionCommand lookAtCommand(String commandId, double x, double y, double z) {
 		JsonObject arguments = new JsonObject();
 		arguments.addProperty("x", x);
@@ -569,6 +808,85 @@ public final class ActionExecutorVerification {
 		@Override
 		public ActionUpdate tick(ActionContext context, long elapsedMs) {
 			return ActionUpdate.running("waiting");
+		}
+	}
+
+	private static final class ThrowingTimeoutAction implements RunningAction {
+		@Override
+		public long timeoutMs() {
+			throw new IllegalStateException("timeout resolution failed");
+		}
+
+		@Override
+		public ActionUpdate tick(ActionContext context, long elapsedMs) {
+			return ActionUpdate.running("unreachable");
+		}
+	}
+
+	private static final class TimeoutOnceAction implements RunningAction {
+		private int timeoutCalls;
+
+		@Override
+		public long timeoutMs() {
+			timeoutCalls++;
+			if (timeoutCalls > 1) {
+				throw new IllegalStateException("timeout was resolved more than once");
+			}
+			return 1_000L;
+		}
+
+		@Override
+		public ActionUpdate tick(ActionContext context, long elapsedMs) {
+			return ActionUpdate.succeeded("TEST_COMPLETE", "Test action completed");
+		}
+	}
+
+	private static final class RecordingElapsedAction implements RunningAction {
+		private final long timeoutMs;
+		private final List<Long> elapsedValues = new ArrayList<>();
+
+		private RecordingElapsedAction(long timeoutMs) {
+			this.timeoutMs = timeoutMs;
+		}
+
+		@Override
+		public long timeoutMs() {
+			return timeoutMs;
+		}
+
+		@Override
+		public ActionUpdate tick(ActionContext context, long elapsedMs) {
+			elapsedValues.add(elapsedMs);
+			return ActionUpdate.running("recording elapsed time");
+		}
+	}
+
+	private static final class ThrowingTickAction implements RunningAction {
+		@Override
+		public long timeoutMs() {
+			return 1_000L;
+		}
+
+		@Override
+		public ActionUpdate tick(ActionContext context, long elapsedMs) {
+			throw new IllegalStateException("tick failed");
+		}
+	}
+
+	private static final class ThrowingCancelAction implements RunningAction {
+		@Override
+		public long timeoutMs() {
+			return 1_000L;
+		}
+
+		@Override
+		public ActionUpdate tick(ActionContext context, long elapsedMs) {
+			return ActionUpdate.running("waiting for cancellation");
+		}
+
+		@Override
+		public void cancel(ActionContext context) {
+			throw new IllegalStateException("cancel failed");
 		}
 	}
 
