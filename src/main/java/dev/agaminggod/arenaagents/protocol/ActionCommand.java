@@ -16,7 +16,7 @@ public record ActionCommand(
 		if (arguments == null) {
 			throw new ProtocolException(ProtocolConstants.ERROR_INVALID_FIELD, "arguments must not be null");
 		}
-		arguments = arguments.deepCopy();
+		arguments = ProtocolCodec.validateActionArguments(type, arguments);
 		if (issuedAtEpochMs <= 0L) {
 			throw new ProtocolException(
 					ProtocolConstants.ERROR_OUT_OF_RANGE,

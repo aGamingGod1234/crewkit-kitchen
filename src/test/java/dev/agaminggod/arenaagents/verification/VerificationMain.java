@@ -26,6 +26,7 @@ public final class VerificationMain {
 		verifyValidActionUnion(codec);
 		verifyBriefExamples(codec);
 		verifyEnvelopeValidation(codec);
+		verifyDirectCommandSchemaValidation();
 		verifyBoundedValidation(codec);
 		verifyStrictArguments(codec);
 		verifyCommandImmutability();
@@ -167,6 +168,24 @@ public final class VerificationMain {
 				"integral block coordinate"
 		);
 		expectProtocolException(
+				() -> codec.decodeCommand(commandJson(
+						"break_block",
+						"\"x\":1.00000000000000001,\"y\":64,\"z\":0,\"timeoutMs\":1"
+				)),
+				"OUT_OF_RANGE",
+				"x",
+				"exact break block coordinate"
+		);
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson(
+						"place_block",
+						"\"x\":0,\"y\":64,\"z\":-2.00000000000000001,\"face\":\"up\",\"itemId\":\"minecraft:stone\""
+				)),
+				"OUT_OF_RANGE",
+				"z",
+				"exact place block coordinate"
+		);
+		expectProtocolException(
 				() -> codec.decodeCommand(commandJson("wait", "\"durationMs\":0")),
 				"OUT_OF_RANGE",
 				"durationMs",
@@ -204,6 +223,58 @@ public final class VerificationMain {
 		ActionCommand longestWait = codec.decodeCommand(commandJson("wait", "\"durationMs\":" + ProtocolConstants.MAX_DURATION_MS));
 		assertEquals(1L, shortestWait.arguments().get("durationMs").getAsLong(), "minimum valid duration");
 		assertEquals(ProtocolConstants.MAX_DURATION_MS, longestWait.arguments().get("durationMs").getAsLong(), "maximum valid duration");
+	}
+
+	private static void verifyDirectCommandSchemaValidation() {
+		JsonObject validArguments = new JsonObject();
+		validArguments.addProperty("durationMs", 250);
+		ActionCommand validCommand = new ActionCommand(
+				COMMAND_ID,
+				ActionType.WAIT,
+				validArguments,
+				ISSUED_AT_EPOCH_MS
+		);
+		assertEquals(250L, validCommand.arguments().get("durationMs").getAsLong(), "direct valid command arguments");
+
+		expectProtocolException(
+				() -> new ActionCommand(
+						COMMAND_ID,
+						ActionType.WAIT,
+						new JsonObject(),
+						ISSUED_AT_EPOCH_MS
+				),
+				"MISSING_FIELD",
+				"durationMs",
+				"direct command required argument"
+		);
+
+		JsonObject unknownArguments = validArguments.deepCopy();
+		unknownArguments.addProperty("extra", true);
+		expectProtocolException(
+				() -> new ActionCommand(
+						COMMAND_ID,
+						ActionType.WAIT,
+						unknownArguments,
+						ISSUED_AT_EPOCH_MS
+				),
+				"UNKNOWN_FIELD",
+				"extra",
+				"direct command unknown argument"
+		);
+
+		JsonObject outOfRangeArguments = new JsonObject();
+		outOfRangeArguments.addProperty("durationMs", ProtocolConstants.MAX_DURATION_MS + 1L);
+		expectProtocolException(
+				() -> new ActionCommand(
+						COMMAND_ID,
+						ActionType.WAIT,
+						outOfRangeArguments,
+						ISSUED_AT_EPOCH_MS
+				),
+				"OUT_OF_RANGE",
+				"durationMs",
+				"direct command bounded argument"
+		);
 	}
 
 	private static void verifyCommandImmutability() {

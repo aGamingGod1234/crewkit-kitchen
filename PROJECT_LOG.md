@@ -1,3 +1,28 @@
+## 2026-07-13 — Task 2 protocol review fixes
+
+### What Was Implemented
+- Replaced double-rounded block-coordinate integrality checks with exact decimal-to-32-bit-integer validation for `break_block` and `place_block`.
+- Reused one action-schema validator from both decoding and the public `ActionCommand` constructor so directly constructed commands cannot bypass required-field, unknown-field, type, or range checks.
+- Made a missing compiled `VerificationMain` a hard `verifyCore` failure instead of a skipped verification task.
+- Added regressions for sub-ULP fractional block coordinates, valid and invalid direct command construction, and the required verification-main wiring.
+
+### Files Modified
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ProtocolCodec.java` — adds exact block-coordinate validation and the shared action-argument validator.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ActionCommand.java` — validates every public construction through the shared action schema.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — expands dependency-free verification from 90 to 101 assertions.
+- `build.gradle` — replaces the optional `verifyCore` predicate with an explicit required-class failure.
+- `PROJECT_LOG.md` — records the review fixes and verification scope.
+
+### Assumptions Made (flag these for review)
+- JSON numbers with a mathematically zero fractional component, such as `1.0`, remain valid block coordinates; any nonzero fractional component is rejected exactly even when conversion to `double` would round it away.
+- The existing signed 32-bit block-coordinate range remains the approved bound.
+
+### Known Issues / Deferred
+- Bridge message envelopes, JSONL socket framing, and coordinator-side validator parity remain in their planned later tasks.
+
+### Suggested Next Steps
+- Continue with Task 3 only after this review-fix commit is accepted.
+
 ## 2026-07-13 — Shared protocol and validation core
 
 ### What Was Implemented

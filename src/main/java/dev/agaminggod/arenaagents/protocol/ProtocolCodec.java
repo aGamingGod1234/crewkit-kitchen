@@ -47,7 +47,10 @@ public final class ProtocolCodec {
 		enforceLineLimit(json);
 		JsonObject commandObject = parseObject(json);
 		ActionType actionType = requireActionType(commandObject);
-		JsonObject arguments = validateAndCopyArguments(commandObject, actionType);
+		JsonObject arguments = validateActionArguments(
+				actionType,
+				copyActionArguments(commandObject, actionType)
+		);
 
 		validateProtocolVersion(commandObject);
 		String commandId = requireBoundedText(
@@ -115,7 +118,7 @@ public final class ProtocolCodec {
 			encoded.add(entry.getKey(), entry.getValue().deepCopy());
 		}
 
-		validateAndCopyArguments(encoded, command.type());
+		validateActionArguments(command.type(), command.arguments());
 		validateKnownFields(encoded, command.type());
 		return encoded;
 	}
@@ -186,28 +189,46 @@ public final class ProtocolCodec {
 		}
 	}
 
-	private static JsonObject validateAndCopyArguments(JsonObject command, ActionType actionType)
+	static JsonObject validateActionArguments(ActionType actionType, JsonObject arguments)
 			throws ProtocolException {
+		if (actionType == null) {
+			throw invalidField("Action type must not be null");
+		}
+		if (arguments == null) {
+			throw invalidField("Action arguments must not be null");
+		}
+
 		switch (actionType) {
-			case MOVE_TO -> validateMoveTo(command);
-			case LOOK_AT -> validateCoordinates(command, false);
-			case ATTACK -> validateAttack(command);
-			case SELECT_ITEM -> requireIdentifier(command, FIELD_ITEM_ID);
-			case USE_ITEM, WAIT -> requireDuration(command, FIELD_DURATION_MS);
-			case BREAK_BLOCK -> validateBreakBlock(command);
-			case PLACE_BLOCK -> validatePlaceBlock(command);
-			case CHAT -> requireBoundedText(command, FIELD_MESSAGE, ProtocolConstants.MAX_CHAT_LENGTH, false);
+			case MOVE_TO -> validateMoveTo(arguments);
+			case LOOK_AT -> validateCoordinates(arguments, false);
+			case ATTACK -> validateAttack(arguments);
+			case SELECT_ITEM -> requireIdentifier(arguments, FIELD_ITEM_ID);
+			case USE_ITEM, WAIT -> requireDuration(arguments, FIELD_DURATION_MS);
+			case BREAK_BLOCK -> validateBreakBlock(arguments);
+			case PLACE_BLOCK -> validatePlaceBlock(arguments);
+			case CHAT -> requireBoundedText(arguments, FIELD_MESSAGE, ProtocolConstants.MAX_CHAT_LENGTH, false);
 			case COMPLETE_GOAL -> requireBoundedText(
-					command,
+					arguments,
 					FIELD_SUMMARY,
 					ProtocolConstants.MAX_SUMMARY_LENGTH,
 					false
 			);
 		}
+		validateKnownArgumentFields(arguments, actionType);
 
+		JsonObject validatedArguments = new JsonObject();
+		for (String field : ACTION_FIELDS.get(actionType)) {
+			validatedArguments.add(field, arguments.get(field).deepCopy());
+		}
+		return validatedArguments;
+	}
+
+	private static JsonObject copyActionArguments(JsonObject command, ActionType actionType) {
 		JsonObject arguments = new JsonObject();
 		for (String field : ACTION_FIELDS.get(actionType)) {
-			arguments.add(field, command.get(field).deepCopy());
+			if (command.has(field)) {
+				arguments.add(field, command.get(field).deepCopy());
+			}
 		}
 		return arguments;
 	}
@@ -254,12 +275,21 @@ public final class ProtocolCodec {
 
 	private static void validateCoordinates(JsonObject command, boolean integral) throws ProtocolException {
 		for (String field : List.of(FIELD_X, FIELD_Y, FIELD_Z)) {
-			double coordinate = requireFiniteNumber(command, field);
-			if (integral && (coordinate != Math.rint(coordinate)
-					|| coordinate < Integer.MIN_VALUE
-					|| coordinate > Integer.MAX_VALUE)) {
-				throw outOfRange(field, "an integral 32-bit block coordinate");
+			if (integral) {
+				requireIntegralBlockCoordinate(command, field);
+			} else {
+				requireFiniteNumber(command, field);
 			}
+		}
+	}
+
+	private static int requireIntegralBlockCoordinate(JsonObject object, String field) throws ProtocolException {
+		JsonPrimitive primitive = requireNumber(object, field);
+		requireFiniteNumber(primitive, field);
+		try {
+			return new BigDecimal(primitive.getAsString()).intValueExact();
+		} catch (ArithmeticException | NumberFormatException exception) {
+			throw outOfRange(field, "an integral 32-bit block coordinate");
 		}
 	}
 
@@ -297,6 +327,10 @@ public final class ProtocolCodec {
 
 	private static double requireFiniteNumber(JsonObject object, String field) throws ProtocolException {
 		JsonPrimitive primitive = requireNumber(object, field);
+		return requireFiniteNumber(primitive, field);
+	}
+
+	private static double requireFiniteNumber(JsonPrimitive primitive, String field) throws ProtocolException {
 		double value;
 		try {
 			value = primitive.getAsDouble();
@@ -363,6 +397,16 @@ public final class ProtocolCodec {
 		Set<String> allowedFields = new HashSet<>(ENVELOPE_FIELDS);
 		allowedFields.addAll(ACTION_FIELDS.get(actionType));
 		for (String field : command.keySet()) {
+			if (!allowedFields.contains(field)) {
+				throw unknownField(field, actionType);
+			}
+		}
+	}
+
+	private static void validateKnownArgumentFields(JsonObject arguments, ActionType actionType)
+			throws ProtocolException {
+		List<String> allowedFields = ACTION_FIELDS.get(actionType);
+		for (String field : arguments.keySet()) {
 			if (!allowedFields.contains(field)) {
 				throw unknownField(field, actionType);
 			}

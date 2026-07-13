@@ -88,17 +88,18 @@ def coreVerificationClassFile = layout.buildDirectory.file(
 
 tasks.register('verifyCore', JavaExec) {
 	group = 'verification'
-	description = 'Runs the dependency-free core verification main when it is present.'
+	description = 'Runs the required dependency-free core verification main.'
 	dependsOn tasks.named('testClasses')
 	classpath = sourceSets.test.runtimeClasspath
 	mainClass.set(coreVerificationMainClass)
 
-	onlyIf {
-		def verificationMainPresent = coreVerificationClassFile.get().asFile.isFile()
-		if (!verificationMainPresent) {
-			logger.lifecycle('Core verification main is not present yet; skipping core verification.')
+	doFirst {
+		def verificationMain = coreVerificationClassFile.get().asFile
+		if (!verificationMain.isFile()) {
+			throw new GradleException(
+				"Required core verification main is missing: ${project.relativePath(verificationMain)}"
+			)
 		}
-		verificationMainPresent
 	}
 }
 
