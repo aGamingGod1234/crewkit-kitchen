@@ -9,9 +9,9 @@
 	},
 	"agents": [
 		{
-			"agentId": "agent55",
+			"agentId": "agent-55",
 			"playerName": "Agent55",
-			"accountProfile": "agent55",
+			"accountProfile": "agent-55",
 			"bridgePort": 25571,
 			"model": "gpt-5.5",
 			"reasoningEffort": "xhigh",
@@ -19,9 +19,9 @@
 			"runtimeDir": "runtime/agent55"
 		},
 		{
-			"agentId": "agent56",
+			"agentId": "agent-56",
 			"playerName": "Agent56",
-			"accountProfile": "agent56",
+			"accountProfile": "agent-56",
 			"bridgePort": 25572,
 			"model": "gpt-5.6-sol",
 			"reasoningEffort": "high",

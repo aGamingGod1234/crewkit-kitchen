@@ -12,7 +12,7 @@ import {
 
 const readyObservation = () => ({
 	protocolVersion: PROTOCOL_VERSION,
-	agentId: 'agent55',
+	agentId: 'agent-55',
 	type: 'observation',
 	messageId: 'server-1',
 	ready: true,
@@ -68,10 +68,10 @@ test('builds a strict versioned command with integral timestamp', () => {
 });
 
 test('validates strict envelopes and protocol version', () => {
-	assert.deepEqual(validateEnvelope({ protocolVersion: 1, agentId: 'agent55', type: 'hello_ack', messageId: 'server-1', replyTo: 'client-1' }), {
-		protocolVersion: 1, agentId: 'agent55', type: 'hello_ack', messageId: 'server-1', replyTo: 'client-1',
+	assert.deepEqual(validateEnvelope({ protocolVersion: 1, agentId: 'agent-55', type: 'hello_ack', messageId: 'server-1', replyTo: 'client-1' }), {
+		protocolVersion: 1, agentId: 'agent-55', type: 'hello_ack', messageId: 'server-1', replyTo: 'client-1',
 	});
-	assert.throws(() => validateEnvelope({ protocolVersion: 2, agentId: 'agent55', type: 'hello_ack', messageId: 'x', replyTo: 'y' }), /Unsupported protocolVersion/);
+	assert.throws(() => validateEnvelope({ protocolVersion: 2, agentId: 'agent-55', type: 'hello_ack', messageId: 'x', replyTo: 'y' }), /Unsupported protocolVersion/);
 });
 
 test('validates bounded observations with strict nested fields', () => {
@@ -85,7 +85,7 @@ test('validates bounded observations with strict nested fields', () => {
 });
 
 test('accepts terminal action results and rejects nonterminal states', () => {
-	const result = { protocolVersion: 1, agentId: 'agent55', type: 'action_result', messageId: 'server-2', commandId: 'command-1', state: 'SUCCEEDED', reasonCode: 'DONE', message: '', completedAtEpochMs: 1_750_000_001_000 };
+	const result = { protocolVersion: 1, agentId: 'agent-55', type: 'action_result', messageId: 'server-2', commandId: 'command-1', state: 'SUCCEEDED', reasonCode: 'DONE', message: '', completedAtEpochMs: 1_750_000_001_000 };
 	assert.deepEqual(validateActionResult(result), result);
 	assert.throws(() => validateActionResult({ ...result, state: 'RUNNING' }), /terminal/);
 });
