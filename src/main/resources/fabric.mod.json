@@ -1,0 +1,22 @@
+{
+	"schemaVersion": 1,
+	"id": "arenaagents",
+	"version": "${version}",
+	"name": "Arena Agents",
+	"license": "All-Rights-Reserved",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"dev.agaminggod.arenaagents.ArenaAgents"
+		],
+		"client": [
+			"dev.agaminggod.arenaagents.client.ArenaAgentsClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~26.1.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

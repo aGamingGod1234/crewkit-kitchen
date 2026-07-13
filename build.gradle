@@ -1,0 +1,118 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+	id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+repositories {
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"arenaagents" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 25
+}
+
+java {
+	withSourcesJar()
+
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+	def archiveName = project.archives_base_name
+	inputs.property "archiveName", archiveName
+
+	from("LICENSE") {
+		rename { "${it}_${archiveName}" }
+	}
+}
+
+def entrypointClassFiles = [
+	layout.buildDirectory.file('classes/java/main/dev/agaminggod/arenaagents/ArenaAgents.class'),
+	layout.buildDirectory.file('classes/java/client/dev/agaminggod/arenaagents/client/ArenaAgentsClient.class')
+]
+
+tasks.register('verifyEntrypoints') {
+	group = 'verification'
+	description = 'Verifies that every Fabric entrypoint declared by the baseline is compiled.'
+	dependsOn tasks.named('compileJava'), tasks.named('compileClientJava')
+
+	doLast {
+		def missingEntrypoints = entrypointClassFiles
+			.collect { it.get().asFile }
+			.findAll { !it.isFile() }
+
+		if (!missingEntrypoints.isEmpty()) {
+			def relativePaths = missingEntrypoints.collect { project.relativePath(it) }.join(', ')
+			throw new GradleException("Missing compiled Fabric entrypoints: ${relativePaths}")
+		}
+	}
+}
+
+def coreVerificationMainClass = 'dev.agaminggod.arenaagents.verification.VerificationMain'
+def coreVerificationClassFile = layout.buildDirectory.file(
+	"classes/java/test/${coreVerificationMainClass.replace('.', '/')}.class"
+)
+
+tasks.register('verifyCore', JavaExec) {
+	group = 'verification'
+	description = 'Runs the dependency-free core verification main when it is present.'
+	dependsOn tasks.named('testClasses')
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass.set(coreVerificationMainClass)
+
+	onlyIf {
+		def verificationMainPresent = coreVerificationClassFile.get().asFile.isFile()
+		if (!verificationMainPresent) {
+			logger.lifecycle('Core verification main is not present yet; skipping core verification.')
+		}
+		verificationMainPresent
+	}
+}
+
+tasks.named('check') {
+	dependsOn tasks.named('verifyCore'), tasks.named('verifyEntrypoints')
+}
+
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			from components.java
+		}
+	}
+
+	repositories {
+	}
+}
