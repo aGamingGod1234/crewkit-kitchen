@@ -6,9 +6,14 @@ import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PipedInputStream;
+import java.io.PipedOutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketAddress;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -84,6 +89,70 @@ public final class BridgeConcurrencyVerification {
 					session.close();
 				}
 			}
+		}
+	}
+
+	public static void verifyCallbackFailureShutdownDoesNotWaitForBlockedOutput(
+			AgentConfig config,
+			ProtocolCodec codec
+	) throws Exception {
+		BlockingSocket socket = new BlockingSocket();
+		CountDownLatch callbackStarted = new CountDownLatch(1);
+		CountDownLatch callbackCompleted = new CountDownLatch(1);
+		AtomicReference<Thread> callbackThread = new AtomicReference<>();
+		AtomicReference<Throwable> callbackEscape = new AtomicReference<>();
+		BridgeSession session = new BridgeSession(
+				config,
+				socket,
+				codec,
+				task -> callbackThread.set(Thread.ofPlatform()
+						.name("arenaagents-verification-blocked-output-callback")
+						.daemon(true)
+						.start(() -> {
+							try {
+								task.run();
+							} catch (Throwable exception) {
+								callbackEscape.set(exception);
+							} finally {
+								callbackCompleted.countDown();
+							}
+						})),
+				command -> {
+					callbackStarted.countDown();
+					throw new IllegalStateException("callback failed");
+				},
+				() -> { }
+		);
+		try {
+			session.start();
+			codec.writeLine(
+					socket.peerInput(),
+					"{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
+							+ "\",\"type\":\"hello\",\"messageId\":\"blocked-output-hello\"}"
+			);
+			socket.awaitOutputWrite();
+			codec.writeLine(
+					socket.peerInput(),
+					"{\"protocolVersion\":1,\"agentId\":\"" + config.agentId()
+							+ "\",\"type\":\"action_command\",\"messageId\":\"blocked-output-action\","
+							+ "\"command\":{\"protocolVersion\":1,\"commandId\":\"blocked-output-command\","
+							+ "\"type\":\"wait\",\"issuedAtEpochMs\":1,\"durationMs\":1}}"
+			);
+			awaitLatch(callbackStarted, "failing callback did not begin");
+			awaitLatch(callbackCompleted, "callback failure waited for blocked output");
+			if (!socket.isClosed()) {
+				throw new AssertionError("callback failure did not close the socket");
+			}
+			if (callbackEscape.get() != null) {
+				throw new AssertionError("callback failure escaped its executor", callbackEscape.get());
+			}
+		} finally {
+			session.close();
+			Thread thread = callbackThread.get();
+			if (thread != null) {
+				thread.join(SOCKET_TIMEOUT_MS);
+			}
+			socket.close();
 		}
 	}
 
@@ -399,6 +468,108 @@ public final class BridgeConcurrencyVerification {
 
 		private void releaseOverflowOffer() {
 			releaseOverflowOffer.countDown();
+		}
+	}
+
+	private static final class BlockingSocket extends Socket {
+		private static final int REMOTE_PORT = 24_731;
+
+		private final PipedInputStream input = new PipedInputStream();
+		private final PipedOutputStream peerInput;
+		private final BlockingOutputStream output = new BlockingOutputStream();
+		private final AtomicBoolean closed = new AtomicBoolean();
+
+		private BlockingSocket() throws IOException {
+			peerInput = new PipedOutputStream(input);
+		}
+
+		@Override
+		public SocketAddress getRemoteSocketAddress() {
+			return new InetSocketAddress("127.0.0.1", REMOTE_PORT);
+		}
+
+		@Override
+		public void setTcpNoDelay(boolean enabled) {
+			// This controlled socket has no TCP transport to configure.
+		}
+
+		@Override
+		public void setSoTimeout(int timeout) {
+			// Blocking behavior is controlled explicitly by the test streams.
+		}
+
+		@Override
+		public InputStream getInputStream() {
+			return input;
+		}
+
+		@Override
+		public OutputStream getOutputStream() {
+			return output;
+		}
+
+		private OutputStream peerInput() {
+			return peerInput;
+		}
+
+		private void awaitOutputWrite() throws InterruptedException {
+			awaitLatch(output.writeEntered(), "writer did not block on controlled output");
+		}
+
+		@Override
+		public boolean isClosed() {
+			return closed.get();
+		}
+
+		@Override
+		public void close() throws IOException {
+			if (!closed.compareAndSet(false, true)) {
+				return;
+			}
+			output.close();
+			IOException failure = null;
+			try {
+				peerInput.close();
+			} catch (IOException exception) {
+				failure = exception;
+			}
+			try {
+				input.close();
+			} catch (IOException exception) {
+				if (failure == null) {
+					failure = exception;
+				} else {
+					failure.addSuppressed(exception);
+				}
+			}
+			if (failure != null) {
+				throw failure;
+			}
+		}
+	}
+
+	private static final class BlockingOutputStream extends OutputStream {
+		private final CountDownLatch writeEntered = new CountDownLatch(1);
+		private final CountDownLatch releaseWrite = new CountDownLatch(1);
+		private final AtomicBoolean closed = new AtomicBoolean();
+
+		@Override
+		public void write(int value) throws IOException {
+			writeEntered.countDown();
+			awaitUninterruptibly(releaseWrite);
+			if (closed.get()) {
+				throw new IOException("controlled output is closed");
+			}
+		}
+
+		private CountDownLatch writeEntered() {
+			return writeEntered;
+		}
+
+		@Override
+		public void close() {
+			closed.set(true);
+			releaseWrite.countDown();
 		}
 	}
 

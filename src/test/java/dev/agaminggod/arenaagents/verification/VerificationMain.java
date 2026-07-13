@@ -75,6 +75,7 @@ public final class VerificationMain {
 		verifyCloseLinearizesPendingAdmission(codec);
 		verifyConcurrentCloseWaitsForCallback(codec);
 		verifyQueueOverflowDoesNotInvertCallbackLock(codec);
+		verifyCallbackFailureShutdownDoesNotWaitForBlockedOutput(codec);
 		verifyBridgeCallbackFailure(codec);
 		verifyBridgeControlValidation(codec);
 		verifyBridgeSingleSessionAndReconnect(codec);
@@ -473,12 +474,11 @@ public final class VerificationMain {
 
 	private static void verifyGeneratedErrorIdIsContained(ProtocolCodec codec) throws Exception {
 		int port = findAvailablePort();
-		RecordingExecutor executor = new RecordingExecutor();
 		try (BridgeServer server = new BridgeServer(
 				enabledConfig(port),
 				codec,
-				executor,
-				command -> { throw new IllegalStateException("callback failed"); }
+				Runnable::run,
+				command -> { }
 		)) {
 			server.start();
 			try (Socket client = connectAuthenticated(codec, port, "hello-error-id")) {
@@ -487,12 +487,15 @@ public final class VerificationMain {
 				String eventId = server.sendEvent("significant_event", payload);
 				assertEquals(eventId, readMessage(codec, client).get("messageId").getAsString(), "generated event id delivered");
 
-				writeMessage(codec, client, actionEnvelope("action-error-id"));
-				awaitCondition(() -> executor.pendingCount() == 1, "failing generated-id callback queued");
-				assertDoesNotThrow(executor::runNext, "generated error id contained");
+				writeMessage(
+						codec,
+						client,
+						"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
+								+ "\",\"type\":\"cancel_action\",\"messageId\":\"protocol-error-id\"}"
+				);
 				JsonObject error = readMessage(codec, client);
 				assertEquals("error", error.get("type").getAsString(), "generated error reported type");
-				assertEquals("CALLBACK_FAILED", error.get("code").getAsString(), "generated error reported code");
+				assertEquals("MISSING_FIELD", error.get("code").getAsString(), "generated error reported code");
 				assertTrue(!eventId.equals(error.get("messageId").getAsString()), "generated error id is unique");
 			}
 		}
@@ -589,6 +592,16 @@ public final class VerificationMain {
 		pass("queue overflow avoids lifecycle and callback lock inversion");
 	}
 
+	private static void verifyCallbackFailureShutdownDoesNotWaitForBlockedOutput(ProtocolCodec codec)
+			throws Exception {
+		int port = findAvailablePort();
+		BridgeConcurrencyVerification.verifyCallbackFailureShutdownDoesNotWaitForBlockedOutput(
+				enabledConfig(port),
+				codec
+		);
+		pass("callback failure shutdown does not wait for blocked output");
+	}
+
 	private static Socket connectAuthenticatedAfterStart(
 			BridgeServer server,
 			ProtocolCodec codec,
@@ -667,7 +680,10 @@ public final class VerificationMain {
 				writeMessage(codec, client, actionEnvelope("action-callback-failure"));
 				awaitCondition(() -> executor.pendingCount() == 1, "failing action callback queued");
 				assertDoesNotThrow(executor::runNext, "action callback failure contained");
-				assertErrorCode(codec, client, "CALLBACK_FAILED", "action callback failure reported");
+				assertTrue(
+						codec.readLine(client.getInputStream()) == null,
+						"action callback failure closes the session"
+				);
 			}
 		}
 	}

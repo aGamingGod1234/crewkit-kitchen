@@ -1,3 +1,27 @@
+## 2026-07-13 — Nonblocking callback-failure shutdown
+
+### What Was Implemented
+- Changed fatal action-callback handling to close the bridge socket immediately without first waiting for error-frame delivery.
+- Added a deterministic blocked-output regression that holds the writer's output lock, fails an action callback, and proves the callback can still finish while shutdown releases the blocked writer.
+- Preserved generated error-ID coverage through an ordinary malformed control message, where synchronous protocol-error delivery remains safe.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeSession.java` — removes network output from the fatal callback-failure path and begins socket shutdown immediately.
+- `src/test/java/dev/agaminggod/arenaagents/client/bridge/BridgeConcurrencyVerification.java` — adds the controlled socket/output fixture and blocked-writer callback-failure regression.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — runs the new regression and updates callback-failure expectations to immediate connection closure.
+- `PROJECT_LOG.md` — records the callback shutdown fix, approved tradeoff, and verification scope.
+
+### Assumptions Made (flag these for review)
+- Fatal callback safety takes priority over delivering a `CALLBACK_FAILED` frame; the coordinator observes connection closure instead, as explicitly approved for this fix.
+
+### Known Issues / Deferred
+- Because the socket is closed immediately, a coordinator cannot distinguish a fatal application callback from another abrupt session failure using an in-band error frame.
+- Action execution, cancellation effects, observation collection, and coordinator behavior remain in their previously assigned later tasks.
+
+### Suggested Next Steps
+- Keep fatal callback paths free of outbound network I/O as later action execution is added.
+- Preserve the blocked-output regression when evolving bridge shutdown or writer ownership.
+
 ## 2026-07-13 — Task 3 bridge lifecycle review fixes
 
 ### What Was Implemented

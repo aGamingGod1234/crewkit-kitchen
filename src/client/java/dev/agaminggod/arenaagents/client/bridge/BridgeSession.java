@@ -325,23 +325,19 @@ public final class BridgeSession implements AutoCloseable {
 	}
 
 	private void dispatchAction(ActionCommand command) {
-		ProtocolException callbackFailure = null;
+		boolean callbackFailed = false;
 		synchronized (callbackLock) {
 			if (!isAuthenticated()) {
 				return;
 			}
 			try {
 				eventSink.onActionCommand(command);
-			} catch (RuntimeException exception) {
-				callbackFailure = new ProtocolException("CALLBACK_FAILED", "Client action callback failed", exception);
+			} catch (RuntimeException ignored) {
+				callbackFailed = true;
 			}
 		}
-		if (callbackFailure != null) {
-			try {
-				writeError(callbackFailure);
-			} finally {
-				close();
-			}
+		if (callbackFailed) {
+			close();
 		}
 	}
 
