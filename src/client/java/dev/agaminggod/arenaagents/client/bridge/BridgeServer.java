@@ -142,6 +142,10 @@ public final class BridgeServer implements AutoCloseable {
 		return session.sendEvent(type, payload);
 	}
 
+	public int encodedEventBytesAtMaximumEnvelope(String type, JsonObject payload) {
+		return BridgeSession.encodedEventBytesAtMaximumEnvelope(config, codec, type, payload);
+	}
+
 	public boolean isRunning() {
 		synchronized (lifecycleLock) {
 			return state == ServerState.RUNNING && serverSocket != null && !serverSocket.isClosed();

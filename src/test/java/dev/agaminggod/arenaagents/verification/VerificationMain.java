@@ -15,6 +15,7 @@ import dev.agaminggod.arenaagents.client.perception.Observation;
 import dev.agaminggod.arenaagents.client.perception.ObservationCollectorVerification;
 import dev.agaminggod.arenaagents.client.perception.ObservationLimits;
 import dev.agaminggod.arenaagents.client.perception.ObservationOrdering;
+import dev.agaminggod.arenaagents.client.perception.ObservationWireBudgetVerification;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
 import dev.agaminggod.arenaagents.protocol.ActionState;
@@ -72,6 +73,8 @@ public final class VerificationMain {
 		verifyActionResultContract();
 		verifyObservationContracts(codec);
 		ObservationCollectorVerification.verifyLoadedChunkBoundary();
+		ObservationCollectorVerification.verifyEntityDistanceBoundary();
+		ObservationWireBudgetVerification.verifyWorstCaseObservationFits();
 		verifyAgentConfigParsing();
 		verifyAgentConfigFiles();
 		verifyJsonLineFraming(codec);

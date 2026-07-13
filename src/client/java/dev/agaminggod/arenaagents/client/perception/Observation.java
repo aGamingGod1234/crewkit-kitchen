@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.client.perception;
 
 import dev.agaminggod.arenaagents.protocol.ActionResult;
+import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import java.util.List;
 import java.util.Objects;
 
@@ -21,7 +22,15 @@ public record Observation(
 	public static final String READY_STATUS = "ready";
 
 	public Observation {
-		status = requireText(status, "status", !ready);
+		status = requireBoundedText(
+				status,
+				"status",
+				ProtocolConstants.MAX_REASON_CODE_LENGTH,
+				false
+		);
+		if (ready && !READY_STATUS.equals(status)) {
+			throw new IllegalArgumentException("ready observation status must be '" + READY_STATUS + "'");
+		}
 		position = Objects.requireNonNull(position, "position must not be null");
 		velocity = Objects.requireNonNull(velocity, "velocity must not be null");
 		view = Objects.requireNonNull(view, "view must not be null");
@@ -37,7 +46,7 @@ public record Observation(
 	public static Observation unavailable(String reason) {
 		return new Observation(
 				false,
-				requireText(reason, "reason", true),
+				reason,
 				Position.ZERO,
 				Velocity.ZERO,
 				View.ZERO,
@@ -51,13 +60,18 @@ public record Observation(
 		);
 	}
 
-	private static String requireText(String value, String field, boolean anyNonblankValueAllowed) {
+	private static String requireBoundedText(
+			String value,
+			String field,
+			int maximumLength,
+			boolean emptyAllowed
+	) {
 		Objects.requireNonNull(value, field + " must not be null");
-		if (value.isBlank()) {
+		if (!emptyAllowed && value.isBlank()) {
 			throw new IllegalArgumentException(field + " must not be blank");
 		}
-		if (!anyNonblankValueAllowed && !READY_STATUS.equals(value)) {
-			throw new IllegalArgumentException("ready observation status must be '" + READY_STATUS + "'");
+		if (value.length() > maximumLength) {
+			throw new IllegalArgumentException(field + " must not exceed " + maximumLength + " characters");
 		}
 		return value;
 	}
@@ -128,7 +142,12 @@ public record Observation(
 			boolean visible
 	) {
 		public EffectStatus {
-			effectId = requireText(effectId, "effectId", true);
+			effectId = requireBoundedText(
+					effectId,
+					"effectId",
+					ProtocolConstants.MAX_IDENTIFIER_LENGTH,
+					false
+			);
 			if (amplifier < 0 || durationTicks < 0) {
 				throw new IllegalArgumentException("effect amplifier and duration must not be negative");
 			}
@@ -143,7 +162,12 @@ public record Observation(
 			boolean thundering
 	) {
 		public WorldStatus {
-			dimensionId = Objects.requireNonNull(dimensionId, "dimensionId must not be null");
+			dimensionId = requireBoundedText(
+					dimensionId,
+					"dimensionId",
+					ProtocolConstants.MAX_IDENTIFIER_LENGTH,
+					true
+			);
 		}
 
 		private static WorldStatus empty() {
@@ -158,9 +182,14 @@ public record Observation(
 			String state
 	) {
 		public ActionStatus {
-			commandId = requirePresenceText(commandId, "commandId", present);
-			type = requirePresenceText(type, "type", present);
-			state = requirePresenceText(state, "state", present);
+			commandId = requirePresenceText(
+					commandId,
+					"commandId",
+					present,
+					ProtocolConstants.MAX_COMMAND_ID_LENGTH
+			);
+			type = requirePresenceText(type, "type", present, ProtocolConstants.MAX_REASON_CODE_LENGTH);
+			state = requirePresenceText(state, "state", present, ProtocolConstants.MAX_REASON_CODE_LENGTH);
 		}
 
 		public static ActionStatus none() {
@@ -177,10 +206,25 @@ public record Observation(
 			long completedAtEpochMs
 	) {
 		public ResultStatus {
-			commandId = requirePresenceText(commandId, "commandId", present);
-			state = requirePresenceText(state, "state", present);
-			reasonCode = requirePresenceText(reasonCode, "reasonCode", present);
-			message = Objects.requireNonNull(message, "message must not be null");
+			commandId = requirePresenceText(
+					commandId,
+					"commandId",
+					present,
+					ProtocolConstants.MAX_COMMAND_ID_LENGTH
+			);
+			state = requirePresenceText(state, "state", present, ProtocolConstants.MAX_REASON_CODE_LENGTH);
+			reasonCode = requirePresenceText(
+					reasonCode,
+					"reasonCode",
+					present,
+					ProtocolConstants.MAX_REASON_CODE_LENGTH
+			);
+			message = requireBoundedText(
+					message,
+					"message",
+					ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH,
+					true
+			);
 			if (present && completedAtEpochMs <= 0L) {
 				throw new IllegalArgumentException("present result must have a positive completion timestamp");
 			}
@@ -206,10 +250,13 @@ public record Observation(
 		}
 	}
 
-	private static String requirePresenceText(String value, String field, boolean present) {
+	private static String requirePresenceText(String value, String field, boolean present, int maximumLength) {
 		Objects.requireNonNull(value, field + " must not be null");
 		if (present == value.isBlank()) {
 			throw new IllegalArgumentException(field + " presence must match the snapshot presence flag");
+		}
+		if (value.length() > maximumLength) {
+			throw new IllegalArgumentException(field + " must not exceed " + maximumLength + " characters");
 		}
 		return value;
 	}

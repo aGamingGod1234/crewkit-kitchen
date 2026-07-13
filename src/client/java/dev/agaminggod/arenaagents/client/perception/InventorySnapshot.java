@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.client.perception;
 
+import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import java.util.List;
 import java.util.Objects;
 
@@ -31,6 +32,11 @@ public record InventorySnapshot(
 		Objects.requireNonNull(value, field + " must not be null");
 		if (value.isBlank()) {
 			throw new IllegalArgumentException(field + " must not be blank");
+		}
+		if (value.length() > ProtocolConstants.MAX_IDENTIFIER_LENGTH) {
+			throw new IllegalArgumentException(
+					field + " must not exceed " + ProtocolConstants.MAX_IDENTIFIER_LENGTH + " characters"
+			);
 		}
 		return value;
 	}

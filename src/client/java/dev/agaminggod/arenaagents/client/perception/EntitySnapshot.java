@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.client.perception;
 
+import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import java.util.Objects;
 
 public record EntitySnapshot(
@@ -15,9 +16,9 @@ public record EntitySnapshot(
 		boolean hostile
 ) {
 	public EntitySnapshot {
-		stableId = requireText(stableId, "stableId");
-		typeId = requireText(typeId, "typeId");
-		name = Objects.requireNonNull(name, "name must not be null");
+		stableId = requireText(stableId, "stableId", false);
+		typeId = requireText(typeId, "typeId", false);
+		name = requireText(name, "name", true);
 		requireFinite(x, "x");
 		requireFinite(y, "y");
 		requireFinite(z, "z");
@@ -26,10 +27,15 @@ public record EntitySnapshot(
 		requireNonNegativeFinite(maxHealth, "maxHealth");
 	}
 
-	private static String requireText(String value, String field) {
+	private static String requireText(String value, String field, boolean emptyAllowed) {
 		Objects.requireNonNull(value, field + " must not be null");
-		if (value.isBlank()) {
+		if (!emptyAllowed && value.isBlank()) {
 			throw new IllegalArgumentException(field + " must not be blank");
+		}
+		if (value.length() > ProtocolConstants.MAX_IDENTIFIER_LENGTH) {
+			throw new IllegalArgumentException(
+					field + " must not exceed " + ProtocolConstants.MAX_IDENTIFIER_LENGTH + " characters"
+			);
 		}
 		return value;
 	}

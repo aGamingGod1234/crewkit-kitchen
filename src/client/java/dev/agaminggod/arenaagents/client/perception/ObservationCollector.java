@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Supplier;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientChunkCache;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
@@ -23,6 +24,7 @@ import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
@@ -173,15 +175,30 @@ public final class ObservationCollector {
 	}
 
 	private List<EntitySnapshot> collectEntities(ClientLevel level, LocalPlayer player) {
-		List<EntitySnapshot> entities = level.getEntitiesOfClass(
+		List<LivingEntity> nearbyEntities = level.getEntitiesOfClass(
 				LivingEntity.class,
 				player.getBoundingBox().inflate(observationRadius),
 				entity -> entity != player && entity.isAlive()
-		).stream().map(entity -> snapshotEntity(player, entity)).toList();
+		);
+		List<EntitySnapshot> entities = new ArrayList<>(nearbyEntities.size());
+		for (LivingEntity entity : nearbyEntities) {
+			double distanceSquared = player.distanceToSqr(entity);
+			if (isEntityDistanceInRadius(distanceSquared, observationRadius)) {
+				entities.add(snapshotEntity(entity, distanceSquared));
+			}
+		}
 		return ObservationLimits.truncateEntities(ObservationOrdering.entities(entities));
 	}
 
-	private static EntitySnapshot snapshotEntity(LocalPlayer player, LivingEntity entity) {
+	static boolean isEntityDistanceInRadius(double distanceSquared, int radius) {
+		int boundedRadius = ObservationLimits.clampObservationRadius(radius);
+		long radiusSquared = (long) boundedRadius * boundedRadius;
+		return Double.isFinite(distanceSquared)
+				&& distanceSquared >= 0.0D
+				&& distanceSquared <= radiusSquared;
+	}
+
+	private static EntitySnapshot snapshotEntity(LivingEntity entity, double distanceSquared) {
 		return new EntitySnapshot(
 				entity.getUUID().toString(),
 				BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString(),
@@ -189,7 +206,7 @@ public final class ObservationCollector {
 				finiteOrZero(entity.getX()),
 				finiteOrZero(entity.getY()),
 				finiteOrZero(entity.getZ()),
-				finiteNonNegativeOrZero(player.distanceToSqr(entity)),
+				distanceSquared,
 				finiteNonNegativeOrZero(entity.getHealth()),
 				finiteNonNegativeOrZero(entity.getMaxHealth()),
 				entity instanceof Enemy
@@ -206,8 +223,8 @@ public final class ObservationCollector {
 				observationRadius,
 				new BlockProbe() {
 					@Override
-					public boolean isLoaded(int x, int y, int z) {
-						return level.hasChunk(x >> 4, z >> 4);
+					public boolean isChunkCached(int chunkX, int chunkZ) {
+						return hasCachedChunk(level.getChunkSource(), chunkX, chunkZ);
 					}
 
 					@Override
@@ -232,6 +249,11 @@ public final class ObservationCollector {
 					}
 				}
 		);
+	}
+
+	static boolean hasCachedChunk(ClientChunkCache chunkCache, int chunkX, int chunkZ) {
+		Objects.requireNonNull(chunkCache, "chunkCache must not be null");
+		return chunkCache.getChunk(chunkX, chunkZ, ChunkStatus.FULL, false) != null;
 	}
 
 	static List<BlockSnapshot> collectNearbyBlocks(
@@ -260,7 +282,7 @@ public final class ObservationCollector {
 			int x = centerX + offset.x();
 			int y = centerY + offset.y();
 			int z = centerZ + offset.z();
-			if (probe.isLoaded(x, y, z)) {
+			if (probe.isChunkCached(x >> 4, z >> 4)) {
 				BlockSnapshot snapshot = probe.snapshot(x, y, z, offset.distanceSquared());
 				if (snapshot != null) {
 					blocks.add(snapshot);
@@ -311,7 +333,7 @@ public final class ObservationCollector {
 	}
 
 	interface BlockProbe {
-		boolean isLoaded(int x, int y, int z);
+		boolean isChunkCached(int chunkX, int chunkZ);
 
 		BlockSnapshot snapshot(int x, int y, int z, double distanceSquared);
 	}

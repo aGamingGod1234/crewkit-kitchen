@@ -1,13 +1,13 @@
 package dev.agaminggod.arenaagents.client;
 
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.client.bridge.BridgeEventSink;
 import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.client.config.AgentConfigLoader;
 import dev.agaminggod.arenaagents.client.perception.Observation;
 import dev.agaminggod.arenaagents.client.perception.ObservationCollector;
+import dev.agaminggod.arenaagents.client.perception.ObservationWireBudget;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import java.io.IOException;
@@ -16,7 +16,6 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.minecraft.client.Minecraft;
 
 public final class ArenaAgentsClient implements ClientModInitializer {
-	private static final String FIELD_PROTOCOL_VERSION = "protocolVersion";
 	private static final String EVENT_OBSERVATION = "observation";
 
 	private BridgeServer bridgeServer;
@@ -50,8 +49,13 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 
 	private void publishObservation() {
 		Observation observation = observationCollector.collect();
-		JsonObject payload = JsonParser.parseString(protocolCodec.encode(observation)).getAsJsonObject();
-		payload.remove(FIELD_PROTOCOL_VERSION);
+		ObservationWireBudget.FittedObservation fitted = ObservationWireBudget.fit(
+				observation,
+				protocolCodec,
+				bridgeServer,
+				EVENT_OBSERVATION
+		);
+		JsonObject payload = fitted.payload();
 		bridgeServer.sendEvent(EVENT_OBSERVATION, payload);
 	}
 

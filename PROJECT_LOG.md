@@ -1,3 +1,44 @@
+## 2026-07-13 — Task 4 bounded observation review fixes
+
+### What Was Implemented
+- Replaced `ClientLevel.hasChunk` with a true non-loading `ClientChunkCache.getChunk(..., ChunkStatus.FULL, false)` cache probe before any block-state, fluid-state, or collision-shape access. Temurin JDK 25 `javap -c` confirmed Minecraft 26.1.2's `ClientLevel.hasChunk(int, int)` is only `iconst_1; ireturn`, while the false-return branch of the cache lookup reaches `aconst_null; areturn` when no cached full chunk exists.
+- Filtered queried entities by a finite spherical radius after the broad-phase AABB query, computing squared player distance exactly once per entity and retaining entities exactly on the radius boundary.
+- Added deterministic observation fitting against the exact `ProtocolCodec` event envelope and UTF-8 byte encoding, reserving the maximum valid generated message-ID length so every published observation remains within the 65,536-byte JSONL limit.
+- Added bounded text validation across observation snapshots and action/result placeholders so worst-case valid strings remain finite inputs to the fitter.
+- Added RED-first regressions for absent client chunks, diagonal/out-of-radius entities, exact-boundary entities, invalid distances, maximum-cap escaped Unicode payloads, stable-prefix fitting, deterministic fitting, reserved-envelope measurement, and overlong snapshot text.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/ArenaAgentsClient.java` — fits each collected observation before publishing its payload.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeServer.java` — exposes exact reserved-envelope byte measurement through the production session codec path.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeSession.java` — shares event construction between real sends and maximum-ID envelope measurement.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/ObservationCollector.java` — uses non-loading chunk-cache probes and finite single-computation spherical entity filtering.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/ObservationWireBudget.java` — deterministically fits observations to the wire limit while preserving stable prefixes and supplies a minimal unavailable fallback.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/BlockSnapshot.java` — bounds serialized block identifiers.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/EntitySnapshot.java` — bounds serialized entity identifiers and names.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/InventorySnapshot.java` — bounds selected and summarized item identifiers.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/Observation.java` — bounds status, dimension, effect, action, and result text fields.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ProtocolCodec.java` — exposes the exact versioned JSON object used by bounded line encoding.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ProtocolConstants.java` — exposes the protocol-version field name to the shared fitter path.
+- `src/test/java/dev/agaminggod/arenaagents/client/perception/ObservationCollectorVerification.java` — verifies cache-before-snapshot behavior and spherical distance edge cases.
+- `src/test/java/dev/agaminggod/arenaagents/client/perception/ObservationWireBudgetVerification.java` — verifies worst-case exact-envelope fitting, determinism, stable prefixes, and string bounds.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — runs the new review-fix fixtures.
+- `PROJECT_LOG.md` — records review evidence, fitting decisions, and deferred integration work.
+
+### Assumptions Made (flag these for review)
+- Deterministic retention priority is fixed as block tail, inventory-summary tail, entity tail, then effect tail; core player/world/action/result state and the selected item remain present, and each retained list is an unchanged stable prefix.
+- Envelope budgeting reserves a 128-byte ASCII generated message ID, the protocol maximum, even though current monotonic `server-N` IDs are normally shorter.
+- A cached chunk at `ChunkStatus.FULL` is the required safe boundary for block snapshot reads; an absent cache entry is skipped without requesting or loading it.
+
+### Known Issues / Deferred
+- Task 9's Node-side observation validator must mirror the new bounded string fields and existing collection caps.
+- No periodic observation scheduler was added; publication remains request-driven as assigned.
+- Official-launcher verification against the copied live world remains deferred to the later integration task.
+
+### Suggested Next Steps
+- Preserve the exact production envelope measurement path if event IDs or envelope fields change.
+- Keep future observation fields individually bounded and include their maximum-cap forms in the wire-budget regression.
+- Exercise cache misses and maximum-cap observation publication during official-launcher integration testing.
+
 ## 2026-07-13 — Nonblocking callback-failure shutdown
 
 ### What Was Implemented

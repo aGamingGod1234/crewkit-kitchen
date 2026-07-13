@@ -23,7 +23,7 @@ import java.util.Map;
 import java.util.Set;
 
 public final class ProtocolCodec {
-	private static final String FIELD_PROTOCOL_VERSION = "protocolVersion";
+	private static final String FIELD_PROTOCOL_VERSION = ProtocolConstants.FIELD_PROTOCOL_VERSION;
 	private static final String FIELD_COMMAND_ID = "commandId";
 	private static final String FIELD_TYPE = "type";
 	private static final String FIELD_ISSUED_AT_EPOCH_MS = "issuedAtEpochMs";
@@ -73,16 +73,19 @@ public final class ProtocolCodec {
 	}
 
 	public String encode(Object value) throws ProtocolException {
+		String json = serialize(toVersionedJsonObject(value));
+		enforceLineLimit(json);
+		return json;
+	}
+
+	public JsonObject toVersionedJsonObject(Object value) throws ProtocolException {
 		if (value == null) {
 			throw invalidField("Protocol value must not be null");
 		}
 
-		JsonObject encodedObject = value instanceof ActionCommand command
+		return value instanceof ActionCommand command
 				? encodeCommand(command)
 				: ensureProtocolVersion(encodeObject(value));
-		String json = serialize(encodedObject);
-		enforceLineLimit(json);
-		return json;
 	}
 
 	public String readLine(InputStream input) throws IOException, ProtocolException {

@@ -17,6 +17,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -41,6 +42,9 @@ public final class BridgeSession implements AutoCloseable {
 	private static final String FIELD_TYPE = "type";
 	private static final String FIELD_MESSAGE_ID = "messageId";
 	private static final String FIELD_COMMAND = "command";
+	private static final String GENERATED_MESSAGE_ID_PREFIX = "server-";
+	private static final String MAXIMUM_GENERATED_MESSAGE_ID = GENERATED_MESSAGE_ID_PREFIX
+			+ "9".repeat(ProtocolConstants.MAX_COMMAND_ID_LENGTH - GENERATED_MESSAGE_ID_PREFIX.length());
 	private static final List<String> ENVELOPE_FIELDS = List.of(
 			FIELD_PROTOCOL_VERSION,
 			FIELD_AGENT_ID,
@@ -148,22 +152,9 @@ public final class BridgeSession implements AutoCloseable {
 		if (!isAuthenticated()) {
 			throw new ProtocolException("NO_AUTHENTICATED_SESSION", "No authenticated coordinator session is active");
 		}
-		if (!OUTBOUND_EVENT_TYPES.contains(type)) {
-			throw new ProtocolException("UNKNOWN_MESSAGE_TYPE", "Unknown outbound bridge message type '" + type + "'");
-		}
-		JsonObject event = createEnvelope(type);
-		String messageId = event.get(FIELD_MESSAGE_ID).getAsString();
-		if (payload != null) {
-			for (var entry : payload.entrySet()) {
-				if (event.has(entry.getKey())) {
-					throw new ProtocolException(
-							ProtocolConstants.ERROR_UNKNOWN_FIELD,
-							"Outbound payload must not replace envelope field '" + entry.getKey() + "'"
-					);
-				}
-				event.add(entry.getKey(), entry.getValue().deepCopy());
-			}
-		}
+		validateOutboundEventType(type);
+		String messageId = nextOutboundMessageId();
+		JsonObject event = createEvent(config, type, messageId, payload);
 		String encoded = codec.encode(event);
 		boolean queued;
 		synchronized (lifecycleLock) {
@@ -180,6 +171,19 @@ public final class BridgeSession implements AutoCloseable {
 			throw outboundQueueFull();
 		}
 		return messageId;
+	}
+
+	static int encodedEventBytesAtMaximumEnvelope(
+			AgentConfig config,
+			ProtocolCodec codec,
+			String type,
+			JsonObject payload
+	) {
+		Objects.requireNonNull(config, "config must not be null");
+		Objects.requireNonNull(codec, "codec must not be null");
+		validateOutboundEventType(type);
+		String encoded = codec.encode(createEvent(config, type, MAXIMUM_GENERATED_MESSAGE_ID, payload));
+		return encoded.getBytes(StandardCharsets.UTF_8).length;
 	}
 
 	static void rejectAdditionalSession(Socket socket, AgentConfig config, ProtocolCodec codec) {
@@ -415,13 +419,36 @@ public final class BridgeSession implements AutoCloseable {
 			}
 			long next = current + 1L;
 			if (outboundSequence.compareAndSet(current, next)) {
-				return "server-" + next;
+				return GENERATED_MESSAGE_ID_PREFIX + next;
 			}
 		}
 	}
 
 	private JsonObject createEnvelope(String type) {
 		return createEnvelope(config, type, nextOutboundMessageId());
+	}
+
+	private static JsonObject createEvent(AgentConfig config, String type, String messageId, JsonObject payload) {
+		JsonObject event = createEnvelope(config, type, messageId);
+		if (payload == null) {
+			return event;
+		}
+		for (var entry : payload.entrySet()) {
+			if (event.has(entry.getKey())) {
+				throw new ProtocolException(
+						ProtocolConstants.ERROR_UNKNOWN_FIELD,
+						"Outbound payload must not replace envelope field '" + entry.getKey() + "'"
+				);
+			}
+			event.add(entry.getKey(), entry.getValue().deepCopy());
+		}
+		return event;
+	}
+
+	private static void validateOutboundEventType(String type) {
+		if (!OUTBOUND_EVENT_TYPES.contains(type)) {
+			throw new ProtocolException("UNKNOWN_MESSAGE_TYPE", "Unknown outbound bridge message type '" + type + "'");
+		}
 	}
 
 	private static JsonObject createEnvelope(AgentConfig config, String type, String messageId) {

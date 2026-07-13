@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.protocol;
 
 public final class ProtocolConstants {
+	public static final String FIELD_PROTOCOL_VERSION = "protocolVersion";
 	public static final int PROTOCOL_VERSION = 1;
 	public static final int MAX_LINE_BYTES = 65_536;
 	public static final int MAX_COMMAND_ID_LENGTH = 128;
