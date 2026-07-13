@@ -7,7 +7,14 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
 import com.google.gson.JsonPrimitive;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.EnumMap;
 import java.util.HashSet;
@@ -76,6 +83,59 @@ public final class ProtocolCodec {
 		String json = serialize(encodedObject);
 		enforceLineLimit(json);
 		return json;
+	}
+
+	public String readLine(InputStream input) throws IOException, ProtocolException {
+		if (input == null) {
+			throw invalidField("Input stream must not be null");
+		}
+
+		ByteArrayOutputStream line = new ByteArrayOutputStream();
+		while (true) {
+			int next = input.read();
+			if (next == -1) {
+				if (line.size() == 0) {
+					return null;
+				}
+				throw new ProtocolException("INCOMPLETE_FRAME", "JSON line ended before a newline delimiter");
+			}
+			if (next == '\n') {
+				return decodeUtf8Line(line.toByteArray());
+			}
+			if (line.size() >= ProtocolConstants.MAX_LINE_BYTES) {
+				throw new ProtocolException(
+						ProtocolConstants.ERROR_LINE_TOO_LARGE,
+						"JSON line exceeds maximum of " + ProtocolConstants.MAX_LINE_BYTES + " UTF-8 bytes"
+				);
+			}
+			line.write(next);
+		}
+	}
+
+	public void writeLine(OutputStream output, String json) throws IOException, ProtocolException {
+		if (output == null) {
+			throw invalidField("Output stream must not be null");
+		}
+		enforceLineLimit(json);
+		output.write(json.getBytes(StandardCharsets.UTF_8));
+		output.write('\n');
+		output.flush();
+	}
+
+	private static String decodeUtf8Line(byte[] bytes) throws ProtocolException {
+		int length = bytes.length;
+		if (length > 0 && bytes[length - 1] == '\r') {
+			length--;
+		}
+		try {
+			return StandardCharsets.UTF_8.newDecoder()
+					.onMalformedInput(CodingErrorAction.REPORT)
+					.onUnmappableCharacter(CodingErrorAction.REPORT)
+					.decode(ByteBuffer.wrap(bytes, 0, length))
+					.toString();
+		} catch (CharacterCodingException exception) {
+			throw new ProtocolException("INVALID_ENCODING", "JSON line must be valid UTF-8", exception);
+		}
 	}
 
 	private static JsonObject ensureProtocolVersion(JsonObject encoded) throws ProtocolException {

@@ -1,3 +1,38 @@
+## 2026-07-13 — Task 3 client configuration and loopback bridge
+
+### What Was Implemented
+- Added a strict four-field client config with named safe defaults, bounded agent identity/port/radius validation, optional loopback-host validation, and Fabric's conventional config directory.
+- Added idempotent config creation using create-new semantics so an existing user config is parsed but never overwritten; malformed, unknown, and incorrectly typed fields fail with explicit protocol codes.
+- Added bounded UTF-8 JSONL framing to the shared codec, including strict decoding, a 64 KiB byte limit, and explicit incomplete-frame errors.
+- Added a `127.0.0.1`-only bridge with first-message `hello` authentication, protocol/agent identity checks, unique bounded message IDs, strict message allowlists, one live coordinator session, and reconnect support.
+- Added daemon accept/reader/writer lifecycle management, a bounded outbound queue with explicit overflow failure, client-executor action dispatch, and clean close wiring for Minecraft shutdown.
+- Expanded dependency-free verification with live loopback authentication, single-session rejection, action dispatch, reconnect, outbound-event, framing, config idempotency, and daemon-thread assertions.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/config/AgentConfig.java` — defines the exact four-field validated client configuration and named defaults.
+- `src/client/java/dev/agaminggod/arenaagents/client/config/AgentConfigLoader.java` — parses, creates, and loads the Fabric client config without overwriting existing data.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeEventSink.java` — defines the parsed action callback boundary.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeSession.java` — implements authenticated JSONL session framing, validation, queues, callbacks, and daemon reader/writer lifecycle.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeServer.java` — binds the single-session acceptor explicitly to `127.0.0.1` and owns reconnect/shutdown behavior.
+- `src/client/java/dev/agaminggod/arenaagents/client/ArenaAgentsClient.java` — loads the Fabric config, starts enabled bridges, dispatches callbacks through the Minecraft executor, and closes on client shutdown.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ProtocolCodec.java` — adds bounded strict UTF-8 line read/write helpers.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — adds Task 3 config, framing, socket, reconnect, and thread assertions.
+- `PROJECT_LOG.md` — records Task 3 behavior, decisions, verification, and deferrals.
+
+### Assumptions Made (flag these for review)
+- The generated example config is disabled by default (`enabled=false`) so installing the JAR does not open a listener until the user or runtime packaging opts in.
+- The named safe observation-radius range is 1–32 blocks, with the approved example default of 12; the named non-privileged bridge-port range is 1024–65535.
+- `action_command` carries the existing Task 2 command object in a nested `command` field because the outer envelope's `type` is reserved for `action_command`.
+- Numeric IPv4 addresses in `127.0.0.0/8`, `localhost`, and IPv6 loopback literals are accepted as loopback config hints, while the actual server bind remains fixed to `127.0.0.1`.
+
+### Known Issues / Deferred
+- Action execution, cancellation effects, observation collection, and request-observation responses remain in Tasks 4 and 5; Task 3 only validates controls and dispatches parsed action commands.
+- There is intentionally no shared secret or model credential in the config; authentication at this stage is the approved loopback plus first-message agent/protocol handshake.
+
+### Suggested Next Steps
+- Implement Task 4 bounded observations and publish them through `BridgeServer.sendEvent`.
+- Implement Task 5's single-action lifecycle behind `BridgeEventSink` while preserving Minecraft-client-thread execution.
+
 ## 2026-07-13 — Task 2 protocol review fixes
 
 ### What Was Implemented
