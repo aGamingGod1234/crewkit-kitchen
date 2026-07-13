@@ -68,6 +68,8 @@ test('initializes before catalog validation and thread start', async () => {
 	const agent = new CodexAgent(config, transport);
 	await agent.start();
 	assert.deepEqual(transport.methods(), ['initialize', 'initialized', 'model/list', 'thread/start']);
+	const initialize = transport.calls.find((call) => call.method === 'initialize').params;
+	assert.deepEqual(initialize.capabilities, { experimentalApi: true, requestAttestation: false });
 	const thread = transport.calls.find((call) => call.method === 'thread/start').params;
 	assert.deepEqual({ model: thread.model, serviceTier: thread.serviceTier, approvalPolicy: thread.approvalPolicy, sandbox: thread.sandbox, dynamicTools: thread.dynamicTools, environments: thread.environments }, {
 		model: 'gpt-5.5', serviceTier: 'fast', approvalPolicy: 'never', sandbox: 'read-only', dynamicTools: [], environments: [],

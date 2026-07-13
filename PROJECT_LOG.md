@@ -505,3 +505,37 @@
 
 ### Suggested Next Steps
 - Prepare the isolated runtimes twice, create both official-launcher installations, and run the sequential authenticated live-test matrix.
+
+## 2026-07-13 — Automated integration hardening and deferred live test
+
+### What Was Implemented
+- Added explicit Codex `experimentalApi` capability negotiation while declining attestation requests, preserving deterministic empty `environments` and `dynamicTools` arrays so planner turns cannot inherit a host-default environment or dynamic tools.
+- Added a regression assertion for the exact initialize capability contract after the local Codex 0.144.0 app server rejected unnegotiated experimental fields.
+- Replaced the Windows PowerShell 5.1-incompatible `Path.GetRelativePath` call with a bounded world-root helper and added hash-gated recovery for an interrupted copy that exists without evidence.
+- Added an idempotent launcher-profile installer that preserves all existing profiles, writes a local backup, and adds the two exact Fabric 0.19.3 isolated installations.
+- Restored the disposable copied world after preflight startup, then independently verified all 80 source/target files and `level.dat` hashes match with no stale `session.lock`.
+
+### Files Modified
+- `coordinator/src/codex-app-server.mjs` — declares the capability required by explicit no-environment/no-dynamic-tool thread settings.
+- `coordinator/test/codex-app-server.test.mjs` — verifies the exact initialization contract.
+- `scripts/prepare-runtime.ps1` — supports Windows PowerShell 5.1 manifest paths and safe interrupted-copy recovery.
+- `scripts/install-launcher-profiles.ps1` — installs or verifies the two isolated official-launcher profiles without overwriting mismatched entries.
+- `README.md`, `PROJECT_LOG.md` — document preparation, launcher-profile preservation, evidence, and the deferred live boundary.
+
+### Verification Evidence
+- `run-automated-verification.ps1` passed: 4,673 Java protocol/bridge assertions, Gradle `check`, `build`, `verifyCore`, `verifyEntrypoints`, JAR assembly, and 42 Node tests with zero failures, skips, or cancellations.
+- All six PowerShell scripts parse with zero syntax errors under Windows PowerShell 5.1.
+- All four packaged Arena Agent JARs share SHA-256 `DAAF4E27DE901A79164A48FD8DD8BA7C3D4E43514333BD0921BE359F4D6BFF91`.
+- Both launcher profiles resolve to Fabric `0.19.3` for Minecraft `26.1.2`, the isolated game directories, the project-local Java 25 executable, and `-Xms1G -Xmx4G`.
+- No launcher/game process remains and ports `25565`, `25571`, and `25572` are closed.
+
+### Assumptions Made (flag these for review)
+- Negotiating the experimental protocol surface is limited to fields the coordinator sends deliberately; Minecraft actions remain the only planner-controlled effect and both environment and dynamic-tool lists remain explicitly empty.
+- Launcher JSON installation is acceptable because the merge is local, backed up, idempotent, and fails closed instead of overwriting an existing mismatched Arena profile.
+
+### Known Issues / Deferred
+- Per user direction, no Minecraft client was launched and no gameplay, server join, in-game command, action execution, or two-agent fight was tested in this phase.
+- Simultaneous authenticated online-mode testing still requires a second licensed Minecraft Java account.
+
+### Suggested Next Steps
+- When live testing is authorized, start the authenticated server and coordinator, launch each isolated profile sequentially, exercise goal/stop/status and action traces, then use two licensed accounts for the simultaneous fight.

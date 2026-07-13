@@ -15,6 +15,7 @@ Both agents use identical code, prompts, action schemas, observation limits, tim
 
 - The bridge binds to loopback only and exposes validated Minecraft actions, never shell or file tools.
 - The original world at `%APPDATA%\.minecraft\saves\New World (76)` is never opened by automated tests. Preparation makes a verified copy under `runtime\server\world`.
+- Launcher profile installation preserves every existing entry, adds only the two isolated Arena Agent profiles, and writes a local backup before changing launcher JSON.
 - The final server remains `online-mode=true`. Offline smoke evidence is labeled separately and is never presented as authenticated verification.
 - Runtime traces and evidence are ignored by Git and must not contain launcher or Codex credentials.
 
@@ -33,6 +34,7 @@ Close Minecraft and the official launcher, then run:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\prepare-runtime.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\prepare-runtime.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\install-launcher-profiles.ps1
 ```
 
 The second run must reuse the verified world copy, Fabric installation, configs, and mods without duplicating them. See [runtime/README.md](runtime/README.md) for the launcher installations and live-test sequence.

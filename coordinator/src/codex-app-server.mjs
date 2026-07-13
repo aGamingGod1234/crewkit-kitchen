@@ -12,6 +12,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const PROFILE_VALUE_PATTERN = /^[A-Za-z0-9._-]+$/;
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Arena Agents', version: '1.0.0' });
+const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
 
 export class CodexProtocolError extends Error {
 	constructor(code, message, options) {
@@ -208,7 +209,7 @@ export class CodexAgent {
 		if (this.#started) return;
 		await this.#transport.start();
 		try {
-			await this.#transport.request('initialize', { clientInfo: CLIENT_INFO });
+			await this.#transport.request('initialize', { clientInfo: CLIENT_INFO, capabilities: CLIENT_CAPABILITIES });
 			this.#transport.notify('initialized', {});
 			const models = await this.#listModels();
 			verifyModelProfile(models, this.#config);
@@ -324,7 +325,7 @@ export async function checkCodexModelProfile(configValue, transport = new CodexS
 	const config = validateAgentConfig(configValue);
 	await transport.start();
 	try {
-		await transport.request('initialize', { clientInfo: CLIENT_INFO });
+		await transport.request('initialize', { clientInfo: CLIENT_INFO, capabilities: CLIENT_CAPABILITIES });
 		transport.notify('initialized', {});
 		const models = [];
 		let cursor = null;

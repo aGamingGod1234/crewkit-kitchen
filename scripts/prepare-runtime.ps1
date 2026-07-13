@@ -49,13 +49,22 @@ function Assert-UnderRoot([string] $Path, [string] $Root, [string] $Label) {
     }
 }
 
+function Get-RelativeWorldPath([string] $Root, [string] $Path) {
+    $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Manifest file escaped the world root: $fullPath"
+    }
+    $fullPath.Substring($rootPrefix.Length)
+}
+
 function Get-WorldManifest([string] $Root) {
     @(Get-ChildItem -LiteralPath $Root -File -Recurse -Force |
         Where-Object Name -ne 'session.lock' |
         Sort-Object FullName |
         ForEach-Object {
             [pscustomobject]@{
-                Path = [IO.Path]::GetRelativePath($Root, $_.FullName)
+                Path = Get-RelativeWorldPath $Root $_.FullName
                 Bytes = $_.Length
                 SHA256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
             }
@@ -153,16 +162,32 @@ if (-not (Test-Path -LiteralPath $TargetWorld)) {
     [IO.File]::WriteAllText($WorldEvidence, ($worldRecord | ConvertTo-Json), $Utf8NoBom)
 } else {
     if (-not (Test-Path -LiteralPath $WorldEvidence -PathType Leaf)) {
-        throw 'Copied world exists without verification evidence; refusing to overwrite or trust it.'
+        $sourceManifest = Get-WorldManifest $ResolvedSourceWorld
+        $targetManifest = Get-WorldManifest $TargetWorld
+        $manifestDifference = Compare-Object $sourceManifest $targetManifest -Property Path,Bytes,SHA256
+        if ($manifestDifference) {
+            throw 'Copied world exists without evidence and does not match the source; refusing to overwrite or trust it.'
+        }
+        $worldRecord = [ordered]@{
+            source = $ResolvedSourceWorld
+            target = $TargetWorld
+            files = $sourceManifest.Count
+            sourceLevelDatSha256 = (Get-FileHash -LiteralPath (Join-Path $ResolvedSourceWorld 'level.dat') -Algorithm SHA256).Hash
+            targetLevelDatSha256 = (Get-FileHash -LiteralPath (Join-Path $TargetWorld 'level.dat') -Algorithm SHA256).Hash
+            copiedAt = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        [IO.File]::WriteAllText($WorldEvidence, ($worldRecord | ConvertTo-Json), $Utf8NoBom)
+        Write-Host "Recovered and verified interrupted world copy: $TargetWorld"
+    } else {
+        $record = Get-Content -LiteralPath $WorldEvidence -Raw | ConvertFrom-Json
+        Assert-ExactPath ([string]$record.source) $ResolvedSourceWorld 'Recorded source world'
+        Assert-ExactPath ([string]$record.target) $TargetWorld 'Recorded copied world'
+        $sourceLevelHash = (Get-FileHash -LiteralPath (Join-Path $ResolvedSourceWorld 'level.dat') -Algorithm SHA256).Hash
+        if (-not $sourceLevelHash.Equals([string]$record.sourceLevelDatSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Source world changed after the verified copy; prepare a new isolated runtime deliberately.'
+        }
+        Write-Host "Using existing verified copied world: $TargetWorld"
     }
-    $record = Get-Content -LiteralPath $WorldEvidence -Raw | ConvertFrom-Json
-    Assert-ExactPath ([string]$record.source) $ResolvedSourceWorld 'Recorded source world'
-    Assert-ExactPath ([string]$record.target) $TargetWorld 'Recorded copied world'
-    $sourceLevelHash = (Get-FileHash -LiteralPath (Join-Path $ResolvedSourceWorld 'level.dat') -Algorithm SHA256).Hash
-    if (-not $sourceLevelHash.Equals([string]$record.sourceLevelDatSha256, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Source world changed after the verified copy; prepare a new isolated runtime deliberately.'
-    }
-    Write-Host "Using existing verified copied world: $TargetWorld"
 }
 
 $eulaPath = Join-Path $Server 'eula.txt'
