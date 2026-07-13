@@ -29,6 +29,9 @@ runtime/*
 logs/
 traces/
 evidence/
+coordinator/.runtime/
+*.pid
+*.port
 *.log
 hs_err_*.log
 replay_*.log
@@ -52,3 +55,4 @@ secrets/
 *.DS_Store
 Thumbs.db
 Desktop.ini
+launcher_profiles.*.backup.json

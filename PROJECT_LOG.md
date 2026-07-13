@@ -416,3 +416,31 @@
 ### Suggested Next Steps
 - Complete Task 8 goal delivery without widening the action protocol.
 - Exercise combat, breaking, and placement against a copied-world server and capture server-confirmed results during official-launcher validation.
+
+## 2026-07-13 — Task 13 safe runtime preparation and packaging
+
+### What Was Implemented
+- Added strict PowerShell entrypoints for verified Java setup, idempotent isolated runtime preparation, authenticated server startup, coordinator startup, and consolidated automated verification.
+- Added SHA-256 verification for the official Fabric installer, non-loading source-world path checks, copied-world manifest evidence, two isolated client configs, and online-mode server safeguards.
+- Documented the exact GPT-5.5/xhigh/Fast and GPT-5.6-Sol/high/Fast launcher installations, evidence classes, commands, and second-account limitation.
+
+### Files Modified
+- `scripts/install-toolchain.ps1` — verifies or installs a caller-supplied SHA-256-pinned Temurin 25 archive.
+- `scripts/prepare-runtime.ps1` — builds, installs Fabric 0.19.3, prepares isolated clients/server, and makes a verified world copy.
+- `scripts/start-test-server.ps1` — starts only the explicitly selected authenticated or labeled offline-smoke server mode.
+- `scripts/start-coordinator.ps1` — verifies Node/Codex prerequisites and starts the selected runtime profile.
+- `scripts/run-automated-verification.ps1` — runs the complete Java/Fabric and Node/fake-E2E gates.
+- `README.md`, `runtime/README.md`, `.gitignore` — document operation and keep generated state out of Git.
+
+### Assumptions Made (flag these for review)
+- Fabric Installer 1.1.1 is pinned to SHA-256 `2487A69DD6F9D9C2605265A7142D77C26AB62EDC620E6BCF810D581D2EE31B79` from the official Fabric Maven sidecar.
+- Launcher installations are created and verified through the official UI; scripts do not copy account files or write credentials.
+- Existing agent configs or server properties that disagree with the required isolated settings cause a hard failure instead of being overwritten.
+
+### Known Issues / Deferred
+- `prepare-runtime.ps1` must run after all implementation commits are integrated so it packages the final JAR.
+- Simultaneous authenticated two-player verification remains blocked until a second licensed Minecraft Java account is available.
+
+### Suggested Next Steps
+- Integrate the coordinator and remaining Java commits, run consolidated verification, then run preparation twice.
+- Create both launcher installations through the official UI and execute the sequential authenticated live-test matrix.
