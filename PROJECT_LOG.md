@@ -1,3 +1,37 @@
+## 2026-07-13 — Shared protocol and validation core
+
+### What Was Implemented
+- Added the exhaustive ten-action protocol vocabulary and explicit running/terminal action states.
+- Added immutable action command and terminal result records with defensive JSON copying and coded validation failures.
+- Added a strict Gson codec for flat action-command JSON, protocol version `1`, UTF-8 line limits, required and unknown fields, finite coordinates, bounded durations, bounded text, and exact per-action argument schemas.
+- Added dependency-free Java verification covering all action types, malformed and oversized input, version mismatch, required fields, numeric and text bounds, immutability, coded failures, and encoding round trips.
+- Updated Gradle's test lifecycle so the dependency-free verification main coexists with Gradle 9's no-discovered-tests check.
+
+### Files Modified
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ProtocolConstants.java` — defines protocol version, validation bounds, and stable error codes.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ActionType.java` — defines the exact snake_case action union and wire lookup.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ActionState.java` — distinguishes running state from the four terminal states.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ActionCommand.java` — adds the immutable validated command record.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ActionResult.java` — adds the immutable terminal result record and machine-readable reason code.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ProtocolException.java` — carries explicit stable error codes and messages.
+- `src/main/java/dev/agaminggod/arenaagents/protocol/ProtocolCodec.java` — parses, validates, and encodes bounded protocol JSON objects.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — runs 90 dependency-free protocol assertions through `verifyCore`.
+- `build.gradle` — allows the intentionally framework-free test source while retaining `verifyCore` as the assertion runner.
+- `PROJECT_LOG.md` — records Task 2 implementation, decisions, deferred work, and verification scope.
+
+### Assumptions Made (flag these for review)
+- Action-specific fields are flat beside `protocolVersion`, `commandId`, `type`, and `issuedAtEpochMs`, matching the approved Task 2 examples; `ActionCommand.arguments()` stores only the action-specific fields.
+- Conservative named bounds are 128 characters for command IDs, 256 for chat/identifiers/selectors, 2,048 for summaries/result messages, 1–600,000 milliseconds for durations, and 0.01–16 blocks for movement tolerance.
+- Block-action coordinates must be integral 32-bit values and placement faces are limited to the six Minecraft direction names.
+- `ActionResult` contains command ID, terminal state, reason code, human-readable message, and completion epoch time, which is the smallest result shape that satisfies the approved terminal-result contract.
+
+### Known Issues / Deferred
+- Bridge message envelopes (`agentId`, `messageId`, bridge message type), loopback framing, and socket lifecycle remain Task 3 work.
+- Coordinator-side parity validation remains Task 9 work.
+
+### Suggested Next Steps
+- Implement Task 3 client configuration and the loopback-only JSONL bridge against this codec.
+
 ## 2026-07-13 — Reproducible Fabric and Node baseline
 
 ### What Was Implemented

@@ -102,6 +102,10 @@ tasks.register('verifyCore', JavaExec) {
 	}
 }
 
+tasks.named('test') {
+	failOnNoDiscoveredTests = false
+}
+
 tasks.named('check') {
 	dependsOn tasks.named('verifyCore'), tasks.named('verifyEntrypoints')
 }

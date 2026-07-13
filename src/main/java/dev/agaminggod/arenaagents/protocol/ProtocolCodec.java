@@ -1,0 +1,408 @@
+package dev.agaminggod.arenaagents.protocol;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
+import java.util.EnumMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+public final class ProtocolCodec {
+	private static final String FIELD_PROTOCOL_VERSION = "protocolVersion";
+	private static final String FIELD_COMMAND_ID = "commandId";
+	private static final String FIELD_TYPE = "type";
+	private static final String FIELD_ISSUED_AT_EPOCH_MS = "issuedAtEpochMs";
+	private static final String FIELD_X = "x";
+	private static final String FIELD_Y = "y";
+	private static final String FIELD_Z = "z";
+	private static final String FIELD_TOLERANCE = "tolerance";
+	private static final String FIELD_SPRINT = "sprint";
+	private static final String FIELD_TARGET_SELECTOR = "targetSelector";
+	private static final String FIELD_TIMEOUT_MS = "timeoutMs";
+	private static final String FIELD_ITEM_ID = "itemId";
+	private static final String FIELD_DURATION_MS = "durationMs";
+	private static final String FIELD_FACE = "face";
+	private static final String FIELD_MESSAGE = "message";
+	private static final String FIELD_SUMMARY = "summary";
+
+	private static final List<String> ENVELOPE_FIELDS = List.of(
+			FIELD_PROTOCOL_VERSION,
+			FIELD_COMMAND_ID,
+			FIELD_TYPE,
+			FIELD_ISSUED_AT_EPOCH_MS
+	);
+	private static final List<String> BLOCK_FACES = List.of("down", "up", "north", "south", "west", "east");
+	private static final Map<ActionType, List<String>> ACTION_FIELDS = createActionFields();
+	private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
+
+	public ActionCommand decodeCommand(String json) throws ProtocolException {
+		enforceLineLimit(json);
+		JsonObject commandObject = parseObject(json);
+		ActionType actionType = requireActionType(commandObject);
+		JsonObject arguments = validateAndCopyArguments(commandObject, actionType);
+
+		validateProtocolVersion(commandObject);
+		String commandId = requireBoundedText(
+				commandObject,
+				FIELD_COMMAND_ID,
+				ProtocolConstants.MAX_COMMAND_ID_LENGTH,
+				false
+		);
+		long issuedAtEpochMs = requirePositiveLong(commandObject, FIELD_ISSUED_AT_EPOCH_MS);
+		validateKnownFields(commandObject, actionType);
+
+		return new ActionCommand(commandId, actionType, arguments, issuedAtEpochMs);
+	}
+
+	public String encode(Object value) throws ProtocolException {
+		if (value == null) {
+			throw invalidField("Protocol value must not be null");
+		}
+
+		JsonObject encodedObject = value instanceof ActionCommand command
+				? encodeCommand(command)
+				: ensureProtocolVersion(encodeObject(value));
+		String json = serialize(encodedObject);
+		enforceLineLimit(json);
+		return json;
+	}
+
+	private static JsonObject ensureProtocolVersion(JsonObject encoded) throws ProtocolException {
+		if (encoded.has(FIELD_PROTOCOL_VERSION)) {
+			validateProtocolVersion(encoded);
+			return encoded;
+		}
+
+		JsonObject versioned = new JsonObject();
+		versioned.addProperty(FIELD_PROTOCOL_VERSION, ProtocolConstants.PROTOCOL_VERSION);
+		for (Map.Entry<String, JsonElement> entry : encoded.entrySet()) {
+			versioned.add(entry.getKey(), entry.getValue().deepCopy());
+		}
+		return versioned;
+	}
+
+	private static String serialize(JsonObject encoded) throws ProtocolException {
+		try {
+			return GSON.toJson(encoded);
+		} catch (RuntimeException exception) {
+			throw new ProtocolException(
+					ProtocolConstants.ERROR_ENCODING_FAILED,
+					"Could not encode protocol value as JSON: " + exception.getMessage(),
+					exception
+			);
+		}
+	}
+
+	private static JsonObject encodeCommand(ActionCommand command) throws ProtocolException {
+		JsonObject encoded = new JsonObject();
+		encoded.addProperty(FIELD_PROTOCOL_VERSION, ProtocolConstants.PROTOCOL_VERSION);
+		encoded.addProperty(FIELD_COMMAND_ID, command.commandId());
+		encoded.addProperty(FIELD_TYPE, command.type().wireName());
+		encoded.addProperty(FIELD_ISSUED_AT_EPOCH_MS, command.issuedAtEpochMs());
+
+		for (Map.Entry<String, JsonElement> entry : command.arguments().entrySet()) {
+			if (encoded.has(entry.getKey())) {
+				throw unknownField(entry.getKey(), command.type());
+			}
+			encoded.add(entry.getKey(), entry.getValue().deepCopy());
+		}
+
+		validateAndCopyArguments(encoded, command.type());
+		validateKnownFields(encoded, command.type());
+		return encoded;
+	}
+
+	private static JsonObject encodeObject(Object value) throws ProtocolException {
+		try {
+			JsonElement element = GSON.toJsonTree(value);
+			if (!element.isJsonObject()) {
+				throw invalidField("Encoded protocol value must be a JSON object");
+			}
+			return element.getAsJsonObject();
+		} catch (ProtocolException exception) {
+			throw exception;
+		} catch (RuntimeException exception) {
+			throw new ProtocolException(
+					ProtocolConstants.ERROR_ENCODING_FAILED,
+					"Could not encode protocol value as JSON: " + exception.getMessage(),
+					exception
+			);
+		}
+	}
+
+	private static JsonObject parseObject(String json) throws ProtocolException {
+		try {
+			JsonElement parsed = JsonParser.parseString(json);
+			if (!parsed.isJsonObject()) {
+				throw malformedJson("Command JSON must be an object", null);
+			}
+			return parsed.getAsJsonObject();
+		} catch (JsonParseException exception) {
+			throw malformedJson("Malformed JSON command: " + exception.getMessage(), exception);
+		}
+	}
+
+	private static void enforceLineLimit(String json) throws ProtocolException {
+		if (json == null) {
+			throw invalidField("Command JSON must not be null");
+		}
+		int byteLength = json.getBytes(StandardCharsets.UTF_8).length;
+		if (byteLength > ProtocolConstants.MAX_LINE_BYTES) {
+			throw new ProtocolException(
+					ProtocolConstants.ERROR_LINE_TOO_LARGE,
+					"Command line is " + byteLength + " UTF-8 bytes; maximum is "
+							+ ProtocolConstants.MAX_LINE_BYTES
+			);
+		}
+	}
+
+	private static ActionType requireActionType(JsonObject command) throws ProtocolException {
+		String wireName = requireString(command, FIELD_TYPE);
+		if (wireName.isBlank()) {
+			throw invalidField("Field '" + FIELD_TYPE + "' must not be blank");
+		}
+		return ActionType.fromWireName(wireName)
+				.orElseThrow(() -> new ProtocolException(
+						ProtocolConstants.ERROR_UNKNOWN_ACTION,
+						"Unknown action type '" + wireName + "'"
+				));
+	}
+
+	private static void validateProtocolVersion(JsonObject command) throws ProtocolException {
+		long version = requireIntegralLong(command, FIELD_PROTOCOL_VERSION);
+		if (version != ProtocolConstants.PROTOCOL_VERSION) {
+			throw new ProtocolException(
+					ProtocolConstants.ERROR_UNSUPPORTED_VERSION,
+					"Unsupported protocolVersion " + version + "; expected " + ProtocolConstants.PROTOCOL_VERSION
+			);
+		}
+	}
+
+	private static JsonObject validateAndCopyArguments(JsonObject command, ActionType actionType)
+			throws ProtocolException {
+		switch (actionType) {
+			case MOVE_TO -> validateMoveTo(command);
+			case LOOK_AT -> validateCoordinates(command, false);
+			case ATTACK -> validateAttack(command);
+			case SELECT_ITEM -> requireIdentifier(command, FIELD_ITEM_ID);
+			case USE_ITEM, WAIT -> requireDuration(command, FIELD_DURATION_MS);
+			case BREAK_BLOCK -> validateBreakBlock(command);
+			case PLACE_BLOCK -> validatePlaceBlock(command);
+			case CHAT -> requireBoundedText(command, FIELD_MESSAGE, ProtocolConstants.MAX_CHAT_LENGTH, false);
+			case COMPLETE_GOAL -> requireBoundedText(
+					command,
+					FIELD_SUMMARY,
+					ProtocolConstants.MAX_SUMMARY_LENGTH,
+					false
+			);
+		}
+
+		JsonObject arguments = new JsonObject();
+		for (String field : ACTION_FIELDS.get(actionType)) {
+			arguments.add(field, command.get(field).deepCopy());
+		}
+		return arguments;
+	}
+
+	private static void validateMoveTo(JsonObject command) throws ProtocolException {
+		validateCoordinates(command, false);
+		double tolerance = requireFiniteNumber(command, FIELD_TOLERANCE);
+		if (tolerance < ProtocolConstants.MIN_MOVEMENT_TOLERANCE
+				|| tolerance > ProtocolConstants.MAX_MOVEMENT_TOLERANCE) {
+			throw outOfRange(
+					FIELD_TOLERANCE,
+					ProtocolConstants.MIN_MOVEMENT_TOLERANCE + " to "
+							+ ProtocolConstants.MAX_MOVEMENT_TOLERANCE
+			);
+		}
+		requireBoolean(command, FIELD_SPRINT);
+	}
+
+	private static void validateAttack(JsonObject command) throws ProtocolException {
+		requireBoundedText(
+				command,
+				FIELD_TARGET_SELECTOR,
+				ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH,
+				false
+		);
+		requireDuration(command, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateBreakBlock(JsonObject command) throws ProtocolException {
+		validateCoordinates(command, true);
+		requireDuration(command, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validatePlaceBlock(JsonObject command) throws ProtocolException {
+		validateCoordinates(command, true);
+		String face = requireString(command, FIELD_FACE);
+		if (!BLOCK_FACES.contains(face)) {
+			throw invalidField(
+					"Field '" + FIELD_FACE + "' must be one of " + String.join(", ", BLOCK_FACES)
+			);
+		}
+		requireIdentifier(command, FIELD_ITEM_ID);
+	}
+
+	private static void validateCoordinates(JsonObject command, boolean integral) throws ProtocolException {
+		for (String field : List.of(FIELD_X, FIELD_Y, FIELD_Z)) {
+			double coordinate = requireFiniteNumber(command, field);
+			if (integral && (coordinate != Math.rint(coordinate)
+					|| coordinate < Integer.MIN_VALUE
+					|| coordinate > Integer.MAX_VALUE)) {
+				throw outOfRange(field, "an integral 32-bit block coordinate");
+			}
+		}
+	}
+
+	private static String requireIdentifier(JsonObject command, String field) throws ProtocolException {
+		return requireBoundedText(command, field, ProtocolConstants.MAX_IDENTIFIER_LENGTH, false);
+	}
+
+	private static long requireDuration(JsonObject command, String field) throws ProtocolException {
+		long duration = requireIntegralLong(command, field);
+		if (duration < ProtocolConstants.MIN_DURATION_MS || duration > ProtocolConstants.MAX_DURATION_MS) {
+			throw outOfRange(
+					field,
+					ProtocolConstants.MIN_DURATION_MS + " to " + ProtocolConstants.MAX_DURATION_MS + " milliseconds"
+			);
+		}
+		return duration;
+	}
+
+	private static long requirePositiveLong(JsonObject object, String field) throws ProtocolException {
+		long value = requireIntegralLong(object, field);
+		if (value <= 0L) {
+			throw outOfRange(field, "a positive integer");
+		}
+		return value;
+	}
+
+	private static long requireIntegralLong(JsonObject object, String field) throws ProtocolException {
+		JsonPrimitive primitive = requireNumber(object, field);
+		try {
+			return new BigDecimal(primitive.getAsString()).longValueExact();
+		} catch (ArithmeticException | NumberFormatException exception) {
+			throw outOfRange(field, "a 64-bit integer");
+		}
+	}
+
+	private static double requireFiniteNumber(JsonObject object, String field) throws ProtocolException {
+		JsonPrimitive primitive = requireNumber(object, field);
+		double value;
+		try {
+			value = primitive.getAsDouble();
+		} catch (NumberFormatException exception) {
+			throw invalidField("Field '" + field + "' must be a number");
+		}
+		if (!Double.isFinite(value)) {
+			throw outOfRange(field, "a finite number");
+		}
+		return value;
+	}
+
+	private static JsonPrimitive requireNumber(JsonObject object, String field) throws ProtocolException {
+		JsonElement element = requireField(object, field);
+		if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isNumber()) {
+			throw invalidField("Field '" + field + "' must be a number");
+		}
+		return element.getAsJsonPrimitive();
+	}
+
+	private static boolean requireBoolean(JsonObject object, String field) throws ProtocolException {
+		JsonElement element = requireField(object, field);
+		if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isBoolean()) {
+			throw invalidField("Field '" + field + "' must be a boolean");
+		}
+		return element.getAsBoolean();
+	}
+
+	private static String requireBoundedText(
+			JsonObject object,
+			String field,
+			int maximumLength,
+			boolean emptyAllowed
+	) throws ProtocolException {
+		String value = requireString(object, field);
+		if (!emptyAllowed && value.isBlank()) {
+			throw invalidField("Field '" + field + "' must not be blank");
+		}
+		if (value.length() > maximumLength) {
+			throw outOfRange(field, "at most " + maximumLength + " characters");
+		}
+		return value;
+	}
+
+	private static String requireString(JsonObject object, String field) throws ProtocolException {
+		JsonElement element = requireField(object, field);
+		if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
+			throw invalidField("Field '" + field + "' must be a string");
+		}
+		return element.getAsString();
+	}
+
+	private static JsonElement requireField(JsonObject object, String field) throws ProtocolException {
+		if (!object.has(field) || object.get(field).isJsonNull()) {
+			throw new ProtocolException(
+					ProtocolConstants.ERROR_MISSING_FIELD,
+					"Required field '" + field + "' is missing"
+			);
+		}
+		return object.get(field);
+	}
+
+	private static void validateKnownFields(JsonObject command, ActionType actionType) throws ProtocolException {
+		Set<String> allowedFields = new HashSet<>(ENVELOPE_FIELDS);
+		allowedFields.addAll(ACTION_FIELDS.get(actionType));
+		for (String field : command.keySet()) {
+			if (!allowedFields.contains(field)) {
+				throw unknownField(field, actionType);
+			}
+		}
+	}
+
+	private static ProtocolException unknownField(String field, ActionType actionType) {
+		return new ProtocolException(
+				ProtocolConstants.ERROR_UNKNOWN_FIELD,
+				"Unknown field '" + field + "' for action '" + actionType.wireName() + "'"
+		);
+	}
+
+	private static ProtocolException invalidField(String message) {
+		return new ProtocolException(ProtocolConstants.ERROR_INVALID_FIELD, message);
+	}
+
+	private static ProtocolException outOfRange(String field, String expectedRange) {
+		return new ProtocolException(
+				ProtocolConstants.ERROR_OUT_OF_RANGE,
+				"Field '" + field + "' must be " + expectedRange
+		);
+	}
+
+	private static ProtocolException malformedJson(String message, Throwable cause) {
+		return new ProtocolException(ProtocolConstants.ERROR_MALFORMED_JSON, message, cause);
+	}
+
+	private static Map<ActionType, List<String>> createActionFields() {
+		Map<ActionType, List<String>> fields = new EnumMap<>(ActionType.class);
+		fields.put(ActionType.MOVE_TO, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT));
+		fields.put(ActionType.LOOK_AT, List.of(FIELD_X, FIELD_Y, FIELD_Z));
+		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_SELECTOR, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.SELECT_ITEM, List.of(FIELD_ITEM_ID));
+		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS));
+		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID));
+		fields.put(ActionType.CHAT, List.of(FIELD_MESSAGE));
+		fields.put(ActionType.WAIT, List.of(FIELD_DURATION_MS));
+		fields.put(ActionType.COMPLETE_GOAL, List.of(FIELD_SUMMARY));
+		return Map.copyOf(fields);
+	}
+}
