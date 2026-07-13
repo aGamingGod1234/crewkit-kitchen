@@ -3,6 +3,7 @@ export const MAX_LINE_BYTES = 65_536;
 export const MAX_COMMAND_ID_LENGTH = 128;
 export const MAX_CHAT_LENGTH = 256;
 export const MAX_SUMMARY_LENGTH = 2_048;
+export const MAX_GOAL_LENGTH = 4_096;
 export const MAX_IDENTIFIER_LENGTH = 256;
 export const MAX_TARGET_SELECTOR_LENGTH = 256;
 export const MAX_REASON_CODE_LENGTH = 128;

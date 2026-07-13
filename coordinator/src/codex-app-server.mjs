@@ -268,6 +268,11 @@ export class CodexAgent {
 		await this.#transport.request('turn/interrupt', { threadId: this.#threadId, turnId: this.#activeTurnId });
 	}
 
+	async restart() {
+		await this.stop();
+		await this.start();
+	}
+
 	async stop() {
 		if (this.#activeTurnId !== null) {
 			try { await this.interrupt(); } catch { /* teardown continues */ }

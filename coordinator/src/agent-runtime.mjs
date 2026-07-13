@@ -4,6 +4,13 @@ import { RetryPolicy } from './retry-policy.mjs';
 import { observationHash } from './trace-writer.mjs';
 
 const STUCK_FAILURE_THRESHOLD = 3;
+const RESTARTABLE_CODEX_FAILURES = new Set([
+	'PROCESS_EXITED',
+	'SPAWN_FAILED',
+	'TRANSPORT_NOT_RUNNING',
+	'TRANSPORT_STOPPED',
+	'INVALID_RESPONSE',
+]);
 
 export class AgentRuntime {
 	#config;
@@ -19,6 +26,7 @@ export class AgentRuntime {
 	#stopping = false;
 	#state = AgentState.IDLE;
 	#goal = null;
+	#goalRevisionSequence = 0;
 	#observation = null;
 	#observationHash = null;
 	#activeCommandId = null;
@@ -132,27 +140,12 @@ export class AgentRuntime {
 			await this.#stopGoal('goal_stop');
 			return;
 		}
-		if (event.operation === 'pause') {
-			if (this.#goal !== null) this.#goal.paused = true;
-			await this.#stopActiveAction();
-			this.#state = AgentState.STOPPED;
-			await this.#trace('goal_paused');
-			return;
-		}
-		if (event.operation === 'resume') {
-			if (this.#goal !== null) this.#goal.paused = false;
-			this.#state = AgentState.IDLE;
-			this.#pendingTrigger = 'goal_resume';
-			this.#bridge.requestObservation();
-			await this.#trace('goal_resumed');
-			return;
-		}
-		if (!Number.isSafeInteger(event.goalRevision) || event.goalRevision < 1 || typeof event.goal !== 'string') throw new Error('goal event is invalid');
-		if (this.#goal !== null && event.goalRevision <= this.#goal.revision) return;
+		if (event.operation !== 'set' || typeof event.goal !== 'string' || event.goal.trim().length === 0) throw new Error('goal event is invalid');
 		await this.#stopActiveAction();
 		this.#planningRevision += 1;
 		try { await this.#codex.interrupt(); } catch { /* stale turn completion is revision-gated */ }
-		this.#goal = { revision: event.goalRevision, text: event.goal, paused: false };
+		this.#goalRevisionSequence += 1;
+		this.#goal = { revision: this.#goalRevisionSequence, text: event.goal };
 		this.#observation = null;
 		this.#observationHash = null;
 		this.#stuckFailures = 0;
@@ -199,7 +192,7 @@ export class AgentRuntime {
 	}
 
 	async #maybePlan() {
-		if (this.#goal === null || this.#goal.paused || this.#observation === null) return;
+		if (this.#goal === null || this.#observation === null) return;
 		if ([AgentState.PLANNING, AgentState.ACTING, AgentState.COMPLETED, AgentState.STOPPED, AgentState.ERROR].includes(this.#state)) return;
 		const trigger = this.#pendingTrigger ?? 'planning_timeout';
 		this.#pendingTrigger = null;
@@ -239,6 +232,14 @@ export class AgentRuntime {
 	async #handlePlanningFailure(revision, error) {
 		if (revision !== this.#planningRevision || this.#goal === null) return;
 		this.#state = AgentState.RECOVERING;
+		if (RESTARTABLE_CODEX_FAILURES.has(error?.code) && typeof this.#codex.restart === 'function') {
+			try {
+				await this.#codex.restart();
+				await this.#trace('codex_restarted');
+			} catch (restartError) {
+				await this.#trace('codex_restart_failed', { result: safeError(restartError) });
+			}
+		}
 		const delayMs = this.#retryPolicy.nextDelay();
 		await this.#trace('planning_retry_scheduled', { result: { ...safeError(error), delayMs } });
 		if (this.#retryHandle !== null) this.#cancelSchedule(this.#retryHandle);

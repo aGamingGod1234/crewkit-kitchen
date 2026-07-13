@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import test from 'node:test';
 
-import { MinecraftBridge, MessageIdGenerator } from '../src/protocol.mjs';
+import { MinecraftBridge, MessageIdGenerator, validateGoalEvent } from '../src/protocol.mjs';
 
 class FakeSocket extends EventEmitter {
 	writes = [];
@@ -83,4 +83,13 @@ test('bridge rejects duplicate terminal action results', async () => {
 
 test('bridge fails closed for non-loopback hosts', () => {
 	assert.throws(() => new MinecraftBridge({ agentId: 'agent-55', host: '0.0.0.0', port: 25571 }), /127\.0\.0\.1/);
+});
+
+test('validates the exact Java v1 goal event payload', () => {
+	const set = { protocolVersion: 1, agentId: 'agent-55', type: 'goal_event', messageId: 'server-4', operation: 'set', goal: 'enter arena' };
+	assert.deepEqual(validateGoalEvent(set), set);
+	assert.deepEqual(validateGoalEvent({ ...set, operation: 'stop', goal: '' }), { ...set, operation: 'stop', goal: '' });
+	assert.throws(() => validateGoalEvent({ ...set, goalRevision: 1 }), /Unknown field/);
+	assert.throws(() => validateGoalEvent({ ...set, operation: 'replace' }), /operation/);
+	assert.throws(() => validateGoalEvent({ ...set, operation: 'stop', goal: 'still active' }), /empty goal/);
 });

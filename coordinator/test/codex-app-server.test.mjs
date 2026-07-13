@@ -102,3 +102,14 @@ test('checks a live catalog profile without starting a planner thread', async ()
 	assert.equal(checked.model, 'gpt-5.5');
 	assert.deepEqual(transport.methods(), ['initialize', 'initialized', 'model/list']);
 });
+
+test('restarts a failed app-server into a fresh persistent thread', async () => {
+	const transport = new FakeCodexTransport();
+	const agent = new CodexAgent(config, transport);
+	await agent.start();
+	await agent.restart();
+	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 2);
+	assert.equal(transport.calls.filter((call) => call.method === '$start').length, 2);
+	assert.equal(transport.calls.filter((call) => call.method === '$stop').length, 1);
+	await agent.stop();
+});

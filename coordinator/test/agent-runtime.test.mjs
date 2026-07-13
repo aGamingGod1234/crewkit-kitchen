@@ -21,9 +21,11 @@ class FakeCodex {
 	inputs = [];
 	decisions = [];
 	started = false;
+	restartCount = 0;
 	async start() { this.started = true; }
 	async stop() { this.started = false; }
 	async interrupt() {}
+	async restart() { this.restartCount += 1; this.started = true; }
 	async decide(input) {
 		this.inputs.push(JSON.parse(input.slice(input.indexOf('{'))));
 		const next = this.decisions.shift();
@@ -54,10 +56,8 @@ const goal = (revision = 1, text = 'enter arena') => ({
 	agentId: 'agent-55',
 	type: 'goal_event',
 	messageId: `goal-${revision}`,
-	goalRevision: revision,
-	operation: revision === 1 ? 'set' : 'replace',
+	operation: 'set',
 	goal: text,
-	issuedAtEpochMs: 1_750_000_000_000 + revision,
 });
 
 const actionResult = (commandId, state = 'SUCCEEDED', reasonCode = 'DONE') => ({
@@ -161,6 +161,21 @@ test('planner timeout uses bounded retry and later succeeds', async () => {
 	run.scheduled.shift()();
 	await eventually(() => run.bridge.actions.length === 1);
 	assert.ok(run.trace.rows.some((row) => row.event === 'planning_retry_scheduled'));
+	await run.runtime.stop();
+});
+
+test('restarts Codex after an app-server process failure before retry', async () => {
+	const run = harness();
+	const exited = new Error('process exited');
+	exited.code = 'PROCESS_EXITED';
+	run.codex.decisions.push(exited, { summary: 'Recovered.', goalStatus: 'in_progress', action: { type: 'wait', durationMs: 25 } });
+	await run.runtime.start();
+	run.bridge.emit('goal_event', goal());
+	run.bridge.emit('observation', observation());
+	await eventually(() => run.scheduled.length === 1);
+	assert.equal(run.codex.restartCount, 1);
+	run.scheduled.shift()();
+	await eventually(() => run.bridge.actions.length === 1);
 	await run.runtime.stop();
 });
 

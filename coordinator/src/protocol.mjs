@@ -4,6 +4,7 @@ import net from 'node:net';
 import {
 	LOOPBACK_HOST,
 	MAX_COMMAND_ID_LENGTH,
+	MAX_GOAL_LENGTH,
 	MAX_LINE_BYTES,
 	MAX_REASON_CODE_LENGTH,
 	MAX_RESULT_MESSAGE_LENGTH,
@@ -280,16 +281,11 @@ function basicEnvelope(message) {
 	};
 }
 
-function validateGoalEvent(message) {
-	const operation = message.operation;
-	const expected = operation === 'stop'
-		? ['goalRevision', 'operation', 'issuedAtEpochMs']
-		: ['goalRevision', 'operation', 'goal', 'issuedAtEpochMs'];
-	const value = validateEnvelope(message, expected);
-	if (!Number.isSafeInteger(value.goalRevision) || value.goalRevision < 1) throw new BridgeProtocolError('INVALID_FIELD', 'goalRevision must be a positive safe integer');
-	if (!['set', 'replace', 'pause', 'resume', 'stop'].includes(value.operation)) throw new BridgeProtocolError('INVALID_FIELD', 'goal operation is unsupported');
-	if (Object.hasOwn(value, 'goal')) requireText(value.goal, 'goal', 4_096);
-	if (!Number.isSafeInteger(value.issuedAtEpochMs) || value.issuedAtEpochMs <= 0) throw new BridgeProtocolError('INVALID_FIELD', 'issuedAtEpochMs must be positive');
+export function validateGoalEvent(message) {
+	const value = validateEnvelope(message, ['operation', 'goal']);
+	if (!['set', 'stop'].includes(value.operation)) throw new BridgeProtocolError('INVALID_FIELD', "goal operation must be 'set' or 'stop'");
+	if (value.operation === 'set') requireText(value.goal, 'goal', MAX_GOAL_LENGTH);
+	else if (value.goal !== '') throw new BridgeProtocolError('INVALID_FIELD', 'stop goal_event must carry an empty goal');
 	return value;
 }
 
