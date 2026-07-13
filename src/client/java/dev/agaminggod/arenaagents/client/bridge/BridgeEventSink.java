@@ -6,6 +6,9 @@ import dev.agaminggod.arenaagents.protocol.ActionCommand;
 public interface BridgeEventSink {
 	void onActionCommand(ActionCommand command);
 
+	default void onCancelAction(String commandId) {
+	}
+
 	default void onObservationRequested() {
 	}
 }

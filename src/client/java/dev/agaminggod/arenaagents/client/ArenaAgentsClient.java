@@ -1,6 +1,9 @@
 package dev.agaminggod.arenaagents.client;
 
 import com.google.gson.JsonObject;
+import dev.agaminggod.arenaagents.client.action.ActionEventPublisher;
+import dev.agaminggod.arenaagents.client.action.ClientActionRuntime;
+import dev.agaminggod.arenaagents.client.action.MinecraftActionContext;
 import dev.agaminggod.arenaagents.client.bridge.BridgeEventSink;
 import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
@@ -13,14 +16,21 @@ import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import java.io.IOException;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class ArenaAgentsClient implements ClientModInitializer {
 	private static final String EVENT_OBSERVATION = "observation";
+	private static final String COORDINATOR_CANCEL_REASON = "coordinator_cancelled";
+	private static final String CLIENT_STOPPING_REASON = "client_stopping";
+	private static final Logger LOGGER = LoggerFactory.getLogger(ArenaAgentsClient.class);
 
 	private BridgeServer bridgeServer;
 	private ProtocolCodec protocolCodec;
 	private ObservationCollector observationCollector;
+	private ClientActionRuntime actionRuntime;
 
 	@Override
 	public void onInitializeClient() {
@@ -31,20 +41,35 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 
 		Minecraft minecraft = Minecraft.getInstance();
 		protocolCodec = new ProtocolCodec();
-		observationCollector = new ObservationCollector(
-				minecraft,
-				config.observationRadius(),
-				Observation.ActionStatus::none,
-				() -> null
-		);
 		bridgeServer = new BridgeServer(
 				config,
 				protocolCodec,
 				minecraft::execute,
 				new ClientBridgeEventSink()
 		);
+		ActionEventPublisher actionPublisher = new ActionEventPublisher(
+				bridgeServer,
+				exception -> LOGGER.warn("Could not publish an Arena Agents action event", exception)
+		);
+		actionRuntime = new ClientActionRuntime(new MinecraftActionContext(minecraft), actionPublisher);
+		observationCollector = new ObservationCollector(
+				minecraft,
+				config.observationRadius(),
+				actionRuntime::currentStatus,
+				actionRuntime::lastResult
+		);
 		bridgeServer.start();
-		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> bridgeServer.close());
+		ClientTickEvents.END_CLIENT_TICK.register(client -> actionRuntime.tick());
+		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> stopClient());
+	}
+
+	private void stopClient() {
+		actionRuntime.stop(CLIENT_STOPPING_REASON);
+		RuntimeException lifecycleFailure = actionRuntime.lastLifecycleFailure();
+		if (lifecycleFailure != null) {
+			LOGGER.warn("Could not release all Arena Agents resources during client shutdown", lifecycleFailure);
+		}
+		bridgeServer.close();
 	}
 
 	private void publishObservation() {
@@ -62,7 +87,12 @@ public final class ArenaAgentsClient implements ClientModInitializer {
 	private final class ClientBridgeEventSink implements BridgeEventSink {
 		@Override
 		public void onActionCommand(ActionCommand command) {
-			// Task 5 owns action execution; Task 4 only preserves the callback boundary.
+			actionRuntime.onActionCommand(command);
+		}
+
+		@Override
+		public void onCancelAction(String commandId) {
+			actionRuntime.onCancelAction(commandId, COORDINATOR_CANCEL_REASON);
 		}
 
 		@Override

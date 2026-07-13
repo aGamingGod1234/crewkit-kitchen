@@ -258,3 +258,57 @@
 - Have Task 5 connect its action-state and last-result owners to the existing typed observation suppliers.
 - Keep Task 9's Node observation validator synchronized with the field order, caps, placeholder shape, and flattened event envelope introduced here.
 - Exercise ready-world observations in the copied test world during the official-launcher verification task.
+
+## 2026-07-13 — Task 5 safe action lifecycle and primitive executors
+
+### What Was Implemented
+- Added a single-owner, client-thread action executor with explicit acceptance, progress, cancellation, timeout, failure, and exactly-once terminal-result behavior.
+- Added a bounded 4,096-command duplicate history, named progress and timeout bounds, monotonic elapsed-time accounting, and observable containment of outbound event failures.
+- Added validated factories and incremental implementations for `wait`, `look_at`, `chat`, `select_item`, and `use_item`; future movement, combat, block, and goal actions fail explicitly without destabilizing the bridge session.
+- Added a Minecraft 26.1.2 action context for safety checks, gradual rotation, chat, deterministic hotbar selection, item use, and exhaustive synthetic-input/resource release.
+- Wired authenticated `action_command` and targeted `cancel_action` controls through the supplied Minecraft executor, published strict `action_progress` and `action_result` envelopes, and connected live action/result owners to observations.
+- Added stop/disconnect/death/screen safety handling so cancellation and unsafe transitions release movement, attack, use, and block-breaking state idempotently.
+- Added RED-first dependency-free verification for lifecycle transitions, every supported primitive, duplicate/busy/deferred commands, clock regression, unsafe acceptance, resource-release failures, event-sink containment, bridge loopback dispatch, observation state, and runtime shutdown.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionContext.java` — defines the pure execution boundary and typed operation results.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionCreationException.java` — carries explicit action-construction failure codes.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionEventPublisher.java` — publishes strict progress and terminal bridge events while containing delivery failures.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionExecutor.java` — owns the single active lifecycle, cancellation, cleanup, timeouts, progress, and terminal results.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionFactory.java` — maps validated protocol commands to supported primitives and explicit deferred failures.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionProgress.java` — defines immutable running-action progress.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ActionUpdate.java` — defines incremental primitive updates.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ChatAction.java` — sends validated chat exactly once.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/ClientActionRuntime.java` — owns bridge callbacks, ticking, observation suppliers, and shutdown cleanup.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/CommandIdHistory.java` — provides bounded duplicate-command tracking.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/LookAtAction.java` — rotates incrementally to a validated target with tolerance and timeout bounds.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/MinecraftActionContext.java` — adapts the pure action boundary to Minecraft 26.1.2 client APIs.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/RunningAction.java` — defines the incremental primitive contract.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/SafetyState.java` — centralizes safe and unsafe client states.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/SelectItemAction.java` — selects the lowest matching hotbar slot deterministically.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/UseItemAction.java` — starts, holds, stops, and cancels bounded item use.
+- `src/client/java/dev/agaminggod/arenaagents/client/action/WaitAction.java` — completes waits from monotonic elapsed time without blocking the client thread.
+- `src/client/java/dev/agaminggod/arenaagents/client/ArenaAgentsClient.java` — wires the runtime, client tick, bridge controls, observations, and stop cleanup.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeEventSink.java` — adds the targeted cancellation callback without breaking the functional action callback API.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeSession.java` — validates and dispatches `cancel_action` through the existing callback lifecycle.
+- `src/test/java/dev/agaminggod/arenaagents/client/action/ActionExecutorVerification.java` — verifies pure lifecycle, primitives, failure containment, and runtime facade behavior.
+- `src/test/java/dev/agaminggod/arenaagents/client/action/MinecraftActionContextVerification.java` — verifies safety precedence, gradual rotation, deterministic slots, and exhaustive cleanup attempts.
+- `src/test/java/dev/agaminggod/arenaagents/client/bridge/BridgeActionIntegrationVerification.java` — verifies live-loopback controls, event envelopes, cancellation, observations, and healthy-session reuse after ordinary failures.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — runs the Task 5 suites through `verifyCore`.
+- `PROJECT_LOG.md` — records Task 5 scope, assumptions, evidence, and deferred work.
+
+### Assumptions Made (flag these for review)
+- The approved protocol's `use_item` shape contains only `durationMs`, so Task 5 uses the validated internal `MAIN_HAND`; selecting an off hand requires a later protocol revision rather than an unapproved wire field.
+- Any open screen makes action execution unsafe, including inventory and chat screens, so acceptance/ticking fails safely and releases synthetic inputs.
+- `select_item` searches only the nine hotbar slots and selects the lowest matching registry ID; it does not rearrange the wider inventory.
+- A 4,096-entry recent command-ID history is the bounded duplicate-rejection window; completed IDs are refreshed so an immediately replayed terminal command cannot be evicted by concurrent rejected work.
+
+### Known Issues / Deferred
+- `move_to` remains Task 6; `attack`, `break_block`, and `place_block` remain Task 7; `complete_goal` remains coordinator-owned. Task 5 returns explicit `ACTION_NOT_IMPLEMENTED` results for them.
+- Official-launcher validation in a copied world remains a later integration task; this task verifies pure behavior, live loopback behavior, and Minecraft 26.1.2 compilation.
+- The current protocol cannot request off-hand use because it has no hand field.
+
+### Suggested Next Steps
+- Implement Task 6 movement against the existing incremental executor and cleanup boundary.
+- Implement Task 7 combat/block actions without weakening the exactly-once terminal and resource-release invariants.
+- Mirror the Task 5 progress/result envelope and cancellation semantics in Task 9's coordinator validators, then exercise them in the official-launcher integration task.

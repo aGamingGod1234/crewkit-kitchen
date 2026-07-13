@@ -261,10 +261,7 @@ public final class BridgeSession implements AutoCloseable {
 		switch (type) {
 			case "hello" -> handleHello(message, messageId);
 			case "action_command" -> handleActionCommand(message);
-			case "cancel_action" -> {
-				validateFields(message, ENVELOPE_FIELDS, "commandId");
-				requireBoundedString(message, "commandId", ProtocolConstants.MAX_COMMAND_ID_LENGTH);
-			}
+			case "cancel_action" -> handleCancelAction(message);
 			case "request_observation" -> handleObservationRequest(message);
 			case "shutdown" -> {
 				validateFields(message, ENVELOPE_FIELDS);
@@ -337,6 +334,20 @@ public final class BridgeSession implements AutoCloseable {
 		}
 	}
 
+	private void handleCancelAction(JsonObject message) {
+		validateFields(message, ENVELOPE_FIELDS, "commandId");
+		String commandId = requireBoundedString(
+				message,
+				"commandId",
+				ProtocolConstants.MAX_COMMAND_ID_LENGTH
+		);
+		try {
+			callbackExecutor.execute(() -> dispatchCancel(commandId));
+		} catch (RuntimeException exception) {
+			throw new ProtocolException("CALLBACK_REJECTED", "Client callback executor rejected cancellation", exception);
+		}
+	}
+
 	private void dispatchAction(ActionCommand command) {
 		boolean callbackFailed = false;
 		synchronized (callbackLock) {
@@ -362,6 +373,23 @@ public final class BridgeSession implements AutoCloseable {
 			}
 			try {
 				eventSink.onObservationRequested();
+			} catch (RuntimeException ignored) {
+				callbackFailed = true;
+			}
+		}
+		if (callbackFailed) {
+			close();
+		}
+	}
+
+	private void dispatchCancel(String commandId) {
+		boolean callbackFailed = false;
+		synchronized (callbackLock) {
+			if (!isAuthenticated()) {
+				return;
+			}
+			try {
+				eventSink.onCancelAction(commandId);
 			} catch (RuntimeException ignored) {
 				callbackFailed = true;
 			}

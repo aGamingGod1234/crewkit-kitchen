@@ -2,7 +2,10 @@ package dev.agaminggod.arenaagents.verification;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import dev.agaminggod.arenaagents.client.action.ActionExecutorVerification;
+import dev.agaminggod.arenaagents.client.action.MinecraftActionContextVerification;
 import dev.agaminggod.arenaagents.client.bridge.BridgeConcurrencyVerification;
+import dev.agaminggod.arenaagents.client.bridge.BridgeActionIntegrationVerification;
 import dev.agaminggod.arenaagents.client.bridge.BridgeEventSink;
 import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
 import dev.agaminggod.arenaagents.client.bridge.BridgeSession;
@@ -71,6 +74,9 @@ public final class VerificationMain {
 		verifyCommandImmutability();
 		verifyCommandEncodingRoundTrip(codec);
 		verifyActionResultContract();
+		passedAssertions += ActionExecutorVerification.verifyLifecycle();
+		passedAssertions += ActionExecutorVerification.verifyPrimitives();
+		passedAssertions += MinecraftActionContextVerification.verifyHelpers();
 		verifyObservationContracts(codec);
 		ObservationCollectorVerification.verifyLoadedChunkBoundary();
 		ObservationCollectorVerification.verifyEntityDistanceBoundary();
@@ -79,6 +85,7 @@ public final class VerificationMain {
 		verifyAgentConfigFiles();
 		verifyJsonLineFraming(codec);
 		verifyBridgeAuthenticationAndDispatch(codec);
+		passedAssertions += BridgeActionIntegrationVerification.verifyLifecycleEventsAndCancellation();
 		verifyBridgeObservationRequestDispatch(codec);
 		verifyClosedSessionDropsQueuedAction(codec);
 		verifyGeneratedErrorIdIsContained(codec);
