@@ -261,7 +261,7 @@ public final class BridgeSession implements AutoCloseable {
 				validateFields(message, ENVELOPE_FIELDS, "commandId");
 				requireBoundedString(message, "commandId", ProtocolConstants.MAX_COMMAND_ID_LENGTH);
 			}
-			case "request_observation" -> validateFields(message, ENVELOPE_FIELDS);
+			case "request_observation" -> handleObservationRequest(message);
 			case "shutdown" -> {
 				validateFields(message, ENVELOPE_FIELDS);
 				close();
@@ -324,6 +324,15 @@ public final class BridgeSession implements AutoCloseable {
 		}
 	}
 
+	private void handleObservationRequest(JsonObject message) {
+		validateFields(message, ENVELOPE_FIELDS);
+		try {
+			callbackExecutor.execute(this::dispatchObservationRequest);
+		} catch (RuntimeException exception) {
+			throw new ProtocolException("CALLBACK_REJECTED", "Client callback executor rejected observation", exception);
+		}
+	}
+
 	private void dispatchAction(ActionCommand command) {
 		boolean callbackFailed = false;
 		synchronized (callbackLock) {
@@ -332,6 +341,23 @@ public final class BridgeSession implements AutoCloseable {
 			}
 			try {
 				eventSink.onActionCommand(command);
+			} catch (RuntimeException ignored) {
+				callbackFailed = true;
+			}
+		}
+		if (callbackFailed) {
+			close();
+		}
+	}
+
+	private void dispatchObservationRequest() {
+		boolean callbackFailed = false;
+		synchronized (callbackLock) {
+			if (!isAuthenticated()) {
+				return;
+			}
+			try {
+				eventSink.onObservationRequested();
 			} catch (RuntimeException ignored) {
 				callbackFailed = true;
 			}

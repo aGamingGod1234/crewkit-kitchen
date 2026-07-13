@@ -177,3 +177,43 @@
 
 ### Suggested Next Steps
 - Implement Task 2's shared protocol records, strict codec, and dependency-free Java verification assertions using TDD.
+## 2026-07-13 — Task 4 bounded world observations
+
+### What Was Implemented
+- Added immutable typed observation, entity, block, inventory, player/effect, world, action, and result snapshots with defensive collections and stable serialized field order.
+- Added deterministic entity/block ordering and named hard caps for entities, blocks, effects, inventory summaries, and block-state probes; the configured radius is clamped to the existing `AgentConfig` range.
+- Added client-thread-only, null-safe collection of player position, velocity, view, health, hunger, armor, effects, selected item, summarized inventory, nearby living entities, nearby non-air blocks, collision/fluid context, dimension, game/default-clock time, weather, and action/result placeholders.
+- Added a nearest-first bounded block scan that checks client chunk availability before block-state access and never requests a chunk.
+- Routed authenticated `request_observation` controls through the existing Minecraft executor and returned a flattened, strictly enveloped `observation` event without adding periodic scheduling or action execution.
+- Added RED-first dependency-free verification for ordering, truncation, immutable snapshots, unavailable state, serialization order, unloaded-chunk avoidance, deterministic block scanning, client-executor dispatch, and observation event envelopes.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/Observation.java` — defines the complete stable observation shape and explicit unavailable/action/result placeholders.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/EntitySnapshot.java` — defines validated nearby-living-entity facts.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/BlockSnapshot.java` — defines block, fluid, and collision facts.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/InventorySnapshot.java` — defines selected-item and aggregated inventory facts.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/ObservationCollector.java` — performs bounded client-thread Minecraft collection without loading chunks.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/ObservationLimits.java` — centralizes radius clamping and hard output/scan caps.
+- `src/client/java/dev/agaminggod/arenaagents/client/perception/ObservationOrdering.java` — centralizes deterministic distance/stable-identifier ordering.
+- `src/client/java/dev/agaminggod/arenaagents/client/ArenaAgentsClient.java` — wires the collector to bridge observation requests.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeEventSink.java` — adds a default observation-request callback while preserving the functional action callback API.
+- `src/client/java/dev/agaminggod/arenaagents/client/bridge/BridgeSession.java` — validates and dispatches observation requests through the provided client executor.
+- `src/test/java/dev/agaminggod/arenaagents/client/perception/ObservationCollectorVerification.java` — verifies deterministic bounded scanning and unloaded-chunk exclusion.
+- `src/test/java/dev/agaminggod/arenaagents/verification/VerificationMain.java` — runs the Task 4 pure and live-loopback assertions.
+- `PROJECT_LOG.md` — records Task 4 scope, decisions, and deferred work.
+
+### Assumptions Made (flag these for review)
+- Named output caps are 64 living entities, 128 blocks, 32 effects, and 64 aggregated inventory item IDs; at most 8,192 nearest block positions are probed per requested observation.
+- Minecraft 26.1.2's `getDefaultClockTime()` is the correct stable world-clock fact to expose alongside monotonic game time.
+- Task 5 may provide current action and last terminal result through the typed suppliers; until then both are explicit `present=false` placeholders.
+- A non-air block is useful observation context when paired with its fluid ID and empty/full collision-shape flags; air is omitted to preserve the block cap for actionable context.
+
+### Known Issues / Deferred
+- Live in-game content validation remains part of the later official-launcher verification task; this task verifies pure collection boundaries, 26.1.2 compilation, and loopback dispatch.
+- Task 5 still owns action lifecycle and cancellation, and Task 11 still owns periodic/event-driven autonomous scheduling.
+- Unexpected runtime collection failures return the explicit `collection_failed` unavailable observation; structured diagnostics/traces remain a later runtime concern.
+
+### Suggested Next Steps
+- Have Task 5 connect its action-state and last-result owners to the existing typed observation suppliers.
+- Keep Task 9's Node observation validator synchronized with the field order, caps, placeholder shape, and flattened event envelope introduced here.
+- Exercise ready-world observations in the copied test world during the official-launcher verification task.

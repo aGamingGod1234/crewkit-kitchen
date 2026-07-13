@@ -3,10 +3,18 @@ package dev.agaminggod.arenaagents.verification;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.client.bridge.BridgeConcurrencyVerification;
+import dev.agaminggod.arenaagents.client.bridge.BridgeEventSink;
 import dev.agaminggod.arenaagents.client.bridge.BridgeServer;
 import dev.agaminggod.arenaagents.client.bridge.BridgeSession;
 import dev.agaminggod.arenaagents.client.config.AgentConfig;
 import dev.agaminggod.arenaagents.client.config.AgentConfigLoader;
+import dev.agaminggod.arenaagents.client.perception.BlockSnapshot;
+import dev.agaminggod.arenaagents.client.perception.EntitySnapshot;
+import dev.agaminggod.arenaagents.client.perception.InventorySnapshot;
+import dev.agaminggod.arenaagents.client.perception.Observation;
+import dev.agaminggod.arenaagents.client.perception.ObservationCollectorVerification;
+import dev.agaminggod.arenaagents.client.perception.ObservationLimits;
+import dev.agaminggod.arenaagents.client.perception.ObservationOrdering;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
 import dev.agaminggod.arenaagents.protocol.ActionState;
@@ -62,10 +70,13 @@ public final class VerificationMain {
 		verifyCommandImmutability();
 		verifyCommandEncodingRoundTrip(codec);
 		verifyActionResultContract();
+		verifyObservationContracts(codec);
+		ObservationCollectorVerification.verifyLoadedChunkBoundary();
 		verifyAgentConfigParsing();
 		verifyAgentConfigFiles();
 		verifyJsonLineFraming(codec);
 		verifyBridgeAuthenticationAndDispatch(codec);
+		verifyBridgeObservationRequestDispatch(codec);
 		verifyClosedSessionDropsQueuedAction(codec);
 		verifyGeneratedErrorIdIsContained(codec);
 		verifyGeneratedOutboundMessageIds(codec);
@@ -386,6 +397,93 @@ public final class VerificationMain {
 		assertTrue(encoded.contains("\"state\":\"SUCCEEDED\""), "encoded terminal state");
 	}
 
+	private static void verifyObservationContracts(ProtocolCodec codec) throws ProtocolException {
+		List<EntitySnapshot> entities = List.of(
+				new EntitySnapshot(
+						"entity-far",
+						"minecraft:zombie",
+						"far",
+						4.0D,
+						64.0D,
+						0.0D,
+						16.0D,
+						20.0F,
+						20.0F,
+						true
+				),
+				new EntitySnapshot(
+						"entity-near-b",
+						"minecraft:cow",
+						"near-b",
+						1.0D,
+						64.0D,
+						0.0D,
+						1.0D,
+						10.0F,
+						10.0F,
+						false
+				),
+				new EntitySnapshot(
+						"entity-near-a",
+						"minecraft:pig",
+						"near-a",
+						-1.0D,
+						64.0D,
+						0.0D,
+						1.0D,
+						10.0F,
+						10.0F,
+						false
+				)
+		);
+		assertEquals(
+				List.of("near-a", "near-b", "far"),
+				ObservationOrdering.entities(entities).stream().map(EntitySnapshot::name).toList(),
+				"entity ordering by distance and stable identifier"
+		);
+
+		List<BlockSnapshot> blocks = new ArrayList<>();
+		for (int index = 0; index < ObservationLimits.MAX_BLOCKS + 5; index++) {
+			blocks.add(new BlockSnapshot(
+					index,
+					64,
+					0,
+					"minecraft:stone",
+					"minecraft:empty",
+					false,
+					true,
+					index * (double) index
+			));
+		}
+		List<BlockSnapshot> truncatedBlocks = ObservationLimits.truncateBlocks(
+				blocks,
+				ObservationLimits.MAX_BLOCKS
+		);
+		assertEquals(128, truncatedBlocks.size(), "block cap");
+		assertEquals(127, truncatedBlocks.getLast().x(), "block truncation preserves deterministic prefix");
+
+		List<InventorySnapshot.ItemSummary> mutableItems = new ArrayList<>();
+		mutableItems.add(new InventorySnapshot.ItemSummary("minecraft:stone", 32));
+		InventorySnapshot inventory = new InventorySnapshot(0, "minecraft:stone", 32, mutableItems);
+		mutableItems.add(new InventorySnapshot.ItemSummary("minecraft:dirt", 16));
+		assertEquals(1, inventory.items().size(), "inventory snapshot defensively copies items");
+
+		Observation unavailable = Observation.unavailable("world_not_ready");
+		assertTrue(!unavailable.ready(), "unavailable observation is explicit");
+		assertEquals("world_not_ready", unavailable.status(), "unavailable observation reason");
+		assertTrue(unavailable.entities().isEmpty(), "unavailable observation has immutable empty entities");
+		assertTrue(!unavailable.currentAction().present(), "unavailable observation has action placeholder");
+		assertTrue(!unavailable.lastResult().present(), "unavailable observation has result placeholder");
+
+		String encoded = codec.encode(unavailable);
+		assertTrue(
+				encoded.indexOf("\"ready\"") < encoded.indexOf("\"status\"")
+						&& encoded.indexOf("\"status\"") < encoded.indexOf("\"position\"")
+						&& encoded.indexOf("\"entities\"") < encoded.indexOf("\"blocks\""),
+				"observation serialization field order"
+		);
+	}
+
 	private static void verifyAgentConfigParsing() {
 		String validJson = "{\"agentId\":\"agent-55\",\"bridgePort\":25571,"
 				+ "\"observationRadius\":12,\"enabled\":true}";
@@ -451,6 +549,43 @@ public final class VerificationMain {
 				assertTrue(received.get() == null, "action callback waits for provided executor");
 				executor.runNext();
 				assertEquals(ActionType.WAIT, received.get().type(), "action callback decoded through protocol codec");
+			}
+		}
+	}
+
+	private static void verifyBridgeObservationRequestDispatch(ProtocolCodec codec) throws Exception {
+		int port = findAvailablePort();
+		RecordingExecutor executor = new RecordingExecutor();
+		AtomicBoolean requested = new AtomicBoolean();
+		AtomicReference<BridgeServer> serverReference = new AtomicReference<>();
+		BridgeEventSink eventSink = new BridgeEventSink() {
+			@Override
+			public void onActionCommand(ActionCommand command) {
+			}
+
+			@Override
+			public void onObservationRequested() {
+				requested.set(true);
+				JsonObject payload = new JsonObject();
+				payload.addProperty("ready", false);
+				payload.addProperty("status", "world_not_ready");
+				serverReference.get().sendEvent("observation", payload);
+			}
+		};
+		try (BridgeServer server = new BridgeServer(enabledConfig(port), codec, executor, eventSink)) {
+			serverReference.set(server);
+			server.start();
+			try (Socket client = connectAuthenticated(codec, port, "hello-observation")) {
+				writeMessage(codec, client, requestObservationEnvelope("request-observation-1"));
+				awaitCondition(() -> executor.pendingCount() == 1, "observation callback queued");
+				assertTrue(!requested.get(), "observation callback waits for provided executor");
+				executor.runNext();
+				assertTrue(requested.get(), "observation callback dispatched on provided executor");
+
+				JsonObject observationEvent = readMessage(codec, client);
+				assertEquals("observation", observationEvent.get("type").getAsString(), "observation event type");
+				assertEquals(AGENT_ID, observationEvent.get("agentId").getAsString(), "observation event agent identity");
+				assertEquals("world_not_ready", observationEvent.get("status").getAsString(), "observation event payload");
 			}
 		}
 	}
@@ -855,6 +990,11 @@ public final class VerificationMain {
 		return "{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
 				+ "\",\"type\":\"action_command\",\"messageId\":\"" + messageId
 				+ "\",\"command\":" + commandJson("wait", "\"durationMs\":250") + "}";
+	}
+
+	private static String requestObservationEnvelope(String messageId) {
+		return "{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
+				+ "\",\"type\":\"request_observation\",\"messageId\":\"" + messageId + "\"}";
 	}
 
 	private static void awaitCondition(BooleanSupplier condition, String label) throws InterruptedException {
