@@ -23,6 +23,14 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run-automated-verification.ps
 
 This uses the project-local Java 25 toolchain, runs the Java/Fabric verification suite and build, then runs the dependency-free coordinator tests. Live launcher/gameplay validation is documented separately below.
 
+For the heavier eight-agent reliability gate, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-performance-reliability-verification.ps1
+```
+
+This repeats the isolated eight-agent soak 50 times after the clean verifier. The summonable-agent path keeps the default four concurrent planner turns, sends at most two queued observations per server tick, caches expensive spatial sections for 10 ticks, and throttles action progress to a material 5% change or a one-second heartbeat. Optional bounded `coordinator_status.latencies` rows expose sample count, p50, and p95 durations without prompts, observations, model output, or credentials. See [the measured headless report](docs/plans/2026-08-11-eight-agent-performance-reliability-report.md).
+
 ## Prepare the isolated mod-pack runtime
 
 Close Minecraft and the official launcher, then run:
