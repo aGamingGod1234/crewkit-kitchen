@@ -18,6 +18,7 @@ import dev.agaminggod.arenaagents.server.AgentRuntimeHooks;
 import dev.agaminggod.arenaagents.server.AgentRuntimeRouter;
 import dev.agaminggod.arenaagents.server.AgentChatReporter;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
+import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
@@ -56,6 +57,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public static final int DEFAULT_PORT = 25_570;
 	public static final int CONNECTION_QUEUE_CAP = 256;
 	public static final int AGENT_QUEUE_CAP = 32;
+	private static final int OBSERVATIONS_PER_TICK = 2;
 	private static final int HANDSHAKE_TIMEOUT_MS = 5_000;
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
@@ -69,6 +71,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final AgentRuntimeRouter router;
 	private final ServerActionExecutor actionExecutor;
 	private final ServerObservationCollector observations;
+	private final ObservationDispatchQueue<AgentId> observationQueue =
+			new ObservationDispatchQueue<>(AgentConstants.DEFAULT_AGENT_LIMIT, OBSERVATIONS_PER_TICK);
 	private final BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 	private final String serverInstanceId = UUID.randomUUID().toString();
 	private final String secret;
@@ -120,6 +124,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 		}
 		actionExecutor.tick();
+		observationQueue.drain(this::sendObservation);
 	}
 
 	public boolean authenticated() {
@@ -395,7 +400,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			router.plannerStarted(id);
 		}
 		if ("agent_ready".equals(envelope.type())) {
-			send("observation", id.toString(), observations.collect(id));
+			queueObservation(id);
 		}
 	}
 
@@ -431,6 +436,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendActionResult(ServerActionResult result) {
+		observations.invalidate(result.agentId());
 		ScenarioRuntimeService.onAgentAction(
 				manager.server(),
 				result.agentId().toString(),
@@ -450,7 +456,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		send("action_result", result.agentId().toString(), payload);
 		if (result.state() != dev.agaminggod.arenaagents.server.runtime.ServerActionState.CANCELLED
 				&& result.actionType() != ActionType.COMPLETE_GOAL) {
-			send("observation", result.agentId().toString(), observations.collect(result.agentId()));
+			queueObservation(result.agentId());
+		}
+	}
+
+	private void queueObservation(AgentId agentId) {
+		observationQueue.offer(agentId);
+	}
+
+	private void sendObservation(AgentId agentId) {
+		if (!authenticated()) return;
+		try {
+			send("observation", agentId.toString(), observations.collect(agentId));
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not collect observation for {}: {}", agentId, exception.getMessage());
 		}
 	}
 

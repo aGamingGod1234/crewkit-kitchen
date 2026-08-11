@@ -10,7 +10,9 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import java.util.Comparator;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -31,9 +33,14 @@ public final class ServerObservationCollector {
 	public static final int BLOCK_RADIUS = 6;
 	public static final int MAX_BLOCKS_PER_TYPE = 8;
 	public static final int MAX_NEARBY_TRANSACTION_TARGETS = 16;
+	private static final int SPATIAL_CACHE_CAPACITY = 16;
+	private static final long SPATIAL_CACHE_TICKS = 10L;
 
 	private final CodexAgentManager manager;
 	private final ServerActionExecutor actionExecutor;
+	private final ObservationSectionCache<SpatialCacheKey, JsonObject> spatialCache =
+			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, JsonObject::deepCopy);
+	private final Map<AgentId, SpatialCacheKey> spatialKeys = new HashMap<>();
 
 	public ServerObservationCollector(CodexAgentManager manager, ServerActionExecutor actionExecutor) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
@@ -50,7 +57,10 @@ public final class ServerObservationCollector {
 		observation.addProperty("ready", ready);
 		observation.addProperty("status", agent == null ? "PLAYER_UNAVAILABLE"
 				: ready ? record.state().name() : "PLAYER_DEAD");
-		if (!ready) return observation;
+		if (!ready) {
+			invalidate(agentId);
+			return observation;
+		}
 
 		ServerLevel level = agent.level();
 		observation.add("position", vector(agent.position()));
@@ -89,8 +99,9 @@ public final class ServerObservationCollector {
 
 		observation.add("inventory", inventory(agent));
 		observation.add("entities", entities(level, agent));
-		observation.add("blocks", blocks(level, agent.blockPosition()));
-		observation.add("nearbyContainers", nearbyTransactionTargets(level, agent));
+		JsonObject spatial = spatialObservation(agentId, level, agent);
+		observation.add("blocks", spatial.get("blocks"));
+		observation.add("nearbyContainers", spatial.get("nearbyContainers"));
 		JsonObject world = new JsonObject();
 		world.addProperty("dimension", level.dimension().identifier().toString());
 		world.addProperty("gameTime", level.getGameTime());
@@ -101,6 +112,30 @@ public final class ServerObservationCollector {
 		observation.add("currentAction", currentAction(agentId));
 		observation.add("lastResult", lastResult(agentId));
 		return observation;
+	}
+
+	public void invalidate(AgentId agentId) {
+		SpatialCacheKey key = spatialKeys.remove(Objects.requireNonNull(agentId, "agentId must not be null"));
+		if (key != null) spatialCache.invalidate(key);
+	}
+
+	private JsonObject spatialObservation(AgentId agentId, ServerLevel level, ServerPlayer agent) {
+		BlockPos position = agent.blockPosition();
+		SpatialCacheKey key = new SpatialCacheKey(
+				agentId,
+				level.dimension().identifier().toString(),
+				position.getX(),
+				position.getY(),
+				position.getZ()
+		);
+		SpatialCacheKey previous = spatialKeys.put(agentId, key);
+		if (previous != null && !previous.equals(key)) spatialCache.invalidate(previous);
+		return spatialCache.getOrCompute(key, level.getGameTime(), () -> {
+			JsonObject value = new JsonObject();
+			value.add("blocks", blocks(level, position));
+			value.add("nearbyContainers", nearbyTransactionTargets(level, agent));
+			return value;
+		});
 	}
 
 	private JsonObject currentAction(AgentId agentId) {
@@ -296,6 +331,9 @@ public final class ServerObservationCollector {
 			List<String> capabilities,
 			double distanceSquared
 	) {
+	}
+
+	private record SpatialCacheKey(AgentId agentId, String dimension, int x, int y, int z) {
 	}
 
 	private static JsonObject vector(Vec3 vector) {
