@@ -16,6 +16,21 @@ public enum ActionType {
 	PLACE_BLOCK("place_block"),
 	CHAT("chat"),
 	WAIT("wait"),
+	SET_DOOR("set_door"),
+	PICK_UP_ITEM("pick_up_item"),
+	DROP_ITEM("drop_item"),
+	NAVIGATE_TO("navigate_to"),
+	FIGHT_TARGET("fight_target"),
+	FLEE_FROM("flee_from"),
+	FOLLOW_ENTITY("follow_entity"),
+	TRANSFER_CONTAINER("transfer_container"),
+	CRAFT_INVENTORY("craft_inventory"),
+	CRAFT_TABLE("craft_table"),
+	FURNACE_TRANSACTION("furnace_transaction"),
+	EQUIP_ITEM("equip_item"),
+	SELECT_TOOL("select_tool"),
+	BLOCK_WITH_SHIELD("block_with_shield"),
+	USE_RANGED("use_ranged"),
 	COMPLETE_GOAL("complete_goal");
 
 	private static final Map<String, ActionType> BY_WIRE_NAME = Arrays.stream(values())

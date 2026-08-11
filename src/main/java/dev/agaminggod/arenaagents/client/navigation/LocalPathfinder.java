@@ -20,6 +20,7 @@ public final class LocalPathfinder implements PathPlanner {
 
 	private static final int WALK_COST = 10;
 	private static final int JUMP_UP_COST = 14;
+	private static final int JUMP_GAP_COST = 18;
 	private static final int DROP_BASE_COST = 11;
 	private static final int DROP_PER_BLOCK_COST = 1;
 	private static final int HEIGHT_HEURISTIC_COST = 1;
@@ -162,6 +163,21 @@ public final class LocalPathfinder implements PathPlanner {
 		}
 		if (isStandable(view, jumpDestination) && isClear(view, current.above(2))) {
 			return new Neighbor(jumpDestination, TraversalType.JUMP_UP, JUMP_UP_COST);
+		}
+
+		GridPosition gapLanding;
+		try {
+			int dx = sameLevel.x() - current.x();
+			int dz = sameLevel.z() - current.z();
+			gapLanding = sameLevel.offset(dx, 0, dz);
+		} catch (ArithmeticException exception) {
+			return null;
+		}
+		if (isClear(view, sameLevel)
+				&& isClear(view, sameLevel.above())
+				&& isClear(view, current.above(2))
+				&& isStandable(view, gapLanding)) {
+			return new Neighbor(gapLanding, TraversalType.JUMP_GAP, JUMP_GAP_COST);
 		}
 
 		for (int drop = 1; drop <= MAX_DROP_BLOCKS; drop++) {

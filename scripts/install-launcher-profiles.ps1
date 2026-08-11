@@ -16,6 +16,12 @@ $Project = [IO.Path]::GetFullPath($ProjectRoot)
 $Java = Join-Path $Project 'runtime\toolchains\temurin-25\jdk-25.0.3+9\bin\javaw.exe'
 $VersionMetadata = Join-Path $env:APPDATA ".minecraft\versions\$VersionId\$VersionId.json"
 $ResolvedProfiles = (Resolve-Path -LiteralPath $LauncherProfiles).Path
+$SecretPath = Join-Path $Project 'runtime\bridge-secret.txt'
+$MinimumBridgeSecretLength = 32
+$MaximumBridgeSecretLength = 256
+$BridgeSecretBytes = 32
+$LegacyJavaArgs = '-Xms1G -Xmx4G'
+$JavaArguments = "$LegacyJavaArgs -Darenaagents.bridgeSecretFile=`"$SecretPath`""
 $Timestamp = (Get-Date).ToUniversalTime().ToString('o')
 
 if (Get-Process -Name MinecraftLauncher,Minecraft -ErrorAction SilentlyContinue) {
@@ -23,6 +29,28 @@ if (Get-Process -Name MinecraftLauncher,Minecraft -ErrorAction SilentlyContinue)
 }
 foreach ($required in @($Java, $VersionMetadata, $ResolvedProfiles)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing launcher-profile prerequisite: $required" }
+}
+
+$secretDirectory = Split-Path -Parent $SecretPath
+New-Item -ItemType Directory -Force -Path $secretDirectory | Out-Null
+if (-not (Test-Path -LiteralPath $SecretPath -PathType Leaf)) {
+    $bytes = New-Object byte[] $BridgeSecretBytes
+    $random = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $random.GetBytes($bytes) } finally { $random.Dispose() }
+    $generatedSecret = [Convert]::ToHexString($bytes).ToLowerInvariant()
+    try {
+        $stream = [IO.File]::Open($SecretPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $writer = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
+            try { $writer.Write($generatedSecret) } finally { $writer.Dispose() }
+        } finally { if ($null -ne $stream) { $stream.Dispose() } }
+    } catch [IO.IOException] {
+        if (-not (Test-Path -LiteralPath $SecretPath -PathType Leaf)) { throw }
+    }
+}
+$secret = [IO.File]::ReadAllText($SecretPath).Trim()
+if ($secret.Length -lt $MinimumBridgeSecretLength -or $secret.Length -gt $MaximumBridgeSecretLength) {
+    throw "Bridge secret must contain $MinimumBridgeSecretLength-$MaximumBridgeSecretLength characters: $SecretPath"
 }
 
 $document = Get-Content -LiteralPath $ResolvedProfiles -Raw | ConvertFrom-Json
@@ -40,12 +68,19 @@ function Add-OrVerifyAgentProfile(
         lastVersionId = $VersionId
         gameDir = $GameDirectory
         javaDir = $Java
-        javaArgs = '-Xms1G -Xmx4G'
+        javaArgs = $JavaArguments
     }
     $property = $document.profiles.PSObject.Properties[$Key]
     if ($null -ne $property) {
         foreach ($field in $expected.Keys) {
-            if ([string]$property.Value.$field -cne [string]$expected[$field]) {
+            $currentValue = [string]$property.Value.$field
+            if ($field -ceq 'javaArgs' -and $currentValue -ceq $LegacyJavaArgs) {
+                $property.Value.javaArgs = $expected.javaArgs
+                $script:changed = $true
+                Write-Host "Migrated bridge-secret JVM argument: $Name"
+                continue
+            }
+            if ($currentValue -cne [string]$expected[$field]) {
                 throw "Existing launcher profile '$Key' differs at '$field'; refusing to overwrite it."
             }
         }

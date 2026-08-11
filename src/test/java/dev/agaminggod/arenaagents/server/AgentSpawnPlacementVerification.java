@@ -1,0 +1,41 @@
+package dev.agaminggod.arenaagents.server;
+
+import java.util.HashSet;
+import java.util.List;
+import net.minecraft.world.phys.Vec3;
+
+public final class AgentSpawnPlacementVerification {
+	private AgentSpawnPlacementVerification() {
+	}
+
+	public static int verify() {
+		Vec3 origin = new Vec3(10.0D, 64.0D, -4.0D);
+		Vec3 forward = AgentSpawnPlacement.inFrontOf(origin, new Vec3(0.6D, -0.8D, 0.0D));
+		assertCoordinate(forward.x, 12.0D, "forward x");
+		assertCoordinate(forward.y, 64.0D, "forward y");
+		assertCoordinate(forward.z, -4.0D, "forward z");
+
+		Vec3 verticalFallback = AgentSpawnPlacement.inFrontOf(origin, new Vec3(0.0D, -1.0D, 0.0D));
+		assertCoordinate(verticalFallback.x, 10.0D, "fallback x");
+		assertCoordinate(verticalFallback.y, 64.0D, "fallback y");
+		assertCoordinate(verticalFallback.z, -2.0D, "fallback z");
+		if (!origin.equals(new Vec3(10.0D, 64.0D, -4.0D))) {
+			throw new AssertionError("spawn placement mutated the source position");
+		}
+		List<Vec3> candidates = AgentSpawnPlacement.candidates(origin, new Vec3(0.0D, 0.0D, 1.0D));
+		if (candidates.size() != 20) throw new AssertionError("expected 20 bounded spawn candidates");
+		if (!candidates.getFirst().equals(new Vec3(10.0D, 64.0D, -2.0D))) {
+			throw new AssertionError("first candidate must remain directly in front of the player");
+		}
+		if (new HashSet<>(candidates).size() != candidates.size()) {
+			throw new AssertionError("spawn candidate grid contains duplicate positions");
+		}
+		return 10;
+	}
+
+	private static void assertCoordinate(double actual, double expected, String label) {
+		if (Math.abs(actual - expected) > 1.0E-9D) {
+			throw new AssertionError(label + " expected " + expected + " but was " + actual);
+		}
+	}
+}

@@ -48,6 +48,11 @@ public final class ActionFactory {
 					arguments.get("face").getAsString(),
 					arguments.get("itemId").getAsString()
 			);
+			case SET_DOOR, PICK_UP_ITEM, DROP_ITEM, NAVIGATE_TO, FIGHT_TARGET, FLEE_FROM, FOLLOW_ENTITY ->
+					deferred(command.type(), "server-side NPC execution");
+			case TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE, FURNACE_TRANSACTION,
+					EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED ->
+					deferred(command.type(), "server-side transaction adapter");
 			case COMPLETE_GOAL -> deferred(command.type(), "coordinator goal completion");
 		};
 	}

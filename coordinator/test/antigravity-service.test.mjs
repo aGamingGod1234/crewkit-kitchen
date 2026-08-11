@@ -1,0 +1,237 @@
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import test from 'node:test';
+
+import {
+	AntigravityProviderService,
+	buildAntigravityLaunch,
+} from '../src/antigravity-service.mjs';
+
+const DECISION = JSON.stringify({
+	summary: 'Wait safely.',
+	goalStatus: 'in_progress',
+	action: {
+		type: 'wait', x: null, y: null, z: null, tolerance: null, sprint: null,
+		targetSelector: null, timeoutMs: null, itemId: null, durationMs: 25,
+		face: null, message: null, open: null, slot: null, count: null, summary: null,
+	},
+});
+
+class FakeChild extends EventEmitter {
+	constructor() {
+		super();
+		this.stdout = new EventEmitter();
+		this.stderr = new EventEmitter();
+		this.exitCode = null;
+		this.signalCode = null;
+		this.pid = 4_242;
+	}
+}
+
+function successfulSpawner(calls, output = DECISION) {
+	return (command, args, options) => {
+		calls.push({ command, args, options });
+		const child = new FakeChild();
+		queueMicrotask(() => {
+			child.stdout.emit('data', Buffer.from(output));
+			child.exitCode = 0;
+			child.emit('close', 0, null);
+		});
+		return child;
+	};
+}
+
+function cancellingTerminator(calls) {
+	return async (child) => {
+		calls.push(child);
+		child.signalCode = 'SIGTERM';
+		child.emit('close', null, 'SIGTERM');
+	};
+}
+
+function config(overrides = {}) {
+	return {
+		provider: 'gemini',
+		cwd: 'C:\\workspace',
+		models: ['gemini-3.1-pro', 'gemini-3.6-flash'],
+		modelReasoningEfforts: {
+			'gemini-3.1-pro': ['high', 'low'],
+			'gemini-3.6-flash': ['high', 'medium', 'low'],
+		},
+		planningTimeoutMs: 1_000,
+		...overrides,
+	};
+}
+
+function profile(overrides = {}) {
+	return {
+		agentId: 'gemini-a',
+		provider: 'gemini',
+		model: 'gemini-3.1-pro',
+		reasoningEffort: 'high',
+		...overrides,
+	};
+}
+
+test('Antigravity launch maps the visible Gemini model and thinking to one exact CLI model', () => {
+	const launch = buildAntigravityLaunch(profile(), config(), {
+		cwd: 'C:\\agents\\gemini\\gemini-a',
+		env: { PATH: 'test' },
+		platform: 'win32',
+	});
+	assert.equal(launch.command, 'agy');
+	assert.deepEqual(launch.argsBeforePrompt, ['--print']);
+	assert.deepEqual(launch.argsAfterPrompt, [
+		'--model', 'gemini-3.1-pro-high',
+		'--sandbox',
+		'--print-timeout', '1s',
+	]);
+	assert.equal(launch.options.cwd, 'C:\\agents\\gemini\\gemini-a');
+	assert.equal(launch.options.env.PATH, 'test');
+	assert.deepEqual(launch.options.stdio, ['ignore', 'pipe', 'pipe']);
+});
+
+test('Antigravity parses planner output and uses the stable per-agent workspace', async () => {
+	const spawnCalls = [];
+	const workspaceCalls = [];
+	const service = new AntigravityProviderService(config(), {
+		platform: 'win32',
+		spawn: successfulSpawner(spawnCalls),
+		workspaceManager: {
+			async prepare(provider, agentId) {
+				workspaceCalls.push({ provider, agentId });
+				return 'C:\\agents\\gemini\\gemini-a';
+			},
+		},
+	});
+	const agent = await service.createAgent(profile(), { recoverySummary: 'Previous movement timed out.' });
+	await agent.setGoalRevision(7);
+	const decision = await agent.decide('Minecraft planner state (authoritative JSON):\n{}', { goalRevision: 7 });
+
+	assert.equal(decision.action.type, 'wait');
+	assert.deepEqual(workspaceCalls, [{ provider: 'gemini', agentId: 'gemini-a' }]);
+	assert.equal(spawnCalls[0].options.cwd, 'C:\\agents\\gemini\\gemini-a');
+	assert.equal(spawnCalls[0].args[0], '--print');
+	assert.match(spawnCalls[0].args[1], /strategic planner for one Minecraft player/);
+	assert.match(spawnCalls[0].args[1], /Previous movement timed out/);
+	assert.deepEqual(spawnCalls[0].args.slice(-5), [
+		'--model', 'gemini-3.1-pro-high', '--sandbox', '--print-timeout', '1s',
+	]);
+	await service.stop();
+});
+
+test('Antigravity rejects unsupported model-thinking combinations and profile conflicts', async () => {
+	const service = new AntigravityProviderService(config(), { spawn: successfulSpawner([]) });
+	await assert.rejects(
+		service.createAgent(profile({ model: 'missing' })),
+		(error) => error?.code === 'UNSUPPORTED_MODEL',
+	);
+	await assert.rejects(
+		service.createAgent(profile({ model: 'gemini-3.1-pro', reasoningEffort: 'medium' })),
+		(error) => error?.code === 'UNSUPPORTED_THINKING',
+	);
+	await service.createAgent(profile());
+	await assert.rejects(
+		service.createAgent(profile({ reasoningEffort: 'low' })),
+		(error) => error?.code === 'AGENT_PROFILE_CONFLICT',
+	);
+	await service.stop();
+});
+
+test('Antigravity interruption terminates the active process and rejects the turn', async () => {
+	const child = new FakeChild();
+	const terminated = [];
+	const service = new AntigravityProviderService(config(), {
+		spawn: () => child,
+		terminate: cancellingTerminator(terminated),
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(1);
+	const turn = agent.decide('state', { goalRevision: 1 });
+	await agent.interrupt();
+
+	await assert.rejects(turn, (error) => error?.code === 'PLAN_CANCELLED');
+	assert.deepEqual(terminated, [child]);
+	await service.stop();
+});
+
+test('Antigravity timeout terminates the process tree and reports PLANNING_TIMEOUT', async () => {
+	const child = new FakeChild();
+	const terminated = [];
+	const service = new AntigravityProviderService(config({ planningTimeoutMs: 5 }), {
+		spawn: () => child,
+		terminate: cancellingTerminator(terminated),
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(1);
+
+	await assert.rejects(
+		agent.decide('state', { goalRevision: 1 }),
+		(error) => error?.code === 'PLANNING_TIMEOUT',
+	);
+	assert.deepEqual(terminated, [child]);
+	await service.stop();
+});
+
+test('Antigravity output overflow is bounded and terminates the process', async () => {
+	const child = new FakeChild();
+	const terminated = [];
+	const service = new AntigravityProviderService(config({ stdoutLimitBytes: 8 }), {
+		spawn: () => {
+			queueMicrotask(() => child.stdout.emit('data', Buffer.from('too much output')));
+			return child;
+		},
+		terminate: cancellingTerminator(terminated),
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(1);
+
+	await assert.rejects(
+		agent.decide('state', { goalRevision: 1 }),
+		(error) => error?.code === 'OUTPUT_LIMIT_EXCEEDED',
+	);
+	assert.deepEqual(terminated, [child]);
+	await service.stop();
+});
+
+test('Antigravity nonzero exit preserves bounded diagnostics without returning a decision', async () => {
+	const service = new AntigravityProviderService(config(), {
+		spawn: () => {
+			const child = new FakeChild();
+			queueMicrotask(() => {
+				child.stderr.emit('data', Buffer.from('authentication required'));
+				child.exitCode = 1;
+				child.emit('close', 1, null);
+			});
+			return child;
+		},
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(1);
+
+	await assert.rejects(
+		agent.decide('state', { goalRevision: 1 }),
+		(error) => error?.code === 'PROVIDER_UNAVAILABLE' && error.message.includes('authentication required'),
+	);
+	await service.stop();
+});
+
+test('Antigravity fails closed before spawn when a Windows prompt is not safely representable', async () => {
+	let spawned = false;
+	const service = new AntigravityProviderService(config(), {
+		platform: 'win32',
+		spawn: () => {
+			spawned = true;
+			return new FakeChild();
+		},
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(1);
+
+	await assert.rejects(
+		agent.decide('x'.repeat(30_000), { goalRevision: 1 }),
+		(error) => error?.code === 'PROMPT_TOO_LARGE',
+	);
+	assert.equal(spawned, false);
+	await service.stop();
+});

@@ -1,6 +1,7 @@
 # Gradle and Java build outputs
 .gradle/
 build/
+dist/
 out/
 classes/
 bin/

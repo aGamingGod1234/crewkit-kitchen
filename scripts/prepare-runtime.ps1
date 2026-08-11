@@ -194,14 +194,20 @@ $eulaPath = Join-Path $Server 'eula.txt'
 if (-not (Test-Path -LiteralPath $eulaPath)) { [IO.File]::WriteAllText($eulaPath, "eula=true`n", $Utf8NoBom) }
 $propertiesPath = Join-Path $Server 'server.properties'
 if (-not (Test-Path -LiteralPath $propertiesPath)) {
-    [IO.File]::WriteAllText($propertiesPath, "online-mode=true`nserver-port=25565`nlevel-name=world`nenable-command-block=false`n", $Utf8NoBom)
+    [IO.File]::WriteAllText($propertiesPath, "online-mode=false`nserver-port=25565`nlevel-name=world`nenable-command-block=false`npause-when-empty-seconds=-1`n", $Utf8NoBom)
 } else {
     $properties = Get-Content -LiteralPath $propertiesPath -Raw
-    foreach ($requiredSetting in @('online-mode=true','server-port=25565','level-name=world')) {
+    foreach ($requiredSetting in @('online-mode=false','server-port=25565','level-name=world')) {
         if ($properties -notmatch "(?m)^$([regex]::Escape($requiredSetting))\r?$") {
             throw "Existing server.properties must contain $requiredSetting"
         }
     }
+    if ($properties -match '(?m)^pause-when-empty-seconds=.*\r?$') {
+        $properties = [regex]::Replace($properties, '(?m)^pause-when-empty-seconds=.*\r?$', 'pause-when-empty-seconds=-1')
+    } else {
+        $properties = $properties.TrimEnd("`r", "`n") + "`npause-when-empty-seconds=-1`n"
+    }
+    [IO.File]::WriteAllText($propertiesPath, $properties, $Utf8NoBom)
 }
 
 $buildEvidence = [ordered]@{

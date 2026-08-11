@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "dev.agaminggod.arenaagents.client.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "AbstractClientPlayerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

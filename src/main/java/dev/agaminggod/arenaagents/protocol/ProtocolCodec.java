@@ -39,6 +39,23 @@ public final class ProtocolCodec {
 	private static final String FIELD_FACE = "face";
 	private static final String FIELD_MESSAGE = "message";
 	private static final String FIELD_SUMMARY = "summary";
+	private static final String FIELD_OPEN = "open";
+	private static final String FIELD_SLOT = "slot";
+	private static final String FIELD_COUNT = "count";
+	private static final String FIELD_DESIRED_RANGE = "desiredRange";
+	private static final String FIELD_DISTANCE = "distance";
+	private static final String FIELD_SOURCE_KIND = "sourceKind";
+	private static final String FIELD_SOURCE_SLOT = "sourceSlot";
+	private static final String FIELD_DESTINATION_KIND = "destinationKind";
+	private static final String FIELD_DESTINATION_SLOT = "destinationSlot";
+	private static final String FIELD_EXPECTED_ITEM_ID = "expectedItemId";
+	private static final String FIELD_RECIPE_ID = "recipeId";
+	private static final String FIELD_OPERATION = "operation";
+	private static final String FIELD_INVENTORY_SLOT = "inventorySlot";
+	private static final String FIELD_TARGET_SLOT = "targetSlot";
+	private static final String FIELD_HOTBAR_SLOT = "hotbarSlot";
+	private static final String FIELD_MIN_REMAINING_DURABILITY = "minRemainingDurability";
+	private static final String FIELD_DRAW_DURATION_MS = "drawDurationMs";
 
 	private static final List<String> ENVELOPE_FIELDS = List.of(
 			FIELD_PROTOCOL_VERSION,
@@ -232,7 +249,7 @@ public final class ProtocolCodec {
 
 	private static ActionType requireActionType(JsonObject command) throws ProtocolException {
 		String wireName = requireString(command, FIELD_TYPE);
-		if (wireName.isBlank()) {
+		if (isProtocolBlank(wireName)) {
 			throw invalidField("Field '" + FIELD_TYPE + "' must not be blank");
 		}
 		return ActionType.fromWireName(wireName)
@@ -252,7 +269,7 @@ public final class ProtocolCodec {
 		}
 	}
 
-	static JsonObject validateActionArguments(ActionType actionType, JsonObject arguments)
+	public static JsonObject validateActionArguments(ActionType actionType, JsonObject arguments)
 			throws ProtocolException {
 		if (actionType == null) {
 			throw invalidField("Action type must not be null");
@@ -270,6 +287,25 @@ public final class ProtocolCodec {
 			case BREAK_BLOCK -> validateBreakBlock(arguments);
 			case PLACE_BLOCK -> validatePlaceBlock(arguments);
 			case CHAT -> requireBoundedText(arguments, FIELD_MESSAGE, ProtocolConstants.MAX_CHAT_LENGTH, false);
+			case SET_DOOR -> {
+				validateCoordinates(arguments, true);
+				requireBoolean(arguments, FIELD_OPEN);
+			}
+			case PICK_UP_ITEM -> requireBoundedText(
+					arguments, FIELD_TARGET_SELECTOR, ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH, false
+			);
+			case DROP_ITEM -> validateDropItem(arguments);
+			case NAVIGATE_TO -> validateNavigateTo(arguments);
+			case FIGHT_TARGET -> validateFightTarget(arguments);
+			case FLEE_FROM, FOLLOW_ENTITY -> validateRangedTargetAction(arguments);
+			case TRANSFER_CONTAINER -> validateTransferContainer(arguments);
+			case CRAFT_INVENTORY -> validateCraftInventory(arguments);
+			case CRAFT_TABLE -> validateCraftTable(arguments);
+			case FURNACE_TRANSACTION -> validateFurnaceTransaction(arguments);
+			case EQUIP_ITEM -> validateEquipItem(arguments);
+			case SELECT_TOOL -> validateSelectTool(arguments);
+			case BLOCK_WITH_SHIELD -> requireDuration(arguments, FIELD_DURATION_MS);
+			case USE_RANGED -> validateUseRanged(arguments);
 			case COMPLETE_GOAL -> requireBoundedText(
 					arguments,
 					FIELD_SUMMARY,
@@ -320,6 +356,33 @@ public final class ProtocolCodec {
 		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
+	private static void validateNavigateTo(JsonObject command) throws ProtocolException {
+		validateMoveTo(command);
+		requireDuration(command, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateFightTarget(JsonObject command) throws ProtocolException {
+		requireBoundedText(
+				command,
+				FIELD_TARGET_SELECTOR,
+				ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH,
+				false
+		);
+		requireFiniteRange(command, FIELD_DESIRED_RANGE, 1.0D, 6.0D);
+		requireDuration(command, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateRangedTargetAction(JsonObject command) throws ProtocolException {
+		requireBoundedText(
+				command,
+				FIELD_TARGET_SELECTOR,
+				ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH,
+				false
+		);
+		requireFiniteRange(command, FIELD_DISTANCE, 1.0D, 64.0D);
+		requireDuration(command, FIELD_TIMEOUT_MS);
+	}
+
 	private static void validateBreakBlock(JsonObject command) throws ProtocolException {
 		validateCoordinates(command, true);
 		requireDuration(command, FIELD_TIMEOUT_MS);
@@ -344,6 +407,106 @@ public final class ProtocolCodec {
 				requireFiniteNumber(command, field);
 			}
 		}
+	}
+
+	private static void validateDropItem(JsonObject arguments) throws ProtocolException {
+		long slot = requireIntegralLong(arguments, FIELD_SLOT);
+		long count = requireIntegralLong(arguments, FIELD_COUNT);
+		if (slot < 0L || slot > 35L) throw invalidField("Field 'slot' must be between 0 and 35");
+		if (count < 1L || count > 64L) throw invalidField("Field 'count' must be between 1 and 64");
+	}
+
+	private static void validateTransferContainer(JsonObject arguments) throws ProtocolException {
+		validateCoordinates(arguments, true);
+		requireOneOf(arguments, FIELD_SOURCE_KIND, List.of("player", "container"));
+		requireNonnegativeInt(arguments, FIELD_SOURCE_SLOT);
+		requireOneOf(arguments, FIELD_DESTINATION_KIND, List.of("player", "container"));
+		requireNonnegativeInt(arguments, FIELD_DESTINATION_SLOT);
+		requireStackCount(arguments);
+		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateCraftInventory(JsonObject arguments) throws ProtocolException {
+		requireIdentifier(arguments, FIELD_RECIPE_ID);
+		requireStackCount(arguments);
+		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateCraftTable(JsonObject arguments) throws ProtocolException {
+		requireIdentifier(arguments, FIELD_RECIPE_ID);
+		validateCoordinates(arguments, true);
+		requireStackCount(arguments);
+		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateFurnaceTransaction(JsonObject arguments) throws ProtocolException {
+		validateCoordinates(arguments, true);
+		requireOneOf(arguments, FIELD_OPERATION, List.of("insert_input", "insert_fuel", "take_output"));
+		requireNonnegativeInt(arguments, FIELD_INVENTORY_SLOT);
+		requireStackCount(arguments);
+		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateEquipItem(JsonObject arguments) throws ProtocolException {
+		requireInventorySlot(arguments, FIELD_SOURCE_SLOT);
+		requireOneOf(arguments, FIELD_TARGET_SLOT, List.of("head", "chest", "legs", "feet", "offhand"));
+		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+	}
+
+	private static void validateSelectTool(JsonObject arguments) throws ProtocolException {
+		requireInventorySlot(arguments, FIELD_SOURCE_SLOT);
+		requireIntegralRange(arguments, FIELD_HOTBAR_SLOT, 0L, 8L);
+		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+		requireNonnegativeInt(arguments, FIELD_MIN_REMAINING_DURABILITY);
+	}
+
+	private static void validateUseRanged(JsonObject arguments) throws ProtocolException {
+		requireBoundedText(arguments, FIELD_TARGET_SELECTOR, ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH, false);
+		requireDuration(arguments, FIELD_DRAW_DURATION_MS);
+		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static long requireStackCount(JsonObject arguments) throws ProtocolException {
+		return requireIntegralRange(arguments, FIELD_COUNT, 1L, 64L);
+	}
+
+	private static long requireInventorySlot(JsonObject arguments, String field) throws ProtocolException {
+		return requireIntegralRange(arguments, field, 0L, 35L);
+	}
+
+	private static long requireNonnegativeInt(JsonObject arguments, String field) throws ProtocolException {
+		return requireIntegralRange(arguments, field, 0L, Integer.MAX_VALUE);
+	}
+
+	private static long requireIntegralRange(JsonObject arguments, String field, long minimum, long maximum)
+			throws ProtocolException {
+		long value = requireIntegralLong(arguments, field);
+		if (value < minimum || value > maximum) throw outOfRange(field, minimum + " to " + maximum);
+		return value;
+	}
+
+	private static String requireOneOf(JsonObject arguments, String field, List<String> allowed)
+			throws ProtocolException {
+		String value = requireString(arguments, field);
+		if (!allowed.contains(value)) {
+			throw invalidField("Field '" + field + "' must be one of " + String.join(", ", allowed));
+		}
+		return value;
+	}
+
+	private static double requireFiniteRange(
+			JsonObject object,
+			String field,
+			double minimum,
+			double maximum
+	) throws ProtocolException {
+		double value = requireFiniteNumber(object, field);
+		if (value < minimum || value > maximum) {
+			throw outOfRange(field, minimum + " to " + maximum);
+		}
+		return value;
 	}
 
 	private static int requireIntegralBlockCoordinate(JsonObject object, String field) throws ProtocolException {
@@ -429,13 +592,31 @@ public final class ProtocolCodec {
 			boolean emptyAllowed
 	) throws ProtocolException {
 		String value = requireString(object, field);
-		if (!emptyAllowed && value.isBlank()) {
+		if (!emptyAllowed && isProtocolBlank(value)) {
 			throw invalidField("Field '" + field + "' must not be blank");
 		}
 		if (value.length() > maximumLength) {
 			throw outOfRange(field, "at most " + maximumLength + " characters");
 		}
 		return value;
+	}
+
+	private static boolean isProtocolBlank(String value) {
+		return value.codePoints().allMatch(ProtocolCodec::isProtocolWhitespace);
+	}
+
+	private static boolean isProtocolWhitespace(int codePoint) {
+		return (codePoint >= 0x0009 && codePoint <= 0x000d)
+				|| (codePoint >= 0x001c && codePoint <= 0x0020)
+				|| codePoint == 0x00a0
+				|| codePoint == 0x1680
+				|| (codePoint >= 0x2000 && codePoint <= 0x200a)
+				|| codePoint == 0x2028
+				|| codePoint == 0x2029
+				|| codePoint == 0x202f
+				|| codePoint == 0x205f
+				|| codePoint == 0x3000
+				|| codePoint == 0xfeff;
 	}
 
 	private static String requireString(JsonObject object, String field) throws ProtocolException {
@@ -509,6 +690,35 @@ public final class ProtocolCodec {
 		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID));
 		fields.put(ActionType.CHAT, List.of(FIELD_MESSAGE));
 		fields.put(ActionType.WAIT, List.of(FIELD_DURATION_MS));
+		fields.put(ActionType.SET_DOOR, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_OPEN));
+		fields.put(ActionType.PICK_UP_ITEM, List.of(FIELD_TARGET_SELECTOR));
+		fields.put(ActionType.DROP_ITEM, List.of(FIELD_SLOT, FIELD_COUNT));
+		fields.put(ActionType.NAVIGATE_TO, List.of(
+				FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT, FIELD_TIMEOUT_MS
+		));
+		fields.put(ActionType.FIGHT_TARGET, List.of(
+				FIELD_TARGET_SELECTOR, FIELD_DESIRED_RANGE, FIELD_TIMEOUT_MS
+		));
+		fields.put(ActionType.FLEE_FROM, List.of(FIELD_TARGET_SELECTOR, FIELD_DISTANCE, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.FOLLOW_ENTITY, List.of(FIELD_TARGET_SELECTOR, FIELD_DISTANCE, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.TRANSFER_CONTAINER, List.of(
+				FIELD_X, FIELD_Y, FIELD_Z, FIELD_SOURCE_KIND, FIELD_SOURCE_SLOT,
+				FIELD_DESTINATION_KIND, FIELD_DESTINATION_SLOT, FIELD_COUNT, FIELD_EXPECTED_ITEM_ID, FIELD_TIMEOUT_MS
+		));
+		fields.put(ActionType.CRAFT_INVENTORY, List.of(FIELD_RECIPE_ID, FIELD_COUNT, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.CRAFT_TABLE, List.of(
+				FIELD_RECIPE_ID, FIELD_X, FIELD_Y, FIELD_Z, FIELD_COUNT, FIELD_TIMEOUT_MS
+		));
+		fields.put(ActionType.FURNACE_TRANSACTION, List.of(
+				FIELD_X, FIELD_Y, FIELD_Z, FIELD_OPERATION, FIELD_INVENTORY_SLOT,
+				FIELD_COUNT, FIELD_EXPECTED_ITEM_ID, FIELD_TIMEOUT_MS
+		));
+		fields.put(ActionType.EQUIP_ITEM, List.of(FIELD_SOURCE_SLOT, FIELD_TARGET_SLOT, FIELD_EXPECTED_ITEM_ID));
+		fields.put(ActionType.SELECT_TOOL, List.of(
+				FIELD_SOURCE_SLOT, FIELD_HOTBAR_SLOT, FIELD_EXPECTED_ITEM_ID, FIELD_MIN_REMAINING_DURABILITY
+		));
+		fields.put(ActionType.BLOCK_WITH_SHIELD, List.of(FIELD_DURATION_MS));
+		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_SELECTOR, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.COMPLETE_GOAL, List.of(FIELD_SUMMARY));
 		return Map.copyOf(fields);
 	}

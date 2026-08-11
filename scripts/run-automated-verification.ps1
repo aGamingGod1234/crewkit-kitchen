@@ -25,4 +25,16 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Coordinator tests failed with code $LASTEXITCODE" }
 } finally { Pop-Location }
 
+$launcherInstaller = Get-Content -LiteralPath (Join-Path $Project 'scripts\install-launcher-profiles.ps1') -Raw
+foreach ($requiredContract in @(
+    'arenaagents.bridgeSecretFile',
+    'runtime\bridge-secret.txt',
+    'RandomNumberGenerator',
+    'LegacyJavaArgs'
+)) {
+    if ($launcherInstaller.IndexOf($requiredContract, [StringComparison]::Ordinal) -lt 0) {
+        throw "Launcher installer is missing the bridge-secret contract: $requiredContract"
+    }
+}
+
 Write-Host 'Automated Java, Fabric, coordinator, and fake-E2E verification passed.'

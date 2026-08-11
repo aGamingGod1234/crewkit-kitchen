@@ -1,9 +1,11 @@
 import { AgentState } from './agent-state.mjs';
+import { FactLedger } from './fact-ledger.mjs';
 import { buildPlannerInput } from './prompts.mjs';
 import { RetryPolicy } from './retry-policy.mjs';
 import { observationHash } from './trace-writer.mjs';
 
 const STUCK_FAILURE_THRESHOLD = 3;
+const RECOVERY_FAILURE_PATTERN = /STUCK|NO_PROGRESS|PATH_BLOCKED|NO_PATH|PATH_LIMIT/i;
 const RESTARTABLE_CODEX_FAILURES = new Set([
 	'PROCESS_EXITED',
 	'SPAWN_FAILED',
@@ -34,12 +36,14 @@ export class AgentRuntime {
 	#planningRevision = 0;
 	#retryHandle = null;
 	#stuckFailures = 0;
+	#factLedger;
 
-	constructor({ config, bridge, codex, traceWriter, retryPolicy, schedule, cancelSchedule }) {
+	constructor({ config, bridge, codex, traceWriter, retryPolicy, schedule, cancelSchedule, factLedger = new FactLedger() }) {
 		this.#config = requireConfig(config);
 		this.#bridge = requireDependency(bridge, 'bridge');
 		this.#codex = requireDependency(codex, 'codex');
 		this.#traceWriter = requireDependency(traceWriter, 'traceWriter');
+		this.#factLedger = requireDependency(factLedger, 'factLedger');
 		this.#retryPolicy = retryPolicy ?? new RetryPolicy();
 		this.#schedule = schedule ?? ((callback, delay) => setTimeout(callback, delay));
 		this.#cancelSchedule = cancelSchedule ?? clearTimeout;
@@ -117,6 +121,7 @@ export class AgentRuntime {
 				break;
 			case 'observation':
 				this.#observation = payload;
+				this.#factLedger.ingest('observation', payload);
 				this.#observationHash = observationHash(payload);
 				this.#pendingTrigger ??= 'observation';
 				await this.#maybePlan();
@@ -125,6 +130,7 @@ export class AgentRuntime {
 				await this.#handleActionResult(payload);
 				break;
 			case 'significant_event':
+				this.#factLedger.ingest('significant_event', payload);
 				this.#pendingTrigger = 'significant_event';
 				await this.#trace('significant_event', { result: payload });
 				await this.#maybePlan();
@@ -174,6 +180,7 @@ export class AgentRuntime {
 	}
 
 	async #handleActionResult(result) {
+		this.#factLedger.ingest('action_result', result);
 		if (this.#activeCommandId === null || result.commandId !== this.#activeCommandId) {
 			await this.#trace('unexpected_action_result', { result });
 			return;
@@ -182,7 +189,7 @@ export class AgentRuntime {
 		if (result.state === 'SUCCEEDED') {
 			this.#stuckFailures = 0;
 			this.#retryPolicy.reset();
-		} else if (typeof result.reasonCode === 'string' && /STUCK|NO_PROGRESS/i.test(result.reasonCode)) {
+		} else if (typeof result.reasonCode === 'string' && RECOVERY_FAILURE_PATTERN.test(result.reasonCode)) {
 			this.#stuckFailures += 1;
 		}
 		this.#state = this.#stuckFailures >= STUCK_FAILURE_THRESHOLD ? AgentState.RECOVERING : AgentState.IDLE;
@@ -203,7 +210,7 @@ export class AgentRuntime {
 			trigger,
 			observation: this.#observation,
 			recovery: { stuckFailures: this.#stuckFailures, active: this.#stuckFailures >= STUCK_FAILURE_THRESHOLD },
-		});
+		}, { untrustedFacts: this.#factLedger.toPlannerFacts() });
 		await this.#trace('planning_started');
 		this.#codex.decide(input).then(
 			(decision) => this.#enqueue(() => this.#handleDecision(revision, decision)),

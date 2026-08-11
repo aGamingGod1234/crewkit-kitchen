@@ -1,8 +1,9 @@
-import { MAX_SUMMARY_LENGTH } from './constants.mjs';
+import { ACTION_FIELDS, MAX_SUMMARY_LENGTH } from './constants.mjs';
 import { validateAction, ValidationError } from './schema.mjs';
 
 const GOAL_STATUSES = new Set(['in_progress', 'completed', 'impossible']);
 const DECISION_KEYS = new Set(['summary', 'goalStatus', 'action']);
+const NULLABLE_ACTION_FIELDS = new Set(Object.values(ACTION_FIELDS).flat());
 
 export class DecisionError extends Error {
 	constructor(code, message, options) {
@@ -28,7 +29,7 @@ export function parseDecision(text) {
 	if (!GOAL_STATUSES.has(value.goalStatus)) throw new DecisionError('INVALID_DECISION', `Unsupported goalStatus '${String(value.goalStatus)}'`);
 	let action;
 	try {
-		action = validateAction(value.action);
+		action = validateAction(compactStructuredAction(value.action));
 	} catch (error) {
 		if (error instanceof ValidationError) throw new DecisionError('INVALID_ACTION', error.message, { cause: error });
 		throw error;
@@ -36,6 +37,13 @@ export function parseDecision(text) {
 	const terminal = value.goalStatus !== 'in_progress';
 	if (terminal !== (action.type === 'complete_goal')) throw new DecisionError('STATUS_ACTION_MISMATCH', 'completed or impossible status must use complete_goal, and in_progress must not');
 	return { summary: value.summary, goalStatus: value.goalStatus, action };
+}
+
+function compactStructuredAction(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
+	return Object.fromEntries(Object.entries(value).filter(([field, fieldValue]) => (
+		fieldValue !== null || !NULLABLE_ACTION_FIELDS.has(field)
+	)));
 }
 
 function unwrapExactJson(text) {

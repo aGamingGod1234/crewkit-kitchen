@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
+import { DEFAULT_CHILD_STOP_TIMEOUT_MS, terminateChildProcess } from './child-process-lifecycle.mjs';
 import { JsonlDecoder, encodeJsonLine } from './jsonl.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
@@ -54,11 +55,13 @@ export class CodexStdioTransport extends EventEmitter {
 	#decoder = null;
 	#requestId = 0;
 	#pending = new Map();
+	#stopTimeoutMs;
 
 	constructor(config, dependencies = {}) {
 		super();
 		this.#config = config;
 		this.#spawn = dependencies.spawn ?? spawn;
+		this.#stopTimeoutMs = dependencies.stopTimeoutMs ?? DEFAULT_CHILD_STOP_TIMEOUT_MS;
 	}
 
 	async start() {
@@ -85,6 +88,7 @@ export class CodexStdioTransport extends EventEmitter {
 			const cleanup = () => { child.off('spawn', onSpawn); child.off('error', onError); };
 			child.once('spawn', onSpawn);
 			child.once('error', onError);
+			if (Number.isInteger(child.pid) && child.pid > 0) onSpawn();
 		});
 	}
 
@@ -95,6 +99,7 @@ export class CodexStdioTransport extends EventEmitter {
 			const timer = setTimeout(() => {
 				this.#pending.delete(id);
 				reject(new CodexProtocolError('REQUEST_TIMEOUT', `Codex request '${method}' timed out after ${timeoutMs} ms`));
+				void this.stop().catch((error) => this.emit('protocolError', error));
 			}, timeoutMs);
 			this.#pending.set(id, { method, resolve, reject, timer });
 			try {
@@ -117,13 +122,7 @@ export class CodexStdioTransport extends EventEmitter {
 		if (child === null) return;
 		this.#child = null;
 		this.#rejectPending(new CodexProtocolError('TRANSPORT_STOPPED', 'Codex app-server transport stopped'));
-		if (!child.killed) child.kill();
-		if (child.exitCode === null && child.signalCode === null) {
-			await Promise.race([
-				new Promise((resolve) => child.once('exit', resolve)),
-				new Promise((resolve) => setTimeout(resolve, 2_000)),
-			]);
-		}
+		await terminateChildProcess(child, { timeoutMs: this.#stopTimeoutMs });
 	}
 
 	#onStdout(child, chunk) {
@@ -132,7 +131,7 @@ export class CodexStdioTransport extends EventEmitter {
 			for (const message of this.#decoder.push(chunk)) this.#acceptMessage(message);
 		} catch (error) {
 			this.emit('protocolError', new CodexProtocolError(error.code ?? 'INVALID_RESPONSE', error.message, { cause: error }));
-			if (!child.killed) child.kill();
+			void this.stop().catch((stopError) => this.emit('protocolError', stopError));
 		}
 	}
 

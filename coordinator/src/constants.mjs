@@ -1,4 +1,5 @@
 export const PROTOCOL_VERSION = 1;
+export const MULTIPLEXED_PROTOCOL_VERSION = 2;
 export const MAX_LINE_BYTES = 65_536;
 export const MAX_COMMAND_ID_LENGTH = 128;
 export const MAX_CHAT_LENGTH = 256;
@@ -17,6 +18,13 @@ export const MAX_BLOCKS = 128;
 export const MAX_EFFECTS = 32;
 export const MAX_INVENTORY_SUMMARIES = 64;
 export const LOOPBACK_HOST = '127.0.0.1';
+export const DEFAULT_AGENT_CAP = 16;
+export const DEFAULT_GOAL_QUEUE_CAP = 16;
+export const DEFAULT_PLANNING_CONCURRENCY = 4;
+export const DEFAULT_SERVICE_TIER = 'priority';
+export const DEFAULT_CONNECTION_QUEUE_CAP = 256;
+export const DEFAULT_AGENT_MESSAGE_QUEUE_CAP = 32;
+export const MAX_BRIDGE_SECRET_LENGTH = 512;
 
 export const TERMINAL_ACTION_STATES = Object.freeze([
 	'SUCCEEDED',
@@ -35,6 +43,21 @@ export const ACTION_FIELDS = Object.freeze({
 	place_block: Object.freeze(['x', 'y', 'z', 'face', 'itemId']),
 	chat: Object.freeze(['message']),
 	wait: Object.freeze(['durationMs']),
+	set_door: Object.freeze(['x', 'y', 'z', 'open']),
+	pick_up_item: Object.freeze(['targetSelector']),
+	drop_item: Object.freeze(['slot', 'count']),
+	navigate_to: Object.freeze(['x', 'y', 'z', 'tolerance', 'sprint', 'timeoutMs']),
+	fight_target: Object.freeze(['targetSelector', 'desiredRange', 'timeoutMs']),
+	flee_from: Object.freeze(['targetSelector', 'distance', 'timeoutMs']),
+	follow_entity: Object.freeze(['targetSelector', 'distance', 'timeoutMs']),
+	transfer_container: Object.freeze(['x', 'y', 'z', 'sourceKind', 'sourceSlot', 'destinationKind', 'destinationSlot', 'count', 'expectedItemId', 'timeoutMs']),
+	craft_inventory: Object.freeze(['recipeId', 'count', 'timeoutMs']),
+	craft_table: Object.freeze(['recipeId', 'x', 'y', 'z', 'count', 'timeoutMs']),
+	furnace_transaction: Object.freeze(['x', 'y', 'z', 'operation', 'inventorySlot', 'count', 'expectedItemId', 'timeoutMs']),
+	equip_item: Object.freeze(['sourceSlot', 'targetSlot', 'expectedItemId']),
+	select_tool: Object.freeze(['sourceSlot', 'hotbarSlot', 'expectedItemId', 'minRemainingDurability']),
+	block_with_shield: Object.freeze(['durationMs']),
+	use_ranged: Object.freeze(['targetSelector', 'drawDurationMs', 'timeoutMs']),
 	complete_goal: Object.freeze(['summary']),
 });
 

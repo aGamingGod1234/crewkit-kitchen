@@ -2,6 +2,10 @@ package dev.agaminggod.arenaagents.verification;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import dev.agaminggod.arenaagents.agent.AgentRegistryVerification;
+import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
+import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
+import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupStateVerification;
 import dev.agaminggod.arenaagents.client.action.ActionExecutorVerification;
 import dev.agaminggod.arenaagents.client.action.CombatInteractionVerification;
 import dev.agaminggod.arenaagents.client.action.MinecraftActionContextVerification;
@@ -25,6 +29,7 @@ import dev.agaminggod.arenaagents.client.navigation.LocalPathfinderVerification;
 import dev.agaminggod.arenaagents.client.navigation.NavigationMovementVerification;
 import dev.agaminggod.arenaagents.client.navigation.MinecraftWalkabilityViewVerification;
 import dev.agaminggod.arenaagents.client.network.GoalReceiverVerification;
+import dev.agaminggod.arenaagents.control.AgentControlVerification;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
 import dev.agaminggod.arenaagents.protocol.ActionState;
@@ -33,6 +38,31 @@ import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.GoalControlVerification;
+import dev.agaminggod.arenaagents.server.AgentModelArgumentVerification;
+import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
+import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerification;
+import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodecVerification;
+import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusVerification;
+import dev.agaminggod.arenaagents.server.perception.BlockObservationOrderingVerification;
+import dev.agaminggod.arenaagents.server.perception.InventoryObservationSlotsVerification;
+import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerification;
+import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
+import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
+import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVerification;
+import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostconditionVerification;
+import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionProtocolVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerPathPlannerVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.NavigationProgressVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.CombatPolicyVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.CombatNavigationFailureVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.SurvivalReflexVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioCoreVerification;
+import dev.agaminggod.arenaagents.scenario.ArenaSpectatorSnapshotVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRuntimeVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioMatchResultVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioPreflightVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioRecoveryVerification;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -90,6 +120,36 @@ public final class VerificationMain {
 		passedAssertions += NavigationMovementVerification.verify();
 		passedAssertions += MinecraftWalkabilityViewVerification.verify();
 		passedAssertions += GoalControlVerification.verify();
+		passedAssertions += AgentModelArgumentVerification.verify();
+		passedAssertions += AgentSpawnPlacementVerification.verify();
+		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();
+		passedAssertions += AgentRegistryVerification.verify();
+		passedAssertions += AgentControlVerification.verify();
+		passedAssertions += BlockObservationOrderingVerification.verify();
+		passedAssertions += InventoryObservationSlotsVerification.verify();
+		passedAssertions += ActionProgressTrackerVerification.verify();
+		passedAssertions += BlockPlacementPostconditionVerification.verify();
+		passedAssertions += ResourceLeaseManagerVerification.verify();
+		passedAssertions += TransactionProtocolVerification.verify();
+		passedAssertions += TransactionPostconditionVerification.verify();
+		passedAssertions += EquipmentAndUseVerification.verify();
+		passedAssertions += ServerActionExecutorVerification.verify();
+		passedAssertions += ServerPathPlannerVerification.verify();
+		passedAssertions += NavigationProgressVerification.verify();
+		passedAssertions += CombatPolicyVerification.verify();
+		passedAssertions += CombatNavigationFailureVerification.verify();
+		passedAssertions += SurvivalReflexVerification.verify();
+		passedAssertions += ScenarioCoreVerification.verify();
+		passedAssertions += ScenarioLaunchRuntimeVerification.verify();
+		passedAssertions += ScenarioMatchResultVerification.verify();
+		passedAssertions += ScenarioPreflightVerification.verify();
+		passedAssertions += ScenarioRecoveryVerification.verify();
+		passedAssertions += ArenaSpectatorSnapshotVerification.verify();
+		passedAssertions += ArenaSpectatorStateVerification.verify();
+		passedAssertions += ArenaAgentsClientBootstrapVerification.verify();
+		passedAssertions += ScenarioSetupStateVerification.verify();
+		passedAssertions += BridgeEnvelopeCodecVerification.verify();
+		passedAssertions += CoordinatorStatusVerification.verify();
 		passedAssertions += GoalReceiverVerification.verify();
 		verifyObservationContracts(codec);
 		ObservationCollectorVerification.verifyLoadedChunkBoundary();
@@ -136,6 +196,21 @@ public final class VerificationMain {
 				"place_block",
 				"chat",
 				"wait",
+				"set_door",
+				"pick_up_item",
+				"drop_item",
+				"navigate_to",
+				"fight_target",
+				"flee_from",
+				"follow_entity",
+				"transfer_container",
+				"craft_inventory",
+				"craft_table",
+				"furnace_transaction",
+				"equip_item",
+				"select_tool",
+				"block_with_shield",
+				"use_ranged",
 				"complete_goal"
 		);
 		List<String> actualWireNames = List.of(ActionType.values()).stream()
@@ -158,6 +233,13 @@ public final class VerificationMain {
 		assertDecodedType(codec, "place_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:stone\"", ActionType.PLACE_BLOCK);
 		assertDecodedType(codec, "chat", "\"message\":\"Ready.\"", ActionType.CHAT);
 		assertDecodedType(codec, "wait", "\"durationMs\":250", ActionType.WAIT);
+		assertDecodedType(codec, "set_door", "\"x\":1,\"y\":64,\"z\":-2,\"open\":true", ActionType.SET_DOOR);
+		assertDecodedType(codec, "pick_up_item", "\"targetSelector\":\"minecraft:item\"", ActionType.PICK_UP_ITEM);
+		assertDecodedType(codec, "drop_item", "\"slot\":0,\"count\":1", ActionType.DROP_ITEM);
+		assertDecodedType(codec, "navigate_to", "\"x\":10,\"y\":64,\"z\":-5,\"tolerance\":1.25,\"sprint\":true,\"timeoutMs\":30000", ActionType.NAVIGATE_TO);
+		assertDecodedType(codec, "fight_target", "\"targetSelector\":\"nearest_hostile\",\"desiredRange\":2.5,\"timeoutMs\":15000", ActionType.FIGHT_TARGET);
+		assertDecodedType(codec, "flee_from", "\"targetSelector\":\"last_attacker\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
+		assertDecodedType(codec, "follow_entity", "\"targetSelector\":\"player:Lucas\",\"distance\":3,\"timeoutMs\":30000", ActionType.FOLLOW_ENTITY);
 		assertDecodedType(codec, "complete_goal", "\"summary\":\"Reached the arena.\"", ActionType.COMPLETE_GOAL);
 	}
 

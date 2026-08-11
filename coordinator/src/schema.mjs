@@ -47,11 +47,76 @@ export function validateAction(value) {
 			requireFiniteRange(action.tolerance, 'action.tolerance', MIN_MOVEMENT_TOLERANCE, MAX_MOVEMENT_TOLERANCE);
 			requireBoolean(action.sprint, 'action.sprint');
 			break;
+		case 'navigate_to':
+			requireCoordinates(action, false, 'action');
+			requireFiniteRange(action.tolerance, 'action.tolerance', MIN_MOVEMENT_TOLERANCE, MAX_MOVEMENT_TOLERANCE);
+			requireBoolean(action.sprint, 'action.sprint');
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
 		case 'look_at':
 			requireCoordinates(action, false, 'action');
 			break;
 		case 'attack':
 			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'fight_target':
+			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
+			requireFiniteRange(action.desiredRange, 'action.desiredRange', 1, 6);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'flee_from':
+		case 'follow_entity':
+			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
+			requireFiniteRange(action.distance, 'action.distance', 1, 64);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'transfer_container':
+			requireCoordinates(action, true, 'action');
+			requireOneOf(action.sourceKind, 'action.sourceKind', ['player', 'container']);
+			requireIntRange(action.sourceSlot, 'action.sourceSlot', 0, INTEGER_MAX);
+			requireOneOf(action.destinationKind, 'action.destinationKind', ['player', 'container']);
+			requireIntRange(action.destinationSlot, 'action.destinationSlot', 0, INTEGER_MAX);
+			requireIntRange(action.count, 'action.count', 1, 64);
+			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'craft_inventory':
+			requireText(action.recipeId, 'action.recipeId', MAX_IDENTIFIER_LENGTH);
+			requireIntRange(action.count, 'action.count', 1, 64);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'craft_table':
+			requireText(action.recipeId, 'action.recipeId', MAX_IDENTIFIER_LENGTH);
+			requireCoordinates(action, true, 'action');
+			requireIntRange(action.count, 'action.count', 1, 64);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'furnace_transaction':
+			requireCoordinates(action, true, 'action');
+			requireOneOf(action.operation, 'action.operation', ['insert_input', 'insert_fuel', 'take_output']);
+			requireIntRange(action.inventorySlot, 'action.inventorySlot', 0, INTEGER_MAX);
+			requireIntRange(action.count, 'action.count', 1, 64);
+			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'equip_item':
+			requireIntRange(action.sourceSlot, 'action.sourceSlot', 0, 35);
+			requireOneOf(action.targetSlot, 'action.targetSlot', ['head', 'chest', 'legs', 'feet', 'offhand']);
+			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+			break;
+		case 'select_tool':
+			requireIntRange(action.sourceSlot, 'action.sourceSlot', 0, 35);
+			requireIntRange(action.hotbarSlot, 'action.hotbarSlot', 0, 8);
+			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+			requireIntRange(action.minRemainingDurability, 'action.minRemainingDurability', 0, INTEGER_MAX);
+			break;
+		case 'block_with_shield':
+			requireDuration(action.durationMs, 'action.durationMs');
+			break;
+		case 'use_ranged':
+			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
+			requireDuration(action.drawDurationMs, 'action.drawDurationMs');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'select_item':
@@ -72,6 +137,19 @@ export function validateAction(value) {
 			break;
 		case 'chat':
 			requireText(action.message, 'action.message', MAX_CHAT_LENGTH);
+			break;
+		case 'set_door':
+			requireCoordinates(action, true, 'action');
+			requireBoolean(action.open, 'action.open');
+			break;
+		case 'pick_up_item':
+			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
+			break;
+		case 'drop_item':
+			requireInt32(action.slot, 'action.slot');
+			requireInt32(action.count, 'action.count');
+			if (action.slot < 0 || action.slot > 35) throw invalid('INVALID_FIELD', 'action.slot must be between 0 and 35');
+			if (action.count < 1 || action.count > 64) throw invalid('INVALID_FIELD', 'action.count must be between 1 and 64');
 			break;
 		case 'complete_goal':
 			requireText(action.summary, 'action.summary', MAX_SUMMARY_LENGTH);
@@ -283,9 +361,27 @@ function requireKeys(value, expected, path) {
 
 function requireText(value, path, maximum, emptyAllowed = false) {
 	if (typeof value !== 'string') throw invalid('INVALID_FIELD', `${path} must be a string`);
-	if (!emptyAllowed && value.trim().length === 0) throw invalid('INVALID_FIELD', `${path} must not be blank`);
+	if (!emptyAllowed && isProtocolBlank(value)) throw invalid('INVALID_FIELD', `${path} must not be blank`);
 	if (value.length > maximum) throw invalid('OUT_OF_RANGE', `${path} must contain at most ${maximum} characters`);
 	return value;
+}
+
+function isProtocolBlank(value) {
+	return [...value].every((character) => isProtocolWhitespace(character.codePointAt(0)));
+}
+
+function isProtocolWhitespace(codePoint) {
+	return (codePoint >= 0x0009 && codePoint <= 0x000d)
+		|| (codePoint >= 0x001c && codePoint <= 0x0020)
+		|| codePoint === 0x00a0
+		|| codePoint === 0x1680
+		|| (codePoint >= 0x2000 && codePoint <= 0x200a)
+		|| codePoint === 0x2028
+		|| codePoint === 0x2029
+		|| codePoint === 0x202f
+		|| codePoint === 0x205f
+		|| codePoint === 0x3000
+		|| codePoint === 0xfeff;
 }
 
 function requireBoolean(value, path) {
@@ -308,6 +404,15 @@ function requireFiniteRange(value, path, minimum, maximum) {
 
 function requireInt32(value, path) {
 	if (!Number.isInteger(value) || value < INTEGER_MIN || value > INTEGER_MAX) throw invalid('OUT_OF_RANGE', `${path} must be a 32-bit integer`);
+}
+
+function requireIntRange(value, path, minimum, maximum) {
+	requireInt32(value, path);
+	if (value < minimum || value > maximum) throw invalid('OUT_OF_RANGE', `${path} must be between ${minimum} and ${maximum}`);
+}
+
+function requireOneOf(value, path, allowed) {
+	if (typeof value !== 'string' || !allowed.includes(value)) throw invalid('INVALID_FIELD', `${path} must be one of ${allowed.join(', ')}`);
 }
 
 function requireSafeInteger(value, path) {

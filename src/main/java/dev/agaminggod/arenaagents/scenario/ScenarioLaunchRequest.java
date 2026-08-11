@@ -1,0 +1,36 @@
+package dev.agaminggod.arenaagents.scenario;
+
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
+
+public record ScenarioLaunchRequest(
+		String scenarioId,
+		String mapVersion,
+		boolean deterministicEvents,
+		List<ScenarioAgentSpec> roster
+) {
+	public ScenarioLaunchRequest {
+		ScenarioPreset preset = ScenarioPresets.require(scenarioId);
+		scenarioId = preset.id();
+		mapVersion = Objects.requireNonNull(mapVersion, "mapVersion must not be null").trim();
+		if (!preset.mapVersion().equals(mapVersion)) {
+			throw new IllegalArgumentException("scenario map version does not match the installed preset");
+		}
+		roster = List.copyOf(Objects.requireNonNull(roster, "roster must not be null"));
+		preset.validateAgentCount(roster.size());
+		HashSet<Integer> slots = new HashSet<>();
+		for (ScenarioAgentSpec agent : roster) {
+			Objects.requireNonNull(agent, "roster must not contain null");
+			if (!slots.add(agent.slot())) {
+				throw new IllegalArgumentException("scenario roster slots must be unique");
+			}
+			if (!"CONFIGURABLE".equals(preset.requiredGameMode())
+					&& !preset.requiredGameMode().equals(agent.gameMode().name())) {
+				throw new IllegalArgumentException(
+						preset.title() + " requires " + preset.requiredGameMode() + " game mode"
+				);
+			}
+		}
+	}
+}

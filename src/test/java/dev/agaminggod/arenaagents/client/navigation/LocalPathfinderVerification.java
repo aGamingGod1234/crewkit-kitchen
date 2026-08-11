@@ -18,6 +18,7 @@ public final class LocalPathfinderVerification {
 		int assertions = 0;
 		assertions += verifyFlatPath();
 		assertions += verifyOneBlockJump();
+		assertions += verifySingleBlockGapJump();
 		assertions += verifySafeThreeBlockDrop();
 		assertions += verifyWallHasNoPath();
 		assertions += verifyUnsafeDropHasNoPath();
@@ -63,6 +64,21 @@ public final class LocalPathfinderVerification {
 		assertEquals(PathOutcome.FOUND, plan.outcome(), "one-block jump outcome");
 		assertEquals(2, plan.nodes().size(), "one-block jump node count");
 		assertEquals(TraversalType.JUMP_UP, plan.nodes().getLast().traversal(), "one-block jump traversal");
+		return 3;
+	}
+
+	private static int verifySingleBlockGapJump() {
+		TestWorld world = new TestWorld()
+				.standable(position(0, 64, 0))
+				.standable(position(2, 64, 0));
+		world.cell(position(1, 64, 0), WalkabilityView.Cell.CLEAR);
+		world.cell(position(1, 65, 0), WalkabilityView.Cell.CLEAR);
+		world.cell(position(0, 66, 0), WalkabilityView.Cell.CLEAR);
+
+		PathPlan plan = find(world, position(0, 64, 0), position(2, 64, 0));
+		assertEquals(PathOutcome.FOUND, plan.outcome(), "single-block gap jump outcome");
+		assertEquals(2, plan.nodes().size(), "single-block gap jump node count");
+		assertEquals("JUMP_GAP", plan.nodes().getLast().traversal().name(), "single-block gap traversal");
 		return 3;
 	}
 

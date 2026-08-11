@@ -1,3 +1,122 @@
+## 2026-07-22 — Headless Minecraft repair and end-to-end verification
+
+### What Was Implemented
+- Fixed the Java bridge compile constant, deterministic coordinator test synchronization, directional protocol fixture, nullable persistence serialization, and Windows PowerShell 5.1 secret generation.
+- Negotiated the live Codex catalog correctly: dynamic agents use the supported `priority` app-server service tier while retaining the separate Fast launcher profile.
+- Replaced the rejected planner `oneOf` output schema with an API-compatible fixed nullable action schema, then compacted and strictly validated it before execution.
+- Kept summoned agents executable without nearby players by adding reference-counted, moving chunk simulation tickets that are released on movement, death, removal, and shutdown.
+- Converted missing-entity action rejection into a terminal failed action result instead of allowing the bridge task to throw and leave the goal stuck.
+- Disabled empty-server pausing only in the isolated headless runtime so multi-turn verification remains deterministic without a connected player.
+- Ran a live authenticated headless lifecycle through the local Codex OAuth/app-server bridge: persisted agent reload, two agents sharing one chunk, peer removal, exact model-authored chat, goal clearing, second reload, registry cleanup, graceful shutdown, and closed-port verification.
+
+### Files Modified
+- `src/main/java/dev/agaminggod/arenaagents/server/CodexAgentManager.java` — manages reference-counted moving chunk tickets for persistent agents.
+- `src/main/java/dev/agaminggod/arenaagents/server/CodexAgentServerRuntime.java` — maintains agent chunk tickets during server ticks.
+- `src/main/java/dev/agaminggod/arenaagents/server/runtime/ServerActionExecutor.java` — reports unloaded-entity action failures without wedging the bridge.
+- `src/main/java/dev/agaminggod/arenaagents/server/bridge/MultiplexedServerBridge.java` and `src/main/java/dev/agaminggod/arenaagents/agent/AgentRegistrySnapshotCodec.java` — compile and nullable-persistence repairs.
+- `coordinator/src/constants.mjs`, `coordinator/src/model-catalog-cache.mjs`, `coordinator/src/codex-service.mjs`, `coordinator/src/dynamic-main.mjs`, and `coordinator/config/dynamic-agents.json` — supported live service-tier defaults.
+- `coordinator/src/prompts.mjs` and `coordinator/src/decision-parser.mjs` — app-server-compatible structured output and strict post-compaction validation.
+- `coordinator/test/*.test.mjs` — timing, protocol, catalog, service-tier, and structured-output regressions.
+- `scripts/start-test-server.ps1`, `scripts/start-dynamic-coordinator.ps1`, and `scripts/prepare-runtime.ps1` — PowerShell 5.1-safe secrets and deterministic headless server behavior.
+- `PROJECT_LOG.md` — final repair and verification evidence.
+
+### Assumptions Made (flag these for review)
+- The copied online-mode dedicated server remains the correct non-destructive runtime target; the original Minecraft world was not launched or modified.
+- A completed goal is correctly represented by the persistent lifecycle as `IDLE`, a newer revision, and `goal=none` after the transient completion transition.
+- A radius-two non-persistent simulation ticket is sufficient for continuous agent navigation while avoiding permanent vanilla forced-chunk changes.
+
+### Known Issues / Deferred
+- Client-only rendering, skins, and visible name tags cannot be observed in a headless dedicated server and still require one normal client launch for visual acceptance.
+- The copied source world contains stale Axiom gamerule keys; Minecraft logs one non-fatal load warning because Axiom is not installed, but the server and agent lifecycle continue normally.
+- Container crafting, furnace transactions, and arbitrary mod-specific interactions remain outside the current bounded server action catalog.
+
+### Suggested Next Steps
+- Launch one normal Fabric client against the isolated server to visually accept the four skins and model/reasoning name tags.
+- Package the verified JAR, coordinator, configuration, and launcher scripts as the distributable mod-pack archive.
+
+## 2026-07-22 — First headless build and runtime-readiness test
+
+### What Was Implemented
+- Ran the project-local Java/Fabric build entrypoint and the independent Node coordinator suite after the user opened the runtime-testing phase.
+- Confirmed the local prerequisites: Temurin Java 25.0.3, Node 25.2.1, Codex CLI 0.144.0, and an authenticated ChatGPT OAuth session.
+- Classified the coordinator failures by tracing their assertions to production code: the protocol test incorrectly treats bidirectional `heartbeat` as directional, while the FIFO scheduler test assumes a fixed number of promise microtasks under Node 25.
+
+### Files Modified
+- `PROJECT_LOG.md` — recorded the first real build/test evidence and the resulting headless-launch stop condition.
+
+### Assumptions Made (flag these for review)
+- No stale previously built mod JAR was treated as evidence for the newly implemented source.
+
+### Known Issues / Deferred
+- `compileJava` fails at `MultiplexedServerBridge.java:416-419` because `AgentConstants.MAX_GOAL_LENGTH` does not exist; no Java tests or fresh mod packaging can run until that reference is corrected.
+- Coordinator tests report 69 passed and 2 failed. The two failures are test-contract/timing defects identified above, but the suite is not green.
+- The headless dedicated server was deliberately not launched with the stale runtime JAR, so command registration, persistence, bridge connection, and agent behavior remain unverified.
+- Client-only rendering, skins, and visible name tags cannot be verified in a headless dedicated server.
+
+### Suggested Next Steps
+- Correct the compile constant and the two coordinator tests, rerun the complete verification script, install the fresh mod JAR into the isolated runtime, then launch the dedicated server and exercise `/codex summon`, lifecycle, persistence, coordinator connection, and a bounded goal through the console.
+
+## 2026-07-22 — Summonable Codex NPC mod-pack implementation
+
+### What Was Implemented
+- Added persistent custom humanoid Codex NPC entities, renderer registration, four original interlocking-mark skin variants, model/reasoning name tags, inventories, lifecycle state, death reconciliation, and manual respawn.
+- Added `/codex summon`, `start`, `stop`, `resume`, `respawn`, `queue`, `steer`, `status`, `list`, and `remove`; bare summon defaults to `gpt-5.6-sol` with `high` reasoning.
+- Added the authenticated loopback protocol-v2 bridge, dynamic multi-agent coordinator, shared Codex app-server transport, per-agent Codex threads, fair planning scheduler, catalog validation, revision/action replay protection, and safe interruption handling.
+- Added server-authoritative observation and execution for navigation, look, attack, select/use item, break/place, doors, pickup/drop, chat, wait, and goal completion with explicit terminal results.
+- Closed the final static-review defects: strict action-type decoding, action-construction rollback, target-position placement protection and collision checks, transactional item-drop rollback, and deterministic bridge thread interruption.
+- Completed static-only verification: 117 Java sources passed a comment/string-aware delimiter scan, 39 JavaScript modules and 7 PowerShell scripts parsed, 4 JSON files and 5 PNG assets validated, mapped placement API signatures were confirmed from the local Minecraft 26.1.2 cache, and `git diff --check` passed.
+- Added isolated runtime launchers and secret handling, client/server assets, protocol/domain verification sources, implementation documentation, and preserved the legacy two-client arena mode.
+
+### Files Modified
+- `src/main/java/dev/agaminggod/arenaagents/agent/**` — persistent NPC domain, entity, lifecycle, validation, and codecs.
+- `src/main/java/dev/agaminggod/arenaagents/server/**` — commands, manager, SavedData, bridge, observations, executor, leases, protection policy, death/respawn runtime.
+- `src/client/java/dev/agaminggod/arenaagents/client/**` — entity renderer and legacy-client compatibility.
+- `src/main/resources/**` — mod metadata, language, icon, and four generated NPC skins.
+- `coordinator/src/**`, `coordinator/test/**`, `coordinator/config/dynamic-agents.json`, `coordinator/package.json` — dynamic coordinator, exact wire schemas, catalog, scheduler, Codex service, planner, configuration, and regression sources.
+- `scripts/start-test-server.ps1`, `scripts/start-dynamic-coordinator.ps1`, `scripts/generate-agent-skins.mjs` — shared-secret startup and deterministic asset generation.
+- `README.md`, `runtime/README.md`, `docs/summonable-codex-agents-implementation-plan.md`, `PROJECT_LOG.md` — operator and implementation documentation.
+
+### Assumptions Made (flag these for review)
+- The confirmed defaults are `gpt-5.6-sol`, `high`, Fast service tier, four planning turns at once, 16 persistent agents, and 32 queued goals per agent.
+- `/codex` remains operator/single-player controlled through the existing `GoalControl::mayControl` permission boundary.
+- Original AI-generated interlocking marks are used instead of copying an official OpenAI trademark asset.
+- The trusted local operator protection policy permits mutations in this isolated pack; integrations for protected third-party servers must inject a stricter policy.
+
+### Known Issues / Deferred
+- Per the user boundary, no Gradle build, automated test suite, Minecraft launch, Codex launch, or gameplay test has run yet; current evidence is static syntax, lexical, contract, and diff auditing only.
+- Container transfers, recipe crafting, furnace transactions, and forced chunk tickets remain explicit fail-closed capabilities pending exact Minecraft 26.1.2 runtime/API validation.
+- Live model/reasoning command suggestions are not yet exposed; invalid profiles are rejected against the loaded Codex catalog at summon time.
+- Runtime validation is still required for Fabric mappings, entity rendering, persistence reload, OAuth/app-server negotiation, multiplayer protection behavior, and long-running concurrency.
+
+### Suggested Next Steps
+- Open the next phase by running the build and automated suites, fixing compile/API issues, then launch only the isolated copied-world runtime.
+- Perform sequential command/entity/persistence checks before enabling multiple concurrent Codex NPCs or protected-server integration.
+
+## 2026-07-22 — Summonable Codex NPC architecture and protocol audit
+
+### What Was Implemented
+- Audited the fixed two-client Fabric/Codex architecture against the confirmed custom humanoid NPC mod-pack requirements.
+- Defined the server-authoritative entity, lifecycle, command, persistence, rendering, dynamic coordinator, planning scheduler, protocol-v2, action, observation, security, and failure-recovery contracts.
+- Recorded a phased implementation and static verification plan while preserving the explicit boundary against launching Minecraft, launching Codex, building, or running tests.
+
+### Files Modified
+- `docs/summonable-codex-agents-implementation-plan.md` — records the approved product contract, static gap audit, target architecture, protocol, phases, risks, and definition of done.
+- `PROJECT_LOG.md` — records this architecture/audit task and its deferred implementation boundary.
+
+### Assumptions Made (flag these for review)
+- The user explicitly approved the recommended custom humanoid NPC architecture and all proposed defaults, including Minecraft 26.1.2, operator-only commands, a configurable default cap of 16 agents, four concurrent Codex planning turns, persistence, survival interactions, and original OpenAI-inspired textures.
+- The target coordinator uses one shared local Codex app-server process with isolated per-agent threads; the current static API path supplies per-turn model and reasoning fields, but live multi-thread behavior remains unverified by instruction.
+
+### Known Issues / Deferred
+- No production code or assets have been added yet.
+- No build, automated test, Minecraft launch, Codex launch, or live protocol test was performed.
+- Custom entity compatibility with vanilla player-only container/recipe/protection APIs requires adapter-level implementation and later runtime verification.
+- The existing two-client comparison implementation remains present and must not be removed without explicit authorization.
+
+### Suggested Next Steps
+- Approve Phase 1 implementation of protocol-v2 contracts, the persistent agent record, lifecycle reducer, revision invariants, scheduler contract, and dependency-free static verification.
+- Keep Minecraft/Codex launch and live integration work deferred until the user explicitly opens Phase 7.
+
 ## 2026-07-13 — Task 4 bounded observation review fixes
 
 ### What Was Implemented
@@ -540,3 +659,186 @@
 
 ### Suggested Next Steps
 - When live testing is authorized, start the authenticated server and coordinator, launch each isolated profile sequentially, exercise goal/stop/status and action traces, then use two licensed accounts for the simultaneous fight.
+
+## 2026-07-23 — Gemini CLI and Kimi CLI provider support
+
+### What Was Implemented
+- Added provider-aware summon profiles for `codex`, `gemini`, and `kimi` while preserving legacy Codex command and snapshot compatibility.
+- Added persistent, cancellable ACP planner sessions for Gemini CLI and Kimi CLI with strict model/thinking validation, denied tool permissions, bounded timeouts, and the existing Minecraft decision schema.
+- Isolated each Kimi NPC process with `KIMI_MODEL_THINKING_EFFORT`, supporting exact K3 `low`, `high`, and `max` settings without copying OAuth credentials.
+- Added provider-aware bridge catalogs, registry persistence, entity synchronization, command routing, and Gemini/Kimi-themed skin variants.
+
+### Files Modified
+- `coordinator/src/acp-transport.mjs`, `coordinator/src/acp-service.mjs`, `coordinator/src/provider-service.mjs` — ACP transport, provider sessions, and backend routing.
+- `coordinator/src/agent-registry.mjs`, `coordinator/src/agent-planner.mjs`, `coordinator/src/codex-service.mjs`, `coordinator/src/dynamic-main.mjs`, `coordinator/src/protocol-v2.mjs`, `coordinator/config/dynamic-agents.json` — provider-aware persistence, planning, configuration, and wire protocol.
+- `coordinator/test/acp-service.test.mjs`, `coordinator/test/provider-service.test.mjs`, `coordinator/test/agent-registry.test.mjs` — provider lifecycle, cancellation, isolation, and legacy migration coverage.
+- `src/main/java/dev/agaminggod/arenaagents/agent/**`, `src/main/java/dev/agaminggod/arenaagents/server/**`, `src/client/java/dev/agaminggod/arenaagents/client/render/**` — provider profile storage, commands, bridge validation, entity sync, and rendering.
+- `scripts/generate-agent-skins.mjs`, `src/main/resources/assets/arenaagents/textures/entity/**` — deterministic Codex, Gemini, and Kimi texture generation.
+- `README.md`, `runtime/README.md`, `PROJECT_LOG.md` — commands, runtime topology, provider limits, and verification notes.
+
+### Verification Evidence
+- Test-first red checks failed on the missing ACP modules, absent provider migration, missing Java profile field, missing recovery context, and the slash-bearing `kimi-code/k3` command token before their implementations were added.
+- Full automated verification passed with 4,722 Java/Fabric protocol and bridge assertions plus 79 Node coordinator tests, with zero failures, skips, or cancellations.
+- Live no-prompt ACP checks created Kimi K3 sessions at `low`, `high`, and `max` using the existing login. Gemini ACP initialization succeeded, while `session/new` returned the installed CLI's individual-account migration error and was surfaced as `PROVIDER_UNAVAILABLE`.
+- A real headless Minecraft server and dynamic coordinator accepted unquoted `/codex summon kimi kimi-code/k3 high KimiCheck2` and `/codex summon gemini auto high GeminiCheck2`. One real Kimi goal completed from `STARTING` to `IDLE` at revision 2; both agents were removed and the server exited with code 0.
+- Runtime preparation rebuilt and copied the provider-enabled JAR into the isolated server and both official-launcher game directories while re-verifying the existing copied world.
+
+### Assumptions Made (flag these for review)
+- Gemini model `auto` means retain the CLI session's configured model; an explicit Gemini model must be advertised by the ACP session before it is accepted.
+- Kimi K3 exposes `low`, `high`, and `max`; the two older Kimi coding aliases are conservatively limited to `high` because the installed configuration does not advertise exact effort support for them.
+
+### Known Issues / Deferred
+- Gemini CLI 0.44.1 initializes ACP locally but this machine's individual Code Assist account rejects `session/new` and directs the user to Antigravity. The failure is isolated to Gemini agents.
+- Provider-themed textures compile and package correctly, but final visual inspection inside a rendered Minecraft client remains deferred.
+- The copied source world still logs pre-existing missing Axiom game-rule keys during load; Minecraft continues to `Done` and this is unrelated to the provider integration.
+
+### Suggested Next Steps
+- Configure a Gemini ACP-compatible account or gateway, then repeat the no-prompt session check and one bounded in-world goal.
+- Perform the final client-side visual pass for the 12 provider skin variants.
+
+## 2026-07-26 — Arena Agents native control GUI and logic audit
+
+### What Was Implemented
+- Added a remappable `G` hotkey that opens a native Minecraft control screen without depending on the optional legacy client bridge.
+- Added server-authoritative snapshots, bounded in-world polling, stale-response rejection, disconnect cleanup, permission-aware controls, agent selection and status, provider/model/thinking configuration, optional names, summon, start, queue, steer, stop, resume, respawn, refresh, and confirmed removal.
+- Added Codex, Gemini, and Kimi presets while keeping model entry editable.
+- Fixed same-agent coordinator ordering so goal control and action results share one chain while cancellation remains immediate.
+- Fixed queued-goal promotion to remove only the exact queued head and fail closed on mismatches.
+- Contained malformed legacy client configuration and bridge startup failures so they cannot crash the Minecraft client.
+- Added persisted dimension/chunk recovery anchors and restores chunk tickets in the correct dimension before entity lookup.
+- Added bounded provider-process termination with `SIGTERM` to `SIGKILL` escalation and automatic teardown on request timeout for Codex, Gemini, and Kimi.
+
+### Files Modified
+- `src/main/java/dev/agaminggod/arenaagents/control/` — immutable GUI contracts, catalog, command construction, selection, snapshot codec/store, and payloads.
+- `src/main/java/dev/agaminggod/arenaagents/server/AgentControlSync.java` — permission-aware server snapshot synchronization.
+- `src/client/java/dev/agaminggod/arenaagents/client/control/AgentControlClient.java` — hotkey, networking, polling, command dispatch, and disconnect lifecycle.
+- `src/client/java/dev/agaminggod/arenaagents/client/gui/AgentControlScreen.java` — native agent management screen and removal confirmation.
+- `src/client/java/dev/agaminggod/arenaagents/client/ArenaAgentsClient.java` and `src/main/java/dev/agaminggod/arenaagents/ArenaAgents.java` — robust bootstrap and payload registration.
+- `src/main/resources/assets/arenaagents/lang/en_us.json` — control-screen translations.
+- `coordinator/src/dynamic-main.mjs` and `coordinator/src/agent-registry.mjs` — deterministic per-agent ordering and exact queue promotion.
+- `src/main/java/dev/agaminggod/arenaagents/agent/` and `server/CodexAgentManager.java` — backward-compatible persisted entity location and recovery targets.
+- `coordinator/src/child-process-lifecycle.mjs`, `acp-transport.mjs`, and `codex-app-server.mjs` — bounded provider teardown and timeout cleanup.
+- `src/test/java/dev/agaminggod/arenaagents/` and `coordinator/test/` — regression and verification coverage.
+- `docs/plans/2026-07-26-agent-control-gui.md` and `docs/plans/task-4a` through `task-4d` reports — implementation and audit evidence.
+
+### Verification Evidence
+- `verifyCore` passed with 4,769 assertions.
+- Full coordinator suite passed 87 of 87 tests.
+- `clean check build` completed successfully.
+- Runtime preparation installed byte-identical JARs in the server and both isolated launcher profiles.
+- A headless Fabric server reached `Done`, saved all dimensions, stopped cleanly, and left ports 25565 and 25570 closed.
+- The packaged JAR contains all required control GUI, synchronization, snapshot, and language resources.
+
+### Assumptions Made (flag these for review)
+- `G` is the default hotkey and remains remappable through Minecraft controls.
+- Provider presets mirror the currently supported coordinator profiles; the editable model field is the escape hatch for future models.
+- Harmless GUI choices are session-local and no OAuth tokens, secrets, or CLI credentials are exposed to Minecraft.
+
+### Known Issues / Deferred
+- Rendered GUI layout, focus, mouse, and keyboard interaction remain untested by explicit phase boundary.
+- The reused test world logs stale Axiom gamerule keys; Minecraft still reaches `Done` and the message is unrelated to Arena Agents.
+- Legacy saved agents without location metadata need one natural rediscovery before their first dimension/chunk anchor can be persisted.
+
+### Suggested Next Steps
+- Perform the deferred visual/client interaction pass when authorized.
+- When live testing is authorized, include restart recovery for unloaded Nether/End agents and cancellation against intentionally unresponsive provider fixtures.
+
+## 2026-07-26 — Full launcher visual QA and standalone modpack release
+
+### What Was Implemented
+- Completed official-launcher visual QA in a disposable isolated world with Codex, Kimi, and Gemini NPCs.
+- Fixed launcher bridge-secret wiring, custom command argument registration, quoted slash-bearing model parsing, GUI startup, collision-aware spawning, reconnect revision ownership, high-reasoning planner timeout budgets, bounded ACP decision diagnostics, and short-window GUI layout.
+- Added a standalone installer and coordinator launcher that create an isolated profile, generate the bridge secret locally, copy both required mod JARs, validate Java/Node versions, and preserve the user's launcher profile.
+- Packaged the release with a manifest, checksums, runtime coordinator, scripts, and no credentials, secrets, logs, or worlds.
+
+### Files Modified
+- `src/client/java/dev/agaminggod/arenaagents/client/gui/AgentControlScreen.java` — height-aware compact layout verified in the live launcher window.
+- `src/main/java/dev/agaminggod/arenaagents/server/AgentModelArgumentType.java`, `AgentSpawnPlacement.java`, and `CodexAgentCommands.java` — safe custom model parsing and collision-free multi-agent placement.
+- `coordinator/src/dynamic-main.mjs`, `protocol-v2.mjs`, and `acp-service.mjs` — authoritative reconnect revisions, safe diagnostics, and provider error handling.
+- `coordinator/config/dynamic-agents.json` — 120-second configurable planner budgets for high-reasoning turns.
+- `scripts/install-launcher-profiles.ps1`, `install-distribution.ps1`, `start-pack-coordinator.ps1`, and `run-automated-verification.ps1` — secure profile installation, standalone startup, and Windows PowerShell 5.1 compatibility.
+- `README.md`, `docs/plans/task-4e-full-visual-release-validation-report.md`, and `dist/arena-agents-modpack-0.1.0/` — release instructions, evidence, and package.
+
+### Verification Evidence
+- Codex agent `8f147d6b` completed a live safe goal to `IDLE`; queue, steer, and stop passed at revisions 10, 11, and 12.
+- Kimi agent `44cf7c3c` completed a live safe goal to `IDLE`.
+- Gemini agent `79972561` failed locally and clearly with the installed CLI's Code Assist ACP migration rejection; other agents and the world remained healthy.
+- Codex, Kimi, and Gemini provider skins/name tags rendered simultaneously without entity overlap.
+- The rebuilt `G` hotkey GUI displayed every action and footer control in the small launcher window after relaunch.
+- Two consecutive full automated verification runs passed: 4,789 Java protocol/bridge assertions and 89 Node tests with zero failures, skips, or cancellations.
+
+### Assumptions Made (flag these for review)
+- Java 25, Node.js 22+, Fabric Loader 0.19.3, Minecraft 26.1.2, and authenticated provider CLIs are acceptable standalone package prerequisites.
+- The standalone installer should fail closed instead of overwriting an existing mismatched `arena-agents-modpack` launcher profile.
+
+### Known Issues / Deferred
+- The installed Gemini CLI/account rejects individual Code Assist ACP sessions and requires the provider migration it reports; compatible Gemini ACP accounts remain supported.
+- Container transfer, recipe crafting, furnace transactions, and forced chunk tickets remain intentionally fail-closed pending validated Minecraft 26.1.2 adapters.
+- Simultaneous authenticated legacy two-player arena testing still requires a second licensed Minecraft Java account.
+
+### Suggested Next Steps
+- Use `dist/arena-agents-modpack-0.1.0.zip` for installation on another machine and repeat the bounded smoke test with that machine's provider logins.
+
+## 2026-07-26 — Per-agent workspace isolation and planner resilience
+
+### What Was Implemented
+- Added stable provider/agent-scoped working directories and wired them into Codex thread cwd plus Gemini/Kimi process and ACP session cwd.
+- Added one configurable, bounded corrective retry for malformed planner decisions; terminal world-action failures remain authoritative and are not replayed.
+- Probed Gemini CLI 0.44.1 headless JSON mode as an ACP fallback and confirmed the installed individual Code Assist account rejects both transports at the same eligibility gate.
+
+### Files Modified
+- `coordinator/src/agent-workspace.mjs` and `coordinator/test/agent-workspace.test.mjs` — safe directory creation, traversal rejection, stability, and provider/agent isolation.
+- `coordinator/src/agent-planner.mjs` and `coordinator/test/agent-planner.test.mjs` — bounded malformed-decision correction and exhaustion behavior.
+- `coordinator/src/codex-service.mjs`, `acp-service.mjs`, `dynamic-main.mjs`, and related tests/config — exact cwd propagation and configurable retry wiring.
+- `README.md`, `runtime/README.md`, and `docs/plans/task-4e-full-visual-release-validation-report.md` — updated isolation, retry, and Gemini compatibility evidence.
+
+### Verification Evidence
+- Full Gradle/Fabric build passed with 4,789 protocol and bridge assertions.
+- Full coordinator suite passed 95 tests with zero failures, skips, or cancellations.
+- Targeted coverage verifies distinct workspaces, traversal rejection, Codex thread cwd, ACP process/session cwd, retry success, and retry exhaustion.
+- Live headless Kimi agent `0d543377` completed to `IDLE` with `goal=none` and created `runtime/agent-workspaces/kimi/0d543377-c204-431e-9750-af28b107ca84`; the agent was removed and ports 25565/25570 were closed afterward.
+
+### Assumptions Made (flag these for review)
+- Persistent agent workspaces should remain after NPC removal so user-created files are never deleted implicitly.
+- One corrective retry is the safest balance between transient formatting recovery and avoiding unbounded model loops.
+
+### Known Issues / Deferred
+- This machine's Gemini account remains externally ineligible for both ACP and headless Gemini CLI use; changing transport cannot bypass the provider-side restriction.
+- Container transfer, recipe crafting, furnace transactions, and forced chunk tickets remain outside the planner allowlist until version-validated transactional adapters exist.
+
+### Suggested Next Steps
+- Re-authenticate Gemini with an ACP-compatible account, then repeat one bounded provider goal.
+- Keep the default retry limit at one unless production traces show a justified need for a higher bounded value.
+## 2026-07-26 — Antigravity-backed Gemini agents
+### What Was Implemented
+- Replaced the active Gemini ACP route with Antigravity CLI while preserving the `gemini` provider identity, skins, commands, GUI controls, name tags, queues, stop/steer behavior, and provider-scoped workspaces.
+- Added exact model/thinking mapping for Gemini 3.1 Pro, Gemini 3.6 Flash, and Gemini 3.5 Flash; each decision uses one cancellable sandboxed `agy --print` process in the NPC's UUID-scoped directory.
+- Added bounded stdout/stderr capture, spawn/nonzero-exit diagnostics, timeout and process-tree cleanup, cancellation, stale-revision rejection, profile conflict checks, and a safe Windows prompt-size boundary.
+- Tightened the planner output contract so models use `action.type`, and added focused Antigravity tests plus a reusable live headless Fabric smoke harness.
+- Verified the authenticated local Antigravity CLI, exact `gemini-3.1-pro-low` routing through a real NPC lifecycle, the default `gemini-3.1-pro-high` planner profile, return to `IDLE`, isolated workspace creation, removal, and clean port/process shutdown.
+
+### Files Modified
+- `coordinator/src/antigravity-service.mjs` — Antigravity provider service and per-turn process lifecycle.
+- `coordinator/src/dynamic-main.mjs` — routes Minecraft Gemini profiles to Antigravity instead of ACP.
+- `coordinator/src/prompts.mjs` — explicit strict action key contract.
+- `coordinator/config/dynamic-agents.json` — Antigravity executable and Gemini model/thinking catalog.
+- `coordinator/test/antigravity-service.test.mjs` — process, profile, parsing, timeout, cancellation, output, and workspace coverage.
+- `coordinator/test/dynamic-main.test.mjs` — Gemini catalog normalization assertions.
+- `src/main/java/dev/agaminggod/arenaagents/control/AgentControlCatalog.java` — GUI Gemini presets.
+- `src/test/java/dev/agaminggod/arenaagents/control/AgentControlVerification.java` — GUI catalog verification.
+- `scripts/run-antigravity-headless-smoke.ps1` — reproducible headless Fabric/Antigravity end-to-end test.
+- `README.md`, `runtime/README.md`, and `dist/arena-agents-modpack-0.1.0/**` — operator guidance and synchronized release artifacts.
+
+### Assumptions Made (flag these for review)
+- The Minecraft-facing provider remains named `gemini`, while Antigravity is only the execution backend.
+- The recommended Gemini default is `gemini-3.1-pro` with `high` thinking.
+- Antigravity's installed effort-specific model IDs are the authoritative way to apply the selected thinking level.
+
+### Known Issues / Deferred
+- Antigravity print mode exposes no stdin or prompt-file option. Windows prompts above 24,000 characters therefore fail closed with `PROMPT_TOO_LARGE` instead of risking command-line truncation.
+- This change received automated GUI catalog coverage and headless Minecraft verification; no new visual skin/layout pass was needed because provider identity and assets were unchanged.
+- The copied test world still logs historical missing Axiom game-rule keys at startup; this does not affect Arena Agents.
+
+### Suggested Next Steps
+- Re-run `scripts/run-antigravity-headless-smoke.ps1` after Antigravity model catalog updates.
+- If Antigravity adds stdin or a structured-output API, replace the Windows prompt-size boundary with that transport.

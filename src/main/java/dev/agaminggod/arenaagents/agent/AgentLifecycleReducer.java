@@ -1,0 +1,275 @@
+package dev.agaminggod.arenaagents.agent;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
+
+public final class AgentLifecycleReducer {
+	private AgentLifecycleReducer() {
+	}
+
+	public static AgentTransition start(AgentRecord current, String prompt, long nowEpochMs) {
+		requireState(current, "start", AgentLifecycleState.IDLE, AgentLifecycleState.PAUSED,
+				AgentLifecycleState.COMPLETED, AgentLifecycleState.ERROR, AgentLifecycleState.DISCONNECTED);
+		AgentGoal goal = AgentGoal.create(prompt, nowEpochMs);
+		AgentRecord revised = current.withLifecycle(
+				AgentLifecycleState.STARTING,
+				Optional.of(goal),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		);
+		return transition(current, revised, current.state().isActive(), current.state().isActive());
+	}
+
+	public static AgentTransition queue(AgentRecord current, String prompt, int queueLimit, long nowEpochMs) {
+		if (queueLimit <= 0) {
+			throw new IllegalArgumentException("queueLimit must be positive");
+		}
+		if (current.queuedGoals().size() >= queueLimit) {
+			throw new AgentDomainException("QUEUE_FULL", "Agent queue limit reached: " + queueLimit);
+		}
+		ArrayList<AgentGoal> queue = new ArrayList<>(current.queuedGoals());
+		queue.add(AgentGoal.create(prompt, nowEpochMs));
+		AgentRecord revised = current.withLifecycle(
+				current.state(),
+				current.currentGoal(),
+				current.goalRevision(),
+				queue,
+				nowEpochMs,
+				current.lastError()
+		);
+		return transition(current, revised, false, false);
+	}
+
+	public static AgentTransition stop(AgentRecord current, long nowEpochMs) {
+		if (current.currentGoal().isEmpty()) {
+			throw new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to stop");
+		}
+		AgentRecord revised = current.withLifecycle(
+				AgentLifecycleState.PAUSED,
+				current.currentGoal(),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				current.lastError()
+		);
+		return transition(current, revised, true, true);
+	}
+
+	public static AgentTransition resume(AgentRecord current, long nowEpochMs) {
+		requireState(current, "resume", AgentLifecycleState.PAUSED);
+		AgentRecord revised = current.withLifecycle(
+				AgentLifecycleState.STARTING,
+				current.currentGoal(),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		);
+		return transition(current, revised, false, false);
+	}
+
+	public static AgentTransition steer(AgentRecord current, String instruction, long nowEpochMs) {
+		AgentGoal currentGoal = current.currentGoal().orElseThrow(
+				() -> new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to steer")
+		);
+		AgentGoal steered = currentGoal.steer(instruction, nowEpochMs);
+		AgentRecord revised = current.withLifecycle(
+				AgentLifecycleState.STARTING,
+				Optional.of(steered),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		);
+		return transition(current, revised, true, true);
+	}
+
+	public static AgentTransition beginPlanning(AgentRecord current, long nowEpochMs) {
+		requireState(current, "plan", AgentLifecycleState.STARTING);
+		return transition(current, current.withLifecycle(
+				AgentLifecycleState.PLANNING,
+				current.currentGoal(),
+				current.goalRevision(),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		), false, false);
+	}
+
+	public static AgentTransition beginAction(AgentRecord current, long revision, long nowEpochMs) {
+		requireState(current, "act", AgentLifecycleState.PLANNING);
+		requireRevision(current, revision);
+		return transition(current, current.withLifecycle(
+				AgentLifecycleState.ACTING,
+				current.currentGoal(),
+				current.goalRevision(),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		), false, false);
+	}
+
+	public static AgentTransition actionFinished(AgentRecord current, long revision, long nowEpochMs) {
+		requireState(current, "finish action", AgentLifecycleState.ACTING);
+		requireRevision(current, revision);
+		return transition(current, current.withLifecycle(
+				AgentLifecycleState.STARTING,
+				current.currentGoal(),
+				current.goalRevision(),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		), false, false);
+	}
+
+	public static AgentTransition completeGoal(AgentRecord current, long revision, long nowEpochMs) {
+		requireState(
+				current,
+				"complete goal",
+				AgentLifecycleState.STARTING,
+				AgentLifecycleState.PLANNING,
+				AgentLifecycleState.ACTING
+		);
+		requireRevision(current, revision);
+		if (current.currentGoal().isEmpty()) {
+			throw new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to complete");
+		}
+		List<AgentGoal> queue = current.queuedGoals();
+		if (queue.isEmpty()) {
+			AgentRecord completed = current.withLifecycle(
+					AgentLifecycleState.IDLE,
+					Optional.empty(),
+					nextRevision(current),
+					List.of(),
+					nowEpochMs,
+					""
+			);
+			return transition(current, completed, true, true);
+		}
+		AgentGoal promoted = queue.getFirst();
+		AgentRecord promotedRecord = current.withLifecycle(
+				AgentLifecycleState.STARTING,
+				Optional.of(promoted),
+				nextRevision(current),
+				queue.subList(1, queue.size()),
+				nowEpochMs,
+				""
+		);
+		return transition(current, promotedRecord, true, true);
+	}
+
+	public static AgentTransition fail(AgentRecord current, String message, long nowEpochMs) {
+		AgentRecord failed = current.withLifecycle(
+				AgentLifecycleState.ERROR,
+				current.currentGoal(),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				AgentValidators.boundedText(message, "error", AgentConstants.MAX_ERROR_LENGTH)
+		);
+		return transition(current, failed, true, true);
+	}
+
+	public static AgentTransition disconnect(AgentRecord current, long nowEpochMs) {
+		if (current.currentGoal().isEmpty()) {
+			return transition(current, current, false, false);
+		}
+		AgentRecord disconnected = current.withLifecycle(
+				AgentLifecycleState.DISCONNECTED,
+				current.currentGoal(),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				"Coordinator disconnected"
+		);
+		return transition(current, disconnected, true, true);
+	}
+
+	public static AgentTransition die(AgentRecord current, long nowEpochMs) {
+		AgentRecord dead = current.withLifecycle(
+				AgentLifecycleState.DEAD,
+				current.currentGoal(),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				current.lastError()
+		).withEntityUuid(Optional.empty(), nowEpochMs);
+		return transition(current, dead, true, true);
+	}
+
+	public static AgentTransition respawn(AgentRecord current, UUID entityUuid, long nowEpochMs) {
+		requireState(current, "respawn", AgentLifecycleState.DEAD);
+		AgentLifecycleState nextState = current.currentGoal().isPresent()
+				? AgentLifecycleState.PAUSED
+				: AgentLifecycleState.IDLE;
+		AgentRecord respawned = current.withLifecycle(
+				nextState,
+				current.currentGoal(),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		).withEntityUuid(Optional.of(Objects.requireNonNull(entityUuid, "entityUuid must not be null")), nowEpochMs);
+		return transition(current, respawned, true, true);
+	}
+
+	public static AgentRecord recoverAfterReload(AgentRecord current, long nowEpochMs) {
+		if (!current.state().isReloadUncertain()) {
+			return current;
+		}
+		return current.withLifecycle(
+				AgentLifecycleState.PAUSED,
+				current.currentGoal(),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				"Recovered paused after reload"
+		);
+	}
+
+	private static void requireRevision(AgentRecord current, long revision) {
+		if (revision != current.goalRevision()) {
+			throw new AgentDomainException(
+					"STALE_REVISION",
+					"Expected goal revision " + current.goalRevision() + " but received " + revision
+			);
+		}
+	}
+
+	private static long nextRevision(AgentRecord current) {
+		if (current.goalRevision() == Long.MAX_VALUE) {
+			throw new AgentDomainException("REVISION_EXHAUSTED", "Agent goal revision is exhausted");
+		}
+		return current.goalRevision() + 1L;
+	}
+
+	private static void requireState(
+			AgentRecord current,
+			String operation,
+			AgentLifecycleState... allowedStates
+	) {
+		for (AgentLifecycleState state : allowedStates) {
+			if (current.state() == state) {
+				return;
+			}
+		}
+		throw new AgentDomainException(
+				"INVALID_TRANSITION",
+				"Cannot " + operation + " agent while it is " + current.state()
+		);
+	}
+
+	private static AgentTransition transition(
+			AgentRecord before,
+			AgentRecord after,
+			boolean cancelAction,
+			boolean interruptPlanner
+	) {
+		return new AgentTransition(before, after, cancelAction, interruptPlanner);
+	}
+}

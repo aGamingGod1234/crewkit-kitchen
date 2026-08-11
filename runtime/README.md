@@ -9,6 +9,7 @@ Everything generated beneath `runtime/` is local evidence or executable state an
 - `downloads/`: SHA-256-verified Fabric installer.
 - `evidence/`: world-copy, build, log, screenshot, and live-test summaries with credentials excluded.
 - `agent55/traces/agent-55.jsonl` and `agent56/traces/agent-56.jsonl`: separate append-only coordinator traces.
+- `bridge-secret.txt`: generated local bridge secret shared by the summonable-NPC server and dynamic coordinator; ignored by Git.
 - `toolchains/temurin-25/jdk-25.0.3+9`: project-local Java runtime.
 
 The isolated client directories are outside the project:
@@ -37,6 +38,19 @@ After `prepare-runtime.ps1` installs `fabric-loader-0.19.3-26.1.2`, create two i
 - JVM arguments: `-Xms1G -Xmx4G`
 
 Do not add account identifiers or copy launcher credential files. Both installations share launcher-managed assets/libraries but isolate mods, config, logs, saves, and options.
+
+## Summonable NPC mode
+
+The summonable NPC architecture runs inside the server rather than consuming a licensed account per agent. Use either isolated Fabric client installation to join the server, then start:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-test-server.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\start-dynamic-coordinator.ps1
+```
+
+Both scripts use `runtime\bridge-secret.txt`. The server receives only its absolute file path; the coordinator receives the secret in its process environment. Keep that file local and never attach it to evidence.
+
+The Fabric mod must be present on both the server and joining client because the custom NPC entity and renderer are mod-defined. Unlike the legacy two-player arena, all summoned NPCs share one server bridge. Codex NPCs retain separate Codex threads on the shared app server. Gemini NPCs use cancellable sandboxed Antigravity CLI print processes with exact combined model/thinking IDs, while Kimi NPCs retain separate ACP processes and sessions. Every provider uses a stable per-agent directory under `runtime/agent-workspaces`, keeping cwd, cancellation, and per-agent thinking settings isolated without copying credentials.
 
 ## Evidence classes
 
