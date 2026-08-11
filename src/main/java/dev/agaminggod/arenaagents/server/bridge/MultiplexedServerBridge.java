@@ -21,6 +21,7 @@ import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import java.io.BufferedInputStream;
@@ -94,7 +95,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		this.router = new AgentRuntimeRouter(manager);
 		this.port = port;
 		this.secret = readSecret(secretPath);
-		this.actionExecutor = new ServerActionExecutor(manager, this::sendActionResult);
+		this.actionExecutor = new ServerActionExecutor(manager, this::sendActionResult, this::sendActionProgress);
 		this.observations = new ServerObservationCollector(manager, actionExecutor);
 	}
 
@@ -458,6 +459,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				&& result.actionType() != ActionType.COMPLETE_GOAL) {
 			queueObservation(result.agentId());
 		}
+	}
+
+	private void sendActionProgress(ServerActionProgress progress) {
+		JsonObject payload = new JsonObject();
+		payload.addProperty("goalRevision", progress.goalRevision());
+		payload.addProperty("actionId", progress.actionId());
+		payload.addProperty("commandId", progress.actionId());
+		payload.addProperty("actionType", progress.actionType().wireName());
+		payload.addProperty("state", "RUNNING");
+		payload.addProperty("progress", progress.progress());
+		payload.addProperty("elapsedMs", progress.elapsedMs());
+		payload.addProperty("observedAtEpochMs", progress.observedAtEpochMs());
+		send("action_progress", progress.agentId().toString(), payload);
 	}
 
 	private void queueObservation(AgentId agentId) {

@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.runtime;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -85,7 +86,16 @@ public final class ServerActionExecutorVerification {
 				ServerObservationCollector.transactionCapabilities("modded:machine"),
 				"modded menu capabilities fail closed"
 		);
-		return 22;
+		AgentId progressAgent = AgentId.random();
+		ServerActionProgress progress = new ServerActionProgress(
+				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 0.5D, 250L, 1_750_000_000_250L
+		);
+		assertEquals(progressAgent, progress.agentId(), "progress retains agent identity");
+		assertEquals(0.5D, progress.progress(), "progress retains bounded fraction");
+		assertThrows(IllegalArgumentException.class, () -> new ServerActionProgress(
+				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 1.1D, 250L, 1_750_000_000_250L
+		), "progress rejects fractions above one");
+		return 25;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

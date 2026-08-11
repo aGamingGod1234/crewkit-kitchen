@@ -4,6 +4,7 @@ final class ActionProgressTracker {
 	private static final double MINIMUM_PROGRESS_BLOCKS = 0.1D;
 
 	private final long stallTimeoutMs;
+	private final double initialDistance;
 	private double bestDistance;
 	private long lastProgressAt;
 
@@ -14,6 +15,7 @@ final class ActionProgressTracker {
 		if (stallTimeoutMs <= 0L) {
 			throw new IllegalArgumentException("stallTimeoutMs must be positive");
 		}
+		this.initialDistance = initialDistance;
 		this.bestDistance = initialDistance;
 		this.lastProgressAt = startedAtEpochMs;
 		this.stallTimeoutMs = stallTimeoutMs;
@@ -29,5 +31,13 @@ final class ActionProgressTracker {
 			return false;
 		}
 		return Math.max(0L, nowEpochMs - lastProgressAt) >= stallTimeoutMs;
+	}
+
+	double progress(double distance) {
+		if (!Double.isFinite(distance) || distance < 0.0D) {
+			throw new IllegalArgumentException("distance must be finite and non-negative");
+		}
+		if (initialDistance == 0.0D) return distance == 0.0D ? 1.0D : 0.0D;
+		return Math.max(0.0D, Math.min(1.0D, 1.0D - distance / initialDistance));
 	}
 }

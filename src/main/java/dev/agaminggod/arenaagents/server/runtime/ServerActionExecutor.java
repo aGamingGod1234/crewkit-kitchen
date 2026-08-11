@@ -45,10 +45,13 @@ public final class ServerActionExecutor {
 	private static final long DEFAULT_TIMEOUT_MS = 60_000L;
 	private static final long MOVEMENT_STALL_TIMEOUT_MS = 4_000L;
 	private static final long PLACE_TIMEOUT_MS = 5_000L;
+	private static final double PROGRESS_EMISSION_DELTA = 0.05D;
+	private static final long PROGRESS_HEARTBEAT_MS = 1_000L;
 
 	private final CodexAgentManager manager;
 	private final AgentRuntimeRouter router;
 	private final Consumer<ServerActionResult> resultSink;
+	private final Consumer<ServerActionProgress> progressSink;
 	private final ServerProtectionPolicy protection;
 	private final ResourceLeaseManager resourceLeases;
 	private final AdvancedInteractionService advancedInteractions;
@@ -59,7 +62,15 @@ public final class ServerActionExecutor {
 	private final Map<AgentId, ServerSurvivalReflexController> survivalReflexes = new LinkedHashMap<>();
 
 	public ServerActionExecutor(CodexAgentManager manager, Consumer<ServerActionResult> resultSink) {
-		this(manager, resultSink, ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR);
+		this(manager, resultSink, progress -> { }, ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR);
+	}
+
+	public ServerActionExecutor(
+			CodexAgentManager manager,
+			Consumer<ServerActionResult> resultSink,
+			Consumer<ServerActionProgress> progressSink
+	) {
+		this(manager, resultSink, progressSink, ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR);
 	}
 
 	public ServerActionExecutor(
@@ -67,9 +78,19 @@ public final class ServerActionExecutor {
 			Consumer<ServerActionResult> resultSink,
 			ServerProtectionPolicy protection
 	) {
+		this(manager, resultSink, progress -> { }, protection);
+	}
+
+	public ServerActionExecutor(
+			CodexAgentManager manager,
+			Consumer<ServerActionResult> resultSink,
+			Consumer<ServerActionProgress> progressSink,
+			ServerProtectionPolicy protection
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		this.resultSink = Objects.requireNonNull(resultSink, "resultSink must not be null");
+		this.progressSink = Objects.requireNonNull(progressSink, "progressSink must not be null");
 		this.protection = Objects.requireNonNull(protection, "protection must not be null");
 		this.resourceLeases = new ResourceLeaseManager();
 		this.advancedInteractions = new AdvancedInteractionService(protection, resourceLeases);
@@ -135,7 +156,12 @@ public final class ServerActionExecutor {
 			} catch (RuntimeException exception) {
 				result = action.result(ServerActionState.FAILED, "ACTION_EXCEPTION", safeMessage(exception), now);
 			}
-			if (result != null) finish(action, result);
+			if (result != null) {
+				finish(action, result);
+			} else {
+				ServerActionProgress progress = action.progress(now);
+				if (progress != null) progressSink.accept(progress);
+			}
 		}
 	}
 
@@ -590,6 +616,8 @@ public final class ServerActionExecutor {
 		private final boolean sprint;
 		private final BlockPos block;
 		private final ActionProgressTracker progress;
+		private final ActionProgressEmissionPolicy progressEmission =
+				new ActionProgressEmissionPolicy(PROGRESS_EMISSION_DELTA, PROGRESS_HEARTBEAT_MS);
 		private ServerController controller;
 		private ServerTransactionAdapter.ActiveTransaction transaction;
 		private String initialBlockId;
@@ -597,6 +625,7 @@ public final class ServerActionExecutor {
 		private String resourceLeaseKey;
 		private boolean started;
 		private float lastHealth;
+		private double lastProgress;
 
 		private ActiveAction(
 				ServerActionRequest request,
@@ -770,6 +799,7 @@ public final class ServerActionExecutor {
 
 			if (mode == Mode.MOVE) {
 				double distance = player.position().distanceTo(destination);
+				lastProgress = progress.progress(distance);
 				OfflineAgentPlayers.actions(player).lookAt(destination).setSprinting(sprint).setForward(1.0F);
 				if (distance <= tolerance) {
 					return result(ServerActionState.SUCCEEDED, "DESTINATION_REACHED", "Destination reached", now);
@@ -805,6 +835,7 @@ public final class ServerActionExecutor {
 			}
 			if (mode == Mode.CONTROLLER) {
 				ServerController.TickResult controllerResult = controller.tick(player, now);
+				lastProgress = controllerResult.progress();
 				return switch (controllerResult.state()) {
 					case RUNNING -> null;
 					case SUCCEEDED -> result(
@@ -823,6 +854,7 @@ public final class ServerActionExecutor {
 			}
 			if (mode == Mode.TRANSACTION) {
 				ServerTransactionAdapter.TickResult transactionResult = transaction.tick(now);
+				lastProgress = timedProgress(elapsed);
 				return switch (transactionResult.state()) {
 					case RUNNING -> null;
 					case SUCCEEDED -> result(ServerActionState.SUCCEEDED, transactionResult.reasonCode(), transactionResult.message(), now);
@@ -835,7 +867,28 @@ public final class ServerActionExecutor {
 			if (elapsed >= timeoutMs) {
 				return result(ServerActionState.TIMED_OUT, "ACTION_TIMED_OUT", "Action timed out", now);
 			}
+			if (mode != Mode.MOVE && mode != Mode.CONTROLLER && mode != Mode.TRANSACTION) {
+				lastProgress = timedProgress(elapsed);
+			}
 			return null;
+		}
+
+		ServerActionProgress progress(long now) {
+			double bounded = Math.max(0.0D, Math.min(0.99D, lastProgress));
+			if (!progressEmission.shouldEmit(bounded, now)) return null;
+			return new ServerActionProgress(
+					request.agentId(),
+					request.goalRevision(),
+					request.actionId(),
+					request.type(),
+					bounded,
+					Math.max(0L, now - startedAt),
+					now
+			);
+		}
+
+		private double timedProgress(long elapsed) {
+			return Math.max(0.0D, Math.min(0.99D, (double) elapsed / timeoutMs));
 		}
 
 		void cancel(String reason) {
