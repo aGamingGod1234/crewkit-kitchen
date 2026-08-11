@@ -91,6 +91,16 @@ public record ArenaSpectatorSnapshot(
 		);
 	}
 
+	public static Optional<PublicView> retainPublication(
+			Optional<PublicView> retainedView,
+			Optional<PublicView> observedView
+	) {
+		Objects.requireNonNull(retainedView, "retainedView must not be null");
+		Objects.requireNonNull(observedView, "observedView must not be null");
+		if (observedView.isPresent()) return observedView;
+		return retainedView.filter(PublicView::terminal);
+	}
+
 	public static ArenaSpectatorSnapshot fromPublicView(long revision, PublicView view) {
 		Objects.requireNonNull(view, "view must not be null");
 		List<Standing> standings = view.participants().stream()

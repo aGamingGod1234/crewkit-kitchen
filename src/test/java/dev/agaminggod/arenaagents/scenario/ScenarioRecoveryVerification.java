@@ -175,7 +175,9 @@ public final class ScenarioRecoveryVerification {
 				profiles.size(),
 				profiles.size(),
 				new CoordinatorStatusSnapshot.SchedulerStatus(0, 0, 4, 12, false),
-				List.of(new CoordinatorStatusSnapshot.CircuitHealth("codex", 0, 0, 0, 0.0D, "closed")),
+				List.of(new CoordinatorStatusSnapshot.CircuitHealth(
+						"codex", "gpt-5.6-sol", "decide", 0, 0, 0, 0.0D, "closed"
+				)),
 				receivedAtEpochMs
 		);
 	}

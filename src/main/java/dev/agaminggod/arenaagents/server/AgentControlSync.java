@@ -75,12 +75,12 @@ public final class AgentControlSync {
 		);
 		long currentTick = publication.nextTick();
 		Optional<ArenaSpectatorSnapshot.PublicView> view = ScenarioRuntimeService.spectatorView(server);
-		if (view.isPresent()) {
-			publication.retainedView = view.orElseThrow();
-		} else if (publication.retainedView == null || !publication.retainedView.terminal()) {
-			publication.retainedView = null;
-			return;
-		}
+		Optional<ArenaSpectatorSnapshot.PublicView> retainedView = ArenaSpectatorSnapshot.retainPublication(
+				Optional.ofNullable(publication.retainedView),
+				view
+		);
+		publication.retainedView = retainedView.orElse(null);
+		if (retainedView.isEmpty()) return;
 		if (!publication.cadence.due(currentTick)) return;
 		ArenaSpectatorSnapshot.PublicView publicView = publication.retainedView;
 		if (!publicView.runId().equals(publication.runId)) {
