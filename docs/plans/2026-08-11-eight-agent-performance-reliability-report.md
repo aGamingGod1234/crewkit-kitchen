@@ -9,7 +9,7 @@ The balanced eight-agent reliability gate passed on 2026-08-11 using only automa
 - Clean Gradle/Fabric `check`, `build`, and `verifyCore`: **5,414 assertions passed**.
 - Coordinator Node suite: **134/134 tests passed**, 0 failed; a separate summary run completed in 887 ms.
 - Eight-agent fake-provider soak: **50/50 independent Node processes passed**.
-- Combined clean verifier and 50-run soak: **48.1 seconds** wall-clock time.
+- Final clean verifier and 50-run soak: **45.1 seconds** wall-clock time.
 - Headless Minecraft 26.1.2 smoke: Fabric Loader 0.19.3 loaded 43 mods, including the current `arenaagents 0.1.0` JAR; the server reached `Done`, accepted `stop`, saved every dimension, and exited successfully.
 - Headless JAR SHA-256: `E091C2E01BBD420CB1D8EE79A49DFBB6D98956D2ECBA73FBADCF2D72AAABBA08`.
 
