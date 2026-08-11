@@ -95,7 +95,13 @@ public final class ServerActionExecutorVerification {
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 1.1D, 250L, 1_750_000_000_250L
 		), "progress rejects fractions above one");
-		return 25;
+		AtomicInteger progressAttempts = new AtomicInteger();
+		ServerActionExecutor.publishProgressBestEffort(item -> {
+			progressAttempts.incrementAndGet();
+			throw new IllegalStateException("bridge backpressure");
+		}, progress);
+		assertEquals(1, progressAttempts.get(), "progress telemetry failure is isolated from the server tick");
+		return 26;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

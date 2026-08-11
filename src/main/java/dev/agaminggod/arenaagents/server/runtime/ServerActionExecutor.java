@@ -160,8 +160,19 @@ public final class ServerActionExecutor {
 				finish(action, result);
 			} else {
 				ServerActionProgress progress = action.progress(now);
-				if (progress != null) progressSink.accept(progress);
+				if (progress != null) publishProgressBestEffort(progressSink, progress);
 			}
+		}
+	}
+
+	static void publishProgressBestEffort(
+			Consumer<ServerActionProgress> progressSink,
+			ServerActionProgress progress
+	) {
+		try {
+			progressSink.accept(progress);
+		} catch (RuntimeException ignored) {
+			// Progress is advisory telemetry; bridge backpressure must never abort the server tick.
 		}
 	}
 
