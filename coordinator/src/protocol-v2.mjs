@@ -423,8 +423,9 @@ export function secretsEqual(left, right) {
 }
 
 function normalizeCoordinatorStatus(value) {
-	const keys = ['reconciled', 'profiles', 'supportedProfileCount', 'rosterReadyCount', 'rosterCount', 'scheduler', 'circuits'];
-	exactKeys(value, keys, keys, 'coordinator_status');
+	const requiredKeys = ['reconciled', 'profiles', 'supportedProfileCount', 'rosterReadyCount', 'rosterCount', 'scheduler', 'circuits'];
+	const allowedKeys = [...requiredKeys, 'latencies'];
+	exactKeys(value, allowedKeys, requiredKeys, 'coordinator_status');
 	const profiles = boundedArray(value.profiles, 'coordinator_status.profiles', 16).map((profile, index) => {
 		const field = `coordinator_status.profiles[${index}]`;
 		exactKeys(profile, ['agentId', 'provider', 'model', 'reasoningEffort'], ['agentId', 'provider', 'model', 'reasoningEffort'], field);
@@ -476,7 +477,20 @@ function normalizeCoordinatorStatus(value) {
 		};
 	});
 	if (new Set(circuits.map((circuit) => JSON.stringify([circuit.provider, circuit.model, circuit.operation]))).size !== circuits.length) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status circuit identities must be unique');
-	return { reconciled: boolean(value.reconciled, 'coordinator_status.reconciled'), profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits };
+	const latencies = boundedArray(value.latencies ?? [], 'coordinator_status.latencies', 16).map((latency, index) => {
+		const field = `coordinator_status.latencies[${index}]`;
+		exactKeys(latency, ['operation', 'count', 'p50Ms', 'p95Ms'], ['operation', 'count', 'p50Ms', 'p95Ms'], field);
+		return {
+			operation: requireIdentifier(latency.operation, `${field}.operation`),
+			count: nonnegativeInteger(latency.count, `${field}.count`),
+			p50Ms: nonnegativeInteger(latency.p50Ms, `${field}.p50Ms`),
+			p95Ms: nonnegativeInteger(latency.p95Ms, `${field}.p95Ms`),
+		};
+	});
+	if (new Set(latencies.map((latency) => latency.operation)).size !== latencies.length) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status latency operations must be unique');
+	}
+	return { reconciled: boolean(value.reconciled, 'coordinator_status.reconciled'), profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits, latencies };
 }
 
 function normalizeRegisteredAgent(value, field) {

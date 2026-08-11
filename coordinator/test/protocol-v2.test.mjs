@@ -39,10 +39,19 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 		scheduler: { active: 1, pending: 0, maxConcurrent: 4, maxPending: 12, warning: false },
 		circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 100, p95Ms: 200, failureRate: 0, circuit: 'closed' }],
 	};
-	assert.deepEqual(validateProtocolV2Payload('coordinator_status', payload), payload);
+	assert.deepEqual(validateProtocolV2Payload('coordinator_status', payload), { ...payload, latencies: [] });
+	const latency = { operation: 'observation_to_plan', count: 8, p50Ms: 25, p95Ms: 80 };
+	assert.deepEqual(
+		validateProtocolV2Payload('coordinator_status', { ...payload, latencies: [latency] }).latencies,
+		[latency],
+	);
 	assert.throws(() => validateProtocolV2Payload('coordinator_status', { ...payload, prompt: 'secret' }), /field/i);
 	assert.throws(() => validateProtocolV2Payload('coordinator_status', { ...payload, supportedProfileCount: 2 }), /inconsistent/i);
 	assert.throws(() => validateProtocolV2Payload('coordinator_status', { ...payload, profiles: [{ ...payload.profiles[0], provider: 7 }] }), /nonblank/i);
+	assert.throws(() => validateProtocolV2Payload('coordinator_status', {
+		...payload,
+		latencies: [{ ...latency, privatePrompt: 'secret' }],
+	}), /field/i);
 });
 
 function registeredRecord(agentId = 'agent-a') {

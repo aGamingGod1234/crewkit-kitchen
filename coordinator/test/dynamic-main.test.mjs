@@ -130,6 +130,7 @@ test('dynamic coordinator wires reconciliation without starting legacy runtimes'
 	const status = bridge.sent.find((message) => message.type === 'coordinator_status')?.payload;
 	assert.equal(status.reconciled, true);
 	assert.deepEqual(status.scheduler, { active: 0, pending: 0, maxConcurrent: 4, maxPending: 12, warning: false });
+	assert.deepEqual(status.latencies, []);
 	assert.equal(JSON.stringify(status).includes('prompt'), false);
 	await coordinator.stop();
 });

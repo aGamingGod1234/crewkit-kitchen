@@ -13,12 +13,20 @@ public final class CoordinatorStatusVerification {
 		assertTrue(snapshot.reconciled(), "reconciled status decoded");
 		assertTrue(snapshot.supports("agent-a", "codex", "gpt-5.6-sol", "high"), "supported identity decoded");
 		assertTrue(snapshot.fresh(3_500L, 2_500L), "freshness boundary inclusive");
+		assertTrue(snapshot.latencies().size() == 1, "latency health decoded");
+		JsonObject legacy = payload();
+		legacy.remove("latencies");
+		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(legacy, 1_000L).latencies().isEmpty(),
+				"legacy status without latencies remains compatible");
 		JsonObject numericIdentity = payload();
 		numericIdentity.getAsJsonArray("profiles").get(0).getAsJsonObject().addProperty("provider", 7);
 		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(numericIdentity, 1_000L), "numeric status identity rejected");
 		payload.addProperty("prompt", "must never cross this seam");
 		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(payload, 1_000L), "unknown private field rejected");
-		return 5;
+		JsonObject invalidLatency = payload();
+		invalidLatency.getAsJsonArray("latencies").get(0).getAsJsonObject().addProperty("p95Ms", -1);
+		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(invalidLatency, 1_000L), "invalid latency rejected");
+		return 8;
 	}
 
 	private static JsonObject payload() {
@@ -54,6 +62,14 @@ public final class CoordinatorStatusVerification {
 		circuit.addProperty("circuit", "closed");
 		circuits.add(circuit);
 		payload.add("circuits", circuits);
+		JsonArray latencies = new JsonArray();
+		JsonObject latency = new JsonObject();
+		latency.addProperty("operation", "observation_to_plan");
+		latency.addProperty("count", 8);
+		latency.addProperty("p50Ms", 25);
+		latency.addProperty("p95Ms", 80);
+		latencies.add(latency);
+		payload.add("latencies", latencies);
 		return payload;
 	}
 

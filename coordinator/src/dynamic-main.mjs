@@ -9,6 +9,7 @@ import { AgentWorkspaceManager } from './agent-workspace.mjs';
 import { AcpProviderService } from './acp-service.mjs';
 import { AntigravityProviderService } from './antigravity-service.mjs';
 import { CodexService } from './codex-service.mjs';
+import { ControlLatencyRegistry } from './control-latency-registry.mjs';
 import { FactLedger } from './fact-ledger.mjs';
 import { ProviderService } from './provider-service.mjs';
 import {
@@ -44,13 +45,14 @@ export class DynamicCoordinator extends EventEmitter {
 	#stopping = false;
 	#closed = false;
 	#healthRegistry;
+	#latencyRegistry;
 	#supportedAgentIds = new Set();
 	#reconciledStatus = false;
 	#setStatusInterval;
 	#clearStatusInterval;
 	#statusHandle = null;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -58,6 +60,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#planner = requireDependency(planner, 'planner');
 		this.#bridge = requireDependency(bridge, 'bridge');
 		this.#healthRegistry = requireDependency(healthRegistry, 'healthRegistry');
+		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
 	}
@@ -307,6 +310,7 @@ export class DynamicCoordinator extends EventEmitter {
 			rosterCount: records.length,
 			scheduler: { active: pressure.active, pending: pressure.pending, maxConcurrent: pressure.maxConcurrent, maxPending: pressure.maxPending, warning: pressure.warning },
 			circuits: healthIdentities.slice(0, 32).map((identity) => this.#healthRegistry.snapshot(identity)),
+			latencies: this.#latencyRegistry.snapshot(),
 		});
 	}
 
@@ -365,6 +369,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		kimi: new AcpProviderService(config.kimi, { transportFactory: dependencies.kimiTransportFactory, workspaceManager }),
 	});
 	const healthRegistry = dependencies.healthRegistry ?? dependencies.planner?.healthRegistry ?? new ProviderHealthRegistry({ now: dependencies.healthNow ?? Date.now });
+	const latencyRegistry = dependencies.latencyRegistry ?? new ControlLatencyRegistry();
 	const planner = dependencies.planner ?? new AgentPlanner({
 		registry,
 		scheduler,
@@ -386,6 +391,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		planner,
 		bridge,
 		healthRegistry,
+		latencyRegistry,
 		setStatusInterval: dependencies.setStatusInterval,
 		clearStatusInterval: dependencies.clearStatusInterval,
 	});

@@ -295,7 +295,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	static CoordinatorStatusSnapshot decodeCoordinatorStatus(JsonObject payload, long receivedAtEpochMs) {
 		try {
-		requireKeys(payload, Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits"), "coordinator_status");
+		Set<String> legacyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits");
+		Set<String> latencyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "latencies");
+		if (!payload.keySet().equals(legacyKeys) && !payload.keySet().equals(latencyKeys)) {
+			throw new BridgeProtocolException("INVALID_FIELD", "coordinator_status");
+		}
 		JsonArray profileValues = requiredArray(payload, "profiles", CoordinatorStatusSnapshot.MAX_PROFILES);
 		ArrayList<CoordinatorStatusSnapshot.SupportedProfile> profiles = new ArrayList<>();
 		for (var element : profileValues) {
@@ -325,9 +329,22 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					requiredDouble(circuit, "failureRate"), requiredStatusString(circuit, "circuit")
 			));
 		}
+		JsonArray latencyValues = payload.has("latencies")
+				? requiredArray(payload, "latencies", CoordinatorStatusSnapshot.MAX_LATENCIES)
+				: new JsonArray();
+		ArrayList<CoordinatorStatusSnapshot.LatencyHealth> latencies = new ArrayList<>();
+		for (var element : latencyValues) {
+			if (!element.isJsonObject()) throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", "latency must be an object");
+			JsonObject latency = element.getAsJsonObject();
+			requireKeys(latency, Set.of("operation", "count", "p50Ms", "p95Ms"), "latency");
+			latencies.add(new CoordinatorStatusSnapshot.LatencyHealth(
+					requiredStatusString(latency, "operation"), requiredInt(latency, "count"),
+					requiredInt(latency, "p50Ms"), requiredInt(latency, "p95Ms")
+			));
+		}
 			return new CoordinatorStatusSnapshot(
 					requiredBoolean(payload, "reconciled"), profiles, requiredInt(payload, "supportedProfileCount"),
-					requiredInt(payload, "rosterReadyCount"), requiredInt(payload, "rosterCount"), schedulerStatus, circuits,
+					requiredInt(payload, "rosterReadyCount"), requiredInt(payload, "rosterCount"), schedulerStatus, circuits, latencies,
 					receivedAtEpochMs
 			);
 		} catch (BridgeProtocolException exception) {
