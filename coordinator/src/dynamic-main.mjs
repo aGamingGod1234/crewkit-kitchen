@@ -22,6 +22,7 @@ import { PlanningScheduler } from './planning-scheduler.mjs';
 import { MultiplexedServerBridge, ProtocolV2Error } from './protocol-v2.mjs';
 import { buildPlannerInput } from './prompts.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
+import { observationHash } from './trace-writer.mjs';
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const COORDINATOR_DIRECTORY = path.resolve(SOURCE_DIRECTORY, '..');
@@ -39,6 +40,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#agentOperations = new Map();
 	#actionSequences = new Map();
 	#outstandingActions = new Map();
+	#lastPlannedObservations = new Map();
 	#factLedgers = new Map();
 	#reconciliation = Promise.resolve();
 	#started = false;
@@ -46,13 +48,15 @@ export class DynamicCoordinator extends EventEmitter {
 	#closed = false;
 	#healthRegistry;
 	#latencyRegistry;
+	#controlNow;
+	#disconnectedAt = null;
 	#supportedAgentIds = new Set();
 	#reconciledStatus = false;
 	#setStatusInterval;
 	#clearStatusInterval;
 	#statusHandle = null;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, controlNow = () => performance.now(), setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -61,6 +65,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#bridge = requireDependency(bridge, 'bridge');
 		this.#healthRegistry = requireDependency(healthRegistry, 'healthRegistry');
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
+		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
+		this.#controlNow = controlNow;
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
 	}
@@ -99,6 +105,7 @@ export class DynamicCoordinator extends EventEmitter {
 		await Promise.allSettled([this.#reconciliation, ...this.#agentOperations.values()]);
 		this.#agentOperations.clear();
 		this.#outstandingActions.clear();
+		this.#lastPlannedObservations.clear();
 		await this.#codexService.stop();
 		this.#started = false;
 		this.#stopping = false;
@@ -124,6 +131,10 @@ export class DynamicCoordinator extends EventEmitter {
 				await this.#bridge.send('agent_error', agentId, { goalRevision: this.#registry.get(agentId)?.goalRevision ?? 0, code: invalid.code, message: invalid.message });
 			}
 			this.#reconciledStatus = true;
+			if (this.#disconnectedAt !== null) {
+				this.#recordLatency('reconnect_reconciliation', this.#disconnectedAt);
+				this.#disconnectedAt = null;
+			}
 			await this.#publishStatus();
 			this.emit('reconciled', reconciliation);
 			});
@@ -149,6 +160,7 @@ export class DynamicCoordinator extends EventEmitter {
 			await this.#planner.remove(message.agentId);
 			this.#actionSequences.delete(message.agentId);
 			this.#outstandingActions.delete(message.agentId);
+			this.#lastPlannedObservations.delete(message.agentId);
 			this.#factLedgers.delete(message.agentId);
 			this.#supportedAgentIds.delete(message.agentId);
 			await this.#publishStatus();
@@ -157,7 +169,10 @@ export class DynamicCoordinator extends EventEmitter {
 			const interruption = this.#beginGoalControlInterruption(message);
 			this.#enqueueAgent(message.agentId, async () => {
 				const record = this.#registry.applyGoalControl(message.agentId, message.payload);
-				if (message.payload.operation !== 'queue') this.#outstandingActions.delete(message.agentId);
+				if (message.payload.operation !== 'queue') {
+					this.#outstandingActions.delete(message.agentId);
+					this.#lastPlannedObservations.delete(message.agentId);
+				}
 				const interruptionResult = await interruption;
 				if (interruptionResult.error !== null) throw interruptionResult.error;
 				if (['start', 'resume', 'steer'].includes(message.payload.operation)) {
@@ -166,12 +181,18 @@ export class DynamicCoordinator extends EventEmitter {
 				this.emit('goalControl', record);
 			});
 		});
-		this.#listen('observation', (message) => this.#enqueueAgent(message.agentId, async () => {
+		this.#listen('observation', (message) => {
+			const receivedAt = this.#controlNow();
+			this.#enqueueAgent(message.agentId, async () => {
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 			if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
 			const observation = message.payload.observation ?? message.payload;
 			const ledger = this.#ledger(record.agentId);
 			ledger.ingest('observation', observation);
+			if (this.#outstandingActions.has(record.agentId)) return;
+			const fingerprint = `${record.goalRevision}:${observationHash(observation)}`;
+			if (this.#lastPlannedObservations.get(record.agentId) === fingerprint) return;
+			this.#lastPlannedObservations.set(record.agentId, fingerprint);
 			await this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING });
 			const decision = await this.#planner.requestPlan({
 				agentId: record.agentId,
@@ -184,9 +205,15 @@ export class DynamicCoordinator extends EventEmitter {
 					observation,
 				}, { untrustedFacts: ledger.toPlannerFacts() }),
 			});
+			this.#recordLatency('observation_to_plan', receivedAt);
 			this.#registry.setState(record.agentId, DynamicAgentState.ACTING, { goalRevision: record.goalRevision });
 			const actionId = this.#nextActionId(record.agentId);
-			const outstanding = { actionId, goalRevision: record.goalRevision };
+			const outstanding = {
+				actionId,
+				goalRevision: record.goalRevision,
+				dispatchedAt: this.#controlNow(),
+				firstProgressRecorded: false,
+			};
 			this.#outstandingActions.set(record.agentId, outstanding);
 			try {
 				await this.#bridge.send('action_command', record.agentId, {
@@ -200,25 +227,40 @@ export class DynamicCoordinator extends EventEmitter {
 				if (this.#outstandingActions.get(record.agentId) === outstanding) this.#outstandingActions.delete(record.agentId);
 				throw error;
 			}
-		}));
-		this.#listen('action_progress', (message) => this.#enqueueAgent(message.agentId, async () => {
-			this.#assertOutstandingAction(message);
+			});
+		});
+		this.#listen('action_progress', (message) => {
+			const receivedAt = this.#controlNow();
+			this.#enqueueAgent(message.agentId, async () => {
+			const outstanding = this.#assertOutstandingAction(message);
+			if (!outstanding.firstProgressRecorded) {
+				outstanding.firstProgressRecorded = true;
+				this.#recordLatency('command_to_first_progress', outstanding.dispatchedAt, receivedAt);
+			}
 			this.emit('actionProgress', message);
-		}));
-		this.#listen('action_result', (message) => this.#enqueueAgent(message.agentId, async () => {
+			});
+		});
+		this.#listen('action_result', (message) => {
+			const receivedAt = this.#controlNow();
+			this.#enqueueAgent(message.agentId, async () => {
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
-			this.#assertOutstandingAction(message);
+			const outstanding = this.#assertOutstandingAction(message);
+			this.#recordLatency('action_completion', outstanding.dispatchedAt, receivedAt);
 			this.#outstandingActions.delete(message.agentId);
+			this.#lastPlannedObservations.delete(message.agentId);
 			this.#ledger(record.agentId).ingest('action_result', message.payload);
 			if (record.state === DynamicAgentState.ACTING) {
 				this.#registry.setState(record.agentId, DynamicAgentState.PLANNING, { goalRevision: record.goalRevision });
 			}
 			this.emit('actionResult', message);
-		}));
+			});
+		});
 		this.#listen('disconnected', () => this.#run(async () => {
+			this.#disconnectedAt ??= this.#controlNow();
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
 			this.#outstandingActions.clear();
+			this.#lastPlannedObservations.clear();
 			await Promise.allSettled(this.#registry.list().map(async (record) => {
 				if (record.state !== DynamicAgentState.DISCONNECTED) this.#registry.setState(record.agentId, DynamicAgentState.DISCONNECTED, { goalRevision: record.goalRevision });
 				await this.#planner.interrupt(record.agentId, 'Minecraft bridge disconnected');
@@ -342,6 +384,16 @@ export class DynamicCoordinator extends EventEmitter {
 		if (outstanding.actionId !== actionId || outstanding.goalRevision !== message.payload.goalRevision) {
 			throw new ProtocolV2Error('STALE_ACTION_RESULT', `Action '${actionId}' is not the outstanding action for '${message.agentId}'`);
 		}
+		return outstanding;
+	}
+
+	#recordLatency(operation, startedAt, finishedAt = this.#controlNow()) {
+		try {
+			if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) return;
+			this.#latencyRegistry.record(operation, Math.max(0, finishedAt - startedAt));
+		} catch {
+			// Non-authoritative metrics cannot break agent control.
+		}
 	}
 }
 
@@ -392,6 +444,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		bridge,
 		healthRegistry,
 		latencyRegistry,
+		controlNow: dependencies.controlNow,
 		setStatusInterval: dependencies.setStatusInterval,
 		clearStatusInterval: dependencies.clearStatusInterval,
 	});

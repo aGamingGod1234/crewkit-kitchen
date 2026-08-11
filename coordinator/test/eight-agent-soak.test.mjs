@@ -120,9 +120,10 @@ function telemetry(provider, errorCode) {
 }
 
 async function eventually(predicate, message = 'condition was not reached') {
-	for (let index = 0; index < 200; index += 1) {
+	const deadline = Date.now() + 1_000;
+	while (Date.now() < deadline) {
 		if (predicate()) return;
-		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error(message);
 }
