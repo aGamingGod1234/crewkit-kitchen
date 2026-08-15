@@ -2,9 +2,15 @@
 	"name": "arena-agents-coordinator",
 	"private": true,
 	"type": "module",
+	"engines": {
+		"node": ">=22"
+	},
 	"scripts": {
-		"start": "node src/main.mjs",
+		"start": "node src/dynamic-main.mjs",
 		"start:dynamic": "node src/dynamic-main.mjs",
 		"test": "node --test"
+	},
+	"dependencies": {
+		"acorn": "8.18.0"
 	}
 }
