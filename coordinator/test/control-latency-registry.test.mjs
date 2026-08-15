@@ -5,12 +5,12 @@ import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 
 test('latency registry bounds samples and reports nearest-rank percentiles', () => {
 	const registry = new ControlLatencyRegistry({ windowSize: 3, operationCap: 2 });
-	for (const value of [10, 20, 30, 40]) registry.record('event_receipt_to_branch', value);
-	registry.record('branch_to_bridge_send', 2);
+	for (const value of [10.25, 20.5, 30.75, 40.125]) registry.record('event_receipt_to_branch', value);
+	registry.record('branch_to_bridge_send', 2.5);
 
 	assert.deepEqual(registry.snapshot(), [
-		{ operation: 'branch_to_bridge_send', count: 1, p50Ms: 2, p95Ms: 2 },
-		{ operation: 'event_receipt_to_branch', count: 3, p50Ms: 30, p95Ms: 40 },
+		{ operation: 'branch_to_bridge_send', count: 1, p50Ms: 2.5, p95Ms: 2.5 },
+		{ operation: 'event_receipt_to_branch', count: 3, p50Ms: 30.75, p95Ms: 40.125 },
 	]);
 });
 

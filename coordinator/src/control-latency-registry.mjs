@@ -67,9 +67,7 @@ function requireOperation(value) {
 
 function requireDuration(value) {
 	if (!Number.isFinite(value) || value < 0) throw new TypeError('duration must be non-negative and finite');
-	const duration = Math.round(value);
-	if (!Number.isSafeInteger(duration)) throw new TypeError('duration must round to a safe integer');
-	return duration;
+	return value;
 }
 
 function percentile(sorted, fraction) {

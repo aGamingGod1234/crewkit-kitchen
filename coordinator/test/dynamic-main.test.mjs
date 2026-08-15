@@ -70,15 +70,28 @@ test('installs a selected-model program and continues its next primitive without
 
 test('injects coordinator latency telemetry into program reaction timing', async () => {
 	let now = 10;
+	let publishStatus = null;
 	const latencyRegistry = new ControlLatencyRegistry();
-	const run = await start({ latencyRegistry, controlNow: () => now++ });
+	const run = await start({
+		latencyRegistry, controlNow: () => now++, epochNow: () => 100,
+		setStatusInterval: (callback) => { publishStatus = callback; return 1; }, clearStatusInterval: () => {},
+	});
 	try {
+		run.planner.requestPlan = async (request) => {
+			run.planner.requests.push(request);
+			return { summary: 'Watch health.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);' };
+		};
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 10, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		const first = run.bridge.sent.find((message) => message.type === 'action_command');
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 11, eventSequence: 2, attention: false, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		assert.equal(latencyRegistry.snapshot().some((entry) => entry.operation === 'event_receipt_to_branch'), false, 'heartbeats never create reaction timing');
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 12, eventSequence: 3, attention: true, observation: { player: { x: 0, y: 64, z: 0, health: 19 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 4 } });
 		await eventually(() => latencyRegistry.snapshot().some((entry) => entry.operation === 'event_receipt_to_branch'));
-		assert.ok(latencyRegistry.snapshot().some((entry) => entry.operation === 'event_receipt_to_branch'));
+		publishStatus();
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'coordinator_status' && message.payload.latencies.some((entry) => entry.operation === 'event_receipt_to_branch')));
 	} finally { await run.coordinator.stop(); }
 });
 

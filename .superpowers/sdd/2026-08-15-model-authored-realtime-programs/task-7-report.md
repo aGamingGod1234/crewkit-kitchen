@@ -16,14 +16,18 @@
 - Completion is measured from bridge send to terminal result, including immediate terminal results; first progress remains first-only.
 - The server uses a bridge-lifetime global observation sequence, so recreating an agent cannot restart its sequence. The manager ignores stale or duplicate server observations and only synthesizes event identities for sequence-less action events.
 - The benchmark now uses `performance.now()`, validates exactly 1,000 watcher branches and commands, and keeps the p95 local timings below 5 ms.
+- Receipt monotonic and epoch timestamps are captured before the per-agent queue, then treated as advisory telemetry only. Throwing, invalid, negative, or regressing clocks omit a sample without blocking observation ingestion or command sends.
+- Reaction metrics are emitted only for a material watcher branch and its matching bridge send. Minecraft publication delay is exclusively `receiptEpochMs - observedAtEpochMs`; local percentiles retain fractional milliseconds.
+- The server advances a publication baseline only after its observation envelope is accepted by the connection queue. Rejections retain a bounded dirty retry marker, so the next accepted observation still contains the missed factual delta.
 
 ## Verification
 
-- Focused Node suites: 37/37 passed, including the real monotonic-clock 1,000 watcher-event benchmark with p95 receipt-to-branch and branch-to-send below 5 ms.
-- Java 25 `verifyCore`: passed with 5,964 protocol and bridge assertions.
+- Focused Node suites: 39/39 passed, including the real monotonic-clock 1,000 watcher-event benchmark with exactly 1,000 positive finite p95 receipt-to-branch and branch-to-send samples below 5 ms.
+- Java 25 `verifyCore`: passed with 5,969 protocol and bridge assertions.
 - No dependency files changed, so a clean archive verification was not required.
 
 ## Commit
 
 - `0dc66a8 feat: stream factual attention events` (11 files, 346 insertions, 30 deletions).
 - `9a29084 fix: correct factual delta timing` (10 files, 226 insertions, 42 deletions).
+- Pending this correction commit: receipt-boundary fault containment, fractional telemetry, and successful-enqueue publication baselines.

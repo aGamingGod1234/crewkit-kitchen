@@ -558,8 +558,8 @@ function normalizeCoordinatorStatus(value) {
 		return {
 			operation: requireIdentifier(latency.operation, `${field}.operation`),
 			count: nonnegativeInteger(latency.count, `${field}.count`),
-			p50Ms: nonnegativeInteger(latency.p50Ms, `${field}.p50Ms`),
-			p95Ms: nonnegativeInteger(latency.p95Ms, `${field}.p95Ms`),
+			p50Ms: nonnegativeFiniteNumber(latency.p50Ms, `${field}.p50Ms`),
+			p95Ms: nonnegativeFiniteNumber(latency.p95Ms, `${field}.p95Ms`),
 		};
 	});
 	if (new Set(latencies.map((latency) => latency.operation)).size !== latencies.length) {
@@ -989,6 +989,11 @@ function integer(value, field) {
 
 function nonnegativeInteger(value, field) {
 	if (!Number.isSafeInteger(value) || value < 0) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a nonnegative safe integer`);
+	return value;
+}
+
+function nonnegativeFiniteNumber(value, field) {
+	if (!Number.isFinite(value) || value < 0) throw new ProtocolV2Error('INVALID_FIELD', `${field} must be a non-negative finite number`);
 	return value;
 }
 

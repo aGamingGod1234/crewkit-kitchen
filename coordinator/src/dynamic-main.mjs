@@ -51,6 +51,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#healthRegistry;
 	#latencyRegistry;
 	#controlNow;
+	#epochNow;
 	#disconnectedAt = null;
 	#supportedAgentIds = new Set();
 	#reconciledStatus = false;
@@ -71,6 +72,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
 		if (typeof epochNow !== 'function') throw new TypeError('epochNow must be a function');
 		this.#controlNow = controlNow;
+		this.#epochNow = epochNow;
 		this.#programRuntime = new ProgramRuntimeManager({
 			registry: this.#registry,
 			bridge: this.#bridge,
@@ -78,7 +80,6 @@ export class DynamicCoordinator extends EventEmitter {
 			reportError: (agentId, error) => this.#reportAgentError(agentId, error),
 			latencyRegistry: this.#latencyRegistry,
 			clock: () => this.#controlNow(),
-			epochClock: epochNow,
 		});
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
@@ -197,7 +198,8 @@ export class DynamicCoordinator extends EventEmitter {
 			});
 		});
 		this.#listen('observation', (message) => {
-			const receivedAt = this.#controlNow();
+			const receiptMonotonicMs = safeClockRead(this.#controlNow);
+			const receiptEpochMs = safeClockRead(this.#epochNow);
 			const lifecycleGeneration = this.#lifecycleGeneration(message.agentId);
 			this.#enqueueAgent(message.agentId, async () => {
 				if (!this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration)) return;
@@ -210,11 +212,12 @@ export class DynamicCoordinator extends EventEmitter {
 					observation,
 					eventSequence: message.payload.eventSequence,
 					attention: message.payload.attention === true,
-					receivedAtMonotonic: receivedAt,
+					receiptMonotonicMs,
+					receiptEpochMs,
 					observedAtEpochMs: message.payload.observedAtEpochMs,
 				});
 				if (installed !== null) return;
-				if ((this.#providerRetryAfter.get(record.agentId) ?? 0) > receivedAt) return;
+				if (receiptMonotonicMs !== null && (this.#providerRetryAfter.get(record.agentId) ?? 0) > receiptMonotonicMs) return;
 				await this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING });
 				const decision = await this.#planner.requestPlan({
 					agentId: record.agentId,
@@ -545,6 +548,15 @@ function positiveInteger(value, field) {
 function nonNegativeInteger(value, field) {
 	if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a non-negative safe integer`);
 	return value;
+}
+
+function safeClockRead(clock) {
+	try {
+		const value = clock();
+		return Number.isFinite(value) && value >= 0 ? value : null;
+	} catch {
+		return null;
+	}
 }
 
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

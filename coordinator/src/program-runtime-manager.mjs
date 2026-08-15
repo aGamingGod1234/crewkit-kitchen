@@ -18,9 +18,9 @@ export class ProgramRuntimeManager {
 	#compilerCorrectionLimit;
 	#latencyRegistry;
 	#clock;
-	#epochClock;
+	#lastClockReading = null;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), epochClock = Date.now } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance) } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
@@ -32,10 +32,8 @@ export class ProgramRuntimeManager {
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
 		if (latencyRegistry !== null && typeof latencyRegistry.record !== 'function') throw new TypeError('latencyRegistry.record must be a function');
 		if (typeof clock !== 'function') throw new TypeError('clock must be a function');
-		if (typeof epochClock !== 'function') throw new TypeError('epochClock must be a function');
 		this.#latencyRegistry = latencyRegistry;
 		this.#clock = clock;
-		this.#epochClock = epochClock;
 	}
 
 	async installDecision(record, decision, { observation, eventSequence } = {}) {
@@ -55,13 +53,18 @@ export class ProgramRuntimeManager {
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return null;
 		const eventSequence = this.#acceptServerEvent(state, payload.eventSequence);
 		if (eventSequence === null) return state.engine.snapshot();
-		const receivedAt = monotonicTimestamp(payload.receivedAtMonotonic) ?? this.#now();
 		const observation = payload.observation ?? payload;
 		state.observation = observation;
+		const receiptMonotonicMs = advancingTimestamp(state, 'lastReceiptMonotonicMs', payload.receiptMonotonicMs);
+		const receiptEpochMs = advancingTimestamp(state, 'lastReceiptEpochMs', payload.receiptEpochMs);
+		if (payload.attention === true) {
+			state.branchReceipt = {
+				eventSequence,
+				receiptMonotonicMs,
+			};
+			this.#recordMinecraftPublication(receiptEpochMs, payload.observedAtEpochMs);
+		}
 		state.engine.ingestObservation({ observation, eventSequence, attention: payload.attention === true });
-		const branchSelectedAt = this.#now();
-		this.#recordMinecraftPublication(payload.observedAtEpochMs);
-		this.#recordLatency('event_receipt_to_branch', branchSelectedAt - receivedAt);
 		this.#syncState(record, state);
 		return state.engine.snapshot();
 	}
@@ -75,8 +78,8 @@ export class ProgramRuntimeManager {
 		if (eventSequence === null) return false;
 		const timing = state.actionTiming.get(payload.actionId);
 		if (timing && timing.firstProgressAt === null) {
-			timing.firstProgressAt = this.#now();
-			this.#recordLatency('command_to_first_progress', timing.firstProgressAt - timing.bridgeSentAt);
+			timing.firstProgressAt = this.#safeNow();
+			if (timing.firstProgressAt !== null && timing.bridgeSentAt !== null) this.#recordLatency('command_to_first_progress', timing.firstProgressAt - timing.bridgeSentAt);
 		}
 		return true;
 	}
@@ -91,7 +94,8 @@ export class ProgramRuntimeManager {
 		if (eventSequence === null) return false;
 		const timing = state.actionTiming.get(payload.actionId);
 		if (timing !== undefined) {
-			this.#recordLatency('action_completion', this.#now() - timing.bridgeSentAt);
+			const completedAt = this.#safeNow();
+			if (completedAt !== null && timing.bridgeSentAt !== null) this.#recordLatency('action_completion', completedAt - timing.bridgeSentAt);
 		}
 		state.engine.ingestActionResult({
 			actionId: internalActionId,
@@ -150,6 +154,9 @@ export class ProgramRuntimeManager {
 			commands: 0,
 			corrections: new Map(),
 			terminalStatus: null,
+			branchReceipt: null,
+			lastReceiptMonotonicMs: null,
+			lastReceiptEpochMs: null,
 			engine: null,
 		};
 		state.engine = new ArenaScriptEngine({
@@ -282,14 +289,19 @@ export class ProgramRuntimeManager {
 		if (record === null || record.goalRevision !== state.goalRevision) return;
 		let actionId = null;
 		try {
-			const branchSelectedAt = this.#now();
+			const branchSelectedAt = this.#safeNow();
 			this.#ensureActing(record);
 			actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
 			state.actionIds.set(actionId, command.actionId);
 			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command));
-			const bridgeSentAt = this.#now();
+			const bridgeSentAt = this.#safeNow();
 			state.actionTiming.set(actionId, { bridgeSentAt, firstProgressAt: null });
-			if (command.provenance.authorizingEventSequence !== null) this.#recordLatency('branch_to_bridge_send', bridgeSentAt - branchSelectedAt);
+			const receipt = command.provenance.authorizingEventSequence === null ? null : state.branchReceipt;
+			if (receipt !== null && receipt.eventSequence === command.provenance.authorizingEventSequence) {
+				if (branchSelectedAt !== null && receipt.receiptMonotonicMs !== null) this.#recordLatency('event_receipt_to_branch', branchSelectedAt - receipt.receiptMonotonicMs);
+				if (bridgeSentAt !== null && branchSelectedAt !== null) this.#recordLatency('branch_to_bridge_send', bridgeSentAt - branchSelectedAt);
+				state.branchReceipt = null;
+			}
 		} catch (error) {
 			if (actionId !== null) this.#rejectDispatchedAction(state, record, actionId, command.actionId, error);
 			this.#reportError(state.agentId, error);
@@ -339,10 +351,15 @@ export class ProgramRuntimeManager {
 		return state.sequence;
 	}
 
-	#now() {
-		const now = this.#clock();
-		if (!Number.isFinite(now)) throw new TypeError('clock must return a finite number');
-		return now;
+	#safeNow() {
+		try {
+			const now = this.#clock();
+			if (!Number.isFinite(now) || now < 0 || (this.#lastClockReading !== null && now < this.#lastClockReading)) return null;
+			this.#lastClockReading = now;
+			return now;
+		} catch {
+			return null;
+		}
 	}
 
 	#recordLatency(operation, duration) {
@@ -352,11 +369,10 @@ export class ProgramRuntimeManager {
 		catch { /* local telemetry cannot interrupt agent control */ }
 	}
 
-	#recordMinecraftPublication(observedAtEpochMs) {
-		if (!Number.isSafeInteger(observedAtEpochMs) || observedAtEpochMs < 0) return;
-		const completedAtEpochMs = this.#epochClock();
-		const duration = completedAtEpochMs - observedAtEpochMs;
-		if (!Number.isFinite(completedAtEpochMs) || duration <= 0 || duration > 60_000) return;
+	#recordMinecraftPublication(receiptEpochMs, observedAtEpochMs) {
+		if (!Number.isFinite(receiptEpochMs) || receiptEpochMs < 0 || !Number.isFinite(observedAtEpochMs) || observedAtEpochMs < 0) return;
+		const duration = receiptEpochMs - observedAtEpochMs;
+		if (duration <= 0 || duration > 60_000) return;
 		this.#recordLatency('minecraft_change_to_publication', duration);
 	}
 
@@ -381,6 +397,12 @@ export class ProgramRuntimeManager {
 }
 
 function versionKey(record) { return `${record.agentId}\u0000${record.goalRevision}`; }
+function advancingTimestamp(state, field, value) {
+	const timestamp = monotonicTimestamp(value);
+	if (timestamp === null || (state[field] !== null && timestamp < state[field])) return null;
+	if (timestamp !== null) state[field] = timestamp;
+	return timestamp;
+}
 function wireActionCommand(record, actionId, command) {
 	const action = command?.action;
 	const provenance = command?.provenance;

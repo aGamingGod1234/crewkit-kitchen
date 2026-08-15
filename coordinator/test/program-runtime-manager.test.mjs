@@ -85,17 +85,19 @@ test('measures one thousand watcher branches with the real monotonic clock', asy
 		await new Promise((resolve) => setImmediate(resolve));
 		let sequence = 2;
 		for (let event = 0; event < 250; event++) {
-			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 19 } }), receivedAtMonotonic: performance.now(), observedAtEpochMs: Date.now(), eventSequence: sequence++, attention: true });
+			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 19 } }), receiptMonotonicMs: performance.now(), receiptEpochMs: Date.now(), observedAtEpochMs: Date.now() - 1, eventSequence: sequence++, attention: true });
+			await new Promise((resolve) => setImmediate(resolve));
 			await manager.onActionResult(registry.get(agentId), { actionId: sent.at(-1).payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: sequence++ });
 			await new Promise((resolve) => setImmediate(resolve));
-			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 20 } }), receivedAtMonotonic: performance.now(), observedAtEpochMs: Date.now(), eventSequence: sequence++, attention: false });
+			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 20 } }), receiptMonotonicMs: performance.now(), receiptEpochMs: Date.now(), observedAtEpochMs: Date.now() - 1, eventSequence: sequence++, attention: false });
 		}
 	}
 	const snapshot = latencies.snapshot();
 	for (const operation of ['event_receipt_to_branch', 'branch_to_bridge_send']) {
 		const metric = snapshot.find((entry) => entry.operation === operation);
 		assert.ok(metric, `${operation} is recorded`);
-		assert.ok(metric.p95Ms < 5, `${operation} p95 stays below 5ms`);
+		assert.equal(metric.count, 1_000, `${operation} has exactly one sample per watcher branch`);
+		assert.ok(Number.isFinite(metric.p95Ms) && metric.p95Ms > 0 && metric.p95Ms < 5, `${operation} p95 is positive and stays below 5ms`);
 	}
 	assert.equal(sent.filter((message) => message.payload.provenance.eventSequence > 1).length, 1_000, 'each watcher event produces exactly one command');
 	assert.equal(snapshot.find((entry) => entry.operation === 'branch_to_bridge_send').count, 1_000, 'each watcher command contributes one branch-to-send sample');
@@ -108,13 +110,13 @@ test('ignores duplicate server observations and omits skewed epoch telemetry', a
 	const manager = new ProgramRuntimeManager({
 		registry,
 		bridge: { send: async () => {} }, planner: { requestPlan: async () => ({ directive: 'continue' }) },
-		latencyRegistry: latencies, clock: () => now++, epochClock: () => 1_000,
+		latencyRegistry: latencies, clock: () => now++,
 	});
 	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
-	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, receivedAtMonotonic: 100, observedAtEpochMs: 2_000, attention: false });
-	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 2, receivedAtMonotonic: 101, observedAtEpochMs: 900, attention: true });
-	assert.equal(latencies.snapshot().find((entry) => entry.operation === 'event_receipt_to_branch').count, 1, 'duplicate server event is ignored before branch timing');
-	assert.equal(latencies.snapshot().some((entry) => entry.operation === 'minecraft_change_to_publication'), false, 'future epoch observation is omitted instead of coerced to zero');
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, receiptMonotonicMs: 100, receiptEpochMs: 1_000, observedAtEpochMs: 2_000, attention: false });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 2, receiptMonotonicMs: 101, receiptEpochMs: 900, observedAtEpochMs: 800, attention: true });
+	assert.equal(latencies.snapshot().some((entry) => entry.operation === 'event_receipt_to_branch'), false, 'duplicate server event is ignored before branch timing');
+	assert.equal(latencies.snapshot().some((entry) => entry.operation === 'minecraft_change_to_publication'), false, 'duplicate future/skewed event is omitted instead of coerced to zero');
 });
 
 test('records completion from bridge send even when no progress arrives', async () => {
@@ -150,6 +152,34 @@ test('records only the first progress event for an action', async () => {
 	assert.equal(manager.onActionProgress(registry.get('agent-a'), { actionId: sent[0].actionId }), true);
 	assert.equal(manager.onActionProgress(registry.get('agent-a'), { actionId: sent[0].actionId }), true);
 	assert.equal(latencies.snapshot().find((entry) => entry.operation === 'command_to_first_progress').count, 1);
+});
+
+test('telemetry clock faults omit samples without interrupting program control', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [];
+	const samples = [Number.NaN, -1, 10, 9, new Error('clock unavailable')];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (_type, _agentId, payload) => sent.push(payload) },
+		planner: { requestPlan: async () => ({ directive: 'continue' }) },
+		latencyRegistry: new ControlLatencyRegistry(),
+		clock: () => {
+			const value = samples.shift();
+			if (value instanceof Error) throw value;
+			return value ?? 10;
+		},
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(1); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: sent[0].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: sent[1].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(sent.length, 3, 'NaN, negative, regressing, and throwing clock reads cannot stop commands');
+	assert.ok(await manager.onObservation(registry.get('agent-a'), {
+		observation: observation(), eventSequence: 2, attention: true,
+		receiptMonotonicMs: -1, receiptEpochMs: Number.NaN, observedAtEpochMs: 1,
+	}), 'invalid receipt timestamps cannot reject a valid observation');
 });
 
 test('disposes an old goal program so late action results cannot advance it', async () => {

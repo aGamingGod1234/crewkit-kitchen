@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.server.perception;
 
 import com.google.gson.JsonObject;
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -45,6 +47,17 @@ public final class ObservationBudgetVerification {
 		assertTrue(crowded.changedFacts().size() <= 256, "changed facts remain protocol bounded at maximum disjoint entity and block changes");
 		assertTrue(crowded.changedFacts().contains("entities"), "entity overflow coalesces to a factual aggregate");
 		assertTrue(crowded.changedFacts().contains("blocks"), "block overflow coalesces to a factual aggregate");
+		MultiplexedServerBridge.PublishedObservationState publication = new MultiplexedServerBridge.PublishedObservationState(16);
+		AgentId retryAgent = AgentId.parse("01234567-89ab-cdef-0123-456789abcdef");
+		publication.commit(retryAgent, previous);
+		AttentionFactDelta failedPublication = publication.delta(retryAgent, current, 10L, 126L);
+		assertTrue(failedPublication.attention(), "failed enqueue sees the material change");
+		assertTrue(publication.markDirty(retryAgent), "failed enqueue retains a bounded retry marker");
+		AttentionFactDelta retryPublication = publication.delta(retryAgent, current, 11L, 127L);
+		assertTrue(retryPublication.attention() && retryPublication.changedFacts().contains("player.health"),
+				"retry retains the last delivered baseline and factual material change");
+		publication.commit(retryAgent, current);
+		assertFalse(publication.delta(retryAgent, current, 12L, 128L).attention(), "successful retry advances the delivered baseline");
 
 		ObservationDispatchQueue<String> queue = new ObservationDispatchQueue<>(3, 2);
 		assertTrue(queue.offer("agent-a"), "first observation request is queued");
@@ -94,7 +107,7 @@ public final class ObservationBudgetVerification {
 		assertEquals(8, burstFirst.size(), "first drain obeys eight-observation budget");
 		assertEquals(8, burstSecond.size(), "second drain serves every remaining agent");
 		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in two drains");
-		return 34;
+		return 38;
 	}
 
 	private static JsonObject observation(double health, boolean onFire, double fallDistance, String actionType) {

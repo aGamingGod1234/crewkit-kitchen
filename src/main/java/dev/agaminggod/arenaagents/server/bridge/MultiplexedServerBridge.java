@@ -89,7 +89,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final AtomicLong messageIds = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private final AtomicLong observationSequences = new AtomicLong();
-	private final Map<AgentId, JsonObject> publishedObservations = new HashMap<>();
+	private final PublishedObservationState publishedObservations = new PublishedObservationState(AgentConstants.DEFAULT_AGENT_LIMIT);
 	private volatile Session session;
 	private volatile ServerSocket serverSocket;
 	private volatile Set<String> catalogProfiles = Set.of();
@@ -366,7 +366,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			requireKeys(latency, Set.of("operation", "count", "p50Ms", "p95Ms"), "latency");
 			latencies.add(new CoordinatorStatusSnapshot.LatencyHealth(
 					requiredStatusString(latency, "operation"), requiredInt(latency, "count"),
-					requiredInt(latency, "p50Ms"), requiredInt(latency, "p95Ms")
+					requiredNonNegativeDouble(latency, "p50Ms"), requiredNonNegativeDouble(latency, "p95Ms")
 			));
 		}
 			return new CoordinatorStatusSnapshot(
@@ -634,12 +634,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendObservation(AgentId agentId) {
-		if (!authenticated()) return;
 		try {
+			if (!authenticated()) {
+				retryObservation(agentId);
+				return;
+			}
 			JsonObject observation = observations.collect(agentId);
 			long eventSequence = observationSequences.incrementAndGet();
-			AttentionFactDelta delta = AttentionFactDelta.between(
-					publishedObservations.get(agentId), observation, eventSequence,
+			AttentionFactDelta delta = publishedObservations.delta(
+					agentId, observation, eventSequence,
 					observation.get("observedAtEpochMs").getAsLong()
 			);
 			observation.addProperty("eventSequence", delta.eventSequence());
@@ -647,10 +650,23 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			JsonArray changedFacts = new JsonArray();
 			delta.changedFacts().forEach(changedFacts::add);
 			observation.add("changedFacts", changedFacts);
-			publishedObservations.put(agentId, observation.deepCopy());
-			send("observation", agentId.toString(), observation);
+			if (!sendObservationEnvelope(agentId, observation)) {
+				retryObservation(agentId);
+				return;
+			}
+			publishedObservations.commit(agentId, observation);
 		} catch (RuntimeException exception) {
+			retryObservation(agentId);
 			LOGGER.warn("Could not collect observation for {}: {}", agentId, exception.getMessage());
+		}
+	}
+
+	private void retryObservation(AgentId agentId) {
+		if (!publishedObservations.markDirty(agentId)) return;
+		try {
+			queueObservation(agentId);
+		} catch (RuntimeException exception) {
+			LOGGER.debug("Could not retain observation retry for {}: {}", agentId, exception.getMessage());
 		}
 	}
 
@@ -673,6 +689,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		active.enqueue(new BridgeEnvelope(2, serverInstanceId, agentId, type,
 				"server-" + messageIds.incrementAndGet(), payload));
+	}
+
+	private boolean sendObservationEnvelope(AgentId agentId, JsonObject payload) {
+		Session active = session;
+		if (active == null || !active.authenticated.get()) return false;
+		active.enqueue(new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
+				"server-" + messageIds.incrementAndGet(), payload));
+		return true;
 	}
 
 	private static JsonObject registeredPayload(AgentRecord record) {
@@ -847,6 +871,45 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		double value = object.get(field).getAsDouble();
 		if (!Double.isFinite(value)) throw new BridgeProtocolException("INVALID_FIELD", field);
 		return value;
+	}
+
+	private static double requiredNonNegativeDouble(JsonObject object, String field) {
+		double value = requiredDouble(object, field);
+		if (value < 0.0D) throw new BridgeProtocolException("INVALID_FIELD", field);
+		return value;
+	}
+
+	/** Retains only successfully delivered baselines and a bounded retry marker. */
+	public static final class PublishedObservationState {
+		private final int retryCapacity;
+		private final Map<AgentId, JsonObject> delivered = new HashMap<>();
+		private final Set<AgentId> dirty = new HashSet<>();
+
+		public PublishedObservationState(int retryCapacity) {
+			if (retryCapacity < 1) throw new IllegalArgumentException("retryCapacity must be positive");
+			this.retryCapacity = retryCapacity;
+		}
+
+		public AttentionFactDelta delta(AgentId agentId, JsonObject current, long eventSequence, long observedAtEpochMs) {
+			return AttentionFactDelta.between(delivered.get(agentId), current, eventSequence, observedAtEpochMs);
+		}
+
+		public void commit(AgentId agentId, JsonObject deliveredObservation) {
+			delivered.put(agentId, deliveredObservation.deepCopy());
+			dirty.remove(agentId);
+		}
+
+		public boolean markDirty(AgentId agentId) {
+			if (dirty.contains(agentId)) return true;
+			if (dirty.size() >= retryCapacity) return false;
+			dirty.add(agentId);
+			return true;
+		}
+
+		public void remove(AgentId agentId) {
+			delivered.remove(agentId);
+			dirty.remove(agentId);
+		}
 	}
 
 	private static void requireKeys(JsonObject object, Set<String> expected, String field) {

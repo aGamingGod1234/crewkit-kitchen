@@ -95,10 +95,10 @@ public record CoordinatorStatusSnapshot(
 		}
 	}
 
-	public record LatencyHealth(String operation, int count, int p50Ms, int p95Ms) {
+	public record LatencyHealth(String operation, int count, double p50Ms, double p95Ms) {
 		public LatencyHealth {
 			operation = nonblank(operation, "operation");
-			if (count < 0 || p50Ms < 0 || p95Ms < 0) throw new IllegalArgumentException("invalid latency health");
+			if (count < 0 || !Double.isFinite(p50Ms) || !Double.isFinite(p95Ms) || p50Ms < 0 || p95Ms < 0) throw new IllegalArgumentException("invalid latency health");
 		}
 	}
 
