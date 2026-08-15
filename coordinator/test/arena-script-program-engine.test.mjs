@@ -241,7 +241,7 @@ test('late continue resumes a cancelled pause-and-notify command only after a fr
 	assert.equal(engine.snapshot().status, 'SUSPENDED');
 	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
 	assert.equal(engine.snapshot().status, 'ACTIVE');
-	assert.equal(dispatched.length, 1);
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 2]);
 	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: false });
 	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 2]);
 });
@@ -363,4 +363,58 @@ test('a command labels the facts sequence actually available when a newer result
 	});
 	assert.equal(dispatched.at(-1).provenance.eventSequence, 5);
 	assert.equal(dispatched.at(-1).provenance.factsEventSequence, 2);
+});
+
+test('a facts advance at an already-fenced event reissues the request instead of accepting stale facts', () => {
+	const { engine, dispatched, modelRequests } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const active = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: active.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3 });
+	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
+	assert.equal(modelRequests[1].eventSequence, 3);
+	assert.equal(modelRequests[1].factsSequence, 2);
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: false });
+	engine.applyDirective({ directive: 'continue', ...modelRequests[1] });
+	assert.equal(modelRequests.length, 3);
+	assert.equal(modelRequests[2].eventSequence, 3);
+	assert.equal(modelRequests[2].factsSequence, 3);
+});
+
+test('an action result resumes immediately when its authoritative observation already arrived', () => {
+	const { engine, dispatched } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);');
+	const active = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: false });
+	engine.ingestActionResult({ actionId: active.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 2]);
+});
+
+test('trusted suspend invalidates an idle pause-and-notify response even after it is already suspended', () => {
+	const { engine, modelRequests } = engineFor('program.onUnhandledAttention("pause_and_notify");');
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	const request = modelRequests[0];
+	const before = engine.snapshot().lifecycleEpoch;
+	engine.suspend('trusted_stop');
+	assert.equal(engine.snapshot().lifecycleEpoch, before + 1);
+	engine.applyDirective({ directive: 'continue', ...request });
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+});
+
+test('terminal non-cancelled results complete queued install, dispose, and interrupt watcher work', () => {
+	const installed = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const first = installed.dispatched.at(-1);
+	installed.engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'next', version: 2, compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(9);'), observation: observation(), eventSequence: 2 });
+	installed.engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	assert.equal(installed.engine.snapshot().programId, 'next');
+
+	const disposed = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const second = disposed.dispatched.at(-1);
+	disposed.engine.dispose();
+	disposed.engine.ingestActionResult({ actionId: second.actionId, state: 'FAILED', reasonCode: 'BLOCKED', eventSequence: 1 });
+	assert.equal(disposed.engine.snapshot().status, 'IDLE');
+
+	const watched = engineFor('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "interrupt" }, async () => { await player.wait(9); }); await player.wait(1);');
+	const third = watched.dispatched.at(-1);
+	watched.engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 2, attention: true });
+	watched.engine.ingestActionResult({ actionId: third.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	assert.equal(watched.dispatched.at(-1).action.arguments, 9);
 });

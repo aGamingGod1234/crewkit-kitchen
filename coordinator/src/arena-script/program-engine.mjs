@@ -58,26 +58,32 @@ export class ArenaScriptEngine {
 		this.#completed.set(actionId, signature);
 		const result = Object.freeze({ stateToken: active.stateToken, state, reasonCode });
 		if (this.#transition || this.#cancelling) {
-			if (state !== 'CANCELLED') { this.#status = 'PAUSED'; return this.snapshot(); }
 			const cancelling = this.#cancelling;
 			this.#cancelling = null;
 			if (this.#transition) { this.#transition.result = Object.freeze({ result, eventSequence, authority: active.authority, executionFactsSequence: active.executionFactsSequence }); return this.#completeTransition(); }
 			if (cancelling?.kind === 'watcher') {
-				this.#vm.abortPendingCommand(result.stateToken);
-				this.#handleYield(this.#vm.runWatcherHandler(cancelling.latch.watcherId, cancelling.latch.facts), watcherExecution(cancelling.latch));
+				if (state === 'CANCELLED') {
+					this.#vm.abortPendingCommand(result.stateToken);
+					this.#handleYield(this.#vm.runWatcherHandler(cancelling.latch.watcherId, cancelling.latch.facts), watcherExecution(cancelling.latch));
+					return this.snapshot();
+				}
+				this.#boundary.unshift(cancelling.latch);
+				this.#pendingResult = Object.freeze({ result, eventSequence, authority: active.authority, executionFactsSequence: active.executionFactsSequence });
+				if (this.#factsSequence >= eventSequence) this.#resumeOrRunBoundary();
 				return this.snapshot();
 			}
 			this.#status = 'SUSPENDED';
 			return this.snapshot();
 		}
 		this.#pendingResult = Object.freeze({ result, eventSequence, authority: active.authority, executionFactsSequence: active.executionFactsSequence });
+		if (this.#factsSequence >= eventSequence) this.#resumeOrRunBoundary();
 		return this.snapshot();
 	}
 
 	applyDirective(directive = {}) {
 		const request = this.#pendingRequest;
 		if (!request || !sameRequest(directive, request)) return this.snapshot();
-		if (this.#coalescedRequest && (this.#coalescedRequest.eventSequence > request.eventSequence || this.#coalescedRequest.lifecycleEpoch !== request.lifecycleEpoch)) {
+		if (this.#coalescedRequest && (this.#coalescedRequest.eventSequence > request.eventSequence || this.#coalescedRequest.factsSequence > request.factsSequence || this.#coalescedRequest.lifecycleEpoch !== request.lifecycleEpoch)) {
 			this.#pendingRequest = this.#coalescedRequest;
 			this.#callbacks.requestModel(this.#pendingRequest);
 			return this.snapshot();
@@ -87,7 +93,10 @@ export class ArenaScriptEngine {
 		this.#requestUpdate = null;
 		if (directive.directive === 'continue') {
 			if (this.#transition?.kind === 'terminal' && this.#transition.reason === 'unhandled_attention') this.#transition = { kind: 'resume' };
-			else if (this.#status === 'SUSPENDED' && (this.#suspendedResult || this.#resumableUnhandled)) { this.#pendingResult = this.#suspendedResult; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#status = 'ACTIVE'; }
+			else if (this.#status === 'SUSPENDED' && (this.#suspendedResult || this.#resumableUnhandled)) {
+				this.#pendingResult = this.#suspendedResult; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#status = 'ACTIVE';
+				if (this.#pendingResult && this.#factsSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
+			}
 			return this.snapshot();
 		}
 		if (directive.directive === 'replace') {
@@ -108,8 +117,8 @@ export class ArenaScriptEngine {
 	}
 
 	suspend(reason = 'suspended') {
-		if (!this.#isLive()) return this.snapshot();
 		this.#invalidateLifecycleRequests();
+		if (!this.#isLive()) return this.snapshot();
 		this.#transition = { kind: 'terminal', status: 'SUSPENDED', reason };
 		if (this.#active) this.#cancelActive(reason); else this.#completeTransition();
 		return this.snapshot();
@@ -153,7 +162,11 @@ export class ArenaScriptEngine {
 		if (!transition) return this.snapshot();
 		if (transition.kind === 'install') return this.#activate(transition.target);
 		if (transition.kind === 'dispose') { this.#clear(); return this.snapshot(); }
-		if (transition.kind === 'resume') { this.#status = 'ACTIVE'; this.#pendingResult = transition.result; return this.snapshot(); }
+		if (transition.kind === 'resume') {
+			this.#status = 'ACTIVE'; this.#pendingResult = transition.result;
+			if (this.#pendingResult && this.#factsSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
+			return this.snapshot();
+		}
 		if (transition.status === 'SUSPENDED' && transition.reason === 'unhandled_attention') { this.#suspendedResult = transition.result ?? null; this.#resumableUnhandled = true; }
 		this.#status = transition.status;
 		return this.snapshot();
@@ -205,7 +218,7 @@ export class ArenaScriptEngine {
 		if (this.#program.compiled.unhandledPolicy === 'pause_and_notify') this.#suspendUnhandledAttention();
 	}
 
-	#invalidateLifecycleRequests() { this.#lifecycleEpoch += 1; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; }
+	#invalidateLifecycleRequests() { this.#lifecycleEpoch += 1; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; this.#suspendedResult = null; this.#resumableUnhandled = false; }
 	#suspendUnhandledAttention() {
 		this.#transition = { kind: 'terminal', status: 'SUSPENDED', reason: 'unhandled_attention' };
 		if (this.#active) this.#cancelActive('unhandled_attention'); else this.#completeTransition();
@@ -278,7 +291,7 @@ function installationRelation(next, current) {
 }
 function sameImmutableProgram(next, current) { return next.agentId === current.agentId && next.modelIdentity === current.modelIdentity && next.programId === current.programId && next.compiled === current.compiled && next.compiled.source === current.compiled.source; }
 function requestContext(program, generation, lifecycleEpoch, eventSequence, factsSequence, observation) { return freezeRecord({ agentId: program.agentId, goalRevision: program.goalRevision, modelIdentity: program.modelIdentity, programId: program.programId, version: program.version, generation, lifecycleEpoch, eventSequence, factsSequence, observation }); }
-function sameRequest(value, request) { return value && ['agentId', 'goalRevision', 'modelIdentity', 'programId', 'version', 'generation', 'lifecycleEpoch', 'eventSequence'].every((key) => value[key] === request[key]); }
+function sameRequest(value, request) { return value && ['agentId', 'goalRevision', 'modelIdentity', 'programId', 'version', 'generation', 'lifecycleEpoch', 'eventSequence', 'factsSequence'].every((key) => value[key] === request[key]); }
 function watcherExecution(authority, executionFactsSequence = authority.eventSequence) { return freezeRecord({ authority, executionFactsSequence }); }
 function watcherMode(compiled, index) { const watches = []; for (const statement of compiled.ast.body) { const call = statement.type === 'ExpressionStatement' ? statement.expression : null; if (call?.type === 'CallExpression' && call.callee.type === 'MemberExpression' && call.callee.object.name === 'program' && call.callee.property.name === 'watch') watches.push(call); } return watches[index]?.arguments[1]?.properties?.find((property) => property.key.name === 'mode')?.value?.value ?? 'boundary'; }
 function freezeRecord(values) { return Object.freeze(Object.assign(Object.create(null), values)); }
