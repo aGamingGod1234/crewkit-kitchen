@@ -42,3 +42,21 @@ test('provider reconciliation groups profiles and preserves an unavailable provi
 	assert.deepEqual(result.valid.map((record) => record.agentId), ['c', 'k']);
 	assert.deepEqual(result.invalid.map((entry) => entry.profile.agentId), ['g']);
 });
+
+test('combined catalog refreshes independent provider CLIs concurrently', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const started = [];
+	const releases = new Map();
+	for (const [provider, service] of Object.entries(services)) {
+		service.catalog.refresh = () => new Promise((resolve) => {
+			started.push(provider);
+			releases.set(provider, () => resolve({ provider, refreshedAtEpochMs: 1, models: [] }));
+		});
+	}
+	const router = new ProviderService(services);
+	const refreshing = router.catalog.refresh();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(started, ['codex', 'gemini', 'kimi']);
+	for (const release of releases.values()) release();
+	await refreshing;
+});

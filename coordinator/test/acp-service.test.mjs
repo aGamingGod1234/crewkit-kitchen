@@ -6,18 +6,15 @@ import { AcpProviderService, buildAcpLaunch } from '../src/acp-service.mjs';
 
 const DECISION = JSON.stringify({
 	summary: 'Wait safely.',
-	goalStatus: 'in_progress',
-	action: {
-		type: 'wait', x: null, y: null, z: null, tolerance: null, sprint: null,
-		targetSelector: null, timeoutMs: null, itemId: null, durationMs: 25,
-		face: null, message: null, open: null, slot: null, count: null, summary: null,
-	},
+	directive: 'replace',
+	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);',
 });
 
 class FakeAcpTransport extends EventEmitter {
-	constructor(configOptions) {
+	constructor(configOptions, { configOptionsAfterModel = null } = {}) {
 		super();
 		this.configOptions = configOptions;
+		this.configOptionsAfterModel = configOptionsAfterModel;
 		this.calls = [];
 		this.started = false;
 	}
@@ -29,7 +26,12 @@ class FakeAcpTransport extends EventEmitter {
 		this.calls.push({ kind: 'request', method, params });
 		if (method === 'initialize') return { protocolVersion: 1, agentInfo: { name: 'fake-acp', version: '1' } };
 		if (method === 'session/new') return { sessionId: 'session-1', configOptions: this.configOptions };
-		if (method === 'session/set_config_option') return { configOptions: this.configOptions };
+		if (method === 'session/set_config_option') {
+			if (params.configId === 'model' && this.configOptionsAfterModel !== null) {
+				this.configOptions = this.configOptionsAfterModel;
+			}
+			return { configOptions: this.configOptions };
+		}
 		if (method === 'session/prompt') {
 			queueMicrotask(() => this.emit('notification', {
 				method: 'session/update',
@@ -58,13 +60,13 @@ test('Gemini ACP sessions apply the exact model and thinking level and parse pla
 	);
 	await agent.setGoalRevision(2);
 	const decision = await agent.decide('authoritative state', { goalRevision: 2 });
-	assert.equal(decision.action.type, 'wait');
+	assert.equal(decision.directive, 'replace');
 	assert.deepEqual(transport.calls.filter((call) => call.method === 'session/set_config_option').map((call) => call.params), [
 		{ sessionId: 'session-1', configId: 'model', value: 'gemini-pro' },
 		{ sessionId: 'session-1', configId: 'thinking', value: 'high' },
 	]);
 	const prompt = transport.calls.find((call) => call.method === 'session/prompt').params.prompt[0].text;
-	assert.match(prompt, /strategic planner for one Minecraft player/i);
+	assert.match(prompt, /strategic author for one Minecraft player/i);
 	assert.match(prompt, /authoritative state/);
 	assert.match(prompt, /Previous movement timed out/);
 	await service.stop();
@@ -127,4 +129,62 @@ test('ACP cancellation is a notification and unsupported profile values fail clo
 	agent.interrupt();
 	assert.equal(transport.calls.at(-1).method, 'session/cancel');
 	await service.stop();
+});
+
+test('Kimi ACP treats its boolean thinking switch as enabled while the exact effort stays process-scoped', async () => {
+	const launch = buildAcpLaunch('kimi', { reasoningEffort: 'low' }, { env: {} });
+	assert.equal(launch.options.env.KIMI_MODEL_THINKING_EFFORT, 'low');
+	const transport = new FakeAcpTransport([
+		{ id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3', options: [{ value: 'kimi-code/k3', name: 'K3' }] },
+		{ id: 'thinking', category: 'thought_level', type: 'select', currentValue: 'on', options: [{ value: 'on', name: 'On' }] },
+	]);
+	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
+	await service.createAgent({ agentId: 'kimi-low', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'low' });
+	assert.equal(transport.calls.some((call) => call.params?.configId === 'thinking' && call.params.value === 'low'), false);
+	await service.stop();
+});
+
+test('Kimi ACP accepts sessions that expose no thinking control because effort is process-scoped', async () => {
+	const transport = new FakeAcpTransport([
+		{ id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3', options: [{ value: 'kimi-code/k3', name: 'K3' }] },
+	]);
+	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
+	await service.createAgent({ agentId: 'kimi-no-thinking-option', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'low' });
+	assert.equal(transport.calls.some((call) => call.params?.configId === 'thinking'), false);
+	await service.stop();
+});
+
+test('ACP refreshes dependent capabilities after changing the model', async () => {
+	const transport = new FakeAcpTransport([
+		{ id: 'model', category: 'model', type: 'select', currentValue: 'auto', options: [{ value: 'auto', name: 'Auto' }, { value: 'kimi-code/k3', name: 'K3' }] },
+		{ id: 'thinking', category: 'thought_level', type: 'select', currentValue: 'high', options: [{ value: 'high', name: 'High' }] },
+	], { configOptionsAfterModel: [
+		{ id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3', options: [{ value: 'auto', name: 'Auto' }, { value: 'kimi-code/k3', name: 'K3' }] },
+		{ id: 'thinking', category: 'thought_level', type: 'select', currentValue: 'high', options: ['low', 'high', 'max'].map((value) => ({ value, name: value })) },
+	] });
+	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
+	await service.createAgent({ agentId: 'kimi-low', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'low' });
+	assert.deepEqual(transport.calls.filter((call) => call.method === 'session/set_config_option').map((call) => call.params.value), ['kimi-code/k3', 'low']);
+	await service.stop();
+});
+
+test('Kimi catalog retains the last discovered display names when a later CLI refresh fails', async () => {
+	let fail = false;
+	const discovered = [{
+		id: 'kimi-code/kimi-for-coding',
+		model: 'kimi-code/kimi-for-coding',
+		displayName: 'K2.7 Coding',
+		reasoningEfforts: ['high'],
+		serviceTiers: [],
+	}];
+	const service = new AcpProviderService(
+		{ provider: 'kimi', cwd: 'C:\\workspace', catalogDiscovery: true },
+		{ discoverCatalog: async () => { if (fail) throw new Error('offline'); return discovered; } },
+	);
+	const first = await service.catalog.refresh({ force: true });
+	fail = true;
+	const retained = await service.catalog.refresh({ force: true });
+	assert.deepEqual(retained, first);
+	assert.equal(retained.models[0].displayName, 'K2.7 Coding');
+	assert.equal(service.catalog.stale, true);
 });

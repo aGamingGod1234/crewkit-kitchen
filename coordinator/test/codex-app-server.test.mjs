@@ -14,6 +14,7 @@ const model = {
 class FakeCodexTransport extends EventEmitter {
 	calls = [];
 	models = [model];
+	autoComplete = true;
 
 	async start() { this.calls.push({ method: '$start' }); }
 	async stop() { this.calls.push({ method: '$stop' }); }
@@ -26,8 +27,8 @@ class FakeCodexTransport extends EventEmitter {
 		if (method === 'model/list') return { data: this.models, nextCursor: null };
 		if (method === 'thread/start') return { thread: { id: 'thread-1' } };
 		if (method === 'turn/start') {
-			queueMicrotask(() => {
-				this.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 1, item: { id: 'item-1', type: 'agentMessage', text: '{"summary":"Done","goalStatus":"completed","action":{"type":"complete_goal","summary":"Done"}}' } } });
+			if (this.autoComplete) queueMicrotask(() => {
+				this.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 1, item: { id: 'item-1', type: 'agentMessage', text: '{"summary":"Done","directive":"finish","status":"completed"}' } } });
 				this.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
 			});
 			return { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } };
@@ -82,13 +83,27 @@ test('runs a persistent-thread turn with exact effort and extracts the final age
 	const agent = new CodexAgent(config, transport);
 	await agent.start();
 	const decision = await agent.decide('compact state');
-	assert.equal(decision.action.type, 'complete_goal');
+	assert.equal(decision.directive, 'finish');
 	const turn = transport.calls.find((call) => call.method === 'turn/start').params;
 	assert.equal(turn.threadId, 'thread-1');
 	assert.equal(turn.model, 'gpt-5.5');
 	assert.equal(turn.effort, 'xhigh');
 	assert.equal(turn.serviceTier, 'fast');
 	assert.deepEqual(turn.environments, []);
+	await agent.stop();
+});
+
+test('uses streamed agent-message deltas when a completed message item is absent', async () => {
+	const transport = new FakeCodexTransport();
+	transport.autoComplete = false;
+	const agent = new CodexAgent(config, transport);
+	await agent.start();
+	const decisionPromise = agent.decide('compact state');
+	await Promise.resolve();
+	const text = '{"summary":"Done","directive":"finish","status":"completed"}';
+	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: text } });
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
+	assert.equal((await decisionPromise).status, 'completed');
 	await agent.stop();
 });
 

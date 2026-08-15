@@ -7,14 +7,31 @@ import {
 	buildAntigravityLaunch,
 } from '../src/antigravity-service.mjs';
 
+test('Antigravity catalog retains the last discovered aliases when a later CLI refresh fails', async () => {
+	let fail = false;
+	const discovered = [{
+		id: 'gemini-3.6-flash',
+		model: 'gemini-3.6-flash',
+		displayName: 'Gemini 3.6 Flash',
+		reasoningEfforts: ['high', 'medium', 'low'],
+		serviceTiers: [],
+	}];
+	const service = new AntigravityProviderService(
+		{ cwd: 'C:\\workspace', catalogDiscovery: true },
+		{ discoverCatalog: async () => { if (fail) throw new Error('offline'); return discovered; } },
+	);
+	const first = await service.catalog.refresh({ force: true });
+	fail = true;
+	const retained = await service.catalog.refresh({ force: true });
+	assert.deepEqual(retained, first);
+	assert.equal(retained.models[0].displayName, 'Gemini 3.6 Flash');
+	assert.equal(service.catalog.stale, true);
+});
+
 const DECISION = JSON.stringify({
 	summary: 'Wait safely.',
-	goalStatus: 'in_progress',
-	action: {
-		type: 'wait', x: null, y: null, z: null, tolerance: null, sprint: null,
-		targetSelector: null, timeoutMs: null, itemId: null, durationMs: 25,
-		face: null, message: null, open: null, slot: null, count: null, summary: null,
-	},
+	directive: 'replace',
+	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);',
 });
 
 class FakeChild extends EventEmitter {
@@ -108,11 +125,11 @@ test('Antigravity parses planner output and uses the stable per-agent workspace'
 	await agent.setGoalRevision(7);
 	const decision = await agent.decide('Minecraft planner state (authoritative JSON):\n{}', { goalRevision: 7 });
 
-	assert.equal(decision.action.type, 'wait');
+	assert.equal(decision.directive, 'replace');
 	assert.deepEqual(workspaceCalls, [{ provider: 'gemini', agentId: 'gemini-a' }]);
 	assert.equal(spawnCalls[0].options.cwd, 'C:\\agents\\gemini\\gemini-a');
 	assert.equal(spawnCalls[0].args[0], '--print');
-	assert.match(spawnCalls[0].args[1], /strategic planner for one Minecraft player/);
+	assert.match(spawnCalls[0].args[1], /strategic author for one Minecraft player/);
 	assert.match(spawnCalls[0].args[1], /Previous movement timed out/);
 	assert.deepEqual(spawnCalls[0].args.slice(-5), [
 		'--model', 'gemini-3.1-pro-high', '--sandbox', '--print-timeout', '1s',

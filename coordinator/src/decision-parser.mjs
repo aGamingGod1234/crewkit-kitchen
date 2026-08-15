@@ -1,9 +1,9 @@
-import { ACTION_FIELDS, MAX_SUMMARY_LENGTH } from './constants.mjs';
-import { validateAction, ValidationError } from './schema.mjs';
+import { MAX_SUMMARY_LENGTH } from './constants.mjs';
 
-const GOAL_STATUSES = new Set(['in_progress', 'completed', 'impossible']);
-const DECISION_KEYS = new Set(['summary', 'goalStatus', 'action']);
-const NULLABLE_ACTION_FIELDS = new Set(Object.values(ACTION_FIELDS).flat());
+const DIRECTIVES = new Set(['replace', 'continue', 'pause', 'finish']);
+const FINISH_STATUSES = new Set(['completed', 'impossible']);
+const DECISION_KEYS = new Set(['summary', 'directive', 'source', 'status']);
+const MAX_SOURCE_LENGTH = 65_536;
 
 export class DecisionError extends Error {
 	constructor(code, message, options) {
@@ -24,26 +24,27 @@ export function parseDecision(text) {
 	}
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new DecisionError('INVALID_DECISION', 'Planner decision must be a JSON object');
 	for (const key of Object.keys(value)) if (!DECISION_KEYS.has(key)) throw new DecisionError('UNKNOWN_DECISION_FIELD', `Unknown decision field '${key}'`);
-	for (const key of DECISION_KEYS) if (!Object.hasOwn(value, key)) throw new DecisionError('MISSING_DECISION_FIELD', `Decision field '${key}' is required`);
+	for (const key of ['summary', 'directive']) if (!Object.hasOwn(value, key)) throw new DecisionError('MISSING_DECISION_FIELD', `Decision field '${key}' is required`);
 	if (typeof value.summary !== 'string' || value.summary.trim().length === 0 || value.summary.length > MAX_SUMMARY_LENGTH) throw new DecisionError('INVALID_DECISION', `Decision summary must be nonblank and at most ${MAX_SUMMARY_LENGTH} characters`);
-	if (!GOAL_STATUSES.has(value.goalStatus)) throw new DecisionError('INVALID_DECISION', `Unsupported goalStatus '${String(value.goalStatus)}'`);
-	let action;
-	try {
-		action = validateAction(compactStructuredAction(value.action));
-	} catch (error) {
-		if (error instanceof ValidationError) throw new DecisionError('INVALID_ACTION', error.message, { cause: error });
-		throw error;
-	}
-	const terminal = value.goalStatus !== 'in_progress';
-	if (terminal !== (action.type === 'complete_goal')) throw new DecisionError('STATUS_ACTION_MISMATCH', 'completed or impossible status must use complete_goal, and in_progress must not');
-	return { summary: value.summary, goalStatus: value.goalStatus, action };
-}
+	if (!DIRECTIVES.has(value.directive)) throw new DecisionError('INVALID_DECISION', `Unsupported directive '${String(value.directive)}'`);
 
-function compactStructuredAction(value) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
-	return Object.fromEntries(Object.entries(value).filter(([field, fieldValue]) => (
-		fieldValue !== null || !NULLABLE_ACTION_FIELDS.has(field)
-	)));
+	if (value.directive === 'replace') {
+		if (!Object.hasOwn(value, 'source') || typeof value.source !== 'string' || value.source.trim().length === 0 || value.source.length > MAX_SOURCE_LENGTH) {
+			throw new DecisionError('DECISION_FIELD_MISMATCH', `replace directive requires nonblank source of at most ${MAX_SOURCE_LENGTH} characters`);
+		}
+		if (Object.hasOwn(value, 'status')) throw new DecisionError('DECISION_FIELD_MISMATCH', 'replace directive must not include status');
+		return { summary: value.summary, directive: 'replace', source: value.source };
+	}
+
+	if (value.directive === 'finish') {
+		if (!Object.hasOwn(value, 'status') || !FINISH_STATUSES.has(value.status)) throw new DecisionError('DECISION_FIELD_MISMATCH', 'finish directive requires status completed or impossible');
+		if (Object.hasOwn(value, 'source')) throw new DecisionError('DECISION_FIELD_MISMATCH', 'finish directive must not include source');
+		return { summary: value.summary, directive: 'finish', status: value.status };
+	}
+
+	if (Object.hasOwn(value, 'source')) throw new DecisionError('DECISION_FIELD_MISMATCH', `${value.directive} directive must not include source`);
+	if (Object.hasOwn(value, 'status')) throw new DecisionError('DECISION_FIELD_MISMATCH', `${value.directive} directive must not include status`);
+	return { summary: value.summary, directive: value.directive };
 }
 
 function unwrapExactJson(text) {
