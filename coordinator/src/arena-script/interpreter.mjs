@@ -1,17 +1,19 @@
 import { ArenaScriptError, executionError } from './errors.mjs';
 import { types as nodeTypes } from 'node:util';
 import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from './limits.mjs';
+import { PLAYER_MEMBER_PRIMITIVES } from './minecraft-api.mjs';
+import { filterObserved, nearest } from './facts.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory']);
 const CAPABILITY_MEMBERS = Object.freeze({
 	program: new Set(['onUnhandledAttention', 'repeatUntil', 'watch', 'checkpoint', 'finish']),
-	player: new Set(['moveTo', 'state', 'wait']),
-	world: new Set(),
-	inventory: new Set(['countTag']),
+	player: new Set([...Object.keys(PLAYER_MEMBER_PRIMITIVES), 'state']),
+	world: new Set(['items', 'entities', 'blocks', 'nearest']),
+	inventory: new Set(['count', 'countTag']),
 });
 const FORBIDDEN_MEMBER_NAMES = new Set(['__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', '__proto__', 'arguments', 'callee', 'caller', 'constructor', 'eval', 'prototype']);
 const ACTION_RESULT_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
-const PLAYER_PRIMITIVES = Object.freeze({ moveTo: 'move_to', wait: 'wait' });
+const PLAYER_PRIMITIVES = PLAYER_MEMBER_PRIMITIVES;
 const CANONICAL_LIMITS = Object.freeze({ depth: 256, nodes: 4_096, keys: 4_096, stringBytes: 16_384, arrayLength: 256, outputBytes: 4_096, resultBytes: 4_096, watcherIdBytes: 128 });
 const IDLE_YIELD = frozenRecord({ kind: 'idle' });
 
@@ -33,6 +35,7 @@ export class ArenaScriptInterpreter {
 	#yield = null;
 	#lifecycle = 'READY';
 	#loopIterations = 0;
+	#watcherEvaluation = false;
 
 	constructor(compiled, bindings, { limits = DEFAULT_ARENA_SCRIPT_LIMITS } = {}) {
 		if (!compiled?.ast || compiled.ast.type !== 'Program') throw executionError('INVALID_PROGRAM', 'ArenaScript INVALID_PROGRAM: compiled program is required');
@@ -81,6 +84,46 @@ export class ArenaScriptInterpreter {
 		this.#frames.push({ type: 'watcher-after-condition', watcher });
 		this.#invokeFunction(watcher.condition, []);
 		return this.#run();
+	}
+
+	evaluateWatcher(watcherId, facts) {
+		if (!this.#started) throw executionError('NOT_STARTED', 'ArenaScript NOT_STARTED: start the program before evaluating watchers');
+		validateWatcherId(watcherId);
+		if (this.#lifecycle !== 'ACTIVE') throw executionError('INACTIVE_LIFECYCLE', `ArenaScript INACTIVE_LIFECYCLE: program is ${this.#lifecycle}`);
+		const watcher = this.#watchers.get(watcherId);
+		if (!watcher) throw executionError('UNKNOWN_WATCHER', `ArenaScript UNKNOWN_WATCHER: ${watcherId}`);
+		const saved = { frames: this.#frames, values: this.#values, waiting: this.#waiting, terminal: this.#terminal, yield: this.#yield, lifecycle: this.#lifecycle };
+		this.#context.facts = freezeFacts(facts);
+		this.#frames = [];
+		this.#values = [];
+		this.#waiting = null;
+		this.#terminal = false;
+		this.#yield = null;
+		this.#watcherEvaluation = false;
+		this.#beginSlice();
+		this.#frames.push({ type: 'watcher-evaluate' });
+		this.#invokeFunction(watcher.condition, []);
+		try {
+			this.#run();
+			return this.#watcherEvaluation;
+		} finally {
+			this.#frames = saved.frames;
+			this.#values = saved.values;
+			this.#waiting = saved.waiting;
+			this.#terminal = saved.terminal;
+			this.#yield = saved.yield;
+			this.#lifecycle = saved.lifecycle;
+		}
+	}
+
+	abortPendingCommand(stateToken) {
+		if (this.#waiting === null || this.#waiting.stateToken !== stateToken) throw executionError('STALE_STATE_TOKEN', 'ArenaScript STALE_STATE_TOKEN: action result does not match the pending command');
+		this.#waiting = null;
+		this.#frames = [];
+		this.#values = [];
+		this.#yield = null;
+		this.#terminal = false;
+		this.#beginSlice();
 	}
 
 	#beginActivation(normalizedFacts) {
@@ -165,6 +208,7 @@ export class ArenaScriptInterpreter {
 			case 'repeat-after-body': return this.#repeatAfterBody(frame);
 			case 'watcher-after-condition': return this.#watcherAfterCondition(frame);
 			case 'watcher-after-handler': this.#values.pop(); return;
+			case 'watcher-evaluate': this.#watcherEvaluation = Boolean(this.#values.pop()); return;
 			default: throw executionError('INVALID_FRAME', `ArenaScript INVALID_FRAME: ${frame.type}`);
 		}
 	}
@@ -368,6 +412,13 @@ export class ArenaScriptInterpreter {
 			case 'program.finish': return this.#terminalYield('finish', node, terminalText(args[0], 'finished', node));
 			case 'program.repeatUntil': return this.#repeatUntil(node, args);
 			case 'player.state': return this.#values.push(this.#context.facts.player);
+			case 'world.items': return this.#values.push(filterObserved(this.#context.facts.world.items, args[0]));
+			case 'world.entities': return this.#values.push(filterObserved(this.#context.facts.world.entities, args[0]));
+			case 'world.blocks': return this.#values.push(filterObserved(this.#context.facts.world.blocks, args[0]));
+			case 'world.nearest': return this.#values.push(nearest(args[0], args[1] ?? this.#context.facts.player));
+			case 'inventory.count':
+				if (typeof args[0] !== 'string') throw this.#error('INVALID_ARGUMENT', 'ArenaScript INVALID_ARGUMENT: inventory item id must be a string', node);
+				return this.#values.push(this.#context.facts.inventory.items.reduce((total, item) => total + (item.itemId === args[0] && Number.isSafeInteger(item.count) ? item.count : 0), 0));
 			case 'inventory.countTag':
 				if (typeof args[0] !== 'string') throw this.#error('INVALID_ARGUMENT', 'ArenaScript INVALID_ARGUMENT: inventory tag must be a string', node);
 				return this.#values.push(this.#context.facts.inventory.tagCounts[args[0]] ?? 0);
@@ -642,12 +693,14 @@ function propertyKey(property) {
 }
 
 function applyBinary(operator, left, right, fail) {
-	if (!isSafeOperand(left) || !isSafeOperand(right)) throw fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: binary operators require primitive values');
 	switch (operator) {
 		case '==': return left === right;
 		case '!=': return left !== right;
 		case '===': return left === right;
 		case '!==': return left !== right;
+	}
+	if (!isSafeOperand(left) || !isSafeOperand(right)) throw fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: binary operators require primitive values');
+	switch (operator) {
 		case '<': return compareOperands(left, right, fail, '<');
 		case '<=': return compareOperands(left, right, fail, '<=');
 		case '>': return compareOperands(left, right, fail, '>');
@@ -699,12 +752,20 @@ function normalizeActionResult(result) {
 
 function freezeFacts(facts) {
 	const root = exactOwnDataRecord(facts, 'facts', ['player', 'world', 'inventory']);
-	const inventory = exactOwnDataRecord(root.inventory, 'facts.inventory', ['tagCounts']);
+	const inventoryEntries = ownDataEntries(root.inventory, 'facts.inventory');
+	const inventory = Object.fromEntries(inventoryEntries);
+	if (!Object.hasOwn(inventory, 'tagCounts') || inventoryEntries.some(([key]) => !['items', 'tagCounts'].includes(key))) throw executionError('INVALID_FACTS', 'ArenaScript INVALID_FACTS: facts.inventory has an invalid schema');
+	const world = freezeDataRecord(root.world, 'facts.world');
 	return frozenRecord({
 		player: freezeDataRecord(root.player, 'facts.player'),
-		world: freezeDataRecord(root.world, 'facts.world'),
-		inventory: frozenRecord({ tagCounts: freezeDataRecord(inventory.tagCounts, 'facts.inventory.tagCounts') }),
+		world: frozenRecord({ items: freezeDataList(world.items ?? [], 'facts.world.items'), entities: freezeDataList(world.entities ?? [], 'facts.world.entities'), blocks: freezeDataList(world.blocks ?? [], 'facts.world.blocks') }),
+		inventory: frozenRecord({ items: freezeDataList(inventory.items ?? [], 'facts.inventory.items'), tagCounts: freezeDataRecord(inventory.tagCounts, 'facts.inventory.tagCounts') }),
 	});
+}
+
+function freezeDataList(value, label) {
+	if (!Array.isArray(value)) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: ${label} must be an array`);
+	return canonicalize(value, { errorCode: 'FACT_LIMIT', invalidCode: 'INVALID_FACTS', label, maxBytes: CANONICAL_LIMITS.stringBytes });
 }
 
 function freezeDataRecord(value, label) {
@@ -720,7 +781,7 @@ function normalizeBindings(bindings) {
 	const player = ownDataEntries(root.player, 'bindings.player', { requireNullPrototype: true, requireFrozen: true, errorCode: 'INVALID_BINDINGS' });
 	const normalizedPlayer = Object.create(null);
 	for (const [name, binding] of player) {
-		if (!['moveTo', 'wait'].includes(name)) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: unsupported player binding');
+		if (!Object.hasOwn(PLAYER_PRIMITIVES, name)) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: unsupported player binding');
 		const action = exactOwnDataRecord(binding, `bindings.player.${name}`, ['primitive'], { requireNullPrototype: true, requireFrozen: true, errorCode: 'INVALID_BINDINGS' });
 		if (action.primitive !== PLAYER_PRIMITIVES[name]) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: player primitive does not match its capability');
 		normalizedPlayer[name] = frozenRecord({ primitive: action.primitive });

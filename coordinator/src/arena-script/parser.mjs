@@ -5,6 +5,7 @@ import {
 	DEFAULT_ARENA_SCRIPT_LIMITS,
 	normalizeArenaScriptLimits,
 } from './limits.mjs';
+import { SCRIPT_API_CALL_PATHS } from './minecraft-api.mjs';
 
 const ALLOWED_GLOBALS = new Set([
 	'program',
@@ -45,10 +46,7 @@ const APPROVED_API_CALL_PATHS = new Set([
 	'program.watch',
 	'program.checkpoint',
 	'program.finish',
-	'player.moveTo',
-	'player.state',
-	'player.wait',
-	'inventory.countTag',
+	...SCRIPT_API_CALL_PATHS,
 ]);
 const APPROVED_BUILTIN_CALLS = new Set(['tryResult']);
 const RESERVED_CAPABILITY_NAMES = new Set([...ALLOWED_GLOBALS, ...APPROVED_BUILTIN_CALLS]);
@@ -458,13 +456,14 @@ function validatePureCondition(node) {
 		}
 		if (current.type === 'CallExpression') {
 			const path = staticMemberPath(current.callee)?.join('.');
-			if (!['player.state', 'inventory.countTag'].includes(path)) {
+			if (!['player.state', 'inventory.count', 'inventory.countTag'].includes(path)) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions can call only factual Arena APIs', current);
 			}
 		}
 		if (current.type === 'MemberExpression') {
 			const path = staticMemberPath(current)?.join('.');
-			if (['player.moveTo', 'player.wait', 'program.checkpoint', 'program.finish', 'program.watch', 'program.repeatUntil'].includes(path)) {
+			if ([...SCRIPT_API_CALL_PATHS].filter((apiPath) => !['player.state', 'inventory.count', 'inventory.countTag'].includes(apiPath)).includes(path)
+				|| ['program.checkpoint', 'program.finish', 'program.watch', 'program.repeatUntil'].includes(path)) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions cannot reference effectful Arena APIs', current);
 			}
 		}
