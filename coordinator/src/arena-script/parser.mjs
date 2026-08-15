@@ -37,6 +37,15 @@ const SPECIAL_PROGRAM_MEMBER_PATHS = [
 	['program', 'repeatUntil'],
 	['program', 'watch'],
 ];
+const APPROVED_API_CALL_PATHS = new Set([
+	'program.onUnhandledAttention',
+	'program.repeatUntil',
+	'program.watch',
+	'player.state',
+	'player.wait',
+	'inventory.countTag',
+]);
+const APPROVED_BUILTIN_CALLS = new Set(['tryResult']);
 const MAX_ARENA_SCRIPT_AST_DEPTH = 256;
 
 const ALLOWED_NODE_TYPES = new Set([
@@ -119,13 +128,14 @@ function validateProgram(ast, limits) {
 		unhandledPolicy: null,
 		watcherCount: 0,
 		userDeclarations: new Set(),
-		functionNames: new Map(),
-		functionNamesByNode: new WeakMap(),
+		functionBindingsByNode: new WeakMap(),
+		functionBindings: new Set(),
 		functionEdges: new Map(),
 	};
 
 	collectDeclarations(ast, state);
-	visit(ast, state, { functionName: null, topLevelExpression: false });
+	const rootScope = createLexicalScope(null, ast.body, state);
+	visit(ast, state, { functionBinding: null, scope: rootScope, topLevelExpression: false });
 
 	if (state.policyCount === 0) {
 		throw arenaError('MISSING_UNHANDLED_POLICY', 'exactly one top-level program.onUnhandledAttention policy is required');
@@ -162,7 +172,7 @@ function visit(node, state, context) {
 	switch (node.type) {
 		case 'Program':
 			for (const statement of node.body) {
-				visit(statement, state, { functionName: null, topLevelExpression: true });
+				visit(statement, state, { ...context, functionBinding: null, topLevelExpression: true });
 			}
 			return;
 		case 'ExpressionStatement':
@@ -171,7 +181,7 @@ function visit(node, state, context) {
 		case 'EmptyStatement':
 			return;
 		case 'BlockStatement':
-			visit(node.body, state, { ...context, topLevelExpression: false });
+			visit(node.body, state, { ...context, scope: createLexicalScope(context.scope, node.body, state), topLevelExpression: false });
 			return;
 		case 'VariableDeclaration':
 			if (node.kind !== 'const' && node.kind !== 'let') {
@@ -221,13 +231,11 @@ function visit(node, state, context) {
 			for (const parameter of node.params) {
 				visit(parameter, state, { ...context, binding: true, topLevelExpression: false });
 			}
-			const functionName = state.functionNamesByNode.get(node) ?? null;
+			const functionBinding = state.functionBindingsByNode.get(node) ?? context.functionBinding;
+			const parameterScope = createParameterScope(context.scope, node, functionBinding);
 			visit(node.body, state, {
-				functionName,
-				functionParameters: new Set([
-					...(context.functionParameters ?? []),
-					...node.params.filter((parameter) => parameter.type === 'Identifier').map((parameter) => parameter.name),
-				]),
+				functionBinding,
+				scope: parameterScope,
 				topLevelExpression: false,
 			});
 			return;
@@ -312,14 +320,24 @@ function validateCallExpression(node, state, context) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'optional calls are not allowed', node);
 	}
 	const path = staticMemberPath(node.callee);
-	if (path?.[0] && !ALLOWED_GLOBALS.has(path[0]) && !state.userDeclarations.has(path[0])) {
-		throw arenaError('UNSAFE_MEMBER_ACCESS', `member root ${path[0]} is outside the ArenaScript environment`, node.callee);
-	}
-	if (!path && node.callee.type === 'Identifier' && node.callee.name !== 'tryResult' && !state.functionNames.has(node.callee.name) && !state.userDeclarations.has(node.callee.name)) {
-		throw arenaError('UNSAFE_MEMBER_ACCESS', `call target ${node.callee.name} is outside the ArenaScript environment`, node.callee);
-	}
-	if (node.callee.type === 'MemberExpression' && state.userDeclarations.has(memberRoot(node.callee))) {
-		throw arenaError('UNSUPPORTED_SYNTAX', 'local member calls and call/apply/bind invocation are not allowed', node.callee);
+	let functionBinding = null;
+	if (node.callee.type === 'Identifier') {
+		functionBinding = resolveBinding(context.scope, node.callee.name);
+		if (!functionBinding?.callable && !APPROVED_BUILTIN_CALLS.has(node.callee.name)) {
+			throw arenaError('UNSUPPORTED_SYNTAX', 'calls must target an immutable local function or approved built-in', node.callee);
+		}
+	} else if (node.callee.type === 'MemberExpression') {
+		if (node.callee.computed || node.callee.optional) {
+			throw arenaError('UNSAFE_MEMBER_ACCESS', 'computed member call targets are not allowed', node.callee);
+		}
+		if (path?.[0] && !ALLOWED_GLOBALS.has(path[0])) {
+			throw arenaError(state.userDeclarations.has(path[0]) ? 'UNSUPPORTED_SYNTAX' : 'UNSAFE_MEMBER_ACCESS', 'unapproved member call targets are not allowed', node.callee);
+		}
+		if (!path || !APPROVED_API_CALL_PATHS.has(path.join('.'))) {
+			throw arenaError('UNSUPPORTED_SYNTAX', 'calls must target an approved Arena API member path', node.callee);
+		}
+	} else {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'calls must use an identifier or approved Arena API member path', node.callee);
 	}
 
 	if (pathEqual(path, ['program', 'onUnhandledAttention'])) {
@@ -342,20 +360,13 @@ function validateCallExpression(node, state, context) {
 	if (pathEqual(path, ['program', 'watch'])) {
 		validateWatcher(node, state, context);
 	}
-	if (node.callee.type === 'Identifier' && context.functionParameters?.has(node.callee.name)) {
-		throw arenaError('UNSUPPORTED_SYNTAX', 'calling function parameters is not allowed', node.callee);
-	}
-	if (node.callee.type === 'Identifier' && state.functionNames.has(node.callee.name)) {
-		if (context.functionName) {
-			let edges = state.functionEdges.get(context.functionName);
+	if (functionBinding && context.functionBinding) {
+		let edges = state.functionEdges.get(context.functionBinding);
 			if (!edges) {
 				edges = new Map();
-				state.functionEdges.set(context.functionName, edges);
+				state.functionEdges.set(context.functionBinding, edges);
 			}
-			edges.set(node.callee.name, node);
-		}
-	} else if (node.callee.type === 'Identifier' && state.userDeclarations.has(node.callee.name)) {
-		throw arenaError('UNSUPPORTED_SYNTAX', 'indirect local-function invocation is not allowed', node.callee);
+		edges.set(functionBinding, node);
 	}
 }
 
@@ -479,12 +490,60 @@ function validateLocalAssignmentTarget(node, state, value, context) {
 	if (node.type !== 'Identifier' || !state.userDeclarations.has(node.name)) {
 		throw arenaError('UNSAFE_MEMBER_ACCESS', 'only local variables may be assigned or updated', node);
 	}
-	if (state.functionNames.has(node.name)) {
+	if (resolveBinding(context.scope, node.name)?.callable) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'callable local bindings cannot be reassigned or updated', node);
 	}
-	if (isFunctionNode(value) || (value?.type === 'Identifier' && (state.functionNames.has(value.name) || context.functionParameters?.has(value.name)))) {
+	if (isFunctionNode(value) || (value?.type === 'Identifier' && resolveBinding(context.scope, value.name)?.callable)) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'callable values cannot be assigned to local bindings', value);
 	}
+}
+
+function createLexicalScope(parent, statements, state) {
+	const scope = { parent, bindings: new Map() };
+	for (const statement of statements) {
+		if (statement?.type === 'FunctionDeclaration' && statement.id?.type === 'Identifier') {
+			registerFunctionBinding(scope, statement.id.name, statement, state);
+			continue;
+		}
+		if (statement?.type !== 'VariableDeclaration') continue;
+		for (const declaration of statement.declarations) {
+			if (declaration.id?.type !== 'Identifier') continue;
+			if (statement.kind === 'const' && isFunctionNode(declaration.init)) {
+				registerFunctionBinding(scope, declaration.id.name, declaration.init, state);
+			} else {
+				scope.bindings.set(declaration.id.name, Object.freeze({ callable: false, name: declaration.id.name }));
+			}
+		}
+	}
+	return scope;
+}
+
+function createParameterScope(parent, node, functionBinding) {
+	const scope = { parent, bindings: new Map() };
+	for (const parameter of node.params) {
+		if (parameter.type === 'Identifier') {
+			scope.bindings.set(parameter.name, Object.freeze({ callable: false, name: parameter.name }));
+		}
+	}
+	if (node.id?.type === 'Identifier' && functionBinding) {
+		scope.bindings.set(node.id.name, functionBinding);
+	}
+	return scope;
+}
+
+function registerFunctionBinding(scope, name, functionNode, state) {
+	const binding = Object.freeze({ callable: true, name, functionNode });
+	scope.bindings.set(name, binding);
+	state.functionBindingsByNode.set(functionNode, binding);
+	state.functionBindings.add(binding);
+}
+
+function resolveBinding(scope, name) {
+	for (let current = scope; current; current = current.parent) {
+		const binding = current.bindings.get(name);
+		if (binding) return binding;
+	}
+	return null;
 }
 
 function collectDeclarations(node, state) {
@@ -497,8 +556,6 @@ function collectDeclarations(node, state) {
 		case 'FunctionDeclaration':
 			if (node.id) {
 				state.userDeclarations.add(node.id.name);
-				state.functionNames.set(node.id.name, node);
-				state.functionNamesByNode.set(node, node.id.name);
 			}
 			for (const parameter of node.params) collectPatternNames(parameter, state);
 			collectDeclarations(node.body, state);
@@ -507,8 +564,6 @@ function collectDeclarations(node, state) {
 		case 'ArrowFunctionExpression':
 			if (node.id) {
 				state.userDeclarations.add(node.id.name);
-				state.functionNames.set(node.id.name, node);
-				state.functionNamesByNode.set(node, node.id.name);
 			}
 			for (const parameter of node.params) collectPatternNames(parameter, state);
 			collectDeclarations(node.body, state);
@@ -516,10 +571,6 @@ function collectDeclarations(node, state) {
 		case 'VariableDeclaration':
 			for (const declaration of node.declarations) {
 				collectPatternNames(declaration.id, state);
-				if (declaration.id.type === 'Identifier' && isFunctionNode(declaration.init)) {
-					state.functionNames.set(declaration.id.name, declaration.init);
-					state.functionNamesByNode.set(declaration.init, declaration.id.name);
-				}
 				collectDeclarations(declaration.init, state);
 			}
 			return;
@@ -549,23 +600,23 @@ function collectPatternNames(pattern, state) {
 function detectRecursion(state) {
 	const colors = new Map();
 	const stack = [];
-	const visitFunction = (name) => {
-		const color = colors.get(name);
+	const visitFunction = (binding) => {
+		const color = colors.get(binding);
 		if (color === 'active') {
 			const node = stack.at(-1)?.node ?? null;
-			throw arenaError('RECURSION_FORBIDDEN', `local function call graph contains recursion through ${name}`, node);
+			throw arenaError('RECURSION_FORBIDDEN', `local function call graph contains recursion through ${binding.name}`, node);
 		}
 		if (color === 'done') return;
-		colors.set(name, 'active');
-		const edges = state.functionEdges.get(name) ?? new Map();
+		colors.set(binding, 'active');
+		const edges = state.functionEdges.get(binding) ?? new Map();
 		for (const [callee, node] of edges) {
-			stack.push({ name, node });
+			stack.push({ binding, node });
 			visitFunction(callee);
 			stack.pop();
 		}
-		colors.set(name, 'done');
+		colors.set(binding, 'done');
 	};
-	for (const name of state.functionNames.keys()) visitFunction(name);
+	for (const binding of state.functionBindings) visitFunction(binding);
 }
 
 function literalObjectProperty(node, expectedName, errorCode) {

@@ -252,3 +252,25 @@ test('rejects forbidden keys in every object literal', () => {
 		);
 	}
 });
+
+test('rejects non-identifier and alias call targets that bypass recursion analysis', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); function again() { (() => again())(); } again();',
+		'program.onUnhandledAttention("continue_and_notify"); function again() { (true ? again : again)(); } again();',
+		'program.onUnhandledAttention("continue_and_notify"); function getAgain() { return again; } function again() { getAgain()(); } again();',
+		'program.onUnhandledAttention("continue_and_notify"); function again() { ({ next: again }).next(); } again();',
+		'program.onUnhandledAttention("continue_and_notify"); function decoy() {} function again() { const decoy = again; decoy(); } again();',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+		);
+	}
+});
+
+test('detects recursion through the external binding of a named function expression', () => {
+	assert.throws(
+		() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); const again = function inner() { again(); }; again();'),
+		(error) => error.name === 'ArenaScriptError' && error.code === 'RECURSION_FORBIDDEN',
+	);
+});
