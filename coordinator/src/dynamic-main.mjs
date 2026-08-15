@@ -234,7 +234,6 @@ export class DynamicCoordinator extends EventEmitter {
 			});
 		});
 		this.#listen('action_progress', (message) => {
-			const receivedAt = this.#controlNow();
 			this.#enqueueAgent(message.agentId, async () => {
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 			if (!this.#programRuntime.onActionProgress(record, message.payload)) throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
@@ -242,7 +241,6 @@ export class DynamicCoordinator extends EventEmitter {
 			});
 		});
 		this.#listen('action_result', (message) => {
-			const receivedAt = this.#controlNow();
 			this.#enqueueAgent(message.agentId, async () => {
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 			this.#ledger(record.agentId).ingest('action_result', message.payload);
@@ -253,7 +251,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listen('disconnected', () => {
 			for (const record of this.#registry.list()) this.#advanceLifecycleGeneration(record.agentId);
 			this.#run(async () => {
-			this.#disconnectedAt ??= this.#controlNow();
+			this.#disconnectedAt ??= safeClockRead(this.#controlNow);
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
 			this.#programRuntime.disposeAll();

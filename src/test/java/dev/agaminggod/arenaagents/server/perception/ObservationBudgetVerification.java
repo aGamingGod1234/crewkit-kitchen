@@ -58,6 +58,15 @@ public final class ObservationBudgetVerification {
 				"retry retains the last delivered baseline and factual material change");
 		publication.commit(retryAgent, current);
 		assertFalse(publication.delta(retryAgent, current, 12L, 128L).attention(), "successful retry advances the delivered baseline");
+		ObservationDispatchQueue<AgentId> removedQueue = new ObservationDispatchQueue<>(16, 8);
+		removedQueue.offer(retryAgent);
+		publication.markDirty(retryAgent);
+		assertTrue(removedQueue.remove(retryAgent), "removed agent leaves pending observation queue");
+		publication.remove(retryAgent);
+		List<AgentId> removedDrains = new ArrayList<>();
+		for (int drain = 0; drain < 8; drain++) removedQueue.drain(removedDrains::add);
+		assertEquals(List.of(), removedDrains, "removed pending agent never retries across later drains");
+		assertEquals(0, publication.retainedCount(), "removed agent leaves no delivered or dirty publication state");
 
 		ObservationDispatchQueue<String> queue = new ObservationDispatchQueue<>(3, 2);
 		assertTrue(queue.offer("agent-a"), "first observation request is queued");
@@ -107,7 +116,7 @@ public final class ObservationBudgetVerification {
 		assertEquals(8, burstFirst.size(), "first drain obeys eight-observation budget");
 		assertEquals(8, burstSecond.size(), "second drain serves every remaining agent");
 		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in two drains");
-		return 38;
+		return 41;
 	}
 
 	private static JsonObject observation(double health, boolean onFire, double fallDistance, String actionType) {

@@ -110,3 +110,18 @@ test('steering and death dispose programs so stale action results are rejected',
 		assert.equal(run.planner.interruptions.includes('agent-a'), true);
 	} finally { await run.coordinator.stop(); }
 });
+
+test('throwing telemetry clocks cannot block action results or disconnect cleanup', async () => {
+	const run = await start({ controlNow: () => { throw new Error('clock unavailable'); } });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 1);
+		const first = run.bridge.sent.find((message) => message.type === 'action_command');
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
+		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
+		run.bridge.emit('disconnected');
+		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DISCONNECTED);
+		assert.equal(run.planner.interruptions.includes('agent-a'), true, 'disconnect still interrupts the live agent');
+	} finally { await run.coordinator.stop(); }
+});

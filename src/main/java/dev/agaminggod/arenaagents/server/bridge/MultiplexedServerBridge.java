@@ -214,6 +214,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void onRemoved(AgentId agentId, long terminalRevision) {
 		actionExecutor.cancel(agentId, "Agent removed");
 		programActions.remove(agentId);
+		observationQueue.remove(agentId);
 		publishedObservations.remove(agentId);
 		JsonObject payload = new JsonObject();
 		payload.addProperty("goalRevision", terminalRevision);
@@ -634,12 +635,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendObservation(AgentId agentId) {
+		if (!authenticated()) {
+			retryObservation(agentId);
+			return;
+		}
+		final JsonObject observation;
 		try {
-			if (!authenticated()) {
-				retryObservation(agentId);
-				return;
-			}
-			JsonObject observation = observations.collect(agentId);
+			observation = observations.collect(agentId);
+			sendCollectedObservation(agentId, observation);
+			return;
+		} catch (AgentDomainException exception) {
+			LOGGER.debug("Dropping observation for removed agent {}: {}", agentId, exception.code());
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not collect observation for {}: {}", agentId, exception.getMessage());
+		}
+	}
+
+	private void sendCollectedObservation(AgentId agentId, JsonObject observation) {
+		try {
 			long eventSequence = observationSequences.incrementAndGet();
 			AttentionFactDelta delta = publishedObservations.delta(
 					agentId, observation, eventSequence,
@@ -655,19 +668,30 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				return;
 			}
 			publishedObservations.commit(agentId, observation);
+		} catch (BridgeProtocolException exception) {
+			if (isTransientObservationDelivery(exception)) retryObservation(agentId);
+			else LOGGER.warn("Dropping observation delivery for {}: {}", agentId, exception.getMessage());
 		} catch (RuntimeException exception) {
-			retryObservation(agentId);
-			LOGGER.warn("Could not collect observation for {}: {}", agentId, exception.getMessage());
+			LOGGER.warn("Dropping observation delivery for {}: {}", agentId, exception.getMessage());
 		}
 	}
 
 	private void retryObservation(AgentId agentId) {
+		try {
+			manager.registry().require(agentId);
+		} catch (AgentDomainException exception) {
+			return;
+		}
 		if (!publishedObservations.markDirty(agentId)) return;
 		try {
 			queueObservation(agentId);
 		} catch (RuntimeException exception) {
 			LOGGER.debug("Could not retain observation retry for {}: {}", agentId, exception.getMessage());
 		}
+	}
+
+	private static boolean isTransientObservationDelivery(BridgeProtocolException exception) {
+		return "AGENT_BACKPRESSURE".equals(exception.code()) || "CONNECTION_BACKPRESSURE".equals(exception.code());
 	}
 
 	private static ScenarioAgentEvent.PublicState publicState(AgentLifecycleState state) {
@@ -909,6 +933,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		public void remove(AgentId agentId) {
 			delivered.remove(agentId);
 			dirty.remove(agentId);
+		}
+
+		public int retainedCount() {
+			return delivered.size() + dirty.size();
 		}
 	}
 
