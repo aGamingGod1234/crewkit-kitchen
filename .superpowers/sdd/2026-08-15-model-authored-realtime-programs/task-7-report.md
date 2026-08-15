@@ -26,3 +26,4 @@
 ## Commit
 
 - `0dc66a8 feat: stream factual attention events` (11 files, 346 insertions, 30 deletions).
+- `9a29084 fix: correct factual delta timing` (10 files, 226 insertions, 42 deletions).
