@@ -147,6 +147,26 @@ test('exhausted empty Codex turns remain planning for quiet observation retry', 
 	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
 });
 
+test('exhausted retryable provider errors enter error after the retry budget', async () => {
+	const registry = new FakeRegistry();
+	const timeout = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
+	const agent = {
+		async setGoalRevision() {},
+		async decide() { throw timeout; },
+	};
+	const planner = createPlanner(registry, agent, 1);
+	await assert.rejects(planner.requestPlan({
+		agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION,
+	}), (error) => error === timeout);
+	assert.deepEqual(registry.states.at(-1), {
+		state: DynamicAgentState.ERROR,
+		options: {
+			goalRevision: GOAL_REVISION,
+			error: { code: 'PLANNING_TIMEOUT', message: 'provider timed out' },
+		},
+	});
+});
+
 test('retries one transient provider initialization failure', async () => {
 	const registry = new FakeRegistry();
 	let createAttempts = 0;

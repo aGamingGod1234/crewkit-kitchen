@@ -22,6 +22,7 @@ export function parseDecision(text) {
 	} catch (error) {
 		throw new DecisionError('MALFORMED_DECISION', 'Planner output must contain only one JSON object', { cause: error });
 	}
+	assertNoDuplicateObjectKeys(json);
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new DecisionError('INVALID_DECISION', 'Planner decision must be a JSON object');
 	for (const key of Object.keys(value)) if (!DECISION_KEYS.has(key)) throw new DecisionError('UNKNOWN_DECISION_FIELD', `Unknown decision field '${key}'`);
 	for (const key of ['summary', 'directive']) if (!Object.hasOwn(value, key)) throw new DecisionError('MISSING_DECISION_FIELD', `Decision field '${key}' is required`);
@@ -29,8 +30,8 @@ export function parseDecision(text) {
 	if (!DIRECTIVES.has(value.directive)) throw new DecisionError('INVALID_DECISION', `Unsupported directive '${String(value.directive)}'`);
 
 	if (value.directive === 'replace') {
-		if (!Object.hasOwn(value, 'source') || typeof value.source !== 'string' || value.source.trim().length === 0 || value.source.length > MAX_SOURCE_LENGTH) {
-			throw new DecisionError('DECISION_FIELD_MISMATCH', `replace directive requires nonblank source of at most ${MAX_SOURCE_LENGTH} characters`);
+		if (!Object.hasOwn(value, 'source') || typeof value.source !== 'string' || value.source.trim().length === 0 || Buffer.byteLength(value.source, 'utf8') > MAX_SOURCE_LENGTH) {
+			throw new DecisionError('DECISION_FIELD_MISMATCH', `replace directive requires nonblank source of at most ${MAX_SOURCE_LENGTH} UTF-8 bytes`);
 		}
 		if (Object.hasOwn(value, 'status')) throw new DecisionError('DECISION_FIELD_MISMATCH', 'replace directive must not include status');
 		return { summary: value.summary, directive: 'replace', source: value.source };
@@ -55,4 +56,72 @@ function unwrapExactJson(text) {
 	}
 	if (!text.startsWith('{') || !text.endsWith('}')) throw new DecisionError('MALFORMED_DECISION', 'Planner output must contain only one JSON object');
 	return text;
+}
+
+function assertNoDuplicateObjectKeys(json) {
+	const scanner = new DuplicateKeyScanner(json);
+	scanner.parseValue();
+	scanner.skipWhitespace();
+	if (!scanner.done) throw new DecisionError('MALFORMED_DECISION', 'Planner output must contain only one JSON object');
+}
+
+class DuplicateKeyScanner {
+	#text;
+	#index = 0;
+
+	constructor(text) { this.#text = text; }
+get done() { return this.#index === this.#text.length; }
+
+	skipWhitespace() { while (/\s/.test(this.#text[this.#index] ?? '')) this.#index += 1; }
+
+	parseValue() {
+		this.skipWhitespace();
+		const next = this.#text[this.#index];
+		if (next === '{') return this.parseObject();
+		if (next === '[') return this.parseArray();
+		if (next === '"') return this.parseString();
+		while (this.#index < this.#text.length && !/[\s,}\]]/.test(this.#text[this.#index])) this.#index += 1;
+	}
+
+	parseObject() {
+		this.#index += 1;
+		const keys = new Set();
+		this.skipWhitespace();
+		if (this.#text[this.#index] === '}') { this.#index += 1; return; }
+		while (true) {
+			this.skipWhitespace();
+			const key = this.parseString();
+			if (keys.has(key)) throw new DecisionError('DUPLICATE_DECISION_FIELD', `Duplicate decision field '${key}'`);
+			keys.add(key);
+			this.skipWhitespace();
+			this.#index += 1;
+			this.parseValue();
+			this.skipWhitespace();
+			if (this.#text[this.#index] === '}') { this.#index += 1; return; }
+			this.#index += 1;
+		}
+	}
+
+	parseArray() {
+		this.#index += 1;
+		this.skipWhitespace();
+		if (this.#text[this.#index] === ']') { this.#index += 1; return; }
+		while (true) {
+			this.parseValue();
+			this.skipWhitespace();
+			if (this.#text[this.#index] === ']') { this.#index += 1; return; }
+			this.#index += 1;
+		}
+	}
+
+	parseString() {
+		const start = this.#index;
+		this.#index += 1;
+		while (this.#index < this.#text.length) {
+			const character = this.#text[this.#index++];
+			if (character === '\\') { this.#index += 1; continue; }
+			if (character === '"') return JSON.parse(this.#text.slice(start, this.#index));
+		}
+		throw new DecisionError('MALFORMED_DECISION', 'Planner output must contain valid JSON strings');
+	}
 }

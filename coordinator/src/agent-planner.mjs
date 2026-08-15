@@ -21,6 +21,10 @@ const RETRYABLE_PROVIDER_ERRORS = new Set([
 	'MISSING_AGENT_MESSAGE',
 	'MISSING_FINAL_MESSAGE',
 ]);
+const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set([
+	'MISSING_AGENT_MESSAGE',
+	'MISSING_FINAL_MESSAGE',
+]);
 
 export class AgentPlanner {
 	#registry;
@@ -136,7 +140,7 @@ export class AgentPlanner {
 				if (
 					error?.code !== 'STALE_PLAN'
 					&& error?.code !== 'PLAN_CANCELLED'
-					&& !RETRYABLE_PROVIDER_ERRORS.has(error?.code)
+					&& !QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)
 					&& this.#isCurrent(agentId, goalRevision)
 					&& !preserveState
 				) {

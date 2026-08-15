@@ -1,5 +1,13 @@
+import { types as nodeTypes } from 'node:util';
+
 const MAX_SOURCE_LENGTH = 65_536;
 const MAX_COMPILER_MESSAGE_LENGTH = 2_048;
+const MAX_COMPILER_CORRECTION_ARRAY = 128;
+const MAX_COMPILER_CORRECTION_RECORD_FIELDS = 64;
+const PLAYER_NUMBER_FIELDS = Object.freeze(['x', 'y', 'z', 'health', 'hunger', 'air', 'yaw', 'pitch']);
+const PLAYER_BOOLEAN_FIELDS = Object.freeze(['fire', 'dead']);
+const CANDIDATE_NUMBER_FIELDS = Object.freeze(['entityId', 'count', 'x', 'y', 'z', 'distance']);
+const CANDIDATE_BOOLEAN_FIELDS = Object.freeze(['reachable', 'visible']);
 
 export const PLANNER_SYSTEM_PROMPT = `You are the strategic author for one Minecraft player. Only the user-selected provider, model, reasoning effort, and service tier write gameplay strategy, choices, conditions, fallbacks, interruption policies, and respawn decisions. The runtime supplies factual observations and executes fixed physical primitives; it does not choose tactics or create replacement programs.
 
@@ -10,7 +18,7 @@ Return exactly one JSON object and no prose or Markdown. Output ArenaScript sour
 {"summary":"terminal result","directive":"finish","status":"completed|impossible"}
 Use replace only with nonblank source. Use continue or pause with neither source nor status. Use finish with status and without source. Do not include unused null fields.
 
-ArenaScript is restricted. Every replacement program declares exactly one top-level program.onUnhandledAttention("continue_and_notify"|"pause_and_notify"). Read facts only through player.state(), inventory.count(itemId), inventory.countTag(tag), world.items(criteria), world.entities(criteria), world.blocks(criteria), and world.nearest(candidates, origin?). Candidate queries and choices must use observed facts only. Candidate fields are stableId, entityId, type, itemId, blockId, count, x, y, z, reachable, visible, distance, and tags.
+ArenaScript is restricted. Every replacement program declares exactly one top-level program.onUnhandledAttention("continue_and_notify"|"pause_and_notify"). Read facts only through player.state(), inventory.count(itemId), inventory.countTag(tag), world.items(criteria), world.entities(criteria), world.blocks(criteria), and world.nearest(candidates, origin?). Candidate queries and choices must use observed facts only. Candidate fields are stableId, entityId, type, itemId, blockId, count, position: { x, y, z }, x, y, z, reachable, visible, distance, and tags.
 
 The fixed physical API calls are player.moveTo({ x, y, z }), player.navigateTo({ x, y, z, tolerance, sprint, timeoutMs }), player.lookAt({ x, y, z }), player.attack({ targetSelector, timeoutMs }), player.selectItem({ itemId }), player.useItem({ durationMs }), player.mine({ x, y, z, timeoutMs }), player.place({ x, y, z, face, itemId, desiredState }), player.chat({ message }), player.wait(durationMs), player.setDoor({ x, y, z, open }), player.dropItem({ slot, count }), player.transferContainer({ x, y, z, sourceKind, sourceSlot, destinationKind, destinationSlot, count, expectedItemId, timeoutMs }), player.craftInventory({ recipeId, count, timeoutMs }), player.craftTable({ recipeId, x, y, z, count, timeoutMs }), player.furnaceTransaction({ x, y, z, operation, inventorySlot, count, expectedItemId, timeoutMs }), player.equipItem({ sourceSlot, targetSlot, expectedItemId }), player.selectTool({ sourceSlot, hotbarSlot, expectedItemId, minRemainingDurability }), player.blockWithShield({ durationMs }), and player.useRanged({ targetSelector, drawDurationMs, timeoutMs }). Use program.repeatUntil(condition, { maxIterations: N }, async () => { ... }), program.watch(condition, { mode: "boundary"|"interrupt" }, async () => { ... }), program.checkpoint(reason), program.finish(summary), and tryResult(awaitedCall) only with their fixed signatures.
 
@@ -73,17 +81,75 @@ function buildCompilerCorrectionInput(state) {
 			column: compilerError.column,
 		},
 		rejectedSourceHash: rejectedSourceHash.trim(),
-		observation: withoutSourceText(observation),
+		observation: projectCompilerObservation(observation),
 	};
 	return `ArenaScript compiler correction (authoritative JSON only):\n${JSON.stringify(correction)}`;
 }
 
-function withoutSourceText(value) {
-	if (Array.isArray(value)) return value.map(withoutSourceText);
-	if (value !== null && typeof value === 'object') {
-		const copy = {};
-		for (const [key, nested] of Object.entries(value)) if (!/source/i.test(key)) copy[key] = withoutSourceText(nested);
-		return copy;
+function projectCompilerObservation(observation) {
+	assertPlainDataRecord(observation, 'observation');
+	const projected = {};
+	copyFiniteNumber(observation, projected, 'resourceCount', 'observation');
+	copyFiniteNumber(observation, projected, 'eventSequence', 'observation');
+	copyFiniteNumber(observation, projected, 'goalRevision', 'observation');
+	if (Object.hasOwn(observation, 'player')) projected.player = projectRecord(
+		observation.player, 'observation.player', PLAYER_NUMBER_FIELDS, PLAYER_BOOLEAN_FIELDS,
+	);
+	if (Object.hasOwn(observation, 'inventory')) projected.inventory = projectRecord(
+		observation.inventory, 'observation.inventory', ['resourceCount', 'occupiedSlots'], [],
+	);
+	for (const field of ['items', 'entities', 'blocks']) {
+		if (Object.hasOwn(observation, field)) projected[field] = projectCandidates(observation[field], `observation.${field}`);
 	}
-	return value;
+	return projected;
+}
+
+function projectCandidates(values, label) {
+	assertDenseDataArray(values, label);
+	return values.map((value, index) => projectRecord(value, `${label}[${index}]`, CANDIDATE_NUMBER_FIELDS, CANDIDATE_BOOLEAN_FIELDS));
+}
+
+function projectRecord(value, label, numberFields, booleanFields) {
+	assertPlainDataRecord(value, label);
+	const projected = {};
+	for (const field of numberFields) copyFiniteNumber(value, projected, field, label);
+	for (const field of booleanFields) copyBoolean(value, projected, field, label);
+	return projected;
+}
+
+function copyFiniteNumber(source, target, field, label) {
+	if (!Object.hasOwn(source, field)) return;
+	if (!Number.isFinite(source[field])) throw new TypeError(`${label}.${field} must be a finite number`);
+	target[field] = source[field];
+}
+
+function copyBoolean(source, target, field, label) {
+	if (!Object.hasOwn(source, field)) return;
+	if (typeof source[field] !== 'boolean') throw new TypeError(`${label}.${field} must be a boolean`);
+	target[field] = source[field];
+}
+
+function assertPlainDataRecord(value, label) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value) || ![null, Object.prototype].includes(Object.getPrototypeOf(value))) {
+		throw new TypeError(`${label} must be a plain data record`);
+	}
+	const keys = Reflect.ownKeys(value);
+	if (keys.length > MAX_COMPILER_CORRECTION_RECORD_FIELDS) throw new TypeError(`${label} exceeds ${MAX_COMPILER_CORRECTION_RECORD_FIELDS} fields`);
+	for (const key of keys) {
+		if (typeof key !== 'string') throw new TypeError(`${label} must use string keys`);
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.get || descriptor.set) throw new TypeError(`${label}.${key} must be own data`);
+	}
+}
+
+function assertDenseDataArray(value, label) {
+	if (!Array.isArray(value) || nodeTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > MAX_COMPILER_CORRECTION_ARRAY) {
+		throw new TypeError(`${label} must be a bounded plain array`);
+	}
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	for (let index = 0; index < value.length; index += 1) {
+		const descriptor = descriptors[String(index)];
+		if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.get || descriptor.set) throw new TypeError(`${label} must contain dense own data`);
+	}
+	if (Reflect.ownKeys(value).some((key) => typeof key === 'symbol' || (key !== 'length' && !/^(0|[1-9]\d*)$/.test(key)))) throw new TypeError(`${label} has unsafe keys`);
 }

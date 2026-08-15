@@ -6,6 +6,7 @@ import {
 	AntigravityProviderService,
 	buildAntigravityLaunch,
 } from '../src/antigravity-service.mjs';
+import { buildPlannerInput } from '../src/prompts.mjs';
 
 test('Antigravity catalog retains the last discovered aliases when a later CLI refresh fails', async () => {
 	let fail = false;
@@ -134,6 +135,27 @@ test('Antigravity parses planner output and uses the stable per-agent workspace'
 	assert.deepEqual(spawnCalls[0].args.slice(-5), [
 		'--model', 'gemini-3.1-pro-high', '--sandbox', '--print-timeout', '1s',
 	]);
+	await service.stop();
+});
+
+test('Antigravity rejects compiler correction without a resumable session instead of starting a fresh process', async () => {
+	const spawnCalls = [];
+	const service = new AntigravityProviderService(config(), {
+		platform: 'win32', spawn: successfulSpawner(spawnCalls),
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(7);
+	await agent.decide('Minecraft planner state (authoritative JSON):\n{}', { goalRevision: 7 });
+	const correction = buildPlannerInput({
+		decisionContext: 'arena_script_compiler_error',
+		compilerError: { code: 'SYNTAX_ERROR', message: 'unexpected token', line: 3, column: 2 },
+		rejectedSourceHash: 'sha256:abc123', observation: { resourceCount: 3 },
+	});
+	await assert.rejects(
+		agent.decide(correction, { goalRevision: 7 }),
+		(error) => error?.code === 'SESSION_CONTINUITY_UNAVAILABLE',
+	);
+	assert.equal(spawnCalls.length, 1, 'compiler correction must not start a new agy --print conversation');
 	await service.stop();
 });
 
