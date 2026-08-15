@@ -456,6 +456,12 @@ function validatePureCondition(node) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions can call only factual Arena APIs', current);
 			}
 		}
+		if (current.type === 'MemberExpression') {
+			const path = staticMemberPath(current)?.join('.');
+			if (['player.moveTo', 'player.wait', 'program.checkpoint', 'program.finish', 'program.watch', 'program.repeatUntil'].includes(path)) {
+				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions cannot reference effectful Arena APIs', current);
+			}
+		}
 		for (const [key, value] of Object.entries(current)) {
 			if (key !== 'loc' && key !== 'start' && key !== 'end' && key !== 'type') stack.push(value);
 		}

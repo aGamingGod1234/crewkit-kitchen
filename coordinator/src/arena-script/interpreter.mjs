@@ -11,6 +11,9 @@ const CAPABILITY_MEMBERS = Object.freeze({
 });
 const FORBIDDEN_MEMBER_NAMES = new Set(['__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', '__proto__', 'arguments', 'callee', 'caller', 'constructor', 'eval', 'prototype']);
 const ACTION_RESULT_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
+const PLAYER_PRIMITIVES = Object.freeze({ moveTo: 'move_to', wait: 'wait' });
+const CANONICAL_LIMITS = Object.freeze({ depth: 256, nodes: 4_096, keys: 4_096, stringBytes: 16_384, arrayLength: 256, outputBytes: 4_096, resultBytes: 4_096, watcherIdBytes: 128 });
+const IDLE_YIELD = frozenRecord({ kind: 'idle' });
 
 /** Deterministically executes a compiled ArenaScript AST without evaluating source JavaScript. */
 export class ArenaScriptInterpreter {
@@ -63,6 +66,7 @@ export class ArenaScriptInterpreter {
 
 	runWatcher(watcherId, facts) {
 		if (!this.#started) throw executionError('NOT_STARTED', 'ArenaScript NOT_STARTED: start the program before running watchers');
+		validateWatcherId(watcherId);
 		if (this.#lifecycle !== 'ACTIVE') throw executionError('INACTIVE_LIFECYCLE', `ArenaScript INACTIVE_LIFECYCLE: program is ${this.#lifecycle}`);
 		if (this.#waiting !== null) throw executionError('NOT_IDLE', 'ArenaScript NOT_IDLE: a command result is still required');
 		const watcher = this.#watchers.get(watcherId);
@@ -96,17 +100,28 @@ export class ArenaScriptInterpreter {
 	}
 
 	#run() {
-		while (this.#frames.length > 0) {
-			if (this.#terminal) return this.#yield;
-			const frame = this.#frames.pop();
-			this.#dispatch(frame);
-			if (this.#yield) {
-				const yielded = this.#yield;
-				this.#yield = null;
-				return yielded;
+		try {
+			while (this.#frames.length > 0) {
+				if (this.#terminal) return this.#yield;
+				const frame = this.#frames.pop();
+				this.#dispatch(frame);
+				if (this.#yield) {
+					const yielded = this.#yield;
+					this.#yield = null;
+					return yielded;
+				}
 			}
+			return IDLE_YIELD;
+		} catch (error) {
+			this.#frames = [];
+			this.#values = [];
+			this.#waiting = null;
+			this.#yield = null;
+			this.#terminal = true;
+			this.#lifecycle = 'PAUSED';
+			if (error instanceof ArenaScriptError) throw error;
+			throw executionError('EXECUTION_ERROR', 'ArenaScript EXECUTION_ERROR: execution failed', null, { cause: error });
 		}
-		return { kind: 'idle' };
 	}
 
 	#dispatch(frame) {
@@ -266,7 +281,8 @@ export class ArenaScriptInterpreter {
 	#afterUnary({ operator, node }) {
 		const value = this.#values.pop();
 		if (operator === '!') return this.#values.push(!value);
-		if (operator === '+') return this.#values.push(+value);
+		assertFiniteNumber(value, () => this.#error('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: unary arithmetic requires a finite number', node));
+		if (operator === '+') return this.#values.push(value);
 		if (operator === '-') return this.#values.push(-value);
 		if (operator === '~') return this.#values.push(~value);
 		throw this.#error('UNSUPPORTED_SYNTAX', `ArenaScript UNSUPPORTED_SYNTAX: unary ${operator}`, node);
@@ -309,6 +325,7 @@ export class ArenaScriptInterpreter {
 	#update(node, environment) {
 		if (node.argument.type !== 'Identifier') throw this.#error('UNSAFE_MEMBER_ACCESS', 'ArenaScript UNSAFE_MEMBER_ACCESS: only local variables may be updated', node);
 		const previous = environment.get(node.argument.name, node.argument);
+		assertFiniteNumber(previous, () => this.#error('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: update requires a finite number', node));
 		const next = node.operator === '++' ? previous + 1 : previous - 1;
 		environment.set(node.argument.name, next, node.argument);
 		this.#values.push(node.prefix ? next : previous);
@@ -623,30 +640,37 @@ function propertyKey(property) {
 }
 
 function applyBinary(operator, left, right, fail) {
+	if (!isSafeOperand(left) || !isSafeOperand(right)) throw fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: binary operators require primitive values');
 	switch (operator) {
-		case '==': return left == right; // ArenaScript admits this operator and has no coercion hooks.
-		case '!=': return left != right;
+		case '==': return left === right;
+		case '!=': return left !== right;
 		case '===': return left === right;
 		case '!==': return left !== right;
-		case '<': return left < right;
-		case '<=': return left <= right;
-		case '>': return left > right;
-		case '>=': return left >= right;
-		case '+': return left + right;
-		case '-': return left - right;
-		case '*': return left * right;
-		case '/': return left / right;
-		case '%': return left % right;
-		case '**': return left ** right;
-		case '|': return left | right;
-		case '&': return left & right;
-		case '^': return left ^ right;
-		case '<<': return left << right;
-		case '>>': return left >> right;
-		case '>>>': return left >>> right;
+		case '<': return compareOperands(left, right, fail, '<');
+		case '<=': return compareOperands(left, right, fail, '<=');
+		case '>': return compareOperands(left, right, fail, '>');
+		case '>=': return compareOperands(left, right, fail, '>=');
+		case '+': return addOperands(left, right, fail);
+		case '-': return numericOperands(left, right, fail, (a, b) => a - b);
+		case '*': return numericOperands(left, right, fail, (a, b) => a * b);
+		case '/': return numericOperands(left, right, fail, (a, b) => a / b);
+		case '%': return numericOperands(left, right, fail, (a, b) => a % b);
+		case '**': return numericOperands(left, right, fail, (a, b) => a ** b);
+		case '|': return numericOperands(left, right, fail, (a, b) => a | b);
+		case '&': return numericOperands(left, right, fail, (a, b) => a & b);
+		case '^': return numericOperands(left, right, fail, (a, b) => a ^ b);
+		case '<<': return numericOperands(left, right, fail, (a, b) => a << b);
+		case '>>': return numericOperands(left, right, fail, (a, b) => a >> b);
+		case '>>>': return numericOperands(left, right, fail, (a, b) => a >>> b);
 		default: throw fail('UNSUPPORTED_SYNTAX', `ArenaScript UNSUPPORTED_SYNTAX: binary ${operator}`);
 	}
 }
+
+function isSafeOperand(value) { return value === null || value === undefined || typeof value === 'boolean' || typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)); }
+function assertFiniteNumber(value, fail) { if (typeof value !== 'number' || !Number.isFinite(value)) throw fail(); }
+function numericOperands(left, right, fail, operation) { assertFiniteNumber(left, () => fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: arithmetic requires finite numbers')); assertFiniteNumber(right, () => fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: arithmetic requires finite numbers')); return operation(left, right); }
+function addOperands(left, right, fail) { if (typeof left === 'string' && typeof right === 'string') return left + right; return numericOperands(left, right, fail, (a, b) => a + b); }
+function compareOperands(left, right, fail, operator) { if (typeof left !== typeof right || !['number', 'string'].includes(typeof left)) throw fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: comparisons require matching strings or finite numbers'); if (operator === '<') return left < right; if (operator === '<=') return left <= right; if (operator === '>') return left > right; return left >= right; }
 
 function actionBinding(bindings, path) {
 	const [root, member] = path.split('.');
@@ -661,6 +685,7 @@ function normalizeActionResult(result) {
 	if (typeof stateToken !== 'string' || stateToken.length === 0 || typeof state !== 'string' || !ACTION_RESULT_STATES.has(state) || typeof reasonCode !== 'string') {
 		throw executionError('INVALID_ACTION_RESULT', 'ArenaScript INVALID_ACTION_RESULT: result fields are invalid');
 	}
+	if (Buffer.byteLength(stateToken, 'utf8') > CANONICAL_LIMITS.resultBytes || Buffer.byteLength(reasonCode, 'utf8') > CANONICAL_LIMITS.resultBytes) throw limitError('RESULT_LIMIT', 'string bytes');
 	return frozenRecord({ stateToken, state, succeeded: state === 'SUCCEEDED', reason: reasonCode, reasonCode });
 }
 
@@ -674,33 +699,8 @@ function freezeFacts(facts) {
 	});
 }
 
-function freezeDataRecord(value, label, seen = new Map()) {
-	const entries = ownDataEntries(value, label);
-	const record = Object.create(null);
-	seen.set(value, record);
-	for (const [key, entry] of entries) {
-		if (FORBIDDEN_MEMBER_NAMES.has(key)) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: forbidden ${label} key`);
-		record[key] = freezeDataValue(entry, `${label}.${key}`, seen);
-	}
-	return Object.freeze(record);
-}
-
-function freezeDataValue(value, label, seen) {
-	if (value === null || typeof value !== 'object') return safePrimitive(value, 'INVALID_FACTS', label);
-	if (seen.has(value)) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: cyclic ${label}`);
-	if (Array.isArray(value)) {
-		if (nodeTypes.isProxy(value)) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: proxy ${label}`);
-		const descriptors = Object.getOwnPropertyDescriptors(value);
-		const array = [];
-		seen.set(value, array);
-		for (let index = 0; index < value.length; index += 1) {
-			const descriptor = descriptors[String(index)];
-			if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: unsafe ${label}`);
-			array.push(freezeDataValue(descriptor.value, `${label}[${index}]`, seen));
-		}
-		return Object.freeze(array);
-	}
-	return freezeDataRecord(value, label, seen);
+function freezeDataRecord(value, label) {
+	return canonicalize(value, { errorCode: 'FACT_LIMIT', invalidCode: 'INVALID_FACTS', label, maxBytes: CANONICAL_LIMITS.stringBytes });
 }
 
 function hoistFunctionDeclarations(statements, environment) {
@@ -714,7 +714,7 @@ function normalizeBindings(bindings) {
 	for (const [name, binding] of player) {
 		if (!['moveTo', 'wait'].includes(name)) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: unsupported player binding');
 		const action = exactOwnDataRecord(binding, `bindings.player.${name}`, ['primitive'], { requireNullPrototype: true, requireFrozen: true, errorCode: 'INVALID_BINDINGS' });
-		if (typeof action.primitive !== 'string' || action.primitive.length === 0) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: primitive must be a non-empty string');
+		if (action.primitive !== PLAYER_PRIMITIVES[name]) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: player primitive does not match its capability');
 		normalizedPlayer[name] = frozenRecord({ primitive: action.primitive });
 	}
 	return frozenRecord({ player: Object.freeze(normalizedPlayer) });
@@ -744,17 +744,8 @@ function ownDataEntries(value, label, { requireNullPrototype = false, requireFro
 	return entries;
 }
 
-function freezeOutput(value, seen = new Set()) {
-	if (value === null || typeof value !== 'object') return safePrimitive(value, 'INVALID_COMMAND', 'command argument');
-	if (seen.has(value)) throw executionError('INVALID_COMMAND', 'ArenaScript INVALID_COMMAND: cyclic command argument');
-	seen.add(value);
-	if (Array.isArray(value)) return Object.freeze(value.map((entry) => freezeOutput(entry, seen)));
-	const output = Object.create(null);
-	for (const [key, entry] of ownDataEntries(value, 'command argument', { requireNullPrototype: true, errorCode: 'INVALID_COMMAND' })) {
-		if (FORBIDDEN_MEMBER_NAMES.has(key)) throw executionError('INVALID_COMMAND', 'ArenaScript INVALID_COMMAND: forbidden command key');
-		output[key] = freezeOutput(entry, seen);
-	}
-	return Object.freeze(output);
+function freezeOutput(value) {
+	return canonicalize(value, { errorCode: 'OUTPUT_LIMIT', invalidCode: 'INVALID_COMMAND', label: 'command argument', maxBytes: CANONICAL_LIMITS.outputBytes, requireNullPrototype: true });
 }
 
 function frozenRecord(values) {
@@ -767,6 +758,75 @@ function safePrimitive(value, code, label) {
 	if (value === undefined || value === null || typeof value === 'string' || typeof value === 'boolean') return value;
 	if (typeof value === 'number' && Number.isFinite(value)) return value;
 	throw executionError(code, `ArenaScript ${code}: ${label} must be a safe data value`);
+}
+
+function canonicalize(value, { errorCode, invalidCode, label, maxBytes, requireNullPrototype = false }) {
+	const state = { nodes: 0, keys: 0, bytes: 0, seen: new Set(), containers: [] };
+	const root = createCanonicalNode(value, label, 0, state, { errorCode, invalidCode, maxBytes, requireNullPrototype });
+	if (!root.container) return root.value;
+	const stack = [root];
+	while (stack.length > 0) {
+		const current = stack.pop();
+		if (current.depth > CANONICAL_LIMITS.depth) throw limitError(errorCode, 'depth');
+		const entries = current.array ? arrayDataEntries(current.source, current.label, invalidCode) : ownDataEntries(current.source, current.label, { requireNullPrototype, errorCode: invalidCode });
+		for (const [key, childValue] of entries) {
+			if (FORBIDDEN_MEMBER_NAMES.has(key)) throw executionError(invalidCode, `ArenaScript ${invalidCode}: forbidden ${current.label} key`);
+			state.keys += 1;
+			addCanonicalBytes(key, state, maxBytes, errorCode);
+			if (state.keys > CANONICAL_LIMITS.keys) throw limitError(errorCode, 'keys');
+			const child = createCanonicalNode(childValue, `${current.label}.${key}`, current.depth + 1, state, { errorCode, invalidCode, maxBytes, requireNullPrototype });
+			current.target[key] = child.value;
+			if (child.container) stack.push(child);
+		}
+	}
+	for (let index = state.containers.length - 1; index >= 0; index -= 1) Object.freeze(state.containers[index]);
+	return root.value;
+}
+
+function createCanonicalNode(value, label, depth, state, options) {
+	if (value === null || typeof value !== 'object') {
+		if (typeof value === 'string') addCanonicalBytes(value, state, options.maxBytes, options.errorCode);
+		try { return { value: safePrimitive(value, options.invalidCode, label), container: false }; } catch (error) { if (error instanceof ArenaScriptError) throw error; throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: invalid ${label}`); }
+	}
+	if (nodeTypes.isProxy(value) || state.seen.has(value)) throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: cyclic or proxy ${label}`);
+	state.seen.add(value);
+	state.nodes += 1;
+	if (state.nodes > CANONICAL_LIMITS.nodes || depth > CANONICAL_LIMITS.depth) throw limitError(options.errorCode, 'nodes');
+	if (Array.isArray(value)) {
+		if (value.length > CANONICAL_LIMITS.arrayLength) throw limitError(options.errorCode, 'array length');
+		const target = [];
+		state.containers.push(target);
+		return { value: target, source: value, target, label, depth, array: true, container: true };
+	}
+	const target = Object.create(null);
+	state.containers.push(target);
+	return { value: target, source: value, target, label, depth, array: false, container: true };
+}
+
+function arrayDataEntries(value, label, errorCode) {
+	if (nodeTypes.isProxy(value) || value.length > CANONICAL_LIMITS.arrayLength) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${label}`);
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	const entries = [];
+	for (let index = 0; index < value.length; index += 1) {
+		const descriptor = descriptors[String(index)];
+		if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${label}`);
+		entries.push([String(index), descriptor.value]);
+	}
+	if (Reflect.ownKeys(value).some((key) => typeof key === 'symbol' || (typeof key === 'string' && key !== 'length' && !/^\d+$/.test(key)))) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${label}`);
+	return entries;
+}
+
+function addCanonicalBytes(value, state, maxBytes, errorCode) {
+	const bytes = Buffer.byteLength(value, 'utf8');
+	if (bytes > CANONICAL_LIMITS.stringBytes) throw limitError(errorCode, 'string bytes');
+	state.bytes += bytes;
+	if (state.bytes > maxBytes) throw limitError(errorCode, 'bytes');
+}
+
+function limitError(code, category) { return executionError(code, `ArenaScript ${code}: canonical ${category} limit exceeded`); }
+
+function validateWatcherId(watcherId) {
+	if (typeof watcherId !== 'string' || watcherId.length === 0 || Buffer.byteLength(watcherId, 'utf8') > CANONICAL_LIMITS.watcherIdBytes) throw executionError('INVALID_WATCHER_ID', 'ArenaScript INVALID_WATCHER_ID: watcher id must be a bounded string');
 }
 
 function terminalText(value, fallback, node) {

@@ -80,8 +80,8 @@ test('runs a registered watcher only when its condition is true', () => {
 			async () => { program.finish("heal"); }
 		);
 	`);
-	assert.deepEqual(vm.start(facts()), { kind: 'idle' });
-	assert.deepEqual(vm.runWatcher('watcher-0', facts()), { kind: 'idle' });
+	assert.equal(vm.start(facts()).kind, 'idle');
+	assert.equal(vm.runWatcher('watcher-0', facts()).kind, 'idle');
 	const fired = vm.runWatcher('watcher-0', facts({ player: { health: 8 } }));
 	assert.equal(fired.kind, 'finish');
 	assert.equal(fired.summary, 'heal');
@@ -252,4 +252,59 @@ test('rejects assignment and updates of initialized const bindings', () => {
 		'program.onUnhandledAttention("continue_and_notify"); const total = 1; total += 1;',
 		'program.onUnhandledAttention("continue_and_notify"); const total = 1; total++;',
 	]) assert.throws(() => interpreter(source).start(facts()), (error) => error.code === 'CONST_ASSIGNMENT');
+});
+
+test('bounds canonical facts, results, and command output without native stack overflow', () => {
+	let deep = 0;
+	for (let index = 0; index < 15_000; index += 1) deep = { child: deep };
+	assert.throws(() => interpreter('program.onUnhandledAttention("continue_and_notify");').start(facts({ player: { deep } })), (error) => error.code === 'FACT_LIMIT');
+	assert.throws(() => interpreter('program.onUnhandledAttention("continue_and_notify");').start(facts({ player: { values: Array.from({ length: 257 }, () => 0) } })), (error) => error.code === 'FACT_LIMIT');
+
+	const resultVm = interpreter('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const command = resultVm.start(facts());
+	assert.throws(() => resultVm.resume({ stateToken: command.stateToken, state: 'SUCCEEDED', reasonCode: 'x'.repeat(4_097) }, facts()), (error) => error.code === 'RESULT_LIMIT');
+
+	const outputVm = interpreter('program.onUnhandledAttention("continue_and_notify"); await player.moveTo(player.state());');
+	assert.throws(() => outputVm.start(facts({ player: { blob: 'x'.repeat(8_193) } })), (error) => error.code === 'OUTPUT_LIMIT');
+});
+
+test('pauses execution errors and blocks watcher activation afterward', () => {
+	const vm = interpreter(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => true, { mode: "boundary" }, async () => { program.finish("watch"); });
+		for (let index = 0; index < 2; index += 1) { }
+	`, { loopIterationsPerYield: 1 });
+	assert.throws(() => vm.start(facts()), (error) => error.code === 'LOOP_LIMIT');
+	assert.throws(() => vm.runWatcher('watcher-0', facts()), (error) => error.code === 'INACTIVE_LIFECYCLE');
+});
+
+test('requires exact player binding primitive mappings', () => {
+	const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify");');
+	for (const [member, primitive] of [['moveTo', 'fight_target'], ['wait', 'move_to']]) {
+		const bindings = Object.freeze(Object.assign(Object.create(null), {
+			player: Object.freeze(Object.assign(Object.create(null), {
+				[member]: Object.freeze(Object.assign(Object.create(null), { primitive })),
+			})),
+		}));
+		assert.throws(() => new ArenaScriptInterpreter(compiled, bindings), (error) => error.code === 'INVALID_BINDINGS');
+	}
+});
+
+test('rejects invalid arithmetic operands and hostile watcher identifiers with stable errors', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); const box = {}; -box;',
+		'program.onUnhandledAttention("continue_and_notify"); const box = {}; box + 1;',
+		'program.onUnhandledAttention("continue_and_notify"); let value = "x"; value++;',
+	]) assert.throws(() => interpreter(source).start(facts()), (error) => error.code === 'INVALID_OPERAND');
+	const vm = interpreter('program.onUnhandledAttention("continue_and_notify");');
+	vm.start(facts());
+	assert.throws(() => vm.runWatcher({ toString() { throw new Error('called'); } }, facts()), (error) => error.code === 'INVALID_WATCHER_ID');
+});
+
+test('returns one shared frozen null-prototype idle yield', () => {
+	const vm = interpreter('program.onUnhandledAttention("continue_and_notify"); program.watch(() => false, { mode: "boundary" }, async () => {});');
+	const first = vm.start(facts());
+	assert.equal(Object.getPrototypeOf(first), null);
+	assert.ok(Object.isFrozen(first));
+	assert.strictEqual(first, vm.runWatcher('watcher-0', facts()));
 });
