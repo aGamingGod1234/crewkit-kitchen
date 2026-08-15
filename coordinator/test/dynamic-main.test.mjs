@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
+import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { createDynamicCoordinator } from '../src/dynamic-main.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
@@ -41,11 +42,11 @@ async function eventually(predicate) {
 	throw new Error('condition was not reached');
 }
 
-async function start() {
+async function start(dependencies = {}) {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
-	const coordinator = createDynamicCoordinator({ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } }, { bridge, registry, planner, codexService: new FakeProvider() });
+	const coordinator = createDynamicCoordinator({ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } }, { bridge, registry, planner, codexService: new FakeProvider(), ...dependencies });
 	await coordinator.start();
 	bridge.emit('ready', { serverInstanceId: 'test', registry: [record()] });
 	await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready'));
@@ -64,6 +65,18 @@ test('installs a selected-model program and continues its next primitive without
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
 		assert.equal(run.planner.requests.length, 1);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('injects coordinator latency telemetry into program reaction timing', async () => {
+	let now = 10;
+	const latencyRegistry = new ControlLatencyRegistry();
+	const run = await start({ latencyRegistry, controlNow: () => now++ });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 10, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		assert.ok(latencyRegistry.snapshot().some((entry) => entry.operation === 'branch_to_bridge_send'));
 	} finally { await run.coordinator.stop(); }
 });
 

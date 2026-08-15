@@ -23,6 +23,7 @@ import dev.agaminggod.arenaagents.server.AgentRuntimeRouter;
 import dev.agaminggod.arenaagents.server.AgentChatReporter;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
+import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
@@ -87,6 +88,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final AtomicBoolean running = new AtomicBoolean();
 	private final AtomicLong messageIds = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
+	private final Map<AgentId, Long> observationSequences = new HashMap<>();
+	private final Map<AgentId, JsonObject> publishedObservations = new HashMap<>();
 	private volatile Session session;
 	private volatile ServerSocket serverSocket;
 	private volatile Set<String> catalogProfiles = Set.of();
@@ -211,6 +214,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void onRemoved(AgentId agentId, long terminalRevision) {
 		actionExecutor.cancel(agentId, "Agent removed");
 		programActions.remove(agentId);
+		observationSequences.remove(agentId);
+		publishedObservations.remove(agentId);
 		JsonObject payload = new JsonObject();
 		payload.addProperty("goalRevision", terminalRevision);
 		send("agent_removed", agentId.toString(), payload);
@@ -632,7 +637,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private void sendObservation(AgentId agentId) {
 		if (!authenticated()) return;
 		try {
-			send("observation", agentId.toString(), observations.collect(agentId));
+			JsonObject observation = observations.collect(agentId);
+			long eventSequence = observationSequences.merge(agentId, 1L, Long::sum);
+			AttentionFactDelta delta = AttentionFactDelta.between(
+					publishedObservations.get(agentId), observation, eventSequence,
+					observation.get("observedAtEpochMs").getAsLong()
+			);
+			observation.addProperty("eventSequence", delta.eventSequence());
+			observation.addProperty("attention", delta.attention());
+			JsonArray changedFacts = new JsonArray();
+			delta.changedFacts().forEach(changedFacts::add);
+			observation.add("changedFacts", changedFacts);
+			publishedObservations.put(agentId, observation.deepCopy());
+			send("observation", agentId.toString(), observation);
 		} catch (RuntimeException exception) {
 			LOGGER.warn("Could not collect observation for {}: {}", agentId, exception.getMessage());
 		}

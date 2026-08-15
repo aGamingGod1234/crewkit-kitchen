@@ -65,6 +65,14 @@ const MAX_CATALOG_MODELS = 512;
 const MAX_MODEL_CAPABILITIES = 32;
 const MAX_REGISTRY_SNAPSHOT_AGENTS = 1_024;
 const MAX_NEARBY_TRANSACTION_TARGETS = 16;
+const MAX_CHANGED_FACTS = 256;
+const FACTUAL_PLAYER_FIELDS = new Set([
+	'health', 'maxHealth', 'armor', 'foodLevel', 'saturation', 'gameMode', 'onGround', 'inWater',
+	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
+]);
+const FACTUAL_TOP_LEVEL_PATHS = new Set([
+	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'nearbyContainers', 'world', 'currentAction', 'lastResult',
+]);
 
 export class ProtocolV2Error extends Error {
 	constructor(code, message, options) {
@@ -633,7 +641,7 @@ function normalizeGoalControl(value) {
 }
 
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -642,10 +650,18 @@ function normalizeObservation(value) {
 		status: boundedText(value.status, 'status', MAX_REASON_CODE_LENGTH),
 	};
 	if (!normalized.ready) {
-		if (Object.keys(value).length !== 4) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Unavailable observation must not contain live entity fields');
+		for (const key of allowed.slice(7)) if (Object.hasOwn(value, key)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Unavailable observation must not contain live entity fields');
+		if (Object.hasOwn(value, 'eventSequence')) normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
+		if (Object.hasOwn(value, 'attention')) normalized.attention = boolean(value.attention, 'attention');
+		if (Object.hasOwn(value, 'changedFacts')) normalized.changedFacts = changedFactPaths(value.changedFacts);
+		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
 	for (const key of allowed.slice(4)) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
+	normalized.attention = boolean(value.attention, 'attention');
+	normalized.changedFacts = changedFactPaths(value.changedFacts);
+	if (!normalized.attention && normalized.changedFacts.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 	normalized.position = vector(value.position, 'position');
 	normalized.velocity = vector(value.velocity, 'velocity');
 	normalized.view = numericObject(value.view, 'view', ['yaw', 'pitch']);
@@ -658,6 +674,24 @@ function normalizeObservation(value) {
 	normalized.currentAction = currentActionObservation(value.currentAction);
 	normalized.lastResult = lastResultObservation(value.lastResult);
 	return normalized;
+}
+
+function changedFactPaths(value) {
+	const paths = boundedArray(value, 'changedFacts', MAX_CHANGED_FACTS).map((path, index) => {
+		if (typeof path !== 'string' || !isFactualChangedPath(path)) {
+			throw new ProtocolV2Error('INVALID_PAYLOAD', `changedFacts[${index}] must be a factual observation path`);
+		}
+		return path;
+	});
+	if (new Set(paths).size !== paths.length) throw new ProtocolV2Error('INVALID_PAYLOAD', 'changedFacts must not contain duplicates');
+	return paths;
+}
+
+function isFactualChangedPath(path) {
+	if (FACTUAL_TOP_LEVEL_PATHS.has(path)) return true;
+	if (path.startsWith('player.')) return FACTUAL_PLAYER_FIELDS.has(path.slice('player.'.length));
+	if (/^entities\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) return true;
+	return /^blocks\.-?\d+,-?\d+,-?\d+$/.test(path);
 }
 
 function normalizeActionProgress(value) {

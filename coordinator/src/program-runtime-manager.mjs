@@ -16,8 +16,10 @@ export class ProgramRuntimeManager {
 	#versions = new Map();
 	#lifecycles = new Map();
 	#compilerCorrectionLimit;
+	#latencyRegistry;
+	#clock;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, compilerCorrectionLimit = 1 } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = () => Date.now() } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
@@ -27,6 +29,10 @@ export class ProgramRuntimeManager {
 		this.#reportError = reportError;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
+		if (latencyRegistry !== null && typeof latencyRegistry.record !== 'function') throw new TypeError('latencyRegistry.record must be a function');
+		if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+		this.#latencyRegistry = latencyRegistry;
+		this.#clock = clock;
 	}
 
 	async installDecision(record, decision, { observation, eventSequence } = {}) {
@@ -44,10 +50,16 @@ export class ProgramRuntimeManager {
 	async onObservation(record, payload = {}) {
 		const state = this.#states.get(record.agentId);
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return null;
+		const receivedAt = this.#now();
 		const observation = payload.observation ?? payload;
 		state.observation = observation;
 		const eventSequence = this.#eventSequence(state, payload.eventSequence);
 		state.engine.ingestObservation({ observation, eventSequence, attention: payload.attention === true });
+		const branchSelectedAt = this.#now();
+		if (Number.isSafeInteger(payload.observedAtEpochMs) && payload.observedAtEpochMs >= 0) {
+			this.#recordLatency('minecraft_change_to_publication', receivedAt - payload.observedAtEpochMs);
+		}
+		this.#recordLatency('event_receipt_to_branch', branchSelectedAt - receivedAt);
 		this.#syncState(record, state);
 		return state.engine.snapshot();
 	}
@@ -57,6 +69,11 @@ export class ProgramRuntimeManager {
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return false;
 		const active = state.engine.snapshot().activeActionId;
 		if (active === null || state.actionIds.get(payload.actionId) !== active) return false;
+		const timing = state.actionTiming.get(payload.actionId);
+		if (timing && timing.firstProgressAt === null) {
+			timing.firstProgressAt = this.#now();
+			this.#recordLatency('command_to_first_progress', timing.firstProgressAt - timing.bridgeSentAt);
+		}
 		this.#eventSequence(state, payload.eventSequence);
 		return true;
 	}
@@ -68,6 +85,10 @@ export class ProgramRuntimeManager {
 		const internalActionId = state.actionIds.get(payload.actionId);
 		if (active === null || internalActionId !== active) return false;
 		const eventSequence = this.#eventSequence(state, payload.eventSequence);
+		const timing = state.actionTiming.get(payload.actionId);
+		if (timing !== undefined && timing.firstProgressAt !== null) {
+			this.#recordLatency('action_completion', this.#now() - timing.firstProgressAt);
+		}
 		state.engine.ingestActionResult({
 			actionId: internalActionId,
 			state: payload.state,
@@ -75,6 +96,7 @@ export class ProgramRuntimeManager {
 			eventSequence,
 		});
 		state.actionIds.delete(payload.actionId);
+		state.actionTiming.delete(payload.actionId);
 		if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
 		this.#syncState(record, state);
 		return true;
@@ -119,6 +141,7 @@ export class ProgramRuntimeManager {
 			observation,
 			disposed: false,
 			actionIds: new Map(),
+			actionTiming: new Map(),
 			commands: 0,
 			corrections: new Map(),
 			terminalStatus: null,
@@ -254,10 +277,14 @@ export class ProgramRuntimeManager {
 		if (record === null || record.goalRevision !== state.goalRevision) return;
 		let actionId = null;
 		try {
+			const branchSelectedAt = this.#now();
 			this.#ensureActing(record);
 			actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
 			state.actionIds.set(actionId, command.actionId);
 			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command));
+			const bridgeSentAt = this.#now();
+			state.actionTiming.set(actionId, { bridgeSentAt, firstProgressAt: null });
+			this.#recordLatency('branch_to_bridge_send', bridgeSentAt - branchSelectedAt);
 		} catch (error) {
 			if (actionId !== null) this.#rejectDispatchedAction(state, record, actionId, command.actionId, error);
 			this.#reportError(state.agentId, error);
@@ -270,6 +297,7 @@ export class ProgramRuntimeManager {
 		if (active !== internalActionId) return;
 		const eventSequence = this.#eventSequence(state);
 		state.actionIds.delete(externalActionId);
+		state.actionTiming.delete(externalActionId);
 		state.engine.ingestActionResult({
 			actionId: internalActionId,
 			state: 'FAILED',
@@ -290,6 +318,18 @@ export class ProgramRuntimeManager {
 		if (Number.isSafeInteger(candidate) && candidate >= state.sequence) state.sequence = candidate;
 		else state.sequence += 1;
 		return state.sequence;
+	}
+
+	#now() {
+		const now = this.#clock();
+		if (!Number.isFinite(now)) throw new TypeError('clock must return a finite number');
+		return now;
+	}
+
+	#recordLatency(operation, duration) {
+		if (this.#latencyRegistry === null) return;
+		try { this.#latencyRegistry.record(operation, Math.max(0, duration)); }
+		catch { /* local telemetry cannot interrupt agent control */ }
 	}
 
 	#ensureActing(record) {
@@ -332,7 +372,7 @@ function wireActionCommand(record, actionId, command) {
 			programId: provenance.programId,
 			programVersion: provenance.version,
 			sourceStepId: provenance.stepId,
-			eventSequence: provenance.eventSequence,
+			eventSequence: provenance.authorizingEventSequence ?? provenance.eventSequence,
 		}),
 	});
 }

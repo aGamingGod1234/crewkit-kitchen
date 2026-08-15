@@ -68,14 +68,16 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#bridge = requireDependency(bridge, 'bridge');
 		this.#healthRegistry = requireDependency(healthRegistry, 'healthRegistry');
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
+		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
+		this.#controlNow = controlNow;
 		this.#programRuntime = new ProgramRuntimeManager({
 			registry: this.#registry,
 			bridge: this.#bridge,
 			planner: this.#planner,
 			reportError: (agentId, error) => this.#reportAgentError(agentId, error),
+			latencyRegistry: this.#latencyRegistry,
+			clock: () => this.#controlNow(),
 		});
-		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
-		this.#controlNow = controlNow;
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
 	}
@@ -143,10 +145,7 @@ export class DynamicCoordinator extends EventEmitter {
 				await this.#bridge.send('agent_error', agentId, { goalRevision: this.#registry.get(agentId)?.goalRevision ?? 0, code: invalid.code, message: invalid.message });
 			}
 			this.#reconciledStatus = true;
-			if (this.#disconnectedAt !== null) {
-				this.#recordLatency('reconnect_reconciliation', this.#disconnectedAt);
-				this.#disconnectedAt = null;
-			}
+			if (this.#disconnectedAt !== null) this.#disconnectedAt = null;
 			await this.#publishStatus();
 			this.emit('reconciled', reconciliation);
 			});
@@ -219,7 +218,6 @@ export class DynamicCoordinator extends EventEmitter {
 					}, { untrustedFacts: ledger.toPlannerFacts() }),
 				});
 				if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
-				this.#recordLatency('observation_to_plan', receivedAt);
 				const runtime = await this.#programRuntime.installDecision(record, decision, { observation, eventSequence: message.payload.eventSequence });
 				if (runtime !== null) this.#providerRetryAfter.delete(record.agentId);
 			});
@@ -384,14 +382,6 @@ export class DynamicCoordinator extends EventEmitter {
 		return ledger;
 	}
 
-	#recordLatency(operation, startedAt, finishedAt = this.#controlNow()) {
-		try {
-			if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) return;
-			this.#latencyRegistry.record(operation, Math.max(0, finishedAt - startedAt));
-		} catch {
-			// Non-authoritative metrics cannot break agent control.
-		}
-	}
 }
 
 export function createDynamicCoordinator(configValue, dependencies = {}) {

@@ -132,6 +132,9 @@ function readyServerObservation(goalRevision = 4) {
 	return {
 		goalRevision,
 		observedAtEpochMs: 20,
+		eventSequence: 7,
+		attention: false,
+		changedFacts: [],
 		ready: true,
 		status: 'PLANNING',
 		position: { x: 10.5, y: 64, z: -3.5 },
@@ -532,6 +535,9 @@ test('protocol v2 preserves bounded ordered build-sequence placements', () => {
 test('accepts the exact rich ready observation emitted by ServerObservationCollector', () => {
 	const payload = readyServerObservation();
 	const normalized = validateProtocolV2Payload('observation', payload);
+	assert.equal(normalized.eventSequence, 7);
+	assert.equal(normalized.attention, false);
+	assert.deepEqual(normalized.changedFacts, []);
 	assert.equal(Object.hasOwn(normalized.player, 'dangerousFall'), false);
 	assert.equal(normalized.player.foodLevel, 14);
 	assert.equal(normalized.player.lastAttacker.type, 'minecraft:zombie');
@@ -548,6 +554,17 @@ test('accepts the exact rich ready observation emitted by ServerObservationColle
 	assert.equal(normalized.entities[2].count, 1);
 	assert.deepEqual(normalized.blocks[0].placeableFaces, ['up', 'north']);
 	assert.deepEqual(normalized.nearbyContainers[0].capabilities, ['transfer_container']);
+});
+
+test('ready observation requires factual delta metadata and rejects decision labels', () => {
+	const payload = readyServerObservation();
+	const { eventSequence: _eventSequence, ...withoutEventSequence } = payload;
+	assert.throws(() => validateProtocolV2Payload('observation', withoutEventSequence), /eventSequence/i);
+	assert.throws(() => validateProtocolV2Payload('observation', { ...payload, changedFacts: ['danger'] }), /changedFacts/i);
+	assert.deepEqual(
+		validateProtocolV2Payload('observation', { ...payload, attention: true, changedFacts: ['player.health', 'entities.00000000-0000-0000-0000-000000000001'] }).changedFacts,
+		['player.health', 'entities.00000000-0000-0000-0000-000000000001'],
+	);
 });
 
 test('delivers the rich server observation without tearing down the authenticated bridge', async () => {

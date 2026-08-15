@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
+import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
 
-function record() {
-	return { agentId: 'agent-a', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'wait', queue: [] };
+function record(agentId = 'agent-a') {
+	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'wait', queue: [] };
 }
 
 function observation(overrides = {}) {
@@ -60,10 +61,44 @@ test('uses an authored watcher before asking the provider for unmatched attentio
 		source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);',
 	}, { observation: observation(), eventSequence: 1 });
 	const first = run.sent[0];
-	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), attention: true });
-	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 37, attention: true });
+	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 38 });
 	assert.equal(run.sent.at(-1).payload.arguments.durationMs, 9);
+	assert.equal(run.sent.at(-1).payload.provenance.eventSequence, 37, 'watcher command repeats the triggering server event identity');
 	assert.equal(run.requests.length, 0);
+});
+
+test('records bounded local reaction metrics for a thousand watcher events with an injected clock', async () => {
+	const registry = new AgentRegistry();
+	for (const agentId of ['agent-a', 'agent-b', 'agent-c', 'agent-d']) registry.register(record(agentId));
+	let now = 0;
+	const latencies = new ControlLatencyRegistry({ windowSize: 1_000 });
+	const sent = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => { now += 1; sent.push({ type, agentId, payload }); } },
+		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
+		latencyRegistry: latencies,
+		clock: () => now++,
+	});
+	for (const agentId of ['agent-a', 'agent-b', 'agent-c', 'agent-d']) {
+		await manager.installDecision(registry.get(agentId), { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(1); }); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
+		await new Promise((resolve) => setImmediate(resolve));
+		let sequence = 2;
+		for (let event = 0; event < 250; event++) {
+			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 19 } }), observedAtEpochMs: now, eventSequence: sequence++, attention: true });
+			await manager.onActionResult(registry.get(agentId), { actionId: sent.at(-1).payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: sequence++ });
+			await new Promise((resolve) => setImmediate(resolve));
+			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 20 } }), observedAtEpochMs: now, eventSequence: sequence++, attention: false });
+		}
+	}
+	const snapshot = latencies.snapshot();
+	for (const operation of ['event_receipt_to_branch', 'branch_to_bridge_send']) {
+		const metric = snapshot.find((entry) => entry.operation === operation);
+		assert.ok(metric, `${operation} is recorded`);
+		assert.ok(metric.p95Ms < 5, `${operation} p95 stays below 5ms`);
+	}
+	assert.ok(sent.length >= 1);
 });
 
 test('disposes an old goal program so late action results cannot advance it', async () => {
