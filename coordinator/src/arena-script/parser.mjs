@@ -46,6 +46,7 @@ const APPROVED_API_CALL_PATHS = new Set([
 	'inventory.countTag',
 ]);
 const APPROVED_BUILTIN_CALLS = new Set(['tryResult']);
+const RESERVED_CAPABILITY_NAMES = new Set([...ALLOWED_GLOBALS, ...APPROVED_BUILTIN_CALLS]);
 const MAX_ARENA_SCRIPT_AST_DEPTH = 256;
 
 const ALLOWED_NODE_TYPES = new Set([
@@ -323,6 +324,9 @@ function validateCallExpression(node, state, context) {
 	let functionBinding = null;
 	if (node.callee.type === 'Identifier') {
 		functionBinding = resolveBinding(context.scope, node.callee.name);
+		if (APPROVED_BUILTIN_CALLS.has(node.callee.name) && functionBinding) {
+			throw arenaError('UNSUPPORTED_SYNTAX', `approved built-in ${node.callee.name} cannot resolve to a local binding`, node.callee);
+		}
 		if (!functionBinding?.callable && !APPROVED_BUILTIN_CALLS.has(node.callee.name)) {
 			throw arenaError('UNSUPPORTED_SYNTAX', 'calls must target an immutable local function or approved built-in', node.callee);
 		}
@@ -332,6 +336,9 @@ function validateCallExpression(node, state, context) {
 		}
 		if (path?.[0] && !ALLOWED_GLOBALS.has(path[0])) {
 			throw arenaError(state.userDeclarations.has(path[0]) ? 'UNSUPPORTED_SYNTAX' : 'UNSAFE_MEMBER_ACCESS', 'unapproved member call targets are not allowed', node.callee);
+		}
+		if (path?.[0] && resolveBinding(context.scope, path[0])) {
+			throw arenaError('UNSUPPORTED_SYNTAX', `approved Arena API root ${path[0]} cannot resolve to a local binding`, node.callee);
 		}
 		if (!path || !APPROVED_API_CALL_PATHS.has(path.join('.'))) {
 			throw arenaError('UNSUPPORTED_SYNTAX', 'calls must target an approved Arena API member path', node.callee);
@@ -502,12 +509,14 @@ function createLexicalScope(parent, statements, state) {
 	const scope = { parent, bindings: new Map() };
 	for (const statement of statements) {
 		if (statement?.type === 'FunctionDeclaration' && statement.id?.type === 'Identifier') {
+			rejectReservedBinding(statement.id.name, statement.id);
 			registerFunctionBinding(scope, statement.id.name, statement, state);
 			continue;
 		}
 		if (statement?.type !== 'VariableDeclaration') continue;
 		for (const declaration of statement.declarations) {
 			if (declaration.id?.type !== 'Identifier') continue;
+			rejectReservedBinding(declaration.id.name, declaration.id);
 			if (statement.kind === 'const' && isFunctionNode(declaration.init)) {
 				registerFunctionBinding(scope, declaration.id.name, declaration.init, state);
 			} else {
@@ -522,10 +531,12 @@ function createParameterScope(parent, node, functionBinding) {
 	const scope = { parent, bindings: new Map() };
 	for (const parameter of node.params) {
 		if (parameter.type === 'Identifier') {
+			rejectReservedBinding(parameter.name, parameter);
 			scope.bindings.set(parameter.name, Object.freeze({ callable: false, name: parameter.name }));
 		}
 	}
 	if (node.id?.type === 'Identifier' && functionBinding) {
+		rejectReservedBinding(node.id.name, node.id);
 		scope.bindings.set(node.id.name, functionBinding);
 	}
 	return scope;
@@ -544,6 +555,12 @@ function resolveBinding(scope, name) {
 		if (binding) return binding;
 	}
 	return null;
+}
+
+function rejectReservedBinding(name, node) {
+	if (RESERVED_CAPABILITY_NAMES.has(name)) {
+		throw arenaError('UNSUPPORTED_SYNTAX', `reserved Arena capability name ${name} cannot be shadowed`, node);
+	}
 }
 
 function collectDeclarations(node, state) {

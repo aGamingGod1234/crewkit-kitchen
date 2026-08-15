@@ -274,3 +274,30 @@ test('detects recursion through the external binding of a named function express
 		(error) => error.name === 'ArenaScriptError' && error.code === 'RECURSION_FORBIDDEN',
 	);
 });
+
+test('rejects shadowed reserved capabilities and built-ins in local bindings and parameters', () => {
+	for (const name of ['program', 'player', 'world', 'inventory', 'tryResult', 'undefined', 'NaN', 'Infinity']) {
+		assert.throws(
+			() => parseArenaScript(`const ${name} = 1; program.onUnhandledAttention("continue_and_notify");`),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+		);
+		assert.throws(
+			() => parseArenaScript(`function local(${name}) {} program.onUnhandledAttention("continue_and_notify");`),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+		);
+	}
+});
+
+test('rejects supplied reserved-name shadowing escapes', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); function again() { const tryResult = again; tryResult(); } again();',
+		'program.onUnhandledAttention("continue_and_notify"); function again(tryResult) { tryResult(tryResult); } again(again);',
+		'program.onUnhandledAttention("continue_and_notify"); function again(player) { player.wait(player); } const box = { wait: again }; again(box);',
+		'const program = { onUnhandledAttention: () => {} }; program.onUnhandledAttention("continue_and_notify");',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+		);
+	}
+});
