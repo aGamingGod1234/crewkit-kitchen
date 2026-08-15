@@ -167,7 +167,9 @@ test('keeps an immutable request identity seen by a one-argument model callback'
 	assert.ok(Object.isFrozen(requests[0]));
 	assert.equal(requests[0].eventSequence, 2);
 	engine.applyDirective({ directive: 'pause', agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, generation: requests[0].generation, eventSequence: 2 });
-	assert.equal(engine.snapshot().status, 'SUSPENDING');
+	assert.equal(requests.length, 2);
+	assert.equal(requests[1].eventSequence, 3);
+	assert.equal(engine.snapshot().status, 'ACTIVE');
 });
 
 test('rejects incomplete provenance before creating a VM or dispatching', () => {
@@ -218,4 +220,77 @@ test('drains multiple boundary watchers in edge order before resuming the base c
 	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 9, 8, 2]);
 	assert.match(first.provenance.source, /^watcher:watcher-0$/);
 	assert.match(second.provenance.source, /^watcher:watcher-1$/);
+});
+
+test('reissues exactly the newest unmatched attention request when an older response arrives', () => {
+	const { engine, modelRequests } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: true });
+	assert.equal(modelRequests.length, 1);
+	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
+	assert.equal(modelRequests.length, 2);
+	assert.equal(modelRequests[1].eventSequence, 3);
+	assert.notEqual(modelRequests[0], modelRequests[1]);
+});
+
+test('late continue resumes a cancelled pause-and-notify command only after a fresh observation', () => {
+	const { engine, dispatched, modelRequests } = engineFor('program.onUnhandledAttention("pause_and_notify"); await player.wait(1); await player.wait(2);');
+	const first = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: first.actionId, state: 'CANCELLED', reasonCode: 'ATTENTION', eventSequence: 2 });
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
+	assert.equal(engine.snapshot().status, 'ACTIVE');
+	assert.equal(dispatched.length, 1);
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: false });
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 2]);
+});
+
+test('drains simultaneous interrupt handlers after one cancellation and carries their facts sequence', () => {
+	const { engine, dispatched, cancelled } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "interrupt" }, async () => { await player.wait(9); await player.wait(7); });
+		program.watch(() => player.state().health < 19, { mode: "interrupt" }, async () => { await player.wait(8); });
+		await player.wait(1);
+	`);
+	const base = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 10 } }), eventSequence: 5, attention: true });
+	assert.deepEqual(cancelled, [base.actionId]);
+	engine.ingestActionResult({ actionId: base.actionId, state: 'CANCELLED', reasonCode: 'DAMAGE', eventSequence: 5 });
+	assert.equal(dispatched.at(-1).provenance.executionFactsSequence, 5);
+	acknowledge(engine, dispatched, observation({ player: { x: 0, y: 64, z: 0, health: 10 } }), 6);
+	assert.equal(dispatched.at(-1).action.arguments, 7);
+	assert.equal(dispatched.at(-1).provenance.executionFactsSequence, 6);
+	acknowledge(engine, dispatched, observation({ player: { x: 0, y: 64, z: 0, health: 10 } }), 7);
+	assert.equal(dispatched.at(-1).action.arguments, 8);
+});
+
+test('rejects replacement authority supplied by a remote directive and retains the active program', () => {
+	const { engine, dispatched, cancelled, modelRequests } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.applyDirective({
+		directive: 'replace', ...modelRequests[0], install: {
+			agentId: 'spoofed-agent', goalRevision: 9, modelIdentity: 'spoofed-model', programId: 'spoofed', version: 9,
+			eventSequence: 99, observation: observation(), compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify");'),
+		},
+	});
+	assert.equal(cancelled.length, 0);
+	assert.equal(dispatched.length, 1);
+	assert.equal(engine.snapshot().programId, 'program-a');
+});
+
+test('trusted lifecycle installs advance goals while pending installs reject downgrades', () => {
+	const { engine, dispatched, cancelled } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const active = dispatched.at(-1);
+	engine.install({
+		agentId: 'agent-a', goalRevision: 2, modelIdentity: 'model-a', programId: 'goal-two', version: 0,
+		compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(2);'), observation: observation(), eventSequence: 2,
+	});
+	assert.deepEqual(cancelled, [active.actionId]);
+	engine.install({
+		agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'stale', version: 99,
+		compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(9);'), observation: observation(), eventSequence: 3,
+	});
+	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'REPLACED', eventSequence: 3 });
+	assert.equal(engine.snapshot().programId, 'goal-two');
 });
