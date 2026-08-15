@@ -76,7 +76,9 @@ test('injects coordinator latency telemetry into program reaction timing', async
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 10, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
-		assert.ok(latencyRegistry.snapshot().some((entry) => entry.operation === 'branch_to_bridge_send'));
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 11, eventSequence: 2, attention: false, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => latencyRegistry.snapshot().some((entry) => entry.operation === 'event_receipt_to_branch'));
+		assert.ok(latencyRegistry.snapshot().some((entry) => entry.operation === 'event_receipt_to_branch'));
 	} finally { await run.coordinator.stop(); }
 });
 

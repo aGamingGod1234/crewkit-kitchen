@@ -88,7 +88,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final AtomicBoolean running = new AtomicBoolean();
 	private final AtomicLong messageIds = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
-	private final Map<AgentId, Long> observationSequences = new HashMap<>();
+	private final AtomicLong observationSequences = new AtomicLong();
 	private final Map<AgentId, JsonObject> publishedObservations = new HashMap<>();
 	private volatile Session session;
 	private volatile ServerSocket serverSocket;
@@ -214,7 +214,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void onRemoved(AgentId agentId, long terminalRevision) {
 		actionExecutor.cancel(agentId, "Agent removed");
 		programActions.remove(agentId);
-		observationSequences.remove(agentId);
 		publishedObservations.remove(agentId);
 		JsonObject payload = new JsonObject();
 		payload.addProperty("goalRevision", terminalRevision);
@@ -638,7 +637,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!authenticated()) return;
 		try {
 			JsonObject observation = observations.collect(agentId);
-			long eventSequence = observationSequences.merge(agentId, 1L, Long::sum);
+			long eventSequence = observationSequences.incrementAndGet();
 			AttentionFactDelta delta = AttentionFactDelta.between(
 					publishedObservations.get(agentId), observation, eventSequence,
 					observation.get("observedAtEpochMs").getAsLong()

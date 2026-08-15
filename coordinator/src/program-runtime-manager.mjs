@@ -18,8 +18,9 @@ export class ProgramRuntimeManager {
 	#compilerCorrectionLimit;
 	#latencyRegistry;
 	#clock;
+	#epochClock;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = () => Date.now() } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), epochClock = Date.now } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
@@ -31,8 +32,10 @@ export class ProgramRuntimeManager {
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
 		if (latencyRegistry !== null && typeof latencyRegistry.record !== 'function') throw new TypeError('latencyRegistry.record must be a function');
 		if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+		if (typeof epochClock !== 'function') throw new TypeError('epochClock must be a function');
 		this.#latencyRegistry = latencyRegistry;
 		this.#clock = clock;
+		this.#epochClock = epochClock;
 	}
 
 	async installDecision(record, decision, { observation, eventSequence } = {}) {
@@ -50,15 +53,14 @@ export class ProgramRuntimeManager {
 	async onObservation(record, payload = {}) {
 		const state = this.#states.get(record.agentId);
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return null;
-		const receivedAt = this.#now();
+		const eventSequence = this.#acceptServerEvent(state, payload.eventSequence);
+		if (eventSequence === null) return state.engine.snapshot();
+		const receivedAt = monotonicTimestamp(payload.receivedAtMonotonic) ?? this.#now();
 		const observation = payload.observation ?? payload;
 		state.observation = observation;
-		const eventSequence = this.#eventSequence(state, payload.eventSequence);
 		state.engine.ingestObservation({ observation, eventSequence, attention: payload.attention === true });
 		const branchSelectedAt = this.#now();
-		if (Number.isSafeInteger(payload.observedAtEpochMs) && payload.observedAtEpochMs >= 0) {
-			this.#recordLatency('minecraft_change_to_publication', receivedAt - payload.observedAtEpochMs);
-		}
+		this.#recordMinecraftPublication(payload.observedAtEpochMs);
 		this.#recordLatency('event_receipt_to_branch', branchSelectedAt - receivedAt);
 		this.#syncState(record, state);
 		return state.engine.snapshot();
@@ -69,12 +71,13 @@ export class ProgramRuntimeManager {
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return false;
 		const active = state.engine.snapshot().activeActionId;
 		if (active === null || state.actionIds.get(payload.actionId) !== active) return false;
+		const eventSequence = this.#actionEventSequence(state, payload.eventSequence);
+		if (eventSequence === null) return false;
 		const timing = state.actionTiming.get(payload.actionId);
 		if (timing && timing.firstProgressAt === null) {
 			timing.firstProgressAt = this.#now();
 			this.#recordLatency('command_to_first_progress', timing.firstProgressAt - timing.bridgeSentAt);
 		}
-		this.#eventSequence(state, payload.eventSequence);
 		return true;
 	}
 
@@ -84,10 +87,11 @@ export class ProgramRuntimeManager {
 		const active = state.engine.snapshot().activeActionId;
 		const internalActionId = state.actionIds.get(payload.actionId);
 		if (active === null || internalActionId !== active) return false;
-		const eventSequence = this.#eventSequence(state, payload.eventSequence);
+		const eventSequence = this.#actionEventSequence(state, payload.eventSequence);
+		if (eventSequence === null) return false;
 		const timing = state.actionTiming.get(payload.actionId);
-		if (timing !== undefined && timing.firstProgressAt !== null) {
-			this.#recordLatency('action_completion', this.#now() - timing.firstProgressAt);
+		if (timing !== undefined) {
+			this.#recordLatency('action_completion', this.#now() - timing.bridgeSentAt);
 		}
 		state.engine.ingestActionResult({
 			actionId: internalActionId,
@@ -127,7 +131,7 @@ export class ProgramRuntimeManager {
 		const existing = this.#states.get(record.agentId);
 		if (existing && !existing.disposed && existing.goalRevision === record.goalRevision) {
 			existing.observation = observation;
-			this.#eventSequence(existing, eventSequence);
+			this.#installationSequence(existing, eventSequence);
 			return existing;
 		}
 		if (existing) this.dispose(record.agentId);
@@ -138,6 +142,7 @@ export class ProgramRuntimeManager {
 			version: this.#versions.get(versionKey(record)) ?? 0,
 			lifecycle: (this.#lifecycles.get(record.agentId) ?? 0) + 1,
 			sequence: Number.isSafeInteger(eventSequence) && eventSequence >= 0 ? eventSequence : 0,
+			lastServerEventSequence: Number.isSafeInteger(eventSequence) && eventSequence >= 1 ? eventSequence : null,
 			observation,
 			disposed: false,
 			actionIds: new Map(),
@@ -168,7 +173,7 @@ export class ProgramRuntimeManager {
 		const version = state.version + 1;
 		state.version = version;
 		this.#versions.set(versionKey(record), version);
-		const sequence = this.#eventSequence(state, eventSequence);
+		const sequence = this.#installationSequence(state, eventSequence);
 		state.observation = observation;
 		return state.engine.install({
 			agentId: record.agentId,
@@ -284,7 +289,7 @@ export class ProgramRuntimeManager {
 			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command));
 			const bridgeSentAt = this.#now();
 			state.actionTiming.set(actionId, { bridgeSentAt, firstProgressAt: null });
-			this.#recordLatency('branch_to_bridge_send', bridgeSentAt - branchSelectedAt);
+			if (command.provenance.authorizingEventSequence !== null) this.#recordLatency('branch_to_bridge_send', bridgeSentAt - branchSelectedAt);
 		} catch (error) {
 			if (actionId !== null) this.#rejectDispatchedAction(state, record, actionId, command.actionId, error);
 			this.#reportError(state.agentId, error);
@@ -295,7 +300,7 @@ export class ProgramRuntimeManager {
 		if (state.disposed || state.actionIds.get(externalActionId) !== internalActionId) return;
 		const active = state.engine.snapshot().activeActionId;
 		if (active !== internalActionId) return;
-		const eventSequence = this.#eventSequence(state);
+		const eventSequence = this.#actionEventSequence(state);
 		state.actionIds.delete(externalActionId);
 		state.actionTiming.delete(externalActionId);
 		state.engine.ingestActionResult({
@@ -314,9 +319,23 @@ export class ProgramRuntimeManager {
 		catch (error) { this.#reportError(state.agentId, error); }
 	}
 
-	#eventSequence(state, candidate) {
+	#acceptServerEvent(state, candidate) {
+		if (!Number.isSafeInteger(candidate) || candidate < 1) return null;
+		if (state.lastServerEventSequence !== null && candidate <= state.lastServerEventSequence) return null;
+		state.lastServerEventSequence = candidate;
+		state.sequence = Math.max(state.sequence, candidate);
+		return candidate;
+	}
+
+	#actionEventSequence(state, candidate = undefined) {
+		if (candidate === undefined || candidate === null) return ++state.sequence;
+		if (!Number.isSafeInteger(candidate) || candidate <= state.sequence) return null;
+		state.sequence = candidate;
+		return candidate;
+	}
+
+	#installationSequence(state, candidate) {
 		if (Number.isSafeInteger(candidate) && candidate >= state.sequence) state.sequence = candidate;
-		else state.sequence += 1;
 		return state.sequence;
 	}
 
@@ -328,8 +347,17 @@ export class ProgramRuntimeManager {
 
 	#recordLatency(operation, duration) {
 		if (this.#latencyRegistry === null) return;
-		try { this.#latencyRegistry.record(operation, Math.max(0, duration)); }
+		if (!Number.isFinite(duration) || duration <= 0) return;
+		try { this.#latencyRegistry.record(operation, duration); }
 		catch { /* local telemetry cannot interrupt agent control */ }
+	}
+
+	#recordMinecraftPublication(observedAtEpochMs) {
+		if (!Number.isSafeInteger(observedAtEpochMs) || observedAtEpochMs < 0) return;
+		const completedAtEpochMs = this.#epochClock();
+		const duration = completedAtEpochMs - observedAtEpochMs;
+		if (!Number.isFinite(completedAtEpochMs) || duration <= 0 || duration > 60_000) return;
+		this.#recordLatency('minecraft_change_to_publication', duration);
 	}
 
 	#ensureActing(record) {
@@ -392,4 +420,8 @@ function stableFailureCode(error) {
 	return typeof error?.code === 'string' && /^[A-Z0-9_]{1,128}$/.test(error.code)
 		? error.code
 		: 'BRIDGE_SEND_REJECTED';
+}
+
+function monotonicTimestamp(value) {
+	return Number.isFinite(value) && value >= 0 ? value : null;
 }

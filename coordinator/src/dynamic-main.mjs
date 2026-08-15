@@ -59,7 +59,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#statusHandle = null;
 	#serverInstanceId = null;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, controlNow = () => performance.now(), setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -69,6 +69,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#healthRegistry = requireDependency(healthRegistry, 'healthRegistry');
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
+		if (typeof epochNow !== 'function') throw new TypeError('epochNow must be a function');
 		this.#controlNow = controlNow;
 		this.#programRuntime = new ProgramRuntimeManager({
 			registry: this.#registry,
@@ -77,6 +78,7 @@ export class DynamicCoordinator extends EventEmitter {
 			reportError: (agentId, error) => this.#reportAgentError(agentId, error),
 			latencyRegistry: this.#latencyRegistry,
 			clock: () => this.#controlNow(),
+			epochClock: epochNow,
 		});
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
@@ -204,7 +206,13 @@ export class DynamicCoordinator extends EventEmitter {
 				const observation = message.payload.observation ?? message.payload;
 				const ledger = this.#ledger(record.agentId);
 				ledger.ingest('observation', observation);
-				const installed = await this.#programRuntime.onObservation(record, { observation, eventSequence: message.payload.eventSequence, attention: message.payload.attention === true });
+				const installed = await this.#programRuntime.onObservation(record, {
+					observation,
+					eventSequence: message.payload.eventSequence,
+					attention: message.payload.attention === true,
+					receivedAtMonotonic: receivedAt,
+					observedAtEpochMs: message.payload.observedAtEpochMs,
+				});
 				if (installed !== null) return;
 				if ((this.#providerRetryAfter.get(record.agentId) ?? 0) > receivedAt) return;
 				await this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING });
@@ -432,6 +440,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		healthRegistry,
 		latencyRegistry,
 		controlNow: dependencies.controlNow,
+		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,
 		clearStatusInterval: dependencies.clearStatusInterval,
 	});

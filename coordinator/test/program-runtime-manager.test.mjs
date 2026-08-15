@@ -68,28 +68,27 @@ test('uses an authored watcher before asking the provider for unmatched attentio
 	assert.equal(run.requests.length, 0);
 });
 
-test('records bounded local reaction metrics for a thousand watcher events with an injected clock', async () => {
+test('measures one thousand watcher branches with the real monotonic clock', async () => {
 	const registry = new AgentRegistry();
 	for (const agentId of ['agent-a', 'agent-b', 'agent-c', 'agent-d']) registry.register(record(agentId));
-	let now = 0;
 	const latencies = new ControlLatencyRegistry({ windowSize: 1_000 });
 	const sent = [];
 	const manager = new ProgramRuntimeManager({
 		registry,
-		bridge: { send: async (type, agentId, payload) => { now += 1; sent.push({ type, agentId, payload }); } },
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
 		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
 		latencyRegistry: latencies,
-		clock: () => now++,
+		clock: performance.now.bind(performance),
 	});
 	for (const agentId of ['agent-a', 'agent-b', 'agent-c', 'agent-d']) {
 		await manager.installDecision(registry.get(agentId), { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(1); }); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
 		await new Promise((resolve) => setImmediate(resolve));
 		let sequence = 2;
 		for (let event = 0; event < 250; event++) {
-			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 19 } }), observedAtEpochMs: now, eventSequence: sequence++, attention: true });
+			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 19 } }), receivedAtMonotonic: performance.now(), observedAtEpochMs: Date.now(), eventSequence: sequence++, attention: true });
 			await manager.onActionResult(registry.get(agentId), { actionId: sent.at(-1).payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: sequence++ });
 			await new Promise((resolve) => setImmediate(resolve));
-			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 20 } }), observedAtEpochMs: now, eventSequence: sequence++, attention: false });
+			await manager.onObservation(registry.get(agentId), { observation: observation({ player: { health: 20 } }), receivedAtMonotonic: performance.now(), observedAtEpochMs: Date.now(), eventSequence: sequence++, attention: false });
 		}
 	}
 	const snapshot = latencies.snapshot();
@@ -98,7 +97,59 @@ test('records bounded local reaction metrics for a thousand watcher events with 
 		assert.ok(metric, `${operation} is recorded`);
 		assert.ok(metric.p95Ms < 5, `${operation} p95 stays below 5ms`);
 	}
-	assert.ok(sent.length >= 1);
+	assert.equal(sent.filter((message) => message.payload.provenance.eventSequence > 1).length, 1_000, 'each watcher event produces exactly one command');
+	assert.equal(snapshot.find((entry) => entry.operation === 'branch_to_bridge_send').count, 1_000, 'each watcher command contributes one branch-to-send sample');
+});
+
+test('ignores duplicate server observations and omits skewed epoch telemetry', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const latencies = new ControlLatencyRegistry();
+	let now = 100;
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} }, planner: { requestPlan: async () => ({ directive: 'continue' }) },
+		latencyRegistry: latencies, clock: () => now++, epochClock: () => 1_000,
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, receivedAtMonotonic: 100, observedAtEpochMs: 2_000, attention: false });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 2, receivedAtMonotonic: 101, observedAtEpochMs: 900, attention: true });
+	assert.equal(latencies.snapshot().find((entry) => entry.operation === 'event_receipt_to_branch').count, 1, 'duplicate server event is ignored before branch timing');
+	assert.equal(latencies.snapshot().some((entry) => entry.operation === 'minecraft_change_to_publication'), false, 'future epoch observation is omitted instead of coerced to zero');
+});
+
+test('records completion from bridge send even when no progress arrives', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const latencies = new ControlLatencyRegistry();
+	let now = 10;
+	const sent = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (_type, _agentId, payload) => sent.push(payload) }, planner: { requestPlan: async () => ({ directive: 'continue' }) },
+		latencyRegistry: latencies, clock: () => now++,
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	await manager.onActionResult(registry.get('agent-a'), { actionId: sent[0].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
+	const completion = latencies.snapshot().find((entry) => entry.operation === 'action_completion');
+	assert.equal(completion.count, 1);
+	assert.equal(latencies.snapshot().some((entry) => entry.operation === 'command_to_first_progress'), false);
+});
+
+test('records only the first progress event for an action', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const latencies = new ControlLatencyRegistry();
+	let now = 10;
+	const sent = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (_type, _agentId, payload) => sent.push(payload) }, planner: { requestPlan: async () => ({ directive: 'continue' }) },
+		latencyRegistry: latencies, clock: () => now++,
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(manager.onActionProgress(registry.get('agent-a'), { actionId: sent[0].actionId }), true);
+	assert.equal(manager.onActionProgress(registry.get('agent-a'), { actionId: sent[0].actionId }), true);
+	assert.equal(latencies.snapshot().find((entry) => entry.operation === 'command_to_first_progress').count, 1);
 });
 
 test('disposes an old goal program so late action results cannot advance it', async () => {

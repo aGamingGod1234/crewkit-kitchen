@@ -567,6 +567,19 @@ test('ready observation requires factual delta metadata and rejects decision lab
 	);
 });
 
+test('ready observation accepts bounded factual aggregate paths at maximum entity and block churn', () => {
+	const payload = readyServerObservation();
+	const changedFacts = [
+		...Array.from({ length: 64 }, (_value, index) => `entities.00000000-0000-0000-0000-${String(index).padStart(12, '0')}`),
+		...Array.from({ length: 128 }, (_value, index) => `blocks.${index},64,0`),
+	];
+	assert.equal(validateProtocolV2Payload('observation', { ...payload, attention: true, changedFacts }).changedFacts.length, 192);
+	assert.deepEqual(
+		validateProtocolV2Payload('observation', { ...payload, attention: true, changedFacts: ['entities', 'blocks'] }).changedFacts,
+		['entities', 'blocks'],
+	);
+});
+
 test('delivers the rich server observation without tearing down the authenticated bridge', async () => {
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
