@@ -104,11 +104,11 @@ export class ArenaScriptEngine {
 	snapshot() { return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, generation: this.#generation, activeActionId: this.#active?.actionId ?? null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null }); }
 
 	#activate(target) {
+		const latestFacts = this.#facts && this.#eventSequence > target.eventSequence ? this.#facts : target.facts;
+		const latestSequence = Math.max(this.#eventSequence, target.eventSequence);
 		this.#clear(false);
 		this.#generation += 1;
 		this.#program = freezeRecord({ agentId: target.agentId, goalRevision: target.goalRevision, modelIdentity: target.modelIdentity, programId: target.programId, version: target.version, compiled: target.compiled });
-		const latestFacts = this.#facts && this.#eventSequence > target.eventSequence ? this.#facts : target.facts;
-		const latestSequence = Math.max(this.#eventSequence, target.eventSequence);
 		this.#facts = latestFacts;
 		this.#eventSequence = latestSequence;
 		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS);
