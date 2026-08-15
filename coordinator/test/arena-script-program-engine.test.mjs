@@ -240,6 +240,8 @@ test('late continue resumes a cancelled pause-and-notify command only after a fr
 	engine.ingestActionResult({ actionId: first.actionId, state: 'CANCELLED', reasonCode: 'ATTENTION', eventSequence: 2 });
 	assert.equal(engine.snapshot().status, 'SUSPENDED');
 	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
+	assert.equal(modelRequests.length, 2);
+	engine.applyDirective({ directive: 'continue', ...modelRequests[1] });
 	assert.equal(engine.snapshot().status, 'ACTIVE');
 	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 2]);
 	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: false });
@@ -417,4 +419,44 @@ test('terminal non-cancelled results complete queued install, dispose, and inter
 	watched.engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 2, attention: true });
 	watched.engine.ingestActionResult({ actionId: third.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
 	assert.equal(watched.dispatched.at(-1).action.arguments, 9);
+});
+
+test('a response for a completed action cannot cancel the successor continuation', () => {
+	const { engine, dispatched, cancelled, modelRequests } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);');
+	const first = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	const firstRequest = modelRequests[0];
+	engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	const second = dispatched.at(-1);
+	assert.notEqual(second.actionId, first.actionId);
+	engine.applyDirective({ directive: 'pause', ...firstRequest });
+	assert.equal(cancelled.length, 0);
+	assert.equal(modelRequests.length, 2);
+	assert.equal(modelRequests[1].activeActionId, second.actionId);
+	engine.applyDirective({ directive: 'pause', ...modelRequests[1] });
+	assert.deepEqual(cancelled, [second.actionId]);
+});
+
+test('identical same-version facts refresh preserves the selected-model turn and rejects an older refresh', () => {
+	const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const requests = [];
+	const engine = new ArenaScriptEngine({ dispatch() {}, cancel() {}, requestModel: (context) => requests.push(context) });
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation(), eventSequence: 1 });
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation(), eventSequence: 3 });
+	engine.applyDirective({ directive: 'continue', ...requests[0] });
+	assert.equal(requests.length, 2);
+	assert.equal(requests[1].factsSequence, 3);
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation(), eventSequence: 2 });
+	assert.equal(requests.length, 2);
+});
+
+test('an exact interrupt cancellation acknowledgement may arrive after a newer observation', () => {
+	const { engine, dispatched } = engineFor('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "interrupt" }, async () => { await player.wait(9); }); await player.wait(1);');
+	const active = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 2, attention: true });
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 3, attention: false });
+	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'DAMAGE', eventSequence: 2 });
+	assert.equal(dispatched.at(-1).action.arguments, 9);
+	assert.equal(engine.snapshot().eventSequence, 3);
 });
