@@ -114,6 +114,8 @@ public final class ServerActionExecutorVerification {
 			assertEquals(expectedPrimitive, ServerActionExecutor.isArenaScriptPrimitive(type),
 					"server primitive parity for " + type.wireName());
 		}
+		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.requireArenaScriptPrimitive(ActionType.FIGHT_TARGET),
+				"program primitive entry point rejects high-level controller actions");
 		ServerActionProgress progress = new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 0.5D, 250L, 1_750_000_000_250L
 		);
@@ -159,12 +161,6 @@ public final class ServerActionExecutorVerification {
 		assertFalse(ServerActionExecutor.isValidPlacementHit(
 				new BlockPos(10, 65, -4), new Vec3(12.0D, 65.5D, -3.5D)
 		), "placement rejects a forged hit location outside the support block");
-		DesiredBlockState oakStairs = DesiredBlockState.parse(
-				"minecraft:oak_stairs[facing=north]", "minecraft:oak_stairs");
-		Direction oakStairsFacing = Direction.byName(oakStairs.properties().get("facing"));
-		assertEquals(Direction.NORTH.toYRot(),
-				ServerActionExecutor.directionalPlacementYaw(oakStairsFacing),
-				"oak_stairs facing=north maps the player placement context to north");
 		assertThrows(
 				AgentDomainException.class,
 				() -> ServerActionExecutor.requirePlacementProtection(

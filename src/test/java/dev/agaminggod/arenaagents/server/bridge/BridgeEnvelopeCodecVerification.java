@@ -21,6 +21,9 @@ public final class BridgeEnvelopeCodecVerification {
 		assertEquals(7L, decoded.payload().get("goalRevision").getAsLong(), "payload revision");
 		expectFailure(() -> codec.decode("{}"), "MISSING_FIELD");
 		expectFailure(() -> codec.decode("x".repeat(BridgeEnvelopeCodec.MAX_LINE_BYTES + 1)), "LINE_TOO_LARGE");
+		expectFailure(() -> codec.decode("{\"protocolVersion\":2,\"protocolVersion\":2}"), "DUPLICATE_FIELD");
+		expectFailure(() -> codec.decode("{\"protocolVersion\":2,\"serverInstanceId\":\"server-instance\",\"agentId\":\"agent\",\"type\":\"observation\",\"messageId\":\"m\",\"payload\":{\"goalRevision\":1,\"goalRevision\":2}}"), "DUPLICATE_FIELD");
+		expectFailure(() -> codec.decode("{\"protocolVersion\":\"2\",\"serverInstanceId\":\"server-instance\",\"agentId\":\"agent\",\"type\":\"observation\",\"messageId\":\"m\",\"payload\":{}}"), "INVALID_FIELD");
 		JsonObject waitArguments = new JsonObject();
 		waitArguments.addProperty("durationMs", 25L);
 		ServerActionRequest primitive = MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
@@ -42,7 +45,17 @@ public final class BridgeEnvelopeCodecVerification {
 		expectFailure(() -> MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
 				2, "server-instance", "00000000-0000-0000-0000-000000000001", "action_command", "message-2", fightPayload
 		)), "UNSUPPORTED_ARENA_SCRIPT_ACTION");
-		return 11;
+		JsonObject aliasPayload = actionPayload("wait-3", ActionType.WAIT.wireName(), waitArguments);
+		aliasPayload.addProperty("commandId", "wait-3");
+		expectFailure(() -> MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
+				2, "server-instance", "00000000-0000-0000-0000-000000000001", "action_command", "message-4", aliasPayload
+		)), "INVALID_FIELD");
+		JsonObject coercionPayload = actionPayload("wait-4", ActionType.WAIT.wireName(), waitArguments);
+		coercionPayload.addProperty("goalRevision", "1");
+		expectFailure(() -> MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
+				2, "server-instance", "00000000-0000-0000-0000-000000000001", "action_command", "message-5", coercionPayload
+		)), "INVALID_FIELD");
+		return 16;
 	}
 
 	private static JsonObject actionPayload(String actionId, String type, JsonObject arguments) {

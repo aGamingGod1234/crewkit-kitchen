@@ -61,8 +61,7 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 
 test('protocol v2 requires immutable provenance on every action command form', () => {
 	const payload = {
-		goalRevision: 1, actionId: 'action-1', summary: 'Wait.', goalStatus: 'in_progress',
-		action: { type: 'wait', durationMs: 25 }, provenance: PROVENANCE,
+		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
 	};
 	const normalized = validateProtocolV2Payload('action_command', payload);
 	assert.deepEqual(normalized.provenance, PROVENANCE);
@@ -72,6 +71,19 @@ test('protocol v2 requires immutable provenance on every action command form', (
 	assert.throws(() => validateProtocolV2Payload('action_command', {
 		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 },
 	}), /provenance/);
+	for (const alias of ['commandId', 'command', 'type', 'action']) {
+		assert.throws(
+			() => validateProtocolV2Payload('action_command', { ...payload, [alias]: alias === 'action' ? { type: 'wait' } : 'forged' }),
+			(error) => error.code === 'INVALID_PAYLOAD_FIELD',
+			`${alias} is not a canonical action command field`,
+		);
+	}
+	const inheritedProvenance = Object.create(PROVENANCE);
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, provenance: inheritedProvenance }),
+		(error) => error.code === 'INVALID_FIELD',
+		'custom/inherited provenance objects are rejected',
+	);
 });
 
 function registeredRecord(agentId = 'agent-a') {
@@ -247,9 +259,8 @@ test('multiplexed bridge rejects stale revisions before writing', async () => {
 	await assert.rejects(bridge.send('action_command', 'agent-a', {
 		goalRevision: 8,
 		actionId: 'action-1',
-		summary: 'Wait.',
-		goalStatus: 'in_progress',
-		action: { type: 'wait', durationMs: 25 },
+		actionType: 'wait',
+		arguments: { durationMs: 25 },
 		provenance: PROVENANCE,
 	}), (error) => error.code === 'STALE_GOAL_REVISION');
 	assert.equal(socket.writes.length, 1);
@@ -334,9 +345,8 @@ test('a newer lifecycle revision removes queued stale action commands under back
 	const staleCommand = bridge.send('action_command', 'agent-a', {
 		goalRevision: 1,
 		actionId: 'action-stale',
-		summary: 'Old action.',
-		goalStatus: 'in_progress',
-		action: { type: 'wait', durationMs: 25 },
+		actionType: 'wait',
+		arguments: { durationMs: 25 },
 		provenance: PROVENANCE,
 	});
 	let staleError = null;
@@ -398,7 +408,7 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
-		['action_command', { goalRevision: 1, actionId: 'action-1', summary: 'Wait.', goalStatus: 'in_progress', action: { type: 'wait', durationMs: 25 }, provenance: PROVENANCE }],
+		['action_command', { goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],
 		['heartbeat', {}],

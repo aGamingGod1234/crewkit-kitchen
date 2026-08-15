@@ -104,6 +104,7 @@ public final class TransactionProtocolVerification {
 				"actionType", "wait"
 		);
 		payload.add("arguments", arguments);
+		payload.add("provenance", provenance());
 		BridgeEnvelope envelope = new BridgeEnvelope(
 				2,
 				"server-instance",
@@ -123,6 +124,13 @@ public final class TransactionProtocolVerification {
 			return;
 		}
 		throw new AssertionError("live bridge accepted an unknown argument");
+	}
+
+	private static JsonObject provenance() {
+		return json(
+				"provider", "codex", "model", "gpt-5.6-sol", "reasoningEffort", "high", "serviceTier", "priority",
+				"programId", "program-7-1", "programVersion", 1, "sourceStepId", "step-1-1", "eventSequence", 1
+		);
 	}
 
 	private static void verifyReplayReturnsRecordedResultAndChangedHashFails() {

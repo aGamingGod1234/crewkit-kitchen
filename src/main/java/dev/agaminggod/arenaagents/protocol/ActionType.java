@@ -14,6 +14,7 @@ public enum ActionType {
 	USE_ITEM("use_item"),
 	BREAK_BLOCK("break_block"),
 	PLACE_BLOCK("place_block"),
+	BUILD_SEQUENCE("build_sequence"),
 	CHAT("chat"),
 	WAIT("wait"),
 	SET_DOOR("set_door"),

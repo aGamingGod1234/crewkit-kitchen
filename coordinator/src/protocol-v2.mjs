@@ -697,34 +697,10 @@ function normalizeActionResult(value) {
 }
 
 function normalizeActionCommand(value) {
-	if (Object.hasOwn(value, 'action')) {
-		let command;
-		try { command = validateActionCommandPayload(value); }
-		catch (error) {
-			if (error instanceof ValidationError) throw new ProtocolV2Error('INVALID_PAYLOAD_FIELD', error.message, { cause: error });
-			throw error;
-		}
-		const action = command.action;
-		const { type, ...argumentsValue } = action;
-		const normalized = {
-			goalRevision: command.goalRevision,
-			actionId: command.actionId,
-			commandId: command.actionId,
-			actionType: type,
-			type,
-			arguments: argumentsValue,
-			provenance: command.provenance,
-		};
-		if (command.summary !== undefined) normalized.summary = command.summary;
-		if (command.goalStatus !== undefined) normalized.goalStatus = command.goalStatus;
-		return deepFreeze(normalized);
-	}
-	const allowed = ['goalRevision', 'actionId', 'commandId', 'actionType', 'type', 'arguments', 'summary', 'goalStatus', 'provenance'];
+	const allowed = ['goalRevision', 'actionId', 'actionType', 'arguments', 'provenance'];
 	exactKeys(value, allowed, ['goalRevision', 'actionId', 'arguments', 'provenance'], 'action_command');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
-	if (value.commandId !== undefined && value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
-	const type = value.actionType ?? value.type;
-	if (value.actionType !== undefined && value.type !== undefined && value.actionType !== value.type) throw new ProtocolV2Error('INVALID_PAYLOAD', 'actionType must match type');
+	const type = requireIdentifier(value.actionType, 'actionType');
 	if (!isPlainObject(value.arguments)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'action_command arguments must be an object');
 	const action = protocolAction({ type, ...value.arguments });
 	const command = validateActionCommandPayload({
@@ -732,13 +708,9 @@ function normalizeActionCommand(value) {
 		actionId,
 		action,
 		provenance: value.provenance,
-		...(value.summary === undefined ? {} : { summary: value.summary }),
-		...(value.goalStatus === undefined ? {} : { goalStatus: value.goalStatus }),
 	});
 	const { type: actionType, ...argumentsValue } = action;
-	const normalized = { goalRevision: command.goalRevision, actionId, commandId: actionId, actionType, type: actionType, arguments: argumentsValue, provenance: command.provenance };
-	if (command.summary !== undefined) normalized.summary = command.summary;
-	if (command.goalStatus !== undefined) normalized.goalStatus = command.goalStatus;
+	const normalized = { goalRevision: command.goalRevision, actionId, actionType, arguments: argumentsValue, provenance: command.provenance };
 	return deepFreeze(normalized);
 }
 
@@ -1019,7 +991,9 @@ function positiveInteger(value, field) {
 }
 
 function isPlainObject(value) {
-	return value !== null && typeof value === 'object' && !Array.isArray(value);
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
 }
 
 function rememberBounded(set, value, maximum) {

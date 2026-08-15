@@ -84,6 +84,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ConcurrentLinkedQueue<Runnable> serverTasks = new ConcurrentLinkedQueue<>();
 	private final AtomicBoolean running = new AtomicBoolean();
 	private final AtomicLong messageIds = new AtomicLong();
+	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private volatile Session session;
 	private volatile ServerSocket serverSocket;
 	private volatile Set<String> catalogProfiles = Set.of();
@@ -207,6 +208,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	@Override
 	public void onRemoved(AgentId agentId, long terminalRevision) {
 		actionExecutor.cancel(agentId, "Agent removed");
+		programActions.remove(agentId);
 		JsonObject payload = new JsonObject();
 		payload.addProperty("goalRevision", terminalRevision);
 		send("agent_removed", agentId.toString(), payload);
@@ -457,13 +459,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void acceptAction(BridgeEnvelope envelope) {
-		ServerActionRequest request = decodeActionRequest(envelope);
-		validateActionProvenance(request);
-		JsonObject payload = envelope.payload();
-		if (payload.has("summary")) {
-			AgentChatReporter.decision(manager, manager.registry().require(request.agentId()), requiredString(payload, "summary"));
+		try {
+			ServerActionRequest request = decodeActionRequest(envelope);
+			validateActionProvenance(request);
+			actionExecutor.submitProgramPrimitive(request);
+		} catch (BridgeProtocolException | AgentDomainException exception) {
+			if (sendRejectedAction(envelope, exception)) return;
+			throw exception;
 		}
-		actionExecutor.submit(request);
 	}
 
 	private void acceptActionCancel(BridgeEnvelope envelope) {
@@ -479,28 +482,55 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	static ServerActionRequest decodeActionRequest(BridgeEnvelope envelope) {
 		JsonObject payload = envelope.payload();
+		requireActionCommandKeys(payload);
 		AgentId agentId = AgentId.parse(envelope.agentId());
-		JsonObject arguments = payload.has("arguments") ? payload.getAsJsonObject("arguments")
-				: payload.has("command") ? payload.getAsJsonObject("command") : new JsonObject();
-		String type = payload.has("actionType") ? requiredString(payload, "actionType") : requiredString(payload, "type");
+		JsonObject arguments = requiredObject(payload, "arguments");
+		String type = requiredString(payload, "actionType");
 		ActionType actionType = ActionType.fromWireName(type).orElseThrow(
 				() -> new BridgeProtocolException("UNKNOWN_ACTION", "Unknown action type '" + type + "'")
 		);
 		if (!ServerActionExecutor.isArenaScriptPrimitive(actionType)) {
 			throw new BridgeProtocolException("UNSUPPORTED_ARENA_SCRIPT_ACTION", "ArenaScript cannot invoke '" + type + "'");
 		}
-		if (ActionType.COMPLETE_GOAL.wireName().equals(type) && !arguments.has("summary") && payload.has("summary")) {
-			arguments.addProperty("summary", requiredString(payload, "summary"));
-		}
 		JsonObject validatedArguments = ProtocolCodec.validateActionArguments(actionType, arguments);
 		return new ServerActionRequest(
 				agentId,
 				requiredLong(payload, "goalRevision"),
-				payload.has("actionId") ? requiredString(payload, "actionId") : requiredString(payload, "commandId"),
+				requiredString(payload, "actionId"),
 				actionType,
 				validatedArguments,
 				decodeActionProvenance(payload)
 		);
+	}
+
+	private static void requireActionCommandKeys(JsonObject payload) {
+		Set<String> expected = Set.of("goalRevision", "actionId", "actionType", "arguments", "provenance");
+		for (String field : expected) if (!payload.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		for (String field : payload.keySet()) if (!expected.contains(field)) throw new BridgeProtocolException("INVALID_FIELD", "action_command");
+	}
+
+	private boolean sendRejectedAction(BridgeEnvelope envelope, RuntimeException exception) {
+		JsonObject payload = envelope.payload();
+		if (!payload.has("goalRevision") || !payload.has("actionId") || !payload.has("actionType")
+				|| !payload.get("goalRevision").isJsonPrimitive() || !payload.get("goalRevision").getAsJsonPrimitive().isNumber()
+				|| !payload.get("actionId").isJsonPrimitive() || !payload.get("actionId").getAsJsonPrimitive().isString()
+				|| !payload.get("actionType").isJsonPrimitive() || !payload.get("actionType").getAsJsonPrimitive().isString()) return false;
+		long goalRevision = payload.get("goalRevision").getAsLong();
+		String actionId = payload.get("actionId").getAsString();
+		String actionType = payload.get("actionType").getAsString();
+		if (goalRevision < 0L || actionId.isBlank() || actionType.isBlank()) return false;
+		JsonObject result = new JsonObject();
+		result.addProperty("goalRevision", goalRevision);
+		result.addProperty("actionId", actionId);
+		result.addProperty("commandId", actionId);
+		result.addProperty("actionType", actionType);
+		result.addProperty("state", "FAILED");
+		result.addProperty("reasonCode", exception instanceof BridgeProtocolException protocol ? protocol.code() : ((AgentDomainException) exception).code());
+		result.addProperty("message", exception.getMessage() == null ? "Action rejected" : exception.getMessage());
+		result.addProperty("elapsedMs", 0L);
+		result.addProperty("observedAtEpochMs", System.currentTimeMillis());
+		send("action_result", envelope.agentId(), result);
+		return true;
 	}
 
 	private void validateActionProvenance(ServerActionRequest request) {
@@ -514,6 +544,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				|| !profile.reasoning().equals(provenance.reasoningEffort()) || !profile.serviceTier().equals(provenance.serviceTier())) {
 			throw new AgentDomainException("STALE_PROVENANCE", "Action provenance does not match the selected model profile");
 		}
+		programActions.accept(request);
 	}
 
 	private static ActionProvenance decodeActionProvenance(JsonObject payload) {
@@ -538,6 +569,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendActionResult(ServerActionResult result) {
+		programActions.terminal(result);
 		observations.invalidate(result.agentId());
 		ScenarioRuntimeService.onAgentAction(
 				manager.server(),
@@ -706,8 +738,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private static String requiredString(JsonObject object, String field) {
-		if (!object.has(field) || !object.get(field).isJsonPrimitive()) throw new BridgeProtocolException("MISSING_FIELD", field);
-		return object.get(field).getAsString();
+		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		if (!object.get(field).isJsonPrimitive() || !object.get(field).getAsJsonPrimitive().isString()) {
+			throw new BridgeProtocolException("INVALID_FIELD", field + " must be a JSON string");
+		}
+		String value = object.get(field).getAsString();
+		if (value.isBlank() || value.length() > 256) throw new BridgeProtocolException("INVALID_FIELD", field + " must be nonblank and bounded");
+		return value;
 	}
 
 	private static String requiredStatusString(JsonObject object, String field) {
@@ -784,10 +821,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private static long requiredLong(JsonObject object, String field) {
-		if (!object.has(field) || !object.get(field).isJsonPrimitive()) throw new BridgeProtocolException("MISSING_FIELD", field);
-		long value = object.get(field).getAsLong();
-		if (value < 0L) throw new BridgeProtocolException("INVALID_GOAL_REVISION", field);
-		return value;
+		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		if (!object.get(field).isJsonPrimitive() || !object.get(field).getAsJsonPrimitive().isNumber()) {
+			throw new BridgeProtocolException("INVALID_FIELD", field + " must be a JSON number");
+		}
+		try {
+			long value = object.get(field).getAsBigDecimal().longValueExact();
+			if (value < 0L || value > ActionProvenance.MAX_SAFE_INTEGER) throw new ArithmeticException();
+			return value;
+		} catch (ArithmeticException exception) {
+			throw new BridgeProtocolException("INVALID_GOAL_REVISION", field + " must be a nonnegative safe integer", exception);
+		}
 	}
 
 	private static long requiredSafeLong(JsonObject object, String field) {

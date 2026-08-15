@@ -75,6 +75,21 @@ public final class AgentRegistry {
 		return new AgentRegistry(snapshot.maxAgents(), snapshot.queueLimit(), recovered, onChange, transitionSink);
 	}
 
+	public synchronized int availableCapacity() {
+		return maxAgents - records.size();
+	}
+
+	public synchronized void requireCapacity(int requested) {
+		if (requested < 0) throw new IllegalArgumentException("requested capacity must not be negative");
+		int available = maxAgents - records.size();
+		if (requested > available) {
+			throw new AgentDomainException(
+					"AGENT_LIMIT_REACHED",
+					"Agent limit reached: " + maxAgents + " total, " + available + " available"
+			);
+		}
+	}
+
 	public synchronized AgentRecord create(
 			String model,
 			String reasoning,
@@ -102,6 +117,18 @@ public final class AgentRegistry {
 			AgentGameMode gameMode,
 			long nowEpochMs
 	) {
+		return create(provider, model, reasoning, "priority", userName, gameMode, nowEpochMs);
+	}
+
+	public synchronized AgentRecord create(
+			String provider,
+			String model,
+			String reasoning,
+			String serviceTier,
+			Optional<String> userName,
+			AgentGameMode gameMode,
+			long nowEpochMs
+	) {
 		if (records.size() >= maxAgents) {
 			throw new AgentDomainException("AGENT_LIMIT_REACHED", "Agent limit reached: " + maxAgents);
 		}
@@ -113,7 +140,7 @@ public final class AgentRegistry {
 			id = AgentId.random();
 		} while (records.containsKey(id));
 		int skinVariant = Math.floorMod(id.value().hashCode(), AgentConstants.DEFAULT_SKIN_VARIANT_COUNT);
-		AgentProfile profile = new AgentProfile(provider, model, reasoning, checkedName, skinVariant, gameMode);
+		AgentProfile profile = new AgentProfile(provider, model, reasoning, serviceTier, checkedName, skinVariant, gameMode);
 		AgentRecord created = AgentRecord.create(id, profile, nowEpochMs);
 		records.put(id, created);
 		onChange.run();

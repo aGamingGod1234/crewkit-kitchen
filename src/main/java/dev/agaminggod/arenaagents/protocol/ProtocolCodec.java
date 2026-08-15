@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.protocol;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
@@ -37,6 +38,10 @@ public final class ProtocolCodec {
 	private static final String FIELD_ITEM_ID = "itemId";
 	private static final String FIELD_DURATION_MS = "durationMs";
 	private static final String FIELD_FACE = "face";
+	private static final String FIELD_DESIRED_STATE = "desiredState";
+	private static final String FIELD_PLACEMENTS = "placements";
+	private static final int MAX_DESIRED_STATE_LENGTH = 512;
+	private static final int MAX_BUILD_SEQUENCE_PLACEMENTS = 32;
 	private static final String FIELD_MESSAGE = "message";
 	private static final String FIELD_SUMMARY = "summary";
 	private static final String FIELD_OPEN = "open";
@@ -286,6 +291,7 @@ public final class ProtocolCodec {
 			case USE_ITEM, WAIT -> requireDuration(arguments, FIELD_DURATION_MS);
 			case BREAK_BLOCK -> validateBreakBlock(arguments);
 			case PLACE_BLOCK -> validatePlaceBlock(arguments);
+			case BUILD_SEQUENCE -> validateBuildSequence(arguments);
 			case CHAT -> requireBoundedText(arguments, FIELD_MESSAGE, ProtocolConstants.MAX_CHAT_LENGTH, false);
 			case SET_DOOR -> {
 				validateCoordinates(arguments, true);
@@ -317,7 +323,8 @@ public final class ProtocolCodec {
 
 		JsonObject validatedArguments = new JsonObject();
 		for (String field : ACTION_FIELDS.get(actionType)) {
-			validatedArguments.add(field, arguments.get(field).deepCopy());
+			JsonElement value = arguments.get(field);
+			validatedArguments.add(field, value == null ? JsonNull.INSTANCE : value.deepCopy());
 		}
 		return validatedArguments;
 	}
@@ -397,6 +404,27 @@ public final class ProtocolCodec {
 			);
 		}
 		requireIdentifier(command, FIELD_ITEM_ID);
+		JsonElement desiredState = command.get(FIELD_DESIRED_STATE);
+		if (desiredState != null && !desiredState.isJsonNull()) {
+			requireBoundedText(command, FIELD_DESIRED_STATE, MAX_DESIRED_STATE_LENGTH, false);
+		}
+	}
+
+	private static void validateBuildSequence(JsonObject command) throws ProtocolException {
+		JsonElement placements = requireField(command, FIELD_PLACEMENTS);
+		if (!placements.isJsonArray()) throw invalidField("Field 'placements' must be an array");
+		int size = placements.getAsJsonArray().size();
+		if (size < 1 || size > MAX_BUILD_SEQUENCE_PLACEMENTS) {
+			throw outOfRange(FIELD_PLACEMENTS, "an array containing 1 to " + MAX_BUILD_SEQUENCE_PLACEMENTS + " entries");
+		}
+		for (int index = 0; index < size; index++) {
+			JsonElement entry = placements.getAsJsonArray().get(index);
+			if (!entry.isJsonObject()) throw invalidField("placements[" + index + "] must be an object");
+			JsonObject placement = entry.getAsJsonObject();
+			validatePlaceBlock(placement);
+			validateKnownArgumentFields(placement, ActionType.PLACE_BLOCK);
+		}
+		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
 	private static void validateCoordinates(JsonObject command, boolean integral) throws ProtocolException {
@@ -687,7 +715,8 @@ public final class ProtocolCodec {
 		fields.put(ActionType.SELECT_ITEM, List.of(FIELD_ITEM_ID));
 		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS));
-		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID));
+		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID, FIELD_DESIRED_STATE));
+		fields.put(ActionType.BUILD_SEQUENCE, List.of(FIELD_PLACEMENTS, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.CHAT, List.of(FIELD_MESSAGE));
 		fields.put(ActionType.WAIT, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.SET_DOOR, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_OPEN));

@@ -256,12 +256,7 @@ export class ProgramRuntimeManager {
 			this.#ensureActing(record);
 			const actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
 			state.actionIds.set(actionId, command.actionId);
-			await this.#bridge.send('action_command', state.agentId, {
-				goalRevision: state.goalRevision,
-				actionId,
-				action: command.action,
-				provenance: command.provenance,
-			});
+			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command));
 		} catch (error) {
 			this.#reportError(state.agentId, error);
 		}
@@ -300,6 +295,34 @@ export class ProgramRuntimeManager {
 }
 
 function versionKey(record) { return `${record.agentId}\u0000${record.goalRevision}`; }
+function wireActionCommand(record, actionId, command) {
+	const action = command?.action;
+	const provenance = command?.provenance;
+	if (!action || typeof action.type !== 'string') {
+		throw codedError('INVALID_ARENA_SCRIPT_COMMAND', 'ArenaScript command has no exact action shape');
+	}
+	return Object.freeze({
+		goalRevision: record.goalRevision,
+		actionId,
+		actionType: action.type,
+		arguments: actionArguments(action.type, action.arguments),
+		provenance: Object.freeze({
+			provider: record.provider,
+			model: record.model,
+			reasoningEffort: record.reasoningEffort,
+			serviceTier: record.serviceTier ?? 'priority',
+			programId: provenance.programId,
+			programVersion: provenance.version,
+			sourceStepId: provenance.stepId,
+			eventSequence: provenance.eventSequence,
+		}),
+	});
+}
+function actionArguments(type, value) {
+	if (value !== null && typeof value === 'object' && !Array.isArray(value)) return structuredClone(value);
+	if (type === 'wait' || type === 'use_item' || type === 'block_with_shield') return { durationMs: value };
+	throw codedError('INVALID_ARENA_SCRIPT_COMMAND', `ArenaScript primitive '${type}' requires an object argument`);
+}
 function requestKey(context) { return [context.programId, context.version, context.generation, context.lifecycleEpoch, context.continuationEpoch, context.activeActionId, context.eventSequence, context.factsSequence].join('\u0000'); }
 function sameEngineRequest(snapshot, context) { return snapshot.programId === context.programId && snapshot.version === context.version && snapshot.generation === context.generation && snapshot.lifecycleEpoch === context.lifecycleEpoch && snapshot.continuationEpoch === context.continuationEpoch && snapshot.activeActionId === context.activeActionId && snapshot.eventSequence === context.eventSequence && snapshot.factsSequence === context.factsSequence; }
 

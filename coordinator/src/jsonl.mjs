@@ -80,6 +80,7 @@ function parseObject(bytes) {
 	}
 	let value;
 	try {
+		assertNoDuplicateKeys(text);
 		value = JSON.parse(text);
 	} catch (error) {
 		throw new JsonlError('MALFORMED_JSON', `Malformed JSONL frame: ${error.message}`, { cause: error });
@@ -89,5 +90,67 @@ function parseObject(bytes) {
 }
 
 function isPlainObject(value) {
-	return value !== null && typeof value === 'object' && !Array.isArray(value);
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
+}
+
+// JSON.parse deliberately accepts duplicate names by retaining the last one. The
+// bridge treats those as ambiguous identities, so scan the already-valid JSON
+// grammar before materialising the object.
+function assertNoDuplicateKeys(text) {
+	let index = 0;
+	const whitespace = () => { while (/\s/u.test(text[index] ?? '')) index += 1; };
+	const string = () => {
+		const start = index;
+		if (text[index++] !== '"') throw new SyntaxError('Expected JSON string');
+		let escaped = false;
+		while (index < text.length) {
+			const character = text[index++];
+			if (escaped) { escaped = false; continue; }
+			if (character === '\\') { escaped = true; continue; }
+			if (character === '"') return JSON.parse(text.slice(start, index));
+		}
+		throw new SyntaxError('Unterminated JSON string');
+	};
+	const literal = () => {
+		while (index < text.length && !/[\s,\]}]/u.test(text[index])) index += 1;
+	};
+	const value = () => {
+		whitespace();
+		if (text[index] === '{') {
+			index += 1;
+			const names = new Set();
+			whitespace();
+			if (text[index] === '}') { index += 1; return; }
+			while (true) {
+				whitespace();
+				const name = string();
+				if (names.has(name)) throw new SyntaxError(`Duplicate JSON object key '${name}'`);
+				names.add(name);
+				whitespace();
+				if (text[index++] !== ':') throw new SyntaxError('Expected colon');
+				value();
+				whitespace();
+				if (text[index] === '}') { index += 1; return; }
+				if (text[index++] !== ',') throw new SyntaxError('Expected comma');
+			}
+		}
+		if (text[index] === '[') {
+			index += 1;
+			whitespace();
+			if (text[index] === ']') { index += 1; return; }
+			while (true) {
+				value();
+				whitespace();
+				if (text[index] === ']') { index += 1; return; }
+				if (text[index++] !== ',') throw new SyntaxError('Expected comma');
+			}
+		}
+		if (text[index] === '"') { string(); return; }
+		literal();
+	};
+	value();
+	whitespace();
+	if (index !== text.length) throw new SyntaxError('Unexpected trailing JSON content');
 }

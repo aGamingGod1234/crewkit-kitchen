@@ -27,7 +27,11 @@ public final class AgentRegistryVerification {
 	private static int verifyLifecycleAndRevisions() {
 		ArrayList<AgentTransition> transitions = new ArrayList<>();
 		AgentRegistry registry = new AgentRegistry(4, 2, () -> { }, transitions::add);
+		assertEquals(4, registry.availableCapacity(), "empty registry exposes all configured capacity");
+		registry.requireCapacity(4);
 		AgentRecord created = registry.create("gpt-5.6-sol", "HIGH", Optional.of("Builder"), START_TIME);
+		assertEquals(3, registry.availableCapacity(), "creating an agent consumes one capacity slot");
+		expectFailure(() -> registry.requireCapacity(4), "AGENT_LIMIT_REACHED");
 		assertEquals(AgentLifecycleState.IDLE, created.state(), "new agent is idle");
 
 		AgentTransition started = registry.start(created.agentId(), "Build a shelter", START_TIME + 1L);
@@ -35,6 +39,11 @@ public final class AgentRegistryVerification {
 		assertEquals(1L, started.after().goalRevision(), "start revision");
 		assertTrue(registry.isCurrentActiveRevision(created.agentId(), 1L), "current active revision accepted");
 		assertTrue(!registry.isCurrentActiveRevision(created.agentId(), 0L), "stale active revision rejected");
+		AgentRecord direct = registry.create("gpt-5.6-sol", "high", Optional.of("Direct"), START_TIME + 1L);
+		registry.start(direct.agentId(), "Move now", START_TIME + 2L);
+		assertEquals(AgentLifecycleState.ACTING,
+				registry.beginAction(direct.agentId(), 1L, START_TIME + 3L).after().state(),
+				"a valid action command may atomically acknowledge a delayed planning-state message");
 
 		AgentTransition planning = registry.beginPlanning(created.agentId(), START_TIME + 2L);
 		assertEquals(AgentLifecycleState.PLANNING, planning.after().state(), "planning state");
@@ -58,7 +67,11 @@ public final class AgentRegistryVerification {
 		AgentTransition resumed = registry.resume(created.agentId(), START_TIME + 6L);
 		assertEquals(4L, resumed.after().goalRevision(), "resume revision");
 		assertEquals(AgentLifecycleState.STARTING, resumed.after().state(), "resume state");
-		return 17;
+		AgentTransition disconnected = registry.disconnect(created.agentId(), START_TIME + 7L);
+		assertEquals(AgentLifecycleState.DISCONNECTED, disconnected.after().state(), "disconnect state");
+		AgentTransition resumedAfterDisconnect = registry.resume(created.agentId(), START_TIME + 8L);
+		assertEquals(AgentLifecycleState.STARTING, resumedAfterDisconnect.after().state(), "resume after coordinator reconnect");
+		return 23;
 	}
 
 	private static int verifyQueueAndSteeringBounds() {
@@ -126,7 +139,7 @@ public final class AgentRegistryVerification {
 		);
 		AgentProfile decoded = codec.decode(codec.encode(snapshot)).records().getFirst().profile();
 		assertEquals("kimi", decoded.provider(), "provider round-trip");
-		assertEquals("kimi-code/k3 · max", decoded.nameTag(), "provider-neutral name tag");
+		assertEquals("Kimi K3 Max | Orchid", decoded.nameTag(), "provider and skin aware name tag");
 
 		String legacy = codec.encode(snapshot).replace("\"provider\":\"kimi\",", "");
 		assertEquals("codex", codec.decode(legacy).records().getFirst().profile().provider(), "legacy provider migration");

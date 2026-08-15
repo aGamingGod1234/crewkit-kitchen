@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
+import dev.agaminggod.arenaagents.server.runtime.BlockPlacementAttemptPolicy;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
@@ -21,7 +22,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.LivingEntity;
-import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
@@ -41,6 +42,7 @@ public final class ServerObservationCollector {
 	private final ObservationSectionCache<SpatialCacheKey, JsonObject> spatialCache =
 			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, JsonObject::deepCopy);
 	private final Map<AgentId, SpatialCacheKey> spatialKeys = new HashMap<>();
+	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
 
 	public ServerObservationCollector(CodexAgentManager manager, ServerActionExecutor actionExecutor) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
@@ -84,14 +86,12 @@ public final class ServerObservationCollector {
 		player.addProperty("maxAir", Math.max(1, agent.getMaxAirSupply()));
 		player.addProperty("suffocating", agent.isInWall());
 		player.addProperty("fallDistance", finite(agent.fallDistance));
-		player.addProperty("dangerousFall", !agent.onGround() && agent.fallDistance > 6.0F);
 		LivingEntity attacker = agent.getLastHurtByMob();
-		if (attacker != null && attacker.isAlive()) {
+		if (attacker != null && attacker.isAlive() && ObservationVisibility.canSeeEntity(agent, attacker)) {
 			JsonObject threat = new JsonObject();
 			threat.addProperty("uuid", attacker.getUUID().toString());
 			threat.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(attacker.getType()).toString());
 			threat.addProperty("distance", finite(agent.distanceTo(attacker)));
-			threat.addProperty("health", finite(attacker.getHealth()));
 			player.add("lastAttacker", threat);
 		}
 		player.add("effects", effects(agent));
@@ -117,6 +117,29 @@ public final class ServerObservationCollector {
 	public void invalidate(AgentId agentId) {
 		SpatialCacheKey key = spatialKeys.remove(Objects.requireNonNull(agentId, "agentId must not be null"));
 		if (key != null) spatialCache.invalidate(key);
+		synchronized (lastRawStates) {
+			lastRawStates.remove(agentId);
+		}
+	}
+
+	/** Returns active agents whose compact factual player state changed since the last sample. */
+	public List<AgentId> changedActiveAgents() {
+		List<AgentId> changed = new ArrayList<>();
+		Map<AgentId, Boolean> active = new HashMap<>();
+		for (ServerActionRequest request : actionExecutor.activeRequests()) {
+			AgentId agentId = request.agentId();
+			active.put(agentId, true);
+			ServerPlayer agent = manager.findAgentPlayer(agentId).orElse(null);
+			if (agent == null || !agent.isAlive()) continue;
+			RawPlayerState current = rawPlayerState(agent);
+			synchronized (lastRawStates) {
+				if (!current.equals(lastRawStates.put(agentId, current))) changed.add(agentId);
+			}
+		}
+		synchronized (lastRawStates) {
+			lastRawStates.keySet().removeIf(agentId -> !active.containsKey(agentId));
+		}
+		return List.copyOf(changed);
 	}
 
 	private JsonObject spatialObservation(AgentId agentId, ServerLevel level, ServerPlayer agent) {
@@ -126,13 +149,15 @@ public final class ServerObservationCollector {
 				level.dimension().identifier().toString(),
 				position.getX(),
 				position.getY(),
-				position.getZ()
+				position.getZ(),
+				Float.floatToIntBits(agent.getYRot()),
+				Float.floatToIntBits(agent.getXRot())
 		);
 		SpatialCacheKey previous = spatialKeys.put(agentId, key);
 		if (previous != null && !previous.equals(key)) spatialCache.invalidate(previous);
 		return spatialCache.getOrCompute(key, level.getGameTime(), () -> {
 			JsonObject value = new JsonObject();
-			value.add("blocks", blocks(level, position));
+			value.add("blocks", blocks(level, agent, position));
 			value.add("nearbyContainers", nearbyTransactionTargets(level, agent));
 			return value;
 		});
@@ -221,6 +246,7 @@ public final class ServerObservationCollector {
 	private static JsonArray entities(ServerLevel level, ServerPlayer agent) {
 		JsonArray values = new JsonArray();
 		level.getEntities(agent, agent.getBoundingBox().inflate(32.0D), Entity::isAlive).stream()
+				.filter(entity -> ObservationVisibility.canSeeEntity(agent, entity))
 				.sorted(Comparator.comparingDouble(agent::distanceToSqr))
 				.limit(MAX_ENTITIES)
 				.forEach(entity -> {
@@ -230,23 +256,19 @@ public final class ServerObservationCollector {
 					json.addProperty("name", entity.getName().getString());
 					json.addProperty("distance", finite(agent.distanceTo(entity)));
 					json.add("position", vector(entity.position()));
-					json.addProperty("hostile", entity instanceof Enemy);
-					if (entity instanceof LivingEntity living) {
-						json.addProperty("health", finite(living.getHealth()));
-						json.addProperty("maxHealth", finite(living.getMaxHealth()));
-					}
 					if (entity instanceof ServerPlayer player) {
-						String gameMode = player.gameMode.getGameModeForPlayer().getName();
 						json.addProperty("isPlayer", true);
-						json.addProperty("gameMode", gameMode);
-						json.addProperty("canBeHarmed", !player.isCreative() && !player.isSpectator());
+					}
+					if (entity instanceof ItemEntity itemEntity) {
+						json.addProperty("itemId", BuiltInRegistries.ITEM.getKey(itemEntity.getItem().getItem()).toString());
+						json.addProperty("count", itemEntity.getItem().getCount());
 					}
 					values.add(json);
 				});
 		return values;
 	}
 
-	private static JsonArray blocks(ServerLevel level, BlockPos center) {
+	private static JsonArray blocks(ServerLevel level, ServerPlayer agent, BlockPos center) {
 		ArrayList<BlockObservationOrdering.Candidate> candidates = new ArrayList<>();
 		for (int y = -3; y <= 3; y++) {
 			for (int x = -BLOCK_RADIUS; x <= BLOCK_RADIUS; x++) {
@@ -264,15 +286,32 @@ public final class ServerObservationCollector {
 				}
 			}
 		}
+		ArrayList<BlockObservationOrdering.Candidate> visible = new ArrayList<>();
+		for (BlockObservationOrdering.Candidate candidate : BlockObservationOrdering.select(
+				candidates,
+				MAX_BLOCKS * 4,
+				MAX_BLOCKS_PER_TYPE * 4
+		)) {
+			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
+			if (ObservationVisibility.canSeeBlock(level, agent, position)) visible.add(candidate);
+		}
 		JsonArray values = new JsonArray();
 		for (BlockObservationOrdering.Candidate candidate :
-				BlockObservationOrdering.select(candidates, MAX_BLOCKS, MAX_BLOCKS_PER_TYPE)) {
+				BlockObservationOrdering.select(visible, MAX_BLOCKS, MAX_BLOCKS_PER_TYPE)) {
 			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
 			JsonObject json = new JsonObject();
 			json.addProperty("x", position.getX());
 			json.addProperty("y", position.getY());
 			json.addProperty("z", position.getZ());
 			json.addProperty("blockId", candidate.blockId());
+			JsonArray placeableFaces = new JsonArray();
+			BlockState supportState = level.getBlockState(position);
+			BlockPlacementAttemptPolicy.supportedFaces(face ->
+					supportState.isFaceSturdy(level, position, face)
+							&& level.getBlockState(position.relative(face)).canBeReplaced()
+							&& agent.isWithinBlockInteractionRange(position, 1.0D)
+			).forEach(face -> placeableFaces.add(face.getSerializedName()));
+			json.add("placeableFaces", placeableFaces);
 			values.add(json);
 		}
 		return values;
@@ -289,6 +328,7 @@ public final class ServerObservationCollector {
 					String blockId = BuiltInRegistries.BLOCK.getKey(level.getBlockState(position).getBlock()).toString();
 					List<String> capabilities = transactionCapabilities(blockId);
 					if (capabilities.isEmpty()) continue;
+					if (!ObservationVisibility.canSeeBlock(level, agent, position)) continue;
 					candidates.add(new TransactionTarget(position, blockId, capabilities,
 							agent.distanceToSqr(Vec3.atCenterOf(position))));
 				}
@@ -333,7 +373,15 @@ public final class ServerObservationCollector {
 	) {
 	}
 
-	private record SpatialCacheKey(AgentId agentId, String dimension, int x, int y, int z) {
+	private record SpatialCacheKey(
+			AgentId agentId,
+			String dimension,
+			int x,
+			int y,
+			int z,
+			int yawBits,
+			int pitchBits
+	) {
 	}
 
 	private static JsonObject vector(Vec3 vector) {
@@ -346,5 +394,35 @@ public final class ServerObservationCollector {
 
 	private static double finite(double value) {
 		return Double.isFinite(value) ? value : 0.0D;
+	}
+
+	private static RawPlayerState rawPlayerState(ServerPlayer agent) {
+		LivingEntity attacker = agent.getLastHurtByMob();
+		return new RawPlayerState(
+				finite(agent.getHealth()),
+				agent.getFoodData().getFoodLevel(),
+				finite(agent.getFoodData().getSaturationLevel()),
+				agent.isOnFire(),
+				agent.isInWater(),
+				Math.max(0, agent.getAirSupply()),
+				agent.isInWall(),
+				agent.onGround(),
+				finite(agent.fallDistance),
+				attacker != null && attacker.isAlive() ? attacker.getUUID() : null
+			);
+	}
+
+	private record RawPlayerState(
+		double health,
+		int foodLevel,
+		double saturation,
+		boolean onFire,
+		boolean inWater,
+		int air,
+		boolean suffocating,
+		boolean onGround,
+		double fallDistance,
+		java.util.UUID lastAttacker
+	) {
 	}
 }

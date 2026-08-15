@@ -114,7 +114,8 @@ public final class ServerActionExecutor {
 		this.advancedInteractions = new AdvancedInteractionService(protection, resourceLeases);
 	}
 
-	public synchronized void submit(ServerActionRequest request) {
+	/** Legacy scenario/operator path. Model-authored commands must use submitProgramPrimitive. */
+	synchronized void submitLegacy(ServerActionRequest request) {
 		Objects.requireNonNull(request, "request must not be null");
 		if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId())) {
 			throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
@@ -154,8 +155,21 @@ public final class ServerActionExecutor {
 		}
 	}
 
+	/** Executes only a model-authored physical primitive received through the coordinator bridge. */
+	public synchronized void submitProgramPrimitive(ServerActionRequest request) {
+		Objects.requireNonNull(request, "request must not be null");
+		requireArenaScriptPrimitive(request.type());
+		submitLegacy(request);
+	}
+
 	public static boolean isArenaScriptPrimitive(ActionType type) {
 		return ARENA_SCRIPT_PRIMITIVES.contains(Objects.requireNonNull(type, "type must not be null"));
+	}
+
+	public static void requireArenaScriptPrimitive(ActionType type) {
+		if (!isArenaScriptPrimitive(type)) {
+			throw new AgentDomainException("UNSUPPORTED_ARENA_SCRIPT_ACTION", "ArenaScript cannot invoke " + type.wireName());
+		}
 	}
 
 	public synchronized void tick() {

@@ -26,9 +26,24 @@ public final class AgentControlCommandBuilder {
 			String optionalName,
 			AgentGameMode gameMode
 	) {
+		return summon(provider, model, reasoning, "priority", optionalName, gameMode);
+	}
+
+	public static String summon(
+			String provider,
+			String model,
+			String reasoning,
+			String serviceTier,
+			String optionalName,
+			AgentGameMode gameMode
+	) {
 		String checkedProvider = AgentControlCatalog.requireProvider(provider);
 		String checkedModel = requireToken(model, "model", AgentConstants.MAX_MODEL_LENGTH);
 		String checkedReasoning = requireToken(reasoning, "reasoning", AgentConstants.MAX_REASONING_LENGTH);
+		String checkedTier = requireToken(serviceTier, "speed mode", 24);
+		if (!AgentControlCatalog.serviceTiers(checkedProvider, checkedModel).contains(checkedTier)) {
+			throw new IllegalArgumentException("speed mode is unavailable for this provider/model");
+		}
 		String normalizedName = normalizeOptional(optionalName);
 		if (normalizedName.length() > AgentConstants.MAX_USER_NAME_LENGTH) {
 			throw new IllegalArgumentException("name exceeds the supported length");
@@ -38,6 +53,7 @@ public final class AgentControlCommandBuilder {
 				+ checkedProvider + " "
 				+ StringArgumentType.escapeIfRequired(checkedModel) + " "
 				+ StringArgumentType.escapeIfRequired(checkedReasoning) + " "
+				+ StringArgumentType.escapeIfRequired(checkedTier) + " "
 				+ Objects.requireNonNull(gameMode, "gameMode must not be null").wireName() + " "
 				+ encodedName;
 	}

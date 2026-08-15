@@ -61,7 +61,7 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition resume(AgentRecord current, long nowEpochMs) {
-		requireState(current, "resume", AgentLifecycleState.PAUSED);
+		requireState(current, "resume", AgentLifecycleState.PAUSED, AgentLifecycleState.DISCONNECTED);
 		AgentRecord revised = current.withLifecycle(
 				AgentLifecycleState.STARTING,
 				current.currentGoal(),
@@ -102,7 +102,7 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition beginAction(AgentRecord current, long revision, long nowEpochMs) {
-		requireState(current, "act", AgentLifecycleState.PLANNING);
+		requireState(current, "act", AgentLifecycleState.STARTING, AgentLifecycleState.PLANNING);
 		requireRevision(current, revision);
 		return transition(current, current.withLifecycle(
 				AgentLifecycleState.ACTING,

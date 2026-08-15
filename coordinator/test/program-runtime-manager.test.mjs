@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
+import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
 
@@ -31,8 +32,12 @@ test('installs a model-authored program and dispatches its next primitive withou
 	const run = harness();
 	await run.manager.installDecision(run.registry.get('agent-a'), { summary: 'Wait twice.', directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
 	assert.equal(run.sent.length, 1);
-	assert.equal(run.sent[0].payload.action.type, 'wait');
+	assert.equal(run.sent[0].payload.actionType, 'wait');
+	assert.deepEqual(run.sent[0].payload.arguments, { durationMs: 1 });
 	assert.equal(run.sent[0].payload.provenance.programId, 'program-1-1');
+	const wire = validateProtocolV2Payload('action_command', run.sent[0].payload);
+	assert.deepEqual(wire.provenance, { ...run.sent[0].payload.provenance });
+	assert.match(wire.provenance.sourceStepId, /^step-\d+-\d+$/);
 	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: run.sent[0].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
 	assert.equal(run.sent.length, 2);
 	assert.equal(run.requests.length, 0, 'pre-authored continuation must not call the provider');
@@ -57,7 +62,7 @@ test('uses an authored watcher before asking the provider for unmatched attentio
 	const first = run.sent[0];
 	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), attention: true });
 	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
-	assert.equal(run.sent.at(-1).payload.action.arguments, 9);
+	assert.equal(run.sent.at(-1).payload.arguments.durationMs, 9);
 	assert.equal(run.requests.length, 0);
 });
 

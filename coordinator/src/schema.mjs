@@ -363,7 +363,8 @@ function requirePresenceText(value, path, present, maximum) {
 }
 
 function requireObject(value, path) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid('INVALID_FIELD', `${path} must be an object`);
+	if (value === null || typeof value !== 'object' || Array.isArray(value)
+			|| ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw invalid('INVALID_FIELD', `${path} must be an object`);
 	return value;
 }
 

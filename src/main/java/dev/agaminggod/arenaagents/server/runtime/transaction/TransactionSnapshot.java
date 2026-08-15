@@ -28,6 +28,44 @@ public record TransactionSnapshot(List<SlotState> slots) {
 		return slots.stream().filter(slot -> slot.itemId().equals(itemId)).mapToInt(SlotState::count).sum();
 	}
 
+	/**
+	 * Expands recipe output aligned to a trimmed CraftingInput back onto the menu's full grid.
+	 * Newer Minecraft versions crop empty rows/columns when constructing CraftingInput, so
+	 * getRemainingItems(input) legitimately returns the cropped input size.
+	 */
+	public static <T> List<T> expandCraftingRemainders(
+			List<T> remainders,
+			int fullGridSize,
+			int fullGridWidth,
+			int trimmedWidth,
+			int leftOffset,
+			int topOffset,
+			T emptyValue
+	) {
+		Objects.requireNonNull(remainders, "remainders must not be null");
+		if (fullGridSize <= 0 || fullGridWidth <= 0 || fullGridSize % fullGridWidth != 0) {
+			throw new IllegalArgumentException("full crafting grid dimensions are invalid");
+		}
+		if (remainders.size() == fullGridSize) return List.copyOf(remainders);
+		if (remainders.isEmpty() || trimmedWidth <= 0 || remainders.size() % trimmedWidth != 0
+				|| leftOffset < 0 || topOffset < 0) {
+			throw new IllegalArgumentException("trimmed crafting remainder layout is invalid");
+		}
+		int trimmedHeight = remainders.size() / trimmedWidth;
+		int fullGridHeight = fullGridSize / fullGridWidth;
+		if (leftOffset + trimmedWidth > fullGridWidth || topOffset + trimmedHeight > fullGridHeight) {
+			throw new IllegalArgumentException("trimmed crafting remainder layout exceeds the full grid");
+		}
+		ArrayList<T> expanded = new ArrayList<>(java.util.Collections.nCopies(fullGridSize, emptyValue));
+		for (int row = 0; row < trimmedHeight; row++) {
+			for (int column = 0; column < trimmedWidth; column++) {
+				expanded.set((row + topOffset) * fullGridWidth + column + leftOffset,
+						remainders.get(row * trimmedWidth + column));
+			}
+		}
+		return List.copyOf(expanded);
+	}
+
 	public TransactionPostcondition.Verdict verifyExactTransfer(
 			TransactionSnapshot after,
 			int sourceIndex,
