@@ -12,9 +12,13 @@
 
 - `node --test coordinator/test/jsonl.test.mjs coordinator/test/protocol-v2.test.mjs coordinator/test/program-runtime-manager.test.mjs coordinator/test/dynamic-main.test.mjs`: 32/32 passed.
 - `JAVA_HOME=<Temurin 25> .\\gradlew.bat verifyCore`: passed with 6,091 assertions in the dirty workspace.
-- Clean archive verification is recorded with the commit hash below after `git archive HEAD` and Java 25 `verifyCore`.
+- `git archive HEAD` clean export with Java 25 `verifyCore`: passed with 5,495 assertions from commit `eb9ef3d`.
 
 ## Risk
 
 - The dirty worktree contains unrelated feature work; this task stages only the provenance changes and the compile/test dependency closure listed above.
 - Legacy V1 fake-bridge fixtures remain outside this V2-only contract and are not a complete-suite gate for this task.
+
+## Commit
+
+- `eb9ef3d fix: harden program action provenance` (57 files: provenance hardening plus the exact Java/client/test dependency closure required for a clean archive build).
