@@ -62,10 +62,13 @@ public final class BridgeEnvelopeCodecVerification {
 				2, "server-instance", "00000000-0000-0000-0000-000000000001", "action_command", "message-6", fractionalProvenance
 		)), "INVALID_PROVENANCE");
 		assertEquals(ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH,
-				MultiplexedServerBridge.boundedRejectionMessage("x".repeat(ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH + 64)).codePointCount(0, ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH),
+				MultiplexedServerBridge.boundedRejectionMessage("x".repeat(ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH + 64)).length(),
 				"rejection messages are bounded before result encoding");
+		String emojiBounded = MultiplexedServerBridge.boundedRejectionMessage("x".repeat(ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH - 1) + "😀".repeat(2));
+		assertEquals(ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH - 1, emojiBounded.length(), "emoji rejection clamp does not split a surrogate pair");
+		assertEquals(false, Character.isHighSurrogate(emojiBounded.charAt(emojiBounded.length() - 1)), "emoji rejection clamp leaves valid UTF-16");
 		assertEquals("Action rejected", MultiplexedServerBridge.boundedRejectionMessage(" \t"), "blank rejection has stable fallback");
-		return 19;
+		return 21;
 	}
 
 	private static JsonObject actionPayload(String actionId, String type, JsonObject arguments) {

@@ -543,7 +543,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	static String boundedRejectionMessage(String message) {
 		String fallback = "Action rejected";
 		if (message == null || message.isBlank()) return fallback;
-		int end = message.offsetByCodePoints(0, Math.min(message.codePointCount(0, message.length()), ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH));
+		int end = Math.min(message.length(), ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH);
+		if (end < message.length() && end > 0 && Character.isHighSurrogate(message.charAt(end - 1))
+				&& Character.isLowSurrogate(message.charAt(end))) end -= 1;
 		String bounded = message.substring(0, end);
 		return bounded.isBlank() ? fallback : bounded;
 	}
