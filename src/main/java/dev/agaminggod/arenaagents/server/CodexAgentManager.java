@@ -284,7 +284,8 @@ public final class CodexAgentManager {
 				long deadline = pendingPlayerSpawns.getOrDefault(record.agentId(), 0L);
 				if (deadline > now) continue;
 				if (seenPlayers.contains(record.agentId())) {
-					savedData.registry().die(record.agentId(), missingDeathSnapshot(record, now), now);
+					// A missing fake is not evidence of vanilla death. Preserve its lifecycle for recovery.
+					savedData.registry().disconnect(record.agentId(), now);
 					continue;
 				}
 				recoverOfflinePlayer(record, now);
@@ -299,17 +300,14 @@ public final class CodexAgentManager {
 		} catch (RuntimeException ignored) {
 			cause = "Agent died";
 		}
+		var respawn = player.getRespawnConfig().respawnData().globalPos();
 		return new AgentDeathSnapshot(
 				cause, player.level().dimension().identifier().toString(), player.getX(), player.getY(), player.getZ(),
-				Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), now
+				Optional.of(respawn.dimension().identifier().toString()), Optional.of((double) respawn.pos().getX()),
+				Optional.of((double) respawn.pos().getY()), Optional.of((double) respawn.pos().getZ()), now
 		);
 	}
 
-	private static AgentDeathSnapshot missingDeathSnapshot(AgentRecord record, long now) {
-		AgentEntityLocation location = record.entityLocation().orElse(new AgentEntityLocation("minecraft:overworld", 0, 0));
-		return new AgentDeathSnapshot("Agent player disappeared", location.dimension(), (location.chunkX() << 4) + 8.5D, 64.0D, (location.chunkZ() << 4) + 8.5D,
-				Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), now);
-	}
 
 	private void hideWorldName(ServerPlayer player) {
 		PlayerTeam team = server.getScoreboard().getPlayerTeam(HIDDEN_AGENT_TEAM);

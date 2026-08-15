@@ -93,7 +93,8 @@ public final class OfflineAgentPlayers {
 	/** Resolves the player's real vanilla bed, anchor, or world-spawn target without accepting a supplied position. */
 	public static VanillaRespawnTarget resolveVanillaRespawn(ServerPlayer player) {
 		java.util.Objects.requireNonNull(player, "player must not be null");
-		TeleportTransition transition = player.findRespawnPositionAndUseSpawnBlock(false, TeleportTransition.DO_NOTHING);
+		// Match ordinary vanilla respawn: a charged respawn anchor is consumed here.
+		TeleportTransition transition = player.findRespawnPositionAndUseSpawnBlock(true, TeleportTransition.DO_NOTHING);
 		return new VanillaRespawnTarget(transition.newLevel(), transition.position(), transition.yRot(), transition.xRot());
 	}
 

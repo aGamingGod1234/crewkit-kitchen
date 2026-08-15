@@ -34,6 +34,7 @@ public final class CodexAgentCommands {
 	private static final String ARGUMENT_PROVIDER = "provider";
 	private static final String ARGUMENT_PROMPT = "prompt";
 	private static final String ARGUMENT_REASONING = "reasoning";
+	private static final String ARGUMENT_SERVICE_TIER = "speed_mode";
 	private static final DynamicCommandExceptionType COMMAND_FAILURE = new DynamicCommandExceptionType(
 			message -> Component.literal(String.valueOf(message))
 	);
@@ -74,8 +75,6 @@ public final class CodexAgentCommands {
 						.then(promptCommand("start", CodexAgentManager::start))
 						.then(agentCommand("stop", CodexAgentManager::stop))
 						.then(agentCommand("resume", CodexAgentManager::resume))
-						.then(Commands.literal("respawn")
-								.then(agentArgument().executes(CodexAgentCommands::respawn)))
 						.then(promptCommand("queue", CodexAgentManager::queue))
 						.then(promptCommand("steer", CodexAgentManager::steer))
 						.then(Commands.literal("status")
@@ -96,18 +95,22 @@ public final class CodexAgentCommands {
 								List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_KIMI), builder))
 						.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model()).then(
 								Commands.argument(ARGUMENT_REASONING, StringArgumentType.word()).then(
-										Commands.argument(ARGUMENT_GAME_MODE, StringArgumentType.word())
+										Commands.argument(ARGUMENT_SERVICE_TIER, StringArgumentType.word())
+												.suggests((context, builder) -> SharedSuggestionProvider.suggest(
+														List.of("priority", "fast"), builder))
+												.then(Commands.argument(ARGUMENT_GAME_MODE, StringArgumentType.word())
 												.suggests((context, builder) -> SharedSuggestionProvider.suggest(
 														List.of("survival", "creative", "adventure"), builder))
 												.then(Commands.argument(ARGUMENT_NAME, StringArgumentType.string())
 														.executes(context -> summon(
 																context,
 																StringArgumentType.getString(context, ARGUMENT_PROVIDER),
-																StringArgumentType.getString(context, ARGUMENT_MODEL),
-																StringArgumentType.getString(context, ARGUMENT_REASONING),
-																Optional.of(StringArgumentType.getString(context, ARGUMENT_NAME)).filter(value -> !value.isBlank()),
-																AgentGameMode.parse(StringArgumentType.getString(context, ARGUMENT_GAME_MODE))
-														))))
+														StringArgumentType.getString(context, ARGUMENT_MODEL),
+														StringArgumentType.getString(context, ARGUMENT_REASONING),
+														StringArgumentType.getString(context, ARGUMENT_SERVICE_TIER),
+														Optional.of(StringArgumentType.getString(context, ARGUMENT_NAME)).filter(value -> !value.isBlank()),
+														AgentGameMode.parse(StringArgumentType.getString(context, ARGUMENT_GAME_MODE))
+												)))))
 		)));
 	}
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> providerSummon(String provider) {
@@ -182,6 +185,19 @@ public final class CodexAgentCommands {
 			AgentGameMode gameMode
 	)
 			throws CommandSyntaxException {
+		return summon(context, provider, model, reasoning, "priority", userName, gameMode);
+	}
+
+	private static int summon(
+			CommandContext<CommandSourceStack> context,
+			String provider,
+			String model,
+			String reasoning,
+			String serviceTier,
+			Optional<String> userName,
+			AgentGameMode gameMode
+	)
+			throws CommandSyntaxException {
 		try {
 			Vec3 summonPosition = context.getSource().getPosition();
 			if (context.getSource().getEntity() != null) {
@@ -191,17 +207,19 @@ public final class CodexAgentCommands {
 						context.getSource().getEntity().getLookAngle()
 				);
 			}
-			AgentRecord record = manager(context).summon(
+			CodexAgentManager manager = manager(context);
+			AgentRecord record = manager.summon(
 					context.getSource().getLevel(),
 					summonPosition,
 					provider,
 					model,
 					reasoning,
+					serviceTier,
 					userName,
 					gameMode
 			);
 			context.getSource().sendSuccess(
-					() -> Component.literal("Summoned " + provider + " agent " + formatIdentity(record)),
+					() -> Component.literal("Created " + manager.displayName(record) + ". It is ready for a task."),
 					false
 			);
 			return 1;
@@ -218,6 +236,7 @@ public final class CodexAgentCommands {
 			PromptOperation operation
 	) throws CommandSyntaxException {
 		try {
+			CodexAgentServerRuntime.requireAutomation(context.getSource().getServer());
 			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
 			String prompt = StringArgumentType.getString(context, ARGUMENT_PROMPT);
 			AgentTransition transition = operation.apply(manager(context), selector, prompt);
@@ -236,6 +255,9 @@ public final class CodexAgentCommands {
 			AgentOperation operation
 	) throws CommandSyntaxException {
 		try {
+			if (operationName.equals("resume")) {
+				CodexAgentServerRuntime.requireAutomation(context.getSource().getServer());
+			}
 			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
 			AgentTransition transition = operation.apply(manager(context), selector);
 			reportTransition(context, operationName, transition);
@@ -262,7 +284,7 @@ public final class CodexAgentCommands {
 	private static int statusAll(CommandContext<CommandSourceStack> context) {
 		List<AgentRecord> records = manager(context).records();
 		if (records.isEmpty()) {
-			context.getSource().sendSuccess(() -> Component.literal("No AI agents are registered"), false);
+			context.getSource().sendSuccess(() -> Component.literal("You have not created any agents yet."), false);
 			return 0;
 		}
 		for (AgentRecord record : records) {
@@ -273,9 +295,10 @@ public final class CodexAgentCommands {
 
 	private static int remove(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		try {
-			AgentRecord removed = manager(context).remove(StringArgumentType.getString(context, ARGUMENT_AGENT));
+			CodexAgentManager manager = manager(context);
+			AgentRecord removed = manager.remove(StringArgumentType.getString(context, ARGUMENT_AGENT));
 			context.getSource().sendSuccess(
-					() -> Component.literal("Removed AI agent " + formatIdentity(removed)),
+					() -> Component.literal("Removed " + manager.displayName(removed) + "."),
 					false
 			);
 			return 1;
@@ -288,9 +311,10 @@ public final class CodexAgentCommands {
 
 	private static int respawn(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		try {
-			AgentRecord record = manager(context).respawnVanilla(StringArgumentType.getString(context, ARGUMENT_AGENT));
+			CodexAgentManager manager = manager(context);
+			AgentRecord record = manager.respawnVanilla(StringArgumentType.getString(context, ARGUMENT_AGENT));
 			context.getSource().sendSuccess(
-					() -> Component.literal("Respawned AI agent " + formatIdentity(record)),
+					() -> Component.literal("Respawned " + manager.displayName(record) + "."),
 					false
 			);
 			return 1;
@@ -322,28 +346,27 @@ public final class CodexAgentCommands {
 			String operation,
 			AgentTransition transition
 	) {
+		String name = manager(context).displayName(transition.after());
+		String message = switch (operation) {
+			case "start" -> "Starting a task for " + name + "...";
+			case "queue" -> "Added a task to " + name + "'s queue.";
+			case "steer" -> "Updating " + name + "'s current task...";
+			case "stop" -> "Paused " + name + ".";
+			case "resume" -> "Resuming " + name + "...";
+			default -> "Updated " + name + ".";
+		};
 		context.getSource().sendSuccess(
-				() -> Component.literal(
-						"AI agent " + operation + " accepted for " + formatIdentity(transition.after())
-								+ " (state=" + transition.after().state()
-								+ ", revision=" + transition.after().goalRevision() + ")"
-				),
+				() -> Component.literal(message),
 				false
 		);
 	}
 
 	private static String formatStatus(AgentRecord record) {
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("none");
-		return formatIdentity(record)
-				+ " state=" + record.state()
-				+ " revision=" + record.goalRevision()
-				+ " queued=" + record.queuedGoals().size()
-				+ " goal=" + currentGoal;
-	}
-
-	private static String formatIdentity(AgentRecord record) {
-		String name = record.profile().userName().map(value -> value + "/").orElse("");
-		return name + record.agentId().shortValue() + " [" + record.profile().nameTag() + "]";
+		return record.profile().userName().orElse(record.profile().nameTag())
+				+ " | " + dev.agaminggod.arenaagents.control.AgentControlPresentation.stateLabel(record.state().name())
+				+ ". Current task: " + currentGoal
+				+ ". Queued tasks: " + record.queuedGoals().size() + ".";
 	}
 
 	private static CodexAgentManager manager(CommandContext<CommandSourceStack> context) {
