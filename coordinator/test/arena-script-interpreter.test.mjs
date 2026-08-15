@@ -308,3 +308,13 @@ test('returns one shared frozen null-prototype idle yield', () => {
 	assert.ok(Object.isFrozen(first));
 	assert.strictEqual(first, vm.runWatcher('watcher-0', facts()));
 });
+
+test('bounds model-created strings before exponential concatenation or terminal output allocation', () => {
+	const doubling = (count) => Array.from({ length: count }, () => 'text = text + text;').join('\n');
+	for (const count of [18, 128]) {
+		const vm = interpreter(`program.onUnhandledAttention("continue_and_notify"); let text = "x"; ${doubling(count)} program.finish(text);`);
+		assert.throws(() => vm.start(facts()), (error) => error.code === 'OUTPUT_LIMIT');
+	}
+	const terminal = interpreter(`program.onUnhandledAttention("continue_and_notify"); program.finish("${'x'.repeat(4_097)}");`);
+	assert.throws(() => terminal.start(facts()), (error) => error.code === 'OUTPUT_LIMIT');
+});

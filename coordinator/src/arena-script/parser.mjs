@@ -201,6 +201,9 @@ function visit(node, state, context) {
 			visit(node.init, state, { ...context, topLevelExpression: false });
 			return;
 		case 'Identifier':
+			if (!context.binding && ['program', 'player', 'world', 'inventory'].includes(node.name) && !context.capabilityMemberObject) {
+				throw arenaError('UNSUPPORTED_SYNTAX', `Arena capability ${node.name} may only be used through an approved direct call`, node);
+			}
 			if (!context.binding && !context.property && !ALLOWED_GLOBALS.has(node.name) && !state.userDeclarations.has(node.name)) {
 				throw arenaError('UNSAFE_MEMBER_ACCESS', `identifier ${node.name} is outside the ArenaScript environment`, node);
 			}
@@ -217,7 +220,7 @@ function visit(node, state, context) {
 			return;
 		case 'MemberExpression':
 			validateMemberExpression(node, state, context);
-			visit(node.object, state, { ...context, topLevelExpression: false });
+			visit(node.object, state, { ...context, capabilityMemberObject: true, topLevelExpression: false });
 			visit(node.property, state, { ...context, property: true, topLevelExpression: false });
 			return;
 		case 'AwaitExpression':
@@ -395,6 +398,9 @@ function validateMemberExpression(node, state, context) {
 	const memberName = propertyName(node.property);
 	if (memberName === null || FORBIDDEN_MEMBER_NAMES.has(memberName)) {
 		throw arenaError('UNSAFE_MEMBER_ACCESS', `member ${memberName ?? '<unknown>'} is not allowed`, node);
+	}
+	if (memberRoot(node) && ALLOWED_GLOBALS.has(memberRoot(node)) && context.directCallCallee !== node) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'Arena capability members may only be used as approved direct call targets', node);
 	}
 	const root = memberRoot(node);
 	if (root && !ALLOWED_GLOBALS.has(root) && !state.userDeclarations.has(root)) {

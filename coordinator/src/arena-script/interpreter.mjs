@@ -244,7 +244,9 @@ export class ArenaScriptInterpreter {
 	#runExpression({ node, environment }) {
 		this.#visit(node);
 		switch (node.type) {
-			case 'Literal': return this.#values.push(node.value);
+			case 'Literal':
+				if (typeof node.value === 'string' && Buffer.byteLength(node.value, 'utf8') > CANONICAL_LIMITS.outputBytes) throw this.#error('OUTPUT_LIMIT', 'ArenaScript OUTPUT_LIMIT: model string exceeds the output limit', node);
+				return this.#values.push(node.value);
 			case 'Identifier': return this.#values.push(environment.get(node.name, node));
 			case 'MemberExpression': this.#frames.push({ type: 'after-member', node }); return this.#frames.push({ type: 'expression', node: node.object, environment });
 			case 'ObjectExpression': {
@@ -669,7 +671,13 @@ function applyBinary(operator, left, right, fail) {
 function isSafeOperand(value) { return value === null || value === undefined || typeof value === 'boolean' || typeof value === 'string' || (typeof value === 'number' && Number.isFinite(value)); }
 function assertFiniteNumber(value, fail) { if (typeof value !== 'number' || !Number.isFinite(value)) throw fail(); }
 function numericOperands(left, right, fail, operation) { assertFiniteNumber(left, () => fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: arithmetic requires finite numbers')); assertFiniteNumber(right, () => fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: arithmetic requires finite numbers')); return operation(left, right); }
-function addOperands(left, right, fail) { if (typeof left === 'string' && typeof right === 'string') return left + right; return numericOperands(left, right, fail, (a, b) => a + b); }
+function addOperands(left, right, fail) {
+	if (typeof left === 'string' && typeof right === 'string') {
+		if (Buffer.byteLength(left, 'utf8') + Buffer.byteLength(right, 'utf8') > CANONICAL_LIMITS.outputBytes) throw fail('OUTPUT_LIMIT', 'ArenaScript OUTPUT_LIMIT: model string exceeds the output limit');
+		return left + right;
+	}
+	return numericOperands(left, right, fail, (a, b) => a + b);
+}
 function compareOperands(left, right, fail, operator) { if (typeof left !== typeof right || !['number', 'string'].includes(typeof left)) throw fail('INVALID_OPERAND', 'ArenaScript INVALID_OPERAND: comparisons require matching strings or finite numbers'); if (operator === '<') return left < right; if (operator === '<=') return left <= right; if (operator === '>') return left > right; return left >= right; }
 
 function actionBinding(bindings, path) {
@@ -832,5 +840,6 @@ function validateWatcherId(watcherId) {
 function terminalText(value, fallback, node) {
 	if (value === undefined) return fallback;
 	if (typeof value !== 'string') throw executionError('INVALID_TERMINAL_VALUE', 'ArenaScript INVALID_TERMINAL_VALUE: terminal values must be strings', node?.loc ? Object.freeze({ start: node.start, end: node.end, line: node.loc.start.line, column: node.loc.start.column }) : null);
+	if (Buffer.byteLength(value, 'utf8') > CANONICAL_LIMITS.outputBytes) throw executionError('OUTPUT_LIMIT', 'ArenaScript OUTPUT_LIMIT: terminal text exceeds the output limit', node?.loc ? Object.freeze({ start: node.start, end: node.end, line: node.loc.start.line, column: node.loc.start.column }) : null);
 	return value;
 }

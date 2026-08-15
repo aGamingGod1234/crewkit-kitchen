@@ -45,6 +45,8 @@ test('rejects side-effecting watcher and repeatUntil conditions', () => {
 		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => program.watch(() => true, { mode: "boundary" }, async () => {}), { maxIterations: 1 }, async () => {});',
 		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.moveTo, { mode: "boundary" }, async () => {});',
 		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => player.wait, { maxIterations: 1 }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); const move = player.moveTo; program.watch(() => move, { mode: "boundary" }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); const p = player; program.watch(() => p.moveTo, { mode: "boundary" }, async () => {});',
 	]) assert.throws(() => parseArenaScript(source), (error) => error.code === 'UNSUPPORTED_SYNTAX');
 });
 
