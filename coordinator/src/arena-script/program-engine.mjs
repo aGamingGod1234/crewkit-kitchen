@@ -2,174 +2,211 @@ import { ArenaScriptInterpreter } from './interpreter.mjs';
 import { createInterpreterFacts } from './facts.mjs';
 import { SCRIPT_BINDINGS } from './minecraft-api.mjs';
 
-/** Coordinates one model-authored ArenaScript program and its factual event stream. */
+/** Runs one provenanced ArenaScript program without adding gameplay decisions. */
 export class ArenaScriptEngine {
-	#callbacks;
-	#vm = null;
-	#program = null;
-	#facts = null;
-	#eventSequence = -1;
-	#active = null;
-	#pendingResult = null;
-	#boundaryWatchers = [];
-	#watcherStates = new Map();
-	#cancelling = null;
-	#modelContext = null;
-	#status = 'IDLE';
+	#callbacks; #vm = null; #program = null; #facts = null; #eventSequence = -1; #generation = 0;
+	#active = null; #pendingResult = null; #boundary = []; #watcherTruth = new Map(); #cancelling = null;
+	#transition = null; #pendingRequest = null; #requestUpdate = null; #completed = new Map(); #deferredBase = null; #status = 'IDLE';
 
 	constructor({ dispatch, cancel, requestModel } = {}) {
 		if (typeof dispatch !== 'function' || typeof cancel !== 'function' || typeof requestModel !== 'function') throw new TypeError('ArenaScriptEngine callbacks dispatch, cancel, and requestModel are required');
 		this.#callbacks = { dispatch, cancel, requestModel };
 	}
 
-	install({ agentId, goalRevision, modelIdentity, programId, version, compiled, observation, eventSequence }) {
-		if (!compiled?.ast || !Number.isSafeInteger(eventSequence)) throw new TypeError('ArenaScriptEngine install requires compiled source and an event sequence');
-		this.dispose();
-		this.#program = Object.freeze({ agentId, goalRevision, modelIdentity, programId, version, compiled });
-		this.#facts = createInterpreterFacts(observation);
-		this.#eventSequence = eventSequence;
-		this.#vm = new ArenaScriptInterpreter(compiled, SCRIPT_BINDINGS);
-		this.#status = 'ACTIVE';
-		this.#handleYield(this.#vm.start(this.#facts), 'step');
-		for (let index = 0; index < compiled.watcherCount && this.#current(); index += 1) this.#watcherStates.set(`watcher-${index}`, this.#vm.evaluateWatcher(`watcher-${index}`, this.#facts));
-		return this.snapshot();
-	}
-
-	ingestObservation({ observation, eventSequence, attention = false }) {
-		if (!this.#current() || !Number.isSafeInteger(eventSequence) || eventSequence <= this.#eventSequence) return this.snapshot();
-		this.#facts = createInterpreterFacts(observation);
-		this.#eventSequence = eventSequence;
-		if (this.#pendingResult && !this.#cancelling) {
-			const result = this.#pendingResult;
-			this.#pendingResult = null;
-			this.#handleYield(this.#vm.resume(result, this.#facts), 'step');
-		}
-		if (attention && this.#current()) this.#evaluateAttention();
-		if (!this.#active && !this.#cancelling && this.#boundaryWatchers.length > 0 && this.#current()) this.#runBoundaryWatcher();
-		return this.snapshot();
-	}
-
-	ingestActionResult({ actionId, state, reasonCode, message = '', eventSequence }) {
-		if (!this.#current() || !this.#active || this.#active.actionId !== actionId || !Number.isSafeInteger(eventSequence) || eventSequence < this.#eventSequence) return this.snapshot();
-		const active = this.#active;
-		this.#active = null;
-		const result = { stateToken: active.stateToken, state, reasonCode };
-		if (this.#cancelling?.actionId === actionId) {
-			if (state !== 'CANCELLED') return this.suspend('cancellation_not_acknowledged');
-			const pending = this.#cancelling;
-			this.#cancelling = null;
-			if (pending.kind === 'watcher') {
-				this.#vm.abortPendingCommand(result.stateToken);
-				this.#handleYield(this.#vm.runWatcher(pending.watcherId, this.#facts), `watcher:${pending.watcherId}`);
-			}
-			else this.suspend('unhandled_attention');
+	install(input) {
+		const target = normalizeInstall(input);
+		if (this.#program && !isNewer(target, this.#program)) throw new RangeError('ArenaScriptEngine installation must advance the goal revision or program version');
+		if (this.#active) {
+			this.#transition = { kind: 'install', target };
+			this.#cancelActive('replace');
 			return this.snapshot();
 		}
-		this.#pendingResult = result;
+		return this.#activate(target);
+	}
+
+	ingestObservation({ observation, eventSequence, attention = false } = {}) {
+		if (!this.#isLive() || !Number.isSafeInteger(eventSequence) || eventSequence < this.#eventSequence) return this.snapshot();
+		const mayResume = this.#pendingResult && eventSequence >= this.#pendingResult.eventSequence;
+		if (eventSequence === this.#eventSequence && !mayResume) return this.snapshot();
+		this.#facts = createInterpreterFacts(observation);
+		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
+		const edges = this.#updateWatchers();
+		if (this.#pendingResult && !this.#cancelling && eventSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
+		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
+		if (attention && edges === 0) this.#requestModel();
 		return this.snapshot();
 	}
 
-	applyDirective({ directive, goalRevision = this.#program?.goalRevision, version = this.#program?.version } = {}) {
-		if (!this.#current() || goalRevision !== this.#program.goalRevision || version !== this.#program.version) return this.snapshot();
-		this.#modelContext = null;
-		if (directive === 'pause') return this.suspend('model_paused');
-		if (directive === 'finish') this.#status = 'FINISHED';
+	ingestActionResult({ actionId, state, reasonCode, eventSequence } = {}) {
+		if (!Number.isSafeInteger(eventSequence) || typeof actionId !== 'string' || typeof state !== 'string' || typeof reasonCode !== 'string') return this.snapshot();
+		const signature = `${state}\u0000${reasonCode}\u0000${eventSequence}`;
+		if (!this.#active || actionId !== this.#active.actionId || eventSequence < this.#eventSequence) {
+			if (this.#completed.has(actionId) && this.#completed.get(actionId) !== signature) return this.snapshot();
+			return this.snapshot();
+		}
+		const active = this.#active;
+		this.#active = null;
+		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
+		this.#completed.set(actionId, signature);
+		const result = Object.freeze({ stateToken: active.stateToken, state, reasonCode });
+		if (this.#transition || this.#cancelling) {
+			if (state !== 'CANCELLED') { this.#status = 'PAUSED'; return this.snapshot(); }
+			const cancelling = this.#cancelling;
+			this.#cancelling = null;
+			if (this.#transition) return this.#completeTransition();
+			if (cancelling?.kind === 'watcher') {
+				this.#vm.abortPendingCommand(result.stateToken);
+				this.#handleYield(this.#vm.runWatcherHandler(cancelling.latch.watcherId, cancelling.latch.facts), `watcher:${cancelling.latch.watcherId}`);
+				return this.snapshot();
+			}
+			this.#status = 'SUSPENDED';
+			return this.snapshot();
+		}
+		this.#pendingResult = Object.freeze({ result, eventSequence });
+		return this.snapshot();
+	}
+
+	applyDirective(directive = {}) {
+		const request = this.#pendingRequest;
+		if (!request || !sameRequest(directive, request)) return this.snapshot();
+		this.#pendingRequest = null;
+		this.#requestUpdate = null;
+		if (directive.directive === 'continue') return this.snapshot();
+		if (directive.directive === 'replace') {
+			try {
+				const target = normalizeInstall(directive.install);
+				if (!isNewer(target, this.#program)) return this.snapshot();
+				this.#transition = { kind: 'install', target };
+			} catch { return this.snapshot(); }
+		} else if (directive.directive === 'pause' || directive.directive === 'finish') {
+			this.#transition = { kind: 'terminal', status: directive.directive === 'pause' ? 'SUSPENDED' : 'FINISHED' };
+		} else return this.snapshot();
+		if (this.#active) this.#cancelActive(`directive:${directive.directive}`);
+		else this.#completeTransition();
 		return this.snapshot();
 	}
 
 	suspend(reason = 'suspended') {
-		if (!this.#current()) return this.snapshot();
-		if (this.#active && !this.#cancelling) {
-			this.#status = 'SUSPENDING';
-			this.#cancelling = { kind: 'suspend', actionId: this.#active.actionId, reason };
-			this.#callbacks.cancel(this.#active.actionId);
-			return this.snapshot();
-		}
-		this.#status = 'SUSPENDED';
+		if (!this.#isLive()) return this.snapshot();
+		this.#transition = { kind: 'terminal', status: 'SUSPENDED', reason };
+		if (this.#active) this.#cancelActive(reason); else this.#completeTransition();
 		return this.snapshot();
 	}
 
 	dispose() {
-		this.#vm = null;
-		this.#program = null;
-		this.#facts = null;
-		this.#active = null;
-		this.#pendingResult = null;
-		this.#boundaryWatchers = [];
-		this.#watcherStates.clear();
-		this.#cancelling = null;
-		this.#modelContext = null;
-		this.#status = 'IDLE';
+		if (this.#active) { this.#transition = { kind: 'dispose' }; this.#cancelActive('dispose'); return; }
+		this.#clear();
 	}
 
-	snapshot() {
-		return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, activeActionId: this.#active?.actionId ?? null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null });
+	snapshot() { return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, generation: this.#generation, activeActionId: this.#active?.actionId ?? null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null }); }
+
+	#activate(target) {
+		this.#clear(false);
+		this.#generation += 1;
+		this.#program = freezeRecord({ agentId: target.agentId, goalRevision: target.goalRevision, modelIdentity: target.modelIdentity, programId: target.programId, version: target.version, compiled: target.compiled });
+		this.#facts = createInterpreterFacts(target.observation);
+		this.#eventSequence = target.eventSequence;
+		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS);
+		this.#status = 'ACTIVE';
+		this.#handleYield(this.#vm.start(this.#facts), 'step');
+		for (let index = 0; index < target.compiled.watcherCount && this.#isLive(); index += 1) this.#watcherTruth.set(`watcher-${index}`, this.#vm.evaluateWatcher(`watcher-${index}`, this.#facts));
+		return this.snapshot();
 	}
 
-	#current() { return this.#vm !== null && ['ACTIVE', 'SUSPENDING'].includes(this.#status); }
+	#clear(resetGeneration = true) {
+		this.#vm = null; this.#program = null; this.#facts = null; this.#eventSequence = -1; this.#active = null; this.#pendingResult = null;
+		this.#boundary = []; this.#watcherTruth.clear(); this.#cancelling = null; this.#transition = null; this.#pendingRequest = null; this.#requestUpdate = null; this.#completed.clear(); this.#deferredBase = null; this.#status = 'IDLE';
+		if (resetGeneration) this.#generation += 1;
+	}
 
-	#evaluateAttention() {
-		let matched = false;
+	#isLive() { return this.#vm !== null && ['ACTIVE', 'SUSPENDING', 'REPLACING', 'FINISHING'].includes(this.#status); }
+	#cancelActive(reason) { if (!this.#active || this.#cancelling) return; this.#cancelling = { kind: 'transition', actionId: this.#active.actionId, reason }; this.#status = reason === 'replace' ? 'REPLACING' : 'SUSPENDING'; this.#callbacks.cancel(this.#active.actionId); }
+	#completeTransition() {
+		const transition = this.#transition; this.#transition = null;
+		if (!transition) return this.snapshot();
+		if (transition.kind === 'install') return this.#activate(transition.target);
+		if (transition.kind === 'dispose') { this.#clear(); return this.snapshot(); }
+		this.#status = transition.status;
+		return this.snapshot();
+	}
+
+	#updateWatchers() {
+		let edges = 0;
 		for (let index = 0; index < this.#program.compiled.watcherCount; index += 1) {
 			const watcherId = `watcher-${index}`;
 			const trueNow = this.#vm.evaluateWatcher(watcherId, this.#facts);
-			const wasTrue = this.#watcherStates.get(watcherId) === true;
-			this.#watcherStates.set(watcherId, trueNow);
-			if (!trueNow) continue;
-			matched = true;
-			if (wasTrue) continue;
-			const mode = watcherMode(this.#program.compiled, index);
-			if (this.#active) {
-				if (mode === 'interrupt' && !this.#cancelling) {
-					this.#cancelling = { kind: 'watcher', watcherId, actionId: this.#active.actionId };
-					this.#callbacks.cancel(this.#active.actionId);
-				} else this.#boundaryWatchers.push(watcherId);
-			} else this.#handleYield(this.#vm.runWatcher(watcherId, this.#facts), `watcher:${watcherId}`);
+			const wasTrue = this.#watcherTruth.get(watcherId) === true;
+			this.#watcherTruth.set(watcherId, trueNow);
+			if (!trueNow || wasTrue) continue;
+			edges += 1;
+			const latch = freezeRecord({ watcherId, mode: watcherMode(this.#program.compiled, index), eventSequence: this.#eventSequence, facts: this.#facts });
+			if (latch.mode === 'interrupt' && this.#active && !this.#cancelling) {
+				this.#cancelling = { kind: 'watcher', actionId: this.#active.actionId, latch };
+				this.#callbacks.cancel(this.#active.actionId);
+			} else this.#boundary.push(latch);
 		}
-		if (!matched) this.#unhandledAttention();
+		return edges;
 	}
 
-	#unhandledAttention() {
-		const context = this.#modelContext ?? {
-			agentId: this.#program.agentId, goalRevision: this.#program.goalRevision, modelIdentity: this.#program.modelIdentity,
-			programId: this.#program.programId, version: this.#program.version, eventSequence: this.#eventSequence, observation: this.#facts,
-		};
-		context.eventSequence = this.#eventSequence;
-		context.observation = this.#facts;
-		if (!this.#modelContext) {
-			this.#modelContext = context;
-			this.#callbacks.requestModel(context);
+	#resumeOrRunBoundary() {
+		if (this.#boundary.length > 0) return this.#runBoundary();
+		const pending = this.#pendingResult; this.#pendingResult = null;
+		const yielded = this.#vm.resume(pending.result, this.#facts);
+		this.#handleYield(yielded, 'step');
+	}
+
+	#runBoundary() {
+		if (this.#active || this.#boundary.length === 0) return;
+		const latch = this.#boundary.shift();
+		if (this.#pendingResult) {
+			this.#deferredBase = this.#pendingResult;
+			this.#pendingResult = null;
+			this.#handleYield(this.#vm.runWatcherHandlerBeforeResume(latch.watcherId, latch.facts), `watcher:${latch.watcherId}`);
+		} else this.#handleYield(this.#vm.runWatcherHandler(latch.watcherId, latch.facts), `watcher:${latch.watcherId}`);
+	}
+
+	#requestModel() {
+		const context = requestContext(this.#program, this.#generation, this.#eventSequence, this.#facts);
+		if (this.#pendingRequest) {
+			this.#pendingRequest = context;
+			if (this.#requestUpdate) this.#requestUpdate(context);
+			return;
 		}
+		this.#pendingRequest = context;
+		const registerUpdate = (listener) => { if (typeof listener === 'function') this.#requestUpdate = listener; };
+		this.#callbacks.requestModel(context, registerUpdate);
 		if (this.#program.compiled.unhandledPolicy === 'pause_and_notify') this.suspend('unhandled_attention');
-	}
-
-	#runBoundaryWatcher() {
-		const watcherId = this.#boundaryWatchers.shift();
-		this.#handleYield(this.#vm.runWatcher(watcherId, this.#facts), `watcher:${watcherId}`);
 	}
 
 	#handleYield(yielded, source) {
 		if (yielded.kind === 'command') {
-			const actionId = `${this.#program.programId}:${this.#program.version}:${yielded.stateToken}`;
-			const command = Object.freeze({
-				actionId,
-				action: Object.freeze({ type: yielded.call.primitive, arguments: yielded.call.arguments }),
-				provenance: Object.freeze({ agentId: this.#program.agentId, goalRevision: this.#program.goalRevision, modelIdentity: this.#program.modelIdentity, programId: this.#program.programId, version: this.#program.version, source, stepId: yielded.stepId, eventSequence: this.#eventSequence }),
-			});
-			this.#active = { actionId, stateToken: yielded.stateToken };
+			const actionId = `${this.#program.programId}:${this.#program.version}:${this.#generation}:${yielded.stateToken}`;
+			const command = freezeRecord({ actionId, action: freezeRecord({ type: yielded.call.primitive, arguments: yielded.call.arguments }), provenance: freezeRecord({ agentId: this.#program.agentId, goalRevision: this.#program.goalRevision, modelIdentity: this.#program.modelIdentity, programId: this.#program.programId, version: this.#program.version, generation: this.#generation, source, stepId: yielded.stepId, eventSequence: this.#eventSequence }) });
+			this.#active = { actionId, stateToken: yielded.stateToken, generation: this.#generation, source };
 			this.#callbacks.dispatch(command);
 			return;
 		}
-		if (yielded.kind === 'finish') this.#status = 'FINISHED';
-		if (yielded.kind === 'checkpoint') this.#status = 'PAUSED';
+		if (yielded.kind === 'finish' || yielded.kind === 'checkpoint') {
+			if (this.#deferredBase) { this.#vm.discardDeferredCommand(); this.#deferredBase = null; }
+			this.#status = yielded.kind === 'finish' ? 'FINISHED' : 'PAUSED';
+			return;
+		}
+		if (yielded.kind === 'idle' && this.#deferredBase) {
+			const deferred = this.#deferredBase; this.#deferredBase = null;
+			this.#handleYield(this.#vm.resumeDeferredCommand(deferred.result, this.#facts), 'step');
+		}
 	}
 }
 
-function watcherMode(compiled, index) {
-	const watches = [];
-	for (const statement of compiled.ast.body) {
-		const call = statement.type === 'ExpressionStatement' ? statement.expression : null;
-		if (call?.type === 'CallExpression' && call.callee.type === 'MemberExpression' && call.callee.object.name === 'program' && call.callee.property.name === 'watch') watches.push(call);
-	}
-	return watches[index]?.arguments[1]?.properties?.find((property) => property.key.name === 'mode')?.value?.value ?? 'boundary';
+function normalizeInstall(input) {
+	if (!input || typeof input !== 'object' || !input.compiled?.ast || !Object.isFrozen(input.compiled)) throw new TypeError('ArenaScriptEngine requires a frozen compiled program');
+	const fields = ['agentId', 'modelIdentity', 'programId'];
+	for (const field of fields) if (typeof input[field] !== 'string' || input[field].trim().length === 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonempty string`);
+	for (const field of ['goalRevision', 'version', 'eventSequence']) if (!Number.isSafeInteger(input[field]) || input[field] < 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonnegative safe integer`);
+	return freezeRecord({ agentId: input.agentId.trim(), goalRevision: input.goalRevision, modelIdentity: input.modelIdentity.trim(), programId: input.programId.trim(), version: input.version, compiled: input.compiled, observation: input.observation, eventSequence: input.eventSequence });
 }
+function isNewer(next, current) { return next.goalRevision > current.goalRevision || (next.goalRevision === current.goalRevision && next.version > current.version); }
+function requestContext(program, generation, eventSequence, observation) { return freezeRecord({ agentId: program.agentId, goalRevision: program.goalRevision, modelIdentity: program.modelIdentity, programId: program.programId, version: program.version, generation, eventSequence, observation }); }
+function sameRequest(value, request) { return value && ['agentId', 'goalRevision', 'modelIdentity', 'programId', 'version', 'generation', 'eventSequence'].every((key) => value[key] === request[key]); }
+function watcherMode(compiled, index) { const watches = []; for (const statement of compiled.ast.body) { const call = statement.type === 'ExpressionStatement' ? statement.expression : null; if (call?.type === 'CallExpression' && call.callee.type === 'MemberExpression' && call.callee.object.name === 'program' && call.callee.property.name === 'watch') watches.push(call); } return watches[index]?.arguments[1]?.properties?.find((property) => property.key.name === 'mode')?.value?.value ?? 'boundary'; }
+function freezeRecord(values) { return Object.freeze(Object.assign(Object.create(null), values)); }

@@ -37,6 +37,14 @@ test('admits the exact Task 2 direct action and terminal API calls', () => {
 	}
 });
 
+test('admits only factual observed-candidate queries in watcher conditions', () => {
+	assert.doesNotThrow(() => parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => world.nearest(world.items({ itemId: "minecraft:oak_log" })) !== null, { mode: "boundary" }, async () => {});
+	`));
+	assert.throws(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.mine({ x: 1 }), { mode: "boundary" }, async () => {});'), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+});
+
 test('rejects side-effecting watcher and repeatUntil conditions', () => {
 	for (const source of [
 		'program.onUnhandledAttention("continue_and_notify"); program.watch(async () => { await player.moveTo({ x: 1 }); return false; }, { mode: "boundary" }, async () => {});',

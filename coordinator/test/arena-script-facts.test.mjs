@@ -47,3 +47,22 @@ test('inventory helpers measure only observed inventory and tag facts', () => {
 	assert.equal(facts.inventory.countTag('#minecraft:logs'), 5);
 	assert.equal(facts.inventory.countTag('#minecraft:unknown'), 0);
 });
+
+test('rejects hostile observation records and synthetic nearest candidate arrays', () => {
+	let read = 0;
+	const accessor = Object.defineProperties({}, {
+		stableId: { enumerable: true, value: 'bad' }, itemId: { enumerable: true, value: 'minecraft:oak_log' }, count: { enumerable: true, value: 1 },
+		x: { enumerable: true, get() { read += 1; return 1; } }, y: { enumerable: true, value: 64 }, z: { enumerable: true, value: 0 },
+	});
+	assert.throws(() => createFactView(observation({ items: [accessor] })), TypeError);
+	assert.equal(read, 0);
+	const facts = createFactView(observation({ items: [{ stableId: 'item', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 }] }));
+	assert.throws(() => facts.world.nearest([{ stableId: 'invented', x: 0, y: 0, z: 0 }]), TypeError);
+});
+
+test('omits candidates with invalid coordinates rather than assigning a synthetic origin', () => {
+	const facts = createFactView(observation({
+		items: [{ stableId: 'bad-coordinate', itemId: 'minecraft:oak_log', count: 1, x: Number.NaN, y: 64, z: 0 }],
+	}));
+	assert.equal(facts.world.items({ itemId: 'minecraft:oak_log' }).length, 0);
+});

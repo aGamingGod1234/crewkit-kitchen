@@ -112,6 +112,93 @@ test('coalesces unmatched continue policy notifications and ignores stale events
 	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: true });
 	engine.ingestObservation({ observation: observation(), eventSequence: 1, attention: true });
 	assert.equal(modelRequests.length, 1);
-	assert.equal(modelRequests[0].eventSequence, 3);
+	assert.equal(modelRequests[0].eventSequence, 2);
 	assert.deepEqual(dispatched.map((row) => row.action.type), ['wait']);
+});
+
+test('fences a replacement behind cancellation and rejects an old action result by generation', () => {
+	const { engine, dispatched, cancelled } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const old = dispatched.at(-1);
+	engine.install({
+		agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-b', version: 2,
+		compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(2);'), observation: observation(), eventSequence: 2,
+	});
+	assert.deepEqual(cancelled, [old.actionId]);
+	assert.equal(dispatched.length, 1);
+	engine.ingestActionResult({ actionId: old.actionId, state: 'CANCELLED', reasonCode: 'REPLACED', eventSequence: 2 });
+	assert.equal(dispatched.length, 2);
+	assert.notEqual(dispatched[1].actionId, old.actionId);
+	engine.ingestActionResult({ actionId: old.actionId, state: 'SUCCEEDED', reasonCode: 'LATE', eventSequence: 3 });
+	assert.equal(dispatched.length, 2);
+});
+
+test('holds an action result until an authoritative observation at or after its result sequence', () => {
+	const { engine, dispatched } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);');
+	const first = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 5 });
+	engine.ingestObservation({ observation: observation(), eventSequence: 4, attention: false });
+	assert.equal(dispatched.length, 1);
+	engine.ingestObservation({ observation: observation(), eventSequence: 5, attention: false });
+	assert.equal(dispatched.length, 2);
+});
+
+test('runs a latched boundary watcher before the base continuation and retains a transient edge', () => {
+	const { engine, dispatched } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); });
+		await player.wait(1); await player.wait(2);
+	`);
+	const first = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 2, attention: true });
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 20 } }), eventSequence: 3, attention: false });
+	engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3 });
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: false });
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 9]);
+});
+
+test('uses immutable request contexts and fences directives to the newest coalesced event', () => {
+	const requests = [];
+	const updates = [];
+	const { engine } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);', {
+		requestModel: (context, registerUpdate) => { requests.push(context); registerUpdate((next) => updates.push(next)); },
+	});
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: true });
+	assert.equal(requests.length, 1);
+	assert.ok(Object.isFrozen(requests[0]));
+	assert.equal(requests[0].eventSequence, 2);
+	assert.equal(updates.length, 1);
+	assert.equal(updates[0].eventSequence, 3);
+	engine.applyDirective({ directive: 'pause', agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, generation: requests[0].generation, eventSequence: 2 });
+	assert.equal(engine.snapshot().status, 'ACTIVE');
+	engine.applyDirective({ directive: 'pause', agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, generation: updates[0].generation, eventSequence: 3 });
+	assert.equal(engine.snapshot().status, 'SUSPENDING');
+});
+
+test('rejects incomplete provenance before creating a VM or dispatching', () => {
+	const engine = new ArenaScriptEngine({ dispatch() { assert.fail('must not dispatch'); }, cancel() {}, requestModel() {} });
+	assert.throws(() => engine.install({ agentId: '', goalRevision: 1, modelIdentity: 'model-a', programId: 'p', version: 1, compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify");'), observation: observation(), eventSequence: 1 }), TypeError);
+	assert.equal(engine.snapshot().status, 'IDLE');
+});
+
+test('rearmer watcher edges after a false observation and disposal waits for cancellation', () => {
+	const { engine, dispatched, cancelled } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "interrupt" }, async () => { await player.wait(9); });
+		await player.wait(1);
+	`);
+	const base = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: base.actionId, state: 'CANCELLED', reasonCode: 'DAMAGE', eventSequence: 2 });
+	const firstReaction = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: firstReaction.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3 });
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 20 } }), eventSequence: 3, attention: false });
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 4, attention: true });
+	assert.equal(dispatched.filter((command) => command.action.arguments === 9).length, 2);
+	const active = dispatched.at(-1);
+	engine.dispose();
+	assert.deepEqual(cancelled, [base.actionId, active.actionId]);
+	assert.notEqual(engine.snapshot().status, 'IDLE');
+	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'DISPOSED', eventSequence: 4 });
+	assert.equal(engine.snapshot().status, 'IDLE');
 });

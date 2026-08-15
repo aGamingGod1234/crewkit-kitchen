@@ -2,7 +2,7 @@ import { ArenaScriptError, executionError } from './errors.mjs';
 import { types as nodeTypes } from 'node:util';
 import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from './limits.mjs';
 import { PLAYER_MEMBER_PRIMITIVES } from './minecraft-api.mjs';
-import { filterObserved, nearest } from './facts.mjs';
+import { filterObserved, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory']);
 const CAPABILITY_MEMBERS = Object.freeze({
@@ -36,6 +36,7 @@ export class ArenaScriptInterpreter {
 	#lifecycle = 'READY';
 	#loopIterations = 0;
 	#watcherEvaluation = false;
+	#deferredCommand = null;
 
 	constructor(compiled, bindings, { limits = DEFAULT_ARENA_SCRIPT_LIMITS } = {}) {
 		if (!compiled?.ast || compiled.ast.type !== 'Program') throw executionError('INVALID_PROGRAM', 'ArenaScript INVALID_PROGRAM: compiled program is required');
@@ -86,6 +87,42 @@ export class ArenaScriptInterpreter {
 		return this.#run();
 	}
 
+	runWatcherHandler(watcherId, facts) {
+		const watcher = this.#watcherForHandler(watcherId, facts);
+		this.#frames.push({ type: 'watcher-after-handler' });
+		this.#invokeFunction(watcher.handler, []);
+		return this.#run();
+	}
+
+	runWatcherHandlerBeforeResume(watcherId, facts) {
+		if (this.#waiting === null || this.#deferredCommand !== null) throw executionError('NOT_WAITING', 'ArenaScript NOT_WAITING: a pending command is required for a boundary watcher');
+		const watcher = this.#watchers.get(watcherId);
+		if (!watcher) throw executionError('UNKNOWN_WATCHER', `ArenaScript UNKNOWN_WATCHER: ${watcherId}`);
+		this.#deferredCommand = { frames: this.#frames, values: this.#values, waiting: this.#waiting };
+		this.#context.facts = freezeFacts(facts);
+		this.#frames = [];
+		this.#values = [];
+		this.#waiting = null;
+		this.#yield = null;
+		this.#terminal = false;
+		this.#beginSlice();
+		this.#frames.push({ type: 'watcher-after-handler' });
+		this.#invokeFunction(watcher.handler, []);
+		return this.#run();
+	}
+
+	resumeDeferredCommand(result, facts) {
+		if (this.#deferredCommand === null) throw executionError('NOT_WAITING', 'ArenaScript NOT_WAITING: no deferred command is available');
+		const deferred = this.#deferredCommand;
+		this.#deferredCommand = null;
+		this.#frames = deferred.frames;
+		this.#values = deferred.values;
+		this.#waiting = deferred.waiting;
+		return this.resume(result, facts);
+	}
+
+	discardDeferredCommand() { this.#deferredCommand = null; }
+
 	evaluateWatcher(watcherId, facts) {
 		if (!this.#started) throw executionError('NOT_STARTED', 'ArenaScript NOT_STARTED: start the program before evaluating watchers');
 		validateWatcherId(watcherId);
@@ -124,6 +161,22 @@ export class ArenaScriptInterpreter {
 		this.#yield = null;
 		this.#terminal = false;
 		this.#beginSlice();
+	}
+
+	#watcherForHandler(watcherId, facts) {
+		if (!this.#started) throw executionError('NOT_STARTED', 'ArenaScript NOT_STARTED: start the program before running watchers');
+		validateWatcherId(watcherId);
+		if (this.#lifecycle !== 'ACTIVE') throw executionError('INACTIVE_LIFECYCLE', `ArenaScript INACTIVE_LIFECYCLE: program is ${this.#lifecycle}`);
+		if (this.#waiting !== null) throw executionError('NOT_IDLE', 'ArenaScript NOT_IDLE: a command result is still required');
+		const watcher = this.#watchers.get(watcherId);
+		if (!watcher) throw executionError('UNKNOWN_WATCHER', `ArenaScript UNKNOWN_WATCHER: ${watcherId}`);
+		this.#context.facts = freezeFacts(facts);
+		this.#frames = [];
+		this.#values = [];
+		this.#terminal = false;
+		this.#yield = null;
+		this.#beginSlice();
+		return watcher;
 	}
 
 	#beginActivation(normalizedFacts) {
@@ -415,7 +468,7 @@ export class ArenaScriptInterpreter {
 			case 'world.items': return this.#values.push(filterObserved(this.#context.facts.world.items, args[0]));
 			case 'world.entities': return this.#values.push(filterObserved(this.#context.facts.world.entities, args[0]));
 			case 'world.blocks': return this.#values.push(filterObserved(this.#context.facts.world.blocks, args[0]));
-			case 'world.nearest': return this.#values.push(nearest(args[0], args[1] ?? this.#context.facts.player));
+			case 'world.nearest': return this.#values.push(nearestFromCurrent(args[0], args[1] ?? this.#context.facts.player, [this.#context.facts.world.items, this.#context.facts.world.entities, this.#context.facts.world.blocks]));
 			case 'inventory.count':
 				if (typeof args[0] !== 'string') throw this.#error('INVALID_ARGUMENT', 'ArenaScript INVALID_ARGUMENT: inventory item id must be a string', node);
 				return this.#values.push(this.#context.facts.inventory.items.reduce((total, item) => total + (item.itemId === args[0] && Number.isSafeInteger(item.count) ? item.count : 0), 0));
@@ -758,7 +811,7 @@ function freezeFacts(facts) {
 	const world = freezeDataRecord(root.world, 'facts.world');
 	return frozenRecord({
 		player: freezeDataRecord(root.player, 'facts.player'),
-		world: frozenRecord({ items: freezeDataList(world.items ?? [], 'facts.world.items'), entities: freezeDataList(world.entities ?? [], 'facts.world.entities'), blocks: freezeDataList(world.blocks ?? [], 'facts.world.blocks') }),
+		world: frozenRecord({ items: markObservedCandidateSet(freezeDataList(world.items ?? [], 'facts.world.items')), entities: markObservedCandidateSet(freezeDataList(world.entities ?? [], 'facts.world.entities')), blocks: markObservedCandidateSet(freezeDataList(world.blocks ?? [], 'facts.world.blocks')) }),
 		inventory: frozenRecord({ items: freezeDataList(inventory.items ?? [], 'facts.inventory.items'), tagCounts: freezeDataRecord(inventory.tagCounts, 'facts.inventory.tagCounts') }),
 	});
 }

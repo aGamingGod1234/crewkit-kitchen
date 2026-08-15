@@ -456,13 +456,13 @@ function validatePureCondition(node) {
 		}
 		if (current.type === 'CallExpression') {
 			const path = staticMemberPath(current.callee)?.join('.');
-			if (!['player.state', 'inventory.count', 'inventory.countTag'].includes(path)) {
+			if (!['player.state', 'inventory.count', 'inventory.countTag', 'world.items', 'world.entities', 'world.blocks', 'world.nearest'].includes(path)) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions can call only factual Arena APIs', current);
 			}
 		}
 		if (current.type === 'MemberExpression') {
 			const path = staticMemberPath(current)?.join('.');
-			if ([...SCRIPT_API_CALL_PATHS].filter((apiPath) => !['player.state', 'inventory.count', 'inventory.countTag'].includes(apiPath)).includes(path)
+			if ([...SCRIPT_API_CALL_PATHS].filter((apiPath) => !['player.state', 'inventory.count', 'inventory.countTag', 'world.items', 'world.entities', 'world.blocks', 'world.nearest'].includes(apiPath)).includes(path)
 				|| ['program.checkpoint', 'program.finish', 'program.watch', 'program.repeatUntil'].includes(path)) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions cannot reference effectful Arena APIs', current);
 			}
