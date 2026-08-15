@@ -21,10 +21,11 @@
 - The server advances a publication baseline only after its observation envelope is accepted by the connection queue. Rejections retain a bounded dirty retry marker, so the next accepted observation still contains the missed factual delta.
 - Removing an agent now removes its queued identity and all delivered/dirty publication state. Only authentication and bounded enqueue backpressure retry; missing-agent collection and other domain failures are permanently dropped.
 - Action-progress and action-result routing no longer read the telemetry clock. Disconnect cleanup uses a safe optional timestamp, so a broken clock cannot prevent program disposal, state transition, or planner interruption.
+- Quiet provider transport omissions now use the same safe clock path. If it is unavailable, no retry deadline is retained and the next fresh observation can retry; error reporting is contained from agent-control work.
 
 ## Verification
 
-- Focused Node suites: 40/40 passed, including the real monotonic-clock 1,000 watcher-event benchmark with exactly 1,000 positive finite p95 receipt-to-branch and branch-to-send samples below 5 ms.
+- Focused Node suites: 41/41 passed, including the real monotonic-clock 1,000 watcher-event benchmark with exactly 1,000 positive finite p95 receipt-to-branch and branch-to-send samples below 5 ms.
 - Java 25 `verifyCore`: passed with 5,972 protocol and bridge assertions.
 - No dependency files changed, so a clean archive verification was not required.
 
@@ -34,3 +35,4 @@
 - `9a29084 fix: correct factual delta timing` (10 files, 226 insertions, 42 deletions).
 - `7f1830a fix: contain factual delta telemetry faults` (13 files, 258 insertions, 60 deletions).
 - `d4e7550 fix: drop stale observation retries` (5 files, 65 insertions, 11 deletions).
+- `702631b fix: contain quiet provider retry clocks` (2 files, 46 insertions, 17 deletions).
