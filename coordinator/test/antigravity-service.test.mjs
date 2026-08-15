@@ -138,7 +138,7 @@ test('Antigravity parses planner output and uses the stable per-agent workspace'
 	await service.stop();
 });
 
-test('Antigravity rejects compiler correction without a resumable session instead of starting a fresh process', async () => {
+test('Antigravity continues compiler correction in the same selected-model workspace session', async () => {
 	const spawnCalls = [];
 	const service = new AntigravityProviderService(config(), {
 		platform: 'win32', spawn: successfulSpawner(spawnCalls),
@@ -151,11 +151,13 @@ test('Antigravity rejects compiler correction without a resumable session instea
 		compilerError: { code: 'SYNTAX_ERROR', message: 'unexpected token', line: 3, column: 2 },
 		rejectedSourceHash: 'sha256:abc123', observation: { resourceCount: 3 },
 	});
-	await assert.rejects(
-		agent.decide(correction, { goalRevision: 7 }),
-		(error) => error?.code === 'SESSION_CONTINUITY_UNAVAILABLE',
-	);
-	assert.equal(spawnCalls.length, 1, 'compiler correction must not start a new agy --print conversation');
+	const decision = await agent.decide(correction, { goalRevision: 7 });
+	assert.equal(decision.directive, 'replace');
+	assert.equal(spawnCalls.length, 2);
+	assert.equal(spawnCalls[0].args.includes('--continue'), false);
+	assert.equal(spawnCalls[1].args.includes('--continue'), true);
+	assert.equal(spawnCalls[1].options.cwd, spawnCalls[0].options.cwd);
+	assert.deepEqual(modelArgs(spawnCalls[1].args), modelArgs(spawnCalls[0].args));
 	await service.stop();
 });
 
@@ -193,6 +195,82 @@ test('Antigravity interruption terminates the active process and rejects the tur
 	assert.deepEqual(terminated, [child]);
 	await service.stop();
 });
+
+test('Antigravity does not continue a session after its first turn fails or is interrupted', async () => {
+	const failedCalls = [];
+	let failedAttempt = 0;
+	const failedService = new AntigravityProviderService(config(), {
+		spawn: (command, args, options) => {
+			failedCalls.push({ command, args, options });
+			const child = new FakeChild();
+			failedAttempt += 1;
+			queueMicrotask(() => {
+				if (failedAttempt === 1) { child.exitCode = 1; child.emit('close', 1, null); return; }
+				child.stdout.emit('data', Buffer.from(DECISION)); child.exitCode = 0; child.emit('close', 0, null);
+			});
+			return child;
+		},
+	});
+	const failedAgent = await failedService.createAgent(profile());
+	await failedAgent.setGoalRevision(1);
+	await assert.rejects(failedAgent.decide('state', { goalRevision: 1 }), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
+	await failedAgent.decide('state', { goalRevision: 1 });
+	assert.equal(failedCalls[1].args.includes('--continue'), false);
+	await failedService.stop();
+
+	const interruptedCalls = [];
+	let interruptedAttempt = 0;
+	const interruptedService = new AntigravityProviderService(config(), {
+		spawn: (command, args, options) => {
+			interruptedCalls.push({ command, args, options });
+			const child = new FakeChild();
+			interruptedAttempt += 1;
+			if (interruptedAttempt === 2) queueMicrotask(() => {
+				child.stdout.emit('data', Buffer.from(DECISION)); child.exitCode = 0; child.emit('close', 0, null);
+			});
+			return child;
+		},
+		terminate: cancellingTerminator([]),
+	});
+	const interruptedAgent = await interruptedService.createAgent(profile());
+	await interruptedAgent.setGoalRevision(1);
+	const active = interruptedAgent.decide('state', { goalRevision: 1 });
+	await interruptedAgent.interrupt();
+	await assert.rejects(active, (error) => error?.code === 'PLAN_CANCELLED');
+	await interruptedAgent.decide('state', { goalRevision: 1 });
+	assert.equal(interruptedCalls[1].args.includes('--continue'), false);
+	await interruptedService.stop();
+});
+
+test('Antigravity never falls back to a fresh turn after a continued turn fails', async () => {
+	const calls = [];
+	let attempt = 0;
+	const service = new AntigravityProviderService(config(), {
+		spawn: (command, args, options) => {
+			calls.push({ command, args, options });
+			const child = new FakeChild();
+			attempt += 1;
+			queueMicrotask(() => {
+				if (attempt === 2) { child.exitCode = 1; child.emit('close', 1, null); return; }
+				child.stdout.emit('data', Buffer.from(DECISION)); child.exitCode = 0; child.emit('close', 0, null);
+			});
+			return child;
+		},
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(1);
+	await agent.decide('state', { goalRevision: 1 });
+	await assert.rejects(agent.decide('state', { goalRevision: 1 }), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
+	await agent.decide('state', { goalRevision: 1 });
+	assert.equal(calls[1].args.includes('--continue'), true);
+	assert.equal(calls[2].args.includes('--continue'), true, 'a failed continuation must not restart in a fresh session');
+	await service.stop();
+});
+
+function modelArgs(args) {
+	const modelIndex = args.indexOf('--model');
+	return args.slice(modelIndex, modelIndex + 2);
+}
 
 test('Antigravity timeout terminates the process tree and reports PLANNING_TIMEOUT', async () => {
 	const child = new FakeChild();

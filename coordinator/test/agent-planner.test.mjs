@@ -78,6 +78,32 @@ test('retries compact envelope validation mismatches with corrective feedback', 
 	}
 });
 
+test('retries a duplicate decision envelope through the same provider agent', async () => {
+	const registry = new FakeRegistry();
+	const inputs = [];
+	let creates = 0;
+	const duplicate = Object.assign(new Error("Duplicate decision field 'source'"), { code: 'DUPLICATE_DECISION_FIELD' });
+	const agent = {
+		async setGoalRevision(revision) { assert.equal(revision, GOAL_REVISION); },
+		async decide(input) {
+			inputs.push(input);
+			if (inputs.length === 1) throw duplicate;
+			return VALID_DECISION;
+		},
+	};
+	const planner = createPlannerForService(registry, {
+		async createAgent() { creates += 1; return agent; },
+		getAgent() { return null; }, async removeAgent() { return false; },
+	}, 1);
+	const result = await planner.requestPlan({
+		agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION,
+	});
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.equal(creates, 1, 'corrective retry must retain the selected provider agent session');
+	assert.equal(inputs.length, 2);
+	assert.match(inputs[1], /DUPLICATE_DECISION_FIELD/);
+});
+
 test('retries one transient provider failure without changing authoritative input', async () => {
 	const registry = new FakeRegistry();
 	const inputs = [];
