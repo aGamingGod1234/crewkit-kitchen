@@ -166,7 +166,7 @@ test('keeps an immutable request identity seen by a one-argument model callback'
 	assert.equal(requests.length, 1);
 	assert.ok(Object.isFrozen(requests[0]));
 	assert.equal(requests[0].eventSequence, 2);
-	engine.applyDirective({ directive: 'pause', agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, generation: requests[0].generation, eventSequence: 2 });
+	engine.applyDirective({ directive: 'pause', ...requests[0] });
 	assert.equal(requests.length, 2);
 	assert.equal(requests[1].eventSequence, 3);
 	assert.equal(engine.snapshot().status, 'ACTIVE');
@@ -293,4 +293,74 @@ test('trusted lifecycle installs advance goals while pending installs reject dow
 	});
 	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'REPLACED', eventSequence: 3 });
 	assert.equal(engine.snapshot().programId, 'goal-two');
+});
+
+test('trusted lifecycle epochs invalidate an in-flight model response before it can override install or suspension', () => {
+	const first = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	first.engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	const request = first.modelRequests[0];
+	const active = first.dispatched.at(-1);
+	first.engine.install({
+		agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'trusted', version: 2,
+		compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(9);'), observation: observation(), eventSequence: 3,
+	});
+	first.engine.applyDirective({ directive: 'pause', ...request });
+	first.engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'REPLACED', eventSequence: 3 });
+	assert.equal(first.engine.snapshot().programId, 'trusted');
+
+	const second = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	second.engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	const suspendedRequest = second.modelRequests[0];
+	second.engine.suspend('trusted_stop');
+	second.engine.applyDirective({ directive: 'continue', ...suspendedRequest });
+	assert.equal(second.engine.snapshot().status, 'SUSPENDING');
+});
+
+test('an action result fences an older request and replacement waits for facts at the fenced sequence', () => {
+	const { engine, dispatched, modelRequests, cancelled } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);');
+	const active = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: active.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3 });
+	engine.applyDirective({ directive: 'replace', ...modelRequests[0], install: { programId: 'facts-fenced', version: 2, compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(9);') } });
+	assert.equal(modelRequests.length, 2);
+	assert.equal(modelRequests[1].eventSequence, 3);
+	engine.applyDirective({ directive: 'replace', ...modelRequests[1], install: { programId: 'facts-fenced', version: 2, compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(9);') } });
+	assert.equal(cancelled.length, 0);
+	assert.equal(engine.snapshot().programId, 'program-a');
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: false });
+	assert.equal(engine.snapshot().programId, 'facts-fenced');
+	assert.equal(dispatched.at(-1).action.arguments, 9);
+});
+
+test('idle pause-and-notify suspension remains resumable by its exact later continue directive', () => {
+	const { engine, modelRequests } = engineFor('program.onUnhandledAttention("pause_and_notify");');
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
+	assert.equal(engine.snapshot().status, 'ACTIVE');
+});
+
+test('same-version lifecycle input only refreshes an identical immutable compiled program', () => {
+	const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const dispatched = []; const cancelled = [];
+	const engine = new ArenaScriptEngine({ dispatch: (command) => dispatched.push(command), cancel: (actionId) => cancelled.push(actionId), requestModel() {} });
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation(), eventSequence: 1 });
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation({ player: { x: 1, y: 64, z: 0, health: 20 } }), eventSequence: 2 });
+	assert.equal(cancelled.length, 0);
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(2);'), observation: observation(), eventSequence: 3 });
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'changed-id', version: 1, compiled, observation: observation(), eventSequence: 4 });
+	assert.equal(engine.snapshot().programId, 'program-a');
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1]);
+});
+
+test('a command labels the facts sequence actually available when a newer result has no matching observation', () => {
+	const { engine, dispatched } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	const first = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 5 });
+	engine.install({
+		agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'replacement', version: 2,
+		compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); await player.wait(9);'), observation: observation(), eventSequence: 2,
+	});
+	assert.equal(dispatched.at(-1).provenance.eventSequence, 5);
+	assert.equal(dispatched.at(-1).provenance.factsEventSequence, 2);
 });
