@@ -702,7 +702,12 @@ function normalizeActionCommand(value) {
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	const type = requireIdentifier(value.actionType, 'actionType');
 	if (!isPlainObject(value.arguments)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'action_command arguments must be an object');
-	const action = protocolAction({ type, ...value.arguments });
+	for (const key of Reflect.ownKeys(value.arguments)) {
+		if (typeof key !== 'string' || key === 'type' || allowed.includes(key)) {
+			throw new ProtocolV2Error('INVALID_PAYLOAD_FIELD', `Reserved action_command argument field '${String(key)}'`);
+		}
+	}
+	const action = protocolAction({ ...value.arguments, type });
 	const command = validateActionCommandPayload({
 		goalRevision: value.goalRevision,
 		actionId,
@@ -911,8 +916,20 @@ function exactKeys(value, allowed, required, field) {
 }
 
 function boundedArray(value, field, maximum) {
-	if (!Array.isArray(value) || value.length > maximum) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an array with at most ${maximum} entries`);
+	if (!isExactArray(value) || value.length > maximum) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a dense plain array with at most ${maximum} entries`);
 	return value;
+}
+
+function isExactArray(value) {
+	if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return false;
+	const expected = ['length', ...Array.from({ length: value.length }, (_, index) => String(index))].sort();
+	const keys = Reflect.ownKeys(value);
+	if (keys.some((key) => typeof key !== 'string') || keys.map(String).sort().join('\u0000') !== expected.join('\u0000')) return false;
+	for (let index = 0; index < value.length; index += 1) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+		if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable || !descriptor.writable || !descriptor.configurable) return false;
+	}
+	return true;
 }
 
 function boundedText(value, field, maximum, minimum = 1) {

@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
+import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelope;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
@@ -119,8 +120,8 @@ public final class TransactionProtocolVerification {
 			decoder.invoke(null, envelope);
 		} catch (InvocationTargetException exception) {
 			Throwable cause = exception.getCause();
-			assertTrue(cause instanceof ProtocolException, "live bridge uses shared protocol validator");
-			assertEquals("UNKNOWN_FIELD", ((ProtocolException) cause).code(), "live bridge rejects unknown argument");
+			assertTrue(cause instanceof BridgeProtocolException, "live bridge wraps shared protocol rejection into a correlated bridge failure");
+			assertEquals("UNKNOWN_FIELD", ((BridgeProtocolException) cause).code(), "live bridge rejects unknown argument");
 			return;
 		}
 		throw new AssertionError("live bridge accepted an unknown argument");

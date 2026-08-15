@@ -50,6 +50,8 @@ import dev.agaminggod.arenaagents.server.perception.InventoryObservationSlotsVer
 import dev.agaminggod.arenaagents.server.perception.ObservationBudgetVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
+import dev.agaminggod.arenaagents.server.runtime.BlockPlacementAttemptPolicyVerification;
+import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVerification;
@@ -60,6 +62,8 @@ import dev.agaminggod.arenaagents.server.runtime.controller.NavigationProgressVe
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatPolicyVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatNavigationFailureVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.SurvivalReflexVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.BuildSequenceProgressVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.ItemPickupProgressVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioCoreVerification;
 import dev.agaminggod.arenaagents.scenario.ArenaSpectatorSnapshotVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRuntimeVerification;
@@ -138,6 +142,8 @@ public final class VerificationMain {
 		passedAssertions += ObservationBudgetVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();
 		passedAssertions += BlockPlacementPostconditionVerification.verify();
+		passedAssertions += BlockPlacementAttemptPolicyVerification.verify();
+		passedAssertions += DesiredBlockStateVerification.verify();
 		passedAssertions += ResourceLeaseManagerVerification.verify();
 		passedAssertions += TransactionProtocolVerification.verify();
 		passedAssertions += TransactionPostconditionVerification.verify();
@@ -148,6 +154,8 @@ public final class VerificationMain {
 		passedAssertions += CombatPolicyVerification.verify();
 		passedAssertions += CombatNavigationFailureVerification.verify();
 		passedAssertions += SurvivalReflexVerification.verify();
+		passedAssertions += BuildSequenceProgressVerification.verify();
+		passedAssertions += ItemPickupProgressVerification.verify();
 		passedAssertions += ScenarioCoreVerification.verify();
 		passedAssertions += ScenarioLaunchRuntimeVerification.verify();
 		passedAssertions += ScenarioMatchResultVerification.verify();

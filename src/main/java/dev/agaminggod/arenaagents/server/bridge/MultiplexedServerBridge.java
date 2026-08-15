@@ -14,6 +14,7 @@ import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
+import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.scenario.ScenarioAgentEvent;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import dev.agaminggod.arenaagents.server.AgentRuntimeHooks;
@@ -492,15 +493,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!ServerActionExecutor.isArenaScriptPrimitive(actionType)) {
 			throw new BridgeProtocolException("UNSUPPORTED_ARENA_SCRIPT_ACTION", "ArenaScript cannot invoke '" + type + "'");
 		}
-		JsonObject validatedArguments = ProtocolCodec.validateActionArguments(actionType, arguments);
-		return new ServerActionRequest(
-				agentId,
-				requiredLong(payload, "goalRevision"),
-				requiredString(payload, "actionId"),
-				actionType,
-				validatedArguments,
-				decodeActionProvenance(payload)
-		);
+		try {
+			JsonObject validatedArguments = ProtocolCodec.validateActionArguments(actionType, arguments);
+			return new ServerActionRequest(agentId, requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"), actionType, validatedArguments, decodeActionProvenance(payload));
+		} catch (ProtocolException exception) {
+			throw new BridgeProtocolException(exception.code(), exception.getMessage(), exception);
+		} catch (IllegalArgumentException exception) {
+			throw new BridgeProtocolException("INVALID_ACTION_REQUEST", exception.getMessage(), exception);
+		}
 	}
 
 	private static void requireActionCommandKeys(JsonObject payload) {
@@ -511,27 +511,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private boolean sendRejectedAction(BridgeEnvelope envelope, RuntimeException exception) {
 		JsonObject payload = envelope.payload();
-		if (!payload.has("goalRevision") || !payload.has("actionId") || !payload.has("actionType")
-				|| !payload.get("goalRevision").isJsonPrimitive() || !payload.get("goalRevision").getAsJsonPrimitive().isNumber()
-				|| !payload.get("actionId").isJsonPrimitive() || !payload.get("actionId").getAsJsonPrimitive().isString()
-				|| !payload.get("actionType").isJsonPrimitive() || !payload.get("actionType").getAsJsonPrimitive().isString()) return false;
-		long goalRevision = payload.get("goalRevision").getAsLong();
-		String actionId = payload.get("actionId").getAsString();
-		String actionType = payload.get("actionType").getAsString();
-		if (goalRevision < 0L || actionId.isBlank() || actionType.isBlank()) return false;
+		RejectionIdentity identity = rejectionIdentity(envelope);
+		if (identity == null) return false;
 		JsonObject result = new JsonObject();
-		result.addProperty("goalRevision", goalRevision);
-		result.addProperty("actionId", actionId);
-		result.addProperty("commandId", actionId);
-		result.addProperty("actionType", actionType);
+		result.addProperty("goalRevision", identity.goalRevision());
+		result.addProperty("actionId", identity.actionId());
+		result.addProperty("commandId", identity.actionId());
+		result.addProperty("actionType", identity.actionType());
 		result.addProperty("state", "FAILED");
 		result.addProperty("reasonCode", exception instanceof BridgeProtocolException protocol ? protocol.code() : ((AgentDomainException) exception).code());
 		result.addProperty("message", exception.getMessage() == null ? "Action rejected" : exception.getMessage());
 		result.addProperty("elapsedMs", 0L);
 		result.addProperty("observedAtEpochMs", System.currentTimeMillis());
-		send("action_result", envelope.agentId(), result);
+		send("action_result", identity.agentId(), result);
 		return true;
 	}
+
+	private static RejectionIdentity rejectionIdentity(BridgeEnvelope envelope) {
+		JsonObject payload = envelope.payload();
+		try {
+			AgentId.parse(envelope.agentId());
+			return new RejectionIdentity(envelope.agentId(), requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"), requiredString(payload, "actionType"));
+		} catch (RuntimeException exception) {
+			return null;
+		}
+	}
+
+	private record RejectionIdentity(String agentId, long goalRevision, String actionId, String actionType) { }
 
 	private void validateActionProvenance(ServerActionRequest request) {
 		AgentRecord record = manager.registry().require(request.agentId());
@@ -838,11 +844,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!object.has(field) || !object.get(field).isJsonPrimitive() || !object.get(field).getAsJsonPrimitive().isNumber()) {
 			throw new BridgeProtocolException("MISSING_FIELD", "provenance." + field);
 		}
-		double value = object.get(field).getAsDouble();
-		if (!Double.isFinite(value) || value != Math.rint(value) || value < 0.0D || value > ActionProvenance.MAX_SAFE_INTEGER) {
+		try {
+			long value = object.get(field).getAsBigDecimal().longValueExact();
+			if (value < 0L || value > ActionProvenance.MAX_SAFE_INTEGER) throw new ArithmeticException();
+			return value;
+		} catch (ArithmeticException exception) {
 			throw new BridgeProtocolException("INVALID_PROVENANCE", "provenance." + field + " must be a nonnegative safe integer");
 		}
-		return (long) value;
 	}
 
 	private final class Session implements AutoCloseable {

@@ -105,3 +105,19 @@ test('caps recursive compiler correction and reports exhaustion without a fallba
 	assert.equal(requests, 1);
 	assert.equal(errors.at(-1).code, 'ARENA_SCRIPT_COMPILER_EXHAUSTED');
 });
+
+test('bridge send rejection unwedges the active program with a stable failed result', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const errors = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => { throw Object.assign(new Error('queue full'), { code: 'AGENT_BACKPRESSURE' }); } },
+		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
+		reportError: (_id, error) => errors.push(error),
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(errors.at(-1).code, 'AGENT_BACKPRESSURE');
+	const snapshot = await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: false });
+	assert.equal(snapshot.activeActionId, null, 'failed send is terminally acknowledged instead of wedging the engine');
+});

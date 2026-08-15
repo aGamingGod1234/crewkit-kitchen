@@ -14,6 +14,7 @@ final class ProgramActionLedger {
 	private static final int MAX_TRACKED_ACTIONS_PER_AGENT = 4_096;
 	private final Map<AgentId, LinkedHashMap<String, ActionProvenance>> accepted = new HashMap<>();
 	private final Map<AgentId, LinkedHashMap<String, ActionProvenance>> terminal = new HashMap<>();
+	private final Map<AgentId, LinkedHashMap<ActionProvenance, String>> actionIdsByProgramStep = new HashMap<>();
 
 	synchronized void accept(ServerActionRequest request) {
 		ActionProvenance prior = lookup(accepted, request.agentId(), request.actionId());
@@ -24,6 +25,11 @@ final class ProgramActionLedger {
 			}
 			throw new AgentDomainException("ACTION_REPLAY", "Action ID has already been accepted");
 		}
+		LinkedHashMap<ActionProvenance, String> actionIds = actionIdsByProgramStep.computeIfAbsent(request.agentId(), ignored -> new LinkedHashMap<>());
+		String priorActionId = actionIds.get(request.provenance());
+		if (priorActionId != null) throw new AgentDomainException("ACTION_REPLAY", "Program step is already bound to action ID " + priorActionId);
+		actionIds.put(request.provenance(), request.actionId());
+		trim(actionIds);
 		LinkedHashMap<String, ActionProvenance> entries = accepted.computeIfAbsent(request.agentId(), ignored -> new LinkedHashMap<>());
 		entries.put(request.actionId(), request.provenance());
 		trim(entries);
@@ -42,6 +48,7 @@ final class ProgramActionLedger {
 	synchronized void remove(AgentId agentId) {
 		accepted.remove(agentId);
 		terminal.remove(agentId);
+		actionIdsByProgramStep.remove(agentId);
 	}
 
 	private static ActionProvenance lookup(Map<AgentId, LinkedHashMap<String, ActionProvenance>> entries, AgentId agentId, String actionId) {
@@ -49,7 +56,7 @@ final class ProgramActionLedger {
 		return perAgent == null ? null : perAgent.get(actionId);
 	}
 
-	private static void trim(LinkedHashMap<String, ActionProvenance> entries) {
+	private static void trim(LinkedHashMap<?, ?> entries) {
 		while (entries.size() > MAX_TRACKED_ACTIONS_PER_AGENT) entries.remove(entries.keySet().iterator().next());
 	}
 }

@@ -20,12 +20,13 @@ public final class ProgramActionLedgerVerification {
 		ServerActionRequest first = request(agent, "action-1", provenance);
 		ledger.accept(first);
 		expectFailure(() -> ledger.accept(first), "ACTION_REPLAY");
+		expectFailure(() -> ledger.accept(request(agent, "action-2", provenance)), "ACTION_REPLAY");
 		expectFailure(() -> ledger.accept(request(agent, "action-1", provenance("program-2", 1L, "step-1", 4L))), "ACTION_PROVENANCE_MISMATCH");
 		ledger.terminal(new ServerActionResult(agent, 7L, "action-1", ActionType.WAIT, ServerActionState.FAILED, "REJECTED", "Rejected", 0L, 1L));
 		expectFailure(() -> ledger.accept(first), "ACTION_REPLAY");
 		ledger.remove(agent);
 		ledger.accept(first);
-		return 5;
+		return 6;
 	}
 
 	private static ServerActionRequest request(AgentId agent, String actionId, ActionProvenance provenance) {

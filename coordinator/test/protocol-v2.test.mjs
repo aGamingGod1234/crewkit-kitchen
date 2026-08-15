@@ -84,6 +84,17 @@ test('protocol v2 requires immutable provenance on every action command form', (
 		(error) => error.code === 'INVALID_FIELD',
 		'custom/inherited provenance objects are rejected',
 	);
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, arguments: { durationMs: 25, type: 'fight_target' } }),
+		(error) => error.code === 'INVALID_PAYLOAD_FIELD',
+		'arguments cannot override the outer action type',
+	);
+	const sparse = []; sparse.length = 1;
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, arguments: { durationMs: 25, extra: sparse } }),
+		(error) => error.code === 'INVALID_PAYLOAD' || error.code === 'INVALID_ACTION',
+		'sparse/custom arrays are rejected before schema normalization',
+	);
 });
 
 function registeredRecord(agentId = 'agent-a') {

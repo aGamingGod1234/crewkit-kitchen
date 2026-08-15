@@ -55,7 +55,12 @@ public final class BridgeEnvelopeCodecVerification {
 		expectFailure(() -> MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
 				2, "server-instance", "00000000-0000-0000-0000-000000000001", "action_command", "message-5", coercionPayload
 		)), "INVALID_FIELD");
-		return 16;
+		JsonObject fractionalProvenance = actionPayload("wait-5", ActionType.WAIT.wireName(), waitArguments);
+		fractionalProvenance.getAsJsonObject("provenance").addProperty("programVersion", 1.5D);
+		expectFailure(() -> MultiplexedServerBridge.decodeActionRequest(new BridgeEnvelope(
+				2, "server-instance", "00000000-0000-0000-0000-000000000001", "action_command", "message-6", fractionalProvenance
+		)), "INVALID_PROVENANCE");
+		return 17;
 	}
 
 	private static JsonObject actionPayload(String actionId, String type, JsonObject arguments) {

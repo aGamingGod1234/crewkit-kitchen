@@ -252,14 +252,32 @@ export class ProgramRuntimeManager {
 		if (state.disposed) return;
 		const record = this.#registry.get(state.agentId);
 		if (record === null || record.goalRevision !== state.goalRevision) return;
+		let actionId = null;
 		try {
 			this.#ensureActing(record);
-			const actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
+			actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
 			state.actionIds.set(actionId, command.actionId);
 			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command));
 		} catch (error) {
+			if (actionId !== null) this.#rejectDispatchedAction(state, record, actionId, command.actionId, error);
 			this.#reportError(state.agentId, error);
 		}
+	}
+
+	#rejectDispatchedAction(state, record, externalActionId, internalActionId, error) {
+		if (state.disposed || state.actionIds.get(externalActionId) !== internalActionId) return;
+		const active = state.engine.snapshot().activeActionId;
+		if (active !== internalActionId) return;
+		const eventSequence = this.#eventSequence(state);
+		state.actionIds.delete(externalActionId);
+		state.engine.ingestActionResult({
+			actionId: internalActionId,
+			state: 'FAILED',
+			reasonCode: stableFailureCode(error),
+			eventSequence,
+		});
+		if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
+		this.#syncState(record, state);
 	}
 
 	async #cancel(state, actionId) {
@@ -328,4 +346,10 @@ function sameEngineRequest(snapshot, context) { return snapshot.programId === co
 
 function codedError(code, message) {
 	return Object.assign(new Error(message), { code });
+}
+
+function stableFailureCode(error) {
+	return typeof error?.code === 'string' && /^[A-Z0-9_]{1,128}$/.test(error.code)
+		? error.code
+		: 'BRIDGE_SEND_REJECTED';
 }
