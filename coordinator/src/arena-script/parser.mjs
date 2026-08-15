@@ -36,11 +36,16 @@ const SPECIAL_PROGRAM_MEMBER_PATHS = [
 	['program', 'onUnhandledAttention'],
 	['program', 'repeatUntil'],
 	['program', 'watch'],
+	['program', 'checkpoint'],
+	['program', 'finish'],
 ];
 const APPROVED_API_CALL_PATHS = new Set([
 	'program.onUnhandledAttention',
 	'program.repeatUntil',
 	'program.watch',
+	'program.checkpoint',
+	'program.finish',
+	'player.moveTo',
 	'player.state',
 	'player.wait',
 	'inventory.countTag',

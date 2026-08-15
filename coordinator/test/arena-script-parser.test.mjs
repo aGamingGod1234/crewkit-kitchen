@@ -21,6 +21,22 @@ test('compiles a bounded program and records its model-owned policy', () => {
 	assert.ok(Object.isFrozen(compiled.stepLocations));
 });
 
+test('admits the exact Task 2 direct action and terminal API calls', () => {
+	assert.doesNotThrow(() => parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		const moved = await tryResult(player.moveTo({ x: 4, y: 64, z: 2 }));
+		if (!moved.succeeded) program.checkpoint(moved.reason);
+		program.finish("arrived");
+	`));
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); const move = player.moveTo; await move({ x: 1, y: 2, z: 3 });',
+		'program.onUnhandledAttention("continue_and_notify"); const finish = program.finish; finish("escaped");',
+		'program.onUnhandledAttention("continue_and_notify"); const checkpoint = program.checkpoint; checkpoint("escaped");',
+	]) {
+		assert.throws(() => parseArenaScript(source), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+	}
+});
+
 test('accepts model-authored locals, conditionals, bounded for loops, and watchers', () => {
 	const compiled = parseArenaScript(`
 		program.onUnhandledAttention("pause_and_notify");

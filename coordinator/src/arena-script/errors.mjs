@@ -6,3 +6,7 @@ export class ArenaScriptError extends Error {
 		this.location = location;
 	}
 }
+
+export function executionError(code, message = `ArenaScript ${code}`, location = null, options = undefined) {
+	return new ArenaScriptError(code, message, location, options);
+}
