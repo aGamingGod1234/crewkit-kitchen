@@ -1,8 +1,10 @@
 import { AcpProtocolError, AcpStdioTransport, buildAcpLaunch } from './acp-transport.mjs';
 import { parseDecision } from './decision-parser.mjs';
+import { discoverKimiCatalog } from './provider-catalog-discovery.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
+const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft AI Agents', version: '2.1.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ fs: { readTextFile: false, writeTextFile: false }, terminal: false });
 
@@ -22,7 +24,10 @@ export class AcpProviderService {
 		if (this.#workspaceManager !== null && typeof this.#workspaceManager.prepare !== 'function') {
 			throw new TypeError('workspaceManager must expose prepare(provider, agentId)');
 		}
-		this.catalog = new StaticAcpCatalog(this.#config);
+		this.catalog = new AcpCatalog(this.#config, {
+			discover: dependencies.discoverCatalog ?? discoverKimiCatalog,
+			execFile: dependencies.execFile,
+		});
 	}
 
 	async start() {}
@@ -30,6 +35,7 @@ export class AcpProviderService {
 	getAgent(agentId) { return this.#agents.get(agentId) ?? null; }
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
+		await this.catalog.refresh();
 		const profile = validateProfile(profileValue, this.#config);
 		const existing = this.#agents.get(profile.agentId);
 		if (existing !== undefined) {
@@ -74,6 +80,7 @@ export class AcpProviderService {
 
 	async reconcile(records) {
 		if (!Array.isArray(records)) throw new TypeError(`${this.#config.provider} reconciliation records must be an array`);
+		await this.catalog.refresh();
 		const desiredIds = new Set(records.map((record) => record.agentId));
 		const removed = [];
 		for (const agentId of this.#agents.keys()) if (!desiredIds.has(agentId)) { await this.removeAgent(agentId); removed.push(agentId); }
@@ -126,19 +133,28 @@ class AcpAgent {
 	}
 
 	async #applyConfig(configOptions) {
+		let currentOptions = configOptions;
 		if (this.#profile.model !== 'auto') {
-			const model = findOption(configOptions, 'model');
+			const model = findOption(currentOptions, 'model');
 			assertOptionValue(model, this.#profile.model, 'UNSUPPORTED_MODEL', `${this.provider} model`);
-			if (model.currentValue !== this.#profile.model) await this.#setConfig(model.id, this.#profile.model);
+			if (model.currentValue !== this.#profile.model) {
+				currentOptions = await this.#setConfig(model.id, this.#profile.model, currentOptions);
+			}
 		}
-		const thinking = findOption(configOptions, 'thought_level');
+		const thinking = findOption(currentOptions, 'thought_level', { optional: this.provider === 'kimi' });
+		if (thinking === null) return;
 		const requested = this.#profile.reasoningEffort;
+		if (this.provider === 'kimi' && isBooleanThinkingOption(thinking)) {
+			if (thinking.currentValue !== 'on') await this.#setConfig(thinking.id, 'on', currentOptions);
+			return;
+		}
 		assertOptionValue(thinking, requested, 'UNSUPPORTED_THINKING', `${this.provider} thinking`);
-		if (thinking.currentValue !== requested) await this.#setConfig(thinking.id, requested);
+		if (thinking.currentValue !== requested) await this.#setConfig(thinking.id, requested, currentOptions);
 	}
 
-	async #setConfig(configId, value) {
-		await this.#transport.request('session/set_config_option', { sessionId: this.#sessionId, configId, value });
+	async #setConfig(configId, value, fallbackOptions) {
+		const response = await this.#transport.request('session/set_config_option', { sessionId: this.#sessionId, configId, value });
+		return Array.isArray(response?.configOptions) ? response.configOptions : fallbackOptions;
 	}
 
 	async setGoalRevision(revision) {
@@ -196,19 +212,62 @@ function decisionExcerpt(value) {
 	return JSON.stringify(String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 512));
 }
 
-class StaticAcpCatalog {
-	constructor(config) { this.config = config; this.stale = false; }
-	async refresh() {
-		return {
-			provider: this.config.provider,
+class AcpCatalog {
+	#config;
+	#dependencies;
+	#snapshot = null;
+
+	constructor(config, dependencies) {
+		this.#config = config;
+		this.#dependencies = dependencies;
+		this.stale = config.catalogDiscovery === true;
+	}
+
+	async refresh({ force = false } = {}) {
+		if (!force && !this.stale && this.#snapshot !== null) return structuredClone(this.#snapshot);
+		let models = null;
+		let discoveryFailed = false;
+		if (this.#config.catalogDiscovery === true && this.#config.provider === 'kimi') {
+			try {
+				models = await this.#dependencies.discover({
+					executable: this.#config.executable ?? 'kimi',
+					execFile: this.#dependencies.execFile,
+					timeoutMs: this.#config.catalogDiscoveryTimeoutMs,
+				});
+			} catch {
+				discoveryFailed = true;
+				if (this.#snapshot !== null) {
+					this.stale = true;
+					return structuredClone(this.#snapshot);
+				}
+			}
+		}
+		if (!Array.isArray(models) || models.length === 0) models = configuredModels(this.#config);
+		this.#config.models = models.map((model) => model.id);
+		this.#config.modelReasoningEfforts = Object.fromEntries(models.map((model) => [model.id, [...model.reasoningEfforts]]));
+		this.#snapshot = {
+			provider: this.#config.provider,
 			refreshedAtEpochMs: Date.now(),
-			models: this.config.models.map((id) => ({ id, model: id, displayName: id, reasoningEfforts: [...this.config.modelReasoningEfforts[id]], serviceTiers: [] })),
+			models: models.map((model) => ({ ...model, reasoningEfforts: [...model.reasoningEfforts], serviceTiers: [...(model.serviceTiers ?? [])] })),
 		};
+		this.stale = discoveryFailed;
+		return structuredClone(this.#snapshot);
 	}
+
 	assertSupported(model, reasoningEffort) {
-		if (!this.config.models.includes(model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `${this.config.provider} model '${model}' is not configured`);
-		if (!this.config.modelReasoningEfforts[model]?.includes(reasoningEffort)) throw new AcpProtocolError('UNSUPPORTED_THINKING', `${this.config.provider} model '${model}' does not support thinking '${reasoningEffort}'`);
+		if (!this.#config.models.includes(model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `${this.#config.provider} model '${model}' is not configured`);
+		if (!this.#config.modelReasoningEfforts[model]?.includes(reasoningEffort)) throw new AcpProtocolError('UNSUPPORTED_THINKING', `${this.#config.provider} model '${model}' does not support thinking '${reasoningEffort}'`);
 	}
+}
+
+function configuredModels(config) {
+	return config.models.map((id) => ({
+		id,
+		model: id,
+		displayName: id,
+		reasoningEfforts: [...config.modelReasoningEfforts[id]],
+		serviceTiers: [],
+	}));
 }
 
 function validateServiceConfig(config) {
@@ -228,6 +287,8 @@ function validateServiceConfig(config) {
 		models,
 		reasoningEfforts,
 		modelReasoningEfforts: Object.fromEntries(models.map((model) => [model, requireStringArray(configuredEfforts[model] ?? reasoningEfforts, `modelReasoningEfforts.${model}`)])),
+		catalogDiscovery: config.catalogDiscovery === true,
+		catalogDiscoveryTimeoutMs: positiveInteger(config.catalogDiscoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS, 'catalogDiscoveryTimeoutMs'),
 		planningTimeoutMs: positiveInteger(config.planningTimeoutMs ?? DEFAULT_PLANNING_TIMEOUT_MS, 'planningTimeoutMs'),
 	};
 }
@@ -241,7 +302,10 @@ function validateProfile(value, config) {
 		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
 	};
 	if (profile.provider !== config.provider) throw new AcpProtocolError('PROVIDER_MISMATCH', `Expected ${config.provider} profile, received ${profile.provider}`);
-	new StaticAcpCatalog(config).assertSupported(profile.model, profile.reasoningEffort);
+	if (!config.models.includes(profile.model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `${config.provider} model '${profile.model}' is not configured`);
+	if (!config.modelReasoningEfforts[profile.model]?.includes(profile.reasoningEffort)) {
+		throw new AcpProtocolError('UNSUPPORTED_THINKING', `${config.provider} model '${profile.model}' does not support thinking '${profile.reasoningEffort}'`);
+	}
 	return profile;
 }
 
@@ -249,9 +313,10 @@ function profilesMatch(left, right) {
 	return ['agentId', 'provider', 'model', 'reasoningEffort'].every((key) => left[key] === right[key]);
 }
 
-function findOption(options, category) {
+function findOption(options, category, { optional = false } = {}) {
 	if (!Array.isArray(options)) throw new AcpProtocolError('INVALID_CONFIG_OPTIONS', 'ACP configOptions must be an array');
 	const option = options.find((entry) => entry?.category === category || entry?.id === (category === 'thought_level' ? 'thinking' : category));
+	if (option === undefined && optional) return null;
 	if (option === undefined) throw new AcpProtocolError(category === 'model' ? 'UNSUPPORTED_MODEL' : 'UNSUPPORTED_THINKING', `ACP session did not expose a ${category} configuration option`);
 	return option;
 }
@@ -259,6 +324,13 @@ function findOption(options, category) {
 function assertOptionValue(option, value, code, label) {
 	const values = Array.isArray(option.options) ? option.options.map((entry) => typeof entry === 'string' ? entry : entry?.value) : [];
 	if (!values.includes(value)) throw new AcpProtocolError(code, `${label} '${value}' is not supported by this ACP session`);
+}
+
+function isBooleanThinkingOption(option) {
+	const values = Array.isArray(option.options)
+		? option.options.map((entry) => typeof entry === 'string' ? entry : entry?.value).filter((value) => typeof value === 'string')
+		: [];
+	return values.length > 0 && values.every((value) => ['on', 'off'].includes(value));
 }
 
 function requireStringArray(value, field) { if (!Array.isArray(value) || value.length === 0) throw new TypeError(`${field} must be a nonempty array`); return [...new Set(value.map((entry) => requireText(entry, field)))]; }

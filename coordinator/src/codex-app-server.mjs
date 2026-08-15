@@ -11,6 +11,7 @@ import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 const APP_SERVER_MAX_LINE_BYTES = 4 * 1_024 * 1_024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
+const MAX_TIMED_OUT_REQUEST_IDS = 1_024;
 const PROFILE_VALUE_PATTERN = /^[A-Za-z0-9._-]+$/;
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Arena Agents', version: '1.0.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
@@ -55,6 +56,7 @@ export class CodexStdioTransport extends EventEmitter {
 	#decoder = null;
 	#requestId = 0;
 	#pending = new Map();
+	#timedOutRequestIds = new Set();
 	#stopTimeoutMs;
 
 	constructor(config, dependencies = {}) {
@@ -98,8 +100,8 @@ export class CodexStdioTransport extends EventEmitter {
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.#pending.delete(id);
+				this.#rememberTimedOutRequest(id);
 				reject(new CodexProtocolError('REQUEST_TIMEOUT', `Codex request '${method}' timed out after ${timeoutMs} ms`));
-				void this.stop().catch((error) => this.emit('protocolError', error));
 			}, timeoutMs);
 			this.#pending.set(id, { method, resolve, reject, timer });
 			try {
@@ -139,6 +141,7 @@ export class CodexStdioTransport extends EventEmitter {
 		if (Object.hasOwn(message, 'id')) {
 			const pending = this.#pending.get(message.id);
 			if (pending === undefined) {
+				if (this.#timedOutRequestIds.delete(message.id)) return;
 				this.emit('protocolError', new CodexProtocolError('UNKNOWN_RESPONSE_ID', `Codex response used unknown id '${String(message.id)}'`));
 				return;
 			}
@@ -177,6 +180,12 @@ export class CodexStdioTransport extends EventEmitter {
 		if (this.#requestId === Number.MAX_SAFE_INTEGER) throw new CodexProtocolError('REQUEST_ID_EXHAUSTED', 'Codex request ID sequence is exhausted');
 		this.#requestId += 1;
 		return this.#requestId;
+	}
+
+	#rememberTimedOutRequest(id) {
+		this.#timedOutRequestIds.add(id);
+		if (this.#timedOutRequestIds.size <= MAX_TIMED_OUT_REQUEST_IDS) return;
+		this.#timedOutRequestIds.delete(this.#timedOutRequestIds.values().next().value);
 	}
 
 	#rejectPending(error) {
@@ -298,17 +307,19 @@ export class CodexAgent {
 	#collectTurn() {
 		let expectedTurnId = null;
 		let lastMessage = null;
+		let streamedMessage = '';
 		let resolvePromise;
 		let rejectPromise;
 		const promise = new Promise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
 		const onNotification = ({ method, params }) => {
 			if (params?.threadId !== this.#threadId) return;
 			if (expectedTurnId !== null && turnIdOf(method, params) !== expectedTurnId) return;
+			if (method === 'item/agentMessage/delta' && typeof params?.delta === 'string') streamedMessage += params.delta;
 			if (method === 'item/completed' && params.item?.type === 'agentMessage' && typeof params.item.text === 'string') lastMessage = params.item.text;
 			if (method === 'turn/completed') {
 				if (params.turn?.status !== 'completed') rejectPromise(new CodexProtocolError('TURN_FAILED', `Codex turn ended with status '${String(params.turn?.status)}'`));
-				else if (lastMessage === null) rejectPromise(new CodexProtocolError('MISSING_FINAL_MESSAGE', 'Codex turn completed without an agent message'));
-				else resolvePromise(lastMessage);
+				else if (lastMessage === null && streamedMessage.length === 0) rejectPromise(new CodexProtocolError('MISSING_FINAL_MESSAGE', 'Codex turn completed without an agent message'));
+				else resolvePromise(lastMessage ?? streamedMessage);
 			}
 		};
 		this.#transport.on('notification', onNotification);

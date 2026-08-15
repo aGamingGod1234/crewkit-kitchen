@@ -5,6 +5,8 @@ import { ModelCatalogCache } from './model-catalog-cache.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
+const THREAD_START_TIMEOUT_MS = 60_000;
+const MAX_BUFFERED_TURN_NOTIFICATIONS = 4_096;
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Codex Agents', version: '2.0.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
 
@@ -77,7 +79,7 @@ export class CodexService {
 			ephemeral: true,
 			baseInstructions: PLANNER_SYSTEM_PROMPT,
 			developerInstructions: recoveryInstructions(recoverySummary),
-		});
+		}, { timeoutMs: THREAD_START_TIMEOUT_MS });
 		const threadId = requireNestedId(response, 'thread', 'thread/start');
 		const agent = new SharedCodexAgent(profile, threadId, this.#transport, {
 			planningTimeoutMs: this.#config.planningTimeoutMs,
@@ -202,12 +204,29 @@ export class SharedCodexAgent {
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new CodexProtocolError('TURN_INTERRUPTED', 'Planning turn was interrupted');
 		const collector = createTurnCollector(this.#transport, this.#threadId);
-		const active = { goalRevision, turnId: null, collector };
+		void collector.promise.catch(() => { /* observed immediately; the decision awaits the original promise after turn/start */ });
+		let lifecycleSettled = false;
+		let rejectLifecycle;
+		const lifecyclePromise = new Promise((_, reject) => { rejectLifecycle = reject; });
+		const active = {
+			goalRevision,
+			turnId: null,
+			collector,
+			lifecyclePromise,
+			cancel(error) {
+				if (lifecycleSettled) return;
+				lifecycleSettled = true;
+				rejectLifecycle(error);
+			},
+		};
 		this.#active = active;
-		const abort = () => { void this.interrupt(); };
+		const abort = () => {
+			active.cancel(new CodexProtocolError('STALE_PLAN', 'Codex turn was aborted'));
+			void this.interrupt().catch(() => { /* stale abort races are handled by the decision's signal check */ });
+		};
 		signal?.addEventListener('abort', abort, { once: true });
 		try {
-			const response = await this.#transport.request('turn/start', {
+			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
 				input: [{ type: 'text', text: input }],
 				model: this.#profile.model,
@@ -216,14 +235,27 @@ export class SharedCodexAgent {
 				approvalPolicy: 'never',
 				environments: [],
 				outputSchema: PLANNER_OUTPUT_SCHEMA,
-			});
+			}, { timeoutMs: this.#planningTimeoutMs });
+			void turnStartPromise.then((response) => {
+				const turnId = response?.turn?.id;
+				if (typeof turnId !== 'string' || (this.#active === active && !lifecycleSettled && !signal?.aborted && !this.#disposed)) return;
+				if (this.#active === active && (active.turnId === null || active.turnId === undefined)) {
+					active.turnId = turnId;
+					void this.interrupt().catch(() => { /* late turn cleanup is best effort */ });
+					return;
+				}
+				void this.#transport.request('turn/interrupt', { threadId: this.#threadId, turnId }).catch(() => { /* late turn cleanup is best effort */ });
+			}, () => { /* the awaited race reports the request failure */ });
+			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			active.turnId = requireNestedId(response, 'turn', 'turn/start');
 			collector.setTurnId(active.turnId);
-			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) {
-				await this.#transport.request('turn/interrupt', { threadId: this.#threadId, turnId: active.turnId });
+			if (this.#active !== active || this.#goalRevision !== goalRevision || lifecycleSettled || signal?.aborted) {
+				try { await this.interrupt(); } catch (error) {
+					if (!signal?.aborted && !this.#disposed) throw error;
+				}
 				throw new CodexProtocolError('STALE_PLAN', 'Codex turn started after its goal revision became obsolete');
 			}
-			const text = await withTimeout(collector.promise, this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
+			const text = await withTimeout(Promise.race([collector.promise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex result belongs to an obsolete goal revision');
 			return parseDecision(text);
 		} catch (error) {
@@ -240,6 +272,7 @@ export class SharedCodexAgent {
 
 	async interrupt() {
 		const active = this.#active;
+		active?.cancel(new CodexProtocolError('STALE_PLAN', 'Codex turn was interrupted'));
 		if (active?.turnId === null || active?.turnId === undefined) return;
 		active.interruptPromise ??= this.#transport.request('turn/interrupt', {
 			threadId: this.#threadId,
@@ -251,6 +284,8 @@ export class SharedCodexAgent {
 	async dispose() {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		const active = this.#active;
+		active?.cancel(new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`));
 		try { await this.interrupt(); } finally {
 			this.#active?.collector.dispose();
 			this.#active = null;
@@ -261,26 +296,54 @@ export class SharedCodexAgent {
 function createTurnCollector(transport, threadId) {
 	let expectedTurnId = null;
 	let lastMessage = null;
+	let streamedMessage = '';
+	let bufferedNotifications = [];
 	let resolvePromise;
 	let rejectPromise;
 	const promise = new Promise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
-	const onNotification = ({ method, params }) => {
-		if (params?.threadId !== threadId) return;
-		const turnId = params?.turnId ?? params?.turn?.id ?? null;
-		if (expectedTurnId !== null && turnId !== null && turnId !== expectedTurnId) return;
+	const acceptNotification = ({ method, params }) => {
+		const turnId = notificationTurnId(params);
+		if (turnId !== null && turnId !== expectedTurnId) return;
+		if (method === 'item/agentMessage/delta' && typeof params?.delta === 'string') streamedMessage += params.delta;
 		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') lastMessage = params.item.text;
 		if (method === 'turn/completed') {
 			if (params?.turn?.status === 'failed') rejectPromise(new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex turn failed'));
-			else if (lastMessage === null) rejectPromise(new CodexProtocolError('MISSING_AGENT_MESSAGE', 'Codex turn completed without an agent message'));
-			else resolvePromise(lastMessage);
+			else if (lastMessage === null && streamedMessage.length === 0) rejectPromise(new CodexProtocolError('MISSING_AGENT_MESSAGE', 'Codex turn completed without an agent message'));
+			else resolvePromise(lastMessage ?? streamedMessage);
 		}
+	};
+	const onNotification = (notification) => {
+		const { params } = notification;
+		if (params?.threadId !== threadId) return;
+		if (expectedTurnId === null) {
+			if (notificationTurnId(params) === null) return;
+			if (bufferedNotifications.length >= MAX_BUFFERED_TURN_NOTIFICATIONS) {
+				rejectPromise(new CodexProtocolError('TURN_NOTIFICATION_OVERFLOW', 'Too many Codex notifications arrived before turn/start completed'));
+				return;
+			}
+			bufferedNotifications.push(notification);
+			return;
+		}
+		acceptNotification(notification);
 	};
 	transport.on('notification', onNotification);
 	return {
 		promise,
-		setTurnId(value) { expectedTurnId = value; },
-		dispose() { transport.off('notification', onNotification); },
+		setTurnId(value) {
+			expectedTurnId = value;
+			const buffered = bufferedNotifications;
+			bufferedNotifications = [];
+			for (const notification of buffered) acceptNotification(notification);
+		},
+		dispose() {
+			bufferedNotifications = [];
+			transport.off('notification', onNotification);
+		},
 	};
+}
+
+function notificationTurnId(params) {
+	return params?.turnId ?? params?.turn?.id ?? null;
 }
 
 function withTimeout(promise, timeoutMs, schedule, cancelSchedule) {
