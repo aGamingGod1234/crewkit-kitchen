@@ -489,3 +489,24 @@ test('results must be nonnegative and cannot predate the exact action dispatch s
 	assert.equal(engine.snapshot().eventSequence, 3);
 	assert.equal(engine.snapshot().factsSequence, 3);
 });
+
+test('an exact request failure never resumes a pause-and-notify program', () => {
+	const { engine, dispatched, modelRequests } = engineFor('program.onUnhandledAttention("pause_and_notify"); await player.wait(1); await player.wait(2);');
+	const first = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: first.actionId, state: 'CANCELLED', reasonCode: 'ATTENTION', eventSequence: 2 });
+	engine.failDirectiveRequest(modelRequests[0]);
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1]);
+});
+
+test('an exact failed request promotes only its newer coalesced attention', () => {
+	const { engine, modelRequests } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: true });
+	engine.failDirectiveRequest(modelRequests[0]);
+	assert.equal(modelRequests.length, 2);
+	assert.equal(modelRequests[1].eventSequence, 3);
+	engine.failDirectiveRequest(modelRequests[0]);
+	assert.equal(modelRequests.length, 2);
+});

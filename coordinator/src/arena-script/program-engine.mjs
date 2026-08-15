@@ -117,6 +117,20 @@ export class ArenaScriptEngine {
 		return this.snapshot();
 	}
 
+	/** Releases only this exact model request without applying a gameplay directive. */
+	failDirectiveRequest(request = {}) {
+		if (!this.#pendingRequest || !sameRequest(request, this.#pendingRequest)) return this.snapshot();
+		const newest = this.#coalescedRequest;
+		this.#pendingRequest = null;
+		this.#coalescedRequest = null;
+		this.#requestUpdate = null;
+		if (newest && !sameRequest(newest, request)) {
+			this.#pendingRequest = newest;
+			this.#callbacks.requestModel(newest);
+		}
+		return this.snapshot();
+	}
+
 	suspend(reason = 'suspended') {
 		this.#invalidateLifecycleRequests();
 		if (!this.#isLive()) return this.snapshot();

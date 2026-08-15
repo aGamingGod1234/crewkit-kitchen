@@ -22,8 +22,8 @@ export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) 
 		const minecraft = new FakeMinecraftBridge(profile.agentId);
 		await minecraft.start();
 		const outputs = [
-			JSON.stringify({ summary: 'Take one step.', goalStatus: 'in_progress', action: { type: 'wait', durationMs: 25 } }),
-			JSON.stringify({ summary: 'Goal complete.', goalStatus: 'completed', action: { type: 'complete_goal', summary: 'Entered arena.' } }),
+			JSON.stringify({ summary: 'Take one step.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);' }),
+			JSON.stringify({ summary: 'Goal complete.', directive: 'finish', status: 'completed' }),
 		];
 		if (malformedFirstAgent === profile.agentId) outputs.unshift('malformed planner output');
 		const codexServer = new FakeCodexServer(profile, outputs);
