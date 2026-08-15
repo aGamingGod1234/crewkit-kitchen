@@ -191,6 +191,7 @@ function visit(node, state, context) {
 			visit(node.declarations, state, { ...context, topLevelExpression: false });
 			return;
 		case 'VariableDeclarator':
+			validateBindingPattern(node.id);
 			visit(node.id, state, { ...context, binding: true, topLevelExpression: false });
 			visit(node.init, state, { ...context, topLevelExpression: false });
 			return;
@@ -223,13 +224,12 @@ function visit(node, state, context) {
 			if (node.generator) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'generator functions are not allowed', node);
 			}
-			if (node.type === 'FunctionDeclaration' && node.id) {
-				visit(node.id, state, { ...context, binding: true, topLevelExpression: false });
-			}
-			if (node.type === 'FunctionExpression' && node.id) {
+			if (node.id) {
+				validateBindingPattern(node.id);
 				visit(node.id, state, { ...context, binding: true, topLevelExpression: false });
 			}
 			for (const parameter of node.params) {
+				validateBindingPattern(parameter);
 				visit(parameter, state, { ...context, binding: true, topLevelExpression: false });
 			}
 			const functionBinding = state.functionBindingsByNode.get(node) ?? context.functionBinding;
@@ -242,6 +242,9 @@ function visit(node, state, context) {
 			return;
 		}
 		case 'IfStatement':
+			if (node.consequent?.type === 'FunctionDeclaration' || node.alternate?.type === 'FunctionDeclaration') {
+				throw arenaError('UNSUPPORTED_SYNTAX', 'blockless conditional function declarations are not allowed', node);
+			}
 			visit(node.test, state, { ...context, topLevelExpression: false });
 			visit(node.consequent, state, { ...context, topLevelExpression: false });
 			visit(node.alternate, state, { ...context, topLevelExpression: false });
@@ -560,6 +563,21 @@ function resolveBinding(scope, name) {
 function rejectReservedBinding(name, node) {
 	if (RESERVED_CAPABILITY_NAMES.has(name)) {
 		throw arenaError('UNSUPPORTED_SYNTAX', `reserved Arena capability name ${name} cannot be shadowed`, node);
+	}
+}
+
+function validateBindingPattern(pattern) {
+	if (!pattern || typeof pattern !== 'object') return;
+	if (pattern.type === 'Identifier') {
+		rejectReservedBinding(pattern.name, pattern);
+		return;
+	}
+	for (const value of Object.values(pattern)) {
+		if (Array.isArray(value)) {
+			for (const child of value) validateBindingPattern(child);
+		} else if (value && typeof value === 'object' && typeof value.type === 'string') {
+			validateBindingPattern(value);
+		}
 	}
 }
 

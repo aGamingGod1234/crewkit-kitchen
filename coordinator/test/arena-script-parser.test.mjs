@@ -301,3 +301,38 @@ test('rejects supplied reserved-name shadowing escapes', () => {
 		);
 	}
 });
+
+test('rejects every reserved capability name at every supported binding site', () => {
+	assert.throws(
+		() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); for (let player=0; player<1; player++){ player.wait(1); }'),
+		(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+	);
+	for (const name of ['program', 'player', 'world', 'inventory', 'tryResult', 'undefined', 'NaN', 'Infinity']) {
+		for (const source of [
+			`program.onUnhandledAttention("continue_and_notify"); const ${name} = 0;`,
+			`program.onUnhandledAttention("continue_and_notify"); for (let ${name} = 0; ${name} < 1; ${name} += 1) {}`,
+			`program.onUnhandledAttention("continue_and_notify"); function ${name}() {}`,
+			`program.onUnhandledAttention("continue_and_notify"); const task = function ${name}() {};`,
+			`program.onUnhandledAttention("continue_and_notify"); function task(${name}) {}`,
+			`program.onUnhandledAttention("continue_and_notify"); const task = (${name}) => {};`,
+		]) {
+			assert.throws(
+				() => parseArenaScript(source),
+				(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+			);
+		}
+	}
+});
+
+test('rejects Annex-B blockless conditional function declarations', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); if (true) function local() {}',
+		'program.onUnhandledAttention("continue_and_notify"); if (true) function tryResult() { tryResult(); } tryResult();',
+		'if (true) function program() {} program.onUnhandledAttention("continue_and_notify");',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+		);
+	}
+});
