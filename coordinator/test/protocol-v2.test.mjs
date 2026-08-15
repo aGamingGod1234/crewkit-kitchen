@@ -5,6 +5,11 @@ import test from 'node:test';
 import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const SECRET = 's'.repeat(32);
+const DESIRED_OAK_STAIRS_STATE = 'minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]';
+const PROVENANCE = Object.freeze({
+	provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+	programId: 'program-1-1', programVersion: 1, sourceStepId: 'step-80-126', eventSequence: 4,
+});
 
 class FakeSocket extends EventEmitter {
 	writes = [];
@@ -54,12 +59,28 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 	}), /field/i);
 });
 
+test('protocol v2 requires immutable provenance on every action command form', () => {
+	const payload = {
+		goalRevision: 1, actionId: 'action-1', summary: 'Wait.', goalStatus: 'in_progress',
+		action: { type: 'wait', durationMs: 25 }, provenance: PROVENANCE,
+	};
+	const normalized = validateProtocolV2Payload('action_command', payload);
+	assert.deepEqual(normalized.provenance, PROVENANCE);
+	assert.throws(() => { normalized.provenance.programId = 'forged'; }, TypeError);
+	assert.equal(PROVENANCE.programId, 'program-1-1');
+	assert.throws(() => validateProtocolV2Payload('action_command', { ...payload, provenance: undefined }), /provenance/);
+	assert.throws(() => validateProtocolV2Payload('action_command', {
+		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 },
+	}), /provenance/);
+});
+
 function registeredRecord(agentId = 'agent-a') {
 	return {
 		schemaVersion: 1,
 		agentId,
 		model: 'gpt-5.6-sol',
 		reasoningEffort: 'high',
+		serviceTier: 'fast',
 		gameMode: 'survival',
 		skinVariant: 'teal',
 		state: 'IDLE',
@@ -107,12 +128,10 @@ function readyServerObservation(goalRevision = 4) {
 			maxAir: 300,
 			suffocating: false,
 			fallDistance: 0,
-			dangerousFall: false,
 			lastAttacker: {
 				uuid: '00000000-0000-0000-0000-000000000001',
 				type: 'minecraft:zombie',
 				distance: 3.25,
-				health: 12,
 			},
 			effects: [{ effectId: 'minecraft:speed', amplifier: 1, duration: 120 }],
 		},
@@ -129,23 +148,34 @@ function readyServerObservation(goalRevision = 4) {
 			name: 'Zombie',
 			distance: 3.25,
 			position: { x: 12, y: 64, z: -2 },
-			hostile: true,
-			health: 12,
-			maxHealth: 20,
 		}, {
 			uuid: '00000000-0000-0000-0000-000000000002',
 			type: 'minecraft:player',
 			name: 'Operator',
 			distance: 5,
 			position: { x: 15, y: 64, z: -3 },
-			hostile: false,
-			health: 20,
-			maxHealth: 20,
 			isPlayer: true,
-			gameMode: 'creative',
-			canBeHarmed: false,
+		}, {
+			uuid: '00000000-0000-0000-0000-000000000003',
+			type: 'minecraft:item',
+			name: 'Oak Log',
+			distance: 1.5,
+			position: { x: 10.5, y: 64, z: -2.5 },
+			itemId: 'minecraft:oak_log',
+			count: 1,
 		}],
-		blocks: [{ x: 11, y: 64, z: -3, blockId: 'minecraft:oak_log' }],
+		blocks: [{
+			x: 11, y: 64, z: -3, blockId: 'minecraft:oak_log', placeableFaces: ['up', 'north'],
+		}],
+		nearbyContainers: [{
+			x: 12,
+			y: 64,
+			z: -4,
+			blockId: 'minecraft:chest',
+			distance: 2.5,
+			withinInteractionRange: true,
+			capabilities: ['transfer_container'],
+		}],
 		world: {
 			dimension: 'minecraft:overworld',
 			gameTime: 200,
@@ -192,6 +222,7 @@ test('multiplexed bridge authenticates once and learns the complete registry sna
 	}))}\n`);
 	const [snapshot] = await ready;
 	assert.equal(snapshot.registry[0].reasoningEffort, 'high');
+	assert.equal(snapshot.registry[0].serviceTier, 'fast');
 	assert.equal(snapshot.registry[0].gameMode, 'survival');
 	assert.deepEqual(bridge.knownAgentIds, ['agent-a']);
 	await bridge.send('planning_state', 'agent-a', { goalRevision: 4, state: 'PLANNING' });
@@ -219,8 +250,42 @@ test('multiplexed bridge rejects stale revisions before writing', async () => {
 		summary: 'Wait.',
 		goalStatus: 'in_progress',
 		action: { type: 'wait', durationMs: 25 },
+		provenance: PROVENANCE,
 	}), (error) => error.code === 'STALE_GOAL_REVISION');
 	assert.equal(socket.writes.length, 1);
+	bridge.stop();
+});
+
+test('an inbound lifecycle revision orders the following observation before async registry work', async () => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 3,
+	});
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId,
+		authenticated: true,
+		registry: [{ ...registeredRecord(), state: 'PAUSED', currentGoal: 'Walk east.', goalRevision: 3 }],
+	}))}\n`);
+	await ready;
+	const received = [];
+	bridge.on('goal_control', (message) => received.push(message.type));
+	bridge.on('observation', (message) => received.push(message.type));
+	const lifecycle = serverEnvelope('goal_control', 'agent-a', 'server-2', {
+		operation: 'resume', goalRevision: 4, updatedAtEpochMs: 10,
+	});
+	const observation = serverEnvelope('observation', 'agent-a', 'server-3', {
+		goalRevision: 4, observedAtEpochMs: 11, ready: false, status: 'PLAYER_UNAVAILABLE',
+	});
+	socket.emit('data', `${JSON.stringify(lifecycle)}\n${JSON.stringify(observation)}\n`);
+	assert.deepEqual(received, ['goal_control', 'observation']);
+	assert.equal(socket.destroyed, false);
 	bridge.stop();
 });
 
@@ -248,6 +313,76 @@ test('multiplexed bridge bounds queued messages per agent while socket is backpr
 	bridge.stop();
 });
 
+test('a newer lifecycle revision removes queued stale action commands under backpressure', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 1,
+	});
+	bridge.start();
+	t.after(() => bridge.stop());
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
+	await ready;
+
+	socket.writable = false;
+	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	const staleCommand = bridge.send('action_command', 'agent-a', {
+		goalRevision: 1,
+		actionId: 'action-stale',
+		summary: 'Old action.',
+		goalStatus: 'in_progress',
+		action: { type: 'wait', durationMs: 25 },
+		provenance: PROVENANCE,
+	});
+	let staleError = null;
+	void staleCommand.catch((error) => { staleError = error; });
+	socket.emit('data', `${JSON.stringify(serverEnvelope('goal_control', 'agent-a', 'server-2', {
+		operation: 'stop', goalRevision: 2, updatedAtEpochMs: 10,
+	}))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(staleError?.code, 'STALE_GOAL_REVISION');
+	socket.writable = true;
+	socket.emit('drain');
+	assert.equal(socket.writes.some((wire) => JSON.parse(wire).type === 'action_command'), false);
+	bridge.stop();
+});
+
+test('a newer lifecycle revision removes queued stale agent readiness under backpressure', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 1,
+	});
+	bridge.start();
+	t.after(() => bridge.stop());
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
+	await ready;
+
+	socket.writable = false;
+	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	const staleReady = bridge.send('agent_ready', 'agent-a', { goalRevision: 1 });
+	let staleError = null;
+	void staleReady.catch((error) => { staleError = error; });
+	socket.emit('data', `${JSON.stringify(serverEnvelope('goal_control', 'agent-a', 'server-2', {
+		operation: 'stop', goalRevision: 2, updatedAtEpochMs: 10,
+	}))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(staleError?.code, 'STALE_GOAL_REVISION');
+	socket.writable = true;
+	socket.emit('drain');
+	assert.equal(socket.writes.some((wire) => JSON.parse(wire).type === 'agent_ready'), false);
+});
+
 test('strict payload validators accept every current wire shape and reject unknown fields', () => {
 	const catalog = { refreshedAtEpochMs: 1, models: [{ id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT 5.6 Sol', reasoningEfforts: ['high'], serviceTiers: ['fast'] }] };
 	const messages = [
@@ -263,7 +398,8 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
-		['action_command', { goalRevision: 1, actionId: 'action-1', summary: 'Wait.', goalStatus: 'in_progress', action: { type: 'wait', durationMs: 25 } }],
+		['action_command', { goalRevision: 1, actionId: 'action-1', summary: 'Wait.', goalStatus: 'in_progress', action: { type: 'wait', durationMs: 25 }, provenance: PROVENANCE }],
+		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],
 		['heartbeat', {}],
 		['shutdown', { reason: 'server_stopping' }],
@@ -272,6 +408,21 @@ test('strict payload validators accept every current wire shape and reject unkno
 	assert.deepEqual(validateProtocolV2Payload('agent_ready', { goalRevision: 2 }), { goalRevision: 2 });
 	for (const [type, payload] of messages) assert.throws(() => validateProtocolV2Payload(type, { ...payload, unexpected: true }), (error) => error.code === 'INVALID_PAYLOAD_FIELD', type);
 	assert.throws(() => validateProtocolV2Payload('hello_ack', { replyTo: 'x', authenticated: true, registry: Array(1_025).fill(registeredRecord()) }), /at most 1024/);
+});
+
+test('action cancellation requires an exact goal revision and action identity', () => {
+	assert.deepEqual(
+		validateProtocolV2Payload('action_cancel', { goalRevision: 4, actionId: 'action-9' }),
+		{ goalRevision: 4, actionId: 'action-9' },
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('action_cancel', { goalRevision: 4 }),
+		(error) => error.code === 'MISSING_FIELD',
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('action_cancel', { goalRevision: 4, actionId: 'action-9', reason: 'danger' }),
+		(error) => error.code === 'INVALID_PAYLOAD_FIELD',
+	);
 });
 
 test('protocol v2 validates raw transaction arguments before normalizing action commands', () => {
@@ -285,6 +436,7 @@ test('protocol v2 validates raw transaction arguments before normalizing action 
 		actionId: 'action-transaction-1',
 		actionType: 'transfer_container',
 		arguments: validTransfer,
+		provenance: PROVENANCE,
 	});
 	assert.deepEqual(normalized.arguments, validTransfer);
 	assert.throws(
@@ -293,21 +445,88 @@ test('protocol v2 validates raw transaction arguments before normalizing action 
 			actionId: 'action-transaction-2',
 			actionType: 'transfer_container',
 			arguments: { ...validTransfer, extra: true },
+			provenance: PROVENANCE,
 		}),
 		(error) => error.code === 'INVALID_ACTION' && /Unknown/.test(error.message),
+	);
+});
+
+test('protocol v2 preserves nullable desired block state and defers block-id matching to execution', () => {
+	const placeArguments = {
+		x: 1, y: 64, z: -2, face: 'up', itemId: 'minecraft:oak_stairs', desiredState: DESIRED_OAK_STAIRS_STATE,
+	};
+	const normalized = validateProtocolV2Payload('action_command', {
+		goalRevision: 4,
+		actionId: 'action-place-1',
+		actionType: 'place_block',
+		arguments: placeArguments,
+		provenance: PROVENANCE,
+	});
+	assert.deepEqual(normalized.arguments, placeArguments);
+	assert.equal(
+		validateProtocolV2Payload('action_command', {
+			goalRevision: 4, actionId: 'action-place-2', actionType: 'place_block',
+			arguments: { ...placeArguments, desiredState: null },
+			provenance: PROVENANCE,
+		}).arguments.desiredState,
+		null,
+	);
+	assert.equal(
+		validateProtocolV2Payload('action_command', {
+			goalRevision: 4, actionId: 'action-place-3', actionType: 'place_block',
+			arguments: { ...placeArguments, desiredState: 'minecraft:stone[facing=north]' },
+			provenance: PROVENANCE,
+		}).arguments.desiredState,
+		'minecraft:stone[facing=north]',
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', {
+			goalRevision: 4, actionId: 'action-place-4', actionType: 'place_block',
+			arguments: { ...placeArguments, desiredState: 'x'.repeat(513) },
+			provenance: PROVENANCE,
+		}),
+		(error) => error.code === 'INVALID_ACTION' && /512/.test(error.message),
+	);
+});
+
+test('protocol v2 preserves bounded ordered build-sequence placements', () => {
+	const placement = {
+		x: 1, y: 64, z: -2, face: 'up', itemId: 'minecraft:oak_stairs', desiredState: DESIRED_OAK_STAIRS_STATE,
+	};
+	const argumentsValue = { placements: Array.from({ length: 32 }, () => ({ ...placement })), timeoutMs: 60_000 };
+	const normalized = validateProtocolV2Payload('action_command', {
+		goalRevision: 4, actionId: 'action-build-1', actionType: 'build_sequence', arguments: argumentsValue, provenance: PROVENANCE,
+	});
+	assert.deepEqual(normalized.arguments, argumentsValue);
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', {
+			goalRevision: 4, actionId: 'action-build-2', actionType: 'build_sequence',
+			arguments: { ...argumentsValue, placements: [...argumentsValue.placements, placement] },
+			provenance: PROVENANCE,
+		}),
+		(error) => error.code === 'INVALID_ACTION' && /32/.test(error.message),
 	);
 });
 
 test('accepts the exact rich ready observation emitted by ServerObservationCollector', () => {
 	const payload = readyServerObservation();
 	const normalized = validateProtocolV2Payload('observation', payload);
+	assert.equal(Object.hasOwn(normalized.player, 'dangerousFall'), false);
 	assert.equal(normalized.player.foodLevel, 14);
 	assert.equal(normalized.player.lastAttacker.type, 'minecraft:zombie');
 	assert.equal(normalized.player.effects[0].duration, 120);
 	assert.equal(normalized.inventory.items[0].slot, 'chest');
 	assert.equal(normalized.inventory.items[1].slot, 2);
 	assert.equal(normalized.inventory.selectedItem, 'minecraft:bread');
-	assert.equal(normalized.entities[1].canBeHarmed, false);
+	assert.deepEqual(
+		Object.keys(normalized.entities[1]).sort(),
+		['distance', 'isPlayer', 'name', 'position', 'type', 'uuid'],
+		'entity observations expose only visually available identity and position facts',
+	);
+	assert.equal(normalized.entities[2].itemId, 'minecraft:oak_log');
+	assert.equal(normalized.entities[2].count, 1);
+	assert.deepEqual(normalized.blocks[0].placeableFaces, ['up', 'north']);
+	assert.deepEqual(normalized.nearbyContainers[0].capabilities, ['transfer_container']);
 });
 
 test('delivers the rich server observation without tearing down the authenticated bridge', async () => {

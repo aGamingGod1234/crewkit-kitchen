@@ -10,7 +10,8 @@ public record ServerActionRequest(
 		long goalRevision,
 		String actionId,
 		ActionType type,
-		JsonObject arguments
+		JsonObject arguments,
+		ActionProvenance provenance
 ) {
 	public ServerActionRequest {
 		Objects.requireNonNull(agentId, "agentId must not be null");
@@ -22,6 +23,7 @@ public record ServerActionRequest(
 		}
 		Objects.requireNonNull(type, "type must not be null");
 		arguments = Objects.requireNonNull(arguments, "arguments must not be null").deepCopy();
+		provenance = Objects.requireNonNull(provenance, "provenance must not be null");
 	}
 
 	@Override

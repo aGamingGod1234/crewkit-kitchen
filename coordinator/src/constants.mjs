@@ -6,6 +6,9 @@ export const MAX_CHAT_LENGTH = 256;
 export const MAX_SUMMARY_LENGTH = 2_048;
 export const MAX_GOAL_LENGTH = 4_096;
 export const MAX_IDENTIFIER_LENGTH = 256;
+export const MAX_PROVENANCE_TEXT_LENGTH = 256;
+export const MAX_DESIRED_STATE_LENGTH = 512;
+export const MAX_BUILD_SEQUENCE_PLACEMENTS = 32;
 export const MAX_TARGET_SELECTOR_LENGTH = 256;
 export const MAX_REASON_CODE_LENGTH = 128;
 export const MAX_RESULT_MESSAGE_LENGTH = 2_048;
@@ -20,7 +23,7 @@ export const MAX_INVENTORY_SUMMARIES = 64;
 export const LOOPBACK_HOST = '127.0.0.1';
 export const DEFAULT_AGENT_CAP = 16;
 export const DEFAULT_GOAL_QUEUE_CAP = 16;
-export const DEFAULT_PLANNING_CONCURRENCY = 4;
+export const DEFAULT_PLANNING_CONCURRENCY = DEFAULT_AGENT_CAP;
 export const DEFAULT_SERVICE_TIER = 'priority';
 export const DEFAULT_CONNECTION_QUEUE_CAP = 256;
 export const DEFAULT_AGENT_MESSAGE_QUEUE_CAP = 32;
@@ -40,7 +43,8 @@ export const ACTION_FIELDS = Object.freeze({
 	select_item: Object.freeze(['itemId']),
 	use_item: Object.freeze(['durationMs']),
 	break_block: Object.freeze(['x', 'y', 'z', 'timeoutMs']),
-	place_block: Object.freeze(['x', 'y', 'z', 'face', 'itemId']),
+	place_block: Object.freeze(['x', 'y', 'z', 'face', 'itemId', 'desiredState']),
+	build_sequence: Object.freeze(['placements', 'timeoutMs']),
 	chat: Object.freeze(['message']),
 	wait: Object.freeze(['durationMs']),
 	set_door: Object.freeze(['x', 'y', 'z', 'open']),

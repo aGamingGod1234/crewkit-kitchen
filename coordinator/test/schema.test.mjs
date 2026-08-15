@@ -5,6 +5,7 @@ import { PROTOCOL_VERSION } from '../src/constants.mjs';
 import {
 	createActionCommand,
 	validateAction,
+	validateActionCommandPayload,
 	validateActionResult,
 	validateEnvelope,
 	validateObservation,
@@ -89,6 +90,30 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 		() => validateAction({ type: 'flee_from', targetSelector: 'last_attacker', distance: 65, timeoutMs: 1_000 }),
 		/between 1 and 64/,
 	);
+});
+
+test('requires detached complete model-program provenance for action commands', () => {
+	const action = { type: 'wait', durationMs: 25 };
+	const provenance = {
+		provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+		programId: 'program-1-1', programVersion: 1, sourceStepId: 'step-80-126', eventSequence: 4,
+	};
+	const command = { goalRevision: 1, actionId: 'action-1', summary: 'Move', action, provenance };
+	assert.deepEqual(validateActionCommandPayload(command), command);
+	const validated = validateActionCommandPayload(command);
+	assert.throws(() => { validated.provenance.programId = 'forged'; }, TypeError);
+	assert.equal(command.provenance.programId, 'program-1-1');
+	assert.throws(
+		() => validateActionCommandPayload({ goalRevision: 1, actionId: 'action-1', summary: 'Move', action }),
+		/provenance/,
+	);
+	for (const field of ['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'sourceStepId']) {
+		assert.throws(() => validateActionCommandPayload({ ...command, provenance: { ...provenance, [field]: '\u00a0' } }), new RegExp(`provenance\\.${field}`));
+	}
+	for (const field of ['programVersion', 'eventSequence']) {
+		assert.throws(() => validateActionCommandPayload({ ...command, provenance: { ...provenance, [field]: -1 } }), new RegExp(`provenance\\.${field}`));
+		assert.throws(() => validateActionCommandPayload({ ...command, provenance: { ...provenance, [field]: Number.MAX_SAFE_INTEGER + 1 } }), new RegExp(`provenance\\.${field}`));
+	}
 });
 
 test('rejects ordinary and non-breaking whitespace-only required action text', () => {

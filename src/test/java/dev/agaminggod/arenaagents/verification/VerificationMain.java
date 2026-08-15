@@ -3,9 +3,17 @@ package dev.agaminggod.arenaagents.verification;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentRegistryVerification;
+import dev.agaminggod.arenaagents.agent.AgentIdentityVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupStateVerification;
+import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupLayoutVerification;
+import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
+import dev.agaminggod.arenaagents.client.gui.ConsoleThemeVerification;
+import dev.agaminggod.arenaagents.client.gui.LiveArenaLayoutVerification;
+import dev.agaminggod.arenaagents.client.gui.LocalizationVerification;
+import dev.agaminggod.arenaagents.client.gui.ScenarioResultsLayoutVerification;
+import dev.agaminggod.arenaagents.client.control.AgentClientPresentationVerification;
 import dev.agaminggod.arenaagents.client.action.ActionExecutorVerification;
 import dev.agaminggod.arenaagents.client.action.CombatInteractionVerification;
 import dev.agaminggod.arenaagents.client.action.MinecraftActionContextVerification;
@@ -40,7 +48,11 @@ import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.GoalControlVerification;
 import dev.agaminggod.arenaagents.server.AgentModelArgumentVerification;
 import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
+import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
+import dev.agaminggod.arenaagents.server.ChunkedSavedPayloadVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorLaunchPolicyVerification;
 import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerification;
+import dev.agaminggod.arenaagents.server.OfflineAgentProfileLookupVerification;
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodecVerification;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusVerification;
 import dev.agaminggod.arenaagents.server.perception.BlockObservationOrderingVerification;
@@ -48,6 +60,8 @@ import dev.agaminggod.arenaagents.server.perception.InventoryObservationSlotsVer
 import dev.agaminggod.arenaagents.server.perception.ObservationBudgetVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
+import dev.agaminggod.arenaagents.server.runtime.BlockPlacementAttemptPolicyVerification;
+import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVerification;
@@ -58,12 +72,16 @@ import dev.agaminggod.arenaagents.server.runtime.controller.NavigationProgressVe
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatPolicyVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatNavigationFailureVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.SurvivalReflexVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.ItemPickupProgressVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.BuildSequenceProgressVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioCoreVerification;
 import dev.agaminggod.arenaagents.scenario.ArenaSpectatorSnapshotVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRuntimeVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioMatchResultVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioPreflightVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioRecoveryVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioBuildProgressVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioActivationFailurePolicyVerification;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -87,6 +105,8 @@ public final class VerificationMain {
 	private static final long ISSUED_AT_EPOCH_MS = 1_750_000_000_000L;
 	private static final String COMMAND_ID = "command-1";
 	private static final String AGENT_ID = "agent-test";
+	private static final String DESIRED_OAK_STAIRS_STATE =
+			"minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]";
 	private static final int SOCKET_TIMEOUT_MS = 2_000;
 	private static final long ASYNC_TIMEOUT_MS = 3_000L;
 	private static final long AUTHENTICATION_RETRY_DELAY_MS = 10L;
@@ -109,6 +129,8 @@ public final class VerificationMain {
 		verifyDirectCommandSchemaValidation();
 		verifyBoundedValidation(codec);
 		verifyStrictArguments(codec);
+		verifyDesiredStateProtocol(codec);
+		verifyBuildSequenceProtocol(codec);
 		verifyCommandImmutability();
 		verifyCommandEncodingRoundTrip(codec);
 		verifyActionResultContract();
@@ -123,14 +145,21 @@ public final class VerificationMain {
 		passedAssertions += GoalControlVerification.verify();
 		passedAssertions += AgentModelArgumentVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();
+		passedAssertions += AgentActivityPresentationVerification.verify();
+		passedAssertions += ChunkedSavedPayloadVerification.verify();
+		passedAssertions += CoordinatorLaunchPolicyVerification.verify();
 		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();
+		passedAssertions += OfflineAgentProfileLookupVerification.verify();
 		passedAssertions += AgentRegistryVerification.verify();
+		passedAssertions += AgentIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
 		passedAssertions += BlockObservationOrderingVerification.verify();
 		passedAssertions += InventoryObservationSlotsVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();
 		passedAssertions += BlockPlacementPostconditionVerification.verify();
+		passedAssertions += BlockPlacementAttemptPolicyVerification.verify();
+		passedAssertions += DesiredBlockStateVerification.verify();
 		passedAssertions += ResourceLeaseManagerVerification.verify();
 		passedAssertions += TransactionProtocolVerification.verify();
 		passedAssertions += TransactionPostconditionVerification.verify();
@@ -141,15 +170,26 @@ public final class VerificationMain {
 		passedAssertions += CombatPolicyVerification.verify();
 		passedAssertions += CombatNavigationFailureVerification.verify();
 		passedAssertions += SurvivalReflexVerification.verify();
+		passedAssertions += ItemPickupProgressVerification.verify();
+		passedAssertions += BuildSequenceProgressVerification.verify();
 		passedAssertions += ScenarioCoreVerification.verify();
 		passedAssertions += ScenarioLaunchRuntimeVerification.verify();
 		passedAssertions += ScenarioMatchResultVerification.verify();
 		passedAssertions += ScenarioPreflightVerification.verify();
 		passedAssertions += ScenarioRecoveryVerification.verify();
+		passedAssertions += ScenarioBuildProgressVerification.verify();
+		passedAssertions += ScenarioActivationFailurePolicyVerification.verify();
 		passedAssertions += ArenaSpectatorSnapshotVerification.verify();
 		passedAssertions += ArenaSpectatorStateVerification.verify();
+		passedAssertions += AgentClientPresentationVerification.verify();
 		passedAssertions += ArenaAgentsClientBootstrapVerification.verify();
 		passedAssertions += ScenarioSetupStateVerification.verify();
+		passedAssertions += ScenarioSetupLayoutVerification.verify();
+		passedAssertions += AgentControlLayoutVerification.verify();
+		passedAssertions += ConsoleThemeVerification.verify();
+		passedAssertions += LiveArenaLayoutVerification.verify();
+		passedAssertions += LocalizationVerification.verify();
+		passedAssertions += ScenarioResultsLayoutVerification.verify();
 		passedAssertions += BridgeEnvelopeCodecVerification.verify();
 		passedAssertions += CoordinatorStatusVerification.verify();
 		passedAssertions += GoalReceiverVerification.verify();
@@ -196,6 +236,7 @@ public final class VerificationMain {
 				"use_item",
 				"break_block",
 				"place_block",
+				"build_sequence",
 				"chat",
 				"wait",
 				"set_door",
@@ -232,7 +273,8 @@ public final class VerificationMain {
 		assertDecodedType(codec, "select_item", "\"itemId\":\"minecraft:diamond_sword\"", ActionType.SELECT_ITEM);
 		assertDecodedType(codec, "use_item", "\"durationMs\":1250", ActionType.USE_ITEM);
 		assertDecodedType(codec, "break_block", "\"x\":1,\"y\":64,\"z\":-2,\"timeoutMs\":5000", ActionType.BREAK_BLOCK);
-		assertDecodedType(codec, "place_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:stone\"", ActionType.PLACE_BLOCK);
+		assertDecodedType(codec, "place_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:stone\",\"desiredState\":null", ActionType.PLACE_BLOCK);
+		assertDecodedType(codec, "build_sequence", "\"placements\":[{\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:stone\",\"desiredState\":null}],\"timeoutMs\":60000", ActionType.BUILD_SEQUENCE);
 		assertDecodedType(codec, "chat", "\"message\":\"Ready.\"", ActionType.CHAT);
 		assertDecodedType(codec, "wait", "\"durationMs\":250", ActionType.WAIT);
 		assertDecodedType(codec, "set_door", "\"x\":1,\"y\":64,\"z\":-2,\"open\":true", ActionType.SET_DOOR);
@@ -390,6 +432,65 @@ public final class VerificationMain {
 		ActionCommand longestWait = codec.decodeCommand(commandJson("wait", "\"durationMs\":" + ProtocolConstants.MAX_DURATION_MS));
 		assertEquals(1L, shortestWait.arguments().get("durationMs").getAsLong(), "minimum valid duration");
 		assertEquals(ProtocolConstants.MAX_DURATION_MS, longestWait.arguments().get("durationMs").getAsLong(), "maximum valid duration");
+	}
+
+	private static void verifyDesiredStateProtocol(ProtocolCodec codec) throws ProtocolException {
+		ActionCommand command = codec.decodeCommand(commandJson(
+				"place_block",
+				"\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:oak_stairs\",\"desiredState\":\""
+						+ DESIRED_OAK_STAIRS_STATE + "\""
+		));
+		assertEquals(
+			DESIRED_OAK_STAIRS_STATE,
+			command.arguments().get("desiredState").getAsString(),
+			"desired block state survives Java protocol validation"
+		);
+
+		ActionCommand nullable = codec.decodeCommand(commandJson(
+				"place_block",
+				"\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:oak_stairs\",\"desiredState\":null"
+		));
+		assertTrue(nullable.arguments().get("desiredState").isJsonNull(), "null desired block state is accepted");
+
+		ActionCommand mismatchedBlockId = codec.decodeCommand(commandJson(
+				"place_block",
+				"\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:oak_stairs\",\"desiredState\":\"minecraft:stone[facing=north]\""
+		));
+		assertEquals(
+			"minecraft:stone[facing=north]",
+			mismatchedBlockId.arguments().get("desiredState").getAsString(),
+			"block-id mismatch is deferred to execution validation"
+		);
+
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson(
+						"place_block",
+						"\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:oak_stairs\",\"desiredState\":\""
+								+ "x".repeat(513) + "\""
+				)),
+				"OUT_OF_RANGE",
+				"desiredState",
+				"desired block state length"
+		);
+	}
+
+	private static void verifyBuildSequenceProtocol(ProtocolCodec codec) throws ProtocolException {
+		String placement = "{\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\","
+				+ "\"itemId\":\"minecraft:stone\",\"desiredState\":null}";
+		String placements32 = java.util.stream.IntStream.range(0, 32)
+				.mapToObj(ignored -> placement)
+				.collect(java.util.stream.Collectors.joining(","));
+		ActionCommand command = codec.decodeCommand(commandJson(
+				"build_sequence", "\"placements\":[" + placements32 + "],\"timeoutMs\":60000"));
+		assertEquals(32, command.arguments().getAsJsonArray("placements").size(),
+				"build sequence preserves 32 ordered placements");
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson(
+						"build_sequence", "\"placements\":[" + placements32 + "," + placement + "],\"timeoutMs\":60000")),
+				"OUT_OF_RANGE",
+				"placements",
+				"build sequence placement limit"
+		);
 	}
 
 	private static void verifyDirectCommandSchemaValidation() {
