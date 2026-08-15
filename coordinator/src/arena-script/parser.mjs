@@ -413,6 +413,7 @@ function validateRepeatUntil(node, state) {
 	if (!isFunctionNode(node.arguments[0]) || !isFunctionNode(node.arguments[2])) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'repeatUntil condition and body must be functions', node);
 	}
+	validatePureCondition(node.arguments[0]);
 }
 
 function validateWatcher(node, state, context) {
@@ -429,6 +430,35 @@ function validateWatcher(node, state, context) {
 	const mode = literalObjectProperty(node.arguments[1], 'mode', 'UNSUPPORTED_SYNTAX');
 	if (!['boundary', 'interrupt'].includes(mode)) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'watcher mode must be the boundary or interrupt literal', node.arguments[1]);
+	}
+	validatePureCondition(node.arguments[0]);
+}
+
+function validatePureCondition(node) {
+	if (node.async) throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions cannot be async', node);
+	const stack = [node];
+	while (stack.length > 0) {
+		const current = stack.pop();
+		if (!current || typeof current !== 'object') continue;
+		if (Array.isArray(current)) {
+			for (const child of current) stack.push(child);
+			continue;
+		}
+		if (current.type === 'AwaitExpression' || current.type === 'AssignmentExpression' || current.type === 'UpdateExpression') {
+			throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions must be factual and side-effect free', current);
+		}
+		if (isFunctionNode(current) && current !== node && current.async) {
+			throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions cannot contain async callbacks', current);
+		}
+		if (current.type === 'CallExpression') {
+			const path = staticMemberPath(current.callee)?.join('.');
+			if (!['player.state', 'inventory.countTag'].includes(path)) {
+				throw arenaError('UNSUPPORTED_SYNTAX', 'watcher and repeatUntil conditions can call only factual Arena APIs', current);
+			}
+		}
+		for (const [key, value] of Object.entries(current)) {
+			if (key !== 'loc' && key !== 'start' && key !== 'end' && key !== 'type') stack.push(value);
+		}
 	}
 }
 

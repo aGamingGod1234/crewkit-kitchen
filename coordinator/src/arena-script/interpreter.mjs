@@ -1,4 +1,5 @@
 import { ArenaScriptError, executionError } from './errors.mjs';
+import { types as nodeTypes } from 'node:util';
 import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from './limits.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory']);
@@ -9,6 +10,7 @@ const CAPABILITY_MEMBERS = Object.freeze({
 	inventory: new Set(['countTag']),
 });
 const FORBIDDEN_MEMBER_NAMES = new Set(['__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', '__proto__', 'arguments', 'callee', 'caller', 'constructor', 'eval', 'prototype']);
+const ACTION_RESULT_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 
 /** Deterministically executes a compiled ArenaScript AST without evaluating source JavaScript. */
 export class ArenaScriptInterpreter {
@@ -26,54 +28,74 @@ export class ArenaScriptInterpreter {
 	#context = null;
 	#watchers = new Map();
 	#yield = null;
+	#lifecycle = 'READY';
+	#loopIterations = 0;
 
 	constructor(compiled, bindings, { limits = DEFAULT_ARENA_SCRIPT_LIMITS } = {}) {
 		if (!compiled?.ast || compiled.ast.type !== 'Program') throw executionError('INVALID_PROGRAM', 'ArenaScript INVALID_PROGRAM: compiled program is required');
 		if (!Object.isFrozen(compiled)) throw executionError('INVALID_PROGRAM', 'ArenaScript INVALID_PROGRAM: compiled program must be frozen');
-		assertFrozenBindings(bindings);
+		const normalizedBindings = normalizeBindings(bindings);
 		this.#compiled = compiled;
-		this.#bindings = bindings;
+		this.#bindings = normalizedBindings;
 		this.#limits = normalizeArenaScriptLimits(limits);
 	}
 
 	start(facts) {
 		if (this.#started) throw executionError('ALREADY_STARTED', 'ArenaScript ALREADY_STARTED: program has already started');
+		const normalizedFacts = freezeFacts(facts);
 		this.#started = true;
-		this.#beginActivation(facts);
+		this.#beginActivation(normalizedFacts);
 		this.#frames.push(statementListFrame(this.#compiled.ast.body, createRootEnvironment(this.#bindings, this.#context)));
 		return this.#run();
 	}
 
 	resume(result, facts) {
 		if (this.#waiting === null) throw executionError('NOT_WAITING', 'ArenaScript NOT_WAITING: no command is awaiting a result');
-		this.#context.facts = freezeFacts(facts);
-		this.#waiting.environment.setResult(normalizeActionResult(result));
+		const normalizedResult = normalizeActionResult(result);
+		if (normalizedResult.stateToken !== this.#waiting.stateToken) throw executionError('STALE_STATE_TOKEN', 'ArenaScript STALE_STATE_TOKEN: action result does not match the pending command');
+		const normalizedFacts = freezeFacts(facts);
+		this.#context.facts = normalizedFacts;
+		this.#waiting.environment.setResult(normalizedResult);
 		this.#waiting = null;
+		this.#beginSlice();
 		return this.#run();
 	}
 
 	runWatcher(watcherId, facts) {
 		if (!this.#started) throw executionError('NOT_STARTED', 'ArenaScript NOT_STARTED: start the program before running watchers');
+		if (this.#lifecycle !== 'ACTIVE') throw executionError('INACTIVE_LIFECYCLE', `ArenaScript INACTIVE_LIFECYCLE: program is ${this.#lifecycle}`);
 		if (this.#waiting !== null) throw executionError('NOT_IDLE', 'ArenaScript NOT_IDLE: a command result is still required');
 		const watcher = this.#watchers.get(watcherId);
 		if (!watcher) throw executionError('UNKNOWN_WATCHER', `ArenaScript UNKNOWN_WATCHER: ${watcherId}`);
-		this.#beginActivation(facts);
+		const normalizedFacts = freezeFacts(facts);
+		this.#context.facts = normalizedFacts;
+		this.#frames = [];
+		this.#values = [];
+		this.#terminal = false;
+		this.#yield = null;
+		this.#beginSlice();
 		this.#frames.push({ type: 'watcher-after-condition', watcher });
 		this.#invokeFunction(watcher.condition, []);
 		return this.#run();
 	}
 
-	#beginActivation(facts) {
-		this.#context = { facts: freezeFacts(facts) };
+	#beginActivation(normalizedFacts) {
+		this.#context = { facts: normalizedFacts };
 		this.#frames = [];
 		this.#values = [];
 		this.#terminal = false;
 		this.#operations = 0;
 		this.#yield = null;
+		this.#lifecycle = 'ACTIVE';
+		this.#loopIterations = 0;
+	}
+
+	#beginSlice() {
+		this.#operations = 0;
+		this.#loopIterations = 0;
 	}
 
 	#run() {
-		this.#operations = 0;
 		while (this.#frames.length > 0) {
 			if (this.#terminal) return this.#yield;
 			const frame = this.#frames.pop();
@@ -159,7 +181,7 @@ export class ArenaScriptInterpreter {
 			case 'BlockStatement': return this.#frames.push(statementListFrame(node.body, new Environment(environment, this.#context)));
 			case 'VariableDeclaration': return this.#runDeclaration(node, environment, 0);
 			case 'FunctionDeclaration':
-				if (!environment.hasOwn(node.id.name)) environment.define(node.id.name, createFunction(node, environment));
+				if (!environment.hasOwn(node.id.name)) environment.define(node.id.name, createFunction(node, environment), 'const');
 				return this.#values.push(normalCompletion());
 			case 'IfStatement': this.#frames.push({ type: 'if', node, environment }); return this.#frames.push({ type: 'expression', node: node.test, environment });
 			case 'ForStatement': {
@@ -185,7 +207,7 @@ export class ArenaScriptInterpreter {
 		const declaration = node.declarations[index];
 		if (declaration.id.type !== 'Identifier') throw this.#error('UNSUPPORTED_SYNTAX', 'ArenaScript UNSUPPORTED_SYNTAX: declaration patterns are not supported', declaration);
 		if (!declaration.init) {
-			environment.define(declaration.id.name, undefined);
+			environment.define(declaration.id.name, undefined, node.kind);
 			return this.#runDeclaration(node, environment, index + 1);
 		}
 		this.#frames.push({ type: 'declare', node, environment, index, declaration });
@@ -193,7 +215,7 @@ export class ArenaScriptInterpreter {
 	}
 
 	#declare(frame) {
-		frame.environment.define(frame.declaration.id.name, this.#values.pop());
+		frame.environment.define(frame.declaration.id.name, this.#values.pop(), frame.node.kind);
 		this.#runDeclaration(frame.node, frame.environment, frame.index + 1);
 	}
 
@@ -280,7 +302,7 @@ export class ArenaScriptInterpreter {
 	#assignmentSet({ environment, name, operator = null, left, node }) {
 		const right = this.#values.pop();
 		const value = operator ? applyBinary(operator, left, right, (code, message) => this.#error(code, message, node)) : right;
-		environment.set(name, value);
+		environment.set(name, value, node?.left);
 		this.#values.push(value);
 	}
 
@@ -323,11 +345,13 @@ export class ArenaScriptInterpreter {
 		switch (callPath) {
 			case 'program.onUnhandledAttention': return this.#values.push(undefined);
 			case 'program.watch': return this.#registerWatcher(node, args);
-			case 'program.checkpoint': return this.#terminalYield('checkpoint', node, String(args[0] ?? 'checkpoint'));
-			case 'program.finish': return this.#terminalYield('finish', node, String(args[0] ?? 'finished'));
+			case 'program.checkpoint': return this.#terminalYield('checkpoint', node, terminalText(args[0], 'checkpoint', node));
+			case 'program.finish': return this.#terminalYield('finish', node, terminalText(args[0], 'finished', node));
 			case 'program.repeatUntil': return this.#repeatUntil(node, args);
 			case 'player.state': return this.#values.push(this.#context.facts.player);
-			case 'inventory.countTag': return this.#values.push(this.#context.facts.inventory.tagCounts[String(args[0])] ?? 0);
+			case 'inventory.countTag':
+				if (typeof args[0] !== 'string') throw this.#error('INVALID_ARGUMENT', 'ArenaScript INVALID_ARGUMENT: inventory tag must be a string', node);
+				return this.#values.push(this.#context.facts.inventory.tagCounts[args[0]] ?? 0);
 			default: return this.#yieldCommand(callPath, args, node, environment);
 		}
 	}
@@ -340,16 +364,22 @@ export class ArenaScriptInterpreter {
 		const stateToken = `arena-state-${++this.#sequence}`;
 		this.#frames.push({ type: 'pending-result', environment });
 		this.#waiting = { environment, stateToken };
-		this.#yield = { kind: 'command', stepId: stepIdFor(node), call: { primitive: binding.primitive, arguments: plainValue(args.length === 1 ? args[0] : args) }, stateToken };
+		this.#yield = frozenRecord({
+			kind: 'command',
+			stepId: stepIdFor(node),
+			call: frozenRecord({ primitive: binding.primitive, arguments: freezeOutput(args.length === 1 ? args[0] : args) }),
+			stateToken,
+		});
 	}
 
 	#terminalYield(kind, node, value) {
 		this.#terminal = true;
+		this.#lifecycle = kind === 'finish' ? 'FINISHED' : 'PAUSED';
 		this.#frames = [];
 		this.#values = [];
 		this.#yield = kind === 'finish'
-			? { kind, stepId: stepIdFor(node), summary: value }
-			: { kind, stepId: stepIdFor(node), reason: value };
+			? frozenRecord({ kind, stepId: stepIdFor(node), summary: value })
+			: frozenRecord({ kind, stepId: stepIdFor(node), reason: value });
 	}
 
 	#registerWatcher(node, args) {
@@ -373,7 +403,7 @@ export class ArenaScriptInterpreter {
 		const condition = this.#values.pop();
 		if (condition) return this.#values.push(undefined);
 		if (frame.iterations >= frame.maxIterations) return this.#terminalYield('checkpoint', frame.node, 'repeat_until_exhausted');
-		if (frame.iterations >= this.#limits.loopIterationsPerYield) throw this.#error('LOOP_LIMIT', `ArenaScript LOOP_LIMIT: exceeded ${this.#limits.loopIterationsPerYield} loop iterations`, frame.node);
+		this.#claimLoopIteration(frame.node);
 		frame.iterations += 1;
 		this.#frames.push({ type: 'repeat-after-body', frame });
 		this.#invokeFunction(frame.body, []);
@@ -395,8 +425,8 @@ export class ArenaScriptInterpreter {
 		if (!isArenaFunction(fn)) throw executionError('UNSUPPORTED_SYNTAX', 'ArenaScript UNSUPPORTED_SYNTAX: only Arena functions can be invoked');
 		if (args.length !== fn.node.params.length) throw this.#error('ARGUMENT_COUNT', 'ArenaScript ARGUMENT_COUNT: argument count does not match function parameters', fn.node);
 		const environment = new Environment(fn.environment, this.#context);
-		for (let index = 0; index < args.length; index += 1) environment.define(fn.node.params[index].name, args[index]);
-		if (fn.node.id?.name) environment.define(fn.node.id.name, fn);
+		for (let index = 0; index < args.length; index += 1) environment.define(fn.node.params[index].name, args[index], 'let');
+		if (fn.node.id?.name) environment.define(fn.node.id.name, fn, 'const');
 		this.#frames.push({ type: 'function-after-body' });
 		if (fn.node.body.type === 'BlockStatement') this.#frames.push(statementListFrame(fn.node.body.body, environment));
 		else this.#frames.push({ type: 'expression', node: fn.node.body, environment });
@@ -500,7 +530,7 @@ export class ArenaScriptInterpreter {
 		if (left.type === 'VariableDeclaration') {
 			const name = left.declarations[0]?.id?.name;
 			if (!name) throw this.#error('UNSUPPORTED_SYNTAX', 'ArenaScript UNSUPPORTED_SYNTAX: loop declaration must use an identifier', left);
-			if (frame.iterations === 1) frame.environment.define(name, value); else frame.environment.set(name, value, left);
+			if (frame.iterations === 1) frame.environment.define(name, value, left.kind); else frame.environment.set(name, value, left);
 		} else if (left.type === 'Identifier') frame.environment.set(left.name, value, left); else throw this.#error('UNSAFE_MEMBER_ACCESS', 'ArenaScript UNSAFE_MEMBER_ACCESS: loop target must be local', left);
 		this.#frames.push({ type: 'for-each-after-body', frame });
 		this.#frames.push({ type: 'statement', node: frame.node.body, environment: frame.environment });
@@ -515,7 +545,12 @@ export class ArenaScriptInterpreter {
 	}
 
 	#assertLoop(node, iterations) {
-		if (iterations >= this.#limits.loopIterationsPerYield) throw this.#error('LOOP_LIMIT', `ArenaScript LOOP_LIMIT: exceeded ${this.#limits.loopIterationsPerYield} loop iterations`, node);
+		this.#claimLoopIteration(node);
+	}
+
+	#claimLoopIteration(node) {
+		if (this.#loopIterations >= this.#limits.loopIterationsPerYield) throw this.#error('LOOP_LIMIT', `ArenaScript LOOP_LIMIT: exceeded ${this.#limits.loopIterationsPerYield} loop iterations`, node);
+		this.#loopIterations += 1;
 	}
 
 	#error(code, message, node = null) {
@@ -530,14 +565,19 @@ class Environment {
 		this.values = new Map();
 		this.result = undefined;
 	}
-	define(name, value) { this.values.set(name, value); }
+	define(name, value, kind = 'let') { this.values.set(name, { kind, value }); }
 	hasOwn(name) { return this.values.has(name); }
 	get(name, node) {
-		for (let current = this; current; current = current.parent) if (current.values.has(name)) return current.values.get(name);
+		for (let current = this; current; current = current.parent) if (current.values.has(name)) return current.values.get(name).value;
 		throw executionError('UNKNOWN_IDENTIFIER', `ArenaScript UNKNOWN_IDENTIFIER: ${name}`, node?.loc ? Object.freeze({ start: node.start, end: node.end, line: node.loc.start.line, column: node.loc.start.column }) : null);
 	}
 	set(name, value, node) {
-		for (let current = this; current; current = current.parent) if (current.values.has(name)) { current.values.set(name, value); return; }
+		for (let current = this; current; current = current.parent) if (current.values.has(name)) {
+			const slot = current.values.get(name);
+			if (slot.kind === 'const') throw executionError('CONST_ASSIGNMENT', `ArenaScript CONST_ASSIGNMENT: ${name} is immutable`, node?.loc ? Object.freeze({ start: node.start, end: node.end, line: node.loc.start.line, column: node.loc.start.column }) : null);
+			slot.value = value;
+			return;
+		}
 		throw this.get(name, node);
 	}
 	setResult(result) { this.result = result; }
@@ -546,11 +586,11 @@ class Environment {
 
 function createRootEnvironment(bindings, context) {
 	const environment = new Environment(null, context);
-	for (const name of CAPABILITY_NAMES) environment.define(name, Object.freeze(Object.assign(Object.create(null), { capability: name })));
-	environment.define('tryResult', Object.freeze(Object.assign(Object.create(null), { builtin: 'tryResult' })));
-	environment.define('undefined', undefined);
-	environment.define('NaN', NaN);
-	environment.define('Infinity', Infinity);
+	for (const name of CAPABILITY_NAMES) environment.define(name, Object.freeze(Object.assign(Object.create(null), { capability: name })), 'const');
+	environment.define('tryResult', Object.freeze(Object.assign(Object.create(null), { builtin: 'tryResult' })), 'const');
+	environment.define('undefined', undefined, 'const');
+	environment.define('NaN', NaN, 'const');
+	environment.define('Infinity', Infinity, 'const');
 	return environment;
 }
 
@@ -610,64 +650,127 @@ function applyBinary(operator, left, right, fail) {
 
 function actionBinding(bindings, path) {
 	const [root, member] = path.split('.');
-	const binding = bindings?.[root]?.[member];
+	const binding = bindings[root]?.[member];
 	if (!binding || typeof binding !== 'object' || typeof binding.primitive !== 'string') return null;
 	return binding;
 }
 
 function normalizeActionResult(result) {
-	if (result === null || typeof result !== 'object' || Array.isArray(result)) throw executionError('INVALID_ACTION_RESULT', 'ArenaScript INVALID_ACTION_RESULT: action result must be an object');
-	const state = String(result.state ?? 'FAILED');
-	const reason = result.reasonCode === undefined ? undefined : String(result.reasonCode);
-	return Object.freeze(Object.assign(Object.create(null), { state, succeeded: state === 'SUCCEEDED', reason, reasonCode: reason }));
+	const values = exactOwnDataRecord(result, 'action result', ['stateToken', 'state', 'reasonCode']);
+	const { stateToken, state, reasonCode } = values;
+	if (typeof stateToken !== 'string' || stateToken.length === 0 || typeof state !== 'string' || !ACTION_RESULT_STATES.has(state) || typeof reasonCode !== 'string') {
+		throw executionError('INVALID_ACTION_RESULT', 'ArenaScript INVALID_ACTION_RESULT: result fields are invalid');
+	}
+	return frozenRecord({ stateToken, state, succeeded: state === 'SUCCEEDED', reason: reasonCode, reasonCode });
 }
 
 function freezeFacts(facts) {
-	if (facts === null || typeof facts !== 'object' || Array.isArray(facts)) throw executionError('INVALID_FACTS', 'ArenaScript INVALID_FACTS: facts must be an object');
-	const player = facts.player && typeof facts.player === 'object' ? facts.player : Object.create(null);
-	const world = facts.world && typeof facts.world === 'object' ? facts.world : Object.create(null);
-	const inventory = facts.inventory && typeof facts.inventory === 'object' ? facts.inventory : Object.create(null);
-	return Object.freeze(Object.assign(Object.create(null), {
-		player: freezeRecord(player),
-		world: freezeRecord(world),
-		inventory: Object.freeze(Object.assign(Object.create(null), { tagCounts: freezeRecord(inventory.tagCounts && typeof inventory.tagCounts === 'object' ? inventory.tagCounts : Object.create(null)) })),
-	}));
+	const root = exactOwnDataRecord(facts, 'facts', ['player', 'world', 'inventory']);
+	const inventory = exactOwnDataRecord(root.inventory, 'facts.inventory', ['tagCounts']);
+	return frozenRecord({
+		player: freezeDataRecord(root.player, 'facts.player'),
+		world: freezeDataRecord(root.world, 'facts.world'),
+		inventory: frozenRecord({ tagCounts: freezeDataRecord(inventory.tagCounts, 'facts.inventory.tagCounts') }),
+	});
 }
 
-function freezeRecord(value, seen = new Map()) {
-	if (value === null || typeof value !== 'object') return value;
-	if (seen.has(value)) return seen.get(value);
-	const record = Array.isArray(value) ? [] : Object.create(null);
+function freezeDataRecord(value, label, seen = new Map()) {
+	const entries = ownDataEntries(value, label);
+	const record = Object.create(null);
 	seen.set(value, record);
-	for (const key of Object.keys(value)) record[key] = freezeRecord(value[key], seen);
+	for (const [key, entry] of entries) {
+		if (FORBIDDEN_MEMBER_NAMES.has(key)) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: forbidden ${label} key`);
+		record[key] = freezeDataValue(entry, `${label}.${key}`, seen);
+	}
 	return Object.freeze(record);
 }
 
-function plainValue(value, seen = new Map()) {
-	if (value === null || typeof value !== 'object') return value;
-	if (seen.has(value)) return seen.get(value);
-	const target = Array.isArray(value) ? [] : {};
-	seen.set(value, target);
-	for (const key of Object.keys(value)) target[key] = plainValue(value[key], seen);
-	return target;
+function freezeDataValue(value, label, seen) {
+	if (value === null || typeof value !== 'object') return safePrimitive(value, 'INVALID_FACTS', label);
+	if (seen.has(value)) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: cyclic ${label}`);
+	if (Array.isArray(value)) {
+		if (nodeTypes.isProxy(value)) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: proxy ${label}`);
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const array = [];
+		seen.set(value, array);
+		for (let index = 0; index < value.length; index += 1) {
+			const descriptor = descriptors[String(index)];
+			if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: unsafe ${label}`);
+			array.push(freezeDataValue(descriptor.value, `${label}[${index}]`, seen));
+		}
+		return Object.freeze(array);
+	}
+	return freezeDataRecord(value, label, seen);
 }
 
 function hoistFunctionDeclarations(statements, environment) {
-	for (const statement of statements) if (statement.type === 'FunctionDeclaration' && !environment.hasOwn(statement.id.name)) environment.define(statement.id.name, createFunction(statement, environment));
+	for (const statement of statements) if (statement.type === 'FunctionDeclaration' && !environment.hasOwn(statement.id.name)) environment.define(statement.id.name, createFunction(statement, environment), 'const');
 }
 
-function assertFrozenBindings(bindings) {
-	if (bindings === null || typeof bindings !== 'object' || !Object.isFrozen(bindings)) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: bindings must be a frozen declarative object');
-	const stack = [bindings];
-	const seen = new Set();
-	while (stack.length > 0) {
-		const value = stack.pop();
-		if (value === null || typeof value !== 'object' || seen.has(value)) continue;
-		seen.add(value);
-		if (!Object.isFrozen(value)) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: bindings must be deeply frozen');
-		for (const key of Reflect.ownKeys(value)) {
-			if (typeof value[key] === 'function') throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: bindings cannot expose native functions');
-			stack.push(value[key]);
-		}
+function normalizeBindings(bindings) {
+	const root = exactOwnDataRecord(bindings, 'bindings', ['player'], { requireNullPrototype: true, requireFrozen: true, errorCode: 'INVALID_BINDINGS' });
+	const player = ownDataEntries(root.player, 'bindings.player', { requireNullPrototype: true, requireFrozen: true, errorCode: 'INVALID_BINDINGS' });
+	const normalizedPlayer = Object.create(null);
+	for (const [name, binding] of player) {
+		if (!['moveTo', 'wait'].includes(name)) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: unsupported player binding');
+		const action = exactOwnDataRecord(binding, `bindings.player.${name}`, ['primitive'], { requireNullPrototype: true, requireFrozen: true, errorCode: 'INVALID_BINDINGS' });
+		if (typeof action.primitive !== 'string' || action.primitive.length === 0) throw executionError('INVALID_BINDINGS', 'ArenaScript INVALID_BINDINGS: primitive must be a non-empty string');
+		normalizedPlayer[name] = frozenRecord({ primitive: action.primitive });
 	}
+	return frozenRecord({ player: Object.freeze(normalizedPlayer) });
+}
+
+function exactOwnDataRecord(value, label, requiredKeys, options = {}) {
+	const { errorCode = label.startsWith('facts') ? 'INVALID_FACTS' : 'INVALID_ACTION_RESULT' } = options;
+	const entries = ownDataEntries(value, label, { ...options, errorCode });
+	const values = Object.create(null);
+	for (const [key, entry] of entries) values[key] = entry;
+	if (entries.length !== requiredKeys.length || requiredKeys.some((key) => !Object.hasOwn(values, key))) throw executionError(errorCode, `ArenaScript ${errorCode}: ${label} has an invalid schema`);
+	return values;
+}
+
+function ownDataEntries(value, label, { requireNullPrototype = false, requireFrozen = false, errorCode = label.startsWith('bindings') ? 'INVALID_BINDINGS' : 'INVALID_FACTS' } = {}) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value)) throw executionError(errorCode, `ArenaScript ${errorCode}: ${label} must be a plain record`);
+	if (requireNullPrototype ? Object.getPrototypeOf(value) !== null : ![null, Object.prototype].includes(Object.getPrototypeOf(value))) throw executionError(errorCode, `ArenaScript ${errorCode}: ${label} has an unsafe prototype`);
+	if (requireFrozen && !Object.isFrozen(value)) throw executionError(errorCode, `ArenaScript ${errorCode}: ${label} must be frozen`);
+	const keys = Reflect.ownKeys(value);
+	if (keys.some((key) => typeof key !== 'string')) throw executionError(errorCode, `ArenaScript ${errorCode}: ${label} cannot use symbols`);
+	const entries = [];
+	for (const key of keys) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.get || descriptor.set) throw executionError(errorCode, `ArenaScript ${errorCode}: ${label}.${key} must be own data`);
+		entries.push([key, descriptor.value]);
+	}
+	return entries;
+}
+
+function freezeOutput(value, seen = new Set()) {
+	if (value === null || typeof value !== 'object') return safePrimitive(value, 'INVALID_COMMAND', 'command argument');
+	if (seen.has(value)) throw executionError('INVALID_COMMAND', 'ArenaScript INVALID_COMMAND: cyclic command argument');
+	seen.add(value);
+	if (Array.isArray(value)) return Object.freeze(value.map((entry) => freezeOutput(entry, seen)));
+	const output = Object.create(null);
+	for (const [key, entry] of ownDataEntries(value, 'command argument', { requireNullPrototype: true, errorCode: 'INVALID_COMMAND' })) {
+		if (FORBIDDEN_MEMBER_NAMES.has(key)) throw executionError('INVALID_COMMAND', 'ArenaScript INVALID_COMMAND: forbidden command key');
+		output[key] = freezeOutput(entry, seen);
+	}
+	return Object.freeze(output);
+}
+
+function frozenRecord(values) {
+	const record = Object.create(null);
+	for (const [key, value] of Object.entries(values)) record[key] = value;
+	return Object.freeze(record);
+}
+
+function safePrimitive(value, code, label) {
+	if (value === undefined || value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+	if (typeof value === 'number' && Number.isFinite(value)) return value;
+	throw executionError(code, `ArenaScript ${code}: ${label} must be a safe data value`);
+}
+
+function terminalText(value, fallback, node) {
+	if (value === undefined) return fallback;
+	if (typeof value !== 'string') throw executionError('INVALID_TERMINAL_VALUE', 'ArenaScript INVALID_TERMINAL_VALUE: terminal values must be strings', node?.loc ? Object.freeze({ start: node.start, end: node.end, line: node.loc.start.line, column: node.loc.start.column }) : null);
+	return value;
 }

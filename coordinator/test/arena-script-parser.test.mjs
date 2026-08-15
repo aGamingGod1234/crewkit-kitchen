@@ -37,6 +37,15 @@ test('admits the exact Task 2 direct action and terminal API calls', () => {
 	}
 });
 
+test('rejects side-effecting watcher and repeatUntil conditions', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(async () => { await player.moveTo({ x: 1 }); return false; }, { mode: "boundary" }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => { program.finish("escaped"); return false; }, { maxIterations: 1 }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => program.checkpoint("escaped"), { mode: "boundary" }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => program.watch(() => true, { mode: "boundary" }, async () => {}), { maxIterations: 1 }, async () => {});',
+	]) assert.throws(() => parseArenaScript(source), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+});
+
 test('accepts model-authored locals, conditionals, bounded for loops, and watchers', () => {
 	const compiled = parseArenaScript(`
 		program.onUnhandledAttention("pause_and_notify");
