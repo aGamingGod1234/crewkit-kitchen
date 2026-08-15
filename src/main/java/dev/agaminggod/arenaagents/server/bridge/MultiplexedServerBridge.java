@@ -15,6 +15,7 @@ import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
+import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.scenario.ScenarioAgentEvent;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import dev.agaminggod.arenaagents.server.AgentRuntimeHooks;
@@ -520,7 +521,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		result.addProperty("actionType", identity.actionType());
 		result.addProperty("state", "FAILED");
 		result.addProperty("reasonCode", exception instanceof BridgeProtocolException protocol ? protocol.code() : ((AgentDomainException) exception).code());
-		result.addProperty("message", exception.getMessage() == null ? "Action rejected" : exception.getMessage());
+		result.addProperty("message", boundedRejectionMessage(exception.getMessage()));
 		result.addProperty("elapsedMs", 0L);
 		result.addProperty("observedAtEpochMs", System.currentTimeMillis());
 		send("action_result", identity.agentId(), result);
@@ -538,6 +539,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private record RejectionIdentity(String agentId, long goalRevision, String actionId, String actionType) { }
+
+	static String boundedRejectionMessage(String message) {
+		String fallback = "Action rejected";
+		if (message == null || message.isBlank()) return fallback;
+		int end = message.offsetByCodePoints(0, Math.min(message.codePointCount(0, message.length()), ProtocolConstants.MAX_RESULT_MESSAGE_LENGTH));
+		String bounded = message.substring(0, end);
+		return bounded.isBlank() ? fallback : bounded;
+	}
 
 	private void validateActionProvenance(ServerActionRequest request) {
 		AgentRecord record = manager.registry().require(request.agentId());

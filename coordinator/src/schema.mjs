@@ -341,9 +341,24 @@ function validateVector(value, path, fields) {
 }
 
 function validateArray(value, path, maximum, validator) {
-	if (!Array.isArray(value)) throw invalid('INVALID_FIELD', `${path} must be an array`);
+	if (!isExactArray(value)) throw invalid('INVALID_FIELD', `${path} must be a dense native array without custom properties`);
 	if (value.length > maximum) throw invalid('OUT_OF_RANGE', `${path} must contain at most ${maximum} entries`);
-	value.forEach((entry, index) => validator(entry, `${path}[${index}]`));
+	for (let index = 0; index < value.length; index += 1) validator(value[index], `${path}[${index}]`);
+}
+
+function isExactArray(value) {
+	if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return false;
+	const ownKeys = Reflect.ownKeys(value);
+	if (ownKeys.some((key) => typeof key !== 'string')) return false;
+	const expected = new Set(['length', ...Array.from({ length: value.length }, (_, index) => String(index))]);
+	if (ownKeys.length !== expected.size || ownKeys.some((key) => !expected.has(key))) return false;
+	const length = Object.getOwnPropertyDescriptor(value, 'length');
+	if (!length || !Object.hasOwn(length, 'value') || length.enumerable || length.configurable || !length.writable) return false;
+	for (let index = 0; index < value.length; index += 1) {
+		const entry = Object.getOwnPropertyDescriptor(value, String(index));
+		if (!entry || !Object.hasOwn(entry, 'value') || !entry.enumerable || !entry.configurable || !entry.writable) return false;
+	}
+	return true;
 }
 
 function requireCoordinates(value, integral, path) {

@@ -92,6 +92,18 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 	);
 });
 
+test('build sequence accepts only dense native placement arrays', () => {
+	const placement = { x: 1, y: 64, z: -2, face: 'up', itemId: 'minecraft:stone', desiredState: null };
+	const valid = { type: 'build_sequence', placements: [placement], timeoutMs: 60_000 };
+	assert.deepEqual(validateAction(valid), valid);
+	const customPrototype = [placement]; Object.setPrototypeOf(customPrototype, null);
+	assert.throws(() => validateAction({ ...valid, placements: customPrototype }), /dense native array/);
+	const sparse = []; sparse.length = 1;
+	assert.throws(() => validateAction({ ...valid, placements: sparse }), /dense native array/);
+	const accessor = [placement]; Object.defineProperty(accessor, '0', { get: () => placement, enumerable: true, configurable: true });
+	assert.throws(() => validateAction({ ...valid, placements: accessor }), /dense native array/);
+});
+
 test('requires detached complete model-program provenance for action commands', () => {
 	const action = { type: 'wait', durationMs: 25 };
 	const provenance = {
