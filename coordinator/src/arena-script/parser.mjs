@@ -32,6 +32,12 @@ const FORBIDDEN_MEMBER_NAMES = new Set([
 ]);
 
 const UNHANDLED_POLICIES = new Set(['continue_and_notify', 'pause_and_notify']);
+const SPECIAL_PROGRAM_MEMBER_PATHS = [
+	['program', 'onUnhandledAttention'],
+	['program', 'repeatUntil'],
+	['program', 'watch'],
+];
+const MAX_ARENA_SCRIPT_AST_DEPTH = 256;
 
 const ALLOWED_NODE_TYPES = new Set([
 	'Program',
@@ -99,6 +105,7 @@ export function parseArenaScript(source, { limits = DEFAULT_ARENA_SCRIPT_LIMITS 
 		);
 	}
 
+	validateAstShape(ast, normalizedLimits);
 	const analysis = validateProgram(ast, normalizedLimits);
 	return deepFreeze({ source, ast, ...analysis });
 }
@@ -188,11 +195,11 @@ function visit(node, state, context) {
 			return;
 		case 'CallExpression':
 			validateCallExpression(node, state, context);
-			visit(node.callee, state, { ...context, topLevelExpression: false });
+			visit(node.callee, state, { ...context, directCallCallee: node.callee, topLevelExpression: false });
 			visit(node.arguments, state, { ...context, topLevelExpression: false });
 			return;
 		case 'MemberExpression':
-			validateMemberExpression(node, state);
+			validateMemberExpression(node, state, context);
 			visit(node.object, state, { ...context, topLevelExpression: false });
 			visit(node.property, state, { ...context, property: true, topLevelExpression: false });
 			return;
@@ -322,19 +329,26 @@ function validateCallExpression(node, state, context) {
 	if (pathEqual(path, ['program', 'watch'])) {
 		validateWatcher(node, state);
 	}
-	if (node.callee.type === 'Identifier' && state.functionNames.has(node.callee.name) && context.functionName) {
-		let edges = state.functionEdges.get(context.functionName);
-		if (!edges) {
-			edges = new Map();
-			state.functionEdges.set(context.functionName, edges);
+	if (node.callee.type === 'Identifier' && state.functionNames.has(node.callee.name)) {
+		if (context.functionName) {
+			let edges = state.functionEdges.get(context.functionName);
+			if (!edges) {
+				edges = new Map();
+				state.functionEdges.set(context.functionName, edges);
+			}
+			edges.set(node.callee.name, node);
 		}
-		edges.set(node.callee.name, node);
+	} else if (node.callee.type === 'Identifier' && state.userDeclarations.has(node.callee.name)) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'indirect local-function invocation is not allowed', node.callee);
 	}
 }
 
-function validateMemberExpression(node, state) {
+function validateMemberExpression(node, state, context) {
 	if (node.computed || node.optional) {
 		throw arenaError('UNSAFE_MEMBER_ACCESS', 'computed and optional member access is not allowed', node);
+	}
+	if (isSpecialProgramMember(node) && context.directCallCallee !== node) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'special program APIs must be called directly', node);
 	}
 	const memberName = propertyName(node.property);
 	if (memberName === null || FORBIDDEN_MEMBER_NAMES.has(memberName)) {
@@ -350,7 +364,7 @@ function validateRepeatUntil(node, state) {
 	if (node.arguments.length !== 3) {
 		throw arenaError('UNBOUNDED_LOOP', 'program.repeatUntil requires condition, literal maxIterations options, and body', node);
 	}
-	const maxIterations = literalObjectProperty(node.arguments[1], 'maxIterations');
+	const maxIterations = literalObjectProperty(node.arguments[1], 'maxIterations', 'UNBOUNDED_LOOP');
 	if (!Number.isSafeInteger(maxIterations) || maxIterations <= 0) {
 		throw arenaError('UNBOUNDED_LOOP', 'repeatUntil maxIterations must be a positive integer literal', node.arguments[1]);
 	}
@@ -367,7 +381,7 @@ function validateWatcher(node, state) {
 	if (node.arguments.length !== 3 || !isFunctionNode(node.arguments[0]) || !isFunctionNode(node.arguments[2])) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'program.watch requires condition, options, and handler functions', node);
 	}
-	const mode = literalObjectProperty(node.arguments[1], 'mode');
+	const mode = literalObjectProperty(node.arguments[1], 'mode', 'UNSUPPORTED_SYNTAX');
 	if (!['boundary', 'interrupt'].includes(mode)) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'watcher mode must be the boundary or interrupt literal', node.arguments[1]);
 	}
@@ -378,10 +392,10 @@ function validateForStatement(node, state) {
 		throw arenaError('UNBOUNDED_LOOP', 'for loops require one let counter initialized with a numeric literal', node);
 	}
 	const declaration = node.init.declarations[0];
-	if (declaration.id.type !== 'Identifier' || !isFiniteNumericLiteral(declaration.init)) {
+	if (declaration.id.type !== 'Identifier' || !isSafeIntegerLiteral(declaration.init)) {
 		throw arenaError('UNBOUNDED_LOOP', 'for loop counter must have a numeric literal initializer', node.init);
 	}
-	if (node.test?.type !== 'BinaryExpression' || !['<', '<=', '>', '>='].includes(node.test.operator) || node.test.left.type !== 'Identifier' || node.test.right.type !== 'Literal' || !isFiniteNumericLiteral(node.test.right)) {
+	if (node.test?.type !== 'BinaryExpression' || !['<', '<=', '>', '>='].includes(node.test.operator) || node.test.left.type !== 'Identifier' || node.test.right.type !== 'Literal' || !isSafeIntegerLiteral(node.test.right)) {
 		throw arenaError('UNBOUNDED_LOOP', 'for loop test must compare its counter with a numeric literal', node.test ?? node);
 	}
 	const counterName = declaration.id.name;
@@ -396,6 +410,10 @@ function validateForStatement(node, state) {
 	if ((ascending && delta < 0) || (!ascending && delta > 0)) {
 		throw arenaError('UNBOUNDED_LOOP', 'for loop counter moves away from its literal bound', node);
 	}
+	const iterations = forLoopIterations(declaration.init.value, node.test.right.value, delta, node.test.operator);
+	if (iterations > BigInt(state.limits.loopIterationsPerYield)) {
+		throw arenaError('UNBOUNDED_LOOP', `for loop exceeds ${state.limits.loopIterationsPerYield} literal iterations`, node);
+	}
 	if (containsCounterMutation(node.body, counterName)) {
 		throw arenaError('UNBOUNDED_LOOP', 'for loop body cannot mutate its counter', node.body);
 	}
@@ -404,11 +422,26 @@ function validateForStatement(node, state) {
 function loopDelta(update, counterName) {
 	if (update?.type === 'UpdateExpression' && update.argument.type === 'Identifier' && update.argument.name === counterName && update.operator === '++') return 1;
 	if (update?.type === 'UpdateExpression' && update.argument.type === 'Identifier' && update.argument.name === counterName && update.operator === '--') return -1;
-	if (update?.type === 'AssignmentExpression' && update.left.type === 'Identifier' && update.left.name === counterName && (update.operator === '+=' || update.operator === '-=') && isFiniteNumericLiteral(update.right)) {
+	if (update?.type === 'AssignmentExpression' && update.left.type === 'Identifier' && update.left.name === counterName && (update.operator === '+=' || update.operator === '-=') && isSafeIntegerLiteral(update.right)) {
 		const value = update.right.value;
 		return update.operator === '+=' ? value : -value;
 	}
 	return null;
+}
+
+function forLoopIterations(initialValue, boundValue, deltaValue, operator) {
+	const initial = BigInt(initialValue);
+	const bound = BigInt(boundValue);
+	const delta = BigInt(deltaValue);
+	if (operator === '<') return initial >= bound ? 0n : divideCeiling(bound - initial, delta);
+	if (operator === '<=') return initial > bound ? 0n : ((bound - initial) / delta) + 1n;
+	const magnitude = -delta;
+	if (operator === '>') return initial <= bound ? 0n : divideCeiling(initial - bound, magnitude);
+	return initial < bound ? 0n : ((initial - bound) / magnitude) + 1n;
+}
+
+function divideCeiling(dividend, divisor) {
+	return (dividend + divisor - 1n) / divisor;
 }
 
 function containsCounterMutation(node, counterName) {
@@ -510,19 +543,38 @@ function detectRecursion(state) {
 	for (const name of state.functionNames.keys()) visitFunction(name);
 }
 
-function literalObjectProperty(node, expectedName) {
+function literalObjectProperty(node, expectedName, errorCode) {
 	if (!node || node.type !== 'ObjectExpression') return null;
-	const property = node.properties.find((candidate) => propertyName(candidate?.key) === expectedName && candidate.kind === 'init' && !candidate.computed);
-	if (!property || property.value.type !== 'Literal') return null;
-	return property.value.value;
+	const names = new Set();
+	let expectedValue = null;
+	for (const property of node.properties) {
+		if (property?.type !== 'Property' || property.kind !== 'init' || property.method || property.computed) {
+			throw arenaError(errorCode, 'options must contain only plain literal properties', property ?? node);
+		}
+		const name = propertyName(property.key);
+		if (name === null || FORBIDDEN_MEMBER_NAMES.has(name) || names.has(name)) {
+			throw arenaError(errorCode, 'options cannot contain duplicate or forbidden property keys', property);
+		}
+		names.add(name);
+		if (name !== expectedName || property.value.type !== 'Literal') {
+			throw arenaError(errorCode, `options must contain exactly one literal ${expectedName} property`, property);
+		}
+		expectedValue = property.value.value;
+	}
+	return names.size === 1 && names.has(expectedName) ? expectedValue : null;
 }
 
 function isFunctionNode(node) {
 	return node?.type === 'ArrowFunctionExpression' || node?.type === 'FunctionExpression' || node?.type === 'FunctionDeclaration';
 }
 
-function isFiniteNumericLiteral(node) {
-	return node?.type === 'Literal' && typeof node.value === 'number' && Number.isFinite(node.value);
+function isSafeIntegerLiteral(node) {
+	return node?.type === 'Literal' && typeof node.value === 'number' && Number.isSafeInteger(node.value);
+}
+
+function isSpecialProgramMember(node) {
+	const path = staticMemberPath(node);
+	return SPECIAL_PROGRAM_MEMBER_PATHS.some((specialPath) => pathEqual(path, specialPath));
 }
 
 function staticMemberPath(node) {
@@ -579,28 +631,63 @@ function parseErrorLocation(error) {
 	});
 }
 
+function validateAstShape(ast, limits) {
+	const stack = [{ node: ast, depth: 1 }];
+	let nodeCount = 0;
+	while (stack.length > 0) {
+		const { node, depth } = stack.pop();
+		if (!node || typeof node !== 'object') continue;
+		if (Array.isArray(node)) {
+			for (const child of node) stack.push({ node: child, depth });
+			continue;
+		}
+		if (typeof node.type !== 'string') continue;
+		nodeCount += 1;
+		if (nodeCount > limits.astNodes || depth > MAX_ARENA_SCRIPT_AST_DEPTH) {
+			throw arenaError('AST_TOO_LARGE', `syntax tree exceeds parser limits of ${limits.astNodes} nodes and ${MAX_ARENA_SCRIPT_AST_DEPTH} depth`, node);
+		}
+		for (const [key, child] of Object.entries(node)) {
+			if (key !== 'loc' && key !== 'start' && key !== 'end' && key !== 'type') {
+				stack.push({ node: child, depth: depth + 1 });
+			}
+		}
+	}
+}
+
 function arenaError(code, message, node = null) {
 	return new ArenaScriptError(code, `ArenaScript ${code}: ${message}`, node && hasLocation(node) ? locationFromNode(node) : null);
 }
 
-class FrozenMap extends Map {
-	set() {
-		throw new TypeError('ArenaScript step locations are immutable');
-	}
-
-	delete() {
-		throw new TypeError('ArenaScript step locations are immutable');
-	}
-
-	clear() {
-		throw new TypeError('ArenaScript step locations are immutable');
-	}
-}
-
 function createFrozenMap(map) {
-	const frozen = new FrozenMap();
-	for (const [key, value] of map) Map.prototype.set.call(frozen, key, Object.freeze({ ...value }));
-	return Object.freeze(frozen);
+	const locations = new Map();
+	for (const [key, value] of map) locations.set(key, Object.freeze({ ...value }));
+	const readonly = {
+		get size() {
+			return locations.size;
+		},
+		get(key) {
+			return locations.get(key);
+		},
+		has(key) {
+			return locations.has(key);
+		},
+		entries() {
+			return locations.entries();
+		},
+		keys() {
+			return locations.keys();
+		},
+		values() {
+			return locations.values();
+		},
+		forEach(callback, thisArg = undefined) {
+			locations.forEach((value, key) => callback.call(thisArg, value, key, readonly));
+		},
+		[Symbol.iterator]() {
+			return locations.entries();
+		},
+	};
+	return Object.freeze(readonly);
 }
 
 function deepFreeze(value, seen = new Set()) {

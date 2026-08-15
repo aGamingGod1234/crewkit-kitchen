@@ -150,3 +150,68 @@ for (const source of [
 		assert.throws(() => parseArenaScript(source), /ArenaScript|policy|unsupported|unsafe|bounded|recursion/i);
 	});
 }
+
+test('rejects aliases of special program APIs', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); const repeat = program.repeatUntil; await repeat(() => true, { maxIterations: 1 }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); const watch = program.watch; watch(() => true, { mode: "boundary" }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); const setPolicy = program.onUnhandledAttention; setPolicy("pause_and_notify");',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.code === 'UNSUPPORTED_SYNTAX',
+		);
+	}
+});
+
+test('rejects alias and parameter-mediated local function calls', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); function again() { const alias = again; alias(); } again();',
+		'program.onUnhandledAttention("continue_and_notify"); function again(fn) { fn(); } again(again);',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.code === 'UNSUPPORTED_SYNTAX',
+		);
+	}
+});
+
+test('rejects unsafe or excessive literal for-loop bounds', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); for (let index = 9007199254740992; index <= 9007199254740992; index += 1) {}',
+		'program.onUnhandledAttention("continue_and_notify"); for (let index = 0; index < 129; index += 1) {}',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.code === 'UNBOUNDED_LOOP',
+		);
+	}
+});
+
+test('rejects duplicate and forbidden loop option keys', () => {
+	for (const options of [
+		'{ maxIterations: 1, maxIterations: 2 }',
+		'{ __proto__: 1, maxIterations: 1 }',
+	]) {
+		assert.throws(
+			() => parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => true, ${options}, async () => {});`),
+			(error) => error.code === 'UNBOUNDED_LOOP',
+		);
+	}
+});
+
+test('rejects a deeply nested AST with a stable parser error', () => {
+	const source = `program.onUnhandledAttention("continue_and_notify"); ${'!'.repeat(300)}true;`;
+	assert.throws(
+		() => parseArenaScript(source),
+		(error) => error.code === 'AST_TOO_LARGE' && error.name === 'ArenaScriptError',
+	);
+});
+
+test('step locations cannot be mutated through Map.prototype', () => {
+	const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify");');
+	const size = compiled.stepLocations.size;
+	assert.throws(() => Map.prototype.set.call(compiled.stepLocations, 'injected', {}), TypeError);
+	assert.equal(compiled.stepLocations.size, size);
+	assert.equal(compiled.stepLocations.get('injected'), undefined);
+});
