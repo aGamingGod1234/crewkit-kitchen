@@ -44,6 +44,20 @@ test('installs a model-authored program and dispatches its next primitive withou
 	assert.equal(run.requests.length, 0, 'pre-authored continuation must not call the provider');
 });
 
+test('emits a provenance-bearing coordinate-free respawn primitive only from authored player code', async () => {
+	const run = harness();
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Respawn at the vanilla target.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();',
+	}, { observation: observation(), eventSequence: 9 });
+	assert.equal(run.sent.length, 1);
+	assert.equal(run.sent[0].type, 'action_command');
+	assert.equal(run.sent[0].payload.actionType, 'respawn');
+	assert.deepEqual(run.sent[0].payload.arguments, {});
+	assert.equal(run.sent[0].payload.provenance.provider, 'codex');
+	assert.equal(run.sent[0].payload.provenance.model, 'gpt-5.6-sol');
+	assert.equal(run.sent[0].payload.provenance.eventSequence, 9);
+});
+
 test('routes invalid source correction to the selected agent planner without a local replacement', async () => {
 	const run = harness();
 	await run.manager.installDecision(run.registry.get('agent-a'), { summary: 'Bad.', directive: 'replace', source: 'not valid ArenaScript {' }, { observation: observation(), eventSequence: 1 });

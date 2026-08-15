@@ -190,7 +190,8 @@ public final class AgentLifecycleReducer {
 		return transition(current, disconnected, true, true);
 	}
 
-	public static AgentTransition die(AgentRecord current, long nowEpochMs) {
+	public static AgentTransition die(AgentRecord current, AgentDeathSnapshot deathSnapshot, long nowEpochMs) {
+		Objects.requireNonNull(deathSnapshot, "deathSnapshot must not be null");
 		AgentRecord dead = current.withLifecycle(
 				AgentLifecycleState.DEAD,
 				current.currentGoal(),
@@ -198,7 +199,7 @@ public final class AgentLifecycleReducer {
 				current.queuedGoals(),
 				nowEpochMs,
 				current.lastError()
-		).withEntityUuid(Optional.empty(), nowEpochMs);
+		).withDeathSnapshot(deathSnapshot, nowEpochMs).withEntityUuid(Optional.empty(), nowEpochMs);
 		return transition(current, dead, true, true);
 	}
 

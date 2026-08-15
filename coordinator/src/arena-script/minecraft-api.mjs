@@ -3,6 +3,7 @@ export const SCRIPT_PRIMITIVES = Object.freeze(new Set([
 	'break_block', 'place_block', 'chat', 'wait', 'set_door', 'drop_item',
 	'transfer_container', 'craft_inventory', 'craft_table', 'furnace_transaction',
 	'equip_item', 'select_tool', 'block_with_shield', 'use_ranged',
+	'respawn',
 ]));
 
 export const PLAYER_MEMBER_PRIMITIVES = Object.freeze({
@@ -12,6 +13,7 @@ export const PLAYER_MEMBER_PRIMITIVES = Object.freeze({
 	transferContainer: 'transfer_container', craftInventory: 'craft_inventory', craftTable: 'craft_table',
 	furnaceTransaction: 'furnace_transaction', equipItem: 'equip_item', selectTool: 'select_tool',
 	blockWithShield: 'block_with_shield', useRanged: 'use_ranged',
+	respawn: 'respawn',
 });
 
 export const FACTUAL_API_PATHS = Object.freeze(new Set([

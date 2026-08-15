@@ -62,6 +62,7 @@ export const ACTION_FIELDS = Object.freeze({
 	select_tool: Object.freeze(['sourceSlot', 'hotbarSlot', 'expectedItemId', 'minRemainingDurability']),
 	block_with_shield: Object.freeze(['durationMs']),
 	use_ranged: Object.freeze(['targetSelector', 'drawDurationMs', 'timeoutMs']),
+	respawn: Object.freeze([]),
 	complete_goal: Object.freeze(['summary']),
 });
 

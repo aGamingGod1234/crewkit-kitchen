@@ -792,6 +792,13 @@ public final class ScenarioRuntimeService {
 		if (state != null && state.activeRun != null && state.pendingResult == null) persistActiveRun(state);
 	}
 
+
+	/** Vanilla death is never intercepted by a scenario. */
+	public static synchronized boolean recoverParkourDeath(ServerPlayer player) {
+		Objects.requireNonNull(player, "player must not be null");
+		return false;
+	}
+
 	private static void beginActivation(RuntimeState state, BuildJob build) {
 		build.session.markReady(0L);
 		build.session.beginCountdown(0L);

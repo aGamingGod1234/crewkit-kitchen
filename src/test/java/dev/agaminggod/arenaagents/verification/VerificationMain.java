@@ -230,6 +230,7 @@ public final class VerificationMain {
 				"select_tool",
 				"block_with_shield",
 				"use_ranged",
+				"respawn",
 				"complete_goal"
 		);
 		List<String> actualWireNames = List.of(ActionType.values()).stream()
@@ -260,6 +261,7 @@ public final class VerificationMain {
 		assertDecodedType(codec, "fight_target", "\"targetSelector\":\"nearest_hostile\",\"desiredRange\":2.5,\"timeoutMs\":15000", ActionType.FIGHT_TARGET);
 		assertDecodedType(codec, "flee_from", "\"targetSelector\":\"last_attacker\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
 		assertDecodedType(codec, "follow_entity", "\"targetSelector\":\"player:Lucas\",\"distance\":3,\"timeoutMs\":30000", ActionType.FOLLOW_ENTITY);
+		assertDecodedType(codec, "respawn", "", ActionType.RESPAWN);
 		assertDecodedType(codec, "complete_goal", "\"summary\":\"Reached the arena.\"", ActionType.COMPLETE_GOAL);
 	}
 

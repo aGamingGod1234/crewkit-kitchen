@@ -630,14 +630,27 @@ function normalizeProvider(value, field) {
 }
 
 function normalizeGoalControl(value) {
-	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
+	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal', 'death'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
 	const operation = boundedText(value.operation, 'operation', MAX_REASON_CODE_LENGTH);
 	if (!['start', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
 	const normalized = { operation, goalRevision: revision(value.goalRevision, 'goalRevision'), updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, 'updatedAtEpochMs') };
 	if (value.goal !== undefined) normalized.goal = boundedText(value.goal, 'goal', MAX_GOAL_LENGTH);
+	if (value.death !== undefined) normalized.death = normalizeDeath(value.death);
 	if (['start', 'steer', 'queue'].includes(operation) && normalized.goal === undefined) throw new ProtocolV2Error('MISSING_FIELD', `goal_control ${operation} requires goal`);
 	if (!['start', 'steer', 'queue'].includes(operation) && normalized.goal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goal`);
+	if (operation === 'dead' && normalized.death === undefined) throw new ProtocolV2Error('MISSING_FIELD', 'goal_control dead requires death facts');
+	if (operation !== 'dead' && normalized.death !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include death facts`);
 	return normalized;
+}
+
+function normalizeDeath(value) {
+	exactKeys(value, ['cause', 'dimensionId', 'x', 'y', 'z', 'diedAtEpochMs'], ['cause', 'dimensionId', 'x', 'y', 'z', 'diedAtEpochMs'], 'death');
+	return Object.freeze({
+		cause: boundedText(value.cause, 'death.cause', MAX_RESULT_MESSAGE_LENGTH),
+		dimensionId: requireIdentifier(value.dimensionId, 'death.dimensionId'),
+		x: finiteNumber(value.x, 'death.x'), y: finiteNumber(value.y, 'death.y'), z: finiteNumber(value.z, 'death.z'),
+		diedAtEpochMs: nonnegativeInteger(value.diedAtEpochMs, 'death.diedAtEpochMs'),
+	});
 }
 
 function normalizeObservation(value) {

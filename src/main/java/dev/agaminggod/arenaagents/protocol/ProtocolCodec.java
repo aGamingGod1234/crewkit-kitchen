@@ -312,6 +312,7 @@ public final class ProtocolCodec {
 			case SELECT_TOOL -> validateSelectTool(arguments);
 			case BLOCK_WITH_SHIELD -> requireDuration(arguments, FIELD_DURATION_MS);
 			case USE_RANGED -> validateUseRanged(arguments);
+			case RESPAWN -> { }
 			case COMPLETE_GOAL -> requireBoundedText(
 					arguments,
 					FIELD_SUMMARY,
@@ -748,6 +749,7 @@ public final class ProtocolCodec {
 		));
 		fields.put(ActionType.BLOCK_WITH_SHIELD, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_SELECTOR, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.RESPAWN, List.of());
 		fields.put(ActionType.COMPLETE_GOAL, List.of(FIELD_SUMMARY));
 		return Map.copyOf(fields);
 	}

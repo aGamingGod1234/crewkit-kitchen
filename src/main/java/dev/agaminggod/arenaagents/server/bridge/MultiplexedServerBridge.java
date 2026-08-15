@@ -207,6 +207,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		} else if ("start".equals(operation) || "steer".equals(operation)) {
 			transition.after().currentGoal().ifPresent(goal -> payload.addProperty("goal", plannerGoal(goal)));
 		}
+		if ("dead".equals(operation)) {
+			transition.after().deathSnapshot().ifPresent(death -> {
+				JsonObject facts = new JsonObject();
+				facts.addProperty("cause", death.cause());
+				facts.addProperty("dimensionId", death.dimensionId());
+				facts.addProperty("x", death.x());
+				facts.addProperty("y", death.y());
+				facts.addProperty("z", death.z());
+				facts.addProperty("diedAtEpochMs", death.diedAtEpochMs());
+				payload.add("death", facts);
+			});
+		}
 		send("goal_control", transition.after().agentId().toString(), payload);
 	}
 
@@ -557,7 +569,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void validateActionProvenance(ServerActionRequest request) {
 		AgentRecord record = manager.registry().require(request.agentId());
-		if (!record.acceptsRevision(request.goalRevision())) {
+		boolean respawn = request.type() == ActionType.RESPAWN;
+		if ((respawn && (record.state() != AgentLifecycleState.DEAD || request.goalRevision() != record.goalRevision()))
+				|| (!respawn && !record.acceptsRevision(request.goalRevision()))) {
 			throw new AgentDomainException("STALE_REVISION", "Coordinator action revision is stale");
 		}
 		ActionProvenance provenance = request.provenance();

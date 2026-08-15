@@ -111,6 +111,42 @@ test('steering and death dispose programs so stale action results are rejected',
 	} finally { await run.coordinator.stop(); }
 });
 
+test('death suspends the active program and asks the same selected model for a coordinate-free respawn program', async () => {
+	const run = await start();
+	try {
+		run.planner.requestPlan = async (request) => {
+			run.planner.requests.push(request);
+			return request.input.includes('fell from a high place')
+				? { summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }
+				: { summary: 'Wait.', directive: 'replace', source: SOURCE };
+		};
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'start', goalRevision: 1, goal: 'Wait.', updatedAtEpochMs: 1,
+		} });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		const stale = run.bridge.sent.find((message) => message.type === 'action_command');
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'dead', goalRevision: 2, updatedAtEpochMs: 2,
+			death: { cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 0, y: 64, z: 0, diedAtEpochMs: 2 },
+		} });
+		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DEAD);
+		await eventually(() => run.bridge.sent.some((message) => message.payload.actionType === 'respawn'));
+		const respawn = run.bridge.sent.find((message) => message.payload.actionType === 'respawn');
+		assert.deepEqual(respawn.payload.arguments, {});
+		assert.equal(respawn.payload.provenance.model, 'gpt-5.6-sol');
+		assert.equal(run.planner.requests.at(-1).agentId, 'agent-a');
+		assert.match(run.planner.requests.at(-1).input, /fell from a high place/);
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
+			goalRevision: 1, actionId: stale.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2,
+		} });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.registry.get('agent-a')?.state, DynamicAgentState.DEAD, 'stale pre-death action cannot resume the suspended program');
+	} finally { await run.coordinator.stop(); }
+});
+
 test('throwing telemetry clocks cannot block action results or disconnect cleanup', async () => {
 	const run = await start({ controlNow: () => { throw new Error('clock unavailable'); } });
 	try {

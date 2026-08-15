@@ -191,6 +191,25 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 				const interruptionResult = await interruption;
 				if (interruptionResult.error !== null) throw interruptionResult.error;
+				if (message.payload.operation === 'dead') {
+					const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
+					const decision = await this.#planner.requestPlan({
+						agentId: record.agentId,
+						goalRevision: record.goalRevision,
+						preserveState: true,
+						input: buildPlannerInput({
+							agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
+							goal: record.currentGoal,
+							goalRevision: record.goalRevision,
+							decisionContext: 'player_death',
+							death: message.payload.death,
+						}),
+					});
+					if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
+					await this.#programRuntime.installDecision(record, decision, {
+						observation: { death: message.payload.death }, eventSequence: 0,
+					});
+				}
 				if (['start', 'resume', 'steer'].includes(message.payload.operation)) {
 					await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
 				}

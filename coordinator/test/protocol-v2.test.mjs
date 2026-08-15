@@ -97,6 +97,34 @@ test('protocol v2 requires immutable provenance on every action command form', (
 	);
 });
 
+test('protocol v2 accepts only coordinate-free respawn arguments', () => {
+	const payload = {
+		goalRevision: 7, actionId: 'respawn-1', actionType: 'respawn', arguments: {}, provenance: PROVENANCE,
+	};
+	assert.deepEqual(validateProtocolV2Payload('action_command', payload).arguments, {});
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, arguments: { x: 1, y: 64, z: 1 } }),
+		(error) => error.code === 'INVALID_ACTION',
+		'respawn never accepts a model supplied position',
+	);
+});
+
+test('protocol v2 accepts exact death facts only on dead lifecycle control', () => {
+	const death = { cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 12.5, y: 64, z: -4.25, diedAtEpochMs: 17 };
+	assert.deepEqual(
+		validateProtocolV2Payload('goal_control', { operation: 'dead', goalRevision: 8, updatedAtEpochMs: 18, death }).death,
+		death,
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_control', { operation: 'dead', goalRevision: 8, updatedAtEpochMs: 18 }),
+		/requires death facts/,
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_control', { operation: 'start', goalRevision: 8, updatedAtEpochMs: 18, goal: 'run', death }),
+		/must not include death/,
+	);
+});
+
 function registeredRecord(agentId = 'agent-a') {
 	return {
 		schemaVersion: 1,

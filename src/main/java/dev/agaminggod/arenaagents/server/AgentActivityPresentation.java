@@ -35,6 +35,7 @@ public final class AgentActivityPresentation {
 			case EQUIP_ITEM -> "Equipping an item";
 			case BLOCK_WITH_SHIELD -> "Blocking with a shield";
 			case USE_RANGED -> "Using a ranged weapon";
+			case RESPAWN -> "Respawning";
 			case COMPLETE_GOAL -> "Finishing the task";
 		};
 	}

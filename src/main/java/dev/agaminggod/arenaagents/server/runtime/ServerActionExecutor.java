@@ -56,7 +56,7 @@ public final class ServerActionExecutor {
 			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.DROP_ITEM,
 			ActionType.TRANSFER_CONTAINER, ActionType.CRAFT_INVENTORY, ActionType.CRAFT_TABLE,
 			ActionType.FURNACE_TRANSACTION, ActionType.EQUIP_ITEM, ActionType.SELECT_TOOL,
-			ActionType.BLOCK_WITH_SHIELD, ActionType.USE_RANGED
+			ActionType.BLOCK_WITH_SHIELD, ActionType.USE_RANGED, ActionType.RESPAWN
 	);
 	private static final double MAX_INTERACTION_DISTANCE_SQUARED = 36.0D;
 	private static final Direction[] HORIZONTAL_PLACEMENT_DIRECTIONS = {
@@ -117,6 +117,10 @@ public final class ServerActionExecutor {
 	/** Legacy scenario/operator path. Model-authored commands must use submitProgramPrimitive. */
 	synchronized void submitLegacy(ServerActionRequest request) {
 		Objects.requireNonNull(request, "request must not be null");
+		if (request.type() == ActionType.RESPAWN) {
+			submitVanillaRespawn(request);
+			return;
+		}
 		if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId())) {
 			throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 		}
@@ -151,6 +155,16 @@ public final class ServerActionExecutor {
 				router.actionFinished(request.agentId(), request.goalRevision());
 			} catch (AgentDomainException stale) { }
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "ACTION_REJECTED";
+			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L);
+		}
+	}
+
+	private void submitVanillaRespawn(ServerActionRequest request) {
+		try {
+			manager.respawnVanilla(request.agentId());
+			emit(request, ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", 0L);
+		} catch (RuntimeException exception) {
+			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
 			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L);
 		}
 	}
@@ -424,7 +438,7 @@ public final class ServerActionExecutor {
 					player,
 					advancedInteractions.begin(player, request, arguments)
 			);
-			case COMPLETE_GOAL -> throw new IllegalStateException("complete_goal is handled before action creation");
+			case RESPAWN, COMPLETE_GOAL -> throw new IllegalStateException("respawn and complete_goal are handled before action creation");
 		};
 	}
 

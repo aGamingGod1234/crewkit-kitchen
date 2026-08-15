@@ -428,6 +428,7 @@ function wireActionCommand(record, actionId, command) {
 }
 function actionArguments(type, value) {
 	if (value !== null && typeof value === 'object' && !Array.isArray(value)) return structuredClone(value);
+	if (type === 'respawn' && (value === undefined || value === null || (Array.isArray(value) && value.length === 0))) return {};
 	if (type === 'wait' || type === 'use_item' || type === 'block_with_shield') return { durationMs: value };
 	throw codedError('INVALID_ARENA_SCRIPT_COMMAND', `ArenaScript primitive '${type}' requires an object argument`);
 }

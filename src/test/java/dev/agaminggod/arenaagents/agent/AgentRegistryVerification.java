@@ -21,6 +21,7 @@ public final class AgentRegistryVerification {
 		assertions += verifyEntityLocationPersistenceAndMigration();
 		assertions += verifyAutomaticProgressPersistence();
 		assertions += verifyEntityRecoveryTarget();
+		assertions += verifyDeathSnapshotPersistenceAndRespawn();
 		return assertions;
 	}
 
@@ -211,6 +212,40 @@ public final class AgentRegistryVerification {
 		assertEquals(legacy.entityUuid().orElseThrow(), target.entityUuid(), "recovery target entity UUID");
 		assertEquals(location, target.location(), "recovery target location");
 		return 3;
+	}
+
+	private static int verifyDeathSnapshotPersistenceAndRespawn() {
+		AgentRecord active = AgentRecord.create(
+				AgentId.random(),
+				new AgentProfile("codex", "gpt-5.6-sol", "high", Optional.of("Miner"), 0),
+				START_TIME
+		);
+		active = AgentLifecycleReducer.start(active, "Mine iron", START_TIME + 1L).after();
+		AgentDeathSnapshot death = new AgentDeathSnapshot(
+				"fell from a high place", "minecraft:the_nether", 12.5D, 64.0D, -3.5D,
+				Optional.of("minecraft:overworld"), Optional.of(100.5D), Optional.of(70.0D), Optional.of(-20.5D),
+				START_TIME + 2L
+		);
+		AgentTransition died = AgentLifecycleReducer.die(active, death, START_TIME + 3L);
+		assertEquals(AgentLifecycleState.DEAD, died.after().state(), "death enters persistent dead state");
+		assertEquals(active.currentGoal(), died.after().currentGoal(), "death retains current goal");
+		assertEquals(active.queuedGoals(), died.after().queuedGoals(), "death retains queued goals");
+		assertEquals(active.profile(), died.after().profile(), "death retains selected model profile");
+		assertEquals(Optional.of(death), died.after().deathSnapshot(), "death retains exact factual snapshot");
+		expectFailure(() -> AgentLifecycleReducer.start(died.after(), "Restart", START_TIME + 4L), "INVALID_TRANSITION");
+
+		AgentRegistrySnapshotCodec codec = new AgentRegistrySnapshotCodec();
+		AgentRegistry.Snapshot snapshot = new AgentRegistry.Snapshot(
+				AgentConstants.SCHEMA_VERSION, AgentConstants.DEFAULT_AGENT_LIMIT, AgentConstants.DEFAULT_QUEUE_LIMIT, List.of(died.after())
+		);
+		String encoded = codec.encode(snapshot);
+		AgentRecord roundTrip = codec.decode(encoded).records().getFirst();
+		assertEquals(died.after().deathSnapshot(), roundTrip.deathSnapshot(), "death snapshot persistence round-trip");
+		String legacy = encoded.replaceFirst(",\\\"death_snapshot\\\":\\{[^}]*\\}", "");
+		assertEquals(Optional.empty(), codec.decode(legacy).records().getFirst().deathSnapshot(), "legacy saves default death snapshot absent");
+		AgentTransition respawned = AgentLifecycleReducer.respawn(died.after(), UUID.randomUUID(), START_TIME + 5L);
+		assertEquals(Optional.empty(), respawned.after().deathSnapshot(), "only successful respawn clears death snapshot");
+		return 10;
 	}
 
 	private static void expectFailure(Runnable operation, String expectedCode) {

@@ -245,8 +245,8 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.disconnect(require(id), nowEpochMs));
 	}
 
-	public synchronized AgentTransition die(AgentId id, long nowEpochMs) {
-		return apply(AgentLifecycleReducer.die(require(id), nowEpochMs));
+	public synchronized AgentTransition die(AgentId id, AgentDeathSnapshot deathSnapshot, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.die(require(id), deathSnapshot, nowEpochMs));
 	}
 
 	public synchronized AgentTransition respawn(AgentId id, UUID entityUuid, long nowEpochMs) {

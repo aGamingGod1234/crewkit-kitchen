@@ -79,6 +79,10 @@ public final class AgentRegistrySnapshotCodec {
 		json.addProperty("inventory_snapshot", record.inventorySnapshot());
 		json.addProperty("automatic_progress", record.automaticProgress());
 		json.addProperty("respawn_policy", record.respawnPolicy().name());
+		record.deathSnapshot().ifPresentOrElse(
+				death -> json.add("death_snapshot", encodeDeathSnapshot(death)),
+				() -> json.add("death_snapshot", null)
+		);
 		json.addProperty("created_at_epoch_ms", record.createdAtEpochMs());
 		json.addProperty("updated_at_epoch_ms", record.updatedAtEpochMs());
 		json.addProperty("last_error", record.lastError());
@@ -105,10 +109,37 @@ public final class AgentRegistrySnapshotCodec {
 				requireString(json, "inventory_snapshot"),
 				optionalBoolean(json, "automatic_progress", true),
 				parseEnum(RespawnPolicy.class, requireString(json, "respawn_policy"), "respawn_policy"),
+				optionalDeathSnapshot(json, "death_snapshot"),
 				requireLong(json, "created_at_epoch_ms"),
 				requireLong(json, "updated_at_epoch_ms"),
 				requireString(json, "last_error")
 		);
+	}
+
+	private static JsonObject encodeDeathSnapshot(AgentDeathSnapshot death) {
+		JsonObject json = new JsonObject();
+		json.addProperty("cause", death.cause());
+		json.addProperty("dimension_id", death.dimensionId());
+		json.addProperty("x", death.x());
+		json.addProperty("y", death.y());
+		json.addProperty("z", death.z());
+		death.respawnDimensionId().ifPresentOrElse(value -> json.addProperty("respawn_dimension_id", value), () -> json.add("respawn_dimension_id", null));
+		death.respawnX().ifPresentOrElse(value -> json.addProperty("respawn_x", value), () -> json.add("respawn_x", null));
+		death.respawnY().ifPresentOrElse(value -> json.addProperty("respawn_y", value), () -> json.add("respawn_y", null));
+		death.respawnZ().ifPresentOrElse(value -> json.addProperty("respawn_z", value), () -> json.add("respawn_z", null));
+		json.addProperty("died_at_epoch_ms", death.diedAtEpochMs());
+		return json;
+	}
+
+	private static Optional<AgentDeathSnapshot> optionalDeathSnapshot(JsonObject object, String field) {
+		if (!object.has(field) || object.get(field).isJsonNull()) return Optional.empty();
+		JsonObject json = requireObject(object.get(field), field);
+		return Optional.of(new AgentDeathSnapshot(
+				requireString(json, "cause"), requireString(json, "dimension_id"),
+				requireDouble(json, "x"), requireDouble(json, "y"), requireDouble(json, "z"),
+				optionalString(json, "respawn_dimension_id"), optionalDouble(json, "respawn_x"), optionalDouble(json, "respawn_y"), optionalDouble(json, "respawn_z"),
+				requireLong(json, "died_at_epoch_ms")
+		));
 	}
 
 	private static JsonObject encodeEntityLocation(AgentEntityLocation location) {
@@ -235,6 +266,19 @@ public final class AgentRegistrySnapshotCodec {
 			throw failure("INVALID_PERSISTED_FIELD", field + " must be an integer");
 		}
 		return element.getAsLong();
+	}
+
+	private static double requireDouble(JsonObject object, String field) {
+		JsonElement element = requireElement(object, field);
+		if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isNumber() || !Double.isFinite(element.getAsDouble())) {
+			throw failure("INVALID_PERSISTED_FIELD", field + " must be a finite number");
+		}
+		return element.getAsDouble();
+	}
+
+	private static Optional<Double> optionalDouble(JsonObject object, String field) {
+		if (!object.has(field) || object.get(field).isJsonNull()) return Optional.empty();
+		return Optional.of(requireDouble(object, field));
 	}
 
 	private static JsonArray requireArray(JsonObject object, String field) {

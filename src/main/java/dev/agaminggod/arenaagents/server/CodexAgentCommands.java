@@ -288,11 +288,7 @@ public final class CodexAgentCommands {
 
 	private static int respawn(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		try {
-			AgentRecord record = manager(context).respawn(
-					StringArgumentType.getString(context, ARGUMENT_AGENT),
-					context.getSource().getLevel(),
-					context.getSource().getPosition()
-			);
+			AgentRecord record = manager(context).respawnVanilla(StringArgumentType.getString(context, ARGUMENT_AGENT));
 			context.getSource().sendSuccess(
 					() -> Component.literal("Respawned AI agent " + formatIdentity(record)),
 					false

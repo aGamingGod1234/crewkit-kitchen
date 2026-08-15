@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server;
 
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
+import dev.agaminggod.arenaagents.agent.AgentDeathSnapshot;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentEntityLocation;
 import dev.agaminggod.arenaagents.agent.AgentEntityRecoveryTarget;
@@ -173,13 +174,7 @@ public final class CodexAgentManager {
 
 	public AgentTransition start(String selector, String prompt) {
 		AgentRecord record = resolve(selector);
-		long now = System.currentTimeMillis();
-		if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
-			findAgentPlayer(record.agentId())
-					.filter(Entity::isAlive)
-					.ifPresent(entity -> savedData.registry().respawn(record.agentId(), entity.getUUID(), now));
-		}
-		return savedData.registry().start(record.agentId(), prompt, now);
+		return savedData.registry().start(record.agentId(), prompt, System.currentTimeMillis());
 	}
 
 	public AgentTransition stop(String selector) {
@@ -202,23 +197,30 @@ public final class CodexAgentManager {
 		return savedData.registry().steer(record.agentId(), prompt, System.currentTimeMillis());
 	}
 
-	public AgentRecord respawn(String selector, ServerLevel level, Vec3 position) {
-		Objects.requireNonNull(level, "level must not be null");
-		Objects.requireNonNull(position, "position must not be null");
-		AgentRecord record = resolve(selector);
+	public AgentRecord respawnVanilla(String selector) {
+		return respawnVanilla(resolve(selector).agentId());
+	}
+
+	public AgentRecord respawnVanilla(AgentId agentId) {
+		AgentRecord record = savedData.registry().require(Objects.requireNonNull(agentId, "agentId must not be null"));
 		if (record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
 			throw new AgentDomainException("AGENT_NOT_DEAD", "Only a dead Codex agent can be respawned");
 		}
 		runtimeHooks.validateProfile(record.profile());
 		try {
+			ServerPlayer deadPlayer = findAgentPlayer(record.agentId()).orElseThrow(
+					() -> new AgentDomainException("AGENT_PLAYER_MISSING", "Dead agent player is unavailable for vanilla respawn resolution")
+			);
+			OfflineAgentPlayers.VanillaRespawnTarget target = OfflineAgentPlayers.resolveVanillaRespawn(deadPlayer);
+			OfflineAgentPlayers.remove(deadPlayer);
 			OfflineAgentPlayers.spawn(
 					server,
 					record.agentId(),
 					record.profile(),
-					position,
-					0.0F,
-					0.0F,
-					level.dimension(),
+					target.position(),
+					target.yaw(),
+					target.pitch(),
+					target.level().dimension(),
 					record.profile().gameMode()
 			);
 			long now = System.currentTimeMillis();
@@ -230,9 +232,9 @@ public final class CodexAgentManager {
 			).after();
 			AgentRecord located = savedData.registry().updateEntityLocation(
 					respawned.agentId(),
-					entityLocation(level, new ChunkPos(
-							((int) Math.floor(position.x)) >> 4,
-							((int) Math.floor(position.z)) >> 4
+					entityLocation(target.level(), new ChunkPos(
+							((int) Math.floor(target.position().x)) >> 4,
+							((int) Math.floor(target.position().z)) >> 4
 					)),
 					now
 			);
@@ -261,7 +263,7 @@ public final class CodexAgentManager {
 				pendingPlayerSpawns.remove(record.agentId());
 				seenPlayers.add(record.agentId());
 				if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
-					savedData.registry().respawn(record.agentId(), player.get().getUUID(), now);
+					continue;
 				}
 				if (record.entityUuid().isEmpty() || !record.entityUuid().get().equals(player.get().getUUID())) {
 					savedData.registry().attachEntity(
@@ -277,17 +279,36 @@ public final class CodexAgentManager {
 				hideWorldName(player.get());
 				trackChunkTicket(record.agentId(), player.get());
 			} else if (player.isPresent() && record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
-				savedData.registry().die(record.agentId(), now);
+				savedData.registry().die(record.agentId(), deathSnapshot(player.get(), now), now);
 			} else if (record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
 				long deadline = pendingPlayerSpawns.getOrDefault(record.agentId(), 0L);
 				if (deadline > now) continue;
 				if (seenPlayers.contains(record.agentId())) {
-					savedData.registry().die(record.agentId(), now);
+					savedData.registry().die(record.agentId(), missingDeathSnapshot(record, now), now);
 					continue;
 				}
 				recoverOfflinePlayer(record, now);
 			}
 		}
+	}
+
+	private static AgentDeathSnapshot deathSnapshot(ServerPlayer player, long now) {
+		String cause;
+		try {
+			cause = player.getCombatTracker().getDeathMessage().getString();
+		} catch (RuntimeException ignored) {
+			cause = "Agent died";
+		}
+		return new AgentDeathSnapshot(
+				cause, player.level().dimension().identifier().toString(), player.getX(), player.getY(), player.getZ(),
+				Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), now
+		);
+	}
+
+	private static AgentDeathSnapshot missingDeathSnapshot(AgentRecord record, long now) {
+		AgentEntityLocation location = record.entityLocation().orElse(new AgentEntityLocation("minecraft:overworld", 0, 0));
+		return new AgentDeathSnapshot("Agent player disappeared", location.dimension(), (location.chunkX() << 4) + 8.5D, 64.0D, (location.chunkZ() << 4) + 8.5D,
+				Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), now);
 	}
 
 	private void hideWorldName(ServerPlayer player) {

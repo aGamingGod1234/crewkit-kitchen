@@ -109,6 +109,7 @@ public final class ServerActionExecutorVerification {
 				case MOVE_TO, NAVIGATE_TO, LOOK_AT, ATTACK, SELECT_ITEM, USE_ITEM, BREAK_BLOCK, PLACE_BLOCK,
 						CHAT, WAIT, SET_DOOR, DROP_ITEM, TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE,
 						FURNACE_TRANSACTION, EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED -> true;
+				case RESPAWN -> true;
 				default -> false;
 			};
 			assertEquals(expectedPrimitive, ServerActionExecutor.isArenaScriptPrimitive(type),

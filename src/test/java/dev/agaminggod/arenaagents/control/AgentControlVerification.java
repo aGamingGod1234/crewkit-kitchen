@@ -45,6 +45,7 @@ public final class AgentControlVerification {
 				"",
 				false,
 				RespawnPolicy.PAUSE_UNTIL_RESPAWN,
+				Optional.empty(),
 				NOW_EPOCH_MS,
 				NOW_EPOCH_MS,
 				""
