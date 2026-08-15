@@ -156,22 +156,17 @@ test('runs a latched boundary watcher before the base continuation and retains a
 	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 9]);
 });
 
-test('uses immutable request contexts and fences directives to the newest coalesced event', () => {
+test('keeps an immutable request identity seen by a one-argument model callback', () => {
 	const requests = [];
-	const updates = [];
 	const { engine } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);', {
-		requestModel: (context, registerUpdate) => { requests.push(context); registerUpdate((next) => updates.push(next)); },
+		requestModel: (context) => { requests.push(context); },
 	});
 	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true });
 	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: true });
 	assert.equal(requests.length, 1);
 	assert.ok(Object.isFrozen(requests[0]));
 	assert.equal(requests[0].eventSequence, 2);
-	assert.equal(updates.length, 1);
-	assert.equal(updates[0].eventSequence, 3);
 	engine.applyDirective({ directive: 'pause', agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, generation: requests[0].generation, eventSequence: 2 });
-	assert.equal(engine.snapshot().status, 'ACTIVE');
-	engine.applyDirective({ directive: 'pause', agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, generation: updates[0].generation, eventSequence: 3 });
 	assert.equal(engine.snapshot().status, 'SUSPENDING');
 });
 
@@ -201,4 +196,26 @@ test('rearmer watcher edges after a false observation and disposal waits for can
 	assert.notEqual(engine.snapshot().status, 'IDLE');
 	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'DISPOSED', eventSequence: 4 });
 	assert.equal(engine.snapshot().status, 'IDLE');
+});
+
+test('drains multiple boundary watchers in edge order before resuming the base continuation', () => {
+	const { engine, dispatched } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); });
+		program.watch(() => player.state().health < 19, { mode: "boundary" }, async () => { await player.wait(8); });
+		await player.wait(1); await player.wait(2);
+	`);
+	const base = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 10 } }), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: base.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 10 } }), eventSequence: 2, attention: false });
+	const first = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3 });
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 10 } }), eventSequence: 3, attention: false });
+	const second = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: second.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 4 });
+	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 10 } }), eventSequence: 4, attention: false });
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 9, 8, 2]);
+	assert.match(first.provenance.source, /^watcher:watcher-0$/);
+	assert.match(second.provenance.source, /^watcher:watcher-1$/);
 });

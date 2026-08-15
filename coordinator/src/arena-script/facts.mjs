@@ -74,8 +74,7 @@ export function markObservedCandidateSet(candidates) {
 
 function copyCandidates(values, kind) {
 	if (values === undefined) return observedList([]);
-	if (!Array.isArray(values) || nodeTypes.isProxy(values)) throw new TypeError(`observation ${kind}s must be an array`);
-	return observedList(values.map((value) => copyCandidate(value, kind)));
+	return observedList(denseDataArray(values, `observation ${kind}s`).map((value) => copyCandidate(value, kind)));
 }
 
 function copyCandidate(value, kind) {
@@ -89,8 +88,9 @@ function copyCandidate(value, kind) {
 	if (kind === 'block' && typeof source.blockId !== 'string') throw new TypeError('observation block has invalid block id');
 	const copied = copyRecord(source, CANDIDATE_FIELDS, `observation ${kind}`);
 	if (Object.hasOwn(source, 'tags')) {
-		if (!Array.isArray(source.tags) || nodeTypes.isProxy(source.tags) || source.tags.some((tag) => typeof tag !== 'string')) throw new TypeError(`observation ${kind} has invalid tags`);
-		copied.tags = Object.freeze([...source.tags]);
+		const tags = denseDataArray(source.tags, `observation ${kind} tags`);
+		if (tags.some((tag) => typeof tag !== 'string')) throw new TypeError(`observation ${kind} has invalid tags`);
+		copied.tags = Object.freeze([...tags]);
 	}
 	copied.position = freezeRecord({ x: source.x, y: source.y, z: source.z });
 	return freezeRecord(copied);
@@ -98,12 +98,28 @@ function copyCandidate(value, kind) {
 
 function copyInventory(values) {
 	if (values === undefined) return Object.freeze([]);
-	if (!Array.isArray(values) || nodeTypes.isProxy(values)) throw new TypeError('observation inventory items must be an array');
-	return Object.freeze(values.map((value) => {
+	return Object.freeze(denseDataArray(values, 'observation inventory items').map((value) => {
 		const source = ownDataRecord(value, 'observation inventory item');
 		if (Reflect.ownKeys(source).some((key) => !['itemId', 'count', 'slot'].includes(key)) || typeof source.itemId !== 'string' || !nonNegativeInteger(source.count)) throw new TypeError('observation inventory item has an invalid schema');
 		return freezeRecord(copyRecord(source, ['itemId', 'count', 'slot'], 'observation inventory item'));
 	}));
+}
+
+function denseDataArray(value, label) {
+	if (!Array.isArray(value) || nodeTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) throw new TypeError(`${label} must be a plain array`);
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	const keys = Reflect.ownKeys(value);
+	if (keys.some((key) => typeof key === 'symbol' || (key !== 'length' && !/^(0|[1-9]\d*)$/.test(key)))) throw new TypeError(`${label} has unsafe keys`);
+	const length = descriptors.length;
+	if (!length || !Object.hasOwn(length, 'value') || length.get || length.set || !Number.isSafeInteger(length.value)) throw new TypeError(`${label} has invalid length`);
+	const copied = [];
+	for (let index = 0; index < length.value; index += 1) {
+		const descriptor = descriptors[String(index)];
+		if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.get || descriptor.set) throw new TypeError(`${label} must be dense own data`);
+		copied.push(descriptor.value);
+	}
+	if (keys.length !== length.value + 1) throw new TypeError(`${label} must not have holes or custom keys`);
+	return copied;
 }
 
 function copyRecord(source, names, label) {

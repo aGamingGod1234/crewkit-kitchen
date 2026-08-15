@@ -14,7 +14,7 @@ export class ArenaScriptEngine {
 	}
 
 	install(input) {
-		const target = normalizeInstall(input);
+		const target = normalizeInstall(input, this.#program);
 		if (this.#program && !isNewer(target, this.#program)) throw new RangeError('ArenaScriptEngine installation must advance the goal revision or program version');
 		if (this.#active) {
 			this.#transition = { kind: 'install', target };
@@ -53,16 +53,16 @@ export class ArenaScriptEngine {
 			if (state !== 'CANCELLED') { this.#status = 'PAUSED'; return this.snapshot(); }
 			const cancelling = this.#cancelling;
 			this.#cancelling = null;
-			if (this.#transition) return this.#completeTransition();
+			if (this.#transition) { this.#transition.result = Object.freeze({ result, eventSequence, authority: active.authority }); return this.#completeTransition(); }
 			if (cancelling?.kind === 'watcher') {
 				this.#vm.abortPendingCommand(result.stateToken);
-				this.#handleYield(this.#vm.runWatcherHandler(cancelling.latch.watcherId, cancelling.latch.facts), `watcher:${cancelling.latch.watcherId}`);
+				this.#handleYield(this.#vm.runWatcherHandler(cancelling.latch.watcherId, cancelling.latch.facts), cancelling.latch);
 				return this.snapshot();
 			}
 			this.#status = 'SUSPENDED';
 			return this.snapshot();
 		}
-		this.#pendingResult = Object.freeze({ result, eventSequence });
+		this.#pendingResult = Object.freeze({ result, eventSequence, authority: active.authority });
 		return this.snapshot();
 	}
 
@@ -71,10 +71,13 @@ export class ArenaScriptEngine {
 		if (!request || !sameRequest(directive, request)) return this.snapshot();
 		this.#pendingRequest = null;
 		this.#requestUpdate = null;
-		if (directive.directive === 'continue') return this.snapshot();
+		if (directive.directive === 'continue') {
+			if (this.#transition?.kind === 'terminal' && this.#transition.reason === 'unhandled_attention') this.#transition = { kind: 'resume' };
+			return this.snapshot();
+		}
 		if (directive.directive === 'replace') {
 			try {
-				const target = normalizeInstall(directive.install);
+				const target = normalizeInstall(directive.install, this.#program);
 				if (!isNewer(target, this.#program)) return this.snapshot();
 				this.#transition = { kind: 'install', target };
 			} catch { return this.snapshot(); }
@@ -104,8 +107,10 @@ export class ArenaScriptEngine {
 		this.#clear(false);
 		this.#generation += 1;
 		this.#program = freezeRecord({ agentId: target.agentId, goalRevision: target.goalRevision, modelIdentity: target.modelIdentity, programId: target.programId, version: target.version, compiled: target.compiled });
-		this.#facts = createInterpreterFacts(target.observation);
-		this.#eventSequence = target.eventSequence;
+		const latestFacts = this.#facts && this.#eventSequence > target.eventSequence ? this.#facts : target.facts;
+		const latestSequence = Math.max(this.#eventSequence, target.eventSequence);
+		this.#facts = latestFacts;
+		this.#eventSequence = latestSequence;
 		this.#vm = new ArenaScriptInterpreter(target.compiled, SCRIPT_BINDINGS);
 		this.#status = 'ACTIVE';
 		this.#handleYield(this.#vm.start(this.#facts), 'step');
@@ -126,6 +131,7 @@ export class ArenaScriptEngine {
 		if (!transition) return this.snapshot();
 		if (transition.kind === 'install') return this.#activate(transition.target);
 		if (transition.kind === 'dispose') { this.#clear(); return this.snapshot(); }
+		if (transition.kind === 'resume') { this.#status = 'ACTIVE'; this.#pendingResult = transition.result; return this.snapshot(); }
 		this.#status = transition.status;
 		return this.snapshot();
 	}
@@ -139,7 +145,7 @@ export class ArenaScriptEngine {
 			this.#watcherTruth.set(watcherId, trueNow);
 			if (!trueNow || wasTrue) continue;
 			edges += 1;
-			const latch = freezeRecord({ watcherId, mode: watcherMode(this.#program.compiled, index), eventSequence: this.#eventSequence, facts: this.#facts });
+			const latch = freezeRecord({ watcherId, mode: watcherMode(this.#program.compiled, index), eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts });
 			if (latch.mode === 'interrupt' && this.#active && !this.#cancelling) {
 				this.#cancelling = { kind: 'watcher', actionId: this.#active.actionId, latch };
 				this.#callbacks.cancel(this.#active.actionId);
@@ -149,40 +155,38 @@ export class ArenaScriptEngine {
 	}
 
 	#resumeOrRunBoundary() {
-		if (this.#boundary.length > 0) return this.#runBoundary();
 		const pending = this.#pendingResult; this.#pendingResult = null;
+		if (!pending.authority && this.#boundary.length > 0) { this.#pendingResult = pending; return this.#runBoundary(); }
 		const yielded = this.#vm.resume(pending.result, this.#facts);
-		this.#handleYield(yielded, 'step');
+		this.#handleYield(yielded, pending.authority ?? 'step');
 	}
 
 	#runBoundary() {
 		if (this.#active || this.#boundary.length === 0) return;
 		const latch = this.#boundary.shift();
-		if (this.#pendingResult) {
+		if (this.#deferredBase) {
+			this.#handleYield(this.#vm.runWatcherHandler(latch.watcherId, latch.facts), latch);
+		} else if (this.#pendingResult) {
 			this.#deferredBase = this.#pendingResult;
 			this.#pendingResult = null;
-			this.#handleYield(this.#vm.runWatcherHandlerBeforeResume(latch.watcherId, latch.facts), `watcher:${latch.watcherId}`);
-		} else this.#handleYield(this.#vm.runWatcherHandler(latch.watcherId, latch.facts), `watcher:${latch.watcherId}`);
+			this.#handleYield(this.#vm.runWatcherHandlerBeforeResume(latch.watcherId, latch.facts), latch);
+		} else this.#handleYield(this.#vm.runWatcherHandler(latch.watcherId, latch.facts), latch);
 	}
 
 	#requestModel() {
 		const context = requestContext(this.#program, this.#generation, this.#eventSequence, this.#facts);
-		if (this.#pendingRequest) {
-			this.#pendingRequest = context;
-			if (this.#requestUpdate) this.#requestUpdate(context);
-			return;
-		}
+		if (this.#pendingRequest) return;
 		this.#pendingRequest = context;
-		const registerUpdate = (listener) => { if (typeof listener === 'function') this.#requestUpdate = listener; };
-		this.#callbacks.requestModel(context, registerUpdate);
+		this.#callbacks.requestModel(context);
 		if (this.#program.compiled.unhandledPolicy === 'pause_and_notify') this.suspend('unhandled_attention');
 	}
 
 	#handleYield(yielded, source) {
 		if (yielded.kind === 'command') {
 			const actionId = `${this.#program.programId}:${this.#program.version}:${this.#generation}:${yielded.stateToken}`;
-			const command = freezeRecord({ actionId, action: freezeRecord({ type: yielded.call.primitive, arguments: yielded.call.arguments }), provenance: freezeRecord({ agentId: this.#program.agentId, goalRevision: this.#program.goalRevision, modelIdentity: this.#program.modelIdentity, programId: this.#program.programId, version: this.#program.version, generation: this.#generation, source, stepId: yielded.stepId, eventSequence: this.#eventSequence }) });
-			this.#active = { actionId, stateToken: yielded.stateToken, generation: this.#generation, source };
+			const authority = source && typeof source === 'object' && typeof source.watcherId === 'string' ? source : null;
+			const command = freezeRecord({ actionId, action: freezeRecord({ type: yielded.call.primitive, arguments: yielded.call.arguments }), provenance: freezeRecord({ agentId: this.#program.agentId, goalRevision: this.#program.goalRevision, modelIdentity: this.#program.modelIdentity, programId: this.#program.programId, version: this.#program.version, generation: this.#generation, source: authority ? `watcher:${authority.watcherId}` : source, watcherId: authority?.watcherId ?? null, authorizingEventSequence: authority?.eventSequence ?? null, factsEventSequence: this.#eventSequence, stepId: yielded.stepId, eventSequence: this.#eventSequence }) });
+			this.#active = { actionId, stateToken: yielded.stateToken, generation: this.#generation, source, authority };
 			this.#callbacks.dispatch(command);
 			return;
 		}
@@ -192,18 +196,26 @@ export class ArenaScriptEngine {
 			return;
 		}
 		if (yielded.kind === 'idle' && this.#deferredBase) {
+			if (this.#boundary.length > 0) return this.#runBoundary();
 			const deferred = this.#deferredBase; this.#deferredBase = null;
 			this.#handleYield(this.#vm.resumeDeferredCommand(deferred.result, this.#facts), 'step');
 		}
 	}
 }
 
-function normalizeInstall(input) {
+function normalizeInstall(input, current = null) {
 	if (!input || typeof input !== 'object' || !input.compiled?.ast || !Object.isFrozen(input.compiled)) throw new TypeError('ArenaScriptEngine requires a frozen compiled program');
-	const fields = ['agentId', 'modelIdentity', 'programId'];
-	for (const field of fields) if (typeof input[field] !== 'string' || input[field].trim().length === 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonempty string`);
-	for (const field of ['goalRevision', 'version', 'eventSequence']) if (!Number.isSafeInteger(input[field]) || input[field] < 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonnegative safe integer`);
-	return freezeRecord({ agentId: input.agentId.trim(), goalRevision: input.goalRevision, modelIdentity: input.modelIdentity.trim(), programId: input.programId.trim(), version: input.version, compiled: input.compiled, observation: input.observation, eventSequence: input.eventSequence });
+	const inherited = current ? { agentId: current.agentId, goalRevision: current.goalRevision, modelIdentity: current.modelIdentity } : null;
+	for (const field of ['agentId', 'modelIdentity', 'goalRevision']) {
+		if (current && Object.hasOwn(input, field) && input[field] !== inherited[field]) throw new TypeError(`ArenaScriptEngine replacement ${field} conflicts with the authenticated program`);
+	}
+	const agentId = current ? inherited.agentId : input.agentId;
+	const modelIdentity = current ? inherited.modelIdentity : input.modelIdentity;
+	const goalRevision = current ? inherited.goalRevision : input.goalRevision;
+	for (const [field, value] of [['agentId', agentId], ['modelIdentity', modelIdentity], ['programId', input.programId]]) if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonempty string`);
+	for (const [field, value] of [['goalRevision', goalRevision], ['version', input.version], ['eventSequence', input.eventSequence]]) if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`ArenaScriptEngine ${field} must be a nonnegative safe integer`);
+	const facts = createInterpreterFacts(input.observation);
+	return freezeRecord({ agentId: agentId.trim(), goalRevision, modelIdentity: modelIdentity.trim(), programId: input.programId.trim(), version: input.version, compiled: input.compiled, facts, eventSequence: input.eventSequence });
 }
 function isNewer(next, current) { return next.goalRevision > current.goalRevision || (next.goalRevision === current.goalRevision && next.version > current.version); }
 function requestContext(program, generation, eventSequence, observation) { return freezeRecord({ agentId: program.agentId, goalRevision: program.goalRevision, modelIdentity: program.modelIdentity, programId: program.programId, version: program.version, generation, eventSequence, observation }); }

@@ -138,6 +138,7 @@ function validateProgram(ast, limits) {
 	};
 
 	collectDeclarations(ast, state);
+	validateWatcherPrologue(ast);
 	const rootScope = createLexicalScope(null, ast.body, state);
 	visit(ast, state, { functionBinding: null, scope: rootScope, topLevelExpression: false });
 
@@ -152,6 +153,36 @@ function validateProgram(ast, limits) {
 		unhandledPolicy: state.unhandledPolicy,
 		watcherCount: state.watcherCount,
 	};
+}
+
+function validateWatcherPrologue(ast) {
+	let prologue = true;
+	for (const statement of ast.body) {
+		if (statement.type === 'EmptyStatement') continue;
+		const path = statement.type === 'ExpressionStatement' && statement.expression.type === 'CallExpression'
+			? staticMemberPath(statement.expression.callee)?.join('.') : null;
+		if (path === 'program.onUnhandledAttention' || path === 'program.watch') {
+			if (!prologue && path === 'program.watch') throw arenaError('UNSUPPORTED_SYNTAX', 'program.watch declarations must precede top-level execution', statement);
+			continue;
+		}
+		if (statementHasTopLevelEffect(statement)) prologue = false;
+	}
+}
+
+function statementHasTopLevelEffect(statement) {
+	const stack = [statement];
+	while (stack.length > 0) {
+		const current = stack.pop();
+		if (!current || typeof current !== 'object') continue;
+		if (Array.isArray(current)) { stack.push(...current); continue; }
+		if (current.type === 'AwaitExpression') return true;
+		if (current.type === 'CallExpression') {
+			const path = staticMemberPath(current.callee)?.join('.');
+			if (path && !['program.onUnhandledAttention', 'program.watch', 'player.state', 'inventory.count', 'inventory.countTag', 'world.items', 'world.entities', 'world.blocks', 'world.nearest'].includes(path)) return true;
+		}
+		for (const [key, value] of Object.entries(current)) if (!['loc', 'start', 'end', 'type'].includes(key)) stack.push(value);
+	}
+	return false;
 }
 
 function visit(node, state, context) {

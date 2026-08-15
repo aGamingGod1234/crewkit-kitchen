@@ -45,6 +45,14 @@ test('admits only factual observed-candidate queries in watcher conditions', () 
 	assert.throws(() => parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.mine({ x: 1 }), { mode: "boundary" }, async () => {});'), (error) => error.code === 'UNSUPPORTED_SYNTAX');
 });
 
+test('requires watchers to appear in the top-level registration prologue', () => {
+	assert.throws(() => parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		await player.wait(1);
+		program.watch(() => true, { mode: "boundary" }, async () => {});
+	`), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+});
+
 test('rejects side-effecting watcher and repeatUntil conditions', () => {
 	for (const source of [
 		'program.onUnhandledAttention("continue_and_notify"); program.watch(async () => { await player.moveTo({ x: 1 }); return false; }, { mode: "boundary" }, async () => {});',
