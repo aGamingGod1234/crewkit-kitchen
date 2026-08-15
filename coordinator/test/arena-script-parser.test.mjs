@@ -215,3 +215,40 @@ test('step locations cannot be mutated through Map.prototype', () => {
 	assert.equal(compiled.stepLocations.size, size);
 	assert.equal(compiled.stepLocations.get('injected'), undefined);
 });
+
+test('rejects callable indirection that bypasses direct recursion analysis', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); function again() { again.call(); } again();',
+		'program.onUnhandledAttention("continue_and_notify"); function again(box) { box.next(box); } const box = { next: again }; again(box);',
+		'program.onUnhandledAttention("continue_and_notify"); function decoy() {} function again(decoy) { decoy(decoy); } again(again);',
+		'program.onUnhandledAttention("continue_and_notify"); function decoy() {} function again(decoy) { return () => decoy(decoy); } again(again);',
+		'program.onUnhandledAttention("continue_and_notify"); let safe = () => {}; const again = () => { safe = again; safe(); }; again();',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+		);
+	}
+});
+
+test('rejects watches that can execute more than once', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); for (let index = 0; index < 17; index += 1) { program.watch(() => true, { mode: "boundary" }, async () => {}); }',
+		'program.onUnhandledAttention("continue_and_notify"); function install() { program.watch(() => true, { mode: "boundary" }, async () => {}); } install();',
+		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => false, { maxIterations: 1 }, async () => { program.watch(() => true, { mode: "boundary" }, async () => {}); });',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSUPPORTED_SYNTAX',
+		);
+	}
+});
+
+test('rejects forbidden keys in every object literal', () => {
+	for (const key of ['__proto__', 'constructor', 'prototype']) {
+		assert.throws(
+			() => parseArenaScript(`program.onUnhandledAttention("continue_and_notify"); const box = { ${key}: 1 };`),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSAFE_MEMBER_ACCESS',
+		);
+	}
+});

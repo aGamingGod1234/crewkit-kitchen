@@ -222,7 +222,14 @@ function visit(node, state, context) {
 				visit(parameter, state, { ...context, binding: true, topLevelExpression: false });
 			}
 			const functionName = state.functionNamesByNode.get(node) ?? null;
-			visit(node.body, state, { functionName, topLevelExpression: false });
+			visit(node.body, state, {
+				functionName,
+				functionParameters: new Set([
+					...(context.functionParameters ?? []),
+					...node.params.filter((parameter) => parameter.type === 'Identifier').map((parameter) => parameter.name),
+				]),
+				topLevelExpression: false,
+			});
 			return;
 		}
 		case 'IfStatement':
@@ -260,7 +267,7 @@ function visit(node, state, context) {
 			if (!ASSIGNMENT_OPERATORS.has(node.operator)) {
 				throw arenaError('UNSUPPORTED_SYNTAX', `assignment operator ${node.operator} is not allowed`, node);
 			}
-			validateLocalAssignmentTarget(node.left, state);
+			validateLocalAssignmentTarget(node.left, state, node.right, context);
 			visit(node.left, state, { ...context, topLevelExpression: false });
 			visit(node.right, state, { ...context, topLevelExpression: false });
 			return;
@@ -268,7 +275,7 @@ function visit(node, state, context) {
 			if (!['++', '--'].includes(node.operator)) {
 				throw arenaError('UNSUPPORTED_SYNTAX', `update operator ${node.operator} is not allowed`, node);
 			}
-			validateLocalAssignmentTarget(node.argument, state);
+			validateLocalAssignmentTarget(node.argument, state, null, context);
 			visit(node.argument, state, { ...context, topLevelExpression: false });
 			return;
 		case 'ConditionalExpression':
@@ -282,6 +289,9 @@ function visit(node, state, context) {
 		case 'Property':
 			if (node.kind !== 'init' || node.method || node.computed) {
 				throw arenaError('UNSUPPORTED_SYNTAX', 'only plain object properties are allowed', node);
+			}
+			if (FORBIDDEN_MEMBER_NAMES.has(propertyName(node.key))) {
+				throw arenaError('UNSAFE_MEMBER_ACCESS', 'object properties cannot use forbidden member names', node.key);
 			}
 			visit(node.key, state, { ...context, property: true, topLevelExpression: false });
 			visit(node.value, state, { ...context, topLevelExpression: false });
@@ -308,6 +318,9 @@ function validateCallExpression(node, state, context) {
 	if (!path && node.callee.type === 'Identifier' && node.callee.name !== 'tryResult' && !state.functionNames.has(node.callee.name) && !state.userDeclarations.has(node.callee.name)) {
 		throw arenaError('UNSAFE_MEMBER_ACCESS', `call target ${node.callee.name} is outside the ArenaScript environment`, node.callee);
 	}
+	if (node.callee.type === 'MemberExpression' && state.userDeclarations.has(memberRoot(node.callee))) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'local member calls and call/apply/bind invocation are not allowed', node.callee);
+	}
 
 	if (pathEqual(path, ['program', 'onUnhandledAttention'])) {
 		if (!context.topLevelExpression) {
@@ -327,7 +340,10 @@ function validateCallExpression(node, state, context) {
 		validateRepeatUntil(node, state);
 	}
 	if (pathEqual(path, ['program', 'watch'])) {
-		validateWatcher(node, state);
+		validateWatcher(node, state, context);
+	}
+	if (node.callee.type === 'Identifier' && context.functionParameters?.has(node.callee.name)) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'calling function parameters is not allowed', node.callee);
 	}
 	if (node.callee.type === 'Identifier' && state.functionNames.has(node.callee.name)) {
 		if (context.functionName) {
@@ -373,7 +389,10 @@ function validateRepeatUntil(node, state) {
 	}
 }
 
-function validateWatcher(node, state) {
+function validateWatcher(node, state, context) {
+	if (!context.topLevelExpression) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'program.watch must be declared exactly once at program top level', node);
+	}
 	state.watcherCount += 1;
 	if (state.watcherCount > state.limits.watchers) {
 		throw arenaError('TOO_MANY_WATCHERS', `program contains more than ${state.limits.watchers} watchers`, node);
@@ -456,9 +475,15 @@ function containsCounterMutation(node, counterName) {
 	return false;
 }
 
-function validateLocalAssignmentTarget(node, state) {
+function validateLocalAssignmentTarget(node, state, value, context) {
 	if (node.type !== 'Identifier' || !state.userDeclarations.has(node.name)) {
 		throw arenaError('UNSAFE_MEMBER_ACCESS', 'only local variables may be assigned or updated', node);
+	}
+	if (state.functionNames.has(node.name)) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'callable local bindings cannot be reassigned or updated', node);
+	}
+	if (isFunctionNode(value) || (value?.type === 'Identifier' && (state.functionNames.has(value.name) || context.functionParameters?.has(value.name)))) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'callable values cannot be assigned to local bindings', value);
 	}
 }
 
