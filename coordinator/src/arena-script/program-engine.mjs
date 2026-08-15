@@ -29,7 +29,7 @@ export class ArenaScriptEngine {
 	}
 
 	ingestObservation({ observation, eventSequence, attention = false } = {}) {
-		if (!this.#isLive() || !Number.isSafeInteger(eventSequence) || eventSequence < this.#eventSequence) return this.snapshot();
+		if (!this.#isLive() || !Number.isSafeInteger(eventSequence) || eventSequence < 0 || eventSequence < this.#eventSequence) return this.snapshot();
 		const mayResume = this.#pendingResult && eventSequence >= this.#pendingResult.eventSequence;
 		if (eventSequence === this.#eventSequence && !mayResume && this.#factsSequence >= eventSequence) return this.snapshot();
 		this.#facts = createInterpreterFacts(observation);
@@ -45,9 +45,9 @@ export class ArenaScriptEngine {
 	}
 
 	ingestActionResult({ actionId, state, reasonCode, eventSequence } = {}) {
-		if (!Number.isSafeInteger(eventSequence) || typeof actionId !== 'string' || typeof state !== 'string' || typeof reasonCode !== 'string') return this.snapshot();
+		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0 || typeof actionId !== 'string' || typeof state !== 'string' || typeof reasonCode !== 'string') return this.snapshot();
 		const signature = `${state}\u0000${reasonCode}\u0000${eventSequence}`;
-		if (!this.#active || actionId !== this.#active.actionId) {
+		if (!this.#active || actionId !== this.#active.actionId || eventSequence < this.#active.actionDispatchEventSequence) {
 			if (this.#completed.has(actionId) && this.#completed.get(actionId) !== signature) return this.snapshot();
 			return this.snapshot();
 		}
@@ -231,6 +231,7 @@ export class ArenaScriptEngine {
 		this.#eventSequence = target.eventSequence;
 		this.#program = freezeRecord({ ...this.#program, eventSequence: target.eventSequence, factsSequence: target.factsSequence });
 		this.#fencePendingRequest();
+		if (!this.#isLive()) return this.snapshot();
 		this.#tryPendingReplacement();
 		this.#updateWatchers();
 		if (this.#pendingResult && !this.#cancelling && this.#factsSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
@@ -256,7 +257,7 @@ export class ArenaScriptEngine {
 			const executionFactsSequence = source?.executionFactsSequence ?? this.#factsSequence;
 			const command = freezeRecord({ actionId, action: freezeRecord({ type: yielded.call.primitive, arguments: yielded.call.arguments }), provenance: freezeRecord({ agentId: this.#program.agentId, goalRevision: this.#program.goalRevision, modelIdentity: this.#program.modelIdentity, programId: this.#program.programId, version: this.#program.version, generation: this.#generation, source: authority ? `watcher:${authority.watcherId}` : source, watcherId: authority?.watcherId ?? null, authorizingEventSequence: authority?.eventSequence ?? null, executionFactsSequence, factsEventSequence: executionFactsSequence, stepId: yielded.stepId, eventSequence: this.#eventSequence }) });
 			this.#continuationEpoch += 1;
-			this.#active = { actionId, stateToken: yielded.stateToken, generation: this.#generation, source, authority, executionFactsSequence };
+			this.#active = { actionId, stateToken: yielded.stateToken, generation: this.#generation, source, authority, executionFactsSequence, actionDispatchEventSequence: this.#eventSequence };
 			this.#fencePendingRequest();
 			this.#callbacks.dispatch(command);
 			return;

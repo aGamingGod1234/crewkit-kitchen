@@ -460,3 +460,32 @@ test('an exact interrupt cancellation acknowledgement may arrive after a newer o
 	assert.equal(dispatched.at(-1).action.arguments, 9);
 	assert.equal(engine.snapshot().eventSequence, 3);
 });
+
+test('a same-version facts refresh caches while suspended without running watcher work', () => {
+	const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);');
+	const dispatched = [];
+	const engine = new ArenaScriptEngine({ dispatch: (command) => dispatched.push(command), cancel() {}, requestModel() {} });
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation(), eventSequence: 1 });
+	engine.suspend('operator');
+	const active = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'OPERATOR', eventSequence: 1 });
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	engine.install({ agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1, compiled, observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 2 });
+	assert.equal(engine.snapshot().factsSequence, 2);
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1]);
+});
+
+test('results must be nonnegative and cannot predate the exact action dispatch sequence', () => {
+	const { engine, dispatched } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);');
+	const first = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'NEGATIVE', eventSequence: -1 });
+	assert.equal(engine.snapshot().activeActionId, first.actionId);
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: false });
+	engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'PREDATES_DISPATCH', eventSequence: 0 });
+	assert.equal(engine.snapshot().activeActionId, first.actionId);
+	engine.ingestActionResult({ actionId: first.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 1 });
+	assert.deepEqual(dispatched.map((command) => command.action.arguments), [1, 2]);
+	assert.equal(engine.snapshot().eventSequence, 3);
+	assert.equal(engine.snapshot().factsSequence, 3);
+});
