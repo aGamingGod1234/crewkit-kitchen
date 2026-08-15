@@ -328,25 +328,36 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #reportAgentError(agentId, error) {
-		if (['PLAN_CANCELLED', 'STALE_PLAN'].includes(error?.code)) return;
-		if (QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)) {
-			// App-server transport silence is retried from the next fresh observation.
-			// It is not a world-action failure that the player or agent must repair.
-			this.#providerRetryAfter.set(agentId, this.#controlNow() + EMPTY_TURN_RETRY_DELAY_MS);
-			return;
-		}
-		this.emit('runtimeError', error);
-		if (!this.#bridge.ready || !this.#registry.has(agentId)) return;
-		const record = this.#registry.get(agentId);
 		try {
-			await this.#bridge.send('agent_error', agentId, {
-				goalRevision: record.goalRevision,
-				code: String(error?.code ?? 'COORDINATOR_ERROR').slice(0, 128),
-				message: String(error?.message ?? error).slice(0, 2_048),
-			});
-		} catch (reportError) {
-			this.emit('runtimeError', reportError);
+			if (['PLAN_CANCELLED', 'STALE_PLAN'].includes(error?.code)) return;
+			if (QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)) {
+				// App-server transport silence is retried from the next fresh observation.
+				// It is not a world-action failure that the player or agent must repair.
+				const retryAt = safeClockRead(this.#controlNow);
+				if (retryAt === null) this.#providerRetryAfter.delete(agentId);
+				else this.#providerRetryAfter.set(agentId, retryAt + EMPTY_TURN_RETRY_DELAY_MS);
+				return;
+			}
+			this.#emitRuntimeError(error);
+			if (!this.#bridge.ready || !this.#registry.has(agentId)) return;
+			const record = this.#registry.get(agentId);
+			try {
+				await this.#bridge.send('agent_error', agentId, {
+					goalRevision: record.goalRevision,
+					code: String(error?.code ?? 'COORDINATOR_ERROR').slice(0, 128),
+					message: String(error?.message ?? error).slice(0, 2_048),
+				});
+			} catch (reportError) {
+				this.#emitRuntimeError(reportError);
+			}
+		} catch (reportFailure) {
+			this.#emitRuntimeError(reportFailure);
 		}
+	}
+
+	#emitRuntimeError(error) {
+		try { this.emit('runtimeError', error); }
+		catch { /* reporting must never reject agent control work */ }
 	}
 
 	async #publishCatalog(snapshot) {

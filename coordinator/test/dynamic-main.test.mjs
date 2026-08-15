@@ -125,3 +125,21 @@ test('throwing telemetry clocks cannot block action results or disconnect cleanu
 		assert.equal(run.planner.interruptions.includes('agent-a'), true, 'disconnect still interrupts the live agent');
 	} finally { await run.coordinator.stop(); }
 });
+
+test('throwing quiet-provider retry clocks leave the next observation eligible', async () => {
+	const run = await start({ controlNow: () => { throw new Error('clock unavailable'); } });
+	const runtimeErrors = [];
+	run.coordinator.on('runtimeError', (error) => runtimeErrors.push(error));
+	try {
+		run.planner.requestPlan = async (request) => {
+			run.planner.requests.push(request);
+			throw Object.assign(new Error('provider emitted no final message'), { code: 'MISSING_FINAL_MESSAGE' });
+		};
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Retry.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.planner.requests.length === 1);
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.planner.requests.length === 2);
+		assert.deepEqual(runtimeErrors, [], 'quiet provider handling stays contained when its retry clock is unavailable');
+	} finally { await run.coordinator.stop(); }
+});
