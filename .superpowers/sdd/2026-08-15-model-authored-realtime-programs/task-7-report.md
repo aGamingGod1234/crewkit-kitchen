@@ -19,11 +19,13 @@
 - Receipt monotonic and epoch timestamps are captured before the per-agent queue, then treated as advisory telemetry only. Throwing, invalid, negative, or regressing clocks omit a sample without blocking observation ingestion or command sends.
 - Reaction metrics are emitted only for a material watcher branch and its matching bridge send. Minecraft publication delay is exclusively `receiptEpochMs - observedAtEpochMs`; local percentiles retain fractional milliseconds.
 - The server advances a publication baseline only after its observation envelope is accepted by the connection queue. Rejections retain a bounded dirty retry marker, so the next accepted observation still contains the missed factual delta.
+- Removing an agent now removes its queued identity and all delivered/dirty publication state. Only authentication and bounded enqueue backpressure retry; missing-agent collection and other domain failures are permanently dropped.
+- Action-progress and action-result routing no longer read the telemetry clock. Disconnect cleanup uses a safe optional timestamp, so a broken clock cannot prevent program disposal, state transition, or planner interruption.
 
 ## Verification
 
-- Focused Node suites: 39/39 passed, including the real monotonic-clock 1,000 watcher-event benchmark with exactly 1,000 positive finite p95 receipt-to-branch and branch-to-send samples below 5 ms.
-- Java 25 `verifyCore`: passed with 5,969 protocol and bridge assertions.
+- Focused Node suites: 40/40 passed, including the real monotonic-clock 1,000 watcher-event benchmark with exactly 1,000 positive finite p95 receipt-to-branch and branch-to-send samples below 5 ms.
+- Java 25 `verifyCore`: passed with 5,972 protocol and bridge assertions.
 - No dependency files changed, so a clean archive verification was not required.
 
 ## Commit
@@ -31,3 +33,4 @@
 - `0dc66a8 feat: stream factual attention events` (11 files, 346 insertions, 30 deletions).
 - `9a29084 fix: correct factual delta timing` (10 files, 226 insertions, 42 deletions).
 - `7f1830a fix: contain factual delta telemetry faults` (13 files, 258 insertions, 60 deletions).
+- `d4e7550 fix: drop stale observation retries` (5 files, 65 insertions, 11 deletions).
