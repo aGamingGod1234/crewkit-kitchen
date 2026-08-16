@@ -252,7 +252,7 @@ public final class VerificationMain {
 	private static void verifyValidActionUnion(ProtocolCodec codec) throws ProtocolException {
 		assertDecodedType(codec, "move_to", "\"x\":1.5,\"y\":64,\"z\":-2.5,\"tolerance\":0.75,\"sprint\":true", ActionType.MOVE_TO);
 		assertDecodedType(codec, "look_at", "\"x\":1,\"y\":65.25,\"z\":3", ActionType.LOOK_AT);
-		assertDecodedType(codec, "attack", "\"targetSelector\":\"nearest_hostile\",\"timeoutMs\":5000", ActionType.ATTACK);
+		assertDecodedType(codec, "attack", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"timeoutMs\":5000", ActionType.ATTACK);
 		assertDecodedType(codec, "select_item", "\"itemId\":\"minecraft:diamond_sword\"", ActionType.SELECT_ITEM);
 		assertDecodedType(codec, "use_item", "\"durationMs\":1250", ActionType.USE_ITEM);
 		assertDecodedType(codec, "break_block", "\"x\":1,\"y\":64,\"z\":-2,\"timeoutMs\":5000", ActionType.BREAK_BLOCK);
