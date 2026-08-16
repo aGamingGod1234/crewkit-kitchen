@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { parseDecision } from '../src/decision-parser.mjs';
+import { SCRIPT_PRIMITIVES } from '../src/arena-script/minecraft-api.mjs';
 import { buildPlannerInput, PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from '../src/prompts.mjs';
 
 test('parses a replace envelope containing ArenaScript source', () => {
@@ -77,6 +78,13 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /multi-tree and pickup example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /watcher example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /compiler diagnostics.*correct/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /coordinate-free player\.respawn\(\)/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /valid only while the authoritative player facts report dead/i);
+	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), [
+		'attack', 'block_with_shield', 'break_block', 'chat', 'craft_inventory', 'craft_table', 'drop_item',
+		'equip_item', 'furnace_transaction', 'look_at', 'move_to', 'navigate_to', 'place_block', 'respawn',
+		'select_item', 'select_tool', 'set_door', 'transfer_container', 'use_item', 'use_ranged', 'wait',
+	]);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /default priority framework|preserve life before|prefer cooked food/i);
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.required, ['summary', 'directive']);
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.directive, {

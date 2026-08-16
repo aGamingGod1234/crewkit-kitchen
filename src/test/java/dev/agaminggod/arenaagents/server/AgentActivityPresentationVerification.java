@@ -39,10 +39,15 @@ public final class AgentActivityPresentationVerification {
 		assertTrue(AgentActivityPresentation.result(result(
 				ServerActionState.CANCELLED, "ACTION_CANCELLED", "Cancelled by explicit model decision")).isEmpty(),
 				"intentional model cancellation is not rendered as a red chat error");
-		assertTrue(AgentActivityPresentation.result(result(
-				ServerActionState.TIMED_OUT, "PLACEMENT_NOT_CONFIRMED", "Block placement was not confirmed")).isPresent(),
-				"real placement failures remain visible");
-		return 14;
+		for (String reason : new String[] {
+				"ITEM_PICKUP_TIMED_OUT", "RANGED_USE_TIMED_OUT", "RANGED_USE_NOT_STARTED",
+				"RANGED_RELEASE_NOT_OBSERVED", "BUILD_SEQUENCE_TIMEOUT", "TARGET_OCCUPIED" }) {
+			assertTrue(!AgentActivityPresentation.shouldShowInChat(reason, true),
+					reason + " remains structured recoverable evidence rather than red chat");
+		}
+		assertTrue(AgentActivityPresentation.shouldShowInChat("PLACEMENT_CONTRACT_BROKEN", false),
+				"contract failures remain visible");
+		return 20;
 	}
 
 	private static ServerActionResult result(ServerActionState state, String reason, String message) {

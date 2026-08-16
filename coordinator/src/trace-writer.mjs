@@ -1,12 +1,19 @@
 import { createHash } from 'node:crypto';
+import { types as nodeTypes } from 'node:util';
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
 const REDACTED = '[REDACTED]';
+const UNSAFE = '[UNSAFE_OBJECT]';
+const BOUNDED = '[BOUNDED]';
 const MAX_TRACE_STRING = 2_048;
 const MAX_PRIVATE_SOURCE = 65_536;
 const MAX_TRACE_ENTRIES = 64;
-const SENSITIVE_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
+const MAX_TRACE_DEPTH = 8;
+const MAX_TRACE_NODES = 512;
+const MAX_TRACE_BYTES = 262_144;
+const SENSITIVE_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
+const SENSITIVE_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 
 /** Append-only bounded traces. Public rows never contain source text or credentials. */
 export class TraceWriter {
@@ -61,60 +68,105 @@ export class TraceWriter {
 
 export function observationHash(observation) {
 	if (observation === null || observation === undefined) return null;
-	return createHash('sha256').update(JSON.stringify(observation), 'utf8').digest('hex');
+	return createHash('sha256').update(JSON.stringify(sanitizeValue(observation, context(false))), 'utf8').digest('hex');
 }
 
-export function redact(value, seen = new WeakSet()) {
-	if (typeof value === 'string') return value.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`);
-	if (value === null || typeof value !== 'object') return value;
-	if (seen.has(value)) return '[CIRCULAR]';
-	seen.add(value);
-	if (Array.isArray(value)) return value.map((entry) => redact(entry, seen));
-	const result = {};
-	for (const [key, entry] of Object.entries(value)) result[key] = SENSITIVE_KEY.test(key) ? REDACTED : redact(entry, seen);
-	return result;
+/** Returns a safe, null-prototype, own-data-only redacted copy. */
+export function redact(value) {
+	return sanitizeValue(value, context(false));
 }
 
 function normalizeRow(eventOrRow, fields) {
 	if (typeof eventOrRow === 'string') {
 		if (eventOrRow.trim().length === 0) throw new TypeError('trace event must be nonblank');
 		if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) throw new TypeError('trace fields must be an object');
-		return { event: eventOrRow, ...fields };
+		return Object.assign(Object.create(null), { event: eventOrRow }, ownData(fields));
 	}
 	if (eventOrRow === null || typeof eventOrRow !== 'object' || Array.isArray(eventOrRow)) throw new TypeError('trace row must be an object or event name');
-	return { ...eventOrRow };
+	return ownData(eventOrRow);
+}
+
+function ownData(value) {
+	if (nodeTypes.isProxy(value)) return Object.assign(Object.create(null), { event: UNSAFE });
+	const result = Object.create(null);
+	let keys;
+	try { keys = Reflect.ownKeys(value); } catch { return Object.assign(result, { event: UNSAFE }); }
+	for (const key of keys) {
+		if (typeof key !== 'string') continue;
+		let descriptor;
+		try { descriptor = Object.getOwnPropertyDescriptor(value, key); } catch { continue; }
+		if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
+		result[key] = descriptor.value;
+		if (Object.keys(result).length >= MAX_TRACE_ENTRIES) break;
+	}
+	return result;
 }
 
 function publicTraceRow(row) {
-	const sourceHash = typeof row.source === 'string' ? `sha256:${hashSource(row.source)}` : row.sourceHash ?? null;
-	const withoutSource = redact({ ...row });
-	delete withoutSource.source;
-	if (sourceHash !== null) withoutSource.sourceHash = sourceHash;
-	return boundTraceRow({ timestampEpochMs: Date.now(), ...withoutSource }, MAX_TRACE_STRING);
+	const source = ownData(row).source;
+	const sourceHash = typeof source === 'string' ? `sha256:${hashSource(source)}` : null;
+	const result = sanitizeValue(row, context(false));
+	if (result && typeof result === 'object' && !Array.isArray(result)) {
+		delete result.source;
+		if (sourceHash !== null) result.sourceHash = sourceHash;
+	}
+	return result;
 }
 
 function privateTraceRow(row) {
-	const sourceHash = typeof row.source === 'string' ? `sha256:${hashSource(row.source)}` : row.sourceHash ?? null;
-	return boundTraceRow({ timestampEpochMs: Date.now(), ...redact(row), ...(sourceHash === null ? {} : { sourceHash }) }, MAX_TRACE_STRING, true);
+	const source = ownData(row).source;
+	const sourceHash = typeof source === 'string' ? `sha256:${hashSource(source)}` : null;
+	const result = sanitizeValue(row, context(true));
+	if (result && typeof result === 'object' && !Array.isArray(result) && sourceHash !== null) result.sourceHash = sourceHash;
+	return result;
 }
 
-function boundTraceRow(value, stringLimit, allowSource = false, seen = new WeakSet(), depth = 0, key = null) {
-	if (typeof value === 'string') {
-		const limit = allowSource && key === 'source' ? MAX_PRIVATE_SOURCE : stringLimit;
-		return value.length <= limit ? value : `${value.slice(0, limit - 3)}...`;
-	}
+function context(allowSource) {
+	return { allowSource, seen: new WeakSet(), nodes: 0, bytes: 0 };
+}
+
+function sanitizeValue(value, state, depth = 0, key = null) {
+	if (typeof value === 'string') return sanitizeString(value, state, key === 'source' && state.allowSource);
 	if (value === null || typeof value !== 'object') return value;
-	if (depth > 8) return '[BOUNDED]';
-	if (seen.has(value)) return '[CIRCULAR]';
-	seen.add(value);
-	if (Array.isArray(value)) return value.slice(0, MAX_TRACE_ENTRIES).map((entry) => boundTraceRow(entry, stringLimit, allowSource, seen, depth + 1));
-	const result = {};
-	for (const [key, entry] of Object.entries(value).slice(0, MAX_TRACE_ENTRIES)) {
-		if (SENSITIVE_KEY.test(key)) result[key] = REDACTED;
-		else if (key === 'source' && !allowSource) continue;
-		else result[key] = boundTraceRow(entry, stringLimit, allowSource, seen, depth + 1, key);
+	if (depth > MAX_TRACE_DEPTH || state.nodes++ >= MAX_TRACE_NODES) return BOUNDED;
+	if (nodeTypes.isProxy(value)) return UNSAFE;
+	if (state.seen.has(value)) return '[CIRCULAR]';
+	state.seen.add(value);
+	let keys;
+	try { keys = Reflect.ownKeys(value); } catch { return UNSAFE; }
+	const output = Array.isArray(value) ? [] : Object.create(null);
+	let entries = 0;
+	for (const property of keys) {
+		if (typeof property !== 'string' || entries >= MAX_TRACE_ENTRIES) continue;
+		let descriptor;
+		try { descriptor = Object.getOwnPropertyDescriptor(value, property); } catch { continue; }
+		if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
+		entries += 1;
+		if (SENSITIVE_KEY.test(property)) output[property] = REDACTED;
+		else if (property === 'source' && !state.allowSource) continue;
+		else output[property] = sanitizeValue(descriptor.value, state, depth + 1, property);
 	}
+	return output;
+}
+
+function sanitizeString(value, state, allowLongSource) {
+	const redacted = value.replace(SENSITIVE_TEXT, `$1${REDACTED}`).replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`);
+	const limit = allowLongSource ? MAX_PRIVATE_SOURCE : MAX_TRACE_STRING;
+	const remaining = Math.max(0, MAX_TRACE_BYTES - state.bytes);
+	const boundedLimit = Math.min(limit, remaining);
+	if (boundedLimit <= 3) return '';
+	const bounded = truncateUtf8(redacted, boundedLimit);
+	const candidate = bounded.length < redacted.length ? `${bounded.slice(0, Math.max(0, bounded.length - 3))}...` : bounded;
+	const result = truncateUtf8(candidate, remaining);
+	state.bytes += Buffer.byteLength(result, 'utf8');
 	return result;
+}
+
+function truncateUtf8(value, limit) {
+	if (Buffer.byteLength(value, 'utf8') <= limit) return value;
+	let end = Math.min(value.length, limit);
+	while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > limit) end -= 1;
+	return value.slice(0, end);
 }
 
 function hashSource(source) {

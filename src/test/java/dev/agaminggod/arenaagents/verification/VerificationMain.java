@@ -4,6 +4,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentRegistryVerification;
 import dev.agaminggod.arenaagents.agent.AgentIdentityVerification;
+import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupStateVerification;
@@ -134,6 +135,7 @@ public final class VerificationMain {
 		passedAssertions += MinecraftWalkabilityViewVerification.verify();
 		passedAssertions += GoalControlVerification.verify();
 		passedAssertions += AgentModelArgumentVerification.verify();
+		passedAssertions += AgentActivityPresentationVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();
 		passedAssertions += OfflineAgentPlayersVerification.verify();
 		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();

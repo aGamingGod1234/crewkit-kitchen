@@ -95,7 +95,13 @@ Container transfers, crafting recipes, and furnace transactions use server-autho
 
 The selected provider, model, reasoning effort, and service tier own gameplay strategy, program source, watcher conditions, interruption policy, fallbacks, and respawn decisions. The coordinator only validates the envelope, compiles the source, evaluates it in the local interpreter, and enforces goal/version/provenance fences. Invalid source is returned to that same selected model with bounded compiler diagnostics; no heuristic or alternate model supplies a replacement.
 
-The interpreter has no shell, filesystem, network, credential, or ambient Minecraft authority. It exposes only capability-scoped physical primitives: movement/navigation, look, jump, attack/fight, item selection/use/equip, block break/place/build, pickup/drop, doors, container transfer, crafting, furnace transactions, shield/ranged use, chat, wait, and coordinate-free respawn. Every command carries the agent, goal revision, program/version, source step, event sequence, and selected-model provenance before Minecraft accepts it.
+The interpreter has no shell, filesystem, network, credential, or ambient Minecraft authority. Its exact `SCRIPT_PRIMITIVES` set is:
+
+```text
+move_to, navigate_to, look_at, attack, select_item, use_item, break_block, place_block, chat, wait, set_door, drop_item, transfer_container, craft_inventory, craft_table, furnace_transaction, equip_item, select_tool, block_with_shield, use_ranged, respawn
+```
+
+Model-authored `repeatUntil`/`watch` loops and factual queries replace high-level fight, flee, follow, pickup, and build controllers; the runtime does not synthesize those strategies. Every command carries the agent, goal revision, program/version, source step, event sequence, and selected-model provenance before Minecraft accepts it.
 
 Death preserves the logical agent and goal while suspending its program. The selected model receives vanilla death facts and must author `await player.respawn()`; the mod follows vanilla respawn, inventory, experience, drop, bed/anchor, world-spawn, and gamerule behavior without an operator or runtime fallback.
 

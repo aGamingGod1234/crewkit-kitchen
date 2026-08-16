@@ -4,18 +4,18 @@ Status: complete.
 
 ## Delivered
 
-- Routine cancellation, retry, and recoverable physical failures stay in structured field-console state. System failures remain visible in Minecraft chat with their reason code.
-- Public JSONL traces are bounded and redacted. They carry ordinary source hashes only; the optional private diagnostic trace carries bounded source. Credential, token, secret, and authorization-shaped fields are never persisted.
+- Routine cancellation, retry, and recoverable physical failures stay in structured field-console state. System failures remain visible in Minecraft chat with their reason code. The Java chat verification is registered in `VerificationMain`.
+- Public JSONL traces are bounded and redacted. They carry ordinary source hashes only; the optional private diagnostic trace carries bounded source. Descriptor-based own-data traversal rejects proxies/accessors, uses null-prototype records, handles circular/custom data safely, and redacts textual credential patterns in both public and private strings.
 - Program traces now cover compilation, replacement, interpreter steps, watcher edges, unhandled attention, checkpoints, finishes, and sandbox/compiler failures. Every command step includes selected provider/model/reasoning/tier, goal revision, program/version, authority, result, and segmented timing fields.
-- The decision parser rejects legacy action arrays with `INVALID_DECISION`; the corrective retry stays on the same selected provider model/session. The V1 coordinator runtime, entrypoint, direct tests, and V1 fixtures were removed. E2E now exercises `DynamicCoordinator` and `ProgramRuntimeManager`.
+- The decision parser rejects legacy action arrays with `INVALID_DECISION`; the corrective retry stays on the same selected provider model/session. The V1 coordinator runtime, entrypoint, direct tests, and V1 fixtures were removed. E2E now exercises `DynamicCoordinator` and `ProgramRuntimeManager` through protocol-v2 envelope validation, including malformed-output correction, action completion, reconnect, and shutdown evidence.
 - README documents the selected-model ownership rule, local interpreter boundary, fixed physical primitives, death/respawn behavior, and segmented latency fields without claiming live success.
 
 ## Verification
 
-- Focused Node tests: 38/38 passed (`trace-writer`, `dynamic-main`, `decision-parser`, `agent-planner`, and migrated E2E tests).
-- Full coordinator suite: 279/279 passed, 0 failed.
-- Dirty Java25 `verifyCore`: 5,999 assertions passed.
-- Clean Java25 `clean verifyCore --rerun-tasks --no-daemon --console=plain`: 5,999 assertions passed.
+- Focused Node tests: 17/17 passed for the review-critical trace/parser/E2E set.
+- Full coordinator suite: 281/281 passed, 0 failed.
+- Dirty Java25 `verifyCore`: 6,019 assertions passed.
+- Clean Java25 `clean verifyCore --rerun-tasks --no-daemon --console=plain`: 6,019 assertions passed.
 - No live Minecraft/provider acceptance is claimed; live gameplay and provider latency remain an operator verification boundary.
 
 ## Hash evidence

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { observationHash, TraceWriter } from '../src/trace-writer.mjs';
+import { observationHash, redact, TraceWriter } from '../src/trace-writer.mjs';
 
 test('appends redacted JSONL rows in order', async () => {
 	const chunks = [];
@@ -58,4 +58,47 @@ test('keeps private source bounded while bounding other diagnostics more tightly
 	const row = rows[0].row;
 	assert.equal(row.source.length, 65_536);
 	assert.equal(row.message.length, 2_048);
+});
+
+test('does not invoke accessors or proxy traps and emits canonical bounded records', async () => {
+	let getterCalled = false;
+	const accessor = {};
+	Object.defineProperty(accessor, 'secret', { enumerable: true, get() { getterCalled = true; throw new Error('must not run'); } });
+	const proxy = new Proxy({ value: 'hidden' }, {
+		ownKeys() { throw new Error('must not run'); },
+		getOwnPropertyDescriptor() { throw new Error('must not run'); },
+	});
+	const custom = Object.create({ inherited: 'must not copy' });
+	custom.own = 'kept';
+	const input = { accessor, proxy, custom };
+	input.circular = input;
+	const result = redact(input);
+	assert.equal(getterCalled, false);
+	assert.equal(Object.getPrototypeOf(result), null);
+	assert.equal(Object.getPrototypeOf(result.custom), null);
+	assert.equal(result.accessor.secret, undefined);
+	assert.equal(result.proxy, '[UNSAFE_OBJECT]');
+	assert.equal(result.custom.inherited, undefined);
+	assert.equal(result.circular, '[CIRCULAR]');
+
+	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', { mkdir: async () => {}, appendFile: async () => {} });
+	await assert.doesNotReject(writer.write('safe', { accessor, proxy }));
+	await writer.close();
+});
+
+test('redacts textual credential patterns from public and private strings', async () => {
+	const rows = [];
+	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {
+		diagnosticFilePath: 'C:\\runtime\\private.jsonl',
+		mkdir: async () => {},
+		appendFile: async (filePath, value) => rows.push({ filePath, value }),
+	});
+	const source = 'program.chat({message: "api_key=abc token=def secret=ghi credential=jkl oauth=mno Bearer qrs"}); await player.wait(1);';
+	await writer.write('public', { message: 'api_key=abc token=def secret=ghi oauth=mno Bearer qrs', source });
+	await writer.writeDiagnostic('private', { source });
+	await writer.close();
+	assert.ok(rows.every(({ value }) => !/(api_key|token|secret|credential|oauth)=?(abc|def|ghi|jkl|mno)|Bearer qrs/i.test(value)));
+	const privateRow = JSON.parse(rows.find(({ filePath }) => filePath.endsWith('private.jsonl')).value);
+	assert.match(privateRow.source, /program\.chat/);
+	assert.doesNotMatch(privateRow.source, /api_key=abc|token=def|secret=ghi|oauth=mno|Bearer qrs/i);
 });
