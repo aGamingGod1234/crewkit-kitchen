@@ -46,6 +46,7 @@ import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerificat
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodecVerification;
 import dev.agaminggod.arenaagents.server.bridge.ProgramActionLedgerVerification;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusVerification;
+import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridgeVerification;
 import dev.agaminggod.arenaagents.server.perception.BlockObservationOrderingVerification;
 import dev.agaminggod.arenaagents.server.perception.InventoryObservationSlotsVerification;
 import dev.agaminggod.arenaagents.server.perception.ObservationBudgetVerification;
@@ -170,6 +171,7 @@ public final class VerificationMain {
 		passedAssertions += BridgeEnvelopeCodecVerification.verify();
 		passedAssertions += ProgramActionLedgerVerification.verify();
 		passedAssertions += CoordinatorStatusVerification.verify();
+		passedAssertions += MultiplexedServerBridgeVerification.verify();
 		passedAssertions += GoalReceiverVerification.verify();
 		verifyObservationContracts(codec);
 		ObservationCollectorVerification.verifyLoadedChunkBoundary();

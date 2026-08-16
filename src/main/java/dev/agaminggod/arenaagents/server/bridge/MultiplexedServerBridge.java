@@ -605,16 +605,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private void sendRespawnResultBeforeControl(ServerActionResult result, AgentTransition transition, Runnable commit) {
 		Session active = session;
 		if (active == null || !active.authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Respawn result has no authenticated coordinator");
-		ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true);
-		ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()));
 		BridgeEnvelope resultEnvelope = new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
 				"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
 		BridgeEnvelope controlEnvelope = new BridgeEnvelope(2, serverInstanceId, transition.after().agentId().toString(), "goal_control",
 				"server-" + messageIds.incrementAndGet(), goalControlPayload(transition, "respawn"));
-		active.enqueuePair(resultEnvelope, controlEnvelope, commit);
+		publishRespawnScenarioEvents(
+				() -> active.enqueuePair(resultEnvelope, controlEnvelope, commit),
+				() -> ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true),
+				() -> ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()))
+		);
 		programActions.terminal(result);
 		observations.invalidate(result.agentId());
 		queueObservation(result.agentId());
+	}
+
+	static void publishRespawnScenarioEvents(Runnable publication, Runnable actionEvent, Runnable stateEvent) {
+		publication.run();
+		actionEvent.run();
+		stateEvent.run();
 	}
 
 	private static JsonObject actionResultPayload(ServerActionResult result) {
