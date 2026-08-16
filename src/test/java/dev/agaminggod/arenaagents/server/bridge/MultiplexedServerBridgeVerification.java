@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server.bridge;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentConstants;
+import dev.agaminggod.arenaagents.agent.AgentDeathSnapshot;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
@@ -69,10 +70,28 @@ public final class MultiplexedServerBridgeVerification {
 		);
 		assertEquals(List.of("paired-messages-and-commit", "action-attempted", "state-after-telemetry-failure"), committed,
 				"scenario callback failure cannot escape or roll back committed respawn publication");
+		verifyDeathFacts();
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyRealBridgeSessionLifecycle();
-		return 27;
+		return 35;
+	}
+
+	private static void verifyDeathFacts() {
+		AgentDeathSnapshot death = new AgentDeathSnapshot(
+				"fell from a high place", "minecraft:the_nether", 12.5D, 64.0D, -3.5D,
+				Optional.of("minecraft:overworld"), Optional.of(100.5D), Optional.of(70.0D), Optional.of(-20.5D),
+				Optional.of(37.5F), Optional.of(-12.25F), Optional.of(true), "spectator", 2_000L
+		);
+		JsonObject facts = MultiplexedServerBridge.deathFacts(death);
+		assertEquals("minecraft:overworld", facts.get("respawnDimensionId").getAsString(), "death facts expose respawn dimension");
+		assertEquals(100.5D, facts.get("respawnX").getAsDouble(), "death facts expose respawn x");
+		assertEquals(70.0D, facts.get("respawnY").getAsDouble(), "death facts expose respawn y");
+		assertEquals(-20.5D, facts.get("respawnZ").getAsDouble(), "death facts expose respawn z");
+		assertEquals(37.5F, facts.get("respawnYaw").getAsFloat(), "death facts expose respawn yaw");
+		assertEquals(-12.25F, facts.get("respawnPitch").getAsFloat(), "death facts expose respawn pitch");
+		assertEquals(true, facts.get("respawnForced").getAsBoolean(), "death facts expose forced respawn flag");
+		assertEquals("spectator", facts.get("gameMode").getAsString(), "death facts expose game mode");
 	}
 
 	private static void verifyRealBridgeSessionLifecycle() {

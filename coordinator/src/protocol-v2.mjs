@@ -651,11 +651,32 @@ function normalizeGoalControl(value) {
 }
 
 function normalizeDeath(value) {
-	exactKeys(value, ['cause', 'dimensionId', 'x', 'y', 'z', 'diedAtEpochMs'], ['cause', 'dimensionId', 'x', 'y', 'z', 'diedAtEpochMs'], 'death');
+	exactKeys(
+		value,
+		['cause', 'dimensionId', 'x', 'y', 'z', 'respawnDimensionId', 'respawnX', 'respawnY', 'respawnZ', 'respawnYaw', 'respawnPitch', 'respawnForced', 'gameMode', 'diedAtEpochMs'],
+		['cause', 'dimensionId', 'x', 'y', 'z', 'respawnDimensionId', 'respawnX', 'respawnY', 'respawnZ', 'respawnYaw', 'respawnPitch', 'respawnForced', 'gameMode', 'diedAtEpochMs'],
+		'death',
+	);
+	const respawnDimensionId = nullableIdentifier(value.respawnDimensionId, 'death.respawnDimensionId');
+	const respawnX = nullableFiniteNumber(value.respawnX, 'death.respawnX');
+	const respawnY = nullableFiniteNumber(value.respawnY, 'death.respawnY');
+	const respawnZ = nullableFiniteNumber(value.respawnZ, 'death.respawnZ');
+	const respawnYaw = nullableFiniteNumber(value.respawnYaw, 'death.respawnYaw');
+	const respawnPitch = nullableFiniteNumber(value.respawnPitch, 'death.respawnPitch');
+	const respawnForced = nullableBoolean(value.respawnForced, 'death.respawnForced');
+	const respawnFacts = [respawnDimensionId, respawnX, respawnY, respawnZ, respawnYaw, respawnPitch, respawnForced];
+	if (respawnFacts.some((fact) => fact === null) && respawnFacts.some((fact) => fact !== null)) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'death vanilla respawn facts must be present together or all null');
+	}
+	const gameMode = requireIdentifier(value.gameMode, 'death.gameMode');
+	if (!['survival', 'creative', 'adventure', 'spectator'].includes(gameMode)) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'death.gameMode must be a vanilla game mode');
+	}
 	return Object.freeze({
 		cause: boundedText(value.cause, 'death.cause', MAX_RESULT_MESSAGE_LENGTH),
 		dimensionId: requireIdentifier(value.dimensionId, 'death.dimensionId'),
 		x: finiteNumber(value.x, 'death.x'), y: finiteNumber(value.y, 'death.y'), z: finiteNumber(value.z, 'death.z'),
+		respawnDimensionId, respawnX, respawnY, respawnZ, respawnYaw, respawnPitch, respawnForced, gameMode,
 		diedAtEpochMs: nonnegativeInteger(value.diedAtEpochMs, 'death.diedAtEpochMs'),
 	});
 }
@@ -1024,9 +1045,21 @@ function boolean(value, field) {
 	return value;
 }
 
+function nullableIdentifier(value, field) {
+	return value === null ? null : requireIdentifier(value, field);
+}
+
+function nullableBoolean(value, field) {
+	return value === null ? null : boolean(value, field);
+}
+
 function finiteNumber(value, field) {
 	if (typeof value !== 'number' || !Number.isFinite(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a finite number`);
 	return value;
+}
+
+function nullableFiniteNumber(value, field) {
+	return value === null ? null : finiteNumber(value, field);
 }
 
 function integer(value, field) {

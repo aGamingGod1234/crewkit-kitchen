@@ -80,6 +80,8 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /compiler diagnostics.*correct/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /coordinate-free player\.respawn\(\)/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /valid only while the authoritative player facts report dead/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /respawnDimensionId.*respawnX.*respawnY.*respawnZ.*respawnYaw.*respawnPitch.*respawnForced.*gameMode/s);
+	assert.match(PLANNER_SYSTEM_PROMPT, /never invent.*respawn/i);
 	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), [
 		'attack', 'block_with_shield', 'break_block', 'chat', 'craft_inventory', 'craft_table', 'drop_item',
 		'equip_item', 'furnace_transaction', 'look_at', 'move_to', 'navigate_to', 'place_block', 'respawn',
@@ -92,6 +94,16 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	});
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.source, { type: 'string', minLength: 1, maxLength: 65_536 });
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.status, { type: 'string', enum: ['completed', 'impossible'] });
+});
+
+test('dead-state planner input carries the normalized vanilla respawn snapshot unchanged', () => {
+	const death = {
+		cause: 'fell from a high place', dimensionId: 'minecraft:the_nether', x: 12.5, y: 64, z: -3.5,
+		respawnDimensionId: 'minecraft:overworld', respawnX: 100.5, respawnY: 70, respawnZ: -20.5,
+		respawnYaw: 37.5, respawnPitch: -12.25, respawnForced: true, gameMode: 'spectator', diedAtEpochMs: 2_000,
+	};
+	const input = buildPlannerInput({ decisionContext: 'player_death', death });
+	assert.deepEqual(JSON.parse(input.slice(input.indexOf('\n') + 1)).death, death);
 });
 
 test('builds compiler correction input from diagnostics and a source hash without source text', () => {

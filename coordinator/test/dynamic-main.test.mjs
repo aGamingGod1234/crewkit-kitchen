@@ -62,7 +62,9 @@ function factToWireObservation(value, goalRevision, eventSequence, attention, ob
 }
 
 const DEATH = Object.freeze({
-	cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 0, y: 64, z: 0, diedAtEpochMs: 2,
+	cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 0, y: 64, z: 0,
+	respawnDimensionId: 'minecraft:overworld', respawnX: 100.5, respawnY: 70, respawnZ: -20.5,
+	respawnYaw: 37.5, respawnPitch: -12.25, respawnForced: true, gameMode: 'spectator', diedAtEpochMs: 2,
 });
 
 async function eventually(predicate) {
@@ -307,6 +309,10 @@ test('death suspends the active program and asks the same selected model for a c
 		assert.equal(respawn.payload.provenance.model, 'gpt-5.6-sol');
 		assert.equal(run.planner.requests.at(-1).agentId, 'agent-a');
 		assert.match(run.planner.requests.at(-1).input, /fell from a high place/);
+		assert.match(run.planner.requests.at(-1).input, /"respawnDimensionId":"minecraft:overworld"/);
+		assert.match(run.planner.requests.at(-1).input, /"respawnYaw":37\.5/);
+		assert.match(run.planner.requests.at(-1).input, /"respawnForced":true/);
+		assert.match(run.planner.requests.at(-1).input, /"gameMode":"spectator"/);
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
 			goalRevision: 1, actionId: stale.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2,
 		} });

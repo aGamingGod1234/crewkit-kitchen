@@ -110,10 +110,40 @@ test('protocol v2 accepts only coordinate-free respawn arguments', () => {
 });
 
 test('protocol v2 accepts exact death facts only on dead lifecycle control', () => {
-	const death = { cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 12.5, y: 64, z: -4.25, diedAtEpochMs: 17 };
+	const death = {
+		cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 12.5, y: 64, z: -4.25,
+		respawnDimensionId: 'minecraft:the_nether', respawnX: 4.5, respawnY: 31, respawnZ: -8.5,
+		respawnYaw: 37.5, respawnPitch: -12.25, respawnForced: true, gameMode: 'spectator', diedAtEpochMs: 17,
+	};
 	assert.deepEqual(
 		validateProtocolV2Payload('goal_control', { operation: 'dead', goalRevision: 8, updatedAtEpochMs: 18, death }).death,
 		death,
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_control', {
+			operation: 'dead', goalRevision: 8, updatedAtEpochMs: 18,
+			death: { ...death, respawnPitch: undefined },
+		}),
+		/missing|respawnPitch/i,
+		'death facts require every captured respawn field in the bounded wire shape',
+	);
+	const noConfiguredRespawn = {
+		...death,
+		respawnDimensionId: null, respawnX: null, respawnY: null, respawnZ: null,
+		respawnYaw: null, respawnPitch: null, respawnForced: null,
+	};
+	assert.deepEqual(
+		validateProtocolV2Payload('goal_control', { operation: 'dead', goalRevision: 8, updatedAtEpochMs: 18, death: noConfiguredRespawn }).death,
+		noConfiguredRespawn,
+		'absence of a configured vanilla respawn remains explicit without inventing a target',
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_control', {
+			operation: 'dead', goalRevision: 8, updatedAtEpochMs: 18,
+			death: { ...death, respawnX: null },
+		}),
+		/present together/,
+		'partial respawn facts are rejected instead of being completed locally',
 	);
 	assert.throws(
 		() => validateProtocolV2Payload('goal_control', { operation: 'dead', goalRevision: 8, updatedAtEpochMs: 18 }),
@@ -126,7 +156,11 @@ test('protocol v2 accepts exact death facts only on dead lifecycle control', () 
 });
 
 test('hello acknowledgement retains death facts for restart reconciliation', () => {
-	const death = { cause: 'burned in lava', dimensionId: 'minecraft:the_nether', x: 4.5, y: 31, z: -8.5, diedAtEpochMs: 23 };
+	const death = {
+		cause: 'burned in lava', dimensionId: 'minecraft:the_nether', x: 4.5, y: 31, z: -8.5,
+		respawnDimensionId: 'minecraft:overworld', respawnX: 10.5, respawnY: 65, respawnZ: -2.5,
+		respawnYaw: 90, respawnPitch: 0, respawnForced: false, gameMode: 'survival', diedAtEpochMs: 23,
+	};
 	const dead = { ...registeredRecord(), state: 'DEAD', currentGoal: 'Escape the Nether.', goalRevision: 7, death };
 	const payload = validateProtocolV2Payload('hello_ack', {
 		replyTo: 'coordinator-1', authenticated: true, registry: [dead],

@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.bridge;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
@@ -698,13 +699,42 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return payload;
 	}
 
-	private static JsonObject deathFacts(dev.agaminggod.arenaagents.agent.AgentDeathSnapshot death) {
+	static JsonObject deathFacts(dev.agaminggod.arenaagents.agent.AgentDeathSnapshot death) {
 		JsonObject facts = new JsonObject();
 		facts.addProperty("cause", death.cause());
 		facts.addProperty("dimensionId", death.dimensionId());
 		facts.addProperty("x", death.x());
 		facts.addProperty("y", death.y());
 		facts.addProperty("z", death.z());
+		death.respawnDimensionId().ifPresentOrElse(
+				value -> facts.addProperty("respawnDimensionId", value),
+				() -> facts.add("respawnDimensionId", JsonNull.INSTANCE)
+		);
+		death.respawnX().ifPresentOrElse(
+				value -> facts.addProperty("respawnX", value),
+				() -> facts.add("respawnX", JsonNull.INSTANCE)
+		);
+		death.respawnY().ifPresentOrElse(
+				value -> facts.addProperty("respawnY", value),
+				() -> facts.add("respawnY", JsonNull.INSTANCE)
+		);
+		death.respawnZ().ifPresentOrElse(
+				value -> facts.addProperty("respawnZ", value),
+				() -> facts.add("respawnZ", JsonNull.INSTANCE)
+		);
+		death.respawnYaw().ifPresentOrElse(
+				value -> facts.addProperty("respawnYaw", value),
+				() -> facts.add("respawnYaw", JsonNull.INSTANCE)
+		);
+		death.respawnPitch().ifPresentOrElse(
+				value -> facts.addProperty("respawnPitch", value),
+				() -> facts.add("respawnPitch", JsonNull.INSTANCE)
+		);
+		death.respawnForced().ifPresentOrElse(
+				value -> facts.addProperty("respawnForced", value),
+				() -> facts.add("respawnForced", JsonNull.INSTANCE)
+		);
+		facts.addProperty("gameMode", death.gameMode());
 		facts.addProperty("diedAtEpochMs", death.diedAtEpochMs());
 		return facts;
 	}
