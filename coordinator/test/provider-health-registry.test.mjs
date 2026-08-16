@@ -83,3 +83,22 @@ test('steering cancellation and stale plans never dilute or open provider health
 	registry.record({ ...key, durationMs: 40, errorCode: 'PROVIDER_UNAVAILABLE' });
 	assert.equal(registry.snapshot(key).circuit, 'open');
 });
+
+test('empty app-server turns remain neutral for provider health', () => {
+	const registry = new ProviderHealthRegistry({ minimumSamples: 1 });
+	const key = { provider: 'codex', model: 'sol', operation: 'decide' };
+	registry.record({ ...key, durationMs: 10, errorCode: 'MISSING_AGENT_MESSAGE' });
+	registry.record({ ...key, durationMs: 20, errorCode: 'MISSING_FINAL_MESSAGE' });
+	assert.deepEqual(registry.snapshot(key), {
+		...key, count: 0, p50Ms: 0, p95Ms: 0, failureRate: 0, circuit: 'closed',
+	});
+});
+
+test('reset clears health carried across Minecraft server instances', () => {
+	const registry = new ProviderHealthRegistry({ minimumSamples: 1, failureRateToOpen: 1 });
+	const key = { provider: 'codex', model: 'sol', operation: 'decide' };
+	registry.record({ ...key, durationMs: 10, errorCode: 'PROVIDER_UNAVAILABLE' });
+	assert.equal(registry.snapshot(key).circuit, 'open');
+	registry.reset();
+	assert.deepEqual(registry.snapshot(key), { ...key, count: 0, p50Ms: 0, p95Ms: 0, failureRate: 0, circuit: 'closed' });
+});

@@ -86,23 +86,40 @@ export function normalizeCatalog(value) {
 	const seen = new Set();
 	return value.map((entry) => {
 		if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) throw new ModelCatalogError('INVALID_CATALOG', 'Each model catalog entry must be an object');
-		const id = requireText(entry.id ?? entry.model, 'model id');
+		const id = requireText(entry.id ?? entry.model ?? entry.slug, 'model id');
 		if (seen.has(id)) throw new ModelCatalogError('INVALID_CATALOG', `Duplicate model '${id}'`);
 		seen.add(id);
 		return {
 			id,
-			model: requireText(entry.model ?? id, 'model'),
-			displayName: typeof entry.displayName === 'string' && entry.displayName.trim().length > 0 ? entry.displayName : id,
-			reasoningEfforts: normalizeStringList(entry.supportedReasoningEfforts, 'reasoningEffort'),
-			serviceTiers: normalizeStringList(entry.serviceTiers, 'id'),
+			model: requireText(entry.model ?? entry.slug ?? id, 'model'),
+			displayName: requireDisplayName(entry.displayName ?? entry.display_name, id),
+			reasoningEfforts: normalizeStringList(
+				entry.supportedReasoningEfforts ?? entry.supportedReasoningLevels ?? entry.supported_reasoning_levels,
+				'reasoningEffort',
+			),
+			serviceTiers: normalizeServiceTiers(entry),
 		};
 	});
+}
+
+function normalizeServiceTiers(entry) {
+	return [...new Set([
+		...normalizeStringList(entry.serviceTiers ?? entry.service_tiers, 'id'),
+		...normalizeStringList(entry.additionalSpeedTiers ?? entry.additional_speed_tiers, 'id'),
+	])];
 }
 
 function normalizeStringList(value, objectKey) {
 	if (value === undefined || value === null) return [];
 	if (!Array.isArray(value)) throw new ModelCatalogError('INVALID_CATALOG', 'Model capability lists must be arrays');
-	return [...new Set(value.map((entry) => requireText(typeof entry === 'string' ? entry : entry?.[objectKey], objectKey)))];
+	return [...new Set(value.map((entry) => requireText(
+		typeof entry === 'string' ? entry : entry?.[objectKey] ?? (objectKey === 'reasoningEffort' ? entry?.effort : undefined),
+		objectKey,
+	)))];
+}
+
+function requireDisplayName(value, fallback) {
+	return typeof value === 'string' && value.trim().length > 0 ? value.trim() : fallback;
 }
 
 function requireText(value, field) {

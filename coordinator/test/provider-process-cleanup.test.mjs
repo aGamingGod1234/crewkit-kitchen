@@ -123,6 +123,7 @@ for (const entry of transportCases()) {
 		assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
 	});
 
+	if (entry.name === 'Codex') continue;
 	test(`${entry.name} request timeout tears down its unresponsive child`, async () => {
 		const child = new UncooperativeChild();
 		const transport = entry.create(child);
@@ -141,6 +142,31 @@ for (const entry of transportCases()) {
 		);
 	});
 }
+
+test('Codex request timeout preserves the shared transport and unrelated requests', async () => {
+	const child = new UncooperativeChild();
+	const requests = [];
+	child.stdin.write = (line) => requests.push(JSON.parse(String(line).trim()));
+	const transport = new CodexStdioTransport(
+		{ model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
+		{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
+	);
+	const protocolErrors = [];
+	transport.on('protocolError', (error) => protocolErrors.push(error.code));
+	await transport.start();
+
+	const timedOut = transport.request('slow/request', {}, { timeoutMs: REQUEST_TIMEOUT_MS });
+	const survivor = transport.request('fast/request', {}, { timeoutMs: SETTLE_TIMEOUT_MS });
+	await assert.rejects(timedOut, (error) => error?.code === 'REQUEST_TIMEOUT');
+	child.stdout.emit('data', `${JSON.stringify({ id: requests[0].id, result: { late: true } })}\n`);
+	child.stdout.emit('data', `${JSON.stringify({ id: requests[1].id, result: { ok: true } })}\n`);
+
+	assert.deepEqual(await within(survivor), { ok: true });
+	assert.deepEqual(protocolErrors, []);
+	assert.deepEqual(child.signals, []);
+	assert.doesNotThrow(() => transport.notify('still/running'));
+	await transport.stop();
+});
 
 test('Windows cleanup terminates the complete provider process tree', async () => {
 	const child = new UncooperativeChild();

@@ -40,7 +40,7 @@
 	"limits": {
 		"agentCap": 16,
 		"goalQueueCap": 32,
-		"planningConcurrency": 4,
+		"planningConcurrency": 16,
 		"invalidDecisionRetries": 1
 	}
 }

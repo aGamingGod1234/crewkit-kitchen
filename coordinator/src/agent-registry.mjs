@@ -181,6 +181,7 @@ export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP,
 		goalRevision,
 		queue: queue.map((entry, index) => normalizeQueuedGoal(entry, index)),
 		lastSummary: optionalText(value.lastSummary, 'lastSummary', MAX_RESULT_MESSAGE_LENGTH),
+		death: normalizeDeath(value.death, state),
 		respawnPolicy: isPlainObject(value.respawnPolicy) ? clone(value.respawnPolicy) : {},
 		createdAtEpochMs: nonnegativeInteger(value.createdAtEpochMs ?? 0, 'createdAtEpochMs'),
 		updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs ?? 0, 'updatedAtEpochMs'),
@@ -245,10 +246,12 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	}
 	if (operation === 'dead') {
 		next.state = DynamicAgentState.DEAD;
+		next.death = normalizeDeath(controlValue.death, DynamicAgentState.DEAD);
 		return next;
 	}
 	if (operation === 'respawn') {
 		next.state = next.currentGoal === null ? DynamicAgentState.IDLE : DynamicAgentState.PAUSED;
+		next.death = null;
 		return next;
 	}
 	if (operation === 'fail') {
@@ -312,6 +315,21 @@ function normalizeError(value) {
 	};
 }
 
+function normalizeDeath(value, state) {
+	if (value === null || value === undefined) {
+		if (state === DynamicAgentState.DEAD) throw new AgentRegistryError('MISSING_DEATH_FACTS', 'DEAD agent requires death facts');
+		return null;
+	}
+	if (state !== DynamicAgentState.DEAD) throw new AgentRegistryError('INVALID_DEATH_FACTS', 'Death facts require DEAD state');
+	if (!isPlainObject(value)) throw new TypeError('death must be an object');
+	return {
+		cause: requireText(value.cause, 'death.cause', MAX_RESULT_MESSAGE_LENGTH),
+		dimensionId: requireIdentifier(value.dimensionId, 'death.dimensionId'),
+		x: finiteNumber(value.x, 'death.x'), y: finiteNumber(value.y, 'death.y'), z: finiteNumber(value.z, 'death.z'),
+		diedAtEpochMs: nonnegativeInteger(value.diedAtEpochMs, 'death.diedAtEpochMs'),
+	};
+}
+
 function optionalGoal(value) {
 	return value === null || value === undefined ? null : requireGoal(value);
 }
@@ -349,6 +367,11 @@ function positiveInteger(value, field) {
 
 function nonnegativeInteger(value, field) {
 	if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative safe integer`);
+	return value;
+}
+
+function finiteNumber(value, field) {
+	if (!Number.isFinite(value)) throw new TypeError(`${field} must be finite`);
 	return value;
 }
 
