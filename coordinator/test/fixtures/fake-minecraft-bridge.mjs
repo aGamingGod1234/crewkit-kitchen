@@ -1,4 +1,4 @@
-import { validateProtocolV2Payload } from '../../src/protocol-v2.mjs';
+import { createProtocolV2Envelope, validateProtocolV2Envelope } from '../../src/protocol-v2.mjs';
 
 export const SELECTED_PROFILE = Object.freeze({
 	agentId: 'task10-agent',
@@ -28,10 +28,14 @@ export class FakeMinecraftBridge {
 	#eventSequence;
 	#clock;
 	#pending = new Map();
+	#messageSequence = 0;
+	#serverInstanceId = 'task10-fake-server';
 
 	sent = [];
 	progress = [];
 	results = [];
+	validatedInbound = 0;
+	validatedOutbound = 0;
 
 	constructor({ record, initialObservation = observation(), onAction = () => ({}), onCancel = () => ({}) } = {}) {
 		this.#record = record;
@@ -56,30 +60,47 @@ export class FakeMinecraftBridge {
 
 	async send(type, agentId, payload) {
 		if (agentId !== this.#record.agentId) throw new Error(`unexpected agent ${agentId}`);
+		const envelope = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId,
+			type,
+			messageId: `out-${++this.#messageSequence}`,
+			payload,
+		});
+		validateProtocolV2Envelope(envelope, { direction: 'coordinator_to_server' });
+		this.validatedOutbound += 1;
+		const normalized = envelope.payload;
 		if (type === 'action_command') {
-			const normalized = validateProtocolV2Payload(type, payload);
-			this.sent.push({ type, agentId, payload: normalized });
+			this.sent.push(envelope);
 			queueMicrotask(() => { void this.#execute(normalized); });
 			return;
 		}
 		if (type === 'action_cancel') {
-			const normalized = validateProtocolV2Payload(type, payload);
-			this.sent.push({ type, agentId, payload: normalized });
+			this.sent.push(envelope);
 			queueMicrotask(() => { void this.#cancel(normalized.actionId); });
 			return;
 		}
-		this.sent.push({ type, agentId, payload });
+		this.sent.push(envelope);
 	}
 
 	async publish(nextObservation, { attention = false, eventSequence = this.#nextSequence(), observedAtEpochMs = this.#clock } = {}) {
-		this.#observation = nextObservation;
+		const inbound = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId: this.#record.agentId,
+			type: 'observation',
+			messageId: `in-${++this.#messageSequence}`,
+			payload: toWireObservation(nextObservation, this.#record.goalRevision, eventSequence, attention, observedAtEpochMs),
+		});
+		const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
+		this.validatedInbound += 1;
+		this.#observation = fromWireObservation(normalized.payload);
 		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
 		if (!this.#manager) throw new Error('FakeMinecraftBridge is not attached to a manager');
 		return this.#manager.onObservation(this.#record, {
-			observation: nextObservation,
-			eventSequence,
-			attention,
-			observedAtEpochMs,
+			observation: this.#observation,
+			eventSequence: normalized.payload.eventSequence,
+			attention: normalized.payload.attention,
+			observedAtEpochMs: normalized.payload.observedAtEpochMs,
 			receiptMonotonicMs: ++this.#clock,
 			receiptEpochMs: observedAtEpochMs + 1,
 		});
@@ -109,25 +130,23 @@ export class FakeMinecraftBridge {
 		const progressSequence = this.#nextSequence();
 		this.progress.push({ actionId: command.actionId, eventSequence: progressSequence });
 		if (this.#manager) {
-			await this.#manager.onActionProgress(this.#record, {
+			const inbound = createProtocolV2Envelope({ serverInstanceId: this.#serverInstanceId, agentId: this.#record.agentId, type: 'action_progress', messageId: `in-${++this.#messageSequence}`, payload: {
 				goalRevision: command.goalRevision,
 				actionId: command.actionId,
-				eventSequence: progressSequence,
-			});
+				commandId: command.actionId,
+				state: 'RUNNING',
+				message: 'progress',
+				progress: 0.5,
+				elapsedMs: 1,
+				observedAtEpochMs: this.#clock,
+			} });
+			const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
+			this.validatedInbound += 1;
+			await this.#manager.onActionProgress(this.#record, normalized.payload);
 		}
 		if (plan.observation !== undefined) this.#observation = plan.observation;
 		const observationSequence = this.#nextSequence();
-		this.#eventSequence = observationSequence;
-		if (this.#manager) {
-			await this.#manager.onObservation(this.#record, {
-				observation: this.#observation,
-				eventSequence: observationSequence,
-				attention: false,
-				observedAtEpochMs: this.#clock,
-				receiptMonotonicMs: ++this.#clock,
-				receiptEpochMs: this.#clock,
-			});
-		}
+		await this.publish(this.#observation, { eventSequence: observationSequence, observedAtEpochMs: this.#clock });
 		const result = {
 			goalRevision: command.goalRevision,
 			actionId: command.actionId,
@@ -135,13 +154,63 @@ export class FakeMinecraftBridge {
 			reasonCode: plan.reasonCode ?? 'DONE',
 		};
 		this.results.push(result);
-		if (this.#manager) await this.#manager.onActionResult(this.#record, result);
+		if (this.#manager) {
+			const inbound = createProtocolV2Envelope({ serverInstanceId: this.#serverInstanceId, agentId: this.#record.agentId, type: 'action_result', messageId: `in-${++this.#messageSequence}`, payload: {
+				...result,
+				commandId: result.actionId,
+				actionType: command.actionType,
+				message: result.reasonCode,
+				elapsedMs: 1,
+				observedAtEpochMs: this.#clock,
+			} });
+			const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
+			this.validatedInbound += 1;
+			await this.#manager.onActionResult(this.#record, normalized.payload);
+		}
 	}
 
 	#nextSequence() {
 		this.#eventSequence += 1;
 		return this.#eventSequence;
 	}
+}
+
+function toWireObservation(value, goalRevision, eventSequence, attention, observedAtEpochMs) {
+	const player = value.player ?? {};
+	const position = { x: player.x ?? 0, y: player.y ?? 64, z: player.z ?? 0 };
+	return {
+		goalRevision,
+		observedAtEpochMs,
+		ready: true,
+		status: 'ready',
+		eventSequence,
+		attention,
+		changedFacts: attention ? ['player.health'] : [],
+		position,
+		velocity: { x: 0, y: 0, z: 0 },
+		view: { yaw: 0, pitch: 0 },
+		player: {
+			health: player.health ?? 20, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5,
+			gameMode: 'survival', onGround: true, inWater: false, onFire: player.fire === true,
+			air: 300, maxAir: 300, suffocating: false, fallDistance: player.fallDistance ?? 0, effects: [],
+		},
+		inventory: { items: (value.inventory?.items ?? []).map((item, index) => ({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: item.slot ?? index })), selectedItem: 'minecraft:air' },
+		entities: (value.items ?? []).map((item) => ({ uuid: item.stableId, type: 'minecraft:item', name: 'drop', distance: Math.hypot(item.x - position.x, item.y - position.y, item.z - position.z), position: { x: item.x, y: item.y, z: item.z }, itemId: item.itemId, count: item.count })),
+		blocks: (value.blocks ?? []).map((block) => ({ x: block.x, y: block.y, z: block.z, blockId: block.blockId, placeableFaces: ['up', 'down', 'north', 'south', 'east', 'west'] })),
+		nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false },
+		currentAction: { active: false }, lastResult: { present: false },
+	};
+}
+
+function fromWireObservation(value) {
+	const items = value.entities.filter((entity) => entity.type === 'minecraft:item').map((entity) => ({ stableId: entity.uuid, itemId: entity.itemId, count: entity.count, x: entity.position.x, y: entity.position.y, z: entity.position.z, reachable: entity.distance <= 16, tags: entity.itemId === 'minecraft:oak_log' ? ['#minecraft:logs'] : [] }));
+	const inventoryItems = value.inventory.items.map((item) => ({ itemId: item.itemId, count: item.count, slot: item.slot }));
+	return {
+		player: { x: value.position.x, y: value.position.y, z: value.position.z, health: value.player.health, fire: value.player.onFire, fallDistance: value.player.fallDistance, dead: value.player.health <= 0 },
+		items,
+		blocks: value.blocks.map((block) => ({ stableId: `${block.x},${block.y},${block.z}`, blockId: block.blockId, x: block.x, y: block.y, z: block.z, reachable: true, tags: block.blockId === 'minecraft:oak_log' ? ['#minecraft:logs'] : [] })),
+		inventory: { items: inventoryItems, tagCounts: { '#minecraft:logs': inventoryItems.filter((item) => item.itemId === 'minecraft:oak_log').reduce((total, item) => total + item.count, 0) } },
+	};
 }
 
 export function commandPayloads(bridge) {
