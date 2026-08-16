@@ -16,6 +16,11 @@ export const PLAYER_MEMBER_PRIMITIVES = Object.freeze({
 	respawn: 'respawn',
 });
 
+export const EXACT_TARGET_ACTIONS = Object.freeze({
+	attack: Object.freeze(['targetId', 'timeoutMs']),
+	useRanged: Object.freeze(['targetId', 'drawDurationMs', 'timeoutMs']),
+});
+
 export const FACTUAL_API_PATHS = Object.freeze(new Set([
 	'player.state', 'world.items', 'world.entities', 'world.blocks', 'world.nearest',
 	'inventory.count', 'inventory.countTag',

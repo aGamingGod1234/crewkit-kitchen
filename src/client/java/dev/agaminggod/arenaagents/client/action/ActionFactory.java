@@ -32,7 +32,7 @@ public final class ActionFactory {
 					arguments.get("sprint").getAsBoolean()
 			);
 			case ATTACK -> new AttackAction(
-					arguments.get("targetSelector").getAsString(),
+					arguments.get("targetId").getAsString(),
 					arguments.get("timeoutMs").getAsLong()
 			);
 			case BREAK_BLOCK -> new BreakBlockAction(

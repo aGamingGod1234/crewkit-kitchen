@@ -480,6 +480,7 @@ export class ArenaScriptInterpreter {
 	}
 
 	#yieldCommand(path, args, node, environment) {
+		validateExactTargetArguments(path, args, node, (message) => this.#error('INVALID_ARGUMENT', `ArenaScript INVALID_ARGUMENT: ${message}`, node));
 		const binding = actionBinding(this.#bindings, path);
 		if (!binding) throw this.#error('UNBOUND_ACTION', `ArenaScript UNBOUND_ACTION: ${path}`, node);
 		if (this.#commands >= this.#limits.commandsPerProgram) throw this.#error('COMMAND_LIMIT', `ArenaScript COMMAND_LIMIT: exceeded ${this.#limits.commandsPerProgram} commands`, node);
@@ -678,6 +679,22 @@ export class ArenaScriptInterpreter {
 
 	#error(code, message, node = null) {
 		return executionError(code, message, node ? this.#compiled.stepLocations.get(stepIdFor(node)) ?? null : null);
+	}
+}
+
+function validateExactTargetArguments(path, args, node, fail) {
+	if (path !== 'player.attack' && path !== 'player.useRanged') return;
+	if (args.length !== 1 || args[0] === null || typeof args[0] !== 'object' || Array.isArray(args[0])) {
+		throw fail('exact target actions require one argument object with targetId');
+	}
+	const target = args[0];
+	const expected = path === 'player.attack' ? ['targetId', 'timeoutMs'] : ['targetId', 'drawDurationMs', 'timeoutMs'];
+	const keys = Object.keys(target);
+	if (keys.length !== expected.length || expected.some((key) => !Object.hasOwn(target, key))) {
+		throw fail('exact target actions require targetId and reject targetSelector');
+	}
+	if (typeof target.targetId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target.targetId)) {
+		throw fail('targetId must be a canonical UUID from an observed candidate stableId');
 	}
 }
 

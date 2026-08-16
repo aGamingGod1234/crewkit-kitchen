@@ -15,6 +15,7 @@ import {
 	MAX_REASON_CODE_LENGTH,
 	MAX_RESULT_MESSAGE_LENGTH,
 	MAX_TARGET_SELECTOR_LENGTH,
+	MAX_TARGET_ID_LENGTH,
 	MIN_DURATION_MS,
 	MIN_MOVEMENT_TOLERANCE,
 	PROTOCOL_VERSION,
@@ -61,7 +62,7 @@ export function validateAction(value) {
 			requireCoordinates(action, false, 'action');
 			break;
 		case 'attack':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
+			requireTargetId(action.targetId, 'action.targetId');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'transfer_container':
@@ -108,7 +109,7 @@ export function validateAction(value) {
 			requireDuration(action.durationMs, 'action.durationMs');
 			break;
 		case 'use_ranged':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
+			requireTargetId(action.targetId, 'action.targetId');
 			requireDuration(action.drawDurationMs, 'action.drawDurationMs');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
@@ -357,6 +358,13 @@ function requireObject(value, path) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)
 			|| ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw invalid('INVALID_FIELD', `${path} must be an object`);
 	return value;
+}
+
+function requireTargetId(value, path) {
+	requireText(value, path, MAX_TARGET_ID_LENGTH);
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+		throw invalid('INVALID_FIELD', `${path} must be a canonical UUID`);
+	}
 }
 
 function requireKeys(value, expected, path, required = expected) {

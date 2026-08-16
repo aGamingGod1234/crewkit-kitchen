@@ -37,6 +37,21 @@ test('admits the exact Task 2 direct action and terminal API calls', () => {
 	}
 });
 
+test('requires exact observed target ids for attack and ranged use', () => {
+	assert.doesNotThrow(() => parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		const target = world.nearest(world.entities());
+		await player.attack({ targetId: target.stableId, timeoutMs: 5_000 });
+		await player.useRanged({ targetId: target.stableId, drawDurationMs: 1_000, timeoutMs: 5_000 });
+	`));
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); await player.attack({ targetSelector: "nearest_hostile", timeoutMs: 1 });',
+		'program.onUnhandledAttention("continue_and_notify"); await player.useRanged({ targetSelector: "nearest_hostile", drawDurationMs: 1, timeoutMs: 1 });',
+	]) {
+		assert.throws(() => parseArenaScript(source), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+	}
+});
+
 test('admits only factual observed-candidate queries in watcher conditions', () => {
 	assert.doesNotThrow(() => parseArenaScript(`
 		program.onUnhandledAttention("continue_and_notify");

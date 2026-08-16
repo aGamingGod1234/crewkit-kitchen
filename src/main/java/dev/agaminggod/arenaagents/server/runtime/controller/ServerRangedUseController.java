@@ -2,10 +2,10 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
+import dev.agaminggod.arenaagents.server.perception.ObservationVisibility;
 import dev.agaminggod.arenaagents.server.runtime.ServerProtectionPolicy;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import dev.agaminggod.arenaagents.server.runtime.transaction.UseConfirmation;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -18,7 +18,6 @@ import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
-import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.projectile.arrow.AbstractArrow;
 import net.minecraft.world.item.BowItem;
 import net.minecraft.world.item.ItemStack;
@@ -46,7 +45,7 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 	) {
 		this.player = Objects.requireNonNull(player, "player must not be null");
 		Objects.requireNonNull(arguments, "arguments must not be null");
-		this.target = findTarget(player, arguments.get("targetSelector").getAsString());
+		this.target = resolveExactObservedTarget(player, arguments.get("targetId").getAsString());
 		boolean protectionAllowed = Objects.requireNonNull(protection, "protection must not be null")
 				.mayUseRangedWeapon(player, target);
 		TargetFacts targetFacts = TargetFacts.from(target, protectionAllowed);
@@ -203,17 +202,23 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 		throw new AgentDomainException("BOW_NOT_EQUIPPED", "A bow must be held in either hand");
 	}
 
-	private static LivingEntity findTarget(ServerPlayer player, String selector) {
-		ServerLevel level = player.level();
-		return level.getEntities(
-				player,
-				player.getBoundingBox().inflate(PROJECTILE_OBSERVATION_RADIUS),
-				entity -> entity instanceof LivingEntity living && living.isAlive()
-		).stream().map(entity -> (LivingEntity) entity).filter(entity -> switch (selector) {
-			case "nearest_hostile" -> entity instanceof Enemy;
-			case "nearest_player" -> entity instanceof ServerPlayer;
-			default -> entity.getUUID().toString().equals(selector);
-		}).min(Comparator.comparingDouble(player::distanceToSqr)).orElseThrow(() ->
-				new AgentDomainException("TARGET_NOT_FOUND", "No ranged target matched selector '" + selector + "'"));
+	private static LivingEntity resolveExactObservedTarget(ServerPlayer player, String targetId) {
+		final UUID uuid;
+		try {
+			uuid = UUID.fromString(targetId);
+		} catch (IllegalArgumentException exception) {
+			throw new AgentDomainException("TARGET_NOT_FOUND", "Target id is not a UUID");
+		}
+		Entity entity = player.level().getEntity(uuid);
+		if (!(entity instanceof LivingEntity target)
+				|| entity.level() != player.level()
+				|| !entity.isAlive()
+				|| entity == player) {
+			throw new AgentDomainException("TARGET_UNAVAILABLE", "Observed ranged target is no longer available");
+		}
+		if (!ObservationVisibility.canSeeEntity(player, target)) {
+			throw new AgentDomainException("TARGET_NOT_VISIBLE", "Observed ranged target is no longer visible");
+		}
+		return target;
 	}
 }

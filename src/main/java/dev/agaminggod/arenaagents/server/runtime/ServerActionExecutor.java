@@ -376,7 +376,7 @@ public final class ServerActionExecutor {
 							number(arguments, "z")
 					)));
 			case ATTACK -> ActiveAction.immediate(request, player,
-					() -> attack(player, string(arguments, "targetSelector")));
+					() -> attack(player, string(arguments, "targetId")));
 			case SELECT_ITEM -> ActiveAction.immediate(request, player,
 					() -> selectItem(player, string(arguments, "itemId")));
 			case USE_ITEM -> ActiveAction.use(request, player, integer(arguments, "durationMs"));
@@ -615,8 +615,8 @@ public final class ServerActionExecutor {
 			long coordinatorGeneration
 	) { }
 
-	private static void attack(ServerPlayer player, String selector) {
-		Entity target = findTarget(player, selector);
+	private static void attack(ServerPlayer player, String targetId) {
+		Entity target = resolveExactObservedTarget(player, targetId);
 		if (target instanceof ServerPlayer targetPlayer
 				&& (targetPlayer.isCreative() || targetPlayer.isSpectator())) {
 			throw new AgentDomainException("TARGET_INVULNERABLE", "Creative and spectator players cannot be valid combat targets");
@@ -627,6 +627,24 @@ public final class ServerActionExecutor {
 		player.lookAt(net.minecraft.commands.arguments.EntityAnchorArgument.Anchor.EYES, target.getEyePosition());
 		player.attack(target);
 		player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
+	}
+
+	/** Resolves only the exact UUID supplied from the agent's retained observation. */
+	static Entity resolveExactObservedTarget(ServerPlayer player, String targetId) {
+		final UUID uuid;
+		try {
+			uuid = UUID.fromString(targetId);
+		} catch (IllegalArgumentException exception) {
+			throw new AgentDomainException("TARGET_NOT_FOUND", "Target id is not a UUID");
+		}
+		Entity target = player.level().getEntity(uuid);
+		if (target == null || target.level() != player.level() || !target.isAlive() || target == player) {
+			throw new AgentDomainException("TARGET_UNAVAILABLE", "Observed target is no longer available");
+		}
+		if (!ObservationVisibility.canSeeEntity(player, target)) {
+			throw new AgentDomainException("TARGET_NOT_VISIBLE", "Observed target is no longer visible");
+		}
+		return target;
 	}
 
 	private static Entity findTarget(ServerPlayer player, String selector) {

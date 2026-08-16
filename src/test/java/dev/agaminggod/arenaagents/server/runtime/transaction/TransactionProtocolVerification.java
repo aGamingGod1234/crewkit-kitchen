@@ -54,7 +54,7 @@ public final class TransactionProtocolVerification {
 						"minRemainingDurability", 32
 				),
 				"block_with_shield", json("durationMs", 750),
-				"use_ranged", json("targetSelector", "nearest_hostile", "drawDurationMs", 1_000, "timeoutMs", 5_000)
+				"use_ranged", json("targetId", "00000000-0000-0000-0000-000000000001", "drawDurationMs", 1_000, "timeoutMs", 5_000)
 		);
 
 		for (Map.Entry<String, JsonObject> entry : valid.entrySet()) {
@@ -91,10 +91,16 @@ public final class TransactionProtocolVerification {
 			blankRecipe.addProperty("recipeId", whitespace);
 			verifyRejects("craft_inventory", blankRecipe, "INVALID_FIELD");
 
-			JsonObject blankSelector = valid.get("use_ranged").deepCopy();
-			blankSelector.addProperty("targetSelector", whitespace);
-			verifyRejects("use_ranged", blankSelector, "INVALID_FIELD");
+			JsonObject blankTarget = valid.get("use_ranged").deepCopy();
+			blankTarget.addProperty("targetId", whitespace);
+			verifyRejects("use_ranged", blankTarget, "INVALID_FIELD");
 		}
+		JsonObject selector = valid.get("use_ranged").deepCopy();
+		selector.addProperty("targetSelector", "nearest_hostile");
+		verifyRejects("use_ranged", selector, "UNKNOWN_FIELD");
+		JsonObject nonUuid = valid.get("use_ranged").deepCopy();
+		nonUuid.addProperty("targetId", "nearest_hostile");
+		verifyRejects("use_ranged", nonUuid, "INVALID_FIELD");
 	}
 
 	private static void verifyLiveBridgeRejectsUnknownArgumentBeforeSubmit() throws Exception {

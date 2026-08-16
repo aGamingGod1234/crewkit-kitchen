@@ -22,6 +22,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 public final class ProtocolCodec {
 	private static final String FIELD_PROTOCOL_VERSION = ProtocolConstants.FIELD_PROTOCOL_VERSION;
@@ -34,6 +35,7 @@ public final class ProtocolCodec {
 	private static final String FIELD_TOLERANCE = "tolerance";
 	private static final String FIELD_SPRINT = "sprint";
 	private static final String FIELD_TARGET_SELECTOR = "targetSelector";
+	private static final String FIELD_TARGET_ID = "targetId";
 	private static final String FIELD_TIMEOUT_MS = "timeoutMs";
 	private static final String FIELD_ITEM_ID = "itemId";
 	private static final String FIELD_DURATION_MS = "durationMs";
@@ -355,12 +357,7 @@ public final class ProtocolCodec {
 	}
 
 	private static void validateAttack(JsonObject command) throws ProtocolException {
-		requireBoundedText(
-				command,
-				FIELD_TARGET_SELECTOR,
-				ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH,
-				false
-		);
+		requireUuid(command, FIELD_TARGET_ID);
 		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
@@ -492,7 +489,7 @@ public final class ProtocolCodec {
 	}
 
 	private static void validateUseRanged(JsonObject arguments) throws ProtocolException {
-		requireBoundedText(arguments, FIELD_TARGET_SELECTOR, ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH, false);
+		requireUuid(arguments, FIELD_TARGET_ID);
 		requireDuration(arguments, FIELD_DRAW_DURATION_MS);
 		requireDuration(arguments, FIELD_TIMEOUT_MS);
 	}
@@ -550,6 +547,17 @@ public final class ProtocolCodec {
 
 	private static String requireIdentifier(JsonObject command, String field) throws ProtocolException {
 		return requireBoundedText(command, field, ProtocolConstants.MAX_IDENTIFIER_LENGTH, false);
+	}
+
+	private static String requireUuid(JsonObject object, String field) throws ProtocolException {
+		String value = requireBoundedText(object, field, 36, false);
+		try {
+			UUID parsed = UUID.fromString(value);
+			if (!parsed.toString().equalsIgnoreCase(value)) throw new IllegalArgumentException();
+			return value;
+		} catch (IllegalArgumentException exception) {
+			throw invalidField("Field '" + field + "' must be a canonical UUID");
+		}
 	}
 
 	private static long requireDuration(JsonObject command, String field) throws ProtocolException {
@@ -712,7 +720,7 @@ public final class ProtocolCodec {
 		Map<ActionType, List<String>> fields = new EnumMap<>(ActionType.class);
 		fields.put(ActionType.MOVE_TO, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT));
 		fields.put(ActionType.LOOK_AT, List.of(FIELD_X, FIELD_Y, FIELD_Z));
-		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_SELECTOR, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_ID, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.SELECT_ITEM, List.of(FIELD_ITEM_ID));
 		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS));
@@ -748,7 +756,7 @@ public final class ProtocolCodec {
 				FIELD_SOURCE_SLOT, FIELD_HOTBAR_SLOT, FIELD_EXPECTED_ITEM_ID, FIELD_MIN_REMAINING_DURABILITY
 		));
 		fields.put(ActionType.BLOCK_WITH_SHIELD, List.of(FIELD_DURATION_MS));
-		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_SELECTOR, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_ID, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.RESPAWN, List.of());
 		fields.put(ActionType.COMPLETE_GOAL, List.of(FIELD_SUMMARY));
 		return Map.copyOf(fields);

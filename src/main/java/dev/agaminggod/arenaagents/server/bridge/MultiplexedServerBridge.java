@@ -69,6 +69,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
 	private static final int MAX_TRACKED_IDS = 4_096;
+	private static final int OBSERVATION_HISTORY_CAPACITY = 64;
+	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
 			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "action_command", "action_cancel", "agent_error", "heartbeat"
@@ -574,6 +576,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				|| !profile.reasoning().equals(provenance.reasoningEffort()) || !profile.serviceTier().equals(provenance.serviceTier())) {
 			throw new AgentDomainException("STALE_PROVENANCE", "Action provenance does not match the selected model profile");
 		}
+		if (request.type() == ActionType.ATTACK || request.type() == ActionType.USE_RANGED) {
+			publishedObservations.requireObservedTarget(
+					request.agentId(),
+					provenance.eventSequence(),
+					request.arguments().get("targetId").getAsString()
+			);
+		}
 		programActions.accept(request);
 	}
 
@@ -987,6 +996,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final int retryCapacity;
 		private final Map<AgentId, JsonObject> delivered = new HashMap<>();
 		private final Set<AgentId> dirty = new HashSet<>();
+		private final Map<AgentId, ObservationTargetHistory> targetHistory = new java.util.LinkedHashMap<>();
 
 		public PublishedObservationState(int retryCapacity) {
 			if (retryCapacity < 1) throw new IllegalArgumentException("retryCapacity must be positive");
@@ -1000,7 +1010,32 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 		public synchronized void commit(AgentId agentId, JsonObject deliveredObservation) {
 			delivered.put(agentId, deliveredObservation.deepCopy());
+			if (deliveredObservation.has("eventSequence") && deliveredObservation.get("eventSequence").isJsonPrimitive()
+					&& deliveredObservation.get("eventSequence").getAsJsonPrimitive().isNumber()) {
+				long eventSequence = deliveredObservation.get("eventSequence").getAsLong();
+				if (!targetHistory.containsKey(agentId) && targetHistory.size() >= AgentConstants.DEFAULT_AGENT_LIMIT) {
+					targetHistory.remove(targetHistory.keySet().iterator().next());
+				}
+				targetHistory.computeIfAbsent(agentId, ignored -> new ObservationTargetHistory())
+						.retain(eventSequence, observedTargetIds(deliveredObservation));
+			}
 			dirty.remove(agentId);
+		}
+
+		/** Requires a target id to be present in the exact bounded observation selected by provenance. */
+		public synchronized void requireObservedTarget(AgentId agentId, long eventSequence, String targetId) {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(targetId, "targetId must not be null");
+			ObservationTargetHistory history = targetHistory.get(agentId);
+			if (history == null || !history.contains(eventSequence)) {
+				if (history != null && history.isOlderThanRetained(eventSequence)) {
+					throw new AgentDomainException("STALE_FACTS", "Action facts event sequence is no longer retained");
+				}
+				throw new AgentDomainException("TARGET_NOT_OBSERVED", "Target was not present in the delivered observation");
+			}
+			if (!history.targets(eventSequence).contains(targetId)) {
+				throw new AgentDomainException("TARGET_NOT_OBSERVED", "Target was not present in the delivered observation");
+			}
 		}
 
 		public synchronized boolean markDirty(AgentId agentId) {
@@ -1013,6 +1048,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		public synchronized void remove(AgentId agentId) {
 			delivered.remove(agentId);
 			dirty.remove(agentId);
+			targetHistory.remove(agentId);
 		}
 
 		public synchronized int retainedCount() {
@@ -1022,6 +1058,41 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		public synchronized void clear() {
 			delivered.clear();
 			dirty.clear();
+			targetHistory.clear();
+		}
+
+		private static Set<String> observedTargetIds(JsonObject observation) {
+			if (!observation.has("entities") || !observation.get("entities").isJsonArray()) return Set.of();
+			HashSet<String> result = new HashSet<>();
+			for (var element : observation.getAsJsonArray("entities")) {
+				if (!element.isJsonObject()) continue;
+				JsonObject entity = element.getAsJsonObject();
+				String targetId = null;
+				if (entity.has("uuid") && entity.get("uuid").isJsonPrimitive() && entity.get("uuid").getAsJsonPrimitive().isString()) {
+					targetId = entity.get("uuid").getAsString();
+				} else if (entity.has("stableId") && entity.get("stableId").isJsonPrimitive() && entity.get("stableId").getAsJsonPrimitive().isString()) {
+					targetId = entity.get("stableId").getAsString();
+				}
+				if (targetId != null && result.size() < MAX_TARGET_IDS_PER_OBSERVATION) result.add(targetId);
+			}
+			return Set.copyOf(result);
+		}
+
+		private static final class ObservationTargetHistory {
+			private final java.util.LinkedHashMap<Long, Set<String>> observations = new java.util.LinkedHashMap<>();
+
+			void retain(long eventSequence, Set<String> targetIds) {
+				observations.put(eventSequence, Set.copyOf(targetIds));
+				while (observations.size() > OBSERVATION_HISTORY_CAPACITY) {
+					observations.remove(observations.keySet().iterator().next());
+				}
+			}
+
+			boolean contains(long eventSequence) { return observations.containsKey(eventSequence); }
+			Set<String> targets(long eventSequence) { return observations.getOrDefault(eventSequence, Set.of()); }
+			boolean isOlderThanRetained(long eventSequence) {
+				return !observations.isEmpty() && eventSequence < observations.keySet().iterator().next();
+			}
 		}
 	}
 

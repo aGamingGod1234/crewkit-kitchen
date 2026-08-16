@@ -407,6 +407,9 @@ function validateCallExpression(node, state, context) {
 	if (pathEqual(path, ['program', 'watch'])) {
 		validateWatcher(node, state, context);
 	}
+	if (pathEqual(path, ['player', 'attack']) || pathEqual(path, ['player', 'useRanged'])) {
+		validateExactTargetCall(node);
+	}
 	if (functionBinding && context.functionBinding) {
 		let edges = state.functionEdges.get(context.functionBinding);
 			if (!edges) {
@@ -414,6 +417,22 @@ function validateCallExpression(node, state, context) {
 				state.functionEdges.set(context.functionBinding, edges);
 			}
 		edges.set(functionBinding, node);
+	}
+}
+
+function validateExactTargetCall(node) {
+	const argument = node.arguments[0];
+	if (!argument || argument.type !== 'ObjectExpression') return;
+	const names = argument.properties.map((property) => propertyName(property.key));
+	if (names.includes('targetSelector')) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'exact target actions require targetId, not targetSelector', argument);
+	}
+	if (!names.includes('targetId')) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'exact target actions require targetId', argument);
+	}
+	const target = argument.properties.find((property) => propertyName(property.key) === 'targetId');
+	if (target?.value?.type === 'Literal' && typeof target.value.value === 'string' && target.value.value.startsWith('nearest_')) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'nearest target selectors are not valid target ids', target.value);
 	}
 }
 

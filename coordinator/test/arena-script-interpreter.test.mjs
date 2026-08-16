@@ -8,6 +8,8 @@ const ACTION_BINDINGS = Object.freeze(Object.assign(Object.create(null), {
 	player: Object.freeze(Object.assign(Object.create(null), {
 		moveTo: Object.freeze(Object.assign(Object.create(null), { primitive: 'move_to' })),
 		wait: Object.freeze(Object.assign(Object.create(null), { primitive: 'wait' })),
+		attack: Object.freeze(Object.assign(Object.create(null), { primitive: 'attack' })),
+		useRanged: Object.freeze(Object.assign(Object.create(null), { primitive: 'use_ranged' })),
 	})),
 }));
 
@@ -51,6 +53,27 @@ test('yields a command and resumes from its typed result', () => {
 	const second = vm.resume(actionResult(first, 'SUCCEEDED', 'ARRIVED'), facts({ player: { x: 4 } }));
 	assert.equal(second.kind, 'finish');
 	assert.equal(second.summary, 'arrived');
+});
+
+test('emits exact stable target ids and rejects selector fallbacks', () => {
+	const targetId = '00000000-0000-0000-0000-000000000001';
+	const vm = interpreter(`
+		program.onUnhandledAttention("continue_and_notify");
+		const target = world.nearest(world.entities());
+		await player.attack({ targetId: target.stableId, timeoutMs: 1 });
+		await player.useRanged({ targetId: target.stableId, drawDurationMs: 1, timeoutMs: 1 });
+	`);
+	const first = vm.start(facts({ world: { entities: [{ stableId: targetId, type: 'minecraft:zombie', x: 1, y: 64, z: 0 }] } }));
+	assert.deepEqual(Object.fromEntries(Object.entries(first.call.arguments)), { targetId, timeoutMs: 1 });
+	const second = vm.resume(actionResult(first), facts({ world: { entities: [{ stableId: targetId, type: 'minecraft:zombie', x: 1, y: 64, z: 0 }] } }));
+	assert.equal(second.call.primitive, 'use_ranged');
+	assert.deepEqual(Object.fromEntries(Object.entries(second.call.arguments)), { targetId, drawDurationMs: 1, timeoutMs: 1 });
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); await player.attack({ targetSelector: "nearest_hostile", timeoutMs: 1 });',
+		'program.onUnhandledAttention("continue_and_notify"); await player.useRanged({ targetSelector: "nearest_hostile", drawDurationMs: 1, timeoutMs: 1 });',
+	]) {
+		assert.throws(() => interpreter(source), (error) => error.code === 'UNSUPPORTED_SYNTAX');
+	}
 });
 
 test('failed typed action results checkpoint with their stable reason', () => {

@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.server.bridge;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
@@ -60,7 +62,46 @@ public final class MultiplexedServerBridgeVerification {
 		);
 		assertEquals(List.of("paired-messages-and-commit", "action-attempted", "state-after-telemetry-failure"), committed,
 				"scenario callback failure cannot escape or roll back committed respawn publication");
-		return 8;
+		verifyExactTargetObservationLedger(registered.getFirst().agentId());
+		return 14;
+	}
+
+	private static void verifyExactTargetObservationLedger(AgentId agent) {
+		MultiplexedServerBridge.PublishedObservationState state = new MultiplexedServerBridge.PublishedObservationState(16);
+		JsonObject observation = new JsonObject();
+		observation.addProperty("eventSequence", 1L);
+		JsonArray entities = new JsonArray();
+		entities.add(entity("00000000-0000-0000-0000-000000000002"));
+		entities.add(entity("00000000-0000-0000-0000-000000000001"));
+		observation.add("entities", entities);
+		state.commit(agent, observation);
+		state.requireObservedTarget(agent, 1L, "00000000-0000-0000-0000-000000000001");
+		assertThrowsCode(() -> state.requireObservedTarget(agent, 1L, "00000000-0000-0000-0000-000000000003"), "TARGET_NOT_OBSERVED");
+		for (long sequence = 2; sequence <= 65; sequence++) {
+			JsonObject next = new JsonObject();
+			next.addProperty("eventSequence", sequence);
+			next.add("entities", new JsonArray());
+			state.commit(agent, next);
+		}
+		assertThrowsCode(() -> state.requireObservedTarget(agent, 1L, "00000000-0000-0000-0000-000000000001"), "STALE_FACTS");
+		state.remove(agent);
+		assertThrowsCode(() -> state.requireObservedTarget(agent, 65L, "00000000-0000-0000-0000-000000000001"), "TARGET_NOT_OBSERVED");
+	}
+
+	private static JsonObject entity(String uuid) {
+		JsonObject entity = new JsonObject();
+		entity.addProperty("uuid", uuid);
+		return entity;
+	}
+
+	private static void assertThrowsCode(Runnable action, String code) {
+		try {
+			action.run();
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException exception) {
+			assertEquals(code, exception.code(), "target observation rejection code");
+			return;
+		}
+		throw new AssertionError("expected " + code);
 	}
 
 	private static void assertTrue(boolean value, String label) {
