@@ -1,6 +1,6 @@
 # Task 8 - Model-authored vanilla respawn
 
-Implementation commit: `170271b` (`fix: make model-authored vanilla respawn restart safe`)
+Implementation commits: `170271b` (`fix: make model-authored vanilla respawn restart safe`) and `f83d18c` (`fix: fence respawn on coordinator loss and remove operator affordance`)
 
 ## Delivered
 
@@ -12,13 +12,15 @@ Implementation commit: `170271b` (`fix: make model-authored vanilla respawn rest
 - Coordinator reconnect/restart reconciliation retains death facts, reissues one dead-state turn to the same selected provider/model, suspends stale active programs, and avoids duplicate replays. Successful respawn publication has an explicit action-result-before-goal-control barrier and stale-result tests.
 - Only an observed, present, non-alive player creates `DEAD`. A missing player is handled as disconnect/recovery and never fabricates a death snapshot.
 - Scenario death interception remains disabled, so scenario recovery cannot silently respawn or replace the model-authored lifecycle.
+- A coordinator disconnect now increments an executor session generation, rolls back any in-flight physical respawn, and fences its result/lifecycle publication. Session closure also rechecks authentication after registry commit, while coordinator reconciliation ignores stale action results from the prior dead turn.
+- The operator and client control surfaces no longer expose a respawn operation or `/codex respawn`; the `DEAD` presentation explicitly remains model-owned.
 
 ## Verification
 
-- Focused coordinator tests: `node --test coordinator/test/program-runtime-manager.test.mjs coordinator/test/protocol-v2.test.mjs coordinator/test/dynamic-main.test.mjs` - **45/45 passed**.
-- Dirty-tree Java 25: `gradlew.bat verifyCore` using `runtime/toolchains/temurin-25/jdk-25.0.3+9` - **5,994 assertions passed**.
-- Clean archive of commit `170271b`, Java 25: `gradlew.bat verifyCore` - **5,594 assertions passed**.
-- Full coordinator suite: **288/290 passed**. The only two failures are the existing `coordinator/test/end-to-end.test.mjs` two-runtime fixture timeouts (`agents remain isolated while progressing concurrently` and `reconnects, retries malformed planner output, and shuts down with trace evidence`); they are the scheduled legacy failures and do not involve Task 8 protocol/lifecycle tests.
+- Focused coordinator tests: `node --test coordinator/test/program-runtime-manager.test.mjs coordinator/test/protocol-v2.test.mjs coordinator/test/dynamic-main.test.mjs` - **46/46 passed**, including disconnect while respawn is pending, reconnect, and stale old completion.
+- Dirty-tree Java 25: `gradlew.bat verifyCore` using `runtime/toolchains/temurin-25/jdk-25.0.3+9` - **5,995 assertions passed**.
+- Clean archive of commit `f83d18c`, Java 25: `gradlew.bat clean verifyCore --rerun-tasks --no-daemon --console=plain` - **5,593 assertions passed**.
+- Full coordinator suite: **289/291 passed**. The only two failures are the existing `coordinator/test/end-to-end.test.mjs` two-runtime fixture timeouts (`agents remain isolated while progressing concurrently` and `reconnects, retries malformed planner output, and shuts down with trace evidence`); they are the scheduled legacy failures and do not involve Task 8 protocol/lifecycle tests.
 
 ## Live validation boundary
 
