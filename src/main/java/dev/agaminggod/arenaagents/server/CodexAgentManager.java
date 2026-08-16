@@ -22,6 +22,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.WeakHashMap;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -197,22 +198,18 @@ public final class CodexAgentManager {
 		return savedData.registry().steer(record.agentId(), prompt, System.currentTimeMillis());
 	}
 
-	public AgentRecord respawnVanilla(String selector) {
-		return respawnVanilla(resolve(selector).agentId());
-	}
-
-	public AgentRecord respawnVanilla(AgentId agentId) {
+	public VanillaRespawnAttempt beginVanillaRespawn(AgentId agentId) {
 		AgentRecord record = savedData.registry().require(Objects.requireNonNull(agentId, "agentId must not be null"));
 		if (record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
 			throw new AgentDomainException("AGENT_NOT_DEAD", "Only a dead Codex agent can be respawned");
 		}
 		runtimeHooks.validateProfile(record.profile());
 		try {
-			ServerPlayer deadPlayer = findAgentPlayer(record.agentId()).orElseThrow(
-					() -> new AgentDomainException("AGENT_PLAYER_MISSING", "Dead agent player is unavailable for vanilla respawn resolution")
+			AgentDeathSnapshot death = record.deathSnapshot().orElseThrow(
+					() -> new AgentDomainException("DEATH_SNAPSHOT_MISSING", "Dead agent has no persisted vanilla respawn facts")
 			);
-			OfflineAgentPlayers.VanillaRespawnTarget target = OfflineAgentPlayers.resolveVanillaRespawn(deadPlayer);
-			OfflineAgentPlayers.remove(deadPlayer);
+			OfflineAgentPlayers.VanillaRespawnTarget target = OfflineAgentPlayers.resolveVanillaRespawn(server, death);
+			findAgentPlayer(record.agentId()).ifPresent(OfflineAgentPlayers::remove);
 			OfflineAgentPlayers.spawn(
 					server,
 					record.agentId(),
@@ -220,31 +217,102 @@ public final class CodexAgentManager {
 					target.position(),
 					target.yaw(),
 					target.pitch(),
-					target.level().dimension(),
-					record.profile().gameMode()
+					target.level().dimension(), target.gameMode()
 			);
 			long now = System.currentTimeMillis();
-			pendingPlayerSpawns.put(record.agentId(), now + 10_000L);
-			AgentRecord respawned = savedData.registry().respawn(
-					record.agentId(),
-					OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile()),
-					now
-			).after();
-			AgentRecord located = savedData.registry().updateEntityLocation(
-					respawned.agentId(),
-					entityLocation(target.level(), new ChunkPos(
-							((int) Math.floor(target.position().x)) >> 4,
-							((int) Math.floor(target.position().z)) >> 4
-					)),
-					now
-			);
-			restoreChunkTicket(located);
-			return located;
+			pendingPlayerSpawns.put(record.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
+			return new VanillaRespawnAttempt(record, target, now + PLAYER_SPAWN_TIMEOUT_MS);
 		} catch (RuntimeException exception) {
-			releaseChunkTicket(record.agentId());
-			OfflineAgentPlayers.find(server, record.agentId(), record.profile()).ifPresent(OfflineAgentPlayers::remove);
+			rollbackVanillaRespawn(record);
 			throw exception;
 		}
+	}
+
+	public boolean verifyVanillaRespawn(VanillaRespawnAttempt attempt, long nowEpochMs) {
+		Objects.requireNonNull(attempt, "attempt must not be null");
+		if (!savedData.registry().require(attempt.deadRecord().agentId()).equals(attempt.deadRecord())) {
+			throw new AgentDomainException("STALE_RESPAWN_ATTEMPT", "Dead lifecycle changed during respawn");
+		}
+		Optional<ServerPlayer> found = findAgentPlayer(attempt.deadRecord().agentId());
+		if (found.isEmpty()) {
+			if (nowEpochMs >= attempt.deadlineEpochMs()) throw new AgentDomainException("PLAYER_SPAWN_TIMEOUT", "Respawned player did not appear before the deadline");
+			return false;
+		}
+		ServerPlayer player = found.orElseThrow();
+		if (!player.isAlive()) throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Respawned player is not alive");
+		Vec3 finalPosition = attempt.target().finalPosition(player);
+		if (player.level() != attempt.target().level() || player.position().distanceToSqr(finalPosition) > 1.0E-8D
+				|| Math.abs(player.getYRot() - attempt.target().yaw()) > 0.001F || Math.abs(player.getXRot() - attempt.target().pitch()) > 0.001F) {
+			boolean moved = player.teleportTo(
+					attempt.target().level(), finalPosition.x, finalPosition.y, finalPosition.z,
+					Set.of(), attempt.target().yaw(), attempt.target().pitch(), true
+			);
+			if (!moved) throw new AgentDomainException("PLAYER_SPAWN_VERIFY_FAILED", "Respawned player could not reach the vanilla target");
+		}
+		if (player.level() != attempt.target().level() || player.position().distanceToSqr(finalPosition) > 1.0E-8D
+				|| player.gameMode.getGameModeForPlayer() != attempt.target().gameMode()) {
+			throw new AgentDomainException("PLAYER_SPAWN_VERIFY_FAILED", "Respawned player failed physical verification");
+		}
+		attempt.verifiedPlayer = player;
+		return true;
+	}
+
+	public AgentTransition commitVanillaRespawn(
+			VanillaRespawnAttempt attempt,
+			BiConsumer<AgentTransition, Runnable> publicationBarrier
+	) {
+		Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null");
+		ServerPlayer player = Objects.requireNonNull(attempt.verifiedPlayer, "respawn must be physically verified before commit");
+		Runnable rollbackWorld = () -> { };
+		try {
+			rollbackWorld = attempt.target().commitWorldEffects();
+			AgentEntityLocation location = entityLocation(player.level(), player.chunkPosition());
+			AgentTransition transition = savedData.registry().respawnAtomically(
+					attempt.deadRecord().agentId(), player.getUUID(), location, System.currentTimeMillis(),
+					(prepared, commit) -> {
+						restoreChunkTicket(prepared.after());
+						try {
+							publicationBarrier.accept(prepared, commit);
+						} catch (RuntimeException exception) {
+							releaseChunkTicket(prepared.after().agentId());
+							throw exception;
+						}
+					}
+			);
+			pendingPlayerSpawns.remove(attempt.deadRecord().agentId());
+			return transition;
+		} catch (RuntimeException exception) {
+			rollbackWorld.run();
+			rollbackVanillaRespawn(attempt.deadRecord());
+			throw exception;
+		}
+	}
+
+	public void rollbackVanillaRespawn(VanillaRespawnAttempt attempt) {
+		if (attempt != null) rollbackVanillaRespawn(attempt.deadRecord());
+	}
+
+	private void rollbackVanillaRespawn(AgentRecord deadRecord) {
+		releaseChunkTicket(deadRecord.agentId());
+		pendingPlayerSpawns.remove(deadRecord.agentId());
+		OfflineAgentPlayers.find(server, deadRecord.agentId(), deadRecord.profile()).ifPresent(OfflineAgentPlayers::remove);
+	}
+
+	public static final class VanillaRespawnAttempt {
+		private final AgentRecord deadRecord;
+		private final OfflineAgentPlayers.VanillaRespawnTarget target;
+		private final long deadlineEpochMs;
+		private ServerPlayer verifiedPlayer;
+
+		private VanillaRespawnAttempt(AgentRecord deadRecord, OfflineAgentPlayers.VanillaRespawnTarget target, long deadlineEpochMs) {
+			this.deadRecord = deadRecord;
+			this.target = target;
+			this.deadlineEpochMs = deadlineEpochMs;
+		}
+
+		public AgentRecord deadRecord() { return deadRecord; }
+		public OfflineAgentPlayers.VanillaRespawnTarget target() { return target; }
+		public long deadlineEpochMs() { return deadlineEpochMs; }
 	}
 
 	public void reconcileDeaths() {
@@ -300,11 +368,28 @@ public final class CodexAgentManager {
 		} catch (RuntimeException ignored) {
 			cause = "Agent died";
 		}
-		var respawn = player.getRespawnConfig().respawnData().globalPos();
+		ServerPlayer.RespawnConfig config = player.getRespawnConfig();
+		Optional<String> respawnDimension = Optional.empty();
+		Optional<Double> respawnX = Optional.empty();
+		Optional<Double> respawnY = Optional.empty();
+		Optional<Double> respawnZ = Optional.empty();
+		Optional<Float> respawnYaw = Optional.empty();
+		Optional<Float> respawnPitch = Optional.empty();
+		Optional<Boolean> respawnForced = Optional.empty();
+		if (config != null) {
+			var data = config.respawnData();
+			respawnDimension = Optional.of(data.dimension().identifier().toString());
+			respawnX = Optional.of((double) data.pos().getX());
+			respawnY = Optional.of((double) data.pos().getY());
+			respawnZ = Optional.of((double) data.pos().getZ());
+			respawnYaw = Optional.of(data.yaw());
+			respawnPitch = Optional.of(data.pitch());
+			respawnForced = Optional.of(config.forced());
+		}
 		return new AgentDeathSnapshot(
 				cause, player.level().dimension().identifier().toString(), player.getX(), player.getY(), player.getZ(),
-				Optional.of(respawn.dimension().identifier().toString()), Optional.of((double) respawn.pos().getX()),
-				Optional.of((double) respawn.pos().getY()), Optional.of((double) respawn.pos().getZ()), now
+				respawnDimension, respawnX, respawnY, respawnZ, respawnYaw, respawnPitch, respawnForced,
+				player.gameMode.getGameModeForPlayer().getName(), now
 		);
 	}
 

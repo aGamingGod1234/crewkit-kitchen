@@ -34,6 +34,10 @@ function record(agentId = 'agent-a') {
 	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] };
 }
 
+const DEATH = Object.freeze({
+	cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 0, y: 64, z: 0, diedAtEpochMs: 2,
+});
+
 async function eventually(predicate) {
 	for (let index = 0; index < 100; index += 1) {
 		if (predicate()) return;
@@ -105,10 +109,43 @@ test('steering and death dispose programs so stale action results are rejected',
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Stop waiting.' } });
 		await eventually(() => run.registry.get('agent-a')?.goalRevision === 2);
 		assert.equal(run.bridge.sent.some((message) => message.type === 'action_cancel' && message.payload.actionId === command.payload.actionId), true);
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 3 } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 3, updatedAtEpochMs: 3, death: DEATH } });
 		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DEAD);
 		assert.equal(run.planner.interruptions.includes('agent-a'), true);
 	} finally { await run.coordinator.stop(); }
+});
+
+test('reconciliation reissues one dead-state turn to the selected session and preserves DEAD across disconnect', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		return { summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' };
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+		{ bridge, registry, planner, codexService: new FakeProvider() },
+	);
+	await coordinator.start();
+	try {
+		const dead = { ...record(), state: DynamicAgentState.DEAD, currentGoal: 'Survive.', goalRevision: 4, death: DEATH };
+		bridge.emit('ready', { serverInstanceId: 'first', registry: [dead] });
+		await eventually(() => bridge.sent.some((message) => message.payload?.actionType === 'respawn'));
+		assert.equal(planner.requests.length, 1);
+		assert.equal(planner.requests[0].preserveState, true);
+		assert.match(planner.requests[0].input, /fell from a high place/);
+		assert.equal(bridge.sent.find((message) => message.payload?.actionType === 'respawn').payload.provenance.model, 'gpt-5.6-sol');
+		bridge.emit('ready', { serverInstanceId: 'first', registry: [dead] });
+		await eventually(() => bridge.sent.filter((message) => message.type === 'agent_ready').length >= 2);
+		assert.equal(planner.requests.length, 1, 'duplicate reconciliation does not create a second dead turn');
+		bridge.emit('disconnected');
+		await eventually(() => planner.interruptions.includes('agent-a'));
+		assert.equal(registry.get('agent-a').state, DynamicAgentState.DEAD, 'transport loss cannot erase persisted DEAD state');
+		bridge.emit('ready', { serverInstanceId: 'first', registry: [dead] });
+		await eventually(() => planner.requests.length === 2);
+		assert.equal(planner.requests.length, 2, 'reconnect reissues exactly one replacement dead turn');
+	} finally { await coordinator.stop(); }
 });
 
 test('death suspends the active program and asks the same selected model for a coordinate-free respawn program', async () => {
@@ -130,7 +167,7 @@ test('death suspends the active program and asks the same selected model for a c
 		const stale = run.bridge.sent.find((message) => message.type === 'action_command');
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
 			operation: 'dead', goalRevision: 2, updatedAtEpochMs: 2,
-			death: { cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 0, y: 64, z: 0, diedAtEpochMs: 2 },
+			death: DEATH,
 		} });
 		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DEAD);
 		await eventually(() => run.bridge.sent.some((message) => message.payload.actionType === 'respawn'));
@@ -144,6 +181,31 @@ test('death suspends the active program and asks the same selected model for a c
 		} });
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(run.registry.get('agent-a')?.state, DynamicAgentState.DEAD, 'stale pre-death action cannot resume the suspended program');
+	} finally { await run.coordinator.stop(); }
+});
+
+test('respawn success is consumed before lifecycle control without a stale-result error', async () => {
+	const run = await start();
+	const errors = [];
+	run.coordinator.on('runtimeError', (error) => errors.push(error));
+	try {
+		run.planner.requestPlan = async (request) => {
+			run.planner.requests.push(request);
+			return request.input.includes('player_death')
+				? { summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }
+				: { summary: 'Wait.', directive: 'replace', source: SOURCE };
+		};
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.', updatedAtEpochMs: 1 } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 2, updatedAtEpochMs: 2, death: DEATH } });
+		await eventually(() => run.bridge.sent.some((message) => message.payload?.actionType === 'respawn'));
+		const command = run.bridge.sent.find((message) => message.payload?.actionType === 'respawn');
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
+			goalRevision: 2, actionId: command.payload.actionId, commandId: command.payload.actionId,
+			actionType: 'respawn', state: 'SUCCEEDED', reasonCode: 'VANILLA_RESPAWNED', message: '', elapsedMs: 1, observedAtEpochMs: 3,
+		} });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'respawn', goalRevision: 3, updatedAtEpochMs: 3 } });
+		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.PAUSED);
+		assert.deepEqual(errors, []);
 	} finally { await run.coordinator.stop(); }
 });
 

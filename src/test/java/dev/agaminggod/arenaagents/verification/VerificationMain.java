@@ -41,6 +41,7 @@ import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.GoalControlVerification;
 import dev.agaminggod.arenaagents.server.AgentModelArgumentVerification;
 import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
+import dev.agaminggod.arenaagents.server.OfflineAgentPlayersVerification;
 import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerification;
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodecVerification;
 import dev.agaminggod.arenaagents.server.bridge.ProgramActionLedgerVerification;
@@ -133,6 +134,7 @@ public final class VerificationMain {
 		passedAssertions += GoalControlVerification.verify();
 		passedAssertions += AgentModelArgumentVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();
+		passedAssertions += OfflineAgentPlayersVerification.verify();
 		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();
 		passedAssertions += AgentRegistryVerification.verify();
 		passedAssertions += AgentIdentityVerification.verify();

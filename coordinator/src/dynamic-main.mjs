@@ -142,6 +142,7 @@ export class DynamicCoordinator extends EventEmitter {
 				if (record === null) throw new ProtocolV2Error('UNKNOWN_AGENT', `Reconciled provider profile references unknown agent '${profile.agentId}'`);
 				await this.#bridge.send('agent_ready', profile.agentId, { goalRevision: record.goalRevision, reconciled: true });
 				this.#supportedAgentIds.add(profile.agentId);
+				if (record.state === DynamicAgentState.DEAD) await this.#installDeadStatePlan(record, record.death);
 			}
 			for (const invalid of providers.invalid) {
 				const agentId = invalid.agentId ?? invalid.profile?.agentId;
@@ -180,11 +181,17 @@ export class DynamicCoordinator extends EventEmitter {
 			await this.#publishStatus();
 		}));
 		this.#listen('goal_control', (message) => {
-			this.#invalidateLifecycleWork(message);
+			const orderedRespawn = message.payload.operation === 'respawn';
+			if (!orderedRespawn) this.#invalidateLifecycleWork(message);
 			const previous = this.#registry.get(message.agentId);
-			if (previous !== null && message.payload.operation !== 'queue') this.#programRuntime.onGoalControl(previous, message.payload.operation);
+			if (!orderedRespawn && previous !== null && message.payload.operation !== 'queue') this.#programRuntime.onGoalControl(previous, message.payload.operation);
 			const interruption = this.#beginGoalControlInterruption(message);
 			this.#enqueueAgent(message.agentId, async () => {
+				if (orderedRespawn) {
+					this.#invalidateLifecycleWork(message);
+					const orderedPrevious = this.#registry.get(message.agentId);
+					if (orderedPrevious !== null) this.#programRuntime.onGoalControl(orderedPrevious, message.payload.operation);
+				}
 				const record = this.#registry.applyGoalControl(message.agentId, message.payload);
 				if (message.payload.operation !== 'queue') {
 					this.#providerRetryAfter.delete(message.agentId);
@@ -192,23 +199,7 @@ export class DynamicCoordinator extends EventEmitter {
 				const interruptionResult = await interruption;
 				if (interruptionResult.error !== null) throw interruptionResult.error;
 				if (message.payload.operation === 'dead') {
-					const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
-					const decision = await this.#planner.requestPlan({
-						agentId: record.agentId,
-						goalRevision: record.goalRevision,
-						preserveState: true,
-						input: buildPlannerInput({
-							agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
-							goal: record.currentGoal,
-							goalRevision: record.goalRevision,
-							decisionContext: 'player_death',
-							death: message.payload.death,
-						}),
-					});
-					if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
-					await this.#programRuntime.installDecision(record, decision, {
-						observation: { death: message.payload.death }, eventSequence: 0,
-					});
+					await this.#installDeadStatePlan(record, message.payload.death);
 				}
 				if (['start', 'resume', 'steer'].includes(message.payload.operation)) {
 					await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
@@ -276,7 +267,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#programRuntime.disposeAll();
 			this.#providerRetryAfter.clear();
 			await Promise.allSettled(this.#registry.list().map(async (record) => {
-				if (record.state !== DynamicAgentState.DISCONNECTED) this.#registry.setState(record.agentId, DynamicAgentState.DISCONNECTED, { goalRevision: record.goalRevision });
+				if (![DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED].includes(record.state)) this.#registry.setState(record.agentId, DynamicAgentState.DISCONNECTED, { goalRevision: record.goalRevision });
 				await this.#planner.interrupt(record.agentId, 'Minecraft bridge disconnected');
 			}));
 			});
@@ -289,6 +280,26 @@ export class DynamicCoordinator extends EventEmitter {
 	#listen(event, listener) {
 		this.#bridge.on(event, listener);
 		this.#listeners.push([event, listener]);
+	}
+
+	async #installDeadStatePlan(record, death) {
+		if (death === null || death === undefined) throw new ProtocolV2Error('MISSING_FIELD', `DEAD agent '${record.agentId}' requires death facts`);
+		if (this.#programRuntime.hasCurrent(record)) return;
+		const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
+		const decision = await this.#planner.requestPlan({
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			preserveState: true,
+			input: buildPlannerInput({
+				agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
+				goal: record.currentGoal,
+				goalRevision: record.goalRevision,
+				decisionContext: 'player_death',
+				death,
+			}),
+		});
+		if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
+		await this.#programRuntime.installDecision(record, decision, { observation: { death }, eventSequence: 0 });
 	}
 
 	#unbindBridge() {

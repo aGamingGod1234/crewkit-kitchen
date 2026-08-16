@@ -105,7 +105,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		this.router = new AgentRuntimeRouter(manager);
 		this.port = port;
 		this.secret = readSecret(secretPath);
-		this.actionExecutor = new ServerActionExecutor(manager, this::sendActionResult, this::sendActionProgress);
+		this.actionExecutor = new ServerActionExecutor(
+				manager, this::sendActionResult, this::sendActionProgress,
+				dev.agaminggod.arenaagents.server.runtime.ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR,
+				this::sendRespawnResultBeforeControl
+		);
 		this.observations = new ServerObservationCollector(manager, actionExecutor);
 	}
 
@@ -197,29 +201,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (operation == null) {
 			return;
 		}
-		JsonObject payload = new JsonObject();
-		payload.addProperty("operation", operation);
-		payload.addProperty("goalRevision", transition.after().goalRevision());
-		payload.addProperty("updatedAtEpochMs", transition.after().updatedAtEpochMs());
-		if ("queue".equals(operation)) {
-			List<AgentGoal> queue = transition.after().queuedGoals();
-			payload.addProperty("goal", queue.get(queue.size() - 1).prompt());
-		} else if ("start".equals(operation) || "steer".equals(operation)) {
-			transition.after().currentGoal().ifPresent(goal -> payload.addProperty("goal", plannerGoal(goal)));
-		}
-		if ("dead".equals(operation)) {
-			transition.after().deathSnapshot().ifPresent(death -> {
-				JsonObject facts = new JsonObject();
-				facts.addProperty("cause", death.cause());
-				facts.addProperty("dimensionId", death.dimensionId());
-				facts.addProperty("x", death.x());
-				facts.addProperty("y", death.y());
-				facts.addProperty("z", death.z());
-				facts.addProperty("diedAtEpochMs", death.diedAtEpochMs());
-				payload.add("death", facts);
-			});
-		}
-		send("goal_control", transition.after().agentId().toString(), payload);
+		send("goal_control", transition.after().agentId().toString(), goalControlPayload(transition, operation));
 	}
 
 	@Override
@@ -614,6 +596,28 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				result.state() == dev.agaminggod.arenaagents.server.runtime.ServerActionState.SUCCEEDED
 						&& !"TARGET_ALREADY_SATISFIED".equals(result.reasonCode())
 		);
+		send("action_result", result.agentId().toString(), actionResultPayload(result));
+		if (result.actionType() != ActionType.COMPLETE_GOAL) {
+			queueObservation(result.agentId());
+		}
+	}
+
+	private void sendRespawnResultBeforeControl(ServerActionResult result, AgentTransition transition, Runnable commit) {
+		Session active = session;
+		if (active == null || !active.authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Respawn result has no authenticated coordinator");
+		ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true);
+		ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()));
+		BridgeEnvelope resultEnvelope = new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
+				"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
+		BridgeEnvelope controlEnvelope = new BridgeEnvelope(2, serverInstanceId, transition.after().agentId().toString(), "goal_control",
+				"server-" + messageIds.incrementAndGet(), goalControlPayload(transition, "respawn"));
+		active.enqueuePair(resultEnvelope, controlEnvelope, commit);
+		programActions.terminal(result);
+		observations.invalidate(result.agentId());
+		queueObservation(result.agentId());
+	}
+
+	private static JsonObject actionResultPayload(ServerActionResult result) {
 		JsonObject payload = new JsonObject();
 		payload.addProperty("goalRevision", result.goalRevision());
 		payload.addProperty("actionId", result.actionId());
@@ -624,10 +628,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("message", result.message());
 		payload.addProperty("elapsedMs", result.elapsedMs());
 		payload.addProperty("observedAtEpochMs", result.observedAtEpochMs());
-		send("action_result", result.agentId().toString(), payload);
-		if (result.actionType() != ActionType.COMPLETE_GOAL) {
-			queueObservation(result.agentId());
+		return payload;
+	}
+
+	private static JsonObject goalControlPayload(AgentTransition transition, String operation) {
+		JsonObject payload = new JsonObject();
+		payload.addProperty("operation", operation);
+		payload.addProperty("goalRevision", transition.after().goalRevision());
+		payload.addProperty("updatedAtEpochMs", transition.after().updatedAtEpochMs());
+		if ("queue".equals(operation)) {
+			List<AgentGoal> queue = transition.after().queuedGoals();
+			payload.addProperty("goal", queue.get(queue.size() - 1).prompt());
+		} else if ("start".equals(operation) || "steer".equals(operation)) {
+			transition.after().currentGoal().ifPresent(goal -> payload.addProperty("goal", plannerGoal(goal)));
 		}
+		if ("dead".equals(operation)) transition.after().deathSnapshot().ifPresent(death -> payload.add("death", deathFacts(death)));
+		return payload;
+	}
+
+	private static JsonObject deathFacts(dev.agaminggod.arenaagents.agent.AgentDeathSnapshot death) {
+		JsonObject facts = new JsonObject();
+		facts.addProperty("cause", death.cause());
+		facts.addProperty("dimensionId", death.dimensionId());
+		facts.addProperty("x", death.x());
+		facts.addProperty("y", death.y());
+		facts.addProperty("z", death.z());
+		facts.addProperty("diedAtEpochMs", death.diedAtEpochMs());
+		return facts;
 	}
 
 	private void sendActionProgress(ServerActionProgress progress) {
@@ -760,6 +787,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!record.lastSummary().isBlank()) {
 			payload.addProperty("lastSummary", record.lastSummary());
 		}
+		record.deathSnapshot().ifPresent(death -> payload.add("death", deathFacts(death)));
 		payload.addProperty("createdAtEpochMs", record.createdAtEpochMs());
 		payload.addProperty("updatedAtEpochMs", record.updatedAtEpochMs());
 		if (!record.lastError().isBlank()) {
@@ -1006,11 +1034,26 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			writerThread = Thread.ofPlatform().daemon().name("arenaagents-v2-writer").start(this::writeLoop);
 		}
 
-		synchronized void enqueue(BridgeEnvelope envelope) {
+		 synchronized void enqueue(BridgeEnvelope envelope) {
 			int agentQueued = queuedByAgent.getOrDefault(envelope.agentId(), 0);
 			if (agentQueued >= AGENT_QUEUE_CAP) throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
 			if (!outbound.offer(envelope)) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue is full");
 			queuedByAgent.put(envelope.agentId(), agentQueued + 1);
+		}
+
+		synchronized void enqueuePair(BridgeEnvelope first, BridgeEnvelope second, Runnable beforeEnqueue) {
+			if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before respawn publication");
+			if (!first.agentId().equals(second.agentId())) throw new IllegalArgumentException("paired envelopes must belong to one agent");
+			int agentQueued = queuedByAgent.getOrDefault(first.agentId(), 0);
+			if (agentQueued > AGENT_QUEUE_CAP - 2) throw new BridgeProtocolException("AGENT_BACKPRESSURE", first.agentId());
+			if (outbound.remainingCapacity() < 2) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot atomically publish respawn");
+			beforeEnqueue.run();
+			if (!outbound.offer(first) || !outbound.offer(second)) {
+				outbound.remove(first);
+				outbound.remove(second);
+				throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Atomic respawn publication failed");
+			}
+			queuedByAgent.put(first.agentId(), agentQueued + 2);
 		}
 
 		private void readLoop() {

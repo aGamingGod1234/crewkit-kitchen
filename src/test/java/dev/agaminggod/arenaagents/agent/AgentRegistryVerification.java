@@ -224,6 +224,7 @@ public final class AgentRegistryVerification {
 		AgentDeathSnapshot death = new AgentDeathSnapshot(
 				"fell from a high place", "minecraft:the_nether", 12.5D, 64.0D, -3.5D,
 				Optional.of("minecraft:overworld"), Optional.of(100.5D), Optional.of(70.0D), Optional.of(-20.5D),
+				Optional.of(37.5F), Optional.of(-12.25F), Optional.of(true), "spectator",
 				START_TIME + 2L
 		);
 		AgentTransition died = AgentLifecycleReducer.die(active, death, START_TIME + 3L);
@@ -241,11 +242,40 @@ public final class AgentRegistryVerification {
 		String encoded = codec.encode(snapshot);
 		AgentRecord roundTrip = codec.decode(encoded).records().getFirst();
 		assertEquals(died.after().deathSnapshot(), roundTrip.deathSnapshot(), "death snapshot persistence round-trip");
+		assertEquals("spectator", roundTrip.deathSnapshot().orElseThrow().gameMode(), "actual live game mode survives restart");
+		assertEquals(Optional.of(true), roundTrip.deathSnapshot().orElseThrow().respawnForced(), "forced vanilla respawn flag survives restart");
+		AgentDeathSnapshot legacyShape = new AgentDeathSnapshot(
+				"legacy death", "minecraft:overworld", 1.0D, 64.0D, 1.0D,
+				Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), START_TIME + 2L
+		);
+		assertEquals("survival", legacyShape.gameMode(), "legacy death constructor defaults to survival");
 		String legacy = encoded.replaceFirst(",\\\"death_snapshot\\\":\\{[^}]*\\}", "");
 		assertEquals(Optional.empty(), codec.decode(legacy).records().getFirst().deathSnapshot(), "legacy saves default death snapshot absent");
-		AgentTransition respawned = AgentLifecycleReducer.respawn(died.after(), UUID.randomUUID(), START_TIME + 5L);
+
+		AgentRegistry registry = AgentRegistry.restore(snapshot, () -> { }, transition -> { }, START_TIME + 4L);
+		AgentRecord exactDead = registry.require(active.agentId());
+		try {
+			registry.respawnAtomically(active.agentId(), UUID.randomUUID(), START_TIME + 5L, (transition, commit) -> {
+				throw new AgentDomainException("RESPAWN_BARRIER_FAILED", "result/control publication failed");
+			});
+			throw new AssertionError("Expected transactional respawn barrier failure");
+		} catch (AgentDomainException exception) {
+			assertEquals("RESPAWN_BARRIER_FAILED", exception.code(), "respawn barrier failure code");
+		}
+		assertEquals(exactDead, registry.require(active.agentId()), "failed respawn retains the exact DEAD record and snapshot");
+		try {
+			registry.respawnAtomically(active.agentId(), UUID.randomUUID(), START_TIME + 5L, (transition, commit) -> {
+				commit.run();
+				throw new AgentDomainException("RESPAWN_PUBLICATION_FAILED", "publication failed after commit");
+			});
+			throw new AssertionError("Expected post-commit respawn barrier failure");
+		} catch (AgentDomainException exception) {
+			assertEquals("RESPAWN_PUBLICATION_FAILED", exception.code(), "post-commit barrier failure code");
+		}
+		assertEquals(exactDead, registry.require(active.agentId()), "post-commit barrier failure restores the exact DEAD record");
+		AgentTransition respawned = registry.respawnAtomically(active.agentId(), UUID.randomUUID(), START_TIME + 6L, (transition, commit) -> commit.run());
 		assertEquals(Optional.empty(), respawned.after().deathSnapshot(), "only successful respawn clears death snapshot");
-		return 10;
+		return 17;
 	}
 
 	private static void expectFailure(Runnable operation, String expectedCode) {

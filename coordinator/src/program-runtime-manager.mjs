@@ -131,6 +131,11 @@ export class ProgramRuntimeManager {
 		for (const agentId of this.#states.keys()) this.dispose(agentId);
 	}
 
+	hasCurrent(record) {
+		const state = this.#states.get(record.agentId);
+		return state !== undefined && !state.disposed && state.goalRevision === record.goalRevision;
+	}
+
 	#state(record, observation, eventSequence) {
 		const existing = this.#states.get(record.agentId);
 		if (existing && !existing.disposed && existing.goalRevision === record.goalRevision) {
@@ -385,6 +390,7 @@ export class ProgramRuntimeManager {
 
 	#syncState(record, state) {
 		const snapshot = state.engine.snapshot();
+		if (this.#registry.get(record.agentId)?.state === DynamicAgentState.DEAD) return;
 		if (snapshot.status === 'FINISHED') this.#setTerminalState(record, state.terminalStatus === 'impossible' ? DynamicAgentState.ERROR : DynamicAgentState.COMPLETED);
 		if (snapshot.status === 'PAUSED' || snapshot.status === 'SUSPENDED') this.#setTerminalState(record, DynamicAgentState.PAUSED);
 	}

@@ -125,6 +125,22 @@ test('protocol v2 accepts exact death facts only on dead lifecycle control', () 
 	);
 });
 
+test('hello acknowledgement retains death facts for restart reconciliation', () => {
+	const death = { cause: 'burned in lava', dimensionId: 'minecraft:the_nether', x: 4.5, y: 31, z: -8.5, diedAtEpochMs: 23 };
+	const dead = { ...registeredRecord(), state: 'DEAD', currentGoal: 'Escape the Nether.', goalRevision: 7, death };
+	const payload = validateProtocolV2Payload('hello_ack', {
+		replyTo: 'coordinator-1', authenticated: true, registry: [dead],
+	});
+	assert.deepEqual(payload.registry[0].death, death);
+	assert.throws(
+		() => validateProtocolV2Payload('hello_ack', {
+			replyTo: 'coordinator-1', authenticated: true,
+			registry: [{ ...dead, death: undefined }],
+		}),
+		/death facts/,
+	);
+});
+
 function registeredRecord(agentId = 'agent-a') {
 	return {
 		schemaVersion: 1,

@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
+import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.AgentChatReporter;
@@ -71,12 +72,14 @@ public final class ServerActionExecutor {
 	private final CodexAgentManager manager;
 	private final AgentRuntimeRouter router;
 	private final Consumer<ServerActionResult> resultSink;
+	private final RespawnResultSink respawnResultSink;
 	private final Consumer<ServerActionProgress> progressSink;
 	private final ServerProtectionPolicy protection;
 	private final ResourceLeaseManager resourceLeases;
 	private final AdvancedInteractionService advancedInteractions;
 	private final Map<AgentId, ActiveAction> active = new LinkedHashMap<>();
 	private final Map<AgentId, CleanupRetry<ServerActionResult>> pendingCompletions = new LinkedHashMap<>();
+	private final Map<AgentId, PendingRespawn> pendingRespawns = new LinkedHashMap<>();
 	private final Map<AgentId, ServerActionResult> lastResults = new LinkedHashMap<>();
 
 	public ServerActionExecutor(CodexAgentManager manager, Consumer<ServerActionResult> resultSink) {
@@ -105,9 +108,23 @@ public final class ServerActionExecutor {
 			Consumer<ServerActionProgress> progressSink,
 			ServerProtectionPolicy protection
 	) {
+		this(manager, resultSink, progressSink, protection, (result, transition, commit) -> {
+			resultSink.accept(result);
+			commit.run();
+		});
+	}
+
+	public ServerActionExecutor(
+			CodexAgentManager manager,
+			Consumer<ServerActionResult> resultSink,
+			Consumer<ServerActionProgress> progressSink,
+			ServerProtectionPolicy protection,
+			RespawnResultSink respawnResultSink
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		this.resultSink = Objects.requireNonNull(resultSink, "resultSink must not be null");
+		this.respawnResultSink = Objects.requireNonNull(respawnResultSink, "respawnResultSink must not be null");
 		this.progressSink = Objects.requireNonNull(progressSink, "progressSink must not be null");
 		this.protection = Objects.requireNonNull(protection, "protection must not be null");
 		this.resourceLeases = new ResourceLeaseManager();
@@ -121,7 +138,7 @@ public final class ServerActionExecutor {
 			submitVanillaRespawn(request);
 			return;
 		}
-		if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId())) {
+		if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
 			throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 		}
 		if (request.type() == ActionType.COMPLETE_GOAL) {
@@ -161,8 +178,10 @@ public final class ServerActionExecutor {
 
 	private void submitVanillaRespawn(ServerActionRequest request) {
 		try {
-			manager.respawnVanilla(request.agentId());
-			emit(request, ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", 0L);
+			if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
+				throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
+			}
+			pendingRespawns.put(request.agentId(), new PendingRespawn(request, manager.beginVanillaRespawn(request.agentId()), System.currentTimeMillis()));
 		} catch (RuntimeException exception) {
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
 			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L);
@@ -188,6 +207,7 @@ public final class ServerActionExecutor {
 
 	public synchronized void tick() {
 		long now = System.currentTimeMillis();
+		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) tickRespawn(pending, now);
 		for (ActiveAction action : new ArrayList<>(active.values())) {
 			CleanupRetry<ServerActionResult> pending = pendingCompletions.get(action.request().agentId());
 			if (pending != null) {
@@ -209,6 +229,20 @@ public final class ServerActionExecutor {
 		}
 	}
 
+	private void tickRespawn(PendingRespawn pending, long now) {
+		try {
+			if (!manager.verifyVanillaRespawn(pending.attempt(), now)) return;
+			ServerActionResult result = result(pending.request(), ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", now - pending.startedAtEpochMs());
+			manager.commitVanillaRespawn(pending.attempt(), (transition, commit) -> publishRespawn(result, transition, commit));
+			pendingRespawns.remove(pending.request().agentId(), pending);
+		} catch (RuntimeException exception) {
+			pendingRespawns.remove(pending.request().agentId(), pending);
+			manager.rollbackVanillaRespawn(pending.attempt());
+			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
+			emit(pending.request(), ServerActionState.FAILED, reason, safeMessage(exception), now - pending.startedAtEpochMs());
+		}
+	}
+
 	static void publishProgressBestEffort(
 			Consumer<ServerActionProgress> progressSink,
 			ServerActionProgress progress
@@ -221,6 +255,12 @@ public final class ServerActionExecutor {
 	}
 
 	public synchronized boolean cancel(AgentId agentId, String reason) {
+		PendingRespawn respawn = pendingRespawns.remove(agentId);
+		if (respawn != null) {
+			manager.rollbackVanillaRespawn(respawn.attempt());
+			emit(respawn.request(), ServerActionState.CANCELLED, "ACTION_CANCELLED", reason == null ? "Action cancelled" : reason, System.currentTimeMillis() - respawn.startedAtEpochMs());
+			return true;
+		}
 		ActiveAction action = active.get(agentId);
 		if (action == null) return false;
 		String cancellationReason = reason == null ? "Action cancelled" : reason;
@@ -247,7 +287,12 @@ public final class ServerActionExecutor {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		Objects.requireNonNull(actionId, "actionId must not be null");
 		ActiveAction action = active.get(agentId);
-		if (action == null) return false;
+		PendingRespawn respawn = pendingRespawns.get(agentId);
+		if (action == null && respawn == null) return false;
+		if (respawn != null) {
+			if (!matchesCancellation(respawn.request(), goalRevision, actionId)) throw new AgentDomainException("STALE_ACTION", "Cancellation does not match the active action");
+			return cancel(agentId, reason);
+		}
 		if (!matchesCancellation(action.request(), goalRevision, actionId)) {
 			throw new AgentDomainException("STALE_ACTION", "Cancellation does not match the active action");
 		}
@@ -516,6 +561,26 @@ public final class ServerActionExecutor {
 		}
 		resultSink.accept(result);
 	}
+
+	private void publishRespawn(ServerActionResult result, AgentTransition transition, Runnable commit) {
+		lastResults.put(result.agentId(), result);
+		try {
+			AgentChatReporter.result(manager, manager.registry().require(result.agentId()), result);
+		} catch (AgentDomainException ignored) { }
+		respawnResultSink.publish(result, transition, commit);
+	}
+
+	private static ServerActionResult result(ServerActionRequest request, ServerActionState state, String reasonCode, String message, long elapsedMs) {
+		return new ServerActionResult(request.agentId(), request.goalRevision(), request.actionId(), request.type(), state,
+				reasonCode, message == null ? "" : message, Math.max(0L, elapsedMs), System.currentTimeMillis());
+	}
+
+	@FunctionalInterface
+	public interface RespawnResultSink {
+		void publish(ServerActionResult result, AgentTransition transition, Runnable commit);
+	}
+
+	private record PendingRespawn(ServerActionRequest request, CodexAgentManager.VanillaRespawnAttempt attempt, long startedAtEpochMs) { }
 
 	private static void attack(ServerPlayer player, String selector) {
 		Entity target = findTarget(player, selector);

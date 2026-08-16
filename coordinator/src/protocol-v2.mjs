@@ -570,7 +570,7 @@ function normalizeCoordinatorStatus(value) {
 
 function normalizeRegisteredAgent(value, field) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
-	const keys = ['schemaVersion', 'agentId', 'entityUuid', 'name', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'gameMode', 'skinVariant', 'state', 'currentGoal', 'goalRevision', 'queue', 'lastSummary', 'createdAtEpochMs', 'updatedAtEpochMs', 'lastError'];
+	const keys = ['schemaVersion', 'agentId', 'entityUuid', 'name', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'gameMode', 'skinVariant', 'state', 'currentGoal', 'goalRevision', 'queue', 'lastSummary', 'death', 'createdAtEpochMs', 'updatedAtEpochMs', 'lastError'];
 	const required = ['schemaVersion', 'agentId', 'model', 'reasoningEffort', 'skinVariant', 'state', 'goalRevision', 'queue', 'createdAtEpochMs', 'updatedAtEpochMs'];
 	exactKeys(value, keys, required, field);
 	const queue = boundedArray(value.queue, `${field}.queue`, 256).map((goal, index) => boundedText(goal, `${field}.queue[${index}]`, MAX_GOAL_LENGTH));
@@ -579,6 +579,10 @@ function normalizeRegisteredAgent(value, field) {
 		exactKeys(value.lastError, ['code', 'message'], ['code', 'message'], `${field}.lastError`);
 		lastError = { code: boundedText(value.lastError.code, `${field}.lastError.code`, MAX_REASON_CODE_LENGTH), message: boundedText(value.lastError.message, `${field}.lastError.message`, MAX_RESULT_MESSAGE_LENGTH) };
 	}
+	const state = boundedText(value.state, `${field}.state`, MAX_REASON_CODE_LENGTH);
+	const death = value.death === undefined ? null : normalizeDeath(value.death);
+	if (state === 'DEAD' && death === null) throw new ProtocolV2Error('MISSING_FIELD', `${field} DEAD state requires death facts`);
+	if (state !== 'DEAD' && death !== null) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} death facts require DEAD state`);
 	return {
 		schemaVersion: nonnegativeInteger(value.schemaVersion, `${field}.schemaVersion`),
 		agentId: requireIdentifier(value.agentId, `${field}.agentId`),
@@ -590,11 +594,12 @@ function normalizeRegisteredAgent(value, field) {
 		serviceTier: requireIdentifier(value.serviceTier ?? 'priority', `${field}.serviceTier`),
 		gameMode: requireIdentifier(value.gameMode ?? 'survival', `${field}.gameMode`),
 		skinVariant: requireIdentifier(value.skinVariant, `${field}.skinVariant`),
-		state: boundedText(value.state, `${field}.state`, MAX_REASON_CODE_LENGTH),
+		state,
 		currentGoal: value.currentGoal === undefined ? null : boundedText(value.currentGoal, `${field}.currentGoal`, MAX_GOAL_LENGTH),
 		goalRevision: revision(value.goalRevision, `${field}.goalRevision`),
 		queue,
 		lastSummary: value.lastSummary === undefined ? null : boundedText(value.lastSummary, `${field}.lastSummary`, MAX_SUMMARY_LENGTH),
+		death,
 		respawnPolicy: {},
 		createdAtEpochMs: nonnegativeInteger(value.createdAtEpochMs, `${field}.createdAtEpochMs`),
 		updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, `${field}.updatedAtEpochMs`),

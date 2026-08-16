@@ -95,12 +95,13 @@ public final class AgentRegistrySnapshotCodec {
 		for (JsonElement element : queueJson) {
 			queue.add(decodeGoal(requireObject(element, "queued goal")));
 		}
+		AgentProfile profile = decodeProfile(requireObject(requireElement(json, "profile"), "profile"));
 		return new AgentRecord(
 				requireInt(json, "schema_version"),
 				AgentId.parse(requireString(json, "agent_id")),
 				optionalUuid(json, "entity_uuid"),
 				optionalEntityLocation(json, "entity_location"),
-				decodeProfile(requireObject(requireElement(json, "profile"), "profile")),
+				profile,
 				parseEnum(AgentLifecycleState.class, requireString(json, "state"), "state"),
 				optionalGoal(json, "current_goal"),
 				requireLong(json, "goal_revision"),
@@ -109,7 +110,7 @@ public final class AgentRegistrySnapshotCodec {
 				requireString(json, "inventory_snapshot"),
 				optionalBoolean(json, "automatic_progress", true),
 				parseEnum(RespawnPolicy.class, requireString(json, "respawn_policy"), "respawn_policy"),
-				optionalDeathSnapshot(json, "death_snapshot"),
+				optionalDeathSnapshot(json, "death_snapshot", profile.gameMode().wireName()),
 				requireLong(json, "created_at_epoch_ms"),
 				requireLong(json, "updated_at_epoch_ms"),
 				requireString(json, "last_error")
@@ -127,17 +128,23 @@ public final class AgentRegistrySnapshotCodec {
 		death.respawnX().ifPresentOrElse(value -> json.addProperty("respawn_x", value), () -> json.add("respawn_x", null));
 		death.respawnY().ifPresentOrElse(value -> json.addProperty("respawn_y", value), () -> json.add("respawn_y", null));
 		death.respawnZ().ifPresentOrElse(value -> json.addProperty("respawn_z", value), () -> json.add("respawn_z", null));
+		death.respawnYaw().ifPresentOrElse(value -> json.addProperty("respawn_yaw", value), () -> json.add("respawn_yaw", null));
+		death.respawnPitch().ifPresentOrElse(value -> json.addProperty("respawn_pitch", value), () -> json.add("respawn_pitch", null));
+		death.respawnForced().ifPresentOrElse(value -> json.addProperty("respawn_forced", value), () -> json.add("respawn_forced", null));
+		json.addProperty("game_mode", death.gameMode());
 		json.addProperty("died_at_epoch_ms", death.diedAtEpochMs());
 		return json;
 	}
 
-	private static Optional<AgentDeathSnapshot> optionalDeathSnapshot(JsonObject object, String field) {
+	private static Optional<AgentDeathSnapshot> optionalDeathSnapshot(JsonObject object, String field, String fallbackGameMode) {
 		if (!object.has(field) || object.get(field).isJsonNull()) return Optional.empty();
 		JsonObject json = requireObject(object.get(field), field);
 		return Optional.of(new AgentDeathSnapshot(
 				requireString(json, "cause"), requireString(json, "dimension_id"),
 				requireDouble(json, "x"), requireDouble(json, "y"), requireDouble(json, "z"),
 				optionalString(json, "respawn_dimension_id"), optionalDouble(json, "respawn_x"), optionalDouble(json, "respawn_y"), optionalDouble(json, "respawn_z"),
+				optionalFloat(json, "respawn_yaw", 0.0F), optionalFloat(json, "respawn_pitch", 0.0F), optionalBooleanValue(json, "respawn_forced", false),
+				json.has("game_mode") ? requireString(json, "game_mode") : fallbackGameMode,
 				requireLong(json, "died_at_epoch_ms")
 		));
 	}
@@ -279,6 +286,23 @@ public final class AgentRegistrySnapshotCodec {
 	private static Optional<Double> optionalDouble(JsonObject object, String field) {
 		if (!object.has(field) || object.get(field).isJsonNull()) return Optional.empty();
 		return Optional.of(requireDouble(object, field));
+	}
+
+	private static Optional<Float> optionalFloat(JsonObject object, String field, float legacyFallback) {
+		if (!object.has("respawn_dimension_id") || object.get("respawn_dimension_id").isJsonNull()) return Optional.empty();
+		return object.has(field) && !object.get(field).isJsonNull()
+				? Optional.of((float) requireDouble(object, field))
+				: Optional.of(legacyFallback);
+	}
+
+	private static Optional<Boolean> optionalBooleanValue(JsonObject object, String field, boolean legacyFallback) {
+		if (!object.has("respawn_dimension_id") || object.get("respawn_dimension_id").isJsonNull()) return Optional.empty();
+		if (!object.has(field) || object.get(field).isJsonNull()) return Optional.of(legacyFallback);
+		JsonElement element = object.get(field);
+		if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isBoolean()) {
+			throw failure("INVALID_PERSISTED_FIELD", field + " must be a boolean");
+		}
+		return Optional.of(element.getAsBoolean());
 	}
 
 	private static JsonArray requireArray(JsonObject object, String field) {

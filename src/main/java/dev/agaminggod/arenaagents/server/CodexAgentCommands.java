@@ -309,22 +309,6 @@ public final class CodexAgentCommands {
 		}
 	}
 
-	private static int respawn(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
-		try {
-			CodexAgentManager manager = manager(context);
-			AgentRecord record = manager.respawnVanilla(StringArgumentType.getString(context, ARGUMENT_AGENT));
-			context.getSource().sendSuccess(
-					() -> Component.literal("Respawned " + manager.displayName(record) + "."),
-					false
-			);
-			return 1;
-		} catch (AgentDomainException exception) {
-			throw commandFailure(exception);
-		} catch (RuntimeException exception) {
-			throw unexpectedFailure("respawn", exception);
-		}
-	}
-
 	private static int toggleAutomatic(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		try {
 			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);

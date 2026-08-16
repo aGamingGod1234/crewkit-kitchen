@@ -11,6 +11,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 public final class AgentRegistry {
 	private final int maxAgents;
@@ -251,6 +252,70 @@ public final class AgentRegistry {
 
 	public synchronized AgentTransition respawn(AgentId id, UUID entityUuid, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.respawn(require(id), entityUuid, nowEpochMs));
+	}
+
+	/** Commits a prepared respawn only after its physical/protocol barrier succeeds. */
+	public synchronized AgentTransition respawnAtomically(
+			AgentId id,
+			UUID entityUuid,
+			long nowEpochMs,
+			BiConsumer<AgentTransition, Runnable> barrier
+	) {
+		Objects.requireNonNull(barrier, "barrier must not be null");
+		AgentTransition transition = AgentLifecycleReducer.respawn(require(id), entityUuid, nowEpochMs);
+		return respawnAtomically(transition, barrier);
+	}
+
+	public synchronized AgentTransition respawnAtomically(
+			AgentId id,
+			UUID entityUuid,
+			AgentEntityLocation entityLocation,
+			long nowEpochMs,
+			BiConsumer<AgentTransition, Runnable> barrier
+	) {
+		Objects.requireNonNull(entityLocation, "entityLocation must not be null");
+		Objects.requireNonNull(barrier, "barrier must not be null");
+		AgentTransition lifecycle = AgentLifecycleReducer.respawn(require(id), entityUuid, nowEpochMs);
+		AgentTransition located = new AgentTransition(
+				lifecycle.before(), lifecycle.after().withEntityLocation(entityLocation, nowEpochMs),
+				lifecycle.cancelAction(), lifecycle.interruptPlanner()
+		);
+		return respawnAtomically(located, barrier);
+	}
+
+	private AgentTransition respawnAtomically(
+			AgentTransition transition,
+			BiConsumer<AgentTransition, Runnable> barrier
+	) {
+		AgentId id = transition.after().agentId();
+		boolean[] committed = { false };
+		Runnable commit = () -> {
+			if (committed[0]) throw new IllegalStateException("respawn transition was already committed");
+			records.put(id, transition.after());
+			try {
+				onChange.run();
+				committed[0] = true;
+			} catch (RuntimeException exception) {
+				records.put(id, transition.before());
+				throw exception;
+			}
+		};
+		try {
+			barrier.accept(transition, commit);
+			if (!committed[0]) throw new IllegalStateException("respawn barrier did not commit the transition");
+			return transition;
+		} catch (RuntimeException exception) {
+			if (committed[0]) {
+				records.put(id, transition.before());
+				try {
+					onChange.run();
+				} catch (RuntimeException rollbackFailure) {
+					exception.addSuppressed(rollbackFailure);
+				}
+				committed[0] = false;
+			}
+			throw exception;
+		}
 	}
 
 	public synchronized AgentRecord updateRecovery(
