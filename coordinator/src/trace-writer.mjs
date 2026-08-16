@@ -110,7 +110,7 @@ function publicTraceRow(row) {
 		delete result.source;
 		if (sourceHash !== null) result.sourceHash = sourceHash;
 	}
-	return result;
+	return boundSerializedRow(result);
 }
 
 function privateTraceRow(row) {
@@ -118,7 +118,7 @@ function privateTraceRow(row) {
 	const sourceHash = typeof source === 'string' ? `sha256:${hashSource(source)}` : null;
 	const result = sanitizeValue(row, context(true));
 	if (result && typeof result === 'object' && !Array.isArray(result) && sourceHash !== null) result.sourceHash = sourceHash;
-	return result;
+	return boundSerializedRow(result);
 }
 
 function context(allowSource) {
@@ -136,7 +136,7 @@ function sanitizeValue(value, state, depth = 0, key = null) {
 			continue;
 		}
 		if (input === null || typeof input !== 'object') {
-			task.assign(input);
+			task.assign(['bigint', 'function', 'symbol'].includes(typeof input) ? UNSAFE : input);
 			continue;
 		}
 		if (task.depth > MAX_TRACE_DEPTH || state.nodes++ >= MAX_TRACE_NODES) {
@@ -173,6 +173,22 @@ function sanitizeValue(value, state, depth = 0, key = null) {
 		}
 	}
 	return root.value;
+}
+
+function boundSerializedRow(row) {
+	let encoded;
+	try { encoded = JSON.stringify(row); } catch { encoded = null; }
+	if (encoded !== null && Buffer.byteLength(encoded, 'utf8') <= MAX_TRACE_BYTES) return row;
+	const bounded = Object.create(null);
+	for (const key of Object.keys(row)) {
+		if (key !== 'event' && !['string', 'number', 'boolean'].includes(typeof row[key]) && row[key] !== null) continue;
+		Object.defineProperty(bounded, key, { enumerable: true, configurable: true, writable: true, value: row[key] });
+		let candidate;
+		try { candidate = JSON.stringify(bounded); } catch { delete bounded[key]; continue; }
+		if (Buffer.byteLength(candidate, 'utf8') > MAX_TRACE_BYTES) delete bounded[key];
+	}
+	Object.defineProperty(bounded, 'truncated', { enumerable: true, configurable: true, writable: true, value: BOUNDED });
+	return bounded;
 }
 
 function sanitizeString(value, state, allowLongSource) {

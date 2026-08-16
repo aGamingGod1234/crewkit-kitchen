@@ -102,3 +102,19 @@ test('redacts textual credential patterns from public and private strings', asyn
 	assert.match(privateRow.source, /program\.chat/);
 	assert.doesNotMatch(privateRow.source, /api_key=abc|token=def|secret=ghi|oauth=mno|Bearer qrs/i);
 });
+
+test('caps serialized rows including huge keys and unsupported non-string values', async () => {
+	const rows = [];
+	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {
+		mkdir: async () => {},
+		appendFile: async (_path, value) => rows.push(value),
+	});
+	const hugeKey = 'k'.repeat(400_000);
+	await assert.doesNotReject(writer.write('bounded', { [hugeKey]: 42, count: 7, bigint: 1n, symbol: Symbol('private') }));
+	await writer.close();
+	assert.ok(Buffer.byteLength(rows[0], 'utf8') <= 262_145);
+	const row = JSON.parse(rows[0]);
+	assert.equal(row.event, 'bounded');
+	assert.equal(row.count, 7);
+	assert.doesNotMatch(rows[0], /k{100}/);
+});

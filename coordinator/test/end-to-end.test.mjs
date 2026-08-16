@@ -25,6 +25,7 @@ test('reconnects, retains selected-model programs, and shuts down with trace evi
 		await run.untilBothComplete();
 		assert.ok(run.connectionCount('agent-55') >= 2);
 		assert.ok(run.plannerAttempts('agent-55') >= 2, 'malformed provider output received a corrective retry');
+		assert.equal(run.correctiveRetryObserved('agent-55'), true, 'AgentPlanner supplied INVALID_DECISION correction input');
 		assert.equal(run.sameSelectedSession('agent-55'), true, 'correction stayed on the selected model session');
 	} finally {
 		const evidence = await run.stop();

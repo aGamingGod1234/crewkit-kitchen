@@ -44,16 +44,11 @@ export const ACTION_FIELDS = Object.freeze({
 	use_item: Object.freeze(['durationMs']),
 	break_block: Object.freeze(['x', 'y', 'z', 'timeoutMs']),
 	place_block: Object.freeze(['x', 'y', 'z', 'face', 'itemId', 'desiredState']),
-	build_sequence: Object.freeze(['placements', 'timeoutMs']),
 	chat: Object.freeze(['message']),
 	wait: Object.freeze(['durationMs']),
 	set_door: Object.freeze(['x', 'y', 'z', 'open']),
-	pick_up_item: Object.freeze(['targetSelector']),
 	drop_item: Object.freeze(['slot', 'count']),
 	navigate_to: Object.freeze(['x', 'y', 'z', 'tolerance', 'sprint', 'timeoutMs']),
-	fight_target: Object.freeze(['targetSelector', 'desiredRange', 'timeoutMs']),
-	flee_from: Object.freeze(['targetSelector', 'distance', 'timeoutMs']),
-	follow_entity: Object.freeze(['targetSelector', 'distance', 'timeoutMs']),
 	transfer_container: Object.freeze(['x', 'y', 'z', 'sourceKind', 'sourceSlot', 'destinationKind', 'destinationSlot', 'count', 'expectedItemId', 'timeoutMs']),
 	craft_inventory: Object.freeze(['recipeId', 'count', 'timeoutMs']),
 	craft_table: Object.freeze(['recipeId', 'x', 'y', 'z', 'count', 'timeoutMs']),
@@ -63,7 +58,6 @@ export const ACTION_FIELDS = Object.freeze({
 	block_with_shield: Object.freeze(['durationMs']),
 	use_ranged: Object.freeze(['targetSelector', 'drawDurationMs', 'timeoutMs']),
 	respawn: Object.freeze([]),
-	complete_goal: Object.freeze(['summary']),
 });
 
 export const BLOCK_FACES = Object.freeze(['down', 'up', 'north', 'south', 'west', 'east']);

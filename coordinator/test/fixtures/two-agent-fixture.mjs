@@ -14,11 +14,11 @@ const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await playe
 export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry({ agentCap: 2 });
-	const planner = new FixturePlanner(registry, { malformedFirstAgent });
+	const provider = new FixtureProvider({ malformedFirstAgent });
 	const trace = { rows: [], privateRows: [], async write(event, fields) { this.rows.push({ event, ...fields }); }, async writeDiagnostic(event, fields) { this.privateRows.push({ event, ...fields }); } };
 	const coordinator = createDynamicCoordinator(
 		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' }, serviceTier: 'fast' }, limits: { agentCap: 2, planningConcurrency: 2 } },
-		{ bridge, registry, planner, codexService: new FixtureProvider(), traceWriter: trace },
+		{ bridge, registry, codexService: provider, traceWriter: trace },
 	);
 	await coordinator.start();
 	bridge.emit('ready', { serverInstanceId: 'fixture-1', registry: PROFILES.map((profile) => ({ ...profile, state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] })) });
@@ -38,13 +38,13 @@ export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) 
 		crossAgentMessages: () => bridge.sent.filter((message) => message.agentId !== 'server' && !PROFILES.some((profile) => profile.agentId === message.agentId)).length,
 		models: () => PROFILES.map((profile) => profile.model),
 		promptsIdentical: () => true,
-		plannerAttempts: (agentId) => planner.attempts.get(agentId) ?? 0,
-		sameSelectedSession: (agentId) => planner.sessions.get(agentId)?.sessionId === agentId,
+		plannerAttempts: (agentId) => provider.attempts.get(agentId) ?? 0,
+		correctiveRetryObserved: (agentId) => provider.inputs.some((input) => input.includes('corrective retry 1') && input.includes('INVALID_DECISION')),
+		sameSelectedSession: (agentId) => provider.sessions.get(agentId)?.sessionId === agentId,
 		actionCounts: () => PROFILES.map((profile) => bridge.sent.filter((message) => message.type === 'action_command' && message.agentId === profile.agentId).length),
 		connectionCount: () => connectionCount,
 		async reconnect() {
 			bridge.emit('disconnected');
-			await eventually(() => planner.interruptions.length >= PROFILES.length);
 			connectionCount += 1;
 			bridge.emit('ready', { serverInstanceId: `fixture-${connectionCount}`, registry: PROFILES.map((profile) => ({ ...profile, state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] })) });
 			await eventually(() => bridge.sent.filter((message) => message.type === 'agent_ready').length >= PROFILES.length * 2);
@@ -92,32 +92,37 @@ class FakeBridge extends EventEmitter {
 
 class FixtureProvider {
 	catalog = { stale: false, refresh: async () => ({ models: [] }), assertSupported() {} };
+	#malformedFirstAgent;
+	attempts = new Map();
+	sessions = new Map();
+	inputs = [];
+	interruptions = [];
+
+	constructor({ malformedFirstAgent }) { this.#malformedFirstAgent = malformedFirstAgent; }
 	async start() {}
 	async stop() {}
-}
-
-class FixturePlanner {
-	constructor(registry, { malformedFirstAgent }) { this.registry = registry; this.malformedFirstAgent = malformedFirstAgent; this.requests = 0; this.inputs = []; this.interruptions = []; this.retries = new Set(); this.attempts = new Map(); this.sessions = new Map(); }
-	async reconcile(records) { const registry = this.registry.reconcile(records); return { registry, providers: { valid: registry.records, invalid: [], catalog: { refreshedAtEpochMs: 1, models: [] } } }; }
-	async requestPlan(request) {
-		this.requests += 1;
-		this.inputs.push(request.input);
-		const session = this.sessions.get(request.agentId) ?? { sessionId: request.agentId, turns: 0 };
-		this.sessions.set(request.agentId, session);
-		this.attempts.set(request.agentId, (this.attempts.get(request.agentId) ?? 0) + 1);
-		if (request.agentId === this.malformedFirstAgent && !this.retries.has(request.agentId)) {
-			this.retries.add(request.agentId);
-			try { parseDecision('{"summary":"legacy","directive":"replace","source":"old","actions":[]}'); }
-			catch (error) {
-				this.inputs.push(`${request.input}\n\ncorrective retry 1: ${error.code}`);
-				this.attempts.set(request.agentId, this.attempts.get(request.agentId) + 1);
-			}
-		}
-		session.turns += 1;
-		return parseDecision(JSON.stringify({ summary: session.turns === 1 ? 'Corrected program.' : 'Continue.', directive: 'replace', source: SOURCE }));
-	}
+	async reconcile(records) { return { valid: records, invalid: [], catalog: { refreshedAtEpochMs: 1, models: [] } }; }
+	getAgent(agentId) { return this.sessions.get(agentId) ?? null; }
+	async remove(agentId) { this.sessions.delete(agentId); }
 	async interrupt(agentId) { this.interruptions.push(agentId); }
-	async remove(agentId) { return this.registry.remove(agentId); }
+	async createAgent(record) {
+		const session = this.sessions.get(record.agentId) ?? { sessionId: record.agentId, turns: 0 };
+		this.sessions.set(record.agentId, session);
+		return {
+			setGoalRevision: async (goalRevision) => { session.goalRevision = goalRevision; },
+			decide: async (input) => {
+				this.inputs.push(input);
+				this.attempts.set(record.agentId, (this.attempts.get(record.agentId) ?? 0) + 1);
+				if (record.agentId === this.#malformedFirstAgent && session.turns === 0 && !session.malformed) {
+					session.malformed = true;
+					parseDecision('{"summary":"legacy","directive":"replace","source":"old","actions":[]}');
+				}
+				session.turns += 1;
+				return parseDecision(JSON.stringify({ summary: session.turns === 1 ? 'Corrected program.' : 'Continue.', directive: 'replace', source: SOURCE }));
+			},
+			interrupt: async () => { this.interruptions.push(record.agentId); },
+		};
+	}
 }
 
 function observation(agentId, goalRevision, eventSequence) {

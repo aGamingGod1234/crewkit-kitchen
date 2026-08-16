@@ -1,7 +1,6 @@
 import {
 	ACTION_FIELDS,
 	BLOCK_FACES,
-	MAX_BUILD_SEQUENCE_PLACEMENTS,
 	MAX_BLOCKS,
 	MAX_CHAT_LENGTH,
 	MAX_COMMAND_ID_LENGTH,
@@ -15,7 +14,6 @@ import {
 	MAX_PROVENANCE_TEXT_LENGTH,
 	MAX_REASON_CODE_LENGTH,
 	MAX_RESULT_MESSAGE_LENGTH,
-	MAX_SUMMARY_LENGTH,
 	MAX_TARGET_SELECTOR_LENGTH,
 	MIN_DURATION_MS,
 	MIN_MOVEMENT_TOLERANCE,
@@ -64,17 +62,6 @@ export function validateAction(value) {
 			break;
 		case 'attack':
 			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
-			requireDuration(action.timeoutMs, 'action.timeoutMs');
-			break;
-		case 'fight_target':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
-			requireFiniteRange(action.desiredRange, 'action.desiredRange', 1, 6);
-			requireDuration(action.timeoutMs, 'action.timeoutMs');
-			break;
-		case 'flee_from':
-		case 'follow_entity':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
-			requireFiniteRange(action.distance, 'action.distance', 1, 64);
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'transfer_container':
@@ -144,11 +131,6 @@ export function validateAction(value) {
 				requireText(action.desiredState, 'action.desiredState', MAX_DESIRED_STATE_LENGTH);
 			}
 			break;
-		case 'build_sequence':
-			validateArray(action.placements, 'action.placements', MAX_BUILD_SEQUENCE_PLACEMENTS, validateBuildPlacement);
-			if (action.placements.length === 0) throw invalid('OUT_OF_RANGE', 'action.placements must contain at least 1 entry');
-			requireDuration(action.timeoutMs, 'action.timeoutMs');
-			break;
 		case 'chat':
 			requireText(action.message, 'action.message', MAX_CHAT_LENGTH);
 			break;
@@ -156,17 +138,11 @@ export function validateAction(value) {
 			requireCoordinates(action, true, 'action');
 			requireBoolean(action.open, 'action.open');
 			break;
-		case 'pick_up_item':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
-			break;
 		case 'drop_item':
 			requireInt32(action.slot, 'action.slot');
 			requireInt32(action.count, 'action.count');
 			if (action.slot < 0 || action.slot > 35) throw invalid('INVALID_FIELD', 'action.slot must be between 0 and 35');
 			if (action.count < 1 || action.count > 64) throw invalid('INVALID_FIELD', 'action.count must be between 1 and 64');
-			break;
-		case 'complete_goal':
-			requireText(action.summary, 'action.summary', MAX_SUMMARY_LENGTH);
 			break;
 	}
 	return structuredClone(action);
@@ -426,17 +402,6 @@ export function validateActionProvenance(value) {
 		sourceStepId: requireText(provenance.sourceStepId, 'provenance.sourceStepId', MAX_PROVENANCE_TEXT_LENGTH),
 		eventSequence: provenance.eventSequence,
 	});
-}
-
-function validateBuildPlacement(value, path) {
-	const placement = requireObject(value, path);
-	requireKeys(placement, ['x', 'y', 'z', 'face', 'itemId', 'desiredState'], path, ['x', 'y', 'z', 'face', 'itemId']);
-	requireCoordinates(placement, true, path);
-	if (!FACES.has(placement.face)) throw invalid('INVALID_FIELD', `${path}.face must be one of ${BLOCK_FACES.join(', ')}`);
-	requireText(placement.itemId, `${path}.itemId`, MAX_IDENTIFIER_LENGTH);
-	if (placement.desiredState !== undefined && placement.desiredState !== null) {
-		requireText(placement.desiredState, `${path}.desiredState`, MAX_DESIRED_STATE_LENGTH);
-	}
 }
 
 function requireText(value, path, maximum, emptyAllowed = false) {

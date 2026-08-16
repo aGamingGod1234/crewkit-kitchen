@@ -557,23 +557,15 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 	);
 });
 
-test('protocol v2 preserves bounded ordered build-sequence placements', () => {
-	const placement = {
-		x: 1, y: 64, z: -2, face: 'up', itemId: 'minecraft:oak_stairs', desiredState: DESIRED_OAK_STAIRS_STATE,
-	};
-	const argumentsValue = { placements: Array.from({ length: 32 }, () => ({ ...placement })), timeoutMs: 60_000 };
-	const normalized = validateProtocolV2Payload('action_command', {
-		goalRevision: 4, actionId: 'action-build-1', actionType: 'build_sequence', arguments: argumentsValue, provenance: PROVENANCE,
-	});
-	assert.deepEqual(normalized.arguments, argumentsValue);
-	assert.throws(
-		() => validateProtocolV2Payload('action_command', {
-			goalRevision: 4, actionId: 'action-build-2', actionType: 'build_sequence',
-			arguments: { ...argumentsValue, placements: [...argumentsValue.placements, placement] },
-			provenance: PROVENANCE,
-		}),
-		(error) => error.code === 'INVALID_ACTION' && /32/.test(error.message),
-	);
+test('protocol v2 rejects retired high-level controller action types', () => {
+	for (const actionType of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+		assert.throws(
+			() => validateProtocolV2Payload('action_command', {
+				goalRevision: 4, actionId: `retired-${actionType}`, actionType, arguments: {}, provenance: PROVENANCE,
+			}),
+			(error) => error.code === 'INVALID_ACTION' && /Unsupported action/.test(error.message),
+		);
+	}
 });
 
 test('accepts the exact rich ready observation emitted by ServerObservationCollector', () => {

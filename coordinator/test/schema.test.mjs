@@ -42,12 +42,8 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'chat', message: 'Ready.' },
 		{ type: 'wait', durationMs: 50 },
 		{ type: 'set_door', x: 1, y: 64, z: 2, open: true },
-		{ type: 'pick_up_item', targetSelector: 'minecraft:item' },
 		{ type: 'drop_item', slot: 0, count: 1 },
 		{ type: 'navigate_to', x: 10, y: 64, z: -5, tolerance: 1.25, sprint: true, timeoutMs: 30_000 },
-		{ type: 'fight_target', targetSelector: 'nearest_hostile', desiredRange: 2.5, timeoutMs: 15_000 },
-		{ type: 'flee_from', targetSelector: 'last_attacker', distance: 16, timeoutMs: 10_000 },
-		{ type: 'follow_entity', targetSelector: 'player:Lucas', distance: 3, timeoutMs: 30_000 },
 		{
 			type: 'transfer_container', x: 1, y: 64, z: -2,
 			sourceKind: 'player', sourceSlot: 0, destinationKind: 'container', destinationSlot: 4,
@@ -60,7 +56,6 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'select_tool', sourceSlot: 5, hotbarSlot: 1, expectedItemId: 'minecraft:iron_pickaxe', minRemainingDurability: 32 },
 		{ type: 'block_with_shield', durationMs: 750 },
 		{ type: 'use_ranged', targetSelector: 'nearest_hostile', drawDurationMs: 1_000, timeoutMs: 5_000 },
-		{ type: 'complete_goal', summary: 'Done.' },
 	];
 	for (const action of actions) assert.deepEqual(validateAction(action), action);
 });
@@ -82,26 +77,9 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 	assert.throws(() => validateAction({ ...validTransfer, count: 0 }), /count/);
 	assert.throws(() => validateAction({ ...validTransfer, extra: true }), /Unknown/);
 	assert.throws(() => validateAction({ type: 'equip_item', sourceSlot: 5, targetSlot: 'mainhand', expectedItemId: 'minecraft:iron_chestplate' }), /targetSlot/);
-	assert.throws(
-		() => validateAction({ type: 'fight_target', targetSelector: 'nearest_hostile', desiredRange: -1, timeoutMs: 1_000 }),
-		/between 1 and 6/,
-	);
-	assert.throws(
-		() => validateAction({ type: 'flee_from', targetSelector: 'last_attacker', distance: 65, timeoutMs: 1_000 }),
-		/between 1 and 64/,
-	);
-});
-
-test('build sequence accepts only dense native placement arrays', () => {
-	const placement = { x: 1, y: 64, z: -2, face: 'up', itemId: 'minecraft:stone', desiredState: null };
-	const valid = { type: 'build_sequence', placements: [placement], timeoutMs: 60_000 };
-	assert.deepEqual(validateAction(valid), valid);
-	const customPrototype = [placement]; Object.setPrototypeOf(customPrototype, null);
-	assert.throws(() => validateAction({ ...valid, placements: customPrototype }), /dense native array/);
-	const sparse = []; sparse.length = 1;
-	assert.throws(() => validateAction({ ...valid, placements: sparse }), /dense native array/);
-	const accessor = [placement]; Object.defineProperty(accessor, '0', { get: () => placement, enumerable: true, configurable: true });
-	assert.throws(() => validateAction({ ...valid, placements: accessor }), /dense native array/);
+	for (const type of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+		assert.throws(() => validateAction({ type }), /Unsupported action/);
+	}
 });
 
 test('requires detached complete model-program provenance for action commands', () => {
