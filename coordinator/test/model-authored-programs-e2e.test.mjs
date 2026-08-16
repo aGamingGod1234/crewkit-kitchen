@@ -48,8 +48,17 @@ test('collects eight logs across two trees using measured pickup range and prove
 		program.finish("Collected eight logs");
 	`);
 	await eventually(() => harness.managerState() === DynamicAgentState.COMPLETED);
-	assert.deepEqual(commandPayloads(harness.bridge).map((command) => command.actionType), ['break_block', 'move_to', 'break_block', 'move_to']);
-	assertCommandProvenance(commandPayloads(harness.bridge), SELECTED_PROFILE, 'program-1-1');
+	const commands = commandPayloads(harness.bridge);
+	assert.deepEqual(commands.map((command) => command.actionType), ['break_block', 'move_to', 'break_block', 'move_to']);
+	assert.deepEqual(commands.filter((command) => command.actionType === 'break_block').map(({ arguments: args }) => ({ x: args.x, y: args.y, z: args.z })), [
+		{ x: 4, y: 64, z: 0 },
+		{ x: 10, y: 64, z: 0 },
+	]);
+	assert.notDeepEqual(commands.filter((command) => command.actionType === 'break_block').map(({ arguments: args }) => ({ x: args.x, y: args.y, z: args.z })), [
+		{ x: 4, y: 64, z: 0 },
+		{ x: 4, y: 64, z: 0 },
+	], 'repeating the first tree coordinate must not produce the second tree drop');
+	assertCommandProvenance(commands, SELECTED_PROFILE, 'program-1-1');
 	assert.ok(harness.bridge.validatedOutbound >= 4);
 	assert.ok(harness.bridge.validatedInbound >= 8, 'progress, observation, and result traffic used protocol-v2 translation');
 	assert.deepEqual(harness.movementEvidence.map((move) => move.target), [{ x: 8, y: 64, z: 0 }, { x: 8, y: 64, z: 0 }]);
@@ -339,14 +348,21 @@ function distance(left, right) {
 	return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z);
 }
 
-function recordScenario(name, ...harnesses) {
-	scenarioResults.push({ name, passed: true, commands: harnesses.reduce((total, harness) => total + commandPayloads(harness.bridge).length, 0) });
+function recordScenario(name, ...entries) {
+	const details = entries.at(-1)?.subcases ? entries.pop() : {};
+	const harnesses = entries;
+	scenarioResults.push({ name, passed: true, commands: harnesses.reduce((total, harness) => total + commandPayloads(harness.bridge).length, 0), ...details });
 }
 
 after(() => {
 	const syntheticLocal = latency.snapshot();
 	const syntheticProvider = [{ operation: 'provider_inference', ...summarize(providerLatencyMs) }];
-	console.log(`TASK10_E2E_SUMMARY ${JSON.stringify({ scenarios: scenarioResults, passed: scenarioResults.length, timing: { basis: 'deterministic_fake_clock', syntheticLocal, syntheticProvider, benchmarkRequired: true } })}`);
+	const scenarios = scenarioResults.filter(({ name }) => !['unreachable_drop', 'disappearing_drop'].includes(name));
+	const dropSubcases = scenarioResults.filter(({ name }) => ['unreachable_drop', 'disappearing_drop'].includes(name));
+	const firstDropIndex = scenarioResults.findIndex(({ name }) => ['unreachable_drop', 'disappearing_drop'].includes(name));
+	const groupedDrop = { name: 'unreachable_and_disappearing_drops', passed: dropSubcases.every(({ passed }) => passed), commands: dropSubcases.reduce((total, scenario) => total + (scenario.commands ?? 0), 0), subcases: dropSubcases.map(({ name }) => name) };
+	if (firstDropIndex >= 0) scenarios.splice(Math.min(firstDropIndex, scenarios.length), 0, groupedDrop);
+	console.log(`TASK10_E2E_SUMMARY ${JSON.stringify({ scenarios, passed: scenarios.length, timing: { basis: 'deterministic_fake_clock', syntheticLocal, syntheticProvider, benchmarkRequired: true } })}`);
 });
 
 async function eventually(predicate, message = 'condition was not reached') {
