@@ -40,6 +40,11 @@ public final class AgentChatReporter {
 	}
 
 	public static void failed(CodexAgentManager manager, AgentRecord record, String error) {
+		failed(manager, record, null, error);
+	}
+
+	public static void failed(CodexAgentManager manager, AgentRecord record, String reasonCode, String error) {
+		if (reasonCode != null && !AgentActivityPresentation.shouldShowInChat(reasonCode, true)) return;
 		report(manager, record, "Needs attention: " + readableError(error), ChatFormatting.RED);
 	}
 

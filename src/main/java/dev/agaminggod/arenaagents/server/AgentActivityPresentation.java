@@ -63,9 +63,18 @@ public final class AgentActivityPresentation {
 		return switch (reasonCode.toUpperCase(Locale.ROOT)) {
 			case "ACTION_CANCELLED", "PATH_BLOCKED", "NO_PATH", "NO_STANDABLE_PATH", "PATH_LIMIT_REACHED",
 					"ACTION_TIMEOUT", "ACTION_TIMED_OUT", "NAVIGATION_TIMED_OUT",
-					"TARGET_NOT_FOUND", "TARGET_UNAVAILABLE", "TARGET_TOO_FAR", "RANGED_TARGET_DENIED" -> false;
+					"TARGET_NOT_FOUND", "TARGET_UNAVAILABLE", "TARGET_TOO_FAR", "RANGED_TARGET_DENIED",
+					"PLACEMENT_NOT_CONFIRMED", "PLACEMENT_STATE_MISMATCH", "PLACEMENT_CONFLICT",
+					"NO_PLACEMENT_SUPPORT", "SELECTION_NOT_CONFIRMED", "ITEM_UNAVAILABLE",
+					"TARGET_NOT_LOADED", "TARGET_LOST", "RETRY_SCHEDULED", "PROVIDER_RETRY",
+					"PLANNING_RETRY", "MISSING_AGENT_MESSAGE", "MISSING_FINAL_MESSAGE" -> false;
 			default -> true;
 		};
+	}
+
+	/** Returns whether a reason belongs in public chat; routine failures stay structured. */
+	public static boolean shouldShowInChat(String reasonCode, boolean routine) {
+		return !routine || shouldAnnounceFailure(reasonCode);
 	}
 
 	private static String readableFailure(String reasonCode, String message) {

@@ -104,6 +104,34 @@ test('retries a duplicate decision envelope through the same provider agent', as
 	assert.match(inputs[1], /DUPLICATE_DECISION_FIELD/);
 });
 
+test('returns a legacy action-array rejection to the same selected model as correction feedback', async () => {
+	const registry = new FakeRegistry();
+	const inputs = [];
+	let creates = 0;
+	const legacy = Object.assign(new Error('Legacy action-array decisions are not supported'), { code: 'INVALID_DECISION' });
+	const agent = {
+		async setGoalRevision(revision) { assert.equal(revision, GOAL_REVISION); },
+		async decide(input) {
+			inputs.push(input);
+			if (inputs.length === 1) throw legacy;
+			return VALID_DECISION;
+		},
+	};
+	const planner = createPlannerForService(registry, {
+		async createAgent() { creates += 1; return agent; },
+		getAgent() { return null; }, async removeAgent() { return false; },
+	}, 1);
+
+	const result = await planner.requestPlan({
+		agentId: AGENT_ID, input: '{"summary":"old","actions":[]}', goalRevision: GOAL_REVISION,
+	});
+
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.equal(creates, 1);
+	assert.equal(inputs.length, 2);
+	assert.match(inputs[1], /INVALID_DECISION/);
+});
+
 test('retries one transient provider failure without changing authoritative input', async () => {
 	const registry = new FakeRegistry();
 	const inputs = [];

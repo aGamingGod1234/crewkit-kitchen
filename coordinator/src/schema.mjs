@@ -393,7 +393,7 @@ export function validateActionCommandPayload(value) {
 	const command = requireObject(value, 'action_command');
 	requireKeys(
 		command,
-		['goalRevision', 'actionId', 'summary', 'goalStatus', 'action', 'provenance'],
+		['goalRevision', 'actionId', 'action', 'provenance'],
 		'action_command',
 		['goalRevision', 'actionId', 'action', 'provenance'],
 	);
@@ -404,8 +404,6 @@ export function validateActionCommandPayload(value) {
 		action: validateAction(command.action),
 		provenance: validateActionProvenance(command.provenance),
 	};
-	if (command.summary !== undefined) normalized.summary = requireText(command.summary, 'summary', MAX_SUMMARY_LENGTH);
-	if (command.goalStatus !== undefined) normalized.goalStatus = requireText(command.goalStatus, 'goalStatus', MAX_REASON_CODE_LENGTH);
 	return deepFreeze(normalized);
 }
 

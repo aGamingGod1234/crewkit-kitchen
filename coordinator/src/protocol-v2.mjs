@@ -23,7 +23,7 @@ import {
 	MULTIPLEXED_PROTOCOL_VERSION,
 } from './constants.mjs';
 import { encodeJsonLine, JsonlDecoder } from './jsonl.mjs';
-import { MessageIdGenerator } from './protocol.mjs';
+import { MessageIdGenerator } from './message-id.mjs';
 import { ValidationError, validateAction, validateActionCommandPayload } from './schema.mjs';
 
 const MAX_COORDINATOR_CIRCUITS = 32;

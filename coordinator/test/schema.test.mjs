@@ -110,15 +110,17 @@ test('requires detached complete model-program provenance for action commands', 
 		provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
 		programId: 'program-1-1', programVersion: 1, sourceStepId: 'step-80-126', eventSequence: 4,
 	};
-	const command = { goalRevision: 1, actionId: 'action-1', summary: 'Move', action, provenance };
+	const command = { goalRevision: 1, actionId: 'action-1', action, provenance };
 	assert.deepEqual(validateActionCommandPayload(command), command);
 	const validated = validateActionCommandPayload(command);
 	assert.throws(() => { validated.provenance.programId = 'forged'; }, TypeError);
 	assert.equal(command.provenance.programId, 'program-1-1');
 	assert.throws(
-		() => validateActionCommandPayload({ goalRevision: 1, actionId: 'action-1', summary: 'Move', action }),
+		() => validateActionCommandPayload({ goalRevision: 1, actionId: 'action-1', action }),
 		/provenance/,
 	);
+	assert.throws(() => validateActionCommandPayload({ ...command, goalStatus: 'in_progress' }), /Unknown field/);
+	assert.throws(() => validateActionCommandPayload({ ...command, actions: [action] }), /Unknown field/);
 	for (const field of ['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'sourceStepId']) {
 		assert.throws(() => validateActionCommandPayload({ ...command, provenance: { ...provenance, [field]: '\u00a0' } }), new RegExp(`provenance\\.${field}`));
 	}

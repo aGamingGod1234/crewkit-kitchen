@@ -23,6 +23,7 @@ import { MultiplexedServerBridge, ProtocolV2Error } from './protocol-v2.mjs';
 import { buildPlannerInput } from './prompts.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
+import { TraceWriter } from './trace-writer.mjs';
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const COORDINATOR_DIRECTORY = path.resolve(SOURCE_DIRECTORY, '..');
@@ -59,8 +60,9 @@ export class DynamicCoordinator extends EventEmitter {
 	#clearStatusInterval;
 	#statusHandle = null;
 	#serverInstanceId = null;
+	#traceWriter;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, traceWriter = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -69,6 +71,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#bridge = requireDependency(bridge, 'bridge');
 		this.#healthRegistry = requireDependency(healthRegistry, 'healthRegistry');
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
+		if (traceWriter !== null && typeof traceWriter.write !== 'function') throw new TypeError('traceWriter.write must be a function');
+		this.#traceWriter = traceWriter;
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
 		if (typeof epochNow !== 'function') throw new TypeError('epochNow must be a function');
 		this.#controlNow = controlNow;
@@ -79,6 +83,7 @@ export class DynamicCoordinator extends EventEmitter {
 			planner: this.#planner,
 			reportError: (agentId, error) => this.#reportAgentError(agentId, error),
 			latencyRegistry: this.#latencyRegistry,
+			trace: (event, fields) => this.#writeTrace(event, fields),
 			clock: () => this.#controlNow(),
 		});
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
@@ -121,6 +126,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#lifecycleGenerations.clear();
 		this.#programRuntime.disposeAll();
 		this.#providerRetryAfter.clear();
+		if (this.#traceWriter !== null && typeof this.#traceWriter.close === 'function') await this.#traceWriter.close();
 		await this.#codexService.stop();
 		this.#started = false;
 		this.#stopping = false;
@@ -395,6 +401,14 @@ export class DynamicCoordinator extends EventEmitter {
 		catch { /* reporting must never reject agent control work */ }
 	}
 
+	#writeTrace(event, fields) {
+		if (this.#traceWriter === null) return;
+		try {
+			Promise.resolve(this.#traceWriter.write(event, fields)).catch(() => {});
+			if (typeof this.#traceWriter.writeDiagnostic === 'function') Promise.resolve(this.#traceWriter.writeDiagnostic(event, fields)).catch(() => {});
+		} catch { /* diagnostics cannot interrupt agent control */ }
+	}
+
 	async #publishCatalog(snapshot) {
 		await this.#bridge.send('catalog_snapshot', 'server', snapshot);
 	}
@@ -486,6 +500,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		bridge,
 		healthRegistry,
 		latencyRegistry,
+		traceWriter: dependencies.traceWriter,
 		controlNow: dependencies.controlNow,
 		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,
@@ -556,7 +571,11 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 
 async function runCli() {
 	const { configPath } = parseDynamicCliArguments(process.argv.slice(2));
-	const coordinator = createDynamicCoordinator(await loadDynamicConfig(configPath));
+	const traceRoot = path.join(PROJECT_DIRECTORY, 'runtime', 'traces');
+	const traceWriter = new TraceWriter(path.join(traceRoot, 'coordinator.jsonl'), {
+		diagnosticFilePath: path.join(traceRoot, 'coordinator-private.jsonl'),
+	});
+	const coordinator = createDynamicCoordinator(await loadDynamicConfig(configPath), { traceWriter });
 	coordinator.on('runtimeError', (error) => {
 		const summary = `[dynamic-coordinator] ${error?.code ?? 'ERROR'}: ${error?.message ?? String(error)}`;
 		const stack = typeof error?.stack === 'string' && !error.stack.startsWith(summary)

@@ -72,6 +72,35 @@ test('installs a selected-model program and continues its next primitive without
 	} finally { await run.coordinator.stop(); }
 });
 
+test('records program authority and typed command diagnostics for the selected model', async () => {
+	const rows = [];
+	const diagnostics = [];
+	const run = await start({ traceWriter: {
+		write: async (event, fields) => rows.push({ event, ...fields }),
+		writeDiagnostic: async (event, fields) => diagnostics.push({ event, ...fields }),
+	} });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => rows.some((row) => row.event === 'program_compiled'));
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		const command = run.bridge.sent.find((message) => message.type === 'action_command');
+		assert.ok(command);
+		const step = rows.find((row) => row.event === 'program_step');
+		assert.equal(step.provider, 'codex');
+		assert.equal(step.model, 'gpt-5.6-sol');
+		assert.equal(step.reasoningEffort, 'high');
+		assert.equal(step.serviceTier, 'priority');
+		assert.equal(step.goalRevision, 1);
+		assert.equal(step.programId, command.payload.provenance.programId);
+		assert.equal(step.sourceStepId, command.payload.provenance.sourceStepId);
+		assert.equal(step.result, null);
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'FAILED', reasonCode: 'PATH_BLOCKED', eventSequence: 2 } });
+		await eventually(() => rows.some((row) => row.event === 'program_step' && row.result?.reasonCode === 'PATH_BLOCKED'));
+		assert.equal(diagnostics.some((row) => row.event === 'program_compiled'), true);
+	} finally { await run.coordinator.stop(); }
+});
+
 test('injects coordinator latency telemetry into program reaction timing', async () => {
 	let now = 10;
 	let publishStatus = null;

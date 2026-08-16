@@ -43,7 +43,10 @@ test('rejects prose, multiple objects, unknown keys, and old action-list fields'
 	assert.throws(() => parseDecision(`Here: ${JSON.stringify(decision)}`), /only one JSON object/);
 	assert.throws(() => parseDecision(`${JSON.stringify(decision)}\n${JSON.stringify(decision)}`), /only one JSON object/);
 	assert.throws(() => parseDecision(JSON.stringify({ ...decision, hidden: true })), /Unknown decision field/);
-	assert.throws(() => parseDecision('{"summary":"old","goalStatus":"in_progress","directive":"replace","actions":[]}'), /goalStatus/);
+	assert.throws(
+		() => parseDecision('{"summary":"old","directive":"replace","source":"old program","actions":[]}'),
+		(error) => error.code === 'INVALID_DECISION' && /action-array/.test(error.message),
+	);
 });
 
 test('rejects duplicate JSON envelope keys before a later value can override them', () => {

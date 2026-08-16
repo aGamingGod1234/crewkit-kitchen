@@ -19,15 +19,18 @@ export class ProgramRuntimeManager {
 	#latencyRegistry;
 	#clock;
 	#lastClockReading = null;
+	#trace;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance) } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance) } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
+		if (typeof trace !== 'function') throw new TypeError('trace must be a function');
 		this.#registry = registry;
 		this.#bridge = bridge;
 		this.#planner = planner;
 		this.#reportError = reportError;
+		this.#trace = trace;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
 		if (latencyRegistry !== null && typeof latencyRegistry.record !== 'function') throw new TypeError('latencyRegistry.record must be a function');
@@ -93,9 +96,27 @@ export class ProgramRuntimeManager {
 		const eventSequence = this.#actionEventSequence(state, payload.eventSequence);
 		if (eventSequence === null) return false;
 		const timing = state.actionTiming.get(payload.actionId);
+		const metadata = state.actionMetadata.get(payload.actionId);
+		const completedAt = this.#safeNow();
 		if (timing !== undefined) {
-			const completedAt = this.#safeNow();
 			if (completedAt !== null && timing.bridgeSentAt !== null) this.#recordLatency('action_completion', completedAt - timing.bridgeSentAt);
+		}
+		if (metadata !== undefined) {
+			this.#traceState(state, 'program_step', {
+				programId: metadata.command.provenance.programId,
+				version: metadata.command.provenance.version,
+				sourceStepId: metadata.command.provenance.stepId,
+				eventSequence,
+				authority: metadata.command.provenance,
+				actionType: metadata.command.action.type,
+				arguments: metadata.command.action.arguments,
+				result: { state: payload.state, reasonCode: payload.reasonCode ?? '' },
+				timing: {
+					branchSelectedToBridgeSendMs: elapsedOrNull(metadata.branchSelectedAt, timing?.bridgeSentAt),
+					bridgeSendToFirstProgressMs: elapsedOrNull(timing?.bridgeSentAt, timing?.firstProgressAt),
+					bridgeSendToCompletionMs: elapsedOrNull(timing?.bridgeSentAt, completedAt),
+				},
+			});
 		}
 		state.engine.ingestActionResult({
 			actionId: internalActionId,
@@ -105,6 +126,7 @@ export class ProgramRuntimeManager {
 		});
 		state.actionIds.delete(payload.actionId);
 		state.actionTiming.delete(payload.actionId);
+		state.actionMetadata.delete(payload.actionId);
 		if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
 		this.#syncState(record, state);
 		return true;
@@ -156,6 +178,9 @@ export class ProgramRuntimeManager {
 			agentId: record.agentId,
 			goalRevision: record.goalRevision,
 			modelIdentity: record.model,
+			provider: record.provider,
+			reasoningEffort: record.reasoningEffort,
+			serviceTier: record.serviceTier ?? 'priority',
 			version: this.#versions.get(versionKey(record)) ?? 0,
 			lifecycle: (this.#lifecycles.get(record.agentId) ?? 0) + 1,
 			sequence: Number.isSafeInteger(eventSequence) && eventSequence >= 0 ? eventSequence : 0,
@@ -164,6 +189,7 @@ export class ProgramRuntimeManager {
 			disposed: false,
 			actionIds: new Map(),
 			actionTiming: new Map(),
+			actionMetadata: new Map(),
 			commands: 0,
 			corrections: new Map(),
 			terminalStatus: null,
@@ -176,6 +202,7 @@ export class ProgramRuntimeManager {
 			dispatch: (command) => { void this.#dispatch(state, command); },
 			cancel: (actionId) => { void this.#cancel(state, actionId); },
 			requestModel: (context) => { void this.#requestReactiveDecision(state, context); },
+			trace: (event, fields) => this.#traceState(state, event, fields),
 		});
 		this.#states.set(record.agentId, state);
 		this.#lifecycles.set(record.agentId, state.lifecycle);
@@ -187,6 +214,10 @@ export class ProgramRuntimeManager {
 		try {
 			compiled = parseArenaScript(source);
 		} catch (error) {
+			this.#traceState(state, 'program_sandbox_error', {
+				result: { code: error?.code ?? 'ARENA_SCRIPT_COMPILE_ERROR', message: String(error?.message ?? error).slice(0, 512) },
+				source,
+			});
 			if (error instanceof ArenaScriptError) return this.#requestCompilerCorrection(state, record, source, error, observation, eventSequence);
 			throw error;
 		}
@@ -195,7 +226,8 @@ export class ProgramRuntimeManager {
 		this.#versions.set(versionKey(record), version);
 		const sequence = this.#installationSequence(state, eventSequence);
 		state.observation = observation;
-		return state.engine.install({
+		this.#traceProgramInstall(state, record, source, version, sequence);
+		const installed = state.engine.install({
 			agentId: record.agentId,
 			goalRevision: record.goalRevision,
 			modelIdentity: record.model,
@@ -205,6 +237,7 @@ export class ProgramRuntimeManager {
 			observation,
 			eventSequence: sequence,
 		});
+		return installed;
 	}
 
 	async #requestCompilerCorrection(state, record, source, error, observation, eventSequence, context = null) {
@@ -238,13 +271,23 @@ export class ProgramRuntimeManager {
 			let compiled;
 			try { compiled = parseArenaScript(decision.source); }
 			catch (nextError) {
-				if (nextError instanceof ArenaScriptError) return this.#requestCompilerCorrection(state, record, decision.source, nextError, observation, eventSequence, context);
+				if (nextError instanceof ArenaScriptError) {
+					this.#traceState(state, 'program_sandbox_error', {
+						programId: context.programId,
+						version: context.version,
+						eventSequence: context.eventSequence,
+						result: { code: nextError.code, message: String(nextError.message).slice(0, 512) },
+						source: decision.source,
+					});
+					return this.#requestCompilerCorrection(state, record, decision.source, nextError, observation, eventSequence, context);
+				}
 				throw nextError;
 			}
 			const version = state.version + 1;
 			state.version = version;
 			this.#versions.set(versionKey(record), version);
 			state.engine.applyDirective({ ...context, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
+			this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			return state.engine.snapshot();
 		} catch (requestError) {
 			this.#reportError(record.agentId, requestError);
@@ -276,13 +319,24 @@ export class ProgramRuntimeManager {
 				let compiled;
 				try { compiled = parseArenaScript(decision.source); }
 				catch (error) {
-					if (error instanceof ArenaScriptError) { await this.#requestCompilerCorrection(state, record, decision.source, error, state.observation, context.eventSequence, context); return; }
+					if (error instanceof ArenaScriptError) {
+						this.#traceState(state, 'program_sandbox_error', {
+							programId: context.programId,
+							version: context.version,
+							eventSequence: context.eventSequence,
+							result: { code: error.code, message: String(error.message).slice(0, 512) },
+							source: decision.source,
+						});
+						await this.#requestCompilerCorrection(state, record, decision.source, error, state.observation, context.eventSequence, context);
+						return;
+					}
 					throw error;
 				}
 				const version = state.version + 1;
 				state.version = version;
 				this.#versions.set(versionKey(record), version);
 				state.engine.applyDirective({ ...context, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
+				this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			} else {
 				const accepted = sameEngineRequest(state.engine.snapshot(), context);
 				state.engine.applyDirective({ ...context, directive: decision?.directive, status: decision?.status });
@@ -306,9 +360,28 @@ export class ProgramRuntimeManager {
 			this.#ensureActing(record);
 			actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
 			state.actionIds.set(actionId, command.actionId);
+			state.actionMetadata.set(actionId, { command, branchSelectedAt });
+			this.#traceState(state, 'program_step', {
+				programId: command.provenance.programId,
+				version: command.provenance.version,
+				sourceStepId: command.provenance.stepId,
+				eventSequence: command.provenance.eventSequence,
+				authority: command.provenance,
+				actionType: command.action.type,
+				arguments: command.action.arguments,
+				result: null,
+				timing: {
+					branchSelectedAt,
+					branchSelectedToBridgeSendMs: null,
+					bridgeSendToFirstProgressMs: null,
+					bridgeSendToCompletionMs: null,
+				},
+			});
 			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command));
 			const bridgeSentAt = this.#safeNow();
 			state.actionTiming.set(actionId, { bridgeSentAt, firstProgressAt: null });
+			const metadata = state.actionMetadata.get(actionId);
+			if (metadata !== undefined) metadata.bridgeSentAt = bridgeSentAt;
 			const receipt = command.provenance.authorizingEventSequence === null ? null : state.branchReceipt;
 			if (receipt !== null && receipt.eventSequence === command.provenance.authorizingEventSequence) {
 				if (branchSelectedAt !== null && receipt.receiptMonotonicMs !== null) this.#recordLatency('event_receipt_to_branch', branchSelectedAt - receipt.receiptMonotonicMs);
@@ -326,8 +399,27 @@ export class ProgramRuntimeManager {
 		const active = state.engine.snapshot().activeActionId;
 		if (active !== internalActionId) return;
 		const eventSequence = this.#actionEventSequence(state);
+		const metadata = state.actionMetadata.get(externalActionId);
+		const timing = state.actionTiming.get(externalActionId);
 		state.actionIds.delete(externalActionId);
 		state.actionTiming.delete(externalActionId);
+		state.actionMetadata.delete(externalActionId);
+		if (metadata !== undefined) this.#traceState(state, 'program_step', {
+			programId: metadata.command.provenance.programId,
+			version: metadata.command.provenance.version,
+			sourceStepId: metadata.command.provenance.stepId,
+			eventSequence,
+			authority: metadata.command.provenance,
+			actionType: metadata.command.action.type,
+			arguments: metadata.command.action.arguments,
+			result: { state: 'FAILED', reasonCode: stableFailureCode(error) },
+			timing: {
+				branchSelectedAt: metadata.branchSelectedAt,
+				branchSelectedToBridgeSendMs: elapsedOrNull(metadata.branchSelectedAt, timing?.bridgeSentAt),
+				bridgeSendToFirstProgressMs: elapsedOrNull(timing?.bridgeSentAt, timing?.firstProgressAt),
+				bridgeSendToCompletionMs: null,
+			},
+		});
 		state.engine.ingestActionResult({
 			actionId: internalActionId,
 			state: 'FAILED',
@@ -373,6 +465,29 @@ export class ProgramRuntimeManager {
 		} catch {
 			return null;
 		}
+	}
+
+	#traceState(state, event, fields = {}) {
+		const snapshot = state.engine?.snapshot?.() ?? {};
+		try {
+			this.#trace(event, {
+				agentId: state.agentId,
+				provider: state.provider,
+				model: state.modelIdentity,
+				reasoningEffort: state.reasoningEffort,
+				serviceTier: state.serviceTier,
+				goalRevision: state.goalRevision,
+				programId: fields.programId ?? snapshot.programId,
+				version: fields.version ?? snapshot.version,
+				...fields,
+			});
+		} catch { /* diagnostics cannot interrupt agent control */ }
+	}
+
+	#traceProgramInstall(state, record, source, version, eventSequence) {
+		const programId = `program-${record.goalRevision}-${version}`;
+		this.#traceState(state, 'program_compiled', { programId, version, source, eventSequence });
+		this.#traceState(state, 'program_replaced', { programId, version, source, eventSequence });
 	}
 
 	#recordLatency(operation, duration) {
@@ -461,4 +576,8 @@ function stableFailureCode(error) {
 
 function monotonicTimestamp(value) {
 	return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function elapsedOrNull(start, end) {
+	return Number.isFinite(start) && Number.isFinite(end) && end >= start ? Math.round(end - start) : null;
 }

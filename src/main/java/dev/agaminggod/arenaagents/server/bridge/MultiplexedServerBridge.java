@@ -382,9 +382,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!router.isCurrentActiveRevision(agentId, goalRevision)) {
 			return;
 		}
+		String code = requiredString(envelope.payload(), "code");
 		String message = requiredString(envelope.payload(), "message");
 		AgentTransition transition = router.plannerFailed(agentId, goalRevision, message);
-		AgentChatReporter.failed(manager, transition.after(), message);
+		AgentChatReporter.failed(manager, transition.after(), code, message);
 	}
 
 	private void disconnectActiveAgents() {

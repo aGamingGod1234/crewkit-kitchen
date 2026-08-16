@@ -17,6 +17,7 @@ Return exactly one JSON object and no prose or Markdown. Output ArenaScript sour
 {"summary":"pause for a selected-model turn","directive":"pause"}
 {"summary":"terminal result","directive":"finish","status":"completed|impossible"}
 Use replace only with nonblank source. Use continue or pause with neither source nor status. Use finish with status and without source. Do not include unused null fields.
+Do not return an actions array or any fixed action-list plan; the ArenaScript source is the only program representation.
 
 ArenaScript is restricted. Every replacement program declares exactly one top-level program.onUnhandledAttention("continue_and_notify"|"pause_and_notify"). Read facts only through player.state(), inventory.count(itemId), inventory.countTag(tag), world.items(criteria), world.entities(criteria), world.blocks(criteria), and world.nearest(candidates, origin?). Candidate queries and choices must use observed facts only. Candidate fields are stableId, entityId, type, itemId, blockId, count, position: { x, y, z }, x, y, z, reachable, visible, distance, and tags.
 

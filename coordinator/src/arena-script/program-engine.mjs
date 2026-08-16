@@ -8,9 +8,10 @@ export class ArenaScriptEngine {
 	#active = null; #pendingResult = null; #boundary = []; #watcherTruth = new Map(); #cancelling = null;
 	#transition = null; #pendingRequest = null; #coalescedRequest = null; #pendingReplacement = null; #suspendedResult = null; #resumableUnhandled = false; #requestUpdate = null; #completed = new Map(); #deferredBase = null; #status = 'IDLE';
 
-	constructor({ dispatch, cancel, requestModel } = {}) {
+	constructor({ dispatch, cancel, requestModel, trace = () => {} } = {}) {
 		if (typeof dispatch !== 'function' || typeof cancel !== 'function' || typeof requestModel !== 'function') throw new TypeError('ArenaScriptEngine callbacks dispatch, cancel, and requestModel are required');
-		this.#callbacks = { dispatch, cancel, requestModel };
+		if (typeof trace !== 'function') throw new TypeError('ArenaScriptEngine trace callback must be a function');
+		this.#callbacks = { dispatch, cancel, requestModel, trace };
 	}
 
 	install(input) {
@@ -197,6 +198,7 @@ export class ArenaScriptEngine {
 			if (!trueNow || wasTrue) continue;
 			edges += 1;
 			const latch = freezeRecord({ watcherId, mode: watcherMode(this.#program.compiled, index), eventSequence: this.#eventSequence, generation: this.#generation, facts: this.#facts });
+			this.#emitTrace('watcher_fired', { watcherId, mode: latch.mode, eventSequence: this.#eventSequence, generation: this.#generation });
 			if (latch.mode === 'interrupt' && this.#active && !this.#cancelling) {
 				this.#cancelling = { kind: 'watcher', actionId: this.#active.actionId, latch };
 				this.#callbacks.cancel(this.#active.actionId);
@@ -226,6 +228,7 @@ export class ArenaScriptEngine {
 
 	#requestModel() {
 		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts);
+		this.#emitTrace('attention_unhandled', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version });
 		if (this.#pendingRequest) { this.#coalescedRequest = context; return; }
 		this.#pendingRequest = context;
 		this.#coalescedRequest = context;
@@ -279,6 +282,12 @@ export class ArenaScriptEngine {
 		if (yielded.kind === 'finish' || yielded.kind === 'checkpoint') {
 			if (this.#deferredBase) { this.#vm.discardDeferredCommand(); this.#deferredBase = null; }
 			this.#status = yielded.kind === 'finish' ? 'FINISHED' : 'PAUSED';
+			this.#emitTrace(yielded.kind === 'finish' ? 'program_finished' : 'program_checkpoint', {
+				programId: this.#program.programId,
+				version: this.#program.version,
+				eventSequence: this.#eventSequence,
+				status: this.#status,
+			});
 			return;
 		}
 		if (yielded.kind === 'idle' && !this.#active && this.#boundary.length > 0) return this.#runBoundary();
@@ -287,6 +296,10 @@ export class ArenaScriptEngine {
 			const deferred = this.#deferredBase; this.#deferredBase = null;
 			this.#handleYield(this.#vm.resumeDeferredCommand(deferred.result, this.#facts), 'step');
 		}
+	}
+
+	#emitTrace(event, fields) {
+		try { this.#callbacks.trace(event, fields); } catch { /* diagnostics cannot interrupt the interpreter */ }
 	}
 }
 
