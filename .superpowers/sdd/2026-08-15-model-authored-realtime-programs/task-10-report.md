@@ -39,7 +39,7 @@ Synthetic fixture timing parsed from the E2E summary:
 - Provider `provider_inference`: count 2, p50 4 ms, p95 4 ms.
 - Real monotonic-clock manager benchmark: `branch_to_bridge_send` count 1,000 p50 0.0118 ms / p95 0.0372 ms; `event_receipt_to_branch` count 1,000 p50 0.1072 ms / p95 0.3966 ms.
 
-These are deterministic fake-clock values, not live Minecraft or provider measurements.
+Only the six E2E segments in the **Synthetic fixture timing parsed from the E2E summary** subsection are deterministic fake-clock values; they are not live Minecraft or provider measurements. The separate **Real monotonic-clock manager benchmark** above comes from `performance.now()` in the 1,000-branch headless manager test. It is real local process timing, but it is still not live Minecraft or provider latency.
 
 ## Java failure investigation
 
