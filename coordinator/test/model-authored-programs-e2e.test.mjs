@@ -15,8 +15,8 @@ const providerLatencyMs = [];
 const scenarioResults = [];
 const PICKUP_RADIUS = 1.5;
 
-const LOG_DROP = (stableId, count, x = 8) => ({ stableId, itemId: 'minecraft:oak_log', count, x, y: 64, z: 0, reachable: true, tags: ['#minecraft:logs'] });
-const LOG_TREE = (stableId, x) => ({ stableId, blockId: 'minecraft:oak_log', x, y: 64, z: 0, reachable: true, tags: ['#minecraft:logs'] });
+const LOG_DROP = (stableId, count, x = 8) => ({ stableId, itemId: 'minecraft:oak_log', count, x, y: 64, z: 0 });
+const LOG_TREE = (stableId, x) => ({ stableId, blockId: 'minecraft:oak_log', x, y: 64, z: 0 });
 
 test('collects eight logs across two trees using measured pickup range and provenance', async () => {
 	const harness = createHarness({
@@ -39,10 +39,10 @@ test('collects eight logs across two trees using measured pickup range and prove
 	});
 	await harness.install(`
 		program.onUnhandledAttention("continue_and_notify");
-		await program.repeatUntil(() => inventory.countTag("#minecraft:logs") >= 8, { maxIterations: 8 }, async () => {
-			const drop = world.nearest(world.items({ tag: "#minecraft:logs", reachable: true }));
+		await program.repeatUntil(() => inventory.count("minecraft:oak_log") >= 8, { maxIterations: 8 }, async () => {
+			const drop = world.nearest(world.items({ itemId: "minecraft:oak_log" }));
 			if (drop !== null) { await player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }); return; }
-			const tree = world.nearest(world.blocks({ tag: "#minecraft:logs", reachable: true }));
+			const tree = world.nearest(world.blocks({ blockId: "minecraft:oak_log" }));
 			if (tree !== null) await player.mine({ x: tree.x, y: tree.y, z: tree.z, timeoutMs: 1 });
 		});
 		program.finish("Collected eight logs");
@@ -69,11 +69,11 @@ test('collects eight logs across two trees using measured pickup range and prove
 test('reports an unreachable drop as a typed model-visible failure', async () => {
 	const unreachable = createHarness({
 		initialObservation: observation({ items: [LOG_DROP('far-drop', 1, 12)] }),
-		onAction: async () => ({ state: 'FAILED', reasonCode: 'PATH_UNAVAILABLE', observation: observation({ items: [{ ...LOG_DROP('far-drop', 1, 12), reachable: false }] }) }),
+		onAction: async () => ({ state: 'FAILED', reasonCode: 'PATH_UNAVAILABLE', observation: observation({ items: [LOG_DROP('far-drop', 1, 12)] }) }),
 	});
 	await unreachable.install(`
 		program.onUnhandledAttention("continue_and_notify");
-		const drop = world.nearest(world.items({ tag: "#minecraft:logs", reachable: true }));
+		const drop = world.nearest(world.items({ itemId: "minecraft:oak_log" }));
 		const result = await tryResult(player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }));
 		if (!result.succeeded) program.checkpoint(result.reason);
 		program.finish("picked up");
@@ -91,10 +91,10 @@ test('reports a disappearing drop as a typed model-visible failure', async () =>
 	});
 	await disappeared.install(`
 		program.onUnhandledAttention("continue_and_notify");
-		const drop = world.nearest(world.items({ tag: "#minecraft:logs", reachable: true }));
+		const drop = world.nearest(world.items({ itemId: "minecraft:oak_log" }));
 		const result = await tryResult(player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }));
 		if (!result.succeeded) program.checkpoint(result.reason);
-		if (inventory.countTag("#minecraft:logs") < 1) program.checkpoint("DROP_NOT_COLLECTED");
+		if (inventory.count("minecraft:oak_log") < 1) program.checkpoint("DROP_NOT_COLLECTED");
 		program.finish("picked up");
 	`);
 	await eventually(() => disappeared.managerState() === DynamicAgentState.PAUSED);
@@ -111,19 +111,19 @@ test('keeps inventory unchanged until a drop enters the modeled pickup radius', 
 			const target = command.arguments;
 			const drop = bridge.currentObservation.items[0];
 			const pickupDistance = distance(target, drop);
-			moves.push({ target, pickupDistance, inventoryCount: bridge.currentObservation.inventory.tagCounts['#minecraft:logs'] });
+			moves.push({ target, pickupDistance, inventoryCount: inventoryCount(bridge.currentObservation.inventory, 'minecraft:oak_log') });
 			const collected = pickupDistance <= PICKUP_RADIUS;
 			return { observation: observation({ player: target, items: collected ? [] : [drop], inventory: collected ? { items: [{ itemId: 'minecraft:oak_log', count: 1 }], tagCounts: { '#minecraft:logs': 1 } } : bridge.currentObservation.inventory }) };
 		},
 	});
-	await harness.install('program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 4, y: 64, z: 0, tolerance: 1, sprint: false }); if (inventory.countTag("#minecraft:logs") < 1) await player.moveTo({ x: 8, y: 64, z: 0, tolerance: 1, sprint: false }); program.finish("picked up");');
+	await harness.install('program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 4, y: 64, z: 0, tolerance: 1, sprint: false }); if (inventory.count("minecraft:oak_log") < 1) await player.moveTo({ x: 8, y: 64, z: 0, tolerance: 1, sprint: false }); program.finish("picked up");');
 	await eventually(() => harness.managerState() === DynamicAgentState.COMPLETED);
 	assert.equal(moves.length, 2);
 	assert.equal(moves[0].pickupDistance, 4);
 	assert.equal(moves[0].inventoryCount, 0);
 	assert.equal(moves[1].pickupDistance, 0);
 	assert.equal(moves[1].inventoryCount, 0);
-	assert.equal(harness.bridge.currentObservation.inventory.tagCounts['#minecraft:logs'], 1);
+	assert.equal(inventoryCount(harness.bridge.currentObservation.inventory, 'minecraft:oak_log'), 1);
 	assertCommandProvenance(commandPayloads(harness.bridge), SELECTED_PROFILE, 'program-1-1');
 	recordScenario('drop_outside_pickup_radius', harness);
 });
@@ -299,7 +299,7 @@ function createHarness({ initialObservation = observation(), onAction = async ()
 	bridge.attach(manager);
 	harness.manager = manager;
 	harness.bridge = bridge;
-	harness.install = (source) => harness.manager.installDecision(record, { summary: 'Task 10 source', directive: 'replace', source }, { observation: initialObservation, eventSequence: 1 });
+	harness.install = (source) => harness.manager.installDecision(record, { summary: 'Task 10 source', directive: 'replace', source }, { observation: bridge.currentObservation, eventSequence: 1 });
 	return harness;
 }
 
@@ -346,6 +346,10 @@ function harnessCount(command, harness) {
 
 function distance(left, right) {
 	return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z);
+}
+
+function inventoryCount(inventory, itemId) {
+	return (inventory?.items ?? []).reduce((total, item) => total + (item.itemId === itemId ? item.count : 0), 0);
 }
 
 function recordScenario(name, ...entries) {

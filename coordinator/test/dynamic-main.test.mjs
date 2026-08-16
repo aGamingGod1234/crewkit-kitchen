@@ -5,6 +5,7 @@ import test from 'node:test';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { createDynamicCoordinator } from '../src/dynamic-main.mjs';
+import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
 
@@ -14,6 +15,13 @@ class FakeBridge extends EventEmitter {
 	start() { this.ready = true; }
 	stop() { this.ready = false; }
 	async send(type, agentId, payload) { this.sent.push({ type, agentId, payload }); }
+	emit(event, message) {
+		if (event === 'observation' && message?.payload?.observation !== undefined) {
+			const payload = message.payload;
+			return super.emit(event, { ...message, payload: factToWireObservation(payload.observation, payload.goalRevision, payload.eventSequence, payload.attention === true, payload.observedAtEpochMs ?? 1) });
+		}
+		return super.emit(event, message);
+	}
 }
 
 class FakeProvider {
@@ -32,6 +40,25 @@ class FakePlanner {
 
 function record(agentId = 'agent-a') {
 	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] };
+}
+
+function factToWireObservation(value, goalRevision, eventSequence, attention, observedAtEpochMs) {
+	const player = value.player ?? {};
+	const position = { x: player.x ?? 0, y: player.y ?? 64, z: player.z ?? 0 };
+	return {
+		goalRevision, observedAtEpochMs, ready: true, status: 'ready', eventSequence, attention,
+		changedFacts: attention ? ['player.health'] : [], position, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 },
+		player: {
+			health: player.health ?? 20, maxHealth: 20, armor: 0, foodLevel: player.hunger ?? 20, saturation: 5,
+			gameMode: 'survival', onGround: true, inWater: false, onFire: player.fire === true,
+			air: player.air ?? 300, maxAir: 300, suffocating: false, fallDistance: player.fallDistance ?? 0, effects: [],
+		},
+		inventory: { items: (value.inventory?.items ?? []).map((item, index) => ({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: item.slot ?? index })), selectedItem: 'minecraft:air' },
+		entities: (value.items ?? []).map((item) => ({ uuid: item.stableId, type: 'minecraft:item', name: 'drop', distance: Math.hypot(item.x - position.x, item.y - position.y, item.z - position.z), position: { x: item.x, y: item.y, z: item.z }, itemId: item.itemId, count: item.count })),
+		blocks: (value.blocks ?? []).map((block) => ({ x: block.x, y: block.y, z: block.z, blockId: block.blockId, placeableFaces: ['up'] })),
+		nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false },
+		currentAction: { active: false }, lastResult: { present: false },
+	};
 }
 
 const DEATH = Object.freeze({
@@ -69,6 +96,46 @@ test('installs a selected-model program and continues its next primitive without
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
 		assert.equal(run.planner.requests.length, 1);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('real protocol-v2 observations adapt before ArenaScript facts normalization', async () => {
+	const run = await start();
+	const runtimeErrors = [];
+	run.coordinator.on('runtimeError', (error) => runtimeErrors.push(error));
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Inspect the nearby drop.' } });
+		const wireObservation = validateProtocolV2Payload('observation', {
+			goalRevision: 1,
+			observedAtEpochMs: 10,
+			ready: true,
+			status: 'ready',
+			eventSequence: 1,
+			attention: false,
+			changedFacts: [],
+			position: { x: 0, y: 64, z: 0 },
+			velocity: { x: 0, y: 0, z: 0 },
+			view: { yaw: 0, pitch: 0 },
+			player: {
+				health: 20, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5,
+				gameMode: 'survival', onGround: true, inWater: false, onFire: false,
+				air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [],
+			},
+			inventory: { items: [], selectedItem: 'minecraft:air' },
+			entities: [{
+				uuid: '00000000-0000-0000-0000-000000000001', type: 'minecraft:item', name: 'Oak Log',
+				distance: 2, position: { x: 2, y: 64, z: 0 }, itemId: 'minecraft:oak_log', count: 1,
+			}],
+			blocks: [{ x: 4, y: 64, z: 0, blockId: 'minecraft:oak_log', placeableFaces: ['up'] }],
+			nearbyContainers: [],
+			world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false },
+			currentAction: { active: false },
+			lastResult: { present: false },
+		});
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: wireObservation });
+		await eventually(() => runtimeErrors.length > 0 || run.bridge.sent.some((message) => message.type === 'action_command'));
+		assert.deepEqual(runtimeErrors, [], `wire observation must be adapted before facts normalization: ${runtimeErrors[0]?.message ?? 'unknown error'}`);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'action_command'), true);
 	} finally { await run.coordinator.stop(); }
 });
 

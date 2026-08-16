@@ -1,4 +1,5 @@
-import { createProtocolV2Envelope, validateProtocolV2Envelope } from '../../src/protocol-v2.mjs';
+import { createProtocolV2Envelope, validateProtocolV2Envelope, validateProtocolV2Payload } from '../../src/protocol-v2.mjs';
+import { adaptObservation } from '../../src/observation-adapter.mjs';
 
 export const SELECTED_PROFILE = Object.freeze({
 	agentId: 'task10-agent',
@@ -41,7 +42,7 @@ export class FakeMinecraftBridge {
 		this.#record = record;
 		this.#onAction = onAction;
 		this.#onCancel = onCancel;
-		this.#observation = initialObservation;
+		this.#observation = adaptObservation(validateProtocolV2Payload('observation', toWireObservation(initialObservation, record.goalRevision, 1, false, 1)));
 		this.#eventSequence = 1;
 		this.#clock = 1;
 	}
@@ -93,7 +94,7 @@ export class FakeMinecraftBridge {
 		});
 		const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
 		this.validatedInbound += 1;
-		this.#observation = fromWireObservation(normalized.payload);
+		this.#observation = adaptObservation(normalized.payload);
 		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
 		if (!this.#manager) throw new Error('FakeMinecraftBridge is not attached to a manager');
 		return this.#manager.onObservation(this.#record, {
@@ -199,17 +200,6 @@ function toWireObservation(value, goalRevision, eventSequence, attention, observ
 		blocks: (value.blocks ?? []).map((block) => ({ x: block.x, y: block.y, z: block.z, blockId: block.blockId, placeableFaces: ['up', 'down', 'north', 'south', 'east', 'west'] })),
 		nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false },
 		currentAction: { active: false }, lastResult: { present: false },
-	};
-}
-
-function fromWireObservation(value) {
-	const items = value.entities.filter((entity) => entity.type === 'minecraft:item').map((entity) => ({ stableId: entity.uuid, itemId: entity.itemId, count: entity.count, x: entity.position.x, y: entity.position.y, z: entity.position.z, reachable: entity.distance <= 16, tags: entity.itemId === 'minecraft:oak_log' ? ['#minecraft:logs'] : [] }));
-	const inventoryItems = value.inventory.items.map((item) => ({ itemId: item.itemId, count: item.count, slot: item.slot }));
-	return {
-		player: { x: value.position.x, y: value.position.y, z: value.position.z, health: value.player.health, fire: value.player.onFire, fallDistance: value.player.fallDistance, dead: value.player.health <= 0 },
-		items,
-		blocks: value.blocks.map((block) => ({ stableId: `${block.x},${block.y},${block.z}`, blockId: block.blockId, x: block.x, y: block.y, z: block.z, reachable: true, tags: block.blockId === 'minecraft:oak_log' ? ['#minecraft:logs'] : [] })),
-		inventory: { items: inventoryItems, tagCounts: { '#minecraft:logs': inventoryItems.filter((item) => item.itemId === 'minecraft:oak_log').reduce((total, item) => total + item.count, 0) } },
 	};
 }
 

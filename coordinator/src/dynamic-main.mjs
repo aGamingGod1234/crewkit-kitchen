@@ -20,6 +20,7 @@ import {
 } from './constants.mjs';
 import { PlanningScheduler } from './planning-scheduler.mjs';
 import { MultiplexedServerBridge, ProtocolV2Error } from './protocol-v2.mjs';
+import { adaptObservation } from './observation-adapter.mjs';
 import { buildPlannerInput } from './prompts.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
@@ -221,9 +222,10 @@ export class DynamicCoordinator extends EventEmitter {
 				if (!this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration)) return;
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 				if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
-				const observation = message.payload.observation ?? message.payload;
+				const wireObservation = message.payload.observation ?? message.payload;
+				const observation = adaptObservation(wireObservation);
 				const ledger = this.#ledger(record.agentId);
-				ledger.ingest('observation', observation);
+				ledger.ingest('observation', wireObservation);
 				const installed = await this.#programRuntime.onObservation(record, {
 					observation,
 					eventSequence: message.payload.eventSequence,
