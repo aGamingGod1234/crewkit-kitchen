@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -34,6 +35,8 @@ public final class ServerObservationCollector {
 	public static final int BLOCK_RADIUS = 6;
 	public static final int MAX_BLOCKS_PER_TYPE = 8;
 	public static final int MAX_NEARBY_TRANSACTION_TARGETS = 16;
+	public static final int MAX_OBSERVATION_TAGS = 32;
+	public static final int MAX_TAG_COUNT_ENTRIES = 128;
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
 	private static final long SPATIAL_CACHE_TICKS = 10L;
 
@@ -207,12 +210,14 @@ public final class ServerObservationCollector {
 	private static JsonObject inventory(ServerPlayer agent) {
 		JsonObject inventory = new JsonObject();
 		JsonArray items = new JsonArray();
+		Map<String, Integer> tagCounts = new HashMap<>();
 		for (EquipmentSlot slot : EquipmentSlot.values()) {
 			ItemStack stack = agent.getItemBySlot(slot);
 			if (stack.isEmpty()) continue;
 			JsonObject item = item(stack);
 			item.addProperty("slot", slot.getName());
 			items.add(item);
+			addTagCounts(tagCounts, stack);
 		}
 		Inventory playerInventory = agent.getInventory();
 		int selectedMainHandSlot = playerInventory.getSelectedSlot();
@@ -228,8 +233,13 @@ public final class ServerObservationCollector {
 			item.addProperty("slot", slot);
 			item.addProperty("hotbar", slot < 9);
 			items.add(item);
+			addTagCounts(tagCounts, stack);
 		}
 		inventory.add("items", items);
+		JsonObject counts = new JsonObject();
+		tagCounts.entrySet().stream().sorted(Map.Entry.comparingByKey()).limit(MAX_TAG_COUNT_ENTRIES)
+				.forEach(entry -> counts.addProperty(entry.getKey(), entry.getValue()));
+		inventory.add("tagCounts", counts);
 		inventory.addProperty("selectedItem", BuiltInRegistries.ITEM.getKey(agent.getMainHandItem().getItem()).toString());
 		return inventory;
 	}
@@ -240,7 +250,18 @@ public final class ServerObservationCollector {
 		item.addProperty("count", stack.getCount());
 		item.addProperty("damage", stack.getDamageValue());
 		item.addProperty("maxDamage", stack.getMaxDamage());
+		item.add("tags", tags(stack.typeHolder()));
 		return item;
+	}
+
+	static void addTagCounts(Map<String, Integer> counts, ItemStack stack) {
+		tags(stack.typeHolder()).forEach(tag -> counts.merge(tag.getAsString(), stack.getCount(), Integer::sum));
+	}
+
+	private static JsonArray tags(Holder<?> holder) {
+		JsonArray values = new JsonArray();
+		holder.tags().map(tag -> "#" + tag.location().toString()).sorted().limit(MAX_OBSERVATION_TAGS).forEach(values::add);
+		return values;
 	}
 
 	private static JsonArray entities(ServerLevel level, ServerPlayer agent) {
@@ -262,6 +283,7 @@ public final class ServerObservationCollector {
 					if (entity instanceof ItemEntity itemEntity) {
 						json.addProperty("itemId", BuiltInRegistries.ITEM.getKey(itemEntity.getItem().getItem()).toString());
 						json.addProperty("count", itemEntity.getItem().getCount());
+						json.add("tags", tags(itemEntity.getItem().typeHolder()));
 					}
 					values.add(json);
 				});
@@ -304,6 +326,7 @@ public final class ServerObservationCollector {
 			json.addProperty("y", position.getY());
 			json.addProperty("z", position.getZ());
 			json.addProperty("blockId", candidate.blockId());
+			json.add("tags", tags(level.getBlockState(position).typeHolder()));
 			JsonArray placeableFaces = new JsonArray();
 			BlockState supportState = level.getBlockState(position);
 			BlockPlacementAttemptPolicy.supportedFaces(face ->

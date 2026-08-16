@@ -207,9 +207,10 @@ function readyServerObservation(goalRevision = 4) {
 		},
 		inventory: {
 			items: [
-				{ itemId: 'minecraft:iron_chestplate', count: 1, damage: 0, maxDamage: 240, slot: 'chest' },
-				{ itemId: 'minecraft:bread', count: 4, damage: 0, maxDamage: 0, slot: 2, hotbar: true },
+				{ itemId: 'minecraft:iron_chestplate', count: 1, damage: 0, maxDamage: 240, slot: 'chest', tags: ['#minecraft:trimmable_armor'] },
+				{ itemId: 'minecraft:bread', count: 4, damage: 0, maxDamage: 0, slot: 2, hotbar: true, tags: ['#minecraft:food'] },
 			],
+			tagCounts: { '#minecraft:trimmable_armor': 1, '#minecraft:food': 4 },
 			selectedItem: 'minecraft:bread',
 		},
 		entities: [{
@@ -217,6 +218,7 @@ function readyServerObservation(goalRevision = 4) {
 			type: 'minecraft:zombie',
 			name: 'Zombie',
 			distance: 3.25,
+			tags: ['#minecraft:hostile'],
 			position: { x: 12, y: 64, z: -2 },
 		}, {
 			uuid: '00000000-0000-0000-0000-000000000002',
@@ -233,9 +235,10 @@ function readyServerObservation(goalRevision = 4) {
 			position: { x: 10.5, y: 64, z: -2.5 },
 			itemId: 'minecraft:oak_log',
 			count: 1,
+			tags: ['#minecraft:item'],
 		}],
 		blocks: [{
-			x: 11, y: 64, z: -3, blockId: 'minecraft:oak_log', placeableFaces: ['up', 'north'],
+			x: 11, y: 64, z: -3, blockId: 'minecraft:oak_log', placeableFaces: ['up', 'north'], tags: ['#minecraft:logs'],
 		}],
 		nearbyContainers: [{
 			x: 12,

@@ -7,7 +7,7 @@ const MAX_COMPILER_CORRECTION_RECORD_FIELDS = 64;
 const PLAYER_NUMBER_FIELDS = Object.freeze(['x', 'y', 'z', 'health', 'hunger', 'air', 'yaw', 'pitch']);
 const PLAYER_BOOLEAN_FIELDS = Object.freeze(['fire', 'dead']);
 const CANDIDATE_NUMBER_FIELDS = Object.freeze(['entityId', 'count', 'x', 'y', 'z', 'distance']);
-const CANDIDATE_BOOLEAN_FIELDS = Object.freeze(['reachable', 'visible']);
+const CANDIDATE_BOOLEAN_FIELDS = Object.freeze([]);
 
 export const PLANNER_SYSTEM_PROMPT = `You are the strategic author for one Minecraft player. Only the user-selected provider, model, reasoning effort, and service tier write gameplay strategy, choices, conditions, fallbacks, interruption policies, and respawn decisions. The runtime supplies factual observations and executes fixed physical primitives; it does not choose tactics or create replacement programs.
 
@@ -19,16 +19,16 @@ Return exactly one JSON object and no prose or Markdown. Output ArenaScript sour
 Use replace only with nonblank source. Use continue or pause with neither source nor status. Use finish with status and without source. Do not include unused null fields.
 Do not return an actions array or any fixed action-list plan; the ArenaScript source is the only program representation.
 
-ArenaScript is restricted. Every replacement program declares exactly one top-level program.onUnhandledAttention("continue_and_notify"|"pause_and_notify"). Read facts only through player.state(), inventory.count(itemId), inventory.countTag(tag), world.items(criteria), world.entities(criteria), world.blocks(criteria), and world.nearest(candidates, origin?). Candidate queries and choices must use observed facts only. Candidate fields are stableId, entityId, type, itemId, blockId, count, position: { x, y, z }, x, y, z, reachable, visible, distance, and tags.
+ArenaScript is restricted. Every replacement program declares exactly one top-level program.onUnhandledAttention("continue_and_notify"|"pause_and_notify"). Read facts only through player.state(), inventory.count(itemId), inventory.countTag(tag), world.items(criteria), world.entities(criteria), world.blocks(criteria), and world.nearest(candidates, origin?). Candidate queries and choices must use observed facts only. Candidate fields are stableId, entityId, type, itemId, blockId, count, position: { x, y, z }, x, y, z, distance, and tags.
 
 The fixed physical API calls are player.moveTo({ x, y, z }), player.navigateTo({ x, y, z, tolerance, sprint, timeoutMs }), player.lookAt({ x, y, z }), player.attack({ targetSelector, timeoutMs }), player.selectItem({ itemId }), player.useItem({ durationMs }), player.mine({ x, y, z, timeoutMs }), player.place({ x, y, z, face, itemId, desiredState }), player.chat({ message }), player.wait(durationMs), player.setDoor({ x, y, z, open }), player.dropItem({ slot, count }), player.transferContainer({ x, y, z, sourceKind, sourceSlot, destinationKind, destinationSlot, count, expectedItemId, timeoutMs }), player.craftInventory({ recipeId, count, timeoutMs }), player.craftTable({ recipeId, x, y, z, count, timeoutMs }), player.furnaceTransaction({ x, y, z, operation, inventorySlot, count, expectedItemId, timeoutMs }), player.equipItem({ sourceSlot, targetSlot, expectedItemId }), player.selectTool({ sourceSlot, hotbarSlot, expectedItemId, minRemainingDurability }), player.blockWithShield({ durationMs }), player.useRanged({ targetSelector, drawDurationMs, timeoutMs }), and coordinate-free player.respawn(). Respawn is valid only while the authoritative player facts report dead; it does not accept coordinates or choose a spawn point. Use program.repeatUntil(condition, { maxIterations: N }, async () => { ... }), program.watch(condition, { mode: "boundary"|"interrupt" }, async () => { ... }), program.checkpoint(reason), program.finish(summary), and tryResult(awaitedCall) only with their fixed signatures.
 
 Multi-tree and pickup example:
 program.onUnhandledAttention("continue_and_notify");
 await program.repeatUntil(() => inventory.countTag("#minecraft:logs") >= 8, { maxIterations: 16 }, async () => {
-  const drop = world.nearest(world.items({ tag: "#minecraft:logs", reachable: true }));
-  if (drop !== null) { await player.moveTo(drop.position); return; }
-  const tree = world.nearest(world.blocks({ tag: "#minecraft:logs", reachable: true }));
+  const drop = world.nearest(world.items({ tag: "#minecraft:logs" }));
+  if (drop !== null) { await player.moveTo(drop.position); inventory.countTag("#minecraft:logs"); return; }
+  const tree = world.nearest(world.blocks({ tag: "#minecraft:logs" }));
   if (tree !== null) await player.mine(tree.position);
 });
 program.finish("Collected logs");

@@ -16,6 +16,8 @@ import {
 	MAX_GOAL_LENGTH,
 	MAX_IDENTIFIER_LENGTH,
 	MAX_INVENTORY_SUMMARIES,
+	MAX_OBSERVATION_TAGS,
+	MAX_TAG_COUNT_ENTRIES,
 	MAX_LINE_BYTES,
 	MAX_REASON_CODE_LENGTH,
 	MAX_RESULT_MESSAGE_LENGTH,
@@ -831,12 +833,12 @@ function playerObservation(value) {
 
 function inventoryObservation(value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'inventory must be an object');
-	exactKeys(value, ['items', 'selectedItem'], ['items', 'selectedItem'], 'inventory');
-	return {
+	exactKeys(value, ['items', 'selectedItem', 'tagCounts'], ['items', 'selectedItem'], 'inventory');
+	const normalizedInventory = {
 		items: boundedArray(value.items, 'inventory.items', MAX_INVENTORY_SUMMARIES).map((item, index) => {
 			exactKeys(
 				item,
-				['itemId', 'count', 'damage', 'maxDamage', 'slot', 'hotbar'],
+				['itemId', 'count', 'damage', 'maxDamage', 'slot', 'hotbar', 'tags'],
 				['itemId', 'count', 'damage', 'maxDamage', 'slot'],
 				`inventory.items[${index}]`,
 			);
@@ -851,10 +853,13 @@ function inventoryObservation(value) {
 				slot,
 			};
 			if (item.hotbar !== undefined) normalized.hotbar = boolean(item.hotbar, `inventory.items[${index}].hotbar`);
+			if (item.tags !== undefined) normalized.tags = observationTags(item.tags, `inventory.items[${index}].tags`);
 			return normalized;
 		}),
 		selectedItem: requireIdentifier(value.selectedItem, 'inventory.selectedItem'),
 	};
+	if (value.tagCounts !== undefined) normalizedInventory.tagCounts = observationTagCounts(value.tagCounts, 'inventory.tagCounts');
+	return normalizedInventory;
 }
 
 function entityObservation(value, index) {
@@ -862,7 +867,7 @@ function entityObservation(value, index) {
 	const field = `entities[${index}]`;
 	exactKeys(
 		value,
-		['uuid', 'type', 'name', 'distance', 'position', 'isPlayer', 'itemId', 'count'],
+		['uuid', 'type', 'name', 'distance', 'position', 'isPlayer', 'itemId', 'count', 'tags'],
 		['uuid', 'type', 'name', 'distance', 'position'],
 		field,
 	);
@@ -874,6 +879,7 @@ function entityObservation(value, index) {
 		distance: finiteNumber(value.distance, `${field}.distance`),
 		position: vector(value.position, `${field}.position`),
 	};
+	if (value.tags !== undefined) normalized.tags = observationTags(value.tags, `${field}.tags`);
 	if (value.isPlayer !== undefined) normalized.isPlayer = boolean(value.isPlayer, `${field}.isPlayer`);
 	if (type === 'minecraft:item') {
 		if (value.itemId === undefined || value.count === undefined) {
@@ -891,7 +897,7 @@ function entityObservation(value, index) {
 function blockObservation(value, index) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `blocks[${index}] must be an object`);
 	const field = `blocks[${index}]`;
-	exactKeys(value, ['x', 'y', 'z', 'blockId', 'placeableFaces'], ['x', 'y', 'z', 'blockId', 'placeableFaces'], field);
+	exactKeys(value, ['x', 'y', 'z', 'blockId', 'placeableFaces', 'tags'], ['x', 'y', 'z', 'blockId', 'placeableFaces'], field);
 	const placeableFaces = boundedArray(value.placeableFaces, `${field}.placeableFaces`, BLOCK_FACES.length)
 		.map((face, faceIndex) => {
 			const normalized = requireIdentifier(face, `${field}.placeableFaces[${faceIndex}]`);
@@ -899,13 +905,36 @@ function blockObservation(value, index) {
 			return normalized;
 		});
 	if (new Set(placeableFaces).size !== placeableFaces.length) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.placeableFaces must be unique`);
-	return {
+	const normalized = {
 		x: integer(value.x, `${field}.x`),
 		y: integer(value.y, `${field}.y`),
 		z: integer(value.z, `${field}.z`),
 		blockId: requireIdentifier(value.blockId, `${field}.blockId`),
 		placeableFaces,
 	};
+	if (value.tags !== undefined) normalized.tags = observationTags(value.tags, `${field}.tags`);
+	return normalized;
+}
+
+function observationTags(value, field) {
+	const tags = boundedArray(value, field, MAX_OBSERVATION_TAGS).map((tag, index) => {
+		if (typeof tag !== 'string' || !tag.startsWith('#') || tag.length < 2 || tag.length > MAX_IDENTIFIER_LENGTH) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}[${index}] must be a tag identifier`);
+		return tag;
+	});
+	if (new Set(tags).size !== tags.length) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be unique`);
+	return tags;
+}
+
+function observationTagCounts(value, field) {
+	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
+	const keys = Object.keys(value);
+	if (keys.length > MAX_TAG_COUNT_ENTRIES) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} exceeds bound of ${MAX_TAG_COUNT_ENTRIES}`);
+	const result = {};
+	for (const key of keys) {
+		if (!key.startsWith('#')) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} keys must be tag identifiers`);
+		result[key] = nonnegativeInteger(value[key], `${field}.${key}`);
+	}
+	return result;
 }
 
 function nearbyContainerObservation(value, index) {

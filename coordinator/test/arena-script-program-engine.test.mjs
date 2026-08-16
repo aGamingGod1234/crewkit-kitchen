@@ -43,29 +43,29 @@ test('measures a multi-tree pickup loop instead of assuming a tree yield or pick
 			() => inventory.countTag("#minecraft:logs") >= 8,
 			{ maxIterations: 8 },
 			async () => {
-				const drop = world.nearest(world.items({ tag: "#minecraft:logs", reachable: true }));
+				const drop = world.nearest(world.items({ tag: "#minecraft:logs" }));
 				if (drop !== null) { await player.moveTo(drop.position); return; }
-				const tree = world.nearest(world.blocks({ tag: "#minecraft:logs", reachable: true }));
+				const tree = world.nearest(world.blocks({ tag: "#minecraft:logs" }));
 				if (tree !== null) await player.mine(tree.position);
 			}
 		);
 		program.finish("Collected at least eight logs");
 	`;
 	const { engine, dispatched } = engineFor(source, { initialObservation: observation({
-		blocks: [{ stableId: 'tree-one', blockId: 'minecraft:oak_log', x: 4, y: 64, z: 0, reachable: true, tags: ['#minecraft:logs'] }],
+		blocks: [{ stableId: 'tree-one', blockId: 'minecraft:oak_log', x: 4, y: 64, z: 0, tags: ['#minecraft:logs'] }],
 	}) });
 	assert.equal(dispatched.at(-1).action.type, 'break_block');
 	acknowledge(engine, dispatched, observation({
-		items: [{ stableId: 'drop-five', itemId: 'minecraft:oak_log', count: 5, x: 8, y: 64, z: 0, reachable: true, tags: ['#minecraft:logs'] }],
+		items: [{ stableId: 'drop-five', itemId: 'minecraft:oak_log', count: 5, x: 8, y: 64, z: 0, tags: ['#minecraft:logs'] }],
 	}), 2);
 	assert.equal(dispatched.at(-1).action.type, 'move_to');
 	acknowledge(engine, dispatched, observation({
-		blocks: [{ stableId: 'tree-two', blockId: 'minecraft:oak_log', x: 10, y: 64, z: 0, reachable: true, tags: ['#minecraft:logs'] }],
+		blocks: [{ stableId: 'tree-two', blockId: 'minecraft:oak_log', x: 10, y: 64, z: 0, tags: ['#minecraft:logs'] }],
 		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } },
 	}), 3);
 	assert.equal(dispatched.at(-1).action.type, 'break_block');
 	acknowledge(engine, dispatched, observation({
-		items: [{ stableId: 'drop-three', itemId: 'minecraft:oak_log', count: 3, x: 8, y: 64, z: 0, reachable: true, tags: ['#minecraft:logs'] }],
+		items: [{ stableId: 'drop-three', itemId: 'minecraft:oak_log', count: 3, x: 8, y: 64, z: 0, tags: ['#minecraft:logs'] }],
 		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } },
 	}), 4);
 	assert.equal(dispatched.at(-1).action.type, 'move_to');

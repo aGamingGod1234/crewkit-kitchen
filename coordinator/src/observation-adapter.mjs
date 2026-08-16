@@ -1,6 +1,6 @@
 import { types as nodeTypes } from 'node:util';
 
-import { MAX_BLOCKS, MAX_ENTITIES, MAX_INVENTORY_SUMMARIES } from './constants.mjs';
+import { MAX_BLOCKS, MAX_ENTITIES, MAX_INVENTORY_SUMMARIES, MAX_OBSERVATION_TAGS, MAX_TAG_COUNT_ENTRIES } from './constants.mjs';
 
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const COORDINATE_FIELDS = ['x', 'y', 'z'];
@@ -8,7 +8,7 @@ const COORDINATE_FIELDS = ['x', 'y', 'z'];
 /** Converts one validated protocol-v2 observation into the narrow ArenaScript fact shape. */
 export function adaptObservation(value) {
 	const source = ownDataRecord(value, 'wire observation');
-	if (source.ready === false) return emptyFacts();
+	if (source.ready === false) return emptyFacts(source.status === 'PLAYER_DEAD');
 	if (source.ready !== true) throw new TypeError('wire observation.ready must be boolean');
 
 	const position = vector(source.position, 'wire observation.position');
@@ -36,7 +36,7 @@ export function adaptObservation(value) {
 	}
 	const items = entities
 		.filter((entity) => entity.type === 'minecraft:item')
-		.map(({ stableId, itemId, count, x, y, z }) => ({ stableId, itemId, count, x, y, z }));
+		.map(({ stableId, itemId, count, distance, tags, x, y, z }) => ({ stableId, itemId, count, ...(distance === undefined ? {} : { distance }), ...(tags === undefined ? {} : { tags }), x, y, z }));
 
 	const blocks = boundedDataArray(source.blocks, 'blocks', MAX_BLOCKS)
 		.map((value, index) => blockFacts(value, index));
@@ -50,20 +50,21 @@ export function adaptObservation(value) {
 	const inventoryItems = boundedDataArray(inventorySource.items, 'inventory.items', MAX_INVENTORY_SUMMARIES)
 		.map((value, index) => inventoryFacts(value, index));
 
+	const tagCounts = tagCountsFacts(inventorySource.tagCounts);
 	return {
 		player,
 		items,
 		entities,
 		blocks,
-		inventory: { items: inventoryItems },
+		inventory: { items: inventoryItems, ...(tagCounts === undefined ? {} : { tagCounts }) },
 	};
 }
 
 /** Alias kept explicit for callers that want to document the protocol boundary. */
 export const adaptWireObservation = adaptObservation;
 
-function emptyFacts() {
-	return { player: {}, items: [], entities: [], blocks: [], inventory: { items: [] } };
+function emptyFacts(dead = false) {
+	return { player: dead ? { dead: true } : {}, items: [], entities: [], blocks: [], inventory: { items: [] } };
 }
 
 function entityFacts(value, index) {
@@ -72,6 +73,8 @@ function entityFacts(value, index) {
 	const point = coordinateSource(source, `entities[${index}]`);
 	const type = identifier(source.type, `entities[${index}].type`);
 	const result = { stableId, type, x: point.x, y: point.y, z: point.z };
+	if (Object.hasOwn(source, 'distance')) result.distance = finiteNumber(source.distance, `entities[${index}].distance`);
+	if (Object.hasOwn(source, 'tags')) result.tags = tags(source.tags, `entities[${index}].tags`);
 	if (type === 'minecraft:item') {
 		result.itemId = identifier(source.itemId, `entities[${index}].itemId`);
 		result.count = positiveInteger(source.count, `entities[${index}].count`);
@@ -83,7 +86,7 @@ function blockFacts(value, index) {
 	const source = ownDataRecord(value, `blocks[${index}]`);
 	const point = coordinateSource(source, `blocks[${index}]`);
 	const stableId = `${point.x},${point.y},${point.z}`;
-	return { stableId, blockId: identifier(source.blockId, `blocks[${index}].blockId`), x: point.x, y: point.y, z: point.z };
+	return { stableId, blockId: identifier(source.blockId, `blocks[${index}].blockId`), ...(Object.hasOwn(source, 'tags') ? { tags: tags(source.tags, `blocks[${index}].tags`) } : {}), x: point.x, y: point.y, z: point.z };
 }
 
 function inventoryFacts(value, index) {
@@ -94,7 +97,30 @@ function inventoryFacts(value, index) {
 		itemId: identifier(source.itemId, `inventory.items[${index}].itemId`),
 		count: nonNegativeInteger(source.count, `inventory.items[${index}].count`),
 		slot,
+		...(Object.hasOwn(source, 'tags') ? { tags: tags(source.tags, `inventory.items[${index}].tags`) } : {}),
 	};
+}
+
+function tags(value, label) {
+	const values = boundedDataArray(value, label, MAX_OBSERVATION_TAGS).map((tag, index) => {
+		if (typeof tag !== 'string' || !tag.startsWith('#') || tag.length < 2 || tag.length > 256) throw new TypeError(`${label}[${index}] must be a tag identifier`);
+		return tag;
+	});
+	if (new Set(values).size !== values.length) throw new TypeError(`${label} must be unique`);
+	return values;
+}
+
+function tagCountsFacts(value) {
+	if (value === undefined) return undefined;
+	const source = ownDataRecord(value, 'wire observation.inventory.tagCounts');
+	const keys = Object.keys(source);
+	if (keys.length > MAX_TAG_COUNT_ENTRIES) throw new TypeError(`tagCounts exceeds bound of ${MAX_TAG_COUNT_ENTRIES}`);
+	const result = {};
+	for (const key of keys) {
+		if (!key.startsWith('#') || key.length < 2 || key.length > 256) throw new TypeError(`tagCounts key must be a tag identifier`);
+		result[key] = nonNegativeInteger(source[key], `tagCounts.${key}`);
+	}
+	return result;
 }
 
 function coordinateSource(source, label) {

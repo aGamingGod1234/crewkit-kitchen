@@ -17,11 +17,11 @@ function observation(overrides = {}) {
 test('nearest considers only the candidate set selected by model code', () => {
 	const facts = createFactView(observation({
 		items: [
-			{ stableId: 'log-far', itemId: 'minecraft:oak_log', count: 2, x: 8, y: 64, z: 0, reachable: true },
-			{ stableId: 'dirt-near', itemId: 'minecraft:dirt', count: 1, x: 1, y: 64, z: 0, reachable: true },
+			{ stableId: 'log-far', itemId: 'minecraft:oak_log', count: 2, x: 8, y: 64, z: 0, tags: ['#minecraft:logs'] },
+			{ stableId: 'dirt-near', itemId: 'minecraft:dirt', count: 1, x: 1, y: 64, z: 0 },
 		],
 	}));
-	const logs = facts.world.items({ itemId: 'minecraft:oak_log', reachable: true });
+	const logs = facts.world.items({ itemId: 'minecraft:oak_log' });
 	assert.equal(facts.world.nearest(logs).stableId, 'log-far');
 });
 

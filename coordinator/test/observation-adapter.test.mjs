@@ -9,12 +9,12 @@ function wireObservation(overrides = {}) {
 		position: { x: 0, y: 64, z: 0 },
 		view: { yaw: 10, pitch: -2 },
 		player: { health: 20, foodLevel: 18, onFire: false, air: 300, fallDistance: 0 },
-		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0 }] },
+		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0, tags: ['#minecraft:logs'] }], tagCounts: { '#minecraft:logs': 2 } },
 		entities: [{
 			uuid: '00000000-0000-0000-0000-000000000001', type: 'minecraft:item',
-			position: { x: 2, y: 64, z: 0 }, itemId: 'minecraft:oak_log', count: 1,
+			position: { x: 2, y: 64, z: 0 }, itemId: 'minecraft:oak_log', count: 1, distance: 2, tags: ['#minecraft:item']
 		}],
-		blocks: [{ x: 4, y: 64, z: 0, blockId: 'minecraft:oak_log' }],
+		blocks: [{ x: 4, y: 64, z: 0, blockId: 'minecraft:oak_log', tags: ['#minecraft:logs'] }],
 		...overrides,
 	};
 }
@@ -22,12 +22,18 @@ function wireObservation(overrides = {}) {
 test('adapts protocol entities and blocks into bounded factual candidate records', () => {
 	const adapted = adaptObservation(wireObservation());
 	assert.deepEqual(adapted.player, { x: 0, y: 64, z: 0, yaw: 10, pitch: -2, health: 20, hunger: 18, air: 300, fire: false, fallDistance: 0 });
-	assert.deepEqual(adapted.items, [{ stableId: '00000000-0000-0000-0000-000000000001', itemId: 'minecraft:oak_log', count: 1, x: 2, y: 64, z: 0 }]);
-	assert.deepEqual(adapted.entities, [{ stableId: '00000000-0000-0000-0000-000000000001', type: 'minecraft:item', x: 2, y: 64, z: 0, itemId: 'minecraft:oak_log', count: 1 }]);
-	assert.deepEqual(adapted.blocks, [{ stableId: '4,64,0', blockId: 'minecraft:oak_log', x: 4, y: 64, z: 0 }]);
-	assert.deepEqual(adapted.inventory, { items: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0 }] });
+	assert.deepEqual(adapted.items, [{ stableId: '00000000-0000-0000-0000-000000000001', itemId: 'minecraft:oak_log', count: 1, distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0 }]);
+	assert.deepEqual(adapted.entities, [{ stableId: '00000000-0000-0000-0000-000000000001', type: 'minecraft:item', distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0, itemId: 'minecraft:oak_log', count: 1 }]);
+	assert.deepEqual(adapted.blocks, [{ stableId: '4,64,0', blockId: 'minecraft:oak_log', tags: ['#minecraft:logs'], x: 4, y: 64, z: 0 }]);
+	assert.deepEqual(adapted.inventory, { items: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0, tags: ['#minecraft:logs'] }], tagCounts: { '#minecraft:logs': 2 } });
 	assert.equal(Object.hasOwn(adapted.items[0], 'reachable'), false);
-	assert.equal(Object.hasOwn(adapted.items[0], 'tags'), false);
+	assert.deepEqual(adapted.items[0].tags, ['#minecraft:item']);
+});
+
+test('rejects malformed, duplicate, and over-bound authoritative tags', () => {
+	assert.throws(() => adaptObservation(wireObservation({ blocks: [{ x: 1, y: 64, z: 0, blockId: 'minecraft:stone', tags: ['#minecraft:logs', '#minecraft:logs'] }] })), /tags must be unique/);
+	assert.throws(() => adaptObservation(wireObservation({ blocks: [{ x: 1, y: 64, z: 0, blockId: 'minecraft:stone', tags: ['minecraft:logs'] }] })), /tag/);
+	assert.throws(() => adaptObservation(wireObservation({ inventory: { items: [], tagCounts: Object.fromEntries(Array.from({ length: 129 }, (_, i) => [`#minecraft:t${i}`, 1])) } })), /tagCounts exceeds bound/);
 });
 
 test('rejects accessors, inherited data, and proxies before reading observation facts', () => {

@@ -178,12 +178,13 @@ export class FakeMinecraftBridge {
 
 function toWireObservation(value, goalRevision, eventSequence, attention, observedAtEpochMs) {
 	const player = value.player ?? {};
+	if (player.dead === true) return { goalRevision, observedAtEpochMs, ready: false, status: 'PLAYER_DEAD', eventSequence, attention: false, changedFacts: [] };
 	const position = { x: player.x ?? 0, y: player.y ?? 64, z: player.z ?? 0 };
 	return {
 		goalRevision,
 		observedAtEpochMs,
-		ready: true,
-		status: 'ready',
+		ready: player.dead !== true,
+		status: player.dead === true ? 'PLAYER_DEAD' : 'ready',
 		eventSequence,
 		attention,
 		changedFacts: attention ? ['player.health'] : [],
@@ -195,9 +196,9 @@ function toWireObservation(value, goalRevision, eventSequence, attention, observ
 			gameMode: 'survival', onGround: true, inWater: false, onFire: player.fire === true,
 			air: 300, maxAir: 300, suffocating: false, fallDistance: player.fallDistance ?? 0, effects: [],
 		},
-		inventory: { items: (value.inventory?.items ?? []).map((item, index) => ({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: item.slot ?? index })), selectedItem: 'minecraft:air' },
-		entities: (value.items ?? []).map((item) => ({ uuid: item.stableId, type: 'minecraft:item', name: 'drop', distance: Math.hypot(item.x - position.x, item.y - position.y, item.z - position.z), position: { x: item.x, y: item.y, z: item.z }, itemId: item.itemId, count: item.count })),
-		blocks: (value.blocks ?? []).map((block) => ({ x: block.x, y: block.y, z: block.z, blockId: block.blockId, placeableFaces: ['up', 'down', 'north', 'south', 'east', 'west'] })),
+		inventory: { items: (value.inventory?.items ?? []).map((item, index) => ({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: item.slot ?? index, ...(item.tags ? { tags: item.tags } : {}) })), selectedItem: 'minecraft:air', ...(value.inventory?.tagCounts ? { tagCounts: value.inventory.tagCounts } : {}) },
+		entities: (value.items ?? []).map((item) => ({ uuid: item.stableId, type: 'minecraft:item', name: 'drop', distance: Math.hypot(item.x - position.x, item.y - position.y, item.z - position.z), position: { x: item.x, y: item.y, z: item.z }, itemId: item.itemId, count: item.count, ...(item.tags ? { tags: item.tags } : {}) })),
+		blocks: (value.blocks ?? []).map((block) => ({ x: block.x, y: block.y, z: block.z, blockId: block.blockId, placeableFaces: ['up', 'down', 'north', 'south', 'east', 'west'], ...(block.tags ? { tags: block.tags } : {}) })),
 		nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false },
 		currentAction: { active: false }, lastResult: { present: false },
 	};

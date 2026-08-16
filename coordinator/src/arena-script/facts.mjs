@@ -4,7 +4,7 @@ const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const OBSERVED_SETS = new WeakSet();
 const CANDIDATE_ORIGINS = new WeakMap();
 const PLAYER_FIELDS = ['x', 'y', 'z', 'health', 'hunger', 'air', 'fire', 'fallDistance', 'dead', 'yaw', 'pitch'];
-const CANDIDATE_FIELDS = ['stableId', 'entityId', 'type', 'itemId', 'blockId', 'count', 'x', 'y', 'z', 'reachable', 'visible', 'distance', 'tags'];
+const CANDIDATE_FIELDS = ['stableId', 'entityId', 'type', 'itemId', 'blockId', 'count', 'x', 'y', 'z', 'distance', 'tags'];
 
 /** Builds an immutable, observation-only fact view. */
 export function createFactView(observation) {
