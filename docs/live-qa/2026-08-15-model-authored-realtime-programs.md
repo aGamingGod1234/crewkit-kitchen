@@ -17,9 +17,11 @@ Record these values from the same run. Do not record secrets, access tokens, or 
 | --- | --- | --- |
 | Git commit | `79d10e66bd9cb4b3541720777e4c0997a49f7379` baseline; update after the verification slice commit | `git rev-parse HEAD` |
 | Mod JAR path | `build/libs/arena-agents-0.1.0.jar` | `Get-FileHash -Algorithm SHA256` |
-| Mod JAR SHA-256 | `1294372DE8822EBDCD20C813A0CF38636B2C2F15C268849E4A257464F074B910` | Fresh full verifier build output; not installed |
-| Installed JAR SHA-256 | **Pending Lucas live run** | Must equal build JAR; record both |
-| Coordinator distribution path/hash | **Pending exact distribution staging** | Record each distributed file or archive hash |
+| Normal profile deployment target | `C:\Users\aGamingGod\AppData\Roaming\.minecraft` | Headless deployment check |
+| Mod JAR SHA-256 | `2D0D1EF76379E21C55F17C0AC840D71836267919F9A4EFBAABCDCDC6CFD6241E` | Built JAR; matched installed copy headlessly |
+| Installed JAR SHA-256 | `2D0D1EF76379E21C55F17C0AC840D71836267919F9A4EFBAABCDCDC6CFD6241E` | Headless build/install parity passed |
+| Coordinator distribution parity | 48 source/archive/installed files passed | Headless parity check |
+| Rollback backup | `C:\Users\aGamingGod\AppData\Roaming\.minecraft\.arena-agents-backup-20260816T070046Z-e0d44af27f3e46eba8a5906ca99f4d39` | Prior 1,339,243-byte JAR and coordinator preserved |
 | Coordinator source `dynamic-main.mjs` SHA-256 | `66890AAA08380E7DA5574C23635B8CF750718BE15B3DC44A9865703EC0C55F8E` | Current source hash |
 | Coordinator source `program-runtime-manager.mjs` SHA-256 | `426D3543D005EEF89B484E0E8D3A16E63131255BF7F9DF0250B59AC575913CCA` | Current source hash |
 | Decision parser SHA-256 | `C3FB1186A653104B5731953797EB3108042A810312E3C57D0D67AB38E4BF9CF6` | Current source hash |
@@ -107,6 +109,6 @@ Evidence from the fresh command above:
 | --- | --- | --- | --- |
 | Headless Task 10 gate | Codex | Pass for the recorded checkout | Fresh command output above |
 | Performance verifier and 50/50 soak | Codex | Pass | Full verifier + Task 10 gate + 50/50 soak in 70.9s |
-| Jar/distribution hash parity | Codex/Lucas | Pending | Record exact hashes |
+| Jar/distribution hash parity | Codex | Pass (headless only) | JAR hash equality and 48-file coordinator parity above |
 | Live Minecraft behavior | Lucas | **Pending Lucas** | Fill checklist and tables |
 | Authority audit | Codex | Pass (source audit only) | Fresh rg evidence above; live behavior remains pending Lucas |

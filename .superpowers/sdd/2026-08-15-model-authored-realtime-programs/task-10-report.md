@@ -53,8 +53,10 @@ It completed successfully with `PASS: 6019 protocol and bridge assertions` and `
 
 ## Hash evidence
 
-- Built JAR SHA-256 from the full verifier build: `1294372DE8822EBDCD20C813A0CF38636B2C2F15C268849E4A257464F074B910`.
-- Installed JAR parity: not performed; no Minecraft install or launch was requested.
+- Headless normal-profile deployment target: `C:\Users\aGamingGod\AppData\Roaming\.minecraft`.
+- Built and installed JAR SHA-256: `2D0D1EF76379E21C55F17C0AC840D71836267919F9A4EFBAABCDCDC6CFD6241E` for both copies; headless build/install hash parity passed.
+- Coordinator source/archive/installed parity: 48 files passed headless parity verification.
+- Rollback backup: `C:\Users\aGamingGod\AppData\Roaming\.minecraft\.arena-agents-backup-20260816T070046Z-e0d44af27f3e46eba8a5906ca99f4d39`; contains the prior 1,339,243-byte JAR and coordinator.
 - `coordinator/src/dynamic-main.mjs`: `66890AAA08380E7DA5574C23635B8CF750718BE15B3DC44A9865703EC0C55F8E`.
 - `coordinator/src/program-runtime-manager.mjs`: `426D3543D005EEF89B484E0E8D3A16E63131255BF7F9DF0250B59AC575913CCA`.
 - `coordinator/src/decision-parser.mjs`: `C3FB1186A653104B5731953797EB3108042A810312E3C57D0D67AB38E4BF9CF6`.
@@ -72,4 +74,4 @@ Evidence: `coordinator/src/program-runtime-manager.mjs:380` sends the interprete
 
 ## Live boundary
 
-Live Minecraft observations, visible physical outcomes, provider availability, exact selected-model settings from the running UI, installed-JAR parity, and live latency remain pending Lucas. Headless verification is not live acceptance and is not reported as such.
+Live Minecraft observations, visible physical outcomes, provider availability, exact selected-model settings from the running UI, and live latency remain pending Lucas. The build/install/hash-parity checks above are headless deployment evidence only; they are not live acceptance and do not establish gameplay behavior.
