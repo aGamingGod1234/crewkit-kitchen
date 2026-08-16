@@ -6,10 +6,16 @@ import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.server.AgentSavedData;
+import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
+import java.lang.reflect.Field;
+import java.net.Socket;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class MultiplexedServerBridgeVerification {
 	private MultiplexedServerBridgeVerification() {
@@ -63,7 +69,102 @@ public final class MultiplexedServerBridgeVerification {
 		assertEquals(List.of("paired-messages-and-commit", "action-attempted", "state-after-telemetry-failure"), committed,
 				"scenario callback failure cannot escape or roll back committed respawn publication");
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
-		return 14;
+		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
+		verifyRealBridgeSessionLifecycle();
+		return 27;
+	}
+
+	private static void verifyRealBridgeSessionLifecycle() {
+		MultiplexedServerBridge bridge = new MultiplexedServerBridge(
+				uninitializedManager(), 0, Path.of("runtime/bridge-secret.txt")
+		);
+		bridge.start();
+		try {
+			assertTrue(!bridge.observationPublicationForVerification().hasActiveSession(),
+					"bridge starts without an accepted session");
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification())) {
+				awaitCondition(bridge.observationPublicationForVerification()::hasActiveSession,
+						"accept loop activates publication for a connected session");
+			}
+			awaitCondition(() -> !bridge.observationPublicationForVerification().hasActiveSession(),
+					"session close deactivates publication and clears lifecycle ownership");
+		} catch (Exception exception) {
+			throw new AssertionError("real bridge session lifecycle failed", exception);
+		} finally {
+			bridge.close();
+		}
+	}
+
+	private static CodexAgentManager uninitializedManager() {
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+			CodexAgentManager manager = (CodexAgentManager) unsafe.allocateInstance(CodexAgentManager.class);
+			Field savedData = CodexAgentManager.class.getDeclaredField("savedData");
+			unsafe.putObject(manager, unsafe.objectFieldOffset(savedData), new AgentSavedData());
+			return manager;
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not allocate lifecycle-only manager", exception);
+		}
+	}
+
+	private static void awaitCondition(java.util.function.BooleanSupplier condition, String label) {
+		long deadline = System.nanoTime() + 2_000_000_000L;
+		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
+			Thread.onSpinWait();
+		}
+		assertTrue(condition.getAsBoolean(), label);
+	}
+
+	private static void verifyObservationPublicationLifecycle(AgentId agent) {
+		MultiplexedServerBridge.ObservationPublication publication = new MultiplexedServerBridge.ObservationPublication(16, 16);
+		Object oldSession = new Object();
+		Object newSession = new Object();
+		MultiplexedServerBridge.onSessionAccepted(publication, oldSession);
+		JsonObject oldObservation = observation("00000000-0000-0000-0000-000000000002", 1_000L);
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+				publication.publish(agent, oldSession, oldObservation, (ignoredAgent, ignoredPayload) -> true),
+				"old session writer commits its observation before disconnect");
+		publication.offer(agent);
+		assertEquals(1, publication.retainedCount(), "old session baseline is retained before reset");
+		assertEquals(1, publication.pendingCount(), "old session queue is retained before reset");
+
+		MultiplexedServerBridge.onSessionClosed(publication, oldSession);
+		MultiplexedServerBridge.onSessionAccepted(publication, newSession);
+		AtomicBoolean staleWriterCalled = new AtomicBoolean();
+		JsonObject staleObservation = observation("00000000-0000-0000-0000-000000000003", 1_001L);
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.STALE_SESSION,
+				publication.publish(agent, oldSession, staleObservation, (ignoredAgent, ignoredPayload) -> {
+					staleWriterCalled.set(true);
+					return true;
+				}),
+				"old session observation cannot publish after reset activates a new session");
+		assertTrue(!staleWriterCalled.get(), "new session writer never receives stale old-session observation");
+		assertEquals(0, publication.retainedCount(), "reset clears old delivered baseline before new session");
+		assertEquals(0, publication.pendingCount(), "reset clears old queued observation before new session");
+
+		List<JsonObject> freshDeliveries = new ArrayList<>();
+		JsonObject freshObservation = observation("00000000-0000-0000-0000-000000000003", 1_002L);
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+				publication.publish(agent, newSession, freshObservation, (ignoredAgent, payload) -> {
+					freshDeliveries.add(payload.deepCopy());
+					return true;
+				}),
+				"new session writer commits a fresh observation");
+		assertEquals(1, freshDeliveries.size(), "new session receives exactly its fresh observation");
+		assertTrue(!freshDeliveries.getFirst().get("attention").getAsBoolean(),
+				"fresh observation starts from an empty reset baseline");
+		assertEquals(1, publication.retainedCount(), "new session baseline is retained after commit");
+	}
+
+	private static JsonObject observation(String targetId, long observedAtEpochMs) {
+		JsonObject observation = new JsonObject();
+		observation.addProperty("observedAtEpochMs", observedAtEpochMs);
+		JsonArray entities = new JsonArray();
+		entities.add(entity(targetId));
+		observation.add("entities", entities);
+		return observation;
 	}
 
 	private static void verifyExactTargetObservationLedger(AgentId agent) {

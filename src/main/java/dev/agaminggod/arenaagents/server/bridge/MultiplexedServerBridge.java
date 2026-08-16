@@ -80,19 +80,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final AgentRuntimeRouter router;
 	private final ServerActionExecutor actionExecutor;
 	private final ServerObservationCollector observations;
-	private final ObservationDispatchQueue<AgentId> observationQueue =
-			new ObservationDispatchQueue<>(AgentConstants.DEFAULT_AGENT_LIMIT, OBSERVATIONS_PER_TICK);
+	private final ObservationPublication observationPublication =
+			new ObservationPublication(AgentConstants.DEFAULT_AGENT_LIMIT, OBSERVATIONS_PER_TICK);
 	private final BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 	private final String serverInstanceId = UUID.randomUUID().toString();
 	private final String secret;
 	private final int port;
 	private final ConcurrentLinkedQueue<Runnable> serverTasks = new ConcurrentLinkedQueue<>();
-	private final Object publicationLifecycleLock = new Object();
 	private final AtomicBoolean running = new AtomicBoolean();
 	private final AtomicLong messageIds = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
-	private final AtomicLong observationSequences = new AtomicLong();
-	private final PublishedObservationState publishedObservations = new PublishedObservationState(AgentConstants.DEFAULT_AGENT_LIMIT);
 	private volatile Session session;
 	private volatile ServerSocket serverSocket;
 	private volatile Set<String> catalogProfiles = Set.of();
@@ -145,7 +142,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		for (AgentId agentId : registeredObservationIds(manager.records())) {
 			queueObservation(agentId);
 		}
-		observationQueue.drain(this::sendObservation);
+		observationPublication.drain(this::sendObservation);
 	}
 
 	static List<AgentId> registeredObservationIds(List<AgentRecord> records) {
@@ -160,6 +157,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public boolean authenticated() {
 		Session active = session;
 		return active != null && active.authenticated.get();
+	}
+
+	ObservationPublication observationPublicationForVerification() {
+		return observationPublication;
+	}
+
+	int boundPortForVerification() {
+		ServerSocket active = serverSocket;
+		if (active == null) throw new IllegalStateException("bridge is not started");
+		return active.getLocalPort();
 	}
 
 	public List<AgentControlModelOption> catalogModels() {
@@ -220,8 +227,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void onRemoved(AgentId agentId, long terminalRevision) {
 		actionExecutor.cancel(agentId, "Agent removed");
 		programActions.remove(agentId);
-		observationQueue.remove(agentId);
-		publishedObservations.remove(agentId);
+		observationPublication.remove(agentId);
 		JsonObject payload = new JsonObject();
 		payload.addProperty("goalRevision", terminalRevision);
 		send("agent_removed", agentId.toString(), payload);
@@ -261,6 +267,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 				Session accepted = new Session(socket);
 				session = accepted;
+				onSessionAccepted(observationPublication, accepted);
 				accepted.start();
 			} catch (IOException exception) {
 				if (running.get()) {
@@ -268,6 +275,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 			}
 		}
+	}
+
+	static void onSessionAccepted(ObservationPublication publication, Object session) {
+		publication.activate(session);
+	}
+
+	static void onSessionClosed(ObservationPublication publication, Object session) {
+		publication.deactivate(session);
 	}
 
 	private void accept(BridgeEnvelope envelope, Session source) {
@@ -577,7 +592,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new AgentDomainException("STALE_PROVENANCE", "Action provenance does not match the selected model profile");
 		}
 		if (request.type() == ActionType.ATTACK || request.type() == ActionType.USE_RANGED) {
-			publishedObservations.requireObservedTarget(
+		observationPublication.requireObservedTarget(
 					request.agentId(),
 					provenance.eventSequence(),
 					request.arguments().get("targetId").getAsString()
@@ -709,50 +724,31 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void queueObservation(AgentId agentId) {
-		observationQueue.offer(agentId);
+		observationPublication.offer(agentId);
 	}
 
 	private void sendObservation(AgentId agentId) {
-		if (!authenticated()) {
+		Session source = session;
+		if (source == null || !source.authenticated.get()) {
 			retryObservation(agentId);
 			return;
 		}
 		final JsonObject observation;
 		try {
 			observation = observations.collect(agentId);
-			sendCollectedObservation(agentId, observation);
+			ObservationPublication.Result result = observationPublication.publish(
+					agentId, source, observation,
+					(ignoredAgent, payload) -> sendObservationEnvelope(source, ignoredAgent, payload)
+			);
+			if (result == ObservationPublication.Result.DELIVERY_RETRY) retryObservation(agentId);
 			return;
 		} catch (AgentDomainException exception) {
 			LOGGER.debug("Dropping observation for removed agent {}: {}", agentId, exception.code());
-		} catch (RuntimeException exception) {
-			LOGGER.warn("Could not collect observation for {}: {}", agentId, exception.getMessage());
-		}
-	}
-
-	private void sendCollectedObservation(AgentId agentId, JsonObject observation) {
-		try {
-			synchronized (publicationLifecycleLock) {
-				long eventSequence = observationSequences.incrementAndGet();
-				AttentionFactDelta delta = publishedObservations.delta(
-						agentId, observation, eventSequence,
-						observation.get("observedAtEpochMs").getAsLong()
-				);
-				observation.addProperty("eventSequence", delta.eventSequence());
-				observation.addProperty("attention", delta.attention());
-				JsonArray changedFacts = new JsonArray();
-				delta.changedFacts().forEach(changedFacts::add);
-				observation.add("changedFacts", changedFacts);
-				if (!sendObservationEnvelope(agentId, observation)) {
-					retryObservation(agentId);
-					return;
-				}
-				publishedObservations.commit(agentId, observation);
-			}
 		} catch (BridgeProtocolException exception) {
 			if (isTransientObservationDelivery(exception)) retryObservation(agentId);
 			else LOGGER.warn("Dropping observation delivery for {}: {}", agentId, exception.getMessage());
 		} catch (RuntimeException exception) {
-			LOGGER.warn("Dropping observation delivery for {}: {}", agentId, exception.getMessage());
+			LOGGER.warn("Could not collect observation for {}: {}", agentId, exception.getMessage());
 		}
 	}
 
@@ -762,19 +758,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		} catch (AgentDomainException exception) {
 			return;
 		}
-		if (!publishedObservations.markDirty(agentId)) return;
+		if (!observationPublication.markDirty(agentId)) return;
 		try {
-			queueObservation(agentId);
+			observationPublication.offer(agentId);
 		} catch (RuntimeException exception) {
 			LOGGER.debug("Could not retain observation retry for {}: {}", agentId, exception.getMessage());
 		}
 	}
 
 	private void resetObservationPublication() {
-		synchronized (publicationLifecycleLock) {
-			observationQueue.clear();
-			publishedObservations.clear();
-		}
+		observationPublication.reset();
 	}
 
 	private static boolean isTransientObservationDelivery(BridgeProtocolException exception) {
@@ -802,10 +795,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				"server-" + messageIds.incrementAndGet(), payload));
 	}
 
-	private boolean sendObservationEnvelope(AgentId agentId, JsonObject payload) {
-		Session active = session;
-		if (active == null || !active.authenticated.get()) return false;
-		active.enqueue(new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
+	private boolean sendObservationEnvelope(Session source, AgentId agentId, JsonObject payload) {
+		if (session != source || !source.open.get() || !source.authenticated.get()) return false;
+		source.enqueue(new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
 				"server-" + messageIds.incrementAndGet(), payload));
 		return true;
 	}
@@ -989,6 +981,91 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		double value = requiredDouble(object, field);
 		if (value < 0.0D) throw new BridgeProtocolException("INVALID_FIELD", field);
 		return value;
+	}
+
+	/** Serializes observation delivery with session identity, queue, and baseline lifecycle. */
+	static final class ObservationPublication {
+		enum Result { COMMITTED, STALE_SESSION, DELIVERY_RETRY }
+
+		@FunctionalInterface
+		interface Writer {
+			boolean send(AgentId agentId, JsonObject payload);
+		}
+
+		private final Object lifecycleLock = new Object();
+		private final ObservationDispatchQueue<AgentId> queue;
+		private final PublishedObservationState published;
+		private final AtomicLong sequences = new AtomicLong();
+		private Object activeSession;
+
+		ObservationPublication(int queueCapacity, int perTickLimit) {
+			queue = new ObservationDispatchQueue<>(queueCapacity, perTickLimit);
+			published = new PublishedObservationState(queueCapacity);
+		}
+
+		void activate(Object session) {
+			synchronized (lifecycleLock) {
+				activeSession = Objects.requireNonNull(session, "session must not be null");
+			}
+		}
+
+		void deactivate(Object session) {
+			synchronized (lifecycleLock) {
+				if (activeSession == session) {
+					activeSession = null;
+					clearLocked();
+				}
+			}
+		}
+
+		void reset() {
+			synchronized (lifecycleLock) {
+				clearLocked();
+			}
+		}
+
+		void offer(AgentId agentId) { queue.offer(agentId); }
+		void drain(java.util.function.Consumer<AgentId> consumer) { queue.drain(consumer); }
+		void remove(AgentId agentId) { queue.remove(agentId); published.remove(agentId); }
+		boolean markDirty(AgentId agentId) { return published.markDirty(agentId); }
+		void requireObservedTarget(AgentId agentId, long eventSequence, String targetId) {
+			published.requireObservedTarget(agentId, eventSequence, targetId);
+		}
+		int pendingCount() { return queue.pendingCount(); }
+		int retainedCount() { return published.retainedCount(); }
+		boolean hasActiveSession() {
+			synchronized (lifecycleLock) {
+				return activeSession != null;
+			}
+		}
+
+		Result publish(AgentId agentId, Object sourceSession, JsonObject observation, Writer writer) {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(sourceSession, "sourceSession must not be null");
+			Objects.requireNonNull(observation, "observation must not be null");
+			Objects.requireNonNull(writer, "writer must not be null");
+			synchronized (lifecycleLock) {
+				if (activeSession != sourceSession) return Result.STALE_SESSION;
+				long eventSequence = sequences.incrementAndGet();
+				AttentionFactDelta delta = published.delta(
+						agentId, observation, eventSequence,
+						observation.get("observedAtEpochMs").getAsLong()
+				);
+				observation.addProperty("eventSequence", delta.eventSequence());
+				observation.addProperty("attention", delta.attention());
+				JsonArray changedFacts = new JsonArray();
+				delta.changedFacts().forEach(changedFacts::add);
+				observation.add("changedFacts", changedFacts);
+				if (!writer.send(agentId, observation)) return Result.DELIVERY_RETRY;
+				published.commit(agentId, observation);
+				return Result.COMMITTED;
+			}
+		}
+
+		private void clearLocked() {
+			queue.clear();
+			published.clear();
+		}
 	}
 
 	/** Retains only successfully delivered baselines and a bounded retry marker. */
@@ -1223,7 +1300,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			interruptPeer(writerThread);
 			try { socket.close(); } catch (IOException ignored) { }
 			if (session == this) {
-				resetObservationPublication();
+				MultiplexedServerBridge.onSessionClosed(observationPublication, this);
 				session = null;
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();
