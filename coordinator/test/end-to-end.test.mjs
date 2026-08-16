@@ -5,6 +5,7 @@ import { startTwoAgentFixture } from './fixtures/two-agent-fixture.mjs';
 
 test('agents remain isolated while progressing concurrently', async () => {
 	const run = await startTwoAgentFixture();
+	let evidence;
 	try {
 		await run.goalBoth('enter the arena');
 		await run.untilBothComplete();
@@ -13,8 +14,9 @@ test('agents remain isolated while progressing concurrently', async () => {
 		assert.equal(run.promptsIdentical(), true);
 		assert.deepEqual(run.actionCounts(), [2, 2]);
 	} finally {
-		await run.stop();
+		evidence = await run.stop();
 	}
+	assertProgramStepProvenance(evidence);
 });
 
 test('reconnects, retains selected-model programs, and shuts down with trace evidence', async () => {
@@ -29,9 +31,23 @@ test('reconnects, retains selected-model programs, and shuts down with trace evi
 		assert.equal(run.sameSelectedSession('agent-55'), true, 'correction stayed on the selected model session');
 	} finally {
 		const evidence = await run.stop();
+		assertProgramStepProvenance(evidence);
 		assert.ok(evidence['agent-55'].some((row) => row.event === 'program_compiled'));
 		assert.ok(evidence['agent-56'].some((row) => row.event === 'program_compiled'));
 		assert.ok(evidence['agent-55'].some((row) => row.event === 'program_finished'));
 		assert.ok(evidence['agent-56'].some((row) => row.event === 'program_finished'));
 	}
 });
+
+function assertProgramStepProvenance(evidence) {
+	const steps = Object.values(evidence).flat().filter((row) => row.event === 'program_step');
+	assert.ok(steps.length > 0, 'trace evidence contains physical program steps');
+	for (const step of steps) {
+		assert.equal(step.model, step.authority.modelIdentity);
+		assert.equal(step.programId, step.authority.programId);
+		assert.match(step.sourceStepId, /^step-/);
+		assert.equal(Number.isSafeInteger(step.eventSequence), true);
+		assert.equal(step.authority.stepId, step.sourceStepId);
+		assert.equal(Number.isSafeInteger(step.authority.eventSequence), true);
+	}
+}

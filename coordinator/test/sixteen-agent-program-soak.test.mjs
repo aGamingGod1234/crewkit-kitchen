@@ -21,6 +21,14 @@ test('sixteen independent agents install distinct model-authored programs and ac
 		eventSequence: 1,
 	})));
 	assert.equal(sent.filter((row) => row.type === 'action_command').length, 16);
-	assert.equal(new Set(sent.map((row) => `${row.agentId}:${row.payload.provenance.programId}`)).size, 16);
-	assert.equal(new Set(sent.map((row) => row.payload.actionId)).size, 16);
+	const commands = sent.filter((row) => row.type === 'action_command');
+	assert.equal(new Set(commands.map((row) => `${row.agentId}:${row.payload.provenance.programId}`)).size, 16);
+	assert.equal(new Set(commands.map((row) => row.payload.actionId)).size, 16);
+	for (const command of commands) {
+		assert.equal(command.payload.provenance.model, 'gpt-5.6-sol');
+		assert.equal(command.payload.provenance.programId, 'program-1-1');
+		assert.match(command.payload.provenance.sourceStepId, /^step-/);
+		assert.equal(Number.isSafeInteger(command.payload.provenance.eventSequence), true);
+	}
+	console.log(`TASK10_SIXTEEN_AGENT_SUMMARY ${JSON.stringify({ scenario: 'sixteen_agent_program_soak', passed: true, agents: agentIds.length, commands: commands.length })}`);
 });

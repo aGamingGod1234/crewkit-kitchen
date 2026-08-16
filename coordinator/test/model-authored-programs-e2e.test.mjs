@@ -1,0 +1,272 @@
+import assert from 'node:assert/strict';
+import { after } from 'node:test';
+import test from 'node:test';
+
+import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
+import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
+import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
+import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { FakeMinecraftBridge, SELECTED_PROFILE, assertCommandProvenance, commandPayloads, observation } from './fixtures/fake-minecraft-bridge.mjs';
+
+const latency = new ControlLatencyRegistry({ windowSize: 20_000 });
+const providerLatencyMs = [];
+const scenarioResults = [];
+
+const LOG_DROP = (stableId, count, x = 8) => ({ stableId, itemId: 'minecraft:oak_log', count, x, y: 64, z: 0, reachable: true, tags: ['#minecraft:logs'] });
+const LOG_TREE = (stableId, x) => ({ stableId, blockId: 'minecraft:oak_log', x, y: 64, z: 0, reachable: true, tags: ['#minecraft:logs'] });
+
+test('collects eight logs across two trees using measured pickup range and provenance', async () => {
+	const harness = createHarness({
+		initialObservation: observation({ blocks: [LOG_TREE('tree-one', 4)] }),
+		onAction: async (command) => {
+			const count = harnessCount(command, harness);
+			if (command.actionType === 'break_block' && count === 1) return { observation: observation({ items: [LOG_DROP('drop-five', 5)] }) };
+			if (command.actionType === 'move_to' && count === 2) return { observation: observation({ blocks: [LOG_TREE('tree-two', 10)], inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } } }) };
+			if (command.actionType === 'break_block' && count === 3) return { observation: observation({ items: [LOG_DROP('drop-three', 3)], inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } } }) };
+			return { observation: observation({ inventory: { items: [{ itemId: 'minecraft:oak_log', count: 8 }], tagCounts: { '#minecraft:logs': 8 } } }) };
+		},
+	});
+	await harness.install(`
+		program.onUnhandledAttention("continue_and_notify");
+		await program.repeatUntil(() => inventory.countTag("#minecraft:logs") >= 8, { maxIterations: 8 }, async () => {
+			const drop = world.nearest(world.items({ tag: "#minecraft:logs", reachable: true }));
+			if (drop !== null) { await player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }); return; }
+			const tree = world.nearest(world.blocks({ tag: "#minecraft:logs", reachable: true }));
+			if (tree !== null) await player.mine({ x: tree.x, y: tree.y, z: tree.z, timeoutMs: 1 });
+		});
+		program.finish("Collected eight logs");
+	`);
+	await eventually(() => harness.managerState() === DynamicAgentState.COMPLETED);
+	assert.deepEqual(commandPayloads(harness.bridge).map((command) => command.actionType), ['break_block', 'move_to', 'break_block', 'move_to']);
+	assertCommandProvenance(commandPayloads(harness.bridge), SELECTED_PROFILE, 'program-1-1');
+	recordScenario('eight_logs_two_trees', harness);
+	recordScenario('drops_outside_pickup_range', harness);
+});
+
+test('reports unreachable and disappearing drops as typed model-visible failures', async () => {
+	const unreachable = createHarness({
+		initialObservation: observation({ items: [LOG_DROP('far-drop', 1, 12)] }),
+		onAction: async () => ({ state: 'FAILED', reasonCode: 'PATH_UNAVAILABLE', observation: observation({ items: [{ ...LOG_DROP('far-drop', 1, 12), reachable: false }] }) }),
+	});
+	await unreachable.install(`
+		program.onUnhandledAttention("continue_and_notify");
+		const drop = world.nearest(world.items({ tag: "#minecraft:logs", reachable: true }));
+		const result = await tryResult(player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }));
+		if (!result.succeeded) program.checkpoint(result.reason);
+		program.finish("picked up");
+	`);
+	await eventually(() => unreachable.managerState() === DynamicAgentState.PAUSED);
+	assert.equal(unreachable.bridge.results[0].reasonCode, 'PATH_UNAVAILABLE');
+	assertCommandProvenance(commandPayloads(unreachable.bridge), SELECTED_PROFILE, 'program-1-1');
+
+	const disappeared = createHarness({
+		initialObservation: observation({ items: [LOG_DROP('vanishing-drop', 1, 6)] }),
+		onAction: async () => ({ observation: observation() }),
+	});
+	await disappeared.install(`
+		program.onUnhandledAttention("continue_and_notify");
+		const drop = world.nearest(world.items({ tag: "#minecraft:logs", reachable: true }));
+		const result = await tryResult(player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }));
+		if (!result.succeeded) program.checkpoint(result.reason);
+		if (inventory.countTag("#minecraft:logs") < 1) program.checkpoint("DROP_NOT_COLLECTED");
+		program.finish("picked up");
+	`);
+	await eventually(() => disappeared.managerState() === DynamicAgentState.PAUSED);
+	assertCommandProvenance(commandPayloads(disappeared.bridge), SELECTED_PROFILE, 'program-1-1');
+	recordScenario('pickup_range_and_drop_disappearance', unreachable, disappeared);
+});
+
+test('runs a matching damage watcher without a provider turn and follows both unmatched policies', async () => {
+	const matching = createHarness({
+		onAction: async (command) => command.actionType === 'break_block'
+			? { attentionObservation: observation({ player: { health: 19 } }), defer: true }
+			: { observation: observation({ player: { health: 19 } }) },
+	});
+	await matching.install(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "interrupt" }, async () => { await player.wait(1); });
+		await player.mine({ x: 1, y: 64, z: 0, timeoutMs: 1 });
+		program.finish("damage handled");
+	`);
+	await eventually(() => matching.bridge.sent.filter((entry) => entry.type === 'action_command').some((entry) => entry.payload.actionType === 'wait'));
+	assert.equal(matching.plannerCalls.length, 0);
+	assert.ok(matching.bridge.sent.some((entry) => entry.type === 'action_cancel'));
+	assertCommandProvenance(commandPayloads(matching.bridge), SELECTED_PROFILE, 'program-1-1');
+
+	const continueHarness = createHarness({
+		onAction: async () => ({ attentionObservation: observation({ player: { health: 19 } }) }),
+	});
+	await continueHarness.install('program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("continued");');
+	await eventually(() => continueHarness.managerState() === DynamicAgentState.COMPLETED);
+	assert.equal(continueHarness.plannerCalls.length, 1);
+	assert.match(continueHarness.plannerCalls[0].input, /program_attention/);
+	assertCommandProvenance(commandPayloads(continueHarness.bridge), SELECTED_PROFILE, 'program-1-1');
+
+	const pauseHarness = createHarness({
+		plannerDecision: (request) => request.input.includes('program_attention') ? { summary: 'Pause.', directive: 'pause' } : null,
+		onAction: async () => ({ attentionObservation: observation({ player: { health: 19 } }), defer: true }),
+	});
+	await pauseHarness.install('program.onUnhandledAttention("pause_and_notify"); await player.wait(1); program.finish("paused");');
+	await eventually(() => pauseHarness.managerState() === DynamicAgentState.PAUSED);
+	assert.equal(pauseHarness.plannerCalls.length, 1);
+	assert.ok(pauseHarness.bridge.sent.some((entry) => entry.type === 'action_cancel'));
+	assertCommandProvenance(commandPayloads(pauseHarness.bridge), SELECTED_PROFILE, 'program-1-1');
+	recordScenario('matching_and_unmatched_damage', matching, continueHarness, pauseHarness);
+});
+
+test('runs a pre-authored fire interrupt at runtime speed without another provider turn', async () => {
+	const harness = createHarness({
+		initialObservation: observation({ player: { fire: false } }),
+		onAction: async (command) => command.actionType === 'break_block'
+			? { attentionObservation: observation({ player: { fire: true } }), defer: true }
+			: { observation: observation({ player: { fire: true } }) },
+	});
+	await harness.install(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().fire === true, { mode: "interrupt" }, async () => { await player.wait(1); });
+		await player.mine({ x: 1, y: 64, z: 0, timeoutMs: 1 });
+	`);
+	await eventually(() => harness.bridge.sent.filter((entry) => entry.type === 'action_command').some((entry) => entry.payload.actionType === 'wait'));
+	assert.equal(harness.plannerCalls.length, 0);
+	assertCommandProvenance(commandPayloads(harness.bridge), SELECTED_PROFILE, 'program-1-1');
+	recordScenario('preauthored_fire_interrupt', harness);
+});
+
+test('pauses when model-authored placement loses its support', async () => {
+	const harness = createHarness({
+		onAction: async () => ({ state: 'FAILED', reasonCode: 'PLACEMENT_SUPPORT_GONE', observation: observation({ blocks: [] }) }),
+	});
+	await harness.install(`
+		program.onUnhandledAttention("continue_and_notify");
+		const result = await tryResult(player.place({ x: 1, y: 64, z: 0, face: "up", itemId: "minecraft:stone" }));
+		if (!result.succeeded) program.checkpoint(result.reason);
+		program.finish("placed");
+	`);
+	await eventually(() => harness.managerState() === DynamicAgentState.PAUSED);
+	assert.equal(harness.bridge.results[0].reasonCode, 'PLACEMENT_SUPPORT_GONE');
+	assertCommandProvenance(commandPayloads(harness.bridge), SELECTED_PROFILE, 'program-1-1');
+	recordScenario('disappearing_placement_support', harness);
+});
+
+test('pauses on path failure and timeout without selecting a replacement destination', async () => {
+	const harness = createHarness({
+		onAction: async () => ({ state: 'TIMED_OUT', reasonCode: 'PATH_TIMEOUT', observation: observation() }),
+	});
+	await harness.install(`
+		program.onUnhandledAttention("continue_and_notify");
+		const result = await tryResult(player.navigateTo({ x: 5, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1 }));
+		if (!result.succeeded) program.checkpoint(result.reason);
+		program.finish("arrived");
+	`);
+	await eventually(() => harness.managerState() === DynamicAgentState.PAUSED);
+	assert.equal(harness.bridge.results[0].state, 'TIMED_OUT');
+	assert.equal(commandPayloads(harness.bridge).length, 1);
+	assertCommandProvenance(commandPayloads(harness.bridge), SELECTED_PROFILE, 'program-1-1');
+	recordScenario('path_failure_and_timeout', harness);
+});
+
+test('retains the selected model session and performs only model-commanded respawn', async () => {
+	const harness = createHarness({ initialObservation: observation({ player: { dead: true, health: 0 } }), onAction: async () => ({ observation: observation({ player: { dead: false, health: 20 } }) }) });
+	await harness.install(`
+		program.onUnhandledAttention("continue_and_notify");
+	if (player.state().dead === true) await player.respawn();
+		program.finish("respawned");
+	`);
+	await eventually(() => harness.managerState() === DynamicAgentState.COMPLETED);
+	const commands = commandPayloads(harness.bridge);
+	assert.deepEqual(commands.map((command) => command.actionType), ['respawn']);
+	assert.equal(harness.profile.model, SELECTED_PROFILE.model);
+	assertCommandProvenance(commands, SELECTED_PROFILE, 'program-1-1');
+	recordScenario('death_retention_and_model_respawn', harness);
+});
+
+test('corrects invalid source through the same selected model', async () => {
+	const harness = createHarness({
+		plannerDecision: (request) => request.input.includes('arena_script_compiler_error')
+			? { summary: 'Corrected.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("corrected");' }
+			: null,
+	});
+	await harness.install('program.onUnhandledAttention("continue_and_notify"); await player.wait(');
+	await eventually(() => harness.managerState() === DynamicAgentState.COMPLETED);
+	assert.equal(harness.plannerCalls.length, 1);
+	assert.ok(harness.plannerCalls.every((call) => call.agentId === SELECTED_PROFILE.agentId && call.model === SELECTED_PROFILE.model));
+	assertCommandProvenance(commandPayloads(harness.bridge), SELECTED_PROFILE, 'program-1-1');
+	recordScenario('same_model_source_correction', harness);
+});
+
+test('rejects a physical command without model-program provenance before bridge acceptance', async () => {
+	const harness = createHarness();
+	await assert.rejects(
+		() => harness.bridge.send('action_command', SELECTED_PROFILE.agentId, { goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
+		(error) => /provenance|MISSING_FIELD/i.test(error.message),
+	);
+	assert.equal(commandPayloads(harness.bridge).length, 0);
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
+		/provenance|MISSING_FIELD/i,
+	);
+	scenarioResults.push({ name: 'provenance_rejection', passed: true });
+});
+
+function createHarness({ initialObservation = observation(), onAction = async () => ({ observation: initialObservation }), plannerDecision = () => null } = {}) {
+	const registry = new AgentRegistry({ agentCap: 1 });
+	const profile = { ...SELECTED_PROFILE };
+	registry.register({ ...profile, state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'Task 10 E2E', queue: [] });
+	const record = registry.get(profile.agentId);
+	const plannerCalls = [];
+	let plannerTime = 0;
+	const planner = {
+		requestPlan: async (request) => {
+			plannerTime += 4;
+			providerLatencyMs.push(plannerTime);
+			const call = { ...request, model: record.model };
+			plannerCalls.push(call);
+			return plannerDecision(request) ?? { summary: 'Continue.', directive: 'continue' };
+		},
+	};
+	const harness = { profile, plannerCalls, manager: null, bridge: null, count: new Map(), totalCommands: 0, install: null, managerState: () => registry.get(profile.agentId).state };
+	const bridge = new FakeMinecraftBridge({ record, initialObservation, onAction: async (command, fakeBridge) => {
+		harness.count.set(command.actionType, (harness.count.get(command.actionType) ?? 0) + 1);
+		harness.totalCommands += 1;
+		return onAction(command, fakeBridge);
+	} });
+	const manager = new ProgramRuntimeManager({ registry, bridge, planner, latencyRegistry: latency, clock: () => ++harness.clock });
+	harness.clock = 0;
+	bridge.attach(manager);
+	harness.manager = manager;
+	harness.bridge = bridge;
+	harness.install = (source) => manager.installDecision(record, { summary: 'Task 10 source', directive: 'replace', source }, { observation: initialObservation, eventSequence: 1 });
+	return harness;
+}
+
+function harnessCount(command, harness) {
+	return harness.totalCommands;
+}
+
+function recordScenario(name, ...harnesses) {
+	scenarioResults.push({ name, passed: true, commands: harnesses.reduce((total, harness) => total + commandPayloads(harness.bridge).length, 0) });
+}
+
+after(() => {
+	const local = latency.snapshot();
+	const provider = [{ operation: 'provider_inference', ...summarize(providerLatencyMs) }];
+	console.log(`TASK10_E2E_SUMMARY ${JSON.stringify({ scenarios: scenarioResults, passed: scenarioResults.length, local, provider })}`);
+});
+
+async function eventually(predicate, message = 'condition was not reached') {
+	const deadline = Date.now() + 2_000;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 2));
+	}
+	throw new Error(message);
+}
+
+function summarize(values) {
+	const sorted = [...values].sort((left, right) => left - right);
+	return sorted.length === 0 ? { count: 0, p50Ms: null, p95Ms: null } : { count: sorted.length, p50Ms: percentile(sorted, 0.5), p95Ms: percentile(sorted, 0.95) };
+}
+
+function percentile(sorted, fraction) {
+	return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)];
+}

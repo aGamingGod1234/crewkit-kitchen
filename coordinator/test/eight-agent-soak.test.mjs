@@ -102,6 +102,7 @@ test('eight-agent fake-provider soak preserves capacity, isolation, cancellation
 		health.record(telemetry('gemini', null));
 		assert.equal(health.snapshot(geminiHealth).circuit, 'closed');
 		assert.equal(health.snapshot(codexHealth).count, 0, 'provider samples remain isolated');
+		console.log(`TASK10_EIGHT_AGENT_SUMMARY ${JSON.stringify({ scenario: 'eight_agent_fake_provider_soak', passed: true, agents: 8, maxConcurrent: scheduler.maxConcurrent, maxPending: scheduler.maxPending, pressureWarning: true, cancellation: 'all-rejected', providerCircuitRecovery: true })}`);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
