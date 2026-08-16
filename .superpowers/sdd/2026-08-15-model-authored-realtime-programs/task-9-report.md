@@ -12,8 +12,8 @@ Status: complete.
 
 ## Verification
 
-- Focused Node tests: 40/40 passed for the review-critical trace/parser/schema/protocol/E2E set.
-- Full coordinator suite: 281/281 passed, 0 failed.
+- Focused Node tests: 41/41 passed for the review-critical trace/parser/schema/protocol/E2E set.
+- Full coordinator suite: 282/282 passed, 0 failed.
 - Dirty Java25 `verifyCore`: 6,019 assertions passed.
 - Clean Java25 `clean verifyCore --rerun-tasks --no-daemon --console=plain`: 6,019 assertions passed.
 - No live Minecraft/provider acceptance is claimed; live gameplay and provider latency remain an operator verification boundary.
@@ -23,7 +23,7 @@ Status: complete.
 SHA-256 hashes from the verified working tree (`Get-FileHash -Algorithm SHA256`):
 
 - `README.md`: `E1E1762361B004F07D68788D62F3374404768852BF70A2B5A007C74708638308`
-- `coordinator/src/trace-writer.mjs`: `ACE8BDA5E5930983100190533FAC01B6C531F2B6AD63FFF7D217427B29ADD674`
+- `coordinator/src/trace-writer.mjs`: `FC0F8219EE2830E636371DFCCDB916E87F9B328A7C8028EF4ADA785B8132CCF8`
 - `coordinator/src/program-runtime-manager.mjs`: `426D3543D005EEF89B484E0E8D3A16E63131255BF7F9DF0250B59AC575913CCA`
 - `coordinator/src/dynamic-main.mjs`: `66890AAA08380E7DA5574C23635B8CF750718BE15B3DC44A9865703EC0C55F8E`
 - `coordinator/src/decision-parser.mjs`: `C3FB1186A653104B5731953797EB3108042A810312E3C57D0D67AB38E4BF9CF6`

@@ -118,3 +118,22 @@ test('caps serialized rows including huge keys and unsupported non-string values
 	assert.equal(row.count, 7);
 	assert.doesNotMatch(rows[0], /k{100}/);
 });
+
+test('reserves truncation-marker bytes at the serialized line boundary', async () => {
+	const lines = [];
+	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {
+		mkdir: async () => {},
+		appendFile: async (_path, value) => lines.push(value),
+	});
+	const fields = Object.fromEntries(Array.from({ length: 64 }, (_, index) => [
+		`${String(index).padStart(2, '0')}-${'k'.repeat(4_200)}`, `🙂${index}`,
+	]));
+	await writer.write('near-boundary', fields);
+	await writer.close();
+	assert.ok(Buffer.byteLength(lines[0], 'utf8') >= 250_000, 'fixture must exercise the near-boundary path');
+	assert.ok(Buffer.byteLength(lines[0], 'utf8') <= 262_144, 'JSONL line including newline must fit the trace cap');
+	const row = JSON.parse(lines[0]);
+	assert.equal(row.event, 'near-boundary');
+	assert.equal(row.truncated, '[BOUNDED]');
+	assert.doesNotMatch(lines[0], /\uD800|\uDFFF/);
+});

@@ -12,6 +12,8 @@ const MAX_TRACE_ENTRIES = 64;
 const MAX_TRACE_DEPTH = 8;
 const MAX_TRACE_NODES = 512;
 const MAX_TRACE_BYTES = 262_144;
+// The JSONL newline consumes one byte, so the serialized object reserves it.
+const MAX_TRACE_ROW_BYTES = MAX_TRACE_BYTES - 1;
 const SENSITIVE_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
 const SENSITIVE_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 
@@ -178,16 +180,16 @@ function sanitizeValue(value, state, depth = 0, key = null) {
 function boundSerializedRow(row) {
 	let encoded;
 	try { encoded = JSON.stringify(row); } catch { encoded = null; }
-	if (encoded !== null && Buffer.byteLength(encoded, 'utf8') <= MAX_TRACE_BYTES) return row;
+	if (encoded !== null && Buffer.byteLength(encoded, 'utf8') <= MAX_TRACE_ROW_BYTES) return row;
 	const bounded = Object.create(null);
+	Object.defineProperty(bounded, 'truncated', { enumerable: true, configurable: true, writable: true, value: BOUNDED });
 	for (const key of Object.keys(row)) {
 		if (key !== 'event' && !['string', 'number', 'boolean'].includes(typeof row[key]) && row[key] !== null) continue;
 		Object.defineProperty(bounded, key, { enumerable: true, configurable: true, writable: true, value: row[key] });
 		let candidate;
 		try { candidate = JSON.stringify(bounded); } catch { delete bounded[key]; continue; }
-		if (Buffer.byteLength(candidate, 'utf8') > MAX_TRACE_BYTES) delete bounded[key];
+		if (Buffer.byteLength(candidate, 'utf8') > MAX_TRACE_ROW_BYTES) delete bounded[key];
 	}
-	Object.defineProperty(bounded, 'truncated', { enumerable: true, configurable: true, writable: true, value: BOUNDED });
 	return bounded;
 }
 
