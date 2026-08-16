@@ -1,7 +1,7 @@
 # Model-authored real-time programs live QA
 
 Date prepared: 2026-08-16
-Implementation baseline: `7bdd98b2ea3e55d5d3d5f6bb240d4c7c4f2ac5f9`
+Implementation baseline: `ef956a043aae88d8933036f5629ab7b10ca2c50b`
 
 ## Acceptance boundary
 
@@ -15,13 +15,13 @@ Record these values from the same run. Do not record secrets, access tokens, or 
 
 | Field | Value | Evidence / command |
 | --- | --- | --- |
-| Git commit | `7bdd98b2ea3e55d5d3d5f6bb240d4c7c4f2ac5f9` | `git rev-parse HEAD` |
+| Git commit | `ef956a043aae88d8933036f5629ab7b10ca2c50b` | `git rev-parse HEAD` |
 | Mod JAR path | `build/libs/arena-agents-0.1.0.jar` | `Get-FileHash -Algorithm SHA256` |
 | Normal profile deployment target | `C:\Users\aGamingGod\AppData\Roaming\.minecraft` | Headless deployment check |
-| Mod JAR SHA-256 | `A72D80736B4DA6FF71786B1BB1F50543BE75DF436900403F284188E4070B788D` | Built JAR; matched installed copy headlessly |
-| Installed JAR SHA-256 | `A72D80736B4DA6FF71786B1BB1F50543BE75DF436900403F284188E4070B788D` | Headless build/install parity passed |
+| Mod JAR SHA-256 | `5B45374823CD86698179205389D10BE99D9B582C0BA1083987AF52F82F68B092` | Built JAR; matched installed copy headlessly |
+| Installed JAR SHA-256 | `5B45374823CD86698179205389D10BE99D9B582C0BA1083987AF52F82F68B092` | Headless build/install parity passed |
 | Coordinator distribution parity | 49 source/archive/installed files passed | Headless parity check |
-| Rollback backup | `C:\Users\aGamingGod\AppData\Roaming\.minecraft\.arena-agents-backup-20260816T091100Z-0440f523bebb43f284debe3ac7ac3599` | Previous 1,495,130-byte JAR and coordinator preserved |
+| Rollback backup | `C:\Users\aGamingGod\AppData\Roaming\.minecraft\.arena-agents-backup-20260816T093958Z-4c48819fbed14983937d49c434410e54` | Previous JAR and coordinator preserved |
 | Coordinator source `dynamic-main.mjs` SHA-256 | `5D7EBE99A0D0B6F57B1EABC24421228D851E1D41D51893AC6214AA0E84C0FE2D` | Current source hash |
 | Coordinator source `program-runtime-manager.mjs` SHA-256 | `426D3543D005EEF89B484E0E8D3A16E63131255BF7F9DF0250B59AC575913CCA` | Current source hash |
 | Decision parser SHA-256 | `C3FB1186A653104B5731953797EB3108042A810312E3C57D0D67AB38E4BF9CF6` | Current source hash |
@@ -73,14 +73,14 @@ Acceptance target: local fact-change-to-command median within one server tick an
 
 Fresh Task 10 gate evidence from the repository checkout:
 
-- Focused Node gate: 140/140 tests passed, including ArenaScript facts/interpreter/parser/program-engine, manager, protocol, and E2E files.
+- Full coordinator suite: 306/306 tests passed in the working checkout; a fresh clean export after `npm ci` passed 305/305.
 - E2E scenarios: 10/10 scenario records passed across 11 E2E tests.
-- Java `verifyCore`: `PASS: 6052 protocol and bridge assertions`.
-- Full performance/reliability verifier: passed the clean automated verifier, this Task 10 gate, and `50/50` eight-agent soak runs in `57.8s`.
+- Java `verifyCore`: `PASS: 6060 protocol and bridge assertions`; a clean export passed 5,658 committed assertions.
+- Full performance/reliability verifier: passed the automated verifier, model-authored gate, and `50/50` eight-agent soak runs in `58.4s`.
 - E2E timing basis: `deterministic_fake_clock`; local and provider p50/p95 values are synthetic fixture timing and are **not measured live latency**.
 - Synthetic local segments: `action_completion` 20 samples p50 2 ms / p95 2 ms; `branch_to_bridge_send` 3 samples p50 1 ms / p95 1 ms; `command_to_first_progress` 20 samples p50 1 ms / p95 1 ms; `event_receipt_to_branch` 3 samples p50 3 ms / p95 3 ms; `minecraft_change_to_publication` 5 samples p50 1 ms / p95 1 ms.
 - Synthetic provider segment: `provider_inference` 2 samples p50 4 ms / p95 4 ms.
-- Real monotonic-clock manager benchmark: `branch_to_bridge_send` 1,000 samples p50 0.0104 ms / p95 0.0291 ms; `event_receipt_to_branch` 1,000 samples p50 0.0924 ms / p95 0.3988 ms. These values come from `performance.now()` in the existing 1,000-branch benchmark, not from Minecraft or a provider.
+- Real monotonic-clock manager benchmark from the final clean export: `branch_to_bridge_send` 1,000 samples p50 0.0099 ms / p95 0.0244 ms; `event_receipt_to_branch` 1,000 samples p50 0.0891 ms / p95 0.2922 ms. These values come from `performance.now()` in the existing 1,000-branch benchmark, not from Minecraft or a provider.
 
 These results establish headless protocol/interpreter behavior only. They do not establish live Minecraft behavior, physical outcomes, model-provider availability, or live latency.
 
@@ -108,7 +108,7 @@ Evidence from the fresh command above:
 | Gate | Owner | Status | Evidence |
 | --- | --- | --- | --- |
 | Headless Task 10 gate | Codex | Pass for the recorded checkout | Fresh command output above |
-| Performance verifier and 50/50 soak | Codex | Pass | Full verifier + Task 10 gate + 50/50 soak in 57.8s |
+| Performance verifier and 50/50 soak | Codex | Pass | Full verifier + model-authored gate + 50/50 soak in 58.4s |
 | Jar/distribution hash parity | Codex | Pass (headless only) | JAR hash equality and 49-file coordinator parity above |
 | Live Minecraft behavior | Lucas | **Pending Lucas** | Fill checklist and tables |
 | Authority audit | Codex | Pass (source audit only) | Fresh rg evidence above; live behavior remains pending Lucas |

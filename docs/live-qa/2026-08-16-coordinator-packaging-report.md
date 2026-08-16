@@ -26,10 +26,10 @@ Result: Java 25 build succeeded; the coordinator manifest contains 49 files and 
 Built JAR SHA-256:
 
 ```text
-A72D80736B4DA6FF71786B1BB1F50543BE75DF436900403F284188E4070B788D
+5B45374823CD86698179205389D10BE99D9B582C0BA1083987AF52F82F68B092
 ```
 
-No Minecraft process was launched during this verification. The normal `.minecraft` profile was then updated transactionally, and installed staging parity passed with all 49 coordinator files matching source and archive hashes. The retained rollback backup is `C:\Users\aGamingGod\AppData\Roaming\.minecraft\.arena-agents-backup-20260816T091100Z-0440f523bebb43f284debe3ac7ac3599`.
+No Minecraft process was launched during this verification. The normal `.minecraft` profile was then updated transactionally, and installed staging parity passed with all 49 coordinator files matching source and archive hashes. The retained rollback backup is `C:\Users\aGamingGod\AppData\Roaming\.minecraft\.arena-agents-backup-20260816T093958Z-4c48819fbed14983937d49c434410e54`.
 
 Installed staging parity can be repeated with:
 
