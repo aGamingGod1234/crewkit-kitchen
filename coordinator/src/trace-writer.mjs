@@ -126,27 +126,53 @@ function context(allowSource) {
 }
 
 function sanitizeValue(value, state, depth = 0, key = null) {
-	if (typeof value === 'string') return sanitizeString(value, state, key === 'source' && state.allowSource);
-	if (value === null || typeof value !== 'object') return value;
-	if (depth > MAX_TRACE_DEPTH || state.nodes++ >= MAX_TRACE_NODES) return BOUNDED;
-	if (nodeTypes.isProxy(value)) return UNSAFE;
-	if (state.seen.has(value)) return '[CIRCULAR]';
-	state.seen.add(value);
-	let keys;
-	try { keys = Reflect.ownKeys(value); } catch { return UNSAFE; }
-	const output = Array.isArray(value) ? [] : Object.create(null);
-	let entries = 0;
-	for (const property of keys) {
-		if (typeof property !== 'string' || entries >= MAX_TRACE_ENTRIES) continue;
-		let descriptor;
-		try { descriptor = Object.getOwnPropertyDescriptor(value, property); } catch { continue; }
-		if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
-		entries += 1;
-		if (SENSITIVE_KEY.test(property)) output[property] = REDACTED;
-		else if (property === 'source' && !state.allowSource) continue;
-		else output[property] = sanitizeValue(descriptor.value, state, depth + 1, property);
+	const root = { value: undefined };
+	const work = [{ value, assign: (result) => { root.value = result; }, depth, key }];
+	while (work.length > 0) {
+		const task = work.pop();
+		const input = task.value;
+		if (typeof input === 'string') {
+			task.assign(sanitizeString(input, state, task.key === 'source' && state.allowSource));
+			continue;
+		}
+		if (input === null || typeof input !== 'object') {
+			task.assign(input);
+			continue;
+		}
+		if (task.depth > MAX_TRACE_DEPTH || state.nodes++ >= MAX_TRACE_NODES) {
+			task.assign(BOUNDED);
+			continue;
+		}
+		if (nodeTypes.isProxy(input)) {
+			task.assign(UNSAFE);
+			continue;
+		}
+		if (state.seen.has(input)) {
+			task.assign('[CIRCULAR]');
+			continue;
+		}
+		state.seen.add(input);
+		let keys;
+		try { keys = Reflect.ownKeys(input); } catch { task.assign(UNSAFE); continue; }
+		const output = Array.isArray(input) ? [] : Object.create(null);
+		task.assign(output);
+		const children = [];
+		let entries = 0;
+		for (const property of keys) {
+			if (typeof property !== 'string' || entries >= MAX_TRACE_ENTRIES) continue;
+			let descriptor;
+			try { descriptor = Object.getOwnPropertyDescriptor(input, property); } catch { continue; }
+			if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
+			entries += 1;
+			if (SENSITIVE_KEY.test(property)) output[property] = REDACTED;
+			else if (property === 'source' && !state.allowSource) continue;
+			else children.push({ value: descriptor.value, assign: (result) => { Object.defineProperty(output, property, { enumerable: true, configurable: true, writable: true, value: result }); }, depth: task.depth + 1, key: property });
+		}
+		for (let index = children.length - 1; index >= 0; index -= 1) {
+			work.push(children[index]);
+		}
 	}
-	return output;
+	return root.value;
 }
 
 function sanitizeString(value, state, allowLongSource) {
