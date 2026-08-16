@@ -74,10 +74,11 @@ Fresh Task 10 gate evidence from the repository checkout:
 - Focused Node gate: 140/140 tests passed, including ArenaScript facts/interpreter/parser/program-engine, manager, protocol, and E2E files.
 - E2E scenarios: 10/10 scenario records passed across 11 E2E tests.
 - Java `verifyCore`: `PASS: 6019 protocol and bridge assertions`.
-- Full performance/reliability verifier: passed the clean automated verifier, this Task 10 gate, and `50/50` eight-agent soak runs in `73.0s`.
+- Full performance/reliability verifier: passed the clean automated verifier, this Task 10 gate, and `50/50` eight-agent soak runs in `70.9s`.
 - E2E timing basis: `deterministic_fake_clock`; local and provider p50/p95 values are synthetic fixture timing and are **not measured live latency**.
 - Synthetic local segments: `action_completion` 20 samples p50 2 ms / p95 2 ms; `branch_to_bridge_send` 3 samples p50 1 ms / p95 1 ms; `command_to_first_progress` 20 samples p50 1 ms / p95 1 ms; `event_receipt_to_branch` 3 samples p50 3 ms / p95 3 ms; `minecraft_change_to_publication` 5 samples p50 1 ms / p95 1 ms.
 - Synthetic provider segment: `provider_inference` 2 samples p50 4 ms / p95 4 ms.
+- Real monotonic-clock manager benchmark: `branch_to_bridge_send` 1,000 samples p50 0.0118 ms / p95 0.0372 ms; `event_receipt_to_branch` 1,000 samples p50 0.1072 ms / p95 0.3966 ms. These values come from `performance.now()` in the existing 1,000-branch benchmark, not from Minecraft or a provider.
 
 These results establish headless protocol/interpreter behavior only. They do not establish live Minecraft behavior, physical outcomes, model-provider availability, or live latency.
 
@@ -96,7 +97,7 @@ Authority audit result: **Fresh source audit recorded; live acceptance remains p
 Evidence from the fresh command above:
 
 - Normal coordinator dispatch is `program-runtime-manager.mjs:380`, where the interpreter's model-authored command is sent as `action_command`.
-- Java normal dispatch is `MultiplexedServerBridge.java:467`, where the accepted request enters `submitProgramPrimitive`; the surrounding bridge validation at lines 510 and 555-557 checks the exact payload, provenance/revision, and dead-state rule before execution.
+- Java normal dispatch is `src/main/java/dev/agaminggod/arenaagents/server/bridge/MultiplexedServerBridge.java:467`, where the accepted request enters `submitProgramPrimitive`; the surrounding bridge validation at lines 510 and 555-557 checks the exact payload, provenance/revision, and dead-state rule before execution.
 - `fight_target`, `flee_from`, `pick_up_item`, and `build_sequence` were not found in the normal coordinator/server search results as runtime strategy dispatch names. Respawn references remain in the explicit ArenaScript API and lifecycle reconciliation paths and are not evidence of an automatic model-independent gameplay choice.
 - This is a source-text audit only. It cannot establish provider behavior, a running Minecraft client's physical result, or live latency; those remain operator gates.
 
@@ -105,7 +106,7 @@ Evidence from the fresh command above:
 | Gate | Owner | Status | Evidence |
 | --- | --- | --- | --- |
 | Headless Task 10 gate | Codex | Pass for the recorded checkout | Fresh command output above |
-| Performance verifier and 50/50 soak | Codex | Pass | Full verifier + Task 10 gate + 50/50 soak in 73.0s |
+| Performance verifier and 50/50 soak | Codex | Pass | Full verifier + Task 10 gate + 50/50 soak in 70.9s |
 | Jar/distribution hash parity | Codex/Lucas | Pending | Record exact hashes |
 | Live Minecraft behavior | Lucas | **Pending Lucas** | Fill checklist and tables |
-| Authority audit | Codex | Pending fresh audit | Record rg output and limitations |
+| Authority audit | Codex | Pass (source audit only) | Fresh rg evidence above; live behavior remains pending Lucas |

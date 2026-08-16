@@ -107,6 +107,10 @@ test('measures one thousand watcher branches with the real monotonic clock', asy
 		}
 	}
 	const snapshot = latencies.snapshot();
+	console.log(`REAL_TIMER_LATENCY_SUMMARY ${JSON.stringify({
+		basis: 'performance_now_monotonic_clock',
+		segments: snapshot.filter(({ operation }) => ['event_receipt_to_branch', 'branch_to_bridge_send'].includes(operation)),
+	})}`);
 	for (const operation of ['event_receipt_to_branch', 'branch_to_bridge_send']) {
 		const metric = snapshot.find((entry) => entry.operation === operation);
 		assert.ok(metric, `${operation} is recorded`);
