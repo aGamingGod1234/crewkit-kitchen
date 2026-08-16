@@ -64,7 +64,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public static final int DEFAULT_PORT = 25_570;
 	public static final int CONNECTION_QUEUE_CAP = 256;
 	public static final int AGENT_QUEUE_CAP = 32;
-	private static final int OBSERVATIONS_PER_TICK = 8;
+	private static final int OBSERVATIONS_PER_TICK = AgentConstants.DEFAULT_AGENT_LIMIT;
 	private static final int HANDSHAKE_TIMEOUT_MS = 5_000;
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
@@ -85,6 +85,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final String secret;
 	private final int port;
 	private final ConcurrentLinkedQueue<Runnable> serverTasks = new ConcurrentLinkedQueue<>();
+	private final Object publicationLifecycleLock = new Object();
 	private final AtomicBoolean running = new AtomicBoolean();
 	private final AtomicLong messageIds = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
@@ -139,10 +140,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 		}
 		actionExecutor.tick();
-		for (AgentId agentId : observations.changedActiveAgents()) {
+		for (AgentId agentId : registeredObservationIds(manager.records())) {
 			queueObservation(agentId);
 		}
 		observationQueue.drain(this::sendObservation);
+	}
+
+	static List<AgentId> registeredObservationIds(List<AgentRecord> records) {
+		Objects.requireNonNull(records, "records must not be null");
+		// The product protocol is hard-capped at 16 agents even if restored data is malformed.
+		return records.stream()
+				.map(AgentRecord::agentId)
+				.limit(AgentConstants.DEFAULT_AGENT_LIMIT)
+				.toList();
 	}
 
 	public boolean authenticated() {
@@ -283,6 +293,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!MessageDigest.isEqual(secret.getBytes(StandardCharsets.UTF_8), supplied.getBytes(StandardCharsets.UTF_8))) {
 			throw new BridgeProtocolException("AUTHENTICATION_FAILED", "Bridge secret did not match");
 		}
+		resetObservationPublication();
 		source.authenticated.set(true);
 		catalogProfiles = Set.of();
 		catalogModels = AgentControlCatalog.fallbackOptions();
@@ -711,21 +722,23 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void sendCollectedObservation(AgentId agentId, JsonObject observation) {
 		try {
-			long eventSequence = observationSequences.incrementAndGet();
-			AttentionFactDelta delta = publishedObservations.delta(
-					agentId, observation, eventSequence,
-					observation.get("observedAtEpochMs").getAsLong()
-			);
-			observation.addProperty("eventSequence", delta.eventSequence());
-			observation.addProperty("attention", delta.attention());
-			JsonArray changedFacts = new JsonArray();
-			delta.changedFacts().forEach(changedFacts::add);
-			observation.add("changedFacts", changedFacts);
-			if (!sendObservationEnvelope(agentId, observation)) {
-				retryObservation(agentId);
-				return;
+			synchronized (publicationLifecycleLock) {
+				long eventSequence = observationSequences.incrementAndGet();
+				AttentionFactDelta delta = publishedObservations.delta(
+						agentId, observation, eventSequence,
+						observation.get("observedAtEpochMs").getAsLong()
+				);
+				observation.addProperty("eventSequence", delta.eventSequence());
+				observation.addProperty("attention", delta.attention());
+				JsonArray changedFacts = new JsonArray();
+				delta.changedFacts().forEach(changedFacts::add);
+				observation.add("changedFacts", changedFacts);
+				if (!sendObservationEnvelope(agentId, observation)) {
+					retryObservation(agentId);
+					return;
+				}
+				publishedObservations.commit(agentId, observation);
 			}
-			publishedObservations.commit(agentId, observation);
 		} catch (BridgeProtocolException exception) {
 			if (isTransientObservationDelivery(exception)) retryObservation(agentId);
 			else LOGGER.warn("Dropping observation delivery for {}: {}", agentId, exception.getMessage());
@@ -745,6 +758,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			queueObservation(agentId);
 		} catch (RuntimeException exception) {
 			LOGGER.debug("Could not retain observation retry for {}: {}", agentId, exception.getMessage());
+		}
+	}
+
+	private void resetObservationPublication() {
+		synchronized (publicationLifecycleLock) {
+			observationQueue.clear();
+			publishedObservations.clear();
 		}
 	}
 
@@ -973,29 +993,35 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			this.retryCapacity = retryCapacity;
 		}
 
-		public AttentionFactDelta delta(AgentId agentId, JsonObject current, long eventSequence, long observedAtEpochMs) {
+		public synchronized AttentionFactDelta delta(AgentId agentId, JsonObject current, long eventSequence, long observedAtEpochMs) {
+			Objects.requireNonNull(agentId, "agentId must not be null");
 			return AttentionFactDelta.between(delivered.get(agentId), current, eventSequence, observedAtEpochMs);
 		}
 
-		public void commit(AgentId agentId, JsonObject deliveredObservation) {
+		public synchronized void commit(AgentId agentId, JsonObject deliveredObservation) {
 			delivered.put(agentId, deliveredObservation.deepCopy());
 			dirty.remove(agentId);
 		}
 
-		public boolean markDirty(AgentId agentId) {
+		public synchronized boolean markDirty(AgentId agentId) {
 			if (dirty.contains(agentId)) return true;
 			if (dirty.size() >= retryCapacity) return false;
 			dirty.add(agentId);
 			return true;
 		}
 
-		public void remove(AgentId agentId) {
+		public synchronized void remove(AgentId agentId) {
 			delivered.remove(agentId);
 			dirty.remove(agentId);
 		}
 
-		public int retainedCount() {
+		public synchronized int retainedCount() {
 			return delivered.size() + dirty.size();
+		}
+
+		public synchronized void clear() {
+			delivered.clear();
+			dirty.clear();
 		}
 	}
 
@@ -1126,6 +1152,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			interruptPeer(writerThread);
 			try { socket.close(); } catch (IOException ignored) { }
 			if (session == this) {
+				resetObservationPublication();
 				session = null;
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();

@@ -30,6 +30,10 @@ public final class ObservationDispatchQueue<T> {
 		return pending.remove(Objects.requireNonNull(identity, "identity must not be null"));
 	}
 
+	public synchronized void clear() {
+		pending.clear();
+	}
+
 	public void drain(Consumer<T> consumer) {
 		Objects.requireNonNull(consumer, "consumer must not be null");
 		for (int emitted = 0; emitted < maximumPerDrain; emitted++) {

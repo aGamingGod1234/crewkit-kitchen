@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.perception;
 
 import com.google.gson.JsonObject;
+import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import java.util.ArrayList;
@@ -24,6 +25,21 @@ public final class ObservationBudgetVerification {
 		assertTrue(delta.changedFacts().contains("currentAction"), "action delta is factual");
 		assertFalse(delta.changedFacts().stream().anyMatch(path -> path.contains("danger") || path.contains("flee") || path.contains("fight")),
 				"deltas do not invent tactical labels");
+		JsonObject factualBefore = observation(20.0D, false, 0.0D, "idle");
+		JsonObject factualAfter = factualBefore.deepCopy();
+		factualAfter.getAsJsonObject("player").addProperty("health", 18.0D);
+		factualAfter.getAsJsonObject("inventory").addProperty("selectedItem", "minecraft:torch");
+		factualAfter.getAsJsonArray("entities").add(entity(1));
+		factualAfter.getAsJsonArray("blocks").add(block(1));
+		factualAfter.getAsJsonObject("world").addProperty("raining", true);
+		AttentionFactDelta worldDelta = AttentionFactDelta.between(factualBefore, factualAfter, 8L, 124L);
+		assertTrue(worldDelta.attention(), "idle observations publish non-action factual changes");
+		assertTrue(worldDelta.changedFacts().contains("player.health"), "damage changes are eligible without action progress");
+		assertTrue(worldDelta.changedFacts().contains("inventory"), "inventory changes are eligible without action progress");
+		assertTrue(worldDelta.changedFacts().contains("entities.00000000-0000-0000-0000-000000000001"),
+				"entity changes are eligible without action progress");
+		assertTrue(worldDelta.changedFacts().contains("blocks.1,64,0"), "block changes are eligible without action progress");
+		assertTrue(worldDelta.changedFacts().contains("world"), "weather changes are eligible without action progress");
 		AttentionFactDelta initialDelta = AttentionFactDelta.between(null, current, 1L, 123L);
 		assertFalse(initialDelta.attention(), "initial observation is not attention");
 		assertEquals(List.of(), initialDelta.changedFacts(), "initial observation has no changed facts");
@@ -58,6 +74,20 @@ public final class ObservationBudgetVerification {
 				"retry retains the last delivered baseline and factual material change");
 		publication.commit(retryAgent, current);
 		assertFalse(publication.delta(retryAgent, current, 12L, 128L).attention(), "successful retry advances the delivered baseline");
+		MultiplexedServerBridge.PublishedObservationState boundedPublication =
+				new MultiplexedServerBridge.PublishedObservationState(AgentConstants.DEFAULT_AGENT_LIMIT);
+		for (int index = 0; index < AgentConstants.DEFAULT_AGENT_LIMIT; index++) {
+			boundedPublication.markDirty(AgentId.parse(String.format("00000000-0000-0000-0000-%012d", index + 100)));
+		}
+		AgentId overflowRetry = AgentId.parse("00000000-0000-0000-0000-000000000116");
+		assertFalse(boundedPublication.markDirty(overflowRetry), "failed deliveries stop at the bounded retry capacity");
+		assertTrue(boundedPublication.markDirty(AgentId.parse("00000000-0000-0000-0000-000000000100")),
+				"a repeated failed delivery remains retry-safe without another marker");
+		assertEquals(AgentConstants.DEFAULT_AGENT_LIMIT, boundedPublication.retainedCount(),
+				"failed-delivery retry markers remain bounded");
+		boundedPublication.clear();
+		assertEquals(0, boundedPublication.retainedCount(),
+				"session loss clears old delivered baselines before reconnect");
 		ObservationDispatchQueue<AgentId> removedQueue = new ObservationDispatchQueue<>(16, 8);
 		removedQueue.offer(retryAgent);
 		publication.markDirty(retryAgent);
@@ -80,15 +110,18 @@ public final class ObservationBudgetVerification {
 		List<String> second = new ArrayList<>();
 		queue.drain(second::add);
 		assertEquals(List.of("agent-c"), second, "remaining observation is deferred to the next drain");
+		queue.offer("stale-agent");
+		queue.clear();
+		assertEquals(0, queue.pendingCount(), "session loss clears stale queued observations before reconnect");
 
-		ObservationSectionCache<String, JsonObject> cache = new ObservationSectionCache<>(2, 10L, JsonObject::deepCopy);
+		ObservationSectionCache<String, JsonObject> cache = new ObservationSectionCache<>(2, 1L, JsonObject::deepCopy);
 		AtomicInteger loads = new AtomicInteger();
 		JsonObject initial = cache.getOrCompute("agent-a", 100L, () -> value("v" + loads.incrementAndGet()));
 		initial.addProperty("value", "caller mutation");
-		assertEquals("v1", cache.getOrCompute("agent-a", 110L, () -> value("v" + loads.incrementAndGet())).get("value").getAsString(),
+		assertEquals("v1", cache.getOrCompute("agent-a", 101L, () -> value("v" + loads.incrementAndGet())).get("value").getAsString(),
 				"fresh cache reuse is defensively copied");
-		assertEquals("v2", cache.getOrCompute("agent-a", 111L, () -> value("v" + loads.incrementAndGet())).get("value").getAsString(),
-				"expired cache entry reloads");
+		assertEquals("v2", cache.getOrCompute("agent-a", 102L, () -> value("v" + loads.incrementAndGet())).get("value").getAsString(),
+				"same-position spatial changes reload within the two-tick bound");
 		cache.invalidate("agent-a");
 		assertEquals("v3", cache.getOrCompute("agent-a", 112L, () -> value("v" + loads.incrementAndGet())).get("value").getAsString(),
 				"explicit invalidation reloads");
@@ -103,20 +136,20 @@ public final class ObservationBudgetVerification {
 				"touch-distance awareness does not disappear outside the camera cone");
 		assertFalse(ObservationVisibility.isWithinViewCone(eye, forward, new Vec3(8.0D, 1.6D, 0.0D)),
 				"a distant side target is outside the bounded visual cone");
-		ObservationDispatchQueue<String> burst = new ObservationDispatchQueue<>(16, 8);
+		ObservationDispatchQueue<String> burst = new ObservationDispatchQueue<>(
+				AgentConstants.DEFAULT_AGENT_LIMIT,
+				AgentConstants.DEFAULT_AGENT_LIMIT
+		);
 		for (int index = 0; index < 16; index++) {
 			String agentId = "agent-" + index;
 			assertTrue(burst.offer(agentId), "each agent enters a bounded burst once");
 			assertFalse(burst.offer(agentId), "same agent burst events coalesce");
 		}
 		List<String> burstFirst = new ArrayList<>();
-		List<String> burstSecond = new ArrayList<>();
 		burst.drain(burstFirst::add);
-		burst.drain(burstSecond::add);
-		assertEquals(8, burstFirst.size(), "first drain obeys eight-observation budget");
-		assertEquals(8, burstSecond.size(), "second drain serves every remaining agent");
-		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in two drains");
-		return 41;
+		assertEquals(AgentConstants.DEFAULT_AGENT_LIMIT, burstFirst.size(), "one drain serves the sixteen-agent tick budget");
+		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in one drain");
+		return 51;
 	}
 
 	private static JsonObject observation(double health, boolean onFire, double fallDistance, String actionType) {

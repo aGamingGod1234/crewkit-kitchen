@@ -1,13 +1,43 @@
 package dev.agaminggod.arenaagents.server.bridge;
 
+import dev.agaminggod.arenaagents.agent.AgentConstants;
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentProfile;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 public final class MultiplexedServerBridgeVerification {
 	private MultiplexedServerBridgeVerification() {
 	}
 
 	public static int verify() {
+		List<AgentRecord> registered = new ArrayList<>();
+		for (int index = 0; index <= AgentConstants.DEFAULT_AGENT_LIMIT; index++) {
+			registered.add(AgentRecord.create(
+					AgentId.parse(String.format("00000000-0000-0000-0000-%012d", index + 1)),
+					new AgentProfile("codex", "gpt-5.6-sol", "high", Optional.empty(), index),
+					1_000L + index
+			));
+		}
+		List<AgentId> candidates = MultiplexedServerBridge.registeredObservationIds(registered);
+		assertEquals(AgentConstants.DEFAULT_AGENT_LIMIT, candidates.size(),
+				"publication remains capped at sixteen despite a malformed seventeen-agent registry");
+		ObservationDispatchQueue<AgentId> publicationQueue = new ObservationDispatchQueue<>(
+				AgentConstants.DEFAULT_AGENT_LIMIT,
+				AgentConstants.DEFAULT_AGENT_LIMIT
+		);
+		candidates.forEach(publicationQueue::offer);
+		List<AgentId> published = new ArrayList<>();
+		publicationQueue.drain(published::add);
+		assertEquals(candidates, published, "all sixteen registered agents publish within one server tick");
+		assertEquals(0, publicationQueue.pendingCount(), "one-tick publication drains the bounded queue");
+		AgentId idleAgent = registered.getFirst().agentId();
+		assertTrue(idleAgent.equals(published.getFirst()),
+				"an idle registered agent without an active action is sampled and published");
+
 		List<String> events = new ArrayList<>();
 		assertThrows(IllegalStateException.class, () -> MultiplexedServerBridge.publishRespawnScenarioEvents(
 				() -> { throw new IllegalStateException("publication failed"); },
@@ -30,7 +60,7 @@ public final class MultiplexedServerBridgeVerification {
 		);
 		assertEquals(List.of("paired-messages-and-commit", "action-attempted", "state-after-telemetry-failure"), committed,
 				"scenario callback failure cannot escape or roll back committed respawn publication");
-		return 4;
+		return 8;
 	}
 
 	private static void assertTrue(boolean value, String label) {

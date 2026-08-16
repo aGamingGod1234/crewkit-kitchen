@@ -38,7 +38,7 @@ public final class ServerObservationCollector {
 	public static final int MAX_OBSERVATION_TAGS = 32;
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
-	private static final long SPATIAL_CACHE_TICKS = 10L;
+	private static final long SPATIAL_CACHE_TICKS = 1L;
 
 	private final CodexAgentManager manager;
 	private final ServerActionExecutor actionExecutor;
