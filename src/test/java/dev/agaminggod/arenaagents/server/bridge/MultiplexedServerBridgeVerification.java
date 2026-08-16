@@ -11,6 +11,7 @@ import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import java.lang.reflect.Field;
 import java.net.Socket;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -75,23 +76,33 @@ public final class MultiplexedServerBridgeVerification {
 	}
 
 	private static void verifyRealBridgeSessionLifecycle() {
-		MultiplexedServerBridge bridge = new MultiplexedServerBridge(
-				uninitializedManager(), 0, Path.of("runtime/bridge-secret.txt")
-		);
-		bridge.start();
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
 		try {
-			assertTrue(!bridge.observationPublicationForVerification().hasActiveSession(),
+			secretFile = Files.createTempFile("arena-agents-bridge-secret-", ".txt");
+			Files.writeString(secretFile, "0123456789abcdef0123456789abcdef");
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge.start();
+			MultiplexedServerBridge activeBridge = bridge;
+			assertTrue(!activeBridge.observationPublicationForVerification().hasActiveSession(),
 					"bridge starts without an accepted session");
-			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification())) {
-				awaitCondition(bridge.observationPublicationForVerification()::hasActiveSession,
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification())) {
+				awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
 						"accept loop activates publication for a connected session");
 			}
-			awaitCondition(() -> !bridge.observationPublicationForVerification().hasActiveSession(),
+			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
 					"session close deactivates publication and clears lifecycle ownership");
 		} catch (Exception exception) {
 			throw new AssertionError("real bridge session lifecycle failed", exception);
 		} finally {
-			bridge.close();
+			if (bridge != null) bridge.close();
+			if (secretFile != null) {
+				try {
+					Files.deleteIfExists(secretFile);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove temporary bridge secret", exception);
+				}
+			}
 		}
 	}
 
