@@ -392,7 +392,7 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private void addLifecycleActions(int x, int y, int availableWidth) {
-		List<String> operations = List.of("stop", "resume", "respawn", "remove");
+		List<String> operations = List.of("stop", "resume", "remove");
 		int buttonWidth = (availableWidth - (ROW_GAP * (operations.size() - 1))) / operations.size();
 		for (int index = 0; index < operations.size(); index++) {
 			String operation = operations.get(index);

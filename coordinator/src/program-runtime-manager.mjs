@@ -110,6 +110,14 @@ export class ProgramRuntimeManager {
 		return true;
 	}
 
+	/** Returns true when a result belongs to an old/disposed action and must be ignored. */
+	isActionResultStale(record, payload = {}) {
+		const state = this.#states.get(record.agentId);
+		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return true;
+		const active = state.engine.snapshot().activeActionId;
+		return active === null || state.actionIds.get(payload.actionId) !== active;
+	}
+
 	onGoalControl(record, operation) {
 		if (operation === 'queue') return;
 		const state = this.#states.get(record.agentId);

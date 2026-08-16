@@ -81,6 +81,7 @@ public final class ServerActionExecutor {
 	private final Map<AgentId, CleanupRetry<ServerActionResult>> pendingCompletions = new LinkedHashMap<>();
 	private final Map<AgentId, PendingRespawn> pendingRespawns = new LinkedHashMap<>();
 	private final Map<AgentId, ServerActionResult> lastResults = new LinkedHashMap<>();
+	private long coordinatorGeneration;
 
 	public ServerActionExecutor(CodexAgentManager manager, Consumer<ServerActionResult> resultSink) {
 		this(manager, resultSink, progress -> { }, ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR);
@@ -181,7 +182,9 @@ public final class ServerActionExecutor {
 			if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
 				throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 			}
-			pendingRespawns.put(request.agentId(), new PendingRespawn(request, manager.beginVanillaRespawn(request.agentId()), System.currentTimeMillis()));
+			pendingRespawns.put(request.agentId(), new PendingRespawn(
+					request, manager.beginVanillaRespawn(request.agentId()), System.currentTimeMillis(), coordinatorGeneration
+			));
 		} catch (RuntimeException exception) {
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
 			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L);
@@ -229,8 +232,22 @@ public final class ServerActionExecutor {
 		}
 	}
 
+	/** Fences and rolls back physical respawns when the coordinator session disappears. */
+	public synchronized void coordinatorDisconnected() {
+		coordinatorGeneration++;
+		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) {
+			pendingRespawns.remove(pending.request().agentId(), pending);
+			manager.rollbackVanillaRespawn(pending.attempt());
+		}
+	}
+
 	private void tickRespawn(PendingRespawn pending, long now) {
 		try {
+			if (!isCurrentCoordinatorGeneration(pending.coordinatorGeneration(), coordinatorGeneration)) {
+				pendingRespawns.remove(pending.request().agentId(), pending);
+				manager.rollbackVanillaRespawn(pending.attempt());
+				return;
+			}
 			if (!manager.verifyVanillaRespawn(pending.attempt(), now)) return;
 			ServerActionResult result = result(pending.request(), ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", now - pending.startedAtEpochMs());
 			manager.commitVanillaRespawn(pending.attempt(), (transition, commit) -> publishRespawn(result, transition, commit));
@@ -238,9 +255,20 @@ public final class ServerActionExecutor {
 		} catch (RuntimeException exception) {
 			pendingRespawns.remove(pending.request().agentId(), pending);
 			manager.rollbackVanillaRespawn(pending.attempt());
+			if (!isCurrentCoordinatorGeneration(pending.coordinatorGeneration(), coordinatorGeneration)
+					|| isCoordinatorDisconnected(exception)) return;
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
 			emit(pending.request(), ServerActionState.FAILED, reason, safeMessage(exception), now - pending.startedAtEpochMs());
 		}
+	}
+
+	private static boolean isCoordinatorDisconnected(RuntimeException exception) {
+		return exception instanceof dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException bridge
+				&& "COORDINATOR_DISCONNECTED".equals(bridge.code());
+	}
+
+	static boolean isCurrentCoordinatorGeneration(long actionGeneration, long currentGeneration) {
+		return actionGeneration == currentGeneration;
 	}
 
 	static void publishProgressBestEffort(
@@ -563,11 +591,11 @@ public final class ServerActionExecutor {
 	}
 
 	private void publishRespawn(ServerActionResult result, AgentTransition transition, Runnable commit) {
+		respawnResultSink.publish(result, transition, commit);
 		lastResults.put(result.agentId(), result);
 		try {
 			AgentChatReporter.result(manager, manager.registry().require(result.agentId()), result);
 		} catch (AgentDomainException ignored) { }
-		respawnResultSink.publish(result, transition, commit);
 	}
 
 	private static ServerActionResult result(ServerActionRequest request, ServerActionState state, String reasonCode, String message, long elapsedMs) {
@@ -580,7 +608,12 @@ public final class ServerActionExecutor {
 		void publish(ServerActionResult result, AgentTransition transition, Runnable commit);
 	}
 
-	private record PendingRespawn(ServerActionRequest request, CodexAgentManager.VanillaRespawnAttempt attempt, long startedAtEpochMs) { }
+	private record PendingRespawn(
+			ServerActionRequest request,
+			CodexAgentManager.VanillaRespawnAttempt attempt,
+			long startedAtEpochMs,
+			long coordinatorGeneration
+	) { }
 
 	private static void attack(ServerPlayer player, String selector) {
 		Entity target = findTarget(player, selector);

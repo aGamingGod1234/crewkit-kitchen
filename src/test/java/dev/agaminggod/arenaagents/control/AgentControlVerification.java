@@ -135,6 +135,10 @@ public final class AgentControlVerification {
 				"operation allowlist"
 		);
 		expectFailure(
+				() -> AgentControlCommandBuilder.agent("respawn", AGENT_UUID),
+				"respawn is model-only"
+		);
+		expectFailure(
 				() -> AgentControlCommandBuilder.prompt("start", AGENT_UUID, " "),
 				"blank prompt"
 		);
@@ -216,21 +220,23 @@ public final class AgentControlVerification {
 		assertTrue(AgentControlActions.supports(acting, "steer"), "active goal can be steered");
 		assertTrue(AgentControlActions.supports(paused, "resume"), "paused agent can resume");
 		assertTrue(AgentControlActions.supports(disconnected, "resume"), "disconnected agent can resume after coordinator recovery");
-		assertTrue(AgentControlActions.supports(dead, "respawn"), "dead agent can respawn");
-		assertTrue(!AgentControlActions.supports(idle, "respawn"), "living agent cannot respawn");
+		assertTrue(!AgentControlActions.supports(dead, "respawn"), "dead agent has no operator respawn action");
+		assertTrue(!AgentControlActions.supports(idle, "respawn"), "living agent has no respawn action");
 		assertTrue(!AgentControlActions.everySupports(List.of(paused, acting), "resume"),
 				"batch action is disabled when any selected agent is incompatible");
 		assertEquals("Starting up...", AgentControlPresentation.stateLabel("STARTING"),
 				"technical starting state is presented as plain language");
 		assertEquals("Working", AgentControlPresentation.stateLabel("ACTING"),
 				"technical acting state is presented as plain language");
+		assertEquals("Dead - awaiting model", AgentControlPresentation.stateLabel("DEAD"),
+				"dead state does not advertise an operator respawn affordance");
 		assertEquals("GPT 5.6 Sol | High", AgentControlPresentation.profileLabel(idle),
 				"agent profile copy is human readable");
 		assertEquals("Fast mode", AgentControlPresentation.speedLabel("fast"),
 				"fast service tier has a human-readable label");
 		assertEquals("Normal", AgentControlPresentation.speedLabel("priority"),
 				"provider-native priority tier is presented as the normal player speed");
-		return 13;
+		return 12;
 	}
 
 	private static int verifySnapshotOrdering() {

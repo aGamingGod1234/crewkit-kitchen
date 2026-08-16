@@ -1048,6 +1048,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (agentQueued > AGENT_QUEUE_CAP - 2) throw new BridgeProtocolException("AGENT_BACKPRESSURE", first.agentId());
 			if (outbound.remainingCapacity() < 2) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot atomically publish respawn");
 			beforeEnqueue.run();
+			if (!open.get() || !authenticated.get()) {
+				throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during respawn publication");
+			}
 			if (!outbound.offer(first) || !outbound.offer(second)) {
 				outbound.remove(first);
 				outbound.remove(second);
@@ -1112,7 +1115,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogLoaded = false;
 				CoordinatorStatusStore.clear(manager.server());
 			}
-			if (wasAuthenticated) serverTasks.add(MultiplexedServerBridge.this::disconnectActiveAgents);
+			if (wasAuthenticated) serverTasks.add(() -> {
+				actionExecutor.coordinatorDisconnected();
+				MultiplexedServerBridge.this.disconnectActiveAgents();
+			});
 		}
 
 		private static void interruptPeer(Thread thread) {

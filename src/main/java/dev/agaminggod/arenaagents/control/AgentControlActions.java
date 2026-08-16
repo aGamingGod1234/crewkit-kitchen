@@ -37,7 +37,6 @@ public final class AgentControlActions {
 			case "stop" -> state.isActive() && !agent.currentGoal().isBlank();
 			case "resume" -> (state == AgentLifecycleState.PAUSED || state == AgentLifecycleState.DISCONNECTED)
 					&& !agent.currentGoal().isBlank();
-			case "respawn" -> state == AgentLifecycleState.DEAD;
 			case "remove" -> true;
 			default -> false;
 		};

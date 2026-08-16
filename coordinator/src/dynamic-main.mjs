@@ -252,9 +252,14 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 		this.#listen('action_result', (message) => {
 			this.#enqueueAgent(message.agentId, async () => {
+			const current = this.#registry.get(message.agentId);
+			if (current === null || message.payload.goalRevision !== current.goalRevision) return;
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 			this.#ledger(record.agentId).ingest('action_result', message.payload);
-			if (!await this.#programRuntime.onActionResult(record, message.payload)) throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
+			if (!await this.#programRuntime.onActionResult(record, message.payload)) {
+				if (this.#programRuntime.isActionResultStale(record, message.payload)) return;
+				throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
+			}
 			this.emit('actionResult', message);
 			});
 		});

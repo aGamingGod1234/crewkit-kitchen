@@ -148,6 +148,41 @@ test('reconciliation reissues one dead-state turn to the selected session and pr
 	} finally { await coordinator.stop(); }
 });
 
+test('disconnect fences the old dead respawn result before reconnect installs a new program', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		return { summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' };
+	};
+	const errors = [];
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+		{ bridge, registry, planner, codexService: new FakeProvider() },
+	);
+	coordinator.on('runtimeError', (error) => errors.push(error));
+	await coordinator.start();
+	try {
+		const dead = { ...record(), state: DynamicAgentState.DEAD, currentGoal: 'Survive.', goalRevision: 4, death: DEATH };
+		bridge.emit('ready', { serverInstanceId: 'first', registry: [dead] });
+		await eventually(() => bridge.sent.some((message) => message.payload?.actionType === 'respawn'));
+		const oldCommand = bridge.sent.find((message) => message.payload?.actionType === 'respawn');
+		bridge.emit('disconnected');
+		await eventually(() => planner.interruptions.includes('agent-a'));
+		bridge.emit('ready', { serverInstanceId: 'second', registry: [dead] });
+		await eventually(() => bridge.sent.filter((message) => message.payload?.actionType === 'respawn').length >= 2);
+		const newCommand = bridge.sent.filter((message) => message.payload?.actionType === 'respawn').at(-1);
+		assert.notEqual(oldCommand.payload.actionId, newCommand.payload.actionId);
+		bridge.emit('action_result', { agentId: 'agent-a', payload: {
+			goalRevision: 4, actionId: oldCommand.payload.actionId, actionType: 'respawn', state: 'SUCCEEDED', reasonCode: 'VANILLA_RESPAWNED', eventSequence: 5,
+		} });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(errors, [], 'old physical completion cannot error the replacement dead turn');
+		assert.equal(registry.get('agent-a')?.state, DynamicAgentState.DEAD);
+	} finally { await coordinator.stop(); }
+});
+
 test('death suspends the active program and asks the same selected model for a coordinate-free respawn program', async () => {
 	const run = await start();
 	try {

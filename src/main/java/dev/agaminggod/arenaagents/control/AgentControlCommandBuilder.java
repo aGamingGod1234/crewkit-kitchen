@@ -9,7 +9,7 @@ import java.util.Objects;
 import java.util.Set;
 
 public final class AgentControlCommandBuilder {
-	private static final Set<String> AGENT_OPERATIONS = Set.of("stop", "resume", "respawn", "remove", "status");
+	private static final Set<String> AGENT_OPERATIONS = Set.of("stop", "resume", "remove", "status");
 	private static final Set<String> PROMPT_OPERATIONS = Set.of("start", "queue", "steer");
 
 	private AgentControlCommandBuilder() {
