@@ -621,8 +621,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	static void publishRespawnScenarioEvents(Runnable publication, Runnable actionEvent, Runnable stateEvent) {
 		publication.run();
-		actionEvent.run();
-		stateEvent.run();
+		try {
+			actionEvent.run();
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Respawn action scenario telemetry failed after committed publication", exception);
+		}
+		try {
+			stateEvent.run();
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Respawn state scenario telemetry failed after committed publication", exception);
+		}
 	}
 
 	private static JsonObject actionResultPayload(ServerActionResult result) {

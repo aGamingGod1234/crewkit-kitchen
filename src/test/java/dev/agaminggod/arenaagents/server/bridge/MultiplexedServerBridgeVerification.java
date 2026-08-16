@@ -22,7 +22,15 @@ public final class MultiplexedServerBridgeVerification {
 		);
 		assertEquals(List.of("publication", "action", "state"), events,
 				"respawn scenario success and PAUSED/IDLE state follow committed paired publication");
-		return 3;
+		List<String> committed = new ArrayList<>();
+		MultiplexedServerBridge.publishRespawnScenarioEvents(
+				() -> committed.add("paired-messages-and-commit"),
+				() -> { committed.add("action-attempted"); throw new IllegalStateException("telemetry unavailable"); },
+				() -> committed.add("state-after-telemetry-failure")
+		);
+		assertEquals(List.of("paired-messages-and-commit", "action-attempted", "state-after-telemetry-failure"), committed,
+				"scenario callback failure cannot escape or roll back committed respawn publication");
+		return 4;
 	}
 
 	private static void assertTrue(boolean value, String label) {
