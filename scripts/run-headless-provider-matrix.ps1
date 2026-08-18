@@ -217,6 +217,12 @@ function Get-ProviderCommand([string] $Provider) {
 	}
 }
 
+function ConvertTo-SafePathSegment([string] $Value) {
+	$segment = [regex]::Replace($Value, '[^A-Za-z0-9._-]', '_').Trim('.')
+	if ([string]::IsNullOrWhiteSpace($segment)) { $segment = 'scenario' }
+	return $segment.Substring(0, [Math]::Min(48, $segment.Length))
+}
+
 function Test-ProviderPreflight([string] $Provider) {
 	if ([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT') -eq '1') {
 		return [pscustomobject]@{ Available = $true; Reason = $null }
@@ -249,7 +255,7 @@ function New-ScenarioConfig([string] $Source, [string] $Destination, [int] $Brid
 
 function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [string] $Template, [string] $MatrixFile, [string] $Java, [string] $Node, [string] $BuiltJar, [switch] $Keep) {
 	$scenarioId = [string] $Scenario.id
-	$scenarioDirectory = Join-Path $RunDirectory $scenarioId
+	$scenarioDirectory = Join-Path $RunDirectory ("$(ConvertTo-SafePathSegment $scenarioId)-$([Guid]::NewGuid().ToString('N').Substring(0, 8))")
 	New-Item -ItemType Directory -Path $scenarioDirectory -Force | Out-Null
 	$serverDirectory = Join-Path $scenarioDirectory 'server'
 	Copy-Item -LiteralPath $Template -Destination $serverDirectory -Recurse -Force
