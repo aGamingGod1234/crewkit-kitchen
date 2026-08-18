@@ -109,7 +109,8 @@ export function scenarioReport(status, scenario, fields = {}) {
 }
 
 function boundReportValue(value, depth = 0) {
-	if (depth > 6 || value === null || typeof value !== 'object') return typeof value === 'string' ? value.slice(0, MAX_DIAGNOSTICS) : value;
+	if (depth > 6) return '[TRUNCATED]';
+	if (value === null || typeof value !== 'object') return typeof value === 'string' ? value.slice(0, MAX_DIAGNOSTICS) : value;
 	if (Array.isArray(value)) return value.slice(0, 64).map((entry) => boundReportValue(entry, depth + 1));
 	return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, entry]) => [key.slice(0, 128), boundReportValue(entry, depth + 1)]));
 }

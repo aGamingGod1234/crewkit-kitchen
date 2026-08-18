@@ -59,3 +59,19 @@ test('creates immutable bounded serializable reports', () => {
 	assert.ok(Object.isFrozen(report));
 	assert.doesNotThrow(() => JSON.stringify(report));
 });
+
+test('replaces deeply nested report values at the depth bound', () => {
+	const scenario = normalizeHeadlessScenario(validScenario(), 0);
+	const payload = {};
+	let cursor = payload;
+	for (let index = 0; index < 8; index += 1) {
+		cursor.child = {};
+		cursor = cursor.child;
+	}
+	cursor.secret = 'credential-shaped-' + 'x'.repeat(10000);
+	const report = scenarioReport('PASSED', scenario, { payload });
+	let bounded = report.payload;
+	for (let index = 0; index < 7; index += 1) bounded = bounded.child;
+	assert.equal(bounded, '[TRUNCATED]');
+	assert.ok(JSON.stringify(report).length < 10000);
+});
