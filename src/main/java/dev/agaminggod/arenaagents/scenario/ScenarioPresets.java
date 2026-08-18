@@ -77,11 +77,11 @@ public final class ScenarioPresets {
 				),
 				List.of("survival-story", "weather", "resource-strategy", "extraction"),
 				List.of(
-						phase("dawn", "Dawn — Establish", 0L, 7_200L, "Gather, scout, craft, cooperate, or contest the ruin."),
-						phase("forecast", "Forecast — Decide", 7_200L, 3_600L, "Visible warnings reveal the approaching storm."),
-						phase("storm", "Storm — Adapt", 10_800L, 7_200L, "Rain, lightning risk, reduced visibility, and displaced mobs."),
-						phase("night", "Night — Survive", 18_000L, 10_800L, "Bounded hostile pressure tests shelter and judgment."),
-						phase("sunrise", "Sunrise — Extract", 28_800L, 7_200L, "Reach extraction or keep collecting score at increasing risk.")
+						phase("dawn", "Dawn | Establish", 0L, 7_200L, "Gather, scout, craft, cooperate, or contest the ruin."),
+						phase("forecast", "Forecast | Decide", 7_200L, 3_600L, "Visible warnings reveal the approaching storm."),
+						phase("storm", "Storm | Adapt", 10_800L, 7_200L, "Rain, lightning risk, reduced visibility, and displaced mobs."),
+						phase("night", "Night | Survive", 18_000L, 10_800L, "Bounded hostile pressure tests shelter and judgment."),
+						phase("sunrise", "Sunrise | Extract", 28_800L, 7_200L, "Reach extraction or keep collecting score at increasing risk.")
 				),
 				List.of(
 						rule("survival", "Survival and extraction", 20, "survival"),
@@ -155,7 +155,7 @@ public final class ScenarioPresets {
 				ScenarioCategory.PVP,
 				"Symmetric starts, unequal choices, and a fortress that closes around the survivors.",
 				"Outlast the field through combat, looting, negotiation, objective control, and intelligent disengagement.",
-				"1.0.0",
+				"2.0.0",
 				2,
 				16,
 				24_000L,
@@ -173,7 +173,7 @@ public final class ScenarioPresets {
 						"Spectator ring and camera anchors"
 				),
 				List.of(
-						"Combat unlock after grace period",
+						"Early contested loot routes",
 						"Contested vault reveal",
 						"Recorded outer-sector collapse",
 						"Final citadel convergence",
@@ -181,8 +181,7 @@ public final class ScenarioPresets {
 				),
 				List.of("pvp", "alliances", "betrayal", "combat-story"),
 				List.of(
-						phase("scouting", "Scouting Grace Period", 0L, 2_400L, "Combat is disabled while movement and looting remain open."),
-						phase("conflict", "Open Conflict", 2_400L, 7_200L, "PvP and the first objectives activate."),
+						phase("conflict", "Open Conflict", 0L, 9_600L, "PvP, looting, movement, and objectives are available immediately."),
 						phase("supply", "Supply Reveal", 9_600L, 4_800L, "A contested vault or supply point is announced."),
 						phase("collapse", "Collapse", 14_400L, 6_000L, "Outer sectors become unsafe in visible recorded phases."),
 						phase("final", "Final Citadel", 20_400L, 3_600L, "Remaining agents converge without forced target selection.")
@@ -207,7 +206,7 @@ public final class ScenarioPresets {
 				"The Thinking Tower",
 				ScenarioCategory.PARKOUR,
 				"Parallel lanes reveal perception, route choice, learning, and risk tolerance.",
-				"Climb through safe, puzzle, and precision routes; adapt to a seeded change; then escape using learned mechanics.",
+				"Reach the finish of your dedicated lane. Move forward over each platform, use glowing checkpoints, and choose whether to use vanilla respawn after a lava fall.",
 				"1.0.0",
 				1,
 				16,
@@ -224,13 +223,7 @@ public final class ScenarioPresets {
 						"Visible checkpoint beacons",
 						"Connected audience sightlines"
 				),
-				List.of(
-						"Seeded route obstruction",
-						"Observation mechanism change",
-						"Checkpoint recovery with penalty",
-						"Optional shortcut reveal",
-						"Timed exit signal"
-				),
+				List.of("Verified checkpoint progress after lava falls"),
 				List.of("parkour", "learning", "route-choice", "comeback"),
 				List.of(
 						phase("calibration", "Calibration", 0L, 2_400L, "Simple jumps establish movement behavior."),

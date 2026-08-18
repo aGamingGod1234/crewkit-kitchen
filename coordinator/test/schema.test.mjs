@@ -5,6 +5,7 @@ import { PROTOCOL_VERSION } from '../src/constants.mjs';
 import {
 	createActionCommand,
 	validateAction,
+	validateActionCommandPayload,
 	validateActionResult,
 	validateEnvelope,
 	validateObservation,
@@ -33,7 +34,7 @@ test('accepts every exact action shape and returns a detached value', () => {
 	const actions = [
 		{ type: 'move_to', x: 1.25, y: 64, z: -2, tolerance: 0.5, sprint: true },
 		{ type: 'look_at', x: 1, y: 2, z: 3 },
-		{ type: 'attack', targetSelector: 'nearest hostile', timeoutMs: 5_000 },
+		{ type: 'attack', targetId: '00000000-0000-0000-0000-000000000001', timeoutMs: 5_000 },
 		{ type: 'select_item', itemId: 'minecraft:diamond_sword' },
 		{ type: 'use_item', durationMs: 250 },
 		{ type: 'break_block', x: 1, y: 64, z: 2, timeoutMs: 5_000 },
@@ -41,12 +42,8 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'chat', message: 'Ready.' },
 		{ type: 'wait', durationMs: 50 },
 		{ type: 'set_door', x: 1, y: 64, z: 2, open: true },
-		{ type: 'pick_up_item', targetSelector: 'minecraft:item' },
 		{ type: 'drop_item', slot: 0, count: 1 },
 		{ type: 'navigate_to', x: 10, y: 64, z: -5, tolerance: 1.25, sprint: true, timeoutMs: 30_000 },
-		{ type: 'fight_target', targetSelector: 'nearest_hostile', desiredRange: 2.5, timeoutMs: 15_000 },
-		{ type: 'flee_from', targetSelector: 'last_attacker', distance: 16, timeoutMs: 10_000 },
-		{ type: 'follow_entity', targetSelector: 'player:Lucas', distance: 3, timeoutMs: 30_000 },
 		{
 			type: 'transfer_container', x: 1, y: 64, z: -2,
 			sourceKind: 'player', sourceSlot: 0, destinationKind: 'container', destinationSlot: 4,
@@ -58,8 +55,7 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'equip_item', sourceSlot: 5, targetSlot: 'chest', expectedItemId: 'minecraft:iron_chestplate' },
 		{ type: 'select_tool', sourceSlot: 5, hotbarSlot: 1, expectedItemId: 'minecraft:iron_pickaxe', minRemainingDurability: 32 },
 		{ type: 'block_with_shield', durationMs: 750 },
-		{ type: 'use_ranged', targetSelector: 'nearest_hostile', drawDurationMs: 1_000, timeoutMs: 5_000 },
-		{ type: 'complete_goal', summary: 'Done.' },
+		{ type: 'use_ranged', targetId: '00000000-0000-0000-0000-000000000001', drawDurationMs: 1_000, timeoutMs: 5_000 },
 	];
 	for (const action of actions) assert.deepEqual(validateAction(action), action);
 });
@@ -81,14 +77,35 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 	assert.throws(() => validateAction({ ...validTransfer, count: 0 }), /count/);
 	assert.throws(() => validateAction({ ...validTransfer, extra: true }), /Unknown/);
 	assert.throws(() => validateAction({ type: 'equip_item', sourceSlot: 5, targetSlot: 'mainhand', expectedItemId: 'minecraft:iron_chestplate' }), /targetSlot/);
+	for (const type of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+		assert.throws(() => validateAction({ type }), /Unsupported action/);
+	}
+});
+
+test('requires detached complete model-program provenance for action commands', () => {
+	const action = { type: 'wait', durationMs: 25 };
+	const provenance = {
+		provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+		programId: 'program-1-1', programVersion: 1, sourceStepId: 'step-80-126', eventSequence: 4,
+	};
+	const command = { goalRevision: 1, actionId: 'action-1', action, provenance };
+	assert.deepEqual(validateActionCommandPayload(command), command);
+	const validated = validateActionCommandPayload(command);
+	assert.throws(() => { validated.provenance.programId = 'forged'; }, TypeError);
+	assert.equal(command.provenance.programId, 'program-1-1');
 	assert.throws(
-		() => validateAction({ type: 'fight_target', targetSelector: 'nearest_hostile', desiredRange: -1, timeoutMs: 1_000 }),
-		/between 1 and 6/,
+		() => validateActionCommandPayload({ goalRevision: 1, actionId: 'action-1', action }),
+		/provenance/,
 	);
-	assert.throws(
-		() => validateAction({ type: 'flee_from', targetSelector: 'last_attacker', distance: 65, timeoutMs: 1_000 }),
-		/between 1 and 64/,
-	);
+	assert.throws(() => validateActionCommandPayload({ ...command, goalStatus: 'in_progress' }), /Unknown field/);
+	assert.throws(() => validateActionCommandPayload({ ...command, actions: [action] }), /Unknown field/);
+	for (const field of ['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'sourceStepId']) {
+		assert.throws(() => validateActionCommandPayload({ ...command, provenance: { ...provenance, [field]: '\u00a0' } }), new RegExp(`provenance\\.${field}`));
+	}
+	for (const field of ['programVersion', 'eventSequence']) {
+		assert.throws(() => validateActionCommandPayload({ ...command, provenance: { ...provenance, [field]: -1 } }), new RegExp(`provenance\\.${field}`));
+		assert.throws(() => validateActionCommandPayload({ ...command, provenance: { ...provenance, [field]: Number.MAX_SAFE_INTEGER + 1 } }), new RegExp(`provenance\\.${field}`));
+	}
 });
 
 test('rejects ordinary and non-breaking whitespace-only required action text', () => {
@@ -98,11 +115,21 @@ test('rejects ordinary and non-breaking whitespace-only required action text', (
 		count: 3, expectedItemId: 'minecraft:oak_log', timeoutMs: 5_000,
 	};
 	const validCraft = { type: 'craft_inventory', recipeId: 'minecraft:oak_planks', count: 4, timeoutMs: 5_000 };
-	const validRanged = { type: 'use_ranged', targetSelector: 'nearest_hostile', drawDurationMs: 1_000, timeoutMs: 5_000 };
+	const validRanged = { type: 'use_ranged', targetId: '00000000-0000-0000-0000-000000000001', drawDurationMs: 1_000, timeoutMs: 5_000 };
 	for (const whitespace of [' \t\r\n', '\u00a0']) {
 		assert.throws(() => validateAction({ ...validTransfer, expectedItemId: whitespace }), /expectedItemId.*blank/);
 		assert.throws(() => validateAction({ ...validCraft, recipeId: whitespace }), /recipeId.*blank/);
-		assert.throws(() => validateAction({ ...validRanged, targetSelector: whitespace }), /targetSelector.*blank/);
+		assert.throws(() => validateAction({ ...validRanged, targetId: whitespace }), /targetId.*(blank|UUID)/);
+	}
+});
+
+test('rejects selectors and non-UUID target ids for exact target actions', () => {
+	for (const type of ['attack', 'use_ranged']) {
+		const action = type === 'attack'
+			? { type, targetId: '00000000-0000-0000-0000-000000000001', timeoutMs: 1 }
+			: { type, targetId: '00000000-0000-0000-0000-000000000001', drawDurationMs: 1, timeoutMs: 1 };
+		assert.throws(() => validateAction({ ...action, targetSelector: 'nearest_hostile' }), /Unknown field/);
+		assert.throws(() => validateAction({ ...action, targetId: 'nearest_hostile' }), /UUID/);
 	}
 });
 

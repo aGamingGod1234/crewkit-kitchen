@@ -15,14 +15,14 @@ const RECORD = Object.freeze({
 });
 const VALID_DECISION = Object.freeze({
 	summary: 'Wait safely',
-	goalStatus: 'in_progress',
-	action: { type: 'wait', durationMs: 100 },
+	directive: 'replace',
+	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(100);',
 });
 
 test('retries one malformed planner decision with bounded corrective feedback', async () => {
 	const registry = new FakeRegistry();
 	const inputs = [];
-	const invalid = Object.assign(new Error('action.type must be a string'), { code: 'INVALID_ACTION' });
+	const invalid = Object.assign(new Error('planner output was not JSON'), { code: 'MALFORMED_DECISION' });
 	const agent = {
 		async setGoalRevision(revision) { assert.equal(revision, GOAL_REVISION); },
 		async decide(input) {
@@ -43,8 +43,93 @@ test('retries one malformed planner decision with bounded corrective feedback', 
 	assert.equal(inputs.length, 2);
 	assert.equal(inputs[0], 'authoritative state');
 	assert.match(inputs[1], /corrective retry 1/);
-	assert.match(inputs[1], /INVALID_ACTION/);
+	assert.match(inputs[1], /MALFORMED_DECISION/);
 	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
+});
+
+test('retries compact envelope validation mismatches with corrective feedback', async () => {
+	for (const invalid of [
+		{ code: 'DECISION_FIELD_MISMATCH', message: 'replace directive requires nonblank source' },
+		{ code: 'DECISION_FIELD_MISMATCH', message: 'finish directive requires status completed or impossible' },
+	]) {
+		const registry = new FakeRegistry();
+		const inputs = [];
+		const error = Object.assign(new Error(invalid.message), { code: invalid.code });
+		const agent = {
+			async setGoalRevision(revision) { assert.equal(revision, GOAL_REVISION); },
+			async decide(input) {
+				inputs.push(input);
+				if (inputs.length === 1) throw error;
+				return VALID_DECISION;
+			},
+		};
+		const planner = createPlanner(registry, agent, 1);
+
+		const result = await planner.requestPlan({
+			agentId: AGENT_ID,
+			input: 'authoritative state',
+			goalRevision: GOAL_REVISION,
+		});
+
+		assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+		assert.equal(inputs.length, 2);
+		assert.match(inputs[1], new RegExp(`corrective retry 1[\\s\\S]*${invalid.code}`));
+		assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
+	}
+});
+
+test('retries a duplicate decision envelope through the same provider agent', async () => {
+	const registry = new FakeRegistry();
+	const inputs = [];
+	let creates = 0;
+	const duplicate = Object.assign(new Error("Duplicate decision field 'source'"), { code: 'DUPLICATE_DECISION_FIELD' });
+	const agent = {
+		async setGoalRevision(revision) { assert.equal(revision, GOAL_REVISION); },
+		async decide(input) {
+			inputs.push(input);
+			if (inputs.length === 1) throw duplicate;
+			return VALID_DECISION;
+		},
+	};
+	const planner = createPlannerForService(registry, {
+		async createAgent() { creates += 1; return agent; },
+		getAgent() { return null; }, async removeAgent() { return false; },
+	}, 1);
+	const result = await planner.requestPlan({
+		agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION,
+	});
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.equal(creates, 1, 'corrective retry must retain the selected provider agent session');
+	assert.equal(inputs.length, 2);
+	assert.match(inputs[1], /DUPLICATE_DECISION_FIELD/);
+});
+
+test('returns a legacy action-array rejection to the same selected model as correction feedback', async () => {
+	const registry = new FakeRegistry();
+	const inputs = [];
+	let creates = 0;
+	const legacy = Object.assign(new Error('Legacy action-array decisions are not supported'), { code: 'INVALID_DECISION' });
+	const agent = {
+		async setGoalRevision(revision) { assert.equal(revision, GOAL_REVISION); },
+		async decide(input) {
+			inputs.push(input);
+			if (inputs.length === 1) throw legacy;
+			return VALID_DECISION;
+		},
+	};
+	const planner = createPlannerForService(registry, {
+		async createAgent() { creates += 1; return agent; },
+		getAgent() { return null; }, async removeAgent() { return false; },
+	}, 1);
+
+	const result = await planner.requestPlan({
+		agentId: AGENT_ID, input: '{"summary":"old","actions":[]}', goalRevision: GOAL_REVISION,
+	});
+
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.equal(creates, 1);
+	assert.equal(inputs.length, 2);
+	assert.match(inputs[1], /INVALID_DECISION/);
 });
 
 test('retries one transient provider failure without changing authoritative input', async () => {
@@ -70,6 +155,70 @@ test('retries one transient provider failure without changing authoritative inpu
 	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
 	assert.deepEqual(inputs, ['authoritative state', 'authoritative state']);
 	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
+});
+
+test('retries one empty Codex turn without changing authoritative input', async () => {
+	const registry = new FakeRegistry();
+	const inputs = [];
+	const emptyTurn = Object.assign(new Error('Codex turn completed without an agent message'), {
+		code: 'MISSING_AGENT_MESSAGE',
+	});
+	const agent = {
+		async setGoalRevision(revision) { assert.equal(revision, GOAL_REVISION); },
+		async decide(input) {
+			inputs.push(input);
+			if (inputs.length === 1) throw emptyTurn;
+			return VALID_DECISION;
+		},
+	};
+	const planner = createPlanner(registry, agent, 1);
+
+	const result = await planner.requestPlan({
+		agentId: AGENT_ID,
+		input: 'authoritative state',
+		goalRevision: GOAL_REVISION,
+	});
+
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.deepEqual(inputs, ['authoritative state', 'authoritative state']);
+});
+
+test('exhausted empty Codex turns remain planning for quiet observation retry', async () => {
+	const registry = new FakeRegistry();
+	const emptyTurn = Object.assign(new Error('Codex turn completed without an agent message'), {
+		code: 'MISSING_AGENT_MESSAGE',
+	});
+	const agent = {
+		async setGoalRevision() {},
+		async decide() { throw emptyTurn; },
+	};
+	const planner = createPlanner(registry, agent, 1);
+	await assert.rejects(planner.requestPlan({
+		agentId: AGENT_ID,
+		input: 'authoritative state',
+		goalRevision: GOAL_REVISION,
+	}), (error) => error === emptyTurn);
+	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
+});
+
+test('exhausted retryable provider errors enter error after the retry budget', async () => {
+	const registry = new FakeRegistry();
+	const timeout = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
+	const agent = {
+		async setGoalRevision() {},
+		async decide() { throw timeout; },
+	};
+	const planner = createPlanner(registry, agent, 1);
+	await assert.rejects(planner.requestPlan({
+		agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION,
+	}), (error) => error === timeout);
+	assert.deepEqual(registry.states.at(-1), {
+		state: DynamicAgentState.ERROR,
+		options: {
+			goalRevision: GOAL_REVISION,
+			error: { code: 'PLANNING_TIMEOUT', message: 'provider timed out' },
+		},
+	});
 });
 
 test('retries one transient provider initialization failure', async () => {

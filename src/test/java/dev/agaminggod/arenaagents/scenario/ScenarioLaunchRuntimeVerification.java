@@ -18,10 +18,11 @@ public final class ScenarioLaunchRuntimeVerification {
 				"citadel-collapse",
 				ScenarioPresets.require("citadel-collapse").mapVersion(),
 				true,
+				ScenarioPlacementMode.AT_PLAYER,
 				List.of(
-						new ScenarioAgentSpec(1, "Codex", "codex", "gpt-5.6-sol", "high",
+						new ScenarioAgentSpec(1, "Codex", "codex", "gpt-5.6-sol", "high", "fast",
 								Optional.of("amber"), AgentGameMode.SURVIVAL),
-						new ScenarioAgentSpec(2, "Gemini", "gemini", "gemini-3.1-pro", "high",
+						new ScenarioAgentSpec(2, "Gemini", "gemini", "gemini-3.1-pro", "high", "priority",
 								Optional.of("azure"), AgentGameMode.SURVIVAL)
 				)
 		);
@@ -32,12 +33,14 @@ public final class ScenarioLaunchRuntimeVerification {
 						"thinking-tower",
 						ScenarioPresets.require("thinking-tower").mapVersion(),
 						true,
+						ScenarioPlacementMode.FIXED_LANE,
 						List.of(new ScenarioAgentSpec(
 								1,
 								"Codex",
 								"codex",
 								"gpt-5.6-sol",
 								"high",
+								"priority",
 								Optional.empty(),
 								AgentGameMode.SURVIVAL
 						))

@@ -23,6 +23,12 @@ test('rejects blank, malformed, scalar, and incomplete frames', () => {
 	assert.throws(() => decoder.finish(), /Incomplete JSONL frame/);
 });
 
+test('rejects duplicate JSON names before materialising the protocol object', () => {
+	const decoder = new JsonlDecoder();
+	assert.throws(() => decoder.push('{"agentId":"a","agentId":"b"}\n'), (error) => error.code === 'MALFORMED_JSON' && /Duplicate/.test(error.message));
+	assert.throws(() => decoder.push('{"payload":{"actionId":"a","actionId":"b"}}\n'), (error) => error.code === 'MALFORMED_JSON' && /Duplicate/.test(error.message));
+});
+
 test('encodes exactly one bounded JSON line', () => {
 	assert.equal(encodeJsonLine({ ok: true }), '{"ok":true}\n');
 	assert.throws(() => encodeJsonLine(null), /must be an object/);

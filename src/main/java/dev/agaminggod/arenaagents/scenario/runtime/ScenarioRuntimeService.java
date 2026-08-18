@@ -5,8 +5,10 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.scenario.ScenarioAgentEvent;
 import dev.agaminggod.arenaagents.scenario.ScenarioAgentSpec;
+import dev.agaminggod.arenaagents.scenario.ScenarioCompletionPolicy;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRequest;
 import dev.agaminggod.arenaagents.scenario.ScenarioParticipant;
+import dev.agaminggod.arenaagents.scenario.ScenarioPlacementMode;
 import dev.agaminggod.arenaagents.scenario.ScenarioPreset;
 import dev.agaminggod.arenaagents.scenario.ScenarioPresets;
 import dev.agaminggod.arenaagents.scenario.ScenarioSession;
@@ -14,21 +16,31 @@ import dev.agaminggod.arenaagents.scenario.ScenarioSessionConfig;
 import dev.agaminggod.arenaagents.scenario.ScenarioSpawn;
 import dev.agaminggod.arenaagents.scenario.ScenarioSpawnAllocator;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshot;
+import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgress;
+import dev.agaminggod.arenaagents.scenario.presentation.ScenarioOperatorMessagePolicy;
 import dev.agaminggod.arenaagents.scenario.result.MatchResultV1;
 import dev.agaminggod.arenaagents.scenario.result.MatchResultWriter;
 import dev.agaminggod.arenaagents.scenario.result.ScenarioPublicEvent;
 import dev.agaminggod.arenaagents.scenario.result.ScenarioPublicFormatter;
 import dev.agaminggod.arenaagents.scenario.result.ScenarioResultPersistence;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
+import dev.agaminggod.arenaagents.server.CodexAgentServerRuntime;
 import dev.agaminggod.arenaagents.server.GoalControl;
+import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusStore;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.Container;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
@@ -59,15 +71,22 @@ public final class ScenarioRuntimeService {
 		}
 		MinecraftServer server = operator.level().getServer();
 		RuntimeState state = STATES.computeIfAbsent(server, ignored -> new RuntimeState());
-		if (state.build != null || state.activation != null) {
+		if (ScenarioActivationFailurePolicy.mayReplacePendingLaunch(
+				state.build != null, state.pendingActivation != null,
+				state.activation != null || state.activeRun != null || state.pendingResult != null)) {
+			state.pendingActivation = null;
+			state.buildProgress = null;
+		}
+		if (state.build != null || state.pendingActivation != null || state.activation != null) {
 			throw new IllegalStateException("An arena is already being prepared");
 		}
 		if (state.activeRun != null || state.pendingResult != null) {
 			throw new IllegalStateException("A scenario is already running");
 		}
+		CodexAgentManager.get(server).registry().requireCapacity(request.roster().size());
 		ScenarioPreset preset = ScenarioPresets.require(request.scenarioId());
 		ServerLevel level = operator.level();
-		BlockPos origin = arenaOrigin(level, preset);
+		BlockPos origin = arenaOrigin(level, preset, operator, request.placementMode());
 		long now = System.currentTimeMillis();
 		long worldSeed = scenarioSeed(level, preset);
 		List<ScenarioParticipant> participants = request.roster().stream()
@@ -88,7 +107,7 @@ public final class ScenarioRuntimeService {
 				participants,
 				now
 		);
-		ScenarioArenaBlueprint blueprint = ScenarioArenaBlueprint.create(preset, origin);
+		ScenarioArenaBlueprint blueprint = ScenarioArenaBlueprint.create(preset, origin, participants.size());
 		removeContestants(CodexAgentManager.get(server), state.agents);
 		state.agents = List.of();
 		state.participantByAgent.clear();
@@ -101,13 +120,21 @@ public final class ScenarioRuntimeService {
 				config,
 				new ScenarioSession(config),
 				blueprint,
-				new ScenarioArenaResetJob(blueprint.placements()),
+				new ScenarioArenaResetJob(blueprint),
+				null,
 				-1
 		);
-		operator.sendSystemMessage(Component.literal(
-				"Preparing " + preset.title() + " — " + blueprint.placements().size()
-						+ " deterministic block changes queued."
-		));
+		state.buildProgress = new ScenarioBuildProgress(
+				config.sessionId().toString(), preset.title(), "canonicalizing", state.nextBuildRevision(),
+				0, state.build.reset().totalPlacements(), 0,
+				origin.getX(), origin.getY(), origin.getZ(), ScenarioBuildProgress.Status.BUILDING,
+				"Preparing the arena blueprint at " + coordinates(origin)
+		);
+		publishOperatorNotice(operator, ScenarioOperatorMessagePolicy.Event.PREPARING,
+				"Preparing " + preset.title() + " at " + coordinates(origin) + ". "
+						+ blueprint.placements().size() + " blueprint blocks will be checked; "
+						+ "construction is happening at this location."
+		);
 	}
 
 	public static synchronized void tick(MinecraftServer server) {
@@ -130,6 +157,10 @@ public final class ScenarioRuntimeService {
 		}
 		if (state.build != null) {
 			tickBuild(state);
+			return;
+		}
+		if (state.pendingActivation != null) {
+			tickPendingActivation(state);
 			return;
 		}
 		if (state.activation != null) {
@@ -193,16 +224,32 @@ public final class ScenarioRuntimeService {
 					activation.session.scores(), state, providers
 			));
 		}
+		if (state.pendingActivation != null) {
+			BuildJob build = state.pendingActivation;
+			Map<String, String> providers = new LinkedHashMap<>();
+			for (ScenarioAgentSpec spec : build.request.roster()) providers.put("slot-" + spec.slot(), spec.provider());
+			return Optional.of(publicViewFromConfig(
+					server, build.config, build.blueprint.origin(), "Waiting for coordinator",
+					build.session.scores(), state, providers
+			));
+		}
 		if (state.build != null) {
 			BuildJob build = state.build;
 			Map<String, String> providers = new LinkedHashMap<>();
 			for (ScenarioAgentSpec spec : build.request.roster()) providers.put("slot-" + spec.slot(), spec.provider());
 			return Optional.of(publicViewFromConfig(
-					server, build.config, build.blueprint.origin(), "Preparing arena",
+					server, build.config, build.blueprint.origin(), buildProgressTitle(build),
 					build.session.scores(), state, providers
 			));
 		}
 		return Optional.empty();
+	}
+
+	/** Read-only build status projection for the operator command center and HUD. */
+	public static synchronized Optional<ScenarioBuildProgress> buildProgress(MinecraftServer server) {
+		Objects.requireNonNull(server, "server must not be null");
+		RuntimeState state = STATES.get(server);
+		return state == null ? Optional.empty() : Optional.ofNullable(state.buildProgress);
 	}
 
 	private static ArenaSpectatorSnapshot.PublicView publicViewFromConfig(
@@ -422,13 +469,16 @@ public final class ScenarioRuntimeService {
 							recovery.snapshot.participants().get(index).id()
 					);
 				}
+				ScenarioParkourRunState parkour = restoreParkourRunState(
+						recovery.session.config(), recovery.snapshot);
 				state.activeRun = new ActiveRun(
 						recovery.session,
 						recovery.clock,
 						recovery.snapshot.operatorId(),
 						recovery.level,
 						new BlockPos(recovery.snapshot.origin().x(), recovery.snapshot.origin().y(), recovery.snapshot.origin().z()),
-						recovery.snapshot.reset()
+						recovery.snapshot.reset(),
+						parkour
 				);
 				state.recovery = null;
 				persistActiveRun(state);
@@ -450,35 +500,169 @@ public final class ScenarioRuntimeService {
 		state.recovery = recovery.nextTick();
 	}
 
+	private static ScenarioParkourRunState restoreParkourRunState(
+			ScenarioSessionConfig config,
+			ScenarioRunSnapshot snapshot
+	) {
+		if (config.preset().category() != dev.agaminggod.arenaagents.scenario.ScenarioCategory.PARKOUR) {
+			return null;
+		}
+		Map<String, Integer> laneByParticipant = new LinkedHashMap<>();
+		for (ScenarioSpawn spawn : new ScenarioSpawnAllocator().allocate(config)) {
+			laneByParticipant.put(spawn.participantId(), spawn.slotIndex());
+		}
+		LinkedHashMap<String, Integer> laneByAgent = new LinkedHashMap<>();
+		for (int index = 0; index < snapshot.boundAgentIds().size(); index++) {
+			String participantId = snapshot.participants().get(index).id();
+			Integer lane = laneByParticipant.get(participantId);
+			if (lane == null) throw new IllegalStateException("parkour lane is unavailable for " + participantId);
+			laneByAgent.put(snapshot.boundAgentIds().get(index), lane);
+		}
+		return new ScenarioParkourRunState(
+				ScenarioParkourCourse.create(config.participants().size()), laneByAgent,
+				snapshot.parkourCheckpoints());
+	}
+
 	private static void tickBuild(RuntimeState state) {
 		BuildJob build = state.build;
 		try {
 			ScenarioArenaResetJob.Tick progress = build.reset.tick(build.level);
+			boolean phaseChanged = progress.phase() != build.reportedPhase;
 			int percent = progress.total() == 0
 					? 100 : (int) (100L * progress.completed() / progress.total());
-			int milestone = percent / 25;
-			if (milestone > build.reportedMilestone) {
-				build.operator.sendSystemMessage(Component.literal(
-						"Arena reset " + progress.phase().name().toLowerCase(java.util.Locale.ROOT)
-								+ " " + Math.min(100, milestone * 25) + "%"
-				));
-				build = build.withReportedMilestone(milestone);
+			boolean terminal = progress.phase() == ScenarioArenaResetJob.Phase.COMPLETE
+					|| progress.phase() == ScenarioArenaResetJob.Phase.FAILED;
+			boolean advanced = progress.worked() > 0 || progress.completed() != build.reportedCompleted;
+			if (!terminal && (phaseChanged || advanced)) {
+				state.buildProgress = ScenarioBuildProgress.fromResetTick(
+						build.config.sessionId().toString(), build.config.preset().title(), progress,
+						build.blueprint.origin().getX(), build.blueprint.origin().getY(), build.blueprint.origin().getZ(),
+						state.nextBuildRevision(), buildProgressDetail(progress));
+				build.operator.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(
+						"Arena at " + coordinates(build.blueprint.origin()) + ": "
+								+ progress.phase().displayName() + " " + progress.completed() + " / "
+								+ progress.total() + " (" + Math.min(100, percent) + "%)"
+				)));
+				build = build.withReportedProgress(progress.phase(), progress.completed());
 			}
 			state.build = build;
 			if (progress.phase() == ScenarioArenaResetJob.Phase.FAILED) {
 				String reason = progress.failureReason().isBlank() ? "RESET_VERIFICATION_FAILED" : progress.failureReason();
+				state.buildProgress = ScenarioBuildProgress.fromResetTick(
+						build.config.sessionId().toString(), build.config.preset().title(), progress,
+						build.blueprint.origin().getX(), build.blueprint.origin().getY(), build.blueprint.origin().getZ(),
+						state.nextBuildRevision(), resetFailureMessage(reason));
+				LOGGER.error(
+						"Arena reset failed at {}: reason={}, mismatches={}, samples={}",
+						coordinates(build.blueprint.origin()), reason,
+						build.reset.mismatchCount(), build.reset.mismatchSamples()
+				);
 				build.session.fail(0L, "Arena preparation failed: " + reason);
-				build.operator.sendSystemMessage(Component.literal("Arena launch failed: " + reason));
+				publishOperatorNotice(build.operator, ScenarioOperatorMessagePolicy.Event.FAILURE,
+						"Arena launch failed: " + resetFailureMessage(reason));
 				state.build = null;
 			} else if (progress.phase() == ScenarioArenaResetJob.Phase.COMPLETE) {
+				populateArenaContainers(build);
+				state.buildProgress = ScenarioBuildProgress.fromResetTick(
+						build.config.sessionId().toString(), build.config.preset().title(), progress,
+						build.blueprint.origin().getX(), build.blueprint.origin().getY(),
+						build.blueprint.origin().getZ(), state.nextBuildRevision(),
+						"Arena ready at " + coordinates(build.blueprint.origin()) + ". Waiting to start agents.");
 				state.build = null;
-				beginActivation(state, build);
+				if (CodexAgentServerRuntime.automationAvailable(build.level.getServer())) {
+					beginActivationOrWait(state, build);
+				} else {
+					waitForCoordinator(state, build);
+				}
 			}
 		} catch (RuntimeException exception) {
+			int total = Math.max(0, build.reset.totalPlacements());
+			int completed = Math.clamp(build.reset.completedWork(), 0, total);
+			ScenarioArenaResetJob.Tick failedTick = new ScenarioArenaResetJob.Tick(
+					ScenarioArenaResetJob.Phase.FAILED, 0, completed, total,
+					Math.clamp(build.reset.changedBlocks(), 0, ScenarioBuildProgress.MAX_TOTAL_WORK),
+					build.reset.receipt(), safeMessage(exception));
+			state.buildProgress = ScenarioBuildProgress.failed(
+					build.config.sessionId().toString(), build.config.preset().title(), failedTick,
+					build.blueprint.origin().getX(), build.blueprint.origin().getY(), build.blueprint.origin().getZ(),
+					state.nextBuildRevision(), safeMessage(exception));
 			build.session.fail(0L, "Arena preparation failed: " + safeMessage(exception));
-			build.operator.sendSystemMessage(Component.literal("Arena launch failed: " + safeMessage(exception)));
+			publishOperatorNotice(build.operator, ScenarioOperatorMessagePolicy.Event.FAILURE,
+					"Arena launch failed: " + safeMessage(exception));
 			state.build = null;
 		}
+	}
+
+	private static void tickPendingActivation(RuntimeState state) {
+		BuildJob build = state.pendingActivation;
+		if (!CodexAgentServerRuntime.automationAvailable(build.level.getServer())) {
+			if (state.runtimeTick % 40L == 0L) {
+				build.operator.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(
+						"Arena ready | connecting agent coordinator..."
+				)));
+			}
+			return;
+		}
+		state.pendingActivation = null;
+		beginActivationOrWait(state, build);
+	}
+
+	private static void beginActivationOrWait(RuntimeState state, BuildJob build) {
+		try {
+			beginActivation(state, build);
+		} catch (RuntimeException exception) {
+			if (ScenarioActivationFailurePolicy.retryWhenCoordinatorReturns(exception)) {
+				waitForCoordinator(state, build);
+				return;
+			}
+			build.session.fail(0L, "Contestant activation failed: " + safeMessage(exception));
+			state.buildProgress = activationFailureProgress(state, build.config, build.blueprint.origin(),
+					"Agents could not start: " + safeMessage(exception));
+			publishOperatorNotice(build.operator, ScenarioOperatorMessagePolicy.Event.FAILURE,
+					"Arena is ready, but agents could not start: " + safeMessage(exception));
+		}
+	}
+
+	private static void waitForCoordinator(RuntimeState state, BuildJob build) {
+		state.pendingActivation = build;
+		build.operator.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(
+				"Arena ready | waiting for agent coordinator"
+		)));
+	}
+
+	private static String buildProgressDetail(ScenarioArenaResetJob.Tick progress) {
+		return switch (progress.phase()) {
+			case CANONICALIZE -> "Preparing the arena blueprint";
+			case LOAD_CHUNKS -> "Loading " + progress.completed() + " of " + progress.total() + " arena chunks";
+			case CLEAR -> "Cleared " + progress.completed() + " of " + progress.total()
+					+ " vertical cells; " + progress.changedBlocks() + " blocks removed";
+			case APPLY -> "Processed " + progress.completed() + " of " + progress.total()
+					+ " blueprint blocks; " + progress.changedBlocks() + " world changes made";
+			case VERIFY -> "Checking " + progress.completed() + " of " + progress.total() + " arena blocks";
+			case REPAIR -> "Corrected " + progress.completed() + " of " + progress.total()
+					+ " mismatched arena blocks";
+			case COMPLETE -> "Arena verified";
+			case FAILED -> progress.failureReason().isBlank() ? "Arena build failed" : progress.failureReason();
+		};
+	}
+
+	private static String buildProgressTitle(BuildJob build) {
+		String label = "Build " + coordinates(build.blueprint.origin()) + " | " + build.reset.progressLabel();
+		return label.length() <= 80 ? label : build.reset.progressLabel();
+	}
+
+	private static String coordinates(BlockPos position) {
+		return position.getX() + ", " + position.getY() + ", " + position.getZ();
+	}
+
+	private static String resetFailureMessage(String reason) {
+		return switch (reason) {
+			case "UNLOADED_MANAGED_CHUNK" -> "a managed arena chunk could not be loaded; retry the launch";
+			case "RESET_VERIFICATION_MISMATCH", "RESET_VERIFICATION_FAILED",
+					"RESET_VERIFICATION_DID_NOT_CONVERGE" ->
+					"the arena remained unstable after three automatic correction passes";
+			default -> reason;
+		};
 	}
 
 	private static void tickActivation(RuntimeState state) {
@@ -490,6 +674,8 @@ public final class ScenarioRuntimeService {
 					readyPlayers.put(contestant.record.agentId().toString(), player)
 			);
 		}
+		ScenarioRosterActivator activator = new ScenarioRosterActivator();
+		activator.protect(readyPlayers.values().stream().toList(), player -> player.setInvulnerable(true));
 		ScenarioPreflight.Verdict preflight = ScenarioPreflight.assess(new ScenarioPreflight.Input(
 				CoordinatorStatusStore.latest(activation.level.getServer()),
 				activation.contestants.stream().map(contestant -> new ScenarioPreflight.RequiredProfile(
@@ -539,19 +725,23 @@ public final class ScenarioRuntimeService {
 					))
 					.toList();
 			ScenarioLoadoutService loadouts = new ScenarioLoadoutService();
-			new ScenarioRosterActivator().activate(
+			activator.activate(
 					ready,
+					contestant -> contestant.player.setInvulnerable(false),
 					contestant -> loadouts.apply(
 							contestant.player,
 							activation.config.preset().category(),
-							contestant.pending.spec.gameMode()
+							ScenarioParticipantPolicy.effectiveGameMode(
+									activation.config.preset().category(), contestant.pending.spec.gameMode())
 					),
 					contestant -> manager.start(
 							contestant.pending.record.agentId().toString(),
 							contestantPrompt(
 									activation.config.preset(),
 									contestant.pending.spec,
-									activation.config
+									activation.config,
+									contestant.pending.laneIndex,
+									activation.origin
 							)
 					)
 			);
@@ -564,25 +754,36 @@ public final class ScenarioRuntimeService {
 						"slot-" + contestant.spec.slot()
 				);
 			}
+			ScenarioParkourRunState parkour = null;
+			if (activation.config.preset().category() == dev.agaminggod.arenaagents.scenario.ScenarioCategory.PARKOUR) {
+				LinkedHashMap<String, Integer> laneByAgent = new LinkedHashMap<>();
+				for (PendingContestant contestant : activation.contestants) {
+					laneByAgent.put(contestant.record.agentId().toString(), contestant.laneIndex);
+				}
+				parkour = new ScenarioParkourRunState(
+						ScenarioParkourCourse.create(activation.config.participants().size()), laneByAgent);
+			}
 			state.activeRun = new ActiveRun(
 					activation.session,
 					new ScenarioRuntimeClock(activation.session),
 					activation.operator.getUUID(),
 					activation.level,
 					activation.origin,
-					activation.resetReceipt
+					activation.resetReceipt,
+					parkour
 			);
 			state.activation = null;
 			persistActiveRun(state);
+			BlockPos operatorSpawn = ScenarioArenaBlueprint.operatorSpawn(activation.origin);
 			activation.operator.teleportTo(
-					activation.origin.getX() + 0.5D,
-					activation.origin.getY() + 15.0D,
-					activation.origin.getZ() + 70.5D
+					operatorSpawn.getX() + 0.5D,
+					operatorSpawn.getY(),
+					operatorSpawn.getZ() + 0.5D
 			);
-			activation.operator.sendSystemMessage(Component.literal(
-					"GO — " + activation.config.preset().title() + " launched with " + ready.size()
+			publishOperatorNotice(activation.operator, ScenarioOperatorMessagePolicy.Event.STARTED,
+					"GO | " + activation.config.preset().title() + " launched with " + ready.size()
 							+ " independently controlled offline players."
-			));
+			);
 		} catch (RuntimeException exception) {
 			failActivation(state, activation, manager, safeMessage(exception));
 		}
@@ -591,21 +792,13 @@ public final class ScenarioRuntimeService {
 	private static void tickActive(RuntimeState state) {
 		ActiveRun run = state.activeRun;
 		if (run == null) return;
+		tickParkourParticipants(state, run);
 		ScenarioRuntimeClock.Update update = run.clock.tick();
-		update.enteredPhase().ifPresent(phase -> sendOperatorMessage(
-				run,
-				"PHASE — " + phase.title() + ": " + phase.description()
-		));
-		for (var event : update.directedEvents()) {
-			ScenarioEventMarker marker = ScenarioEventMarker.forEvent(event);
-			BlockPos markerPosition = run.origin.offset(marker.x(), marker.y(), marker.z());
-			if (run.level.hasChunkAt(markerPosition)) {
-				run.level.setBlock(markerPosition, Blocks.GOLD_BLOCK.defaultBlockState(), 2);
-			}
-			sendOperatorMessage(run, "ARENA EVENT — " + event.description());
+		if (!run.session.state().terminal()) {
+			completionReason(state, run).ifPresent(reason -> run.session.finish(update.elapsedTick(), reason));
 		}
 		if (run.clock.snapshot().elapsedTick() % 20L == 0L) persistActiveRun(state);
-		if (!update.finishedNow()) return;
+		if (!run.session.state().terminal()) return;
 		CodexAgentManager manager = CodexAgentManager.get(run.level.getServer());
 		for (AgentRecord agent : state.agents) {
 			try {
@@ -614,18 +807,76 @@ public final class ScenarioRuntimeService {
 				// A contestant may already have completed, failed, or died.
 			}
 		}
-		sendOperatorMessage(
-				run,
-				"FINISHED — " + run.session.config().preset().title() + ": "
+		publishOperatorNotice(
+				run.level.getServer().getPlayerList().getPlayer(run.operatorId),
+				ScenarioOperatorMessagePolicy.Event.FINISHED,
+				"FINISHED | " + run.session.config().preset().title() + ": "
 						+ run.session.completionReason().orElse("Scenario complete")
 		);
 		ScenarioRunSnapshot terminalSnapshot = persistActiveRun(state);
 		beginResultPersistence(state, run.level.getServer(), terminalSnapshot);
 	}
 
-	private static void sendOperatorMessage(ActiveRun run, String message) {
-		ServerPlayer operator = run.level.getServer().getPlayerList().getPlayer(run.operatorId);
-		if (operator != null) operator.sendSystemMessage(Component.literal(message));
+	/**
+	 * Vanilla death is never intercepted by a scenario. A selected model may later
+	 * choose the coordinate-free vanilla respawn primitive for its dead agent.
+	 */
+	public static synchronized boolean recoverParkourDeath(ServerPlayer player) {
+		Objects.requireNonNull(player, "player must not be null");
+		return false;
+	}
+
+	private static void tickParkourParticipants(RuntimeState state, ActiveRun run) {
+		if (run.parkour == null) return;
+		CodexAgentManager manager = CodexAgentManager.get(run.level.getServer());
+		for (AgentRecord agent : state.agents) {
+			ServerPlayer player = manager.findAgentPlayer(agent.agentId()).orElse(null);
+			if (player == null || !player.isAlive()) continue;
+			player.setGameMode(GameType.ADVENTURE);
+			ScenarioParkourRecovery.Decision decision = run.parkour.evaluate(
+					agent.agentId().toString(),
+					player.getX() - run.origin.getX(),
+					player.getY() - run.origin.getY(),
+					player.getZ() - run.origin.getZ()
+			);
+		}
+	}
+
+	private static Optional<String> completionReason(RuntimeState state, ActiveRun run) {
+		CodexAgentManager manager = CodexAgentManager.get(run.level.getServer());
+		Map<String, AgentRecord> currentRecords = new LinkedHashMap<>();
+		for (AgentRecord record : manager.records()) {
+			currentRecords.put(record.agentId().toString(), record);
+		}
+		ArrayList<ScenarioCompletionPolicy.ParticipantState> participants = new ArrayList<>();
+		for (AgentRecord boundAgent : state.agents) {
+			String agentId = boundAgent.agentId().toString();
+			String participantId = state.participantByAgent.get(agentId);
+			if (participantId == null) continue;
+			AgentRecord current = currentRecords.get(agentId);
+			ScenarioParticipant participant = run.session.config().requireParticipant(participantId);
+			boolean alive = current != null
+					&& manager.findAgentPlayer(boundAgent.agentId()).map(ServerPlayer::isAlive).orElse(false);
+			participants.add(new ScenarioCompletionPolicy.ParticipantState(
+				agentId, participant.team(),
+					current == null ? AgentLifecycleState.DISCONNECTED : current.state(), alive
+			));
+		}
+		if (participants.size() != run.session.config().participants().size()) return Optional.empty();
+		return ScenarioCompletionPolicy.finishReason(
+				run.session.config().preset().category(), participants,
+				run.parkour != null && run.parkour.allFinished()
+		);
+	}
+
+	private static void publishOperatorNotice(
+			ServerPlayer operator,
+			ScenarioOperatorMessagePolicy.Event event,
+			String message
+	) {
+		if (operator == null || ScenarioOperatorMessagePolicy.surface(event)
+				!= ScenarioOperatorMessagePolicy.Surface.ACTION_BAR) return;
+		operator.connection.send(new ClientboundSetActionBarTextPacket(Component.literal(message)));
 	}
 
 	private static ScenarioRunSnapshot persistActiveRun(RuntimeState state) {
@@ -637,6 +888,7 @@ public final class ScenarioRuntimeService {
 				run.level.dimension().identifier().toString(),
 				run.operatorId,
 				state.agents.stream().map(agent -> agent.agentId().toString()).toList(),
+				run.parkour == null ? Map.of() : run.parkour.checkpoints(),
 				new ScenarioRunSnapshot.Origin(run.origin.getX(), run.origin.getY(), run.origin.getZ()),
 				run.resetReceipt,
 				state.publicEvents
@@ -697,6 +949,12 @@ public final class ScenarioRuntimeService {
 		if (pending == null) return;
 		ScenarioResultPersistence.Status status = pending.persistence.poll(state.runtimeTick);
 		if (status.durable()) {
+			// Scenario contestants are run-owned. Leaving their durable registry rows
+			// behind makes the next run collide with the same roster display names.
+			List<String> boundAgentIds = ScenarioOwnedAgentIds.forCleanup(state.agents.stream()
+					.map(agent -> agent.agentId().toString())
+					.toList(), pending.snapshot.boundAgentIds());
+			if (!removeBoundAgentsStrict(CodexAgentManager.get(server), boundAgentIds)) return;
 			ScenarioSavedData.get(server).clear();
 			state.pendingResult = null;
 			state.activeRun = null;
@@ -789,12 +1047,11 @@ public final class ScenarioRuntimeService {
 
 	public static synchronized void release(MinecraftServer server) {
 		RuntimeState state = STATES.remove(server);
+		if (state != null && state.build != null) state.build.reset.close(state.build.level);
 		if (state != null && state.activeRun != null && state.pendingResult == null) persistActiveRun(state);
 	}
 
 	private static void beginActivation(RuntimeState state, BuildJob build) {
-		build.session.markReady(0L);
-		build.session.beginCountdown(0L);
 		CodexAgentManager manager = CodexAgentManager.get(build.level.getServer());
 		Map<String, ScenarioAgentSpec> specs = new LinkedHashMap<>();
 		for (ScenarioAgentSpec spec : build.request.roster()) {
@@ -807,26 +1064,29 @@ public final class ScenarioRuntimeService {
 				ScenarioAgentSpec spec = specs.get(spawn.participantId());
 				Vec3 position = new Vec3(
 						build.blueprint.origin().getX() + spawn.x() + 0.5D,
-						build.blueprint.origin().getY()
-								+ (build.config.preset().category() == dev.agaminggod.arenaagents.scenario.ScenarioCategory.PARKOUR
-								? 2.0D : 1.0D),
+						build.blueprint.origin().getY() + spawn.y(),
 						build.blueprint.origin().getZ() + spawn.z() + 0.5D
 				);
+				var effectiveGameMode = ScenarioParticipantPolicy.effectiveGameMode(
+						build.config.preset().category(), spec.gameMode());
 				AgentRecord record = manager.summon(
 						build.level,
 						position,
 						spec.provider(),
 						spec.model(),
 						spec.reasoning(),
+						spec.serviceTier(),
 						Optional.of(spec.displayName()),
-						spec.gameMode()
+						effectiveGameMode
 				);
-				contestants.add(new PendingContestant(record, spec));
+				contestants.add(new PendingContestant(record, spec, spawn.slotIndex()));
 			}
 		} catch (RuntimeException exception) {
 			removeContestants(manager, contestants.stream().map(PendingContestant::record).toList());
 			throw exception;
 		}
+		build.session.markReady(0L);
+		build.session.beginCountdown(0L);
 		List<PendingContestant> pending = List.copyOf(contestants);
 		state.activation = new ActivationJob(
 				build.session,
@@ -844,9 +1104,8 @@ public final class ScenarioRuntimeService {
 				System.currentTimeMillis(),
 				0L
 		);
-		build.operator.sendSystemMessage(Component.literal(
-				"Arena ready — waiting for " + pending.size() + " offline contestants."
-		));
+		publishOperatorNotice(build.operator, ScenarioOperatorMessagePolicy.Event.READY,
+				"Arena ready | waiting for " + pending.size() + " offline contestants.");
 	}
 
 	private static void failActivation(
@@ -856,11 +1115,25 @@ public final class ScenarioRuntimeService {
 			String reason
 	) {
 		activation.session.fail(0L, "Contestant activation failed: " + reason);
-		activation.operator.sendSystemMessage(Component.literal("Arena launch failed: " + reason));
+		state.buildProgress = activationFailureProgress(
+				state, activation.config, activation.origin, "Agents could not start: " + reason);
+		publishOperatorNotice(activation.operator, ScenarioOperatorMessagePolicy.Event.FAILURE,
+				"Arena launch failed: " + reason);
 		removeContestants(manager, activation.contestants.stream().map(PendingContestant::record).toList());
 		state.activation = null;
 		state.activeRun = null;
 		state.agents = List.of();
+	}
+
+	private static ScenarioBuildProgress activationFailureProgress(
+			RuntimeState state,
+			ScenarioSessionConfig config,
+			BlockPos origin,
+			String detail
+	) {
+		return ScenarioBuildProgress.rejected(
+				config.sessionId().toString(), config.preset().title(), state.nextBuildRevision(),
+				origin.getX(), origin.getY(), origin.getZ(), detail);
 	}
 
 	private static void removeContestants(CodexAgentManager manager, List<AgentRecord> contestants) {
@@ -923,8 +1196,22 @@ public final class ScenarioRuntimeService {
 	private static String contestantPrompt(
 			ScenarioPreset preset,
 			ScenarioAgentSpec spec,
-			ScenarioSessionConfig config
+			ScenarioSessionConfig config,
+			int laneIndex,
+			BlockPos origin
 	) {
+		String arenaSpecific = "";
+		if (preset.category() == dev.agaminggod.arenaagents.scenario.ScenarioCategory.PARKOUR) {
+			ScenarioParkourCourse.Lane lane = ScenarioParkourCourse.create(config.participants().size())
+					.lanes().get(laneIndex);
+			ScenarioParkourCourse.Platform start = lane.platforms().getFirst();
+			ScenarioParkourCourse.Platform finish = lane.platforms().getLast();
+			arenaSpecific = "Your dedicated lane is " + lane.index() + " at world x approximately "
+					+ (origin.getX() + start.centerX()) + ". Stay in that lane; do not jump to another contestant's course. "
+					+ "Advance toward increasing world z from " + (origin.getZ() + start.centerZ()) + " to "
+					+ (origin.getZ() + finish.centerZ())
+					+ ". Glowing platforms are checkpoints. Death remains a normal vanilla death; choose respawn only when appropriate.";
+		}
 		return """
 				You are contestant %s in the Minecraft AI Arena scenario "%s".
 				Primary objective: %s
@@ -934,6 +1221,7 @@ public final class ScenarioRuntimeService {
 				Use navigation/combat/flee/follow controller actions for sustained behavior. Preserve yourself in Survival,
 				but do not invent an objective beyond this brief. Other contestants are independently controlled.
 				Session seed: %d. Team: %s.
+				%s
 				""".formatted(
 				spec.displayName(),
 				preset.title(),
@@ -941,11 +1229,69 @@ public final class ScenarioRuntimeService {
 				String.join(", ", preset.landmarks()),
 				String.join(", ", preset.dynamicEvents()),
 				config.worldSeed(),
-				spec.team().orElse("solo")
+				spec.team().orElse("solo"),
+				arenaSpecific
 		).trim();
 	}
 
-	private static BlockPos arenaOrigin(ServerLevel level, ScenarioPreset preset) {
+	private static void populateArenaContainers(BuildJob build) {
+		if (build.config.preset().category() != dev.agaminggod.arenaagents.scenario.ScenarioCategory.PVP) return;
+		for (ScenarioArenaBlueprint.Placement placement :
+				ScenarioArenaResetJob.canonicalize(build.blueprint.placements())) {
+			if (placement.state().getBlock() != Blocks.CHEST && placement.state().getBlock() != Blocks.BARREL) continue;
+			if (!(build.level.getBlockEntity(placement.position()) instanceof Container container)) {
+				throw new IllegalStateException("MISSING_LOOT_CONTAINER_AT_" + placement.position().toShortString());
+			}
+			ScenarioLootManifest manifest = ScenarioLootManifest.forContainer(
+					build.blueprint.origin(), placement.position(), build.config.worldSeed());
+			Map<Integer, ItemStack> expected = new java.util.HashMap<>();
+			for (ScenarioLootManifest.Entry entry : manifest.entries()) {
+				if (entry.slot() >= container.getContainerSize()) {
+					throw new IllegalStateException("LOOT_SLOT_OUT_OF_RANGE_AT_" + placement.position().toShortString());
+				}
+				expected.put(entry.slot(), lootStack(entry));
+			}
+			for (int slot = 0; slot < container.getContainerSize(); slot++) {
+				ItemStack wanted = expected.getOrDefault(slot, ItemStack.EMPTY);
+				if (!sameStack(container.getItem(slot), wanted)) container.setItem(slot, wanted.copy());
+			}
+			container.setChanged();
+			for (int slot = 0; slot < container.getContainerSize(); slot++) {
+				ItemStack wanted = expected.getOrDefault(slot, ItemStack.EMPTY);
+				if (!sameStack(container.getItem(slot), wanted)) {
+					throw new IllegalStateException("LOOT_VERIFICATION_FAILED_AT_"
+							+ placement.position().toShortString() + "_SLOT_" + slot);
+				}
+			}
+		}
+	}
+
+	private static ItemStack lootStack(ScenarioLootManifest.Entry entry) {
+		Identifier identifier = Identifier.tryParse(entry.itemId());
+		if (identifier == null || !BuiltInRegistries.ITEM.containsKey(identifier)) {
+			throw new IllegalStateException("UNKNOWN_LOOT_ITEM_" + entry.itemId());
+		}
+		return new ItemStack(BuiltInRegistries.ITEM.getValue(identifier), entry.count());
+	}
+
+	private static boolean sameStack(ItemStack actual, ItemStack expected) {
+		if (actual.isEmpty() || expected.isEmpty()) return actual.isEmpty() && expected.isEmpty();
+		return actual.getItem() == expected.getItem() && actual.getCount() == expected.getCount();
+	}
+
+	static BlockPos arenaOrigin(
+			ServerLevel level,
+			ScenarioPreset preset,
+			ServerPlayer operator,
+			ScenarioPlacementMode placementMode
+	) {
+		if (placementMode != ScenarioPlacementMode.FIXED_LANE) {
+			int distance = placementMode == ScenarioPlacementMode.IN_FRONT_OF_PLAYER ? 80 : 0;
+			int x = operator.getBlockX() + operator.getDirection().getStepX() * distance;
+			int z = operator.getBlockZ() + operator.getDirection().getStepZ() * distance;
+			int surface = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+			return new BlockPos(x, surface - 1, z);
+		}
 		int lane = switch (preset.category()) {
 			case SURVIVAL -> 0;
 			case BUILDING -> 1;
@@ -969,6 +1315,9 @@ public final class ScenarioRuntimeService {
 
 	private static final class RuntimeState {
 		private BuildJob build;
+		private BuildJob pendingActivation;
+		private ScenarioBuildProgress buildProgress;
+		private long buildProgressRevision;
 		private ActivationJob activation;
 		private RecoveryJob recovery;
 		private CleanupJob cleanup;
@@ -979,6 +1328,10 @@ public final class ScenarioRuntimeService {
 		private final LinkedHashMap<String, String> participantByAgent = new LinkedHashMap<>();
 		private long runtimeTick;
 		private boolean restoreAttempted;
+
+		private long nextBuildRevision() {
+			return ++buildProgressRevision;
+		}
 	}
 
 	private record CleanupJob(
@@ -1020,7 +1373,7 @@ public final class ScenarioRuntimeService {
 		}
 	}
 
-	private record PendingContestant(AgentRecord record, ScenarioAgentSpec spec) {
+	private record PendingContestant(AgentRecord record, ScenarioAgentSpec spec, int laneIndex) {
 	}
 
 	private record ReadyContestant(PendingContestant pending, ServerPlayer player) {
@@ -1062,7 +1415,8 @@ public final class ScenarioRuntimeService {
 			UUID operatorId,
 			ServerLevel level,
 			BlockPos origin,
-			ScenarioResetReceipt resetReceipt
+			ScenarioResetReceipt resetReceipt,
+			ScenarioParkourRunState parkour
 	) {
 	}
 
@@ -1074,10 +1428,11 @@ public final class ScenarioRuntimeService {
 			ScenarioSession session,
 			ScenarioArenaBlueprint blueprint,
 			ScenarioArenaResetJob reset,
-			int reportedMilestone
+			ScenarioArenaResetJob.Phase reportedPhase,
+			int reportedCompleted
 	) {
-		private BuildJob withReportedMilestone(int value) {
-			return new BuildJob(operator, level, request, config, session, blueprint, reset, value);
+		private BuildJob withReportedProgress(ScenarioArenaResetJob.Phase phase, int value) {
+			return new BuildJob(operator, level, request, config, session, blueprint, reset, phase, value);
 		}
 	}
 }

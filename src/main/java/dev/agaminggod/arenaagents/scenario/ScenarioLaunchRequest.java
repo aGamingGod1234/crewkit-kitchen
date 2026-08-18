@@ -8,6 +8,7 @@ public record ScenarioLaunchRequest(
 		String scenarioId,
 		String mapVersion,
 		boolean deterministicEvents,
+		ScenarioPlacementMode placementMode,
 		List<ScenarioAgentSpec> roster
 ) {
 	public ScenarioLaunchRequest {
@@ -17,6 +18,7 @@ public record ScenarioLaunchRequest(
 		if (!preset.mapVersion().equals(mapVersion)) {
 			throw new IllegalArgumentException("scenario map version does not match the installed preset");
 		}
+		placementMode = Objects.requireNonNull(placementMode, "placementMode must not be null");
 		roster = List.copyOf(Objects.requireNonNull(roster, "roster must not be null"));
 		preset.validateAgentCount(roster.size());
 		HashSet<Integer> slots = new HashSet<>();

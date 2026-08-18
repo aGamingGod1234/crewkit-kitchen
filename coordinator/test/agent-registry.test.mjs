@@ -124,6 +124,25 @@ test('record normalization excludes transient coordinator handles', () => {
 	assert.equal(Object.hasOwn(normalized, 'activeTurnId'), false);
 });
 
+test('dead record normalization preserves every authoritative vanilla respawn fact', () => {
+	const death = {
+		cause: 'fell from a high place', dimensionId: 'minecraft:the_nether', x: 12.5, y: 64, z: -3.5,
+		respawnDimensionId: 'minecraft:overworld', respawnX: 100.5, respawnY: 70, respawnZ: -20.5,
+		respawnYaw: 37.5, respawnPitch: -12.25, respawnForced: true, gameMode: 'spectator', diedAtEpochMs: 2_000,
+	};
+	const normalized = normalizeAgentRecord(record('agent-a', {
+		state: DynamicAgentState.DEAD, currentGoal: 'Survive.', goalRevision: 2, death,
+	}));
+	assert.deepEqual(normalized.death, death);
+	assert.throws(
+		() => normalizeAgentRecord(record('agent-a', {
+			state: DynamicAgentState.DEAD, currentGoal: 'Survive.', goalRevision: 2,
+			death: { ...death, respawnX: null },
+		})),
+		/present together/,
+	);
+});
+
 test('registry persistence codec is deterministic and pauses active work on reload', () => {
 	const encoded = encodeAgentRegistrySnapshot([
 		record('agent-b'),

@@ -18,8 +18,9 @@
 	},
 	"gemini": {
 		"executable": "agy",
-		"models": ["gemini-3.1-pro", "gemini-3.6-flash", "gemini-3.5-flash"],
+		"models": ["gemini-3.7-flash", "gemini-3.1-pro", "gemini-3.6-flash", "gemini-3.5-flash"],
 		"modelReasoningEfforts": {
+			"gemini-3.7-flash": ["high", "medium", "low"],
 			"gemini-3.1-pro": ["high", "low"],
 			"gemini-3.6-flash": ["high", "medium", "low"],
 			"gemini-3.5-flash": ["high", "medium", "low"]
@@ -40,7 +41,7 @@
 	"limits": {
 		"agentCap": 16,
 		"goalQueueCap": 32,
-		"planningConcurrency": 4,
+		"planningConcurrency": 16,
 		"invalidDecisionRetries": 1
 	}
 }

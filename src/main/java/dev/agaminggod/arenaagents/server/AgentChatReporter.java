@@ -13,41 +13,57 @@ public final class AgentChatReporter {
 	}
 
 	public static void planning(CodexAgentManager manager, AgentRecord record) {
-		report(manager, record, "Planning", "Reviewing the goal and current world state.", ChatFormatting.GRAY);
+		// Planning state belongs in the field console; chat is reserved for meaningful activity.
+	}
+
+	public static void stillPlanning(CodexAgentManager manager, AgentRecord record) {
+		// Deliberately quiet: periodic provider heartbeat text drowned out actual actions.
 	}
 
 	public static void acting(CodexAgentManager manager, AgentRecord record, ServerActionRequest request) {
-		String action = request.type().wireName().replace('_', ' ');
-		report(manager, record, "Acting", action, ChatFormatting.WHITE);
+		if (AgentActivityPresentation.shouldAnnounceAction(request.type())) {
+			report(manager, record, AgentActivityPresentation.action(request.type()), ChatFormatting.WHITE);
+		}
 	}
 
 	public static void decision(CodexAgentManager manager, AgentRecord record, String summary) {
-		report(manager, record, "Decision", summary, ChatFormatting.YELLOW);
+		// The concrete action that follows is clearer than repeating the planner's internal summary.
 	}
 
 	public static void result(CodexAgentManager manager, AgentRecord record, ServerActionResult result) {
-		String status = result.state().name().toLowerCase(Locale.ROOT);
-		ChatFormatting color = result.state().name().equals("SUCCEEDED") ? ChatFormatting.GREEN : ChatFormatting.RED;
-		report(manager, record, capitalize(status), result.message(), color);
+		AgentActivityPresentation.result(result).ifPresent(message ->
+				report(manager, record, message, ChatFormatting.RED));
 	}
 
 	public static void completed(CodexAgentManager manager, AgentRecord record, String summary) {
-		report(manager, record, "Completed", summary, ChatFormatting.GREEN);
+		report(manager, record, summary == null || summary.isBlank() ? "Task complete" : summary, ChatFormatting.GREEN);
+	}
+
+	public static void failed(CodexAgentManager manager, AgentRecord record, String error) {
+		failed(manager, record, null, error);
+	}
+
+	public static void failed(CodexAgentManager manager, AgentRecord record, String reasonCode, String error) {
+		if (reasonCode != null && !AgentActivityPresentation.shouldShowInChat(reasonCode, true)) return;
+		report(manager, record, "Needs attention: " + readableError(error), ChatFormatting.RED);
+	}
+
+	public static void disconnected(CodexAgentManager manager, AgentRecord record) {
+		report(manager, record,
+				"Connection lost. Reconnect the coordinator, then resume or restart this task.", ChatFormatting.RED);
 	}
 
 	private static void report(
 			CodexAgentManager manager,
 			AgentRecord record,
-			String status,
 			String message,
-			ChatFormatting statusColor
+			ChatFormatting messageColor
 	) {
 		if (!manager.automaticProgress(record.agentId())) return;
 		MutableComponent prefix = Component.literal("[" + manager.displayName(record) + "]")
 				.withStyle(familyColor(record.profile().provider()));
-		MutableComponent body = Component.literal(" " + status + " · ").withStyle(statusColor)
-				.append(Component.literal(message == null || message.isBlank() ? "No details." : message)
-						.withStyle(ChatFormatting.GRAY));
+		MutableComponent body = Component.literal(" " + (message == null || message.isBlank() ? "No details." : message))
+				.withStyle(messageColor);
 		manager.server().getPlayerList().broadcastSystemMessage(prefix.append(body), false);
 	}
 
@@ -60,7 +76,9 @@ public final class AgentChatReporter {
 		};
 	}
 
-	private static String capitalize(String value) {
-		return value.substring(0, 1).toUpperCase(Locale.ROOT) + value.substring(1);
+	private static String readableError(String error) {
+		if (error == null || error.isBlank()) return "the model provider returned no error details.";
+		String compact = error.replace('\n', ' ').replace('\r', ' ').trim();
+		return compact.length() <= 240 ? compact : compact.substring(0, 237) + "...";
 	}
 }

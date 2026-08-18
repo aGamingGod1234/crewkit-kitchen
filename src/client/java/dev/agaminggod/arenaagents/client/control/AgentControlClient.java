@@ -4,15 +4,16 @@ import com.mojang.blaze3d.platform.InputConstants;
 import dev.agaminggod.arenaagents.client.gui.AgentControlScreen;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioLaunchPlan;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioLaunchRegistry;
-import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupScreen;
 import dev.agaminggod.arenaagents.client.presentation.ArenaSpectatorHud;
 import dev.agaminggod.arenaagents.client.presentation.ArenaSpectatorState;
 import dev.agaminggod.arenaagents.client.presentation.ScenarioResultsScreen;
 import dev.agaminggod.arenaagents.client.presentation.SpectatorCameraAssistant;
+import dev.agaminggod.arenaagents.client.presentation.ScenarioBuildProgressState;
 import dev.agaminggod.arenaagents.scenario.ScenarioAgentSpec;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRequest;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshotPayload;
+import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressPayload;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
@@ -53,6 +54,7 @@ public final class AgentControlClient {
 	));
 	private static final AgentControlSnapshotStore SNAPSHOTS = new AgentControlSnapshotStore();
 	private static final ArenaSpectatorState SPECTATOR_STATE = new ArenaSpectatorState();
+	private static final ScenarioBuildProgressState BUILD_PROGRESS_STATE = new ScenarioBuildProgressState();
 	private static final SpectatorCameraAssistant CAMERA_ASSISTANT = new SpectatorCameraAssistant();
 	private static Preferences preferences = Preferences.defaults();
 	private static boolean registered;
@@ -82,7 +84,19 @@ public final class AgentControlClient {
 		if (!spectatorReceiverRegistered) {
 			throw new IllegalStateException("Arena Agents spectator snapshot receiver is already registered");
 		}
-		ArenaSpectatorHud.register(SPECTATOR_STATE);
+		boolean buildProgressReceiverRegistered = ClientPlayNetworking.registerGlobalReceiver(
+				ScenarioBuildProgressPayload.TYPE,
+				(payload, context) -> context.client().execute(() -> {
+					if (!BUILD_PROGRESS_STATE.accept(payload)) return;
+					if (context.client().screen instanceof dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupScreen screen) {
+						screen.acceptBuildProgress();
+					}
+				})
+		);
+		if (!buildProgressReceiverRegistered) {
+			throw new IllegalStateException("Arena Agents build progress receiver is already registered");
+		}
+		ArenaSpectatorHud.register(SPECTATOR_STATE, BUILD_PROGRESS_STATE);
 		ClientTickEvents.END_CLIENT_TICK.register(AgentControlClient::tick);
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clearConnectionState());
 		ScenarioLaunchRegistry.register(AgentControlClient::launchScenario);
@@ -93,12 +107,28 @@ public final class AgentControlClient {
 		return SNAPSHOTS.current();
 	}
 
+	public static Optional<dev.agaminggod.arenaagents.control.AgentControlAgent> agentForPlayer(String profileName) {
+		return SNAPSHOTS.current().flatMap(snapshot -> AgentPlayerIdentity.find(snapshot, profileName));
+	}
+
+	public static boolean isAgentPlayer(String profileName) {
+		return agentForPlayer(profileName).isPresent();
+	}
+
 	public static ArenaSpectatorState spectatorState() {
 		return SPECTATOR_STATE;
 	}
 
+	public static ScenarioBuildProgressState buildProgressState() {
+		return BUILD_PROGRESS_STATE;
+	}
+
 	public static Preferences preferences() {
 		return preferences;
+	}
+
+	public static String openControlKeyLabel() {
+		return OPEN_CONTROL.getTranslatedKeyMessage().getString();
 	}
 
 	public static Set<String> hiddenAgentIds() {
@@ -146,20 +176,23 @@ public final class AgentControlClient {
 					plan.scenarioId(),
 					plan.mapVersion(),
 					plan.deterministicEvents(),
+					plan.placementMode(),
 					plan.roster().stream().map(agent -> new ScenarioAgentSpec(
 							agent.slot(),
 							agent.displayName(),
 							agent.provider(),
 							agent.model(),
 							agent.reasoning(),
+							agent.serviceTier(),
 							Optional.of(agent.team()).filter(value -> !value.isBlank()),
 							agent.gameMode()
 					)).toList()
 			);
+			BUILD_PROGRESS_STATE.clear();
 			ClientPlayNetworking.send(ScenarioLaunchPayload.fromRequest(request));
 			return new ScenarioLaunchRegistry.Result(
 					true,
-					plan.scenarioTitle() + " is being built; progress will appear in chat"
+					plan.scenarioTitle() + " build request sent; live progress will appear here"
 			);
 		} catch (RuntimeException exception) {
 			String message = exception.getMessage();
@@ -173,7 +206,8 @@ public final class AgentControlClient {
 	private static void tick(Minecraft client) {
 		while (OPEN_CONTROL.consumeClick()) {
 			if (client.player != null && client.level != null && client.screen == null) {
-				client.setScreen(new ScenarioSetupScreen());
+				client.setScreen(new AgentControlScreen());
+				requestSnapshot();
 			}
 		}
 		while (TOGGLE_CAMERA_ASSISTANT.consumeClick()) {
@@ -191,24 +225,22 @@ public final class AgentControlClient {
 				CAMERA_ASSISTANT.resetTracking();
 			}
 		}
-		if (client.screen instanceof AgentControlScreen) {
-			if (refreshCountdown <= 0) {
-				requestSnapshot();
-				refreshCountdown = SNAPSHOT_REFRESH_TICKS;
-			} else {
-				refreshCountdown--;
-			}
-		} else {
-			refreshCountdown = 0;
-		}
+		boolean connected = client.player != null && client.level != null && client.getConnection() != null;
+		SnapshotRefreshPolicy.Tick refresh = SnapshotRefreshPolicy.advance(
+				refreshCountdown, connected, SNAPSHOT_REFRESH_TICKS);
+		refreshCountdown = refresh.nextCountdown();
+		if (refresh.requestSnapshot()) requestSnapshot();
 		CAMERA_ASSISTANT.tick(client, SPECTATOR_STATE);
 		showResultsIfAvailable(client);
 	}
 
 	private static void acceptSnapshot(AgentControlSnapshot nextSnapshot) {
-		if (!SNAPSHOTS.accept(Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null"))) {
+		Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
+		if (!SNAPSHOTS.accept(nextSnapshot)) {
 			return;
 		}
+		AgentControlCatalog.installRuntimeCatalog(nextSnapshot.catalog());
+		normalizePreferences();
 		Minecraft client = Minecraft.getInstance();
 		if (client.screen instanceof AgentControlScreen screen) {
 			screen.acceptSnapshot(nextSnapshot);
@@ -233,9 +265,22 @@ public final class AgentControlClient {
 
 	private static void clearConnectionState() {
 		SNAPSHOTS.clear();
+		AgentControlCatalog.resetRuntimeCatalog();
+		preferences = Preferences.defaults();
 		SPECTATOR_STATE.clearOnDisconnect();
+		BUILD_PROGRESS_STATE.clear();
 		CAMERA_ASSISTANT.resetTracking();
 		refreshCountdown = 0;
+	}
+
+	private static void normalizePreferences() {
+		String provider = AgentControlCatalog.providers().contains(preferences.provider())
+				? preferences.provider() : AgentControlCatalog.providers().getFirst();
+		String model = AgentControlCatalog.models(provider).contains(preferences.model())
+				? preferences.model() : AgentControlCatalog.defaultModel(provider);
+		String reasoning = AgentControlCatalog.reasoningEfforts(provider, model).contains(preferences.reasoning())
+				? preferences.reasoning() : AgentControlCatalog.defaultReasoning(provider, model);
+		preferences = new Preferences(provider, model, reasoning);
 	}
 
 	public record Preferences(String provider, String model, String reasoning) {

@@ -24,8 +24,10 @@ $Utf8NoBom = [Text.UTF8Encoding]::new($false)
 $PackageRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $ModsSource = Join-Path $PackageRoot 'mods'
 $RuntimeDirectory = Join-Path $PackageRoot 'runtime'
+$RuntimeDeploymentHelper = Join-Path $PSScriptRoot 'distribution-runtime.ps1'
 $SecretPath = Join-Path $RuntimeDirectory 'bridge-secret.txt'
 $ResolvedGameDirectory = [IO.Path]::GetFullPath($GameDirectory)
+$InstalledPackageRoot = Join-Path $ResolvedGameDirectory 'arena-agents-runtime'
 $VersionMetadata = Join-Path $env:APPDATA ".minecraft\versions\$VersionId\$VersionId.json"
 
 if (Get-Process -Name MinecraftLauncher,Minecraft -ErrorAction SilentlyContinue) {
@@ -54,11 +56,13 @@ if ($LASTEXITCODE -ne 0) { throw "Java version check failed with code $LASTEXITC
 if ($javaVersion -notmatch 'version "25(\.|")') {
     throw "Arena Agents requires Java 25. Detected: $($javaVersion.Trim())"
 }
-foreach ($required in @($LauncherProfiles, $VersionMetadata, $ModsSource)) {
-    if (-not (Test-Path -LiteralPath $required)) { throw "Missing installation prerequisite: $required" }
+foreach ($required in @($LauncherProfiles, $VersionMetadata, $ModsSource, $RuntimeDeploymentHelper)) {
+	if (-not (Test-Path -LiteralPath $required)) { throw "Missing installation prerequisite: $required" }
 }
 
-New-Item -ItemType Directory -Force -Path $RuntimeDirectory, (Join-Path $ResolvedGameDirectory 'mods') | Out-Null
+. $RuntimeDeploymentHelper
+
+New-Item -ItemType Directory -Force -Path $RuntimeDirectory, (Join-Path $ResolvedGameDirectory 'mods'), $InstalledPackageRoot | Out-Null
 if (-not (Test-Path -LiteralPath $SecretPath -PathType Leaf)) {
     $bytes = New-Object byte[] $SecretByteCount
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -78,12 +82,16 @@ foreach ($mod in $includedMods) {
     Copy-Item -LiteralPath $mod.FullName -Destination (Join-Path $ResolvedGameDirectory 'mods') -Force
 }
 
+New-Item -ItemType Directory -Force -Path (Join-Path $InstalledPackageRoot 'runtime') | Out-Null
+Copy-Item -LiteralPath $SecretPath -Destination (Join-Path $InstalledPackageRoot 'runtime\bridge-secret.txt') -Force
+$runtimeDeployment = Install-ArenaCoordinatorRuntime -SourceRoot $PackageRoot -InstalledPackageRoot $InstalledPackageRoot
+
 $resolvedProfiles = (Resolve-Path -LiteralPath $LauncherProfiles).Path
 $document = Get-Content -LiteralPath $resolvedProfiles -Raw | ConvertFrom-Json
 if ($null -eq $document.profiles) {
     $document | Add-Member -MemberType NoteProperty -Name profiles -Value ([pscustomobject]@{})
 }
-$javaArguments = "-Xms1G -Xmx4G -Darenaagents.bridgeSecretFile=`"$SecretPath`""
+$javaArguments = "-Xms1G -Xmx4G -Darenaagents.bridgeSecretFile=`"$SecretPath`" -Darenaagents.packageRoot=`"$InstalledPackageRoot`""
 $expected = [ordered]@{
     gameDir = $ResolvedGameDirectory
     javaArgs = $javaArguments
@@ -123,4 +131,5 @@ if ($changed) {
 
 Write-Host "Arena Agents installed to $ResolvedGameDirectory"
 Write-Host "Launcher profile: $ProfileName"
-Write-Host 'Start the coordinator with .\scripts\start-pack-coordinator.ps1 before entering a world.'
+if ($null -ne $runtimeDeployment.BackupPath) { Write-Host "Previous coordinator backup: $($runtimeDeployment.BackupPath)" }
+Write-Host 'The bundled coordinator now starts and reconnects automatically in a world.'

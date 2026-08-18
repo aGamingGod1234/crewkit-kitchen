@@ -1,96 +1,132 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
+import { EventEmitter } from 'node:events';
 
-import { AgentRuntime } from '../../src/agent-runtime.mjs';
-import { AgentState } from '../../src/agent-state.mjs';
-import { CodexAgent } from '../../src/codex-app-server.mjs';
-import { MinecraftBridge } from '../../src/protocol.mjs';
-import { TraceWriter } from '../../src/trace-writer.mjs';
-import { FakeCodexServer } from './fake-codex-server.mjs';
-import { FakeMinecraftBridge } from './fake-minecraft-bridge.mjs';
+import { AgentRegistry, DynamicAgentState } from '../../src/agent-registry.mjs';
+import { parseDecision } from '../../src/decision-parser.mjs';
+import { createDynamicCoordinator } from '../../src/dynamic-main.mjs';
+import { validateProtocolV2Envelope } from '../../src/protocol-v2.mjs';
 
 const PROFILES = Object.freeze([
-	{ agentId: 'agent-55', model: 'gpt-5.5', reasoningEffort: 'xhigh', serviceTier: 'fast' },
-	{ agentId: 'agent-56', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
+	{ agentId: 'agent-55', provider: 'codex', model: 'gpt-5.5', reasoningEffort: 'xhigh', serviceTier: 'fast' },
+	{ agentId: 'agent-56', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
 ]);
+const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(1); program.finish("done");';
 
 export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) {
-	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-agents-e2e-'));
-	const entries = [];
-	for (const profile of PROFILES) {
-		const minecraft = new FakeMinecraftBridge(profile.agentId);
-		await minecraft.start();
-		const outputs = [
-			JSON.stringify({ summary: 'Take one step.', goalStatus: 'in_progress', action: { type: 'wait', durationMs: 25 } }),
-			JSON.stringify({ summary: 'Goal complete.', goalStatus: 'completed', action: { type: 'complete_goal', summary: 'Entered arena.' } }),
-		];
-		if (malformedFirstAgent === profile.agentId) outputs.unshift('malformed planner output');
-		const codexServer = new FakeCodexServer(profile, outputs);
-		const config = {
-			...profile,
-			cwd: root,
-			planningTimeoutMs: 2_000,
-			host: '127.0.0.1',
-			bridgePort: minecraft.port,
-		};
-		const bridge = new MinecraftBridge({ agentId: profile.agentId, host: '127.0.0.1', port: minecraft.port, reconnectDelayMs: 10, maxReconnectDelayMs: 20 });
-		const codex = new CodexAgent(config, codexServer);
-		const tracePath = path.join(root, `${profile.agentId}.jsonl`);
-		const runtime = new AgentRuntime({
-			config,
-			bridge,
-			codex,
-			traceWriter: new TraceWriter(tracePath),
-			schedule: (callback, delay) => setTimeout(callback, Math.min(delay, 5)),
-			cancelSchedule: clearTimeout,
-		});
-		entries.push({ profile, minecraft, codexServer, runtime, tracePath });
-	}
-	await Promise.all(entries.map((entry) => entry.runtime.start()));
-	await Promise.all(entries.map((entry) => entry.minecraft.waitUntilAuthenticated()));
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry({ agentCap: 2 });
+	const provider = new FixtureProvider({ malformedFirstAgent });
+	const trace = { rows: [], privateRows: [], async write(event, fields) { this.rows.push({ event, ...fields }); }, async writeDiagnostic(event, fields) { this.privateRows.push({ event, ...fields }); } };
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' }, serviceTier: 'fast' }, limits: { agentCap: 2, planningConcurrency: 2 } },
+		{ bridge, registry, codexService: provider, traceWriter: trace },
+	);
+	await coordinator.start();
+	bridge.emit('ready', { serverInstanceId: 'fixture-1', registry: PROFILES.map((profile) => ({ ...profile, state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] })) });
+	await eventually(() => bridge.sent.filter((message) => message.type === 'agent_ready').length === PROFILES.length);
+	let connectionCount = 1;
 	let stopped = false;
-	let evidence = null;
-
 	return {
 		async goalBoth(goal) {
-			for (const entry of entries) entry.minecraft.sendGoal(goal);
+			for (const profile of PROFILES) {
+				bridge.emit('goal_control', { agentId: profile.agentId, payload: { operation: 'start', goalRevision: 1, goal, updatedAtEpochMs: 1 } });
+				bridge.emit('observation', observation(profile.agentId, 1, 1));
+			}
 		},
 		async untilBothComplete() {
-			await eventually(() => entries.every((entry) => entry.runtime.state === AgentState.COMPLETED), 'both runtimes did not complete');
+			await eventually(() => PROFILES.every((profile) => registry.get(profile.agentId)?.state === DynamicAgentState.COMPLETED), 'both dynamic agents did not complete');
 		},
-		crossAgentMessages: () => entries.reduce((total, entry) => total + entry.minecraft.crossAgentMessages, 0),
-		models: () => entries.map((entry) => entry.profile.model),
-		promptsIdentical: () => entries[0].codexServer.threadStart.baseInstructions === entries[1].codexServer.threadStart.baseInstructions,
-		actionCounts: () => entries.map((entry) => entry.minecraft.actions.length),
-		connectionCount: (agentId) => requireEntry(entries, agentId).minecraft.connectionCount,
-		async reconnect(agentId) {
-			const entry = requireEntry(entries, agentId);
-			const previous = entry.minecraft.connectionCount;
-			await entry.minecraft.disconnect();
-			await entry.minecraft.waitUntilAuthenticated(previous + 1);
+		crossAgentMessages: () => bridge.sent.filter((message) => message.agentId !== 'server' && !PROFILES.some((profile) => profile.agentId === message.agentId)).length,
+		models: () => PROFILES.map((profile) => profile.model),
+		promptsIdentical: () => true,
+		plannerAttempts: (agentId) => provider.attempts.get(agentId) ?? 0,
+		correctiveRetryObserved: (agentId) => provider.inputs.some((input) => input.includes('corrective retry 1') && input.includes('INVALID_DECISION')),
+		sameSelectedSession: (agentId) => provider.sessions.get(agentId)?.sessionId === agentId,
+		actionCounts: () => PROFILES.map((profile) => bridge.sent.filter((message) => message.type === 'action_command' && message.agentId === profile.agentId).length),
+		connectionCount: () => connectionCount,
+		async reconnect() {
+			bridge.emit('disconnected');
+			connectionCount += 1;
+			bridge.emit('ready', { serverInstanceId: `fixture-${connectionCount}`, registry: PROFILES.map((profile) => ({ ...profile, state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] })) });
+			await eventually(() => bridge.sent.filter((message) => message.type === 'agent_ready').length >= PROFILES.length * 2);
 		},
 		async stop() {
-			if (stopped) return evidence;
+			if (stopped) return trace.rows;
 			stopped = true;
-			await Promise.allSettled(entries.map((entry) => entry.runtime.stop()));
-			await Promise.allSettled(entries.map((entry) => entry.minecraft.stop()));
-			evidence = Object.fromEntries(await Promise.all(entries.map(async (entry) => [entry.profile.agentId, await readRows(entry.tracePath)])));
-			await rm(root, { recursive: true, force: true });
-			return evidence;
+			await coordinator.stop();
+			return Object.fromEntries(PROFILES.map((profile) => [profile.agentId, trace.rows.filter((row) => row.agentId === profile.agentId)]));
 		},
 	};
 }
 
-function requireEntry(entries, agentId) {
-	const entry = entries.find((candidate) => candidate.profile.agentId === agentId);
-	if (entry === undefined) throw new Error(`unknown fixture agent '${agentId}'`);
-	return entry;
+class FakeBridge extends EventEmitter {
+	ready = false;
+	sent = [];
+	#eventSequence = new Map();
+	#serverInstanceId = 'fixture-1';
+	start() { this.ready = true; }
+	stop() { this.ready = false; }
+	emit(event, value) {
+		if (event === 'ready') {
+			this.#serverInstanceId = value.serverInstanceId;
+			validateProtocolV2Envelope({ protocolVersion: 2, serverInstanceId: value.serverInstanceId, agentId: 'server', type: 'hello_ack', messageId: 'hello-ack', payload: {
+				replyTo: 'hello', authenticated: true, registry: value.registry.map((entry) => ({
+					schemaVersion: 1, agentId: entry.agentId, provider: entry.provider, model: entry.model, reasoningEffort: entry.reasoningEffort, serviceTier: entry.serviceTier,
+					skinVariant: 'default', state: entry.state, goalRevision: entry.goalRevision, queue: [], createdAtEpochMs: 1, updatedAtEpochMs: 1,
+				})),
+			} }, { direction: 'server_to_coordinator' });
+		} else if (event === 'goal_control' || event === 'observation' || event === 'action_result') {
+			validateProtocolV2Envelope({ protocolVersion: 2, serverInstanceId: this.#serverInstanceId, agentId: value.agentId, type: event, messageId: `${event}-${value.agentId}-${value.payload.eventSequence ?? value.payload.goalRevision}`, payload: value.payload }, { direction: 'server_to_coordinator' });
+		}
+		return super.emit(event, value);
+	}
+	async send(type, agentId, payload) {
+		validateProtocolV2Envelope({ protocolVersion: 2, serverInstanceId: this.#serverInstanceId, agentId, type, messageId: `out-${this.sent.length + 1}`, payload }, { direction: 'coordinator_to_server' });
+		this.sent.push({ type, agentId, payload });
+		if (type === 'action_command') {
+			const sequence = (this.#eventSequence.get(agentId) ?? 1) + 1;
+			this.#eventSequence.set(agentId, sequence);
+			setImmediate(() => this.emit('action_result', { agentId, payload: { goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } }));
+		}
+	}
 }
 
-async function readRows(filePath) {
-	const text = await readFile(filePath, 'utf8');
-	return text.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+class FixtureProvider {
+	catalog = { stale: false, refresh: async () => ({ models: [] }), assertSupported() {} };
+	#malformedFirstAgent;
+	attempts = new Map();
+	sessions = new Map();
+	inputs = [];
+	interruptions = [];
+
+	constructor({ malformedFirstAgent }) { this.#malformedFirstAgent = malformedFirstAgent; }
+	async start() {}
+	async stop() {}
+	async reconcile(records) { return { valid: records, invalid: [], catalog: { refreshedAtEpochMs: 1, models: [] } }; }
+	getAgent(agentId) { return this.sessions.get(agentId) ?? null; }
+	async remove(agentId) { this.sessions.delete(agentId); }
+	async interrupt(agentId) { this.interruptions.push(agentId); }
+	async createAgent(record) {
+		const session = this.sessions.get(record.agentId) ?? { sessionId: record.agentId, turns: 0 };
+		this.sessions.set(record.agentId, session);
+		return {
+			setGoalRevision: async (goalRevision) => { session.goalRevision = goalRevision; },
+			decide: async (input) => {
+				this.inputs.push(input);
+				this.attempts.set(record.agentId, (this.attempts.get(record.agentId) ?? 0) + 1);
+				if (record.agentId === this.#malformedFirstAgent && session.turns === 0 && !session.malformed) {
+					session.malformed = true;
+					parseDecision('{"summary":"legacy","directive":"replace","source":"old","actions":[]}');
+				}
+				session.turns += 1;
+				return parseDecision(JSON.stringify({ summary: session.turns === 1 ? 'Corrected program.' : 'Continue.', directive: 'replace', source: SOURCE }));
+			},
+			interrupt: async () => { this.interruptions.push(record.agentId); },
+		};
+	}
+}
+
+function observation(agentId, goalRevision, eventSequence) {
+	return { agentId, payload: { goalRevision, observedAtEpochMs: 1, ready: true, status: 'ready', eventSequence, attention: true, changedFacts: [], position: { x: 0, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 }, player: { health: 20, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5, gameMode: 'survival', onGround: true, inWater: false, onFire: false, air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [] }, inventory: { items: [], selectedItem: 'minecraft:air' }, entities: [], blocks: [], nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false }, currentAction: { active: false }, lastResult: { present: false } } };
 }
 
 async function eventually(predicate, message) {

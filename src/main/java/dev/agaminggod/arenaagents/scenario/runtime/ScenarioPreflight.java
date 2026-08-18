@@ -9,7 +9,7 @@ import java.util.Set;
 
 public final class ScenarioPreflight {
 	public static final long STATUS_MAXIMUM_AGE_MS = 2_500L;
-	public static final long FIRST_WAVE_DEADLINE_MS = 30_000L;
+	public static final long FIRST_WAVE_DEADLINE_MS = 75_000L;
 
 	private ScenarioPreflight() {
 	}

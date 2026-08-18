@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.protocol;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
@@ -21,6 +22,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 public final class ProtocolCodec {
 	private static final String FIELD_PROTOCOL_VERSION = ProtocolConstants.FIELD_PROTOCOL_VERSION;
@@ -33,10 +35,15 @@ public final class ProtocolCodec {
 	private static final String FIELD_TOLERANCE = "tolerance";
 	private static final String FIELD_SPRINT = "sprint";
 	private static final String FIELD_TARGET_SELECTOR = "targetSelector";
+	private static final String FIELD_TARGET_ID = "targetId";
 	private static final String FIELD_TIMEOUT_MS = "timeoutMs";
 	private static final String FIELD_ITEM_ID = "itemId";
 	private static final String FIELD_DURATION_MS = "durationMs";
 	private static final String FIELD_FACE = "face";
+	private static final String FIELD_DESIRED_STATE = "desiredState";
+	private static final String FIELD_PLACEMENTS = "placements";
+	private static final int MAX_DESIRED_STATE_LENGTH = 512;
+	private static final int MAX_BUILD_SEQUENCE_PLACEMENTS = 32;
 	private static final String FIELD_MESSAGE = "message";
 	private static final String FIELD_SUMMARY = "summary";
 	private static final String FIELD_OPEN = "open";
@@ -286,6 +293,7 @@ public final class ProtocolCodec {
 			case USE_ITEM, WAIT -> requireDuration(arguments, FIELD_DURATION_MS);
 			case BREAK_BLOCK -> validateBreakBlock(arguments);
 			case PLACE_BLOCK -> validatePlaceBlock(arguments);
+			case BUILD_SEQUENCE -> validateBuildSequence(arguments);
 			case CHAT -> requireBoundedText(arguments, FIELD_MESSAGE, ProtocolConstants.MAX_CHAT_LENGTH, false);
 			case SET_DOOR -> {
 				validateCoordinates(arguments, true);
@@ -306,6 +314,7 @@ public final class ProtocolCodec {
 			case SELECT_TOOL -> validateSelectTool(arguments);
 			case BLOCK_WITH_SHIELD -> requireDuration(arguments, FIELD_DURATION_MS);
 			case USE_RANGED -> validateUseRanged(arguments);
+			case RESPAWN -> { }
 			case COMPLETE_GOAL -> requireBoundedText(
 					arguments,
 					FIELD_SUMMARY,
@@ -317,7 +326,8 @@ public final class ProtocolCodec {
 
 		JsonObject validatedArguments = new JsonObject();
 		for (String field : ACTION_FIELDS.get(actionType)) {
-			validatedArguments.add(field, arguments.get(field).deepCopy());
+			JsonElement value = arguments.get(field);
+			validatedArguments.add(field, value == null ? JsonNull.INSTANCE : value.deepCopy());
 		}
 		return validatedArguments;
 	}
@@ -347,12 +357,7 @@ public final class ProtocolCodec {
 	}
 
 	private static void validateAttack(JsonObject command) throws ProtocolException {
-		requireBoundedText(
-				command,
-				FIELD_TARGET_SELECTOR,
-				ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH,
-				false
-		);
+		requireUuid(command, FIELD_TARGET_ID);
 		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
@@ -397,6 +402,27 @@ public final class ProtocolCodec {
 			);
 		}
 		requireIdentifier(command, FIELD_ITEM_ID);
+		JsonElement desiredState = command.get(FIELD_DESIRED_STATE);
+		if (desiredState != null && !desiredState.isJsonNull()) {
+			requireBoundedText(command, FIELD_DESIRED_STATE, MAX_DESIRED_STATE_LENGTH, false);
+		}
+	}
+
+	private static void validateBuildSequence(JsonObject command) throws ProtocolException {
+		JsonElement placements = requireField(command, FIELD_PLACEMENTS);
+		if (!placements.isJsonArray()) throw invalidField("Field 'placements' must be an array");
+		int size = placements.getAsJsonArray().size();
+		if (size < 1 || size > MAX_BUILD_SEQUENCE_PLACEMENTS) {
+			throw outOfRange(FIELD_PLACEMENTS, "an array containing 1 to " + MAX_BUILD_SEQUENCE_PLACEMENTS + " entries");
+		}
+		for (int index = 0; index < size; index++) {
+			JsonElement entry = placements.getAsJsonArray().get(index);
+			if (!entry.isJsonObject()) throw invalidField("placements[" + index + "] must be an object");
+			JsonObject placement = entry.getAsJsonObject();
+			validatePlaceBlock(placement);
+			validateKnownArgumentFields(placement, ActionType.PLACE_BLOCK);
+		}
+		requireDuration(command, FIELD_TIMEOUT_MS);
 	}
 
 	private static void validateCoordinates(JsonObject command, boolean integral) throws ProtocolException {
@@ -463,7 +489,7 @@ public final class ProtocolCodec {
 	}
 
 	private static void validateUseRanged(JsonObject arguments) throws ProtocolException {
-		requireBoundedText(arguments, FIELD_TARGET_SELECTOR, ProtocolConstants.MAX_TARGET_SELECTOR_LENGTH, false);
+		requireUuid(arguments, FIELD_TARGET_ID);
 		requireDuration(arguments, FIELD_DRAW_DURATION_MS);
 		requireDuration(arguments, FIELD_TIMEOUT_MS);
 	}
@@ -521,6 +547,17 @@ public final class ProtocolCodec {
 
 	private static String requireIdentifier(JsonObject command, String field) throws ProtocolException {
 		return requireBoundedText(command, field, ProtocolConstants.MAX_IDENTIFIER_LENGTH, false);
+	}
+
+	private static String requireUuid(JsonObject object, String field) throws ProtocolException {
+		String value = requireBoundedText(object, field, 36, false);
+		try {
+			UUID parsed = UUID.fromString(value);
+			if (!parsed.toString().equalsIgnoreCase(value)) throw new IllegalArgumentException();
+			return value;
+		} catch (IllegalArgumentException exception) {
+			throw invalidField("Field '" + field + "' must be a canonical UUID");
+		}
 	}
 
 	private static long requireDuration(JsonObject command, String field) throws ProtocolException {
@@ -683,11 +720,12 @@ public final class ProtocolCodec {
 		Map<ActionType, List<String>> fields = new EnumMap<>(ActionType.class);
 		fields.put(ActionType.MOVE_TO, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TOLERANCE, FIELD_SPRINT));
 		fields.put(ActionType.LOOK_AT, List.of(FIELD_X, FIELD_Y, FIELD_Z));
-		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_SELECTOR, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.ATTACK, List.of(FIELD_TARGET_ID, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.SELECT_ITEM, List.of(FIELD_ITEM_ID));
 		fields.put(ActionType.USE_ITEM, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS));
-		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID));
+		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID, FIELD_DESIRED_STATE));
+		fields.put(ActionType.BUILD_SEQUENCE, List.of(FIELD_PLACEMENTS, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.CHAT, List.of(FIELD_MESSAGE));
 		fields.put(ActionType.WAIT, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.SET_DOOR, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_OPEN));
@@ -718,7 +756,8 @@ public final class ProtocolCodec {
 				FIELD_SOURCE_SLOT, FIELD_HOTBAR_SLOT, FIELD_EXPECTED_ITEM_ID, FIELD_MIN_REMAINING_DURABILITY
 		));
 		fields.put(ActionType.BLOCK_WITH_SHIELD, List.of(FIELD_DURATION_MS));
-		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_SELECTOR, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_ID, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.RESPAWN, List.of());
 		fields.put(ActionType.COMPLETE_GOAL, List.of(FIELD_SUMMARY));
 		return Map.copyOf(fields);
 	}

@@ -11,6 +11,8 @@ public record AgentControlAgent(
 		String provider,
 		String model,
 		String reasoning,
+		String playerName,
+		int skinVariant,
 		String state,
 		String currentGoal,
 		int queuedGoalCount,
@@ -36,6 +38,11 @@ public record AgentControlAgent(
 		provider = requireBounded(provider, "provider", AgentConstants.MAX_REASONING_LENGTH);
 		model = requireBounded(model, "model", AgentConstants.MAX_MODEL_LENGTH);
 		reasoning = requireBounded(reasoning, "reasoning", AgentConstants.MAX_REASONING_LENGTH);
+		playerName = requireBounded(playerName, "playerName", 16);
+		if (playerName.isBlank()) throw new IllegalArgumentException("playerName must not be blank");
+		if (skinVariant < 0 || skinVariant >= AgentConstants.DEFAULT_SKIN_VARIANT_COUNT) {
+			throw new IllegalArgumentException("skinVariant is outside the supported range");
+		}
 		state = requireBounded(state, "state", MAX_STATE_LENGTH);
 		currentGoal = requireBounded(currentGoal, "currentGoal", MAX_CURRENT_GOAL_LENGTH);
 		lastSummary = requireBounded(lastSummary, "lastSummary", MAX_LAST_SUMMARY_LENGTH);

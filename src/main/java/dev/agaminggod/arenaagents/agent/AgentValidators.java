@@ -8,6 +8,7 @@ public final class AgentValidators {
 	private static final String ERROR_TOO_LONG = "VALUE_TOO_LONG";
 	private static final String ERROR_CONTROL_CHARACTER = "CONTROL_CHARACTER";
 	private static final Set<String> PROVIDERS = Set.of("codex", "gemini", "kimi");
+	private static final Set<String> SERVICE_TIERS = Set.of("priority", "fast");
 
 	private AgentValidators() {
 	}
@@ -30,6 +31,14 @@ public final class AgentValidators {
 
 	public static String requireReasoning(String value) {
 		return requireSingleLine(value, "reasoning", AgentConstants.MAX_REASONING_LENGTH).toLowerCase(Locale.ROOT);
+	}
+
+	public static String requireServiceTier(String value) {
+		String tier = requireSingleLine(value, "speed mode", 24).toLowerCase(Locale.ROOT);
+		if (!SERVICE_TIERS.contains(tier)) {
+			throw failure("INVALID_SERVICE_TIER", "speed mode must be priority or fast");
+		}
+		return tier;
 	}
 
 	public static String requireUserName(String value) {

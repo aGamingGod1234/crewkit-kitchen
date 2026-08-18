@@ -1,5 +1,12 @@
 const MAX_OPERATION_LENGTH = 128;
 const MAX_OPERATION_CAP = 16;
+const LOCAL_OPERATIONS = new Set([
+	'minecraft_change_to_publication',
+	'event_receipt_to_branch',
+	'branch_to_bridge_send',
+	'command_to_first_progress',
+	'action_completion',
+]);
 
 export class ControlLatencyRegistry {
 	#windowSize;
@@ -54,14 +61,13 @@ function requireOperation(value) {
 	if (operation.length === 0 || operation.length > MAX_OPERATION_LENGTH) {
 		throw new TypeError(`operation must be nonblank and at most ${MAX_OPERATION_LENGTH} characters`);
 	}
+	if (!LOCAL_OPERATIONS.has(operation)) throw new TypeError('operation must be a named local control operation');
 	return operation;
 }
 
 function requireDuration(value) {
 	if (!Number.isFinite(value) || value < 0) throw new TypeError('duration must be non-negative and finite');
-	const duration = Math.round(value);
-	if (!Number.isSafeInteger(duration)) throw new TypeError('duration must round to a safe integer');
-	return duration;
+	return value;
 }
 
 function percentile(sorted, fraction) {

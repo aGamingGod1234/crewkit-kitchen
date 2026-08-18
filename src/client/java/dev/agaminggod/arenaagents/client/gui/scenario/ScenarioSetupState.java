@@ -2,28 +2,58 @@ package dev.agaminggod.arenaagents.client.gui.scenario;
 
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.scenario.ScenarioPlacementMode;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
-import java.util.Set;
-import java.util.function.UnaryOperator;
 
 public final class ScenarioSetupState {
-	private ScenarioWizardStep step = ScenarioWizardStep.MODE;
+	private ScenarioWizardStep step = ScenarioWizardStep.ARENA;
 	private ScenarioPreset selectedScenario = ScenarioPreset.LAST_VALLEY;
 	private final List<ScenarioAgentConfig> roster = new ArrayList<>();
-	private final Set<Integer> selectedIndices = new LinkedHashSet<>();
+	private int selectedIndex;
 	private boolean deterministicEvents = true;
+	private ScenarioPlacementMode placementMode = ScenarioPlacementMode.IN_FRONT_OF_PLAYER;
 
-	private ScenarioSetupState() {
-		roster.add(ScenarioAgentConfig.defaults(selectedScenario.defaultGameMode()));
-		selectedIndices.add(0);
+	private ScenarioSetupState(ScenarioAgentConfig initialConfig) {
+		roster.add(Objects.requireNonNull(initialConfig, "initialConfig must not be null"));
 	}
 
 	public static ScenarioSetupState defaults() {
-		return new ScenarioSetupState();
+		return new ScenarioSetupState(ScenarioAgentConfig.defaults(AgentGameMode.SURVIVAL));
+	}
+
+	public static ScenarioSetupState defaults(String provider, String model, String reasoning) {
+		return new ScenarioSetupState(ScenarioAgentConfig.configuredDefaults(
+				provider, model, reasoning, AgentGameMode.SURVIVAL));
+	}
+
+	public static ScenarioSetupState fromLaunchPlan(ScenarioLaunchPlan plan) {
+		Objects.requireNonNull(plan, "plan must not be null");
+		ScenarioPreset preset = java.util.Arrays.stream(ScenarioPreset.values())
+				.filter(candidate -> candidate.id().equals(plan.scenarioId()))
+				.findFirst()
+				.orElseThrow(() -> new IllegalArgumentException("unknown arena preset: " + plan.scenarioId()));
+		List<ScenarioLaunchPlan.Agent> ordered = plan.roster().stream()
+				.sorted(java.util.Comparator.comparingInt(ScenarioLaunchPlan.Agent::slot))
+				.toList();
+		if (ordered.isEmpty()) throw new IllegalArgumentException("launch plan roster must not be empty");
+		ScenarioSetupState restored = new ScenarioSetupState(configFrom(ordered.getFirst()));
+		restored.roster.clear();
+		for (ScenarioLaunchPlan.Agent agent : ordered) restored.roster.add(configFrom(agent));
+		restored.selectedScenario = preset;
+		restored.deterministicEvents = plan.deterministicEvents();
+		restored.placementMode = plan.placementMode();
+		restored.step = ScenarioWizardStep.REVIEW;
+		return restored;
+	}
+
+	private static ScenarioAgentConfig configFrom(ScenarioLaunchPlan.Agent agent) {
+		return new ScenarioAgentConfig(
+				agent.provider(), agent.model(), agent.reasoning(), agent.serviceTier(),
+				agent.displayName(), agent.team(), agent.gameMode()
+		);
 	}
 
 	public ScenarioWizardStep step() {
@@ -38,8 +68,8 @@ public final class ScenarioSetupState {
 		return List.copyOf(roster);
 	}
 
-	public Set<Integer> selectedIndices() {
-		return Set.copyOf(selectedIndices);
+	public int selectedIndex() {
+		return selectedIndex;
 	}
 
 	public boolean deterministicEvents() {
@@ -50,8 +80,20 @@ public final class ScenarioSetupState {
 		this.deterministicEvents = deterministicEvents;
 	}
 
+	public ScenarioPlacementMode placementMode() {
+		return placementMode;
+	}
+
+	public void setPlacementMode(ScenarioPlacementMode placementMode) {
+		this.placementMode = Objects.requireNonNull(placementMode, "placementMode must not be null");
+	}
+
 	public void choosePresetWorkflow() {
 		step = ScenarioWizardStep.ARENA;
+	}
+
+	public void showBuildDashboard() {
+		step = ScenarioWizardStep.REVIEW;
 	}
 
 	public void selectScenario(ScenarioPreset preset) {
@@ -66,7 +108,6 @@ public final class ScenarioSetupState {
 
 	public void next() {
 		step = switch (step) {
-			case MODE -> ScenarioWizardStep.ARENA;
 			case ARENA -> ScenarioWizardStep.ROSTER;
 			case ROSTER -> validationErrors().isEmpty() ? ScenarioWizardStep.REVIEW : ScenarioWizardStep.ROSTER;
 			case REVIEW -> ScenarioWizardStep.REVIEW;
@@ -75,8 +116,7 @@ public final class ScenarioSetupState {
 
 	public void previous() {
 		step = switch (step) {
-			case MODE -> ScenarioWizardStep.MODE;
-			case ARENA -> ScenarioWizardStep.MODE;
+			case ARENA -> ScenarioWizardStep.ARENA;
 			case ROSTER -> ScenarioWizardStep.ARENA;
 			case REVIEW -> ScenarioWizardStep.ROSTER;
 		};
@@ -95,60 +135,33 @@ public final class ScenarioSetupState {
 		while (roster.size() > count) {
 			roster.removeLast();
 		}
-		selectedIndices.removeIf(index -> index < 0 || index >= roster.size());
-		if (selectedIndices.isEmpty() && !roster.isEmpty()) {
-			selectedIndices.add(0);
-		}
-	}
-
-	public void setSelectedIndices(Set<Integer> indices) {
-		selectedIndices.clear();
-		for (Integer index : Objects.requireNonNull(indices, "indices must not be null")) {
-			if (index != null && index >= 0 && index < roster.size()) {
-				selectedIndices.add(index);
-			}
-		}
+		selectedIndex = Math.clamp(selectedIndex, 0, roster.size() - 1);
 	}
 
 	public void selectOnly(int index) {
 		checkIndex(index);
-		selectedIndices.clear();
-		selectedIndices.add(index);
-	}
-
-	public void toggleSelected(int index) {
-		checkIndex(index);
-		if (!selectedIndices.add(index)) {
-			selectedIndices.remove(index);
-		}
-	}
-
-	public void selectAll() {
-		selectedIndices.clear();
-		for (int index = 0; index < roster.size(); index++) {
-			selectedIndices.add(index);
-		}
-	}
-
-	public void clearSelection() {
-		selectedIndices.clear();
+		selectedIndex = index;
 	}
 
 	public void applyProvider(String provider) {
 		AgentControlCatalog.requireProvider(provider);
-		applySelected(config -> config.withProvider(provider));
+		updateSelected(roster.get(selectedIndex).withProvider(provider));
 	}
 
 	public void applyModel(String model) {
-		applySelected(config -> config.withModel(model));
+		updateSelected(roster.get(selectedIndex).withModel(model));
 	}
 
 	public void applyReasoning(String reasoning) {
-		applySelected(config -> config.withReasoning(reasoning));
+		updateSelected(roster.get(selectedIndex).withReasoning(reasoning));
+	}
+
+	public void applyServiceTier(String serviceTier) {
+		updateSelected(roster.get(selectedIndex).withServiceTier(serviceTier));
 	}
 
 	public void applyTeam(String team) {
-		applySelected(config -> config.withTeam(team));
+		updateSelected(roster.get(selectedIndex).withTeam(team));
 	}
 
 	public void applyGameMode(AgentGameMode gameMode) {
@@ -156,25 +169,23 @@ public final class ScenarioSetupState {
 			throw new IllegalArgumentException(selectedScenario.title() + " requires "
 					+ selectedScenario.defaultGameMode().displayName());
 		}
-		applySelected(config -> config.withGameMode(gameMode));
+		updateSelected(roster.get(selectedIndex).withGameMode(gameMode));
 	}
 
 	public void renameSelected(String name) {
-		if (selectedIndices.size() != 1) {
-			throw new IllegalStateException("Select one agent to set a custom name");
-		}
-		int index = selectedIndices.iterator().next();
-		roster.set(index, roster.get(index).withName(name));
+		updateSelected(roster.get(selectedIndex).withName(name));
 	}
 
 	public String displayNameAt(int index) {
 		checkIndex(index);
 		ScenarioAgentConfig config = roster.get(index);
-		String base = config.name().isBlank() ? readableModelName(config.model()) : config.name();
+		String base = config.name().isBlank()
+				? AgentControlCatalog.displayName(config.provider(), config.model()) : config.name();
 		int duplicateIndex = 0;
 		for (int current = 0; current < index; current++) {
 			ScenarioAgentConfig previous = roster.get(current);
-			String previousBase = previous.name().isBlank() ? readableModelName(previous.model()) : previous.name();
+			String previousBase = previous.name().isBlank()
+					? AgentControlCatalog.displayName(previous.provider(), previous.model()) : previous.name();
 			if (base.equalsIgnoreCase(previousBase)) {
 				duplicateIndex++;
 			}
@@ -198,6 +209,9 @@ public final class ScenarioSetupState {
 			if (!AgentControlCatalog.reasoningEfforts(config.provider(), config.model()).contains(config.reasoning())) {
 				errors.add("Agent " + (index + 1) + " has an unavailable thinking level");
 			}
+			if (!AgentControlCatalog.serviceTiers(config.provider(), config.model()).contains(config.serviceTier())) {
+				errors.add("Agent " + (index + 1) + " has an unavailable speed mode");
+			}
 		}
 		return List.copyOf(errors);
 	}
@@ -220,6 +234,7 @@ public final class ScenarioSetupState {
 					config.provider(),
 					config.model(),
 					config.reasoning(),
+					config.serviceTier(),
 					config.team(),
 					config.gameMode()
 			));
@@ -229,6 +244,7 @@ public final class ScenarioSetupState {
 				selectedScenario.title(),
 				selectedScenario.mapVersion(),
 				deterministicEvents,
+				placementMode,
 				agents
 		);
 	}
@@ -260,10 +276,8 @@ public final class ScenarioSetupState {
 		return result.isEmpty() ? model : result.toString();
 	}
 
-	private void applySelected(UnaryOperator<ScenarioAgentConfig> operation) {
-		for (Integer index : selectedIndices) {
-			roster.set(index, operation.apply(roster.get(index)));
-		}
+	private void updateSelected(ScenarioAgentConfig config) {
+		roster.set(selectedIndex, Objects.requireNonNull(config, "config must not be null"));
 	}
 
 	private void checkIndex(int index) {

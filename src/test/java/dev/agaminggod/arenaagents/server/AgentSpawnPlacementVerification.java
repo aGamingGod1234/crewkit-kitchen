@@ -1,7 +1,11 @@
 package dev.agaminggod.arenaagents.server;
 
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentProfile;
+import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import java.util.HashSet;
 import java.util.List;
+import java.util.UUID;
 import net.minecraft.world.phys.Vec3;
 
 public final class AgentSpawnPlacementVerification {
@@ -30,7 +34,15 @@ public final class AgentSpawnPlacementVerification {
 		if (new HashSet<>(candidates).size() != candidates.size()) {
 			throw new AssertionError("spawn candidate grid contains duplicate positions");
 		}
-		return 10;
+		String playerName = OfflineAgentPlayers.playerName(
+				new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc")),
+				new AgentProfile("codex", "gpt-5.6-sol", "high", "fast", java.util.Optional.empty(), 0,
+						AgentGameMode.SURVIVAL)
+		);
+		if (!playerName.equals("SolCyan_193A9ADD")) {
+			throw new AssertionError("offline agent username should be readable, was " + playerName);
+		}
+		return 11;
 	}
 
 	private static void assertCoordinate(double actual, double expected, String label) {

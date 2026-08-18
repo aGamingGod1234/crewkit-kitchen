@@ -32,7 +32,7 @@ public record ArenaSpectatorSnapshot(
 		List<ScenarioPublicEvent> feed,
 		Optional<DirectorRecommendation> recommendation
 ) {
-	public static final int MAX_STANDINGS = 8;
+	public static final int MAX_STANDINGS = 16;
 	public static final int MAX_FEED_ENTRIES = 6;
 	private static final Pattern ID = Pattern.compile("[a-z0-9][a-z0-9_-]*");
 	private static final Pattern HASH = Pattern.compile("[0-9a-f]{64}");

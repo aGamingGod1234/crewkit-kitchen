@@ -1,9 +1,9 @@
-import { ACTION_FIELDS, MAX_SUMMARY_LENGTH } from './constants.mjs';
-import { validateAction, ValidationError } from './schema.mjs';
+import { MAX_SUMMARY_LENGTH } from './constants.mjs';
 
-const GOAL_STATUSES = new Set(['in_progress', 'completed', 'impossible']);
-const DECISION_KEYS = new Set(['summary', 'goalStatus', 'action']);
-const NULLABLE_ACTION_FIELDS = new Set(Object.values(ACTION_FIELDS).flat());
+const DIRECTIVES = new Set(['replace', 'continue', 'pause', 'finish']);
+const FINISH_STATUSES = new Set(['completed', 'impossible']);
+const DECISION_KEYS = new Set(['summary', 'directive', 'source', 'status']);
+const MAX_SOURCE_LENGTH = 65_536;
 
 export class DecisionError extends Error {
 	constructor(code, message, options) {
@@ -22,28 +22,33 @@ export function parseDecision(text) {
 	} catch (error) {
 		throw new DecisionError('MALFORMED_DECISION', 'Planner output must contain only one JSON object', { cause: error });
 	}
+	assertNoDuplicateObjectKeys(json);
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new DecisionError('INVALID_DECISION', 'Planner decision must be a JSON object');
+	if (Object.hasOwn(value, 'actions')) throw new DecisionError('INVALID_DECISION', 'Legacy action-array decisions are not supported; return ArenaScript source in the decision envelope');
 	for (const key of Object.keys(value)) if (!DECISION_KEYS.has(key)) throw new DecisionError('UNKNOWN_DECISION_FIELD', `Unknown decision field '${key}'`);
-	for (const key of DECISION_KEYS) if (!Object.hasOwn(value, key)) throw new DecisionError('MISSING_DECISION_FIELD', `Decision field '${key}' is required`);
+	for (const key of ['summary', 'directive']) if (!Object.hasOwn(value, key)) throw new DecisionError('MISSING_DECISION_FIELD', `Decision field '${key}' is required`);
 	if (typeof value.summary !== 'string' || value.summary.trim().length === 0 || value.summary.length > MAX_SUMMARY_LENGTH) throw new DecisionError('INVALID_DECISION', `Decision summary must be nonblank and at most ${MAX_SUMMARY_LENGTH} characters`);
-	if (!GOAL_STATUSES.has(value.goalStatus)) throw new DecisionError('INVALID_DECISION', `Unsupported goalStatus '${String(value.goalStatus)}'`);
-	let action;
-	try {
-		action = validateAction(compactStructuredAction(value.action));
-	} catch (error) {
-		if (error instanceof ValidationError) throw new DecisionError('INVALID_ACTION', error.message, { cause: error });
-		throw error;
-	}
-	const terminal = value.goalStatus !== 'in_progress';
-	if (terminal !== (action.type === 'complete_goal')) throw new DecisionError('STATUS_ACTION_MISMATCH', 'completed or impossible status must use complete_goal, and in_progress must not');
-	return { summary: value.summary, goalStatus: value.goalStatus, action };
-}
+	if (!DIRECTIVES.has(value.directive)) throw new DecisionError('INVALID_DECISION', `Unsupported directive '${String(value.directive)}'`);
+	const hasSource = Object.hasOwn(value, 'source') && value.source !== null;
+	const hasStatus = Object.hasOwn(value, 'status') && value.status !== null;
 
-function compactStructuredAction(value) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
-	return Object.fromEntries(Object.entries(value).filter(([field, fieldValue]) => (
-		fieldValue !== null || !NULLABLE_ACTION_FIELDS.has(field)
-	)));
+	if (value.directive === 'replace') {
+		if (!hasSource || typeof value.source !== 'string' || value.source.trim().length === 0 || Buffer.byteLength(value.source, 'utf8') > MAX_SOURCE_LENGTH) {
+			throw new DecisionError('DECISION_FIELD_MISMATCH', `replace directive requires nonblank source of at most ${MAX_SOURCE_LENGTH} UTF-8 bytes`);
+		}
+		if (hasStatus) throw new DecisionError('DECISION_FIELD_MISMATCH', 'replace directive must not include status');
+		return { summary: value.summary, directive: 'replace', source: value.source };
+	}
+
+	if (value.directive === 'finish') {
+		if (!hasStatus || !FINISH_STATUSES.has(value.status)) throw new DecisionError('DECISION_FIELD_MISMATCH', 'finish directive requires status completed or impossible');
+		if (hasSource) throw new DecisionError('DECISION_FIELD_MISMATCH', 'finish directive must not include source');
+		return { summary: value.summary, directive: 'finish', status: value.status };
+	}
+
+	if (hasSource) throw new DecisionError('DECISION_FIELD_MISMATCH', `${value.directive} directive must not include source`);
+	if (hasStatus) throw new DecisionError('DECISION_FIELD_MISMATCH', `${value.directive} directive must not include status`);
+	return { summary: value.summary, directive: value.directive };
 }
 
 function unwrapExactJson(text) {
@@ -54,4 +59,72 @@ function unwrapExactJson(text) {
 	}
 	if (!text.startsWith('{') || !text.endsWith('}')) throw new DecisionError('MALFORMED_DECISION', 'Planner output must contain only one JSON object');
 	return text;
+}
+
+function assertNoDuplicateObjectKeys(json) {
+	const scanner = new DuplicateKeyScanner(json);
+	scanner.parseValue();
+	scanner.skipWhitespace();
+	if (!scanner.done) throw new DecisionError('MALFORMED_DECISION', 'Planner output must contain only one JSON object');
+}
+
+class DuplicateKeyScanner {
+	#text;
+	#index = 0;
+
+	constructor(text) { this.#text = text; }
+get done() { return this.#index === this.#text.length; }
+
+	skipWhitespace() { while (/\s/.test(this.#text[this.#index] ?? '')) this.#index += 1; }
+
+	parseValue() {
+		this.skipWhitespace();
+		const next = this.#text[this.#index];
+		if (next === '{') return this.parseObject();
+		if (next === '[') return this.parseArray();
+		if (next === '"') return this.parseString();
+		while (this.#index < this.#text.length && !/[\s,}\]]/.test(this.#text[this.#index])) this.#index += 1;
+	}
+
+	parseObject() {
+		this.#index += 1;
+		const keys = new Set();
+		this.skipWhitespace();
+		if (this.#text[this.#index] === '}') { this.#index += 1; return; }
+		while (true) {
+			this.skipWhitespace();
+			const key = this.parseString();
+			if (keys.has(key)) throw new DecisionError('DUPLICATE_DECISION_FIELD', `Duplicate decision field '${key}'`);
+			keys.add(key);
+			this.skipWhitespace();
+			this.#index += 1;
+			this.parseValue();
+			this.skipWhitespace();
+			if (this.#text[this.#index] === '}') { this.#index += 1; return; }
+			this.#index += 1;
+		}
+	}
+
+	parseArray() {
+		this.#index += 1;
+		this.skipWhitespace();
+		if (this.#text[this.#index] === ']') { this.#index += 1; return; }
+		while (true) {
+			this.parseValue();
+			this.skipWhitespace();
+			if (this.#text[this.#index] === ']') { this.#index += 1; return; }
+			this.#index += 1;
+		}
+	}
+
+	parseString() {
+		const start = this.#index;
+		this.#index += 1;
+		while (this.#index < this.#text.length) {
+			const character = this.#text[this.#index++];
+			if (character === '\\') { this.#index += 1; continue; }
+			if (character === '"') return JSON.parse(this.#text.slice(start, this.#index));
+		}
+		throw new DecisionError('MALFORMED_DECISION', 'Planner output must contain valid JSON strings');
+	}
 }

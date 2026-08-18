@@ -15,14 +15,14 @@ public final class ArenaSpectatorSnapshotVerification {
 
 	public static int verify() {
 		List<ArenaSpectatorSnapshot.Standing> standings = new ArrayList<>();
-		for (int index = 0; index < 10; index++) {
+		for (int index = 0; index < 16; index++) {
 			standings.add(ArenaSpectatorSnapshot.Standing.candidate(
 					"agent-" + index,
 					"Agent " + index,
 					index % 3 == 0 ? "codex" : index % 3 == 1 ? "gemini" : "kimi",
-					index == 8 || index == 9 ? 99.0D : index,
+					index == 14 || index == 15 ? 99.0D : index,
 					Math.max(0, 100 - index * 9),
-					index == 9 ? "eliminated" : "acting"
+					index == 15 ? "eliminated" : "acting"
 			));
 		}
 		List<ScenarioPublicEvent> feed = new ArrayList<>();
@@ -49,11 +49,11 @@ public final class ArenaSpectatorSnapshotVerification {
 				"expired recommendation candidates are ignored");
 
 		ArenaSpectatorSnapshot first = snapshot(41L, 120L, false, standings, feed, Optional.of(participant), "");
-		assertEquals(8, first.standings().size(), "snapshot retains at most eight standings");
-		assertEquals(List.of("agent-8", "agent-9"),
+		assertEquals(16, first.standings().size(), "snapshot carries the complete sixteen-agent arena roster");
+		assertEquals(List.of("agent-14", "agent-15"),
 				first.standings().subList(0, 2).stream().map(ArenaSpectatorSnapshot.Standing::participantId).toList(),
 				"score ties use stable participant id ordering");
-		assertEquals(List.of(1, 2, 3, 4, 5, 6, 7, 8),
+		assertEquals(java.util.stream.IntStream.rangeClosed(1, 16).boxed().toList(),
 				first.standings().stream().map(ArenaSpectatorSnapshot.Standing::rank).toList(),
 				"standings include explicit deterministic rank numbers");
 		assertEquals(6, first.feed().size(), "snapshot retains at most six public feed entries");

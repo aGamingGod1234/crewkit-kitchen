@@ -1,20 +1,32 @@
 package dev.agaminggod.arenaagents.scenario;
 
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioLoadoutPlan;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioLoadoutService;
+import dev.agaminggod.arenaagents.scenario.runtime.ScenarioLootManifest;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioEventMarker;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioParkourCourse;
+import dev.agaminggod.arenaagents.scenario.runtime.ScenarioParkourRecovery;
+import dev.agaminggod.arenaagents.scenario.runtime.ScenarioParkourRunState;
+import dev.agaminggod.arenaagents.scenario.runtime.ScenarioParticipantPolicy;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioPlacementBatchPolicy;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRosterReadinessBarrier;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRosterActivator;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeClock;
+import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.LocalPathfinder;
+import dev.agaminggod.arenaagents.client.navigation.PathOutcome;
+import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.Optional;
 import java.util.UUID;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.Blocks;
 
 public final class ScenarioCoreVerification {
 	private static final UUID SESSION_ID = UUID.fromString("11111111-2222-3333-4444-555555555555");
@@ -33,9 +45,16 @@ public final class ScenarioCoreVerification {
 		assertions += verifyBuiltInPresets();
 		assertions += verifySessionConfigValidation();
 		assertions += verifyDeterministicSpawnAllocation();
+		assertions += verifyAdaptiveSpawnLayouts();
+		assertions += verifyRepresentativeArenaScaling();
+		assertions += verifyAuthoredSpawnStations();
 		assertions += verifyBuildingPlotSpawnAlignment();
+		assertions += verifyScenarioCompletionPolicy();
 		assertions += verifyControllerReachableParkourCourse();
+		assertions += verifyParkourCheckpointsAndRecovery();
+		assertions += verifyParkourParticipantRuntime();
 		assertions += verifyStandardizedLoadouts();
+		assertions += verifyPvpLootManifests();
 		assertions += verifyLoadoutApplication();
 		assertions += verifyRosterReadinessBarrier();
 		assertions += verifyRosterActivationOrder();
@@ -47,6 +66,32 @@ public final class ScenarioCoreVerification {
 		assertions += verifyLifecycle();
 		assertions += verifyScoringAndEvidence();
 		assertions += verifyReset();
+		return assertions;
+	}
+
+	private static int verifyRepresentativeArenaScaling() {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
+		BlockPos origin = new BlockPos(100, 70, -40);
+		int assertions = 0;
+		for (ScenarioPreset preset : ScenarioPresets.all()) {
+			for (int count : new int[]{2, 8, 16}) {
+				var blueprint = dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.create(
+						preset, origin, count);
+				Map<Long, dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement> byPosition =
+						dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaResetJob.canonicalize(
+								blueprint.placements()).stream().collect(java.util.stream.Collectors.toMap(
+								placement -> placement.position().asLong(), placement -> placement));
+				List<ScenarioSpawnLayout.Slot> slots = ScenarioSpawnLayout.slots(preset.category(), count);
+				assertEquals(count, slots.size(), preset.id() + " representative roster size " + count);
+				assertTrue(slots.stream().allMatch(slot -> byPosition.containsKey(
+						origin.offset(slot.x(), slot.floorY(), slot.z()).asLong())),
+						preset.id() + " authors every representative spawn " + count);
+				assertTrue(blueprint.siteBounds().columnCount() > 0,
+						preset.id() + " has a nonempty managed footprint " + count);
+				assertions += 3;
+			}
+		}
 		return assertions;
 	}
 
@@ -86,13 +131,25 @@ public final class ScenarioCoreVerification {
 
 	private static int verifyRosterActivationOrder() {
 		ArrayList<String> events = new ArrayList<>();
-		new ScenarioRosterActivator().activate(
+		ScenarioRosterActivator activator = new ScenarioRosterActivator();
+		activator.protect(
 				List.of("agent-a", "agent-b", "agent-c"),
+				agent -> events.add("protect-" + agent)
+		);
+		activator.activate(
+				List.of("agent-a", "agent-b", "agent-c"),
+				agent -> events.add("release-" + agent),
 				agent -> events.add("load-" + agent),
 				agent -> events.add("start-" + agent)
 		);
 		assertEquals(
 				List.of(
+						"protect-agent-a",
+						"protect-agent-b",
+						"protect-agent-c",
+						"release-agent-a",
+						"release-agent-b",
+						"release-agent-c",
 						"load-agent-a",
 						"load-agent-b",
 						"load-agent-c",
@@ -133,44 +190,43 @@ public final class ScenarioCoreVerification {
 		ScenarioParkourCourse course = ScenarioParkourCourse.create();
 		assertEquals(16, course.lanes().size(), "parkour course exposes sixteen independent lanes");
 		assertEquals(
-				new ScenarioParkourCourse.Platform(-23, 1, -24),
+				new ScenarioParkourCourse.Platform(
+						-61, 1, -40, ScenarioParkourCourse.Stage.EASY, true, 3),
 				course.lanes().getFirst().platforms().getFirst(),
 				"first parkour lane starts at the authored west edge"
 		);
 		assertEquals(
-				new ScenarioParkourCourse.Platform(22, 17, 24),
+				new ScenarioParkourCourse.Platform(
+						59, 14, 10, ScenarioParkourCourse.Stage.EXTREME, true, 3),
 				course.lanes().getLast().platforms().getLast(),
 				"last parkour lane reaches the common finish row"
 		);
 		assertTrue(
-				course.lanes().stream().allMatch(lane -> {
-					for (int index = 1; index < lane.platforms().size(); index++) {
-						ScenarioParkourCourse.Platform previous = lane.platforms().get(index - 1);
-						ScenarioParkourCourse.Platform next = lane.platforms().get(index);
-						int zDistance = next.z() - previous.z();
-						int yDistance = next.y() - previous.y();
-						if (!((zDistance == 2 && yDistance == 0) || (zDistance == 1 && yDistance == 1))) {
-							return false;
-						}
-					}
-					return true;
-				}),
-				"every parkour transition is a supported gap jump or one-block step-up"
+				course.lanes().stream().allMatch(ScenarioParkourCourse.Lane::transitionsReachable),
+				"every parkour transition stays inside the controller reach envelope"
 		);
+		for (ScenarioParkourCourse.Lane lane : course.lanes()) {
+			String traversalFailure = controllerTraversalFailure(lane);
+			assertTrue(traversalFailure == null,
+					"the real navigation pathfinder can traverse authored parkour lane " + lane.index()
+							+ (traversalFailure == null ? "" : ": " + traversalFailure));
+		}
 		assertTrue(
 				course.lanes().stream()
 						.flatMap(lane -> lane.platforms().stream())
-						.allMatch(platform -> platform.x() >= -23 && platform.x() <= 22
-								&& platform.y() >= 1 && platform.y() <= 17
-								&& platform.z() >= -24 && platform.z() <= 24),
+						.allMatch(platform -> platform.x() >= -62 && platform.x() + platform.width() - 1 <= 63
+								&& platform.y() >= 1 && platform.y() <= 18
+								&& platform.z() >= -40 && platform.z() <= 19),
 				"parkour course stays inside the authored arena bounds"
 		);
+		for (int index = 1; index < course.lanes().size(); index++) {
+			ScenarioParkourCourse.Platform previous = course.lanes().get(index - 1).platforms().getFirst();
+			ScenarioParkourCourse.Platform current = course.lanes().get(index).platforms().getFirst();
+			assertTrue(current.x() - (previous.x() + previous.width() - 1) >= 6,
+					"adjacent parkour lanes remain beyond a normal cross-lane jump");
+		}
 
-		List<Double> laneAxes = List.of(
-				-23.0D, -20.0D, -17.0D, -14.0D, -11.0D, -8.0D, -5.0D, -2.0D,
-				1.0D, 4.0D, 7.0D, 10.0D, 13.0D, 16.0D, 19.0D, 22.0D
-		);
-		int assertions = 5;
+		int assertions = 36;
 		for (int count = 1; count <= 16; count++) {
 			List<ScenarioSpawn> allocated = new ScenarioSpawnAllocator().allocate(
 					config(ScenarioPresets.require("thinking-tower"), 8_000L + count, 11L, participants(count))
@@ -181,12 +237,222 @@ public final class ScenarioCoreVerification {
 					"parkour lane starts are unique " + count
 			);
 			assertTrue(
-					allocated.stream().allMatch(spawn -> laneAxes.contains(spawn.x()) && spawn.z() == -24.0D),
+					allocated.stream().allMatch(spawn -> spawn.x() >= -60.0D && spawn.x() <= 60.0D
+							&& spawn.z() == -40.0D),
 					"parkour contestants spawn on authored lane starts " + count
 			);
 			assertions += 2;
 		}
 		return assertions;
+	}
+
+	private static String controllerTraversalFailure(ScenarioParkourCourse.Lane lane) {
+		Set<GridPosition> supports = new HashSet<>();
+		Set<GridPosition> arena = new HashSet<>();
+		for (ScenarioParkourCourse.Platform platform : lane.platforms()) {
+			int zRadius = platform.checkpoint() ? 1 : 0;
+			for (int x = platform.x(); x < platform.x() + platform.width(); x++) {
+				for (int z = platform.z() - zRadius; z <= platform.z() + zRadius; z++) {
+					supports.add(new GridPosition(x, platform.y(), z));
+				}
+			}
+		}
+		for (int x = lane.platforms().stream().mapToInt(ScenarioParkourCourse.Platform::x).min().orElseThrow() - 3;
+				x <= lane.platforms().stream().mapToInt(p -> p.x() + p.width()).max().orElseThrow() + 3; x++) {
+			for (int y = 0; y <= 20; y++) {
+				for (int z = ScenarioParkourCourse.START_Z - 3; z <= 24; z++) arena.add(new GridPosition(x, y, z));
+			}
+		}
+		WalkabilityView view = position -> !arena.contains(position) ? WalkabilityView.Cell.UNLOADED
+				: supports.contains(position) ? WalkabilityView.Cell.SAFE_SUPPORT
+				: position.y() == 0 ? WalkabilityView.Cell.HAZARD : WalkabilityView.Cell.CLEAR;
+		LocalPathfinder pathfinder = new LocalPathfinder();
+		ScenarioParkourCourse.Platform laneStart = lane.platforms().getFirst();
+		ScenarioParkourCourse.Platform laneFinish = lane.platforms().getLast();
+		var completePlan = pathfinder.findPath(
+				view,
+				new GridPosition((int) Math.floor(laneStart.centerX()), laneStart.y() + 1, laneStart.z()),
+				new GridPosition((int) Math.floor(laneFinish.centerX()), laneFinish.y() + 1, laneFinish.z()),
+				LocalPathfinder.MAX_EXPANDED_NODES,
+				Long.MAX_VALUE,
+				() -> 0L
+		);
+		if (completePlan.outcome() != PathOutcome.FOUND) {
+			return "complete route returned " + completePlan.outcome() + " after "
+					+ completePlan.expandedNodes() + " nodes";
+		}
+		for (int index = 1; index < lane.platforms().size(); index++) {
+			ScenarioParkourCourse.Platform start = lane.platforms().get(index - 1);
+			ScenarioParkourCourse.Platform finish = lane.platforms().get(index);
+			var plan = pathfinder.findPath(
+					view,
+					new GridPosition((int) Math.floor(start.centerX()), start.y() + 1, start.z()),
+					new GridPosition((int) Math.floor(finish.centerX()), finish.y() + 1, finish.z()),
+					LocalPathfinder.MAX_EXPANDED_NODES,
+					Long.MAX_VALUE,
+					() -> 0L
+			);
+			if (plan.outcome() != PathOutcome.FOUND) {
+				GridPosition startFeet = new GridPosition(
+						(int) Math.floor(start.centerX()), start.y() + 1, start.z());
+				GridPosition finishFeet = new GridPosition(
+						(int) Math.floor(finish.centerX()), finish.y() + 1, finish.z());
+				return "transition " + (index - 1) + " -> " + index + " returned " + plan.outcome()
+						+ " after " + plan.expandedNodes() + " nodes; start=" + startFeet + "/"
+						+ view.cellAt(startFeet) + "/" + view.cellAt(startFeet.below()) + ", finish="
+						+ finishFeet + "/" + view.cellAt(finishFeet) + "/" + view.cellAt(finishFeet.below());
+			}
+		}
+		return null;
+	}
+
+	private static int verifyParkourCheckpointsAndRecovery() {
+		ScenarioParkourCourse.Lane lane = ScenarioParkourCourse.create(1).lanes().getFirst();
+		assertEquals(
+				List.of(
+						ScenarioParkourCourse.Stage.EASY,
+						ScenarioParkourCourse.Stage.MEDIUM,
+						ScenarioParkourCourse.Stage.HARD,
+						ScenarioParkourCourse.Stage.EXTREME
+				),
+				lane.platforms().stream().map(ScenarioParkourCourse.Platform::stage).distinct().toList(),
+				"parkour lane progresses through four ordered difficulty stages"
+		);
+		assertEquals(List.of(0, 8, 16, 24, 32), lane.checkpointIndices(),
+				"parkour checkpoints mark the start and every difficulty boundary");
+
+		List<String> stageSignatures = ScenarioParkourCourse.Stage.values().length == 4
+				? java.util.Arrays.stream(ScenarioParkourCourse.Stage.values())
+						.map(stage -> lane.transitionSignature(stage)).toList()
+				: List.of();
+		assertEquals(4, new HashSet<>(stageSignatures).size(),
+				"each parkour difficulty uses a distinct movement grammar");
+		assertTrue(lane.platforms().stream().anyMatch(platform -> platform.width() == 1),
+				"later stages include precision one-block landings");
+		assertTrue(lane.platforms().stream().map(ScenarioParkourCourse.Platform::width).distinct().count() == 3,
+				"the route varies landing widths instead of repeating one staircase shape");
+		assertTrue(lane.platforms().stream().map(ScenarioParkourCourse.Platform::y).distinct().count() >= 6,
+				"the route has meaningful vertical composition");
+		assertTrue(lane.transitionsReachable(),
+				"every progressive parkour transition stays inside the controller reach envelope");
+
+		ScenarioParkourRecovery progress = new ScenarioParkourRecovery(lane);
+		ScenarioParkourCourse.Platform checkpoint20 = lane.platforms().get(16);
+		ScenarioParkourRecovery.Decision advanced = progress.evaluate(
+				0, checkpoint20.x() + 0.5D, checkpoint20.y() + 1.0D, checkpoint20.z() + 0.5D);
+		assertEquals(16, advanced.checkpointIndex(), "standing on a later checkpoint advances progress");
+		assertTrue(!advanced.recover(), "standing on a checkpoint does not trigger recovery");
+		ScenarioParkourCourse.Platform checkpoint10 = lane.platforms().get(8);
+		ScenarioParkourRecovery.Decision backwards = progress.evaluate(
+				16, checkpoint10.x() + 0.5D, checkpoint10.y() + 1.0D, checkpoint10.z() + 0.5D);
+		assertEquals(16, backwards.checkpointIndex(), "checkpoint progress never moves backwards");
+		ScenarioParkourRecovery.Decision fallen = progress.evaluate(16, 0.0D, 1.0D, 0.0D);
+		assertTrue(!fallen.recover(), "touching lava does not teleport a still-living contestant");
+		assertTrue(!progress.evaluate(16, 0.0D, 1.8D, 0.0D).recover(),
+				"falling contestants are allowed to die in lava before checkpoint respawn");
+		assertEquals(
+				new ScenarioParkourRecovery.Target(
+						checkpoint20.centerX(), checkpoint20.y() + 1.0D, checkpoint20.z() + 0.5D),
+				fallen.target(), "recovery returns to the center of the latest checkpoint"
+		);
+		ScenarioParkourRecovery.Decision crossedLane = progress.evaluate(
+				16, checkpoint20.centerX() + ScenarioParkourCourse.LANE_PITCH,
+				checkpoint20.standingY(), checkpoint20.centerZ());
+		assertTrue(!crossedLane.recover(), "crossing a lane never causes an invisible forced teleport");
+		assertEquals(fallen.target(), crossedLane.target(),
+				"lane crossing returns to the participant's own checkpoint");
+
+		BlockPos origin = new BlockPos(0, 70, 0);
+		var blueprint = dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.create(
+				ScenarioPresets.require("thinking-tower"), origin, 2);
+		Map<Long, dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement> byPosition =
+				dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaResetJob.canonicalize(blueprint.placements())
+						.stream().collect(java.util.stream.Collectors.toMap(
+								placement -> placement.position().asLong(), placement -> placement));
+		BlockPos beacon = byPosition.values().stream()
+				.filter(placement -> placement.state().getBlock() == Blocks.BEACON)
+				.map(dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement::position)
+				.findFirst().orElseThrow();
+		for (int x = -1; x <= 1; x++) {
+			for (int z = -1; z <= 1; z++) {
+				assertEquals(Blocks.EMERALD_BLOCK, byPosition.get(beacon.offset(x, -1, z).asLong()).state().getBlock(),
+						"finish beacon uses a 3 by 3 mineral base");
+			}
+		}
+		assertTrue(!byPosition.containsKey(beacon.offset(-2, -1, 0).asLong())
+				|| byPosition.get(beacon.offset(-2, -1, 0).asLong()).state().getBlock() != Blocks.EMERALD_BLOCK,
+				"finish beacon base does not extend to five blocks");
+		assertEquals(Blocks.LAVA, byPosition.get(origin.offset(0, 0, 0).asLong()).state().getBlock(),
+				"parkour failure floor is lava rather than a decorative solid floor");
+		assertTrue(byPosition.values().stream().filter(placement -> placement.state().getBlock() == Blocks.LAVA).count()
+				>= 100, "the visible parkour floor is substantially lava-backed");
+		for (int x = -10; x <= 10; x++) {
+			assertEquals(Blocks.POLISHED_BLACKSTONE_BRICKS,
+					byPosition.get(origin.offset(x, 0, -43).asLong()).state().getBlock(),
+					"parkour lava has a sealed north curb at fluid level");
+			assertEquals(Blocks.POLISHED_BLACKSTONE_BRICKS,
+					byPosition.get(origin.offset(x, 0, 31).asLong()).state().getBlock(),
+					"parkour lava has a sealed south curb at fluid level");
+		}
+		assertTrue(byPosition.values().stream().noneMatch(placement ->
+				placement.state().getBlock() == Blocks.BIRCH_PLANKS),
+				"parkour platforms contain no flammable wooden surfaces");
+		for (ScenarioParkourCourse.Lane authoredLane : ScenarioParkourCourse.create(2).lanes()) {
+			ScenarioParkourCourse.Platform start = authoredLane.platforms().getFirst();
+			ScenarioParkourCourse.Platform next = authoredLane.platforms().get(1);
+			assertEquals(start.z() + 3, next.z(),
+					"first jump clears the spawning checkpoint with one navigable gap");
+		}
+		var pvpBlueprint = dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.create(
+				ScenarioPresets.require("citadel-collapse"), origin, 16);
+		Map<Long, dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement> pvpByPosition =
+				dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaResetJob.canonicalize(pvpBlueprint.placements())
+						.stream().collect(java.util.stream.Collectors.toMap(
+								placement -> placement.position().asLong(), placement -> placement));
+		long lootContainers = pvpByPosition.values().stream().filter(placement ->
+				placement.state().getBlock() == Blocks.CHEST || placement.state().getBlock() == Blocks.BARREL).count();
+		assertTrue(lootContainers >= 30, "survival-games arena exposes abundant center and outer loot locations");
+		assertTrue(pvpBlueprint.siteBounds().maximumX() - pvpBlueprint.siteBounds().minimumX() >= 160,
+				"sixteen-player survival-games arena scales beyond the old small combat box");
+		assertTrue(pvpByPosition.values().stream().anyMatch(placement -> placement.state().getBlock() == Blocks.WATER),
+				"survival-games arena contains navigable terrain rather than only stone and lava");
+		return 33;
+	}
+
+	private static int verifyParkourParticipantRuntime() {
+		ScenarioParkourCourse course = ScenarioParkourCourse.create(2);
+		ScenarioParkourRunState state = new ScenarioParkourRunState(
+				course, Map.of("agent-kimi", 1, "agent-sol", 0));
+		ScenarioParkourCourse.Platform kimiCheckpoint = course.lanes().get(1).platforms().get(16);
+		ScenarioParkourRecovery.Decision kimi = state.evaluate(
+				"agent-kimi", kimiCheckpoint.centerX(), kimiCheckpoint.standingY(), kimiCheckpoint.centerZ());
+		assertEquals(16, kimi.checkpointIndex(), "runtime advances the checkpoint for the allocated lane");
+		assertEquals(0, state.checkpointIndex("agent-sol"),
+				"one participant's checkpoint never advances another participant");
+		ScenarioParkourRecovery.Decision recovered = state.evaluate("agent-kimi", 0.0D, 1.0D, 0.0D);
+		assertTrue(!recovered.recover(), "runtime waits for genuine death before respawn");
+		assertEquals(kimi.target(), recovered.target(), "runtime remembers the latest checkpoint target");
+		ScenarioParkourRecovery.Decision wrongLane = state.evaluate(
+				"agent-kimi",
+				course.lanes().getFirst().platforms().get(16).centerX(),
+				kimiCheckpoint.standingY(), kimiCheckpoint.centerZ());
+		assertTrue(!wrongLane.recover(), "runtime does not secretly teleport a live wrong-lane participant");
+		assertEquals(kimi.target(), wrongLane.target(), "wrong-lane recovery preserves independent progress");
+		assertEquals(Map.of("agent-kimi", 16, "agent-sol", 0), state.checkpoints(),
+				"runtime exposes an immutable checkpoint snapshot keyed by agent");
+		ScenarioParkourRunState restored = new ScenarioParkourRunState(
+				course, Map.of("agent-kimi", 1, "agent-sol", 0), state.checkpoints());
+		assertEquals(16, restored.checkpointIndex("agent-kimi"),
+				"runtime restores each participant's persisted checkpoint");
+		assertEquals(kimi.target(), restored.evaluate("agent-kimi", 0.0D, 1.0D, 0.0D).target(),
+				"restored checkpoint selects the same recovery target");
+		assertEquals(AgentGameMode.ADVENTURE,
+				ScenarioParticipantPolicy.effectiveGameMode(ScenarioCategory.PARKOUR, AgentGameMode.SURVIVAL),
+				"parkour forces Adventure mode even when an agent requested Survival");
+		assertEquals(AgentGameMode.CREATIVE,
+				ScenarioParticipantPolicy.effectiveGameMode(ScenarioCategory.BUILDING, AgentGameMode.CREATIVE),
+				"non-parkour scenarios preserve the configured game mode");
+		return 11;
 	}
 
 	private static int verifyStandardizedLoadouts() {
@@ -213,21 +479,7 @@ public final class ScenarioCoreVerification {
 		);
 
 		ScenarioLoadoutPlan pvp = ScenarioLoadoutPlan.forContestant(ScenarioCategory.PVP, AgentGameMode.SURVIVAL);
-		assertTrue(pvp.hasItem("minecraft:iron_sword"), "PvP loadout includes a weapon");
-		assertTrue(pvp.hasItem("minecraft:cooked_beef"), "PvP loadout includes food");
-		assertEquals(
-				List.of(
-						ScenarioLoadoutPlan.ArmorSlot.HEAD,
-						ScenarioLoadoutPlan.ArmorSlot.CHEST,
-						ScenarioLoadoutPlan.ArmorSlot.LEGS,
-						ScenarioLoadoutPlan.ArmorSlot.FEET
-				),
-				pvp.entries().stream()
-						.map(ScenarioLoadoutPlan.Entry::armorSlot)
-						.filter(slot -> slot != ScenarioLoadoutPlan.ArmorSlot.NONE)
-						.toList(),
-				"PvP armor is equipped in every armor slot"
-		);
+		assertEquals(List.of(), pvp.entries(), "PvP contestants start completely empty and earn every item");
 
 		ScenarioLoadoutPlan parkour = ScenarioLoadoutPlan.forContestant(
 				ScenarioCategory.PARKOUR,
@@ -243,7 +495,57 @@ public final class ScenarioCoreVerification {
 				new HashSet<>(survival.entries().stream().map(ScenarioLoadoutPlan.Entry::inventorySlot).toList()).size(),
 				"survival loadout uses unique inventory slots"
 		);
-		return 14;
+		return 12;
+	}
+
+	private static int verifyPvpLootManifests() {
+		BlockPos origin = new BlockPos(100, 70, -40);
+		long seed = 917_221L;
+		ScenarioLootManifest house = ScenarioLootManifest.forContainer(
+				origin, origin.offset(-27, 2, -18), seed);
+		ScenarioLootManifest dungeon = ScenarioLootManifest.forContainer(
+				origin, origin.offset(-42, -5, -35), seed);
+		ScenarioLootManifest center = ScenarioLootManifest.forContainer(
+				origin, origin.offset(9, 2, 0), seed);
+		assertEquals(house, ScenarioLootManifest.forContainer(origin, origin.offset(-27, 2, -18), seed),
+				"the same world seed and container position produce identical loot");
+		assertEquals(ScenarioLootManifest.Tier.HOUSE, house.tier(), "house containers use the house tier");
+		assertEquals(ScenarioLootManifest.Tier.DUNGEON, dungeon.tier(), "underground containers use the dungeon tier");
+		assertEquals(ScenarioLootManifest.Tier.CENTER, center.tier(), "cornucopia containers use the center tier");
+		assertTrue(!house.entries().isEmpty() && !dungeon.entries().isEmpty() && !center.entries().isEmpty(),
+				"every authored loot tier is nonempty");
+		assertTrue(house.entries().stream().anyMatch(entry -> Set.of(
+				"minecraft:bread", "minecraft:cooked_beef").contains(entry.itemId())),
+				"house loot always contains food");
+		assertTrue(house.entries().stream().anyMatch(entry -> Set.of(
+				"minecraft:stone_sword", "minecraft:stone_axe", "minecraft:shield").contains(entry.itemId())),
+				"house loot always contains basic equipment");
+		assertTrue(dungeon.entries().stream().anyMatch(entry -> Set.of(
+				"minecraft:iron_sword", "minecraft:iron_axe", "minecraft:bow", "minecraft:crossbow").contains(entry.itemId())),
+				"dungeon loot always contains an iron or ranged item");
+		assertTrue(center.entries().stream().anyMatch(entry -> Set.of(
+				"minecraft:iron_chestplate", "minecraft:golden_apple", "minecraft:ender_pearl", "minecraft:diamond_sword").contains(entry.itemId())),
+				"center loot always contains a high-tier item");
+		assertEquals((long) house.entries().size(), house.entries().stream().map(ScenarioLootManifest.Entry::slot).distinct().count(),
+				"manifest slots are unique");
+		var blueprint = dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.create(
+				ScenarioPresets.require("citadel-collapse"), origin, 16);
+		List<dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement> containers =
+				dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaResetJob.canonicalize(blueprint.placements())
+						.stream().filter(placement -> placement.state().is(Blocks.CHEST)
+								|| placement.state().is(Blocks.BARREL)).toList();
+		assertEquals(33, containers.size(), "the PvP blueprint authors exactly 33 loot containers");
+		Map<ScenarioLootManifest.Tier, Long> tierCounts = containers.stream()
+				.map(placement -> ScenarioLootManifest.forContainer(origin, placement.position(), seed))
+				.peek(manifest -> assertTrue(!manifest.entries().isEmpty(), "every authored container has useful loot"))
+				.collect(java.util.stream.Collectors.groupingBy(
+						ScenarioLootManifest::tier, java.util.stream.Collectors.counting()));
+		assertEquals(Map.of(
+				ScenarioLootManifest.Tier.CENTER, 17L,
+				ScenarioLootManifest.Tier.DUNGEON, 6L,
+				ScenarioLootManifest.Tier.HOUSE, 10L), tierCounts,
+				"all center, dungeon, house, and tower containers receive the intended loot tier");
+		return 12;
 	}
 
 	private static int verifyLoadoutApplication() {
@@ -254,23 +556,12 @@ public final class ScenarioCoreVerification {
 		);
 		assertEquals(1, target.resetCount, "loadout application resets stale inventory");
 		assertEquals(
-				List.of(
-						"0=minecraft:iron_swordx1",
-						"1=minecraft:bowx1",
-						"2=minecraft:arrowx32",
-						"3=minecraft:cooked_beefx16",
-						"4=minecraft:shieldx1"
-				),
+				List.of(),
 				target.inventory,
-				"PvP inventory entries are placed in deterministic slots"
+				"PvP activation clears stale inventory without granting starter items"
 		);
 		assertEquals(
-				List.of(
-						"HEAD=minecraft:iron_helmetx1",
-						"CHEST=minecraft:iron_chestplatex1",
-						"LEGS=minecraft:iron_leggingsx1",
-						"FEET=minecraft:iron_bootsx1"
-				),
+				List.of(),
 				target.armor,
 				"PvP armor entries are equipped rather than left in inventory"
 		);
@@ -401,6 +692,12 @@ public final class ScenarioCoreVerification {
 				firstAllocation.stream().map(ScenarioSpawn::participantId).sorted().toList(),
 				"all participants allocated"
 		);
+		ScenarioSessionConfig twelve = config(ScenarioPresets.require("thinking-tower"), 193L, 7L, participants(12));
+		assertEquals(
+				twelve.participants().stream().map(ScenarioParticipant::id).toList(),
+				allocator.allocate(twelve).stream().map(ScenarioSpawn::participantId).toList(),
+				"double-digit rosters preserve the durable participant binding order"
+		);
 		for (int count = 1; count <= 16; count++) {
 			List<ScenarioSpawn> allocated = allocator.allocate(
 					config(ScenarioPresets.require("thinking-tower"), 1_000L + count, 8L, participants(count))
@@ -412,12 +709,105 @@ public final class ScenarioCoreVerification {
 					"parkour lanes " + count
 			);
 		}
-		return 52;
+		return 53;
+	}
+
+	private static int verifyAdaptiveSpawnLayouts() {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
+		int assertions = 0;
+		for (ScenarioCategory category : ScenarioCategory.values()) {
+			int minimum = category == ScenarioCategory.PVP ? 2 : 1;
+			for (int count = minimum; count <= 16; count++) {
+				List<ScenarioSpawnLayout.Slot> slots = ScenarioSpawnLayout.slots(category, count);
+				assertEquals(count, slots.size(), category + " authors only the requested stations " + count);
+				assertEquals(count, new HashSet<>(slots.stream()
+						.map(slot -> slot.x() + ":" + slot.z()).toList()).size(),
+						category + " stations remain unique " + count);
+				assertions += 2;
+			}
+		}
+
+		List<ScenarioSpawnLayout.Slot> pair = ScenarioSpawnLayout.slots(ScenarioCategory.PARKOUR, 2);
+		assertEquals(0, pair.getFirst().x() + pair.getLast().x(),
+				"two parkour lanes are centered around the arena axis");
+		assertEquals(pair.getFirst().z(), pair.getLast().z(),
+				"two parkour starts share one aligned start line");
+
+		BlockPos origin = new BlockPos(100, 70, -40);
+		ScenarioPreset parkour = ScenarioPresets.require("thinking-tower");
+		var blueprint = dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.create(
+				parkour, origin, 2);
+		Map<Long, dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement> byPosition =
+				dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaResetJob.canonicalize(blueprint.placements())
+						.stream().collect(java.util.stream.Collectors.toMap(
+								placement -> placement.position().asLong(), placement -> placement));
+		for (ScenarioSpawnLayout.Slot slot : pair) {
+			BlockPos marker = origin.offset(slot.x(), slot.floorY(), slot.z());
+			assertEquals(Blocks.SEA_LANTERN, byPosition.get(marker.asLong()).state().getBlock(),
+					"active parkour lane has an aligned start marker " + slot.index());
+			assertions++;
+		}
+		Set<String> activeCoordinates = pair.stream().map(slot -> slot.x() + ":" + slot.z())
+				.collect(java.util.stream.Collectors.toSet());
+		for (ScenarioSpawnLayout.Slot inactive : ScenarioSpawnLayout.slots(ScenarioCategory.PARKOUR, 16)) {
+			if (activeCoordinates.contains(inactive.x() + ":" + inactive.z())) continue;
+			BlockPos marker = origin.offset(inactive.x(), inactive.floorY(), inactive.z());
+			var placement = byPosition.get(marker.asLong());
+			assertTrue(placement == null || placement.state().getBlock() != Blocks.SEA_LANTERN,
+					"inactive parkour lane is not authored " + inactive.index());
+			assertions++;
+		}
+		return assertions + 2;
+	}
+
+	private static int verifyAuthoredSpawnStations() {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
+		BlockPos origin = new BlockPos(100, 70, -40);
+		int assertions = 0;
+		for (ScenarioPreset preset : ScenarioPresets.all()) {
+			List<ScenarioSpawnLayout.Slot> slots = ScenarioSpawnLayout.slots(preset.category());
+			assertEquals(16, slots.size(), preset.id() + " exposes sixteen authored spawn stations");
+			assertEquals(16, new HashSet<>(slots.stream().map(slot -> slot.x() + ":" + slot.z()).toList()).size(),
+					preset.id() + " spawn stations are unique");
+			var blueprint = dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.create(preset, origin);
+			Map<Long, dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement> byPosition =
+					dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaResetJob.canonicalize(blueprint.placements())
+							.stream().collect(java.util.stream.Collectors.toMap(
+									placement -> placement.position().asLong(), placement -> placement));
+			Set<net.minecraft.world.level.block.Block> palette = byPosition.values().stream()
+					.map(placement -> placement.state().getBlock())
+					.filter(block -> block != Blocks.AIR)
+					.collect(java.util.stream.Collectors.toSet());
+			assertTrue(palette.size() >= 10, preset.id() + " uses a varied, textured material palette");
+			List<net.minecraft.world.level.block.Block> signatureColors = switch (preset.category()) {
+				case SURVIVAL -> List.of(Blocks.MOSS_BLOCK, Blocks.PODZOL, Blocks.WATER, Blocks.OAK_PLANKS);
+				case BUILDING -> List.of(Blocks.CALCITE, Blocks.TUFF_BRICKS, Blocks.CUT_COPPER, Blocks.GOLD_BLOCK);
+				case PVP -> List.of(Blocks.CRACKED_STONE_BRICKS, Blocks.MOSSY_STONE_BRICKS,
+						Blocks.POLISHED_BASALT, Blocks.RED_CONCRETE, Blocks.BLUE_CONCRETE);
+				case PARKOUR -> List.of(Blocks.LAVA, Blocks.SMOOTH_QUARTZ,
+						Blocks.PRISMARINE_BRICKS, Blocks.PURPUR_BLOCK, Blocks.RED_NETHER_BRICKS,
+						Blocks.GOLD_BLOCK, Blocks.EMERALD_BLOCK);
+			};
+			assertTrue(palette.containsAll(signatureColors), preset.id() + " retains its authored color identity");
+			for (ScenarioSpawnLayout.Slot slot : slots) {
+				BlockPos station = origin.offset(slot.x(), slot.floorY(), slot.z());
+				assertEquals(Blocks.SEA_LANTERN, byPosition.get(station.asLong()).state().getBlock(),
+						preset.id() + " spawn " + slot.index() + " has a visible center marker");
+			}
+			BlockPos operatorSpawn = blueprint.operatorSpawn();
+			assertEquals(Blocks.SEA_LANTERN, byPosition.get(operatorSpawn.below().asLong()).state().getBlock(),
+					preset.id() + " operator spawn stands on the observation deck marker");
+			assertTrue(!byPosition.containsKey(operatorSpawn.asLong()),
+					preset.id() + " operator feet space is provided by whole-site clearing");
+			assertions += 22;
+		}
+		return assertions;
 	}
 
 	private static int verifyBuildingPlotSpawnAlignment() {
 		ScenarioSpawnAllocator allocator = new ScenarioSpawnAllocator();
-		List<Double> plotAxes = List.of(-36.0D, -12.0D, 12.0D, 36.0D);
 		int assertions = 0;
 		for (int count = 1; count <= 16; count++) {
 			List<ScenarioSpawn> allocated = allocator.allocate(
@@ -429,12 +819,99 @@ public final class ScenarioCoreVerification {
 					"building plot positions are unique " + count
 			);
 			assertTrue(
-					allocated.stream().allMatch(spawn -> plotAxes.contains(spawn.x()) && plotAxes.contains(spawn.z())),
-					"building contestants start at plot centers " + count
+					allocated.stream().allMatch(spawn -> Math.abs(spawn.x()) <= 36.0D
+							&& Math.abs(spawn.z()) <= 36.0D),
+					"building contestants stay inside the centered plot envelope " + count
 			);
 			assertions += 2;
 		}
-		return assertions;
+		assertEquals(List.of("24.0:0.0"), buildingCoordinates(allocator, 1),
+				"one building plot reserves the central pavilion");
+		assertEquals(List.of("-12.0:0.0", "12.0:0.0"), buildingCoordinates(allocator, 2),
+				"two building plots are equally spaced around center");
+		assertEquals(List.of("-12.0:-12.0", "-12.0:12.0", "12.0:-12.0", "12.0:12.0"),
+				buildingCoordinates(allocator, 4), "four building plots form a centered square");
+		assertEquals(16, buildingCoordinates(allocator, 16).size(),
+				"sixteen building plots retain full capacity");
+		BlockPos origin = new BlockPos(0, 70, 0);
+		var blueprint = dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.create(
+				ScenarioPresets.require("impossible-brief"), origin, 1);
+		Map<Long, dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement> placements =
+				dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaResetJob.canonicalize(blueprint.placements()).stream()
+						.collect(java.util.stream.Collectors.toMap(
+								placement -> placement.position().asLong(), placement -> placement));
+		ScenarioSpawn singleSpawn = allocator.allocate(config(
+				ScenarioPresets.require("impossible-brief"), 9_999L, 19L, participants(1))).getFirst();
+		assertTrue(isAirOrUnspecified(placements, origin.offset(
+				(int) singleSpawn.x(), (int) singleSpawn.y(), (int) singleSpawn.z())),
+				"single building contestant has clear feet space");
+		assertTrue(isAirOrUnspecified(placements, origin.offset(
+				(int) singleSpawn.x(), (int) singleSpawn.y() + 1, (int) singleSpawn.z())),
+				"single building contestant has clear head space");
+		return assertions + 6;
+	}
+
+	private static int verifyScenarioCompletionPolicy() {
+		List<ScenarioCompletionPolicy.ParticipantState> allCompleted = List.of(
+				participantState("agent-a", Optional.empty(), AgentLifecycleState.COMPLETED, true),
+				participantState("agent-b", Optional.empty(), AgentLifecycleState.COMPLETED, true)
+		);
+		List<ScenarioCompletionPolicy.ParticipantState> onePlanning = List.of(
+				participantState("agent-a", Optional.empty(), AgentLifecycleState.COMPLETED, true),
+				participantState("agent-b", Optional.empty(), AgentLifecycleState.PLANNING, true)
+		);
+		assertTrue(ScenarioCompletionPolicy.finishReason(ScenarioCategory.SURVIVAL, allCompleted, false).isPresent(),
+				"survival ends only after every chosen model completes");
+		assertEquals(Optional.empty(), ScenarioCompletionPolicy.finishReason(ScenarioCategory.BUILDING, onePlanning, false),
+				"building remains under the selected models' control while any model is active");
+		assertTrue(ScenarioCompletionPolicy.finishReason(ScenarioCategory.BUILDING, allCompleted, false).isPresent(),
+				"building ends after every chosen model explicitly completes");
+		List<ScenarioCompletionPolicy.ParticipantState> twoPvpSurvivors = List.of(
+				participantState("agent-a", Optional.empty(), AgentLifecycleState.ACTING, true),
+				participantState("agent-b", Optional.empty(), AgentLifecycleState.ACTING, true)
+		);
+		assertEquals(Optional.empty(), ScenarioCompletionPolicy.finishReason(ScenarioCategory.PVP, twoPvpSurvivors, false),
+				"pvp continues while multiple individual contestants remain alive");
+		assertTrue(ScenarioCompletionPolicy.finishReason(ScenarioCategory.PVP, List.of(
+				participantState("agent-a", Optional.of("red"), AgentLifecycleState.ACTING, true),
+				participantState("agent-b", Optional.of("red"), AgentLifecycleState.ACTING, true),
+				participantState("agent-c", Optional.of("blue"), AgentLifecycleState.DEAD, false)
+		), false).isPresent(), "pvp finishes when one team remains alive");
+		assertEquals(Optional.empty(), ScenarioCompletionPolicy.finishReason(ScenarioCategory.PARKOUR, allCompleted, false),
+				"parkour does not trust model completion in place of the course finish");
+		assertTrue(ScenarioCompletionPolicy.finishReason(ScenarioCategory.PARKOUR, onePlanning, true).isPresent(),
+				"parkour ends when every contestant reaches the final checkpoint");
+		ScenarioParkourCourse course = ScenarioParkourCourse.create(2);
+		assertTrue(!new ScenarioParkourRunState(course, Map.of("agent-a", 0, "agent-b", 1)).allFinished(),
+				"parkour is unfinished before every final checkpoint");
+		assertTrue(new ScenarioParkourRunState(course, Map.of("agent-a", 0, "agent-b", 1), Map.of(
+				"agent-a", ScenarioParkourCourse.PLATFORM_COUNT - 1,
+				"agent-b", ScenarioParkourCourse.PLATFORM_COUNT - 1
+		)).allFinished(), "parkour completion is derived from verified final checkpoints");
+		return 9;
+	}
+
+	private static ScenarioCompletionPolicy.ParticipantState participantState(
+			String agentId,
+			Optional<String> team,
+			AgentLifecycleState lifecycle,
+			boolean alive
+	) {
+		return new ScenarioCompletionPolicy.ParticipantState(agentId, team, lifecycle, alive);
+	}
+
+	private static boolean isAirOrUnspecified(
+			Map<Long, dev.agaminggod.arenaagents.scenario.runtime.ScenarioArenaBlueprint.Placement> placements,
+			BlockPos position
+	) {
+		var placement = placements.get(position.asLong());
+		return placement == null || placement.state().isAir();
+	}
+
+	private static List<String> buildingCoordinates(ScenarioSpawnAllocator allocator, int count) {
+		return allocator.allocate(config(
+				ScenarioPresets.require("impossible-brief"), 9_000L + count, 19L, participants(count)))
+				.stream().map(spawn -> spawn.x() + ":" + spawn.z()).sorted().toList();
 	}
 
 	private static int verifyDeterministicDirectorEvents() {
@@ -513,14 +990,14 @@ public final class ScenarioCoreVerification {
 				new HashSet<>(directedEvents).size(),
 				"runtime clock dispatches every directed event exactly once"
 		);
-		assertEquals(1, finishSignals, "runtime clock finishes exactly once");
-		assertEquals(ScenarioSessionState.FINISHED, session.state(), "runtime clock finishes the session at duration");
-		assertEquals(
-				"Scenario duration elapsed",
-				session.completionReason().orElseThrow(),
-				"runtime clock records the bounded completion reason"
-		);
-		return 5;
+		assertEquals(0, finishSignals, "configured duration never ends an open-ended scenario");
+		assertEquals(ScenarioSessionState.RUNNING, session.state(), "runtime clock remains running beyond former duration");
+		assertEquals(session.config().durationTicks() + 2L, clock.snapshot().elapsedTick(),
+				"elapsed telemetry continues increasing beyond the phase schedule");
+		session.finish(clock.snapshot().elapsedTick(), "Operator ended observation");
+		assertTrue(clock.tick().finishedNow(), "explicit gameplay or operator completion ends the runtime once");
+		assertTrue(!clock.tick().finishedNow(), "terminal completion is emitted only once");
+		return 6;
 	}
 
 	private static int verifyPhases() {
@@ -530,7 +1007,12 @@ public final class ScenarioCoreVerification {
 		assertEquals("sunrise", survival.phaseAt(survival.defaultDurationTicks() - 1L).orElseThrow().id(), "last phase");
 		assertEquals(Optional.empty(), survival.phaseAt(survival.defaultDurationTicks()), "after final phase");
 		assertEquals(Optional.empty(), survival.phaseAt(-1L), "negative elapsed tick");
-		return 5;
+		ScenarioPreset citadel = ScenarioPresets.require("citadel-collapse");
+		assertEquals("conflict", citadel.phaseAt(0L).orElseThrow().id(), "PvP conflict is open from tick zero");
+		assertTrue(citadel.playerCombat(), "PvP player combat is enabled from launch");
+		assertTrue(citadel.dynamicEvents().stream().noneMatch(event -> event.toLowerCase(java.util.Locale.ROOT).contains("grace")),
+				"PvP metadata contains no grace-period instruction");
+		return 8;
 	}
 
 	private static int verifyLifecycle() {

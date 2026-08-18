@@ -1,10 +1,12 @@
 package dev.agaminggod.arenaagents.server;
 
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
+import dev.agaminggod.arenaagents.agent.AgentDeathSnapshot;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentEntityLocation;
 import dev.agaminggod.arenaagents.agent.AgentEntityRecoveryTarget;
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
@@ -17,20 +19,22 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Locale;
 import java.util.UUID;
 import java.util.WeakHashMap;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import net.minecraft.core.BlockPos;
-import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.scores.PlayerTeam;
+import net.minecraft.world.scores.Team;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,6 +44,7 @@ public final class CodexAgentManager {
 	private static final int AGENT_TICKET_RADIUS = 2;
 	private static final long PLAYER_SPAWN_TIMEOUT_MS = 10_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
+	private static final String HIDDEN_AGENT_TEAM = "arenaagents_hidden";
 	private static final TicketType AGENT_TICKET_TYPE = new TicketType(
 			TicketType.NO_TIMEOUT,
 			TicketType.FLAG_LOADING | TicketType.FLAG_SIMULATION | TicketType.FLAG_KEEP_DIMENSION_ACTIVE
@@ -111,16 +116,30 @@ public final class CodexAgentManager {
 			Optional<String> userName,
 			AgentGameMode gameMode
 	) {
+		return summon(level, position, provider, model, reasoning, "priority", userName, gameMode);
+	}
+
+	public AgentRecord summon(
+			ServerLevel level,
+			Vec3 position,
+			String provider,
+			String model,
+			String reasoning,
+			String serviceTier,
+			Optional<String> userName,
+			AgentGameMode gameMode
+	) {
 		Objects.requireNonNull(level, "level must not be null");
 		Objects.requireNonNull(position, "position must not be null");
 		long now = System.currentTimeMillis();
 		AgentRegistry registry = savedData.registry();
-		AgentRecord created = registry.create(provider, model, reasoning, userName, gameMode, now);
+		AgentRecord created = registry.create(provider, model, reasoning, serviceTier, userName, gameMode, now);
 		try {
 			runtimeHooks.validateProfile(created.profile());
 			OfflineAgentPlayers.spawn(
 					server,
 					created.agentId(),
+					created.profile(),
 					position,
 					0.0F,
 					0.0F,
@@ -130,7 +149,7 @@ public final class CodexAgentManager {
 			pendingPlayerSpawns.put(created.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
 			AgentRecord attached = registry.attachEntity(
 					created.agentId(),
-					OfflineAgentPlayers.offlineUuid(created.agentId()),
+					OfflineAgentPlayers.offlineUuid(created.agentId(), created.profile()),
 					entityLocation(level, new ChunkPos(
 							((int) Math.floor(position.x)) >> 4,
 							((int) Math.floor(position.z)) >> 4
@@ -142,7 +161,7 @@ public final class CodexAgentManager {
 			return attached;
 		} catch (RuntimeException exception) {
 			releaseChunkTicket(created.agentId());
-			OfflineAgentPlayers.find(server, created.agentId()).ifPresent(OfflineAgentPlayers::remove);
+			OfflineAgentPlayers.find(server, created.agentId(), created.profile()).ifPresent(OfflineAgentPlayers::remove);
 			if (pendingPlayerSpawns.remove(created.agentId()) != null) {
 				cancelledPlayerSpawns.record(created.agentId(), System.currentTimeMillis());
 			}
@@ -157,13 +176,7 @@ public final class CodexAgentManager {
 
 	public AgentTransition start(String selector, String prompt) {
 		AgentRecord record = resolve(selector);
-		long now = System.currentTimeMillis();
-		if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
-			findAgentPlayer(record.agentId())
-					.filter(Entity::isAlive)
-					.ifPresent(entity -> savedData.registry().respawn(record.agentId(), entity.getUUID(), now));
-		}
-		return savedData.registry().start(record.agentId(), prompt, now);
+		return savedData.registry().start(record.agentId(), prompt, System.currentTimeMillis());
 	}
 
 	public AgentTransition stop(String selector) {
@@ -186,52 +199,132 @@ public final class CodexAgentManager {
 		return savedData.registry().steer(record.agentId(), prompt, System.currentTimeMillis());
 	}
 
-	public AgentRecord respawn(String selector, ServerLevel level, Vec3 position) {
-		Objects.requireNonNull(level, "level must not be null");
-		Objects.requireNonNull(position, "position must not be null");
-		AgentRecord record = resolve(selector);
+	public VanillaRespawnAttempt beginVanillaRespawn(AgentId agentId) {
+		AgentRecord record = savedData.registry().require(Objects.requireNonNull(agentId, "agentId must not be null"));
 		if (record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
 			throw new AgentDomainException("AGENT_NOT_DEAD", "Only a dead Codex agent can be respawned");
 		}
 		runtimeHooks.validateProfile(record.profile());
 		try {
+			AgentDeathSnapshot death = record.deathSnapshot().orElseThrow(
+					() -> new AgentDomainException("DEATH_SNAPSHOT_MISSING", "Dead agent has no persisted vanilla respawn facts")
+			);
+			OfflineAgentPlayers.VanillaRespawnTarget target = OfflineAgentPlayers.resolveVanillaRespawn(server, death);
+			findAgentPlayer(record.agentId()).ifPresent(OfflineAgentPlayers::remove);
 			OfflineAgentPlayers.spawn(
 					server,
 					record.agentId(),
-					position,
-					0.0F,
-					0.0F,
-					level.dimension(),
-					record.profile().gameMode()
+					record.profile(),
+					target.position(),
+					target.yaw(),
+					target.pitch(),
+					target.level().dimension(), target.gameMode()
 			);
 			long now = System.currentTimeMillis();
-			pendingPlayerSpawns.put(record.agentId(), now + 10_000L);
-			AgentRecord respawned = savedData.registry().respawn(
-					record.agentId(),
-					OfflineAgentPlayers.offlineUuid(record.agentId()),
-					now
-			).after();
-			AgentRecord located = savedData.registry().updateEntityLocation(
-					respawned.agentId(),
-					entityLocation(level, new ChunkPos(
-							((int) Math.floor(position.x)) >> 4,
-							((int) Math.floor(position.z)) >> 4
-					)),
-					now
-			);
-			restoreChunkTicket(located);
-			return located;
+			pendingPlayerSpawns.put(record.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
+			return new VanillaRespawnAttempt(record, target, now + PLAYER_SPAWN_TIMEOUT_MS);
 		} catch (RuntimeException exception) {
-			releaseChunkTicket(record.agentId());
-			OfflineAgentPlayers.find(server, record.agentId()).ifPresent(OfflineAgentPlayers::remove);
+			rollbackVanillaRespawn(record);
 			throw exception;
 		}
+	}
+
+	public boolean verifyVanillaRespawn(VanillaRespawnAttempt attempt, long nowEpochMs) {
+		Objects.requireNonNull(attempt, "attempt must not be null");
+		if (!savedData.registry().require(attempt.deadRecord().agentId()).equals(attempt.deadRecord())) {
+			throw new AgentDomainException("STALE_RESPAWN_ATTEMPT", "Dead lifecycle changed during respawn");
+		}
+		Optional<ServerPlayer> found = findAgentPlayer(attempt.deadRecord().agentId());
+		if (found.isEmpty()) {
+			if (nowEpochMs >= attempt.deadlineEpochMs()) throw new AgentDomainException("PLAYER_SPAWN_TIMEOUT", "Respawned player did not appear before the deadline");
+			return false;
+		}
+		ServerPlayer player = found.orElseThrow();
+		if (!player.isAlive()) throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Respawned player is not alive");
+		Vec3 finalPosition = attempt.target().finalPosition(player);
+		if (player.level() != attempt.target().level() || player.position().distanceToSqr(finalPosition) > 1.0E-8D
+				|| Math.abs(player.getYRot() - attempt.target().yaw()) > 0.001F || Math.abs(player.getXRot() - attempt.target().pitch()) > 0.001F) {
+			boolean moved = player.teleportTo(
+					attempt.target().level(), finalPosition.x, finalPosition.y, finalPosition.z,
+					Set.of(), attempt.target().yaw(), attempt.target().pitch(), true
+			);
+			if (!moved) throw new AgentDomainException("PLAYER_SPAWN_VERIFY_FAILED", "Respawned player could not reach the vanilla target");
+		}
+		if (player.level() != attempt.target().level() || player.position().distanceToSqr(finalPosition) > 1.0E-8D
+				|| player.gameMode.getGameModeForPlayer() != attempt.target().gameMode()) {
+			throw new AgentDomainException("PLAYER_SPAWN_VERIFY_FAILED", "Respawned player failed physical verification");
+		}
+		attempt.verifiedPlayer = player;
+		return true;
+	}
+
+	public AgentTransition commitVanillaRespawn(
+			VanillaRespawnAttempt attempt,
+			BiConsumer<AgentTransition, Runnable> publicationBarrier
+	) {
+		Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null");
+		ServerPlayer player = Objects.requireNonNull(attempt.verifiedPlayer, "respawn must be physically verified before commit");
+		Runnable rollbackWorld = () -> { };
+		try {
+			rollbackWorld = attempt.target().commitWorldEffects();
+			AgentEntityLocation location = entityLocation(player.level(), player.chunkPosition());
+			AgentTransition transition = savedData.registry().respawnAtomically(
+					attempt.deadRecord().agentId(), player.getUUID(), location, System.currentTimeMillis(),
+					(prepared, commit) -> {
+						restoreChunkTicket(prepared.after());
+						try {
+							publicationBarrier.accept(prepared, commit);
+						} catch (RuntimeException exception) {
+							releaseChunkTicket(prepared.after().agentId());
+							throw exception;
+						}
+					}
+			);
+			pendingPlayerSpawns.remove(attempt.deadRecord().agentId());
+			return transition;
+		} catch (RuntimeException exception) {
+			rollbackWorld.run();
+			rollbackVanillaRespawn(attempt.deadRecord());
+			throw exception;
+		}
+	}
+
+	public void rollbackVanillaRespawn(VanillaRespawnAttempt attempt) {
+		if (attempt != null) rollbackVanillaRespawn(attempt.deadRecord());
+	}
+
+	private void rollbackVanillaRespawn(AgentRecord deadRecord) {
+		releaseChunkTicket(deadRecord.agentId());
+		pendingPlayerSpawns.remove(deadRecord.agentId());
+		OfflineAgentPlayers.find(server, deadRecord.agentId(), deadRecord.profile()).ifPresent(OfflineAgentPlayers::remove);
+	}
+
+	public static final class VanillaRespawnAttempt {
+		private final AgentRecord deadRecord;
+		private final OfflineAgentPlayers.VanillaRespawnTarget target;
+		private final long deadlineEpochMs;
+		private ServerPlayer verifiedPlayer;
+
+		private VanillaRespawnAttempt(AgentRecord deadRecord, OfflineAgentPlayers.VanillaRespawnTarget target, long deadlineEpochMs) {
+			this.deadRecord = deadRecord;
+			this.target = target;
+			this.deadlineEpochMs = deadlineEpochMs;
+		}
+
+		public AgentRecord deadRecord() { return deadRecord; }
+		public OfflineAgentPlayers.VanillaRespawnTarget target() { return target; }
+		public long deadlineEpochMs() { return deadlineEpochMs; }
 	}
 
 	public void reconcileDeaths() {
 		long now = System.currentTimeMillis();
 		for (AgentId cancelled : cancelledPlayerSpawns.active(now)) {
-			OfflineAgentPlayers.find(server, cancelled).ifPresent(OfflineAgentPlayers::remove);
+			try {
+				AgentRecord cancelledRecord = savedData.registry().require(cancelled);
+				OfflineAgentPlayers.find(server, cancelled, cancelledRecord.profile()).ifPresent(OfflineAgentPlayers::remove);
+			} catch (AgentDomainException ignored) {
+				// Cancellation can outlive the rolled-back registry entry; no mapped player remains addressable.
+			}
 		}
 		for (AgentRecord record : records()) {
 			Optional<ServerPlayer> player = findAgentPlayer(record.agentId());
@@ -239,7 +332,7 @@ public final class CodexAgentManager {
 				pendingPlayerSpawns.remove(record.agentId());
 				seenPlayers.add(record.agentId());
 				if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
-					savedData.registry().respawn(record.agentId(), player.get().getUUID(), now);
+					continue;
 				}
 				if (record.entityUuid().isEmpty() || !record.entityUuid().get().equals(player.get().getUUID())) {
 					savedData.registry().attachEntity(
@@ -249,21 +342,85 @@ public final class CodexAgentManager {
 							now
 					);
 				}
-				player.get().setCustomName(Component.literal(displayName(record)));
-				player.get().setCustomNameVisible(true);
+				// Identity and status belong in the field console, not as noisy world-space labels.
+				player.get().setCustomName(null);
+				player.get().setCustomNameVisible(false);
+				hideWorldName(player.get());
 				trackChunkTicket(record.agentId(), player.get());
 			} else if (player.isPresent() && record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
-				savedData.registry().die(record.agentId(), now);
+				savedData.registry().die(record.agentId(), deathSnapshot(player.get(), now), now);
 			} else if (record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
 				long deadline = pendingPlayerSpawns.getOrDefault(record.agentId(), 0L);
 				if (deadline > now) continue;
 				if (seenPlayers.contains(record.agentId())) {
-					savedData.registry().die(record.agentId(), now);
+					// A missing fake is not evidence of vanilla death. Preserve its lifecycle for recovery.
+					savedData.registry().disconnect(record.agentId(), now);
 					continue;
 				}
 				recoverOfflinePlayer(record, now);
 			}
 		}
+	}
+
+	public boolean captureDeath(ServerPlayer player, DamageSource source) {
+		Objects.requireNonNull(player, "player must not be null");
+		Objects.requireNonNull(source, "source must not be null");
+		long now = System.currentTimeMillis();
+		String cause;
+		try {
+			cause = source.getLocalizedDeathMessage(player).getString();
+		} catch (RuntimeException ignored) {
+			cause = "Agent died";
+		}
+		return AgentDeathCapture.record(
+				savedData.registry(), player.getUUID(), deathSnapshot(player, cause, now), now
+		);
+	}
+
+	private static AgentDeathSnapshot deathSnapshot(ServerPlayer player, long now) {
+		String cause;
+		try {
+			cause = player.getCombatTracker().getDeathMessage().getString();
+		} catch (RuntimeException ignored) {
+			cause = "Agent died";
+		}
+		return deathSnapshot(player, cause, now);
+	}
+
+	private static AgentDeathSnapshot deathSnapshot(ServerPlayer player, String cause, long now) {
+		ServerPlayer.RespawnConfig config = player.getRespawnConfig();
+		Optional<String> respawnDimension = Optional.empty();
+		Optional<Double> respawnX = Optional.empty();
+		Optional<Double> respawnY = Optional.empty();
+		Optional<Double> respawnZ = Optional.empty();
+		Optional<Float> respawnYaw = Optional.empty();
+		Optional<Float> respawnPitch = Optional.empty();
+		Optional<Boolean> respawnForced = Optional.empty();
+		if (config != null) {
+			var data = config.respawnData();
+			respawnDimension = Optional.of(data.dimension().identifier().toString());
+			respawnX = Optional.of((double) data.pos().getX());
+			respawnY = Optional.of((double) data.pos().getY());
+			respawnZ = Optional.of((double) data.pos().getZ());
+			respawnYaw = Optional.of(data.yaw());
+			respawnPitch = Optional.of(data.pitch());
+			respawnForced = Optional.of(config.forced());
+		}
+		return new AgentDeathSnapshot(
+				cause, player.level().dimension().identifier().toString(), player.getX(), player.getY(), player.getZ(),
+				respawnDimension, respawnX, respawnY, respawnZ, respawnYaw, respawnPitch, respawnForced,
+				player.gameMode.getGameModeForPlayer().getName(), now
+		);
+	}
+
+
+	private void hideWorldName(ServerPlayer player) {
+		PlayerTeam team = server.getScoreboard().getPlayerTeam(HIDDEN_AGENT_TEAM);
+		if (team == null) {
+			team = server.getScoreboard().addPlayerTeam(HIDDEN_AGENT_TEAM);
+			team.setNameTagVisibility(Team.Visibility.NEVER);
+		}
+		server.getScoreboard().addPlayerToTeam(player.getScoreboardName(), team);
 	}
 
 	private void recoverOfflinePlayer(AgentRecord record, long now) {
@@ -296,6 +453,7 @@ public final class CodexAgentManager {
 			OfflineAgentPlayers.spawn(
 					server,
 					record.agentId(),
+					record.profile(),
 					position,
 					0.0F,
 					0.0F,
@@ -305,7 +463,7 @@ public final class CodexAgentManager {
 			pendingPlayerSpawns.put(record.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
 			savedData.registry().attachEntity(
 					record.agentId(),
-					OfflineAgentPlayers.offlineUuid(record.agentId()),
+					OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile()),
 					entityLocation(level, new ChunkPos(
 							((int) Math.floor(position.x)) >> 4,
 							((int) Math.floor(position.z)) >> 4
@@ -362,34 +520,14 @@ public final class CodexAgentManager {
 	}
 
 	public String displayName(AgentRecord target) {
-		String base = target.profile().userName().orElseGet(() ->
-				humanize(target.profile().model()) + " " + capitalize(target.profile().reasoning()));
+		String base = AgentIdentity.displayName(target.profile());
 		int duplicate = 0;
 		for (AgentRecord record : records()) {
 			if (record.agentId().equals(target.agentId())) break;
-			String candidate = record.profile().userName().orElseGet(() ->
-					humanize(record.profile().model()) + " " + capitalize(record.profile().reasoning()));
+			String candidate = AgentIdentity.displayName(record.profile());
 			if (candidate.equals(base)) duplicate++;
 		}
 		return duplicate == 0 ? base : base + " (" + duplicate + ")";
-	}
-
-	private static String humanize(String value) {
-		String[] parts = value.replace('_', '-').split("-");
-		StringBuilder result = new StringBuilder();
-		for (String part : parts) {
-			if (part.isBlank()) continue;
-			if (!result.isEmpty()) result.append(' ');
-			if (part.equalsIgnoreCase("gpt")) result.append("GPT");
-			else result.append(capitalize(part));
-		}
-		return result.toString();
-	}
-
-	private static String capitalize(String value) {
-		if (value == null || value.isBlank()) return "";
-		String lower = value.toLowerCase(Locale.ROOT);
-		return lower.substring(0, 1).toUpperCase(Locale.ROOT) + lower.substring(1);
 	}
 
 	public AgentRecord resolve(String selector) {
@@ -421,8 +559,8 @@ public final class CodexAgentManager {
 	}
 
 	public Optional<ServerPlayer> findAgentPlayer(AgentId agentId) {
-		savedData.registry().require(agentId);
-		return OfflineAgentPlayers.find(server, agentId);
+		AgentRecord record = savedData.registry().require(agentId);
+		return OfflineAgentPlayers.find(server, agentId, record.profile());
 	}
 
 	private Optional<CodexAgentEntity> findLoadedAgentEntity(AgentId agentId) {

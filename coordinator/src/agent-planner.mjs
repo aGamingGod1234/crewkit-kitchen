@@ -10,13 +10,21 @@ const RETRYABLE_DECISION_ERRORS = new Set([
 	'INVALID_DECISION',
 	'UNKNOWN_DECISION_FIELD',
 	'MISSING_DECISION_FIELD',
-	'INVALID_ACTION',
-	'STATUS_ACTION_MISMATCH',
+	'DECISION_FIELD_MISMATCH',
+	'DUPLICATE_DECISION_FIELD',
 ]);
 const RETRYABLE_PROVIDER_ERRORS = new Set([
 	'PLANNING_TIMEOUT',
 	'PROVIDER_UNAVAILABLE',
 	'SPAWN_FAILED',
+	// Codex app-server can complete a turn without emitting an agent-message
+	// item. A single clean retry is safer than permanently erroring the agent.
+	'MISSING_AGENT_MESSAGE',
+	'MISSING_FINAL_MESSAGE',
+]);
+const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set([
+	'MISSING_AGENT_MESSAGE',
+	'MISSING_FINAL_MESSAGE',
 ]);
 
 export class AgentPlanner {
@@ -57,13 +65,13 @@ export class AgentPlanner {
 
 	get healthRegistry() { return this.#healthRegistry; }
 
-	requestPlan({ agentId, input, goalRevision, recoverySummary = null }) {
+	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
 		const queuedAt = this.#now();
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
 			const queueWaitMs = elapsed(queuedAt, this.#now());
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
-			this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
+			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
 			try {
 				let agent;
 				let initializationRetryCount = 0;
@@ -130,7 +138,13 @@ export class AgentPlanner {
 					}
 				}
 			} catch (error) {
-				if (error?.code !== 'STALE_PLAN' && error?.code !== 'PLAN_CANCELLED' && this.#isCurrent(agentId, goalRevision)) {
+				if (
+					error?.code !== 'STALE_PLAN'
+					&& error?.code !== 'PLAN_CANCELLED'
+					&& !QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)
+					&& this.#isCurrent(agentId, goalRevision)
+					&& !preserveState
+				) {
 					this.#registry.setState(agentId, DynamicAgentState.ERROR, {
 						goalRevision,
 						error: { code: String(error?.code ?? 'PLANNING_FAILED').slice(0, 128), message: String(error?.message ?? error).slice(0, 2_048) },

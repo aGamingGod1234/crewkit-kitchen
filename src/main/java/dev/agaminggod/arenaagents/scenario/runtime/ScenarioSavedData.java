@@ -4,6 +4,8 @@ import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.List;
+import dev.agaminggod.arenaagents.server.ChunkedSavedPayload;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.util.datafix.DataFixTypes;
@@ -12,8 +14,10 @@ import net.minecraft.world.level.saveddata.SavedDataType;
 
 public final class ScenarioSavedData extends SavedData {
 	private static final String PAYLOAD_FIELD = "payload";
+	private static final String PAYLOAD_CHUNKS_FIELD = "payload_chunks";
 	private static final Codec<ScenarioSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
-			Codec.STRING.optionalFieldOf(PAYLOAD_FIELD, "").forGetter(ScenarioSavedData::encodePayload)
+			Codec.STRING.optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
+			Codec.STRING.listOf().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload()))
 	).apply(instance, ScenarioSavedData::decodePayload));
 	public static final SavedDataType<ScenarioSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "scenario_run"),
@@ -57,7 +61,8 @@ public final class ScenarioSavedData extends SavedData {
 		return snapshot == null ? "" : snapshot.toJson();
 	}
 
-	private static ScenarioSavedData decodePayload(String payload) {
+	private static ScenarioSavedData decodePayload(String legacyPayload, List<String> chunks) {
+		String payload = ChunkedSavedPayload.join(legacyPayload, chunks);
 		if (payload == null || payload.isBlank()) return new ScenarioSavedData();
 		return new ScenarioSavedData(ScenarioRunSnapshot.fromJson(payload));
 	}

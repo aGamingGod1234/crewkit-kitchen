@@ -26,3 +26,22 @@ test('catalog refreshes once, normalizes capabilities, and reconciles profiles',
 	now = 151;
 	assert.equal(cache.stale, true);
 });
+
+test('catalog preserves Codex speed tiers and raw catalog naming variants', async () => {
+	const cache = new ModelCatalogCache(async () => [{
+		slug: 'gpt-5.6-sol',
+		display_name: 'GPT-5.6-Sol',
+		supported_reasoning_levels: [{ effort: 'low' }, { effort: 'ultra' }],
+		service_tiers: [{ id: 'priority' }],
+		additional_speed_tiers: ['fast'],
+	}]);
+	await cache.refresh();
+	assert.deepEqual(cache.find('gpt-5.6-sol'), {
+		id: 'gpt-5.6-sol',
+		model: 'gpt-5.6-sol',
+		displayName: 'GPT-5.6-Sol',
+		reasoningEfforts: ['low', 'ultra'],
+		serviceTiers: ['priority', 'fast'],
+	});
+	assert.equal(cache.assertSupported('gpt-5.6-sol', 'ultra', 'fast').id, 'gpt-5.6-sol');
+});

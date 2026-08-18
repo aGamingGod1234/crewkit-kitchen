@@ -5,6 +5,9 @@ import { ModelCatalogCache } from './model-catalog-cache.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
+const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
+const THREAD_START_TIMEOUT_MS = 60_000;
+const MAX_BUFFERED_TURN_NOTIFICATIONS = 4_096;
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Codex Agents', version: '2.0.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
 
@@ -77,10 +80,11 @@ export class CodexService {
 			ephemeral: true,
 			baseInstructions: PLANNER_SYSTEM_PROMPT,
 			developerInstructions: recoveryInstructions(recoverySummary),
-		});
+		}, { timeoutMs: THREAD_START_TIMEOUT_MS });
 		const threadId = requireNestedId(response, 'thread', 'thread/start');
-		const agent = new SharedCodexAgent(profile, threadId, this.#transport, {
+	const agent = new SharedCodexAgent(profile, threadId, this.#transport, {
 			planningTimeoutMs: this.#config.planningTimeoutMs,
+			maxDecisionBytes: this.#config.maxDecisionBytes,
 			schedule: this.#config.schedule,
 			cancelSchedule: this.#config.cancelSchedule,
 		});
@@ -161,6 +165,7 @@ export class SharedCodexAgent {
 	#threadId;
 	#transport;
 	#planningTimeoutMs;
+	#maxDecisionBytes;
 	#schedule;
 	#cancelSchedule;
 	#goalRevision = 0;
@@ -172,6 +177,7 @@ export class SharedCodexAgent {
 		this.#threadId = threadId;
 		this.#transport = transport;
 		this.#planningTimeoutMs = dependencies.planningTimeoutMs ?? DEFAULT_PLANNING_TIMEOUT_MS;
+		this.#maxDecisionBytes = dependencies.maxDecisionBytes ?? DEFAULT_MAX_DECISION_BYTES;
 		this.#schedule = dependencies.schedule ?? setTimeout;
 		this.#cancelSchedule = dependencies.cancelSchedule ?? clearTimeout;
 	}
@@ -201,13 +207,30 @@ export class SharedCodexAgent {
 		requireRevision(goalRevision);
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new CodexProtocolError('TURN_INTERRUPTED', 'Planning turn was interrupted');
-		const collector = createTurnCollector(this.#transport, this.#threadId);
-		const active = { goalRevision, turnId: null, collector };
+		const collector = createTurnCollector(this.#transport, this.#threadId, this.#maxDecisionBytes);
+		void collector.promise.catch(() => { /* observed immediately; the decision awaits the original promise after turn/start */ });
+		let lifecycleSettled = false;
+		let rejectLifecycle;
+		const lifecyclePromise = new Promise((_, reject) => { rejectLifecycle = reject; });
+		const active = {
+			goalRevision,
+			turnId: null,
+			collector,
+			lifecyclePromise,
+			cancel(error) {
+				if (lifecycleSettled) return;
+				lifecycleSettled = true;
+				rejectLifecycle(error);
+			},
+		};
 		this.#active = active;
-		const abort = () => { void this.interrupt(); };
+		const abort = () => {
+			active.cancel(new CodexProtocolError('STALE_PLAN', 'Codex turn was aborted'));
+			void this.interrupt().catch(() => { /* stale abort races are handled by the decision's signal check */ });
+		};
 		signal?.addEventListener('abort', abort, { once: true });
 		try {
-			const response = await this.#transport.request('turn/start', {
+			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
 				input: [{ type: 'text', text: input }],
 				model: this.#profile.model,
@@ -216,18 +239,31 @@ export class SharedCodexAgent {
 				approvalPolicy: 'never',
 				environments: [],
 				outputSchema: PLANNER_OUTPUT_SCHEMA,
-			});
+			}, { timeoutMs: this.#planningTimeoutMs });
+			void turnStartPromise.then((response) => {
+				const turnId = response?.turn?.id;
+				if (typeof turnId !== 'string' || (this.#active === active && !lifecycleSettled && !signal?.aborted && !this.#disposed)) return;
+				if (this.#active === active && (active.turnId === null || active.turnId === undefined)) {
+					active.turnId = turnId;
+					void this.interrupt().catch(() => { /* late turn cleanup is best effort */ });
+					return;
+				}
+				void this.#transport.request('turn/interrupt', { threadId: this.#threadId, turnId }).catch(() => { /* late turn cleanup is best effort */ });
+			}, () => { /* the awaited race reports the request failure */ });
+			const response = await withTimeout(Promise.race([turnStartPromise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			active.turnId = requireNestedId(response, 'turn', 'turn/start');
 			collector.setTurnId(active.turnId);
-			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) {
-				await this.#transport.request('turn/interrupt', { threadId: this.#threadId, turnId: active.turnId });
+			if (this.#active !== active || this.#goalRevision !== goalRevision || lifecycleSettled || signal?.aborted) {
+				try { await this.interrupt(); } catch (error) {
+					if (!signal?.aborted && !this.#disposed) throw error;
+				}
 				throw new CodexProtocolError('STALE_PLAN', 'Codex turn started after its goal revision became obsolete');
 			}
-			const text = await withTimeout(collector.promise, this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
+			const text = await withTimeout(Promise.race([collector.promise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex result belongs to an obsolete goal revision');
 			return parseDecision(text);
 		} catch (error) {
-			if (error?.code === 'PLANNING_TIMEOUT') {
+			if (error?.code === 'PLANNING_TIMEOUT' || error?.code === 'TURN_OUTPUT_LIMIT') {
 				try { await this.interrupt(); } catch { /* original timeout remains authoritative */ }
 			}
 			throw error;
@@ -240,6 +276,7 @@ export class SharedCodexAgent {
 
 	async interrupt() {
 		const active = this.#active;
+		active?.cancel(new CodexProtocolError('STALE_PLAN', 'Codex turn was interrupted'));
 		if (active?.turnId === null || active?.turnId === undefined) return;
 		active.interruptPromise ??= this.#transport.request('turn/interrupt', {
 			threadId: this.#threadId,
@@ -251,6 +288,8 @@ export class SharedCodexAgent {
 	async dispose() {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		const active = this.#active;
+		active?.cancel(new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`));
 		try { await this.interrupt(); } finally {
 			this.#active?.collector.dispose();
 			this.#active = null;
@@ -258,29 +297,78 @@ export class SharedCodexAgent {
 	}
 }
 
-function createTurnCollector(transport, threadId) {
+function createTurnCollector(transport, threadId, maxDecisionBytes) {
 	let expectedTurnId = null;
 	let lastMessage = null;
+	let streamedMessage = '';
+	let streamedMessageBytes = 0;
+	let outputLimitError = null;
+	let bufferedNotifications = [];
 	let resolvePromise;
 	let rejectPromise;
 	const promise = new Promise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
-	const onNotification = ({ method, params }) => {
-		if (params?.threadId !== threadId) return;
-		const turnId = params?.turnId ?? params?.turn?.id ?? null;
-		if (expectedTurnId !== null && turnId !== null && turnId !== expectedTurnId) return;
-		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') lastMessage = params.item.text;
+	const acceptNotification = ({ method, params }) => {
+		const turnId = notificationTurnId(params);
+		if (turnId !== null && turnId !== expectedTurnId) return;
+		if (outputLimitError !== null) return;
+		if (method === 'item/agentMessage/delta' && typeof params?.delta === 'string') {
+			const deltaBytes = Buffer.byteLength(params.delta, 'utf8');
+			if (streamedMessageBytes + deltaBytes > maxDecisionBytes) {
+				outputLimitError = new CodexProtocolError('TURN_OUTPUT_LIMIT', `Codex planner output exceeded ${maxDecisionBytes} bytes`);
+				rejectPromise(outputLimitError);
+				return;
+			}
+			streamedMessageBytes += deltaBytes;
+			streamedMessage += params.delta;
+		}
+		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') {
+			if (Buffer.byteLength(params.item.text, 'utf8') > maxDecisionBytes) {
+				outputLimitError = new CodexProtocolError('TURN_OUTPUT_LIMIT', `Codex planner output exceeded ${maxDecisionBytes} bytes`);
+				rejectPromise(outputLimitError);
+				return;
+			}
+			lastMessage = params.item.text;
+			streamedMessage = '';
+			streamedMessageBytes = 0;
+		}
 		if (method === 'turn/completed') {
 			if (params?.turn?.status === 'failed') rejectPromise(new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex turn failed'));
-			else if (lastMessage === null) rejectPromise(new CodexProtocolError('MISSING_AGENT_MESSAGE', 'Codex turn completed without an agent message'));
-			else resolvePromise(lastMessage);
+			else if (lastMessage === null && streamedMessage.length === 0) rejectPromise(new CodexProtocolError('MISSING_AGENT_MESSAGE', 'Codex turn completed without an agent message'));
+			else resolvePromise(lastMessage ?? streamedMessage);
 		}
+	};
+	const onNotification = (notification) => {
+		const { params } = notification;
+		if (params?.threadId !== threadId) return;
+		if (expectedTurnId === null) {
+			if (notificationTurnId(params) === null) return;
+			if (bufferedNotifications.length >= MAX_BUFFERED_TURN_NOTIFICATIONS) {
+				rejectPromise(new CodexProtocolError('TURN_NOTIFICATION_OVERFLOW', 'Too many Codex notifications arrived before turn/start completed'));
+				return;
+			}
+			bufferedNotifications.push(notification);
+			return;
+		}
+		acceptNotification(notification);
 	};
 	transport.on('notification', onNotification);
 	return {
 		promise,
-		setTurnId(value) { expectedTurnId = value; },
-		dispose() { transport.off('notification', onNotification); },
+		setTurnId(value) {
+			expectedTurnId = value;
+			const buffered = bufferedNotifications;
+			bufferedNotifications = [];
+			for (const notification of buffered) acceptNotification(notification);
+		},
+		dispose() {
+			bufferedNotifications = [];
+			transport.off('notification', onNotification);
+		},
 	};
+}
+
+function notificationTurnId(params) {
+	return params?.turnId ?? params?.turn?.id ?? null;
 }
 
 function withTimeout(promise, timeoutMs, schedule, cancelSchedule) {
@@ -298,12 +386,15 @@ function validateServiceConfig(value, { requireLaunchProfile }) {
 	if (typeof value.cwd !== 'string' || value.cwd.trim().length === 0) throw new TypeError('Codex service cwd must be nonblank');
 	const planningTimeoutMs = value.planningTimeoutMs ?? DEFAULT_PLANNING_TIMEOUT_MS;
 	if (!Number.isSafeInteger(planningTimeoutMs) || planningTimeoutMs <= 0) throw new TypeError('planningTimeoutMs must be a positive safe integer');
+	const maxDecisionBytes = value.maxDecisionBytes ?? DEFAULT_MAX_DECISION_BYTES;
+	if (!Number.isSafeInteger(maxDecisionBytes) || maxDecisionBytes <= 0) throw new TypeError('maxDecisionBytes must be a positive safe integer');
 	const catalogTtlMs = value.catalogTtlMs ?? 60_000;
 	if (!Number.isSafeInteger(catalogTtlMs) || catalogTtlMs <= 0) throw new TypeError('catalogTtlMs must be a positive safe integer');
 	if (requireLaunchProfile && value.launchProfile === undefined) throw new TypeError('Codex service launchProfile is required when no transport is injected');
 	return {
 		...value,
 		planningTimeoutMs,
+		maxDecisionBytes,
 		catalogTtlMs,
 		schedule: value.schedule ?? setTimeout,
 		cancelSchedule: value.cancelSchedule ?? clearTimeout,

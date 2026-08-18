@@ -85,14 +85,10 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		} finally { leases.release(key, id); }
 	}
 
-	public Result pickUp(ServerPlayer agent, ItemEntity item) {
+	public Result validatePickUp(ServerPlayer agent, ItemEntity item) {
 		if (!item.isAlive() || item.getItem().isEmpty()) return Result.failed("ITEM_UNAVAILABLE", "Item entity is no longer available");
 		if (!protection.mayTakeEntity(agent, item)) return Result.failed("PROTECTION_DENIED", "Item pickup denied");
-		ItemStack remainder = item.getItem().copy();
-		agent.getInventory().add(remainder);
-		item.setItem(remainder);
-		if (remainder.isEmpty()) item.discard();
-		return Result.succeeded("Picked up available item stack space");
+		return Result.succeeded("Item may be approached for normal player collision pickup");
 	}
 
 	public Result drop(ServerPlayer agent, int slot, int count) {
@@ -421,8 +417,9 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 					);
 				}
 				List<ItemStack> gridStacks = gridSlots.stream().map(slot -> slot.getItem().copy()).toList();
-				CraftingInput input = CraftingInput.of(
+				CraftingInput.Positioned positionedInput = CraftingInput.ofPositioned(
 						craftingMenu.getGridWidth(), craftingMenu.getGridHeight(), gridStacks);
+				CraftingInput input = positionedInput.input();
 				RecipeHolder<CraftingRecipe> exact = player.level().recipeAccess().getRecipeFor(
 						RecipeType.CRAFTING, input, player.level(), recipeKey).orElse(null);
 				if (!craftingRecipe.matches(input, player.level()) || exact == null || !exact.id().equals(recipeKey)) {
@@ -443,11 +440,21 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 						);
 					}
 				}
-				List<ItemStack> remainders = craftingRecipe.getRemainingItems(input);
-				if (remainders.size() != gridSlots.size()) {
+				List<ItemStack> remainders;
+				try {
+					remainders = TransactionSnapshot.expandCraftingRemainders(
+							craftingRecipe.getRemainingItems(input),
+							gridSlots.size(),
+							craftingMenu.getGridWidth(),
+							input.width(),
+							positionedInput.left(),
+							positionedInput.top(),
+							ItemStack.EMPTY
+					);
+				} catch (IllegalArgumentException invalidRemainders) {
 					return failureAfterPlacement(
 							"CRAFT_REMAINDER_UNSAFE",
-							"Recipe remainder layout did not match the crafting grid",
+							"Recipe remainder layout could not be aligned with the crafting grid",
 							placementGuard,
 							gridSlots
 					);

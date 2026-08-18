@@ -1,7 +1,6 @@
 package dev.agaminggod.arenaagents.agent;
 
 import java.util.Optional;
-import net.minecraft.network.chat.Component;
 import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.network.syncher.SynchedEntityData;
@@ -189,7 +188,7 @@ public final class CodexAgentEntity extends PathfinderMob {
 	}
 
 	private void refreshNameTag() {
-		setCustomName(Component.literal(getModelName() + " · " + getReasoningEffort()));
-		setCustomNameVisible(true);
+		setCustomName(null);
+		setCustomNameVisible(false);
 	}
 }

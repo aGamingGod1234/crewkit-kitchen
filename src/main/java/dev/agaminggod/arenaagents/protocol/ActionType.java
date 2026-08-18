@@ -14,6 +14,7 @@ public enum ActionType {
 	USE_ITEM("use_item"),
 	BREAK_BLOCK("break_block"),
 	PLACE_BLOCK("place_block"),
+	BUILD_SEQUENCE("build_sequence"),
 	CHAT("chat"),
 	WAIT("wait"),
 	SET_DOOR("set_door"),
@@ -31,6 +32,7 @@ public enum ActionType {
 	SELECT_TOOL("select_tool"),
 	BLOCK_WITH_SHIELD("block_with_shield"),
 	USE_RANGED("use_ranged"),
+	RESPAWN("respawn"),
 	COMPLETE_GOAL("complete_goal");
 
 	private static final Map<String, ActionType> BY_WIRE_NAME = Arrays.stream(values())

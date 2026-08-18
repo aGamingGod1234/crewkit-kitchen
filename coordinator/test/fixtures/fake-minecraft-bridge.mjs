@@ -1,156 +1,222 @@
-import net from 'node:net';
+import { createProtocolV2Envelope, validateProtocolV2Envelope, validateProtocolV2Payload } from '../../src/protocol-v2.mjs';
+import { adaptObservation } from '../../src/observation-adapter.mjs';
 
-import { encodeJsonLine, JsonlDecoder } from '../../src/jsonl.mjs';
+export const SELECTED_PROFILE = Object.freeze({
+	agentId: 'task10-agent',
+	provider: 'codex',
+	model: 'gpt-5.6-sol',
+	reasoningEffort: 'high',
+	serviceTier: 'fast',
+});
 
+export function observation(overrides = {}) {
+	return {
+		player: { x: 0, y: 64, z: 0, health: 20, dead: false, ...overrides.player },
+		items: overrides.items ?? [],
+		entities: overrides.entities ?? [],
+		blocks: overrides.blocks ?? [],
+		inventory: { items: [], tagCounts: { '#minecraft:logs': 0 }, ...overrides.inventory },
+	};
+}
+
+/** Deterministic loopback bridge that executes only commands accepted by protocol v2. */
 export class FakeMinecraftBridge {
-	#agentId;
-	#server;
-	#socket = null;
-	#decoder = null;
+	#record;
+	#manager;
+	#onAction;
+	#onCancel;
+	#observation;
+	#eventSequence;
+	#clock;
+	#pending = new Map();
 	#messageSequence = 0;
-	#authenticated = false;
-	#connectionCount = 0;
-	#crossAgentMessages = 0;
-	#actions = [];
+	#serverInstanceId = 'task10-fake-server';
 
-	constructor(agentId) {
-		this.#agentId = agentId;
-		this.#server = net.createServer((socket) => this.#accept(socket));
+	sent = [];
+	progress = [];
+	results = [];
+	validatedInbound = 0;
+	validatedOutbound = 0;
+
+	constructor({ record, initialObservation = observation(), onAction = () => ({}), onCancel = () => ({}) } = {}) {
+		this.#record = record;
+		this.#onAction = onAction;
+		this.#onCancel = onCancel;
+		this.#observation = adaptObservation(validateProtocolV2Payload('observation', toWireObservation(initialObservation, record.goalRevision, 1, false, 1)));
+		this.#eventSequence = 1;
+		this.#clock = 1;
 	}
 
-	get port() { return this.#server.address().port; }
-	get connectionCount() { return this.#connectionCount; }
-	get crossAgentMessages() { return this.#crossAgentMessages; }
-	get actions() { return [...this.#actions]; }
+	attach(manager) {
+		this.#manager = manager;
+	}
 
-	async start() {
-		await new Promise((resolve, reject) => {
-			this.#server.once('error', reject);
-			this.#server.listen(0, '127.0.0.1', () => {
-				this.#server.off('error', reject);
-				resolve();
-			});
+	get currentObservation() {
+		return this.#observation;
+	}
+
+	get eventSequence() {
+		return this.#eventSequence;
+	}
+
+	async send(type, agentId, payload) {
+		if (agentId !== this.#record.agentId) throw new Error(`unexpected agent ${agentId}`);
+		const envelope = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId,
+			type,
+			messageId: `out-${++this.#messageSequence}`,
+			payload,
 		});
-	}
-
-	async waitUntilAuthenticated(minimumConnections = 1) {
-		await eventually(() => this.#authenticated && this.#connectionCount >= minimumConnections, `fake bridge ${this.#agentId} did not authenticate`);
-	}
-
-	sendGoal(goal) {
-		this.#send({
-			type: 'goal_event',
-			operation: 'set',
-			goal,
-		});
-	}
-
-	async disconnect() {
-		const socket = this.#socket;
-		if (socket === null) return;
-		await new Promise((resolve) => {
-			socket.once('close', resolve);
-			socket.destroy();
-		});
-	}
-
-	async stop() {
-		if (this.#socket !== null && !this.#socket.destroyed) this.#socket.destroy();
-		if (!this.#server.listening) return;
-		await new Promise((resolve, reject) => this.#server.close((error) => error ? reject(error) : resolve()));
-	}
-
-	#accept(socket) {
-		this.#connectionCount += 1;
-		this.#authenticated = false;
-		this.#socket = socket;
-		this.#decoder = new JsonlDecoder();
-		socket.setNoDelay(true);
-		socket.on('data', (chunk) => {
-			try {
-				for (const message of this.#decoder.push(chunk)) this.#handle(message);
-			} catch {
-				socket.destroy();
-			}
-		});
-		socket.on('close', () => {
-			if (socket === this.#socket) {
-				this.#socket = null;
-				this.#authenticated = false;
-			}
-		});
-	}
-
-	#handle(message) {
-		if (message.agentId !== this.#agentId) {
-			this.#crossAgentMessages += 1;
-			this.#socket.destroy();
+		validateProtocolV2Envelope(envelope, { direction: 'coordinator_to_server' });
+		this.validatedOutbound += 1;
+		const normalized = envelope.payload;
+		if (type === 'action_command') {
+			this.sent.push(envelope);
+			queueMicrotask(() => { void this.#execute(normalized); });
 			return;
 		}
-		if (!this.#authenticated) {
-			if (message.type !== 'hello') throw new Error('first message must be hello');
-			this.#authenticated = true;
-			this.#send({ type: 'hello_ack', replyTo: message.messageId });
+		if (type === 'action_cancel') {
+			this.sent.push(envelope);
+			queueMicrotask(() => { void this.#cancel(normalized.actionId); });
 			return;
 		}
-		switch (message.type) {
-			case 'request_observation':
-				this.#sendObservation();
-				break;
-			case 'action_command':
-				this.#actions.push(structuredClone(message.command));
-				setImmediate(() => {
-					if (this.#authenticated) this.#send({
-						type: 'action_result',
-						commandId: message.command.commandId,
-						state: 'SUCCEEDED',
-						reasonCode: 'FIXTURE_DONE',
-						message: '',
-						completedAtEpochMs: Date.now(),
-					});
-				});
-				break;
-			case 'cancel_action':
-				this.#send({ type: 'action_result', commandId: message.commandId, state: 'CANCELLED', reasonCode: 'COORDINATOR_CANCELLED', message: '', completedAtEpochMs: Date.now() });
-				break;
-			case 'shutdown':
-				this.#socket.destroy();
-				break;
-			default:
-				throw new Error(`unexpected coordinator message '${message.type}'`);
-		}
+		this.sent.push(envelope);
 	}
 
-	#sendObservation() {
-		this.#send({
+	async publish(nextObservation, { attention = false, eventSequence = this.#nextSequence(), observedAtEpochMs = this.#clock } = {}) {
+		const inbound = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId: this.#record.agentId,
 			type: 'observation',
-			ready: true,
-			status: 'ready',
-			position: { x: 0, y: 64, z: 0 },
-			velocity: { x: 0, y: 0, z: 0 },
-			view: { yaw: 0, pitch: 0 },
-			player: { health: 20, maxHealth: 20, hunger: 20, armor: 0, effects: [] },
-			inventory: { selectedSlot: 0, selectedItemId: 'minecraft:air', selectedItemCount: 0, items: [] },
-			entities: [],
-			blocks: [],
-			world: { dimensionId: 'minecraft:overworld', gameTime: 1, defaultClockTime: 1, raining: false, thundering: false },
-			currentAction: { present: false, commandId: '', type: '', state: '' },
-			lastResult: { present: false, commandId: '', state: '', reasonCode: '', message: '', completedAtEpochMs: 0 },
+			messageId: `in-${++this.#messageSequence}`,
+			payload: toWireObservation(nextObservation, this.#record.goalRevision, eventSequence, attention, observedAtEpochMs),
+		});
+		const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
+		this.validatedInbound += 1;
+		this.#observation = adaptObservation(normalized.payload);
+		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
+		if (!this.#manager) throw new Error('FakeMinecraftBridge is not attached to a manager');
+		return this.#manager.onObservation(this.#record, {
+			observation: this.#observation,
+			eventSequence: normalized.payload.eventSequence,
+			attention: normalized.payload.attention,
+			observedAtEpochMs: normalized.payload.observedAtEpochMs,
+			receiptMonotonicMs: ++this.#clock,
+			receiptEpochMs: observedAtEpochMs + 1,
 		});
 	}
 
-	#send(payload) {
-		if (this.#socket === null || this.#socket.destroyed) throw new Error(`fake bridge ${this.#agentId} is disconnected`);
-		this.#messageSequence += 1;
-		this.#socket.write(encodeJsonLine({ protocolVersion: 1, agentId: this.#agentId, messageId: `server-${this.#messageSequence}`, ...payload }));
+	async #execute(command) {
+		const plan = await this.#onAction(command, this);
+		if (plan?.defer === true) this.#pending.set(command.actionId, command);
+		if (plan?.attentionObservation !== undefined) {
+			await this.publish(plan.attentionObservation, { attention: true, eventSequence: this.#nextSequence() });
+		}
+		if (plan?.defer === true) {
+			return;
+		}
+		await this.#finish(command, plan);
+	}
+
+	async #cancel(actionId) {
+		const command = this.#pending.get(actionId) ?? this.sent.find((entry) => entry.type === 'action_command' && entry.payload.actionId === actionId)?.payload;
+		if (!command) return;
+		this.#pending.delete(actionId);
+		const plan = await this.#onCancel(command, this);
+		await this.#finish(command, { state: 'CANCELLED', reasonCode: plan?.reasonCode ?? 'CANCELLED', observation: plan?.observation ?? this.#observation });
+	}
+
+	async #finish(command, plan = {}) {
+		const progressSequence = this.#nextSequence();
+		this.progress.push({ actionId: command.actionId, eventSequence: progressSequence });
+		if (this.#manager) {
+			const inbound = createProtocolV2Envelope({ serverInstanceId: this.#serverInstanceId, agentId: this.#record.agentId, type: 'action_progress', messageId: `in-${++this.#messageSequence}`, payload: {
+				goalRevision: command.goalRevision,
+				actionId: command.actionId,
+				commandId: command.actionId,
+				state: 'RUNNING',
+				message: 'progress',
+				progress: 0.5,
+				elapsedMs: 1,
+				observedAtEpochMs: this.#clock,
+			} });
+			const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
+			this.validatedInbound += 1;
+			await this.#manager.onActionProgress(this.#record, normalized.payload);
+		}
+		if (plan.observation !== undefined) this.#observation = plan.observation;
+		const observationSequence = this.#nextSequence();
+		await this.publish(this.#observation, { eventSequence: observationSequence, observedAtEpochMs: this.#clock });
+		const result = {
+			goalRevision: command.goalRevision,
+			actionId: command.actionId,
+			state: plan.state ?? 'SUCCEEDED',
+			reasonCode: plan.reasonCode ?? 'DONE',
+		};
+		this.results.push(result);
+		if (this.#manager) {
+			const inbound = createProtocolV2Envelope({ serverInstanceId: this.#serverInstanceId, agentId: this.#record.agentId, type: 'action_result', messageId: `in-${++this.#messageSequence}`, payload: {
+				...result,
+				commandId: result.actionId,
+				actionType: command.actionType,
+				message: result.reasonCode,
+				elapsedMs: 1,
+				observedAtEpochMs: this.#clock,
+			} });
+			const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
+			this.validatedInbound += 1;
+			await this.#manager.onActionResult(this.#record, normalized.payload);
+		}
+	}
+
+	#nextSequence() {
+		this.#eventSequence += 1;
+		return this.#eventSequence;
 	}
 }
 
-async function eventually(predicate, message) {
-	const deadline = Date.now() + 5_000;
-	while (Date.now() < deadline) {
-		if (predicate()) return;
-		await new Promise((resolve) => setTimeout(resolve, 5));
+function toWireObservation(value, goalRevision, eventSequence, attention, observedAtEpochMs) {
+	const player = value.player ?? {};
+	if (player.dead === true) return { goalRevision, observedAtEpochMs, ready: false, status: 'PLAYER_DEAD', eventSequence, attention: false, changedFacts: [] };
+	const position = { x: player.x ?? 0, y: player.y ?? 64, z: player.z ?? 0 };
+	return {
+		goalRevision,
+		observedAtEpochMs,
+		ready: player.dead !== true,
+		status: player.dead === true ? 'PLAYER_DEAD' : 'ready',
+		eventSequence,
+		attention,
+		changedFacts: attention ? ['player.health'] : [],
+		position,
+		velocity: { x: 0, y: 0, z: 0 },
+		view: { yaw: 0, pitch: 0 },
+		player: {
+			health: player.health ?? 20, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5,
+			gameMode: 'survival', onGround: true, inWater: false, onFire: player.fire === true,
+			air: 300, maxAir: 300, suffocating: false, fallDistance: player.fallDistance ?? 0, effects: [],
+		},
+		inventory: { items: (value.inventory?.items ?? []).map((item, index) => ({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: item.slot ?? index, ...(item.tags ? { tags: item.tags } : {}) })), selectedItem: 'minecraft:air', ...(value.inventory?.tagCounts ? { tagCounts: value.inventory.tagCounts } : {}) },
+		entities: (value.items ?? []).map((item) => ({ uuid: item.stableId, type: 'minecraft:item', name: 'drop', distance: Math.hypot(item.x - position.x, item.y - position.y, item.z - position.z), position: { x: item.x, y: item.y, z: item.z }, itemId: item.itemId, count: item.count, ...(item.tags ? { tags: item.tags } : {}) })),
+		blocks: (value.blocks ?? []).map((block) => ({ x: block.x, y: block.y, z: block.z, blockId: block.blockId, placeableFaces: ['up', 'down', 'north', 'south', 'east', 'west'], ...(block.tags ? { tags: block.tags } : {}) })),
+		nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false },
+		currentAction: { active: false }, lastResult: { present: false },
+	};
+}
+
+export function commandPayloads(bridge) {
+	return bridge.sent.filter((entry) => entry.type === 'action_command').map((entry) => entry.payload);
+}
+
+export function assertCommandProvenance(commands, profile = SELECTED_PROFILE, expectedProgramId = null) {
+	for (const command of commands) {
+		const payload = command.payload ?? command;
+		const provenance = payload.provenance;
+		if (provenance === null || typeof provenance !== 'object') throw new Error('command is missing model-program provenance');
+		if (provenance.model !== profile.model) throw new Error(`command used ${provenance.model}, expected ${profile.model}`);
+		if (expectedProgramId !== null && provenance.programId !== expectedProgramId) throw new Error(`command used ${provenance.programId}, expected ${expectedProgramId}`);
+		if (!/^program-\d+-\d+$/.test(provenance.programId)) throw new Error(`invalid program id ${provenance.programId}`);
+		if (!/^step-/.test(provenance.sourceStepId)) throw new Error(`invalid source step ${provenance.sourceStepId}`);
+		if (!Number.isSafeInteger(provenance.eventSequence)) throw new Error('command event sequence is not a safe integer');
 	}
-	throw new Error(message);
 }

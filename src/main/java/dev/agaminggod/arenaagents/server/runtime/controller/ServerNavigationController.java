@@ -7,6 +7,7 @@ import dev.agaminggod.arenaagents.client.navigation.PathOutcome;
 import dev.agaminggod.arenaagents.client.navigation.PathPlan;
 import dev.agaminggod.arenaagents.client.navigation.TraversalType;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
+import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
 
@@ -37,7 +38,10 @@ public final class ServerNavigationController implements ServerController {
 			long timeoutMs
 	) {
 		this.destination = Objects.requireNonNull(destination, "destination must not be null");
-		if (!Double.isFinite(tolerance) || tolerance < 0.1D || timeoutMs <= 0L) {
+		if (!Double.isFinite(tolerance)
+				|| tolerance < ProtocolConstants.MIN_MOVEMENT_TOLERANCE
+				|| tolerance > ProtocolConstants.MAX_MOVEMENT_TOLERANCE
+				|| timeoutMs <= 0L || timeoutMs > ProtocolConstants.MAX_DURATION_MS) {
 			throw new IllegalArgumentException("invalid navigation tolerance or timeout");
 		}
 		this.tolerance = tolerance;
@@ -102,7 +106,8 @@ public final class ServerNavigationController implements ServerController {
 		if (remaining <= tolerance + 0.5D) {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
-		return replan(player, nowEpochMs, remaining, true);
+		TickResult replanned = replan(player, nowEpochMs, remaining, true);
+		return replanned == null ? TickResult.running(currentProgress()) : replanned;
 	}
 
 	private TickResult replan(

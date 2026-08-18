@@ -174,12 +174,14 @@ export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP,
 		provider: requireProvider(value.provider ?? 'codex'),
 		model: requireIdentifier(value.model, 'model'),
 		reasoningEffort: requireIdentifier(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireIdentifier(value.serviceTier ?? 'priority', 'serviceTier'),
 		skinVariant: requireIdentifier(value.skinVariant ?? 'default', 'skinVariant'),
 		state: normalizedState,
 		currentGoal: optionalGoal(value.currentGoal),
 		goalRevision,
 		queue: queue.map((entry, index) => normalizeQueuedGoal(entry, index)),
 		lastSummary: optionalText(value.lastSummary, 'lastSummary', MAX_RESULT_MESSAGE_LENGTH),
+		death: normalizeDeath(value.death, state),
 		respawnPolicy: isPlainObject(value.respawnPolicy) ? clone(value.respawnPolicy) : {},
 		createdAtEpochMs: nonnegativeInteger(value.createdAtEpochMs ?? 0, 'createdAtEpochMs'),
 		updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs ?? 0, 'updatedAtEpochMs'),
@@ -244,10 +246,12 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	}
 	if (operation === 'dead') {
 		next.state = DynamicAgentState.DEAD;
+		next.death = normalizeDeath(controlValue.death, DynamicAgentState.DEAD);
 		return next;
 	}
 	if (operation === 'respawn') {
 		next.state = next.currentGoal === null ? DynamicAgentState.IDLE : DynamicAgentState.PAUSED;
+		next.death = null;
 		return next;
 	}
 	if (operation === 'fail') {
@@ -311,6 +315,37 @@ function normalizeError(value) {
 	};
 }
 
+function normalizeDeath(value, state) {
+	if (value === null || value === undefined) {
+		if (state === DynamicAgentState.DEAD) throw new AgentRegistryError('MISSING_DEATH_FACTS', 'DEAD agent requires death facts');
+		return null;
+	}
+	if (state !== DynamicAgentState.DEAD) throw new AgentRegistryError('INVALID_DEATH_FACTS', 'Death facts require DEAD state');
+	if (!isPlainObject(value)) throw new TypeError('death must be an object');
+	const respawnDimensionId = nullableIdentifier(value.respawnDimensionId, 'death.respawnDimensionId');
+	const respawnX = nullableFiniteNumber(value.respawnX, 'death.respawnX');
+	const respawnY = nullableFiniteNumber(value.respawnY, 'death.respawnY');
+	const respawnZ = nullableFiniteNumber(value.respawnZ, 'death.respawnZ');
+	const respawnYaw = nullableFiniteNumber(value.respawnYaw, 'death.respawnYaw');
+	const respawnPitch = nullableFiniteNumber(value.respawnPitch, 'death.respawnPitch');
+	const respawnForced = nullableBoolean(value.respawnForced, 'death.respawnForced');
+	const respawnFacts = [respawnDimensionId, respawnX, respawnY, respawnZ, respawnYaw, respawnPitch, respawnForced];
+	if (respawnFacts.some((fact) => fact === null) && respawnFacts.some((fact) => fact !== null)) {
+		throw new AgentRegistryError('INVALID_DEATH_FACTS', 'death vanilla respawn facts must be present together or all null');
+	}
+	const gameMode = requireIdentifier(value.gameMode, 'death.gameMode');
+	if (!['survival', 'creative', 'adventure', 'spectator'].includes(gameMode)) {
+		throw new AgentRegistryError('INVALID_DEATH_FACTS', 'death.gameMode must be a vanilla game mode');
+	}
+	return {
+		cause: requireText(value.cause, 'death.cause', MAX_RESULT_MESSAGE_LENGTH),
+		dimensionId: requireIdentifier(value.dimensionId, 'death.dimensionId'),
+		x: finiteNumber(value.x, 'death.x'), y: finiteNumber(value.y, 'death.y'), z: finiteNumber(value.z, 'death.z'),
+		respawnDimensionId, respawnX, respawnY, respawnZ, respawnYaw, respawnPitch, respawnForced, gameMode,
+		diedAtEpochMs: nonnegativeInteger(value.diedAtEpochMs, 'death.diedAtEpochMs'),
+	};
+}
+
 function optionalGoal(value) {
 	return value === null || value === undefined ? null : requireGoal(value);
 }
@@ -321,6 +356,16 @@ function requireGoal(value) {
 
 function requireIdentifier(value, field) {
 	return requireText(value, field, MAX_IDENTIFIER_LENGTH);
+}
+
+function nullableIdentifier(value, field) {
+	return value === null ? null : requireIdentifier(value, field);
+}
+
+function nullableBoolean(value, field) {
+	if (value === null) return null;
+	if (typeof value !== 'boolean') throw new TypeError(`${field} must be a boolean or null`);
+	return value;
 }
 
 function optionalIdentifier(value, field) {
@@ -349,6 +394,15 @@ function positiveInteger(value, field) {
 function nonnegativeInteger(value, field) {
 	if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${field} must be a nonnegative safe integer`);
 	return value;
+}
+
+function finiteNumber(value, field) {
+	if (!Number.isFinite(value)) throw new TypeError(`${field} must be finite`);
+	return value;
+}
+
+function nullableFiniteNumber(value, field) {
+	return value === null ? null : finiteNumber(value, field);
 }
 
 function isPlainObject(value) {

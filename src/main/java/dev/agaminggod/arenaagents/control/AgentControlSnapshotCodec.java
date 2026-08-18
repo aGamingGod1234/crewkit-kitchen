@@ -31,8 +31,11 @@ public final class AgentControlSnapshotCodec {
 			return new AgentControlSnapshot(
 					snapshot.schemaVersion(),
 					snapshot.canControl(),
+					snapshot.automationAvailable(),
+					snapshot.automationStatus(),
 					snapshot.generatedAtEpochMs(),
-					snapshot.agents()
+					snapshot.agents(),
+					snapshot.catalog()
 			);
 		} catch (RuntimeException exception) {
 			throw new IllegalArgumentException("Invalid control snapshot", exception);

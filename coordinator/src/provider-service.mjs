@@ -59,11 +59,10 @@ export class ProviderService {
 class CombinedProviderCatalog {
 	constructor(services) { this.services = services; this.stale = false; }
 	async refresh(options) {
-		const snapshots = [];
-		for (const [provider, service] of this.services) {
-			const snapshot = await service.catalog.refresh(options);
-			snapshots.push({ provider, ...snapshot });
-		}
+		const snapshots = await Promise.all([...this.services].map(async ([provider, service]) => ({
+			provider,
+			...await service.catalog.refresh(options),
+		})));
 		return { refreshedAtEpochMs: Date.now(), models: snapshots.flatMap((snapshot) => (snapshot.models ?? []).map((model) => ({ ...model, provider: model.provider ?? snapshot.provider }))) };
 	}
 	assertSupported(provider, model, reasoningEffort, serviceTier) {

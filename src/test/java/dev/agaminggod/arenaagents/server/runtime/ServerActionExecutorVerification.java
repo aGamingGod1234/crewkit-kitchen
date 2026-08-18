@@ -1,10 +1,17 @@
 package dev.agaminggod.arenaagents.server.runtime;
 
+import com.google.gson.JsonObject;
+import dev.agaminggod.arenaagents.agent.AgentDomainException;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
+
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.phys.Vec3;
 
 public final class ServerActionExecutorVerification {
 	private ServerActionExecutorVerification() {
@@ -87,11 +94,49 @@ public final class ServerActionExecutorVerification {
 				"modded menu capabilities fail closed"
 		);
 		AgentId progressAgent = AgentId.random();
+		ActionProvenance provenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L
+		);
+		assertEquals("program-7-1", provenance.programId(), "provenance retains program identity");
+		assertThrows(IllegalArgumentException.class, () -> new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "\u00a0", 4L
+		), "provenance rejects non-breaking blank source steps");
+		assertThrows(IllegalArgumentException.class, () -> new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", -1L
+		), "provenance rejects negative event sequences");
+		for (ActionType type : ActionType.values()) {
+			boolean expectedPrimitive = switch (type) {
+				case MOVE_TO, NAVIGATE_TO, LOOK_AT, ATTACK, SELECT_ITEM, USE_ITEM, BREAK_BLOCK, PLACE_BLOCK,
+						CHAT, WAIT, SET_DOOR, DROP_ITEM, TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE,
+						FURNACE_TRANSACTION, EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED -> true;
+				case RESPAWN -> true;
+				default -> false;
+			};
+			assertEquals(expectedPrimitive, ServerActionExecutor.isArenaScriptPrimitive(type),
+					"server primitive parity for " + type.wireName());
+		}
+		assertThrows(AgentDomainException.class, () -> ServerActionExecutor.requireArenaScriptPrimitive(ActionType.FIGHT_TARGET),
+				"program primitive entry point rejects high-level controller actions");
 		ServerActionProgress progress = new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 0.5D, 250L, 1_750_000_000_250L
 		);
 		assertEquals(progressAgent, progress.agentId(), "progress retains agent identity");
 		assertEquals(0.5D, progress.progress(), "progress retains bounded fraction");
+		ServerActionRequest cancellationTarget = new ServerActionRequest(
+				progressAgent, 7L, "action-7", ActionType.WAIT, new JsonObject(), provenance);
+		assertThrows(NullPointerException.class, () -> new ServerActionRequest(
+				progressAgent, 7L, "action-7", ActionType.WAIT, new JsonObject(), null
+		), "requests reject absent provenance");
+		assertTrue(ServerActionExecutor.matchesCancellation(cancellationTarget, 7L, "action-7"),
+				"cancellation matches the exact revision and action identity");
+		assertFalse(ServerActionExecutor.matchesCancellation(cancellationTarget, 8L, "action-7"),
+				"cancellation rejects a newer goal revision");
+		assertFalse(ServerActionExecutor.matchesCancellation(cancellationTarget, 7L, "action-8"),
+				"cancellation rejects a different action identity");
+		assertTrue(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 4L),
+				"respawn completion remains valid only for its coordinator generation");
+		assertFalse(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 5L),
+				"respawn completion from a disconnected coordinator generation is ignored");
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 1.1D, 250L, 1_750_000_000_250L
 		), "progress rejects fractions above one");
@@ -101,7 +146,49 @@ public final class ServerActionExecutorVerification {
 			throw new IllegalStateException("bridge backpressure");
 		}, progress);
 		assertEquals(1, progressAttempts.get(), "progress telemetry failure is isolated from the server tick");
-		return 26;
+		assertEquals(ServerController.TickResult.failed(
+				"CONTROLLER_NO_RESULT", "Navigation controller returned no result", 0.4D),
+				ServerActionExecutor.requireControllerResult(null, 0.4D, "Navigation"),
+				"missing controller results become bounded failures instead of null dereferences");
+		assertEquals(
+				new Vec3(10.5D, 65.999D, -3.5D),
+				ServerActionExecutor.placementLookTarget(new BlockPos(10, 65, -4), Direction.UP),
+				"placement aims at the requested support face instead of its center"
+		);
+		assertEquals(
+				new Vec3(10.999D, 65.5D, -3.5D),
+				ServerActionExecutor.placementLookTarget(new BlockPos(10, 65, -4), Direction.EAST),
+				"horizontal placement aims at the requested support face"
+		);
+		assertTrue(ServerActionExecutor.isValidPlacementHit(
+				new BlockPos(10, 65, -4), new Vec3(10.999D, 65.5D, -3.5D)
+		), "placement accepts a hit location on the support block face");
+		assertFalse(ServerActionExecutor.isValidPlacementHit(
+				new BlockPos(10, 65, -4), new Vec3(12.0D, 65.5D, -3.5D)
+		), "placement rejects a forged hit location outside the support block");
+		assertThrows(
+				AgentDomainException.class,
+				() -> ServerActionExecutor.requirePlacementProtection(
+						ServerProtectionPolicy.DENY_ALL, null, null, BlockPos.ZERO
+				),
+				"placement honors the configured protection policy"
+		);
+		assertEquals("28c7b487-49f8-4eb1-bf03-848553cce39a",
+				EntityTargetSelector.normalize("uuid:28c7b487-49f8-4eb1-bf03-848553cce39a"),
+				"observation-style UUID selectors are accepted");
+		assertEquals("SolEmer", EntityTargetSelector.normalize("name=SolEmer"),
+				"observation-style name selectors are accepted");
+		assertEquals("Lucas", EntityTargetSelector.normalize("player:Lucas"),
+				"explicit player selectors retain their existing behavior");
+		assertEquals("nearest_hostile", EntityTargetSelector.normalize("nearest_hostile"),
+				"symbolic proximity selectors remain unchanged");
+		assertEquals("TARGET_OCCUPIED",
+				ServerActionExecutor.failureReason(new dev.agaminggod.arenaagents.agent.AgentDomainException(
+						"TARGET_OCCUPIED", "changed world")),
+				"runtime revalidation preserves a precise recoverable domain reason");
+		assertEquals("ACTION_EXCEPTION", ServerActionExecutor.failureReason(new IllegalStateException("broken")),
+				"unexpected runtime exceptions remain isolated");
+		return 40;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

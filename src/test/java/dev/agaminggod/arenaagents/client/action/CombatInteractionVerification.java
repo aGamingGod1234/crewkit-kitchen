@@ -83,7 +83,7 @@ public final class CombatInteractionVerification {
 		FakeContext context = new FakeContext();
 		context.targets = List.of(target(OPPONENT_ID, "Opponent", "minecraft:player", true, false, 4.0D));
 		context.weapons = List.of(new WeaponCandidate("minecraft:diamond_sword", 2));
-		AttackAction action = new AttackAction("player:Opponent", ACTION_TIMEOUT_MS);
+		AttackAction action = new AttackAction(OPPONENT_ID.toString(), ACTION_TIMEOUT_MS);
 
 		ActionUpdate attacking = action.tick(context, 0L);
 		assertEquals(ActionState.RUNNING, attacking.state(), "attack remains active after swing");
@@ -108,7 +108,7 @@ public final class CombatInteractionVerification {
 		assertEquals("TARGET_DEFEATED", defeated.reasonCode(), "dead target result code");
 
 		FakeContext missingContext = new FakeContext();
-		ActionUpdate missing = new AttackAction("player:Missing", ACTION_TIMEOUT_MS).tick(missingContext, 0L);
+		ActionUpdate missing = new AttackAction("00000000-0000-0000-0000-000000000099", ACTION_TIMEOUT_MS).tick(missingContext, 0L);
 		assertEquals(ActionState.FAILED, missing.state(), "missing target fails explicitly");
 		assertEquals("TARGET_GONE", missing.reasonCode(), "missing target reason");
 

@@ -1,10 +1,19 @@
 package dev.agaminggod.arenaagents.server.bridge;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
+import java.io.IOException;
+import java.io.StringReader;
+import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
 import java.util.Set;
 
 public final class BridgeEnvelopeCodec {
@@ -12,7 +21,7 @@ public final class BridgeEnvelopeCodec {
 	private static final Set<String> FIELDS = Set.of(
 			"protocolVersion", "serverInstanceId", "agentId", "type", "messageId", "payload"
 	);
-	private static final Gson GSON = new Gson();
+	private static final Gson GSON = new GsonBuilder().serializeNulls().create();
 
 	public BridgeEnvelope decode(String line) {
 		if (line == null || line.getBytes(StandardCharsets.UTF_8).length > MAX_LINE_BYTES) {
@@ -20,8 +29,10 @@ public final class BridgeEnvelopeCodec {
 		}
 		JsonElement parsed;
 		try {
-			parsed = JsonParser.parseString(line);
-		} catch (RuntimeException exception) {
+			parsed = decodeUniqueJson(line);
+		} catch (BridgeProtocolException exception) {
+			throw exception;
+		} catch (RuntimeException | IOException exception) {
 			throw new BridgeProtocolException("MALFORMED_JSON", "Protocol line is not valid JSON", exception);
 		}
 		if (!parsed.isJsonObject()) {
@@ -42,13 +53,76 @@ public final class BridgeEnvelopeCodec {
 			throw new BridgeProtocolException("INVALID_FIELD", "payload must be an object");
 		}
 		return new BridgeEnvelope(
-				object.get("protocolVersion").getAsInt(),
-				object.get("serverInstanceId").getAsString(),
-				object.get("agentId").getAsString(),
-				object.get("type").getAsString(),
-				object.get("messageId").getAsString(),
+				requiredInteger(object, "protocolVersion"),
+				requiredString(object, "serverInstanceId"),
+				requiredString(object, "agentId"),
+				requiredString(object, "type"),
+				requiredString(object, "messageId"),
 				object.getAsJsonObject("payload")
 		);
+	}
+
+	private static JsonElement decodeUniqueJson(String line) throws IOException {
+		try (JsonReader reader = new JsonReader(new StringReader(line))) {
+			reader.setLenient(false);
+			JsonElement value = readElement(reader);
+			if (reader.peek() != JsonToken.END_DOCUMENT) throw new BridgeProtocolException("MALFORMED_JSON", "Protocol line has trailing content");
+			return value;
+		}
+	}
+
+	private static JsonElement readElement(JsonReader reader) throws IOException {
+		return switch (reader.peek()) {
+			case BEGIN_OBJECT -> readObject(reader);
+			case BEGIN_ARRAY -> readArray(reader);
+			case STRING -> new JsonPrimitive(reader.nextString());
+			case NUMBER -> new JsonPrimitive(new BigDecimal(reader.nextString()));
+			case BOOLEAN -> new JsonPrimitive(reader.nextBoolean());
+			case NULL -> {
+				reader.nextNull();
+				yield JsonNull.INSTANCE;
+			}
+			default -> throw new BridgeProtocolException("MALFORMED_JSON", "Protocol line has an invalid JSON token");
+		};
+	}
+
+	private static JsonObject readObject(JsonReader reader) throws IOException {
+		JsonObject object = new JsonObject();
+		Set<String> names = new HashSet<>();
+		reader.beginObject();
+		while (reader.hasNext()) {
+			String name = reader.nextName();
+			if (!names.add(name)) throw new BridgeProtocolException("DUPLICATE_FIELD", "Duplicate JSON field: " + name);
+			object.add(name, readElement(reader));
+		}
+		reader.endObject();
+		return object;
+	}
+
+	private static JsonArray readArray(JsonReader reader) throws IOException {
+		JsonArray array = new JsonArray();
+		reader.beginArray();
+		while (reader.hasNext()) array.add(readElement(reader));
+		reader.endArray();
+		return array;
+	}
+
+	private static String requiredString(JsonObject object, String field) {
+		if (!object.get(field).isJsonPrimitive() || !object.get(field).getAsJsonPrimitive().isString()) {
+			throw new BridgeProtocolException("INVALID_FIELD", field + " must be a JSON string");
+		}
+		return object.get(field).getAsString();
+	}
+
+	private static int requiredInteger(JsonObject object, String field) {
+		if (!object.get(field).isJsonPrimitive() || !object.get(field).getAsJsonPrimitive().isNumber()) {
+			throw new BridgeProtocolException("INVALID_FIELD", field + " must be a JSON number");
+		}
+		try {
+			return object.get(field).getAsBigDecimal().intValueExact();
+		} catch (ArithmeticException exception) {
+			throw new BridgeProtocolException("INVALID_FIELD", field + " must be an integer", exception);
+		}
 	}
 
 	public String encode(BridgeEnvelope envelope) {

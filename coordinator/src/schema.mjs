@@ -4,16 +4,18 @@ import {
 	MAX_BLOCKS,
 	MAX_CHAT_LENGTH,
 	MAX_COMMAND_ID_LENGTH,
+	MAX_DESIRED_STATE_LENGTH,
 	MAX_DURATION_MS,
 	MAX_EFFECTS,
 	MAX_ENTITIES,
 	MAX_IDENTIFIER_LENGTH,
 	MAX_INVENTORY_SUMMARIES,
 	MAX_MOVEMENT_TOLERANCE,
+	MAX_PROVENANCE_TEXT_LENGTH,
 	MAX_REASON_CODE_LENGTH,
 	MAX_RESULT_MESSAGE_LENGTH,
-	MAX_SUMMARY_LENGTH,
 	MAX_TARGET_SELECTOR_LENGTH,
+	MAX_TARGET_ID_LENGTH,
 	MIN_DURATION_MS,
 	MIN_MOVEMENT_TOLERANCE,
 	PROTOCOL_VERSION,
@@ -39,7 +41,10 @@ export function validateAction(value) {
 	const action = requireObject(value, 'action');
 	const type = requireText(action.type, 'action.type', MAX_REASON_CODE_LENGTH);
 	if (!ACTION_TYPES.has(type)) throw invalid('UNKNOWN_ACTION', `Unsupported action '${type}'`);
-	requireKeys(action, ['type', ...ACTION_FIELDS[type]], 'action');
+	const requiredFields = type === 'place_block'
+		? ACTION_FIELDS[type].filter((field) => field !== 'desiredState')
+		: ACTION_FIELDS[type];
+	requireKeys(action, ['type', ...ACTION_FIELDS[type]], 'action', ['type', ...requiredFields]);
 
 	switch (type) {
 		case 'move_to':
@@ -57,18 +62,7 @@ export function validateAction(value) {
 			requireCoordinates(action, false, 'action');
 			break;
 		case 'attack':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
-			requireDuration(action.timeoutMs, 'action.timeoutMs');
-			break;
-		case 'fight_target':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
-			requireFiniteRange(action.desiredRange, 'action.desiredRange', 1, 6);
-			requireDuration(action.timeoutMs, 'action.timeoutMs');
-			break;
-		case 'flee_from':
-		case 'follow_entity':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
-			requireFiniteRange(action.distance, 'action.distance', 1, 64);
+			requireTargetId(action.targetId, 'action.targetId');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'transfer_container':
@@ -115,7 +109,7 @@ export function validateAction(value) {
 			requireDuration(action.durationMs, 'action.durationMs');
 			break;
 		case 'use_ranged':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
+			requireTargetId(action.targetId, 'action.targetId');
 			requireDuration(action.drawDurationMs, 'action.drawDurationMs');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
@@ -134,6 +128,9 @@ export function validateAction(value) {
 			requireCoordinates(action, true, 'action');
 			if (!FACES.has(action.face)) throw invalid('INVALID_FIELD', `action.face must be one of ${BLOCK_FACES.join(', ')}`);
 			requireText(action.itemId, 'action.itemId', MAX_IDENTIFIER_LENGTH);
+			if (action.desiredState !== undefined && action.desiredState !== null) {
+				requireText(action.desiredState, 'action.desiredState', MAX_DESIRED_STATE_LENGTH);
+			}
 			break;
 		case 'chat':
 			requireText(action.message, 'action.message', MAX_CHAT_LENGTH);
@@ -142,17 +139,11 @@ export function validateAction(value) {
 			requireCoordinates(action, true, 'action');
 			requireBoolean(action.open, 'action.open');
 			break;
-		case 'pick_up_item':
-			requireText(action.targetSelector, 'action.targetSelector', MAX_TARGET_SELECTOR_LENGTH);
-			break;
 		case 'drop_item':
 			requireInt32(action.slot, 'action.slot');
 			requireInt32(action.count, 'action.count');
 			if (action.slot < 0 || action.slot > 35) throw invalid('INVALID_FIELD', 'action.slot must be between 0 and 35');
 			if (action.count < 1 || action.count > 64) throw invalid('INVALID_FIELD', 'action.count must be between 1 and 64');
-			break;
-		case 'complete_goal':
-			requireText(action.summary, 'action.summary', MAX_SUMMARY_LENGTH);
 			break;
 	}
 	return structuredClone(action);
@@ -327,9 +318,24 @@ function validateVector(value, path, fields) {
 }
 
 function validateArray(value, path, maximum, validator) {
-	if (!Array.isArray(value)) throw invalid('INVALID_FIELD', `${path} must be an array`);
+	if (!isExactArray(value)) throw invalid('INVALID_FIELD', `${path} must be a dense native array without custom properties`);
 	if (value.length > maximum) throw invalid('OUT_OF_RANGE', `${path} must contain at most ${maximum} entries`);
-	value.forEach((entry, index) => validator(entry, `${path}[${index}]`));
+	for (let index = 0; index < value.length; index += 1) validator(value[index], `${path}[${index}]`);
+}
+
+function isExactArray(value) {
+	if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return false;
+	const ownKeys = Reflect.ownKeys(value);
+	if (ownKeys.some((key) => typeof key !== 'string')) return false;
+	const expected = new Set(['length', ...Array.from({ length: value.length }, (_, index) => String(index))]);
+	if (ownKeys.length !== expected.size || ownKeys.some((key) => !expected.has(key))) return false;
+	const length = Object.getOwnPropertyDescriptor(value, 'length');
+	if (!length || !Object.hasOwn(length, 'value') || length.enumerable || length.configurable || !length.writable) return false;
+	for (let index = 0; index < value.length; index += 1) {
+		const entry = Object.getOwnPropertyDescriptor(value, String(index));
+		if (!entry || !Object.hasOwn(entry, 'value') || !entry.enumerable || !entry.configurable || !entry.writable) return false;
+	}
+	return true;
 }
 
 function requireCoordinates(value, integral, path) {
@@ -349,14 +355,61 @@ function requirePresenceText(value, path, present, maximum) {
 }
 
 function requireObject(value, path) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid('INVALID_FIELD', `${path} must be an object`);
+	if (value === null || typeof value !== 'object' || Array.isArray(value)
+			|| ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw invalid('INVALID_FIELD', `${path} must be an object`);
 	return value;
 }
 
-function requireKeys(value, expected, path) {
+function requireTargetId(value, path) {
+	requireText(value, path, MAX_TARGET_ID_LENGTH);
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+		throw invalid('INVALID_FIELD', `${path} must be a canonical UUID`);
+	}
+}
+
+function requireKeys(value, expected, path, required = expected) {
 	const allowed = new Set(expected);
 	for (const key of Object.keys(value)) if (!allowed.has(key)) throw invalid('UNKNOWN_FIELD', `Unknown field '${path === 'message' || path === 'action' ? key : `${path}.${key}`}'`);
-	for (const key of expected) if (!Object.hasOwn(value, key)) throw invalid('MISSING_FIELD', `Required field '${path}.${key}' is missing`);
+	for (const key of required) if (!Object.hasOwn(value, key)) throw invalid('MISSING_FIELD', `Required field '${path}.${key}' is missing`);
+}
+
+export function validateActionCommandPayload(value) {
+	const command = requireObject(value, 'action_command');
+	requireKeys(
+		command,
+		['goalRevision', 'actionId', 'action', 'provenance'],
+		'action_command',
+		['goalRevision', 'actionId', 'action', 'provenance'],
+	);
+	requireNonNegativeSafeInteger(command.goalRevision, 'goalRevision');
+	const normalized = {
+		goalRevision: command.goalRevision,
+		actionId: requireText(command.actionId, 'actionId', MAX_COMMAND_ID_LENGTH),
+		action: validateAction(command.action),
+		provenance: validateActionProvenance(command.provenance),
+	};
+	return deepFreeze(normalized);
+}
+
+export function validateActionProvenance(value) {
+	const provenance = requireObject(value, 'provenance');
+	requireKeys(
+		provenance,
+		['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'programVersion', 'sourceStepId', 'eventSequence'],
+		'provenance',
+	);
+	requirePositiveSafeInteger(provenance.programVersion, 'provenance.programVersion');
+	requireNonNegativeSafeInteger(provenance.eventSequence, 'provenance.eventSequence');
+	return deepFreeze({
+		provider: requireText(provenance.provider, 'provenance.provider', MAX_PROVENANCE_TEXT_LENGTH),
+		model: requireText(provenance.model, 'provenance.model', MAX_PROVENANCE_TEXT_LENGTH),
+		reasoningEffort: requireText(provenance.reasoningEffort, 'provenance.reasoningEffort', MAX_PROVENANCE_TEXT_LENGTH),
+		serviceTier: requireText(provenance.serviceTier, 'provenance.serviceTier', MAX_PROVENANCE_TEXT_LENGTH),
+		programId: requireText(provenance.programId, 'provenance.programId', MAX_PROVENANCE_TEXT_LENGTH),
+		programVersion: provenance.programVersion,
+		sourceStepId: requireText(provenance.sourceStepId, 'provenance.sourceStepId', MAX_PROVENANCE_TEXT_LENGTH),
+		eventSequence: provenance.eventSequence,
+	});
 }
 
 function requireText(value, path, maximum, emptyAllowed = false) {
@@ -382,6 +435,12 @@ function isProtocolWhitespace(codePoint) {
 		|| codePoint === 0x205f
 		|| codePoint === 0x3000
 		|| codePoint === 0xfeff;
+}
+
+function deepFreeze(value) {
+	if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value)) deepFreeze(child);
+	return Object.freeze(value);
 }
 
 function requireBoolean(value, path) {

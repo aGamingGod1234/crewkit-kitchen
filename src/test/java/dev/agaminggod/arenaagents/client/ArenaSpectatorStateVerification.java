@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.client;
 
 import dev.agaminggod.arenaagents.client.presentation.ArenaSpectatorState;
 import dev.agaminggod.arenaagents.client.presentation.ArenaSpectatorHud;
+import dev.agaminggod.arenaagents.client.presentation.ArenaHudPresentation;
 import dev.agaminggod.arenaagents.client.presentation.ScenarioResultsScreen;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshot;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshotPayload;
@@ -58,6 +59,31 @@ public final class ArenaSpectatorStateVerification {
 		assertEquals(0xFF8E86FF, ArenaSpectatorHud.providerColor("antigravity"),
 				"Antigravity shares the Gemini provider-family color");
 		assertEquals(0xFFFFB45E, ArenaSpectatorHud.providerColor("kimi"), "Kimi has a stable HUD color");
+		assertTrue(!ArenaHudPresentation.worldOverlayEnabled(),
+				"agent state and standings never cover the live world view");
+		ArenaHudPresentation.CompactRoster crowdedRoster = ArenaHudPresentation.compactRoster(8);
+		assertEquals(4, crowdedRoster.visibleCount(), "compact HUD stays glanceable without covering the play area");
+		assertEquals(4, crowdedRoster.overflowCount(), "compact HUD routes the remaining agents to the live-arena page");
+		ArenaHudPresentation.CompactRoster shortRoster = ArenaHudPresentation.compactRoster(3);
+		assertEquals(3, shortRoster.visibleCount(), "compact HUD does not invent empty agent rows");
+		assertEquals(0, shortRoster.overflowCount(), "short rosters have no overflow notice");
+		assertTrue(ArenaHudPresentation.compactHeight(8) <= 128,
+				"the maximum roster HUD leaves most of the world view unobstructed");
+		assertTrue(ArenaHudPresentation.compactHeight(1) < ArenaHudPresentation.compactHeight(8),
+				"the HUD only occupies vertical space for visible agents");
+		assertEquals(0xFF66D9A3, ArenaHudPresentation.healthColor(72), "healthy agents use the stable mint health color");
+		assertEquals(0xFFF2BD58, ArenaHudPresentation.healthColor(35), "wounded agents use the amber warning color");
+		assertEquals(0xFFFF737A, ArenaHudPresentation.healthColor(20), "critical agents use the coral fault color");
+		assertEquals("01:05 / 02:00", ArenaHudPresentation.timeLabel(1_300L, 2_400L, false),
+				"match time is readable without exposing implementation ticks");
+		assertEquals("FINAL  02:00", ArenaHudPresentation.timeLabel(2_400L, 2_400L, true),
+				"terminal match time has an unmistakable final state");
+		assertEquals("FINAL  01:05 / 02:00", ArenaHudPresentation.timeLabel(1_300L, 2_400L, true),
+				"terminal match time reports actual elapsed time instead of pretending the full duration ran");
+		assertEquals("Waiting for model", ArenaHudPresentation.statusLabel("waiting_for_model"),
+				"machine status identifiers become human-readable labels");
+		assertEquals("Codex", ArenaHudPresentation.providerLabel("CODEX"),
+				"provider identity is exposed in text instead of color alone");
 		assertEquals(
 				"#1 Agent A [codex] 4 | HP 85% | completed",
 				ArenaSpectatorHud.standingLabel(terminal.standings().getFirst()),
@@ -82,7 +108,7 @@ public final class ArenaSpectatorStateVerification {
 		state.clearOnDisconnect();
 		assertTrue(state.snapshot().isEmpty(), "disconnect clears spectator snapshots");
 		assertTrue(state.cameraDisabled(), "disconnect clears camera opt-in");
-		return 42;
+		return 47;
 	}
 
 	private static ArenaSpectatorSnapshot snapshot(

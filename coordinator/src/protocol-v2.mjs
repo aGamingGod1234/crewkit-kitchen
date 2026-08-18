@@ -5,6 +5,7 @@ import net from 'node:net';
 import {
 	DEFAULT_AGENT_MESSAGE_QUEUE_CAP,
 	DEFAULT_CONNECTION_QUEUE_CAP,
+	BLOCK_FACES,
 	LOOPBACK_HOST,
 	MAX_BRIDGE_SECRET_LENGTH,
 	MAX_BLOCKS,
@@ -15,6 +16,8 @@ import {
 	MAX_GOAL_LENGTH,
 	MAX_IDENTIFIER_LENGTH,
 	MAX_INVENTORY_SUMMARIES,
+	MAX_OBSERVATION_TAGS,
+	MAX_TAG_COUNT_ENTRIES,
 	MAX_LINE_BYTES,
 	MAX_REASON_CODE_LENGTH,
 	MAX_RESULT_MESSAGE_LENGTH,
@@ -22,8 +25,8 @@ import {
 	MULTIPLEXED_PROTOCOL_VERSION,
 } from './constants.mjs';
 import { encodeJsonLine, JsonlDecoder } from './jsonl.mjs';
-import { MessageIdGenerator } from './protocol.mjs';
-import { validateAction } from './schema.mjs';
+import { MessageIdGenerator } from './message-id.mjs';
+import { ValidationError, validateAction, validateActionCommandPayload } from './schema.mjs';
 
 const MAX_COORDINATOR_CIRCUITS = 32;
 
@@ -34,6 +37,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'agent_ready',
 	'planning_state',
 	'action_command',
+	'action_cancel',
 	'agent_error',
 	'heartbeat',
 ]);
@@ -54,7 +58,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
 const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'action_progress', 'action_result']);
-const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['planning_state', 'action_command', 'agent_error']);
+const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'action_command', 'action_cancel', 'agent_error']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
@@ -62,6 +66,15 @@ const PENDING_SERVER_INSTANCE_ID = 'pending';
 const MAX_CATALOG_MODELS = 512;
 const MAX_MODEL_CAPABILITIES = 32;
 const MAX_REGISTRY_SNAPSHOT_AGENTS = 1_024;
+const MAX_NEARBY_TRANSACTION_TARGETS = 16;
+const MAX_CHANGED_FACTS = 256;
+const FACTUAL_PLAYER_FIELDS = new Set([
+	'health', 'maxHealth', 'armor', 'foodLevel', 'saturation', 'gameMode', 'onGround', 'inWater',
+	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
+]);
+const FACTUAL_TOP_LEVEL_PATHS = new Set([
+	'ready', 'status', 'position', 'velocity', 'view', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult',
+]);
 
 export class ProtocolV2Error extends Error {
 	constructor(code, message, options) {
@@ -147,6 +160,12 @@ export function validateProtocolV2Payload(type, value) {
 			return { goalRevision: revision(value.goalRevision, 'goalRevision'), state: boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH) };
 		case 'action_command':
 			return normalizeActionCommand(value);
+		case 'action_cancel':
+			exactKeys(value, ['goalRevision', 'actionId'], ['goalRevision', 'actionId'], type);
+			return {
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
+				actionId: requireIdentifier(value.actionId, 'actionId'),
+			};
 		case 'agent_error':
 			exactKeys(value, ['goalRevision', 'code', 'message'], ['goalRevision', 'code', 'message'], type);
 			return {
@@ -193,6 +212,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#inboundMessageIds = new Set();
 	#terminalActionIds = new Set();
 	#knownAgentIds = new Set();
+	#observedRevisions = new Map();
 
 	constructor(config, dependencies = {}) {
 		super();
@@ -270,6 +290,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#onConnect(socket) {
 		if (socket !== this.#socket || !this.#running) return;
 		this.#inboundMessageIds.clear();
+		this.#observedRevisions.clear();
 		const messageId = this.#messageIds.next();
 		this.#helloMessageId = messageId;
 		const hello = createProtocolV2Envelope({
@@ -310,13 +331,17 @@ export class MultiplexedServerBridge extends EventEmitter {
 			return;
 		}
 		if (envelope.serverInstanceId !== this.#serverInstanceId) throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Server instance changed during an authenticated session');
+		this.#trackInboundRevision(envelope);
 		this.#assertRevision(envelope, REVISION_GUARDED_INBOUND_TYPES);
 		this.#trackTerminalResult(envelope);
 		if (envelope.type === 'agent_registered') this.#knownAgentIds.add(envelope.agentId);
 		if (envelope.agentId !== 'server' && !this.#knownAgentIds.has(envelope.agentId) && envelope.type !== 'agent_registered') {
 			throw new ProtocolV2Error('UNKNOWN_AGENT', `Message references unknown agent '${envelope.agentId}'`);
 		}
-		if (envelope.type === 'agent_removed') this.#knownAgentIds.delete(envelope.agentId);
+		if (envelope.type === 'agent_removed') {
+			this.#knownAgentIds.delete(envelope.agentId);
+			this.#observedRevisions.delete(envelope.agentId);
+		}
 		this.emit(envelope.type, envelope);
 		this.emit('message', envelope);
 	}
@@ -330,6 +355,10 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (!Array.isArray(registry)) throw new ProtocolV2Error('INVALID_REGISTRY_SNAPSHOT', 'hello_ack registry must be an array');
 		this.#serverInstanceId = envelope.serverInstanceId;
 		this.#knownAgentIds = new Set(registry.map((entry) => requireIdentifier(entry?.agentId, 'registry agentId')));
+		this.#observedRevisions = new Map(registry.map((entry) => [
+			requireIdentifier(entry?.agentId, 'registry agentId'),
+			revision(entry?.goalRevision, 'registry goalRevision'),
+		]));
 		if (this.#knownAgentIds.size !== registry.length) throw new ProtocolV2Error('DUPLICATE_AGENT', 'hello_ack registry contains duplicate agents');
 		this.#ready = true;
 		this.#reconnectDelayMs = this.#initialReconnectDelayMs;
@@ -340,8 +369,56 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (!guardedTypes.has(envelope.type)) return;
 		const revision = envelope.payload.goalRevision;
 		if (!Number.isSafeInteger(revision) || revision < 0) throw new ProtocolV2Error('INVALID_GOAL_REVISION', `${envelope.type} requires a nonnegative goalRevision`);
-		const current = this.#currentRevision(envelope.agentId);
+		const current = this.#trackedRevision(envelope.agentId);
 		if (current !== null && current !== undefined && revision !== current) throw new ProtocolV2Error('STALE_GOAL_REVISION', `Message revision ${revision} does not match current revision ${current}`);
+	}
+
+	#trackInboundRevision(envelope) {
+		if (envelope.type === 'agent_registered') {
+			this.#observedRevisions.set(envelope.agentId, envelope.payload.goalRevision);
+			return;
+		}
+		if (envelope.type !== 'goal_control') return;
+		const next = envelope.payload.goalRevision;
+		const current = this.#trackedRevision(envelope.agentId);
+		if (current !== null && current !== undefined) {
+			if (envelope.payload.operation === 'queue' && next !== current) {
+				throw new ProtocolV2Error('STALE_GOAL_REVISION', `Queued goal revision ${next} does not match current revision ${current}`);
+			}
+			if (envelope.payload.operation !== 'queue' && next < current) {
+				throw new ProtocolV2Error('STALE_GOAL_REVISION', `Goal revision ${next} moved backwards from ${current}`);
+			}
+		}
+		this.#observedRevisions.set(envelope.agentId, next);
+		if (envelope.payload.operation !== 'queue' && (current === null || current === undefined || next > current)) {
+			this.#dropSupersededQueuedMessages(envelope.agentId, next);
+		}
+	}
+
+	#dropSupersededQueuedMessages(agentId, goalRevision) {
+		const retained = [];
+		for (const entry of this.#outboundQueue) {
+			if (entry.envelope.agentId !== agentId
+					|| !REVISION_GUARDED_OUTBOUND_TYPES.has(entry.envelope.type)
+					|| entry.envelope.payload.goalRevision === goalRevision) {
+				retained.push(entry);
+				continue;
+			}
+			this.#decrementQueued(agentId);
+			entry.reject(new ProtocolV2Error(
+				'STALE_GOAL_REVISION',
+				`Queued ${entry.envelope.type} revision ${entry.envelope.payload.goalRevision} was superseded by lifecycle revision ${goalRevision}`,
+			));
+		}
+		this.#outboundQueue = retained;
+	}
+
+	#trackedRevision(agentId) {
+		const observed = this.#observedRevisions.get(agentId);
+		const applied = this.#currentRevision(agentId);
+		if (observed === undefined || observed === null) return applied;
+		if (applied === undefined || applied === null) return observed;
+		return Math.max(observed, applied);
 	}
 
 	#trackTerminalResult(envelope) {
@@ -483,8 +560,8 @@ function normalizeCoordinatorStatus(value) {
 		return {
 			operation: requireIdentifier(latency.operation, `${field}.operation`),
 			count: nonnegativeInteger(latency.count, `${field}.count`),
-			p50Ms: nonnegativeInteger(latency.p50Ms, `${field}.p50Ms`),
-			p95Ms: nonnegativeInteger(latency.p95Ms, `${field}.p95Ms`),
+			p50Ms: nonnegativeFiniteNumber(latency.p50Ms, `${field}.p50Ms`),
+			p95Ms: nonnegativeFiniteNumber(latency.p95Ms, `${field}.p95Ms`),
 		};
 	});
 	if (new Set(latencies.map((latency) => latency.operation)).size !== latencies.length) {
@@ -495,7 +572,7 @@ function normalizeCoordinatorStatus(value) {
 
 function normalizeRegisteredAgent(value, field) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
-	const keys = ['schemaVersion', 'agentId', 'entityUuid', 'name', 'provider', 'model', 'reasoningEffort', 'gameMode', 'skinVariant', 'state', 'currentGoal', 'goalRevision', 'queue', 'lastSummary', 'createdAtEpochMs', 'updatedAtEpochMs', 'lastError'];
+	const keys = ['schemaVersion', 'agentId', 'entityUuid', 'name', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'gameMode', 'skinVariant', 'state', 'currentGoal', 'goalRevision', 'queue', 'lastSummary', 'death', 'createdAtEpochMs', 'updatedAtEpochMs', 'lastError'];
 	const required = ['schemaVersion', 'agentId', 'model', 'reasoningEffort', 'skinVariant', 'state', 'goalRevision', 'queue', 'createdAtEpochMs', 'updatedAtEpochMs'];
 	exactKeys(value, keys, required, field);
 	const queue = boundedArray(value.queue, `${field}.queue`, 256).map((goal, index) => boundedText(goal, `${field}.queue[${index}]`, MAX_GOAL_LENGTH));
@@ -504,6 +581,10 @@ function normalizeRegisteredAgent(value, field) {
 		exactKeys(value.lastError, ['code', 'message'], ['code', 'message'], `${field}.lastError`);
 		lastError = { code: boundedText(value.lastError.code, `${field}.lastError.code`, MAX_REASON_CODE_LENGTH), message: boundedText(value.lastError.message, `${field}.lastError.message`, MAX_RESULT_MESSAGE_LENGTH) };
 	}
+	const state = boundedText(value.state, `${field}.state`, MAX_REASON_CODE_LENGTH);
+	const death = value.death === undefined ? null : normalizeDeath(value.death);
+	if (state === 'DEAD' && death === null) throw new ProtocolV2Error('MISSING_FIELD', `${field} DEAD state requires death facts`);
+	if (state !== 'DEAD' && death !== null) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} death facts require DEAD state`);
 	return {
 		schemaVersion: nonnegativeInteger(value.schemaVersion, `${field}.schemaVersion`),
 		agentId: requireIdentifier(value.agentId, `${field}.agentId`),
@@ -512,13 +593,15 @@ function normalizeRegisteredAgent(value, field) {
 		provider: normalizeProvider(value.provider ?? 'codex', `${field}.provider`),
 		model: requireIdentifier(value.model, `${field}.model`),
 		reasoningEffort: requireIdentifier(value.reasoningEffort, `${field}.reasoningEffort`),
+		serviceTier: requireIdentifier(value.serviceTier ?? 'priority', `${field}.serviceTier`),
 		gameMode: requireIdentifier(value.gameMode ?? 'survival', `${field}.gameMode`),
 		skinVariant: requireIdentifier(value.skinVariant, `${field}.skinVariant`),
-		state: boundedText(value.state, `${field}.state`, MAX_REASON_CODE_LENGTH),
+		state,
 		currentGoal: value.currentGoal === undefined ? null : boundedText(value.currentGoal, `${field}.currentGoal`, MAX_GOAL_LENGTH),
 		goalRevision: revision(value.goalRevision, `${field}.goalRevision`),
 		queue,
 		lastSummary: value.lastSummary === undefined ? null : boundedText(value.lastSummary, `${field}.lastSummary`, MAX_SUMMARY_LENGTH),
+		death,
 		respawnPolicy: {},
 		createdAtEpochMs: nonnegativeInteger(value.createdAtEpochMs, `${field}.createdAtEpochMs`),
 		updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, `${field}.updatedAtEpochMs`),
@@ -554,18 +637,52 @@ function normalizeProvider(value, field) {
 }
 
 function normalizeGoalControl(value) {
-	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
+	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal', 'death'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
 	const operation = boundedText(value.operation, 'operation', MAX_REASON_CODE_LENGTH);
 	if (!['start', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
 	const normalized = { operation, goalRevision: revision(value.goalRevision, 'goalRevision'), updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, 'updatedAtEpochMs') };
 	if (value.goal !== undefined) normalized.goal = boundedText(value.goal, 'goal', MAX_GOAL_LENGTH);
+	if (value.death !== undefined) normalized.death = normalizeDeath(value.death);
 	if (['start', 'steer', 'queue'].includes(operation) && normalized.goal === undefined) throw new ProtocolV2Error('MISSING_FIELD', `goal_control ${operation} requires goal`);
 	if (!['start', 'steer', 'queue'].includes(operation) && normalized.goal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goal`);
+	if (operation === 'dead' && normalized.death === undefined) throw new ProtocolV2Error('MISSING_FIELD', 'goal_control dead requires death facts');
+	if (operation !== 'dead' && normalized.death !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include death facts`);
 	return normalized;
 }
 
+function normalizeDeath(value) {
+	exactKeys(
+		value,
+		['cause', 'dimensionId', 'x', 'y', 'z', 'respawnDimensionId', 'respawnX', 'respawnY', 'respawnZ', 'respawnYaw', 'respawnPitch', 'respawnForced', 'gameMode', 'diedAtEpochMs'],
+		['cause', 'dimensionId', 'x', 'y', 'z', 'respawnDimensionId', 'respawnX', 'respawnY', 'respawnZ', 'respawnYaw', 'respawnPitch', 'respawnForced', 'gameMode', 'diedAtEpochMs'],
+		'death',
+	);
+	const respawnDimensionId = nullableIdentifier(value.respawnDimensionId, 'death.respawnDimensionId');
+	const respawnX = nullableFiniteNumber(value.respawnX, 'death.respawnX');
+	const respawnY = nullableFiniteNumber(value.respawnY, 'death.respawnY');
+	const respawnZ = nullableFiniteNumber(value.respawnZ, 'death.respawnZ');
+	const respawnYaw = nullableFiniteNumber(value.respawnYaw, 'death.respawnYaw');
+	const respawnPitch = nullableFiniteNumber(value.respawnPitch, 'death.respawnPitch');
+	const respawnForced = nullableBoolean(value.respawnForced, 'death.respawnForced');
+	const respawnFacts = [respawnDimensionId, respawnX, respawnY, respawnZ, respawnYaw, respawnPitch, respawnForced];
+	if (respawnFacts.some((fact) => fact === null) && respawnFacts.some((fact) => fact !== null)) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'death vanilla respawn facts must be present together or all null');
+	}
+	const gameMode = requireIdentifier(value.gameMode, 'death.gameMode');
+	if (!['survival', 'creative', 'adventure', 'spectator'].includes(gameMode)) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'death.gameMode must be a vanilla game mode');
+	}
+	return Object.freeze({
+		cause: boundedText(value.cause, 'death.cause', MAX_RESULT_MESSAGE_LENGTH),
+		dimensionId: requireIdentifier(value.dimensionId, 'death.dimensionId'),
+		x: finiteNumber(value.x, 'death.x'), y: finiteNumber(value.y, 'death.y'), z: finiteNumber(value.z, 'death.z'),
+		respawnDimensionId, respawnX, respawnY, respawnZ, respawnYaw, respawnPitch, respawnForced, gameMode,
+		diedAtEpochMs: nonnegativeInteger(value.diedAtEpochMs, 'death.diedAtEpochMs'),
+	});
+}
+
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'world', 'currentAction', 'lastResult'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -574,10 +691,18 @@ function normalizeObservation(value) {
 		status: boundedText(value.status, 'status', MAX_REASON_CODE_LENGTH),
 	};
 	if (!normalized.ready) {
-		if (Object.keys(value).length !== 4) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Unavailable observation must not contain live entity fields');
+		for (const key of allowed.slice(7)) if (Object.hasOwn(value, key)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Unavailable observation must not contain live entity fields');
+		if (Object.hasOwn(value, 'eventSequence')) normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
+		if (Object.hasOwn(value, 'attention')) normalized.attention = boolean(value.attention, 'attention');
+		if (Object.hasOwn(value, 'changedFacts')) normalized.changedFacts = changedFactPaths(value.changedFacts);
+		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
 	for (const key of allowed.slice(4)) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
+	normalized.attention = boolean(value.attention, 'attention');
+	normalized.changedFacts = changedFactPaths(value.changedFacts);
+	if (!normalized.attention && normalized.changedFacts.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 	normalized.position = vector(value.position, 'position');
 	normalized.velocity = vector(value.velocity, 'velocity');
 	normalized.view = numericObject(value.view, 'view', ['yaw', 'pitch']);
@@ -585,10 +710,29 @@ function normalizeObservation(value) {
 	normalized.inventory = inventoryObservation(value.inventory);
 	normalized.entities = boundedArray(value.entities, 'entities', MAX_ENTITIES).map(entityObservation);
 	normalized.blocks = boundedArray(value.blocks, 'blocks', MAX_BLOCKS).map(blockObservation);
+	normalized.nearbyContainers = boundedArray(value.nearbyContainers, 'nearbyContainers', MAX_NEARBY_TRANSACTION_TARGETS).map(nearbyContainerObservation);
 	normalized.world = worldObservation(value.world);
 	normalized.currentAction = currentActionObservation(value.currentAction);
 	normalized.lastResult = lastResultObservation(value.lastResult);
 	return normalized;
+}
+
+function changedFactPaths(value) {
+	const paths = boundedArray(value, 'changedFacts', MAX_CHANGED_FACTS).map((path, index) => {
+		if (typeof path !== 'string' || !isFactualChangedPath(path)) {
+			throw new ProtocolV2Error('INVALID_PAYLOAD', `changedFacts[${index}] must be a factual observation path`);
+		}
+		return path;
+	});
+	if (new Set(paths).size !== paths.length) throw new ProtocolV2Error('INVALID_PAYLOAD', 'changedFacts must not contain duplicates');
+	return paths;
+}
+
+function isFactualChangedPath(path) {
+	if (FACTUAL_TOP_LEVEL_PATHS.has(path)) return true;
+	if (path.startsWith('player.')) return FACTUAL_PLAYER_FIELDS.has(path.slice('player.'.length));
+	if (/^entities\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path)) return true;
+	return /^blocks\.-?\d+,-?\d+,-?\d+$/.test(path);
 }
 
 function normalizeActionProgress(value) {
@@ -628,38 +772,36 @@ function normalizeActionResult(value) {
 }
 
 function normalizeActionCommand(value) {
-	if (Object.hasOwn(value, 'action')) {
-		exactKeys(value, ['goalRevision', 'actionId', 'summary', 'goalStatus', 'action'], ['goalRevision', 'actionId', 'summary', 'goalStatus', 'action'], 'action_command');
-		const action = protocolAction(value.action);
-		const { type, ...argumentsValue } = action;
-		return {
-			goalRevision: revision(value.goalRevision, 'goalRevision'),
-			actionId: requireIdentifier(value.actionId, 'actionId'),
-			commandId: requireIdentifier(value.actionId, 'actionId'),
-			actionType: type,
-			type,
-			arguments: argumentsValue,
-			summary: boundedText(value.summary, 'summary', MAX_SUMMARY_LENGTH),
-			goalStatus: boundedText(value.goalStatus, 'goalStatus', MAX_REASON_CODE_LENGTH),
-		};
-	}
-	const allowed = ['goalRevision', 'actionId', 'commandId', 'actionType', 'type', 'arguments', 'summary', 'goalStatus'];
-	exactKeys(value, allowed, ['goalRevision', 'actionId', 'arguments'], 'action_command');
+	const allowed = ['goalRevision', 'actionId', 'actionType', 'arguments', 'provenance'];
+	exactKeys(value, allowed, ['goalRevision', 'actionId', 'arguments', 'provenance'], 'action_command');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
-	if (value.commandId !== undefined && value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
-	const type = value.actionType ?? value.type;
-	if (value.actionType !== undefined && value.type !== undefined && value.actionType !== value.type) throw new ProtocolV2Error('INVALID_PAYLOAD', 'actionType must match type');
+	const type = requireIdentifier(value.actionType, 'actionType');
 	if (!isPlainObject(value.arguments)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'action_command arguments must be an object');
-	const action = protocolAction({ type, ...value.arguments });
+	for (const key of Reflect.ownKeys(value.arguments)) {
+		if (typeof key !== 'string' || key === 'type' || allowed.includes(key)) {
+			throw new ProtocolV2Error('INVALID_PAYLOAD_FIELD', `Reserved action_command argument field '${String(key)}'`);
+		}
+	}
+	const action = protocolAction({ ...value.arguments, type });
+	const command = validateActionCommandPayload({
+		goalRevision: value.goalRevision,
+		actionId,
+		action,
+		provenance: value.provenance,
+	});
 	const { type: actionType, ...argumentsValue } = action;
-	const normalized = { goalRevision: revision(value.goalRevision, 'goalRevision'), actionId, commandId: actionId, actionType, type: actionType, arguments: argumentsValue };
-	if (value.summary !== undefined) normalized.summary = boundedText(value.summary, 'summary', MAX_SUMMARY_LENGTH);
-	if (value.goalStatus !== undefined) normalized.goalStatus = boundedText(value.goalStatus, 'goalStatus', MAX_REASON_CODE_LENGTH);
-	return normalized;
+	const normalized = { goalRevision: command.goalRevision, actionId, actionType, arguments: argumentsValue, provenance: command.provenance };
+	return deepFreeze(normalized);
 }
 
 function protocolAction(value) {
 	try { return validateAction(value); } catch (error) { throw new ProtocolV2Error('INVALID_ACTION', error.message, { cause: error }); }
+}
+
+function deepFreeze(value) {
+	if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value)) deepFreeze(child);
+	return Object.freeze(value);
 }
 
 function playerObservation(value) {
@@ -667,7 +809,7 @@ function playerObservation(value) {
 	const allowed = [
 		'health', 'maxHealth', 'armor', 'foodLevel', 'saturation', 'gameMode',
 		'onGround', 'inWater', 'onFire', 'air', 'maxAir', 'suffocating',
-		'fallDistance', 'dangerousFall', 'lastAttacker', 'effects',
+		'fallDistance', 'lastAttacker', 'effects',
 	];
 	const required = allowed.filter((field) => field !== 'lastAttacker');
 	exactKeys(value, allowed, required, 'player');
@@ -685,7 +827,6 @@ function playerObservation(value) {
 		maxAir: nonnegativeInteger(value.maxAir, 'player.maxAir'),
 		suffocating: boolean(value.suffocating, 'player.suffocating'),
 		fallDistance: finiteNumber(value.fallDistance, 'player.fallDistance'),
-		dangerousFall: boolean(value.dangerousFall, 'player.dangerousFall'),
 		effects: boundedArray(value.effects, 'player.effects', MAX_EFFECTS).map((effect, index) => {
 			exactKeys(effect, ['effectId', 'amplifier', 'duration'], ['effectId', 'amplifier', 'duration'], `effects[${index}]`);
 			return {
@@ -698,15 +839,14 @@ function playerObservation(value) {
 	if (value.lastAttacker !== undefined) {
 		exactKeys(
 			value.lastAttacker,
-			['uuid', 'type', 'distance', 'health'],
-			['uuid', 'type', 'distance', 'health'],
+			['uuid', 'type', 'distance'],
+			['uuid', 'type', 'distance'],
 			'player.lastAttacker',
 		);
 		normalized.lastAttacker = {
 			uuid: requireIdentifier(value.lastAttacker.uuid, 'player.lastAttacker.uuid'),
 			type: requireIdentifier(value.lastAttacker.type, 'player.lastAttacker.type'),
 			distance: finiteNumber(value.lastAttacker.distance, 'player.lastAttacker.distance'),
-			health: finiteNumber(value.lastAttacker.health, 'player.lastAttacker.health'),
 		};
 	}
 	return normalized;
@@ -714,12 +854,12 @@ function playerObservation(value) {
 
 function inventoryObservation(value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'inventory must be an object');
-	exactKeys(value, ['items', 'selectedItem'], ['items', 'selectedItem'], 'inventory');
-	return {
+	exactKeys(value, ['items', 'selectedItem', 'tagCounts'], ['items', 'selectedItem'], 'inventory');
+	const normalizedInventory = {
 		items: boundedArray(value.items, 'inventory.items', MAX_INVENTORY_SUMMARIES).map((item, index) => {
 			exactKeys(
 				item,
-				['itemId', 'count', 'damage', 'maxDamage', 'slot', 'hotbar'],
+				['itemId', 'count', 'damage', 'maxDamage', 'slot', 'hotbar', 'tags'],
 				['itemId', 'count', 'damage', 'maxDamage', 'slot'],
 				`inventory.items[${index}]`,
 			);
@@ -734,10 +874,13 @@ function inventoryObservation(value) {
 				slot,
 			};
 			if (item.hotbar !== undefined) normalized.hotbar = boolean(item.hotbar, `inventory.items[${index}].hotbar`);
+			if (item.tags !== undefined) normalized.tags = observationTags(item.tags, `inventory.items[${index}].tags`);
 			return normalized;
 		}),
 		selectedItem: requireIdentifier(value.selectedItem, 'inventory.selectedItem'),
 	};
+	if (value.tagCounts !== undefined) normalizedInventory.tagCounts = observationTagCounts(value.tagCounts, 'inventory.tagCounts');
+	return normalizedInventory;
 }
 
 function entityObservation(value, index) {
@@ -745,30 +888,95 @@ function entityObservation(value, index) {
 	const field = `entities[${index}]`;
 	exactKeys(
 		value,
-		['uuid', 'type', 'name', 'distance', 'position', 'hostile', 'health', 'maxHealth', 'isPlayer', 'gameMode', 'canBeHarmed'],
-		['uuid', 'type', 'name', 'distance', 'position', 'hostile'],
+		['uuid', 'type', 'name', 'distance', 'position', 'isPlayer', 'itemId', 'count', 'tags'],
+		['uuid', 'type', 'name', 'distance', 'position'],
 		field,
 	);
+	const type = requireIdentifier(value.type, `${field}.type`);
 	const normalized = {
 		uuid: requireIdentifier(value.uuid, `${field}.uuid`),
-		type: requireIdentifier(value.type, `${field}.type`),
+		type,
 		name: boundedText(value.name, `${field}.name`, MAX_CHAT_LENGTH),
 		distance: finiteNumber(value.distance, `${field}.distance`),
 		position: vector(value.position, `${field}.position`),
-		hostile: boolean(value.hostile, `${field}.hostile`),
 	};
-	if (value.health !== undefined) normalized.health = finiteNumber(value.health, `${field}.health`);
-	if (value.maxHealth !== undefined) normalized.maxHealth = finiteNumber(value.maxHealth, `${field}.maxHealth`);
+	if (value.tags !== undefined) normalized.tags = observationTags(value.tags, `${field}.tags`);
 	if (value.isPlayer !== undefined) normalized.isPlayer = boolean(value.isPlayer, `${field}.isPlayer`);
-	if (value.gameMode !== undefined) normalized.gameMode = requireIdentifier(value.gameMode, `${field}.gameMode`);
-	if (value.canBeHarmed !== undefined) normalized.canBeHarmed = boolean(value.canBeHarmed, `${field}.canBeHarmed`);
+	if (type === 'minecraft:item') {
+		if (value.itemId === undefined || value.count === undefined) {
+			throw new ProtocolV2Error('MISSING_FIELD', `${field} item entities require itemId and count`);
+		}
+		normalized.itemId = requireIdentifier(value.itemId, `${field}.itemId`);
+		normalized.count = nonnegativeInteger(value.count, `${field}.count`);
+		if (normalized.count < 1) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.count must be positive`);
+	} else if (value.itemId !== undefined || value.count !== undefined) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} itemId and count are only valid for item entities`);
+	}
 	return normalized;
 }
 
 function blockObservation(value, index) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `blocks[${index}] must be an object`);
-	exactKeys(value, ['x', 'y', 'z', 'blockId'], ['x', 'y', 'z', 'blockId'], `blocks[${index}]`);
-	return { x: integer(value.x, `blocks[${index}].x`), y: integer(value.y, `blocks[${index}].y`), z: integer(value.z, `blocks[${index}].z`), blockId: requireIdentifier(value.blockId, `blocks[${index}].blockId`) };
+	const field = `blocks[${index}]`;
+	exactKeys(value, ['x', 'y', 'z', 'blockId', 'placeableFaces', 'tags'], ['x', 'y', 'z', 'blockId', 'placeableFaces'], field);
+	const placeableFaces = boundedArray(value.placeableFaces, `${field}.placeableFaces`, BLOCK_FACES.length)
+		.map((face, faceIndex) => {
+			const normalized = requireIdentifier(face, `${field}.placeableFaces[${faceIndex}]`);
+			if (!BLOCK_FACES.includes(normalized)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.placeableFaces contains unsupported face '${normalized}'`);
+			return normalized;
+		});
+	if (new Set(placeableFaces).size !== placeableFaces.length) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.placeableFaces must be unique`);
+	const normalized = {
+		x: integer(value.x, `${field}.x`),
+		y: integer(value.y, `${field}.y`),
+		z: integer(value.z, `${field}.z`),
+		blockId: requireIdentifier(value.blockId, `${field}.blockId`),
+		placeableFaces,
+	};
+	if (value.tags !== undefined) normalized.tags = observationTags(value.tags, `${field}.tags`);
+	return normalized;
+}
+
+function observationTags(value, field) {
+	const tags = boundedArray(value, field, MAX_OBSERVATION_TAGS).map((tag, index) => {
+		if (typeof tag !== 'string' || !tag.startsWith('#') || tag.length < 2 || tag.length > MAX_IDENTIFIER_LENGTH) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}[${index}] must be a tag identifier`);
+		return tag;
+	});
+	if (new Set(tags).size !== tags.length) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be unique`);
+	return tags;
+}
+
+function observationTagCounts(value, field) {
+	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
+	const keys = Object.keys(value);
+	if (keys.length > MAX_TAG_COUNT_ENTRIES) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} exceeds bound of ${MAX_TAG_COUNT_ENTRIES}`);
+	const result = {};
+	for (const key of keys) {
+		if (!key.startsWith('#')) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} keys must be tag identifiers`);
+		result[key] = nonnegativeInteger(value[key], `${field}.${key}`);
+	}
+	return result;
+}
+
+function nearbyContainerObservation(value, index) {
+	const field = `nearbyContainers[${index}]`;
+	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
+	exactKeys(
+		value,
+		['x', 'y', 'z', 'blockId', 'distance', 'withinInteractionRange', 'capabilities'],
+		['x', 'y', 'z', 'blockId', 'distance', 'withinInteractionRange', 'capabilities'],
+		field,
+	);
+	return {
+		x: integer(value.x, `${field}.x`),
+		y: integer(value.y, `${field}.y`),
+		z: integer(value.z, `${field}.z`),
+		blockId: requireIdentifier(value.blockId, `${field}.blockId`),
+		distance: finiteNumber(value.distance, `${field}.distance`),
+		withinInteractionRange: boolean(value.withinInteractionRange, `${field}.withinInteractionRange`),
+		capabilities: boundedArray(value.capabilities, `${field}.capabilities`, MAX_MODEL_CAPABILITIES)
+			.map((capability, capabilityIndex) => requireIdentifier(capability, `${field}.capabilities[${capabilityIndex}]`)),
+	};
 }
 
 function worldObservation(value) {
@@ -810,8 +1018,20 @@ function exactKeys(value, allowed, required, field) {
 }
 
 function boundedArray(value, field, maximum) {
-	if (!Array.isArray(value) || value.length > maximum) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an array with at most ${maximum} entries`);
+	if (!isExactArray(value) || value.length > maximum) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a dense plain array with at most ${maximum} entries`);
 	return value;
+}
+
+function isExactArray(value) {
+	if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return false;
+	const expected = ['length', ...Array.from({ length: value.length }, (_, index) => String(index))].sort();
+	const keys = Reflect.ownKeys(value);
+	if (keys.some((key) => typeof key !== 'string') || keys.map(String).sort().join('\u0000') !== expected.join('\u0000')) return false;
+	for (let index = 0; index < value.length; index += 1) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+		if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable || !descriptor.writable || !descriptor.configurable) return false;
+	}
+	return true;
 }
 
 function boundedText(value, field, maximum, minimum = 1) {
@@ -825,9 +1045,21 @@ function boolean(value, field) {
 	return value;
 }
 
+function nullableIdentifier(value, field) {
+	return value === null ? null : requireIdentifier(value, field);
+}
+
+function nullableBoolean(value, field) {
+	return value === null ? null : boolean(value, field);
+}
+
 function finiteNumber(value, field) {
 	if (typeof value !== 'number' || !Number.isFinite(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a finite number`);
 	return value;
+}
+
+function nullableFiniteNumber(value, field) {
+	return value === null ? null : finiteNumber(value, field);
 }
 
 function integer(value, field) {
@@ -837,6 +1069,11 @@ function integer(value, field) {
 
 function nonnegativeInteger(value, field) {
 	if (!Number.isSafeInteger(value) || value < 0) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a nonnegative safe integer`);
+	return value;
+}
+
+function nonnegativeFiniteNumber(value, field) {
+	if (!Number.isFinite(value) || value < 0) throw new ProtocolV2Error('INVALID_FIELD', `${field} must be a non-negative finite number`);
 	return value;
 }
 
@@ -890,7 +1127,9 @@ function positiveInteger(value, field) {
 }
 
 function isPlainObject(value) {
-	return value !== null && typeof value === 'object' && !Array.isArray(value);
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
 }
 
 function rememberBounded(set, value, maximum) {

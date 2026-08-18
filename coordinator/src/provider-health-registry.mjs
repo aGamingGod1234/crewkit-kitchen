@@ -94,6 +94,10 @@ export class ProviderHealthRegistry {
 		});
 	}
 
+	reset() {
+		this.#operations.clear();
+	}
+
 	#state(identityValue) {
 		const identity = requireIdentity(identityValue);
 		const key = JSON.stringify([identity.provider, identity.model, identity.operation]);
@@ -132,7 +136,10 @@ function requirePart(value, field) {
 }
 
 function isNeutralOutcome(errorCode) {
-	return errorCode === 'PLAN_CANCELLED' || errorCode === 'STALE_PLAN';
+	return errorCode === 'PLAN_CANCELLED'
+		|| errorCode === 'STALE_PLAN'
+		|| errorCode === 'MISSING_AGENT_MESSAGE'
+		|| errorCode === 'MISSING_FINAL_MESSAGE';
 }
 
 function percentile(sorted, fraction) {

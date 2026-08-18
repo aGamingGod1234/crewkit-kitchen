@@ -61,7 +61,7 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition resume(AgentRecord current, long nowEpochMs) {
-		requireState(current, "resume", AgentLifecycleState.PAUSED);
+		requireState(current, "resume", AgentLifecycleState.PAUSED, AgentLifecycleState.DISCONNECTED);
 		AgentRecord revised = current.withLifecycle(
 				AgentLifecycleState.STARTING,
 				current.currentGoal(),
@@ -102,7 +102,7 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition beginAction(AgentRecord current, long revision, long nowEpochMs) {
-		requireState(current, "act", AgentLifecycleState.PLANNING);
+		requireState(current, "act", AgentLifecycleState.STARTING, AgentLifecycleState.PLANNING);
 		requireRevision(current, revision);
 		return transition(current, current.withLifecycle(
 				AgentLifecycleState.ACTING,
@@ -190,7 +190,8 @@ public final class AgentLifecycleReducer {
 		return transition(current, disconnected, true, true);
 	}
 
-	public static AgentTransition die(AgentRecord current, long nowEpochMs) {
+	public static AgentTransition die(AgentRecord current, AgentDeathSnapshot deathSnapshot, long nowEpochMs) {
+		Objects.requireNonNull(deathSnapshot, "deathSnapshot must not be null");
 		AgentRecord dead = current.withLifecycle(
 				AgentLifecycleState.DEAD,
 				current.currentGoal(),
@@ -198,7 +199,7 @@ public final class AgentLifecycleReducer {
 				current.queuedGoals(),
 				nowEpochMs,
 				current.lastError()
-		).withEntityUuid(Optional.empty(), nowEpochMs);
+		).withDeathSnapshot(deathSnapshot, nowEpochMs).withEntityUuid(Optional.empty(), nowEpochMs);
 		return transition(current, dead, true, true);
 	}
 

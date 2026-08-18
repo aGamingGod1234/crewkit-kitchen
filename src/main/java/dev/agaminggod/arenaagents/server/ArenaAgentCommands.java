@@ -134,7 +134,7 @@ public final class ArenaAgentCommands {
 	private static String formatStatus(ServerPlayer player, GoalStatus status) {
 		String prefix = "Arena agent " + playerName(player) + ": ";
 		return switch (status.status()) {
-			case ACTIVE -> prefix + "active goal — " + status.goal();
+			case ACTIVE -> prefix + "active goal | " + status.goal();
 			case STOPPED -> prefix + "stopped";
 			case UNKNOWN -> prefix + "no goal has been delivered this server session";
 		};

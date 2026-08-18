@@ -11,6 +11,7 @@ public record ScenarioAgentSpec(
 		String provider,
 		String model,
 		String reasoning,
+		String serviceTier,
 		Optional<String> team,
 		AgentGameMode gameMode
 ) {
@@ -22,6 +23,7 @@ public record ScenarioAgentSpec(
 		provider = required(provider, "provider", 24);
 		model = required(model, "model", 128);
 		reasoning = required(reasoning, "reasoning", 32);
+		serviceTier = required(serviceTier, "serviceTier", 24);
 		team = Objects.requireNonNull(team, "team must not be null")
 				.map(value -> required(value, "team", 48));
 		Objects.requireNonNull(gameMode, "gameMode must not be null");

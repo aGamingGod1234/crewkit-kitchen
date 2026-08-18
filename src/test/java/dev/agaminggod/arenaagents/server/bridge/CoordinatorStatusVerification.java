@@ -2,6 +2,8 @@ package dev.agaminggod.arenaagents.server.bridge;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import dev.agaminggod.arenaagents.control.AgentControlModelOption;
+import java.util.List;
 
 public final class CoordinatorStatusVerification {
 	private CoordinatorStatusVerification() {
@@ -14,6 +16,10 @@ public final class CoordinatorStatusVerification {
 		assertTrue(snapshot.supports("agent-a", "codex", "gpt-5.6-sol", "high"), "supported identity decoded");
 		assertTrue(snapshot.fresh(3_500L, 2_500L), "freshness boundary inclusive");
 		assertTrue(snapshot.latencies().size() == 1, "latency health decoded");
+		JsonObject fractionalLatency = payload();
+		fractionalLatency.getAsJsonArray("latencies").get(0).getAsJsonObject().addProperty("p50Ms", 25.25D);
+		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(fractionalLatency, 1_000L).latencies().getFirst().p50Ms() == 25.25D,
+				"fractional local latency is preserved");
 		JsonObject legacy = payload();
 		legacy.remove("latencies");
 		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(legacy, 1_000L).latencies().isEmpty(),
@@ -26,7 +32,39 @@ public final class CoordinatorStatusVerification {
 		JsonObject invalidLatency = payload();
 		invalidLatency.getAsJsonArray("latencies").get(0).getAsJsonObject().addProperty("p95Ms", -1);
 		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(invalidLatency, 1_000L), "invalid latency rejected");
-		return 8;
+		JsonObject catalog = catalogPayload();
+		List<AgentControlModelOption> models = MultiplexedServerBridge.decodeCatalog(catalog);
+		assertTrue(models.size() == 1, "catalog model decoded");
+		assertTrue(models.getFirst().displayName().equals("GPT Future"), "catalog display name preserved");
+		assertTrue(models.getFirst().reasoningEfforts().equals(List.of("medium", "ultra")),
+				"catalog reasoning efforts preserved");
+		assertTrue(models.getFirst().serviceTiers().equals(List.of("priority", "fast")),
+				"catalog speed tiers preserved");
+		catalog.addProperty("privatePrompt", "must never cross this seam");
+		assertThrows(() -> MultiplexedServerBridge.decodeCatalog(catalog), "unknown catalog field rejected");
+		return 14;
+	}
+
+	private static JsonObject catalogPayload() {
+		JsonObject payload = new JsonObject();
+		payload.addProperty("refreshedAtEpochMs", 1_000L);
+		JsonArray models = new JsonArray();
+		JsonObject model = new JsonObject();
+		model.addProperty("provider", "codex");
+		model.addProperty("id", "gpt-future");
+		model.addProperty("model", "gpt-future-wire");
+		model.addProperty("displayName", "GPT Future");
+		JsonArray efforts = new JsonArray();
+		efforts.add("medium");
+		efforts.add("ultra");
+		model.add("reasoningEfforts", efforts);
+		JsonArray tiers = new JsonArray();
+		tiers.add("priority");
+		tiers.add("fast");
+		model.add("serviceTiers", tiers);
+		models.add(model);
+		payload.add("models", models);
+		return payload;
 	}
 
 	private static JsonObject payload() {

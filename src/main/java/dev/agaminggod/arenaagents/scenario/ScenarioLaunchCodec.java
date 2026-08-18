@@ -22,6 +22,7 @@ public final class ScenarioLaunchCodec {
 		root.addProperty("scenarioId", request.scenarioId());
 		root.addProperty("mapVersion", request.mapVersion());
 		root.addProperty("deterministicEvents", request.deterministicEvents());
+		root.addProperty("placementMode", request.placementMode().wireName());
 		JsonArray roster = new JsonArray();
 		for (ScenarioAgentSpec agent : request.roster()) {
 			JsonObject value = new JsonObject();
@@ -30,6 +31,7 @@ public final class ScenarioLaunchCodec {
 			value.addProperty("provider", agent.provider());
 			value.addProperty("model", agent.model());
 			value.addProperty("reasoning", agent.reasoning());
+			value.addProperty("serviceTier", agent.serviceTier());
 			agent.team().ifPresent(team -> value.addProperty("team", team));
 			value.addProperty("gameMode", agent.gameMode().name());
 			roster.add(value);
@@ -47,16 +49,16 @@ public final class ScenarioLaunchCodec {
 			throw new IllegalArgumentException("scenario launch request is empty or too large");
 		}
 		JsonObject root = JsonParser.parseString(encoded).getAsJsonObject();
-		requireKeys(root, Set.of("scenarioId", "mapVersion", "deterministicEvents", "roster"));
+		requireKeys(root, Set.of("scenarioId", "mapVersion", "deterministicEvents", "placementMode", "roster"));
 		ArrayList<ScenarioAgentSpec> roster = new ArrayList<>();
 		for (var element : root.getAsJsonArray("roster")) {
 			JsonObject value = element.getAsJsonObject();
 			Set<String> allowed = Set.of(
-					"slot", "displayName", "provider", "model", "reasoning", "team", "gameMode"
+					"slot", "displayName", "provider", "model", "reasoning", "serviceTier", "team", "gameMode"
 			);
 			if (!allowed.containsAll(value.keySet())
 					|| !value.keySet().containsAll(Set.of(
-							"slot", "displayName", "provider", "model", "reasoning", "gameMode"
+							"slot", "displayName", "provider", "model", "reasoning", "serviceTier", "gameMode"
 					))) {
 				throw new IllegalArgumentException("scenario roster entry contains missing or unknown fields");
 			}
@@ -66,6 +68,7 @@ public final class ScenarioLaunchCodec {
 					value.get("provider").getAsString(),
 					value.get("model").getAsString(),
 					value.get("reasoning").getAsString(),
+					value.get("serviceTier").getAsString(),
 					value.has("team") ? Optional.of(value.get("team").getAsString()) : Optional.empty(),
 					AgentGameMode.parse(value.get("gameMode").getAsString())
 			));
@@ -74,12 +77,14 @@ public final class ScenarioLaunchCodec {
 				root.get("scenarioId").getAsString(),
 				root.get("mapVersion").getAsString(),
 				root.get("deterministicEvents").getAsBoolean(),
+				ScenarioPlacementMode.parse(root.get("placementMode").getAsString()),
 				roster
 		);
 		return new ScenarioLaunchRequest(
 				request.scenarioId(),
 				request.mapVersion(),
 				request.deterministicEvents(),
+				request.placementMode(),
 				request.roster()
 		);
 	}

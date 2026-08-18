@@ -10,6 +10,21 @@ function deferred() {
 	return { promise, resolve, reject };
 }
 
+test('default scheduler starts all sixteen independent agent turns together', async () => {
+	const scheduler = new PlanningScheduler();
+	const gates = Array.from({ length: 16 }, () => deferred());
+	const started = gates.map(() => deferred());
+	const runs = gates.map((gate, index) => scheduler.schedule(`agent-${index}`, async () => {
+		started[index].resolve();
+		await gate.promise;
+	}));
+	await Promise.all(started.map((entry) => entry.promise));
+	assert.equal(scheduler.activeCount, 16);
+	assert.equal(scheduler.pendingCount, 0);
+	for (const gate of gates) gate.resolve();
+	await Promise.all(runs);
+});
+
 test('scheduler rejects configurations above the global sixteen-turn cap', () => {
 	assert.throws(() => new PlanningScheduler({ maxConcurrent: 17, maxPending: 0 }), /must not exceed 16/);
 	assert.throws(() => new PlanningScheduler({ maxConcurrent: 16, maxPending: 1 }), /must not exceed 16/);

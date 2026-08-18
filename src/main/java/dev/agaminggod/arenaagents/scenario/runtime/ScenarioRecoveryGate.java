@@ -54,6 +54,15 @@ public final class ScenarioRecoveryGate {
 		return new Decision(ready, resume, ready ? "" : "AGENTS_NOT_ACTIVE");
 	}
 
+	public static List<String> deadAgentIds(List<AgentStatus> agents) {
+		List<AgentStatus> copied = List.copyOf(Objects.requireNonNull(agents, "agents must not be null"));
+		return copied.stream()
+				.filter(agent -> agent.state() == AgentLifecycleState.DEAD)
+				.map(AgentStatus::agentId)
+				.sorted()
+				.toList();
+	}
+
 	public record AgentStatus(String agentId, AgentLifecycleState state, boolean playerReady) {
 		public AgentStatus {
 			Objects.requireNonNull(agentId, "agentId must not be null");

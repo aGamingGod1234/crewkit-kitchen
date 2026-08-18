@@ -248,7 +248,7 @@ public final class BridgeActionIntegrationVerification {
 	private static String attackCommand(String commandId) {
 		return "{\"protocolVersion\":1,\"commandId\":\"" + commandId
 				+ "\",\"type\":\"attack\",\"issuedAtEpochMs\":1750000000000,"
-				+ "\"targetSelector\":\"player:Missing\",\"timeoutMs\":5000}";
+				+ "\"targetId\":\"00000000-0000-0000-0000-000000000099\",\"timeoutMs\":5000}";
 	}
 
 	private static void write(ProtocolCodec codec, Socket socket, String json) throws IOException {

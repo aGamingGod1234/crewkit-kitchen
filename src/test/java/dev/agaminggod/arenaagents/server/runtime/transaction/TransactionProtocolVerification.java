@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
+import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelope;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
@@ -53,7 +54,7 @@ public final class TransactionProtocolVerification {
 						"minRemainingDurability", 32
 				),
 				"block_with_shield", json("durationMs", 750),
-				"use_ranged", json("targetSelector", "nearest_hostile", "drawDurationMs", 1_000, "timeoutMs", 5_000)
+				"use_ranged", json("targetId", "00000000-0000-0000-0000-000000000001", "drawDurationMs", 1_000, "timeoutMs", 5_000)
 		);
 
 		for (Map.Entry<String, JsonObject> entry : valid.entrySet()) {
@@ -90,10 +91,16 @@ public final class TransactionProtocolVerification {
 			blankRecipe.addProperty("recipeId", whitespace);
 			verifyRejects("craft_inventory", blankRecipe, "INVALID_FIELD");
 
-			JsonObject blankSelector = valid.get("use_ranged").deepCopy();
-			blankSelector.addProperty("targetSelector", whitespace);
-			verifyRejects("use_ranged", blankSelector, "INVALID_FIELD");
+			JsonObject blankTarget = valid.get("use_ranged").deepCopy();
+			blankTarget.addProperty("targetId", whitespace);
+			verifyRejects("use_ranged", blankTarget, "INVALID_FIELD");
 		}
+		JsonObject selector = valid.get("use_ranged").deepCopy();
+		selector.addProperty("targetSelector", "nearest_hostile");
+		verifyRejects("use_ranged", selector, "UNKNOWN_FIELD");
+		JsonObject nonUuid = valid.get("use_ranged").deepCopy();
+		nonUuid.addProperty("targetId", "nearest_hostile");
+		verifyRejects("use_ranged", nonUuid, "INVALID_FIELD");
 	}
 
 	private static void verifyLiveBridgeRejectsUnknownArgumentBeforeSubmit() throws Exception {
@@ -104,6 +111,7 @@ public final class TransactionProtocolVerification {
 				"actionType", "wait"
 		);
 		payload.add("arguments", arguments);
+		payload.add("provenance", provenance());
 		BridgeEnvelope envelope = new BridgeEnvelope(
 				2,
 				"server-instance",
@@ -118,11 +126,18 @@ public final class TransactionProtocolVerification {
 			decoder.invoke(null, envelope);
 		} catch (InvocationTargetException exception) {
 			Throwable cause = exception.getCause();
-			assertTrue(cause instanceof ProtocolException, "live bridge uses shared protocol validator");
-			assertEquals("UNKNOWN_FIELD", ((ProtocolException) cause).code(), "live bridge rejects unknown argument");
+			assertTrue(cause instanceof BridgeProtocolException, "live bridge wraps shared protocol rejection into a correlated bridge failure");
+			assertEquals("UNKNOWN_FIELD", ((BridgeProtocolException) cause).code(), "live bridge rejects unknown argument");
 			return;
 		}
 		throw new AssertionError("live bridge accepted an unknown argument");
+	}
+
+	private static JsonObject provenance() {
+		return json(
+				"provider", "codex", "model", "gpt-5.6-sol", "reasoningEffort", "high", "serviceTier", "priority",
+				"programId", "program-7-1", "programVersion", 1, "sourceStepId", "step-1-1", "eventSequence", 1
+		);
 	}
 
 	private static void verifyReplayReturnsRecordedResultAndChangedHashFails() {

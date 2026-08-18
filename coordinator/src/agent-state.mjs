@@ -1,9 +1,0 @@
-export const AgentState = Object.freeze({
-	IDLE: 'IDLE',
-	PLANNING: 'PLANNING',
-	ACTING: 'ACTING',
-	RECOVERING: 'RECOVERING',
-	COMPLETED: 'COMPLETED',
-	STOPPED: 'STOPPED',
-	ERROR: 'ERROR',
-});

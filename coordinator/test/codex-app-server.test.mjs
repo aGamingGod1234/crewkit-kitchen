@@ -14,6 +14,7 @@ const model = {
 class FakeCodexTransport extends EventEmitter {
 	calls = [];
 	models = [model];
+	autoComplete = true;
 
 	async start() { this.calls.push({ method: '$start' }); }
 	async stop() { this.calls.push({ method: '$stop' }); }
@@ -26,8 +27,8 @@ class FakeCodexTransport extends EventEmitter {
 		if (method === 'model/list') return { data: this.models, nextCursor: null };
 		if (method === 'thread/start') return { thread: { id: 'thread-1' } };
 		if (method === 'turn/start') {
-			queueMicrotask(() => {
-				this.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 1, item: { id: 'item-1', type: 'agentMessage', text: '{"summary":"Done","goalStatus":"completed","action":{"type":"complete_goal","summary":"Done"}}' } } });
+			if (this.autoComplete) queueMicrotask(() => {
+				this.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 1, item: { id: 'item-1', type: 'agentMessage', text: '{"summary":"Done","directive":"finish","status":"completed"}' } } });
 				this.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
 			});
 			return { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } };
@@ -63,6 +64,23 @@ test('launches the npm Codex JavaScript entrypoint directly on Windows', () => {
 	assert.deepEqual(launch.args.slice(1), buildCodexArgs(config));
 });
 
+test('Codex launch retains provider configuration but strips bridge credentials', () => {
+	const launch = resolveCodexLaunch(config, {
+		platform: 'win32',
+		env: {
+			APPDATA: 'C:\\Users\\lucas\\AppData\\Roaming',
+			PATH: 'C:\\Windows\\System32',
+			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
+			ARENA_AGENT_BRIDGE_SECRET_FILE: 'C:\\runtime\\bridge.secret',
+		},
+		execPath: 'C:\\node.exe',
+		existsSync: () => true,
+	});
+	assert.equal(launch.environment.PATH, 'C:\\Windows\\System32');
+	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET, undefined);
+	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined);
+});
+
 test('initializes before catalog validation and thread start', async () => {
 	const transport = new FakeCodexTransport();
 	const agent = new CodexAgent(config, transport);
@@ -82,13 +100,46 @@ test('runs a persistent-thread turn with exact effort and extracts the final age
 	const agent = new CodexAgent(config, transport);
 	await agent.start();
 	const decision = await agent.decide('compact state');
-	assert.equal(decision.action.type, 'complete_goal');
+	assert.equal(decision.directive, 'finish');
 	const turn = transport.calls.find((call) => call.method === 'turn/start').params;
 	assert.equal(turn.threadId, 'thread-1');
 	assert.equal(turn.model, 'gpt-5.5');
 	assert.equal(turn.effort, 'xhigh');
 	assert.equal(turn.serviceTier, 'fast');
 	assert.deepEqual(turn.environments, []);
+	await agent.stop();
+});
+
+test('uses streamed agent-message deltas when a completed message item is absent', async () => {
+	const transport = new FakeCodexTransport();
+	transport.autoComplete = false;
+	const agent = new CodexAgent(config, transport);
+	await agent.start();
+	const decisionPromise = agent.decide('compact state');
+	await Promise.resolve();
+	const text = '{"summary":"Done","directive":"finish","status":"completed"}';
+	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: text } });
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
+	assert.equal((await decisionPromise).status, 'completed');
+	await agent.stop();
+});
+
+test('rejects an over-budget streamed Codex decision before parsing it', async () => {
+	const transport = new FakeCodexTransport();
+	transport.autoComplete = false;
+	const agent = new CodexAgent({ ...config, maxDecisionBytes: 32 }, transport);
+	await agent.start();
+	const decision = agent.decide('compact state');
+	await Promise.resolve();
+	transport.emit('notification', {
+		method: 'item/agentMessage/delta',
+		params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'x'.repeat(33) },
+	});
+	transport.emit('notification', {
+		method: 'turn/completed',
+		params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } },
+	});
+	await assert.rejects(decision, (error) => error?.code === 'TURN_OUTPUT_LIMIT');
 	await agent.stop();
 });
 

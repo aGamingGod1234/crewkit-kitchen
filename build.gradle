@@ -16,6 +16,16 @@ repositories {
 loom {
 	splitEnvironmentSourceSets()
 
+	def developmentBridgeSecret = layout.projectDirectory.file('runtime/bridge-secret.txt').asFile.absolutePath
+	runs {
+		client {
+			vmArg "-Darenaagents.bridgeSecretFile=${developmentBridgeSecret}"
+		}
+		server {
+			vmArg "-Darenaagents.bridgeSecretFile=${developmentBridgeSecret}"
+		}
+	}
+
 	mods {
 		"arenaagents" {
 			sourceSet sourceSets.main
@@ -51,12 +61,52 @@ java {
 	targetCompatibility = JavaVersion.VERSION_25
 }
 
+def coordinatorRuntimeIncludes = [
+	'package.json',
+	'package-lock.json',
+	'config/**',
+	'src/**',
+	'node_modules/acorn/**',
+]
+def coordinatorManifest = layout.buildDirectory.file('generated/coordinator/coordinator-manifest.txt')
+
+tasks.register('generateCoordinatorManifest') {
+	group = 'build'
+	description = 'Generates the deterministic runtime coordinator file manifest.'
+	inputs.dir(layout.projectDirectory.dir('coordinator'))
+	outputs.file(coordinatorManifest)
+
+	doLast {
+		def coordinatorDirectory = layout.projectDirectory.dir('coordinator').asFile
+		def files = fileTree(coordinatorDirectory) {
+			coordinatorRuntimeIncludes.each { include it }
+		}.files
+		def prefixLength = coordinatorDirectory.absolutePath.length() + 1
+		def entries = files
+			.collect { it.absolutePath.substring(prefixLength).replaceAll('\\\\', '/') }
+			.sort()
+		def output = coordinatorManifest.get().asFile
+		output.parentFile.mkdirs()
+		output.text = entries.join('\n') + '\n'
+	}
+}
+
 jar {
 	def archiveName = project.archives_base_name
 	inputs.property "archiveName", archiveName
+	dependsOn tasks.named('generateCoordinatorManifest')
 
 	from("LICENSE") {
 		rename { "${it}_${archiveName}" }
+	}
+	from("NOTICE-FONTS.md")
+	from("coordinator") {
+		into "arena-agents/coordinator"
+		coordinatorRuntimeIncludes.each { include it }
+	}
+	from(coordinatorManifest) {
+		into "arena-agents/coordinator"
+		rename { 'coordinator-manifest.txt' }
 	}
 }
 

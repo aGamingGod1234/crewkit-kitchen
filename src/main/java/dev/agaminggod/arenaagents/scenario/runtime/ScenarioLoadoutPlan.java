@@ -38,17 +38,7 @@ public record ScenarioLoadoutPlan(List<Entry> entries) {
 							item("minecraft:white_concrete", 64, 4),
 							item("minecraft:scaffolding", 64, 5)
 					));
-			case PVP -> new ScenarioLoadoutPlan(List.of(
-					item("minecraft:iron_sword", 1, 0),
-					item("minecraft:bow", 1, 1),
-					item("minecraft:arrow", 32, 2),
-					item("minecraft:cooked_beef", 16, 3),
-					item("minecraft:shield", 1, 4),
-					armor("minecraft:iron_helmet", 5, ArmorSlot.HEAD),
-					armor("minecraft:iron_chestplate", 6, ArmorSlot.CHEST),
-					armor("minecraft:iron_leggings", 7, ArmorSlot.LEGS),
-					armor("minecraft:iron_boots", 8, ArmorSlot.FEET)
-			));
+			case PVP -> new ScenarioLoadoutPlan(List.of());
 			case PARKOUR -> new ScenarioLoadoutPlan(List.of(
 					item("minecraft:cooked_beef", 16, 0),
 					armor("minecraft:leather_boots", 1, ArmorSlot.FEET)

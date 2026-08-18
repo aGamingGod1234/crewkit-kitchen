@@ -5,16 +5,20 @@ import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
+import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.AgentChatReporter;
 import dev.agaminggod.arenaagents.server.AgentRuntimeRouter;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
+import dev.agaminggod.arenaagents.server.perception.ObservationVisibility;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerBuildSequenceController;
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatIntent;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerCombatController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerNavigationController;
-import dev.agaminggod.arenaagents.server.runtime.controller.ServerSurvivalReflexController;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerItemPickupController;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -22,6 +26,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import net.minecraft.core.BlockPos;
@@ -35,13 +40,29 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 
 public final class ServerActionExecutor {
+	private static final Set<ActionType> ARENA_SCRIPT_PRIMITIVES = Set.of(
+			ActionType.MOVE_TO, ActionType.NAVIGATE_TO, ActionType.LOOK_AT, ActionType.ATTACK,
+			ActionType.SELECT_ITEM, ActionType.USE_ITEM, ActionType.BREAK_BLOCK, ActionType.PLACE_BLOCK,
+			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.DROP_ITEM,
+			ActionType.TRANSFER_CONTAINER, ActionType.CRAFT_INVENTORY, ActionType.CRAFT_TABLE,
+			ActionType.FURNACE_TRANSACTION, ActionType.EQUIP_ITEM, ActionType.SELECT_TOOL,
+			ActionType.BLOCK_WITH_SHIELD, ActionType.USE_RANGED, ActionType.RESPAWN
+	);
 	private static final double MAX_INTERACTION_DISTANCE_SQUARED = 36.0D;
+	private static final Direction[] HORIZONTAL_PLACEMENT_DIRECTIONS = {
+			Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST
+	};
 	private static final long DEFAULT_TIMEOUT_MS = 60_000L;
 	private static final long MOVEMENT_STALL_TIMEOUT_MS = 4_000L;
 	private static final long PLACE_TIMEOUT_MS = 5_000L;
@@ -51,15 +72,16 @@ public final class ServerActionExecutor {
 	private final CodexAgentManager manager;
 	private final AgentRuntimeRouter router;
 	private final Consumer<ServerActionResult> resultSink;
+	private final RespawnResultSink respawnResultSink;
 	private final Consumer<ServerActionProgress> progressSink;
 	private final ServerProtectionPolicy protection;
 	private final ResourceLeaseManager resourceLeases;
 	private final AdvancedInteractionService advancedInteractions;
 	private final Map<AgentId, ActiveAction> active = new LinkedHashMap<>();
 	private final Map<AgentId, CleanupRetry<ServerActionResult>> pendingCompletions = new LinkedHashMap<>();
+	private final Map<AgentId, PendingRespawn> pendingRespawns = new LinkedHashMap<>();
 	private final Map<AgentId, ServerActionResult> lastResults = new LinkedHashMap<>();
-	private final Map<AgentId, Float> observedHealth = new LinkedHashMap<>();
-	private final Map<AgentId, ServerSurvivalReflexController> survivalReflexes = new LinkedHashMap<>();
+	private long coordinatorGeneration;
 
 	public ServerActionExecutor(CodexAgentManager manager, Consumer<ServerActionResult> resultSink) {
 		this(manager, resultSink, progress -> { }, ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR);
@@ -87,22 +109,37 @@ public final class ServerActionExecutor {
 			Consumer<ServerActionProgress> progressSink,
 			ServerProtectionPolicy protection
 	) {
+		this(manager, resultSink, progressSink, protection, (result, transition, commit) -> {
+			resultSink.accept(result);
+			commit.run();
+		});
+	}
+
+	public ServerActionExecutor(
+			CodexAgentManager manager,
+			Consumer<ServerActionResult> resultSink,
+			Consumer<ServerActionProgress> progressSink,
+			ServerProtectionPolicy protection,
+			RespawnResultSink respawnResultSink
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		this.resultSink = Objects.requireNonNull(resultSink, "resultSink must not be null");
+		this.respawnResultSink = Objects.requireNonNull(respawnResultSink, "respawnResultSink must not be null");
 		this.progressSink = Objects.requireNonNull(progressSink, "progressSink must not be null");
 		this.protection = Objects.requireNonNull(protection, "protection must not be null");
 		this.resourceLeases = new ResourceLeaseManager();
 		this.advancedInteractions = new AdvancedInteractionService(protection, resourceLeases);
 	}
 
-	public synchronized void submit(ServerActionRequest request) {
+	/** Legacy scenario/operator path. Model-authored commands must use submitProgramPrimitive. */
+	synchronized void submitLegacy(ServerActionRequest request) {
 		Objects.requireNonNull(request, "request must not be null");
-		ServerSurvivalReflexController reflex = survivalReflexes.remove(request.agentId());
-		if (reflex != null) {
-			manager.findAgentPlayer(request.agentId()).ifPresent(OfflineAgentPlayers::stop);
+		if (request.type() == ActionType.RESPAWN) {
+			submitVanillaRespawn(request);
+			return;
 		}
-		if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId())) {
+		if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
 			throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 		}
 		if (request.type() == ActionType.COMPLETE_GOAL) {
@@ -140,21 +177,51 @@ public final class ServerActionExecutor {
 		}
 	}
 
+	private void submitVanillaRespawn(ServerActionRequest request) {
+		try {
+			if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
+				throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
+			}
+			pendingRespawns.put(request.agentId(), new PendingRespawn(
+					request, manager.beginVanillaRespawn(request.agentId()), System.currentTimeMillis(), coordinatorGeneration
+			));
+		} catch (RuntimeException exception) {
+			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
+			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L);
+		}
+	}
+
+	/** Executes only a model-authored physical primitive received through the coordinator bridge. */
+	public synchronized void submitProgramPrimitive(ServerActionRequest request) {
+		Objects.requireNonNull(request, "request must not be null");
+		requireArenaScriptPrimitive(request.type());
+		submitLegacy(request);
+	}
+
+	public static boolean isArenaScriptPrimitive(ActionType type) {
+		return ARENA_SCRIPT_PRIMITIVES.contains(Objects.requireNonNull(type, "type must not be null"));
+	}
+
+	public static void requireArenaScriptPrimitive(ActionType type) {
+		if (!isArenaScriptPrimitive(type)) {
+			throw new AgentDomainException("UNSUPPORTED_ARENA_SCRIPT_ACTION", "ArenaScript cannot invoke " + type.wireName());
+		}
+	}
+
 	public synchronized void tick() {
 		long now = System.currentTimeMillis();
-		tickSurvivalReflexes(now);
+		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) tickRespawn(pending, now);
 		for (ActiveAction action : new ArrayList<>(active.values())) {
 			CleanupRetry<ServerActionResult> pending = pendingCompletions.get(action.request().agentId());
 			if (pending != null) {
 				finish(action, pending.pending());
 				continue;
 			}
-			if (survivalReflexes.containsKey(action.request().agentId())) continue;
 			ServerActionResult result;
 			try {
 				result = action.tick(now);
 			} catch (RuntimeException exception) {
-				result = action.result(ServerActionState.FAILED, "ACTION_EXCEPTION", safeMessage(exception), now);
+				result = action.result(ServerActionState.FAILED, failureReason(exception), safeMessage(exception), now);
 			}
 			if (result != null) {
 				finish(action, result);
@@ -163,6 +230,45 @@ public final class ServerActionExecutor {
 				if (progress != null) publishProgressBestEffort(progressSink, progress);
 			}
 		}
+	}
+
+	/** Fences and rolls back physical respawns when the coordinator session disappears. */
+	public synchronized void coordinatorDisconnected() {
+		coordinatorGeneration++;
+		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) {
+			pendingRespawns.remove(pending.request().agentId(), pending);
+			manager.rollbackVanillaRespawn(pending.attempt());
+		}
+	}
+
+	private void tickRespawn(PendingRespawn pending, long now) {
+		try {
+			if (!isCurrentCoordinatorGeneration(pending.coordinatorGeneration(), coordinatorGeneration)) {
+				pendingRespawns.remove(pending.request().agentId(), pending);
+				manager.rollbackVanillaRespawn(pending.attempt());
+				return;
+			}
+			if (!manager.verifyVanillaRespawn(pending.attempt(), now)) return;
+			ServerActionResult result = result(pending.request(), ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", now - pending.startedAtEpochMs());
+			manager.commitVanillaRespawn(pending.attempt(), (transition, commit) -> publishRespawn(result, transition, commit));
+			pendingRespawns.remove(pending.request().agentId(), pending);
+		} catch (RuntimeException exception) {
+			pendingRespawns.remove(pending.request().agentId(), pending);
+			manager.rollbackVanillaRespawn(pending.attempt());
+			if (!isCurrentCoordinatorGeneration(pending.coordinatorGeneration(), coordinatorGeneration)
+					|| isCoordinatorDisconnected(exception)) return;
+			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
+			emit(pending.request(), ServerActionState.FAILED, reason, safeMessage(exception), now - pending.startedAtEpochMs());
+		}
+	}
+
+	private static boolean isCoordinatorDisconnected(RuntimeException exception) {
+		return exception instanceof dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException bridge
+				&& "COORDINATOR_DISCONNECTED".equals(bridge.code());
+	}
+
+	static boolean isCurrentCoordinatorGeneration(long actionGeneration, long currentGeneration) {
+		return actionGeneration == currentGeneration;
 	}
 
 	static void publishProgressBestEffort(
@@ -176,39 +282,13 @@ public final class ServerActionExecutor {
 		}
 	}
 
-	private void tickSurvivalReflexes(long now) {
-		for (var record : manager.records()) {
-			manager.findAgentPlayer(record.agentId()).ifPresent(player -> {
-				float previous = observedHealth.getOrDefault(record.agentId(), player.getHealth());
-				boolean tookDamage = player.getHealth() + 0.01F < previous;
-				observedHealth.put(record.agentId(), player.getHealth());
-				if (!survivalReflexes.containsKey(record.agentId())) {
-					ServerSurvivalReflexController detected =
-							ServerSurvivalReflexController.detect(player, tookDamage, now);
-					if (detected != null) {
-						ActiveAction interrupted = active.get(record.agentId());
-						if (interrupted != null) {
-							finish(interrupted, interrupted.result(
-									ServerActionState.FAILED,
-									"THREAT_DETECTED",
-									"Emergency motor reflex interrupted the action for immediate replanning",
-									now
-							));
-						}
-						survivalReflexes.put(record.agentId(), detected);
-					}
-				}
-			});
-		}
-		for (var entry : new ArrayList<>(survivalReflexes.entrySet())) {
-			ServerPlayer player = manager.findAgentPlayer(entry.getKey()).orElse(null);
-			if (player == null || entry.getValue().tick(player, now)) {
-				survivalReflexes.remove(entry.getKey());
-			}
-		}
-	}
-
 	public synchronized boolean cancel(AgentId agentId, String reason) {
+		PendingRespawn respawn = pendingRespawns.remove(agentId);
+		if (respawn != null) {
+			manager.rollbackVanillaRespawn(respawn.attempt());
+			emit(respawn.request(), ServerActionState.CANCELLED, "ACTION_CANCELLED", reason == null ? "Action cancelled" : reason, System.currentTimeMillis() - respawn.startedAtEpochMs());
+			return true;
+		}
 		ActiveAction action = active.get(agentId);
 		if (action == null) return false;
 		String cancellationReason = reason == null ? "Action cancelled" : reason;
@@ -231,6 +311,27 @@ public final class ServerActionExecutor {
 		return true;
 	}
 
+	public synchronized boolean cancel(AgentId agentId, long goalRevision, String actionId, String reason) {
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Objects.requireNonNull(actionId, "actionId must not be null");
+		ActiveAction action = active.get(agentId);
+		PendingRespawn respawn = pendingRespawns.get(agentId);
+		if (action == null && respawn == null) return false;
+		if (respawn != null) {
+			if (!matchesCancellation(respawn.request(), goalRevision, actionId)) throw new AgentDomainException("STALE_ACTION", "Cancellation does not match the active action");
+			return cancel(agentId, reason);
+		}
+		if (!matchesCancellation(action.request(), goalRevision, actionId)) {
+			throw new AgentDomainException("STALE_ACTION", "Cancellation does not match the active action");
+		}
+		return cancel(agentId, reason);
+	}
+
+	static boolean matchesCancellation(ServerActionRequest request, long goalRevision, String actionId) {
+		Objects.requireNonNull(request, "request must not be null");
+		return request.goalRevision() == goalRevision && request.actionId().equals(actionId);
+	}
+
 	private void complete(ActiveAction action, ServerActionResult result) {
 		active.remove(action.request().agentId(), action);
 		pendingCompletions.remove(action.request().agentId());
@@ -251,7 +352,8 @@ public final class ServerActionExecutor {
 
 	private ActiveAction createAction(ServerActionRequest request, ServerPlayer player) {
 		if (player.gameMode.getGameModeForPlayer() == GameType.ADVENTURE
-				&& (request.type() == ActionType.BREAK_BLOCK || request.type() == ActionType.PLACE_BLOCK)) {
+				&& (request.type() == ActionType.BREAK_BLOCK || request.type() == ActionType.PLACE_BLOCK
+				|| request.type() == ActionType.BUILD_SEQUENCE)) {
 			throw new AgentDomainException("GAME_MODE_RESTRICTED", "Adventure agents cannot break or place blocks");
 		}
 		JsonObject arguments = request.arguments();
@@ -274,7 +376,7 @@ public final class ServerActionExecutor {
 							number(arguments, "z")
 					)));
 			case ATTACK -> ActiveAction.immediate(request, player,
-					() -> attack(player, string(arguments, "targetSelector")));
+					() -> attack(player, string(arguments, "targetId")));
 			case SELECT_ITEM -> ActiveAction.immediate(request, player,
 					() -> selectItem(player, string(arguments, "itemId")));
 			case USE_ITEM -> ActiveAction.use(request, player, integer(arguments, "durationMs"));
@@ -286,16 +388,19 @@ public final class ServerActionExecutor {
 			);
 			case PLACE_BLOCK -> {
 				BlockPos position = blockPosition(arguments);
-				Direction face = Direction.byName(string(arguments, "face"));
 				String itemId = string(arguments, "itemId");
 				String initialBlockId = blockId(player.level().getBlockState(position));
 				String expectedBlockId = expectedBlockId(itemId);
-				if (initialBlockId.equals(expectedBlockId)) {
-					throw new AgentDomainException(
-							"TARGET_ALREADY_OCCUPIED",
-							"Placement target already contains " + expectedBlockId
-					);
+				DesiredBlockState desiredBlockState = DesiredBlockState.parse(
+						arguments.has("desiredState") && !arguments.get("desiredState").isJsonNull()
+								? arguments.get("desiredState").getAsString() : null,
+						expectedBlockId
+				);
+				Direction requestedFace = Direction.byName(string(arguments, "face"));
+				if (!initialBlockId.equals(expectedBlockId)) {
+					validatePlaceBlock(protection, player, position, requestedFace, itemId);
 				}
+				int initialItemCount = inventoryItemCount(player, itemId);
 				String resourceKey = blockResourceKey(player, position);
 				if (!resourceLeases.acquire(
 						resourceKey,
@@ -309,10 +414,14 @@ public final class ServerActionExecutor {
 					ActiveAction action = ActiveAction.placeBlock(
 							request,
 							player,
-							() -> placeBlock(player, position, face, itemId),
+							() -> placeBlock(protection, player, position, requestedFace, itemId, desiredBlockState),
 							position,
 							initialBlockId,
-							expectedBlockId
+							expectedBlockId,
+							desiredBlockState,
+							requestedFace,
+							itemId,
+							initialItemCount
 					);
 					action.resourceLeaseKey = resourceKey;
 					yield action;
@@ -321,6 +430,16 @@ public final class ServerActionExecutor {
 					throw exception;
 				}
 			}
+			case BUILD_SEQUENCE -> ActiveAction.controller(
+					request,
+					player,
+					new ServerBuildSequenceController(
+							buildPlacements(arguments),
+							System.currentTimeMillis(),
+							integer(arguments, "timeoutMs"),
+							new BuildSequencePlacementDriver(request)
+					)
+			);
 			case CHAT -> ActiveAction.immediate(request, player, () ->
 					player.level().getServer().getPlayerList().broadcastSystemMessage(
 							Component.literal("<" + player.getScoreboardName() + "> " + string(arguments, "message")),
@@ -335,9 +454,12 @@ public final class ServerActionExecutor {
 							bool(arguments, "open")
 					)
 			));
-			case PICK_UP_ITEM -> ActiveAction.immediate(request, player, () -> requireResult(
-					advancedInteractions.pickUp(player, findItem(player, string(arguments, "targetSelector")))
-			));
+			case PICK_UP_ITEM -> {
+				ItemEntity item = findItem(player, string(arguments, "targetSelector"));
+				requireResult(advancedInteractions.validatePickUp(player, item));
+				yield ActiveAction.controller(request, player,
+						new ServerItemPickupController(player, item, System.currentTimeMillis()));
+			}
 			case DROP_ITEM -> ActiveAction.immediate(request, player, () -> requireResult(
 					advancedInteractions.drop(player, integer(arguments, "slot"), integer(arguments, "count"))
 			));
@@ -389,7 +511,7 @@ public final class ServerActionExecutor {
 					player,
 					advancedInteractions.begin(player, request, arguments)
 			);
-			case COMPLETE_GOAL -> throw new IllegalStateException("complete_goal is handled before action creation");
+			case RESPAWN, COMPLETE_GOAL -> throw new IllegalStateException("respawn and complete_goal are handled before action creation");
 		};
 	}
 
@@ -468,8 +590,33 @@ public final class ServerActionExecutor {
 		resultSink.accept(result);
 	}
 
-	private static void attack(ServerPlayer player, String selector) {
-		Entity target = findTarget(player, selector);
+	private void publishRespawn(ServerActionResult result, AgentTransition transition, Runnable commit) {
+		respawnResultSink.publish(result, transition, commit);
+		lastResults.put(result.agentId(), result);
+		try {
+			AgentChatReporter.result(manager, manager.registry().require(result.agentId()), result);
+		} catch (AgentDomainException ignored) { }
+	}
+
+	private static ServerActionResult result(ServerActionRequest request, ServerActionState state, String reasonCode, String message, long elapsedMs) {
+		return new ServerActionResult(request.agentId(), request.goalRevision(), request.actionId(), request.type(), state,
+				reasonCode, message == null ? "" : message, Math.max(0L, elapsedMs), System.currentTimeMillis());
+	}
+
+	@FunctionalInterface
+	public interface RespawnResultSink {
+		void publish(ServerActionResult result, AgentTransition transition, Runnable commit);
+	}
+
+	private record PendingRespawn(
+			ServerActionRequest request,
+			CodexAgentManager.VanillaRespawnAttempt attempt,
+			long startedAtEpochMs,
+			long coordinatorGeneration
+	) { }
+
+	private static void attack(ServerPlayer player, String targetId) {
+		Entity target = resolveExactObservedTarget(player, targetId);
 		if (target instanceof ServerPlayer targetPlayer
 				&& (targetPlayer.isCreative() || targetPlayer.isSpectator())) {
 			throw new AgentDomainException("TARGET_INVULNERABLE", "Creative and spectator players cannot be valid combat targets");
@@ -482,28 +629,60 @@ public final class ServerActionExecutor {
 		player.swing(net.minecraft.world.InteractionHand.MAIN_HAND);
 	}
 
+	/** Resolves only the exact UUID supplied from the agent's retained observation. */
+	static Entity resolveExactObservedTarget(ServerPlayer player, String targetId) {
+		final UUID uuid;
+		try {
+			uuid = UUID.fromString(targetId);
+		} catch (IllegalArgumentException exception) {
+			throw new AgentDomainException("TARGET_NOT_FOUND", "Target id is not a UUID");
+		}
+		Entity target = player.level().getEntity(uuid);
+		if (target == null || target.level() != player.level() || !target.isAlive() || target == player) {
+			throw new AgentDomainException("TARGET_UNAVAILABLE", "Observed target is no longer available");
+		}
+		if (!ObservationVisibility.canSeeEntity(player, target)) {
+			throw new AgentDomainException("TARGET_NOT_VISIBLE", "Observed target is no longer visible");
+		}
+		return target;
+	}
+
 	private static Entity findTarget(ServerPlayer player, String selector) {
 		ServerLevel level = player.level();
+		String normalized = EntityTargetSelector.normalize(selector);
 		java.util.function.Predicate<Entity> predicate;
-		if ("nearest_hostile".equals(selector)) {
+		if ("nearest_hostile".equals(normalized)) {
 			predicate = entity -> entity instanceof Enemy && entity.isAlive();
-		} else if ("nearest_player".equals(selector)) {
+		} else if ("nearest_player".equals(normalized)) {
 			predicate = entity -> entity instanceof ServerPlayer && entity != player && entity.isAlive();
-		} else if ("nearest_living".equals(selector)) {
+		} else if ("nearest_living".equals(normalized)) {
 			predicate = entity -> entity instanceof LivingEntity && entity != player && entity.isAlive();
 		} else {
+			ServerPlayer named = level.getServer().getPlayerList().getPlayerByName(normalized);
+			if (named != null && named != player && named.isAlive()) return named;
+			for (var record : managerRecords(level)) {
+				if (!AgentIdentity.displayName(record.profile()).equalsIgnoreCase(normalized)) continue;
+				ServerPlayer agentPlayer = OfflineAgentPlayers.find(level.getServer(), record.agentId(), record.profile())
+						.orElse(null);
+				if (agentPlayer != null && agentPlayer != player && agentPlayer.isAlive()) return agentPlayer;
+			}
 			try {
-				UUID uuid = UUID.fromString(selector);
+				UUID uuid = UUID.fromString(normalized);
 				Entity direct = level.getEntity(uuid);
 				if (direct != null && direct.isAlive()) return direct;
 			} catch (IllegalArgumentException ignored) {
 			}
 			throw new AgentDomainException("TARGET_NOT_FOUND", "Unknown or unavailable target selector: " + selector);
 		}
-		return level.getEntities(player, player.getBoundingBox().inflate(32.0D), predicate)
+		return level.getEntities(player, player.getBoundingBox().inflate(128.0D), predicate)
 				.stream()
+				.filter(entity -> ObservationVisibility.canSeeEntity(player, entity))
 				.min(Comparator.comparingDouble(player::distanceToSqr))
 				.orElseThrow(() -> new AgentDomainException("TARGET_NOT_FOUND", "No matching target is nearby"));
+	}
+
+	private static List<dev.agaminggod.arenaagents.agent.AgentRecord> managerRecords(ServerLevel level) {
+		return CodexAgentManager.get(level.getServer()).records();
 	}
 
 	private static void selectItem(ServerPlayer player, String itemId) {
@@ -533,19 +712,191 @@ public final class ServerActionExecutor {
 		OfflineAgentPlayers.actions(player).setSlot(found + 1);
 	}
 
-	private static void placeBlock(ServerPlayer player, BlockPos position, Direction face, String itemId) {
-		if (face == null) throw new AgentDomainException("INVALID_FACE", "Unknown block face");
-		if (player.distanceToSqr(Vec3.atCenterOf(position)) > MAX_INTERACTION_DISTANCE_SQUARED) {
-			throw new AgentDomainException("TARGET_TOO_FAR", "Placement target is out of reach");
+	private static void validatePlaceBlock(
+			ServerProtectionPolicy protection,
+			ServerPlayer player,
+			BlockPos position,
+			Direction requestedFace,
+			String itemId
+	) {
+		requirePlacementProtection(protection, player, player.level(), position);
+		String currentBlockId = blockId(player.level().getBlockState(position));
+		if (!player.level().getBlockState(position).canBeReplaced()) {
+			throw new AgentDomainException("TARGET_OCCUPIED", "Placement target contains " + currentBlockId);
 		}
 		selectItem(player, itemId);
 		if (!(player.getMainHandItem().getItem() instanceof BlockItem)) {
 			throw new AgentDomainException("ITEM_NOT_PLACEABLE", itemId + " is not a block item");
 		}
+		if (placementFace(player, position, requestedFace) == null) {
+			throw new AgentDomainException("NO_PLACEMENT_SUPPORT", "No adjacent solid face can support this placement");
+		}
+		BlockHitResult hit = placementHit(player, position, requestedFace);
+		if (hit == null) {
+			throw new AgentDomainException("NO_PLACEMENT_SUPPORT", "No adjacent solid face can support this placement");
+		}
+		requirePlacementGates(protection, player, position, hit);
+	}
+
+	static void requirePlacementProtection(
+			ServerProtectionPolicy policy,
+			ServerPlayer player,
+			ServerLevel level,
+			BlockPos position
+	) {
+		if (policy == null || !policy.mayModifyBlock(player, level, position)) {
+			throw new AgentDomainException("PROTECTION_DENIED", "Block placement denied");
+		}
+	}
+
+	private static void placeBlock(
+			ServerProtectionPolicy protection,
+			ServerPlayer player,
+			BlockPos position,
+			Direction requestedFace,
+			String itemId,
+			DesiredBlockState desiredBlockState
+	) {
+		validatePlaceBlock(protection, player, position, requestedFace, itemId);
+		BlockHitResult hit = placementHit(player, position, requestedFace);
+		if (hit == null) {
+			throw new AgentDomainException("NO_PLACEMENT_SUPPORT", "No adjacent solid face can support this placement");
+		}
+		ItemStack stack = player.getMainHandItem();
+		orientPlayerForDesiredState(player, (BlockItem) stack.getItem(), stack, hit, desiredBlockState);
+		InteractionResult result = player.gameMode.useItemOn(
+				player,
+				player.level(),
+				stack,
+				InteractionHand.MAIN_HAND,
+				hit
+		);
+		if (result.consumesAction()) player.swing(InteractionHand.MAIN_HAND);
+	}
+
+	private static BlockHitResult placementHit(ServerPlayer player, BlockPos position, Direction requestedFace) {
+		Direction face = placementFace(player, position, requestedFace);
+		if (face == null) return null;
 		BlockPos support = position.relative(face.getOpposite());
-		OfflineAgentPlayers.actions(player)
-				.lookAt(Vec3.atCenterOf(support))
-				.start(EntityPlayerActionPack.ActionType.USE, EntityPlayerActionPack.Action.once());
+		return new BlockHitResult(
+				placementLookTarget(support, face),
+				face,
+				support,
+				false
+		);
+	}
+
+	private static void requirePlacementGates(
+			ServerProtectionPolicy protection,
+			ServerPlayer player,
+			BlockPos target,
+			BlockHitResult hit
+	) {
+		ServerLevel level = player.level();
+		BlockPos support = hit.getBlockPos();
+		requirePlacementProtection(protection, player, level, target);
+		requirePlacementProtection(protection, player, level, support);
+		if (level.getServer().isUnderSpawnProtection(level, target, player)
+				|| level.getServer().isUnderSpawnProtection(level, support, player)
+				|| !level.mayInteract(player, target)
+				|| !level.mayInteract(player, support)) {
+			throw new AgentDomainException("PROTECTION_DENIED", "Vanilla placement protection denied the target or support block");
+		}
+		if (!player.isWithinBlockInteractionRange(support, 1.0D)
+				|| !isValidPlacementHit(support, hit.getLocation())) {
+			throw new AgentDomainException("TARGET_TOO_FAR", "Placement hit is out of reach");
+		}
+	}
+
+	static boolean isValidPlacementHit(BlockPos support, Vec3 hitLocation) {
+		Vec3 offset = hitLocation.subtract(Vec3.atCenterOf(support));
+		return Math.abs(offset.x()) < 1.0000001D
+				&& Math.abs(offset.y()) < 1.0000001D
+				&& Math.abs(offset.z()) < 1.0000001D;
+	}
+
+	static float directionalPlacementYaw(Direction direction) {
+		if (direction == null || !direction.getAxis().isHorizontal()) {
+			throw new IllegalArgumentException("direction must be horizontal");
+		}
+		return direction.toYRot();
+	}
+
+	private static void orientPlayerForDesiredState(
+			ServerPlayer player,
+			BlockItem blockItem,
+			ItemStack stack,
+			BlockHitResult hit,
+			DesiredBlockState desiredBlockState
+	) {
+		String requestedFacing = desiredBlockState.properties().get("facing");
+		Direction requestedDirection = requestedFacing == null ? null : Direction.byName(requestedFacing);
+		float originalYaw = player.getYRot();
+		float originalHeadYaw = player.getYHeadRot();
+		if (requestedDirection == null || !requestedDirection.getAxis().isHorizontal()) {
+			BlockState predicted = predictedPlacementState(player, blockItem, stack, hit);
+			if (predicted == null || !desiredBlockState.matches(predicted)) {
+				throw new AgentDomainException(
+						"PLACEMENT_STATE_MISMATCH",
+						"Requested block state cannot be produced by vanilla placement context"
+				);
+			}
+			return;
+		}
+		for (Direction direction : HORIZONTAL_PLACEMENT_DIRECTIONS) {
+			float yaw = directionalPlacementYaw(direction);
+			player.setYRot(yaw);
+			player.setYHeadRot(yaw);
+			BlockState predicted = predictedPlacementState(player, blockItem, stack, hit);
+			if (predicted != null && desiredBlockState.matches(predicted)) return;
+		}
+		player.setYRot(originalYaw);
+		player.setYHeadRot(originalHeadYaw);
+		throw new AgentDomainException(
+				"PLACEMENT_STATE_MISMATCH",
+				"Requested directional state cannot be produced by vanilla placement context"
+		);
+	}
+
+	private static BlockState predictedPlacementState(
+			ServerPlayer player,
+			BlockItem blockItem,
+			ItemStack stack,
+			BlockHitResult hit
+	) {
+		BlockPlaceContext context = blockItem.updatePlacementContext(
+				new BlockPlaceContext(player, InteractionHand.MAIN_HAND, stack, hit)
+		);
+		return context == null ? null : blockItem.getBlock().getStateForPlacement(context);
+	}
+
+	private static Direction placementFace(ServerPlayer player, BlockPos position, Direction requestedFace) {
+		return BlockPlacementAttemptPolicy.chooseFace(requestedFace, candidate -> {
+			BlockPos support = position.relative(candidate.getOpposite());
+			return player.level().getBlockState(support).isFaceSturdy(player.level(), support, candidate);
+		});
+	}
+
+	private static int inventoryItemCount(ServerPlayer player, String itemId) {
+		Identifier identifier = Identifier.tryParse(itemId);
+		if (identifier == null || !BuiltInRegistries.ITEM.containsKey(identifier)) return 0;
+		int count = 0;
+		for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
+			ItemStack stack = player.getInventory().getItem(slot);
+			if (!stack.isEmpty() && BuiltInRegistries.ITEM.getKey(stack.getItem()).equals(identifier)) {
+				count += stack.getCount();
+			}
+		}
+		return count;
+	}
+
+	static Vec3 placementLookTarget(BlockPos support, Direction face) {
+		Vec3 center = Vec3.atCenterOf(support);
+		return center.add(
+				face.getStepX() * 0.499D,
+				face.getStepY() * 0.499D,
+				face.getStepZ() * 0.499D
+		);
 	}
 
 	private static String expectedBlockId(String itemId) {
@@ -568,18 +919,21 @@ public final class ServerActionExecutor {
 	}
 
 	private static ItemEntity findItem(ServerPlayer player, String selector) {
-		if (!"nearest_item".equals(selector)) {
+		if (!"nearest_item".equals(EntityTargetSelector.normalize(selector))) {
 			try {
 				Entity entity = player.level().getEntity(UUID.fromString(selector));
-				if (entity instanceof ItemEntity item) return item;
-			} catch (IllegalArgumentException ignored) {
+				if (entity instanceof ItemEntity item && item.isAlive()) return item;
+			} catch (IllegalArgumentException exception) {
+				throw new AgentDomainException("ITEM_NOT_FOUND", "Invalid item target selector: " + selector);
 			}
+			throw new AgentDomainException("ITEM_NOT_FOUND", "The selected item entity is unavailable");
 		}
 		return player.level().getEntitiesOfClass(
 						ItemEntity.class,
-						player.getBoundingBox().inflate(6.0D),
+						player.getBoundingBox().inflate(64.0D),
 						Entity::isAlive
 				).stream()
+				.filter(item -> ObservationVisibility.canSeeEntity(player, item))
 				.min(Comparator.comparingDouble(player::distanceToSqr))
 				.orElseThrow(() -> new AgentDomainException("ITEM_NOT_FOUND", "No item entity is nearby"));
 	}
@@ -590,6 +944,25 @@ public final class ServerActionExecutor {
 
 	private static BlockPos blockPosition(JsonObject arguments) {
 		return BlockPos.containing(number(arguments, "x"), number(arguments, "y"), number(arguments, "z"));
+	}
+
+	private static List<ServerBuildSequenceController.Placement> buildPlacements(JsonObject arguments) {
+		List<ServerBuildSequenceController.Placement> placements = new ArrayList<>();
+		arguments.getAsJsonArray("placements").forEach(element -> {
+			JsonObject placement = element.getAsJsonObject();
+			Direction face = Direction.byName(string(placement, "face"));
+			if (face == null) throw new AgentDomainException("INVALID_FIELD", "Unknown placement face");
+			placements.add(new ServerBuildSequenceController.Placement(
+					integer(placement, "x"),
+					integer(placement, "y"),
+					integer(placement, "z"),
+					face,
+					string(placement, "itemId"),
+					placement.has("desiredState") && !placement.get("desiredState").isJsonNull()
+							? string(placement, "desiredState") : null
+			));
+		});
+		return List.copyOf(placements);
 	}
 
 	private static String string(JsonObject object, String field) {
@@ -613,6 +986,88 @@ public final class ServerActionExecutor {
 		return message == null || message.isBlank() ? throwable.getClass().getSimpleName() : message;
 	}
 
+	static String failureReason(Throwable throwable) {
+		return throwable instanceof AgentDomainException domain ? domain.code() : "ACTION_EXCEPTION";
+	}
+
+	private final class BuildSequencePlacementDriver implements ServerBuildSequenceController.PlacementDriver {
+		private final ServerActionRequest parent;
+		private ActiveAction child;
+
+		private BuildSequencePlacementDriver(ServerActionRequest parent) {
+			this.parent = parent;
+		}
+
+		@Override
+		public boolean isInRange(ServerPlayer player, ServerBuildSequenceController.Placement placement) {
+			if (player == null) return false;
+			BlockPos target = new BlockPos(placement.x(), placement.y(), placement.z());
+			BlockPos support = target.relative(placement.face().getOpposite());
+			return player.isWithinBlockInteractionRange(support, 1.0D);
+		}
+
+		@Override
+		public ServerController.TickResult tick(
+				ServerPlayer player,
+				ServerBuildSequenceController.Placement placement,
+				int index,
+				long nowEpochMs
+		) {
+			try {
+				if (child == null) {
+					JsonObject arguments = new JsonObject();
+					arguments.addProperty("x", placement.x());
+					arguments.addProperty("y", placement.y());
+					arguments.addProperty("z", placement.z());
+					arguments.addProperty("face", placement.face().getName());
+					arguments.addProperty("itemId", placement.itemId());
+					if (placement.desiredState() == null) arguments.add("desiredState", com.google.gson.JsonNull.INSTANCE);
+					else arguments.addProperty("desiredState", placement.desiredState());
+					child = createAction(new ServerActionRequest(
+							parent.agentId(), parent.goalRevision(), parent.actionId(), ActionType.PLACE_BLOCK, arguments, parent.provenance()
+					), player);
+				}
+				ServerActionResult result = child.tick(nowEpochMs);
+				if (result == null) return ServerController.TickResult.running(child.lastProgress);
+				ActiveAction completed = child;
+				double completedProgress = child.lastProgress;
+				child = null;
+				cleanupChild(completed);
+				if (result.state() == ServerActionState.SUCCEEDED) {
+					return ServerController.TickResult.succeeded(result.reasonCode(), result.message());
+				}
+				return ServerController.TickResult.failed(result.reasonCode(), result.message(), completedProgress);
+			} catch (RuntimeException failure) {
+				if (child != null) {
+					ActiveAction failed = child;
+					child = null;
+					try { cleanupChild(failed); } catch (RuntimeException ignored) { }
+				}
+				return ServerController.TickResult.failed(failureReason(failure), safeMessage(failure), 0.0D);
+			}
+		}
+
+		@Override
+		public void cancel(ServerPlayer player) {
+			if (child == null) return;
+			ActiveAction cancelled = child;
+			child = null;
+			try {
+				cancelled.cancel("Build sequence cancelled");
+			} finally {
+				releaseResourceLease(cancelled);
+			}
+		}
+
+		private void cleanupChild(ActiveAction action) {
+			try {
+				action.cleanup();
+			} finally {
+				releaseResourceLease(action);
+			}
+		}
+	}
+
 	private static final class ActiveAction {
 		private enum Mode { IMMEDIATE, MOVE, USE, BREAK, PLACE, WAIT, CONTROLLER, TRANSACTION }
 
@@ -633,9 +1088,13 @@ public final class ServerActionExecutor {
 		private ServerTransactionAdapter.ActiveTransaction transaction;
 		private String initialBlockId;
 		private String expectedBlockId;
+		private DesiredBlockState desiredBlockState;
+		private Direction placementRequestedFace;
+		private String placementItemId;
+		private int initialPlacementItemCount;
 		private String resourceLeaseKey;
+		private int placementAttempts;
 		private boolean started;
-		private float lastHealth;
 		private double lastProgress;
 
 		private ActiveAction(
@@ -659,7 +1118,6 @@ public final class ServerActionExecutor {
 			this.tolerance = tolerance;
 			this.sprint = sprint;
 			this.block = block;
-			this.lastHealth = player.getHealth();
 			this.progress = mode == Mode.MOVE
 					? new ActionProgressTracker(player.position().distanceTo(destination), startedAt, MOVEMENT_STALL_TIMEOUT_MS)
 					: null;
@@ -699,7 +1157,11 @@ public final class ServerActionExecutor {
 				Runnable operation,
 				BlockPos block,
 				String initialBlockId,
-				String expectedBlockId
+				String expectedBlockId,
+				DesiredBlockState desiredBlockState,
+				Direction placementRequestedFace,
+				String itemId,
+				int initialItemCount
 		) {
 			ActiveAction action = new ActiveAction(
 					request,
@@ -714,6 +1176,10 @@ public final class ServerActionExecutor {
 			);
 			action.initialBlockId = Objects.requireNonNull(initialBlockId, "initialBlockId must not be null");
 			action.expectedBlockId = Objects.requireNonNull(expectedBlockId, "expectedBlockId must not be null");
+			action.desiredBlockState = Objects.requireNonNull(desiredBlockState, "desiredBlockState must not be null");
+			action.placementRequestedFace = placementRequestedFace;
+			action.placementItemId = Objects.requireNonNull(itemId, "itemId must not be null");
+			action.initialPlacementItemCount = Math.max(0, initialItemCount);
 			return action;
 		}
 
@@ -767,16 +1233,6 @@ public final class ServerActionExecutor {
 
 		ServerActionResult tick(long now) {
 			if (!player.isAlive()) return result(ServerActionState.FAILED, "AGENT_DEAD", "Agent player died", now);
-			if (player.getHealth() + 0.01F < lastHealth) {
-				lastHealth = player.getHealth();
-				return result(
-						ServerActionState.FAILED,
-						"THREAT_DETECTED",
-						"Agent took damage; interrupting the current action to reassess fight or flight",
-						now
-				);
-			}
-			lastHealth = player.getHealth();
 			long elapsed = Math.max(0L, now - startedAt);
 			if (!started) {
 				started = true;
@@ -797,7 +1253,8 @@ public final class ServerActionExecutor {
 								.lookAt(Vec3.atCenterOf(block))
 								.start(EntityPlayerActionPack.ActionType.ATTACK, EntityPlayerActionPack.Action.continuous());
 					}
-					case PLACE -> immediate.run();
+					case PLACE -> {
+					}
 					case WAIT -> {
 					}
 					case CONTROLLER -> {
@@ -826,26 +1283,42 @@ public final class ServerActionExecutor {
 			} else if (mode == Mode.BREAK && player.level().getBlockState(block).isAir()) {
 				return result(ServerActionState.SUCCEEDED, "BLOCK_BROKEN", "Block broken", now);
 			} else if (mode == Mode.PLACE) {
+				boolean placementOwned = player.isCreative()
+						? placementAttempts > 0
+						: inventoryItemCount(player, placementItemId) == initialPlacementItemCount - 1;
 				BlockPlacementPostcondition.Decision decision = BlockPlacementPostcondition.evaluate(
 						initialBlockId,
-						blockId(player.level().getBlockState(block)),
-						expectedBlockId,
-						elapsed >= timeoutMs
-				);
+						player.level().getBlockState(block),
+						desiredBlockState,
+										placementOwned,
+										elapsed >= timeoutMs,
+										placementAttempts
+								);
+				if (decision == BlockPlacementPostcondition.Decision.ALREADY_SATISFIED) {
+					return result(ServerActionState.SUCCEEDED, "TARGET_ALREADY_SATISFIED", "Requested block was already present", now);
+				}
 				if (decision == BlockPlacementPostcondition.Decision.SUCCEEDED) {
 					return result(ServerActionState.SUCCEEDED, "BLOCK_PLACED", "Block placement confirmed", now);
 				}
 				if (decision == BlockPlacementPostcondition.Decision.CONFLICT) {
-					return result(ServerActionState.FAILED, "PLACEMENT_CONFLICT", "A different block occupied the target", now);
+					return result(ServerActionState.FAILED, "PLACEMENT_CONFLICT", placementFailureMessage(
+							"A different block or state occupied the target"), now);
 				}
-				if (decision == BlockPlacementPostcondition.Decision.TIMED_OUT) {
-					return result(ServerActionState.TIMED_OUT, "PLACEMENT_NOT_CONFIRMED", "Block placement was not confirmed", now);
+				if (decision == BlockPlacementPostcondition.Decision.TIMED_OUT
+						|| decision == BlockPlacementPostcondition.Decision.EXHAUSTED) {
+					return result(ServerActionState.TIMED_OUT, "PLACEMENT_NOT_CONFIRMED", placementFailureMessage(
+							"Block placement was not confirmed"), now);
+				}
+				if (BlockPlacementAttemptPolicy.shouldAttempt(elapsed, placementAttempts)) {
+					immediate.run();
+					placementAttempts += 1;
 				}
 			} else if ((mode == Mode.USE || mode == Mode.WAIT) && elapsed >= timeoutMs) {
 				return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
 			}
 			if (mode == Mode.CONTROLLER) {
-				ServerController.TickResult controllerResult = controller.tick(player, now);
+				ServerController.TickResult controllerResult = requireControllerResult(
+						controller.tick(player, now), lastProgress, controller.getClass().getSimpleName());
 				lastProgress = controllerResult.progress();
 				return switch (controllerResult.state()) {
 					case RUNNING -> null;
@@ -902,6 +1375,20 @@ public final class ServerActionExecutor {
 			return Math.max(0.0D, Math.min(0.99D, (double) elapsed / timeoutMs));
 		}
 
+		private String placementFailureMessage(String prefix) {
+			var currentState = player.level().getBlockState(block);
+			String actual = blockId(currentState) + DesiredBlockState.stableProperties(currentState);
+			Direction face = placementFace(player, block, placementRequestedFace);
+			BlockPos support = face == null ? null : block.relative(face.getOpposite());
+			double distance = Math.sqrt(player.distanceToSqr(Vec3.atCenterOf(block)));
+			return prefix
+					+ "; expected=" + desiredBlockState.blockId() + desiredBlockState.properties()
+					+ ", actual=" + actual
+					+ ", support=" + (support == null ? "none" : support + " face=" + face)
+					+ ", distance=" + String.format(java.util.Locale.ROOT, "%.3f", distance)
+					+ ", itemCount=" + inventoryItemCount(player, placementItemId);
+		}
+
 		void cancel(String reason) {
 			ServerTransactionAdapter.runBestEffort(
 					() -> { if (transaction != null) transaction.cancel(reason); },
@@ -931,5 +1418,21 @@ public final class ServerActionExecutor {
 					now
 			);
 		}
+	}
+
+	static ServerController.TickResult requireControllerResult(
+			ServerController.TickResult result,
+			double lastProgress,
+			String controllerName
+	) {
+		if (result != null) return result;
+		String readable = controllerName == null || controllerName.isBlank()
+				? "Controller" : controllerName.replace("Server", "").replace("Controller", " controller").trim();
+		if (!readable.toLowerCase(java.util.Locale.ROOT).endsWith("controller")) readable += " controller";
+		return ServerController.TickResult.failed(
+				"CONTROLLER_NO_RESULT",
+				readable + " returned no result",
+				Math.max(0.0D, Math.min(1.0D, lastProgress))
+		);
 	}
 }

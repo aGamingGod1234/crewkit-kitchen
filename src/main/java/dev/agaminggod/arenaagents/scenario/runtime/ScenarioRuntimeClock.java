@@ -62,15 +62,11 @@ public final class ScenarioRuntimeClock {
 			return new Update(elapsedTick, Optional.empty(), List.of(), false);
 		}
 		if (session.state() != ScenarioSessionState.RUNNING) {
-			finished = session.state().terminal();
-			return new Update(elapsedTick, Optional.empty(), List.of(), false);
+			boolean finishedNow = session.state().terminal();
+			finished = finishedNow;
+			return new Update(elapsedTick, Optional.empty(), List.of(), finishedNow);
 		}
 		long currentTick = elapsedTick;
-		if (currentTick >= session.config().durationTicks()) {
-			session.finish(currentTick, "Scenario duration elapsed");
-			finished = true;
-			return new Update(currentTick, Optional.empty(), List.of(), true);
-		}
 
 		Optional<ScenarioPhase> enteredPhase = session.phaseAt(currentTick)
 				.filter(phase -> !phase.id().equals(activePhaseId));
@@ -83,7 +79,7 @@ public final class ScenarioRuntimeClock {
 					Optional.empty(),
 					"phase",
 					0.0D,
-					phase.title() + " — " + phase.description(),
+					phase.title() + " | " + phase.description(),
 					Map.of("phaseId", phase.id())
 			);
 		});

@@ -2,7 +2,6 @@ package dev.agaminggod.arenaagents.client.action;
 
 import dev.agaminggod.arenaagents.client.combat.CombatController;
 import dev.agaminggod.arenaagents.client.combat.CombatTarget;
-import dev.agaminggod.arenaagents.client.combat.TargetSelector;
 import dev.agaminggod.arenaagents.client.combat.WeaponCandidate;
 import dev.agaminggod.arenaagents.client.combat.WeaponSelector;
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
@@ -16,20 +15,19 @@ public final class AttackAction implements RunningAction {
 	private static final float AIM_TOLERANCE = 3.0F;
 	private static final double APPROACH_MARGIN = 0.75D;
 
-	private final String selectorText;
+	private final UUID targetId;
 	private final long timeoutMs;
-	private final TargetSelector targetSelector = new TargetSelector();
 	private final WeaponSelector weaponSelector = new WeaponSelector();
 	private final CombatController combatController = new CombatController();
-	private UUID targetId;
 	private GridPosition approachPosition;
 	private MoveToAction approachAction;
 	private boolean weaponSelected;
 
-	public AttackAction(String selectorText, long timeoutMs) {
-		this.selectorText = Objects.requireNonNull(selectorText, "selectorText must not be null");
-		if (selectorText.isBlank()) {
-			throw new ActionCreationException("INVALID_TARGET_SELECTOR", "Target selector must not be blank");
+	public AttackAction(String targetId, long timeoutMs) {
+		try {
+			this.targetId = UUID.fromString(Objects.requireNonNull(targetId, "targetId must not be null"));
+		} catch (IllegalArgumentException exception) {
+			throw new ActionCreationException("INVALID_TARGET_ID", "Target id must be a UUID");
 		}
 		if (timeoutMs <= 0L) {
 			throw new ActionCreationException("INVALID_ATTACK_TIMEOUT", "Attack timeout must be positive");
@@ -45,15 +43,13 @@ public final class AttackAction implements RunningAction {
 	@Override
 	public ActionUpdate tick(ActionContext context, long elapsedMs) {
 		ActionContext.CombatSnapshot snapshot = context.combatSnapshot();
-		Optional<CombatTarget> selected = targetId == null
-				? targetSelector.select(snapshot.targets(), selectorText)
-				: snapshot.targets().stream().filter(target -> target.uuid().equals(targetId)).findFirst();
+		Optional<CombatTarget> selected = snapshot.targets().stream()
+				.filter(target -> target.uuid().equals(targetId)).findFirst();
 		if (selected.isEmpty()) {
 			stopMovement(context);
 			return ActionUpdate.failed("TARGET_GONE", "Selected combat target is unavailable");
 		}
 		CombatTarget target = selected.orElseThrow();
-		targetId = target.uuid();
 		if (!target.alive()) {
 			stopMovement(context);
 			return ActionUpdate.succeeded("TARGET_DEFEATED", "Combat target is no longer alive");

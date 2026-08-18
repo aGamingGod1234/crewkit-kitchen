@@ -1,8 +1,8 @@
 package dev.agaminggod.arenaagents.client.gui.scenario;
 
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.scenario.ScenarioPlacementMode;
 import java.util.List;
-import java.util.Set;
 
 public final class ScenarioSetupStateVerification {
 	private ScenarioSetupStateVerification() {
@@ -12,30 +12,43 @@ public final class ScenarioSetupStateVerification {
 		int assertions = 0;
 
 		ScenarioSetupState state = ScenarioSetupState.defaults();
-		assertEquals(ScenarioWizardStep.MODE, state.step(), "wizard starts at mode");
+		assertEquals(ScenarioWizardStep.ARENA, state.step(), "arena tab starts at preset selection");
 		assertEquals(ScenarioPreset.LAST_VALLEY, state.selectedScenario(), "survival preset is the safe default");
 		assertEquals(1, state.roster().size(), "wizard starts with one agent");
 		assertEquals("GPT 5.6 Sol", state.displayNameAt(0), "default model has a readable name");
 		assertEquals(AgentGameMode.SURVIVAL, state.roster().getFirst().gameMode(), "survival is the default game mode");
 		assertions += 5;
 
-		state.choosePresetWorkflow();
-		assertEquals(ScenarioWizardStep.ARENA, state.step(), "preset workflow advances to arena library");
+		ScenarioSetupState preferred = ScenarioSetupState.defaults("gemini", "gemini-3.1-pro", "low");
+		assertEquals("gemini", preferred.roster().getFirst().provider(),
+				"arena setup inherits the operator's last provider preference");
+		assertEquals("gemini-3.1-pro", preferred.roster().getFirst().model(),
+				"arena setup inherits the operator's last model preference");
+		assertEquals("low", preferred.roster().getFirst().reasoning(),
+				"arena setup inherits the operator's last thinking preference");
+		preferred.showBuildDashboard();
+		assertEquals(ScenarioWizardStep.REVIEW, preferred.step(),
+				"an active server build can reopen directly on its progress dashboard");
+		assertions += 4;
+
 		state.selectScenario(ScenarioPreset.CITADEL_COLLAPSE);
 		assertEquals(2, state.roster().size(), "PvP enforces its two-agent minimum");
 		assertEquals("GPT 5.6 Sol", state.displayNameAt(0), "first duplicate has no suffix");
 		assertEquals("GPT 5.6 Sol (1)", state.displayNameAt(1), "second duplicate starts at one");
-		assertions += 4;
+		assertions += 3;
 
 		state.setAgentCount(4);
 		assertEquals(4, state.roster().size(), "agent count expands exactly");
-		state.setSelectedIndices(Set.of(1, 3));
+		state.selectOnly(1);
 		state.applyProvider("gemini");
-		assertEquals("gemini", state.roster().get(1).provider(), "bulk provider applies to first selection");
-		assertEquals("gemini", state.roster().get(3).provider(), "bulk provider applies to second selection");
-		assertEquals("codex", state.roster().get(0).provider(), "bulk provider leaves unselected rows unchanged");
+		assertEquals("gemini", state.roster().get(1).provider(), "provider applies to the configured agent");
+		assertEquals("codex", state.roster().get(3).provider(), "provider leaves the next agent unchanged");
+		assertEquals("codex", state.roster().get(0).provider(), "provider leaves the previous agent unchanged");
 		assertEquals("gemini-3.1-pro", state.roster().get(1).model(), "provider change selects a valid default model");
 		assertEquals("high", state.roster().get(1).reasoning(), "provider change selects a valid reasoning level");
+		state.selectOnly(2);
+		state.applyReasoning("medium");
+		assertEquals("high", state.roster().get(1).reasoning(), "moving next preserves the previous agent config");
 		assertions += 6;
 
 		state.next();
@@ -46,6 +59,8 @@ public final class ScenarioSetupStateVerification {
 		assertTrue(state.canLaunch(), "valid review can launch");
 		ScenarioLaunchPlan plan = state.launchPlan();
 		assertEquals("citadel-collapse", plan.scenarioId(), "launch plan preserves scenario id");
+		assertEquals(ScenarioPlacementMode.IN_FRONT_OF_PLAYER, plan.placementMode(),
+				"launch defaults to a visible build in front of the operator");
 		assertEquals(4, plan.roster().size(), "launch plan preserves roster count");
 		assertEquals(List.of(1, 2, 3, 4), plan.roster().stream().map(ScenarioLaunchPlan.Agent::slot).toList(),
 				"launch plan uses stable one-based slots");
@@ -58,9 +73,14 @@ public final class ScenarioSetupStateVerification {
 		ScenarioLaunchRegistry.Result result = ScenarioLaunchRegistry.launch(plan);
 		assertTrue(result.accepted(), "registered runtime accepts launch");
 		assertEquals("Queued Citadel Collapse", result.message(), "launch result preserves runtime feedback");
+		assertEquals(plan, ScenarioLaunchRegistry.lastAcceptedPlan().orElseThrow(),
+				"an accepted build remains available when the failed-build screen is reopened");
+		ScenarioSetupState resumed = ScenarioSetupState.fromLaunchPlan(
+				ScenarioLaunchRegistry.lastAcceptedPlan().orElseThrow());
+		assertEquals(plan, resumed.launchPlan(), "retry reconstruction preserves the entire configured roster");
 		ScenarioLaunchRegistry.clear();
 		assertTrue(!ScenarioLaunchRegistry.isAvailable(), "clearing runtime disables launch");
-		assertions += 12;
+		assertions += 15;
 
 		state.previous();
 		assertEquals(ScenarioWizardStep.ROSTER, state.step(), "previous returns to roster");
@@ -72,7 +92,6 @@ public final class ScenarioSetupStateVerification {
 		assertEquals(AgentGameMode.ADVENTURE, state.roster().getFirst().gameMode(),
 				"scenario-required game mode is visibly enforced");
 		state.selectScenario(ScenarioPreset.IMPOSSIBLE_BRIEF);
-		state.selectAll();
 		state.applyGameMode(AgentGameMode.SURVIVAL);
 		assertEquals(AgentGameMode.SURVIVAL, state.roster().getFirst().gameMode(),
 				"configurable building arena accepts survival mode");

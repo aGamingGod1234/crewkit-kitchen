@@ -759,7 +759,7 @@ public final class ActionExecutorVerification {
 				arguments.addProperty("sprint", false);
 			}
 			case ATTACK -> {
-				arguments.addProperty("targetSelector", "nearest_hostile");
+				arguments.addProperty("targetId", "00000000-0000-0000-0000-000000000001");
 				arguments.addProperty("timeoutMs", 1_000L);
 			}
 			case BREAK_BLOCK -> {
