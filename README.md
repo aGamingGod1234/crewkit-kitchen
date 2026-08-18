@@ -83,18 +83,24 @@ Arena setup defaults to building 80 blocks in front of the operator so construct
 
 ## Visual release validation
 
-The current offline-player release is covered by the headless Java/Fabric and coordinator verification suites. Live Minecraft gameplay and provider-latency acceptance remain pending; headless checks do not establish live success.
+The current offline-player release is covered by the headless Java/Fabric and coordinator verification suites. The opt-in real-provider matrix below adds live Fabric-server, provider-turn, action-result, and program-completion verification without opening a Minecraft client.
 
 ## Real-provider headless matrix checks
 
-The real-provider runner is opt-in. Before running it, prepare the isolated Fabric server template, build the mod, and log in to the provider CLI that owns the selected profile. Codex requires an authenticated local `codex` session; Gemini requires a usable `agy` account and installed model; Kimi requires a usable `kimi` ACP account and installed model. The runner uses those existing local logins and reads only the generated Minecraft RCON password file. It never reads provider credentials.
+The real-provider runner is opt-in. First materialize the ignored runnable server from the tracked `server-template/` skeleton. The materializer verifies pinned Fabric downloads, builds the mod, and requires explicit Minecraft EULA acceptance:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-headless-server-template.ps1 -AcceptMinecraftEula
+```
+
+Then log in to the provider CLI that owns the selected profile. Codex requires an authenticated local `codex` session; Gemini requires a usable `agy` account and installed model; Kimi requires a usable `kimi` ACP account and installed model. The runner uses those existing local logins and reads only the generated Minecraft RCON password file. It never reads provider credentials. Minecraft/Fabric binaries, generated EULA state, worlds, logs, and credentials remain ignored under `runtime/`; only the source skeleton and pinned materializer belong in Git.
 
 These checks start Minecraft and a coordinator, consume provider turns, and can take several minutes or incur provider usage costs. Run them only when that cost and latency are acceptable. They are separate from the fast, provider-free offline test suite and do not replace `npm test`.
 
 Run one Codex scenario from the repository root:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-headless-provider-matrix.ps1 -ProjectRoot (Get-Location) -MatrixPath .\coordinator\config\headless-provider-matrix.json -ScenarioId codex-chat-completion
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-headless-provider-matrix.ps1 -ProjectRoot (Get-Location) -MatrixPath .\coordinator\config\headless-provider-matrix.json -ScenarioId codex-movement-chat
 ```
 
 Run every configured scenario sequentially:
@@ -109,7 +115,7 @@ The lower-level coordinator command is also available through `npm run headless:
 npm --prefix .\coordinator run headless:matrix -- --config <absolute-matrix.json> --scenario codex-chat-completion --run-directory <absolute-run-directory> --rcon-host 127.0.0.1 --rcon-port <rcon-port> --rcon-password-file <absolute-rcon-password-file> --protocol-audit <absolute-protocol.jsonl> --provider-turns <absolute-provider-turns.jsonl>
 ```
 
-The command prints the matrix report path and one summary line per scenario. Reports are written under `runtime/headless-runs/<run-id>/`, with `matrix-report.json` at the run root and an individual `report.json` plus bounded traces under each scenario directory. The direct runner accepts at most 16 selected scenarios and rejects matrix reports larger than 262,144 bytes. When supplied, `--provider-turns` points at the private provider-turn recorder artifact; the runner reads only its bounded row metadata and reports the artifact path, never raw provider text. A provider that is unavailable is reported as `SKIPPED` and returns exit code 0 when optional; `--require-all` classifies that same skip as `FAILED` and returns exit code 1. Provider, bridge, assertion, timeout, and cleanup failures always return a nonzero exit code. Do not paste RCON passwords or provider output into issue reports.
+Each scenario builds a small temporary stone platform in its isolated world, asks the selected real model to author the task program, and evaluates Minecraft-produced evidence. Action assertions can require a terminal `resultState`, so dispatching an action that later fails cannot produce a false pass. The command prints the matrix report path and one summary line per scenario. Reports are written under `runtime/headless-runs/<run-id>/`, with `matrix-report.json` at the run root and bounded reports under each scenario directory. Generated servers, credentials, private provider turns, and detailed traces are removed after every run unless `-KeepArtifacts` is explicitly supplied. The direct runner accepts at most 16 selected scenarios and rejects matrix reports larger than 262,144 bytes. When supplied, `--provider-turns` points at the private provider-turn recorder artifact; the runner reads only its bounded row metadata and reports the artifact path, never raw provider text. A provider that is unavailable is reported as `SKIPPED` and returns exit code 0 when optional; `--require-all` classifies that same skip as `FAILED` and returns exit code 1. Provider, bridge, assertion, timeout, and cleanup failures always return a nonzero exit code. Do not paste RCON passwords or provider output into issue reports.
 
 ## Current action surface
 

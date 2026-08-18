@@ -13,7 +13,7 @@ const scenario = (overrides = {}) => normalizeHeadlessScenario({
 	assert: [
 		{ type: 'lifecycle', state: 'COMPLETED' },
 		{ type: 'chat', message: 'HEADLESS_PASS' },
-		{ type: 'action', actionType: 'move', args: { x: 1 } },
+		{ type: 'action', actionType: 'move', args: { x: 1 }, resultState: 'SUCCEEDED' },
 		{ type: 'program', event: 'program_finished', status: 'COMPLETED' },
 		{ type: 'rcon', command: 'data get entity @s Pos', match: '1.0' },
 	],
@@ -27,12 +27,11 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	let statusReads = 0;
 	let clock = 100;
 	let recorderClosed = 0;
-	const audit = { rows: [
-		{ direction: 'coordinator_to_server', type: 'action_command', agentId: 'runner-case-agent', payload: { actionType: 'move', arguments: { x: 1, y: 0, z: 0 } } },
-	] };
 	const files = new Map([
 		['coordinator.jsonl', jsonl([
-			{ event: 'chat', message: 'HEADLESS_PASS' },
+			{ event: 'program_step', actionType: 'move', arguments: { x: 1, y: 0, z: 0 }, result: { state: 'SUCCEEDED', reasonCode: 'DONE' } },
+			{ event: 'program_step', actionType: 'chat', arguments: { message: 'HEADLESS_PASS' }, result: null },
+			{ event: 'program_step', actionType: 'chat', arguments: { message: 'HEADLESS_PASS' }, result: { state: 'SUCCEEDED', reasonCode: 'DONE' } },
 			{ event: 'program_finished', status: 'COMPLETED' },
 		])],
 		['server.log', 'agent chat: HEADLESS_PASS\n'],
@@ -40,6 +39,8 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	const rcon = {
 		command: async (command) => {
 			commands.push(command);
+			if (command.includes('forceload ')) return { text: 'OK' };
+			if (command.includes(' run fill ')) return { text: 'Successfully filled blocks' };
 			if (command.includes('codex summon-configured ')) return { text: 'Created runner-case-agent. It is ready for a task.' };
 			if (command.startsWith('codex start ')) return { text: 'Goal started.' };
 			if (command.startsWith('codex status ')) return { text: statusReads++ === 0 ? 'state=RUNNING' : 'state=COMPLETED' };
@@ -51,20 +52,54 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	const report = await runHeadlessScenario({
 		scenario: scenario(), runDirectory: 'C:/runs/runner-case', rcon,
 		now: () => ++clock, readFile: async (file) => files.get(String(file).split(/[\\/]/).pop()) ?? '',
-		protocolAudit: audit, providerTurnRecorder: { record: async () => { throw new Error('must not be called'); }, close: async () => { recorderClosed += 1; } },
+		providerTurnRecorder: { record: async () => { throw new Error('must not be called'); }, close: async () => { recorderClosed += 1; } },
 		poll: async () => {},
 	});
 
 	assert.equal(report.status, 'PASSED');
 	assert.equal(report.classification, 'PASSED');
-	assert.match(commands[0], /^execute positioned 0 64 0 run codex summon-configured codex gpt-5\.6-sol high priority survival headless_runner_case_/);
-	assert.match(commands[1], /^codex start headless_runner_case_[^ ]+ Do the bounded task$/);
-	assert.match(commands[2], /^codex status headless_runner_case_[^ ]+$/);
+	assert.equal(commands[0], 'execute in minecraft:overworld run forceload add 0 0');
+	assert.equal(commands[1], 'execute in minecraft:overworld run fill -8 200 -8 8 200 8 minecraft:stone');
+	assert.equal(commands[2], 'execute in minecraft:overworld run fill -8 201 -8 8 204 8 minecraft:air');
+	assert.match(commands[3], /^execute in minecraft:overworld positioned 0.5 201 0.5 run codex summon-configured codex gpt-5\.6-sol high priority survival headless_runner_case_/);
+	assert.equal(commands[4], 'execute in minecraft:overworld run forceload remove 0 0');
+	assert.match(commands[5], /^codex start headless_runner_case_[^ ]+ Do the bounded task$/);
+	assert.match(commands[6], /^codex status headless_runner_case_[^ ]+$/);
 	assert.equal(commands.at(-1), 'data get entity @s Pos');
 	assert.equal(commands.some((command) => command.includes('action_result')), false);
 	assert.equal(recorderClosed, 1);
 	assert.equal(report.assertions.every((result) => result.passed), true);
+	assert.deepEqual(report.assertions.find((result) => result.type === 'chat').actual, ['HEADLESS_PASS']);
 	assert.ok(report.evidence.paths.protocol);
+});
+
+test('releases the temporary spawn chunk when summon fails', async () => {
+	const commands = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }),
+		runDirectory: 'C:/runs/summon-failure',
+		rcon: {
+			command: async (command) => {
+				commands.push(command);
+				return { text: command.includes('summon-configured') ? 'ERROR: summon failed' : 'ok' };
+			},
+			close: async () => {},
+		},
+		now: () => 1,
+		readFile: async () => '',
+		poll: async () => {},
+		writeFile: async () => {},
+	});
+	assert.equal(report.classification, 'ERROR');
+	assert.deepEqual(commands.slice(0, 5), [
+		'execute in minecraft:overworld run forceload add 0 0',
+		'execute in minecraft:overworld run fill -8 200 -8 8 200 8 minecraft:stone',
+		'execute in minecraft:overworld run fill -8 201 -8 8 204 8 minecraft:air',
+		commands[3],
+		'execute in minecraft:overworld run forceload remove 0 0',
+	]);
+	assert.match(commands[3], /summon-configured/);
+	assert.equal(commands.some((command) => command.startsWith('codex start ')), false);
 });
 
 test('parses the exact Java codex status lifecycle strings', async () => {
@@ -173,12 +208,12 @@ test('evaluates exact chat, action arguments, program, lifecycle, and read-only 
 	const result = evaluateHeadlessAssertions([
 		{ type: 'lifecycle', state: 'COMPLETED' },
 		{ type: 'chat', message: 'hello' },
-		{ type: 'action', actionType: 'place_block', args: { x: 2, face: 'up' } },
+		{ type: 'action', actionType: 'place_block', args: { x: 2, face: 'up' }, resultState: 'SUCCEEDED' },
 		{ type: 'program', event: 'program_finished', status: 'COMPLETED' },
 		{ type: 'rcon', command: 'list', match: 'There are 1' },
 	], {
 		lifecycle: 'COMPLETED', chats: ['hello'],
-		actions: [{ actionType: 'place_block', arguments: { x: 2, face: 'up', extra: true } }],
+		actions: [{ actionType: 'place_block', arguments: { x: 2, face: 'up', extra: true }, result: { state: 'SUCCEEDED' } }],
 		program: [{ event: 'program_finished', status: 'COMPLETED' }],
 		rcon: [{ command: 'list', text: 'There are 1 of a max of 20 players online' }],
 	});

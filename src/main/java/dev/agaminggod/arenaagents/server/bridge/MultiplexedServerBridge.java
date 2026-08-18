@@ -101,7 +101,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private volatile boolean catalogLoaded;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
-		this(manager, DEFAULT_PORT, configuredSecretPath());
+		this(manager, configuredPort(), configuredSecretPath());
 	}
 
 	public MultiplexedServerBridge(CodexAgentManager manager, int port, Path secretPath) {
@@ -935,6 +935,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		String configured = System.getProperty("arenaagents.bridgeSecretFile");
 		if (configured == null || configured.isBlank()) configured = System.getenv("ARENA_AGENT_BRIDGE_SECRET_FILE");
 		return configured == null || configured.isBlank() ? Paths.get("runtime", "bridge-secret.txt") : Paths.get(configured);
+	}
+
+	static int configuredPort() {
+		String configured = System.getProperty("arenaagents.bridgePort");
+		if (configured == null || configured.isBlank()) return DEFAULT_PORT;
+		final int parsed;
+		try {
+			parsed = Integer.parseInt(configured);
+		} catch (NumberFormatException exception) {
+			throw new IllegalArgumentException("arenaagents.bridgePort must be an integer from 1 to 65535", exception);
+		}
+		if (parsed < 1 || parsed > 65_535) {
+			throw new IllegalArgumentException("arenaagents.bridgePort must be an integer from 1 to 65535");
+		}
+		return parsed;
 	}
 
 	private static String readSecret(Path path) {

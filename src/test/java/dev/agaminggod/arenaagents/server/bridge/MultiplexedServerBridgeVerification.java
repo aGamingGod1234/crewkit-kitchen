@@ -24,6 +24,16 @@ public final class MultiplexedServerBridgeVerification {
 	}
 
 	public static int verify() {
+		String previousBridgePort = System.getProperty("arenaagents.bridgePort");
+		try {
+			System.setProperty("arenaagents.bridgePort", "25571");
+			assertEquals(25_571, MultiplexedServerBridge.configuredPort(), "headless bridge port property");
+			System.setProperty("arenaagents.bridgePort", "70000");
+			assertThrows(IllegalArgumentException.class, MultiplexedServerBridge::configuredPort, "out-of-range bridge port property");
+		} finally {
+			if (previousBridgePort == null) System.clearProperty("arenaagents.bridgePort");
+			else System.setProperty("arenaagents.bridgePort", previousBridgePort);
+		}
 		List<AgentRecord> registered = new ArrayList<>();
 		for (int index = 0; index <= AgentConstants.DEFAULT_AGENT_LIMIT; index++) {
 			registered.add(AgentRecord.create(
@@ -74,7 +84,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyRealBridgeSessionLifecycle();
-		return 35;
+		return 37;
 	}
 
 	private static void verifyDeathFacts() {

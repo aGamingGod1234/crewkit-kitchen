@@ -155,6 +155,7 @@ public final class FakeServer {
         try (socket; BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8)); OutputStream output = socket.getOutputStream()) {
             String hello = reader.readLine();
             if (hello == null) return;
+            if ("1".equals(System.getenv("ARENA_HEADLESS_FAKE_NO_HELLO_ACK"))) return;
             Matcher messageId = Pattern.compile("\\\"messageId\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"").matcher(hello);
             if (!messageId.find()) return;
             String response = "{\"protocolVersion\":2,\"serverInstanceId\":\"fake-server\",\"agentId\":\"server\",\"type\":\"hello_ack\",\"messageId\":\"fake-ack\",\"payload\":{\"replyTo\":\"" + messageId.group(1) + "\",\"authenticated\":true,\"registry\":[]}}\n";
@@ -171,12 +172,21 @@ public final class FakeServer {
         int serverPort = Integer.parseInt(properties.getProperty("server-port"));
         int rconPort = Integer.parseInt(properties.getProperty("rcon.port"));
         int bridgePort = bridgePort();
+        if (!Integer.toString(bridgePort).equals(System.getProperty("arenaagents.bridgePort"))) {
+            throw new IOException("headless bridge port JVM property did not match coordinator config");
+        }
+        if (!"false".equals(System.getProperty("arenaagents.coordinatorAutoStart"))) {
+            throw new IOException("headless coordinator auto-start was not disabled");
+        }
         AtomicBoolean running = new AtomicBoolean(true);
         ServerSocket minecraft = new ServerSocket(serverPort, 16, InetAddress.getLoopbackAddress());
         ServerSocket rcon = new ServerSocket(rconPort, 16, InetAddress.getLoopbackAddress());
         ServerSocket bridge = new ServerSocket(bridgePort, 16, InetAddress.getLoopbackAddress());
         Files.createDirectories(Path.of("logs"));
-        Files.writeString(Path.of("logs", "latest.log"), "Done (0.1s)!\n", StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        Files.createDirectories(Path.of(properties.getProperty("level-name"), "dimensions", "minecraft", "overworld", "data", "arenaagents"));
+        OutputStream latestLog = Files.newOutputStream(Path.of("logs", "latest.log"), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        latestLog.write("Done (0.1s)!\n".getBytes(StandardCharsets.UTF_8));
+        latestLog.flush();
         new ProcessBuilder("powershell.exe", "-NoProfile", "-Command", "Start-Sleep -Seconds 3").inheritIO().start();
         Thread acceptor = new Thread(() -> {
             while (running.get()) {
@@ -205,6 +215,7 @@ public final class FakeServer {
         stopReader.setDaemon(true);
         stopReader.start();
         while (running.get()) Thread.sleep(100L);
+        latestLog.close();
     }
 }
 '@ | Set-Content -LiteralPath $source -NoNewline
@@ -306,6 +317,10 @@ try {
 	}
 
 	Enable-FakeServer $fixture
+	Set-TestEnvironment 'ARENA_HEADLESS_FAKE_NO_HELLO_ACK' '1'
+	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Coordinator bridge did not become ready'
+	Set-TestEnvironment 'ARENA_HEADLESS_FAKE_NO_HELLO_ACK' $null
+	Write-Output 'PASS open bridge port without authenticated handshake is not ready'
 	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '5'
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'ready|timed out|failed|required'
 	if (-not (Test-PortClosed 39165) -or -not (Test-PortClosed 39166) -or -not (Test-PortClosed 39167)) { throw 'Allocated ports remained open after timeout cleanup' }
@@ -345,15 +360,20 @@ try {
 	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39169'
 	Set-TestEnvironment 'ARENA_HEADLESS_BRIDGE_PORT' '39170'
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') -KeepArtifacts } 'ready|timed out|failed|required'
-	$keptMatrixReport = Get-ChildItem -LiteralPath $runRoot -Recurse -Filter matrix-report.json | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-	$keptScenarioReport = Get-ChildItem -LiteralPath $runRoot -Recurse -Filter report.json | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+	$keptRunDirectory = Get-ChildItem -LiteralPath $runRoot -Directory | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+	$keptMatrixReport = Get-Item -LiteralPath (Join-Path $keptRunDirectory.FullName 'matrix-report.json')
+	$keptScenarioReport = Get-ChildItem -LiteralPath $keptRunDirectory.FullName -Directory | ForEach-Object { Get-Item -LiteralPath (Join-Path $_.FullName 'report.json') -ErrorAction SilentlyContinue } | Select-Object -First 1
 	$keptScenarioDirectory = Split-Path -Parent $keptScenarioReport.FullName
 	if (-not (Test-Path -LiteralPath (Join-Path $keptScenarioDirectory 'rcon-password.txt'))) { throw 'KeepArtifacts did not retain the RCON credential artifact' }
+	if (-not (Test-Path -LiteralPath (Join-Path $keptScenarioDirectory 'coordinator.jsonl'))) { throw 'KeepArtifacts did not retain the coordinator evidence trace at the runner path' }
 	$properties = Get-Content -Raw -LiteralPath (Join-Path $keptScenarioDirectory 'server\server.properties')
 	if ($properties -notmatch '(?m)^rcon\.ip=127\.0\.0\.1\r?$') { throw "RCON loopback binding was not configured: $properties" }
 	Write-Output 'PASS matrix report forwarding, cleanup retention, KeepArtifacts, and loopback RCON'
-	$copiedWorlds = @(Get-ChildItem -LiteralPath $runRoot -Recurse -Directory -Filter world -ErrorAction SilentlyContinue)
-	if ($copiedWorlds.Count -gt 0) { throw 'Server template world was copied into a scenario' }
+	foreach ($runDirectory in @(Get-ChildItem -LiteralPath $runRoot -Directory)) {
+		foreach ($scenarioDirectory in @(Get-ChildItem -LiteralPath $runDirectory.FullName -Directory)) {
+			if (Test-Path -LiteralPath (Join-Path $scenarioDirectory.FullName 'server\world')) { throw 'Server template world was copied into a scenario' }
+		}
+	}
 
 	$dummyScript = Join-Path $project 'dummy-child-tree.ps1'
 	Set-Content -LiteralPath $dummyScript -Value "Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30'`nStart-Sleep -Seconds 30" -NoNewline
@@ -373,8 +393,9 @@ try {
 	}
 	Write-Output 'PASS timeout cleanup, port verification, child-tree cleanup, and provider isolation hooks'
 } finally {
-	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS','ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS','ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS')) { Set-TestEnvironment $name $null }
+	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_FAKE_NO_HELLO_ACK','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS','ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS','ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS')) { Set-TestEnvironment $name $null }
 	if (Test-Path -LiteralPath $project) {
-		Remove-Item -LiteralPath $project -Recurse -Force
+		$extendedProject = if ($project.StartsWith('\\')) { '\\?\UNC\' + $project.Substring(2) } else { '\\?\' + [IO.Path]::GetFullPath($project) }
+		[IO.Directory]::Delete($extendedProject, $true)
 	}
 }

@@ -35,7 +35,7 @@ test('supports every bounded assertion shape and rejects unknown keys', () => {
 	const assertions = [
 		{ type: 'lifecycle', state: 'ERROR' },
 		{ type: 'chat', message: 'marker' },
-		{ type: 'action', actionType: 'move', args: { x: 1 } },
+		{ type: 'action', actionType: 'move', args: { x: 1 }, resultState: 'SUCCEEDED' },
 		{ type: 'program', event: 'program_finished', status: 'COMPLETED' },
 		{ type: 'rcon', command: 'data get entity @s Pos', match: '1.0' },
 	];

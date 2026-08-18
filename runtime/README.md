@@ -4,9 +4,11 @@ Everything generated beneath `runtime/` is local evidence or executable state an
 
 ## Directories
 
-- `server/`: Fabric 0.19.3 online-mode server and verified copy of `New World (76)`.
+- `server-template/`: reproducible runnable Fabric server generated from the tracked `server-template/` skeleton by `scripts/prepare-headless-server-template.ps1`; binaries, EULA state, and generated libraries stay ignored.
+- `headless-runs/`: isolated per-run server copies, bounded reports, and optionally retained private diagnostics from the real-provider matrix.
+- `server/`: legacy interactive Fabric server state.
 - `server-offline-smoke/`: optional, clearly labeled offline smoke server; never authenticated evidence.
-- `downloads/`: SHA-256-verified Fabric installer.
+- `downloads/`: cached SHA-256-verified Fabric installer and Fabric API downloads used by the materializer.
 - `evidence/`: world-copy, build, log, screenshot, and live-test summaries with credentials excluded.
 - `agent55/traces/agent-55.jsonl` and `agent56/traces/agent-56.jsonl`: separate append-only coordinator traces.
 - `bridge-secret.txt`: generated local bridge secret shared by the summonable-NPC server and dynamic coordinator; ignored by Git.

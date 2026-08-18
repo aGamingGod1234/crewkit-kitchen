@@ -24,7 +24,9 @@
       "timeoutMs": 180000,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
-        { "type": "chat", "message": "HEADLESS_MOVE_PASS" }
+        { "type": "chat", "message": "HEADLESS_MOVE_PASS" },
+        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
+        { "type": "program", "event": "program_finished", "status": "FINISHED" }
       ]
     }
   ]

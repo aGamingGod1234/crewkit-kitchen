@@ -21,11 +21,12 @@ const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'se
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
 	chat: new Set(['type', 'message']),
-	action: new Set(['type', 'actionType', 'args']),
+	action: new Set(['type', 'actionType', 'args', 'resultState']),
 	program: new Set(['type', 'event', 'status']),
 	rcon: new Set(['type', 'command', 'match']),
 };
 const LIFECYCLE_STATES = new Set(['COMPLETED', 'ERROR', 'DEAD']);
+const ACTION_RESULT_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 
 function freeze(value) {
 	if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -61,6 +62,10 @@ function normalizeAssertion(value, index) {
 	} else if (type === 'chat') result.message = text(value.message, `${field}.message`);
 	else if (type === 'action') {
 		result.actionType = text(value.actionType, `${field}.actionType`);
+		if (value.resultState !== undefined) {
+			result.resultState = text(value.resultState, `${field}.resultState`).toUpperCase();
+			if (!ACTION_RESULT_STATES.has(result.resultState)) throw new TypeError(`${field}.resultState is unsupported`);
+		}
 		if (value.args !== undefined) {
 			if (!value.args || typeof value.args !== 'object' || Array.isArray(value.args)) throw new TypeError(`${field}.args must be an object`);
 			result.args = structuredClone(value.args);
@@ -193,7 +198,18 @@ export async function runHeadlessScenario({
 		return { result, text: textValue };
 	};
 	try {
-		const summon = await command(`execute positioned 0 64 0 run codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} survival ${generatedName}`);
+		await command('execute in minecraft:overworld run forceload add 0 0');
+		let summon;
+		try {
+			const floor = await command('execute in minecraft:overworld run fill -8 200 -8 8 200 8 minecraft:stone');
+			if (isFailedResponse(floor.text)) throw new Error('Could not prepare the headless arena floor');
+			const clearance = await command('execute in minecraft:overworld run fill -8 201 -8 8 204 8 minecraft:air');
+			if (isFailedResponse(clearance.text)) throw new Error('Could not clear the headless arena spawn');
+			summon = await command(`execute in minecraft:overworld positioned 0.5 201 0.5 run codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} survival ${generatedName}`);
+		} finally {
+			const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
+			await command('execute in minecraft:overworld run forceload remove 0 0', { deadlineMs: cleanupDeadline });
+		}
 		if (isSkippedResponse(summon.text)) classification = 'SKIPPED_PROFILE';
 		if (classification === null && isFailedResponse(summon.text)) {
 			classification = 'ERROR';
@@ -404,7 +420,9 @@ function evaluateAssertion(assertion, evidence, index) {
 	else if (type === 'chat') { actual = evidence.chats ?? []; passed = actual.includes(assertion.message); }
 	else if (type === 'action') {
 		actual = evidence.actions ?? [];
-		passed = actual.some((entry) => entry?.actionType === assertion.actionType && (assertion.args === undefined || objectSubset(assertion.args, entry.arguments ?? entry.args ?? {})));
+		passed = actual.some((entry) => entry?.actionType === assertion.actionType
+			&& (assertion.args === undefined || objectSubset(assertion.args, entry.arguments ?? entry.args ?? {}))
+			&& (assertion.resultState === undefined || entry.result?.state === assertion.resultState));
 	}
 	else if (type === 'program') {
 		actual = evidence.program ?? [];
@@ -427,13 +445,17 @@ function objectSubset(expected, actual) {
 function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRows = [], serverLog = '', rcon = [] }) {
 	const rows = [...protocolRows, ...auditRows(protocolAudit)];
 	const normalizedRows = rows.map(unwrapAuditRow).filter(Boolean);
-	const actions = normalizedRows.filter((row) => row.type === 'action_command').map((row) => row.payload ?? row);
-	const chats = [
+	const actions = [
+		...normalizedRows.filter((row) => row.type === 'action_command').map((row) => row.payload ?? row),
+		...traceRows.filter((row) => row.event === 'program_step' && typeof row.actionType === 'string')
+			.map((row) => ({ actionType: row.actionType, arguments: row.arguments ?? {}, result: row.result ?? null })),
+	];
+	const chats = [...new Set([
 		...traceRows.filter((row) => row.event === 'chat').map((row) => row.message ?? row.text),
 		...normalizedRows.filter((row) => row.type === 'chat').map((row) => row.payload?.message ?? row.message),
 		...actions.filter((row) => row.actionType === 'chat').map((row) => row.arguments?.message ?? row.args?.message),
 		...extractChatMarkers(serverLog),
-	].filter((value) => typeof value === 'string');
+	].filter((value) => typeof value === 'string'))];
 	const program = traceRows.filter((row) => typeof row.event === 'string' && row.event.startsWith('program_'));
 	program.push(...normalizedRows.filter((row) => typeof row.type === 'string' && row.type.startsWith('program_')).map((row) => ({ event: row.type, ...(row.payload ?? {}) })));
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
@@ -480,7 +502,7 @@ async function readEvidence(directory, readFile, tailReader, protocolAudit, prov
 
 function evidenceSummary(directory, fileEvidence, protocolAudit) {
 	const paths = fileEvidence.paths ?? { protocol: path.join(directory, 'protocol.jsonl'), coordinator: path.join(directory, 'coordinator.jsonl'), server: path.join(directory, 'server.log') };
-	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: auditRows(protocolAudit).length, providerTurnsRows: fileEvidence.providerTurnsRows ?? 0 };
+	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: fileEvidence.protocolRows?.length ?? auditRows(protocolAudit).length, providerTurnsRows: fileEvidence.providerTurnsRows ?? 0 };
 }
 
 async function readBoundedTail(readTail, file) {

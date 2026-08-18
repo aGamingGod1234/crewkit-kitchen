@@ -41,12 +41,27 @@ function Quote-Argument([string] $Value) {
 
 function Read-Text([string] $Path) {
 	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
-	return [IO.File]::ReadAllText($Path)
+	try {
+		$share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+		$stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, $share)
+		try {
+			$reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true, 4096, $true)
+			try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+		} finally {
+			$stream.Dispose()
+		}
+	} catch [IO.IOException] {
+		return ''
+	}
 }
 
 function Test-BindFailure([string] $ServerLogPath, [string] $ServerStderrPath) {
 	$text = "$(Read-Text $ServerLogPath)`n$(Read-Text $ServerStderrPath)"
 	return $text -match '(?i)(address already in use|failed to bind|could not bind|bind.+failed|port.+already)'
+}
+
+function Test-CoordinatorHandshake([string] $ProtocolAuditPath) {
+	return (Read-Text $ProtocolAuditPath) -match '"direction"\s*:\s*"server_to_coordinator"[^\r\n]*"type"\s*:\s*"hello_ack"'
 }
 
 function Protect-LocalFile([string] $Path) {
@@ -272,18 +287,24 @@ function Set-ServerProperties([string] $Path, [hashtable] $Values) {
 }
 
 function Remove-ScenarioArtifacts([string] $ScenarioDirectory) {
-	foreach ($relativePath in @('server', 'provider-workspaces', 'traces', 'logs', 'rcon-password.txt', 'coordinator-config.json', 'protocol.jsonl', 'provider-turns.private.jsonl')) {
+	foreach ($relativePath in @('server', 'provider-workspaces', 'traces', 'logs', 'rcon-password.txt', 'coordinator-config.json', 'coordinator.jsonl', 'protocol.jsonl', 'provider-turns.private.jsonl')) {
 		$target = Join-Path $ScenarioDirectory $relativePath
 		if (-not (Test-Path -LiteralPath $target)) { continue }
+		$extendedTarget = if ($target.StartsWith('\\')) { '\\?\UNC\' + $target.Substring(2) } else { '\\?\' + [IO.Path]::GetFullPath($target) }
 		$deadline = [DateTime]::UtcNow.AddSeconds($CleanupTimeoutSeconds)
 		$lastError = $null
 		do {
 			try {
-				Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+				if ([IO.Directory]::Exists($extendedTarget)) {
+					[IO.Directory]::Delete($extendedTarget, $true)
+				} elseif ([IO.File]::Exists($extendedTarget)) {
+					[IO.File]::Delete($extendedTarget)
+				}
 				$lastError = $null
 				break
 			} catch {
 				$lastError = $_
+				if (-not (Test-Path -LiteralPath $target)) { $lastError = $null; break }
 				if ([DateTime]::UtcNow -ge $deadline) { throw "Could not remove generated artifact '$target': $($_.Exception.Message)" }
 				Start-Sleep -Milliseconds 100
 			}
@@ -436,6 +457,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$serverLog = Join-Path $serverDirectory 'logs\latest.log'
 	$protocolAudit = Join-Path $scenarioDirectory 'protocol.jsonl'
 	$providerTurns = Join-Path $scenarioDirectory 'provider-turns.private.jsonl'
+	$coordinatorTrace = Join-Path $scenarioDirectory 'coordinator.jsonl'
+	[IO.File]::WriteAllText($coordinatorTrace, '', [Text.UTF8Encoding]::new($false))
 	$coordinatorConfig = Join-Path $scenarioDirectory 'coordinator-config.json'
 	$sourceConfig = Join-Path $Project 'coordinator\config\dynamic-agents.json'
 	if (-not (Test-Path -LiteralPath $sourceConfig -PathType Leaf)) { throw "Missing coordinator config: $sourceConfig" }
@@ -480,13 +503,13 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$cleanupFailure = $null
 	$processIds = [System.Collections.Generic.List[int]]::new()
 	try {
-		$serverArgs = "-Darenaagents.bridgeSecretFile=$(Quote-Argument $secretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
 		$serverStdoutPath = Join-Path $logsDirectory 'fabric.stdout.log'
 		$serverStderrPath = Join-Path $logsDirectory 'fabric.stderr.log'
 		$serverAttempt = 0
 		$serverReady = $false
 		while (-not $serverReady) {
 			$serverAttempt += 1
+			$serverArgs = "-Darenaagents.bridgePort=$bridgePort -Darenaagents.coordinatorAutoStart=false -Darenaagents.bridgeSecretFile=$(Quote-Argument $secretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
 			$serverHandle = Start-RedirectedProcess $Java $serverArgs $serverDirectory $serverStdoutPath $serverStderrPath @{}
 			try {
 				Wait-Condition { (Test-Port $serverPort) -and ((Read-Text $serverLog).Contains('Done (')) } $StartupTimeoutSeconds 'Fabric server did not become ready'
@@ -521,14 +544,14 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			$coordinatorAttempt += 1
 			$coordinatorEnvironment = @{
 				ARENA_AGENT_BRIDGE_SECRET = $secret; ARENA_HEADLESS_RUN_ID = [IO.Path]::GetFileName($RunDirectory); ARENA_HEADLESS_SCENARIO_ID = $scenarioId
-				ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns; ARENA_HEADLESS_TRACE_PATH = (Join-Path $traceDirectory 'coordinator.jsonl')
+				ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns; ARENA_HEADLESS_TRACE_PATH = $coordinatorTrace
 				ARENA_HEADLESS_BRIDGE_PORT = $bridgePort; ARENA_HEADLESS_RCON_PORT = $rconPort; ARENA_HEADLESS_MINECRAFT_PORT = $serverPort
 			}
 			$coordinatorHandle = Start-RedirectedProcess $Node $coordinatorArgs (Join-Path $Project 'coordinator') $coordinatorStdoutPath $coordinatorStderrPath $coordinatorEnvironment
 			try {
 				Wait-Condition {
 					if ($coordinatorHandle.Process.HasExited) { throw "Coordinator exited before bridge readiness: $(ConvertTo-BoundedText (Read-Text $coordinatorStderrPath) $MaxDiagnosticText)" }
-					Test-Port $bridgePort
+					(Test-Port $bridgePort) -and (Test-CoordinatorHandshake $protocolAudit)
 				} $StartupTimeoutSeconds 'Coordinator bridge did not become ready'
 				$coordinatorReady = $true
 			} catch {
@@ -550,6 +573,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				}
 				Protect-LocalFile $propertiesPath
 				New-ScenarioConfig $sourceConfig $coordinatorConfig $bridgePort $providerWorkspace
+				$serverArgs = "-Darenaagents.bridgePort=$bridgePort -Darenaagents.coordinatorAutoStart=false -Darenaagents.bridgeSecretFile=$(Quote-Argument $secretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
 				$serverHandle = Start-RedirectedProcess $Java $serverArgs $serverDirectory $serverStdoutPath $serverStderrPath @{}
 				Wait-Condition { (Test-Port $serverPort) -and ((Read-Text $serverLog).Contains('Done (')) } $StartupTimeoutSeconds 'Fabric server did not become ready after coordinator bind retry'
 				Wait-Condition { Test-Port $rconPort } $StartupTimeoutSeconds 'RCON did not become ready after coordinator bind retry'
