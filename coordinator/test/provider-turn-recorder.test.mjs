@@ -14,7 +14,7 @@ test('records bounded redacted private turns and hash/excerpt-only public rows',
 	await recorder.record({
 		provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', goalRevision: 4, attempt: 2, retry: true,
 		input: 'prompt authorization: Bearer abc123 token=secret-token password=hunter2 SECRET_SHAPED=supersecret ' + '🙂'.repeat(100_000),
-		output: '{"directive":"finish"}',
+		output: '{"directive":"finish"}' + '漢'.repeat(40_000),
 	});
 	await recorder.close();
 
@@ -31,8 +31,10 @@ test('records bounded redacted private turns and hash/excerpt-only public rows',
 	assert.equal(privateRow.retry, true);
 	assert.equal(privateRow.outcome, 'success');
 	assert.equal(privateRow.timestamp, 1234);
-	assert.equal(privateRow.output, '{"directive":"finish"}');
+	assert.match(privateRow.output, /^\{"directive":"finish"\}/);
 	assert.ok(Buffer.byteLength(JSON.stringify(privateRow), 'utf8') <= 262_144);
+	assert.ok(Buffer.byteLength(privateRow.input, 'utf8') <= 65_536);
+	assert.ok(Buffer.byteLength(privateRow.output, 'utf8') <= 65_536);
 	assert.equal(privateRow.input.includes('abc123'), false);
 	assert.equal(privateRow.input.includes('hunter2'), false);
 	assert.equal(privateRow.input.includes('supersecret'), false);
@@ -40,8 +42,32 @@ test('records bounded redacted private turns and hash/excerpt-only public rows',
 	assert.equal(typeof publicRows[0].outputHash, 'string');
 	assert.equal(typeof publicRows[0].inputExcerpt, 'string');
 	assert.equal(typeof publicRows[0].outputExcerpt, 'string');
+	assert.ok(Buffer.byteLength(publicRows[0].inputExcerpt, 'utf8') <= 512);
+	assert.ok(Buffer.byteLength(publicRows[0].outputExcerpt, 'utf8') <= 512);
 	assert.equal(Object.hasOwn(publicRows[0], 'input'), false);
 	assert.equal(JSON.stringify(publicRows[0]).includes('secret-token'), false);
+});
+
+test('redacts quoted JSON credential keys and values in both private and public records', async () => {
+	const privateRows = [];
+	const publicRows = [];
+	const recorder = new ProviderTurnRecorder({
+		runId: 'run-json', scenarioId: 'scenario-json', privatePath: 'private.jsonl',
+		appendFile: async (_path, text) => privateRows.push(JSON.parse(text)), publicSink: (row) => publicRows.push(row),
+	});
+	const quotedSecrets = '{"token":"TOKENSECRET","password":"PASSSECRET","client_secret":"CLIENTSECRET","authorization":"Bearer BEARERSECRET"}';
+	await recorder.record({ provider: 'codex', model: 'm', reasoningEffort: 'high', goalRevision: 1, attempt: 1, retry: false, input: quotedSecrets, output: quotedSecrets });
+	await recorder.close();
+
+	assert.equal(privateRows.length, 1);
+	assert.equal(JSON.stringify(privateRows[0]).includes('TOKENSECRET'), false);
+	assert.equal(JSON.stringify(privateRows[0]).includes('PASSSECRET'), false);
+	assert.equal(JSON.stringify(privateRows[0]).includes('CLIENTSECRET'), false);
+	assert.equal(JSON.stringify(privateRows[0]).includes('BEARERSECRET'), false);
+	assert.equal(JSON.stringify(publicRows[0]).includes('TOKENSECRET'), false);
+	assert.equal(JSON.stringify(publicRows[0]).includes('PASSSECRET'), false);
+	assert.equal(JSON.stringify(publicRows[0]).includes('CLIENTSECRET'), false);
+	assert.equal(JSON.stringify(publicRows[0]).includes('BEARERSECRET'), false);
 });
 
 test('serializes records and swallows public sink failures without blocking close', async () => {

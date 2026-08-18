@@ -7,6 +7,7 @@ const MAX_ROW_BYTES = 262_143;
 const SENSITIVE_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 const SECRET_SHAPED_TEXT = /((?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 const BEARER_TEXT = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
+const QUOTED_SECRET_TEXT = /((?:["']?)(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*["']?\s*[:=]\s*["']))([^"'\\\s,;}\]]+)(["'])/gi;
 const PATH_TEXT = /(?:[A-Za-z]:\\[^\s\]]+|(?:^|\s)\/[^\s]+)/g;
 
 /** Bounded, serialized provider-turn capture with private source and public evidence. */
@@ -131,6 +132,7 @@ function boundedMeta(value) {
 function redactAndBound(value, bytes) {
 	const redacted = String(value ?? '')
 		.replace(BEARER_TEXT, 'Bearer [REDACTED]')
+		.replace(QUOTED_SECRET_TEXT, '$1[REDACTED]$3')
 		.replace(SENSITIVE_TEXT, '$1[REDACTED]')
 		.replace(SECRET_SHAPED_TEXT, '$1[REDACTED]');
 	return truncateUtf8(redacted, bytes);

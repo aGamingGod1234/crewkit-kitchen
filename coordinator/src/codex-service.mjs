@@ -231,7 +231,7 @@ export class SharedCodexAgent {
 		};
 		signal?.addEventListener('abort', abort, { once: true });
 		let rawOutput = '';
-		let outputRecorded = false;
+		let outputHandled = false;
 		try {
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
@@ -265,22 +265,22 @@ export class SharedCodexAgent {
 			const text = await withTimeout(Promise.race([collector.promise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			rawOutput = text;
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex result belongs to an obsolete goal revision');
+			let decision;
+			let parseError = null;
+			try {
+				decision = parseDecision(text);
+			} catch (error) {
+				parseError = error;
+			}
+			outputHandled = true;
 			await recordProviderTurn(turnRecorder, {
 				provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
-				goalRevision, attempt, retry, input, output: text,
+				goalRevision, attempt, retry, input, output: text, error: parseError,
 			});
-			outputRecorded = true;
-			try {
-				return parseDecision(text);
-			} catch (error) {
-				await recordProviderTurn(turnRecorder, {
-					provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
-					goalRevision, attempt, retry, input, output: text, error,
-				});
-				throw error;
-			}
+			if (parseError !== null) throw parseError;
+			return decision;
 		} catch (error) {
-			if (!outputRecorded) await recordProviderTurn(turnRecorder, {
+			if (!outputHandled) await recordProviderTurn(turnRecorder, {
 				provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: rawOutput, error,
 			});

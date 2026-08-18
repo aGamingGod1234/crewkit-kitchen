@@ -201,7 +201,7 @@ class AcpAgent {
 		this.#transport.on('notification', onNotification);
 		signal?.addEventListener('abort', abort, { once: true });
 		let rawOutput = '';
-		let outputRecorded = false;
+		let outputHandled = false;
 		const prompt = `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`;
 		try {
 			const response = await withTimeout(Promise.race([this.#transport.request('session/prompt', {
@@ -212,26 +212,26 @@ class AcpAgent {
 			if (response?.stopReason !== 'end_turn') throw new AcpProtocolError('INCOMPLETE_TURN', `${this.provider} ACP stopped with '${String(response?.stopReason)}'`);
 			const decisionText = chunks.join('');
 			rawOutput = decisionText;
-			await recordProviderTurn(turnRecorder, {
-				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
-				goalRevision, attempt, retry, input: prompt, output: decisionText,
-			});
-			outputRecorded = true;
+			let decision;
+			let parseError = null;
 			try {
-				return parseDecision(decisionText);
+				decision = parseDecision(decisionText);
 			} catch (error) {
-				await recordProviderTurn(turnRecorder, {
-					provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
-					goalRevision, attempt, retry, input: prompt, output: decisionText, error,
-				});
-				throw new AcpProtocolError(
+				parseError = new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
 					`${this.provider} returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
 					{ cause: error },
 				);
 			}
+			outputHandled = true;
+			await recordProviderTurn(turnRecorder, {
+				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
+			});
+			if (parseError !== null) throw parseError;
+			return decision;
 		} catch (error) {
-			if (!outputRecorded) await recordProviderTurn(turnRecorder, {
+			if (!outputHandled) await recordProviderTurn(turnRecorder, {
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
 			});

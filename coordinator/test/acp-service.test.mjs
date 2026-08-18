@@ -73,6 +73,22 @@ test('Gemini ACP sessions apply the exact model and thinking level and parse pla
 	await service.stop();
 });
 
+test('ACP malformed output records one final error row for the attempt', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.message = 'not-json';
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-malformed-record', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	const turnRecorder = { async record(row) { rows.push(row); } };
+	await assert.rejects(agent.decide('authoritative state', { goalRevision: 2, turnRecorder, attempt: 4, retry: true }), (error) => error?.code === 'MALFORMED_DECISION');
+	assert.equal(rows.length, 1);
+	assert.equal(rows[0].error?.code, 'MALFORMED_DECISION');
+	assert.equal(rows[0].attempt, 4);
+	assert.equal(rows[0].retry, true);
+	await service.stop();
+});
+
 test('ACP processes and sessions use the same per-agent workspace', async () => {
 	const transport = new FakeAcpTransport(options());
 	let launchProfile = null;

@@ -196,7 +196,7 @@ class AntigravityAgent {
 		};
 		signal?.addEventListener('abort', abort, { once: true });
 		let rawOutput = '';
-		let outputRecorded = false;
+		let outputHandled = false;
 		try {
 			const decisionText = await operation.promise;
 			rawOutput = decisionText;
@@ -204,26 +204,26 @@ class AntigravityAgent {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
 			this.#hasConversation = true;
-			await recordProviderTurn(turnRecorder, {
-				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
-				goalRevision, attempt, retry, input: prompt, output: decisionText,
-			});
-			outputRecorded = true;
+			let decision;
+			let parseError = null;
 			try {
-				return parseDecision(decisionText.trim());
+				decision = parseDecision(decisionText.trim());
 			} catch (error) {
-				await recordProviderTurn(turnRecorder, {
-					provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
-					goalRevision, attempt, retry, input: prompt, output: decisionText, error,
-				});
-				throw new AcpProtocolError(
+				parseError = new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
 					`gemini returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
 					{ cause: error },
 				);
 			}
+			outputHandled = true;
+			await recordProviderTurn(turnRecorder, {
+				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
+			});
+			if (parseError !== null) throw parseError;
+			return decision;
 		} catch (error) {
-			if (!outputRecorded) await recordProviderTurn(turnRecorder, {
+			if (!outputHandled) await recordProviderTurn(turnRecorder, {
 				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
 			});
