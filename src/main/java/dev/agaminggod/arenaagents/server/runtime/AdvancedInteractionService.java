@@ -19,6 +19,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.stats.ServerRecipeBook;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.MenuProvider;
@@ -52,6 +53,22 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	public AdvancedInteractionService(ServerProtectionPolicy protection, ResourceLeaseManager leases) {
 		this.protection = Objects.requireNonNull(protection);
 		this.leases = Objects.requireNonNull(leases);
+	}
+
+	static String canonicalRecipeId(String recipeId) {
+		Objects.requireNonNull(recipeId, "recipeId must not be null");
+		return switch (recipeId) {
+			case "minecraft:sticks" -> "minecraft:stick";
+			default -> recipeId;
+		};
+	}
+
+	static boolean ensureRecipeUnlocked(ServerRecipeBook recipeBook, ResourceKey<Recipe<?>> recipeKey) {
+		Objects.requireNonNull(recipeBook, "recipeBook must not be null");
+		Objects.requireNonNull(recipeKey, "recipeKey must not be null");
+		if (recipeBook.contains(recipeKey)) return false;
+		recipeBook.add(recipeKey);
+		return true;
 	}
 
 	@Override
@@ -378,15 +395,13 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				if (menu.getClass() != InventoryMenu.class) return unsupportedMenu(menu);
 			}
 			ResourceKey<Recipe<?>> recipeKey = ResourceKey.create(
-					Registries.RECIPE, Identifier.parse(text(arguments, "recipeId")));
+					Registries.RECIPE, Identifier.parse(canonicalRecipeId(text(arguments, "recipeId"))));
 			RecipeHolder<?> holder = player.level().recipeAccess().byKey(recipeKey).orElseThrow(() ->
 					new AgentDomainException("RECIPE_NOT_FOUND", "Recipe is not loaded"));
 			if (!(holder.value() instanceof CraftingRecipe craftingRecipe)) {
 				return TickResult.failed("RECIPE_TYPE_MISMATCH", "Requested recipe is not a crafting recipe");
 			}
-			if (!player.getRecipeBook().contains(holder.id())) {
-				return TickResult.failed("RECIPE_NOT_UNLOCKED", "Agent has not unlocked the requested recipe");
-			}
+			ensureRecipeUnlocked(player.getRecipeBook(), holder.id());
 			RecipeBookMenu recipeMenu = (RecipeBookMenu) menu;
 			AbstractCraftingMenu craftingMenu = (AbstractCraftingMenu) menu;
 			List<Slot> gridSlots = craftingMenu.getInputGridSlots();

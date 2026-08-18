@@ -49,6 +49,7 @@ import dev.agaminggod.arenaagents.server.perception.ObservationBudgetVerificatio
 import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
+import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostconditionVerification;
@@ -132,6 +133,7 @@ public final class VerificationMain {
 		passedAssertions += ActionProgressTrackerVerification.verify();
 		passedAssertions += BlockPlacementPostconditionVerification.verify();
 		passedAssertions += ResourceLeaseManagerVerification.verify();
+		passedAssertions += RecipeActionVerification.verify();
 		passedAssertions += TransactionProtocolVerification.verify();
 		passedAssertions += TransactionPostconditionVerification.verify();
 		passedAssertions += EquipmentAndUseVerification.verify();
