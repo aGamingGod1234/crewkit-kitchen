@@ -13,4 +13,4 @@
 - GREEN: `node --test test/headless-rcon.test.mjs test/jsonl.test.mjs` passed (14 tests).
 - `git diff --check` passed.
 
-Commit: pending
+Implementation commit: `baa73d3`
