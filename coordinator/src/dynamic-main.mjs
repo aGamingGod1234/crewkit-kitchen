@@ -63,8 +63,9 @@ export class DynamicCoordinator extends EventEmitter {
 	#statusHandle = null;
 	#serverInstanceId = null;
 	#traceWriter;
+	#providerTurnRecorder;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, traceWriter = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, traceWriter = null, providerTurnRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -75,6 +76,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
 		if (traceWriter !== null && typeof traceWriter.write !== 'function') throw new TypeError('traceWriter.write must be a function');
 		this.#traceWriter = traceWriter;
+		if (providerTurnRecorder !== null && typeof providerTurnRecorder.close !== 'function') throw new TypeError('providerTurnRecorder.close must be a function');
+		this.#providerTurnRecorder = providerTurnRecorder;
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
 		if (typeof epochNow !== 'function') throw new TypeError('epochNow must be a function');
 		this.#controlNow = controlNow;
@@ -130,6 +133,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#programRuntime.disposeAll();
 		this.#providerRetryAfter.clear();
 		if (this.#traceWriter !== null && typeof this.#traceWriter.close === 'function') await this.#traceWriter.close();
+		if (this.#providerTurnRecorder !== null) await Promise.resolve(this.#providerTurnRecorder.close()).catch(() => {});
 		await this.#codexService.stop();
 		this.#started = false;
 		this.#stopping = false;
@@ -464,6 +468,7 @@ export class DynamicCoordinator extends EventEmitter {
 }
 
 export function createDynamicCoordinator(configValue, dependencies = {}) {
+	const providerTurnRecorder = dependencies.providerTurnRecorder ?? null;
 	const config = normalizeDynamicConfig(configValue, dependencies.env ?? process.env);
 	const providerEnvironment = createProviderChildEnvironment(
 		dependencies.env ?? process.env,
@@ -489,7 +494,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 			workspaceManager,
 		}),
 		kimi: new AcpProviderService({ ...config.kimi, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transportFactory: dependencies.kimiTransportFactory, workspaceManager }),
-	});
+	}, { turnRecorder: providerTurnRecorder });
 	const healthRegistry = dependencies.healthRegistry ?? dependencies.planner?.healthRegistry ?? new ProviderHealthRegistry({ now: dependencies.healthNow ?? Date.now });
 	const latencyRegistry = dependencies.latencyRegistry ?? new ControlLatencyRegistry();
 	const planner = dependencies.planner ?? new AgentPlanner({
@@ -499,6 +504,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		invalidDecisionRetries: config.limits.invalidDecisionRetries,
 		healthRegistry,
 		telemetrySink: dependencies.telemetrySink,
+		turnRecorder: providerTurnRecorder,
 	});
 	const bridge = dependencies.bridge ?? new MultiplexedServerBridge(config.bridge, {
 		audit: dependencies.protocolAudit,
@@ -516,6 +522,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		healthRegistry,
 		latencyRegistry,
 		traceWriter: dependencies.traceWriter,
+		providerTurnRecorder,
 		controlNow: dependencies.controlNow,
 		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,

@@ -3,6 +3,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { AcpProtocolError } from './acp-transport.mjs';
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
 import { parseDecision } from './decision-parser.mjs';
+import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { discoverAntigravityCatalog } from './provider-catalog-discovery.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
@@ -169,7 +170,7 @@ class AntigravityAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `gemini agent '${this.agentId}' is disposed`);
 		if (this.#activeOperation !== null) throw new AcpProtocolError('TURN_IN_PROGRESS', `gemini agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -194,15 +195,27 @@ class AntigravityAgent {
 			void operation.cancel(new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled'));
 		};
 		signal?.addEventListener('abort', abort, { once: true });
+		let rawOutput = '';
+		let outputRecorded = false;
 		try {
 			const decisionText = await operation.promise;
+			rawOutput = decisionText;
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
 			this.#hasConversation = true;
+			await recordProviderTurn(turnRecorder, {
+				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: decisionText,
+			});
+			outputRecorded = true;
 			try {
 				return parseDecision(decisionText.trim());
 			} catch (error) {
+				await recordProviderTurn(turnRecorder, {
+					provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+					goalRevision, attempt, retry, input: prompt, output: decisionText, error,
+				});
 				throw new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
 					`gemini returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
@@ -210,6 +223,10 @@ class AntigravityAgent {
 				);
 			}
 		} catch (error) {
+			if (!outputRecorded) await recordProviderTurn(turnRecorder, {
+				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
+			});
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal', { cause: error });
 			}

@@ -4,8 +4,12 @@ export class ProviderService {
 	#services;
 	#assignments = new Map();
 
-	constructor(services) {
+	#turnRecorder;
+
+	constructor(services, { turnRecorder = null } = {}) {
 		if (services === null || typeof services !== 'object') throw new TypeError('provider services are required');
+		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
+		this.#turnRecorder = turnRecorder;
 		this.#services = new Map(PROVIDERS.map((provider) => {
 			const service = services[provider];
 			if (service === null || service === undefined) throw new TypeError(`${provider} service is required`);
@@ -19,7 +23,9 @@ export class ProviderService {
 
 	async createAgent(profileValue, options) {
 		const profile = { ...profileValue, provider: normalizeProvider(profileValue?.provider) };
-		const agent = await this.#services.get(profile.provider).createAgent(profile, options);
+		const agent = await this.#services.get(profile.provider).createAgent(profile, this.#turnRecorder === null
+			? options
+			: { ...options, turnRecorder: this.#turnRecorder });
 		this.#assignments.set(profile.agentId, profile.provider);
 		return agent;
 	}

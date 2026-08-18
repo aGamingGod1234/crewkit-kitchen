@@ -3,6 +3,7 @@ import { DEFAULT_SERVICE_TIER } from './constants.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { ModelCatalogCache } from './model-catalog-cache.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { recordProviderTurn } from './provider-turn-recorder.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
@@ -200,7 +201,7 @@ export class SharedCodexAgent {
 		if (this.#active !== null && this.#active.goalRevision !== revision) await this.interrupt();
 	}
 
-	async decide(input, { goalRevision, signal } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false } = {}) {
 		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -229,6 +230,8 @@ export class SharedCodexAgent {
 			void this.interrupt().catch(() => { /* stale abort races are handled by the decision's signal check */ });
 		};
 		signal?.addEventListener('abort', abort, { once: true });
+		let rawOutput = '';
+		let outputRecorded = false;
 		try {
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
@@ -260,9 +263,27 @@ export class SharedCodexAgent {
 				throw new CodexProtocolError('STALE_PLAN', 'Codex turn started after its goal revision became obsolete');
 			}
 			const text = await withTimeout(Promise.race([collector.promise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
+			rawOutput = text;
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex result belongs to an obsolete goal revision');
-			return parseDecision(text);
+			await recordProviderTurn(turnRecorder, {
+				provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input, output: text,
+			});
+			outputRecorded = true;
+			try {
+				return parseDecision(text);
+			} catch (error) {
+				await recordProviderTurn(turnRecorder, {
+					provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+					goalRevision, attempt, retry, input, output: text, error,
+				});
+				throw error;
+			}
 		} catch (error) {
+			if (!outputRecorded) await recordProviderTurn(turnRecorder, {
+				provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input, output: rawOutput, error,
+			});
 			if (error?.code === 'PLANNING_TIMEOUT' || error?.code === 'TURN_OUTPUT_LIMIT') {
 				try { await this.interrupt(); } catch { /* original timeout remains authoritative */ }
 			}

@@ -357,6 +357,33 @@ test('provider circuit rejects work before allocating a provider session', async
 	assert.equal(registry.states.at(-1).options.error.code, 'PROVIDER_CIRCUIT_OPEN');
 });
 
+test('passes the exact optional turn recorder to the selected provider without changing the decision attempt', async () => {
+	const registry = new FakeRegistry();
+	const recorder = { record: async () => { throw new Error('recorder unavailable'); } };
+	const optionsSeen = [];
+	let attempts = 0;
+	const agent = {
+		async setGoalRevision() {},
+		async decide(input, options) {
+			attempts += 1;
+			optionsSeen.push({ input, options });
+			try { await options.turnRecorder.record({ input }); } catch { /* provider hooks are observational */ }
+			return VALID_DECISION;
+		},
+	};
+	const planner = new AgentPlanner({
+		registry,
+		turnRecorder: recorder,
+		scheduler: { schedule(_id, operation) { return operation({ signal: new AbortController().signal }); }, cancel() { return false; } },
+		codexService: { async createAgent() { return agent; }, getAgent() { return null; }, async removeAgent() { return false; } },
+	});
+
+	const result = await planner.requestPlan({ agentId: AGENT_ID, input: 'state', goalRevision: GOAL_REVISION });
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.equal(attempts, 1);
+	assert.equal(optionsSeen[0].options.turnRecorder, recorder);
+});
+
 function createPlanner(registry, agent, invalidDecisionRetries) {
 	return createPlannerForService(registry, {
 		async createAgent() { return agent; },

@@ -1,5 +1,6 @@
 import { AcpProtocolError, AcpStdioTransport, buildAcpLaunch } from './acp-transport.mjs';
 import { parseDecision } from './decision-parser.mjs';
+import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { discoverKimiCatalog } from './provider-catalog-discovery.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 
@@ -168,7 +169,7 @@ class AcpAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `${this.provider} agent '${this.agentId}' is disposed`);
 		if (this.#active) throw new AcpProtocolError('TURN_IN_PROGRESS', `${this.provider} agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -199,23 +200,42 @@ class AcpAgent {
 		this.#active = true;
 		this.#transport.on('notification', onNotification);
 		signal?.addEventListener('abort', abort, { once: true });
+		let rawOutput = '';
+		let outputRecorded = false;
+		const prompt = `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`;
 		try {
 			const response = await withTimeout(Promise.race([this.#transport.request('session/prompt', {
 				sessionId: this.#sessionId,
-				prompt: [{ type: 'text', text: `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}` }],
+				prompt: [{ type: 'text', text: prompt }],
 			}, { timeoutMs: this.#planningTimeoutMs }), outputLimit]), this.#planningTimeoutMs);
 			if (signal?.aborted || goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_PLAN', `${this.provider} result belongs to an obsolete goal`);
 			if (response?.stopReason !== 'end_turn') throw new AcpProtocolError('INCOMPLETE_TURN', `${this.provider} ACP stopped with '${String(response?.stopReason)}'`);
 			const decisionText = chunks.join('');
+			rawOutput = decisionText;
+			await recordProviderTurn(turnRecorder, {
+				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: decisionText,
+			});
+			outputRecorded = true;
 			try {
 				return parseDecision(decisionText);
 			} catch (error) {
+				await recordProviderTurn(turnRecorder, {
+					provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+					goalRevision, attempt, retry, input: prompt, output: decisionText, error,
+				});
 				throw new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
 					`${this.provider} returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
 					{ cause: error },
 				);
 			}
+		} catch (error) {
+			if (!outputRecorded) await recordProviderTurn(turnRecorder, {
+				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
+			});
+			throw error;
 		} finally {
 			this.#active = false;
 			this.#transport.off('notification', onNotification);
