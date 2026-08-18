@@ -58,6 +58,7 @@ import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVeri
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementAttemptPolicyVerification;
 import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
+import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostconditionVerification;
@@ -153,6 +154,7 @@ public final class VerificationMain {
 		passedAssertions += BlockPlacementAttemptPolicyVerification.verify();
 		passedAssertions += DesiredBlockStateVerification.verify();
 		passedAssertions += ResourceLeaseManagerVerification.verify();
+		passedAssertions += RecipeActionVerification.verify();
 		passedAssertions += TransactionProtocolVerification.verify();
 		passedAssertions += TransactionPostconditionVerification.verify();
 		passedAssertions += EquipmentAndUseVerification.verify();
