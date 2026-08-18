@@ -35,9 +35,13 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STARTED.register(CodexAgentServerRuntime::start);
 		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::tick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
-		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) ->
-				!(entity instanceof net.minecraft.server.level.ServerPlayer player)
-						|| !ScenarioRuntimeService.recoverParkourDeath(player));
+		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) -> {
+			if (!(entity instanceof net.minecraft.server.level.ServerPlayer player)) return true;
+			return AgentDeathCapture.allowVanillaDeath(
+					ScenarioRuntimeService.recoverParkourDeath(player),
+					() -> CodexAgentManager.get(player.level().getServer()).captureDeath(player, source)
+			);
+		});
 		registered = true;
 	}
 

@@ -7,10 +7,12 @@ import { DEFAULT_CHILD_STOP_TIMEOUT_MS, terminateChildProcess } from './child-pr
 import { JsonlDecoder, encodeJsonLine } from './jsonl.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { createProviderChildEnvironment } from './provider-environment.mjs';
 
 const APP_SERVER_MAX_LINE_BYTES = 4 * 1_024 * 1_024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
+const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
 const MAX_TIMED_OUT_REQUEST_IDS = 1_024;
 const PROFILE_VALUE_PATTERN = /^[A-Za-z0-9._-]+$/;
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Arena Agents', version: '1.0.0' });
@@ -39,14 +41,17 @@ export function buildCodexArgs(config) {
 
 export function resolveCodexLaunch(config, dependencies = {}) {
 	const platform = dependencies.platform ?? process.platform;
-	const environment = dependencies.env ?? process.env;
+	const environment = createProviderChildEnvironment(
+		dependencies.env ?? config.environment ?? process.env,
+		config.bridgeSecretEnvironmentVariable,
+	);
 	const nodeExecutable = dependencies.execPath ?? process.execPath;
 	const pathExists = dependencies.existsSync ?? existsSync;
 	if (platform === 'win32' && typeof environment.APPDATA === 'string') {
 		const entrypoint = path.join(environment.APPDATA, 'npm', 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-		if (pathExists(entrypoint)) return { command: nodeExecutable, args: [entrypoint, ...buildCodexArgs(config)] };
+		if (pathExists(entrypoint)) return { command: nodeExecutable, args: [entrypoint, ...buildCodexArgs(config)], environment };
 	}
-	return { command: 'codex', args: buildCodexArgs(config) };
+	return { command: 'codex', args: buildCodexArgs(config), environment };
 }
 
 export class CodexStdioTransport extends EventEmitter {
@@ -74,6 +79,7 @@ export class CodexStdioTransport extends EventEmitter {
 			const launch = resolveCodexLaunch(this.#config);
 			child = this.#spawn(launch.command, launch.args, {
 				cwd: this.#config.cwd,
+				env: launch.environment,
 				stdio: ['pipe', 'pipe', 'pipe'],
 				windowsHide: true,
 			});
@@ -265,6 +271,9 @@ export class CodexAgent {
 			return parseDecision(text);
 		} catch (error) {
 			if (error?.code === 'TIMEOUT') throw new CodexProtocolError('PLANNING_TIMEOUT', `Codex planning exceeded ${this.#config.planningTimeoutMs} ms`, { cause: error });
+			if (error?.code === 'TURN_OUTPUT_LIMIT') {
+				try { await this.interrupt(); } catch { /* the bounded failure remains authoritative */ }
+			}
 			throw error;
 		} finally {
 			collector.dispose();
@@ -308,14 +317,35 @@ export class CodexAgent {
 		let expectedTurnId = null;
 		let lastMessage = null;
 		let streamedMessage = '';
+		let streamedMessageBytes = 0;
+		let outputLimitError = null;
 		let resolvePromise;
 		let rejectPromise;
 		const promise = new Promise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
 		const onNotification = ({ method, params }) => {
 			if (params?.threadId !== this.#threadId) return;
 			if (expectedTurnId !== null && turnIdOf(method, params) !== expectedTurnId) return;
-			if (method === 'item/agentMessage/delta' && typeof params?.delta === 'string') streamedMessage += params.delta;
-			if (method === 'item/completed' && params.item?.type === 'agentMessage' && typeof params.item.text === 'string') lastMessage = params.item.text;
+			if (outputLimitError !== null) return;
+			if (method === 'item/agentMessage/delta' && typeof params?.delta === 'string') {
+				const deltaBytes = Buffer.byteLength(params.delta, 'utf8');
+				if (streamedMessageBytes + deltaBytes > this.#config.maxDecisionBytes) {
+					outputLimitError = new CodexProtocolError('TURN_OUTPUT_LIMIT', `Codex planner output exceeded ${this.#config.maxDecisionBytes} bytes`);
+					rejectPromise(outputLimitError);
+					return;
+				}
+				streamedMessageBytes += deltaBytes;
+				streamedMessage += params.delta;
+			}
+			if (method === 'item/completed' && params.item?.type === 'agentMessage' && typeof params.item.text === 'string') {
+				if (Buffer.byteLength(params.item.text, 'utf8') > this.#config.maxDecisionBytes) {
+					outputLimitError = new CodexProtocolError('TURN_OUTPUT_LIMIT', `Codex planner output exceeded ${this.#config.maxDecisionBytes} bytes`);
+					rejectPromise(outputLimitError);
+					return;
+				}
+				lastMessage = params.item.text;
+				streamedMessage = '';
+				streamedMessageBytes = 0;
+			}
 			if (method === 'turn/completed') {
 				if (params.turn?.status !== 'completed') rejectPromise(new CodexProtocolError('TURN_FAILED', `Codex turn ended with status '${String(params.turn?.status)}'`));
 				else if (lastMessage === null && streamedMessage.length === 0) rejectPromise(new CodexProtocolError('MISSING_FINAL_MESSAGE', 'Codex turn completed without an agent message'));
@@ -372,7 +402,9 @@ function validateAgentConfig(config) {
 	if (typeof config.cwd !== 'string' || config.cwd.trim().length === 0) throw new TypeError('cwd must be a nonblank path');
 	const planningTimeoutMs = config.planningTimeoutMs ?? DEFAULT_PLANNING_TIMEOUT_MS;
 	if (!Number.isSafeInteger(planningTimeoutMs) || planningTimeoutMs <= 0) throw new TypeError('planningTimeoutMs must be a positive safe integer');
-	return { ...config, planningTimeoutMs };
+	const maxDecisionBytes = config.maxDecisionBytes ?? DEFAULT_MAX_DECISION_BYTES;
+	if (!Number.isSafeInteger(maxDecisionBytes) || maxDecisionBytes <= 0) throw new TypeError('maxDecisionBytes must be a positive safe integer');
+	return { ...config, planningTimeoutMs, maxDecisionBytes };
 }
 
 function profileValue(value, field) {

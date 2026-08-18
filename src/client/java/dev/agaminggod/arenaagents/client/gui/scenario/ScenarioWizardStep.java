@@ -1,10 +1,9 @@
 package dev.agaminggod.arenaagents.client.gui.scenario;
 
 public enum ScenarioWizardStep {
-	MODE("Mode"),
-	ARENA("Arena"),
+	ARENA("Preset"),
 	ROSTER("Roster"),
-	REVIEW("Review");
+	REVIEW("Launch");
 
 	private final String displayName;
 

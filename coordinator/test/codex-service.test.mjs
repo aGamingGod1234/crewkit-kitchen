@@ -106,6 +106,20 @@ test('Codex service accepts the streamed agent-message contract when no complete
 	await service.stop();
 });
 
+test('Codex service cancels an over-budget streamed planner decision before parsing it', async () => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace', maxDecisionBytes: 32 }, { transport });
+	const agent = await service.createAgent(profile('agent-bounded'));
+	await agent.setGoalRevision(1);
+	const decisionPromise = agent.decide('Observation.', { goalRevision: 1 });
+	await Promise.resolve();
+	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'x'.repeat(33) } });
+	await assert.rejects(decisionPromise, (error) => error?.code === 'TURN_OUTPUT_LIMIT');
+	assert.ok(transport.calls.some((call) => call.method === 'turn/interrupt' && call.params.turnId === 'turn-1'));
+	await service.stop();
+});
+
 test('Codex threads use provider-scoped per-agent workspaces', async () => {
 	const transport = new FakeSharedTransport();
 	const prepared = [];

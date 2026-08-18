@@ -4,8 +4,11 @@ import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchPayload;
+import dev.agaminggod.arenaagents.scenario.ScenarioPresets;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshot;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshotPayload;
+import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgress;
+import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressPayload;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -14,10 +17,10 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.WeakHashMap;
+import net.minecraft.core.BlockPos;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
-import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
@@ -42,6 +45,10 @@ public final class AgentControlSync {
 				ArenaSpectatorSnapshotPayload.TYPE,
 				ArenaSpectatorSnapshotPayload.CODEC
 		);
+		PayloadTypeRegistry.clientboundPlay().register(
+				ScenarioBuildProgressPayload.TYPE,
+				ScenarioBuildProgressPayload.CODEC
+		);
 		boolean receiverRegistered = ServerPlayNetworking.registerGlobalReceiver(
 				AgentControlRequestPayload.TYPE,
 				(payload, context) -> context.server().execute(() -> sendSnapshot(context.player()))
@@ -54,10 +61,9 @@ public final class AgentControlSync {
 				(payload, context) -> context.server().execute(() -> {
 					try {
 						ScenarioRuntimeService.launch(context.player(), payload.request());
+						sendCurrentBuildProgress(context.player());
 					} catch (RuntimeException exception) {
-						context.player().sendSystemMessage(Component.literal(
-								"Scenario launch rejected: " + safeMessage(exception)
-						));
+						publishRejectedBuild(context.player(), payload, exception);
 					}
 				})
 		);
@@ -65,7 +71,66 @@ public final class AgentControlSync {
 			throw new IllegalStateException("Arena Agents scenario launch receiver is already registered");
 		}
 		ServerTickEvents.END_SERVER_TICK.register(AgentControlSync::publishSpectatorSnapshot);
+		ServerTickEvents.END_SERVER_TICK.register(AgentControlSync::publishBuildProgress);
 		registered = true;
+	}
+
+	private static void sendCurrentBuildProgress(ServerPlayer player) {
+		if (!ServerPlayNetworking.canSend(player, ScenarioBuildProgressPayload.TYPE)) return;
+		ScenarioRuntimeService.buildProgress(player.level().getServer()).ifPresent(progress -> {
+			try {
+				ServerPlayNetworking.send(player, ScenarioBuildProgressPayload.fromProgress(progress));
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Could not send initial arena coordinates to {}", player.getScoreboardName(), exception);
+			}
+		});
+	}
+
+	private static void publishRejectedBuild(
+			ServerPlayer player,
+			ScenarioLaunchPayload payload,
+			RuntimeException exception
+	) {
+		if (!ServerPlayNetworking.canSend(player, ScenarioBuildProgressPayload.TYPE)) return;
+		String title;
+		try {
+			title = ScenarioPresets.require(payload.request().scenarioId()).title();
+		} catch (RuntimeException invalidScenario) {
+			title = payload.request().scenarioId();
+		}
+		BlockPos origin = player.blockPosition();
+		String detail = compactDetail("Arena launch rejected: " + safeMessage(exception));
+		ScenarioBuildProgress rejected = ScenarioBuildProgress.rejected(
+				"rejected-" + UUID.randomUUID(), title,
+				origin.getX(), origin.getY(), origin.getZ(), detail);
+		try {
+			ServerPlayNetworking.send(player, ScenarioBuildProgressPayload.fromProgress(rejected));
+		} catch (RuntimeException sendFailure) {
+			LOGGER.warn("Could not send rejected arena status to {}", player.getScoreboardName(), sendFailure);
+		}
+	}
+
+	private static synchronized void publishBuildProgress(MinecraftServer server) {
+		Optional<ScenarioBuildProgress> current = ScenarioRuntimeService.buildProgress(server);
+		if (current.isEmpty()) return;
+		SpectatorPublication publication = SPECTATOR_PUBLICATIONS.computeIfAbsent(
+				server, ignored -> new SpectatorPublication());
+		ScenarioBuildProgress progress = current.orElseThrow();
+		Set<UUID> connectedPlayers = new HashSet<>();
+		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+			connectedPlayers.add(player.getUUID());
+			if (!ServerPlayNetworking.canSend(player, ScenarioBuildProgressPayload.TYPE)) continue;
+			ScenarioBuildProgress previous = publication.lastBuildByPlayer.get(player.getUUID());
+			if (previous != null && previous.buildId().equals(progress.buildId())
+					&& previous.revision() >= progress.revision()) continue;
+			try {
+				ServerPlayNetworking.send(player, ScenarioBuildProgressPayload.fromProgress(progress));
+				publication.lastBuildByPlayer.put(player.getUUID(), progress);
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Could not send Arena Agents build progress to {}", player.getScoreboardName(), exception);
+			}
+		}
+		publication.lastBuildByPlayer.keySet().retainAll(connectedPlayers);
 	}
 
 	private static synchronized void publishSpectatorSnapshot(MinecraftServer server) {
@@ -115,13 +180,22 @@ public final class AgentControlSync {
 		return message == null || message.isBlank() ? throwable.getClass().getSimpleName() : message;
 	}
 
+	private static String compactDetail(String value) {
+		String compact = value.replace('\n', ' ').replace('\r', ' ').strip();
+		return compact.length() <= ScenarioBuildProgress.MAX_DETAIL_LENGTH
+				? compact : compact.substring(0, ScenarioBuildProgress.MAX_DETAIL_LENGTH - 3) + "...";
+	}
+
 	public static void sendSnapshot(ServerPlayer player) {
 		try {
 			boolean canControl = GoalControl.mayControl(player.createCommandSourceStack());
 			AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(
 					canControl,
+					CodexAgentServerRuntime.automationAvailable(player.level().getServer()),
+					CodexAgentServerRuntime.automationStatus(player.level().getServer()),
 					System.currentTimeMillis(),
-					CodexAgentManager.get(player.level().getServer()).records()
+					CodexAgentManager.get(player.level().getServer()).records(),
+					CodexAgentServerRuntime.modelCatalog(player.level().getServer())
 			);
 			if (ServerPlayNetworking.canSend(player, AgentControlSnapshotPayload.TYPE)) {
 				ServerPlayNetworking.send(player, AgentControlSnapshotPayload.fromSnapshot(snapshot));
@@ -135,6 +209,7 @@ public final class AgentControlSync {
 		private final ArenaSpectatorSnapshot.PublicationCadence cadence =
 				new ArenaSpectatorSnapshot.PublicationCadence(4);
 		private final Map<UUID, ArenaSpectatorSnapshot> lastByPlayer = new LinkedHashMap<>();
+		private final Map<UUID, ScenarioBuildProgress> lastBuildByPlayer = new LinkedHashMap<>();
 		private long serverTick;
 		private long revision;
 		private String runId = "";

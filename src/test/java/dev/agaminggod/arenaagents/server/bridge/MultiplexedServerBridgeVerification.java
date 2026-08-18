@@ -92,6 +92,21 @@ public final class MultiplexedServerBridgeVerification {
 		assertEquals(-12.25F, facts.get("respawnPitch").getAsFloat(), "death facts expose respawn pitch");
 		assertEquals(true, facts.get("respawnForced").getAsBoolean(), "death facts expose forced respawn flag");
 		assertEquals("spectator", facts.get("gameMode").getAsString(), "death facts expose game mode");
+		AgentDeathSnapshot noConfiguredRespawn = new AgentDeathSnapshot(
+				"fell from a high place", "minecraft:overworld", 12.5D, 64.0D, -3.5D,
+				Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(),
+				Optional.empty(), Optional.empty(), Optional.empty(), "survival", 2_001L
+		);
+		JsonObject envelopePayload = new JsonObject();
+		envelopePayload.add("death", MultiplexedServerBridge.deathFacts(noConfiguredRespawn));
+		BridgeEnvelope roundTrip = new BridgeEnvelopeCodec().decode(new BridgeEnvelopeCodec().encode(
+				new BridgeEnvelope(2, "server-instance", "server", "hello_ack", "death-null-check", envelopePayload)
+		));
+		JsonObject encodedDeath = roundTrip.payload().getAsJsonObject("death");
+		for (String field : List.of("respawnDimensionId", "respawnX", "respawnY", "respawnZ", "respawnYaw", "respawnPitch", "respawnForced")) {
+			assertTrue(encodedDeath.has(field) && encodedDeath.get(field).isJsonNull(),
+					"encoded death facts retain explicit null " + field);
+		}
 	}
 
 	private static void verifyRealBridgeSessionLifecycle() {

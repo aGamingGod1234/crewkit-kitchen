@@ -3,7 +3,10 @@
   "package": "dev.agaminggod.arenaagents.client.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
-    "AbstractClientPlayerMixin"
+    "AbstractClientPlayerMixin",
+    "AvatarRendererMixin",
+    "FontManagerAccessor",
+    "MinecraftFontManagerAccessor"
   ],
   "injectors": {
     "defaultRequire": 1

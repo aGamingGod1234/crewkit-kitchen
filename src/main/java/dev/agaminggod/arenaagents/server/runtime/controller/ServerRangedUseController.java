@@ -23,7 +23,7 @@ import net.minecraft.world.item.BowItem;
 import net.minecraft.world.item.ItemStack;
 
 public final class ServerRangedUseController implements ServerTransactionAdapter.ActiveTransaction {
-	private static final double PROJECTILE_OBSERVATION_RADIUS = 64.0D;
+	private static final double PROJECTILE_OBSERVATION_RADIUS = 128.0D;
 	private final ServerPlayer player;
 	private final LivingEntity target;
 	private final InteractionHand hand;

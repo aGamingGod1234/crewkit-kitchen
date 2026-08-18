@@ -5,6 +5,7 @@ public final class NavigationProgressVerification {
 	}
 
 	public static int verify() {
+		new ServerNavigationController(new net.minecraft.world.phys.Vec3(1.0D, 64.0D, 1.0D), 0.01D, false, 0L, 1_000L);
 		WaypointProgress progress = new WaypointProgress(10.0D, 1_000L, 4_000L, 3);
 
 		WaypointProgress.Update advanced = progress.observe(8.0D, true, 1_100L);

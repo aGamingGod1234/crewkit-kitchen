@@ -4,6 +4,7 @@ import { AcpProtocolError } from './acp-transport.mjs';
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { discoverAntigravityCatalog } from './provider-catalog-discovery.mjs';
+import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 
 const DEFAULT_EXECUTABLE = 'agy';
@@ -13,6 +14,7 @@ const DEFAULT_STDERR_LIMIT_BYTES = 64 * 1_024;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const MAX_WINDOWS_PROMPT_CHARS = 24_000;
 const GEMINI_MODEL_REASONING = Object.freeze({
+	'gemini-3.7-flash': Object.freeze(['high', 'medium', 'low']),
 	'gemini-3.1-pro': Object.freeze(['high', 'low']),
 	'gemini-3.6-flash': Object.freeze(['high', 'medium', 'low']),
 	'gemini-3.5-flash': Object.freeze(['high', 'medium', 'low']),
@@ -253,7 +255,10 @@ export function buildAntigravityLaunch(profile, configValue = {}, dependencies =
 		],
 		options: {
 			cwd: dependencies.cwd ?? config.cwd,
-			env: { ...(dependencies.env ?? process.env) },
+			env: createProviderChildEnvironment(
+				dependencies.env ?? config.environment ?? process.env,
+				config.bridgeSecretEnvironmentVariable,
+			),
 			stdio: ['ignore', 'pipe', 'pipe'],
 			windowsHide: true,
 		},

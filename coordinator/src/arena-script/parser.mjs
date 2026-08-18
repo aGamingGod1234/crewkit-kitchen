@@ -5,7 +5,7 @@ import {
 	DEFAULT_ARENA_SCRIPT_LIMITS,
 	normalizeArenaScriptLimits,
 } from './limits.mjs';
-import { SCRIPT_API_CALL_PATHS } from './minecraft-api.mjs';
+import { PLAYER_MEMBER_PRIMITIVES, SCRIPT_API_CALL_PATHS } from './minecraft-api.mjs';
 
 const ALLOWED_GLOBALS = new Set([
 	'program',
@@ -410,6 +410,9 @@ function validateCallExpression(node, state, context) {
 	if (pathEqual(path, ['player', 'attack']) || pathEqual(path, ['player', 'useRanged'])) {
 		validateExactTargetCall(node);
 	}
+	if (path?.[0] === 'player' && Object.hasOwn(PLAYER_MEMBER_PRIMITIVES, path[1])) {
+		validatePlayerPrimitiveArity(node, path[1]);
+	}
 	if (functionBinding && context.functionBinding) {
 		let edges = state.functionEdges.get(context.functionBinding);
 			if (!edges) {
@@ -417,6 +420,18 @@ function validateCallExpression(node, state, context) {
 				state.functionEdges.set(context.functionBinding, edges);
 			}
 		edges.set(functionBinding, node);
+	}
+}
+
+function validatePlayerPrimitiveArity(node, memberName) {
+	if (memberName === 'respawn') {
+		if (node.arguments.length !== 0) {
+			throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', 'player.respawn requires no arguments', node);
+		}
+		return;
+	}
+	if (node.arguments.length !== 1) {
+		throw arenaError('INVALID_ARENA_SCRIPT_COMMAND', `player.${memberName} requires exactly one action argument`, node);
 	}
 }
 

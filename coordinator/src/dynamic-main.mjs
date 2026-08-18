@@ -24,6 +24,7 @@ import { adaptObservation } from './observation-adapter.mjs';
 import { buildPlannerInput } from './prompts.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
+import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { TraceWriter } from './trace-writer.mjs';
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
@@ -457,6 +458,10 @@ export class DynamicCoordinator extends EventEmitter {
 
 export function createDynamicCoordinator(configValue, dependencies = {}) {
 	const config = normalizeDynamicConfig(configValue, dependencies.env ?? process.env);
+	const providerEnvironment = createProviderChildEnvironment(
+		dependencies.env ?? process.env,
+		config.bridge.secretEnvironmentVariable,
+	);
 	const registry = dependencies.registry ?? new AgentRegistry({
 		agentCap: config.limits.agentCap,
 		queueCap: config.limits.goalQueueCap,
@@ -469,14 +474,14 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 	});
 	const workspaceManager = dependencies.workspaceManager ?? new AgentWorkspaceManager(config.workspaceRoot);
 	const codexService = dependencies.providerService ?? dependencies.codexService ?? new ProviderService({
-		codex: new CodexService(config.codex, { transport: dependencies.codexTransport, now: dependencies.now ?? Date.now, workspaceManager }),
-		gemini: new AntigravityProviderService(config.gemini, {
+		codex: new CodexService({ ...config.codex, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transport: dependencies.codexTransport, now: dependencies.now ?? Date.now, workspaceManager }),
+		gemini: new AntigravityProviderService({ ...config.gemini, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, {
 			spawn: dependencies.antigravitySpawn,
 			terminate: dependencies.terminateProviderProcess,
 			platform: dependencies.platform,
 			workspaceManager,
 		}),
-		kimi: new AcpProviderService(config.kimi, { transportFactory: dependencies.kimiTransportFactory, workspaceManager }),
+		kimi: new AcpProviderService({ ...config.kimi, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transportFactory: dependencies.kimiTransportFactory, workspaceManager }),
 	});
 	const healthRegistry = dependencies.healthRegistry ?? dependencies.planner?.healthRegistry ?? new ProviderHealthRegistry({ now: dependencies.healthNow ?? Date.now });
 	const latencyRegistry = dependencies.latencyRegistry ?? new ControlLatencyRegistry();
@@ -546,8 +551,9 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 			provider: 'gemini',
 			cwd,
 			catalogDiscovery: true,
-			models: ['gemini-3.1-pro', 'gemini-3.6-flash', 'gemini-3.5-flash'],
+			models: ['gemini-3.7-flash', 'gemini-3.1-pro', 'gemini-3.6-flash', 'gemini-3.5-flash'],
 			modelReasoningEfforts: {
+				'gemini-3.7-flash': ['high', 'medium', 'low'],
 				'gemini-3.1-pro': ['high', 'low'],
 				'gemini-3.6-flash': ['high', 'medium', 'low'],
 				'gemini-3.5-flash': ['high', 'medium', 'low'],

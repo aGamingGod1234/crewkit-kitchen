@@ -5,6 +5,7 @@ import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
+const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft AI Agents', version: '2.1.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ fs: { readTextFile: false, writeTextFile: false }, terminal: false });
 
@@ -59,6 +60,7 @@ export class AcpProviderService {
 		const transport = this.#transportFactory({ ...profile, cwd });
 		const agent = new AcpAgent(profile, transport, {
 			planningTimeoutMs: this.#config.planningTimeoutMs,
+			maxDecisionBytes: this.#config.maxDecisionBytes,
 			recoverySummary: normalizeRecoverySummary(recoverySummary),
 		});
 		try { await agent.start(cwd); } catch (error) {
@@ -105,16 +107,18 @@ class AcpAgent {
 	#profile;
 	#transport;
 	#planningTimeoutMs;
+	#maxDecisionBytes;
 	#recoverySummary;
 	#sessionId = null;
 	#goalRevision = 0;
 	#active = false;
 	#disposed = false;
 
-	constructor(profile, transport, { planningTimeoutMs, recoverySummary }) {
+	constructor(profile, transport, { planningTimeoutMs, maxDecisionBytes, recoverySummary }) {
 		this.#profile = structuredClone(profile);
 		this.#transport = transport;
 		this.#planningTimeoutMs = planningTimeoutMs;
+		this.#maxDecisionBytes = maxDecisionBytes;
 		this.#recoverySummary = recoverySummary;
 	}
 
@@ -171,20 +175,35 @@ class AcpAgent {
 		if (goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled');
 		const chunks = [];
+		let decisionBytes = 0;
+		let outputLimitError = null;
+		let rejectOutputLimit;
+		const outputLimit = new Promise((_, reject) => { rejectOutputLimit = reject; });
+		void outputLimit.catch(() => { /* the decision awaits this promise in the request race */ });
 		const onNotification = ({ method, params }) => {
 			if (method !== 'session/update' || params?.sessionId !== this.#sessionId) return;
 			const update = params.update;
-			if (update?.sessionUpdate === 'agent_message_chunk' && update.content?.type === 'text' && typeof update.content.text === 'string') chunks.push(update.content.text);
+			if (outputLimitError !== null || update?.sessionUpdate !== 'agent_message_chunk' || update.content?.type !== 'text' || typeof update.content.text !== 'string') return;
+			const chunk = update.content.text;
+			const chunkBytes = Buffer.byteLength(chunk, 'utf8');
+			if (decisionBytes + chunkBytes > this.#maxDecisionBytes) {
+				outputLimitError = new AcpProtocolError('PLANNER_OUTPUT_LIMIT', `${this.provider} planner output exceeded ${this.#maxDecisionBytes} bytes`);
+				rejectOutputLimit(outputLimitError);
+				try { this.interrupt(); } catch { /* the bounded failure remains authoritative */ }
+				return;
+			}
+			decisionBytes += chunkBytes;
+			chunks.push(chunk);
 		};
 		const abort = () => this.interrupt();
 		this.#active = true;
 		this.#transport.on('notification', onNotification);
 		signal?.addEventListener('abort', abort, { once: true });
 		try {
-			const response = await withTimeout(this.#transport.request('session/prompt', {
+			const response = await withTimeout(Promise.race([this.#transport.request('session/prompt', {
 				sessionId: this.#sessionId,
 				prompt: [{ type: 'text', text: `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}` }],
-			}, { timeoutMs: this.#planningTimeoutMs }), this.#planningTimeoutMs);
+			}, { timeoutMs: this.#planningTimeoutMs }), outputLimit]), this.#planningTimeoutMs);
 			if (signal?.aborted || goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_PLAN', `${this.provider} result belongs to an obsolete goal`);
 			if (response?.stopReason !== 'end_turn') throw new AcpProtocolError('INCOMPLETE_TURN', `${this.provider} ACP stopped with '${String(response?.stopReason)}'`);
 			const decisionText = chunks.join('');
@@ -290,6 +309,7 @@ function validateServiceConfig(config) {
 		catalogDiscovery: config.catalogDiscovery === true,
 		catalogDiscoveryTimeoutMs: positiveInteger(config.catalogDiscoveryTimeoutMs ?? DEFAULT_DISCOVERY_TIMEOUT_MS, 'catalogDiscoveryTimeoutMs'),
 		planningTimeoutMs: positiveInteger(config.planningTimeoutMs ?? DEFAULT_PLANNING_TIMEOUT_MS, 'planningTimeoutMs'),
+		maxDecisionBytes: positiveInteger(config.maxDecisionBytes ?? DEFAULT_MAX_DECISION_BYTES, 'maxDecisionBytes'),
 	};
 }
 

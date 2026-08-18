@@ -19,9 +19,11 @@ import org.slf4j.LoggerFactory;
 public final class AgentSavedData extends SavedData {
 	private static final Logger LOGGER = LoggerFactory.getLogger(AgentSavedData.class);
 	private static final String PAYLOAD_FIELD = "payload";
+	private static final String PAYLOAD_CHUNKS_FIELD = "payload_chunks";
 	private static final AgentRegistrySnapshotCodec SNAPSHOT_CODEC = new AgentRegistrySnapshotCodec();
 	private static final Codec<AgentSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
-			Codec.STRING.fieldOf(PAYLOAD_FIELD).forGetter(AgentSavedData::encodePayload)
+			Codec.STRING.optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
+			Codec.STRING.listOf().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload()))
 	).apply(instance, AgentSavedData::decodePayload));
 	public static final SavedDataType<AgentSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "codex_agents"),
@@ -73,8 +75,8 @@ public final class AgentSavedData extends SavedData {
 		return SNAPSHOT_CODEC.encode(registry.snapshot());
 	}
 
-	private static AgentSavedData decodePayload(String payload) {
-		return new AgentSavedData(SNAPSHOT_CODEC.decode(payload));
+	private static AgentSavedData decodePayload(String legacyPayload, List<String> chunks) {
+		return new AgentSavedData(SNAPSHOT_CODEC.decode(ChunkedSavedPayload.join(legacyPayload, chunks)));
 	}
 
 	private void dispatchTransition(AgentTransition transition) {

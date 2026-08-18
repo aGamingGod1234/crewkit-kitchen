@@ -22,7 +22,8 @@ foreach ($required in @($Main, $ResolvedConfig)) {
 
 $node = (Get-Command node -ErrorAction Stop).Source
 $nodeVersion = (& $node --version).Trim()
-if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v25\.') { throw "Node 25 is required; found $nodeVersion" }
+if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(\d+)') { throw "Could not parse Node.js version '$nodeVersion'." }
+if ([int]$Matches[1] -lt 22) { throw "Node.js 22 or newer is required; found $nodeVersion" }
 
 $codex = (Get-Command codex -ErrorAction Stop).Source
 & $codex login status | Out-Host

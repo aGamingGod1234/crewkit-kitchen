@@ -29,9 +29,11 @@ public final class ScenarioPreflightVerification {
 		assertEquals("ROSTER_NOT_READY", ScenarioPreflight.assess(input(now, Optional.of(status(now, required, true, 0, 1, 0, 0, "closed")), List.of(required), "hash-a", "hash-a")).code(), "matching profile without ready roster waits");
 		assertEquals("SCHEDULER_HEADROOM", ScenarioPreflight.assess(input(now, Optional.of(status(now, required, true, 1, 1, 4, 12, "closed")), List.of(required), "hash-a", "hash-a")).code(), "full scheduler waits");
 		assertEquals("PROVIDER_CIRCUIT_OPEN", ScenarioPreflight.assess(input(now, Optional.of(status(now, required, true, 1, 1, 0, 0, "open")), List.of(required), "hash-a", "hash-a")).code(), "open provider circuit waits");
+		ScenarioPreflight.Input startupStillPending = new ScenarioPreflight.Input(Optional.empty(), List.of(required), "minecraft:overworld", "minecraft:overworld", "hash-a", "hash-a", true, now - 60_001L, now);
+		assertEquals("COORDINATOR_STATUS_STALE", ScenarioPreflight.assess(startupStillPending).code(), "full concurrent provider startup window remains available");
 		ScenarioPreflight.Input expiredWave = new ScenarioPreflight.Input(Optional.of(healthy), List.of(required), "minecraft:overworld", "minecraft:overworld", "hash-a", "hash-a", true, now - ScenarioPreflight.FIRST_WAVE_DEADLINE_MS - 1L, now);
 		assertEquals("FIRST_WAVE_DEADLINE", ScenarioPreflight.assess(expiredWave).code(), "first-wave deadline fails closed");
-		return 11;
+		return 12;
 	}
 
 	private static ScenarioPreflight.Input input(long now, Optional<CoordinatorStatusSnapshot> status, List<ScenarioPreflight.RequiredProfile> profiles, String expectedHash, String actualHash) {

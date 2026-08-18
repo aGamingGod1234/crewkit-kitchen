@@ -16,6 +16,7 @@
 		]
 	},
 	"mixins": [
+		"arenaagents.mixins.json",
 		{
 			"config": "arenaagents.client.mixins.json",
 			"environment": "client"

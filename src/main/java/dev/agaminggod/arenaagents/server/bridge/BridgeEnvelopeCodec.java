@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.bridge;
 
 import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
@@ -20,7 +21,7 @@ public final class BridgeEnvelopeCodec {
 	private static final Set<String> FIELDS = Set.of(
 			"protocolVersion", "serverInstanceId", "agentId", "type", "messageId", "payload"
 	);
-	private static final Gson GSON = new Gson();
+	private static final Gson GSON = new GsonBuilder().serializeNulls().create();
 
 	public BridgeEnvelope decode(String line) {
 		if (line == null || line.getBytes(StandardCharsets.UTF_8).length > MAX_LINE_BYTES) {

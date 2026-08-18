@@ -88,12 +88,23 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 		'select_item', 'select_tool', 'set_door', 'transfer_container', 'use_item', 'use_ranged', 'wait',
 	]);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /default priority framework|preserve life before|prefer cooked food/i);
-	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.required, ['summary', 'directive']);
+	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.required, ['summary', 'directive', 'source', 'status']);
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.directive, {
 		type: 'string', enum: ['replace', 'continue', 'pause', 'finish'],
 	});
-	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.source, { type: 'string', minLength: 1, maxLength: 65_536 });
-	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.status, { type: 'string', enum: ['completed', 'impossible'] });
+	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.source, { type: ['string', 'null'], minLength: 1, maxLength: 65_536 });
+	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.status, { type: ['string', 'null'], enum: ['completed', 'impossible', null] });
+});
+
+test('parses the canonical nullable decision envelope required by the Codex structured-output API', () => {
+	assert.deepEqual(
+		parseDecision('{"summary":"Wait","directive":"replace","source":"program.onUnhandledAttention(\\"continue_and_notify\\"); await player.wait(1);","status":null}'),
+		{ summary: 'Wait', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);' },
+	);
+	assert.deepEqual(
+		parseDecision('{"summary":"Done","directive":"finish","source":null,"status":"completed"}'),
+		{ summary: 'Done', directive: 'finish', status: 'completed' },
+	);
 });
 
 test('dead-state planner input carries the normalized vanilla respawn snapshot unchanged', () => {

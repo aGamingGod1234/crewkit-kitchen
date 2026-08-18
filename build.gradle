@@ -16,6 +16,16 @@ repositories {
 loom {
 	splitEnvironmentSourceSets()
 
+	def developmentBridgeSecret = layout.projectDirectory.file('runtime/bridge-secret.txt').asFile.absolutePath
+	runs {
+		client {
+			vmArg "-Darenaagents.bridgeSecretFile=${developmentBridgeSecret}"
+		}
+		server {
+			vmArg "-Darenaagents.bridgeSecretFile=${developmentBridgeSecret}"
+		}
+	}
+
 	mods {
 		"arenaagents" {
 			sourceSet sourceSets.main

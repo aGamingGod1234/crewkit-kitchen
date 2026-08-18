@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { DEFAULT_CHILD_STOP_TIMEOUT_MS, terminateChildProcess } from './child-process-lifecycle.mjs';
 import { JsonlDecoder, encodeJsonLine } from './jsonl.mjs';
+import { createProviderChildEnvironment } from './provider-environment.mjs';
 
 const MAX_LINE_BYTES = 4 * 1_024 * 1_024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -19,7 +20,10 @@ export class AcpProtocolError extends Error {
 
 export function buildAcpLaunch(provider, profile = {}, dependencies = {}) {
 	const normalizedProvider = requireProvider(provider);
-	const environment = { ...(dependencies.env ?? process.env) };
+	const environment = createProviderChildEnvironment(
+		dependencies.env ?? profile.environment ?? process.env,
+		profile.bridgeSecretEnvironmentVariable,
+	);
 	if (normalizedProvider === 'kimi') environment.KIMI_MODEL_THINKING_EFFORT = requireKimiEffort(profile.reasoningEffort ?? 'high');
 	const options = {
 		cwd: profile.cwd,

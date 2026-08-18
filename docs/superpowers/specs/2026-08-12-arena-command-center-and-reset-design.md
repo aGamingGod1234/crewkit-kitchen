@@ -18,7 +18,14 @@ The Arena tab uses three steps:
 
 The setup panel reserves separate regions for the title/tabs, step rail, content, status, and footer. The roster uses a two-column list/editor layout when enough width is available and a compact stacked layout otherwise. Status text never shares the footer button baseline.
 
-The agent screen uses the model catalogue rather than free text, keeps the visual anchor and command selection consistent, explains an empty selection accurately, enables lifecycle actions only when every selected agent supports them, and names/counts every destructive batch accurately.
+The Agents tab is split into four focused pages instead of placing every control in one panel:
+
+1. Your Agents: choose an agent and see its plain-language state and current task.
+2. Create Agent: choose provider, model, thinking depth, game mode, and an optional friendly name.
+3. Give Task: write one instruction, then start it, queue it, or adjust the current task.
+4. Manage Agent: pause, resume, respawn, change automatic progress, or remove the selected agent.
+
+The model field uses the catalogue rather than free text. Lifecycle states, task results, and chat feedback use reader-facing names instead of IDs, revisions, and internal enum values. Task controls are disabled when the authenticated coordinator is unavailable, and the server rejects the same operations instead of reporting a start that cannot progress.
 
 ## Arena reset lifecycle
 

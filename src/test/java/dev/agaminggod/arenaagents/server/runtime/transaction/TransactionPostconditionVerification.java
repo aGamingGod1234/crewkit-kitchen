@@ -152,7 +152,20 @@ public final class TransactionPostconditionVerification {
 		assertFalse(creativePlacement.useMaxItems(), "creative one-craft mode does not swap into max-item placement");
 		assertTrue(creativePlacement.allowDroppingItemsToClear(),
 				"creative status occupies handlePlacement's second boolean");
-		return 33;
+
+		assertEquals(List.of("a", "b"), TransactionSnapshot.expandCraftingRemainders(
+				List.of("a", "b"), 2, 2, 2, 0, 0, "empty"),
+				"already full-grid remainder layouts are preserved");
+		assertEquals(List.of("empty", "empty", "empty", "empty", "a", "b", "empty", "empty", "empty"),
+				TransactionSnapshot.expandCraftingRemainders(List.of("a", "b"), 9, 3, 2, 1, 1, "empty"),
+				"trimmed recipe remainders are restored to their full crafting-grid coordinates");
+		assertEquals(List.of("empty", "empty", "empty", "empty", "a", "empty", "empty", "b", "empty"),
+				TransactionSnapshot.expandCraftingRemainders(List.of("a", "b"), 9, 3, 1, 1, 1, "empty"),
+				"vertical trimmed recipes preserve their one-column remainder layout");
+		assertThrows(IllegalArgumentException.class,
+				() -> TransactionSnapshot.expandCraftingRemainders(List.of("a", "b"), 4, 2, 2, 2, 0, "empty"),
+				"out-of-bounds remainder positioning is rejected");
+		return 37;
 	}
 
 	private static TransactionSnapshot.OwnedStack owned(String itemId, int count, String fingerprint) {

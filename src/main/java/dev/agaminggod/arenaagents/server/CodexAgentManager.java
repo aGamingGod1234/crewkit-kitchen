@@ -27,6 +27,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
@@ -361,6 +362,21 @@ public final class CodexAgentManager {
 		}
 	}
 
+	public boolean captureDeath(ServerPlayer player, DamageSource source) {
+		Objects.requireNonNull(player, "player must not be null");
+		Objects.requireNonNull(source, "source must not be null");
+		long now = System.currentTimeMillis();
+		String cause;
+		try {
+			cause = source.getLocalizedDeathMessage(player).getString();
+		} catch (RuntimeException ignored) {
+			cause = "Agent died";
+		}
+		return AgentDeathCapture.record(
+				savedData.registry(), player.getUUID(), deathSnapshot(player, cause, now), now
+		);
+	}
+
 	private static AgentDeathSnapshot deathSnapshot(ServerPlayer player, long now) {
 		String cause;
 		try {
@@ -368,6 +384,10 @@ public final class CodexAgentManager {
 		} catch (RuntimeException ignored) {
 			cause = "Agent died";
 		}
+		return deathSnapshot(player, cause, now);
+	}
+
+	private static AgentDeathSnapshot deathSnapshot(ServerPlayer player, String cause, long now) {
 		ServerPlayer.RespawnConfig config = player.getRespawnConfig();
 		Optional<String> respawnDimension = Optional.empty();
 		Optional<Double> respawnX = Optional.empty();

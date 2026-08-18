@@ -2,8 +2,8 @@ package dev.agaminggod.arenaagents.client.mixin;
 
 import dev.agaminggod.arenaagents.client.control.AgentControlClient;
 import dev.agaminggod.arenaagents.client.render.CodexAgentRenderer;
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
-import java.util.Locale;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.core.ClientAsset;
 import net.minecraft.resources.Identifier;
@@ -20,20 +20,16 @@ abstract class AbstractClientPlayerMixin {
 	private void arenaagents$agentSkin(CallbackInfoReturnable<PlayerSkin> callback) {
 		AbstractClientPlayer player = (AbstractClientPlayer) (Object) this;
 		String profileName = player.getGameProfile().name();
-		AgentControlAgent agent = AgentControlClient.snapshot()
-				.flatMap(snapshot -> snapshot.agents().stream()
-						.filter(candidate -> offlinePlayerName(candidate).equals(profileName))
-						.findFirst())
-				.orElse(null);
-		if (agent == null) return;
+		AgentControlAgent agent = AgentControlClient.agentForPlayer(profileName).orElse(null);
+		AgentIdentity.SkinIdentity fallback = agent == null
+				? AgentIdentity.skinForPlayerName(profileName).orElse(null) : null;
+		if (agent == null && fallback == null) return;
 
-		int variant = Math.floorMod(agent.agentId().hashCode(), 4);
-		Identifier texture = CodexAgentRenderer.textureFor(agent.provider(), variant);
+		Identifier texture = agent != null
+				? CodexAgentRenderer.textureFor(agent.provider(), agent.skinVariant())
+				: CodexAgentRenderer.textureFor(fallback.provider(), fallback.variant());
 		ClientAsset.Texture body = new ClientAsset.ResourceTexture(texture, texture);
 		callback.setReturnValue(new PlayerSkin(body, null, null, PlayerModelType.WIDE, false));
 	}
 
-	private static String offlinePlayerName(AgentControlAgent agent) {
-		return "AA" + agent.agentId().replace("-", "").substring(0, 14).toUpperCase(Locale.ROOT);
-	}
 }

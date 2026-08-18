@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-12T15:10:00+08:00",
+  "title": "Design System: Arena Agents Field Console",
+  "extensions": {
+    "colorMeta": {
+      "obsidian-panel": { "role": "neutral", "displayName": "Obsidian Panel", "canonical": "#18202B", "tonalRamp": ["#10151C", "#18202B", "#263342", "#3A4A5D", "#596B7E", "#8493A2", "#B7C1CA", "#E7EBEF"] },
+      "signal-amber": { "role": "primary", "displayName": "Signal Amber", "canonical": "#F2BD58", "tonalRamp": ["#2B210D", "#4C3913", "#73571E", "#9A772E", "#BF9741", "#DDB258", "#F2CD83", "#FAE9C4"] },
+      "success-mint": { "role": "success", "displayName": "Success Mint", "canonical": "#66D9A3", "tonalRamp": ["#10281D", "#17452F", "#206444", "#2E865D", "#45A978", "#66C997", "#99DEBB", "#D8F2E5"] },
+      "fault-coral": { "role": "error", "displayName": "Fault Coral", "canonical": "#FF737A", "tonalRamp": ["#321316", "#571C21", "#80272E", "#AA3740", "#D4515A", "#ED747B", "#F7A6AA", "#FCD9DB"] }
+    },
+    "typographyMeta": {
+      "title": { "displayName": "Workspace Title", "purpose": "Current workspace and selected subject." },
+      "body": { "displayName": "Console Body", "purpose": "Readable task and runtime information." },
+      "label": { "displayName": "Control Label", "purpose": "Navigation, fields, chips, and metadata." }
+    },
+    "shadows": [],
+    "motion": [
+      { "name": "state-change", "value": "180ms ease-out", "purpose": "Selection and workspace changes only." }
+    ],
+    "breakpoints": [
+      { "name": "compact", "value": "520px" },
+      { "name": "wide", "value": "760px" }
+    ]
+  },
+  "components": [],
+  "narrative": {
+    "northStar": "The Field Command Table",
+    "overview": "A dark, legible in-world operations surface with unmistakable selection and runtime truth.",
+    "keyCharacteristics": ["Full-row selected states", "Stable navigation and activity regions", "Separated setup and group control", "Dense readable information"],
+    "rules": [
+      { "name": "Signal Rarity", "body": "Amber marks what is current or actionable. It is never decorative.", "section": "colors" },
+      { "name": "Human Copy", "body": "Lifecycle and error text are phrased for a player, not a protocol engineer.", "section": "typography" },
+      { "name": "Flat Console", "body": "Focus and selection use tonal change and keylines, not ornamental glow.", "section": "elevation" }
+    ],
+    "dos": ["Show exact arena placement and measurable block progress.", "Separate single-agent setup from group messaging."],
+    "donts": ["Do not use tiny glyphs as the only selection signal.", "Do not bundle every control into one screen."]
+  }
+}

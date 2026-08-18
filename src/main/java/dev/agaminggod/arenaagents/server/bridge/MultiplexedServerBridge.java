@@ -54,7 +54,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
@@ -70,6 +69,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
 	private static final int MAX_TRACKED_IDS = 4_096;
+	private static final int SERVER_TASK_CAP = 4_096;
+	private static final int SERVER_TASKS_PER_TICK = 256;
 	private static final int OBSERVATION_HISTORY_CAPACITY = 64;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
@@ -87,8 +88,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final String serverInstanceId = UUID.randomUUID().toString();
 	private final String secret;
 	private final int port;
-	private final ConcurrentLinkedQueue<Runnable> serverTasks = new ConcurrentLinkedQueue<>();
+	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(SERVER_TASK_CAP);
 	private final AtomicBoolean running = new AtomicBoolean();
+	private final AtomicBoolean coordinatorDisconnectPending = new AtomicBoolean();
+	private final AtomicBoolean activeDisconnectPending = new AtomicBoolean();
 	private final AtomicLong messageIds = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private volatile Session session;
@@ -131,14 +134,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	public void tick() {
-		Runnable task;
-		while ((task = serverTasks.poll()) != null) {
+		if (coordinatorDisconnectPending.getAndSet(false)) {
+			actionExecutor.coordinatorDisconnected();
+			disconnectActiveAgents();
+		}
+		if (activeDisconnectPending.getAndSet(false)) {
+			disconnectActiveAgents();
+		}
+		serverTasks.drain(SERVER_TASKS_PER_TICK, task -> {
 			try {
 				task.run();
 			} catch (RuntimeException exception) {
 				LOGGER.error("Codex bridge server task failed", exception);
 			}
-		}
+		});
 		actionExecutor.tick();
 		for (AgentId agentId : registeredObservationIds(manager.records())) {
 			queueObservation(agentId);
@@ -213,7 +222,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		if (!authenticated()) {
 			if (transition.after().state().isActive()) {
-				serverTasks.add(this::disconnectActiveAgents);
+				requestActiveDisconnect();
 			}
 			return;
 		}
@@ -297,10 +306,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!serverInstanceId.equals(envelope.serverInstanceId())) {
 			throw new BridgeProtocolException("SERVER_INSTANCE_MISMATCH", "Authenticated session changed serverInstanceId");
 		}
-		serverTasks.add(() -> {
+		if (!serverTasks.offer(() -> {
 			if (session != source || !source.open.get() || !source.authenticated.get()) return;
 			routeAuthenticated(envelope);
-		});
+		})) {
+			throw new BridgeProtocolException("SERVER_TASK_QUEUE_FULL", "Coordinator exceeded the bounded server task queue");
+		}
 	}
 
 	private void acceptHello(BridgeEnvelope envelope, Session source) {
@@ -415,6 +426,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		String message = requiredString(envelope.payload(), "message");
 		AgentTransition transition = router.plannerFailed(agentId, goalRevision, message);
 		AgentChatReporter.failed(manager, transition.after(), code, message);
+	}
+
+	private void requestActiveDisconnect() {
+		if (!serverTasks.offer(this::disconnectActiveAgents)) {
+			activeDisconnectPending.set(true);
+			LOGGER.warn("Codex bridge server task queue is full; active-agent disconnect was coalesced");
+		}
 	}
 
 	private void disconnectActiveAgents() {
@@ -1337,10 +1355,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogLoaded = false;
 				CoordinatorStatusStore.clear(manager.server());
 			}
-			if (wasAuthenticated) serverTasks.add(() -> {
-				actionExecutor.coordinatorDisconnected();
-				MultiplexedServerBridge.this.disconnectActiveAgents();
-			});
+			if (wasAuthenticated) coordinatorDisconnectPending.set(true);
 		}
 
 		private static void interruptPeer(Thread thread) {

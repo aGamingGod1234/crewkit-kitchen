@@ -37,6 +37,7 @@ public record ScenarioRunSnapshot(
 		String dimensionId,
 		UUID operatorId,
 		List<String> boundAgentIds,
+		Map<String, Integer> parkourCheckpoints,
 		Origin origin,
 		ScenarioSessionState state,
 		Optional<String> completionReason,
@@ -46,11 +47,18 @@ public record ScenarioRunSnapshot(
 		ScenarioRuntimeClock.Snapshot clock,
 		List<ScenarioPublicEvent> publicEvents
 ) {
-	public static final int CURRENT_VERSION = 1;
-	private static final Set<String> ROOT_KEYS = Set.of(
+	public static final int CURRENT_VERSION = 2;
+	private static final int LEGACY_VERSION = 1;
+	private static final Set<String> ROOT_KEYS_V1 = Set.of(
 			"version", "sessionId", "scenarioId", "mapVersion", "worldSeed", "eventSeed",
 			"durationTicks", "deterministicEvents", "participants", "createdAtEpochMs",
 			"dimensionId", "operatorId", "boundAgentIds", "origin", "state",
+			"completionReason", "lastElapsedTick", "scores", "reset", "clock", "publicEvents"
+	);
+	private static final Set<String> ROOT_KEYS = Set.of(
+			"version", "sessionId", "scenarioId", "mapVersion", "worldSeed", "eventSeed",
+			"durationTicks", "deterministicEvents", "participants", "createdAtEpochMs",
+			"dimensionId", "operatorId", "boundAgentIds", "parkourCheckpoints", "origin", "state",
 			"completionReason", "lastElapsedTick", "scores", "reset", "clock", "publicEvents"
 	);
 
@@ -87,6 +95,20 @@ public record ScenarioRunSnapshot(
 		if (boundAgentIds.size() != participants.size()) {
 			throw failure("INVALID_SCENARIO_SNAPSHOT", "bound agents must exactly match participants");
 		}
+		TreeMap<String, Integer> orderedCheckpoints = new TreeMap<>();
+		for (Map.Entry<String, Integer> entry : Objects.requireNonNull(
+				parkourCheckpoints, "parkourCheckpoints must not be null").entrySet()) {
+			String agentId = text(entry.getKey(), "parkour checkpoint agentId", 96);
+			int checkpoint = Objects.requireNonNull(entry.getValue(), "parkour checkpoint must not be null");
+			if (!boundAgentIds.contains(agentId)) {
+				throw failure("INVALID_SCENARIO_SNAPSHOT", "parkour checkpoint agent is not bound");
+			}
+			if (checkpoint < 0 || checkpoint >= ScenarioParkourCourse.PLATFORM_COUNT) {
+				throw failure("INVALID_SCENARIO_SNAPSHOT", "parkour checkpoint is invalid");
+			}
+			orderedCheckpoints.put(agentId, checkpoint);
+		}
+		parkourCheckpoints = Map.copyOf(orderedCheckpoints);
 		origin = Objects.requireNonNull(origin, "origin must not be null");
 		state = Objects.requireNonNull(state, "state must not be null");
 		completionReason = Objects.requireNonNull(completionReason, "completionReason must not be null")
@@ -123,6 +145,7 @@ public record ScenarioRunSnapshot(
 			String dimensionId,
 			UUID operatorId,
 			List<String> boundAgentIds,
+			Map<String, Integer> parkourCheckpoints,
 			Origin origin,
 			ScenarioResetReceipt reset,
 			List<ScenarioPublicEvent> publicEvents
@@ -147,6 +170,7 @@ public record ScenarioRunSnapshot(
 				dimensionId,
 				operatorId,
 				boundAgentIds,
+				parkourCheckpoints,
 				origin,
 				persistedState,
 				session.completionReason(),
@@ -185,7 +209,7 @@ public record ScenarioRunSnapshot(
 		return new ScenarioRunSnapshot(
 				version, sessionId, scenarioId, mapVersion, worldSeed, eventSeed, durationTicks,
 				deterministicEvents, participants, createdAtEpochMs, dimensionId, operatorId,
-				boundAgentIds, origin, ScenarioSessionState.FAILED, Optional.of(normalized),
+				boundAgentIds, parkourCheckpoints, origin, ScenarioSessionState.FAILED, Optional.of(normalized),
 				lastElapsedTick, scores, reset, clock, publicEvents
 		);
 	}
@@ -209,6 +233,9 @@ public record ScenarioRunSnapshot(
 		JsonArray agentArray = new JsonArray();
 		for (String agentId : boundAgentIds) agentArray.add(agentId);
 		root.add("boundAgentIds", agentArray);
+		JsonObject checkpointObject = new JsonObject();
+		new TreeMap<>(parkourCheckpoints).forEach(checkpointObject::addProperty);
+		root.add("parkourCheckpoints", checkpointObject);
 		root.add("origin", origin.toJson());
 		root.addProperty("state", state.name());
 		if (completionReason.isPresent()) root.addProperty("completionReason", completionReason.orElseThrow());
@@ -232,15 +259,22 @@ public record ScenarioRunSnapshot(
 			JsonElement parsed = JsonParser.parseString(Objects.requireNonNull(json, "json must not be null"));
 			if (!parsed.isJsonObject()) throw failure("INVALID_SCENARIO_SNAPSHOT", "root must be an object");
 			JsonObject root = parsed.getAsJsonObject();
-			requireExactKeys(root, ROOT_KEYS, "root");
 			int version = exactInt(root, "version");
-			if (version != CURRENT_VERSION) {
+			if (version != LEGACY_VERSION && version != CURRENT_VERSION) {
 				throw failure("UNSUPPORTED_SCENARIO_SNAPSHOT", "unsupported snapshot version " + version);
 			}
+			requireExactKeys(root, version == LEGACY_VERSION ? ROOT_KEYS_V1 : ROOT_KEYS, "root");
 			List<Participant> participants = new ArrayList<>();
 			for (JsonElement item : array(root, "participants")) participants.add(Participant.fromJson(item));
 			List<String> boundAgents = new ArrayList<>();
 			for (JsonElement item : array(root, "boundAgentIds")) boundAgents.add(string(item, "boundAgentId"));
+			TreeMap<String, Integer> checkpoints = new TreeMap<>();
+			if (version == CURRENT_VERSION) {
+				JsonObject checkpointObject = object(root, "parkourCheckpoints");
+				for (Map.Entry<String, JsonElement> entry : checkpointObject.entrySet()) {
+					checkpoints.put(entry.getKey(), exactInt(checkpointObject, entry.getKey()));
+				}
+			}
 			TreeMap<String, Double> scores = new TreeMap<>();
 			JsonObject scoreObject = object(root, "scores");
 			for (Map.Entry<String, JsonElement> entry : scoreObject.entrySet()) {
@@ -252,7 +286,7 @@ public record ScenarioRunSnapshot(
 			Optional<String> completionReason = reason.isJsonNull()
 					? Optional.empty() : Optional.of(string(reason, "completionReason"));
 			return new ScenarioRunSnapshot(
-					version,
+					CURRENT_VERSION,
 					UUID.fromString(string(root.get("sessionId"), "sessionId")),
 					string(root.get("scenarioId"), "scenarioId"),
 					string(root.get("mapVersion"), "mapVersion"),
@@ -265,6 +299,7 @@ public record ScenarioRunSnapshot(
 					string(root.get("dimensionId"), "dimensionId"),
 					UUID.fromString(string(root.get("operatorId"), "operatorId")),
 					boundAgents,
+					checkpoints,
 					Origin.fromJson(root.get("origin")),
 					ScenarioSessionState.valueOf(string(root.get("state"), "state")),
 					completionReason,

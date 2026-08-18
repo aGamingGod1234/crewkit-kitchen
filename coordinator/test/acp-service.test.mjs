@@ -17,6 +17,7 @@ class FakeAcpTransport extends EventEmitter {
 		this.configOptionsAfterModel = configOptionsAfterModel;
 		this.calls = [];
 		this.started = false;
+		this.message = DECISION;
 	}
 
 	async start() { this.started = true; }
@@ -35,7 +36,7 @@ class FakeAcpTransport extends EventEmitter {
 		if (method === 'session/prompt') {
 			queueMicrotask(() => this.emit('notification', {
 				method: 'session/update',
-				params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: DECISION } } },
+				params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: this.message } } },
 			}));
 			await new Promise((resolve) => setImmediate(resolve));
 			return { stopReason: 'end_turn' };
@@ -100,11 +101,19 @@ test('ACP processes and sessions use the same per-agent workspace', async () => 
 });
 
 test('Kimi launches one effort-isolated process and applies the exact ACP thinking level', async () => {
-	const launch = buildAcpLaunch('kimi', { reasoningEffort: 'max' }, { env: { PATH: 'test' } });
+	const launch = buildAcpLaunch('kimi', { reasoningEffort: 'max' }, {
+		env: {
+			PATH: 'test',
+			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
+			ARENA_AGENT_BRIDGE_SECRET_FILE: 'C:\\runtime\\bridge.secret',
+		},
+	});
 	assert.equal(launch.command, 'kimi');
 	assert.deepEqual(launch.args, ['acp']);
 	assert.equal(launch.options.env.KIMI_MODEL_THINKING_EFFORT, 'max');
 	assert.equal(launch.options.env.PATH, 'test');
+	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET, undefined, 'provider child cannot inherit the bridge secret');
+	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined, 'provider child cannot inherit the bridge secret file path');
 
 	const transport = new FakeAcpTransport([
 		{ id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3', options: [{ value: 'kimi-code/k3', name: 'K3' }] },
@@ -128,6 +137,23 @@ test('ACP cancellation is a notification and unsupported profile values fail clo
 	const agent = await service.createAgent({ agentId: 'good', provider: 'gemini', model: 'auto', reasoningEffort: 'high' });
 	agent.interrupt();
 	assert.equal(transport.calls.at(-1).method, 'session/cancel');
+	await service.stop();
+});
+
+test('ACP rejects a streamed planner decision once its aggregate byte budget is exceeded', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.message = 'x'.repeat(33);
+	const service = new AcpProviderService(
+		{ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'], maxDecisionBytes: 32 },
+		{ transportFactory: () => transport },
+	);
+	const agent = await service.createAgent({ agentId: 'gemini-bounded', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(1);
+	await assert.rejects(
+		agent.decide('authoritative state', { goalRevision: 1 }),
+		(error) => error?.code === 'PLANNER_OUTPUT_LIMIT',
+	);
+	assert.equal(transport.calls.some((call) => call.kind === 'notification' && call.method === 'session/cancel'), true);
 	await service.stop();
 });
 

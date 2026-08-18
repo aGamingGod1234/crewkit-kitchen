@@ -29,6 +29,15 @@ test('Antigravity catalog retains the last discovered aliases when a later CLI r
 	assert.equal(service.catalog.stale, true);
 });
 
+test('Antigravity fallback configuration accepts the installed Gemini 3.7 Flash model', async () => {
+	const service = new AntigravityProviderService({ cwd: 'C:\\workspace' });
+	const agent = await service.createAgent({
+		agentId: 'gemini-current', provider: 'gemini', model: 'gemini-3.7-flash', reasoningEffort: 'high',
+	});
+	assert.equal(agent.provider, 'gemini');
+	await service.stop();
+});
+
 const DECISION = JSON.stringify({
 	summary: 'Wait safely.',
 	directive: 'replace',
@@ -94,7 +103,7 @@ function profile(overrides = {}) {
 test('Antigravity launch maps the visible Gemini model and thinking to one exact CLI model', () => {
 	const launch = buildAntigravityLaunch(profile(), config(), {
 		cwd: 'C:\\agents\\gemini\\gemini-a',
-		env: { PATH: 'test' },
+		env: { PATH: 'test', ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret' },
 		platform: 'win32',
 	});
 	assert.equal(launch.command, 'agy');
@@ -106,6 +115,7 @@ test('Antigravity launch maps the visible Gemini model and thinking to one exact
 	]);
 	assert.equal(launch.options.cwd, 'C:\\agents\\gemini\\gemini-a');
 	assert.equal(launch.options.env.PATH, 'test');
+	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET, undefined, 'Gemini child cannot inherit the bridge secret');
 	assert.deepEqual(launch.options.stdio, ['ignore', 'pipe', 'pipe']);
 });
 

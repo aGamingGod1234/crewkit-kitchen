@@ -133,6 +133,10 @@ public final class ServerActionExecutorVerification {
 				"cancellation rejects a newer goal revision");
 		assertFalse(ServerActionExecutor.matchesCancellation(cancellationTarget, 7L, "action-8"),
 				"cancellation rejects a different action identity");
+		assertTrue(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 4L),
+				"respawn completion remains valid only for its coordinator generation");
+		assertFalse(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 5L),
+				"respawn completion from a disconnected coordinator generation is ignored");
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 1.1D, 250L, 1_750_000_000_250L
 		), "progress rejects fractions above one");
@@ -184,7 +188,7 @@ public final class ServerActionExecutorVerification {
 				"runtime revalidation preserves a precise recoverable domain reason");
 		assertEquals("ACTION_EXCEPTION", ServerActionExecutor.failureReason(new IllegalStateException("broken")),
 				"unexpected runtime exceptions remain isolated");
-		return 38;
+		return 40;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

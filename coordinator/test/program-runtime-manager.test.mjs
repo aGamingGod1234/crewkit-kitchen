@@ -68,6 +68,41 @@ test('routes invalid source correction to the selected agent planner without a l
 	assert.match(run.requests[0].input, /ArenaScript compiler correction/);
 });
 
+test('corrects an omitted mine argument through the selected model before bridge dispatch', async () => {
+	const registry = new AgentRegistry();
+	registry.register(record());
+	const sent = [];
+	const requests = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: {
+			requestPlan: async (request) => {
+				requests.push(request);
+				return {
+					summary: 'Use a valid primitive argument.',
+					directive: 'replace',
+					source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+				};
+			},
+		},
+	});
+
+	await manager.installDecision(registry.get('agent-a'), {
+		summary: 'Mine a block.',
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.mine();',
+	}, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(requests.length, 1);
+	assert.equal(requests[0].agentId, 'agent-a');
+	assert.equal(requests[0].preserveState, true);
+	assert.match(requests[0].input, /ArenaScript compiler correction/);
+	assert.equal(sent.length, 1);
+	assert.equal(sent[0].payload.actionType, 'wait');
+});
+
 test('uses an authored watcher before asking the provider for unmatched attention', async () => {
 	const run = harness();
 	await run.manager.installDecision(run.registry.get('agent-a'), {
