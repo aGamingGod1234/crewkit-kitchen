@@ -301,6 +301,16 @@ export function parseHeadlessCliArguments(args) {
 	return result;
 }
 
+/** Render a small, secret-free handoff suitable for terminals and CI logs. */
+export function formatHeadlessCliOutput(report) {
+	if (!report || typeof report !== 'object') throw new TypeError('matrix report must be an object');
+	const lines = [`Report: ${String(report.reportPath ?? '')}`, `Matrix: ${String(report.status ?? 'UNKNOWN')}`];
+	for (const scenario of Array.isArray(report.scenarios) ? report.scenarios : []) {
+		lines.push(`${String(scenario.status ?? 'UNKNOWN')} ${String(scenario.scenarioId ?? 'unknown')}`);
+	}
+	return `${lines.join('\n')}\n`;
+}
+
 export async function runHeadlessMatrix({
 	configPath, scenarioId = null, runDirectory, rconHost = '127.0.0.1', rconPort, rconPasswordFile,
 	protocolAuditPath = null, providerTurnsPath = null, requireAll = false,
@@ -603,7 +613,7 @@ async function runHeadlessCli() {
 	const parsed = parseHeadlessCliArguments(process.argv.slice(2));
 	if (parsed.help) { process.stdout.write(`${HEADLESS_CLI_USAGE}\n`); return; }
 	const result = await runHeadlessMatrix(parsed);
-	process.stdout.write(`${JSON.stringify(result.report)}\n`);
+	process.stdout.write(formatHeadlessCliOutput(result.report));
 	process.exitCode = result.exitCode;
 }
 

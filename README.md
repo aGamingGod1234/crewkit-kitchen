@@ -85,6 +85,32 @@ Arena setup defaults to building 80 blocks in front of the operator so construct
 
 The current offline-player release is covered by the headless Java/Fabric and coordinator verification suites. Live Minecraft gameplay and provider-latency acceptance remain pending; headless checks do not establish live success.
 
+## Real-provider headless matrix checks
+
+The real-provider runner is opt-in. Before running it, prepare the isolated Fabric server template, build the mod, and log in to the provider CLI that owns the selected profile. Codex requires an authenticated local `codex` session; Gemini requires a usable `agy` account and installed model; Kimi requires a usable `kimi` ACP account and installed model. The runner uses those existing local logins and reads only the generated Minecraft RCON password file. It never reads provider credentials.
+
+These checks start Minecraft and a coordinator, consume provider turns, and can take several minutes or incur provider usage costs. Run them only when that cost and latency are acceptable. They are separate from the fast, provider-free offline test suite and do not replace `npm test`.
+
+Run one Codex scenario from the repository root:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-headless-provider-matrix.ps1 -ProjectRoot (Get-Location) -MatrixPath .\coordinator\config\headless-provider-matrix.json -ScenarioId codex-chat-completion
+```
+
+Run every configured scenario sequentially:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-headless-provider-matrix.ps1 -ProjectRoot (Get-Location) -MatrixPath .\coordinator\config\headless-provider-matrix.json -RequireAll
+```
+
+The lower-level coordinator command is also available through `npm run headless:matrix` when a prepared server and RCON password file already exist. All paths must be absolute:
+
+```powershell
+npm --prefix .\coordinator run headless:matrix -- --config <absolute-matrix.json> --scenario codex-chat-completion --run-directory <absolute-run-directory> --rcon-host 127.0.0.1 --rcon-port <rcon-port> --rcon-password-file <absolute-rcon-password-file> --protocol-audit <absolute-protocol.jsonl> --provider-turns <absolute-provider-turns.jsonl>
+```
+
+The command prints the matrix report path and one summary line per scenario. Reports are written under `runtime/headless-runs/<run-id>/`, with `matrix-report.json` at the run root and an individual `report.json` plus bounded traces under each scenario directory. A provider that is unavailable is reported as `SKIPPED` and returns exit code 0 when optional; `--require-all` classifies that same skip as `FAILED` and returns exit code 1. Provider, bridge, assertion, timeout, and cleanup failures always return a nonzero exit code. Do not paste RCON passwords or provider output into issue reports.
+
 ## Current action surface
 
 The server-authoritative executor drives Carpet's real player action pack for movement, looking, jumping, attacking, item use, and block interaction. Observations include vanilla HUD/player state, inventory/equipment, visible nearby entities and blocks, world state, the active action, and the last result. Entity and block facts are gated by the current view and line of sight; hidden creature health and other server-only combat facts are not exposed as sight. Damage publishes a fresh factual observation without cancelling the current action or choosing fight, flight, or replanning for the model. Death is reconciled into a persistent `DEAD` lifecycle state and remains under the selected model's coordinate-free respawn primitive.
