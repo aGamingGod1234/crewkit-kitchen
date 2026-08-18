@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+	[switch] $SetupFailureOnly
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -264,11 +266,44 @@ try {
 	$unsafeMatrix = Join-Path $fixture 'unsafe-matrix.json'
 	Set-Content -LiteralPath $unsafeMatrix -Value '{"version":1,"scenarios":[{"id":"../escape","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $unsafeMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'safe|separator|scenario ID|control'
+	foreach ($invalidCharacter in @(':', '*', '?', '<', '>', '|')) {
+		$invalidIdMatrix = Join-Path $fixture "invalid-id-$([int][char]$invalidCharacter).json"
+		$invalidId = "fixture${invalidCharacter}name"
+		$invalidScenario = [pscustomobject]@{ id = $invalidId; provider = 'codex'; model = 'fixture'; reasoningEffort = 'low'; serviceTier = 'fast'; task = 'fixture'; timeoutMs = 1000; assert = @([pscustomobject]@{ type = 'lifecycle'; state = 'COMPLETED' }) }
+		Set-Content -LiteralPath $invalidIdMatrix -Value ([pscustomobject]@{ version = 1; scenarios = @($invalidScenario) } | ConvertTo-Json -Depth 8) -NoNewline
+		Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $invalidIdMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'safe|separator|scenario ID|control'
+	}
+	Write-Output 'PASS Windows-invalid scenario ID characters are rejected before setup'
 	$largeMatrix = Join-Path $fixture 'large-matrix.json'
 	$largeScenarios = @(1..17 | ForEach-Object { [pscustomobject]@{ id = "fixture-$_"; provider = 'codex'; model = 'fixture'; reasoningEffort = 'low'; serviceTier = 'fast'; task = 'fixture'; timeoutMs = 1000; assert = @([pscustomobject]@{ type = 'lifecycle'; state = 'COMPLETED' }) } })
 	Set-Content -LiteralPath $largeMatrix -Value ([pscustomobject]@{ version = 1; scenarios = $largeScenarios } | ConvertTo-Json -Depth 8) -NoNewline
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $largeMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Selected scenario count|bounded maximum|maximum'
 	Write-Output 'PASS selected scenario count is bounded'
+
+	if ($SetupFailureOnly) {
+		$sourceConfigPath = Join-Path $fixture 'coordinator\config\dynamic-agents.json'
+		$validSourceConfig = Get-Content -Raw -LiteralPath $sourceConfigPath
+		Set-Content -LiteralPath $sourceConfigPath -Value '{ malformed coordinator config' -NoNewline
+		try {
+			Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'failed|required|JSON|parse|Unexpected'
+			$setupFailureMatrixReport = Get-ChildItem -LiteralPath (Join-Path $fixture 'runtime\headless-runs') -Recurse -Filter matrix-report.json | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+			if ($null -eq $setupFailureMatrixReport) { throw 'Setup failure did not write a matrix report' }
+			$setupFailureMatrix = Get-Content -Raw -LiteralPath $setupFailureMatrixReport.FullName | ConvertFrom-Json
+			if ($setupFailureMatrix.status -ne 'FAILED' -or @($setupFailureMatrix.scenarios).Count -ne 1 -or $setupFailureMatrix.scenarios[0].status -ne 'FAILED') { throw 'Setup failure matrix report did not record a failed scenario' }
+			$setupFailureScenarioReport = Get-ChildItem -LiteralPath (Split-Path -Parent $setupFailureMatrixReport.FullName) -Recurse -Filter report.json -ErrorAction SilentlyContinue | Select-Object -First 1
+			if ($null -eq $setupFailureScenarioReport) { throw 'Setup failure did not write a scenario report' }
+			$setupFailureScenarioDirectory = Split-Path -Parent $setupFailureScenarioReport.FullName
+			foreach ($leakedArtifact in @('rcon-password.txt', 'server', 'provider-workspaces')) {
+				if (Test-Path -LiteralPath (Join-Path $setupFailureScenarioDirectory $leakedArtifact)) { throw "Setup failure retained $leakedArtifact" }
+			}
+			$setupReportText = Get-Content -Raw -LiteralPath $setupFailureScenarioReport.FullName
+			if ($setupReportText -match 'malformed coordinator config') { throw 'Setup failure report retained raw configuration content' }
+			Write-Output 'PASS setup failure cleanup and bounded reports'
+		} finally {
+			Set-Content -LiteralPath $sourceConfigPath -Value $validSourceConfig -NoNewline
+		}
+		return
+	}
 
 	Enable-FakeServer $fixture
 	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '5'

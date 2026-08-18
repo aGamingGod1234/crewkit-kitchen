@@ -358,8 +358,8 @@ function ConvertTo-BoundedText([object] $Value, [int] $Maximum = 128) {
 }
 
 function Assert-SafeScenarioId([string] $Value) {
-	if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Length -gt 128 -or $Value -match '[\\/\x00-\x1f\x7f]' -or $Value.Contains('..')) {
-		throw "Scenario ID must be a safe path segment without separators, '..', or control characters: $Value"
+	if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Length -gt 128 -or $Value -match '[\\/\x00-\x1f\x7f:*?"<>|]' -or $Value.Contains('..')) {
+		throw "Scenario ID must be a safe Windows path segment without separators, '..', control characters, or reserved filename characters: $Value"
 	}
 }
 
@@ -397,6 +397,10 @@ function New-ScenarioConfig([string] $Source, [string] $Destination, [int] $Brid
 function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [string] $Template, [string] $MatrixFile, [string] $Java, [string] $Node, [string] $BuiltJar, [switch] $Keep) {
 	$scenarioId = [string] $Scenario.id
 	$scenarioDirectory = Join-Path $RunDirectory ("$(ConvertTo-SafePathSegment $scenarioId)-$([Guid]::NewGuid().ToString('N').Substring(0, 8))")
+	$setupStarted = $false
+	$secretCreated = $false
+	try {
+	$setupStarted = $true
 	New-Item -ItemType Directory -Path $scenarioDirectory -Force | Out-Null
 	$serverDirectory = Join-Path $scenarioDirectory 'server'
 	Copy-Item -LiteralPath $Template -Destination $serverDirectory -Recurse -Force
@@ -411,6 +415,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$serverPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_MINECRAFT_PORT') @($bridgePort, $rconPort)
 	$secret = New-Secret
 	$secretPath = Join-Path $scenarioDirectory 'rcon-password.txt'
+	$secretCreated = $true
 	Write-PrivateText $secretPath $secret
 	$propertiesPath = Join-Path $serverDirectory 'server.properties'
 	Set-ServerProperties $propertiesPath @{
@@ -442,6 +447,27 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		ports = [pscustomobject]@{ minecraft = $serverPort; rcon = $rconPort; bridge = $bridgePort }; levelName = $worldName
 	}
 	Write-BoundedJson (Join-Path $scenarioDirectory 'manifest.json') $manifest $MaxManifestBytes 'scenario manifest'
+	} catch {
+		if (-not $secretCreated) { throw }
+		$setupDiagnostics = ConvertTo-BoundedText "Scenario setup failed ($($_.Exception.GetType().Name))" $MaxDiagnosticText
+		$setupCleanupStatus = 'NOT_REQUIRED'
+		if (-not $Keep -and $setupStarted) {
+			$setupCleanupStatus = 'CLEAN'
+			try { Remove-ScenarioArtifacts $scenarioDirectory } catch {
+				$setupCleanupStatus = 'FAILED'
+				$setupDiagnostics = 'Scenario setup cleanup failed'
+			}
+		}
+		if ($setupStarted -and (Test-Path -LiteralPath $scenarioDirectory -PathType Container)) {
+			$setupReport = [pscustomobject]@{
+				status = 'FAILED'; scenarioId = (ConvertTo-BoundedText $scenarioId); provider = (ConvertTo-BoundedText $Scenario.provider)
+				model = (ConvertTo-BoundedText $Scenario.model); reasoningEffort = (ConvertTo-BoundedText $Scenario.reasoningEffort)
+				exitCode = $null; cleanup = [pscustomobject]@{ status = $setupCleanupStatus }; artifactsKept = [bool] $Keep; diagnostics = $setupDiagnostics
+			}
+			try { Write-BoundedJson (Join-Path $scenarioDirectory 'report.json') $setupReport $MaxMatrixReportBytes 'scenario setup report' } catch {}
+		}
+		throw $setupDiagnostics
+	}
 	$serverHandle = $null
 	$coordinatorHandle = $null
 	$runnerHandle = $null
