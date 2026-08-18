@@ -23,6 +23,9 @@ test('normalizes one bounded real-provider scenario', () => {
 
 test('rejects duplicate IDs, unknown assertion types, and unbounded timeouts', () => {
 	assert.throws(() => normalizeHeadlessMatrix({ version: 1, scenarios: [validScenario(), validScenario()] }), /duplicate/i);
+	assert.throws(() => normalizeHeadlessScenario({ ...validScenario(), id: '../escape' }, 0), /id|path|separator/i);
+	assert.throws(() => normalizeHeadlessScenario({ ...validScenario(), id: 'bad\\id' }, 0), /id|path|separator/i);
+	assert.throws(() => normalizeHeadlessScenario({ ...validScenario(), id: 'bad\u0000id' }, 0), /id|control/i);
 	assert.throws(() => normalizeHeadlessScenario({ ...validScenario(), assert: [{ type: 'unknown' }] }, 0), /assert/i);
 	assert.throws(() => normalizeHeadlessScenario({ ...validScenario(), timeoutMs: 0 }, 0), /timeout/i);
 	assert.throws(() => normalizeHeadlessScenario({ ...validScenario(), timeoutMs: 900001 }, 0), /timeout/i);

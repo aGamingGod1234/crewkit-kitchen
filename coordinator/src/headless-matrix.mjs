@@ -1,5 +1,7 @@
 import path from 'node:path';
 import { mkdir as defaultMkdir, open as defaultOpen, readFile as defaultReadFile, writeFile as defaultWriteFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { HeadlessRconClient } from './headless-rcon.mjs';
 import { redact as redactTrace } from './trace-writer.mjs';
 
 const PROVIDERS = new Set(['codex', 'gemini', 'kimi']);
@@ -74,6 +76,7 @@ function normalizeAssertion(value, index) {
 
 export function normalizeHeadlessScenario(value, index = 0) {
 	exactKeys(value, SCENARIO_KEYS, `scenarios[${index}]`);
+	if (typeof value?.id !== 'string' || /[\\/\u0000-\u001f\u007f]/.test(value.id) || value.id.includes('..')) throw new TypeError(`scenarios[${index}].id must be a safe path segment`);
 	const assertions = value.assert ?? value.assertions;
 	if (value.assert !== undefined && value.assertions !== undefined) throw new TypeError('use only assert or assertions');
 	if (!Array.isArray(assertions) || assertions.length === 0) throw new TypeError('scenario requires one or more assertions');
@@ -265,6 +268,80 @@ export async function writeHeadlessReport(runDirectory, report, writeFile = defa
 	const bounded = boundReportValue(report);
 	if (writeFile === defaultWriteFile) await defaultMkdir(directory, { recursive: true });
 	await writeFile(path.join(directory, 'report.json'), `${JSON.stringify(bounded, null, 2)}\n`, { encoding: 'utf8' });
+}
+
+const HEADLESS_CLI_USAGE = 'Usage: node src/headless-matrix.mjs --config <absolute-path> --run-directory <absolute-path> --rcon-host <host> --rcon-port <port> --rcon-password-file <absolute-path> [--scenario <id>] [--protocol-audit <absolute-path>] [--provider-turns <absolute-path>] [--require-all]';
+
+export function parseHeadlessCliArguments(args) {
+	if (!Array.isArray(args)) throw new TypeError('CLI arguments must be an array');
+	const result = { configPath: null, scenarioId: null, runDirectory: null, rconHost: '127.0.0.1', rconPort: null, rconPasswordFile: null, protocolAuditPath: null, providerTurnsPath: null, requireAll: false };
+	const valueFlags = new Map([
+		['--config', 'configPath'], ['--scenario', 'scenarioId'], ['--run-directory', 'runDirectory'],
+		['--rcon-host', 'rconHost'], ['--rcon-port', 'rconPort'], ['--rcon-password-file', 'rconPasswordFile'],
+		['--protocol-audit', 'protocolAuditPath'], ['--provider-turns', 'providerTurnsPath'],
+	]);
+	for (let index = 0; index < args.length; index += 1) {
+		const flag = args[index];
+		if (flag === '--require-all') { result.requireAll = true; continue; }
+		if (flag === '--help' || flag === '-h') return { help: true };
+		const key = valueFlags.get(flag);
+		if (!key || index + 1 >= args.length || String(args[index + 1]).startsWith('--')) throw new Error(HEADLESS_CLI_USAGE);
+		const value = String(args[++index]);
+		result[key] = key === 'rconPort' ? Number(value) : value;
+	}
+	for (const key of ['configPath', 'runDirectory', 'rconPasswordFile']) {
+		if (typeof result[key] !== 'string' || !path.isAbsolute(result[key])) throw new Error(`${key} must be an absolute path\n${HEADLESS_CLI_USAGE}`);
+	}
+	for (const key of ['protocolAuditPath', 'providerTurnsPath']) {
+		if (result[key] !== null && !path.isAbsolute(result[key])) throw new Error(`${key} must be an absolute path`);
+	}
+	if (!Number.isInteger(result.rconPort) || result.rconPort < 1 || result.rconPort > 65535) throw new Error(`rconPort must be a valid port\n${HEADLESS_CLI_USAGE}`);
+	if (typeof result.rconHost !== 'string' || result.rconHost.trim() === '') throw new Error('rconHost must be nonblank');
+	if (result.scenarioId !== null && (result.scenarioId.trim() === '' || /[\u0000-\u001f\u007f]/.test(result.scenarioId))) throw new Error('scenario must be bounded text without control characters');
+	return result;
+}
+
+export async function runHeadlessMatrix({
+	configPath, scenarioId = null, runDirectory, rconHost = '127.0.0.1', rconPort, rconPasswordFile,
+	protocolAuditPath = null, providerTurnsPath = null, requireAll = false,
+	readFile = defaultReadFile, writeFile = defaultWriteFile, mkdir = defaultMkdir,
+	rconFactory = (options) => new HeadlessRconClient(options),
+} = {}) {
+	if (typeof readFile !== 'function' || typeof writeFile !== 'function' || typeof mkdir !== 'function' || typeof rconFactory !== 'function') throw new TypeError('headless CLI dependencies must be functions');
+	const matrix = normalizeHeadlessMatrix(JSON.parse(await readFile(configPath, 'utf8')));
+	const scenarios = selectHeadlessScenarios(matrix, scenarioId);
+	const password = String(await readFile(rconPasswordFile, 'utf8')).trim();
+	if (password.length === 0) throw new Error('RCON password file is empty');
+	const runId = path.basename(path.resolve(runDirectory));
+	const scenarioReports = [];
+	for (const scenario of scenarios) {
+		const scenarioDirectory = scenarioId === null ? path.join(path.resolve(runDirectory), scenario.id) : path.resolve(runDirectory);
+		let rcon = null;
+		try {
+			rcon = rconFactory({ host: rconHost, port: rconPort, password });
+			if (!rcon || typeof rcon.connect !== 'function' || typeof rcon.command !== 'function') throw new TypeError('rconFactory must return a HeadlessRconClient-compatible object');
+			await rcon.connect();
+			const report = await runHeadlessScenario({ scenario, runDirectory: scenarioDirectory, rcon, protocolAudit: protocolAuditPath });
+			scenarioReports.push(report);
+		} catch (error) {
+			try { await rcon?.close?.(); } catch {}
+			scenarioReports.push(scenarioReport('FAILED', scenario, { classification: 'ERROR', diagnostics: error?.message ?? String(error), cleanup: { status: 'FAILED' } }));
+		}
+	}
+	const classifiedReports = scenarioReports.map((report) => {
+		if (requireAll && report.status === 'SKIPPED') return { ...report, status: 'FAILED', classification: 'REQUIRED_PROFILE_UNAVAILABLE' };
+		return report;
+	});
+	const failed = classifiedReports.filter((report) => report.status === 'FAILED');
+	const passed = classifiedReports.filter((report) => report.status === 'PASSED');
+	const status = failed.length > 0 ? 'FAILED' : passed.length > 0 ? 'PASSED' : 'SKIPPED';
+	const report = {
+		runId, status, requireAll: Boolean(requireAll), scenarios: classifiedReports,
+		reportPath: path.join(path.resolve(runDirectory), 'matrix-report.json'),
+	};
+	await mkdir(path.resolve(runDirectory), { recursive: true });
+	await writeFile(report.reportPath, `${JSON.stringify(report, null, 2)}\n`, { encoding: 'utf8' });
+	return { report, exitCode: failed.length > 0 ? 1 : 0 };
 }
 
 async function finishReport(scenario, report, directory, writeFile, classification, error) {
@@ -521,3 +598,18 @@ async function defaultReadTail(file, maxBytes) {
 }
 
 async function defaultPoll() { await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS)); }
+
+async function runHeadlessCli() {
+	const parsed = parseHeadlessCliArguments(process.argv.slice(2));
+	if (parsed.help) { process.stdout.write(`${HEADLESS_CLI_USAGE}\n`); return; }
+	const result = await runHeadlessMatrix(parsed);
+	process.stdout.write(`${JSON.stringify(result.report)}\n`);
+	process.exitCode = result.exitCode;
+}
+
+if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	runHeadlessCli().catch((error) => {
+		process.stderr.write(`${error?.stack ?? error}\n`);
+		process.exitCode = 1;
+	});
+}

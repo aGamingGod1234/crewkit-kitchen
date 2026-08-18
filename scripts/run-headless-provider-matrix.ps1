@@ -19,6 +19,8 @@ $configuredCleanupTimeout = 0
 if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS'), [ref] $configuredStartupTimeout) -and $configuredStartupTimeout -gt 0) { $StartupTimeoutSeconds = $configuredStartupTimeout }
 if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS'), [ref] $configuredCleanupTimeout) -and $configuredCleanupTimeout -gt 0) { $CleanupTimeoutSeconds = $configuredCleanupTimeout }
 $MaxPortAttempts = 30
+$StartupBindRetries = 2
+$OutputDrainTimeoutMilliseconds = 1000
 
 function Quote-Argument([string] $Value) {
 	return '"' + $Value.Replace('"', '\"') + '"'
@@ -27,6 +29,11 @@ function Quote-Argument([string] $Value) {
 function Read-Text([string] $Path) {
 	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
 	return [IO.File]::ReadAllText($Path)
+}
+
+function Test-BindFailure([string] $ServerLogPath, [string] $ServerStderrPath) {
+	$text = "$(Read-Text $ServerLogPath)`n$(Read-Text $ServerStderrPath)"
+	return $text -match '(?i)(address already in use|failed to bind|could not bind|bind.+failed|port.+already)'
 }
 
 function Protect-LocalFile([string] $Path) {
@@ -63,8 +70,9 @@ function Test-Port([int] $Port) {
 	return $null -ne ($connections | Select-Object -First 1)
 }
 
-function Reserve-FreePort([int] $Preferred = 0) {
+function Reserve-FreePort([int] $Preferred = 0, [int[]] $Exclude = @()) {
 	if ($Preferred -gt 0) {
+		if ($Exclude -contains $Preferred) { throw "Configured ports must be distinct; port $Preferred was requested more than once" }
 		if (Test-Port $Preferred) { throw "Required port $Preferred is already occupied" }
 		return $Preferred
 	}
@@ -72,7 +80,9 @@ function Reserve-FreePort([int] $Preferred = 0) {
 		$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
 		try {
 			$listener.Start()
-			return ([Net.IPEndPoint] $listener.LocalEndpoint).Port
+			$port = ([Net.IPEndPoint] $listener.LocalEndpoint).Port
+			if ($Exclude -contains $port) { continue }
+			return $port
 		} finally {
 			$listener.Stop()
 		}
@@ -90,10 +100,33 @@ function Get-ConfiguredPort([string] $EnvironmentName) {
 	return $port
 }
 
-function Stop-ProcessTree([int] $ProcessId) {
+function Get-ProcessTreeIds([int] $ProcessId) {
+	$ids = @($ProcessId)
 	$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue)
-	foreach ($child in $children) { Stop-ProcessTree -ProcessId ([int] $child.ProcessId) }
-	Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+	foreach ($child in $children) { $ids += Get-ProcessTreeIds -ProcessId ([int] $child.ProcessId) }
+	return $ids
+}
+
+function Stop-ProcessTree([int] $ProcessId) {
+	$ids = @(Get-ProcessTreeIds $ProcessId | Select-Object -Unique)
+	$deadline = [DateTime]::UtcNow.AddSeconds($CleanupTimeoutSeconds)
+	do {
+		foreach ($id in @($ids)) {
+			$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$id" -ErrorAction SilentlyContinue)
+			foreach ($child in $children) {
+				if ($ids -notcontains [int] $child.ProcessId) { $ids += [int] $child.ProcessId }
+			}
+		}
+		foreach ($id in ($ids | Sort-Object -Descending)) {
+			try { Stop-Process -Id ([int] $id) -Force -ErrorAction Stop } catch {
+				if (Get-Process -Id ([int] $id) -ErrorAction SilentlyContinue) { throw "Could not terminate process tree rooted at $ProcessId (process $id): $($_.Exception.Message)" }
+			}
+		}
+		Start-Sleep -Milliseconds 100
+		$remaining = @($ids | Where-Object { Get-Process -Id ([int] $_) -ErrorAction SilentlyContinue })
+		if ($remaining.Count -eq 0) { return }
+	} while ([DateTime]::UtcNow -lt $deadline)
+	throw "Process tree rooted at $ProcessId remains alive: $($remaining -join ',')"
 }
 
 function Start-RedirectedProcess(
@@ -133,8 +166,17 @@ function Start-RedirectedProcess(
 function Complete-RedirectedProcess($Handle) {
 	if ($null -eq $Handle) { return }
 	if (-not $Handle.Process.HasExited) { return }
-	try { [IO.File]::WriteAllText($Handle.StdoutPath, $Handle.StdoutTask.Result) } catch {}
-	try { [IO.File]::WriteAllText($Handle.StderrPath, $Handle.StderrTask.Result) } catch {}
+	foreach ($stream in @(@{ Task = $Handle.StdoutTask; Path = $Handle.StdoutPath }, @{ Task = $Handle.StderrTask; Path = $Handle.StderrPath })) {
+		try {
+			if ($stream.Task.Wait($OutputDrainTimeoutMilliseconds)) {
+				[IO.File]::WriteAllText($stream.Path, [string] $stream.Task.Result)
+			} else {
+				[IO.File]::WriteAllText($stream.Path, '[output drain timed out]')
+			}
+		} catch {
+			try { [IO.File]::WriteAllText($stream.Path, '[output drain failed]') } catch {}
+		}
+	}
 }
 
 function New-Secret() {
@@ -148,7 +190,8 @@ function Set-ServerProperties([string] $Path, [hashtable] $Values) {
 	$lines = @()
 	if (Test-Path -LiteralPath $Path -PathType Leaf) { $lines = @(Get-Content -LiteralPath $Path) }
 	$seen = @{}
-	$result = foreach ($line in $lines) {
+	$result = @(
+	foreach ($line in $lines) {
 		if ($line -match '^\s*([^#=:\s]+)\s*=') {
 			$key = $Matches[1]
 			if ($Values.ContainsKey($key)) {
@@ -159,10 +202,33 @@ function Set-ServerProperties([string] $Path, [hashtable] $Values) {
 		}
 		$line
 	}
+	)
 	foreach ($entry in $Values.GetEnumerator()) {
 		if (-not $seen.ContainsKey($entry.Key)) { $result += "$($entry.Key)=$($entry.Value)" }
 	}
-	[IO.File]::WriteAllLines($Path, [string[]] $result, [Text.UTF8Encoding]::new($false))
+	[IO.File]::WriteAllText($Path, (($result -join [Environment]::NewLine) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+}
+
+function Remove-ScenarioArtifacts([string] $ScenarioDirectory) {
+	foreach ($relativePath in @('server', 'provider-workspaces', 'traces', 'logs', 'rcon-password.txt', 'coordinator-config.json', 'protocol.jsonl', 'provider-turns.private.jsonl')) {
+		$target = Join-Path $ScenarioDirectory $relativePath
+		if (-not (Test-Path -LiteralPath $target)) { continue }
+		$deadline = [DateTime]::UtcNow.AddSeconds($CleanupTimeoutSeconds)
+		$lastError = $null
+		do {
+			try {
+				Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+				$lastError = $null
+				break
+			} catch {
+				$lastError = $_
+				if ([DateTime]::UtcNow -ge $deadline) { throw "Could not remove generated artifact '$target': $($_.Exception.Message)" }
+				Start-Sleep -Milliseconds 100
+			}
+		} while ([DateTime]::UtcNow -lt $deadline)
+		if ($null -ne $lastError -and (Test-Path -LiteralPath $target)) { throw "Could not remove generated artifact '$target': $($lastError.Exception.Message)" }
+		if (Test-Path -LiteralPath $target) { throw "Artifact cleanup left '$target' behind" }
+	}
 }
 
 function Resolve-Java([string] $Project) {
@@ -223,6 +289,18 @@ function ConvertTo-SafePathSegment([string] $Value) {
 	return $segment.Substring(0, [Math]::Min(48, $segment.Length))
 }
 
+function ConvertTo-BoundedText([object] $Value, [int] $Maximum = 128) {
+	$text = [string] $Value
+	if ($text.Length -gt $Maximum) { return $text.Substring(0, $Maximum) }
+	return $text
+}
+
+function Assert-SafeScenarioId([string] $Value) {
+	if ([string]::IsNullOrWhiteSpace($Value) -or $Value.Length -gt 128 -or $Value -match '[\\/\x00-\x1f\x7f]' -or $Value.Contains('..')) {
+		throw "Scenario ID must be a safe path segment without separators, '..', or control characters: $Value"
+	}
+}
+
 function Test-ProviderPreflight([string] $Provider) {
 	if ([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT') -eq '1') {
 		return [pscustomobject]@{ Available = $true; Reason = $null }
@@ -244,6 +322,7 @@ function Test-ProviderPreflight([string] $Provider) {
 
 function New-ScenarioConfig([string] $Source, [string] $Destination, [int] $BridgePort, [string] $WorkspaceRoot) {
 	$config = Get-Content -Raw -LiteralPath $Source | ConvertFrom-Json
+	$config.bridge.host = '127.0.0.1'
 	$config.bridge.port = $BridgePort
 	if ($null -eq $config.PSObject.Properties['workspaceRoot']) { $config | Add-Member -NotePropertyName workspaceRoot -NotePropertyValue $WorkspaceRoot } else { $config.workspaceRoot = $WorkspaceRoot }
 	if ($null -eq $config.codex.PSObject.Properties['cwd']) { $config.codex | Add-Member -NotePropertyName cwd -NotePropertyValue $WorkspaceRoot } else { $config.codex.cwd = $WorkspaceRoot }
@@ -266,8 +345,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	Copy-Item -LiteralPath $BuiltJar -Destination (Join-Path $modsDirectory ([IO.Path]::GetFileName($BuiltJar))) -Force
 	$worldName = "headless-$([IO.Path]::GetFileName($RunDirectory))-$scenarioId-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 	$bridgePort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_BRIDGE_PORT')
-	$rconPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_RCON_PORT')
-	$serverPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_MINECRAFT_PORT')
+	$rconPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_RCON_PORT') @($bridgePort)
+	$serverPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_MINECRAFT_PORT') @($bridgePort, $rconPort)
 	$secret = New-Secret
 	$secretPath = Join-Path $scenarioDirectory 'rcon-password.txt'
 	Write-PrivateText $secretPath $secret
@@ -277,6 +356,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		'enable-rcon' = 'true'
 		'rcon.password' = $secret
 		'rcon.port' = $rconPort
+		'rcon.ip' = '127.0.0.1'
 		'server-port' = $serverPort
 		'level-name' = $worldName
 		'pause-when-empty-seconds' = '-1'
@@ -305,11 +385,39 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$runnerHandle = $null
 	$failure = $null
 	$runnerExit = $null
+	$cleanupFailure = $null
+	$processIds = @()
 	try {
 		$serverArgs = "-Darenaagents.bridgeSecretFile=$(Quote-Argument $secretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
-		$serverHandle = Start-RedirectedProcess $Java $serverArgs $serverDirectory (Join-Path $logsDirectory 'fabric.stdout.log') (Join-Path $logsDirectory 'fabric.stderr.log') @{}
-		Wait-Condition { (Test-Port $serverPort) -and ((Read-Text $serverLog).Contains('Done (')) } $StartupTimeoutSeconds 'Fabric server did not become ready'
-		Wait-Condition { Test-Port $rconPort } $StartupTimeoutSeconds 'RCON did not become ready'
+		$serverStdoutPath = Join-Path $logsDirectory 'fabric.stdout.log'
+		$serverStderrPath = Join-Path $logsDirectory 'fabric.stderr.log'
+		$serverAttempt = 0
+		$serverReady = $false
+		while (-not $serverReady) {
+			$serverAttempt += 1
+			$serverHandle = Start-RedirectedProcess $Java $serverArgs $serverDirectory $serverStdoutPath $serverStderrPath @{}
+			try {
+				Wait-Condition { (Test-Port $serverPort) -and ((Read-Text $serverLog).Contains('Done (')) } $StartupTimeoutSeconds 'Fabric server did not become ready'
+				Wait-Condition { Test-Port $rconPort } $StartupTimeoutSeconds 'RCON did not become ready'
+				$serverReady = $true
+			} catch {
+				Complete-RedirectedProcess $serverHandle
+				$bindFailure = $serverHandle.Process.HasExited -and (Test-BindFailure $serverLog $serverStderrPath)
+				if (-not $bindFailure -or $serverAttempt -gt $StartupBindRetries) { throw }
+				$processIds += @(Get-ProcessTreeIds $serverHandle.Process.Id | Select-Object -Unique)
+				try { Stop-ProcessTree $serverHandle.Process.Id } catch { throw "Server bind retry cleanup failed: $($_.Exception.Message)" }
+				$serverHandle = $null
+				$bridgePort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_BRIDGE_PORT')
+				$rconPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_RCON_PORT') @($bridgePort)
+				$serverPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_MINECRAFT_PORT') @($bridgePort, $rconPort)
+				Set-ServerProperties $propertiesPath @{
+					'online-mode' = 'false'; 'enable-rcon' = 'true'; 'rcon.password' = $secret; 'rcon.port' = $rconPort; 'rcon.ip' = '127.0.0.1'
+					'server-port' = $serverPort; 'level-name' = $worldName; 'pause-when-empty-seconds' = '-1'
+				}
+				Protect-LocalFile $propertiesPath
+				New-ScenarioConfig $sourceConfig $coordinatorConfig $bridgePort $providerWorkspace
+			}
+		}
 		$coordinatorArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\dynamic-main.mjs')) --config $(Quote-Argument $coordinatorConfig)"
 		$coordinatorEnvironment = @{
 			ARENA_AGENT_BRIDGE_SECRET = $secret; ARENA_HEADLESS_RUN_ID = [IO.Path]::GetFileName($RunDirectory); ARENA_HEADLESS_SCENARIO_ID = $scenarioId
@@ -343,14 +451,19 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		}
 		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) {
 			if ($null -ne $handle -and $null -ne $handle.Process) {
-				try { Stop-ProcessTree $handle.Process.Id } catch {}
+				$processIds += @(Get-ProcessTreeIds $handle.Process.Id | Select-Object -Unique)
+				try { Stop-ProcessTree $handle.Process.Id } catch { if ($null -eq $cleanupFailure) { $cleanupFailure = $_ }; if ($null -eq $failure) { $failure = $_ } }
 			}
 		}
-		try { Wait-Condition { -not (Test-Port $serverPort) -and -not (Test-Port $rconPort) -and -not (Test-Port $bridgePort) } $CleanupTimeoutSeconds 'Scenario cleanup left an allocated listener running' } catch { if ($null -eq $failure) { $failure = $_ } }
+		try { Wait-Condition { -not (Test-Port $serverPort) -and -not (Test-Port $rconPort) -and -not (Test-Port $bridgePort) } $CleanupTimeoutSeconds 'Scenario cleanup left an allocated listener running' } catch { $cleanupFailure = $_; if ($null -eq $failure) { $failure = $_ } }
 		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) { Complete-RedirectedProcess $handle }
 	}
+	if (-not $Keep) {
+		try { Remove-ScenarioArtifacts $scenarioDirectory } catch { $cleanupFailure = $_; if ($null -eq $failure) { $failure = $_ } }
+	}
 	$status = if ($null -eq $failure) { 'PASSED' } else { 'FAILED' }
-	$report = [pscustomobject]@{ status = $status; scenarioId = $scenarioId; provider = [string] $Scenario.provider; model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; exitCode = $runnerExit; cleanup = [pscustomobject]@{ status = if ($null -eq $failure) { 'CLEAN' } else { 'FAILED' } }; artifacts = $manifest; diagnostics = if ($null -eq $failure) { $null } else { $failure.Exception.Message } }
+	$cleanupStatus = if ($null -eq $cleanupFailure) { 'CLEAN' } else { 'FAILED' }
+	$report = [pscustomobject]@{ status = $status; scenarioId = $scenarioId; provider = [string] $Scenario.provider; model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; exitCode = $runnerExit; cleanup = [pscustomobject]@{ status = $cleanupStatus; processIds = $processIds; diagnostics = if ($null -eq $cleanupFailure) { $null } else { $cleanupFailure.Exception.Message } }; artifacts = $manifest; artifactsKept = [bool] $Keep; diagnostics = if ($null -eq $failure) { $null } else { $failure.Exception.Message } }
 	[IO.File]::WriteAllText((Join-Path $scenarioDirectory 'report.json'), ($report | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
 	return $report
 }
@@ -374,12 +487,38 @@ if (-not (Test-Path -LiteralPath $builtJar -PathType Leaf)) { throw "Missing bui
 $matrix = Read-Matrix $MatrixPath
 $selected = @($matrix.scenarios | Where-Object { [string]::IsNullOrWhiteSpace($ScenarioId) -or [string] $_.id -eq $ScenarioId })
 if ($selected.Count -eq 0) { throw "Unknown scenario '$ScenarioId'" }
+foreach ($scenario in $selected) { Assert-SafeScenarioId ([string] $scenario.id) }
+$manifestScenarios = @(
+	foreach ($scenario in $selected) {
+		$assertionTypes = @()
+		if ($null -ne $scenario.PSObject.Properties['assert']) {
+			$assertionTypes = @($scenario.assert | ForEach-Object {
+				if ($null -ne $_ -and $null -ne $_.PSObject.Properties['type']) { ConvertTo-BoundedText $_.type 64 }
+			}) | Select-Object -First 16
+		}
+		$serviceTier = 'priority'
+		if ($null -ne $scenario.PSObject.Properties['serviceTier'] -and $null -ne $scenario.serviceTier) {
+			$serviceTier = ConvertTo-BoundedText $scenario.serviceTier
+		}
+		[pscustomobject]@{
+			id = ConvertTo-BoundedText $scenario.id
+			provider = ConvertTo-BoundedText $scenario.provider
+			model = ConvertTo-BoundedText $scenario.model
+			reasoningEffort = ConvertTo-BoundedText $scenario.reasoningEffort
+			serviceTier = $serviceTier
+			timeoutMs = if ($null -ne $scenario.PSObject.Properties['timeoutMs']) { [int] $scenario.timeoutMs } else { $null }
+			assertionTypes = @($assertionTypes)
+		}
+	}
+)
+$manifestVersion = if ($null -ne $matrix.PSObject.Properties['version']) { [int] $matrix.version } else { 1 }
+$manifestSummary = [pscustomobject]@{ version = $manifestVersion; scenarioCount = $manifestScenarios.Count; scenarios = $manifestScenarios }
 $runId = "run-$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
 $runDirectory = Join-Path $root "runtime\headless-runs\$runId"
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
 $reports = @()
 $manifestPath = Join-Path $runDirectory 'matrix-manifest.json'
-[IO.File]::WriteAllText($manifestPath, ($matrix | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+[IO.File]::WriteAllText($manifestPath, ($manifestSummary | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
 foreach ($scenario in $selected) {
 	$preflight = Test-ProviderPreflight ([string] $scenario.provider)
 	if (-not $preflight.Available) {

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,6 +25,7 @@ import { buildPlannerInput } from './prompts.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
+import { ProviderTurnRecorder } from './provider-turn-recorder.mjs';
 import { TraceWriter } from './trace-writer.mjs';
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
@@ -538,6 +539,21 @@ export function parseDynamicCliArguments(args) {
 	return { configPath: args[1] };
 }
 
+export function resolveDynamicCliRuntime(environment = process.env) {
+	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) throw new TypeError('runtime environment must be an object');
+	const tracePath = environment.ARENA_HEADLESS_TRACE_PATH ?? path.join(PROJECT_DIRECTORY, 'runtime', 'traces', 'coordinator.jsonl');
+	const separator = tracePath.includes('\\') ? '\\' : '/';
+	const traceDirectory = tracePath.slice(0, Math.max(0, tracePath.lastIndexOf(separator)));
+	return {
+		tracePath,
+		diagnosticTracePath: environment.ARENA_HEADLESS_PRIVATE_TRACE_PATH ?? `${traceDirectory}${separator}coordinator-private.jsonl`,
+		protocolAuditPath: environment.ARENA_PROTOCOL_AUDIT_PATH ?? null,
+		providerTurnsPath: environment.ARENA_PROVIDER_TURNS_PATH ?? null,
+		runId: environment.ARENA_HEADLESS_RUN_ID ?? 'dynamic-run',
+		scenarioId: environment.ARENA_HEADLESS_SCENARIO_ID ?? 'dynamic',
+	};
+}
+
 export async function loadDynamicConfig(configPath = DEFAULT_DYNAMIC_CONFIG_PATH) {
 	const document = JSON.parse(await readFile(configPath, 'utf8'));
 	return normalizeDynamicConfig(document, process.env);
@@ -594,11 +610,16 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 
 async function runCli() {
 	const { configPath } = parseDynamicCliArguments(process.argv.slice(2));
-	const traceRoot = path.join(PROJECT_DIRECTORY, 'runtime', 'traces');
-	const traceWriter = new TraceWriter(path.join(traceRoot, 'coordinator.jsonl'), {
-		diagnosticFilePath: path.join(traceRoot, 'coordinator-private.jsonl'),
+	const runtime = resolveDynamicCliRuntime(process.env);
+	const traceWriter = new TraceWriter(runtime.tracePath, { diagnosticFilePath: runtime.diagnosticTracePath });
+	const protocolAudit = runtime.protocolAuditPath === null ? null : createJsonlAudit(runtime.protocolAuditPath, { runId: runtime.runId, scenarioId: runtime.scenarioId });
+	if (runtime.providerTurnsPath !== null) await mkdir(path.dirname(path.resolve(runtime.providerTurnsPath)), { recursive: true });
+	const providerTurnRecorder = runtime.providerTurnsPath === null ? null : new ProviderTurnRecorder({
+		runId: runtime.runId,
+		scenarioId: runtime.scenarioId,
+		privatePath: runtime.providerTurnsPath,
 	});
-	const coordinator = createDynamicCoordinator(await loadDynamicConfig(configPath), { traceWriter });
+	const coordinator = createDynamicCoordinator(await loadDynamicConfig(configPath), { traceWriter, protocolAudit, providerTurnRecorder });
 	coordinator.on('runtimeError', (error) => {
 		const summary = `[dynamic-coordinator] ${error?.code ?? 'ERROR'}: ${error?.message ?? String(error)}`;
 		const stack = typeof error?.stack === 'string' && !error.stack.startsWith(summary)
@@ -606,13 +627,37 @@ async function runCli() {
 			: '';
 		process.stderr.write(`${summary}${stack}\n`);
 	});
-	await coordinator.start();
-	const shutdown = async () => {
-		await coordinator.stop();
-		process.exitCode = 0;
+	try {
+		await coordinator.start();
+		const shutdown = async () => {
+			await coordinator.stop();
+			if (protocolAudit !== null) await protocolAudit.close();
+			process.exitCode = 0;
+		};
+		process.once('SIGINT', shutdown);
+		process.once('SIGTERM', shutdown);
+	} catch (error) {
+		await coordinator.stop().catch(() => {});
+		if (protocolAudit !== null) await protocolAudit.close().catch(() => {});
+		throw error;
+	}
+}
+
+function createJsonlAudit(filePath, metadata) {
+	if (typeof filePath !== 'string' || filePath.trim() === '') throw new TypeError('protocol audit path must be nonblank');
+	let queue = Promise.resolve();
+	let closed = false;
+	const ready = mkdir(path.dirname(path.resolve(filePath)), { recursive: true });
+	const audit = (direction, envelope) => {
+		if (closed) return Promise.reject(new Error('protocol audit is closed'));
+		const row = { ...metadata, direction, envelope };
+		let encoded;
+		try { encoded = `${JSON.stringify(row)}\n`; } catch (error) { return Promise.reject(error); }
+		queue = queue.catch(() => {}).then(async () => { await ready; await appendFile(filePath, encoded, { encoding: 'utf8', flag: 'a' }); });
+		return queue;
 	};
-	process.once('SIGINT', shutdown);
-	process.once('SIGTERM', shutdown);
+	audit.close = async () => { closed = true; await queue; };
+	return audit;
 }
 
 function requireDependency(value, name) {
