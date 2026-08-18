@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "id": "codex-chat-completion",
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "reasoningEffort": "high",
+      "serviceTier": "fast",
+      "task": "Send exactly one chat message HEADLESS_CODEX_PASS, then finish the goal.",
+      "timeoutMs": 180000,
+      "assert": [
+        { "type": "lifecycle", "state": "COMPLETED" },
+        { "type": "chat", "message": "HEADLESS_CODEX_PASS" }
+      ]
+    },
+    {
+      "id": "codex-movement-chat",
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "reasoningEffort": "high",
+      "serviceTier": "fast",
+      "task": "Move one step forward and send exactly one chat message HEADLESS_MOVE_PASS, then finish the goal.",
+      "timeoutMs": 180000,
+      "assert": [
+        { "type": "lifecycle", "state": "COMPLETED" },
+        { "type": "chat", "message": "HEADLESS_MOVE_PASS" }
+      ]
+    }
+  ]
+}
