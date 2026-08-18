@@ -88,6 +88,18 @@ async function start(dependencies = {}) {
 	return { bridge, registry, planner, scheduler, coordinator };
 }
 
+test('dynamic coordinator forwards protocol audit to its constructed bridge', () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	assert.throws(() => createDynamicCoordinator({
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+	}, {
+		registry, planner, scheduler: new PlanningScheduler(), codexService: new FakeProvider(),
+		protocolAudit: 'invalid audit callback',
+	}), /audit must be a function or null/);
+});
+
 test('does not submit a duplicate initial plan while the agent already has a scheduled turn', async () => {
 	let release;
 	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });

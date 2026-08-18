@@ -204,6 +204,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#connectionQueueCap;
 	#agentQueueCap;
 	#messageIds;
+	#audit;
 	#socket = null;
 	#decoder = null;
 	#running = false;
@@ -218,7 +219,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#knownAgentIds = new Set();
 	#observedRevisions = new Map();
 
-	constructor(config, dependencies = {}) {
+	constructor(config, { audit = null, ...dependencies } = {}) {
 		super();
 		if (!isPlainObject(config)) throw new TypeError('multiplexed bridge config must be an object');
 		this.#host = config.host ?? LOOPBACK_HOST;
@@ -238,6 +239,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#connectionQueueCap = positiveInteger(config.connectionQueueCap ?? DEFAULT_CONNECTION_QUEUE_CAP, 'connectionQueueCap');
 		this.#agentQueueCap = positiveInteger(config.agentQueueCap ?? DEFAULT_AGENT_MESSAGE_QUEUE_CAP, 'agentQueueCap');
 		this.#messageIds = dependencies.messageIds ?? new MessageIdGenerator('coordinator-v2');
+		if (audit !== null && typeof audit !== 'function') throw new TypeError('audit must be a function or null');
+		this.#audit = audit;
 	}
 
 	get ready() { return this.#ready; }
@@ -304,7 +307,9 @@ export class MultiplexedServerBridge extends EventEmitter {
 			messageId,
 			payload: { secret: this.#secret },
 		});
-		socket.write(encodeJsonLine(hello));
+		const encoded = encodeJsonLine(hello);
+		this.#invokeAudit('coordinator_to_server', hello);
+		socket.write(encoded);
 	}
 
 	#onData(socket, chunk) {
@@ -328,6 +333,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 
 	#accept(value) {
 		const envelope = validateProtocolV2Envelope(value, { direction: 'server_to_coordinator' });
+		this.#invokeAudit('server_to_coordinator', envelope);
 		if (this.#inboundMessageIds.has(envelope.messageId)) throw new ProtocolV2Error('DUPLICATE_MESSAGE', `Duplicate message ID '${envelope.messageId}'`);
 		rememberBounded(this.#inboundMessageIds, envelope.messageId, MAX_TRACKED_MESSAGE_IDS);
 		if (!this.#ready) {
@@ -451,13 +457,30 @@ export class MultiplexedServerBridge extends EventEmitter {
 			const entry = this.#outboundQueue.shift();
 			this.#decrementQueued(entry.envelope.agentId);
 			let writable;
-			try { writable = socket.write(entry.encoded); } catch (error) { entry.reject(error); this.#fail(error); return; }
+			try {
+				this.#invokeAudit('coordinator_to_server', entry.envelope);
+				writable = socket.write(entry.encoded);
+			} catch (error) { entry.reject(error); this.#fail(error); return; }
 			entry.resolve(entry.envelope.messageId);
 			if (!writable) {
 				this.#writeBlocked = true;
 				return;
 			}
 		}
+	}
+
+	#invokeAudit(direction, envelope) {
+		if (this.#audit === null) return;
+		let result;
+		try { result = this.#audit(direction, structuredClone(envelope)); }
+		catch (error) { this.#reportAuditError(error); return; }
+		if (result !== null && result !== undefined && typeof result.then === 'function') {
+			Promise.resolve(result).catch((error) => this.#reportAuditError(error));
+		}
+	}
+
+	#reportAuditError(error) {
+		try { this.emit('auditError', error); } catch {}
 	}
 
 	#decrementQueued(agentId) {

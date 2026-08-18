@@ -501,6 +501,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		telemetrySink: dependencies.telemetrySink,
 	});
 	const bridge = dependencies.bridge ?? new MultiplexedServerBridge(config.bridge, {
+		audit: dependencies.protocolAudit,
 		socketFactory: dependencies.socketFactory,
 		schedule: dependencies.schedule,
 		cancelSchedule: dependencies.cancelSchedule,
