@@ -70,6 +70,31 @@ test('redacts quoted JSON credential keys and values in both private and public 
 	assert.equal(JSON.stringify(publicRows[0]).includes('BEARERSECRET'), false);
 });
 
+test('redacts escaped and delimiter-rich quoted JSON credential values', async () => {
+	const privateRows = [];
+	const publicRows = [];
+	const recorder = new ProviderTurnRecorder({
+		runId: 'run-json-rich', scenarioId: 'scenario-json-rich', privatePath: 'private.jsonl',
+		appendFile: async (_path, text) => privateRows.push(JSON.parse(text)), publicSink: (row) => publicRows.push(row),
+	});
+	const quotedSecrets = [
+		'{"token":"TOKEN SECRET"}',
+		'{"token":"TOKEN\\nSECRET"}',
+		'{"password": "my password"}',
+		'{"client_secret":"CLIENT,SECRET"}',
+		'{"authorization":"secret } value"}',
+	].join(' ');
+	await recorder.record({ provider: 'codex', model: 'm', reasoningEffort: 'high', goalRevision: 1, attempt: 1, retry: false, input: quotedSecrets, output: quotedSecrets });
+	await recorder.close();
+
+	const privateText = JSON.stringify(privateRows[0]);
+	const publicText = JSON.stringify(publicRows[0]);
+	for (const secret of ['TOKEN SECRET', 'TOKEN\\nSECRET', 'my password', 'CLIENT,SECRET', 'secret } value']) {
+		assert.equal(privateText.includes(secret), false, `private record leaked ${secret}`);
+		assert.equal(publicText.includes(secret), false, `public record leaked ${secret}`);
+	}
+});
+
 test('serializes records and swallows public sink failures without blocking close', async () => {
 	const writes = [];
 	let release;

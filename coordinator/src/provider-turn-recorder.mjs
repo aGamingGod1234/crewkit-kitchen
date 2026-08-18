@@ -7,7 +7,7 @@ const MAX_ROW_BYTES = 262_143;
 const SENSITIVE_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 const SECRET_SHAPED_TEXT = /((?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 const BEARER_TEXT = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
-const QUOTED_SECRET_TEXT = /((?:["']?)(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*["']?\s*[:=]\s*["']))([^"'\\\s,;}\]]+)(["'])/gi;
+const QUOTED_SECRET_KEY = /(["'])(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\1\s*:\s*(["'])/gi;
 const PATH_TEXT = /(?:[A-Za-z]:\\[^\s\]]+|(?:^|\s)\/[^\s]+)/g;
 
 /** Bounded, serialized provider-turn capture with private source and public evidence. */
@@ -130,12 +130,37 @@ function boundedMeta(value) {
 }
 
 function redactAndBound(value, bytes) {
-	const redacted = String(value ?? '')
+	const redacted = String(value ?? '');
+	// Scan quoted JSON values so delimiters, spaces, and escaped quotes cannot terminate redaction early.
+	const safelyRedacted = redactQuotedJsonSecrets(redacted)
 		.replace(BEARER_TEXT, 'Bearer [REDACTED]')
-		.replace(QUOTED_SECRET_TEXT, '$1[REDACTED]$3')
 		.replace(SENSITIVE_TEXT, '$1[REDACTED]')
 		.replace(SECRET_SHAPED_TEXT, '$1[REDACTED]');
-	return truncateUtf8(redacted, bytes);
+	return truncateUtf8(safelyRedacted, bytes);
+}
+
+function redactQuotedJsonSecrets(value) {
+	let result = '';
+	let cursor = 0;
+	QUOTED_SECRET_KEY.lastIndex = 0;
+	let match;
+	while ((match = QUOTED_SECRET_KEY.exec(value)) !== null) {
+		const valueStart = QUOTED_SECRET_KEY.lastIndex;
+		let valueEnd = valueStart;
+		while (valueEnd < value.length) {
+			if (value[valueEnd] === '\\') {
+				valueEnd += 2;
+				continue;
+			}
+			if (value[valueEnd] === match[2]) break;
+			valueEnd += 1;
+		}
+		if (valueEnd >= value.length) break;
+		result += value.slice(cursor, valueStart) + '[REDACTED]' + match[2];
+		cursor = valueEnd + 1;
+		QUOTED_SECRET_KEY.lastIndex = cursor;
+	}
+	return result + value.slice(cursor);
 }
 
 function truncateUtf8(value, bytes) {
