@@ -18,8 +18,73 @@ test('parses the headless matrix CLI contract and rejects missing flags', () => 
 	assert.equal(parsed.configPath, 'C:/matrix.json');
 	assert.equal(parsed.scenarioId, 'case');
 	assert.equal(parsed.rconPort, 25575);
+	assert.equal(parsed.providerTurnsPath, 'C:/runs/provider.jsonl');
 	assert.equal(parsed.requireAll, true);
 	assert.throws(() => parseHeadlessCliArguments(['--config', 'relative.json']), /absolute|run-directory|usage/i);
+});
+
+test('wires provider-turn capture into scenario evidence paths', async () => {
+	const providerTurnsPath = 'C:/runs/case/provider-turns.private.jsonl';
+	const result = await runHeadlessMatrix({
+		configPath: 'C:/matrix.json', scenarioId: 'case', runDirectory: 'C:/runs/case', rconPort: 25575,
+		rconPasswordFile: 'C:/runs/password.txt', providerTurnsPath,
+		readFile: async (file) => file.endsWith('matrix.json') ? JSON.stringify({ version: 1, scenarios: [{
+			id: 'case', provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
+			assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
+		}] }) : 'password',
+		writeFile: async () => {}, mkdir: async () => {}, rconFactory: () => ({
+			connect: async () => {},
+			command: async (command) => command.startsWith('codex status') ? { text: 'state=COMPLETED' } : { text: 'ok' },
+			close: async () => {},
+		}),
+	});
+	assert.equal(result.report.scenarios[0].evidence.paths.providerTurns, providerTurnsPath);
+});
+
+test('rejects a selected matrix larger than the bounded scenario limit', async () => {
+	const scenarios = Array.from({ length: 17 }, (_, index) => ({
+		id: `case-${index}`, provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
+		assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
+	}));
+	await assert.rejects(() => runHeadlessMatrix({
+		configPath: 'C:/matrix.json', runDirectory: 'C:/runs/cases', rconPort: 25575,
+		rconPasswordFile: 'C:/runs/password.txt',
+		readFile: async () => JSON.stringify({ version: 1, scenarios }),
+	}), /16|scenario/i);
+});
+
+test('rejects a matrix report that exceeds the bounded byte limit', async () => {
+	const huge = 'x'.repeat(4096);
+	const writes = [];
+	const scenarios = Array.from({ length: 16 }, (_, index) => ({
+		id: `${index}-${huge}`, provider: 'codex', model: huge, reasoningEffort: huge, serviceTier: huge, task: 't', timeoutMs: 1000,
+		assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
+	}));
+	await assert.rejects(() => runHeadlessMatrix({
+		configPath: 'C:/matrix.json', runDirectory: 'C:/runs/cases', rconPort: 25575,
+		rconPasswordFile: 'C:/runs/password.txt',
+		readFile: async (file) => file.endsWith('matrix.json') ? JSON.stringify({ version: 1, scenarios }) : 'password',
+		writeFile: async (file, content) => writes.push({ file, content }), mkdir: async () => {},
+		rconFactory: () => ({ connect: async () => {}, command: async () => ({ text: 'state=COMPLETED' }), close: async () => {} }),
+	}), /262144|bounded|report/i);
+	assert.equal(writes.length, 0);
+});
+
+test('reports CLEAN setup cleanup when RCON connect fails but close succeeds', async () => {
+	const result = await runHeadlessMatrix({
+		configPath: 'C:/matrix.json', runDirectory: 'C:/runs/connect-failure', rconPort: 25575,
+		rconPasswordFile: 'C:/runs/password.txt',
+		readFile: async (file) => file.endsWith('matrix.json') ? JSON.stringify({ version: 1, scenarios: [{
+			id: 'case', provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
+			assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
+		}] }) : 'password',
+		writeFile: async () => {}, mkdir: async () => {}, rconFactory: () => ({
+			connect: async () => { throw new Error('connect failed'); }, command: async () => {}, close: async () => {},
+		}),
+	});
+	assert.equal(result.exitCode, 1);
+	assert.equal(result.report.scenarios[0].classification, 'ERROR');
+	assert.equal(result.report.scenarios[0].cleanup.status, 'CLEAN');
 });
 
 test('rejects unknown flags and relative optional artifact paths', () => {

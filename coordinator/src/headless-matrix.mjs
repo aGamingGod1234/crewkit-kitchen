@@ -10,6 +10,8 @@ const MAX_DIAGNOSTICS = 4096;
 const MAX_TEXT = 4096;
 const MAX_ASSERTION_ARGS = 8192;
 const MAX_EVIDENCE_BYTES = 16_384;
+const MAX_SCENARIOS = 16;
+const MAX_MATRIX_REPORT_BYTES = 262_144;
 const POLL_INTERVAL_MS = 50;
 const SENSITIVE_REPORT_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
 const REPORT_SECRET_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
@@ -146,6 +148,7 @@ export async function runHeadlessScenario({
 	readTail = null,
 	writeFile = defaultWriteFile,
 	protocolAudit = null,
+	providerTurnsPath = null,
 	providerTurnRecorder = null,
 	poll = defaultPoll,
 } = {}) {
@@ -225,7 +228,7 @@ export async function runHeadlessScenario({
 		if (classification === null && terminalState === 'DEAD') classification = 'DEAD';
 		if (classification === null && terminalState === null) classification = 'TIMEOUT';
 		const evidenceResult = await collectHeadlessEvidence({
-			directory, readFile, tailReader, protocolAudit, assertions, terminalState, rconEvidence,
+			directory, readFile, tailReader, protocolAudit, providerTurnsPath, assertions, terminalState, rconEvidence,
 			readOnlyCommand: (value) => command(value, { readOnly: true, attempt: 0 }),
 			deadline, now, startedAt, poll,
 		});
@@ -320,6 +323,7 @@ export async function runHeadlessMatrix({
 	if (typeof readFile !== 'function' || typeof writeFile !== 'function' || typeof mkdir !== 'function' || typeof rconFactory !== 'function') throw new TypeError('headless CLI dependencies must be functions');
 	const matrix = normalizeHeadlessMatrix(JSON.parse(await readFile(configPath, 'utf8')));
 	const scenarios = selectHeadlessScenarios(matrix, scenarioId);
+	if (scenarios.length > MAX_SCENARIOS) throw new RangeError(`selected scenario count exceeds bounded maximum of ${MAX_SCENARIOS}`);
 	const password = String(await readFile(rconPasswordFile, 'utf8')).trim();
 	if (password.length === 0) throw new Error('RCON password file is empty');
 	const runId = path.basename(path.resolve(runDirectory));
@@ -331,11 +335,12 @@ export async function runHeadlessMatrix({
 			rcon = rconFactory({ host: rconHost, port: rconPort, password });
 			if (!rcon || typeof rcon.connect !== 'function' || typeof rcon.command !== 'function') throw new TypeError('rconFactory must return a HeadlessRconClient-compatible object');
 			await rcon.connect();
-			const report = await runHeadlessScenario({ scenario, runDirectory: scenarioDirectory, rcon, protocolAudit: protocolAuditPath });
+			const report = await runHeadlessScenario({ scenario, runDirectory: scenarioDirectory, rcon, protocolAudit: protocolAuditPath, providerTurnsPath });
 			scenarioReports.push(report);
 		} catch (error) {
-			try { await rcon?.close?.(); } catch {}
-			scenarioReports.push(scenarioReport('FAILED', scenario, { classification: 'ERROR', diagnostics: error?.message ?? String(error), cleanup: { status: 'FAILED' } }));
+			let cleanupStatus = 'CLEAN';
+			try { await rcon?.close?.(); } catch { cleanupStatus = 'FAILED'; }
+			scenarioReports.push(scenarioReport('FAILED', scenario, { classification: 'ERROR', diagnostics: error?.message ?? String(error), cleanup: { status: cleanupStatus } }));
 		}
 	}
 	const classifiedReports = scenarioReports.map((report) => {
@@ -350,7 +355,9 @@ export async function runHeadlessMatrix({
 		reportPath: path.join(path.resolve(runDirectory), 'matrix-report.json'),
 	};
 	await mkdir(path.resolve(runDirectory), { recursive: true });
-	await writeFile(report.reportPath, `${JSON.stringify(report, null, 2)}\n`, { encoding: 'utf8' });
+	const encodedReport = `${JSON.stringify(report, null, 2)}\n`;
+	if (Buffer.byteLength(encodedReport, 'utf8') > MAX_MATRIX_REPORT_BYTES) throw new RangeError(`matrix report exceeds bounded size of ${MAX_MATRIX_REPORT_BYTES} bytes`);
+	await writeFile(report.reportPath, encodedReport, { encoding: 'utf8' });
 	return { report, exitCode: failed.length > 0 ? 1 : 0 };
 }
 
@@ -424,14 +431,14 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
 }
 
-async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll }) {
+async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll }) {
 	for (const assertion of assertions) {
 		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
 		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
 		catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; }
 	}
 	let attempt = 0;
-	let fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit);
+	let fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath);
 	let evidence = makeEvidence({ terminalState, protocolAudit, ...fileEvidence, rcon: rconEvidence });
 	let assertionResult = evaluateHeadlessAssertions(assertions, evidence);
 	const waitsForFiles = assertions.some((assertion) => assertion.type !== 'lifecycle' && assertion.type !== 'rcon');
@@ -440,29 +447,32 @@ async function collectHeadlessEvidence({ directory, readFile, tailReader, protoc
 			await withDeadline(() => poll({ phase: 'evidence', attempt, deadline, evidence, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
 		} catch (error) { if (error?.code === 'HEADLESS_TIMEOUT') break; throw error; }
 		attempt += 1;
-		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit);
+		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath);
 		evidence = makeEvidence({ terminalState, protocolAudit, ...fileEvidence, rcon: rconEvidence });
 		assertionResult = evaluateHeadlessAssertions(assertions, evidence);
 	}
 	return { fileEvidence, evidence, assertionResult };
 }
 
-async function readEvidence(directory, readFile, tailReader, protocolAudit) {
+async function readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath = null) {
 	const protocolPath = typeof protocolAudit === 'string' ? protocolAudit : path.join(directory, 'protocol.jsonl');
 	const coordinatorPath = path.join(directory, 'coordinator.jsonl');
 	const serverPath = path.join(directory, 'server.log');
-	const [protocolText, coordinatorText, serverLog] = await Promise.all([
+	const providerTurns = typeof providerTurnsPath === 'string' ? providerTurnsPath : null;
+	const [protocolText, coordinatorText, serverLog, providerTurnsText] = await Promise.all([
 		readBoundedTail(tailReader, protocolPath), readBoundedTail(tailReader, coordinatorPath), readBoundedTail(tailReader, serverPath),
+		providerTurns === null ? '' : readBoundedTail(tailReader, providerTurns),
 	]);
 	return {
 		protocolRows: parseJsonl(protocolText), traceRows: parseJsonl(coordinatorText), serverLog,
-		paths: { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath },
+		paths: { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath, ...(providerTurns === null ? {} : { providerTurns }) },
+		providerTurnsRows: providerTurns === null ? 0 : parseJsonl(providerTurnsText).length,
 	};
 }
 
 function evidenceSummary(directory, fileEvidence, protocolAudit) {
 	const paths = fileEvidence.paths ?? { protocol: path.join(directory, 'protocol.jsonl'), coordinator: path.join(directory, 'coordinator.jsonl'), server: path.join(directory, 'server.log') };
-	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: auditRows(protocolAudit).length };
+	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: auditRows(protocolAudit).length, providerTurnsRows: fileEvidence.providerTurnsRows ?? 0 };
 }
 
 async function readBoundedTail(readTail, file) {
