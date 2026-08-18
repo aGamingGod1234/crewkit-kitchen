@@ -1,4 +1,5 @@
 ﻿import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import net from 'node:net';
 import test from 'node:test';
 import { HeadlessRconClient, normalizeRconResult } from '../src/headless-rcon.mjs';
@@ -34,6 +35,16 @@ const startServer = handler => new Promise((resolve, reject) => {
   server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
 });
 const stopServer = server => new Promise(resolve => server.close(() => resolve()));
+
+class DeferredSocket extends EventEmitter {
+  readyState = 'opening';
+  destroyed = false;
+  write() {}
+  destroy() {
+    this.destroyed = true;
+    queueMicrotask(() => this.emit('close'));
+  }
+}
 
 test('authenticates, frames little-endian packets, and handles fragmented responses', async () => {
   const { server, port } = await startServer((socket, request) => {
@@ -103,4 +114,52 @@ test('decodes a large response into bounded UTF-8 text', async () => {
   await client.connect();
   try { assert.equal((await client.command('bounded')).text, 'abcde'); }
   finally { await client.close(); await stopServer(server); }
+});
+
+test('close during connect rejects the connect promise and prevents reuse', async () => {
+  const socket = new DeferredSocket();
+  const client = new HeadlessRconClient({ port: 25575, password: 'pw', socketFactory: () => socket });
+  const connecting = client.connect();
+  await client.close();
+  await assert.rejects(connecting, error => error.code === 'RCON_CLOSED');
+  assert.equal(socket.destroyed, true);
+  await assert.rejects(() => client.connect(), error => error.code === 'RCON_CLOSED');
+});
+
+test('authentication failure closes the session and cannot reconnect on its socket', async () => {
+  let connections = 0;
+  const { server, port } = await startServer((socket, request) => {
+    if (request.type === 3) socket.write(packet(-1, 2));
+  });
+  server.on('connection', () => { connections += 1; });
+  const client = new HeadlessRconClient({ host: '127.0.0.1', port, password: 'bad' });
+  try {
+    await assert.rejects(() => client.connect(), error => error.code === 'RCON_AUTH_FAILED');
+    assert.equal(client.state, 'closed');
+    await assert.rejects(() => client.connect(), error => error.code === 'RCON_CLOSED');
+    assert.equal(connections, 1);
+  } finally { await client.close(); await stopServer(server); }
+});
+
+test('synchronous socket factory failure does not leave a connecting client', async () => {
+  const client = new HeadlessRconClient({ port: 25575, password: 'pw', socketFactory: () => { throw new Error('factory failed'); } });
+  await assert.rejects(() => client.connect(), error => error.code === 'RCON_CONNECT_FAILED');
+  assert.equal(client.state, 'closed');
+  await assert.rejects(() => client.connect(), error => error.code === 'RCON_CLOSED');
+});
+
+test('rejects packets without both RCON string terminators', async () => {
+  const { server, port } = await startServer((socket, request) => {
+    if (request.type === 3) socket.write(packet(request.id, 2));
+    else {
+      const malformed = packet(request.id, 0, 'oops');
+      malformed[malformed.length - 1] = 1;
+      socket.write(malformed);
+    }
+  });
+  const client = new HeadlessRconClient({ host: '127.0.0.1', port, password: 'pw' });
+  try {
+    await client.connect();
+    await assert.rejects(() => client.command('bad-terminator'), error => error.code === 'RCON_PROTOCOL');
+  } finally { await client.close(); await stopServer(server); }
 });
