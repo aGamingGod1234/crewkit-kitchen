@@ -14,13 +14,21 @@ $ErrorActionPreference = 'Stop'
 $PollMilliseconds = 250
 $StartupTimeoutSeconds = 120
 $CleanupTimeoutSeconds = 30
+$RunnerGraceSeconds = 30
 $configuredStartupTimeout = 0
 $configuredCleanupTimeout = 0
+$configuredRunnerGrace = 0
 if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS'), [ref] $configuredStartupTimeout) -and $configuredStartupTimeout -gt 0) { $StartupTimeoutSeconds = $configuredStartupTimeout }
 if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS'), [ref] $configuredCleanupTimeout) -and $configuredCleanupTimeout -gt 0) { $CleanupTimeoutSeconds = $configuredCleanupTimeout }
+if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_RUNNER_GRACE_SECONDS'), [ref] $configuredRunnerGrace) -and $configuredRunnerGrace -gt 0) { $RunnerGraceSeconds = $configuredRunnerGrace }
 $MaxPortAttempts = 30
 $StartupBindRetries = 2
+$CoordinatorBindRetries = 2
 $OutputDrainTimeoutMilliseconds = 1000
+$MaxSelectedScenarios = 16
+$MaxManifestBytes = 65536
+$MaxMatrixReportBytes = 262144
+$MaxDiagnosticText = 4096
 
 function Quote-Argument([string] $Value) {
 	return '"' + $Value.Replace('"', '\"') + '"'
@@ -107,26 +115,45 @@ function Get-ProcessTreeIds([int] $ProcessId) {
 	return $ids
 }
 
-function Stop-ProcessTree([int] $ProcessId) {
-	$ids = @(Get-ProcessTreeIds $ProcessId | Select-Object -Unique)
+function Add-ProcessTreeSnapshot([System.Collections.Generic.List[int]] $ProcessIds, [int] $ProcessId) {
+	if ($ProcessId -le 0) { return }
+	foreach ($id in @(Get-ProcessTreeIds $ProcessId | Select-Object -Unique)) {
+		if (-not $ProcessIds.Contains([int] $id)) { $ProcessIds.Add([int] $id) }
+	}
+}
+
+function Stop-TrackedProcessIds([System.Collections.Generic.List[int]] $ProcessIds) {
 	$deadline = [DateTime]::UtcNow.AddSeconds($CleanupTimeoutSeconds)
+	$remaining = @()
 	do {
-		foreach ($id in @($ids)) {
-			$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$id" -ErrorAction SilentlyContinue)
-			foreach ($child in $children) {
-				if ($ids -notcontains [int] $child.ProcessId) { $ids += [int] $child.ProcessId }
+		foreach ($id in @($ProcessIds.ToArray())) {
+			if (Get-Process -Id ([int] $id) -ErrorAction SilentlyContinue) {
+				foreach ($descendant in @(Get-ProcessTreeIds ([int] $id) | Select-Object -Unique)) {
+					if (-not $ProcessIds.Contains([int] $descendant)) { $ProcessIds.Add([int] $descendant) }
+				}
 			}
 		}
-		foreach ($id in ($ids | Sort-Object -Descending)) {
+		foreach ($id in @($ProcessIds.ToArray() | Sort-Object -Descending)) {
 			try { Stop-Process -Id ([int] $id) -Force -ErrorAction Stop } catch {
-				if (Get-Process -Id ([int] $id) -ErrorAction SilentlyContinue) { throw "Could not terminate process tree rooted at $ProcessId (process $id): $($_.Exception.Message)" }
+				if (Get-Process -Id ([int] $id) -ErrorAction SilentlyContinue) { throw "Could not terminate tracked process ${id}: $($_.Exception.Message)" }
 			}
 		}
 		Start-Sleep -Milliseconds 100
-		$remaining = @($ids | Where-Object { Get-Process -Id ([int] $_) -ErrorAction SilentlyContinue })
+		$remaining = @($ProcessIds.ToArray() | Where-Object { Get-Process -Id ([int] $_) -ErrorAction SilentlyContinue })
 		if ($remaining.Count -eq 0) { return }
 	} while ([DateTime]::UtcNow -lt $deadline)
-	throw "Process tree rooted at $ProcessId remains alive: $($remaining -join ',')"
+	throw "Tracked process cleanup left live PIDs: $($remaining -join ',')"
+}
+
+function Assert-TrackedProcessIdsGone([System.Collections.Generic.List[int]] $ProcessIds) {
+	$remaining = @($ProcessIds.ToArray() | Where-Object { Get-Process -Id ([int] $_) -ErrorAction SilentlyContinue })
+	if ($remaining.Count -gt 0) { throw "Tracked process cleanup left live PIDs: $($remaining -join ',')" }
+}
+
+function Stop-ProcessTree([int] $ProcessId) {
+	$ids = [System.Collections.Generic.List[int]]::new()
+	Add-ProcessTreeSnapshot $ids $ProcessId
+	Stop-TrackedProcessIds $ids
 }
 
 function Start-RedirectedProcess(
@@ -177,6 +204,13 @@ function Complete-RedirectedProcess($Handle) {
 			try { [IO.File]::WriteAllText($stream.Path, '[output drain failed]') } catch {}
 		}
 	}
+}
+
+function Write-BoundedJson([string] $Path, [object] $Value, [int] $MaximumBytes, [string] $Label) {
+	$json = $Value | ConvertTo-Json -Depth 20
+	$encoding = [Text.UTF8Encoding]::new($false)
+	if ($encoding.GetByteCount($json) -gt $MaximumBytes) { throw "$Label exceeds the bounded size of $MaximumBytes bytes" }
+	[IO.File]::WriteAllText($Path, $json, $encoding)
 }
 
 function New-Secret() {
@@ -379,14 +413,14 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		serverDirectory = $serverDirectory; providerWorkspace = $providerWorkspace; protocolAudit = $protocolAudit; providerTurns = $providerTurns
 		ports = [pscustomobject]@{ minecraft = $serverPort; rcon = $rconPort; bridge = $bridgePort }; levelName = $worldName
 	}
-	[IO.File]::WriteAllText((Join-Path $scenarioDirectory 'manifest.json'), ($manifest | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+	Write-BoundedJson (Join-Path $scenarioDirectory 'manifest.json') $manifest $MaxManifestBytes 'scenario manifest'
 	$serverHandle = $null
 	$coordinatorHandle = $null
 	$runnerHandle = $null
 	$failure = $null
 	$runnerExit = $null
 	$cleanupFailure = $null
-	$processIds = @()
+	$processIds = [System.Collections.Generic.List[int]]::new()
 	try {
 		$serverArgs = "-Darenaagents.bridgeSecretFile=$(Quote-Argument $secretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
 		$serverStdoutPath = Join-Path $logsDirectory 'fabric.stdout.log'
@@ -404,8 +438,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				Complete-RedirectedProcess $serverHandle
 				$bindFailure = $serverHandle.Process.HasExited -and (Test-BindFailure $serverLog $serverStderrPath)
 				if (-not $bindFailure -or $serverAttempt -gt $StartupBindRetries) { throw }
-				$processIds += @(Get-ProcessTreeIds $serverHandle.Process.Id | Select-Object -Unique)
-				try { Stop-ProcessTree $serverHandle.Process.Id } catch { throw "Server bind retry cleanup failed: $($_.Exception.Message)" }
+				Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
+				try { Stop-TrackedProcessIds $processIds } catch { throw "Server bind retry cleanup failed: $($_.Exception.Message)" }
 				$serverHandle = $null
 				$bridgePort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_BRIDGE_PORT')
 				$rconPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_RCON_PORT') @($bridgePort)
@@ -418,14 +452,52 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				New-ScenarioConfig $sourceConfig $coordinatorConfig $bridgePort $providerWorkspace
 			}
 		}
+		# Keep the complete server tree tracked before any coordinator retry can restart it.
+		Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
 		$coordinatorArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\dynamic-main.mjs')) --config $(Quote-Argument $coordinatorConfig)"
-		$coordinatorEnvironment = @{
-			ARENA_AGENT_BRIDGE_SECRET = $secret; ARENA_HEADLESS_RUN_ID = [IO.Path]::GetFileName($RunDirectory); ARENA_HEADLESS_SCENARIO_ID = $scenarioId
-			ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns; ARENA_HEADLESS_TRACE_PATH = (Join-Path $traceDirectory 'coordinator.jsonl')
-			ARENA_HEADLESS_BRIDGE_PORT = $bridgePort; ARENA_HEADLESS_RCON_PORT = $rconPort; ARENA_HEADLESS_MINECRAFT_PORT = $serverPort
+		$coordinatorStdoutPath = Join-Path $traceDirectory 'dynamic.stdout.log'
+		$coordinatorStderrPath = Join-Path $traceDirectory 'dynamic.stderr.log'
+		$coordinatorAttempt = 0
+		$coordinatorReady = $false
+		while (-not $coordinatorReady) {
+			$coordinatorAttempt += 1
+			$coordinatorEnvironment = @{
+				ARENA_AGENT_BRIDGE_SECRET = $secret; ARENA_HEADLESS_RUN_ID = [IO.Path]::GetFileName($RunDirectory); ARENA_HEADLESS_SCENARIO_ID = $scenarioId
+				ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns; ARENA_HEADLESS_TRACE_PATH = (Join-Path $traceDirectory 'coordinator.jsonl')
+				ARENA_HEADLESS_BRIDGE_PORT = $bridgePort; ARENA_HEADLESS_RCON_PORT = $rconPort; ARENA_HEADLESS_MINECRAFT_PORT = $serverPort
+			}
+			$coordinatorHandle = Start-RedirectedProcess $Node $coordinatorArgs (Join-Path $Project 'coordinator') $coordinatorStdoutPath $coordinatorStderrPath $coordinatorEnvironment
+			try {
+				Wait-Condition {
+					if ($coordinatorHandle.Process.HasExited) { throw "Coordinator exited before bridge readiness: $(ConvertTo-BoundedText (Read-Text $coordinatorStderrPath) $MaxDiagnosticText)" }
+					Test-Port $bridgePort
+				} $StartupTimeoutSeconds 'Coordinator bridge did not become ready'
+				$coordinatorReady = $true
+			} catch {
+				Complete-RedirectedProcess $coordinatorHandle
+				$bindFailure = $coordinatorHandle.Process.HasExited -and (Test-BindFailure $coordinatorStdoutPath $coordinatorStderrPath)
+				if (-not $bindFailure -or $coordinatorAttempt -gt $CoordinatorBindRetries) { throw }
+				Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Process.Id
+				try { Stop-TrackedProcessIds $processIds } catch { throw "Coordinator bind retry cleanup failed: $($_.Exception.Message)" }
+				$coordinatorHandle = $null
+				# The Fabric process owns the bridge listener. Reallocate all three ports and
+				# restart it before retrying the coordinator, otherwise a new bridge port
+				# would never be served by the old process.
+				$bridgePort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_BRIDGE_PORT')
+				$rconPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_RCON_PORT') @($bridgePort)
+				$serverPort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_MINECRAFT_PORT') @($bridgePort, $rconPort)
+				Set-ServerProperties $propertiesPath @{
+					'online-mode' = 'false'; 'enable-rcon' = 'true'; 'rcon.password' = $secret; 'rcon.port' = $rconPort; 'rcon.ip' = '127.0.0.1'
+					'server-port' = $serverPort; 'level-name' = $worldName; 'pause-when-empty-seconds' = '-1'
+				}
+				Protect-LocalFile $propertiesPath
+				New-ScenarioConfig $sourceConfig $coordinatorConfig $bridgePort $providerWorkspace
+				$serverHandle = Start-RedirectedProcess $Java $serverArgs $serverDirectory $serverStdoutPath $serverStderrPath @{}
+				Wait-Condition { (Test-Port $serverPort) -and ((Read-Text $serverLog).Contains('Done (')) } $StartupTimeoutSeconds 'Fabric server did not become ready after coordinator bind retry'
+				Wait-Condition { Test-Port $rconPort } $StartupTimeoutSeconds 'RCON did not become ready after coordinator bind retry'
+				Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
+			}
 		}
-		$coordinatorHandle = Start-RedirectedProcess $Node $coordinatorArgs (Join-Path $Project 'coordinator') (Join-Path $traceDirectory 'dynamic.stdout.log') (Join-Path $traceDirectory 'dynamic.stderr.log') $coordinatorEnvironment
-		Wait-Condition { Test-Port $bridgePort } $StartupTimeoutSeconds 'Coordinator bridge did not become ready'
 		$runnerArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\headless-matrix.mjs')) --config $(Quote-Argument $MatrixFile) --scenario $(Quote-Argument $scenarioId) --run-directory $(Quote-Argument $scenarioDirectory) --rcon-host 127.0.0.1 --rcon-port $rconPort --rcon-password-file $(Quote-Argument $secretPath) --protocol-audit $(Quote-Argument $protocolAudit) --provider-turns $(Quote-Argument $providerTurns)"
 		if ($RequireAll) { $runnerArgs += ' --require-all' }
 		$runnerEnvironment = @{
@@ -433,13 +505,19 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns
 		}
 		$runnerHandle = Start-RedirectedProcess $Node $runnerArgs (Join-Path $Project 'coordinator') (Join-Path $traceDirectory 'runner.stdout.log') (Join-Path $traceDirectory 'runner.stderr.log') $runnerEnvironment
-		if (-not $runnerHandle.Process.WaitForExit(([int] $Scenario.timeoutMs + 30000))) { throw "Scenario '$scenarioId' timed out" }
+		Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
+		Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Process.Id
+		Add-ProcessTreeSnapshot $processIds $runnerHandle.Process.Id
+		if (-not $runnerHandle.Process.WaitForExit(([int] $Scenario.timeoutMs + ($RunnerGraceSeconds * 1000)))) { throw "Scenario '$scenarioId' timed out" }
 		$runnerExit = $runnerHandle.Process.ExitCode
 		Complete-RedirectedProcess $runnerHandle
 		if ($runnerExit -ne 0) { throw "Scenario '$scenarioId' failed with runner exit code $runnerExit" }
 	} catch {
 		$failure = $_
 	} finally {
+		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) {
+			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $processIds $handle.Process.Id }
+		}
 		if ($null -ne $serverHandle -and $null -ne $serverHandle.Process) {
 			try {
 				if (-not $serverHandle.Process.HasExited) {
@@ -449,12 +527,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				}
 			} catch {}
 		}
-		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) {
-			if ($null -ne $handle -and $null -ne $handle.Process) {
-				$processIds += @(Get-ProcessTreeIds $handle.Process.Id | Select-Object -Unique)
-				try { Stop-ProcessTree $handle.Process.Id } catch { if ($null -eq $cleanupFailure) { $cleanupFailure = $_ }; if ($null -eq $failure) { $failure = $_ } }
-			}
-		}
+		try { Stop-TrackedProcessIds $processIds } catch { if ($null -eq $cleanupFailure) { $cleanupFailure = $_ }; if ($null -eq $failure) { $failure = $_ } }
+		try { Assert-TrackedProcessIdsGone $processIds } catch { if ($null -eq $cleanupFailure) { $cleanupFailure = $_ }; if ($null -eq $failure) { $failure = $_ } }
 		try { Wait-Condition { -not (Test-Port $serverPort) -and -not (Test-Port $rconPort) -and -not (Test-Port $bridgePort) } $CleanupTimeoutSeconds 'Scenario cleanup left an allocated listener running' } catch { $cleanupFailure = $_; if ($null -eq $failure) { $failure = $_ } }
 		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) { Complete-RedirectedProcess $handle }
 	}
@@ -463,8 +537,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	}
 	$status = if ($null -eq $failure) { 'PASSED' } else { 'FAILED' }
 	$cleanupStatus = if ($null -eq $cleanupFailure) { 'CLEAN' } else { 'FAILED' }
-	$report = [pscustomobject]@{ status = $status; scenarioId = $scenarioId; provider = [string] $Scenario.provider; model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; exitCode = $runnerExit; cleanup = [pscustomobject]@{ status = $cleanupStatus; processIds = $processIds; diagnostics = if ($null -eq $cleanupFailure) { $null } else { $cleanupFailure.Exception.Message } }; artifacts = $manifest; artifactsKept = [bool] $Keep; diagnostics = if ($null -eq $failure) { $null } else { $failure.Exception.Message } }
-	[IO.File]::WriteAllText((Join-Path $scenarioDirectory 'report.json'), ($report | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+	$report = [pscustomobject]@{ status = $status; scenarioId = (ConvertTo-BoundedText $scenarioId); provider = (ConvertTo-BoundedText $Scenario.provider); model = (ConvertTo-BoundedText $Scenario.model); reasoningEffort = (ConvertTo-BoundedText $Scenario.reasoningEffort); exitCode = $runnerExit; cleanup = [pscustomobject]@{ status = $cleanupStatus; processIds = @($processIds); diagnostics = if ($null -eq $cleanupFailure) { $null } else { ConvertTo-BoundedText $cleanupFailure.Exception.Message $MaxDiagnosticText } }; artifacts = $manifest; artifactsKept = [bool] $Keep; diagnostics = if ($null -eq $failure) { $null } else { ConvertTo-BoundedText $failure.Exception.Message $MaxDiagnosticText } }
+	Write-BoundedJson (Join-Path $scenarioDirectory 'report.json') $report $MaxMatrixReportBytes 'scenario report'
 	return $report
 }
 
@@ -487,6 +561,7 @@ if (-not (Test-Path -LiteralPath $builtJar -PathType Leaf)) { throw "Missing bui
 $matrix = Read-Matrix $MatrixPath
 $selected = @($matrix.scenarios | Where-Object { [string]::IsNullOrWhiteSpace($ScenarioId) -or [string] $_.id -eq $ScenarioId })
 if ($selected.Count -eq 0) { throw "Unknown scenario '$ScenarioId'" }
+if ($selected.Count -gt $MaxSelectedScenarios) { throw "Selected scenario count $($selected.Count) exceeds the bounded maximum of $MaxSelectedScenarios" }
 foreach ($scenario in $selected) { Assert-SafeScenarioId ([string] $scenario.id) }
 $manifestScenarios = @(
 	foreach ($scenario in $selected) {
@@ -518,24 +593,24 @@ $runDirectory = Join-Path $root "runtime\headless-runs\$runId"
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
 $reports = @()
 $manifestPath = Join-Path $runDirectory 'matrix-manifest.json'
-[IO.File]::WriteAllText($manifestPath, ($manifestSummary | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+Write-BoundedJson $manifestPath $manifestSummary $MaxManifestBytes 'matrix manifest'
 foreach ($scenario in $selected) {
 	$preflight = Test-ProviderPreflight ([string] $scenario.provider)
 	if (-not $preflight.Available) {
 		$status = if ($RequireAll) { 'FAILED' } else { 'SKIPPED' }
-		$reports += [pscustomobject]@{ status = $status; scenarioId = [string] $scenario.id; provider = [string] $scenario.provider; skippedReason = $preflight.Reason; cleanup = [pscustomobject]@{ status = 'NOT_STARTED' } }
+		$reports += [pscustomobject]@{ status = $status; scenarioId = (ConvertTo-BoundedText $scenario.id); provider = (ConvertTo-BoundedText $scenario.provider); skippedReason = (ConvertTo-BoundedText $preflight.Reason $MaxDiagnosticText); cleanup = [pscustomobject]@{ status = 'NOT_STARTED' } }
 		continue
 	}
 	try {
 		$reports += Invoke-Scenario $scenario $root $runDirectory $ServerTemplate $MatrixPath $java $node $builtJar -Keep:$KeepArtifacts
 	} catch {
-		$reports += [pscustomobject]@{ status = 'FAILED'; scenarioId = [string] $scenario.id; provider = [string] $scenario.provider; cleanup = [pscustomobject]@{ status = 'FAILED' }; diagnostics = $_.Exception.Message }
+		$reports += [pscustomobject]@{ status = 'FAILED'; scenarioId = (ConvertTo-BoundedText $scenario.id); provider = (ConvertTo-BoundedText $scenario.provider); cleanup = [pscustomobject]@{ status = 'FAILED' }; diagnostics = (ConvertTo-BoundedText $_.Exception.Message $MaxDiagnosticText) }
 	}
 }
 $failed = @($reports | Where-Object { $_.status -eq 'FAILED' })
 $matrixStatus = if ($failed.Count -gt 0) { 'FAILED' } elseif (@($reports | Where-Object { $_.status -eq 'PASSED' }).Count -gt 0) { 'PASSED' } else { 'SKIPPED' }
-$matrixReport = [pscustomobject]@{ runId = $runId; status = $matrixStatus; requireAll = [bool] $RequireAll; scenarios = $reports; reportPath = (Join-Path $runDirectory 'matrix-report.json'); artifactsKept = [bool] $KeepArtifacts }
-[IO.File]::WriteAllText($matrixReport.reportPath, ($matrixReport | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
+$matrixReport = [pscustomobject]@{ runId = $runId; status = $matrixStatus; requireAll = [bool] $RequireAll; scenarios = @($reports | Select-Object -First $MaxSelectedScenarios); reportPath = (Join-Path $runDirectory 'matrix-report.json'); artifactsKept = [bool] $KeepArtifacts }
+Write-BoundedJson $matrixReport.reportPath $matrixReport $MaxMatrixReportBytes 'matrix report'
 $matrixReport | ConvertTo-Json -Depth 20
 if ($failed.Count -gt 0) {
 	$diagnostics = (@($failed | ForEach-Object { if ($_.diagnostics) { $_.diagnostics } }) -join '; ')

@@ -54,7 +54,10 @@ input.on('line', (line) => {
 		limits = [pscustomobject]@{ agentCap = 1; goalQueueCap = 1; planningConcurrency = 1 }
 	}
 	Set-Content -LiteralPath (Join-Path $Root 'coordinator\config\dynamic-agents.json') -Value ($dynamicConfig | ConvertTo-Json -Depth 8) -NoNewline
-	Set-Content -LiteralPath (Join-Path $Root 'matrix.json') -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
+	# The default fixture deliberately expects ERROR so the first run proves the
+	# wrapper records a runner failure and still performs complete cleanup. The
+	# normal-path fixture below expects COMPLETED.
+	Set-Content -LiteralPath (Join-Path $Root 'matrix.json') -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"ERROR"}]}]}' -NoNewline
 }
 
 function Enable-FakeServer([string] $Root) {
@@ -131,7 +134,7 @@ public final class FakeServer {
                 int id = readLittleEndian(payload, 0);
                 int type = readLittleEndian(payload, 4);
                 String command = new String(payload, 8, length - 10, StandardCharsets.UTF_8);
-                String response = type == 3 ? "" : command.contains("summon-configured") ? "ERROR fake server" : "state=ERROR";
+                String response = type == 3 ? "" : command.contains("summon-configured") ? "OK" : command.startsWith("codex status") ? "state=COMPLETED" : "OK";
                 writeResponse(output, id, type == 3 ? 2 : 0, response);
                 output.flush();
             }
@@ -241,6 +244,8 @@ try {
 	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39166'
 	Set-TestEnvironment 'ARENA_HEADLESS_BRIDGE_PORT' '39167'
 	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '1'
+	Set-TestEnvironment 'ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS' '3'
+	Set-TestEnvironment 'ARENA_HEADLESS_RUNNER_GRACE_SECONDS' '2'
 	$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 39165)
 	$listener.Start()
 	try {
@@ -257,6 +262,11 @@ try {
 	$unsafeMatrix = Join-Path $fixture 'unsafe-matrix.json'
 	Set-Content -LiteralPath $unsafeMatrix -Value '{"version":1,"scenarios":[{"id":"../escape","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $unsafeMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'safe|separator|scenario ID|control'
+	$largeMatrix = Join-Path $fixture 'large-matrix.json'
+	$largeScenarios = @(1..17 | ForEach-Object { [pscustomobject]@{ id = "fixture-$_"; provider = 'codex'; model = 'fixture'; reasoningEffort = 'low'; serviceTier = 'fast'; task = 'fixture'; timeoutMs = 1000; assert = @([pscustomobject]@{ type = 'lifecycle'; state = 'COMPLETED' }) } })
+	Set-Content -LiteralPath $largeMatrix -Value ([pscustomobject]@{ version = 1; scenarios = $largeScenarios } | ConvertTo-Json -Depth 8) -NoNewline
+	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $largeMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Selected scenario count|bounded maximum|maximum'
+	Write-Output 'PASS selected scenario count is bounded'
 
 	Enable-FakeServer $fixture
 	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '5'
@@ -279,6 +289,20 @@ try {
 	if (Test-Path -LiteralPath (Join-Path $defaultScenarioDirectory 'rcon-password.txt')) { throw 'Default cleanup retained the RCON credential' }
 	if (Test-Path -LiteralPath (Join-Path $defaultScenarioDirectory 'server')) { throw 'Default cleanup retained the copied server' }
 	if (Test-Path -LiteralPath (Join-Path $defaultScenarioDirectory 'provider-workspaces')) { throw 'Default cleanup retained provider workspaces' }
+
+	# Exercise a successful normal path with the same fake server and verify the
+	# wrapper's graceful-stop snapshot also removes the server's child helper.
+	$successMatrix = Join-Path $fixture 'success-matrix.json'
+	Set-Content -LiteralPath $successMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
+	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39168'
+	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39169'
+	Set-TestEnvironment 'ARENA_HEADLESS_BRIDGE_PORT' '39170'
+	& $scriptPath -ProjectRoot $fixture -MatrixPath $successMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') | Out-Null
+	$successMatrixReportPath = Join-Path (Get-ChildItem -LiteralPath $runRoot -Directory | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).FullName 'matrix-report.json'
+	$successMatrixReport = Get-Content -Raw -LiteralPath $successMatrixReportPath | ConvertFrom-Json
+	if ($successMatrixReport.status -ne 'PASSED' -or $successMatrixReport.scenarios[0].status -ne 'PASSED' -or $successMatrixReport.scenarios[0].cleanup.status -ne 'CLEAN') { throw 'Successful normal-cleanup fixture did not pass cleanly' }
+	if (@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'FakeServer|Start-Sleep -Seconds 30' }).Count -gt 0) { throw 'Successful normal cleanup left dummy server descendants running' }
+	Write-Output 'PASS successful normal cleanup and descendant verification'
 
 	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39168'
 	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39169'
@@ -312,7 +336,7 @@ try {
 	}
 	Write-Output 'PASS timeout cleanup, port verification, child-tree cleanup, and provider isolation hooks'
 } finally {
-	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS')) { Set-TestEnvironment $name $null }
+	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS')) { Set-TestEnvironment $name $null }
 	if (Test-Path -LiteralPath $project) {
 		Remove-Item -LiteralPath $project -Recurse -Force
 	}
