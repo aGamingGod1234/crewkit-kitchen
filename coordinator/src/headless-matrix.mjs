@@ -335,7 +335,15 @@ export async function runHeadlessMatrix({
 			rcon = rconFactory({ host: rconHost, port: rconPort, password });
 			if (!rcon || typeof rcon.connect !== 'function' || typeof rcon.command !== 'function') throw new TypeError('rconFactory must return a HeadlessRconClient-compatible object');
 			await rcon.connect();
-			const report = await runHeadlessScenario({ scenario, runDirectory: scenarioDirectory, rcon, protocolAudit: protocolAuditPath, providerTurnsPath });
+			const report = await runHeadlessScenario({
+				scenario,
+				runDirectory: scenarioDirectory,
+				rcon,
+				readFile,
+				writeFile,
+				protocolAudit: protocolAuditPath,
+				providerTurnsPath,
+			});
 			scenarioReports.push(report);
 		} catch (error) {
 			let cleanupStatus = 'CLEAN';

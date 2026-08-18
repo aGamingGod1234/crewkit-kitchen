@@ -28,10 +28,14 @@ test('wires provider-turn capture into scenario evidence paths', async () => {
 	const result = await runHeadlessMatrix({
 		configPath: 'C:/matrix.json', scenarioId: 'case', runDirectory: 'C:/runs/case', rconPort: 25575,
 		rconPasswordFile: 'C:/runs/password.txt', providerTurnsPath,
-		readFile: async (file) => file.endsWith('matrix.json') ? JSON.stringify({ version: 1, scenarios: [{
-			id: 'case', provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
-			assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
-		}] }) : 'password',
+		readFile: async (file) => {
+			if (file.endsWith('matrix.json')) return JSON.stringify({ version: 1, scenarios: [{
+				id: 'case', provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
+				assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
+			}] });
+			if (file === providerTurnsPath) return '{"row":1,"providerOutput":"private-provider-text"}\n{"row":2}\n';
+			return 'password';
+		},
 		writeFile: async () => {}, mkdir: async () => {}, rconFactory: () => ({
 			connect: async () => {},
 			command: async (command) => command.startsWith('codex status') ? { text: 'state=COMPLETED' } : { text: 'ok' },
@@ -39,6 +43,8 @@ test('wires provider-turn capture into scenario evidence paths', async () => {
 		}),
 	});
 	assert.equal(result.report.scenarios[0].evidence.paths.providerTurns, providerTurnsPath);
+	assert.equal(result.report.scenarios[0].evidence.providerTurnsRows, 2);
+	assert.doesNotMatch(JSON.stringify(result.report), /private-provider-text/);
 });
 
 test('rejects a selected matrix larger than the bounded scenario limit', async () => {
