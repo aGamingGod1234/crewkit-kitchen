@@ -75,7 +75,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "action_command", "action_cancel", "agent_error", "heartbeat"
+			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel", "agent_error", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -343,6 +343,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "catalog_snapshot" -> acceptCatalog(envelope.payload());
 			case "coordinator_status" -> acceptCoordinatorStatus(envelope.payload());
 			case "agent_ready", "planning_state" -> plannerReady(envelope);
+			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "action_command" -> acceptAction(envelope);
 			case "action_cancel" -> acceptActionCancel(envelope);
 			case "agent_error" -> acceptAgentError(envelope);
@@ -426,6 +427,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		String message = requiredString(envelope.payload(), "message");
 		AgentTransition transition = router.plannerFailed(agentId, goalRevision, message);
 		AgentChatReporter.failed(manager, transition.after(), code, message);
+	}
+
+	private void acceptGoalCompleted(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("goalRevision"), "goal_completed");
+		long goalRevision = requiredLong(payload, "goalRevision");
+		router.coordinatorCompleted(agentId, goalRevision);
 	}
 
 	private void requestActiveDisconnect() {

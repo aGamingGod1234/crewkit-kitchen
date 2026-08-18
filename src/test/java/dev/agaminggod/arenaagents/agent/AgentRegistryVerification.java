@@ -14,6 +14,7 @@ public final class AgentRegistryVerification {
 	public static int verify() {
 		int assertions = 0;
 		assertions += verifyLifecycleAndRevisions();
+		assertions += verifyCoordinatorCompletion();
 		assertions += verifyQueueAndSteeringBounds();
 		assertions += verifyIdentityResolution();
 		assertions += verifyPersistenceRecovery();
@@ -73,6 +74,22 @@ public final class AgentRegistryVerification {
 		AgentTransition resumedAfterDisconnect = registry.resume(created.agentId(), START_TIME + 8L);
 		assertEquals(AgentLifecycleState.STARTING, resumedAfterDisconnect.after().state(), "resume after coordinator reconnect");
 		return 23;
+	}
+
+	private static int verifyCoordinatorCompletion() {
+		ArrayList<AgentTransition> transitions = new ArrayList<>();
+		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transitions::add);
+		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("Coordinator"), START_TIME);
+		registry.start(created.agentId(), "Finish this task", START_TIME + 1L);
+		registry.beginPlanning(created.agentId(), START_TIME + 2L);
+		AgentRecord completed = registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 3L);
+		assertEquals(AgentLifecycleState.COMPLETED, completed.state(), "coordinator completion state");
+		assertEquals(1L, completed.goalRevision(), "coordinator completion preserves goal revision");
+		assertEquals("Finish this task", completed.currentGoal().orElseThrow().prompt(), "coordinator completion preserves current goal");
+		assertEquals(2, transitions.size(), "coordinator completion does not echo a synthetic lifecycle transition");
+		assertEquals(AgentLifecycleState.COMPLETED, registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 4L).state(), "repeated coordinator completion is idempotent");
+		expectFailure(() -> registry.coordinatorCompleted(created.agentId(), 0L, START_TIME + 5L), "STALE_REVISION");
+		return 6;
 	}
 
 	private static int verifyQueueAndSteeringBounds() {

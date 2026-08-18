@@ -84,6 +84,7 @@ export class DynamicCoordinator extends EventEmitter {
 			bridge: this.#bridge,
 			planner: this.#planner,
 			reportError: (agentId, error) => this.#reportAgentError(agentId, error),
+			onCompleted: (record) => this.#publishGoalCompleted(record),
 			latencyRegistry: this.#latencyRegistry,
 			trace: (event, fields) => this.#writeTrace(event, fields),
 			clock: () => this.#controlNow(),
@@ -236,6 +237,7 @@ export class DynamicCoordinator extends EventEmitter {
 					observedAtEpochMs: message.payload.observedAtEpochMs,
 				});
 				if (installed !== null) return;
+				if (this.#scheduler.hasScheduled(record.agentId)) return;
 				if (receiptMonotonicMs !== null && (this.#providerRetryAfter.get(record.agentId) ?? 0) > receiptMonotonicMs) return;
 				await this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING });
 				const decision = await this.#planner.requestPlan({
@@ -414,6 +416,11 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #publishCatalog(snapshot) {
 		await this.#bridge.send('catalog_snapshot', 'server', snapshot);
+	}
+
+	async #publishGoalCompleted(record) {
+		if (!this.#bridge.ready || !this.#supportedAgentIds.has(record.agentId)) return;
+		await this.#bridge.send('goal_completed', record.agentId, { goalRevision: record.goalRevision });
 	}
 
 	async #publishStatus() {

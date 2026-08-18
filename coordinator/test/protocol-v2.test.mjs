@@ -59,6 +59,12 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 	}), /field/i);
 });
 
+test('protocol v2 carries a coordinator goal completion update', () => {
+	const payload = { goalRevision: 4 };
+	assert.deepEqual(validateProtocolV2Payload('goal_completed', payload), payload);
+	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, unexpected: true }), /field/i);
+});
+
 test('protocol v2 requires immutable provenance on every action command form', () => {
 	const payload = {
 		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
@@ -503,6 +509,7 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
+		['goal_completed', { goalRevision: 1 }],
 		['action_command', { goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],

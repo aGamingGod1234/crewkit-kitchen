@@ -4,6 +4,7 @@ import test from 'node:test';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
+import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
@@ -16,7 +17,7 @@ function observation(overrides = {}) {
 	return { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} }, ...overrides };
 }
 
-function harness() {
+function harness(options = {}) {
 	const registry = new AgentRegistry();
 	registry.register(record());
 	const sent = [];
@@ -25,6 +26,7 @@ function harness() {
 		registry,
 		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
 		planner: { requestPlan: async (request) => { requests.push(request); return { summary: 'Continue.', directive: 'continue' }; } },
+		onCompleted: options.onCompleted,
 	});
 	return { manager, registry, sent, requests };
 }
@@ -42,6 +44,20 @@ test('installs a model-authored program and dispatches its next primitive withou
 	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: run.sent[0].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
 	assert.equal(run.sent.length, 2);
 	assert.equal(run.requests.length, 0, 'pre-authored continuation must not call the provider');
+});
+
+test('reports a completed ArenaScript program after its final action result', async () => {
+	const changes = [];
+	const run = harness({ onCompleted: (changed) => changes.push(changed) });
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Wait, then finish.',
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");',
+	}, { observation: observation(), eventSequence: 1 });
+	const command = run.sent[0];
+	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
+	assert.equal(run.registry.get('agent-a').state, DynamicAgentState.COMPLETED);
+	assert.equal(changes.at(-1)?.state, DynamicAgentState.COMPLETED, 'terminal state is reported to the bridge owner');
 });
 
 test('emits a provenance-bearing coordinate-free respawn primitive only from authored player code', async () => {
@@ -115,6 +131,41 @@ test('uses an authored watcher before asking the provider for unmatched attentio
 	assert.equal(run.sent.at(-1).payload.arguments.durationMs, 9);
 	assert.equal(run.sent.at(-1).payload.provenance.eventSequence, 37, 'watcher command repeats the triggering server event identity');
 	assert.equal(run.requests.length, 0);
+});
+
+test('serializes coalesced reactive planner requests for one program', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [];
+	const requests = [];
+	const errors = [];
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });
+	let releaseFirst;
+	const firstPlan = new Promise((resolve) => { releaseFirst = resolve; });
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (_type, _agentId, payload) => sent.push(payload) },
+		planner: {
+			requestPlan: (request) => scheduler.schedule(request.agentId, async () => {
+				requests.push(request);
+				if (requests.length === 1) return firstPlan;
+				return { directive: 'continue', summary: 'continue' };
+			}),
+		},
+		reportError: (_agentId, error) => errors.push(error),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: true });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3, attention: true });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 1, 'coalesced attention must not start a second planner request before the first response is applied');
+	releaseFirst({ directive: 'continue', summary: 'continue' });
+	for (let attempt = 0; attempt < 5 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2, 'the newest coalesced context is still serviced after the first response');
+	assert.equal(errors.filter((error) => error.code === 'PLAN_ALREADY_ACTIVE').length, 0, 'the scheduler must not reject the coalesced request as a duplicate active turn');
+	scheduler.close();
 });
 
 test('measures one thousand watcher branches with the real monotonic clock', async () => {

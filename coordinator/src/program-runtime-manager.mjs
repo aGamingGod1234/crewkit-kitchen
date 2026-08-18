@@ -20,17 +20,20 @@ export class ProgramRuntimeManager {
 	#clock;
 	#lastClockReading = null;
 	#trace;
+	#onCompleted;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance) } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance) } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
 		if (typeof trace !== 'function') throw new TypeError('trace must be a function');
+		if (typeof onCompleted !== 'function') throw new TypeError('onCompleted must be a function');
 		this.#registry = registry;
 		this.#bridge = bridge;
 		this.#planner = planner;
 		this.#reportError = reportError;
 		this.#trace = trace;
+		this.#onCompleted = onCompleted;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
 		if (latencyRegistry !== null && typeof latencyRegistry.record !== 'function') throw new TypeError('latencyRegistry.record must be a function');
@@ -196,6 +199,8 @@ export class ProgramRuntimeManager {
 			branchReceipt: null,
 			lastReceiptMonotonicMs: null,
 			lastReceiptEpochMs: null,
+			reactiveRequest: null,
+			reactiveRequestActive: false,
 			engine: null,
 		};
 		state.engine = new ArenaScriptEngine({
@@ -296,6 +301,26 @@ export class ProgramRuntimeManager {
 	}
 
 	async #requestReactiveDecision(state, context) {
+		state.reactiveRequest = context;
+		if (state.reactiveRequestActive) return;
+		state.reactiveRequestActive = true;
+		try {
+			while (!state.disposed && state.reactiveRequest !== null) {
+				const request = state.reactiveRequest;
+				state.reactiveRequest = null;
+				await this.#runReactiveDecision(state, request);
+				// Give planner cleanup a turn before starting the newest coalesced request.
+				if (state.reactiveRequest !== null) await Promise.resolve();
+			}
+		} finally {
+			const pending = state.disposed ? null : state.reactiveRequest;
+			state.reactiveRequest = null;
+			state.reactiveRequestActive = false;
+			if (pending !== null) void this.#requestReactiveDecision(state, pending);
+		}
+	}
+
+	async #runReactiveDecision(state, context) {
 		const record = this.#registry.get(state.agentId);
 		if (state.disposed || record === null || record.goalRevision !== state.goalRevision) return;
 		try {
@@ -521,7 +546,14 @@ export class ProgramRuntimeManager {
 	#setTerminalState(record, state) {
 		const current = this.#registry.get(record.agentId);
 		if (current === null || current.goalRevision !== record.goalRevision || current.state === state) return;
-		this.#registry.setState(record.agentId, state, { goalRevision: record.goalRevision });
+		const updated = this.#registry.setState(record.agentId, state, { goalRevision: record.goalRevision });
+		if (state === DynamicAgentState.COMPLETED) {
+			try {
+				Promise.resolve(this.#onCompleted(updated)).catch((error) => this.#reportError(record.agentId, error));
+			} catch (error) {
+				this.#reportError(record.agentId, error);
+			}
+		}
 	}
 }
 

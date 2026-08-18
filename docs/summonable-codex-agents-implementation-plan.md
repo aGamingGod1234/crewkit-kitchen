@@ -159,7 +159,7 @@ Required envelope fields:
 
 Important payloads:
 
-- Coordinator to server: `hello`, `catalog_snapshot`, `agent_ready`, `planning_state`, `action_command`, `agent_error`, `heartbeat`.
+- Coordinator to server: `hello`, `catalog_snapshot`, `agent_ready`, `planning_state`, `goal_completed`, `action_command`, `agent_error`, `heartbeat`.
 - Server to coordinator: `hello_ack`, `catalog_request`, `agent_registered`, `agent_removed`, `goal_control`, `observation`, `action_progress`, `action_result`, `heartbeat`, `shutdown`.
 
 Protocol rules:

@@ -36,6 +36,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'coordinator_status',
 	'agent_ready',
 	'planning_state',
+	'goal_completed',
 	'action_command',
 	'action_cancel',
 	'agent_error',
@@ -58,7 +59,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
 const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'action_progress', 'action_result']);
-const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'action_command', 'action_cancel', 'agent_error']);
+const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'action_command', 'action_cancel', 'agent_error']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
@@ -158,6 +159,9 @@ export function validateProtocolV2Payload(type, value) {
 		case 'planning_state':
 			exactKeys(value, ['goalRevision', 'state'], ['goalRevision', 'state'], type);
 			return { goalRevision: revision(value.goalRevision, 'goalRevision'), state: boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH) };
+		case 'goal_completed':
+			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
+			return { goalRevision: revision(value.goalRevision, 'goalRevision') };
 		case 'action_command':
 			return normalizeActionCommand(value);
 		case 'action_cancel':

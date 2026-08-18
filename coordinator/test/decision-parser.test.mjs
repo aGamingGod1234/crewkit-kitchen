@@ -74,7 +74,7 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /ArenaScript source inside the JSON envelope/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /exactly one.*onUnhandledAttention/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /observed facts only/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /player\.moveTo\(\{ x, y, z \}\)/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.moveTo\(\{ x, y, z, tolerance, sprint \}\)/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /multi-tree and pickup example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /watcher example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /compiler diagnostics.*correct/i);
