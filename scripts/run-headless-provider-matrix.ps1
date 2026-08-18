@@ -29,14 +29,18 @@ function Read-Text([string] $Path) {
 	return [IO.File]::ReadAllText($Path)
 }
 
+function Protect-LocalFile([string] $Path) {
+	# Do not inherit a broad ACL for generated credentials or their server config.
+	$grant = "$($env:USERNAME):(R,W)"
+	& icacls.exe $Path /inheritance:r /grant:r $grant | Out-Null
+	if ($LASTEXITCODE -ne 0) { throw "Could not restrict permissions on generated secret: $Path" }
+}
+
 function Write-PrivateText([string] $Path, [string] $Value) {
 	$parent = Split-Path -Parent $Path
 	New-Item -ItemType Directory -Path $parent -Force | Out-Null
 	[IO.File]::WriteAllText($Path, $Value, [Text.UTF8Encoding]::new($false))
-	# Do not inherit a broad ACL for generated bridge/RCON credentials.
-	$grant = "$($env:USERNAME):(R,W)"
-	& icacls.exe $Path /inheritance:r /grant:r $grant | Out-Null
-	if ($LASTEXITCODE -ne 0) { throw "Could not restrict permissions on generated secret: $Path" }
+	Protect-LocalFile $Path
 }
 
 function Wait-Condition([scriptblock] $Condition, [int] $TimeoutSeconds, [string] $FailureMessage) {
@@ -271,6 +275,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		'level-name' = $worldName
 		'pause-when-empty-seconds' = '-1'
 	}
+	Protect-LocalFile $propertiesPath
 	$logsDirectory = Join-Path $scenarioDirectory 'logs'
 	$traceDirectory = Join-Path $scenarioDirectory 'traces'
 	$providerWorkspace = Join-Path $scenarioDirectory 'provider-workspaces'
