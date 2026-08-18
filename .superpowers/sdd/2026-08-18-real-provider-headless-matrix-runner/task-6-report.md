@@ -24,4 +24,4 @@
 
 ## Commit
 
-This report and the two Task 6 scripts are included in the scoped Task 6 commit. The final commit hash is available from `git log -1 --oneline` after commit.
+Task 6 commits are `72615cd` (wrapper and tests), `ae0660d` (credential-file ACL hardening), and `10d3b07` (scenario artifact path isolation). This report is included in the scoped Task 6 history.
