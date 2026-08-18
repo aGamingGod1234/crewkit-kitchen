@@ -175,7 +175,7 @@ public final class FakeServer {
         ServerSocket bridge = new ServerSocket(bridgePort, 16, InetAddress.getLoopbackAddress());
         Files.createDirectories(Path.of("logs"));
         Files.writeString(Path.of("logs", "latest.log"), "Done (0.1s)!\n", StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-        new ProcessBuilder("powershell.exe", "-NoProfile", "-Command", "Start-Sleep -Seconds 30").inheritIO().start();
+        new ProcessBuilder("powershell.exe", "-NoProfile", "-Command", "Start-Sleep -Seconds 3").inheritIO().start();
         Thread acceptor = new Thread(() -> {
             while (running.get()) {
                 try { serveRcon(rcon.accept(), running); } catch (IOException ignored) { return; }
@@ -223,7 +223,7 @@ function Stop-TestProcessTree([int] $ProcessId) {
 }
 
 function Test-PortClosed([int] $Port) {
-	return $null -eq (Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1)
+	return $null -eq (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
 
 $project = Join-Path ([IO.Path]::GetTempPath()) "arena-headless-wrapper-test-$([Guid]::NewGuid().ToString('N'))"
@@ -244,8 +244,10 @@ try {
 	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39166'
 	Set-TestEnvironment 'ARENA_HEADLESS_BRIDGE_PORT' '39167'
 	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '1'
-	Set-TestEnvironment 'ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS' '3'
+	Set-TestEnvironment 'ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS' '1'
 	Set-TestEnvironment 'ARENA_HEADLESS_RUNNER_GRACE_SECONDS' '2'
+	Set-TestEnvironment 'ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS' '1'
+	Set-TestEnvironment 'ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS' '100'
 	$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 39165)
 	$listener.Start()
 	try {
@@ -301,7 +303,7 @@ try {
 	$successMatrixReportPath = Join-Path (Get-ChildItem -LiteralPath $runRoot -Directory | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).FullName 'matrix-report.json'
 	$successMatrixReport = Get-Content -Raw -LiteralPath $successMatrixReportPath | ConvertFrom-Json
 	if ($successMatrixReport.status -ne 'PASSED' -or $successMatrixReport.scenarios[0].status -ne 'PASSED' -or $successMatrixReport.scenarios[0].cleanup.status -ne 'CLEAN') { throw 'Successful normal-cleanup fixture did not pass cleanly' }
-	if (@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'FakeServer|Start-Sleep -Seconds 30' }).Count -gt 0) { throw 'Successful normal cleanup left dummy server descendants running' }
+	if (@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'FakeServer|Start-Sleep -Seconds 3' }).Count -gt 0) { throw 'Successful normal cleanup left dummy server descendants running' }
 	Write-Output 'PASS successful normal cleanup and descendant verification'
 
 	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39168'
@@ -336,7 +338,7 @@ try {
 	}
 	Write-Output 'PASS timeout cleanup, port verification, child-tree cleanup, and provider isolation hooks'
 } finally {
-	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS')) { Set-TestEnvironment $name $null }
+	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS','ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS','ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS')) { Set-TestEnvironment $name $null }
 	if (Test-Path -LiteralPath $project) {
 		Remove-Item -LiteralPath $project -Recurse -Force
 	}

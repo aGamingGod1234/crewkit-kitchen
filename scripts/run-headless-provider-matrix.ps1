@@ -15,16 +15,21 @@ $PollMilliseconds = 250
 $StartupTimeoutSeconds = 120
 $CleanupTimeoutSeconds = 30
 $RunnerGraceSeconds = 30
+$GracefulStopTimeoutMilliseconds = 10000
+$OutputDrainTimeoutMilliseconds = 1000
 $configuredStartupTimeout = 0
 $configuredCleanupTimeout = 0
 $configuredRunnerGrace = 0
+$configuredGracefulStopTimeout = 0
+$configuredOutputDrainTimeout = 0
 if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS'), [ref] $configuredStartupTimeout) -and $configuredStartupTimeout -gt 0) { $StartupTimeoutSeconds = $configuredStartupTimeout }
 if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS'), [ref] $configuredCleanupTimeout) -and $configuredCleanupTimeout -gt 0) { $CleanupTimeoutSeconds = $configuredCleanupTimeout }
 if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_RUNNER_GRACE_SECONDS'), [ref] $configuredRunnerGrace) -and $configuredRunnerGrace -gt 0) { $RunnerGraceSeconds = $configuredRunnerGrace }
+if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS'), [ref] $configuredGracefulStopTimeout) -and $configuredGracefulStopTimeout -gt 0) { $GracefulStopTimeoutMilliseconds = $configuredGracefulStopTimeout * 1000 }
+if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS'), [ref] $configuredOutputDrainTimeout) -and $configuredOutputDrainTimeout -gt 0) { $OutputDrainTimeoutMilliseconds = $configuredOutputDrainTimeout }
 $MaxPortAttempts = 30
 $StartupBindRetries = 2
 $CoordinatorBindRetries = 2
-$OutputDrainTimeoutMilliseconds = 1000
 $MaxSelectedScenarios = 16
 $MaxManifestBytes = 65536
 $MaxMatrixReportBytes = 262144
@@ -74,7 +79,7 @@ function Get-ProcessCommand([string] $Name) {
 }
 
 function Test-Port([int] $Port) {
-	$connections = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
+	$connections = Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue
 	return $null -ne ($connections | Select-Object -First 1)
 }
 
@@ -122,14 +127,37 @@ function Add-ProcessTreeSnapshot([System.Collections.Generic.List[int]] $Process
 	}
 }
 
+function Get-ProcessChildrenSnapshot() {
+	$childrenByParent = @{}
+	foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+		$parentId = [int] $process.ParentProcessId
+		if (-not $childrenByParent.ContainsKey($parentId)) {
+			$childrenByParent[$parentId] = [System.Collections.Generic.List[int]]::new()
+		}
+		$childrenByParent[$parentId].Add([int] $process.ProcessId)
+	}
+	return $childrenByParent
+}
+
 function Stop-TrackedProcessIds([System.Collections.Generic.List[int]] $ProcessIds) {
 	$deadline = [DateTime]::UtcNow.AddSeconds($CleanupTimeoutSeconds)
 	$remaining = @()
 	do {
-		foreach ($id in @($ProcessIds.ToArray())) {
-			if (Get-Process -Id ([int] $id) -ErrorAction SilentlyContinue) {
-				foreach ($descendant in @(Get-ProcessTreeIds ([int] $id) | Select-Object -Unique)) {
-					if (-not $ProcessIds.Contains([int] $descendant)) { $ProcessIds.Add([int] $descendant) }
+		# Refresh one parent/child snapshot per pass and only traverse from tracked roots.
+		# This preserves PID tracking and avoids adopting unrelated processes from the snapshot.
+		$childrenByParent = Get-ProcessChildrenSnapshot
+		foreach ($root in @($ProcessIds.ToArray())) {
+			if (-not (Get-Process -Id ([int] $root) -ErrorAction SilentlyContinue)) { continue }
+			$pending = [System.Collections.Generic.Queue[int]]::new()
+			$visited = [System.Collections.Generic.HashSet[int]]::new()
+			$pending.Enqueue([int] $root)
+			while ($pending.Count -gt 0) {
+				$current = $pending.Dequeue()
+				if (-not $visited.Add($current) -or -not $childrenByParent.ContainsKey($current)) { continue }
+				foreach ($child in $childrenByParent[$current]) {
+					$childId = [int] $child
+					if (-not $ProcessIds.Contains($childId)) { $ProcessIds.Add($childId) }
+					$pending.Enqueue($childId)
 				}
 			}
 		}
@@ -523,7 +551,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				if (-not $serverHandle.Process.HasExited) {
 					$serverHandle.Process.StandardInput.WriteLine('stop')
 					$serverHandle.Process.StandardInput.Flush()
-					$null = $serverHandle.Process.WaitForExit(10000)
+					$null = $serverHandle.Process.WaitForExit($GracefulStopTimeoutMilliseconds)
 				}
 			} catch {}
 		}
