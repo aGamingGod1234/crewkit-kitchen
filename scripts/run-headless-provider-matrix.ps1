@@ -448,7 +448,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	}
 	Write-BoundedJson (Join-Path $scenarioDirectory 'manifest.json') $manifest $MaxManifestBytes 'scenario manifest'
 	} catch {
-		if (-not $secretCreated) { throw }
+		$setupException = $_
 		$setupDiagnostics = ConvertTo-BoundedText "Scenario setup failed ($($_.Exception.GetType().Name))" $MaxDiagnosticText
 		$setupCleanupStatus = 'NOT_REQUIRED'
 		if (-not $Keep -and $setupStarted) {
@@ -465,6 +465,10 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				exitCode = $null; cleanup = [pscustomobject]@{ status = $setupCleanupStatus }; artifactsKept = [bool] $Keep; diagnostics = $setupDiagnostics
 			}
 			try { Write-BoundedJson (Join-Path $scenarioDirectory 'report.json') $setupReport $MaxMatrixReportBytes 'scenario setup report' } catch {}
+		}
+		if (-not $secretCreated) {
+			if ($setupCleanupStatus -eq 'FAILED') { throw 'Scenario setup cleanup failed' }
+			throw $setupException
 		}
 		throw $setupDiagnostics
 	}
