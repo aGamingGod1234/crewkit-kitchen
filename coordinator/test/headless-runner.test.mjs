@@ -40,7 +40,7 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	const rcon = {
 		command: async (command) => {
 			commands.push(command);
-			if (command.startsWith('codex summon-configured ')) return { text: 'Created runner-case-agent. It is ready for a task.' };
+			if (command.includes('codex summon-configured ')) return { text: 'Created runner-case-agent. It is ready for a task.' };
 			if (command.startsWith('codex start ')) return { text: 'Goal started.' };
 			if (command.startsWith('codex status ')) return { text: statusReads++ === 0 ? 'state=RUNNING' : 'state=COMPLETED' };
 			if (command === 'data get entity @s Pos') return { text: '[1.0d, 64.0d, 1.0d]' };
@@ -57,7 +57,7 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 
 	assert.equal(report.status, 'PASSED');
 	assert.equal(report.classification, 'PASSED');
-	assert.match(commands[0], /^codex summon-configured codex gpt-5\.6-sol high priority survival headless_runner_case_/);
+	assert.match(commands[0], /^execute positioned 0 64 0 run codex summon-configured codex gpt-5\.6-sol high priority survival headless_runner_case_/);
 	assert.match(commands[1], /^codex start headless_runner_case_[^ ]+ Do the bounded task$/);
 	assert.match(commands[2], /^codex status headless_runner_case_[^ ]+$/);
 	assert.equal(commands.at(-1), 'data get entity @s Pos');
@@ -65,6 +65,108 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	assert.equal(recorderClosed, 1);
 	assert.equal(report.assertions.every((result) => result.passed), true);
 	assert.ok(report.evidence.paths.protocol);
+});
+
+test('parses the exact Java codex status lifecycle strings', async () => {
+	for (const [statusText, expected] of [
+		['runner | Task complete. Goal finished.', 'PASSED'],
+		['runner | Needs attention. Provider failed.', 'ERROR'],
+		['runner | Dead - awaiting model.', 'DEAD'],
+	]) {
+		const commands = [];
+		const report = await runHeadlessScenario({
+			scenario: scenario({ assert: [{ type: 'lifecycle', state: expected === 'PASSED' ? 'COMPLETED' : expected }] }),
+			runDirectory: 'C:/runs/status-shapes',
+			rcon: {
+				command: async (command) => { commands.push(command); return { text: command.startsWith('codex status') ? statusText : 'ok' }; },
+				close: async () => {},
+			},
+			now: () => 1,
+			readFile: async () => '', poll: async () => {}, writeFile: async () => {},
+		});
+		assert.equal(report.classification, expected);
+		assert.equal(commands.filter((command) => command.includes('codex status')).length, 1);
+	}
+});
+
+test('polls beyond the old 256-attempt cap until a long-deadline terminal state', async () => {
+	let clock = 0;
+	let statusReads = 0;
+	const report = await runHeadlessScenario({
+		scenario: scenario({ timeoutMs: 20_000, assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }),
+		runDirectory: 'C:/runs/long-poll',
+		rcon: {
+		command: async (command) => ({ text: command.startsWith('codex status') ? (++statusReads > 300 ? 'runner | Task complete. Goal finished.' : 'runner | Working.') : 'ok' }),
+		close: async () => {},
+	},
+	now: () => clock,
+	readFile: async () => '',
+	poll: async ({ phase }) => { if (phase === 'status') clock += 50; },
+	writeFile: async () => {},
+	});
+	assert.equal(report.status, 'PASSED');
+	assert.ok(statusReads > 256);
+});
+
+test('continues evidence polling for late markers and reads bounded tails', async () => {
+	let evidenceReady = false;
+	const padded = 'x'.repeat(20_000) + 'agent chat: LATE_PASS\n';
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'chat', message: 'LATE_PASS' }] }),
+		runDirectory: 'C:/runs/late-evidence',
+		rcon: {
+		command: async (command) => ({ text: command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }),
+		close: async () => {},
+	},
+	now: () => 1,
+	readFile: async () => evidenceReady ? 'agent chat: LATE_PASS\n' : '',
+		readTail: async () => evidenceReady ? padded : '',
+	poll: async ({ phase }) => { if (phase === 'evidence') evidenceReady = true; },
+	writeFile: async () => {},
+	});
+	assert.equal(report.status, 'PASSED');
+});
+
+test('redacts secret-bearing diagnostics and RCON evidence from serialized reports', async () => {
+	let writes = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'rcon', command: 'list', match: 'missing' }] }),
+		runDirectory: 'C:/runs/redaction',
+		rcon: {
+		command: async (command) => command === 'list' ? { text: '{"password":"shh-secret", "token":"tok-secret"}' } : { text: command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' },
+		close: async () => {},
+	},
+	 now: () => 1, readFile: async () => '', poll: async () => {},
+	writeFile: async (_file, content) => { writes.push(content); },
+	});
+	assert.equal(report.classification, 'ASSERTION_MISMATCH');
+	assert.equal(writes.length, 1);
+	assert.doesNotMatch(writes[0], /shh-secret|tok-secret/);
+});
+
+test('rejects mutation-capable RCON assertion commands using a conservative allowlist', async () => {
+	for (const unsafe of ['scoreboard players set @s x 1', '/give @s diamond', 'weather thunder', 'time set day', 'gamemode creative', 'function foo', 'item replace entity @s weapon.mainhand stone', 'tag @s add admin', 'execute as @s run give @s diamond']) {
+		let forwarded = false;
+		const report = await runHeadlessScenario({
+			scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'rcon', command: unsafe, match: 'never' }] }),
+			runDirectory: 'C:/runs/rcon-deny',
+			rcon: { command: async (command) => { forwarded = forwarded || command === unsafe; return { text: command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }; }, close: async () => {} },
+			now: () => 1, readFile: async () => '', poll: async () => {}, writeFile: async () => {},
+		});
+		assert.equal(forwarded, false);
+		assert.equal(report.classification, 'ERROR');
+	}
+});
+
+test('returns cleanup failure even when cleanup report writing also fails', async () => {
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }),
+		runDirectory: 'C:/runs/cleanup-write',
+		rcon: { command: async (command) => ({ text: command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }), close: async () => { throw new Error('port still open password=secret'); } },
+		now: () => 1, readFile: async () => '', poll: async () => {}, writeFile: async () => { throw new Error('disk unavailable token=secret'); },
+	});
+	assert.equal(report.classification, 'CLEANUP_FAILURE');
+	assert.equal(report.status, 'FAILED');
 });
 
 test('evaluates exact chat, action arguments, program, lifecycle, and read-only RCON assertions', () => {
@@ -88,14 +190,14 @@ test('classifies timeout, terminal ERROR/DEAD, skipped profiles, assertion misma
 	const make = async (statusText, overrides = {}) => {
 		let clock = 0;
 		const rcon = {
-			command: async (command) => command.startsWith('codex summon-configured') ? { text: 'Created agent. ready' } : command.startsWith('codex start') ? { text: 'started' } : { text: statusText },
+			command: async (command) => command.includes('codex summon-configured') ? { text: 'Created agent. ready' } : command.startsWith('codex start') ? { text: 'started' } : { text: statusText },
 			close: overrides.close ?? (async () => {}),
 		};
-		const selectedScenario = overrides.scenario ?? scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] });
+		const selectedScenario = overrides.scenario ? { ...scenario(), ...overrides.scenario } : scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] });
 		return runHeadlessScenario({
-			scenario: selectedScenario,
 			runDirectory: 'C:/runs/classifications', rcon, now: () => clock++, readFile: async () => '', poll: async () => {},
 			...overrides,
+			scenario: selectedScenario,
 		});
 	};
 	assert.equal((await make('still running', { now: () => 2_000 })).classification, 'TIMEOUT');

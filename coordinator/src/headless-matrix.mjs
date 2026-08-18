@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { mkdir as defaultMkdir, readFile as defaultReadFile, writeFile as defaultWriteFile } from 'node:fs/promises';
+import { mkdir as defaultMkdir, open as defaultOpen, readFile as defaultReadFile, writeFile as defaultWriteFile } from 'node:fs/promises';
+import { redact as redactTrace } from './trace-writer.mjs';
 
 const PROVIDERS = new Set(['codex', 'gemini', 'kimi']);
 const MAX_TIMEOUT_MS = 900_000;
@@ -7,8 +8,11 @@ const MAX_DIAGNOSTICS = 4096;
 const MAX_TEXT = 4096;
 const MAX_ASSERTION_ARGS = 8192;
 const MAX_EVIDENCE_BYTES = 16_384;
-const MAX_POLL_ATTEMPTS = 256;
 const POLL_INTERVAL_MS = 50;
+const SENSITIVE_REPORT_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
+const REPORT_SECRET_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
+const REPORT_BEARER_TEXT = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
+const REPORT_QUOTED_SECRET_KEY = /(["'])(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\1\s*:\s*(["'])/gi;
 const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'assert', 'assertions']);
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
@@ -108,7 +112,8 @@ export function scenarioReport(status, scenario, fields = {}) {
 	const normalizedStatus = text(status, 'status').toUpperCase();
 	const report = { status: normalizedStatus, scenarioId: scenario.id, profile: { provider: scenario.provider, model: scenario.model, reasoningEffort: scenario.reasoningEffort, serviceTier: scenario.serviceTier } };
 	for (const [key, value] of Object.entries(fields)) {
-		if (key === 'diagnostics' || key === 'error') report[key] = String(value).slice(0, MAX_DIAGNOSTICS);
+		if (key === 'status') continue;
+		if (key === 'diagnostics' || key === 'error') report[key] = redactReportText(value, MAX_DIAGNOSTICS);
 		else report[key] = boundReportValue(value);
 	}
 	return freeze(report);
@@ -116,9 +121,9 @@ export function scenarioReport(status, scenario, fields = {}) {
 
 function boundReportValue(value, depth = 0) {
 	if (depth > 6) return '[TRUNCATED]';
-	if (value === null || typeof value !== 'object') return typeof value === 'string' ? value.slice(0, MAX_DIAGNOSTICS) : value;
+	if (value === null || typeof value !== 'object') return typeof value === 'string' ? redactReportText(value, MAX_DIAGNOSTICS) : value;
 	if (Array.isArray(value)) return value.slice(0, 64).map((entry) => boundReportValue(entry, depth + 1));
-	return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, entry]) => [key.slice(0, 128), boundReportValue(entry, depth + 1)]));
+	return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, entry]) => [key.slice(0, 128), SENSITIVE_REPORT_KEY.test(key) ? '[REDACTED]' : boundReportValue(entry, depth + 1)]));
 }
 
 /** Evaluate only evidence that was observed from the server/protocol path. */
@@ -135,6 +140,7 @@ export async function runHeadlessScenario({
 	rcon,
 	now = Date.now,
 	readFile = defaultReadFile,
+	readTail = null,
 	writeFile = defaultWriteFile,
 	protocolAudit = null,
 	providerTurnRecorder = null,
@@ -145,6 +151,7 @@ export async function runHeadlessScenario({
 	if (typeof now !== 'function' || typeof readFile !== 'function' || typeof writeFile !== 'function' || typeof poll !== 'function') throw new TypeError('runner dependencies must be functions');
 	const directory = normalizeRunDirectory(runDirectory);
 	const assertions = scenario.assertions ?? scenario.assert ?? [];
+	validateRunnerScenario(scenario, assertions);
 	const profile = {
 		provider: boundedScalar(scenario.provider), model: boundedScalar(scenario.model),
 		reasoningEffort: boundedScalar(scenario.reasoningEffort), serviceTier: boundedScalar(scenario.serviceTier),
@@ -154,46 +161,59 @@ export async function runHeadlessScenario({
 		let cleanup = { status: 'NOT_REQUIRED' };
 		try { await closeResources(rcon, providerTurnRecorder); } catch (error) { cleanup = { status: 'FAILED', diagnostics: boundedText(error?.message ?? error, MAX_DIAGNOSTICS) }; }
 		const report = scenarioReport(cleanup.status === 'FAILED' ? 'FAILED' : 'SKIPPED', scenario, { classification: cleanup.status === 'FAILED' ? 'CLEANUP_FAILURE' : 'SKIPPED_PROFILE', reason: scenario.skipReason ?? scenario.reason ?? 'provider profile unavailable', cleanup });
-		await writeHeadlessReport(directory, report, writeFile);
-		return report;
+		return await persistReportOrFailure(scenario, report, directory, writeFile);
 	}
 	const generatedName = generatedAgentName(scenario, now);
 	const commands = [];
 	const rconEvidence = [];
 	const startedAt = Number(now());
-	const timeoutMs = Number.isSafeInteger(scenario.timeoutMs) && scenario.timeoutMs > 0 ? scenario.timeoutMs : MAX_TIMEOUT_MS;
+	if (!Number.isFinite(startedAt)) throw new TypeError('now must return a finite number');
+	const timeoutMs = scenario.timeoutMs;
+	const deadline = startedAt + timeoutMs;
+	const tailReader = readTail ?? (readFile === defaultReadFile
+		? defaultReadTail
+		: async (file, limit) => boundedTailText(await readFile(file, 'utf8'), limit));
 	let terminalState = null;
 	let classification = null;
 	let diagnostics = '';
 	let closed = false;
-	const command = async (value, { readOnly = false } = {}) => {
+	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
 		commands.push(commandText);
-		const result = await rcon.command(commandText);
+		const result = await withDeadline(() => rcon.command(commandText), deadlineMs, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
 		const textValue = boundedText(result?.text ?? result, MAX_EVIDENCE_BYTES);
 		if (readOnly) rconEvidence.push({ command: commandText, text: textValue });
 		return { result, text: textValue };
 	};
 	try {
-		const summon = await command(`codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} survival ${generatedName}`);
+		const summon = await command(`execute positioned 0 64 0 run codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} survival ${generatedName}`);
 		if (isSkippedResponse(summon.text)) classification = 'SKIPPED_PROFILE';
 		if (classification === null && isFailedResponse(summon.text)) {
 			classification = 'ERROR';
 			diagnostics = summon.text;
 		}
 		if (classification === null) {
-			if (!isAcceptedResponse(summon.text)) await poll({ phase: 'summon', attempt: 0, deadline: startedAt + timeoutMs, response: summon.text, now });
-			await command(`codex start ${generatedName} ${scenario.task}`);
+			if (!isAcceptedResponse(summon.text)) await withDeadline(() => poll({ phase: 'summon', attempt: 0, deadline, response: summon.text, now }), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT');
+			await command(`codex start ${generatedName} ${scenario.task}`, { attempt: 0 });
 			let attempts = 0;
-			while (terminalState === null && attempts < MAX_POLL_ATTEMPTS) {
-				const status = await command(`codex status ${generatedName}`);
+			while (terminalState === null) {
+				if (logicalNow(now, startedAt, attempts) >= deadline) { classification = 'TIMEOUT'; break; }
+				let status;
+				try { status = await command(`codex status ${generatedName}`, { attempt: attempts }); }
+				catch (error) {
+					if (error?.code === 'HEADLESS_TIMEOUT') { classification = 'TIMEOUT'; break; }
+					throw error;
+				}
 				const parsedState = parseLifecycle(status.text);
 				terminalState = LIFECYCLE_STATES.has(parsedState) ? parsedState : null;
 				if (terminalState !== null) break;
-				const elapsed = Math.max(Number(now()) - startedAt, attempts * POLL_INTERVAL_MS);
-				if (elapsed >= timeoutMs) { classification = 'TIMEOUT'; break; }
-				await poll({ phase: 'status', attempt: attempts, deadline: startedAt + timeoutMs, status: status.text, readStatus: () => command(`codex status ${generatedName}`), now });
+				try {
+					await withDeadline(() => poll({ phase: 'status', attempt: attempts, deadline, status: status.text, readStatus: () => command(`codex status ${generatedName}`, { attempt: attempts }), now }), deadline, () => logicalNow(now, startedAt, attempts), 'HEADLESS_TIMEOUT');
+				} catch (error) {
+					if (error?.code === 'HEADLESS_TIMEOUT') { classification = 'TIMEOUT'; break; }
+					throw error;
+				}
 				attempts += 1;
 			}
 			if (terminalState === null && classification === null) classification = 'TIMEOUT';
@@ -201,12 +221,12 @@ export async function runHeadlessScenario({
 		if (classification === null && terminalState === 'ERROR') classification = 'ERROR';
 		if (classification === null && terminalState === 'DEAD') classification = 'DEAD';
 		if (classification === null && terminalState === null) classification = 'TIMEOUT';
-		const fileEvidence = await readEvidence(directory, readFile, protocolAudit);
-		for (const assertion of assertions) {
-			if (assertion.type === 'rcon') await command(assertion.command, { readOnly: true });
-		}
-		const evidence = makeEvidence({ terminalState, protocolAudit, ...fileEvidence, rcon: rconEvidence });
-		const assertionResult = evaluateHeadlessAssertions(assertions, evidence);
+		const evidenceResult = await collectHeadlessEvidence({
+			directory, readFile, tailReader, protocolAudit, assertions, terminalState, rconEvidence,
+			readOnlyCommand: (value) => command(value, { readOnly: true, attempt: 0 }),
+			deadline, now, startedAt, poll,
+		});
+		const { fileEvidence, evidence, assertionResult } = evidenceResult;
 		if (classification === null && !assertionResult.passed) classification = 'ASSERTION_MISMATCH';
 		if (classification === null) classification = 'PASSED';
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
@@ -223,16 +243,19 @@ export async function runHeadlessScenario({
 			return await finishReport(scenario, report, directory, writeFile, 'CLEANUP_FAILURE', error);
 		}
 		const finished = scenarioReport(report.status, scenario, { ...report, cleanup: { status: closed ? 'CLEAN' : 'FAILED' } });
-		await writeHeadlessReport(directory, finished, writeFile);
-		return finished;
+		return await persistReportOrFailure(scenario, finished, directory, writeFile);
 	} catch (error) {
 		diagnostics = boundedText(error?.message ?? error, MAX_DIAGNOSTICS);
+		let cleanupError = null;
 		try { await closeResources(rcon, providerTurnRecorder); }
-		catch (cleanupError) { return await finishReport(scenario, base, directory, writeFile, 'CLEANUP_FAILURE', cleanupError); }
-		const status = classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
-		const report = scenarioReport(status, scenario, { classification: classification ?? 'ERROR', diagnostics, generatedName, commands, cleanup: { status: 'CLEAN' } });
-		await writeHeadlessReport(directory, report, writeFile);
-		return report;
+		catch (errorDuringCleanup) { cleanupError = errorDuringCleanup; }
+		const failureClassification = cleanupError !== null ? 'CLEANUP_FAILURE' : classification ?? (error?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR');
+		const status = failureClassification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
+		const report = scenarioReport(status, scenario, {
+			classification: failureClassification, diagnostics: cleanupError === null ? diagnostics : boundedText(cleanupError?.message ?? cleanupError, MAX_DIAGNOSTICS),
+			generatedName, commands, cleanup: cleanupError === null ? { status: 'CLEAN' } : { status: 'FAILED', diagnostics: cleanupError?.message ?? String(cleanupError) },
+		});
+		return await persistReportOrFailure(scenario, report, directory, writeFile);
 	}
 }
 
@@ -246,8 +269,20 @@ export async function writeHeadlessReport(runDirectory, report, writeFile = defa
 
 async function finishReport(scenario, report, directory, writeFile, classification, error) {
 	const finished = scenarioReport('FAILED', scenario, { ...report, classification, cleanup: { status: 'FAILED', diagnostics: boundedText(error?.message ?? error, MAX_DIAGNOSTICS) } });
-	await writeHeadlessReport(directory, finished, writeFile);
-	return finished;
+	return await persistReportOrFailure(scenario, finished, directory, writeFile);
+}
+
+async function persistReportOrFailure(scenario, report, directory, writeFile) {
+	try {
+		await writeHeadlessReport(directory, report, writeFile);
+		return report;
+	} catch (error) {
+		return scenarioReport('FAILED', scenario, {
+			...report,
+			classification: 'CLEANUP_FAILURE',
+			cleanup: { status: 'FAILED', diagnostics: boundedText(error?.message ?? error, MAX_DIAGNOSTICS) },
+		});
+	}
 }
 
 async function closeResources(rcon, providerTurnRecorder) {
@@ -302,12 +337,35 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
 }
 
-async function readEvidence(directory, readFile, protocolAudit) {
+async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll }) {
+	for (const assertion of assertions) {
+		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
+		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
+		catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; }
+	}
+	let attempt = 0;
+	let fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit);
+	let evidence = makeEvidence({ terminalState, protocolAudit, ...fileEvidence, rcon: rconEvidence });
+	let assertionResult = evaluateHeadlessAssertions(assertions, evidence);
+	const waitsForFiles = assertions.some((assertion) => assertion.type !== 'lifecycle' && assertion.type !== 'rcon');
+	while (!assertionResult.passed && waitsForFiles && logicalNow(now, startedAt, attempt) < deadline) {
+		try {
+			await withDeadline(() => poll({ phase: 'evidence', attempt, deadline, evidence, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
+		} catch (error) { if (error?.code === 'HEADLESS_TIMEOUT') break; throw error; }
+		attempt += 1;
+		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit);
+		evidence = makeEvidence({ terminalState, protocolAudit, ...fileEvidence, rcon: rconEvidence });
+		assertionResult = evaluateHeadlessAssertions(assertions, evidence);
+	}
+	return { fileEvidence, evidence, assertionResult };
+}
+
+async function readEvidence(directory, readFile, tailReader, protocolAudit) {
 	const protocolPath = typeof protocolAudit === 'string' ? protocolAudit : path.join(directory, 'protocol.jsonl');
 	const coordinatorPath = path.join(directory, 'coordinator.jsonl');
 	const serverPath = path.join(directory, 'server.log');
 	const [protocolText, coordinatorText, serverLog] = await Promise.all([
-		readBounded(readFile, protocolPath), readBounded(readFile, coordinatorPath), readBounded(readFile, serverPath),
+		readBoundedTail(tailReader, protocolPath), readBoundedTail(tailReader, coordinatorPath), readBoundedTail(tailReader, serverPath),
 	]);
 	return {
 		protocolRows: parseJsonl(protocolText), traceRows: parseJsonl(coordinatorText), serverLog,
@@ -320,8 +378,8 @@ function evidenceSummary(directory, fileEvidence, protocolAudit) {
 	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: auditRows(protocolAudit).length };
 }
 
-async function readBounded(readFile, file) {
-	try { return boundedText(await readFile(file, 'utf8'), MAX_EVIDENCE_BYTES); } catch { return ''; }
+async function readBoundedTail(readTail, file) {
+	try { return boundedTailText(await readTail(file, MAX_EVIDENCE_BYTES), MAX_EVIDENCE_BYTES); } catch { return ''; }
 }
 
 function parseJsonl(value) {
@@ -359,6 +417,9 @@ function generatedAgentName(scenario, timestamp) {
 function parseLifecycle(value) {
 	const textValue = String(value ?? '').toUpperCase().trim();
 	if (LIFECYCLE_STATES.has(textValue)) return textValue;
+	if (/\|\s*TASK COMPLETE\s*\./i.test(textValue)) return 'COMPLETED';
+	if (/\|\s*NEEDS ATTENTION\s*\./i.test(textValue)) return 'ERROR';
+	if (/\|\s*DEAD\s*-\s*AWAITING MODEL\s*\./i.test(textValue)) return 'DEAD';
 	const match = textValue.match(/(?:STATE|STATUS|LIFECYCLE)\s*[:=]\s*(COMPLETED|ERROR|DEAD|RUNNING|STARTING|IDLE|STOPPED)/);
 	return match ? match[1] : null;
 }
@@ -366,7 +427,20 @@ function parseLifecycle(value) {
 function isFailedResponse(value) { return /(?:\bERROR\b|\bFAILED\b|unknown agent|unable to|rejected)/i.test(String(value ?? '')); }
 function isSkippedResponse(value) { return /(?:SKIP|unavailable|not logged in|not installed|profile unavailable|catalog unavailable)/i.test(String(value ?? '')); }
 function isAcceptedResponse(value) { return String(value ?? '').trim().length > 0; }
-function isReadOnlyRcon(value) { return !/(?:^|\s)(?:summon|start|stop|kill|setblock|fill|clone|give|tp|teleport|data\s+(?:merge|modify|remove)|execute\s+.*\b(?:run|summon|setblock|give)\b)/i.test(value); }
+function isReadOnlyRcon(value) {
+	const source = String(value ?? '');
+	if (/[\u0000-\u001f\u007f;&|`]/.test(source)) return false;
+	const command = source.trim().replace(/^\/+/, '').replace(/\s+/g, ' ');
+	return /^(?:list(?:\s+.*)?|seed|difficulty|data\s+get(?:\s+.*)?|time\s+query\s+(?:day|daytime|gametime)|weather\s+query|gamerule\s+[A-Za-z0-9_.-]+)$/.test(command);
+}
+function validateRunnerScenario(scenario, assertions) {
+	for (const field of ['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task']) {
+		const value = scenario[field];
+		if (typeof value !== 'string' || value.trim() === '' || value.length > MAX_TEXT || /[\u0000-\u001f\u007f]/.test(value)) throw new TypeError(`scenario.${field} must be bounded text without control characters`);
+	}
+	if (!Number.isSafeInteger(scenario.timeoutMs) || scenario.timeoutMs <= 0 || scenario.timeoutMs > MAX_TIMEOUT_MS) throw new RangeError('scenario.timeoutMs is out of bounds');
+	if (!Array.isArray(assertions) || assertions.length === 0) throw new TypeError('scenario requires assertions');
+}
 function boundedScalar(value) { return value === null || value === undefined ? null : String(value).slice(0, MAX_TEXT); }
 function boundedText(value, limit) {
 	const textValue = Buffer.isBuffer(value) ? value.toString('utf8') : String(value ?? '');
@@ -374,6 +448,76 @@ function boundedText(value, limit) {
 	let end = Math.min(textValue.length, limit);
 	while (end > 0 && Buffer.byteLength(textValue.slice(0, end), 'utf8') > limit) end -= 1;
 	return textValue.slice(0, end);
+}
+
+function boundedTailText(value, limit) {
+	const textValue = Buffer.isBuffer(value) ? value.toString('utf8') : String(value ?? '');
+	if (Buffer.byteLength(textValue, 'utf8') <= limit) return textValue;
+	return Buffer.from(textValue, 'utf8').subarray(-limit).toString('utf8');
+}
+
+function redactReportText(value, limit) {
+	let textValue = Buffer.isBuffer(value) ? value.toString('utf8') : String(value ?? '');
+	try {
+		const redacted = redactTrace(textValue);
+		if (typeof redacted === 'string') textValue = redacted;
+	} catch { /* fall through to the local bounded redactor */ }
+	textValue = redactQuotedJsonSecrets(textValue)
+		.replace(REPORT_BEARER_TEXT, 'Bearer [REDACTED]')
+		.replace(REPORT_SECRET_TEXT, '$1[REDACTED]');
+	return boundedText(textValue, limit);
+}
+
+function redactQuotedJsonSecrets(value) {
+	let result = '';
+	let cursor = 0;
+	REPORT_QUOTED_SECRET_KEY.lastIndex = 0;
+	let match;
+	while ((match = REPORT_QUOTED_SECRET_KEY.exec(value)) !== null) {
+		const valueStart = REPORT_QUOTED_SECRET_KEY.lastIndex;
+		let valueEnd = valueStart;
+		while (valueEnd < value.length) {
+			if (value[valueEnd] === '\\') { valueEnd += 2; continue; }
+			if (value[valueEnd] === match[2]) break;
+			valueEnd += 1;
+		}
+		if (valueEnd >= value.length) break;
+		result += value.slice(cursor, valueStart) + '[REDACTED]' + match[2];
+		cursor = valueEnd + 1;
+		REPORT_QUOTED_SECRET_KEY.lastIndex = cursor;
+	}
+	return result + value.slice(cursor);
+}
+
+function logicalNow(now, startedAt, attempt) {
+	const observed = Number(now());
+	return Math.max(Number.isFinite(observed) ? observed : startedAt, startedAt + attempt * POLL_INTERVAL_MS);
+}
+
+function headlessTimeout() {
+	const error = new Error('headless scenario deadline exceeded');
+	error.code = 'HEADLESS_TIMEOUT';
+	return error;
+}
+
+async function withDeadline(operation, deadline, currentTime, code = 'HEADLESS_TIMEOUT') {
+	const remaining = deadline - currentTime();
+	if (!(remaining > 0)) throw Object.assign(headlessTimeout(), { code });
+	let timer;
+	const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(headlessTimeout(), { code })), remaining); });
+	try { return await Promise.race([Promise.resolve().then(operation), timeout]); }
+	finally { clearTimeout(timer); }
+}
+
+async function defaultReadTail(file, maxBytes) {
+	const handle = await defaultOpen(file, 'r');
+	try {
+		const stats = await handle.stat();
+		const size = Math.min(Number(stats.size), maxBytes);
+		const buffer = Buffer.alloc(size);
+		if (size > 0) await handle.read(buffer, 0, size, Number(stats.size) - size);
+		return buffer.toString('utf8');
+	} finally { await handle.close(); }
 }
 
 async function defaultPoll() { await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS)); }
