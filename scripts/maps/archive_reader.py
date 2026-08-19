@@ -52,6 +52,119 @@ _WINDOWS_REPARSE_POINT = 0x0400
 _COPY_CHUNK_SIZE = 1024 * 1024
 
 
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _CREATE_FILE = _KERNEL32.CreateFileW
+    _CREATE_FILE.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _CREATE_FILE.restype = wintypes.HANDLE
+    _CLOSE_HANDLE = _KERNEL32.CloseHandle
+    _CLOSE_HANDLE.argtypes = [wintypes.HANDLE]
+    _CLOSE_HANDLE.restype = wintypes.BOOL
+    _GET_FINAL_PATH = _KERNEL32.GetFinalPathNameByHandleW
+    _GET_FINAL_PATH.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    _GET_FINAL_PATH.restype = wintypes.DWORD
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
+    _FILE_SHARE_READ = 0x1
+    _FILE_SHARE_WRITE = 0x2
+    _OPEN_EXISTING = 3
+    _CREATE_NEW = 1
+    _GENERIC_WRITE = 0x40000000
+    _FILE_ATTRIBUTE_NORMAL = 0x80
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+
+
+class _PinnedDirectory:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._handle: int | None = None
+        if os.name != "nt":
+            _reject_linked_path(path)
+            return
+
+        handle = _CREATE_FILE(
+            str(path),
+            0,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            None,
+            _OPEN_EXISTING,
+            _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+        if handle == _INVALID_HANDLE:
+            raise OSError(ctypes.get_last_error(), f"unable to pin directory: {path}")
+        self._handle = handle
+        try:
+            attributes = path.lstat().st_file_attributes
+            if not path.is_dir() or attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                raise ArchiveSafetyError(f"destination contains a link or reparse point: {path}")
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = _GET_FINAL_PATH(handle, buffer, len(buffer), 0)
+            if not length or length >= len(buffer):
+                raise OSError(ctypes.get_last_error(), f"unable to resolve pinned directory: {path}")
+            actual = buffer.value
+            if actual.startswith("\\\\?\\"):
+                actual = actual[4:]
+            if os.path.normcase(os.path.abspath(actual)) != os.path.normcase(os.path.abspath(path)):
+                raise ArchiveSafetyError(f"pinned directory resolved outside its expected path: {path}")
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self._handle is not None:
+            _CLOSE_HANDLE(self._handle)
+            self._handle = None
+
+
+def _pin_directory_chain(path: Path) -> list[_PinnedDirectory]:
+    resolved = Path(os.path.abspath(path))
+    chain = list(reversed((resolved, *resolved.parents)))
+    pins: list[_PinnedDirectory] = []
+    try:
+        for directory in chain:
+            pins.append(_PinnedDirectory(directory))
+        return pins
+    except Exception:
+        for pin in reversed(pins):
+            pin.close()
+        raise
+
+
+def _open_new_leaf(path: Path) -> BinaryIO:
+    if os.name != "nt":
+        return path.open("xb")
+    handle = _CREATE_FILE(
+        str(path),
+        _GENERIC_WRITE,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE,
+        None,
+        _CREATE_NEW,
+        _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle == _INVALID_HANDLE:
+        raise OSError(ctypes.get_last_error(), f"unable to create extraction leaf safely: {path}")
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+    except Exception:
+        _CLOSE_HANDLE(handle)
+        raise
+    return os.fdopen(descriptor, "wb")
+
+
 def _has_reparse_attribute(path: Path) -> bool:
     try:
         attributes = path.lstat().st_file_attributes
@@ -173,20 +286,37 @@ def safe_extract(
     resolved_destination = requested_destination.resolve(strict=False)
     resolved_parent = resolved_destination.parent
     resolved_parent.mkdir(parents=True, exist_ok=True)
-    temporary_root = Path(tempfile.mkdtemp(prefix=".map-extract-", dir=resolved_parent))
+    parent_pins: list[_PinnedDirectory] = []
+    temporary_root: Path | None = None
+    temporary_root_pin: _PinnedDirectory | None = None
+    child_pins: dict[str, _PinnedDirectory] = {}
 
     try:
+        parent_pins = _pin_directory_chain(resolved_parent)
+        temporary_root = Path(tempfile.mkdtemp(prefix=".map-extract-", dir=resolved_parent))
+        temporary_root_pin = _PinnedDirectory(temporary_root)
+
+        def ensure_pinned_directory(relative_path: Path) -> Path:
+            current = temporary_root
+            for component in relative_path.parts:
+                current = current / component
+                current.mkdir(exist_ok=True)
+                key = os.path.normcase(os.path.abspath(current))
+                if key not in child_pins:
+                    child_pins[key] = _PinnedDirectory(current)
+            return current
+
         with zipfile.ZipFile(archive, "r") as source:
             approved = _approve_members(source, limits)
             for member in approved:
                 output_path = temporary_root / member.relative_path
                 if member.is_directory:
-                    output_path.mkdir(parents=True, exist_ok=True)
+                    ensure_pinned_directory(member.relative_path)
                     continue
 
-                output_path.parent.mkdir(parents=True, exist_ok=True)
+                ensure_pinned_directory(member.relative_path.parent)
                 written = 0
-                with source.open(member.info, "r") as input_stream, output_path.open("xb") as output_stream:
+                with source.open(member.info, "r") as input_stream, _open_new_leaf(output_path) as output_stream:
                     while chunk := input_stream.read(_COPY_CHUNK_SIZE):
                         written += len(chunk)
                         if written > member.info.file_size or written > limits.max_member_size:
@@ -199,12 +329,22 @@ def safe_extract(
                         f"archive member size differs from declaration: {member.info.filename!r}"
                     )
 
+        for pin in reversed(list(child_pins.values())):
+            pin.close()
+        child_pins.clear()
         temporary_root.replace(resolved_destination)
+        temporary_root = None
         return [resolved_destination / member.relative_path for member in approved if not member.is_directory]
     except (ArchiveSafetyError, zipfile.BadZipFile, RuntimeError, OSError) as error:
         if isinstance(error, ArchiveSafetyError):
             raise
         raise ArchiveSafetyError(f"archive extraction failed safely: {error}") from error
     finally:
-        if temporary_root.exists():
+        for pin in reversed(list(child_pins.values())):
+            pin.close()
+        if temporary_root_pin is not None:
+            temporary_root_pin.close()
+        if temporary_root is not None and temporary_root.exists():
             shutil.rmtree(temporary_root)
+        for pin in reversed(parent_pins):
+            pin.close()

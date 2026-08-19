@@ -4,6 +4,7 @@ import hashlib
 import http.server
 import io
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -15,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator
+from unittest import mock
 
 from scripts.maps.archive_reader import ArchiveLimits, ArchiveSafetyError, safe_extract
 
@@ -302,6 +304,51 @@ class SafeExtractTests(unittest.TestCase):
                     with self.assertRaisesRegex(ArchiveSafetyError, "Windows"):
                         safe_extract(archive, Path(temporary_directory) / "research", ArchiveLimits())
 
+    @unittest.skipUnless(os.name == "nt", "Windows directory handle semantics")
+    def test_parent_junction_swap_before_temporary_creation_cannot_escape(self) -> None:
+        archive = zip_fixture([("world/level.dat", b"contained", None)])
+        real_mkdtemp = tempfile.mkdtemp
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            parent = root / "validated-parent"
+            backup = root / "validated-parent-backup"
+            outside = root / "outside"
+            parent.mkdir()
+            outside.mkdir()
+            destination = parent / "destination"
+
+            def swap_parent_then_create(*args: object, **kwargs: object) -> str:
+                parent.rename(backup)
+                escaped_parent = str(parent).replace("'", "''")
+                escaped_outside = str(outside).replace("'", "''")
+                subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        f"New-Item -ItemType Junction -Path '{escaped_parent}' "
+                        f"-Target '{escaped_outside}' | Out-Null",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return real_mkdtemp(*args, **kwargs)
+
+            escaped = False
+            try:
+                with mock.patch("scripts.maps.archive_reader.tempfile.mkdtemp", side_effect=swap_parent_then_create):
+                    with self.assertRaises(ArchiveSafetyError):
+                        safe_extract(archive, destination, ArchiveLimits())
+                escaped = (outside / "destination" / "world" / "level.dat").exists()
+            finally:
+                if parent.exists() or parent.is_symlink():
+                    parent.rmdir()
+                if backup.exists():
+                    backup.rename(parent)
+
+            self.assertFalse(escaped)
+
 
 class SourceLedgerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -391,11 +438,19 @@ class FetchMapSourceTests(unittest.TestCase):
         kill_after_publish: int | None = None,
         external_collision_at_publish: int | None = None,
         external_collision_bytes: bytes = b"external writer",
+        replace_after_publish: int | None = None,
+        replacement_bytes: bytes = b"external replacement",
+        destination_junction_target: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         instrumented_script_path = script_path
         if any(
             value is not None
-            for value in (fail_after_publish, kill_after_publish, external_collision_at_publish)
+            for value in (
+                fail_after_publish,
+                kill_after_publish,
+                external_collision_at_publish,
+                replace_after_publish,
+            )
         ):
             script_text = script_path.read_text(encoding="utf-8")
             current_statements = [
@@ -404,7 +459,7 @@ class FetchMapSourceTests(unittest.TestCase):
             ]
             owned_statements = [
                 "    Publish-OwnedFile -PartialPath $partialPath -FinalPath $archivePath -Owned ([ref]$archivePublishedByThisRun)",
-                "        Publish-OwnedFile -PartialPath $partialEvidencePath -FinalPath $evidencePath -Owned ([ref]$evidencePublishedByThisRun)",
+                "    Publish-OwnedFile -PartialPath $partialEvidencePath -FinalPath $evidencePath -Owned ([ref]$evidencePublishedByThisRun)",
             ]
             statements = owned_statements if all(statement in script_text for statement in owned_statements) else current_statements
             if not all(statement in script_text for statement in statements):
@@ -424,7 +479,30 @@ class FetchMapSourceTests(unittest.TestCase):
                     after = "\n        throw 'Injected failure after owned publication.'" if publish_index == 2 else "\n    throw 'Injected failure after owned publication.'"
                 if kill_after_publish == publish_index:
                     after = "\n        Stop-Process -Id $PID -Force" if publish_index == 2 else "\n    Stop-Process -Id $PID -Force"
+                if replace_after_publish == publish_index:
+                    encoded_bytes = ",".join(str(value) for value in replacement_bytes)
+                    indentation = "        " if publish_index == 2 else "    "
+                    after = (
+                        f"\n{indentation}Remove-Item -LiteralPath {target_path} -Force"
+                        f"\n{indentation}[System.IO.File]::WriteAllBytes({target_path}, [byte[]]@({encoded_bytes}))"
+                        f"\n{indentation}throw 'Injected failure after external replacement.'"
+                    )
                 script_text = script_text.replace(statement, before + statement + after, 1)
+            instrumented_script_path = script_path.with_name("fetch_map_source.instrumented.ps1")
+            instrumented_script_path.write_text(script_text, encoding="utf-8")
+
+        if destination_junction_target is not None:
+            script_text = instrumented_script_path.read_text(encoding="utf-8")
+            creation = "New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null"
+            escaped_target = str(destination_junction_target).replace("'", "''")
+            swap = (
+                creation
+                + "\nRemove-Item -LiteralPath $destinationPath -Force"
+                + f"\nNew-Item -ItemType Junction -Path $destinationPath -Target '{escaped_target}' | Out-Null"
+            )
+            if creation not in script_text:
+                raise AssertionError("Destination creation could not be instrumented")
+            script_text = script_text.replace(creation, swap, 1)
             instrumented_script_path = script_path.with_name("fetch_map_source.instrumented.ps1")
             instrumented_script_path.write_text(script_text, encoding="utf-8")
 
@@ -587,8 +665,7 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertTrue((destination / "fixture.zip").is_file())
                 self.assertEqual(external_bytes, (destination / "fixture.zip").read_bytes())
                 self.assertFalse((destination / "fixture.zip.sha256.json").exists())
-                self.assertEqual([], list(destination.glob("*.partial")))
-                self.assertEqual([], list(destination.glob(".*.partial")))
+                self.assertTrue((destination / ".arenaagents-acquisition.journal.json").is_file())
 
     def test_external_evidence_collision_is_not_deleted_by_rollback(self) -> None:
         payload = b"evidence collision download"
@@ -607,48 +684,50 @@ class FetchMapSourceTests(unittest.TestCase):
                 )
 
                 self.assertNotEqual(0, result.returncode)
-                self.assertFalse((destination / "fixture.zip").exists())
+                self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
                 self.assertTrue((destination / "fixture.zip.sha256.json").is_file())
                 self.assertEqual(external_bytes, (destination / "fixture.zip.sha256.json").read_bytes())
-                self.assertEqual([], list(destination.glob("*.partial")))
-                self.assertEqual([], list(destination.glob(".*.partial")))
+                self.assertTrue((destination / ".arenaagents-acquisition.journal.json").is_file())
 
-    def test_archive_promotion_failure_after_evidence_only_recovery_leaves_no_pair(self) -> None:
-        payload = b"preexisting evidence archive"
-        approved_url = "https://approved.invalid/archive"
+    def test_replaced_owned_archive_is_preserved_on_rollback(self) -> None:
+        payload = b"owned archive before replacement"
+        replacement = b"replacement archive from external writer"
         with LocalHttpSource(payload) as source:
-            with isolated_fetch_repository(approved_url, payload) as (repository, script_path):
-                destination = repository / "runtime" / "map-research" / "preexisting"
-                destination.mkdir(parents=True)
-                evidence_path = destination / "fixture.zip.sha256.json"
-                evidence_path.write_text(
-                    json.dumps(
-                        {
-                            "schemaVersion": 1,
-                            "sourceKey": "local-test",
-                            "url": approved_url,
-                            "filename": "fixture.zip",
-                            "retrievedAtUtc": "2026-08-19T00:00:00Z",
-                            "size": len(payload),
-                            "sha256": hashlib.sha256(payload).hexdigest(),
-                        }
-                    ),
-                    encoding="utf-8",
-                )
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "replace-archive"
 
                 result = self.run_isolated_fetch(
                     repository,
                     script_path,
                     destination,
                     source.url("/archive"),
-                    fail_after_publish=1,
+                    replace_after_publish=1,
+                    replacement_bytes=replacement,
                 )
 
                 self.assertNotEqual(0, result.returncode)
-                self.assertFalse((destination / "fixture.zip").exists())
-                self.assertFalse(evidence_path.exists())
-                self.assertEqual([], list(destination.glob("*.partial")))
-                self.assertEqual([], list(destination.glob(".*.partial")))
+                self.assertTrue((destination / "fixture.zip").is_file())
+                self.assertEqual(replacement, (destination / "fixture.zip").read_bytes())
+
+    def test_replaced_owned_evidence_is_preserved_on_rollback(self) -> None:
+        payload = b"owned evidence before replacement"
+        replacement = b"replacement evidence from external writer"
+        with LocalHttpSource(payload) as source:
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "replace-evidence"
+
+                result = self.run_isolated_fetch(
+                    repository,
+                    script_path,
+                    destination,
+                    source.url("/archive"),
+                    replace_after_publish=2,
+                    replacement_bytes=replacement,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertTrue((destination / "fixture.zip.sha256.json").is_file())
+                self.assertEqual(replacement, (destination / "fixture.zip.sha256.json").read_bytes())
 
     def test_hard_kill_after_archive_promotion_recovers_on_retry(self) -> None:
         payload = b"hard-kill map archive"
@@ -666,6 +745,7 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertNotEqual(0, interrupted.returncode)
                 self.assertTrue((destination / "fixture.zip").is_file())
                 self.assertFalse((destination / "fixture.zip.sha256.json").exists())
+                self.assertTrue((destination / ".arenaagents-acquisition.journal.json").is_file())
 
                 retry = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
                 reuse = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
@@ -678,10 +758,11 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
                 evidence = json.loads((destination / "fixture.zip.sha256.json").read_text(encoding="utf-8"))
                 self.assertEqual(hashlib.sha256(payload).hexdigest(), evidence["sha256"])
+                self.assertFalse((destination / ".arenaagents-acquisition.journal.json").exists())
                 self.assertEqual([], list(destination.glob("*.partial")))
                 self.assertEqual([], list(destination.glob(".*.partial")))
 
-    def test_archive_only_with_ledger_sha256_is_reacquired_not_reused(self) -> None:
+    def test_unowned_archive_only_is_preserved_and_fails_closed(self) -> None:
         payload = b"ledger-locked orphan archive"
         approved_url = "https://approved.invalid/archive"
         with LocalHttpSource(payload) as source:
@@ -696,12 +777,12 @@ class FetchMapSourceTests(unittest.TestCase):
 
                 result = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
 
-                self.assertEqual(0, result.returncode, result.stderr)
-                self.assertIn("False", result.stdout)
-                self.assertEqual(1, source.requests.get("/archive", 0))
-                self.assertTrue((destination / "fixture.zip.sha256.json").is_file())
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
+                self.assertEqual(0, source.requests.get("/archive", 0))
+                self.assertFalse((destination / "fixture.zip.sha256.json").exists())
 
-    def test_evidence_only_is_replaced_during_recovery(self) -> None:
+    def test_unowned_evidence_only_is_preserved_and_fails_closed(self) -> None:
         payload = b"orphan evidence archive"
         approved_url = "https://approved.invalid/archive"
         with LocalHttpSource(payload) as source:
@@ -713,13 +794,10 @@ class FetchMapSourceTests(unittest.TestCase):
 
                 result = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
 
-                self.assertEqual(0, result.returncode, result.stderr)
-                self.assertIn("False", result.stdout)
-                self.assertEqual(1, source.requests.get("/archive", 0))
-                replacement = json.loads(evidence_path.read_text(encoding="utf-8"))
-                self.assertEqual("local-test", replacement["sourceKey"])
-                self.assertEqual(hashlib.sha256(payload).hexdigest(), replacement["sha256"])
-                self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
+                self.assertNotEqual(0, result.returncode)
+                self.assertEqual("not trusted as evidence", evidence_path.read_text(encoding="utf-8"))
+                self.assertEqual(0, source.requests.get("/archive", 0))
+                self.assertFalse((destination / "fixture.zip").exists())
 
     def test_interrupted_recovery_removes_only_source_scoped_uuid_partials(self) -> None:
         payload = b"stale partial recovery archive"
@@ -743,12 +821,12 @@ class FetchMapSourceTests(unittest.TestCase):
 
                 result = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
 
-                self.assertEqual(0, result.returncode, result.stderr)
-                self.assertFalse(stale_archive_partial.exists())
-                self.assertFalse(stale_evidence_partial.exists())
+                self.assertNotEqual(0, result.returncode)
+                self.assertTrue(stale_archive_partial.exists())
+                self.assertTrue(stale_evidence_partial.exists())
                 self.assertEqual(b"unrelated", unrelated_partial.read_bytes())
                 self.assertTrue((destination / "fixture.zip").is_file())
-                self.assertTrue((destination / "fixture.zip.sha256.json").is_file())
+                self.assertFalse((destination / "fixture.zip.sha256.json").exists())
 
     def test_hard_kill_after_evidence_promotion_leaves_valid_pair_for_reuse(self) -> None:
         payload = b"hard-kill complete pair"
@@ -766,6 +844,7 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertNotEqual(0, interrupted.returncode)
                 self.assertTrue((destination / "fixture.zip").is_file())
                 self.assertTrue((destination / "fixture.zip.sha256.json").is_file())
+                self.assertTrue((destination / ".arenaagents-acquisition.journal.json").is_file())
 
                 reuse = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
 
@@ -773,47 +852,9 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertIn("True", reuse.stdout)
                 self.assertEqual(1, source.requests.get("/archive", 0))
                 self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
+                self.assertFalse((destination / ".arenaagents-acquisition.journal.json").exists())
 
-    def test_hard_kill_during_evidence_only_recovery_retries_from_clean_state(self) -> None:
-        payload = b"evidence orphan hard-kill archive"
-        approved_url = "https://approved.invalid/archive"
-        observed_orphan_at_request: list[bool] = []
-        evidence_holder: dict[str, Path] = {}
-
-        def observe_evidence_orphan() -> None:
-            observed_orphan_at_request.append(evidence_holder["path"].exists())
-
-        with LocalHttpSource(payload, on_archive_request=observe_evidence_orphan) as source:
-            with isolated_fetch_repository(approved_url, payload) as (repository, script_path):
-                destination = repository / "runtime" / "map-research" / "evidence-hard-kill"
-                destination.mkdir(parents=True)
-                evidence_path = destination / "fixture.zip.sha256.json"
-                evidence_path.write_text("orphan evidence must not be trusted", encoding="utf-8")
-                evidence_holder["path"] = evidence_path
-
-                interrupted = self.run_isolated_fetch(
-                    repository,
-                    script_path,
-                    destination,
-                    source.url("/archive"),
-                    kill_after_publish=1,
-                )
-                retry = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
-                reuse = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
-
-                self.assertNotEqual(0, interrupted.returncode)
-                self.assertEqual([False, False], observed_orphan_at_request)
-                self.assertEqual(0, retry.returncode, retry.stderr)
-                self.assertEqual(0, reuse.returncode, reuse.stderr)
-                self.assertIn("False", retry.stdout)
-                self.assertIn("True", reuse.stdout)
-                self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
-                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-                self.assertEqual(hashlib.sha256(payload).hexdigest(), evidence["sha256"])
-                self.assertEqual([], list(destination.glob("*.partial")))
-                self.assertEqual([], list(destination.glob(".*.partial")))
-
-    def test_stale_source_partials_are_removed_when_neither_final_exists(self) -> None:
+    def test_unowned_source_partials_are_preserved_when_neither_final_exists(self) -> None:
         payload = b"neither-final stale partial archive"
         acquisition_id = "b" * 32
         with LocalHttpSource(payload) as source:
@@ -830,11 +871,11 @@ class FetchMapSourceTests(unittest.TestCase):
                 result = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
 
                 self.assertEqual(0, result.returncode, result.stderr)
-                self.assertFalse(stale_archive.exists())
-                self.assertFalse(stale_evidence.exists())
+                self.assertTrue(stale_archive.exists())
+                self.assertTrue(stale_evidence.exists())
                 self.assertEqual(b"unrelated", unrelated.read_bytes())
 
-    def test_complete_pair_reuse_also_cleans_stale_source_partials(self) -> None:
+    def test_complete_pair_reuse_preserves_unowned_source_partials(self) -> None:
         payload = b"complete pair stale partial archive"
         acquisition_id = "c" * 32
         with LocalHttpSource(payload) as source:
@@ -852,8 +893,29 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertEqual(0, reuse.returncode, reuse.stderr)
                 self.assertIn("True", reuse.stdout)
                 self.assertEqual(1, source.requests.get("/archive", 0))
-                self.assertFalse(stale_archive.exists())
-                self.assertFalse(stale_evidence.exists())
+                self.assertTrue(stale_archive.exists())
+                self.assertTrue(stale_evidence.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory handle semantics")
+    def test_destination_junction_swap_before_pinning_cannot_write_outside(self) -> None:
+        payload = b"junction-contained map archive"
+        with LocalHttpSource(payload) as source:
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "junction-race"
+                outside = repository / "outside"
+                outside.mkdir()
+
+                result = self.run_isolated_fetch(
+                    repository,
+                    script_path,
+                    destination,
+                    source.url("/archive"),
+                    destination_junction_target=outside,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse((outside / "fixture.zip").exists())
+                self.assertFalse((outside / "fixture.zip.sha256.json").exists())
 
     def test_hostile_expected_paths_fail_closed_without_deletion(self) -> None:
         payload = b"hostile final path archive"
