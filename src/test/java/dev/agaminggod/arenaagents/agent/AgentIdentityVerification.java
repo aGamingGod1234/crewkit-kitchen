@@ -5,8 +5,11 @@ import com.google.gson.JsonParser;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -92,6 +95,8 @@ public final class AgentIdentityVerification {
 				new ModelCase("cursor", "cursor-next", "cursor", "cursor_next")
 		);
 		Set<String> transportCodes = new HashSet<>();
+		Set<String> texturePaths = new HashSet<>();
+		Map<String, Set<String>> textureBytesByProvider = new HashMap<>();
 		for (ModelCase model : models) {
 			for (int variant = 0; variant < AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT; variant++) {
 				AgentVisualIdentity.Resolved resolved = AgentVisualIdentity.resolve(model.provider(), model.slug(), variant);
@@ -106,8 +111,16 @@ public final class AgentIdentityVerification {
 				assertEquals(resolved,
 						AgentVisualIdentity.resolveTransportCode(resolved.transportCode()).orElseThrow(),
 						"transport identity round-trips");
+				assertTrue(texturePaths.add(resolved.texturePath()), "manifest texture paths are globally unique");
+				byte[] textureBytes = readTexture(resolved.texturePath());
+				assertRgbaSkin(textureBytes, resolved.texturePath());
+				assertTrue(textureBytesByProvider
+						.computeIfAbsent(resolved.providerKey(), ignored -> new HashSet<>())
+						.add(Base64.getEncoder().encodeToString(textureBytes)),
+						"provider textures are byte-distinct");
 			}
 		}
+		assertEquals(64, texturePaths.size(), "manifest resolves exactly 64 agent texture artifacts");
 
 		AgentVisualIdentity.Resolved kimiK3 = AgentVisualIdentity.resolve("kimi", "kimi-code/k3", 0);
 		AgentVisualIdentity.Resolved kimiK3256 = AgentVisualIdentity.resolve("kimi", "kimi-code/k3-256k", 0);
@@ -164,7 +177,39 @@ public final class AgentIdentityVerification {
 				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
 				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
 				"project-owned codex entity texture", "non-project manifest texture rejected");
-		return 497;
+		return 1138;
+	}
+
+	private static byte[] readTexture(String texturePath) {
+		String[] location = texturePath.split(":", 2);
+		String resourcePath = "assets/" + location[0] + "/" + location[1];
+		try (var stream = AgentIdentityVerification.class.getClassLoader().getResourceAsStream(resourcePath)) {
+			if (stream == null) throw new AssertionError("manifest texture is missing: " + texturePath);
+			return stream.readAllBytes();
+		} catch (IOException exception) {
+			throw new AssertionError("manifest texture could not be read: " + texturePath, exception);
+		}
+	}
+
+	private static void assertRgbaSkin(byte[] bytes, String texturePath) {
+		assertTrue(bytes.length >= 29, texturePath + " contains a complete PNG header");
+		assertTrue(bytes[0] == (byte) 137 && bytes[1] == 80 && bytes[2] == 78 && bytes[3] == 71
+				&& bytes[4] == 13 && bytes[5] == 10 && bytes[6] == 26 && bytes[7] == 10,
+				texturePath + " has a PNG signature");
+		assertEquals(13, readBigEndianInt(bytes, 8), texturePath + " has a complete IHDR payload");
+		assertEquals("IHDR", new String(bytes, 12, 4, StandardCharsets.US_ASCII),
+				texturePath + " begins with IHDR");
+		assertEquals(64, readBigEndianInt(bytes, 16), texturePath + " has 64px width");
+		assertEquals(64, readBigEndianInt(bytes, 20), texturePath + " has 64px height");
+		assertEquals(8, Byte.toUnsignedInt(bytes[24]), texturePath + " uses 8-bit channels");
+		assertEquals(6, Byte.toUnsignedInt(bytes[25]), texturePath + " uses RGBA color");
+	}
+
+	private static int readBigEndianInt(byte[] bytes, int offset) {
+		return (Byte.toUnsignedInt(bytes[offset]) << 24)
+				| (Byte.toUnsignedInt(bytes[offset + 1]) << 16)
+				| (Byte.toUnsignedInt(bytes[offset + 2]) << 8)
+				| Byte.toUnsignedInt(bytes[offset + 3]);
 	}
 
 	private static String manifestWith(Consumer<JsonObject> mutation) {
