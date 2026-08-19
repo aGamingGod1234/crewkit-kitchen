@@ -63,6 +63,7 @@ import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridgeVerificat
 import dev.agaminggod.arenaagents.server.perception.BlockObservationOrderingVerification;
 import dev.agaminggod.arenaagents.server.perception.InventoryObservationSlotsVerification;
 import dev.agaminggod.arenaagents.server.perception.ObservationBudgetVerification;
+import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudgetVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementAttemptPolicyVerification;
@@ -162,6 +163,7 @@ public final class VerificationMain {
 		passedAssertions += BlockObservationOrderingVerification.verify();
 		passedAssertions += InventoryObservationSlotsVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
+		passedAssertions += ServerObservationWireBudgetVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();
 		passedAssertions += BlockPlacementPostconditionVerification.verify();
 		passedAssertions += BlockPlacementAttemptPolicyVerification.verify();
