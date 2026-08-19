@@ -13,6 +13,7 @@ import dev.agaminggod.arenaagents.client.gui.AgentRosterGridVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.ConsoleThemeVerification;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupStateVerification;
+import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupLayoutVerification;
 import dev.agaminggod.arenaagents.client.action.ActionExecutorVerification;
 import dev.agaminggod.arenaagents.client.action.CombatInteractionVerification;
 import dev.agaminggod.arenaagents.client.action.MinecraftActionContextVerification;
@@ -186,6 +187,7 @@ public final class VerificationMain {
 		passedAssertions += AgentRosterGridVerification.verify();
 		passedAssertions += ConsoleThemeVerification.verify();
 		passedAssertions += ScenarioSetupStateVerification.verify();
+		passedAssertions += ScenarioSetupLayoutVerification.verify();
 		passedAssertions += BridgeEnvelopeCodecVerification.verify();
 		passedAssertions += BoundedServerTaskQueueVerification.verify();
 		passedAssertions += ProgramActionLedgerVerification.verify();

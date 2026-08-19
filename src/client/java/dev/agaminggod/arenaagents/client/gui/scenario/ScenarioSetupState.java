@@ -1,11 +1,13 @@
 package dev.agaminggod.arenaagents.client.gui.scenario;
 
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentModelNames;
+import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.control.AgentRosterEntry;
 import dev.agaminggod.arenaagents.scenario.ScenarioPlacementMode;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 
 public final class ScenarioSetupState {
@@ -70,6 +72,21 @@ public final class ScenarioSetupState {
 
 	public int selectedIndex() {
 		return selectedIndex;
+	}
+
+	public String slotIdAt(int index) {
+		checkIndex(index);
+		return "scenario-slot:" + (index + 1);
+	}
+
+	public void selectSlot(String exactId) {
+		if (exactId == null) return;
+		for (int index = 0; index < roster.size(); index++) {
+			if (slotIdAt(index).equals(exactId)) {
+				selectedIndex = index;
+				return;
+			}
+		}
 	}
 
 	public boolean deterministicEvents() {
@@ -138,6 +155,23 @@ public final class ScenarioSetupState {
 		selectedIndex = Math.clamp(selectedIndex, 0, roster.size() - 1);
 	}
 
+	public boolean addDraftSlot() {
+		if (roster.size() >= selectedScenario.maximumAgents()) return false;
+		ScenarioAgentConfig template = roster.get(selectedIndex).withName("");
+		roster.add(selectedScenario.gameModeLocked()
+				? template.withGameMode(selectedScenario.defaultGameMode())
+				: template);
+		selectedIndex = roster.size() - 1;
+		return true;
+	}
+
+	public boolean removeFocusedDraftSlot() {
+		if (roster.size() <= selectedScenario.minimumAgents()) return false;
+		roster.remove(selectedIndex);
+		selectedIndex = Math.clamp(selectedIndex, 0, roster.size() - 1);
+		return true;
+	}
+
 	public void selectOnly(int index) {
 		checkIndex(index);
 		selectedIndex = index;
@@ -180,17 +214,84 @@ public final class ScenarioSetupState {
 		checkIndex(index);
 		ScenarioAgentConfig config = roster.get(index);
 		String base = config.name().isBlank()
-				? AgentControlCatalog.displayName(config.provider(), config.model()) : config.name();
+				? modelDisplayName(config) : config.name();
 		int duplicateIndex = 0;
 		for (int current = 0; current < index; current++) {
 			ScenarioAgentConfig previous = roster.get(current);
 			String previousBase = previous.name().isBlank()
-					? AgentControlCatalog.displayName(previous.provider(), previous.model()) : previous.name();
+					? modelDisplayName(previous) : previous.name();
 			if (base.equalsIgnoreCase(previousBase)) {
 				duplicateIndex++;
 			}
 		}
 		return duplicateIndex == 0 ? base : base + " (" + duplicateIndex + ")";
+	}
+
+	public List<AgentRosterEntry> rosterEntries() {
+		List<AgentRosterEntry> entries = new ArrayList<>(roster.size());
+		for (int index = 0; index < roster.size(); index++) {
+			ScenarioAgentConfig config = roster.get(index);
+			String unavailableReason = unavailableReasonAt(index);
+			entries.add(new AgentRosterEntry(
+					slotIdAt(index),
+					displayNameAt(index),
+					config.provider(),
+					AgentModelNames.shortLabel(config.provider(), config.model()),
+					unavailableReason.isEmpty() ? "Ready" : "Unavailable",
+					unavailableReason.isEmpty(),
+					unavailableReason
+			));
+		}
+		return List.copyOf(entries);
+	}
+
+	public String unavailableReasonAt(int index) {
+		checkIndex(index);
+		ScenarioAgentConfig config = roster.get(index);
+		if (selectedScenario.gameModeLocked() && config.gameMode() != selectedScenario.defaultGameMode()) {
+			return "Game mode must be " + selectedScenario.defaultGameMode().displayName();
+		}
+		if (!AgentControlCatalog.providers().contains(config.provider())) {
+			return "Provider " + config.provider() + " is unavailable";
+		}
+		if (!AgentControlCatalog.models(config.provider()).contains(config.model())) {
+			return "Model " + AgentModelNames.displayName(config.provider(), config.model()) + " is unavailable";
+		}
+		if (!AgentControlCatalog.reasoningEfforts(config.provider(), config.model()).contains(config.reasoning())) {
+			return "Thinking level " + config.reasoning() + " is unavailable";
+		}
+		if (!AgentControlCatalog.serviceTiers(config.provider(), config.model()).contains(config.serviceTier())) {
+			return "Speed mode " + config.serviceTier() + " is unavailable";
+		}
+		return "";
+	}
+
+	public AgentVisualIdentity.Resolved previewVisualIdentityAt(int index) {
+		checkIndex(index);
+		ScenarioAgentConfig config = roster.get(index);
+		int oneBasedSlot = index + 1;
+		int previewVariant = Math.floorMod(oneBasedSlot - 1, AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT);
+		return AgentVisualIdentity.resolve(config.provider(), config.model(), previewVariant);
+	}
+
+	public boolean repairFocusedSlot() {
+		if (unavailableReasonAt(selectedIndex).isEmpty()) return false;
+		ScenarioAgentConfig current = roster.get(selectedIndex);
+		String provider = AgentControlCatalog.providers().contains(current.provider())
+				? current.provider() : AgentControlCatalog.providers().getFirst();
+		List<String> models = AgentControlCatalog.models(provider);
+		String model = models.contains(current.model()) ? current.model() : models.getFirst();
+		List<String> reasoningEfforts = AgentControlCatalog.reasoningEfforts(provider, model);
+		String reasoning = reasoningEfforts.contains(current.reasoning())
+				? current.reasoning() : AgentControlCatalog.defaultReasoning(provider, model);
+		List<String> serviceTiers = AgentControlCatalog.serviceTiers(provider, model);
+		String serviceTier = serviceTiers.contains(current.serviceTier()) ? current.serviceTier()
+				: serviceTiers.contains("priority") ? "priority" : serviceTiers.getFirst();
+		AgentGameMode gameMode = selectedScenario.gameModeLocked()
+				? selectedScenario.defaultGameMode() : current.gameMode();
+		roster.set(selectedIndex, new ScenarioAgentConfig(
+				provider, model, reasoning, serviceTier, current.name(), current.team(), gameMode));
+		return true;
 	}
 
 	public List<String> validationErrors() {
@@ -199,19 +300,8 @@ public final class ScenarioSetupState {
 			errors.add("Agent count is outside the arena's supported range");
 		}
 		for (int index = 0; index < roster.size(); index++) {
-			ScenarioAgentConfig config = roster.get(index);
-			if (selectedScenario.gameModeLocked() && config.gameMode() != selectedScenario.defaultGameMode()) {
-				errors.add("Agent " + (index + 1) + " has the wrong game mode");
-			}
-			if (!AgentControlCatalog.models(config.provider()).contains(config.model())) {
-				errors.add("Agent " + (index + 1) + " has an unavailable model");
-			}
-			if (!AgentControlCatalog.reasoningEfforts(config.provider(), config.model()).contains(config.reasoning())) {
-				errors.add("Agent " + (index + 1) + " has an unavailable thinking level");
-			}
-			if (!AgentControlCatalog.serviceTiers(config.provider(), config.model()).contains(config.serviceTier())) {
-				errors.add("Agent " + (index + 1) + " has an unavailable speed mode");
-			}
+			String unavailableReason = unavailableReasonAt(index);
+			if (!unavailableReason.isEmpty()) errors.add("Agent " + (index + 1) + ": " + unavailableReason);
 		}
 		return List.copyOf(errors);
 	}
@@ -249,31 +339,12 @@ public final class ScenarioSetupState {
 		);
 	}
 
-	public static String readableModelName(String model) {
-		String value = Objects.requireNonNull(model, "model must not be null");
-		if (value.startsWith("kimi-code/")) {
-			value = "kimi-" + value.substring("kimi-code/".length());
+	private static String modelDisplayName(ScenarioAgentConfig config) {
+		if (AgentControlCatalog.providers().contains(config.provider())
+				&& AgentControlCatalog.models(config.provider()).contains(config.model())) {
+			return AgentControlCatalog.displayName(config.provider(), config.model());
 		}
-		String[] pieces = value.replace('_', '-').split("-");
-		StringBuilder result = new StringBuilder();
-		for (String piece : pieces) {
-			if (piece.isBlank() || piece.matches("\\d+")) {
-				continue;
-			}
-			if (!result.isEmpty()) {
-				result.append(' ');
-			}
-			if (piece.equalsIgnoreCase("gpt")) {
-				result.append("GPT");
-			} else if (piece.matches("\\d+(\\.\\d+)+")) {
-				result.append(piece);
-			} else if (piece.matches("[a-zA-Z]+\\d+")) {
-				result.append(piece.toUpperCase(Locale.ROOT));
-			} else {
-				result.append(Character.toUpperCase(piece.charAt(0))).append(piece.substring(1));
-			}
-		}
-		return result.isEmpty() ? model : result.toString();
+		return AgentModelNames.displayName(config.provider(), config.model());
 	}
 
 	private void updateSelected(ScenarioAgentConfig config) {

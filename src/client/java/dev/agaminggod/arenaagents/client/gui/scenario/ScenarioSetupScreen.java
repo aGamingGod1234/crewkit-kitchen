@@ -2,7 +2,10 @@ package dev.agaminggod.arenaagents.client.gui.scenario;
 
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.client.gui.AgentControlScreen;
+import dev.agaminggod.arenaagents.client.gui.AgentRosterGrid;
+import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayout;
 import dev.agaminggod.arenaagents.client.gui.ConsoleFont;
 import dev.agaminggod.arenaagents.client.gui.ConsoleTheme;
 import dev.agaminggod.arenaagents.client.gui.ConsoleFocusIdentity;
@@ -12,28 +15,34 @@ import dev.agaminggod.arenaagents.client.gui.widget.ConsoleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleCycleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleEditBox;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleScenarioTile;
-import dev.agaminggod.arenaagents.client.gui.widget.ConsoleSelectionRow;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlPresentation;
+import dev.agaminggod.arenaagents.control.AgentRosterEntry;
+import dev.agaminggod.arenaagents.control.AgentRosterFilter;
+import dev.agaminggod.arenaagents.control.AgentRosterPage;
+import dev.agaminggod.arenaagents.control.AgentRosterViewState;
 import dev.agaminggod.arenaagents.scenario.ScenarioPlacementMode;
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgress;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.AbstractWidget;
-import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.network.chat.Component;
-import org.lwjgl.glfw.GLFW;
 
 /** Responsive Arena tab for the in-game command center. */
 public final class ScenarioSetupScreen extends Screen {
 	private static final int PANEL_COLOR = ConsoleTheme.PANEL;
 	private static final int PANEL_EDGE = ConsoleTheme.BORDER;
 	private static final int SURFACE_COLOR = ConsoleTheme.SURFACE;
-	private static final int SURFACE_SELECTED = ConsoleTheme.SURFACE_SELECTED;
 	private static final int GOLD = ConsoleTheme.ACCENT;
 	private static final int TEXT = ConsoleTheme.TEXT;
 	private static final int MUTED = ConsoleTheme.MUTED;
@@ -43,8 +52,13 @@ public final class ScenarioSetupScreen extends Screen {
 	private static final int GAP = 5;
 
 	private final ScenarioSetupState state;
-	private int rosterScroll;
-	private int visibleRosterRows = 7;
+	private final AgentRosterViewState rosterView = new AgentRosterViewState();
+	private AgentRosterFilter rosterFilter = AgentRosterFilter.all();
+	private List<AgentRosterEntry> rosterEntries = List.of();
+	private Map<String, AgentVisualIdentity.Resolved> rosterVisuals = Map.of();
+	private AgentRosterGrid rosterGrid;
+	private boolean compactEditorOpen;
+	private boolean queuedInspectorRebuild;
 	private int compactEditorSection;
 	private String feedback = "";
 	private boolean feedbackError;
@@ -82,6 +96,8 @@ public final class ScenarioSetupScreen extends Screen {
 	@Override
 	protected void init() {
 		nameInput = null;
+		rosterGrid = null;
+		refreshDraftRoster();
 		if (firstInitialization) {
 			firstInitialization = false;
 			ScenarioBuildProgress progress = AgentControlClient.buildProgressState().progress().orElse(null);
@@ -125,46 +141,41 @@ public final class ScenarioSetupScreen extends Screen {
 		renderShell(graphics, layout);
 		renderStepRail(graphics, layout);
 		renderStepContent(graphics, layout);
+		if (rosterGrid != null) rosterGrid.extractRenderState(graphics);
 		super.extractRenderState(graphics, mouseX, mouseY, partialTick);
 		renderStatus(graphics, layout);
 	}
 
 	@Override
 	public boolean keyPressed(KeyEvent event) {
-		if (getFocused() instanceof EditBox) return super.keyPressed(event);
+		if (super.keyPressed(event)) return true;
 		if (state.step() == ScenarioWizardStep.ARENA) {
 			ScenarioPreset preset = ScenarioPreset.fromLetter(event.key());
 			if (preset != null) {
-				state.selectScenario(preset);
+				selectScenario(preset);
 				setFeedback(preset.title() + " selected", false);
 				rebuildWidgets();
 				return true;
 			}
 		}
-		if (event.key() == GLFW.GLFW_KEY_LEFT && state.step() != ScenarioWizardStep.ARENA) {
-			goPrevious();
-			return true;
-		}
-		if (event.key() == GLFW.GLFW_KEY_RIGHT && state.step() != ScenarioWizardStep.REVIEW) {
-			goNext();
-			return true;
-		}
-		return super.keyPressed(event);
+		return false;
 	}
 
 	@Override
 	public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
-		if ((state.step() == ScenarioWizardStep.ROSTER || state.step() == ScenarioWizardStep.REVIEW)
-				&& state.roster().size() > visibleRosterRows) {
-			int next = Math.clamp(rosterScroll + (verticalAmount > 0.0D ? -1 : 1),
-					0, state.roster().size() - visibleRosterRows);
-			if (next != rosterScroll) {
-				rosterScroll = next;
-				rebuildWidgets();
-				return true;
-			}
+		if (rosterGrid != null
+				&& rosterGrid.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount)) {
+			return true;
 		}
 		return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
+	}
+
+	@Override
+	public void tick() {
+		super.tick();
+		if (!queuedInspectorRebuild) return;
+		queuedInspectorRebuild = false;
+		rebuildWidgets();
 	}
 
 	private void addTabs(ScenarioSetupLayout layout) {
@@ -208,7 +219,7 @@ public final class ScenarioSetupScreen extends Screen {
 						? layout.contentRight() - x : tileWidth;
 				addRenderableWidget(consoleButton(String.valueOf(preset.letter()), x, layout.contentTop(), width,
 						ROW_HEIGHT, state.selectedScenario() == preset, preset.accentColor(), () -> {
-							state.selectScenario(preset);
+							selectScenario(preset);
 							setFeedback(preset.title() + " selected", false);
 							rebuildWidgets();
 						}));
@@ -239,7 +250,7 @@ public final class ScenarioSetupScreen extends Screen {
 					Component.literal(String.valueOf(preset.letter())), Component.literal(preset.title()),
 					Component.literal(preset.category() + "  |  " + preset.duration()),
 					selected, preset.accentColor(), () -> {
-						state.selectScenario(preset);
+						selectScenario(preset);
 						setFeedback(preset.category() + " | " + preset.duration(), false);
 						rebuildWidgets();
 					}
@@ -254,29 +265,17 @@ public final class ScenarioSetupScreen extends Screen {
 	}
 
 	private void initRoster(ScenarioSetupLayout layout) {
-		int left = layout.contentLeft();
-		int contentWidth = layout.contentWidth();
-		int toolbarY = layout.contentTop();
-		addCountControls(left, toolbarY, contentWidth, layout.wideRoster());
-		int bodyTop = toolbarY + ROW_HEIGHT + GAP;
-		if (layout.wideRoster()) {
-			int listWidth = Math.clamp(contentWidth * 45 / 100, 210, 310);
-			int editorX = left + listWidth + 12;
-			visibleRosterRows = Math.clamp((layout.contentBottom() - bodyTop - ROW_HEIGHT) / 40, 2, 7);
-			addRosterRows(left, bodyTop, listWidth, visibleRosterRows);
-			addRosterEditor(editorX, bodyTop, contentWidth - listWidth - 12, false);
-			int navY = Math.min(bodyTop + 178, layout.contentBottom() - ROW_HEIGHT);
-			int navWidth = (contentWidth - listWidth - 12 - GAP) / 2;
-			addRenderableWidget(consoleButton("PREVIOUS AGENT", editorX, navY, navWidth, ROW_HEIGHT,
-					false, () -> moveCompactSelection(-1)));
-			addRenderableWidget(consoleButton("NEXT AGENT", editorX + navWidth + GAP, navY,
-					contentWidth - listWidth - 12 - navWidth - GAP, ROW_HEIGHT,
-					false, () -> moveCompactSelection(1)));
+		if (layout.compactRoster() && compactEditorOpen) {
+			ScenarioSetupLayout.Bounds editor = layout.compactEditorBounds();
+			addCompactRosterEditor(editor.left(), editor.top(), editor.width());
 		} else {
-			visibleRosterRows = 1;
-			addCompactRosterSelection(left + 154, toolbarY, contentWidth - 154);
-			bodyTop = toolbarY + ROW_HEIGHT + 3;
-			addCompactRosterEditor(left, bodyTop, contentWidth);
+			addLineupControls(layout.rosterHeaderBounds());
+			if (filtersVisible()) addRosterFilters(layout.filterBounds(false));
+			addRosterGrid(layout.rosterBounds(filtersVisible(), false), false);
+			if (!layout.compactRoster()) {
+				ScenarioSetupLayout.Bounds editor = layout.editorBounds();
+				addRosterEditor(editor.left(), editor.top(), editor.width(), false);
+			}
 		}
 		addFooter(layout, true, true, "Review setup");
 	}
@@ -286,17 +285,17 @@ public final class ScenarioSetupScreen extends Screen {
 			addBuildFooter(layout);
 			return;
 		}
-		int left = layout.contentLeft();
-		int contentWidth = layout.contentWidth();
-		int half = (contentWidth - GAP) / 2;
-		addRenderableWidget(new ConsoleCycleButton<>(font, left, layout.contentTop(), half, ROW_HEIGHT,
+		ScenarioSetupLayout.Bounds controls = layout.reviewControlBounds();
+		int half = (controls.width() - GAP) / 2;
+		addRenderableWidget(new ConsoleCycleButton<>(font, controls.left(), controls.top(), half, ROW_HEIGHT,
 				Component.literal("Event seed"), List.of(true, false), state.deterministicEvents(),
 				value -> Component.literal(value ? "Deterministic" : "Randomized"), state::setDeterministicEvents));
-		addRenderableWidget(new ConsoleCycleButton<>(font, left + half + GAP, layout.contentTop(), half, ROW_HEIGHT,
+		addRenderableWidget(new ConsoleCycleButton<>(font, controls.left() + half + GAP, controls.top(),
+				controls.width() - half - GAP, ROW_HEIGHT,
 				Component.translatable("screen.arenaagents.build.location"), List.of(ScenarioPlacementMode.values()),
 				state.placementMode(), mode -> Component.literal(mode.displayName()), this::setPlacementMode));
-		int rosterTop = layout.contentTop() + ROW_HEIGHT + GAP + 42;
-		visibleRosterRows = Math.clamp((layout.contentBottom() - rosterTop) / 18, 1, 10);
+		if (filtersVisible()) addRosterFilters(layout.filterBounds(true));
+		addRosterGrid(layout.rosterBounds(filtersVisible(), true), true);
 		addFooter(layout, true, true, "Launch arena");
 	}
 
@@ -319,35 +318,118 @@ public final class ScenarioSetupScreen extends Screen {
 		}
 	}
 
-	private void addCountControls(int x, int y, int width, boolean showQuickCounts) {
-		int countWidth = 34;
-		addRenderableWidget(consoleButton("-", x, y, countWidth, ROW_HEIGHT, false, () -> changeCount(-1)));
-		ConsoleButton count = consoleButton(state.roster().size() + " AGENTS", x + countWidth + GAP, y,
-				72, ROW_HEIGHT, false, () -> { });
+	private void addLineupControls(ScenarioSetupLayout.Bounds bounds) {
+		int buttonWidth = (bounds.width() - GAP * 2) / 3;
+		String countLabel = bounds.width() >= 420
+				? "Event team " + state.roster().size() + " / " + state.selectedScenario().maximumAgents()
+				: state.roster().size() + " / " + state.selectedScenario().maximumAgents();
+		ConsoleButton count = consoleButton(countLabel, bounds.left(), bounds.top(), buttonWidth,
+				ROW_HEIGHT, false, () -> { });
 		count.active = false;
 		addRenderableWidget(count);
-		addRenderableWidget(consoleButton("+", x + countWidth + GAP + 72 + GAP, y, countWidth, ROW_HEIGHT,
-				false, () -> changeCount(1)));
-		if (!showQuickCounts) return;
-		int quickX = x + countWidth * 2 + 72 + GAP * 3;
-		for (int requested : List.of(2, 4, 8, 16)) {
-			addRenderableWidget(consoleButton(String.valueOf(requested), quickX, y, 30, ROW_HEIGHT,
-					state.roster().size() == requested, () -> setCount(requested)));
-			quickX += 30 + GAP;
-		}
+		int addX = bounds.left() + buttonWidth + GAP;
+		ConsoleButton add = consoleButton("Add", addX, bounds.top(), buttonWidth, ROW_HEIGHT, false, this::addDraftSlot);
+		add.active = state.roster().size() < state.selectedScenario().maximumAgents();
+		addRenderableWidget(add);
+		int removeX = addX + buttonWidth + GAP;
+		ConsoleButton remove = consoleButton("Remove", removeX, bounds.top(), bounds.right() - removeX,
+				ROW_HEIGHT, false, this::removeFocusedDraftSlot);
+		remove.active = state.roster().size() > state.selectedScenario().minimumAgents();
+		addRenderableWidget(remove);
 	}
 
-	private void addCompactRosterSelection(int x, int y, int width) {
-		int buttonWidth = Math.max(38, (width - GAP) / 2);
-		addRenderableWidget(consoleButton("PREV", x, y, buttonWidth, ROW_HEIGHT, false,
-				() -> moveCompactSelection(-1)));
-		addRenderableWidget(consoleButton("NEXT", x + buttonWidth + GAP, y,
-				width - buttonWidth - GAP, ROW_HEIGHT, false, () -> moveCompactSelection(1)));
+	private void addRosterFilters(ScenarioSetupLayout.Bounds bounds) {
+		int controlWidth = (bounds.width() - GAP * 2) / 3;
+		ConsoleEditBox query = new ConsoleEditBox(font, bounds.left(), bounds.top(), controlWidth, ROW_HEIGHT,
+				Component.literal("Search agents"), Component.literal("Name, provider, or model"),
+				"scenario-roster-query");
+		query.setMaxLength(80);
+		query.setValue(rosterFilter.query());
+		query.setResponder(value -> applyRosterFilter(
+				new AgentRosterFilter(value, rosterFilter.provider(), rosterFilter.state())));
+		addRenderableWidget(query);
+
+		List<String> providers = providerOptions();
+		addRenderableWidget(new ConsoleCycleButton<>(font, bounds.left() + controlWidth + GAP, bounds.top(),
+				controlWidth, ROW_HEIGHT, Component.literal("Provider"), providers, rosterFilter.provider(),
+				value -> Component.literal(value.isBlank() ? "All" : capitalize(value)),
+				value -> applyRosterFilter(
+						new AgentRosterFilter(rosterFilter.query(), value, rosterFilter.state()))));
+		int statusX = bounds.left() + (controlWidth + GAP) * 2;
+		addRenderableWidget(new ConsoleCycleButton<>(font, statusX, bounds.top(), bounds.right() - statusX,
+				ROW_HEIGHT, Component.literal("Status"), List.of("", "Ready", "Unavailable"), rosterFilter.state(),
+				value -> Component.literal(value.isBlank() ? "All" : value),
+				value -> applyRosterFilter(
+						new AgentRosterFilter(rosterFilter.query(), rosterFilter.provider(), value))));
+	}
+
+	private void addRosterGrid(ScenarioSetupLayout.Bounds bounds, boolean review) {
+		if (bounds.width() < 24 || bounds.height() < 24) return;
+		AgentRosterGridLayout gridLayout = AgentRosterGridLayout.calculate(
+				bounds.left(), bounds.top(), bounds.right(), bounds.bottom(), filteredCount());
+		int pageSize = gridLayout.pageSize() == 0 ? 1 : gridLayout.pageSize();
+		AgentRosterPage page = rosterView.page(pageSize);
+		Set<String> includedSlots = new LinkedHashSet<>();
+		for (AgentRosterEntry entry : rosterEntries) includedSlots.add(entry.id());
+		rosterGrid = new AgentRosterGrid(
+				font, page, gridLayout, includedSlots, AgentRosterGrid.Mode.FOCUS_ONLY,
+				id -> id.equals(rosterView.focusedId()), rosterVisuals::get,
+				new AgentRosterGrid.Actions() {
+					@Override
+					public void focus(String id) {
+						focusSlot(id);
+						focusRosterWidget(id);
+					}
+
+					@Override
+					public void open(String id) {
+						focusSlot(id);
+						if (review) state.previous();
+						if (layout().compactRoster()) compactEditorOpen = true;
+						queuedInspectorRebuild = true;
+					}
+
+					@Override
+					public void toggle(String id) {
+					}
+
+					@Override
+					public void selectRangeTo(String id) {
+					}
+
+					@Override
+					public void selectAll() {
+					}
+
+					@Override
+					public void changePage(int delta) {
+						int pageSize = Math.max(1, gridLayout.pageSize());
+						int before = rosterView.page(pageSize).page();
+						if (delta < 0) rosterView.previousPage(pageSize);
+						else if (delta > 0) rosterView.nextPage(pageSize);
+						if (rosterView.page(pageSize).page() != before) rebuildWidgets();
+					}
+				});
+		for (AbstractWidget widget : rosterGrid.widgets()) addRenderableWidget(widget);
+	}
+
+	private void focusRosterWidget(String id) {
+		String identity = "agent-tile:" + id;
+		children().stream()
+				.filter(AbstractWidget.class::isInstance)
+				.map(AbstractWidget.class::cast)
+				.filter(widget -> ConsoleFocusIdentity.of(widget).equals(identity))
+				.findFirst()
+				.ifPresent(this::setInitialFocus);
 	}
 
 	private void addCompactRosterEditor(int x, int y, int width) {
 		ScenarioAgentConfig anchor = selectedConfig();
 		if (anchor == null) return;
+		if (!state.unavailableReasonAt(state.selectedIndex()).isEmpty()) {
+			addInvalidEditor(x, y, width);
+			return;
+		}
 		int tabWidth = (width - GAP) / 2;
 		addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.roster.model_speed"),
 				x, y, tabWidth, ROW_HEIGHT,
@@ -385,7 +467,10 @@ public final class ScenarioSetupScreen extends Screen {
 		nameInput = consoleEditBox(x, editorY, width, "compact-agent-name");
 		nameInput.setMaxLength(AgentConstants.MAX_USER_NAME_LENGTH);
 		nameInput.setValue(anchor.name());
-		nameInput.setResponder(value -> state.renameSelected(value));
+		nameInput.setResponder(value -> {
+			state.renameSelected(value);
+			refreshDraftRoster();
+		});
 		addRenderableWidget(nameInput);
 		int secondY = editorY + ROW_HEIGHT + 2;
 		addRenderableWidget(new ConsoleCycleButton<>(font, x, secondY, columnWidth, ROW_HEIGHT,
@@ -397,32 +482,13 @@ public final class ScenarioSetupScreen extends Screen {
 				value -> applyAndRebuild(() -> state.applyGameMode(value))));
 	}
 
-	private void addRosterRows(int x, int y, int width, int maximumRows) {
-		List<ScenarioAgentConfig> roster = state.roster();
-		rosterScroll = Math.clamp(rosterScroll, 0, Math.max(0, roster.size() - maximumRows));
-		int visible = Math.min(maximumRows, roster.size() - rosterScroll);
-		for (int row = 0; row < visible; row++) {
-			int index = rosterScroll + row;
-			ScenarioAgentConfig config = roster.get(index);
-			boolean selected = state.selectedIndex() == index;
-			addRenderableWidget(new ConsoleSelectionRow(
-					font, x, y + row * 40, width, 36,
-					Component.literal(String.valueOf(index + 1)), Component.literal(state.displayNameAt(index)),
-					Component.literal(capitalize(config.provider()) + "  |  "
-							+ AgentControlCatalog.displayName(config.provider(), config.model())),
-					Component.literal(AgentControlPresentation.speedLabel(config.serviceTier())),
-					"setup-" + index,
-					selected, false, providerColor(config.provider()), () -> {
-						state.selectOnly(index);
-						rebuildWidgets();
-					}
-			));
-		}
-	}
-
 	private void addRosterEditor(int x, int y, int width, boolean compact) {
 		ScenarioAgentConfig anchor = selectedConfig();
 		if (anchor == null) return;
+		if (!state.unavailableReasonAt(state.selectedIndex()).isEmpty()) {
+			addInvalidEditor(x, y, width);
+			return;
+		}
 		int columnWidth = compact ? (width - GAP) / 2 : width;
 		int right = x + columnWidth + GAP;
 		addRenderableWidget(new ConsoleCycleButton<>(font, x, y, columnWidth, ROW_HEIGHT,
@@ -451,8 +517,17 @@ public final class ScenarioSetupScreen extends Screen {
 				compact ? width : columnWidth, "roster-agent-name");
 		nameInput.setMaxLength(AgentConstants.MAX_USER_NAME_LENGTH);
 		nameInput.setValue(anchor.name());
-		nameInput.setResponder(value -> state.renameSelected(value));
+		nameInput.setResponder(value -> {
+			state.renameSelected(value);
+			refreshDraftRoster();
+		});
 		addRenderableWidget(nameInput);
+	}
+
+	private void addInvalidEditor(int x, int y, int width) {
+		addRenderableWidget(new ConsoleButton(font, x, y + ROW_HEIGHT + GAP, width, ROW_HEIGHT,
+				Component.literal("Update settings"), false, GOLD, ConsoleButton.Tone.PRIMARY,
+				this::repairFocusedSlot));
 	}
 
 	private void addSpeedModeControl(ScenarioAgentConfig anchor, int x, int y, int width) {
@@ -476,7 +551,9 @@ public final class ScenarioSetupScreen extends Screen {
 		int right = layout.contentRight();
 		int buttonWidth = layout.footerButtonWidth();
 		if (previous) {
-			String previousLabel = state.step() == ScenarioWizardStep.ROSTER ? "Back to arena" : "Back to agents";
+			String previousLabel = state.step() == ScenarioWizardStep.ROSTER && layout.compactRoster()
+					&& compactEditorOpen ? "Back to lineup"
+					: state.step() == ScenarioWizardStep.ROSTER ? "Back to arena" : "Back to lineup";
 			addRenderableWidget(consoleButton(previousLabel.toUpperCase(Locale.ROOT), left, layout.footerY(),
 					buttonWidth, ROW_HEIGHT, false, this::goPrevious));
 		} else {
@@ -561,7 +638,19 @@ public final class ScenarioSetupScreen extends Screen {
 	}
 
 	private void renderRosterBands(GuiGraphicsExtractor graphics, ScenarioSetupLayout layout, int x, int width) {
-		// Agent rows render their own complete selected, hover, badge, and metadata states.
+		if (layout.showsRoster(compactEditorOpen)) {
+			ScenarioSetupLayout.Bounds roster = layout.rosterBounds(filtersVisible(), false);
+			if (filteredCount() == 0) {
+				ConsoleText.centered(graphics, font, "No lineup slots match these filters",
+						roster.left() + roster.width() / 2, roster.top() + 8, MUTED);
+			}
+		}
+		if (!layout.showsEditor(compactEditorOpen)) return;
+		String reason = state.unavailableReasonAt(state.selectedIndex());
+		if (reason.isEmpty()) return;
+		ScenarioSetupLayout.Bounds editor = layout.compactRoster()
+				? layout.compactEditorBounds() : layout.editorBounds();
+		graphics.text(font, fit(reason, editor.width()), editor.left(), editor.top(), ERROR, false);
 	}
 
 	private void renderReview(GuiGraphicsExtractor graphics, ScenarioSetupLayout layout, int x, int width) {
@@ -569,30 +658,10 @@ public final class ScenarioSetupScreen extends Screen {
 			renderBuildProgress(graphics, layout, x, width);
 			return;
 		}
-		ScenarioPreset preset = state.selectedScenario();
-		int y = layout.contentTop() + ROW_HEIGHT + GAP;
-		graphics.fill(x, y, x + width, y + 36, SURFACE_COLOR);
-		graphics.text(font, preset.letter() + " | " + preset.title(), x + 8, y + 6, preset.accentColor(), false);
-		graphics.text(font, preset.category() + " | " + preset.duration() + " | map " + preset.mapVersion()
-				+ " | " + state.placementMode().displayName(),
-				x + 8, y + 20, MUTED, false);
-		int rosterY = y + 42;
-		List<ScenarioAgentConfig> roster = state.roster();
-		rosterScroll = Math.clamp(rosterScroll, 0, Math.max(0, roster.size() - visibleRosterRows));
-		int visible = Math.min(visibleRosterRows, roster.size() - rosterScroll);
-		for (int row = 0; row < visible; row++) {
-			int index = rosterScroll + row;
-			ScenarioAgentConfig config = roster.get(index);
-			int rowY = rosterY + row * 18;
-			graphics.fill(x, rowY, x + width, rowY + 16, row % 2 == 0 ? SURFACE_COLOR : SURFACE_SELECTED);
-			graphics.text(font, (index + 1) + "  " + state.displayNameAt(index), x + 6, rowY + 4,
-					providerColor(config.provider()), false);
-			if (width >= 500) {
-				graphics.text(font, config.provider() + " | " + config.model() + " | " + config.reasoning()
-						+ " | " + AgentControlPresentation.speedLabel(config.serviceTier())
-						+ " | " + config.team() + " | " + config.gameMode().displayName(),
-						x + Math.min(190, width / 3), rowY + 4, MUTED, false);
-			}
+		ScenarioSetupLayout.Bounds roster = layout.rosterBounds(filtersVisible(), true);
+		if (filteredCount() == 0) {
+			ConsoleText.centered(graphics, font, "No lineup slots match these filters",
+					roster.left() + roster.width() / 2, roster.top() + 8, MUTED);
 		}
 	}
 
@@ -644,8 +713,8 @@ public final class ScenarioSetupScreen extends Screen {
 						: progress.status() == ScenarioBuildProgress.Status.READY ? SUCCESS : GOLD;
 			}
 		} else if (message.isBlank() && state.step() == ScenarioWizardStep.ROSTER) {
-			message = "Configuring agent " + (state.selectedIndex() + 1) + " of " + state.roster().size()
-					+ " | Previous/Next changes which agent you edit";
+			message = "Editing agent " + (state.selectedIndex() + 1) + " of " + state.roster().size()
+					+ " | " + state.displayNameAt(state.selectedIndex());
 			color = MUTED;
 		} else if (message.isBlank() && state.step() == ScenarioWizardStep.REVIEW) {
 			if (!ScenarioLaunchRegistry.isAvailable()) {
@@ -682,32 +751,47 @@ public final class ScenarioSetupScreen extends Screen {
 	}
 
 	private void goPrevious() {
+		if (state.step() == ScenarioWizardStep.ROSTER && layout().compactRoster() && compactEditorOpen) {
+			compactEditorOpen = false;
+			setFeedback("", false);
+			rebuildWidgets();
+			return;
+		}
 		state.previous();
+		compactEditorOpen = false;
 		setFeedback("", false);
 		rebuildWidgets();
 	}
 
 	private void goNext() {
+		ScenarioWizardStep previous = state.step();
 		state.next();
+		if (previous == ScenarioWizardStep.ROSTER && state.step() == ScenarioWizardStep.REVIEW) {
+			resetRosterFilters();
+			compactEditorOpen = false;
+		}
 		setFeedback("", false);
 		rebuildWidgets();
 	}
 
-	private void changeCount(int delta) {
-		setCount(state.roster().size() + delta);
-	}
-
-	private void moveCompactSelection(int direction) {
-		int current = state.selectedIndex();
-		state.selectOnly(Math.floorMod(current + direction, state.roster().size()));
-		setFeedback("Configuring agent " + (state.selectedIndex() + 1) + " of " + state.roster().size()
-				+ " | " + state.displayNameAt(state.selectedIndex()), false);
+	private void addDraftSlot() {
+		if (!state.addDraftSlot()) return;
+		refreshDraftRoster();
+		setFeedback("Added " + state.displayNameAt(state.selectedIndex()), false);
 		rebuildWidgets();
 	}
 
-	private void setCount(int count) {
-		state.setAgentCount(count);
-		rosterScroll = Math.min(rosterScroll, Math.max(0, state.roster().size() - visibleRosterRows));
+	private void removeFocusedDraftSlot() {
+		if (!state.removeFocusedDraftSlot()) return;
+		refreshDraftRoster();
+		setFeedback("Event team now has " + state.roster().size() + " agents", false);
+		rebuildWidgets();
+	}
+
+	private void repairFocusedSlot() {
+		if (!state.repairFocusedSlot()) return;
+		refreshDraftRoster();
+		setFeedback("Agent settings updated to the current catalog", false);
 		rebuildWidgets();
 	}
 
@@ -723,6 +807,7 @@ public final class ScenarioSetupScreen extends Screen {
 	private void applyAndRebuild(Runnable operation) {
 		try {
 			operation.run();
+			refreshDraftRoster();
 			setFeedback("Agent " + (state.selectedIndex() + 1) + " of " + state.roster().size()
 					+ " updated | " + state.displayNameAt(state.selectedIndex()), false);
 		} catch (IllegalArgumentException | IllegalStateException exception) {
@@ -738,6 +823,84 @@ public final class ScenarioSetupScreen extends Screen {
 
 	private ScenarioAgentConfig selectedConfig() {
 		return state.roster().get(state.selectedIndex());
+	}
+
+	private void selectScenario(ScenarioPreset preset) {
+		state.selectScenario(preset);
+		refreshDraftRoster();
+	}
+
+	private void refreshDraftRoster() {
+		List<AgentRosterEntry> candidateEntries = state.rosterEntries();
+		Map<String, AgentVisualIdentity.Resolved> candidateVisuals = new LinkedHashMap<>();
+		for (int index = 0; index < candidateEntries.size(); index++) {
+			candidateVisuals.put(candidateEntries.get(index).id(), state.previewVisualIdentityAt(index));
+		}
+		List<AgentRosterEntry> publishedEntries = List.copyOf(candidateEntries);
+		Map<String, AgentVisualIdentity.Resolved> publishedVisuals = Map.copyOf(candidateVisuals);
+		rosterView.reconcile(publishedEntries);
+		rosterView.setFilter(rosterFilter);
+		String preferredFocus = state.slotIdAt(state.selectedIndex());
+		AgentRosterEntry preferredEntry = publishedEntries.stream()
+				.filter(entry -> entry.id().equals(preferredFocus)).findFirst().orElseThrow();
+		if (rosterFilter.matches(preferredEntry)) {
+			rosterView.focus(preferredFocus);
+		} else {
+			publishedEntries.stream().filter(rosterFilter::matches).findFirst().ifPresent(entry -> {
+				rosterView.focus(entry.id());
+				state.selectSlot(entry.id());
+			});
+		}
+		rosterEntries = publishedEntries;
+		rosterVisuals = publishedVisuals;
+	}
+
+	private void focusSlot(String id) {
+		state.selectSlot(id);
+		rosterView.focus(id);
+		queuedInspectorRebuild = true;
+	}
+
+	private boolean filtersVisible() {
+		return rosterEntries.size() >= 9;
+	}
+
+	private int filteredCount() {
+		return (int) rosterEntries.stream().filter(rosterFilter::matches).count();
+	}
+
+	private List<String> providerOptions() {
+		List<String> providers = new ArrayList<>();
+		providers.add("");
+		for (AgentRosterEntry entry : rosterEntries) {
+			if (providers.stream().noneMatch(value -> value.equalsIgnoreCase(entry.provider()))) {
+				providers.add(entry.provider());
+			}
+		}
+		return List.copyOf(providers);
+	}
+
+	private void applyRosterFilter(AgentRosterFilter filter) {
+		AgentRosterFilter next = Objects.requireNonNull(filter, "roster filter must not be null");
+		boolean changed = !rosterFilter.equals(next);
+		rosterFilter = next;
+		rosterView.setFilter(next);
+		if (changed) rosterView.setPage(1, 1);
+		boolean focusVisible = rosterEntries.stream()
+				.anyMatch(entry -> entry.id().equals(rosterView.focusedId()) && next.matches(entry));
+		if (!focusVisible) {
+			rosterEntries.stream().filter(next::matches).findFirst().ifPresent(entry -> {
+				rosterView.focus(entry.id());
+				state.selectSlot(entry.id());
+			});
+		}
+		rebuildWidgets();
+	}
+
+	private void resetRosterFilters() {
+		rosterFilter = AgentRosterFilter.all();
+		rosterView.setFilter(rosterFilter);
+		rosterView.setPage(1, 1);
 	}
 
 	private ConsoleButton consoleButton(
@@ -777,10 +940,6 @@ public final class ScenarioSetupScreen extends Screen {
 
 	private ScenarioSetupLayout layout() {
 		return ScenarioSetupLayout.calculate(width, height);
-	}
-
-	private static int providerColor(String provider) {
-		return ConsoleTheme.providerColor(provider);
 	}
 
 	private static String capitalize(String value) {
