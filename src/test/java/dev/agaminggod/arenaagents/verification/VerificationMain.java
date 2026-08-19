@@ -86,6 +86,7 @@ import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRuntimeVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioMatchResultVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioPreflightVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioRecoveryVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioArenaModuleVerification;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -183,6 +184,7 @@ public final class VerificationMain {
 		passedAssertions += ScenarioMatchResultVerification.verify();
 		passedAssertions += ScenarioPreflightVerification.verify();
 		passedAssertions += ScenarioRecoveryVerification.verify();
+		passedAssertions += ScenarioArenaModuleVerification.verify();
 		passedAssertions += ArenaSpectatorSnapshotVerification.verify();
 		passedAssertions += ArenaSpectatorStateVerification.verify();
 		passedAssertions += ArenaAgentsClientBootstrapVerification.verify();
