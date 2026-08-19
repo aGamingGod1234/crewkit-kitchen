@@ -74,6 +74,16 @@ function Remove-StaleAcquisitionPartials([string]$DestinationPath, [string]$Arch
     }
 }
 
+function Publish-OwnedFile([string]$PartialPath, [string]$FinalPath, [ref]$Owned) {
+    Assert-SafeRegularFile -Path $PartialPath -Description 'Acquisition partial path'
+    if (Test-Path -LiteralPath $FinalPath) {
+        Assert-SafeRegularFile -Path $FinalPath -Description 'Publication collision path'
+        throw "Map publication destination already exists: $FinalPath"
+    }
+    [System.IO.File]::Move($PartialPath, $FinalPath)
+    $Owned.Value = $true
+}
+
 function Enter-MapAcquisitionLock([string]$LockPath, [int]$TimeoutMilliseconds = 30000) {
     $waitTimer = [System.Diagnostics.Stopwatch]::StartNew()
     while ($true) {
@@ -203,8 +213,8 @@ $acquisitionId = [System.Guid]::NewGuid().ToString('N')
 $partialPath = Join-Path $destinationPath ('.' + [string]$source.archive.filename + '.' + $acquisitionId + '.partial')
 $partialEvidencePath = "$evidencePath.$acquisitionId.partial"
 $publishEvidence = -not $evidenceExistedBefore
-$archivePromotionAttemptedByThisRun = $false
-$evidencePromotionAttemptedByThisRun = $false
+$archivePublishedByThisRun = $false
+$evidencePublishedByThisRun = $false
 $publishSucceeded = $false
 try {
     Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri $approvedUri.AbsoluteUri -OutFile $partialPath
@@ -232,11 +242,9 @@ try {
     if ($publishEvidence) {
         [System.IO.File]::WriteAllText($partialEvidencePath, (($evidence | ConvertTo-Json -Depth 4) + "`n"), $utf8WithoutBom)
     }
-    $archivePromotionAttemptedByThisRun = $true
-    Move-Item -LiteralPath $partialPath -Destination $archivePath
+    Publish-OwnedFile -PartialPath $partialPath -FinalPath $archivePath -Owned ([ref]$archivePublishedByThisRun)
     if ($publishEvidence) {
-        $evidencePromotionAttemptedByThisRun = $true
-        Move-Item -LiteralPath $partialEvidencePath -Destination $evidencePath
+        Publish-OwnedFile -PartialPath $partialEvidencePath -FinalPath $evidencePath -Owned ([ref]$evidencePublishedByThisRun)
     }
     $publishSucceeded = $true
 
@@ -249,12 +257,12 @@ try {
     }
 } finally {
     if (-not $publishSucceeded) {
-        if ($evidencePromotionAttemptedByThisRun -and -not $evidenceExistedBefore) {
+        if ($evidencePublishedByThisRun -and -not $evidenceExistedBefore) {
             if (Test-Path -LiteralPath $evidencePath) {
                 Remove-Item -LiteralPath $evidencePath -Force
             }
         }
-        if ($archivePromotionAttemptedByThisRun -and -not $archiveExistedBefore) {
+        if ($archivePublishedByThisRun -and -not $archiveExistedBefore) {
             if (Test-Path -LiteralPath $archivePath) {
                 Remove-Item -LiteralPath $archivePath -Force
             }

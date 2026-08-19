@@ -387,32 +387,51 @@ class FetchMapSourceTests(unittest.TestCase):
         destination: Path,
         transport_url: str,
         *,
-        fail_after_move: int | None = None,
-        kill_after_move: int | None = None,
+        fail_after_publish: int | None = None,
+        kill_after_publish: int | None = None,
+        external_collision_at_publish: int | None = None,
+        external_collision_bytes: bytes = b"external writer",
     ) -> subprocess.CompletedProcess[str]:
-        escaped_script = str(script_path).replace("'", "''")
+        instrumented_script_path = script_path
+        if any(
+            value is not None
+            for value in (fail_after_publish, kill_after_publish, external_collision_at_publish)
+        ):
+            script_text = script_path.read_text(encoding="utf-8")
+            current_statements = [
+                "    Move-Item -LiteralPath $partialPath -Destination $archivePath",
+                "        Move-Item -LiteralPath $partialEvidencePath -Destination $evidencePath",
+            ]
+            owned_statements = [
+                "    Publish-OwnedFile -PartialPath $partialPath -FinalPath $archivePath -Owned ([ref]$archivePublishedByThisRun)",
+                "        Publish-OwnedFile -PartialPath $partialEvidencePath -FinalPath $evidencePath -Owned ([ref]$evidencePublishedByThisRun)",
+            ]
+            statements = owned_statements if all(statement in script_text for statement in owned_statements) else current_statements
+            if not all(statement in script_text for statement in statements):
+                raise AssertionError("Map publication statements could not be instrumented")
+            for publish_index, statement in enumerate(statements, start=1):
+                target_path = "$archivePath" if publish_index == 1 else "$evidencePath"
+                before = ""
+                after = ""
+                if external_collision_at_publish == publish_index:
+                    encoded_bytes = ",".join(str(value) for value in external_collision_bytes)
+                    before = (
+                        f"    [System.IO.File]::WriteAllBytes({target_path}, [byte[]]@({encoded_bytes}))\n"
+                        if publish_index == 1
+                        else f"        [System.IO.File]::WriteAllBytes({target_path}, [byte[]]@({encoded_bytes}))\n"
+                    )
+                if fail_after_publish == publish_index:
+                    after = "\n        throw 'Injected failure after owned publication.'" if publish_index == 2 else "\n    throw 'Injected failure after owned publication.'"
+                if kill_after_publish == publish_index:
+                    after = "\n        Stop-Process -Id $PID -Force" if publish_index == 2 else "\n    Stop-Process -Id $PID -Force"
+                script_text = script_text.replace(statement, before + statement + after, 1)
+            instrumented_script_path = script_path.with_name("fetch_map_source.instrumented.ps1")
+            instrumented_script_path.write_text(script_text, encoding="utf-8")
+
+        escaped_script = str(instrumented_script_path).replace("'", "''")
         escaped_destination = str(destination).replace("'", "''")
         escaped_transport_url = transport_url.replace("'", "''")
-        move_interceptor = ""
-        if fail_after_move is not None:
-            move_interceptor = (
-                "$global:MapTestMoveCount = 0; "
-                "function Move-Item { param([string]$LiteralPath, [string]$Destination); "
-                "$global:MapTestMoveCount++; "
-                "Microsoft.PowerShell.Management\\Move-Item @PSBoundParameters; "
-                f"if ($global:MapTestMoveCount -eq {fail_after_move}) {{ "
-                "throw 'Injected failure after move side effect.' } }; "
-            )
-        if kill_after_move is not None:
-            move_interceptor = (
-                "$global:MapTestMoveCount = 0; "
-                "function Move-Item { param([string]$LiteralPath, [string]$Destination); "
-                "$global:MapTestMoveCount++; "
-                "Microsoft.PowerShell.Management\\Move-Item @PSBoundParameters; "
-                f"if ($global:MapTestMoveCount -eq {kill_after_move}) {{ "
-                "Stop-Process -Id $PID -Force } }; "
-            )
-        command = move_interceptor + (
+        command = (
             "function Invoke-WebRequest { param([switch]$UseBasicParsing, [int]$MaximumRedirection, "
             "[uri]$Uri, [string]$OutFile); "
             f"$parameters = @{{ UseBasicParsing = $true; Uri = '{escaped_transport_url}'; "
@@ -538,13 +557,59 @@ class FetchMapSourceTests(unittest.TestCase):
                     script_path,
                     destination,
                     source.url("/archive"),
-                    fail_after_move=2,
+                    fail_after_publish=2,
                 )
 
                 self.assertNotEqual(0, result.returncode)
-                self.assertIn("after move side effect", (result.stdout + result.stderr).lower())
+                self.assertIn("after owned publication", (result.stdout + result.stderr).lower())
                 self.assertFalse((destination / "fixture.zip").exists())
                 self.assertFalse((destination / "fixture.zip.sha256.json").exists())
+                self.assertEqual([], list(destination.glob("*.partial")))
+                self.assertEqual([], list(destination.glob(".*.partial")))
+
+    def test_external_archive_collision_is_not_deleted_by_rollback(self) -> None:
+        payload = b"archive collision download"
+        external_bytes = b"external archive owner"
+        with LocalHttpSource(payload) as source:
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "archive-collision"
+
+                result = self.run_isolated_fetch(
+                    repository,
+                    script_path,
+                    destination,
+                    source.url("/archive"),
+                    external_collision_at_publish=1,
+                    external_collision_bytes=external_bytes,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertTrue((destination / "fixture.zip").is_file())
+                self.assertEqual(external_bytes, (destination / "fixture.zip").read_bytes())
+                self.assertFalse((destination / "fixture.zip.sha256.json").exists())
+                self.assertEqual([], list(destination.glob("*.partial")))
+                self.assertEqual([], list(destination.glob(".*.partial")))
+
+    def test_external_evidence_collision_is_not_deleted_by_rollback(self) -> None:
+        payload = b"evidence collision download"
+        external_bytes = b"external evidence owner"
+        with LocalHttpSource(payload) as source:
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "evidence-collision"
+
+                result = self.run_isolated_fetch(
+                    repository,
+                    script_path,
+                    destination,
+                    source.url("/archive"),
+                    external_collision_at_publish=2,
+                    external_collision_bytes=external_bytes,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse((destination / "fixture.zip").exists())
+                self.assertTrue((destination / "fixture.zip.sha256.json").is_file())
+                self.assertEqual(external_bytes, (destination / "fixture.zip.sha256.json").read_bytes())
                 self.assertEqual([], list(destination.glob("*.partial")))
                 self.assertEqual([], list(destination.glob(".*.partial")))
 
@@ -576,7 +641,7 @@ class FetchMapSourceTests(unittest.TestCase):
                     script_path,
                     destination,
                     source.url("/archive"),
-                    fail_after_move=1,
+                    fail_after_publish=1,
                 )
 
                 self.assertNotEqual(0, result.returncode)
@@ -596,7 +661,7 @@ class FetchMapSourceTests(unittest.TestCase):
                     script_path,
                     destination,
                     source.url("/archive"),
-                    kill_after_move=1,
+                    kill_after_publish=1,
                 )
                 self.assertNotEqual(0, interrupted.returncode)
                 self.assertTrue((destination / "fixture.zip").is_file())
@@ -696,7 +761,7 @@ class FetchMapSourceTests(unittest.TestCase):
                     script_path,
                     destination,
                     source.url("/archive"),
-                    kill_after_move=2,
+                    kill_after_publish=2,
                 )
                 self.assertNotEqual(0, interrupted.returncode)
                 self.assertTrue((destination / "fixture.zip").is_file())
@@ -731,7 +796,7 @@ class FetchMapSourceTests(unittest.TestCase):
                     script_path,
                     destination,
                     source.url("/archive"),
-                    kill_after_move=1,
+                    kill_after_publish=1,
                 )
                 retry = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
                 reuse = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
