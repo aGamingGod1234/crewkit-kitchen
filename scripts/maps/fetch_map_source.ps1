@@ -144,9 +144,9 @@ $acquisitionLock = Enter-MapAcquisitionLock -LockPath $lockPath
 try {
 $archivePath = Join-Path $destinationPath ([string]$source.archive.filename)
 $evidencePath = "$archivePath.sha256.json"
+Remove-StaleAcquisitionPartials -DestinationPath $destinationPath -ArchiveFilename ([string]$source.archive.filename)
 $archiveExistedBefore = Test-Path -LiteralPath $archivePath
 $evidenceExistedBefore = Test-Path -LiteralPath $evidencePath
-$evidenceOrphanAwaitingReplacement = $false
 if ($archiveExistedBefore) {
     Assert-SafeRegularFile -Path $archivePath -Description 'Expected archive path'
 }
@@ -154,17 +154,13 @@ if ($evidenceExistedBefore) {
     Assert-SafeRegularFile -Path $evidencePath -Description 'Expected evidence path'
 }
 if ($archiveExistedBefore -xor $evidenceExistedBefore) {
-    Remove-StaleAcquisitionPartials -DestinationPath $destinationPath -ArchiveFilename ([string]$source.archive.filename)
-    if ($archiveExistedBefore) {
-        Remove-Item -LiteralPath $archivePath -Force
-        $archiveExistedBefore = $false
-    } else {
-        # Keep the orphan evidence until the new archive has promoted. This
-        # preserves it if acquisition fails before replacement, but it is not
-        # read or trusted as checksum evidence for this run.
-        $evidenceOrphanAwaitingReplacement = $true
-        $evidenceExistedBefore = $false
+    $orphanPath = if ($archiveExistedBefore) { $archivePath } else { $evidencePath }
+    Remove-Item -LiteralPath $orphanPath -Force
+    if (Test-Path -LiteralPath $orphanPath) {
+        throw "Interrupted acquisition orphan could not be removed: $orphanPath"
     }
+    $archiveExistedBefore = $false
+    $evidenceExistedBefore = $false
 }
 $lockedSha256 = if ($null -ne $source.archive.sha256) { ([string]$source.archive.sha256).ToLowerInvariant() } else { $null }
 $existingEvidence = $null
@@ -239,10 +235,6 @@ try {
     $archivePromotionAttemptedByThisRun = $true
     Move-Item -LiteralPath $partialPath -Destination $archivePath
     if ($publishEvidence) {
-        if ($evidenceOrphanAwaitingReplacement) {
-            Assert-SafeRegularFile -Path $evidencePath -Description 'Interrupted evidence path'
-            Remove-Item -LiteralPath $evidencePath -Force
-        }
         $evidencePromotionAttemptedByThisRun = $true
         Move-Item -LiteralPath $partialEvidencePath -Destination $evidencePath
     }

@@ -14,7 +14,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from scripts.maps.archive_reader import ArchiveLimits, ArchiveSafetyError, safe_extract
 
@@ -22,10 +22,16 @@ from scripts.maps.archive_reader import ArchiveLimits, ArchiveSafetyError, safe_
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 class LocalHttpSource:
-    def __init__(self, payload: bytes, wait_for_archive_requests: int | None = None) -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        wait_for_archive_requests: int | None = None,
+        on_archive_request: Callable[[], None] | None = None,
+    ) -> None:
         self.payload = payload
         self.requests: dict[str, int] = {}
         self.wait_for_archive_requests = wait_for_archive_requests
+        self.on_archive_request = on_archive_request
         self._request_condition = threading.Condition()
 
         source = self
@@ -46,6 +52,8 @@ class LocalHttpSource:
                     self.end_headers()
                     return
                 if self.path in ("/archive", "/target"):
+                    if self.path == "/archive" and source.on_archive_request is not None:
+                        source.on_archive_request()
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(source.payload)))
                     self.end_headers()
@@ -540,7 +548,7 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertEqual([], list(destination.glob("*.partial")))
                 self.assertEqual([], list(destination.glob(".*.partial")))
 
-    def test_archive_promotion_failure_preserves_preexisting_evidence(self) -> None:
+    def test_archive_promotion_failure_after_evidence_only_recovery_leaves_no_pair(self) -> None:
         payload = b"preexisting evidence archive"
         approved_url = "https://approved.invalid/archive"
         with LocalHttpSource(payload) as source:
@@ -548,18 +556,20 @@ class FetchMapSourceTests(unittest.TestCase):
                 destination = repository / "runtime" / "map-research" / "preexisting"
                 destination.mkdir(parents=True)
                 evidence_path = destination / "fixture.zip.sha256.json"
-                evidence_bytes = json.dumps(
-                    {
-                        "schemaVersion": 1,
-                        "sourceKey": "local-test",
-                        "url": approved_url,
-                        "filename": "fixture.zip",
-                        "retrievedAtUtc": "2026-08-19T00:00:00Z",
-                        "size": len(payload),
-                        "sha256": hashlib.sha256(payload).hexdigest(),
-                    }
-                ).encode()
-                evidence_path.write_bytes(evidence_bytes)
+                evidence_path.write_text(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "sourceKey": "local-test",
+                            "url": approved_url,
+                            "filename": "fixture.zip",
+                            "retrievedAtUtc": "2026-08-19T00:00:00Z",
+                            "size": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
 
                 result = self.run_isolated_fetch(
                     repository,
@@ -571,7 +581,7 @@ class FetchMapSourceTests(unittest.TestCase):
 
                 self.assertNotEqual(0, result.returncode)
                 self.assertFalse((destination / "fixture.zip").exists())
-                self.assertEqual(evidence_bytes, evidence_path.read_bytes())
+                self.assertFalse(evidence_path.exists())
                 self.assertEqual([], list(destination.glob("*.partial")))
                 self.assertEqual([], list(destination.glob(".*.partial")))
 
@@ -698,6 +708,87 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertIn("True", reuse.stdout)
                 self.assertEqual(1, source.requests.get("/archive", 0))
                 self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
+
+    def test_hard_kill_during_evidence_only_recovery_retries_from_clean_state(self) -> None:
+        payload = b"evidence orphan hard-kill archive"
+        approved_url = "https://approved.invalid/archive"
+        observed_orphan_at_request: list[bool] = []
+        evidence_holder: dict[str, Path] = {}
+
+        def observe_evidence_orphan() -> None:
+            observed_orphan_at_request.append(evidence_holder["path"].exists())
+
+        with LocalHttpSource(payload, on_archive_request=observe_evidence_orphan) as source:
+            with isolated_fetch_repository(approved_url, payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "evidence-hard-kill"
+                destination.mkdir(parents=True)
+                evidence_path = destination / "fixture.zip.sha256.json"
+                evidence_path.write_text("orphan evidence must not be trusted", encoding="utf-8")
+                evidence_holder["path"] = evidence_path
+
+                interrupted = self.run_isolated_fetch(
+                    repository,
+                    script_path,
+                    destination,
+                    source.url("/archive"),
+                    kill_after_move=1,
+                )
+                retry = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
+                reuse = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
+
+                self.assertNotEqual(0, interrupted.returncode)
+                self.assertEqual([False, False], observed_orphan_at_request)
+                self.assertEqual(0, retry.returncode, retry.stderr)
+                self.assertEqual(0, reuse.returncode, reuse.stderr)
+                self.assertIn("False", retry.stdout)
+                self.assertIn("True", reuse.stdout)
+                self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), evidence["sha256"])
+                self.assertEqual([], list(destination.glob("*.partial")))
+                self.assertEqual([], list(destination.glob(".*.partial")))
+
+    def test_stale_source_partials_are_removed_when_neither_final_exists(self) -> None:
+        payload = b"neither-final stale partial archive"
+        acquisition_id = "b" * 32
+        with LocalHttpSource(payload) as source:
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "neither-stale"
+                destination.mkdir(parents=True)
+                stale_archive = destination / f".fixture.zip.{acquisition_id}.partial"
+                stale_evidence = destination / f"fixture.zip.sha256.json.{acquisition_id}.partial"
+                unrelated = destination / f".other.zip.{acquisition_id}.partial"
+                stale_archive.write_bytes(b"stale")
+                stale_evidence.write_bytes(b"stale")
+                unrelated.write_bytes(b"unrelated")
+
+                result = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertFalse(stale_archive.exists())
+                self.assertFalse(stale_evidence.exists())
+                self.assertEqual(b"unrelated", unrelated.read_bytes())
+
+    def test_complete_pair_reuse_also_cleans_stale_source_partials(self) -> None:
+        payload = b"complete pair stale partial archive"
+        acquisition_id = "c" * 32
+        with LocalHttpSource(payload) as source:
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "complete-stale"
+                first = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
+                self.assertEqual(0, first.returncode, first.stderr)
+                stale_archive = destination / f".fixture.zip.{acquisition_id}.partial"
+                stale_evidence = destination / f"fixture.zip.sha256.json.{acquisition_id}.partial"
+                stale_archive.write_bytes(b"stale")
+                stale_evidence.write_bytes(b"stale")
+
+                reuse = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
+
+                self.assertEqual(0, reuse.returncode, reuse.stderr)
+                self.assertIn("True", reuse.stdout)
+                self.assertEqual(1, source.requests.get("/archive", 0))
+                self.assertFalse(stale_archive.exists())
+                self.assertFalse(stale_evidence.exists())
 
     def test_hostile_expected_paths_fail_closed_without_deletion(self) -> None:
         payload = b"hostile final path archive"
