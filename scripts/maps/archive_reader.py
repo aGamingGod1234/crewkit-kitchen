@@ -44,7 +44,10 @@ class _ApprovedMember:
 
 
 _DRIVE_PATH = re.compile(r"^[A-Za-z]:")
-_WINDOWS_DEVICE = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$", re.IGNORECASE)
+_WINDOWS_DEVICE = re.compile(
+    r"^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?$",
+    re.IGNORECASE,
+)
 _WINDOWS_REPARSE_POINT = 0x0400
 _COPY_CHUNK_SIZE = 1024 * 1024
 

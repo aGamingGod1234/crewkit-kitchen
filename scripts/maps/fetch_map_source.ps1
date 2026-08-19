@@ -126,10 +126,15 @@ if (Test-Path -LiteralPath $archivePath) {
     return
 }
 
-$partialPath = Join-Path $destinationPath ('.' + [string]$source.archive.filename + '.' + [System.Guid]::NewGuid().ToString('N') + '.partial')
-$partialEvidencePath = "$evidencePath.partial"
+$acquisitionId = [System.Guid]::NewGuid().ToString('N')
+$partialPath = Join-Path $destinationPath ('.' + [string]$source.archive.filename + '.' + $acquisitionId + '.partial')
+$partialEvidencePath = "$evidencePath.$acquisitionId.partial"
+$publishEvidence = -not (Test-Path -LiteralPath $evidencePath)
+$archivePublishedByThisRun = $false
+$evidencePublishedByThisRun = $false
+$publishSucceeded = $false
 try {
-    Invoke-WebRequest -UseBasicParsing -Uri $approvedUri.AbsoluteUri -OutFile $partialPath
+    Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri $approvedUri.AbsoluteUri -OutFile $partialPath
     $downloadedFile = Get-Item -LiteralPath $partialPath
     if ($null -ne $source.archive.size -and $downloadedFile.Length -ne [long]$source.archive.size) {
         throw "Downloaded size $($downloadedFile.Length) does not match ledger size $($source.archive.size) for '$SourceKey'."
@@ -151,9 +156,19 @@ try {
         sha256 = $downloadedSha256
     }
     $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($partialEvidencePath, (($evidence | ConvertTo-Json -Depth 4) + "`n"), $utf8WithoutBom)
+    if ($publishEvidence) {
+        [System.IO.File]::WriteAllText($partialEvidencePath, (($evidence | ConvertTo-Json -Depth 4) + "`n"), $utf8WithoutBom)
+    }
     Move-Item -LiteralPath $partialPath -Destination $archivePath
-    Move-Item -LiteralPath $partialEvidencePath -Destination $evidencePath
+    $archivePublishedByThisRun = $true
+    if ($publishEvidence) {
+        if ($env:ARENAAGENTS_MAP_FETCH_FAIL_EVIDENCE_PROMOTION -eq '1') {
+            throw "Injected evidence promotion failure."
+        }
+        Move-Item -LiteralPath $partialEvidencePath -Destination $evidencePath
+        $evidencePublishedByThisRun = $true
+    }
+    $publishSucceeded = $true
 
     [pscustomobject]@{
         sourceKey = $SourceKey
@@ -163,6 +178,14 @@ try {
         reused = $false
     }
 } finally {
+    if (-not $publishSucceeded) {
+        if ($evidencePublishedByThisRun -and (Test-Path -LiteralPath $evidencePath)) {
+            Remove-Item -LiteralPath $evidencePath -Force
+        }
+        if ($archivePublishedByThisRun -and (Test-Path -LiteralPath $archivePath)) {
+            Remove-Item -LiteralPath $archivePath -Force
+        }
+    }
     if (Test-Path -LiteralPath $partialPath) {
         Remove-Item -LiteralPath $partialPath -Force
     }
