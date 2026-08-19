@@ -7,6 +7,7 @@ import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.exceptions.DynamicCommandExceptionType;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import java.util.List;
@@ -158,7 +159,7 @@ public final class CodexAgentCommands {
 	}
 
 	private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, String> agentArgument() {
-		return Commands.argument(ARGUMENT_AGENT, StringArgumentType.word())
+		return Commands.argument(ARGUMENT_AGENT, StringArgumentType.string())
 				.suggests((context, builder) -> SharedSuggestionProvider.suggest(
 						manager(context).selectors(),
 						builder
@@ -347,7 +348,7 @@ public final class CodexAgentCommands {
 
 	private static String formatStatus(AgentRecord record) {
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("none");
-		return record.profile().userName().orElse(record.profile().nameTag())
+		return AgentIdentity.displayName(record.agentId(), record.profile())
 				+ " | " + dev.agaminggod.arenaagents.control.AgentControlPresentation.stateLabel(record.state().name())
 				+ ". Current task: " + currentGoal
 				+ ". Queued tasks: " + record.queuedGoals().size() + ".";

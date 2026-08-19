@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.agent.RespawnPolicy;
 import java.util.List;
 import java.util.Optional;
@@ -31,7 +32,7 @@ public final class AgentControlVerification {
 	}
 
 	private static int verifySnapshotRoundTripAndBounds() {
-		AgentRecord record = new AgentRecord(
+		AgentRecord namedRecord = new AgentRecord(
 				1,
 				new AgentId(UUID.fromString(AGENT_UUID)),
 				Optional.of(UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")),
@@ -50,25 +51,80 @@ public final class AgentControlVerification {
 				NOW_EPOCH_MS,
 				""
 		);
-		AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, List.of(record));
+		List<AgentRecord> records = List.of(
+				namedRecord,
+				record("193a9add-1234-5678-9abc-123456789abc", "codex", "gpt-5.6-sol", "high", 2),
+				record("293a9add-1234-5678-9abc-123456789abc", "gemini", "gemini-3.1-pro", "high", 1),
+				record("393a9add-1234-5678-9abc-123456789abc", "kimi", "kimi-code/k3", "max", 3),
+				record("493a9add-1234-5678-9abc-123456789abc", "cursor", "composer-2.5", "high", 0)
+		);
+		AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, records);
 		AgentControlSnapshot decoded = AgentControlSnapshotCodec.decode(AgentControlSnapshotCodec.encode(snapshot));
 		AgentControlAgent agent = decoded.agents().getFirst();
+		AgentControlAgent unnamed = decoded.agents().get(1);
 
 		assertEquals(snapshot, decoded, "snapshot JSON round trip");
+		assertEquals(6, decoded.schemaVersion(), "schema 6 identity snapshot round trip");
 		assertEquals(AGENT_UUID, agent.agentId(), "snapshot carries stable full agent ID");
-		assertEquals("Builder", agent.displayName(), "snapshot carries optional user name");
+		assertEquals("Builder", agent.displayName(), "named snapshot carries the canonical operator display name");
+		assertEquals("Builder", agent.friendlyName(), "named snapshot carries the exact explicit friendly name separately");
+		assertEquals("Sol GTqa3RI0VniavBI0VniavA", unnamed.displayName(),
+				"unnamed snapshot carries the stable ID-aware canonical display name");
+		assertEquals("", unnamed.friendlyName(), "unnamed snapshot carries a blank explicit friendly name");
+		assertEquals(List.of("kimi", "codex", "gemini", "kimi", "cursor"),
+				decoded.agents().stream().map(AgentControlAgent::provider).toList(),
+				"schema 6 round-trips all four providers without changing the named record");
 		assertEquals("Build a safe house", agent.currentGoal(), "snapshot carries active goal");
 		assertEquals(1, agent.queuedGoalCount(), "snapshot carries queue count");
 		assertEquals(false, agent.automaticProgress(), "snapshot carries automatic progress preference");
 		assertTrue(agent.entityPresent(), "snapshot carries entity presence");
 		assertTrue(decoded.automationAvailable(), "legacy ready snapshot reports available automation");
 		assertEquals("Automation ready", decoded.automationStatus(), "snapshot carries a human-readable readiness message");
+		expectFailure(
+				() -> AgentControlSnapshotCodec.decode(AgentControlSnapshotCodec.encode(snapshot)
+						.replaceFirst("\\\"schemaVersion\\\":6", "\\\"schemaVersion\\\":5")),
+				"schema 5 control snapshot"
+		);
 		expectFailure(() -> AgentControlSnapshotCodec.decode("{\"schemaVersion\":999}"), "unsupported snapshot schema");
 		expectFailure(
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
 				"snapshot agent bound"
 		);
-		return 11;
+		expectFailure(() -> new AgentControlAgent(
+				agent.agentId(), agent.shortId(), agent.displayName(), agent.friendlyName(), agent.provider(), agent.model(),
+				agent.reasoning(), agent.playerName(), AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT, agent.state(),
+				agent.currentGoal(), agent.queuedGoalCount(), agent.lastSummary(), agent.lastError(),
+				agent.automaticProgress(), agent.entityPresent()
+		), "manifest skin variant bound");
+		return 17;
+	}
+
+	private static AgentRecord record(
+			String id,
+			String provider,
+			String model,
+			String reasoning,
+			int skinVariant
+	) {
+		return new AgentRecord(
+				1,
+				new AgentId(UUID.fromString(id)),
+				Optional.empty(),
+				Optional.empty(),
+				new AgentProfile(provider, model, reasoning, Optional.empty(), skinVariant),
+				AgentLifecycleState.IDLE,
+				Optional.empty(),
+				0L,
+				List.of(),
+				"",
+				"",
+				true,
+				RespawnPolicy.PAUSE_UNTIL_RESPAWN,
+				Optional.empty(),
+				NOW_EPOCH_MS,
+				NOW_EPOCH_MS,
+				""
+		);
 	}
 
 	private static int verifyProviderPresets() {
@@ -266,6 +322,7 @@ public final class AgentControlVerification {
 		return new AgentControlAgent(
 				id,
 				id.substring(0, 8),
+				name,
 				name,
 				"codex",
 				"gpt-5.6-sol",

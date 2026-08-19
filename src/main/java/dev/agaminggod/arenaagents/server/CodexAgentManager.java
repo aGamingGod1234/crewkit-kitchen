@@ -520,14 +520,8 @@ public final class CodexAgentManager {
 	}
 
 	public String displayName(AgentRecord target) {
-		String base = AgentIdentity.displayName(target.profile());
-		int duplicate = 0;
-		for (AgentRecord record : records()) {
-			if (record.agentId().equals(target.agentId())) break;
-			String candidate = AgentIdentity.displayName(record.profile());
-			if (candidate.equals(base)) duplicate++;
-		}
-		return duplicate == 0 ? base : base + " (" + duplicate + ")";
+		Objects.requireNonNull(target, "target must not be null");
+		return AgentIdentity.displayName(target.agentId(), target.profile());
 	}
 
 	public AgentRecord resolve(String selector) {

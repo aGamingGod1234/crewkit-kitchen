@@ -2,6 +2,11 @@ package dev.agaminggod.arenaagents.server.runtime;
 
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
+import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
+import dev.agaminggod.arenaagents.agent.AgentProfile;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.agent.RespawnPolicy;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
@@ -9,6 +14,9 @@ import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.phys.Vec3;
@@ -182,13 +190,48 @@ public final class ServerActionExecutorVerification {
 				"explicit player selectors retain their existing behavior");
 		assertEquals("nearest_hostile", EntityTargetSelector.normalize("nearest_hostile"),
 				"symbolic proximity selectors remain unchanged");
+		AgentRecord namedTarget = targetRecord(
+				"12345678-1234-5678-9abc-123456789abc", Optional.of("Rook"));
+		AgentRecord unnamedTarget = targetRecord(
+				"193a9add-1234-5678-9abc-123456789abc", Optional.empty());
+		assertEquals(namedTarget.agentId(), ServerActionExecutor.resolveNamedTargetIdentity(
+				"rook", List.of(namedTarget, unnamedTarget), null).orElseThrow().agentId().orElseThrow(),
+				"explicit friendly names resolve agent action targets case-insensitively");
+		assertEquals(unnamedTarget.agentId(), ServerActionExecutor.resolveNamedTargetIdentity(
+				"Sol GTqa3RI0VniavBI0VniavA", List.of(namedTarget, unnamedTarget), null)
+						.orElseThrow().agentId().orElseThrow(),
+				"ID-aware canonical display names resolve unnamed agent action targets");
+		assertTrue(ServerActionExecutor.resolveNamedTargetIdentity(
+				"c02_193A9ADD", List.of(namedTarget, unnamedTarget), "c02_193A9ADD").isEmpty(),
+				"hidden technical player names never resolve as action selectors");
+		AgentDomainException ambiguous = assertThrows(AgentDomainException.class,
+				() -> ServerActionExecutor.resolveNamedTargetIdentity(
+						"Rook", List.of(namedTarget, unnamedTarget), "Rook"),
+				"an ordinary player sharing an agent friendly name is rejected as ambiguous");
+		assertEquals("AMBIGUOUS_TARGET", ambiguous.code(),
+				"ambiguous ordinary-player and agent selectors retain a precise domain reason");
+		assertEquals("Lucas", ServerActionExecutor.resolveNamedTargetIdentity(
+				"Lucas", List.of(namedTarget, unnamedTarget), "Lucas").orElseThrow().ordinaryPlayerName().orElseThrow(),
+				"unambiguous ordinary player names retain their existing selector behavior");
 		assertEquals("TARGET_OCCUPIED",
 				ServerActionExecutor.failureReason(new dev.agaminggod.arenaagents.agent.AgentDomainException(
 						"TARGET_OCCUPIED", "changed world")),
 				"runtime revalidation preserves a precise recoverable domain reason");
 		assertEquals("ACTION_EXCEPTION", ServerActionExecutor.failureReason(new IllegalStateException("broken")),
 				"unexpected runtime exceptions remain isolated");
-		return 40;
+		return 46;
+	}
+
+	private static AgentRecord targetRecord(String id, Optional<String> friendlyName) {
+		AgentId agentId = new AgentId(UUID.fromString(id));
+		return new AgentRecord(
+				1, agentId, Optional.empty(), Optional.empty(),
+				new AgentProfile("codex", "gpt-5.6-sol", "high", "priority", friendlyName, 2,
+						AgentGameMode.SURVIVAL),
+				AgentLifecycleState.IDLE, Optional.empty(), 0L, List.of(), "", "", true,
+				RespawnPolicy.PAUSE_UNTIL_RESPAWN, Optional.empty(),
+				1_750_000_000_000L, 1_750_000_000_000L, ""
+		);
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {
@@ -203,11 +246,11 @@ public final class ServerActionExecutorVerification {
 		if (value) throw new AssertionError(label);
 	}
 
-	private static void assertThrows(Class<? extends Throwable> type, Runnable action, String label) {
+	private static <T extends Throwable> T assertThrows(Class<T> type, Runnable action, String label) {
 		try {
 			action.run();
 		} catch (Throwable throwable) {
-			if (type.isInstance(throwable)) return;
+			if (type.isInstance(throwable)) return type.cast(throwable);
 			throw new AssertionError(label + " threw " + throwable.getClass().getSimpleName(), throwable);
 		}
 		throw new AssertionError(label + " did not throw " + type.getSimpleName());

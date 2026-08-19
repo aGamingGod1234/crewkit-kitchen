@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.control;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import java.util.Objects;
 
 public final class AgentControlSnapshotCodec {
@@ -24,7 +26,12 @@ public final class AgentControlSnapshotCodec {
 			throw new IllegalArgumentException("Control snapshot exceeds the wire limit");
 		}
 		try {
-			AgentControlSnapshot snapshot = GSON.fromJson(checked, AgentControlSnapshot.class);
+			JsonObject object = JsonParser.parseString(checked).getAsJsonObject();
+			if (!object.has("schemaVersion")
+					|| object.get("schemaVersion").getAsInt() != AgentControlSnapshot.SCHEMA_VERSION) {
+				throw new IllegalArgumentException("Unsupported control snapshot schema");
+			}
+			AgentControlSnapshot snapshot = GSON.fromJson(object, AgentControlSnapshot.class);
 			if (snapshot == null) {
 				throw new IllegalArgumentException("Control snapshot must be a JSON object");
 			}
