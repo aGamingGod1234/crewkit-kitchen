@@ -1,6 +1,9 @@
 package dev.agaminggod.arenaagents.control;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import java.util.Objects;
 
 public final class AgentControlSnapshotCodec {
@@ -24,7 +27,11 @@ public final class AgentControlSnapshotCodec {
 			throw new IllegalArgumentException("Control snapshot exceeds the wire limit");
 		}
 		try {
-			AgentControlSnapshot snapshot = GSON.fromJson(checked, AgentControlSnapshot.class);
+			JsonObject object = JsonParser.parseString(checked).getAsJsonObject();
+			if (schemaVersion(object) != AgentControlSnapshot.SCHEMA_VERSION) {
+				throw new IllegalArgumentException("Unsupported control snapshot schema");
+			}
+			AgentControlSnapshot snapshot = GSON.fromJson(object, AgentControlSnapshot.class);
 			if (snapshot == null) {
 				throw new IllegalArgumentException("Control snapshot must be a JSON object");
 			}
@@ -39,6 +46,18 @@ public final class AgentControlSnapshotCodec {
 			);
 		} catch (RuntimeException exception) {
 			throw new IllegalArgumentException("Invalid control snapshot", exception);
+		}
+	}
+
+	private static int schemaVersion(JsonObject object) {
+		JsonElement value = object.get("schemaVersion");
+		if (value == null || !value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
+			throw new IllegalArgumentException("Control snapshot schema must be an integer");
+		}
+		try {
+			return value.getAsBigDecimal().intValueExact();
+		} catch (ArithmeticException | NumberFormatException exception) {
+			throw new IllegalArgumentException("Control snapshot schema must be an integer", exception);
 		}
 	}
 }

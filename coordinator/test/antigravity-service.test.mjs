@@ -155,11 +155,14 @@ test('Antigravity malformed output records one final error row for the attempt',
 	await agent.setGoalRevision(7);
 	const rows = [];
 	const turnRecorder = { async record(row) { rows.push(row); } };
-	await assert.rejects(agent.decide('authoritative state', { goalRevision: 7, turnRecorder, attempt: 5, retry: true }), (error) => error?.code === 'MALFORMED_DECISION');
+	await assert.rejects(agent.decide('authoritative state', { goalRevision: 7, turnRecorder, attempt: 5, retry: true, queueWaitMs: 17 }), (error) => error?.code === 'MALFORMED_DECISION');
 	assert.equal(rows.length, 1);
 	assert.equal(rows[0].error?.code, 'MALFORMED_DECISION');
 	assert.equal(rows[0].attempt, 5);
 	assert.equal(rows[0].retry, true);
+	assert.equal(rows[0].agentId, 'gemini-malformed-record');
+	assert.equal(rows[0].timing.queueWaitMs, 17);
+	assert.equal(Object.hasOwn(rows[0], 'tokens'), false);
 	assert.ok(rows[0].timing.durationMs >= 0);
 	assert.equal(rows[0].timing.apiDurationMs, null);
 	await service.stop();

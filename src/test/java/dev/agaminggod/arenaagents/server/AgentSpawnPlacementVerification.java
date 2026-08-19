@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import java.util.HashSet;
@@ -34,15 +35,22 @@ public final class AgentSpawnPlacementVerification {
 		if (new HashSet<>(candidates).size() != candidates.size()) {
 			throw new AssertionError("spawn candidate grid contains duplicate positions");
 		}
-		String playerName = OfflineAgentPlayers.playerName(
-				new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc")),
-				new AgentProfile("codex", "gpt-5.6-sol", "high", "fast", java.util.Optional.empty(), 0,
-						AgentGameMode.SURVIVAL)
-		);
-		if (!playerName.equals("SolCyan_193A9ADD")) {
-			throw new AssertionError("offline agent username should be readable, was " + playerName);
+		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
+		AgentProfile profile = new AgentProfile(
+				"codex", "gpt-5.6-sol", "high", "fast", java.util.Optional.empty(), 0,
+				AgentGameMode.SURVIVAL);
+		String playerName = OfflineAgentPlayers.playerName(id, profile);
+		if (playerName.length() > 16) {
+			throw new AssertionError("offline agent username exceeds Minecraft's limit: " + playerName);
 		}
-		return 11;
+		if (!playerName.equals(OfflineAgentPlayers.playerName(id, profile))) {
+			throw new AssertionError("offline agent username is not stable: " + playerName);
+		}
+		if (!AgentIdentity.skinForPlayerName(playerName).orElseThrow()
+				.equals(new AgentIdentity.SkinIdentity("codex", "sol", 0))) {
+			throw new AssertionError("offline agent username lost its manifest transport identity: " + playerName);
+		}
+		return 13;
 	}
 
 	private static void assertCoordinate(double actual, double expected, String label) {

@@ -17,9 +17,19 @@ const validScenario = (overrides = {}) => ({
 test('normalizes one bounded real-provider scenario', () => {
 	const matrix = normalizeHeadlessMatrix({ version: 1, scenarios: [validScenario()] });
 	assert.deepEqual(matrix.scenarios[0].assertions, [{ type: 'lifecycle', state: 'COMPLETED' }]);
+	assert.equal(matrix.scenarios[0].rosterSize, 1);
 	assert.equal(matrix.version, 1);
 	assert.ok(Object.isFrozen(matrix));
 	assert.ok(Object.isFrozen(matrix.scenarios[0]));
+});
+
+test('normalizes only supported concurrent roster sizes', () => {
+	for (const rosterSize of [1, 8, 16]) {
+		assert.equal(normalizeHeadlessScenario(validScenario({ rosterSize })).rosterSize, rosterSize);
+	}
+	for (const rosterSize of [0, 2, 7, 9, 17, '8']) {
+		assert.throws(() => normalizeHeadlessScenario(validScenario({ rosterSize })), /rosterSize/i);
+	}
 });
 
 test('accepts Cursor Composer and Grok scenarios through the same matrix schema', () => {
@@ -42,6 +52,7 @@ test('checked-in live matrix covers every provider with real model and setting c
 		assert.ok(scenarios.every((scenario) => ['chat', 'action', 'program'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
 	}
 	assert.deepEqual([...new Set(matrix.scenarios.filter((scenario) => scenario.provider === 'cursor').map((scenario) => scenario.model))], ['composer-2.5', 'grok-4.5', 'grok-4.6']);
+	assert.deepEqual([...new Set(matrix.scenarios.map((scenario) => scenario.rosterSize))].sort((left, right) => left - right), [1, 8, 16]);
 });
 
 test('rejects duplicate IDs, unknown assertion types, and unbounded timeouts', () => {

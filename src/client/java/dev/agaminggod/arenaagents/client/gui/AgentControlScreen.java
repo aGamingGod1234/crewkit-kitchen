@@ -2,12 +2,13 @@ package dev.agaminggod.arenaagents.client.gui;
 
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentModelNames;
+import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.client.control.AgentControlClient;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupScreen;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleCycleButton;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleEditBox;
-import dev.agaminggod.arenaagents.client.gui.widget.ConsoleSelectionRow;
 import dev.agaminggod.arenaagents.client.presentation.ArenaHudPresentation;
 import dev.agaminggod.arenaagents.client.presentation.ArenaSpectatorHud;
 import dev.agaminggod.arenaagents.control.AgentControlActions;
@@ -15,14 +16,19 @@ import dev.agaminggod.arenaagents.control.AgentControlAgent;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlCommandBuilder;
 import dev.agaminggod.arenaagents.control.AgentControlPresentation;
-import dev.agaminggod.arenaagents.control.AgentControlSelection;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
+import dev.agaminggod.arenaagents.control.AgentRosterEntry;
+import dev.agaminggod.arenaagents.control.AgentRosterFilter;
+import dev.agaminggod.arenaagents.control.AgentRosterPage;
+import dev.agaminggod.arenaagents.control.AgentRosterViewState;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshot;
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgress;
 import dev.agaminggod.arenaagents.scenario.result.ScenarioPublicEvent;
-import java.util.LinkedHashSet;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -30,8 +36,11 @@ import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.MultiLineEditBox;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import org.lwjgl.glfw.GLFW;
 
 /** Human-oriented command center. Detailed workflows live on separate pages. */
 public final class AgentControlScreen extends Screen {
@@ -52,8 +61,12 @@ public final class AgentControlScreen extends Screen {
 
 	private AgentControlSnapshot snapshot;
 	private final Screen parent;
-	private String selectedAgentId = "";
-	private final Set<String> groupSelectedAgentIds = new LinkedHashSet<>();
+	private final AgentRosterViewState rosterState = new AgentRosterViewState();
+	private AgentRosterFilter rosterFilter = AgentRosterFilter.all();
+	private List<AgentRosterEntry> rosterEntries = List.of();
+	private Map<String, AgentVisualIdentity.Resolved> rosterVisuals = Map.of();
+	private AgentRosterGrid rosterGrid;
+	private AgentRosterPage visibleRosterPage;
 	private String provider;
 	private String model;
 	private String reasoning;
@@ -64,8 +77,8 @@ public final class AgentControlScreen extends Screen {
 	private String feedback = "";
 	private boolean feedbackError;
 	private boolean selectNewlySummonedAgent;
-	private int rosterScroll;
 	private int liveScroll;
+	private boolean compactGroupComposer;
 	private Page page = Page.OVERVIEW;
 	private ConsoleEditBox nameInput;
 	private MultiLineEditBox promptInput;
@@ -96,8 +109,7 @@ public final class AgentControlScreen extends Screen {
 		if (!AgentControlCatalog.reasoningEfforts(provider, model).contains(reasoning)) {
 			reasoning = AgentControlCatalog.defaultReasoning(provider, model);
 		}
-		snapshot = AgentControlClient.snapshot().orElse(null);
-		if (snapshot != null) selectedAgentId = AgentControlSelection.resolve("", snapshot.agents());
+		AgentControlClient.snapshot().ifPresent(this::replaceSnapshot);
 	}
 
 	public static AgentControlScreen live(Screen parent) {
@@ -110,17 +122,22 @@ public final class AgentControlScreen extends Screen {
 
 	public void acceptSnapshot(AgentControlSnapshot nextSnapshot) {
 		AgentControlSnapshot previous = snapshot;
-		snapshot = Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
+		AgentControlSnapshot checkedSnapshot = Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
+		List<AgentRosterEntry> candidateEntries = rosterEntries(checkedSnapshot);
+		Map<String, AgentVisualIdentity.Resolved> candidateVisuals = rosterVisuals(checkedSnapshot);
+		rosterState.reconcile(candidateEntries);
+		snapshot = checkedSnapshot;
+		rosterEntries = candidateEntries;
+		rosterVisuals = candidateVisuals;
 		if (previous != null && snapshot.generatedAtEpochMs() > previous.generatedAtEpochMs() && !feedbackError) {
 			feedback = "";
 		}
-		groupSelectedAgentIds.retainAll(snapshot.agents().stream().map(AgentControlAgent::agentId).toList());
 		if (selectNewlySummonedAgent) {
 			for (AgentControlAgent agent : snapshot.agents()) {
 				boolean existed = previous != null && previous.agents().stream()
 						.anyMatch(item -> item.agentId().equals(agent.agentId()));
 				if (!existed) {
-					selectedAgentId = agent.agentId();
+					rosterState.focus(agent.agentId());
 					selectNewlySummonedAgent = false;
 					page = Page.OVERVIEW;
 					feedback = "";
@@ -128,15 +145,34 @@ public final class AgentControlScreen extends Screen {
 				}
 			}
 		}
-		selectedAgentId = AgentControlSelection.resolve(selectedAgentId, snapshot.agents());
+		if (!AgentControlLayout.rosterFiltersVisible(snapshot.agents().size())) {
+			setRosterFilterWithoutRebuild(AgentRosterFilter.all());
+		} else {
+			normalizeRosterFilterOptions();
+		}
+		if (page == Page.GROUP && snapshot.agents().size() < 2) {
+			page = Page.OVERVIEW;
+			compactGroupComposer = false;
+		}
 		if (minecraft != null && !(getFocused() instanceof EditBox)
 				&& !(getFocused() instanceof MultiLineEditBox)) rebuildWidgets();
+	}
+
+	private void replaceSnapshot(AgentControlSnapshot nextSnapshot) {
+		List<AgentRosterEntry> candidateEntries = rosterEntries(nextSnapshot);
+		Map<String, AgentVisualIdentity.Resolved> candidateVisuals = rosterVisuals(nextSnapshot);
+		rosterState.reconcile(candidateEntries);
+		snapshot = nextSnapshot;
+		rosterEntries = candidateEntries;
+		rosterVisuals = candidateVisuals;
 	}
 
 	@Override
 	protected void init() {
 		nameInput = null;
 		promptInput = null;
+		rosterGrid = null;
+		visibleRosterPage = null;
 		addNavigation();
 		switch (page) {
 			case OVERVIEW -> initOverview();
@@ -147,6 +183,92 @@ public final class AgentControlScreen extends Screen {
 			case MANAGE -> initManage();
 			case REMOVE_CONFIRM -> initRemoveConfirm();
 		}
+	}
+
+	@Override
+	public Component getNarrationMessage() {
+		MutableComponent narration = getTitle().copy();
+		switch (page) {
+			case OVERVIEW -> appendAgentNarration(narration, selectedAgent(), true);
+			case GROUP -> appendGroupNarration(narration);
+			case LIVE -> appendLiveNarration(narration);
+			case CREATE -> appendNarration(narration,
+					Component.literal("Create an agent, " + capitalize(provider) + ", "
+							+ AgentControlCatalog.displayName(provider, model)));
+			case TASK, MANAGE, REMOVE_CONFIRM -> appendAgentNarration(narration, selectedAgent(), false);
+		}
+		if (!feedback.isBlank()) appendNarration(narration, Component.literal(feedback));
+		return narration;
+	}
+
+	private void appendAgentNarration(MutableComponent narration, AgentControlAgent agent, boolean detailed) {
+		if (agent == null) return;
+		String identity = detailed
+				? agent.displayName() + ", " + AgentControlPresentation.profileLabel(agent)
+				: agent.displayName();
+		appendNarration(narration, Component.literal(identity + ", "
+				+ AgentControlPresentation.stateLabel(agent.state())));
+		if (!detailed) return;
+		appendNarration(narration, Component.literal(agent.currentGoal().isBlank()
+				? "No current task" : "Task: " + agent.currentGoal()));
+		if (!agent.lastError().isBlank()) {
+			appendNarration(narration, Component.literal("Needs attention: " + agent.lastError()));
+		}
+	}
+
+	private void appendGroupNarration(MutableComponent narration) {
+		int selected = rosterState.selectedIds().size();
+		int hidden = visibleRosterPage == null ? 0 : visibleRosterPage.hiddenSelectedCount();
+		appendNarration(narration, hidden > 0
+				? Component.translatable("screen.arenaagents.roster.scope.hidden", selected, hidden)
+				: Component.translatable("screen.arenaagents.roster.scope.selected", selected));
+		appendRosterPageNarration(narration, visibleRosterPage);
+	}
+
+	private void appendLiveNarration(MutableComponent narration) {
+		ArenaSpectatorSnapshot arena = AgentControlClient.spectatorState().snapshot().orElse(null);
+		ScenarioBuildProgress build = AgentControlClient.buildProgressState().progress().orElse(null);
+		if (AgentControlClient.buildProgressState().shouldDisplayBeforeMatch(arena != null) || arena == null) {
+			appendBuildNarration(narration, build);
+			return;
+		}
+		appendNarration(narration, Component.literal(arena.scenarioTitle() + ", " + arena.phaseTitle()));
+		if (arena.standings().isEmpty()) return;
+		int index = Math.clamp(liveScroll, 0, arena.standings().size() - 1);
+		ArenaSpectatorSnapshot.Standing standing = arena.standings().get(index);
+		appendNarration(narration, Component.literal("Rank " + standing.rank() + ", "
+				+ standing.displayName() + ", score " + ArenaSpectatorHud.scoreText(standing.score())
+				+ ", health " + standing.healthPercent() + "%, "
+				+ ArenaHudPresentation.statusLabel(standing.status())));
+	}
+
+	private static void appendBuildNarration(MutableComponent narration, ScenarioBuildProgress build) {
+		if (build == null) {
+			appendNarration(narration, Component.literal("No active match or arena build"));
+			return;
+		}
+		String status = switch (build.status()) {
+			case BUILDING -> "Building arena";
+			case READY -> "Arena ready";
+			case FAILED -> "Build failed";
+		};
+		appendNarration(narration, Component.literal(status + ", " + build.scenarioTitle() + ", "
+				+ build.percent() + "%, " + build.humanPhase() + ", "
+				+ build.completed() + " of " + build.total()));
+		if (build.status() == ScenarioBuildProgress.Status.FAILED && !build.detail().isBlank()) {
+			appendNarration(narration, Component.literal(build.detail()));
+		}
+	}
+
+	private static void appendRosterPageNarration(MutableComponent narration, AgentRosterPage page) {
+		if (page == null || page.totalFiltered() == 0) return;
+		appendNarration(narration, Component.translatable("screen.arenaagents.roster.page",
+				page.firstIndex(), page.lastIndex(), page.totalFiltered()));
+	}
+
+	private static void appendNarration(MutableComponent narration, Component context) {
+		if (context == null || context.getString().isBlank()) return;
+		narration.append(". ").append(context);
 	}
 
 	@Override
@@ -181,21 +303,17 @@ public final class AgentControlScreen extends Screen {
 			case MANAGE -> renderManage(graphics);
 			case REMOVE_CONFIRM -> renderRemoveConfirm(graphics);
 		}
+		if (rosterGrid != null) rosterGrid.extractRenderState(graphics);
 		super.extractRenderState(graphics, mouseX, mouseY, partialTick);
 		renderStatus(graphics);
 	}
 
 	@Override
 	public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
-		if ((page == Page.OVERVIEW || page == Page.GROUP) && snapshot != null) {
-			int visible = visibleRows();
-			int maximum = Math.max(0, snapshot.agents().size() - visible);
-			int next = Math.clamp(rosterScroll + (verticalAmount > 0.0D ? -1 : 1), 0, maximum);
-			if (next != rosterScroll) {
-				rosterScroll = next;
-				rebuildWidgets();
-				return true;
-			}
+		if ((page == Page.OVERVIEW || page == Page.GROUP) && rosterGrid != null
+				&& rosterGrid.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount)) {
+			rebuildWidgets();
+			return true;
 		}
 		if (page == Page.LIVE) {
 			ArenaSpectatorSnapshot arena = AgentControlClient.spectatorState().snapshot().orElse(null);
@@ -214,8 +332,21 @@ public final class AgentControlScreen extends Screen {
 		return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
 	}
 
+	@Override
+	public boolean keyPressed(KeyEvent event) {
+		if (event.key() == GLFW.GLFW_KEY_ESCAPE && page == Page.GROUP
+				&& !rosterState.selectedIds().isEmpty()) {
+			rosterState.clearSelection();
+			compactGroupComposer = false;
+			rebuildWidgets();
+			return true;
+		}
+		return super.keyPressed(event);
+	}
+
 	private void addNavigation() {
 		AgentControlLayout layout = layout();
+		boolean groupAvailable = snapshot == null || snapshot.agents().size() > 1;
 		boolean agentWorkflow = page == Page.OVERVIEW || page == Page.CREATE || page == Page.TASK
 				|| page == Page.MANAGE || page == Page.REMOVE_CONFIRM;
 		if (layout.sideNavigation()) {
@@ -225,27 +356,34 @@ public final class AgentControlScreen extends Screen {
 			addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.agents"),
 					left, y, navigationWidth, ROW_HEIGHT, agentWorkflow,
 					() -> show(Page.OVERVIEW)));
-			addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.group"),
-					left, y + 31, navigationWidth, ROW_HEIGHT, page == Page.GROUP,
-					() -> show(Page.GROUP)));
+			if (groupAvailable) {
+				addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.group"),
+						left, y + 31, navigationWidth, ROW_HEIGHT, page == Page.GROUP,
+						() -> show(Page.GROUP)));
+			}
 			addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.live"),
-					left, y + 62, navigationWidth, ROW_HEIGHT, page == Page.LIVE,
+					left, y + (groupAvailable ? 62 : 31), navigationWidth, ROW_HEIGHT, page == Page.LIVE,
 					() -> show(Page.LIVE)));
 			addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.build"),
-					left, y + 93, navigationWidth, ROW_HEIGHT, false,
+					left, y + (groupAvailable ? 93 : 62), navigationWidth, ROW_HEIGHT, false,
 					this::openArenaSetup));
 			return;
 		}
-		String[] labels = {"AGENTS", "GROUP", "LIVE", "BUILD"};
-		boolean[] selected = {agentWorkflow, page == Page.GROUP, page == Page.LIVE, false};
-		Runnable[] actions = {() -> show(Page.OVERVIEW), () -> show(Page.GROUP), () -> show(Page.LIVE), this::openArenaSetup};
-		int available = layout.contentWidth() - GAP * 3;
-		int buttonWidth = available / 4;
-		for (int index = 0; index < labels.length; index++) {
+		List<String> labels = groupAvailable
+				? List.of("Agents", "Group", "Live", "Build") : List.of("Agents", "Live", "Build");
+		List<Boolean> selected = groupAvailable
+				? List.of(agentWorkflow, page == Page.GROUP, page == Page.LIVE, false)
+				: List.of(agentWorkflow, page == Page.LIVE, false);
+		List<Runnable> actions = groupAvailable
+				? List.of(() -> show(Page.OVERVIEW), () -> show(Page.GROUP), () -> show(Page.LIVE), this::openArenaSetup)
+				: List.of(() -> show(Page.OVERVIEW), () -> show(Page.LIVE), this::openArenaSetup);
+		int available = layout.contentWidth() - GAP * (labels.size() - 1);
+		int buttonWidth = available / labels.size();
+		for (int index = 0; index < labels.size(); index++) {
 			int x = layout.contentLeft() + index * (buttonWidth + GAP);
-			int actualWidth = index == labels.length - 1 ? layout.contentRight() - x : buttonWidth;
-			addRenderableWidget(consoleButton(labels[index], x, layout.navigationTop(), actualWidth, ROW_HEIGHT,
-					selected[index], actions[index]));
+			int actualWidth = index == labels.size() - 1 ? layout.contentRight() - x : buttonWidth;
+			addRenderableWidget(consoleButton(labels.get(index), x, layout.navigationTop(), actualWidth, ROW_HEIGHT,
+					selected.get(index), actions.get(index)));
 		}
 	}
 
@@ -263,43 +401,31 @@ public final class AgentControlScreen extends Screen {
 
 	private void initOverview() {
 		AgentControlLayout layout = layout();
-		int top = layout.contentTop() + 24;
+		boolean filtersVisible = filtersVisible();
 		if (layout.splitWorkspace()) {
-			addAgentRows(layout.canvasLeft(), top, layout.canvasWidth());
-			addOverviewActions(layout.contextLeft(), top, layout.contextWidth());
+			addRosterFilters(layout.canvasLeft(), layout.contentTop(), layout.canvasWidth());
+			addRosterGrid(layout.rosterBounds(filtersVisible, false), AgentRosterGrid.Mode.FOCUS_ONLY);
+			addOverviewActions(layout.contextLeft(), layout.contentTop(), layout.contextWidth());
+			addOverviewFooter();
+		} else if (layout.sideNavigation()) {
+			addRosterFilters(layout.canvasLeft(), layout.contentTop(), layout.canvasWidth());
+			addRosterGrid(layout.rosterBounds(filtersVisible, false), AgentRosterGrid.Mode.FOCUS_ONLY);
+			addCompactOverviewActions(layout.contentLeft(), layout.footerY(), layout.contentWidth());
 		} else {
-			addAgentRows(layout.canvasLeft(), top, layout.canvasWidth());
+			addRosterFilters(layout.canvasLeft(), layout.contentTop(), layout.canvasWidth());
+			addRosterGrid(layout.rosterBounds(filtersVisible, true), AgentRosterGrid.Mode.FOCUS_ONLY);
 			addCompactOverviewActions(layout.contentLeft(), layout.contentBottom() - ROW_HEIGHT, layout.contentWidth());
-		}
-		addOverviewFooter();
-	}
-
-	private void addAgentRows(int x, int y, int width) {
-		if (snapshot == null) return;
-		List<AgentControlAgent> agents = snapshot.agents();
-		int visible = visibleRows();
-		rosterScroll = Math.clamp(rosterScroll, 0, Math.max(0, agents.size() - visible));
-		for (int row = 0; row < Math.min(visible, agents.size() - rosterScroll); row++) {
-			AgentControlAgent agent = agents.get(rosterScroll + row);
-			boolean selected = agent.agentId().equals(selectedAgentId);
-			ConsoleSelectionRow button = new ConsoleSelectionRow(
-					font, x, y + row * 43, width, 38,
-					Component.literal(initials(agentDisplayName(agent))),
-					Component.literal(agentDisplayName(agent)),
-					Component.literal(capitalize(agent.provider()) + "  |  " + AgentControlPresentation.profileLabel(agent)),
-					Component.literal(AgentControlPresentation.stateLabel(agent.state())),
-					agent.agentId(),
-					selected, false, providerColor(agent.provider()), () -> {
-				selectedAgentId = agent.agentId();
-				rebuildWidgets();
-			});
-			addRenderableWidget(button);
+			addOverviewFooter();
 		}
 	}
 
 	private void initGroup() {
+		if (snapshot != null && snapshot.agents().size() < 2) {
+			page = Page.OVERVIEW;
+			initOverview();
+			return;
+		}
 		AgentControlLayout layout = layout();
-		int top = layout.contentTop() + (layout.sideNavigation() ? 24 : 0);
 		boolean columns = layout.splitWorkspace() || layout.contentWidth() >= 500;
 		if (columns) {
 			int listX = layout.canvasLeft();
@@ -310,19 +436,27 @@ public final class AgentControlScreen extends Screen {
 					? layout.contextLeft()
 					: listX + listWidth + 12;
 			int controlWidth = layout.contentRight() - controlX;
-			addGroupRows(listX, top, listWidth);
-			promptInput = multiLineInput(controlX, top, controlWidth, 66,
+			addRosterFilters(listX, layout.contentTop(), listWidth);
+			int gridTop = layout.contentTop() + (filtersVisible() ? 30 : 0);
+			addRosterGrid(new AgentControlLayout.Bounds(
+					listX, gridTop, listX + listWidth, layout.contentBottom()),
+					AgentRosterGrid.Mode.MULTI_SELECT);
+			promptInput = multiLineInput(controlX, layout.contentTop(), controlWidth, 66,
 					"Group task", "Describe one shared outcome for the selected agents");
 			addRenderableWidget(promptInput);
-			addVerticalGroupActions(controlX, top + 74, controlWidth);
+			addVerticalGroupActions(controlX, layout.contentTop() + 74, controlWidth);
 		} else {
-			addGroupRows(layout.contentLeft(), top, layout.contentWidth());
-			int promptY = top + 43;
-			int promptHeight = Math.max(30, layout.contentBottom() - promptY - ROW_HEIGHT - GAP);
-			promptInput = multiLineInput(layout.contentLeft(), promptY, layout.contentWidth(), promptHeight,
-					"Group task", "Tell the selected group what to do");
-			addRenderableWidget(promptInput);
-			addHorizontalGroupActions(layout.contentLeft(), layout.contentBottom() - ROW_HEIGHT, layout.contentWidth());
+			if (compactGroupComposer) {
+				AgentControlLayout.Bounds composer = layout.composerBounds();
+				promptInput = multiLineInput(composer.left(), composer.top(), composer.width(), composer.height(),
+						"Group task", "Tell the selected group what to do");
+				addRenderableWidget(promptInput);
+				addCompactComposerActions(layout.workspaceActionBounds());
+			} else {
+				addRosterFilters(layout.contentLeft(), layout.contentTop(), layout.contentWidth());
+				addRosterGrid(layout.rosterBounds(filtersVisible(), true), AgentRosterGrid.Mode.MULTI_SELECT);
+				addCompactSelectionActions(layout.workspaceActionBounds());
+			}
 		}
 		addOverviewFooter();
 	}
@@ -331,22 +465,22 @@ public final class AgentControlScreen extends Screen {
 		List<AgentControlAgent> selected = selectedGroupAgents();
 		for (int index = 0; index < 3; index++) {
 			String operation = List.of("start", "queue", "steer").get(index);
-			String label = List.of("START NOW", "ADD TO QUEUE", "ADJUST TASK").get(index);
+			String label = List.of("Start now", "Add to queue", "Adjust task").get(index);
 			ConsoleButton action = index == 0
 					? primaryButton(label, x, y + index * 31, width, ROW_HEIGHT, () -> submitGroupPrompt(operation))
 					: consoleButton(label, x, y + index * 31, width, ROW_HEIGHT, false,
 							() -> submitGroupPrompt(operation));
-			action.active = canUseAutomation() && AgentControlActions.everySupports(selected, operation);
+			action.active = canUseAutomation() && !selected.isEmpty();
 			addRenderableWidget(action);
 		}
-		addRenderableWidget(consoleButton("CLEAR SELECTION", x, y + 93, width, ROW_HEIGHT, false,
+		addRenderableWidget(consoleButton("Clear selection", x, y + 93, width, ROW_HEIGHT, false,
 				this::clearGroupSelection));
 	}
 
 	private void addHorizontalGroupActions(int x, int y, int width) {
 		List<AgentControlAgent> selected = selectedGroupAgents();
 		String[] operations = {"start", "queue", "steer"};
-		String[] labels = {"START", "QUEUE", "ADJUST", "CLEAR"};
+		String[] labels = {"Start", "Queue", "Adjust", "Clear"};
 		int buttonWidth = (width - GAP * 3) / 4;
 		for (int index = 0; index < labels.length; index++) {
 			int buttonX = x + index * (buttonWidth + GAP);
@@ -362,46 +496,164 @@ public final class AgentControlScreen extends Screen {
 							() -> submitGroupPrompt(operation))
 					: consoleButton(labels[index], buttonX, y, actualWidth, ROW_HEIGHT, false,
 							() -> submitGroupPrompt(operation));
-			action.active = canUseAutomation() && AgentControlActions.everySupports(selected, operation);
+			action.active = canUseAutomation() && !selected.isEmpty();
 			addRenderableWidget(action);
 		}
 	}
 
 	private void clearGroupSelection() {
-		groupSelectedAgentIds.clear();
+		rosterState.clearSelection();
 		rebuildWidgets();
 	}
 
-	private void addGroupRows(int x, int y, int width) {
-		if (snapshot == null) return;
-		List<AgentControlAgent> agents = snapshot.agents();
-		int visible = visibleRows();
-		rosterScroll = Math.clamp(rosterScroll, 0, Math.max(0, agents.size() - visible));
-		for (int row = 0; row < Math.min(visible, agents.size() - rosterScroll); row++) {
-			AgentControlAgent agent = agents.get(rosterScroll + row);
-			boolean selected = groupSelectedAgentIds.contains(agent.agentId());
-			addRenderableWidget(new ConsoleSelectionRow(
-					font, x, y + row * 43, width, 38,
-					Component.literal(initials(agentDisplayName(agent))),
-					Component.literal(agentDisplayName(agent)),
-					Component.literal(AgentControlPresentation.profileLabel(agent)),
-					Component.literal(AgentControlPresentation.stateLabel(agent.state())),
-					agent.agentId(),
-					selected, true, providerColor(agent.provider()), () -> {
-				if (!groupSelectedAgentIds.add(agent.agentId())) groupSelectedAgentIds.remove(agent.agentId());
-				rebuildWidgets();
-			}));
+	private void addRosterFilters(int x, int y, int width) {
+		if (!filtersVisible()) return;
+		int controlWidth = (width - GAP * 2) / 3;
+		ConsoleEditBox query = new ConsoleEditBox(font, x, y, controlWidth, ROW_HEIGHT,
+				Component.translatable("screen.arenaagents.roster.search"),
+				Component.translatable("screen.arenaagents.roster.search_hint"), "roster-query");
+		query.setMaxLength(80);
+		query.setValue(rosterFilter.query());
+		query.setResponder(value -> applyRosterFilter(
+				new AgentRosterFilter(value, rosterFilter.provider(), rosterFilter.state())));
+		addRenderableWidget(query);
+
+		List<String> providers = providerOptions();
+		addRenderableWidget(new ConsoleCycleButton<>(
+				font, x + controlWidth + GAP, y, controlWidth, ROW_HEIGHT,
+				Component.translatable("screen.arenaagents.roster.filter.provider"),
+				providers, rosterFilter.provider(), value -> value.isBlank()
+						? Component.translatable("screen.arenaagents.roster.filter.all_providers")
+						: Component.literal(capitalize(value)),
+				value -> applyRosterFilter(new AgentRosterFilter(rosterFilter.query(), value, rosterFilter.state()))));
+		List<String> states = stateOptions();
+		int stateX = x + (controlWidth + GAP) * 2;
+		addRenderableWidget(new ConsoleCycleButton<>(
+				font, stateX, y, x + width - stateX, ROW_HEIGHT,
+				Component.translatable("screen.arenaagents.roster.filter.status"),
+				states, rosterFilter.state(), value -> value.isBlank()
+						? Component.translatable("screen.arenaagents.roster.filter.all_statuses")
+						: Component.literal(value),
+				value -> applyRosterFilter(new AgentRosterFilter(rosterFilter.query(), rosterFilter.provider(), value))));
+	}
+
+	private void addRosterGrid(AgentControlLayout.Bounds region, AgentRosterGrid.Mode mode) {
+		if (snapshot == null || region.width() < 24 || region.height() < 24) return;
+		AgentRosterPage probe = rosterState.page(1);
+		AgentRosterGridLayout gridLayout = AgentRosterGridLayout.calculate(
+				region.left(), region.top(), region.right(), region.bottom(), probe.totalFiltered());
+		AgentRosterPage rosterPage = rosterState.page(Math.max(1, gridLayout.pageSize()));
+		visibleRosterPage = rosterPage;
+		Set<String> selected = mode == AgentRosterGrid.Mode.MULTI_SELECT
+				? rosterState.selectedIds() : Set.of();
+		rosterGrid = new AgentRosterGrid(
+				font,
+				rosterPage,
+				gridLayout,
+				selected,
+				mode,
+				id -> id.equals(rosterState.focusedId()),
+				id -> rosterVisuals.get(id),
+				new AgentRosterGrid.Actions() {
+					@Override
+					public void focus(String id) {
+						rosterState.focus(id);
+						focusRosterWidget(id);
+					}
+
+					@Override
+					public void open(String id) {
+						rosterState.focus(id);
+						if (mode == AgentRosterGrid.Mode.FOCUS_ONLY) show(Page.MANAGE);
+					}
+
+					@Override
+					public void toggle(String id) {
+						rosterState.toggle(id);
+						rebuildWidgets();
+					}
+
+					@Override
+					public void selectRangeTo(String id) {
+						rosterState.selectRangeTo(id);
+						rebuildWidgets();
+					}
+
+					@Override
+					public void selectAll() {
+						rosterState.selectAll();
+						rebuildWidgets();
+					}
+
+					@Override
+					public void changePage(int delta) {
+						if (delta < 0) rosterState.previousPage(Math.max(1, gridLayout.pageSize()));
+						else if (delta > 0) rosterState.nextPage(Math.max(1, gridLayout.pageSize()));
+						rebuildWidgets();
+					}
+				});
+		for (AbstractWidget widget : rosterGrid.widgets()) addRenderableWidget(widget);
+	}
+
+	private void focusRosterWidget(String id) {
+		String identity = "agent-tile:" + id;
+		children().stream()
+				.filter(AbstractWidget.class::isInstance)
+				.map(AbstractWidget.class::cast)
+				.filter(widget -> ConsoleFocusIdentity.of(widget).equals(identity))
+				.findFirst()
+				.ifPresent(this::setInitialFocus);
+	}
+
+	private void addCompactSelectionActions(AgentControlLayout.Bounds bounds) {
+		int buttonWidth = (bounds.width() - GAP) / 2;
+		ConsoleButton compose = primaryButton(
+				"Compose", bounds.left(), bounds.top(), buttonWidth, bounds.height(), () -> {
+					compactGroupComposer = true;
+					rebuildWidgets();
+				});
+		compose.active = !rosterState.selectedIds().isEmpty();
+		addRenderableWidget(compose);
+		addRenderableWidget(consoleButton(
+				"Clear", bounds.left() + buttonWidth + GAP, bounds.top(),
+				bounds.width() - buttonWidth - GAP, bounds.height(), false, this::clearGroupSelection));
+	}
+
+	private void addCompactComposerActions(AgentControlLayout.Bounds bounds) {
+		String[] operations = {"start", "queue", "steer"};
+		String[] labels = {"Start", "Queue", "Adjust", "Back"};
+		int buttonWidth = (bounds.width() - GAP * 3) / 4;
+		List<AgentControlAgent> selected = selectedGroupAgents();
+		for (int index = 0; index < labels.length; index++) {
+			int buttonX = bounds.left() + index * (buttonWidth + GAP);
+			int actualWidth = index == labels.length - 1 ? bounds.right() - buttonX : buttonWidth;
+			if (index == labels.length - 1) {
+				addRenderableWidget(consoleButton(labels[index], buttonX, bounds.top(), actualWidth, bounds.height(),
+						false, () -> {
+							compactGroupComposer = false;
+							rebuildWidgets();
+						}));
+				continue;
+			}
+			String operation = operations[index];
+			ConsoleButton action = index == 0
+					? primaryButton(labels[index], buttonX, bounds.top(), actualWidth, bounds.height(),
+							() -> submitGroupPrompt(operation))
+					: consoleButton(labels[index], buttonX, bounds.top(), actualWidth, bounds.height(), false,
+							() -> submitGroupPrompt(operation));
+			action.active = canUseAutomation() && !selected.isEmpty();
+			addRenderableWidget(action);
 		}
 	}
 
 	private void addOverviewActions(int x, int y, int width) {
-		ConsoleButton create = primaryButton("CREATE AN AGENT", x, y, width, ROW_HEIGHT, () -> show(Page.CREATE));
+		ConsoleButton create = primaryButton("Create an agent", x, y, width, ROW_HEIGHT, () -> show(Page.CREATE));
 		create.active = canControl();
 		addRenderableWidget(create);
-		ConsoleButton task = consoleButton("GIVE A TASK", x, y + 32, width, 24, false, () -> show(Page.TASK));
+		ConsoleButton task = consoleButton("Give a task", x, y + 32, width, 24, false, () -> show(Page.TASK));
 		task.active = canUseAutomation() && selectedAgent() != null;
 		addRenderableWidget(task);
-		ConsoleButton manage = consoleButton("MANAGE SELECTED AGENT", x, y + 64, width, 24, false,
+		ConsoleButton manage = consoleButton("Manage selected agent", x, y + 64, width, 24, false,
 				() -> show(Page.MANAGE));
 		manage.active = canControl() && selectedAgent() != null;
 		addRenderableWidget(manage);
@@ -409,14 +661,14 @@ public final class AgentControlScreen extends Screen {
 
 	private void addCompactOverviewActions(int x, int y, int width) {
 		int buttonWidth = (width - GAP * 2) / 3;
-		ConsoleButton create = primaryButton("CREATE", x, y, buttonWidth, ROW_HEIGHT, () -> show(Page.CREATE));
+		ConsoleButton create = primaryButton("Create", x, y, buttonWidth, ROW_HEIGHT, () -> show(Page.CREATE));
 		create.active = canControl();
 		addRenderableWidget(create);
-		ConsoleButton task = consoleButton("GIVE TASK", x + buttonWidth + GAP, y, buttonWidth, ROW_HEIGHT,
+		ConsoleButton task = consoleButton("Give task", x + buttonWidth + GAP, y, buttonWidth, ROW_HEIGHT,
 				false, () -> show(Page.TASK));
 		task.active = canUseAutomation() && selectedAgent() != null;
 		addRenderableWidget(task);
-		ConsoleButton manage = consoleButton("MANAGE", x + (buttonWidth + GAP) * 2, y,
+		ConsoleButton manage = consoleButton("Manage", x + (buttonWidth + GAP) * 2, y,
 				width - (buttonWidth + GAP) * 2, ROW_HEIGHT, false, () -> show(Page.MANAGE));
 		manage.active = canControl() && selectedAgent() != null;
 		addRenderableWidget(manage);
@@ -424,9 +676,9 @@ public final class AgentControlScreen extends Screen {
 
 	private void initLive() {
 		int y = layout().footerY();
-		addRenderableWidget(consoleButton("REFRESH AGENTS", contentLeft(), y, 118, ROW_HEIGHT, false,
+		addRenderableWidget(consoleButton("Refresh agents", contentLeft(), y, 118, ROW_HEIGHT, false,
 				AgentControlClient::requestSnapshot));
-		addRenderableWidget(consoleButton("CLOSE", contentRight() - 96, y, 96, ROW_HEIGHT, false, this::onClose));
+		addRenderableWidget(consoleButton("Close", contentRight() - 96, y, 96, ROW_HEIGHT, false, this::onClose));
 	}
 
 	private void initCreate() {
@@ -503,10 +755,10 @@ public final class AgentControlScreen extends Screen {
 			String operation = List.of("start", "queue", "steer").get(index);
 			String label = List.of("Start now", "Add to queue", "Adjust current task").get(index);
 			ConsoleButton action = index == 0
-					? primaryButton(label.toUpperCase(Locale.ROOT),
+					? primaryButton(label,
 							x + index * (buttonWidth + GAP), actionY, buttonWidth, ROW_HEIGHT,
 							() -> submitPrompt(operation))
-					: consoleButton(label.toUpperCase(Locale.ROOT),
+					: consoleButton(label,
 							x + index * (buttonWidth + GAP), actionY, buttonWidth, ROW_HEIGHT, false,
 							() -> submitPrompt(operation));
 			action.active = canUseAutomation() && AgentControlActions.supports(agent, operation);
@@ -524,9 +776,9 @@ public final class AgentControlScreen extends Screen {
 		AgentControlLayout layout = layout();
 		int buttonWidth = Math.min(148, (layout.contentWidth() - GAP) / 2);
 		int y = layout.footerY();
-		addRenderableWidget(consoleButton("KEEP AGENT", layout.contentLeft(), y, buttonWidth, ROW_HEIGHT,
+		addRenderableWidget(consoleButton("Keep agent", layout.contentLeft(), y, buttonWidth, ROW_HEIGHT,
 				false, () -> show(Page.MANAGE)));
-		ConsoleButton remove = dangerButton("REMOVE PERMANENTLY", layout.contentRight() - buttonWidth, y,
+		ConsoleButton remove = dangerButton("Remove permanently", layout.contentRight() - buttonWidth, y,
 				buttonWidth, ROW_HEIGHT, this::submitConfirmedRemove);
 		remove.active = canControl();
 		addRenderableWidget(remove);
@@ -546,7 +798,7 @@ public final class AgentControlScreen extends Screen {
 		for (int index = 0; index < 2; index++) {
 			String operation = List.of("stop", "resume").get(index);
 			String label = List.of("Pause work", "Resume work").get(index);
-			ConsoleButton action = consoleButton(label.toUpperCase(Locale.ROOT),
+			ConsoleButton action = consoleButton(label,
 					x + index * (buttonWidth + GAP), top, buttonWidth, ROW_HEIGHT, false,
 					() -> submitAgentOperation(operation));
 			action.active = canControl()
@@ -555,12 +807,12 @@ public final class AgentControlScreen extends Screen {
 			addRenderableWidget(action);
 		}
 		ConsoleButton automatic = consoleButton(
-				agent.automaticProgress() ? "AUTOMATIC PROGRESS: ON" : "AUTOMATIC PROGRESS: OFF",
+				agent.automaticProgress() ? "Automatic progress: On" : "Automatic progress: Off",
 				x, top + 32, (width - GAP) / 2, ROW_HEIGHT, agent.automaticProgress(),
 				() -> submitAgentOperation("auto"));
 		automatic.active = canControl();
 		addRenderableWidget(automatic);
-		ConsoleButton remove = dangerButton("REMOVE AGENT...", x + (width - GAP) / 2 + GAP, top + 32,
+		ConsoleButton remove = dangerButton("Remove agent...", x + (width - GAP) / 2 + GAP, top + 32,
 				(width - GAP) / 2, ROW_HEIGHT, this::confirmRemove);
 		remove.active = canControl();
 		addRenderableWidget(remove);
@@ -570,22 +822,22 @@ public final class AgentControlScreen extends Screen {
 	private void addOverviewFooter() {
 		int y = layout().footerY();
 		int x = contentLeft();
-		addRenderableWidget(consoleButton("REFRESH", x, y, 96, ROW_HEIGHT, false,
+		addRenderableWidget(consoleButton("Refresh", x, y, 96, ROW_HEIGHT, false,
 				AgentControlClient::requestSnapshot));
-		addRenderableWidget(consoleButton("CLOSE", contentRight() - 96, y, 96, ROW_HEIGHT, false, this::onClose));
+		addRenderableWidget(consoleButton("Close", contentRight() - 96, y, 96, ROW_HEIGHT, false, this::onClose));
 	}
 
 	private void addCreateFooter() {
 		int y = layout().footerY();
-		addRenderableWidget(consoleButton("CANCEL", contentLeft(), y, 96, ROW_HEIGHT, false,
+		addRenderableWidget(consoleButton("Cancel", contentLeft(), y, 96, ROW_HEIGHT, false,
 				() -> show(Page.OVERVIEW)));
-		addRenderableWidget(primaryButton("CREATE AGENT", contentRight() - 130, y, 130, ROW_HEIGHT,
+		addRenderableWidget(primaryButton("Create agent", contentRight() - 130, y, 130, ROW_HEIGHT,
 				this::submitSummon));
 	}
 
 	private void addBackFooter() {
 		int y = layout().footerY();
-		addRenderableWidget(consoleButton("BACK TO AGENTS", contentLeft(), y, 130, ROW_HEIGHT, false,
+		addRenderableWidget(consoleButton("Back to agents", contentLeft(), y, 130, ROW_HEIGHT, false,
 				() -> show(Page.OVERVIEW)));
 	}
 
@@ -597,17 +849,19 @@ public final class AgentControlScreen extends Screen {
 			graphics.fill(left, layout.panelTop(), navigationRight, layout.panelBottom(), NAV_SURFACE);
 			graphics.fill(navigationRight, layout.panelTop(), navigationRight + 1, layout.panelBottom(), PANEL_EDGE);
 			graphics.fill(layout.contentLeft(), layout.panelTop() + 31, layout.panelRight(), layout.panelTop() + 32, PANEL_EDGE);
-			graphics.text(font, "ARENA", left + 14, layout.panelTop() + 8, ACCENT, false);
-			graphics.text(font, "AGENTS", left + 14, layout.panelTop() + 19, TEXT, false);
-			graphics.text(font, "FIELD CONSOLE", left + 14, layout.panelTop() + 35, MUTED, false);
-			graphics.text(font, "OPERATIONS", left + 14, layout.navigationTop() - 15, MUTED, false);
+			graphics.text(font, "Arena", left + 14, layout.panelTop() + 8, ACCENT, false);
+			graphics.text(font, "Agents", left + 14, layout.panelTop() + 19, TEXT, false);
+			graphics.text(font, "Field Console", left + 14, layout.panelTop() + 35, MUTED, false);
+			graphics.text(font, "Operations", left + 14, layout.navigationTop() - 15, MUTED, false);
 		} else {
 			graphics.fill(left, layout.panelTop(), layout.panelRight(), layout.panelTop() + 37, NAV_SURFACE);
 			graphics.fill(left, layout.panelTop() + 37, layout.panelRight(), layout.panelTop() + 38, PANEL_EDGE);
-			graphics.text(font, "ARENA AGENTS", left + 14, layout.panelTop() + 10, TEXT, false);
-			graphics.text(font, "FIELD CONSOLE", left + 14, layout.panelTop() + 22, MUTED, false);
+			graphics.text(font, "Arena Agents", left + 14, layout.panelTop() + 10, TEXT, false);
+			if (page != Page.GROUP) {
+				graphics.text(font, "Field Console", left + 14, layout.panelTop() + 22, MUTED, false);
+			}
 		}
-		String connection = snapshot == null ? "SYNCING" : snapshot.canControl() ? "LINK ONLINE" : "VIEW ONLY";
+		String connection = snapshot == null ? "Syncing" : snapshot.canControl() ? "Link online" : "View only";
 		int connectionColor = snapshot != null && snapshot.canControl() ? SUCCESS : ACCENT;
 		if (layout.sideNavigation()) {
 			int navigationRight = layout.contentLeft() - 14;
@@ -631,8 +885,8 @@ public final class AgentControlScreen extends Screen {
 			case GROUP -> throw new IllegalStateException("Group page uses its dedicated header");
 			case LIVE -> "Live arena";
 			case CREATE -> "Create an agent";
-			case TASK -> selectedAgent() == null ? "Give a task" : "Give " + agentDisplayName(selectedAgent()) + " a task";
-			case MANAGE -> selectedAgent() == null ? "Manage agent" : "Manage " + agentDisplayName(selectedAgent());
+			case TASK -> selectedAgent() == null ? "Give a task" : "Give " + selectedAgent().displayName() + " a task";
+			case MANAGE -> selectedAgent() == null ? "Manage agent" : "Manage " + selectedAgent().displayName();
 			case REMOVE_CONFIRM -> "Confirm agent removal";
 		};
 		graphics.text(font, heading, contentLeft(), layout.panelTop() + 9, TEXT, false);
@@ -645,10 +899,19 @@ public final class AgentControlScreen extends Screen {
 
 	private void renderGroup(GuiGraphicsExtractor graphics) {
 		AgentControlLayout layout = layout();
-		if (!layout.sideNavigation()) return;
-		int count = groupSelectedAgentIds.size();
+		int count = rosterState.selectedIds().size();
+		int hidden = rosterState.page(1).hiddenSelectedCount();
+		String scope = (hidden > 0
+				? Component.translatable("screen.arenaagents.roster.scope.hidden", count, hidden)
+				: Component.translatable("screen.arenaagents.roster.scope.selected", count)).getString();
+		AgentControlLayout.Bounds scopeBounds = layout.groupScopeBounds();
+		if (!layout.sideNavigation()) {
+			graphics.text(font, fit(scope, scopeBounds.width()), scopeBounds.left(), scopeBounds.top() + 3,
+					count == 0 ? MUTED : ACCENT, false);
+			return;
+		}
 		graphics.text(font, "Group prompt", contentLeft(), layout.panelTop() + 9, TEXT, false);
-		graphics.text(font, count + (count == 1 ? " agent selected" : " agents selected"), contentLeft(), layout.contentTop() + 4,
+		graphics.text(font, scope, scopeBounds.left(), scopeBounds.top() + 3,
 				count == 0 ? MUTED : ACCENT, false);
 		if (contentWidth() >= 560) {
 			graphics.text(font, "Group selection changes messaging only. Configure agents one at a time.",
@@ -683,9 +946,9 @@ public final class AgentControlScreen extends Screen {
 		LiveArenaLayout live = LiveArenaLayout.calculate(available, layout.contentHeight(), arena.standings().size());
 		liveScroll = Math.clamp(liveScroll, 0, live.maximumScroll());
 		int end = Math.min(arena.standings().size(), liveScroll + live.visibleCount());
-		String range = arena.standings().isEmpty() ? "NO AGENTS"
-				: "AGENTS " + (liveScroll + 1) + "-" + end + " OF " + arena.standings().size()
-				+ (live.maximumScroll() > 0 ? " | SCROLL" : "");
+		String range = arena.standings().isEmpty() ? "No agents"
+				: "Agents " + (liveScroll + 1) + " to " + end + " of " + arena.standings().size()
+				+ (live.maximumScroll() > 0 ? ", scroll" : "");
 		String displayedRange = fit(range, Math.max(90, available / 2));
 		graphics.text(font, fit(ArenaHudPresentation.statusLabel(arena.phaseTitle()),
 				Math.max(40, available - font.width(displayedRange) - 30)), left + 10, top + 20, ACCENT, false);
@@ -722,8 +985,8 @@ public final class AgentControlScreen extends Screen {
 		int color = build.status() == ScenarioBuildProgress.Status.FAILED ? ERROR
 				: build.status() == ScenarioBuildProgress.Status.READY ? SUCCESS : ACCENT;
 		graphics.fill(left, top, right, top + (detailed ? 104 : 38), SURFACE);
-		graphics.text(font, build.status() == ScenarioBuildProgress.Status.BUILDING ? "BUILDING ARENA"
-				: build.status() == ScenarioBuildProgress.Status.READY ? "ARENA READY" : "BUILD FAILED",
+		graphics.text(font, build.status() == ScenarioBuildProgress.Status.BUILDING ? "Building arena"
+				: build.status() == ScenarioBuildProgress.Status.READY ? "Arena ready" : "Build failed",
 				left + 12, top + 10, color, false);
 		graphics.text(font, fit(build.scenarioTitle(), Math.max(40, right - left - 170)), left + 12, top + 24, TEXT, false);
 		String percentage = build.percent() + "%";
@@ -733,7 +996,7 @@ public final class AgentControlScreen extends Screen {
 		graphics.fill(barLeft, top + 42, barRight, top + 47, TRACK);
 		graphics.fill(barLeft, top + 42, barLeft + (barRight - barLeft) * build.percent() / 100, top + 47, color);
 		if (!detailed) return;
-		graphics.text(font, build.humanPhase() + " | " + build.completed() + " / " + build.total(),
+		graphics.text(font, build.humanPhase() + ", " + build.completed() + " of " + build.total(),
 				left + 12, top + 55, TEXT, false);
 		graphics.text(font, "World changes made: " + build.changedBlocks(), left + 12, top + 69, MUTED, false);
 		graphics.text(font, "Location: " + build.originLabel(), left + 12, top + 83, MUTED, false);
@@ -744,7 +1007,7 @@ public final class AgentControlScreen extends Screen {
 		int left = contentLeft();
 		int top = layout().contentTop();
 		graphics.fill(left, top, contentRight(), top + 86, SURFACE);
-		graphics.text(font, "NO ACTIVE MATCH", left + 14, top + 14, ACCENT, false);
+		graphics.text(font, "No active match", left + 14, top + 14, ACCENT, false);
 		graphics.text(font, "Health, score, state, timer and match activity will appear here.",
 				left + 14, top + 35, TEXT, false);
 		graphics.text(font, "Use Build Arena to prepare a deterministic showcase and dedicated spawn stations.",
@@ -767,9 +1030,9 @@ public final class AgentControlScreen extends Screen {
 		ConsoleText.centered(graphics, font, Component.literal("#" + standing.rank()), left + 19, top + 16, provider);
 		int textLeft = left + 39;
 		graphics.text(font, fit(standing.displayName(), width - 150), textLeft, top + 7, TEXT, false);
-		String score = "SCORE " + ArenaSpectatorHud.scoreText(standing.score());
+		String score = "Score " + ArenaSpectatorHud.scoreText(standing.score());
 		graphics.text(font, score, left + width - font.width(score) - 8, top + 7, provider, false);
-		graphics.text(font, capitalize(standing.providerFamily()) + "  /  "
+		graphics.text(font, capitalize(standing.providerFamily()) + ", "
 				+ ArenaHudPresentation.statusLabel(standing.status()), textLeft, top + 20, MUTED, false);
 		String healthLabel = "HP " + standing.healthPercent() + "%";
 		int barLeft = textLeft;
@@ -789,7 +1052,7 @@ public final class AgentControlScreen extends Screen {
 			int top,
 			int width
 	) {
-		graphics.text(font, "RECENT MATCH ACTIVITY", left, top, MUTED, false);
+		graphics.text(font, "Recent match activity", left, top, MUTED, false);
 		int y = top + 14;
 		if (feed.isEmpty()) {
 			graphics.text(font, "Waiting for the first scored action.", left, y, MUTED, false);
@@ -820,8 +1083,8 @@ public final class AgentControlScreen extends Screen {
 		if (layout.splitWorkspace() && selected != null) {
 			int x = layout.contextLeft();
 			int detailTop = layout.contentTop() + 126;
-			graphics.text(font, "SELECTED AGENT", x, detailTop, MUTED, false);
-			graphics.text(font, agentDisplayName(selected), x, detailTop + 17, TEXT, false);
+			graphics.text(font, "Selected agent", x, detailTop, MUTED, false);
+			graphics.text(font, selected.displayName(), x, detailTop + 17, TEXT, false);
 			graphics.text(font, AgentControlPresentation.profileLabel(selected), x, detailTop + 31, MUTED, false);
 			graphics.text(font, AgentControlPresentation.stateLabel(selected.state()), x, detailTop + 45,
 					stateColor(selected.state()), false);
@@ -877,7 +1140,7 @@ public final class AgentControlScreen extends Screen {
 		int bottom = Math.min(layout.contentBottom(), top + 104);
 		graphics.fill(left, top, right, bottom, ConsoleTheme.ERROR);
 		graphics.fill(left + 2, top + 2, right - 2, bottom - 2, ConsoleTheme.SURFACE);
-		graphics.text(font, "REMOVE " + fit(agentDisplayName(agent).toUpperCase(Locale.ROOT), right - left - 34),
+		graphics.text(font, "Remove " + fit(agent.displayName(), right - left - 34),
 				left + 14, top + 14, ERROR, false);
 		graphics.text(font, "This deletes the agent and its saved state.", left + 14, top + 37, TEXT, false);
 		graphics.text(font, "This cannot be undone from the Field Console.", left + 14, top + 53, MUTED, false);
@@ -905,8 +1168,8 @@ public final class AgentControlScreen extends Screen {
 			ScenarioBuildProgress build = AgentControlClient.buildProgressState().progress().orElse(null);
 			if (build != null && build.status() == ScenarioBuildProgress.Status.BUILDING) {
 				AgentControlLayout layout = layout();
-				String message = "Arena build | " + build.humanPhase() + " | " + build.percent()
-						+ "% | " + build.originLabel();
+				String message = "Arena build, " + build.humanPhase() + ", " + build.percent()
+						+ "%, " + build.originLabel();
 				ConsoleText.centered(graphics, font, fit(message, layout.contentWidth()), width / 2,
 						layout.footerY() - 14, ACCENT);
 			}
@@ -947,21 +1210,26 @@ public final class AgentControlScreen extends Screen {
 			setFeedback(snapshot == null ? "Automation is not ready" : snapshot.automationStatus(), true);
 			return;
 		}
-		if (!AgentControlActions.everySupports(agents, operation)) {
-			setFeedback("That command is not available for every selected agent", true);
+		var blocker = AgentControlActions.firstUnsupported(agents, operation);
+		if (blocker.isPresent()) {
+			AgentControlAgent agent = blocker.orElseThrow();
+			setFeedback(agent.displayName() + " cannot " + operation + " while "
+					+ AgentControlPresentation.stateLabel(agent.state()), true);
 			return;
 		}
 		try {
 			prompt = promptInput.getValue();
-			int queued = 0;
+			List<String> accepted = new ArrayList<>();
+			List<String> rejected = new ArrayList<>();
 			for (AgentControlAgent agent : agents) {
 				if (AgentControlClient.sendCommand(
-						AgentControlCommandBuilder.prompt(operation, agent.agentId(), prompt))) queued++;
+						AgentControlCommandBuilder.prompt(operation, agent.agentId(), prompt))) {
+					accepted.add(agent.displayName());
+				} else {
+					rejected.add(agent.displayName());
+				}
 			}
-			setFeedback(queued == agents.size()
-					? "Queued for " + queued + (queued == 1 ? " agent" : " agents") + "; awaiting server updates"
-					: "Only " + queued + " of " + agents.size() + " commands reached the server connection",
-					queued != agents.size());
+			setFeedback(AgentControlActions.deliverySummary(accepted, rejected), !rejected.isEmpty());
 		} catch (IllegalArgumentException exception) {
 			setFeedback(exception.getMessage(), true);
 		}
@@ -970,7 +1238,7 @@ public final class AgentControlScreen extends Screen {
 	private void submitAgentOperation(String operation) {
 		AgentControlAgent agent = selectedAgent();
 		if (agent == null) return;
-		send(AgentControlCommandBuilder.agent(operation, agent.agentId()), "Updating " + agentDisplayName(agent) + "...");
+		send(AgentControlCommandBuilder.agent(operation, agent.agentId()), "Updating " + agent.displayName() + "...");
 	}
 
 	private void confirmRemove() {
@@ -983,7 +1251,7 @@ public final class AgentControlScreen extends Screen {
 		page = Page.OVERVIEW;
 		rebuildWidgets();
 		send(AgentControlCommandBuilder.agent("remove", agent.agentId()),
-				"Removing " + agentDisplayName(agent) + "...");
+				"Removing " + agent.displayName() + "...");
 	}
 
 	private void send(String command, String pendingMessage) {
@@ -992,7 +1260,12 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private void show(Page next) {
-		page = next;
+		Page destination = next;
+		if (next == Page.GROUP && snapshot != null && snapshot.agents().size() < 2) {
+			destination = Page.OVERVIEW;
+		}
+		page = destination;
+		if (page != Page.GROUP) compactGroupComposer = false;
 		feedback = "";
 		rebuildWidgets();
 	}
@@ -1007,15 +1280,98 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private AgentControlAgent selectedAgent() {
-		if (snapshot == null || selectedAgentId.isBlank()) return null;
-		return snapshot.agents().stream().filter(agent -> agent.agentId().equals(selectedAgentId)).findFirst().orElse(null);
+		if (snapshot == null || rosterState.focusedId().isBlank()) return null;
+		return snapshot.agents().stream()
+				.filter(agent -> agent.agentId().equals(rosterState.focusedId())).findFirst().orElse(null);
 	}
 
 	private List<AgentControlAgent> selectedGroupAgents() {
 		if (snapshot == null) return List.of();
 		return snapshot.agents().stream()
-				.filter(agent -> groupSelectedAgentIds.contains(agent.agentId()))
+				.filter(agent -> rosterState.selectedIds().contains(agent.agentId()))
 				.toList();
+	}
+
+	private boolean filtersVisible() {
+		return snapshot != null && AgentControlLayout.rosterFiltersVisible(snapshot.agents().size());
+	}
+
+	private List<String> providerOptions() {
+		List<String> options = new ArrayList<>();
+		options.add("");
+		for (AgentRosterEntry entry : rosterEntries) {
+			if (options.stream().noneMatch(value -> value.equalsIgnoreCase(entry.provider()))) {
+				options.add(entry.provider());
+			}
+		}
+		return List.copyOf(options);
+	}
+
+	private List<String> stateOptions() {
+		List<String> options = new ArrayList<>();
+		options.add("");
+		for (AgentRosterEntry entry : rosterEntries) {
+			if (options.stream().noneMatch(value -> value.equalsIgnoreCase(entry.state()))) {
+				options.add(entry.state());
+			}
+		}
+		return List.copyOf(options);
+	}
+
+	private void applyRosterFilter(AgentRosterFilter filter) {
+		setRosterFilterWithoutRebuild(filter);
+		rebuildWidgets();
+	}
+
+	private void setRosterFilterWithoutRebuild(AgentRosterFilter filter) {
+		AgentRosterFilter nextFilter = Objects.requireNonNull(filter, "roster filter must not be null");
+		int currentPage = rosterState.page(1).page();
+		int nextPage = AgentControlLayout.rosterPageAfterFilterUpdate(rosterFilter, nextFilter, currentPage);
+		rosterFilter = nextFilter;
+		rosterState.setFilter(rosterFilter);
+		if (nextPage != currentPage) rosterState.setPage(nextPage, 1);
+		boolean focusVisible = rosterEntries.stream()
+				.anyMatch(entry -> entry.id().equals(rosterState.focusedId()) && rosterFilter.matches(entry));
+		if (!focusVisible) {
+			rosterEntries.stream().filter(rosterFilter::matches).findFirst()
+					.ifPresent(entry -> rosterState.focus(entry.id()));
+		}
+	}
+
+	private void normalizeRosterFilterOptions() {
+		String provider = providerOptions().stream()
+				.anyMatch(value -> value.equalsIgnoreCase(rosterFilter.provider())) ? rosterFilter.provider() : "";
+		String state = stateOptions().stream()
+				.anyMatch(value -> value.equalsIgnoreCase(rosterFilter.state())) ? rosterFilter.state() : "";
+		setRosterFilterWithoutRebuild(new AgentRosterFilter(rosterFilter.query(), provider, state));
+	}
+
+	private static List<AgentRosterEntry> rosterEntries(AgentControlSnapshot snapshot) {
+		List<AgentRosterEntry> entries = new ArrayList<>();
+		for (AgentControlAgent agent : snapshot.agents()) {
+			entries.add(new AgentRosterEntry(
+					agent.agentId(),
+					agent.displayName(),
+					agent.provider(),
+					AgentModelNames.shortLabel(agent.provider(), agent.model()),
+					AgentControlPresentation.stateLabel(agent.state()),
+					true,
+					""
+			));
+		}
+		return List.copyOf(entries);
+	}
+
+	private static Map<String, AgentVisualIdentity.Resolved> rosterVisuals(AgentControlSnapshot snapshot) {
+		Map<String, AgentVisualIdentity.Resolved> visuals = new LinkedHashMap<>();
+		for (AgentControlAgent agent : snapshot.agents()) {
+			AgentVisualIdentity.Resolved previous = visuals.put(
+					agent.agentId(),
+					AgentVisualIdentity.resolve(agent.provider(), agent.model(), agent.skinVariant())
+			);
+			if (previous != null) throw new IllegalArgumentException("Duplicate agent roster ID: " + agent.agentId());
+		}
+		return Map.copyOf(visuals);
 	}
 
 	private MultiLineEditBox multiLineInput(
@@ -1095,16 +1451,6 @@ public final class AgentControlScreen extends Screen {
 		return canControl() && snapshot.automationAvailable();
 	}
 
-	private int visibleRows() {
-		AgentControlLayout layout = layout();
-		int top = layout.contentTop() + (page == Page.GROUP && !layout.sideNavigation() ? 0 : 24);
-		if (page == Page.GROUP && !(layout.splitWorkspace() || layout.contentWidth() >= 500)) return 1;
-		int bottom = page == Page.OVERVIEW && !layout.splitWorkspace()
-				? layout.contentBottom() - ROW_HEIGHT - GAP
-				: layout.contentBottom();
-		return Math.max(1, Math.min(7, Math.max(1, bottom - top + 5) / 43));
-	}
-
 	private int panelWidth() {
 		return layout().panelWidth();
 	}
@@ -1129,17 +1475,6 @@ public final class AgentControlScreen extends Screen {
 		return AgentControlLayout.calculate(width, height);
 	}
 
-	private String agentDisplayName(AgentControlAgent agent) {
-		String defaultTag = agent.model() + " | " + agent.reasoning();
-		return agent.displayName().equals(defaultTag)
-				? AgentControlPresentation.profileLabel(agent)
-				: agent.displayName();
-	}
-
-	private static int providerColor(String provider) {
-		return ConsoleTheme.providerColor(provider);
-	}
-
 	private static int stateColor(String state) {
 		return switch (state.toUpperCase(Locale.ROOT)) {
 			case "ERROR", "DEAD", "DISCONNECTED" -> ERROR;
@@ -1151,15 +1486,6 @@ public final class AgentControlScreen extends Screen {
 	private static String capitalize(String value) {
 		if (value == null || value.isBlank()) return "";
 		return Character.toUpperCase(value.charAt(0)) + value.substring(1).toLowerCase(Locale.ROOT);
-	}
-
-	private static String initials(String value) {
-		StringBuilder result = new StringBuilder(2);
-		for (String part : value.trim().split("\\s+")) {
-			if (!part.isBlank()) result.append(Character.toUpperCase(part.charAt(0)));
-			if (result.length() == 2) break;
-		}
-		return result.isEmpty() ? "AI" : result.toString();
 	}
 
 	private String fit(String value, int available) {

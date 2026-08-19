@@ -169,7 +169,7 @@ class AcpAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `${this.provider} agent '${this.agentId}' is disposed`);
 		if (this.#active) throw new AcpProtocolError('TURN_IN_PROGRESS', `${this.provider} agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -218,25 +218,27 @@ class AcpAgent {
 			try {
 				decision = parseDecision(decisionText);
 			} catch (error) {
-				parseError = new AcpProtocolError(
-					error?.code ?? 'INVALID_DECISION',
-					`${this.provider} returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
-					{ cause: error },
-				);
+				parseError = new AcpProtocolError(error?.code ?? 'INVALID_DECISION', `${this.provider} returned an invalid planner decision`, { cause: error });
+				parseError.category = 'decision_parse';
 			}
 			outputHandled = true;
+			const tokens = acpTokenUsage(response?.usage) ?? (this.provider === 'gemini' ? geminiQuotaTokenUsage(response?._meta) : null);
 			await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
-				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
-				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
+				goalRevision, attempt, retry, input: prompt, output: parseError === null ? decisionText : '', error: structuredProviderError(parseError),
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(tokens === null ? {} : { tokens }),
 			});
 			if (parseError !== null) throw parseError;
 			return decision;
 		} catch (error) {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
-				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(isRateLimitError(error) ? { rateLimited: true } : {}),
 			});
 			throw error;
 		} finally {
@@ -250,8 +252,28 @@ class AcpAgent {
 	async dispose() { if (this.#disposed) return; this.#disposed = true; if (this.#active) this.interrupt(); await this.#transport.stop(); }
 }
 
-function decisionExcerpt(value) {
-	return JSON.stringify(String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 512));
+function acpTokenUsage(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+	return {
+		input: nativeToken(value.inputTokens), output: nativeToken(value.outputTokens), reasoning: nativeToken(value.thoughtTokens),
+		cached: nativeToken(value.cachedReadTokens), cacheWrite: nativeToken(value.cachedWriteTokens),
+	};
+}
+
+function nativeToken(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
+function geminiQuotaTokenUsage(value) {
+	const counts = value?.quota?.token_count;
+	if (counts === null || typeof counts !== 'object' || Array.isArray(counts)) return null;
+	return { input: nativeToken(counts.input_tokens), output: nativeToken(counts.output_tokens), reasoning: null, cached: null, cacheWrite: null };
+}
+
+function isRateLimitError(error) {
+	return [error?.code, error?.status, error?.statusCode, error?.httpStatusCode, error?.data?.status, error?.data?.httpStatusCode].some((value) => value === 429);
+}
+
+function structuredProviderError(error) {
+	return error === null ? null : { code: typeof error.code === 'string' ? error.code : 'PROVIDER_ERROR', category: error.category === 'decision_parse' ? 'decision_parse' : 'provider' };
 }
 
 class AcpCatalog {

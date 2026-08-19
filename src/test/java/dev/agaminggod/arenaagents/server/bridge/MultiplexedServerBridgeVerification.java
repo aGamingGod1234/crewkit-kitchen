@@ -13,6 +13,9 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
+import dev.agaminggod.arenaagents.protocol.ActionType;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
 import java.lang.reflect.Field;
 import java.net.Socket;
 import java.nio.file.Files;
@@ -50,16 +53,29 @@ public final class MultiplexedServerBridgeVerification {
 				"publication remains capped at sixteen despite a malformed seventeen-agent registry");
 		ObservationDispatchQueue<AgentId> publicationQueue = new ObservationDispatchQueue<>(
 				AgentConstants.DEFAULT_AGENT_LIMIT,
-				AgentConstants.DEFAULT_AGENT_LIMIT
+				2
 		);
 		candidates.forEach(publicationQueue::offer);
 		List<AgentId> published = new ArrayList<>();
 		publicationQueue.drain(published::add);
-		assertEquals(candidates, published, "all sixteen registered agents publish within one server tick");
-		assertEquals(0, publicationQueue.pendingCount(), "one-tick publication drains the bounded queue");
+		assertEquals(candidates.subList(0, 2), published, "one server tick publishes exactly two registered agents");
+		assertEquals(14, publicationQueue.pendingCount(), "remaining registered agents stay queued for later ticks");
 		AgentId idleAgent = registered.getFirst().agentId();
 		assertTrue(idleAgent.equals(published.getFirst()),
 				"an idle registered agent without an active action is sampled and published");
+		ServerActionResult placed = result(idleAgent, ActionType.PLACE_BLOCK, ServerActionState.SUCCEEDED);
+		ServerActionResult waited = result(idleAgent, ActionType.WAIT, ServerActionState.SUCCEEDED);
+		ServerActionResult failedPlacement = result(idleAgent, ActionType.PLACE_BLOCK, ServerActionState.FAILED);
+		ServerActionResult alreadyPlaced = new ServerActionResult(idleAgent, 1L, "cadence-test", ActionType.PLACE_BLOCK,
+				ServerActionState.SUCCEEDED, "TARGET_ALREADY_SATISFIED", "test", 1L, 1L);
+		assertTrue(MultiplexedServerBridge.invalidatesSpatialObservation(placed),
+				"successful world-changing action explicitly invalidates raw spatial candidates");
+		assertTrue(!MultiplexedServerBridge.invalidatesSpatialObservation(waited),
+				"successful non-world action retains reusable raw spatial candidates");
+		assertTrue(!MultiplexedServerBridge.invalidatesSpatialObservation(failedPlacement),
+				"failed world action does not invalidate unchanged raw spatial candidates");
+		assertTrue(!MultiplexedServerBridge.invalidatesSpatialObservation(alreadyPlaced),
+				"already-satisfied world action retains unchanged raw spatial candidates");
 
 		List<String> events = new ArrayList<>();
 		assertThrows(IllegalStateException.class, () -> MultiplexedServerBridge.publishRespawnScenarioEvents(
@@ -92,7 +108,12 @@ public final class MultiplexedServerBridgeVerification {
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyRealBridgeSessionLifecycle();
-		return 38;
+		return 42;
+	}
+
+	private static ServerActionResult result(AgentId agentId, ActionType type, ServerActionState state) {
+		return new ServerActionResult(agentId, 1L, "cadence-test", type, state,
+				state == ServerActionState.SUCCEEDED ? "OK" : "FAILED", "test", 1L, 1L);
 	}
 
 	private static void verifyDeathFacts() {

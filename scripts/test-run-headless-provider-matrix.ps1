@@ -146,7 +146,7 @@ public final class FakeServer {
                 int type = readLittleEndian(payload, 4);
                 String command = new String(payload, 8, length - 10, StandardCharsets.UTF_8);
                 String summonResponse = System.getenv("ARENA_HEADLESS_FAKE_SUMMON_RESPONSE");
-                String response = type == 3 ? "" : command.contains("summon-configured") ? (summonResponse == null ? "OK" : summonResponse) : command.startsWith("codex status") ? "state=COMPLETED" : "OK";
+                String response = type == 3 ? "" : command.contains("summon-configured") ? (summonResponse == null ? "Created fixture_agent. It is ready for a task." : summonResponse) : command.startsWith("codex status") ? "state=COMPLETED" : "OK";
                 writeResponse(output, id, type == 3 ? 2 : 0, response);
                 output.flush();
             }
@@ -429,7 +429,7 @@ try {
 	}
 
 	$wrapperText = Get-Content -Raw -LiteralPath $scriptPath
-	foreach ($requiredPattern in @('Stop-ProcessTree', 'Get-ProcessTreeIds', 'Get-CimInstance Win32_Process', 'Wait-Condition', 'Test-Port', 'ARENA_AGENT_BRIDGE_SECRET', 'provider-workspaces', 'cleanupFailure', 'artifactsKept', 'rcon.ip')) {
+	foreach ($requiredPattern in @('Stop-ProcessTree', 'Add-ProcessTreeSnapshot', 'Test-ProcessIdentityMatch', 'Get-TrackedResourceSnapshot', 'CreationDate', 'ParentProcessId', 'Get-CimInstance Win32_Process', 'Wait-Condition', 'Test-Port', 'ARENA_AGENT_BRIDGE_SECRET', 'provider-workspaces', 'cleanupFailure', 'artifactsKept', 'rcon.ip')) {
 		if ($wrapperText -notmatch [regex]::Escape($requiredPattern)) { throw "Lifecycle wrapper missing cleanup/isolation hook '$requiredPattern'" }
 	}
 	Write-Output 'PASS timeout cleanup, port verification, child-tree cleanup, and provider isolation hooks'

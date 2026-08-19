@@ -126,6 +126,19 @@ public final class BridgeEnvelopeCodec {
 	}
 
 	public String encode(BridgeEnvelope envelope) {
+		String encoded = serialize(envelope);
+		if (encodedBytes(encoded) > MAX_LINE_BYTES) {
+			throw new BridgeProtocolException("LINE_TOO_LARGE", "Encoded protocol line exceeds wire limit");
+		}
+		return encoded + "\n";
+	}
+
+	/** Returns the exact UTF-8 wire size, including the newline frame delimiter. */
+	public int encodedBytes(BridgeEnvelope envelope) {
+		return encodedBytes(serialize(envelope));
+	}
+
+	private static String serialize(BridgeEnvelope envelope) {
 		JsonObject object = new JsonObject();
 		object.addProperty("protocolVersion", envelope.protocolVersion());
 		object.addProperty("serverInstanceId", envelope.serverInstanceId());
@@ -133,10 +146,10 @@ public final class BridgeEnvelopeCodec {
 		object.addProperty("type", envelope.type());
 		object.addProperty("messageId", envelope.messageId());
 		object.add("payload", envelope.payload());
-		String encoded = GSON.toJson(object);
-		if (encoded.getBytes(StandardCharsets.UTF_8).length + 1 > MAX_LINE_BYTES) {
-			throw new BridgeProtocolException("LINE_TOO_LARGE", "Encoded protocol line exceeds wire limit");
-		}
-		return encoded + "\n";
+		return GSON.toJson(object);
+	}
+
+	private static int encodedBytes(String serialized) {
+		return serialized.getBytes(StandardCharsets.UTF_8).length + 1;
 	}
 }

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { ProviderTurnRecorder } from '../src/provider-turn-recorder.mjs';
+import { createProviderTurnTelemetry } from '../src/provider-turn-telemetry.mjs';
 
 test('records bounded redacted private turns and hash/excerpt-only public rows', async () => {
 	const privateRows = [];
@@ -84,6 +86,48 @@ test('preserves wall-clock timing when a provider has no native API duration', a
 	assert.deepEqual(rows[0].timing, { durationMs: 42, apiDurationMs: null });
 });
 
+test('preserves agent isolation and provider-native usage without estimating missing categories', async () => {
+	const rows = [];
+	const recorder = new ProviderTurnRecorder({
+		runId: 'run-metrics', scenarioId: 'scenario-metrics', privatePath: 'private.jsonl',
+		appendFile: async (_path, text) => rows.push(JSON.parse(text)),
+	});
+	await recorder.record({
+		agentId: 'agent-8', provider: 'codex', model: 'm', reasoningEffort: 'high', retry: true,
+		timing: { durationMs: 80, apiDurationMs: 60, queueWaitMs: 20 },
+		tokens: { input: 100, output: 25, reasoning: 10, cached: 40 },
+		rateLimited: true, compaction: true,
+	});
+	await recorder.close();
+
+	assert.equal(rows[0].agentId, 'agent-8');
+	assert.deepEqual(rows[0].timing, { durationMs: 80, apiDurationMs: 60, queueWaitMs: 20 });
+	assert.deepEqual(rows[0].tokens, { input: 100, output: 25, reasoning: 10, cached: 40, cacheWrite: null });
+	assert.equal(rows[0].rateLimited, true);
+	assert.equal(rows[0].compaction, true);
+});
+
+test('optional complete provider telemetry remains a strict bounded allowlist', () => {
+	const telemetry = createProviderTurnTelemetry({
+		provider: 'codex', model: 'm', operation: 'decide', durationMs: 50,
+		tokens: { input: 12, output: null, reasoning: 3, cached: null, cacheWrite: 4 },
+		rateLimited: true, compaction: false, privatePrompt: 'never retain this',
+	});
+	assert.deepEqual(telemetry.tokens, { input: 12, output: null, reasoning: 3, cached: null, cacheWrite: 4 });
+	assert.equal(telemetry.rateLimited, true);
+	assert.equal(telemetry.compaction, false);
+	assert.equal(JSON.stringify(telemetry).includes('privatePrompt'), false);
+});
+
+test('complete latency snapshots include a nearest-rank p99 without changing legacy status snapshots', () => {
+	const registry = new ControlLatencyRegistry({ windowSize: 100 });
+	for (let value = 1; value <= 100; value += 1) registry.record('action_completion', value);
+	assert.deepEqual(registry.performanceSnapshot(), [{
+		operation: 'action_completion', count: 100, p50Ms: 50, p95Ms: 95, p99Ms: 99,
+	}]);
+	assert.deepEqual(registry.snapshot(), [{ operation: 'action_completion', count: 100, p50Ms: 50, p95Ms: 95 }]);
+});
+
 test('redacts escaped and delimiter-rich quoted JSON credential values', async () => {
 	const privateRows = [];
 	const publicRows = [];
@@ -129,18 +173,18 @@ test('serializes records and swallows public sink failures without blocking clos
 	assert.deepEqual(writes.map((row) => row.attempt), [1, 2]);
 });
 
-test('error rows contain typed bounded provider errors without stack, paths, or environment values', async () => {
+test('error rows retain only allowlisted structured fields', async () => {
 	const rows = [];
 	const recorder = new ProviderTurnRecorder({
 		runId: 'run', scenarioId: 'scenario', privatePath: 'private.jsonl', appendFile: async (_path, text) => rows.push(JSON.parse(text)),
 	});
-	const error = Object.assign(new Error('failed at C:\\Users\\lucas\\secret\\provider.js token=env-value'), { code: 'PROVIDER_UNAVAILABLE', stack: 'Error\n at C:\\Users\\lucas\\secret\\provider.js' });
+	const error = Object.assign(new Error('ARBITRARY_PROVIDER_SECRET at C:\\Users\\lucas\\secret\\provider.js token=env-value'), { code: 'PROVIDER_UNAVAILABLE', category: 'provider', stack: 'Error\n at C:\\Users\\lucas\\secret\\provider.js' });
 	await recorder.record({ provider: 'gemini', model: 'm', reasoningEffort: 'high', goalRevision: 2, attempt: 1, retry: false, input: 'prompt', output: 'partial output', error });
 	await recorder.close();
 	assert.equal(rows[0].outcome, 'error');
 	assert.equal(rows[0].error.code, 'PROVIDER_UNAVAILABLE');
-	assert.equal(typeof rows[0].error.message, 'string');
-	assert.equal(Object.hasOwn(rows[0].error, 'stack'), false);
+	assert.deepEqual(rows[0].error, { code: 'PROVIDER_UNAVAILABLE', category: 'provider' });
+	assert.equal(JSON.stringify(rows[0]).includes('ARBITRARY_PROVIDER_SECRET'), false);
 	assert.equal(JSON.stringify(rows[0]).includes('C:\\Users\\lucas\\secret'), false);
 	assert.equal(JSON.stringify(rows[0]).includes('env-value'), false);
 });

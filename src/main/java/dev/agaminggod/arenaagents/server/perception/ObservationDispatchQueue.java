@@ -26,6 +26,17 @@ public final class ObservationDispatchQueue<T> {
 		return true;
 	}
 
+	/** Promotes urgent work to the front while retaining one pending entry per identity. */
+	public synchronized boolean offerFirst(T identity) {
+		Objects.requireNonNull(identity, "identity must not be null");
+		boolean present = pending.remove(identity);
+		if (!present && pending.size() >= capacity) {
+			throw new IllegalStateException("observation dispatch capacity is full");
+		}
+		pending.addFirst(identity);
+		return true;
+	}
+
 	public synchronized boolean remove(T identity) {
 		return pending.remove(Objects.requireNonNull(identity, "identity must not be null"));
 	}

@@ -115,6 +115,7 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 			child.stdout.emit('data', Buffer.from(JSON.stringify({
 				type: 'result', subtype: 'success', is_error: false, result: DECISION,
 				session_id: 'cursor-session-1', duration_ms: 1_234, duration_api_ms: 987,
+				usage: { inputTokens: 90, outputTokens: 14, cacheReadTokens: 22, cacheWriteTokens: 3 },
 			})));
 			child.exitCode = 0;
 			child.emit('close', 0, null);
@@ -130,7 +131,7 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	await agent.setGoalRevision(7);
 	const turns = [];
 	const turnRecorder = { async record(row) { turns.push(row); } };
-	const first = await agent.decide('authoritative state', { goalRevision: 7, turnRecorder });
+	const first = await agent.decide('authoritative state', { goalRevision: 7, turnRecorder, queueWaitMs: 11 });
 	const second = await agent.decide('compiler correction', { goalRevision: 7, turnRecorder, attempt: 2, retry: true });
 
 	assert.equal(first.directive, 'replace');
@@ -139,9 +140,39 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	assert.match(children[0].stdin.chunks.join(''), /authoritative state/);
 	assert.deepEqual(calls[1].args.slice(-2), ['--resume', 'cursor-session-1']);
 	assert.equal(turns.length, 2);
-	assert.deepEqual(turns[0].timing, { durationMs: 1_234, apiDurationMs: 987 });
+	assert.deepEqual(turns[0].timing, { durationMs: 1_234, apiDurationMs: 987, queueWaitMs: 11 });
+	assert.equal(turns[0].agentId, 'cursor-a');
+	assert.deepEqual(turns[0].tokens, { input: 90, output: 14, reasoning: null, cached: 22, cacheWrite: 3 });
 	assert.equal(turns[1].attempt, 2);
 	assert.equal(turns[1].retry, true);
+	await service.stop();
+});
+
+test('Cursor parse failures record only a generic structured error', async () => {
+	const secret = 'ARBITRARY_CURSOR_MODEL_SECRET';
+	const spawn = () => {
+		const child = new FakeChild();
+		queueMicrotask(() => {
+			child.stdout.emit('data', Buffer.from(JSON.stringify({
+				type: 'result', subtype: 'success', is_error: false, result: `not-json ${secret}`,
+				session_id: 'cursor-session-secret', duration_ms: 12, duration_api_ms: 9,
+			})));
+			child.exitCode = 0;
+			child.emit('close', 0, null);
+		});
+		return child;
+	};
+	const service = new CursorProviderService(config(), {
+		spawn, discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+		workspaceManager: { async prepare() { return 'C:\\agents\\cursor\\cursor-secret'; } },
+	});
+	const agent = await service.createAgent(profile({ agentId: 'cursor-secret' }));
+	await agent.setGoalRevision(1);
+	const rows = [];
+	await assert.rejects(agent.decide('state', { goalRevision: 1, turnRecorder: { async record(row) { rows.push(row); } } }), (error) => error?.code === 'MALFORMED_DECISION');
+	assert.equal(rows.length, 1);
+	assert.deepEqual(rows[0].error, { code: 'MALFORMED_DECISION', category: 'decision_parse' });
+	assert.doesNotMatch(JSON.stringify(rows[0]), new RegExp(secret));
 	await service.stop();
 });
 

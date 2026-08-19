@@ -7,6 +7,7 @@ import java.util.Objects;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
+import net.minecraft.client.gui.narration.NarratedElementType;
 import net.minecraft.client.gui.narration.NarrationElementOutput;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
@@ -20,12 +21,8 @@ public final class ConsoleButton extends AbstractWidget implements ConsoleFocusT
 		PRIMARY,
 		DANGER
 	}
-	private static final int IDLE_BORDER = 0xFF46515F;
-	private static final int IDLE_FILL = 0xFF222B36;
-	private static final int HOVER_FILL = 0xFF2D3947;
-	private static final int DISABLED_FILL = 0xFF1B2129;
-	private static final int DISABLED_TEXT = 0xFF6E7884;
-	private static final int TEXT = 0xFFF2F5F8;
+	private static final int DANGER_FILL = 0xFF44242B;
+	private static final int DANGER_HOVER_FILL = 0xFF573038;
 	private final Font font;
 	private final Runnable onPress;
 	private final int accent;
@@ -68,19 +65,38 @@ public final class ConsoleButton extends AbstractWidget implements ConsoleFocusT
 
 	@Override
 	protected void extractWidgetRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
-		int border = isFocused() ? ConsoleTheme.FOCUS
-				: tone == Tone.DANGER ? ConsoleTheme.ERROR
-				: tone == Tone.PRIMARY || selected ? accent : IDLE_BORDER;
-		int fill = !active ? DISABLED_FILL
-				: tone == Tone.PRIMARY ? (isHoveredOrFocused() ? 0xFFFFD27A : accent)
-				: tone == Tone.DANGER ? (isHoveredOrFocused() ? 0xFF573038 : 0xFF44242B)
-				: selected ? 0xFF313943 : isHoveredOrFocused() ? HOVER_FILL : IDLE_FILL;
-		graphics.fill(getX(), getY(), getRight(), getBottom(), border);
-		int inset = isFocused() || selected ? 2 : 1;
-		graphics.fill(getX() + inset, getY() + inset, getRight() - inset, getBottom() - inset, fill);
-		int text = active ? (tone == Tone.PRIMARY ? ConsoleTheme.TRACK : TEXT) : DISABLED_TEXT;
+		Presentation style = presentation(tone, active, selected, isFocused(), isHovered(), accent);
+		graphics.fill(getX(), getY(), getRight(), getBottom(), style.border());
+		graphics.fill(getX() + style.inset(), getY() + style.inset(),
+				getRight() - style.inset(), getBottom() - style.inset(), style.fill());
 		ConsoleText.centered(graphics, font, fittedMessage(), getX() + getWidth() / 2,
-				getY() + (getHeight() - 9) / 2, text);
+				getY() + (getHeight() - 9) / 2, style.text());
+	}
+
+	public static Presentation presentation(
+			Tone tone,
+			boolean active,
+			boolean selected,
+			boolean focused,
+			boolean hovered,
+			int accent
+	) {
+		Objects.requireNonNull(tone, "tone must not be null");
+		int border = !active ? ConsoleTheme.BORDER
+				: focused ? ConsoleTheme.FOCUS
+				: tone == Tone.DANGER ? ConsoleTheme.ERROR
+				: tone == Tone.PRIMARY || selected ? ConsoleTheme.ACCENT : ConsoleTheme.BORDER;
+		int fill = !active ? ConsoleTheme.TRACK
+				: tone == Tone.DANGER ? (hovered || focused ? DANGER_HOVER_FILL : DANGER_FILL)
+				: tone == Tone.PRIMARY || selected ? ConsoleTheme.ROSTER_SELECTED_SURFACE
+				: hovered || focused ? ConsoleTheme.SURFACE_HOVER : ConsoleTheme.SURFACE;
+		int text = !active ? ConsoleTheme.MUTED
+				: tone == Tone.PRIMARY ? ConsoleTheme.ACCENT : ConsoleTheme.TEXT;
+		return new Presentation(border, fill, text, 1);
+	}
+
+	public static String selectionNarrationKey(boolean selected) {
+		return selected ? "screen.arenaagents.control.selected" : "";
 	}
 
 	private Component fittedMessage() {
@@ -111,10 +127,15 @@ public final class ConsoleButton extends AbstractWidget implements ConsoleFocusT
 	@Override
 	protected void updateWidgetNarration(NarrationElementOutput output) {
 		defaultButtonNarrationText(output);
+		String hint = selectionNarrationKey(selected);
+		if (!hint.isEmpty()) output.add(NarratedElementType.HINT, Component.translatable(hint));
 	}
 
 	@Override
 	public String consoleFocusIdentity() {
 		return "button:" + getMessage().getString();
+	}
+
+	public record Presentation(int border, int fill, int text, int inset) {
 	}
 }

@@ -361,6 +361,7 @@ test('passes the exact optional turn recorder to the selected provider without c
 	const registry = new FakeRegistry();
 	const recorder = { record: async () => { throw new Error('recorder unavailable'); } };
 	const optionsSeen = [];
+	let clock = 100;
 	let attempts = 0;
 	const agent = {
 		async setGoalRevision() {},
@@ -374,7 +375,8 @@ test('passes the exact optional turn recorder to the selected provider without c
 	const planner = new AgentPlanner({
 		registry,
 		turnRecorder: recorder,
-		scheduler: { schedule(_id, operation) { return operation({ signal: new AbortController().signal }); }, cancel() { return false; } },
+		now: () => clock,
+		scheduler: { schedule(_id, operation) { clock = 137; return operation({ signal: new AbortController().signal }); }, cancel() { return false; } },
 		codexService: { async createAgent() { return agent; }, getAgent() { return null; }, async removeAgent() { return false; } },
 	});
 
@@ -382,6 +384,7 @@ test('passes the exact optional turn recorder to the selected provider without c
 	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
 	assert.equal(attempts, 1);
 	assert.equal(optionsSeen[0].options.turnRecorder, recorder);
+	assert.equal(optionsSeen[0].options.queueWaitMs, 37);
 });
 
 test('preserves attempt and retry metadata through corrective provider retries', async () => {

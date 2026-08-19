@@ -3,6 +3,7 @@ const MAX_IDENTITY_LENGTH = 128;
 export function createProviderTurnTelemetry(value) {
 	const input = requireObject(value, 'provider telemetry');
 	const errorCode = normalizeErrorCode(input.errorCode ?? input.error?.code ?? (input.error == null ? null : 'ERROR'));
+	const tokens = input.tokens === null || input.tokens === undefined ? null : normalizeTokens(input.tokens);
 	return Object.freeze({
 		provider: requireIdentity(input.provider, 'provider'),
 		model: requireIdentity(input.model, 'model'),
@@ -14,7 +15,20 @@ export function createProviderTurnTelemetry(value) {
 		timeout: Boolean(input.timeout),
 		retry: Boolean(input.retry),
 		restart: Boolean(input.restart),
+		...(tokens === null ? {} : { tokens }),
+		...(input.rateLimited === undefined ? {} : { rateLimited: Boolean(input.rateLimited) }),
+		...(input.compaction === undefined ? {} : { compaction: Boolean(input.compaction) }),
 	});
+}
+
+function normalizeTokens(value) {
+	const input = requireObject(value, 'tokens');
+	return Object.freeze(Object.fromEntries(['input', 'output', 'reasoning', 'cached', 'cacheWrite'].map((category) => {
+		const count = input[category];
+		if (count === null || count === undefined) return [category, null];
+		if (!Number.isSafeInteger(count) || count < 0) throw new TypeError(`${category} tokens must be a nonnegative safe integer or null`);
+		return [category, count];
+	})));
 }
 
 export function normalizeErrorCode(value) {

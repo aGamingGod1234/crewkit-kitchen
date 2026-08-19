@@ -131,73 +131,165 @@ function Get-ConfiguredPort([string] $EnvironmentName) {
 	return $port
 }
 
-function Get-ProcessTreeIds([int] $ProcessId) {
-	$ids = @($ProcessId)
-	$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ProcessId" -ErrorAction SilentlyContinue)
-	foreach ($child in $children) { $ids += Get-ProcessTreeIds -ProcessId ([int] $child.ProcessId) }
-	return $ids
+function ConvertTo-ProcessCreationKey($Value) {
+	if ($null -eq $Value) { return $null }
+	if ($Value -is [DateTime]) { return $Value.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture) }
+	$valueText = [string] $Value
+	if ([string]::IsNullOrWhiteSpace($valueText)) { return $null }
+	return $valueText
 }
 
-function Add-ProcessTreeSnapshot([System.Collections.Generic.List[int]] $ProcessIds, [int] $ProcessId) {
-	if ($ProcessId -le 0) { return }
-	foreach ($id in @(Get-ProcessTreeIds $ProcessId | Select-Object -Unique)) {
-		if (-not $ProcessIds.Contains([int] $id)) { $ProcessIds.Add([int] $id) }
-	}
-}
-
-function Get-ProcessChildrenSnapshot() {
-	$childrenByParent = @{}
+function Get-ProcessSnapshot() {
+	$byId = @{}
 	foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
-		$parentId = [int] $process.ParentProcessId
-		if (-not $childrenByParent.ContainsKey($parentId)) {
-			$childrenByParent[$parentId] = [System.Collections.Generic.List[int]]::new()
+		$id = [int] $process.ProcessId
+		$creationDate = ConvertTo-ProcessCreationKey $process.CreationDate
+		if ($id -le 0 -or $null -eq $creationDate) { continue }
+		$byId[$id] = [pscustomobject]@{
+			ProcessId = $id
+			ParentProcessId = [int] $process.ParentProcessId
+			CreationDate = $creationDate
+			WorkingSetSize = if ($null -eq $process.WorkingSetSize) { 0L } else { [long] $process.WorkingSetSize }
 		}
-		$childrenByParent[$parentId].Add([int] $process.ProcessId)
 	}
-	return $childrenByParent
+	return $byId
 }
 
-function Stop-TrackedProcessIds([System.Collections.Generic.List[int]] $ProcessIds) {
+function Test-ProcessIdentityMatch($Identity, $Process) {
+	if ($null -eq $Identity -or $null -eq $Process) { return $false }
+	$expectedCreation = ConvertTo-ProcessCreationKey $Identity.CreationDate
+	$actualCreation = ConvertTo-ProcessCreationKey $Process.CreationDate
+	return [int] $Identity.ProcessId -eq [int] $Process.ProcessId `
+		-and [int] $Identity.ParentProcessId -eq [int] $Process.ParentProcessId `
+		-and $null -ne $expectedCreation -and $expectedCreation -eq $actualCreation
+}
+
+function Test-ChildCreationAfterParent($Parent, $Child) {
+	[long] $parentTicks = 0
+	[long] $childTicks = 0
+	if (-not [long]::TryParse((ConvertTo-ProcessCreationKey $Parent.CreationDate), [ref] $parentTicks)) { return $false }
+	if (-not [long]::TryParse((ConvertTo-ProcessCreationKey $Child.CreationDate), [ref] $childTicks)) { return $false }
+	return $childTicks -ge $parentTicks
+}
+
+function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities, $ProcessIdentity) {
+	$processes = Get-ProcessSnapshot
+	$rootId = if ($ProcessIdentity -is [int]) { [int] $ProcessIdentity } else { [int] $ProcessIdentity.ProcessId }
+	if ($rootId -le 0) { return }
+	$expectedRoot = if ($ProcessIdentity -is [int]) { $null } else { $ProcessIdentity }
+	$existingRoot = @($ProcessIdentities.ToArray() | Where-Object { [int] $_.ProcessId -eq $rootId } | Select-Object -First 1)
+
+	$childrenByParent = @{}
+	foreach ($process in $processes.Values) {
+		$parentId = [int] $process.ParentProcessId
+		if (-not $childrenByParent.ContainsKey($parentId)) { $childrenByParent[$parentId] = [System.Collections.Generic.List[object]]::new() }
+		$childrenByParent[$parentId].Add($process)
+	}
+	$pending = [System.Collections.Generic.Queue[object]]::new()
+	$visited = [System.Collections.Generic.HashSet[int]]::new()
+	if ($processes.ContainsKey($rootId)) {
+		if ($null -ne $expectedRoot -and -not (Test-ProcessIdentityMatch $expectedRoot $processes[$rootId])) { return }
+		if ($existingRoot.Count -gt 0 -and -not (Test-ProcessIdentityMatch $existingRoot[0] $processes[$rootId])) { return }
+		$pending.Enqueue($processes[$rootId])
+	} else {
+		if ($null -eq $expectedRoot -or $existingRoot.Count -eq 0 -or -not (Test-ProcessIdentityMatch $expectedRoot $existingRoot[0])) { return }
+		if ($childrenByParent.ContainsKey($rootId)) {
+			foreach ($child in $childrenByParent[$rootId]) {
+				if (Test-ChildCreationAfterParent $expectedRoot $child) { $pending.Enqueue($child) }
+			}
+		}
+	}
+	while ($pending.Count -gt 0) {
+		$current = $pending.Dequeue()
+		$currentId = [int] $current.ProcessId
+		if (-not $visited.Add($currentId)) { continue }
+		$existing = @($ProcessIdentities.ToArray() | Where-Object { [int] $_.ProcessId -eq $currentId } | Select-Object -First 1)
+		if ($existing.Count -gt 0 -and -not (Test-ProcessIdentityMatch $existing[0] $current)) { continue }
+		if ($existing.Count -eq 0) {
+			$ProcessIdentities.Add([pscustomobject]@{ ProcessId = $currentId; ParentProcessId = [int] $current.ParentProcessId; CreationDate = [string] $current.CreationDate })
+		}
+		if ($childrenByParent.ContainsKey($currentId)) {
+			foreach ($child in $childrenByParent[$currentId]) {
+				if (Test-ChildCreationAfterParent $current $child) { $pending.Enqueue($child) }
+			}
+		}
+	}
+}
+
+function Get-TrackedResourceSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities) {
+	$processes = Get-ProcessSnapshot
+	$liveCount = 0
+	[long] $rssBytes = 0
+	foreach ($identity in @($ProcessIdentities.ToArray())) {
+		$id = [int] $identity.ProcessId
+		if (-not $processes.ContainsKey($id) -or -not (Test-ProcessIdentityMatch $identity $processes[$id])) { continue }
+		$liveCount += 1
+		$rssBytes += [long] $processes[$id].WorkingSetSize
+	}
+	return [pscustomobject]@{ processCount = $liveCount; rssBytes = $rssBytes }
+}
+
+function Measure-RunnerResourcesUntilExit(
+	$RunnerHandle,
+	[object[]] $TrackedHandles,
+	[System.Collections.Generic.List[object]] $ProcessIdentities,
+	[DateTime] $Deadline
+) {
+	$peakProcessCount = 0
+	[long] $peakRssBytes = 0
+	while ($true) {
+		foreach ($handle in $TrackedHandles) {
+			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIdentities $(if ($null -ne $handle.Identity) { $handle.Identity } else { $handle.Process.Id }) }
+		}
+		$sample = Get-TrackedResourceSnapshot $ProcessIdentities
+		$peakProcessCount = [Math]::Max($peakProcessCount, [int] $sample.processCount)
+		$peakRssBytes = [Math]::Max($peakRssBytes, [long] $sample.rssBytes)
+		$runnerExited = $RunnerHandle.Process.HasExited
+		if (-not $runnerExited) { $runnerExited = $RunnerHandle.Process.WaitForExit($PollMilliseconds) }
+		if ($runnerExited) {
+			foreach ($handle in $TrackedHandles) {
+				if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIdentities $(if ($null -ne $handle.Identity) { $handle.Identity } else { $handle.Process.Id }) }
+			}
+			$finalSample = Get-TrackedResourceSnapshot $ProcessIdentities
+			$peakProcessCount = [Math]::Max($peakProcessCount, [int] $finalSample.processCount)
+			$peakRssBytes = [Math]::Max($peakRssBytes, [long] $finalSample.rssBytes)
+			break
+		}
+		if ([DateTime]::UtcNow -ge $Deadline) { throw 'Scenario runner timed out' }
+	}
+	return [pscustomobject]@{ processCount = $peakProcessCount; peakRssBytes = $peakRssBytes }
+}
+
+function Stop-TrackedProcessIds([System.Collections.Generic.List[object]] $ProcessIdentities) {
 	$deadline = [DateTime]::UtcNow.AddSeconds($CleanupTimeoutSeconds)
 	$remaining = @()
 	do {
-		# Refresh one parent/child snapshot per pass and only traverse from tracked roots.
-		# This preserves PID tracking and avoids adopting unrelated processes from the snapshot.
-		$childrenByParent = Get-ProcessChildrenSnapshot
-		foreach ($root in @($ProcessIds.ToArray())) {
-			if (-not (Get-Process -Id ([int] $root) -ErrorAction SilentlyContinue)) { continue }
-			$pending = [System.Collections.Generic.Queue[int]]::new()
-			$visited = [System.Collections.Generic.HashSet[int]]::new()
-			$pending.Enqueue([int] $root)
-			while ($pending.Count -gt 0) {
-				$current = $pending.Dequeue()
-				if (-not $visited.Add($current) -or -not $childrenByParent.ContainsKey($current)) { continue }
-				foreach ($child in $childrenByParent[$current]) {
-					$childId = [int] $child
-					if (-not $ProcessIds.Contains($childId)) { $ProcessIds.Add($childId) }
-					$pending.Enqueue($childId)
-				}
-			}
-		}
-		foreach ($id in @($ProcessIds.ToArray() | Sort-Object -Descending)) {
-			try { Stop-Process -Id ([int] $id) -Force -ErrorAction Stop } catch {
-				if (Get-Process -Id ([int] $id) -ErrorAction SilentlyContinue) { throw "Could not terminate tracked process ${id}: $($_.Exception.Message)" }
+		foreach ($root in @($ProcessIdentities.ToArray())) { Add-ProcessTreeSnapshot $ProcessIdentities $root }
+		$processes = Get-ProcessSnapshot
+		foreach ($identity in @($ProcessIdentities.ToArray() | Sort-Object ProcessId -Descending)) {
+			$id = [int] $identity.ProcessId
+			if (-not $processes.ContainsKey($id) -or -not (Test-ProcessIdentityMatch $identity $processes[$id])) { continue }
+			try { Stop-Process -Id $id -Force -ErrorAction Stop } catch {
+				$current = Get-ProcessSnapshot
+				if ($current.ContainsKey($id) -and (Test-ProcessIdentityMatch $identity $current[$id])) { throw "Could not terminate tracked process ${id}: $($_.Exception.Message)" }
 			}
 		}
 		Start-Sleep -Milliseconds 100
-		$remaining = @($ProcessIds.ToArray() | Where-Object { Get-Process -Id ([int] $_) -ErrorAction SilentlyContinue })
+		$current = Get-ProcessSnapshot
+		$remaining = @($ProcessIdentities.ToArray() | Where-Object { $current.ContainsKey([int] $_.ProcessId) -and (Test-ProcessIdentityMatch $_ $current[[int] $_.ProcessId]) })
 		if ($remaining.Count -eq 0) { return }
 	} while ([DateTime]::UtcNow -lt $deadline)
-	throw "Tracked process cleanup left live PIDs: $($remaining -join ',')"
+	throw "Tracked process cleanup left live PIDs: $(@($remaining | ForEach-Object { $_.ProcessId }) -join ',')"
 }
 
-function Assert-TrackedProcessIdsGone([System.Collections.Generic.List[int]] $ProcessIds) {
-	$remaining = @($ProcessIds.ToArray() | Where-Object { Get-Process -Id ([int] $_) -ErrorAction SilentlyContinue })
-	if ($remaining.Count -gt 0) { throw "Tracked process cleanup left live PIDs: $($remaining -join ',')" }
+function Assert-TrackedProcessIdsGone([System.Collections.Generic.List[object]] $ProcessIdentities) {
+	$current = Get-ProcessSnapshot
+	$remaining = @($ProcessIdentities.ToArray() | Where-Object { $current.ContainsKey([int] $_.ProcessId) -and (Test-ProcessIdentityMatch $_ $current[[int] $_.ProcessId]) })
+	if ($remaining.Count -gt 0) { throw "Tracked process cleanup left live PIDs: $(@($remaining | ForEach-Object { $_.ProcessId }) -join ',')" }
 }
 
 function Stop-ProcessTree([int] $ProcessId) {
-	$ids = [System.Collections.Generic.List[int]]::new()
+	$ids = [System.Collections.Generic.List[object]]::new()
 	Add-ProcessTreeSnapshot $ids $ProcessId
 	Stop-TrackedProcessIds $ids
 }
@@ -225,10 +317,18 @@ function Start-RedirectedProcess(
 	$process = [Diagnostics.Process]::new()
 	$process.StartInfo = $startInfo
 	if (-not $process.Start()) { throw "Could not start process: $FileName" }
+	$processes = Get-ProcessSnapshot
+	if (-not $processes.ContainsKey([int] $process.Id)) {
+		try { $process.Kill() } catch {}
+		throw "Could not capture process identity: $FileName"
+	}
+	$observed = $processes[[int] $process.Id]
+	$identity = [pscustomobject]@{ ProcessId = [int] $observed.ProcessId; ParentProcessId = [int] $observed.ParentProcessId; CreationDate = [string] $observed.CreationDate }
 	$stdoutTask = $process.StandardOutput.ReadToEndAsync()
 	$stderrTask = $process.StandardError.ReadToEndAsync()
 	return @{
 		Process = $process
+		Identity = $identity
 		StdoutTask = $stdoutTask
 		StderrTask = $stderrTask
 		StdoutPath = $StdoutPath
@@ -481,6 +581,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$manifest = [pscustomobject]@{
 		runId = [IO.Path]::GetFileName($RunDirectory); scenarioId = $scenarioId; provider = [string] $Scenario.provider
 		model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; serviceTier = $serviceTier
+		rosterSize = if ($null -eq $Scenario.PSObject.Properties['rosterSize']) { 1 } else { [int] $Scenario.rosterSize }
 		serverDirectory = $serverDirectory; providerWorkspace = $providerWorkspace; protocolAudit = $protocolAudit; providerTurns = $providerTurns
 		ports = [pscustomobject]@{ minecraft = $serverPort; rcon = $rconPort; bridge = $bridgePort }; levelName = $worldName
 	}
@@ -517,7 +618,9 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$runnerExit = $null
 	$runnerReport = $null
 	$cleanupFailure = $null
-	$processIds = [System.Collections.Generic.List[int]]::new()
+	$processIds = [System.Collections.Generic.List[object]]::new()
+	$peakProcessCount = 0
+	[long] $peakRssBytes = 0
 	try {
 		$serverStdoutPath = Join-Path $logsDirectory 'fabric.stdout.log'
 		$serverStderrPath = Join-Path $logsDirectory 'fabric.stderr.log'
@@ -535,7 +638,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				Complete-RedirectedProcess $serverHandle
 				$bindFailure = $serverHandle.Process.HasExited -and (Test-BindFailure $serverLog $serverStderrPath)
 				if (-not $bindFailure -or $serverAttempt -gt $StartupBindRetries) { throw }
-				Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
+				Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
 				try { Stop-TrackedProcessIds $processIds } catch { throw "Server bind retry cleanup failed: $($_.Exception.Message)" }
 				$serverHandle = $null
 				$bridgePort = Reserve-FreePort (Get-ConfiguredPort 'ARENA_HEADLESS_BRIDGE_PORT')
@@ -550,7 +653,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			}
 		}
 		# Keep the complete server tree tracked before any coordinator retry can restart it.
-		Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
+		Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
 		$coordinatorArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\dynamic-main.mjs')) --config $(Quote-Argument $coordinatorConfig)"
 		$coordinatorStdoutPath = Join-Path $traceDirectory 'dynamic.stdout.log'
 		$coordinatorStderrPath = Join-Path $traceDirectory 'dynamic.stderr.log'
@@ -575,7 +678,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				Complete-RedirectedProcess $coordinatorHandle
 				$bindFailure = $coordinatorHandle.Process.HasExited -and (Test-BindFailure $coordinatorStdoutPath $coordinatorStderrPath)
 				if (-not $bindFailure -or $coordinatorAttempt -gt $CoordinatorBindRetries) { throw }
-				Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Process.Id
+				Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Identity
 				try { Stop-TrackedProcessIds $processIds } catch { throw "Coordinator bind retry cleanup failed: $($_.Exception.Message)" }
 				$coordinatorHandle = $null
 				# The Fabric process owns the bridge listener. Reallocate all three ports and
@@ -594,7 +697,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 				$serverHandle = Start-RedirectedProcess $Java $serverArgs $serverDirectory $serverStdoutPath $serverStderrPath @{}
 				Wait-Condition { (Test-Port $serverPort) -and ((Read-Text $serverLog).Contains('Done (')) } $StartupTimeoutSeconds 'Fabric server did not become ready after coordinator bind retry'
 				Wait-Condition { Test-Port $rconPort } $StartupTimeoutSeconds 'RCON did not become ready after coordinator bind retry'
-				Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
+				Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
 			}
 		}
 		$runnerArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\headless-matrix.mjs')) --config $(Quote-Argument $MatrixFile) --scenario $(Quote-Argument $scenarioId) --run-directory $(Quote-Argument $scenarioDirectory) --rcon-host 127.0.0.1 --rcon-port $rconPort --rcon-password-file $(Quote-Argument $secretPath) --protocol-audit $(Quote-Argument $protocolAudit) --provider-turns $(Quote-Argument $providerTurns)"
@@ -604,10 +707,18 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns
 		}
 		$runnerHandle = Start-RedirectedProcess $Node $runnerArgs (Join-Path $Project 'coordinator') (Join-Path $traceDirectory 'runner.stdout.log') (Join-Path $traceDirectory 'runner.stderr.log') $runnerEnvironment
-		Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
-		Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Process.Id
-		Add-ProcessTreeSnapshot $processIds $runnerHandle.Process.Id
-		if (-not $runnerHandle.Process.WaitForExit(([int] $Scenario.timeoutMs + ($RunnerGraceSeconds * 1000)))) { throw "Scenario '$scenarioId' timed out" }
+		Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
+		Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Identity
+		Add-ProcessTreeSnapshot $processIds $runnerHandle.Identity
+		$runnerDeadline = [DateTime]::UtcNow.AddMilliseconds([int] $Scenario.timeoutMs + ($RunnerGraceSeconds * 1000))
+		try {
+			$resourcePeak = Measure-RunnerResourcesUntilExit $runnerHandle @($serverHandle, $coordinatorHandle, $runnerHandle) $processIds $runnerDeadline
+		} catch {
+			if ($_.Exception.Message -eq 'Scenario runner timed out') { throw "Scenario '$scenarioId' timed out" }
+			throw
+		}
+		$peakProcessCount = [int] $resourcePeak.processCount
+		$peakRssBytes = [long] $resourcePeak.peakRssBytes
 		$runnerExit = $runnerHandle.Process.ExitCode
 		Complete-RedirectedProcess $runnerHandle
 		$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'report.json') $MaxMatrixReportBytes 'runner scenario report'
@@ -619,7 +730,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		$failure = $_
 	} finally {
 		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) {
-			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $processIds $handle.Process.Id }
+			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $processIds $handle.Identity }
 		}
 		if ($null -ne $serverHandle -and $null -ne $serverHandle.Process) {
 			try {
@@ -644,13 +755,26 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	if ($null -ne $runnerReport) {
 		foreach ($property in $runnerReport.PSObject.Properties) { $reportFields[$property.Name] = $property.Value }
 	}
+	$metricFields = [ordered]@{}
+	if ($null -ne $runnerReport -and $null -ne $runnerReport.PSObject.Properties['metrics'] -and $null -ne $runnerReport.metrics) {
+		foreach ($property in $runnerReport.metrics.PSObject.Properties) { $metricFields[$property.Name] = $property.Value }
+	}
+	$resourceFields = [ordered]@{}
+	if ($metricFields.Contains('resources') -and $null -ne $metricFields['resources']) {
+		foreach ($property in $metricFields['resources'].PSObject.Properties) { $resourceFields[$property.Name] = $property.Value }
+	}
+	$resourceFields['processCount'] = $peakProcessCount
+	$resourceFields['peakRssBytes'] = $peakRssBytes
+	if (-not $resourceFields.Contains('minecraftMspt')) { $resourceFields['minecraftMspt'] = $null }
+	$metricFields['resources'] = [pscustomobject] $resourceFields
+	$reportFields['metrics'] = [pscustomobject] $metricFields
 	$reportFields['status'] = $status
 	$reportFields['scenarioId'] = ConvertTo-BoundedText $scenarioId
 	$reportFields['exitCode'] = $runnerExit
 	$reportFields['cleanup'] = [pscustomobject]@{
 		status = $cleanupStatus
 		runner = if ($null -eq $runnerReport) { $null } else { $runnerReport.cleanup }
-		processIds = @($processIds)
+		processIds = @($processIds | ForEach-Object { [int] $_.ProcessId } | Select-Object -Unique)
 		diagnostics = if ($null -eq $cleanupFailure) { $null } else { ConvertTo-BoundedText $cleanupFailure.Exception.Message $MaxDiagnosticText }
 	}
 	$reportFields['artifacts'] = $manifest
@@ -704,6 +828,7 @@ $manifestScenarios = @(
 			model = ConvertTo-BoundedText $scenario.model
 			reasoningEffort = ConvertTo-BoundedText $scenario.reasoningEffort
 			serviceTier = $serviceTier
+			rosterSize = if ($null -eq $scenario.PSObject.Properties['rosterSize']) { 1 } else { [int] $scenario.rosterSize }
 			timeoutMs = if ($null -ne $scenario.PSObject.Properties['timeoutMs']) { [int] $scenario.timeoutMs } else { $null }
 			assertionTypes = @($assertionTypes)
 		}
