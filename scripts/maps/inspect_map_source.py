@@ -8,10 +8,10 @@ import json
 from pathlib import Path
 
 try:
-    from scripts.maps.convert_map_module import _canonical_state, _compound, _list, _tag
+    from scripts.maps.convert_map_module import _canonical_state, _compound, _compound_list_allow_empty_end, _list, _tag
     from scripts.maps.nbt_reader import read_bounded
 except ModuleNotFoundError:  # Direct execution adds scripts/maps, not the repository root.
-    from convert_map_module import _canonical_state, _compound, _list, _tag
+    from convert_map_module import _canonical_state, _compound, _compound_list_allow_empty_end, _list, _tag
     from nbt_reader import read_bounded
 
 
@@ -28,7 +28,7 @@ def inspect_structure(path: str | Path) -> dict[str, object]:
         raise ValueError("randomized multi-palette structures are rejected")
     palette = _list(_tag(structure, "palette", 9), 10, "palette")
     blocks = _list(_tag(structure, "blocks", 9), 10, "blocks")
-    entities = _list(_tag(structure, "entities", 9), 10, "entities")
+    entities = _compound_list_allow_empty_end(_tag(structure, "entities", 9), "entities")
     states = sorted(_canonical_state(_compound(entry, "palette entry"))[2] for entry in palette)
     return {
         "sha256": hashlib.sha256(payload).hexdigest(),

@@ -967,7 +967,6 @@ class FetchMapSourceTests(unittest.TestCase):
             destination = Path(temporary_directory)
             archive = destination / "re-structured.zip"
             archive.write_bytes(b"not the approved archive")
-            checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
             evidence = {
                 "schemaVersion": 1,
                 "sourceKey": "re-structured",
@@ -975,7 +974,7 @@ class FetchMapSourceTests(unittest.TestCase):
                 "filename": "re-structured.zip",
                 "retrievedAtUtc": "2026-08-19T00:00:00Z",
                 "size": archive.stat().st_size,
-                "sha256": checksum,
+                "sha256": "4b552b9100bebf8dece5faf1bedd586be318a03d7279d2ae10b4a53b000a1d33",
             }
             (destination / "re-structured.zip.sha256.json").write_text(
                 json.dumps(evidence), encoding="utf-8"
@@ -993,7 +992,6 @@ class FetchMapSourceTests(unittest.TestCase):
             destination = Path(temporary_directory)
             archive = destination / "re-structured.zip"
             archive.write_bytes(b"x" * 97_543)
-            checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
             evidence = {
                 "schemaVersion": 1,
                 "sourceKey": "re-structured",
@@ -1001,7 +999,7 @@ class FetchMapSourceTests(unittest.TestCase):
                 "filename": "re-structured.zip",
                 "retrievedAtUtc": "2026-08-19T00:00:00Z",
                 "size": archive.stat().st_size,
-                "sha256": checksum,
+                "sha256": "4b552b9100bebf8dece5faf1bedd586be318a03d7279d2ae10b4a53b000a1d33",
             }
             (destination / "re-structured.zip.sha256.json").write_text(
                 json.dumps(evidence), encoding="utf-8"
@@ -1047,6 +1045,7 @@ def nbt_structure(
     blocks: list[tuple[tuple[int, int, int], int, bytes | None]] | None = None,
     entities: list[bytes] | None = None,
     use_palettes: bool = False,
+    empty_entities_tag: int = 10,
 ) -> bytes:
     palette = palette or [("minecraft:stone", {})]
     blocks = blocks or [((0, 0, 0), 0, None)]
@@ -1071,7 +1070,7 @@ def nbt_structure(
         (3, "DataVersion", struct.pack(">i", data_version)),
         (9, "size", nbt_list(3, [struct.pack(">i", value) for value in size])),
         (9, "blocks", nbt_list(10, block_payloads)),
-        (9, "entities", nbt_list(10, entities or [])),
+        (9, "entities", nbt_list(empty_entities_tag if not entities else 10, entities or [])),
     ]
     if use_palettes:
         root_entries.append((9, "palettes", nbt_list(9, [nbt_list(10, palette_payloads)])))
@@ -1284,6 +1283,17 @@ class MapConversionTests(unittest.TestCase):
 
         verify_module(output, self.catalog)
 
+    def test_accepts_vanilla_end_typed_empty_entities_list_only_when_empty(self) -> None:
+        payload = nbt_structure(empty_entities_tag=0)
+        selection, output = self.write_case(payload)
+
+        module = self.convert(selection, output)
+
+        self.assertEqual("test-room", module["id"])
+        from scripts.maps.inspect_map_source import inspect_structure
+
+        self.assertEqual(0, inspect_structure(self.source / "room.nbt")["entityCount"])
+
     def test_equivalent_palette_compound_and_block_order_is_byte_identical(self) -> None:
         first = nbt_structure(
             palette=[("minecraft:stone", {}), ("minecraft:air", {})],
@@ -1405,6 +1415,48 @@ class MapConversionTests(unittest.TestCase):
         self.ledger.write_text(json.dumps(ledger), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "archive evidence"):
             self.convert(selection, output)
+
+    def test_external_selection_requires_bounded_curation_notes(self) -> None:
+        archive_hash = "1" * 64
+        evidence = self.source / "archive-evidence.json"
+        evidence.write_text(
+            json.dumps({"sourceKey": "external", "sha256": archive_hash}),
+            encoding="utf-8",
+        )
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        ledger["sources"]["external"] = {
+            "origin": "external",
+            "bundleEligible": True,
+            "licenseStatus": "verified",
+            "archive": {"sha256": archive_hash},
+        }
+        self.ledger.write_text(json.dumps(ledger), encoding="utf-8")
+        base = {
+            "sourceKey": "external",
+            "archiveEvidence": {"path": evidence.name, "sha256": archive_hash},
+        }
+
+        for curation in (
+            None,
+            {"intendedMechanic": "", "cropNotes": "Full template.", "transformationNotes": "DFU only."},
+            {"intendedMechanic": "x" * 513, "cropNotes": "Full template.", "transformationNotes": "DFU only."},
+            {"intendedMechanic": "Climb", "cropNotes": "Full template."},
+        ):
+            changes = dict(base)
+            if curation is not None:
+                changes["curation"] = curation
+            selection, output = self.write_case(nbt_structure(), selection_changes=changes)
+            with self.subTest(curation=curation), self.assertRaisesRegex(ValueError, "curation"):
+                self.convert(selection, output)
+
+        changes = dict(base)
+        changes["curation"] = {
+            "intendedMechanic": "Climb",
+            "cropNotes": "Full template; no crop.",
+            "transformationNotes": "Official STRUCTURE DFU only.",
+        }
+        selection, output = self.write_case(nbt_structure(), selection_changes=changes)
+        self.assertEqual("test-room", self.convert(selection, output)["id"])
 
     def test_map_tool_scripts_are_directly_executable(self) -> None:
         for script in ("inspect_map_source.py", "convert_map_module.py", "verify_map_modules.py"):

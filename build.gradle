@@ -160,6 +160,7 @@ tasks.named('test') {
 
 def mapBlockStateCatalog = layout.projectDirectory.file('maps/registries/minecraft-26.1.2-block-states.json')
 def mapCatalogExporterClasses = layout.buildDirectory.dir('classes/java/mapCatalogExporter')
+def mapStructureDataFixerClasses = layout.buildDirectory.dir('classes/java/mapStructureDataFixer')
 
 tasks.register('compileMapBlockStateCatalogExporter', JavaCompile) {
 	dependsOn tasks.named('classes')
@@ -194,6 +195,34 @@ tasks.register('exportOwnedMapFixture', JavaExec) {
 	classpath = files(mapCatalogExporterClasses) + sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
 	mainClass.set('dev.agaminggod.arenaagents.scenario.MapBlockStateCatalogExporter')
 	args '--owned-fixture', layout.projectDirectory.file('maps/selections/fixtures/tiny-owned-room.nbt').asFile.absolutePath
+}
+
+tasks.register('compileMapStructureDataFixer', JavaCompile) {
+	dependsOn tasks.named('classes')
+	source = files('src/test/java/dev/agaminggod/arenaagents/scenario/MapStructureDataFixer.java')
+	classpath = sourceSets.test.compileClasspath + sourceSets.main.output
+	destinationDirectory.set(mapStructureDataFixerClasses)
+	options.release = 25
+}
+
+tasks.register('verifyMapStructureDataFixer', JavaExec) {
+	group = 'verification'
+	description = 'Verifies the bounded Minecraft structure-template DataFixer seam.'
+	dependsOn tasks.named('compileMapStructureDataFixer')
+	classpath = files(mapStructureDataFixerClasses) + sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.scenario.MapStructureDataFixer')
+	args '--self-test'
+}
+
+tasks.register('upgradeMapStructure', JavaExec) {
+	group = 'verification'
+	description = 'Upgrades one ignored structure-template NBT with Minecraft STRUCTURE DataFixerUpper.'
+	dependsOn tasks.named('compileMapStructureDataFixer')
+	classpath = files(mapStructureDataFixerClasses) + sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.scenario.MapStructureDataFixer')
+	if (project.hasProperty('mapInput') && project.hasProperty('mapOutput')) {
+		args project.property('mapInput'), project.property('mapOutput')
+	}
 }
 
 tasks.named('check') {

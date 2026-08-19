@@ -29,6 +29,7 @@ _SELECTION_KEYS = {
     "sourceKey",
     "input",
     "archiveEvidence",
+    "curation",
     "difficulty",
     "bounds",
     "allowedTransforms",
@@ -196,6 +197,16 @@ def _list(value: object, element_tag: int, description: str) -> tuple[object, ..
     return value.values
 
 
+def _compound_list_allow_empty_end(value: object, description: str) -> tuple[object, ...]:
+    if not isinstance(value, NbtList):
+        raise ValueError(f"{description} must be an NBT list")
+    if value.element_tag_id == 10:
+        return value.values
+    if value.element_tag_id == 0 and not value.values:
+        return value.values
+    raise ValueError(f"{description} must be a compound list or an End-typed empty list")
+
+
 def _canonical_state(entry: dict[str, NbtTag]) -> tuple[str, dict[str, str], str]:
     unknown = set(entry) - {"Name", "Properties"}
     if unknown:
@@ -242,7 +253,7 @@ def _load_catalog(path: Path) -> set[str]:
     return set(states)
 
 
-def _validate_provenance(selection: dict[str, Any], ledger_path: Path, source_root: Path) -> None:
+def _validate_provenance(selection: dict[str, Any], ledger_path: Path, source_root: Path) -> bool:
     ledger = _expect_object(strict_json_load(ledger_path), "source ledger", set(strict_json_load(ledger_path).keys()), required={"sources"})
     sources = ledger["sources"]
     if not isinstance(sources, dict) or selection["sourceKey"] not in sources:
@@ -253,7 +264,7 @@ def _validate_provenance(selection: dict[str, Any], ledger_path: Path, source_ro
     if source.get("origin") == "project-owned":
         if "archiveEvidence" in selection:
             raise ValueError("project-owned selection must not declare archive evidence")
-        return
+        return False
     evidence_record = selection.get("archiveEvidence")
     if not isinstance(evidence_record, dict):
         raise ValueError("external selection requires locked archive evidence")
@@ -267,6 +278,22 @@ def _validate_provenance(selection: dict[str, Any], ledger_path: Path, source_ro
     evidence = strict_json_load(evidence_path)
     if not isinstance(evidence, dict) or evidence.get("sourceKey") != selection["sourceKey"] or evidence.get("sha256") != expected:
         raise ValueError("archive evidence content does not bind the selected source")
+    return True
+
+
+def _validate_curation(selection: dict[str, Any], external: bool) -> None:
+    if not external:
+        if "curation" in selection:
+            raise ValueError("project-owned selection must not declare external curation notes")
+        return
+    notes = _expect_object(
+        selection.get("curation"),
+        "curation",
+        {"intendedMechanic", "cropNotes", "transformationNotes"},
+    )
+    for key, value in notes.items():
+        if not isinstance(value, str) or value != value.strip() or not 1 <= len(value) <= 512:
+            raise ValueError(f"curation {key} must be a trimmed nonblank string of at most 512 characters")
 
 
 def convert_selection(
@@ -297,7 +324,7 @@ def convert_selection(
         strict_json_load(selection_file),
         "selection",
         _SELECTION_KEYS,
-        required=_SELECTION_KEYS - {"archiveEvidence"},
+        required=_SELECTION_KEYS - {"archiveEvidence", "curation"},
     )
     if selection["schemaVersion"] != 1:
         raise ValueError("selection schemaVersion must be 1")
@@ -307,7 +334,8 @@ def convert_selection(
     if not isinstance(selection["sourceKey"], str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", selection["sourceKey"]):
         raise ValueError("selection sourceKey is invalid")
     _expect_int(selection["difficulty"], "difficulty", 1, 5)
-    _validate_provenance(selection, Path(ledger_path), source)
+    external = _validate_provenance(selection, Path(ledger_path), source)
+    _validate_curation(selection, external)
 
     input_record = _expect_object(selection["input"], "selection input", {"path", "sha256"})
     relative_input = _relative_input(input_record["path"])
@@ -374,7 +402,7 @@ def convert_selection(
             raise ValueError(f"state is absent from the exact 26.1.2 catalog: {canonical}")
         source_palette.append((block_id, properties, canonical))
 
-    entity_values = _list(_tag(structure, "entities", 9), 10, "entities")
+    entity_values = _compound_list_allow_empty_end(_tag(structure, "entities", 9), "entities")
     blocks = _list(_tag(structure, "blocks", 9), 10, "blocks")
     expected_removed = _expect_object(selection["expectedRemoved"], "expectedRemoved", {"entities", "blockEntities"})
     expected_entities = _expect_int(expected_removed["entities"], "expectedRemoved entities", 0)
