@@ -16,8 +16,18 @@ public final class AgentRosterViewState {
 	private int currentPage = 1;
 
 	public void reconcile(List<AgentRosterEntry> entries) {
-		roster = List.copyOf(Objects.requireNonNull(entries, "entries"));
-		selectedIds.removeIf(id -> entryIndex(id, roster) < 0);
+		List<AgentRosterEntry> candidateRoster = List.copyOf(Objects.requireNonNull(entries, "entries"));
+		Set<String> candidateIds = new HashSet<>();
+		for (AgentRosterEntry entry : candidateRoster) {
+			if (!candidateIds.add(entry.id())) {
+				throw new IllegalArgumentException("Duplicate agent roster ID: " + entry.id());
+			}
+		}
+		roster = candidateRoster;
+		selectedIds.removeIf(id -> {
+			AgentRosterEntry entry = entry(id);
+			return entry == null || !entry.selectable();
+		});
 		if (entryIndex(focusedId, roster) >= 0) {
 			return;
 		}
@@ -66,6 +76,7 @@ public final class AgentRosterViewState {
 		}
 		rangeAnchorId = id;
 		if (!entry.selectable()) {
+			selectedIds.remove(id);
 			return;
 		}
 		if (!selectedIds.add(id)) {

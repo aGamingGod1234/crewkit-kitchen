@@ -15,6 +15,8 @@ public final class AgentRosterViewStateVerification {
 		assertions += verifyRangeAndFilteredSelection();
 		assertions += verifyPagingAtRosterBounds();
 		assertions += verifyReconciliationAndSnapshots();
+		assertions += verifyInvalidAuthoritativeRostersAreAtomic();
+		assertions += verifyUnavailableSelectionReconciliation();
 		return assertions;
 	}
 
@@ -160,6 +162,61 @@ public final class AgentRosterViewStateVerification {
 		return 7;
 	}
 
+	private static int verifyUnavailableSelectionReconciliation() {
+		AgentRosterViewState state = new AgentRosterViewState();
+		state.reconcile(List.of(entry(1, false), entry(2, true)));
+		state.focus("agent-2");
+		state.toggle("agent-2");
+		assertEquals(List.of("agent-2"), List.copyOf(state.selectedIds()),
+				"available entry can enter explicit scope");
+
+		state.reconcile(List.of(entry(1, false), unavailableEntry(2)));
+		assertEquals(Set.of(), state.selectedIds(),
+				"entry becoming unavailable is pruned from explicit scope");
+		assertEquals("agent-2", state.focusedId(),
+				"unavailable focused entry remains inspectable after reconciliation");
+		assertEquals(0, state.page(8).hiddenSelectedCount(),
+				"pruned unavailable entry is not retained as hidden selection");
+		state.toggle("agent-2");
+		assertEquals(Set.of(), state.selectedIds(),
+				"unavailable entry cannot be restored to explicit scope by toggling");
+		return 5;
+	}
+
+	private static int verifyInvalidAuthoritativeRostersAreAtomic() {
+		AgentRosterViewState state = new AgentRosterViewState();
+		state.reconcile(entries(3, Set.of()));
+		state.focus("agent-2");
+		state.toggle("agent-2");
+		AgentRosterPage before = state.page(8);
+		AgentRosterEntry duplicate = new AgentRosterEntry(
+				"agent-1", "Duplicate", "kimi", "K3", "Idle", true, ""
+		);
+
+		expectFailure(() -> state.reconcile(List.of(entry(1, false), duplicate)),
+				"duplicate authoritative roster ID");
+		assertEquals(before, state.page(8), "duplicate rejection preserves the previous roster page");
+		assertEquals("agent-2", state.focusedId(), "duplicate rejection preserves focus");
+		assertEquals(List.of("agent-2"), List.copyOf(state.selectedIds()),
+				"duplicate rejection preserves explicit selection");
+
+		ArrayList<AgentRosterEntry> rosterWithNull = new ArrayList<>();
+		rosterWithNull.add(entry(1, false));
+		rosterWithNull.add(null);
+		expectNullFailure(() -> state.reconcile(rosterWithNull), "null authoritative roster entry");
+		assertEquals(before, state.page(8), "null-entry rejection preserves the previous roster page");
+		assertEquals("agent-2", state.focusedId(), "null-entry rejection preserves focus");
+		assertEquals(List.of("agent-2"), List.copyOf(state.selectedIds()),
+				"null-entry rejection preserves explicit selection");
+
+		expectNullFailure(() -> state.reconcile(null), "null authoritative roster");
+		assertEquals(before, state.page(8), "null-list rejection preserves the previous roster page");
+		assertEquals("agent-2", state.focusedId(), "null-list rejection preserves focus");
+		assertEquals(List.of("agent-2"), List.copyOf(state.selectedIds()),
+				"null-list rejection preserves explicit selection");
+		return 12;
+	}
+
 	private static List<AgentRosterEntry> entries(int count, Set<String> unavailableIds) {
 		ArrayList<AgentRosterEntry> entries = new ArrayList<>();
 		for (int index = 1; index <= count; index++) {
@@ -186,6 +243,13 @@ public final class AgentRosterViewStateVerification {
 		);
 	}
 
+	private static AgentRosterEntry unavailableEntry(int index) {
+		AgentRosterEntry entry = entry(index, false);
+		return new AgentRosterEntry(
+				entry.id(), entry.name(), entry.provider(), entry.modelLabel(), entry.state(), false, "Disconnected"
+		);
+	}
+
 	private static void expectFailure(Runnable operation, String label) {
 		try {
 			operation.run();
@@ -200,6 +264,15 @@ public final class AgentRosterViewStateVerification {
 			operation.run();
 			throw new AssertionError(label + " should fail");
 		} catch (UnsupportedOperationException expected) {
+			// Expected.
+		}
+	}
+
+	private static void expectNullFailure(Runnable operation, String label) {
+		try {
+			operation.run();
+			throw new AssertionError(label + " should fail");
+		} catch (NullPointerException expected) {
 			// Expected.
 		}
 	}
