@@ -79,6 +79,10 @@ public final class AgentVisualIdentity {
 		));
 	}
 
+	static void validateManifest(String encoded) {
+		parseManifest(requireObject(JsonParser.parseString(requireText(encoded, "manifest")), "manifest"));
+	}
+
 	private static Manifest loadManifest() {
 		try (InputStream stream = AgentVisualIdentity.class.getClassLoader().getResourceAsStream(MANIFEST_RESOURCE)) {
 			if (stream == null) throw invalid("missing classpath resource " + MANIFEST_RESOURCE);
@@ -227,8 +231,8 @@ public final class AgentVisualIdentity {
 			throw invalid(label + "." + key + " must be an integer");
 		}
 		try {
-			return value.getAsInt();
-		} catch (NumberFormatException exception) {
+			return value.getAsBigDecimal().intValueExact();
+		} catch (ArithmeticException | NumberFormatException exception) {
 			throw invalid(label + "." + key + " must be an integer");
 		}
 	}

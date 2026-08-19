@@ -1,10 +1,16 @@
 package dev.agaminggod.arenaagents.agent;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 public final class AgentIdentityVerification {
 	private AgentIdentityVerification() {
@@ -102,7 +108,73 @@ public final class AgentIdentityVerification {
 				"unknown model fallback is deterministic");
 		assertTrue(AgentVisualIdentity.resolveTransportCode("not-a-transport-code").isEmpty(),
 				"unknown transport identity is rejected");
-		return 470;
+
+		expectInvalidManifest(manifestWith(root -> root.addProperty("schemaVersion", 1.5D)),
+				"schemaVersion must be an integer", "fractional manifest schema rejected");
+		expectInvalidManifest(manifestWith(root -> root.addProperty("schemaVersion", 2_147_483_648L)),
+				"schemaVersion must be an integer", "out-of-range manifest schema rejected");
+		expectInvalidManifest(manifestWith(root -> root.addProperty("schemaVersion", 2)),
+				"schemaVersion must be 1", "wrong manifest schema rejected");
+		expectInvalidManifest(manifestWith(root -> root.addProperty("unexpected", true)),
+				"unknown keys [unexpected]", "unknown manifest key rejected");
+		expectInvalidManifest(manifestWith(root -> {
+			JsonObject cursorProvider = root.getAsJsonArray("providers").get(3).getAsJsonObject();
+			cursorProvider.addProperty("key", "codex");
+			cursorProvider.getAsJsonArray("families").forEach(family ->
+					family.getAsJsonObject().getAsJsonArray("variants").forEach(variant -> {
+						JsonObject value = variant.getAsJsonObject();
+						value.addProperty("texturePath", value.get("texturePath").getAsString()
+								.replace("cursor_", "codex_"));
+					}));
+		}), "duplicate provider: codex", "duplicate manifest provider rejected");
+		expectInvalidManifest(manifestWith(root -> root.getAsJsonArray("providers").get(0).getAsJsonObject()
+				.getAsJsonArray("families").get(1).getAsJsonObject().addProperty("key", "sol")),
+				"duplicate family sol", "duplicate manifest family rejected");
+		expectInvalidManifest(manifestWith(root -> {
+			var variants = root.getAsJsonArray("providers").get(0).getAsJsonObject()
+					.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants");
+			variants.get(1).getAsJsonObject().addProperty("transportCode",
+					variants.get(0).getAsJsonObject().get("transportCode").getAsString());
+		}), "duplicate transport code: c00", "duplicate manifest transport code rejected");
+		expectInvalidManifest(manifestWith(root -> root.getAsJsonArray("providers").get(0).getAsJsonObject()
+				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").remove(3)),
+				"must declare exactly four variants", "invalid manifest variant count rejected");
+		expectInvalidManifest(manifestWith(root -> root.getAsJsonArray("providers").get(0).getAsJsonObject()
+				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
+				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
+				"project-owned codex entity texture", "non-project manifest texture rejected");
+		return 488;
+	}
+
+	private static String manifestWith(Consumer<JsonObject> mutation) {
+		try (var stream = AgentIdentityVerification.class.getClassLoader().getResourceAsStream(
+				"assets/arenaagents/identity/agent_visual_manifest.json")) {
+			if (stream == null) throw new AssertionError("agent visual manifest fixture is missing");
+			JsonObject root = JsonParser.parseString(new String(stream.readAllBytes(), StandardCharsets.UTF_8))
+					.getAsJsonObject();
+			mutation.accept(root);
+			return root.toString();
+		} catch (IOException exception) {
+			throw new AssertionError("agent visual manifest fixture could not be read", exception);
+		}
+	}
+
+	private static void expectInvalidManifest(String manifest, String expectedMessagePart, String label) {
+		String firstMessage = invalidManifestMessage(manifest, label);
+		String secondMessage = invalidManifestMessage(manifest, label);
+		assertTrue(firstMessage.contains(expectedMessagePart), label + " reports its cause");
+		assertEquals(firstMessage, secondMessage, label + " is stable");
+	}
+
+	private static String invalidManifestMessage(String manifest, String label) {
+		try {
+			AgentVisualIdentity.validateManifest(manifest);
+		} catch (IllegalStateException exception) {
+			return exception.getMessage();
+		} catch (RuntimeException exception) {
+			throw new AssertionError(label + " threw " + exception.getClass().getSimpleName(), exception);
+		}
+		throw new AssertionError(label + ": expected invalid manifest rejection");
 	}
 
 	private record ModelCase(String provider, String slug, String chassis, String family) {
