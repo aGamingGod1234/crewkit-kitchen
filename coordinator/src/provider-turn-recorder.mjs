@@ -8,7 +8,6 @@ const SENSITIVE_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?toke
 const SECRET_SHAPED_TEXT = /((?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 const BEARER_TEXT = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const QUOTED_SECRET_KEY = /(["'])(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\1\s*:\s*(["'])/gi;
-const PATH_TEXT = /(?:[A-Za-z]:\\[^\s\]]+|(?:^|\s)\/[^\s]+)/g;
 
 /** Bounded, serialized provider-turn capture with private source and public evidence. */
 export class ProviderTurnRecorder {
@@ -93,7 +92,6 @@ function privateRecord(row) {
 	const result = { ...row };
 	result.input = redactAndBound(row.input, MAX_PRIVATE_TEXT_BYTES);
 	result.output = redactAndBound(row.output, MAX_PRIVATE_TEXT_BYTES);
-	if (row.error !== undefined) result.error = { code: row.error.code, message: redactAndBound(row.error.message, 2_048) };
 	return boundRow(result);
 }
 
@@ -118,7 +116,7 @@ function publicRecord(row) {
 		outputHash: hash(row.output),
 		inputExcerpt: redactAndBound(row.input, MAX_PUBLIC_EXCERPT_BYTES),
 		outputExcerpt: redactAndBound(row.output, MAX_PUBLIC_EXCERPT_BYTES),
-		...(row.error === undefined ? {} : { error: { code: row.error.code, message: redactAndBound(row.error.message, MAX_PUBLIC_EXCERPT_BYTES) } }),
+		...(row.error === undefined ? {} : { error: row.error }),
 	};
 }
 
@@ -151,9 +149,19 @@ function boundedDuration(value, field) {
 
 function normalizeError(value) {
 	if (value === null || value === undefined) return null;
-	const code = boundedMeta(value?.code ?? 'PROVIDER_ERROR') ?? 'PROVIDER_ERROR';
-	const message = normalizeText(value?.message ?? value);
-	return { code, message: message.replace(PATH_TEXT, ' [PATH]') };
+	const code = typeof value?.code === 'string' && /^[A-Z0-9_]{1,128}$/.test(value.code) ? value.code : 'PROVIDER_ERROR';
+	const category = ['decision_parse', 'rate_limit', 'timeout', 'cancelled', 'transport', 'provider'].includes(value?.category)
+		? value.category : providerErrorCategory(code);
+	return { code, category };
+}
+
+function providerErrorCategory(code) {
+	if (/DECISION|PLANNER_OUTPUT/.test(code)) return 'decision_parse';
+	if (/RATE|LIMIT/.test(code)) return 'rate_limit';
+	if (/TIMEOUT/.test(code)) return 'timeout';
+	if (/CANCEL|STALE/.test(code)) return 'cancelled';
+	if (/RPC|TRANSPORT|PROCESS|SPAWN/.test(code)) return 'transport';
+	return 'provider';
 }
 
 function normalizeText(value) {

@@ -31,7 +31,7 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('${wrapper}', [ref] $tokens, [ref] $errors)
 if ($errors.Count -gt 0) { throw $errors[0].Message }
-$required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit')
+$required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit')
 $definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name }, $true))
 foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Text }
 $script:PollMilliseconds = 10
@@ -55,7 +55,7 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('${wrapper}', [ref] $tokens, [ref] $errors)
 if ($errors.Count -gt 0) { throw $errors[0].Message }
-$required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Stop-TrackedProcessIds', 'Assert-TrackedProcessIdsGone')
+$required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Stop-TrackedProcessIds', 'Assert-TrackedProcessIdsGone')
 $definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name }, $true))
 foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Text }
 $script:CleanupTimeoutSeconds = 1
@@ -63,7 +63,10 @@ $script:PollMilliseconds = 1
 $script:stopped = @()
 $script:currentCreation = 'NEW'
 $script:currentParent = 1
-function Get-CimInstance { [pscustomobject]@{ ProcessId = 4242; ParentProcessId = $script:currentParent; CreationDate = $script:currentCreation; WorkingSetSize = 9999 } }
+function Get-CimInstance { @(
+	[pscustomobject]@{ ProcessId = 4242; ParentProcessId = $script:currentParent; CreationDate = $script:currentCreation; WorkingSetSize = 9999 },
+	[pscustomobject]@{ ProcessId = 4243; ParentProcessId = 4242; CreationDate = '999999'; WorkingSetSize = 8888 }
+) }
 function Stop-Process { param([int] $Id) $script:stopped += $Id }
 $tracked = [System.Collections.Generic.List[object]]::new()
 $tracked.Add([pscustomobject]@{ ProcessId = 4242; ParentProcessId = 1; CreationDate = 'OLD' })
@@ -73,11 +76,43 @@ $script:currentParent = 999
 $ancestrySample = Get-TrackedResourceSnapshot $tracked
 Stop-TrackedProcessIds $tracked
 Assert-TrackedProcessIdsGone $tracked
-[pscustomobject]@{ count = $sample.processCount; rss = $sample.rssBytes; ancestryCount = $ancestrySample.processCount; stopped = @($script:stopped) } | ConvertTo-Json -Compress
+[pscustomobject]@{ count = $sample.processCount; rss = $sample.rssBytes; ancestryCount = $ancestrySample.processCount; tracked = @($tracked | ForEach-Object { $_.ProcessId }); stopped = @($script:stopped) } | ConvertTo-Json -Compress
 `;
 	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
 	assert.equal(result.status, 0, result.stderr || result.stdout);
-	assert.deepEqual(JSON.parse(result.stdout.trim()), { count: 0, rss: 0, ancestryCount: 0, stopped: [] });
+	assert.deepEqual(JSON.parse(result.stdout.trim()), { count: 0, rss: 0, ancestryCount: 0, tracked: [4242], stopped: [] });
+});
+
+test('PowerShell final snapshot adopts and cleans an authentic late child after its parent exits', () => {
+	const wrapper = path.resolve('../scripts/run-headless-provider-matrix.ps1').replaceAll("'", "''");
+	const script = `
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('${wrapper}', [ref] $tokens, [ref] $errors)
+if ($errors.Count -gt 0) { throw $errors[0].Message }
+$required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit', 'Stop-TrackedProcessIds')
+$definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name }, $true))
+foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Text }
+$script:CleanupTimeoutSeconds = 1
+$script:PollMilliseconds = 1
+$script:childLive = $true
+$script:stopped = @()
+function Get-CimInstance {
+	if (-not $script:childLive) { return @() }
+	return @([pscustomobject]@{ ProcessId = 20; ParentProcessId = 10; CreationDate = '200'; WorkingSetSize = 4000 })
+}
+function Stop-Process { param([int] $Id) $script:stopped += $Id; if ($Id -eq 20) { $script:childLive = $false } }
+$tracked = [System.Collections.Generic.List[object]]::new()
+$root = [pscustomobject]@{ ProcessId = 10; ParentProcessId = 1; CreationDate = '100' }
+$tracked.Add($root)
+$runner = @{ Process = [pscustomobject]@{ HasExited = $true }; Identity = $root }
+$peak = Measure-RunnerResourcesUntilExit $runner @($runner) $tracked ([DateTime]::UtcNow.AddSeconds(1))
+Stop-TrackedProcessIds $tracked
+[pscustomobject]@{ tracked = @($tracked | ForEach-Object { $_.ProcessId }); count = $peak.processCount; rss = $peak.peakRssBytes; stopped = @($script:stopped) } | ConvertTo-Json -Compress
+`;
+	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
+	assert.equal(result.status, 0, result.stderr || result.stdout);
+	assert.deepEqual(JSON.parse(result.stdout.trim()), { tracked: [10, 20], count: 1, rss: 4000, stopped: [20] });
 });
 
 test('runs a real-provider scenario with exact RCON sequence and injected evidence', async () => {
@@ -290,11 +325,13 @@ test('reports bounded p50 p95 p99 metrics and null provider-native token categor
 		{ agentId, provider: 'codex', model: 'gpt-5.6-sol', retry: false, outcome: 'success', timing: { queueWaitMs: 1, durationMs: 10, apiDurationMs: 8 }, tokens: { input: 10, output: 2, reasoning: 1, cached: 3, cacheWrite: null } },
 		{ agentId, provider: 'codex', model: 'gpt-5.6-sol', retry: true, outcome: 'error', error: { code: 'RATE_LIMITED', message: 'bounded' }, rateLimited: true, compaction: true, timing: { queueWaitMs: 9, durationMs: 90, apiDurationMs: 80 }, tokens: { input: 20, output: 4, reasoning: 2, cached: 6, cacheWrite: null } },
 	];
-	const protocolRows = [1, 5, 9].flatMap((value, index) => [
+	const protocolRows = [{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId, payload: {
+		agentId, name: agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+	} } }, ...[1, 5, 9].flatMap((value, index) => [
 		{ timestamp: index * 100, direction: 'server_to_coordinator', envelope: { type: 'observation', agentId, payload: { metrics: { collectionMs: value } } } },
 		{ timestamp: index * 100 + 20, direction: 'server_to_coordinator', envelope: { type: 'action_result', agentId, payload: {} } },
 		{ timestamp: index * 100 + 20 + value, direction: 'server_to_coordinator', envelope: { type: 'observation', agentId, payload: {} } },
-	]);
+	])];
 	const files = new Map([
 		['provider.jsonl', jsonl(providerRows)],
 		['protocol.jsonl', jsonl(protocolRows)],
@@ -335,6 +372,71 @@ test('binds single-agent metrics to the authoritative snapshot ID instead of the
 		readFile: async (file) => files.get(String(file).replace('C:/', '')) ?? '', writeFile: async () => {}, poll: async () => {},
 	});
 	assert.deepEqual(report.metrics.latencyMs.inference, { count: 1, p50: 10, p95: 10, p99: 10 });
+});
+
+test('evaluates single-agent assertions only after exact authoritative identity isolation', async () => {
+	const generatedName = 'headless_runner_case_2s';
+	const files = new Map([
+		['protocol.jsonl', jsonl([
+			{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'authoritative', payload: { agentId: 'authoritative', name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } } },
+			{ direction: 'server_to_coordinator', envelope: { type: 'chat', agentId: 'unrelated', payload: { agentId: 'unrelated', message: 'UNRELATED_ONLY' } } },
+		])],
+		['coordinator.jsonl', jsonl([{ agentId: 'unrelated', event: 'chat', message: 'UNRELATED_ONLY' }])],
+		['server.log', 'unrelated chat: UNRELATED_ONLY\n'],
+	]);
+	const report = await runHeadlessScenario({
+		scenario: scenario({ timeoutMs: 1, assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'chat', message: 'UNRELATED_ONLY' }] }),
+		runDirectory: 'C:/runs/single-assertion-isolation',
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? `Created ${generatedName}. It is ready for a task.` : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		now: () => 100, protocolAudit: 'C:/protocol.jsonl',
+		readFile: async (file) => files.get(String(file).replace('C:/', '')) ?? '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.classification, 'ASSERTION_MISMATCH');
+	assert.deepEqual(report.assertions.find((entry) => entry.type === 'chat').actual, []);
+	assert.doesNotMatch(JSON.stringify(report.evidence), /UNRELATED_ONLY/);
+});
+
+test('aggregates concurrent metrics from exact member IDs and preserves per-agent metrics', async () => {
+	const names = [];
+	const providerRows = Array.from({ length: 8 }, (_value, index) => ({
+		agentId: `metric-agent-${index + 1}`, provider: 'codex', model: 'gpt-5.6-sol', retry: index === 1,
+		rateLimited: index === 2, compaction: index === 3,
+		timing: { queueWaitMs: index + 1, durationMs: 20 + index, apiDurationMs: 10 + index },
+		tokens: { input: index + 1, output: 1, reasoning: 0, cached: 0, cacheWrite: 0 },
+	}));
+	const report = await runHeadlessScenario({
+		scenario: scenario({ rosterSize: 8, assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/concurrent-metrics',
+		rcon: { command: async (command) => {
+			if (command.includes('summon-configured')) { const name = command.split(' ').at(-1); names.push(name); return { text: `Created ${name}. It is ready for a task.` }; }
+			return { text: command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
+		}, close: async () => {} },
+		now: () => 100, providerTurnsPath: 'C:/provider.jsonl', protocolAudit: 'C:/protocol.jsonl',
+		readFile: async (file) => {
+			if (String(file).endsWith('provider.jsonl')) return jsonl(providerRows);
+			if (String(file).endsWith('protocol.jsonl')) return jsonl(names.map((name, index) => ({ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `metric-agent-${index + 1}`, payload: { agentId: `metric-agent-${index + 1}`, name, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } } })));
+			return '';
+		}, writeFile: async () => {}, poll: async () => {},
+	});
+	assert.deepEqual(report.metrics.latencyMs.queue, { count: 8, p50: 4, p95: 8, p99: 8 });
+	assert.deepEqual(report.metrics.tokens, { input: 36, output: 8, reasoning: 0, cached: 0, cacheWrite: 0 });
+	assert.deepEqual({ retries: report.metrics.retries, rateLimits: report.metrics.rateLimits, compactions: report.metrics.compactions }, { retries: 1, rateLimits: 1, compactions: 1 });
+	assert.ok(report.agents.every((agent) => agent.metrics.latencyMs.queue.count === 1 && agent.metrics.tokens.output === 1));
+});
+
+test('provider turn summaries expose only allowlisted structured errors', async () => {
+	const generatedName = 'headless_runner_case_2s';
+	const secret = 'ARBITRARY_MODEL_SECRET_TEXT';
+	const files = new Map([
+		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'summary-agent', payload: { agentId: 'summary-agent', name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } } }])],
+		['provider.jsonl', jsonl([{ agentId: 'summary-agent', provider: 'codex', model: 'gpt-5.6-sol', outcome: 'error', error: { code: 'MALFORMED_DECISION', category: 'decision_parse', message: secret, data: { prompt: secret } }, timing: { durationMs: 5, apiDurationMs: 4 } }])],
+	]);
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/summary-error',
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? `Created ${generatedName}. It is ready for a task.` : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		now: () => 100, providerTurnsPath: 'C:/provider.jsonl', protocolAudit: 'C:/protocol.jsonl', readFile: async (file) => files.get(String(file).replace('C:/', '')) ?? '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.doesNotMatch(JSON.stringify(report), new RegExp(secret));
+	assert.deepEqual(report.timings.turns[0].error, { code: 'MALFORMED_DECISION', category: 'decision_parse' });
 });
 
 test('fails closed when single-agent authoritative snapshot identity is missing', async () => {

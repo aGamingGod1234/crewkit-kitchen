@@ -182,13 +182,9 @@ function requireKimiEffort(value) {
 	return value;
 }
 
-function rpcErrorMessage(error) {
-	if (typeof error?.message === 'string') return error.message;
-	return JSON.stringify(error);
-}
-
 function rpcProtocolError(method, value) {
-	const error = new AcpProtocolError('RPC_ERROR', `${method}: ${rpcErrorMessage(value)}`);
+	const error = new AcpProtocolError('RPC_ERROR', `${method}: ACP provider returned an RPC error`);
+	error.category = 'transport';
 	if (Number.isSafeInteger(value?.code)) error.rpcCode = value.code;
 	const status = [value?.status, value?.statusCode, value?.httpStatusCode, value?.data?.status, value?.data?.statusCode, value?.data?.httpStatusCode]
 		.find((candidate) => Number.isSafeInteger(candidate) && candidate >= 100 && candidate <= 599);

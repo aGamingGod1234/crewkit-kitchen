@@ -186,13 +186,14 @@ class CursorAgent {
 			let parseError = null;
 			try { decision = parseDecision(result.result.trim()); }
 			catch (error) {
-				parseError = new AcpProtocolError(error?.code ?? 'INVALID_DECISION', `cursor returned an invalid planner decision: ${error?.message ?? String(error)} [output=${excerpt(result.result)}]`, { cause: error });
+				parseError = new AcpProtocolError(error?.code ?? 'INVALID_DECISION', 'cursor returned an invalid planner decision', { cause: error });
+				parseError.category = 'decision_parse';
 			}
 			outputHandled = true;
 			await recordProviderTurn(turnRecorder, {
 				agentId: this.agentId,
 				provider: 'cursor', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
-				goalRevision, attempt, retry, input: prompt, output: result.result, error: parseError, timing,
+				goalRevision, attempt, retry, input: prompt, output: parseError === null ? result.result : '', error: structuredProviderError(parseError), timing,
 				...(result.tokens === null ? {} : { tokens: result.tokens }),
 			});
 			if (parseError !== null) throw parseError;
@@ -224,6 +225,7 @@ class CursorAgent {
 }
 
 function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
+function structuredProviderError(error) { return error === null ? null : { code: typeof error.code === 'string' ? error.code : 'PROVIDER_ERROR', category: error.category === 'decision_parse' ? 'decision_parse' : 'provider' }; }
 
 export function buildCursorLaunch(profile, configValue = {}, dependencies = {}) {
 	const platform = dependencies.platform ?? process.platform;

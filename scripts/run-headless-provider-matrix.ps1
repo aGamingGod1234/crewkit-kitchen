@@ -164,14 +164,20 @@ function Test-ProcessIdentityMatch($Identity, $Process) {
 		-and $null -ne $expectedCreation -and $expectedCreation -eq $actualCreation
 }
 
+function Test-ChildCreationAfterParent($Parent, $Child) {
+	[long] $parentTicks = 0
+	[long] $childTicks = 0
+	if (-not [long]::TryParse((ConvertTo-ProcessCreationKey $Parent.CreationDate), [ref] $parentTicks)) { return $false }
+	if (-not [long]::TryParse((ConvertTo-ProcessCreationKey $Child.CreationDate), [ref] $childTicks)) { return $false }
+	return $childTicks -ge $parentTicks
+}
+
 function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities, $ProcessIdentity) {
 	$processes = Get-ProcessSnapshot
 	$rootId = if ($ProcessIdentity -is [int]) { [int] $ProcessIdentity } else { [int] $ProcessIdentity.ProcessId }
-	if ($rootId -le 0 -or -not $processes.ContainsKey($rootId)) { return }
+	if ($rootId -le 0) { return }
 	$expectedRoot = if ($ProcessIdentity -is [int]) { $null } else { $ProcessIdentity }
-	if ($null -ne $expectedRoot -and -not (Test-ProcessIdentityMatch $expectedRoot $processes[$rootId])) { return }
 	$existingRoot = @($ProcessIdentities.ToArray() | Where-Object { [int] $_.ProcessId -eq $rootId } | Select-Object -First 1)
-	if ($existingRoot.Count -gt 0 -and -not (Test-ProcessIdentityMatch $existingRoot[0] $processes[$rootId])) { return }
 
 	$childrenByParent = @{}
 	foreach ($process in $processes.Values) {
@@ -181,7 +187,18 @@ function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $Proc
 	}
 	$pending = [System.Collections.Generic.Queue[object]]::new()
 	$visited = [System.Collections.Generic.HashSet[int]]::new()
-	$pending.Enqueue($processes[$rootId])
+	if ($processes.ContainsKey($rootId)) {
+		if ($null -ne $expectedRoot -and -not (Test-ProcessIdentityMatch $expectedRoot $processes[$rootId])) { return }
+		if ($existingRoot.Count -gt 0 -and -not (Test-ProcessIdentityMatch $existingRoot[0] $processes[$rootId])) { return }
+		$pending.Enqueue($processes[$rootId])
+	} else {
+		if ($null -eq $expectedRoot -or $existingRoot.Count -eq 0 -or -not (Test-ProcessIdentityMatch $expectedRoot $existingRoot[0])) { return }
+		if ($childrenByParent.ContainsKey($rootId)) {
+			foreach ($child in $childrenByParent[$rootId]) {
+				if (Test-ChildCreationAfterParent $expectedRoot $child) { $pending.Enqueue($child) }
+			}
+		}
+	}
 	while ($pending.Count -gt 0) {
 		$current = $pending.Dequeue()
 		$currentId = [int] $current.ProcessId
@@ -191,7 +208,11 @@ function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $Proc
 		if ($existing.Count -eq 0) {
 			$ProcessIdentities.Add([pscustomobject]@{ ProcessId = $currentId; ParentProcessId = [int] $current.ParentProcessId; CreationDate = [string] $current.CreationDate })
 		}
-		if ($childrenByParent.ContainsKey($currentId)) { foreach ($child in $childrenByParent[$currentId]) { $pending.Enqueue($child) } }
+		if ($childrenByParent.ContainsKey($currentId)) {
+			foreach ($child in $childrenByParent[$currentId]) {
+				if (Test-ChildCreationAfterParent $current $child) { $pending.Enqueue($child) }
+			}
+		}
 	}
 }
 
@@ -223,8 +244,17 @@ function Measure-RunnerResourcesUntilExit(
 		$sample = Get-TrackedResourceSnapshot $ProcessIdentities
 		$peakProcessCount = [Math]::Max($peakProcessCount, [int] $sample.processCount)
 		$peakRssBytes = [Math]::Max($peakRssBytes, [long] $sample.rssBytes)
-		if ($RunnerHandle.Process.HasExited) { break }
-		if ($RunnerHandle.Process.WaitForExit($PollMilliseconds)) { break }
+		$runnerExited = $RunnerHandle.Process.HasExited
+		if (-not $runnerExited) { $runnerExited = $RunnerHandle.Process.WaitForExit($PollMilliseconds) }
+		if ($runnerExited) {
+			foreach ($handle in $TrackedHandles) {
+				if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIdentities $(if ($null -ne $handle.Identity) { $handle.Identity } else { $handle.Process.Id }) }
+			}
+			$finalSample = Get-TrackedResourceSnapshot $ProcessIdentities
+			$peakProcessCount = [Math]::Max($peakProcessCount, [int] $finalSample.processCount)
+			$peakRssBytes = [Math]::Max($peakRssBytes, [long] $finalSample.rssBytes)
+			break
+		}
 		if ([DateTime]::UtcNow -ge $Deadline) { throw 'Scenario runner timed out' }
 	}
 	return [pscustomobject]@{ processCount = $peakProcessCount; peakRssBytes = $peakRssBytes }

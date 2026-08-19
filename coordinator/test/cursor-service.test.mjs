@@ -148,6 +148,34 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	await service.stop();
 });
 
+test('Cursor parse failures record only a generic structured error', async () => {
+	const secret = 'ARBITRARY_CURSOR_MODEL_SECRET';
+	const spawn = () => {
+		const child = new FakeChild();
+		queueMicrotask(() => {
+			child.stdout.emit('data', Buffer.from(JSON.stringify({
+				type: 'result', subtype: 'success', is_error: false, result: `not-json ${secret}`,
+				session_id: 'cursor-session-secret', duration_ms: 12, duration_api_ms: 9,
+			})));
+			child.exitCode = 0;
+			child.emit('close', 0, null);
+		});
+		return child;
+	};
+	const service = new CursorProviderService(config(), {
+		spawn, discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+		workspaceManager: { async prepare() { return 'C:\\agents\\cursor\\cursor-secret'; } },
+	});
+	const agent = await service.createAgent(profile({ agentId: 'cursor-secret' }));
+	await agent.setGoalRevision(1);
+	const rows = [];
+	await assert.rejects(agent.decide('state', { goalRevision: 1, turnRecorder: { async record(row) { rows.push(row); } } }), (error) => error?.code === 'MALFORMED_DECISION');
+	assert.equal(rows.length, 1);
+	assert.deepEqual(rows[0].error, { code: 'MALFORMED_DECISION', category: 'decision_parse' });
+	assert.doesNotMatch(JSON.stringify(rows[0]), new RegExp(secret));
+	await service.stop();
+});
+
 test('Cursor rejects models outside Composer and Grok plus unsupported settings', async () => {
 	assert.throws(
 		() => new CursorProviderService(config({ models: ['claude-opus-4-8'], modelReasoningEfforts: { 'claude-opus-4-8': ['high'] } })),

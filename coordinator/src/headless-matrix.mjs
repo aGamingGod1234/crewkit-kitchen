@@ -289,10 +289,9 @@ export async function runHeadlessScenario({
 		const evidenceResult = await collectHeadlessEvidence({
 			directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence,
 			readOnlyCommand: (value) => command(value, { readOnly: true, attempt: 0 }),
-			deadline, now, startedAt, poll,
+			deadline, now, startedAt, poll, scenario, generatedName,
 		});
-		const { fileEvidence, evidence, assertionResult } = evidenceResult;
-		const identity = resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, generatedName);
+		const { scopedEvidence, scopedAudit, identity, assertionResult } = evidenceResult;
 		const resolvedAgentId = identity.agentId;
 		if (identity.error !== null) {
 			classification = 'ERROR';
@@ -302,11 +301,9 @@ export async function runHeadlessScenario({
 		if (classification === null) classification = 'PASSED';
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
 		const elapsedMs = Math.max(0, Number(now()) - startedAt);
-		const scopedEvidence = identity.authoritative ? isolateFileEvidence(fileEvidence, resolvedAgentId, generatedName) : fileEvidence;
-		const scopedAudit = identity.authoritative ? auditRows(protocolAudit).filter((row) => rowMatchesAgent(row, resolvedAgentId)).slice(-256) : protocolAudit;
 		const report = scenarioReport(status, scenario, {
 			classification, generatedName, lifecycle: terminalState, elapsedMs,
-			commands, assertions: assertionResult.results, evidence: evidenceSummary(directory, fileEvidence, protocolAudit),
+			commands, assertions: assertionResult.results, evidence: evidenceSummary(directory, scopedEvidence, scopedAudit),
 			timings: timingSummary(profile, scopedEvidence, scopedAudit, elapsedMs),
 			metrics: performanceMetrics(profile, scopedEvidence, scopedAudit, resolvedAgentId, { minecraftMspt }),
 			diagnostics,
@@ -459,6 +456,10 @@ async function runConcurrentHeadlessScenario({
 			members, directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset,
 			assertions, rconEvidence, readOnlyCommand: (value) => command(value, { readOnly: true }), deadline, now, startedAt, poll,
 		});
+		const exactAgentIds = members.map((member) => member.agentId).filter(Boolean);
+		const aggregateEvidence = isolateRosterFileEvidence(evidenceResult.fileEvidence, members);
+		const aggregateAudit = auditRows(protocolAudit).slice(protocolAuditOffset)
+			.filter((row) => exactAgentIds.some((agentId) => rowMatchesAgent(row, agentId))).slice(-256 * Math.max(1, exactAgentIds.length));
 		for (const member of members) {
 			const isolated = evidenceResult.byAgent.get(member.agentId);
 			if (member.classification === null && isolated !== undefined && !isolated.assertionResult.passed) member.classification = 'ASSERTION_MISMATCH';
@@ -466,6 +467,7 @@ async function runConcurrentHeadlessScenario({
 		}
 		const agentReports = members.map((member) => {
 			const isolated = evidenceResult.byAgent.get(member.agentId);
+			const isolatedAudit = auditRows(protocolAudit).slice(protocolAuditOffset).filter((row) => rowMatchesAgent(row, member.agentId)).slice(-256);
 			return boundReportValue({
 				agentId: member.agentId,
 				generatedName: member.generatedName,
@@ -474,6 +476,7 @@ async function runConcurrentHeadlessScenario({
 				lifecycle: member.lifecycle,
 				assertions: isolated?.assertionResult.results ?? [],
 				evidence: isolated === undefined ? null : evidenceSummary(directory, isolated.fileEvidence, protocolAudit),
+				metrics: isolated === undefined ? null : performanceMetrics(profile, isolated.fileEvidence, isolatedAudit, member.agentId),
 				diagnostics: member.diagnostics,
 			});
 		});
@@ -489,8 +492,8 @@ async function runConcurrentHeadlessScenario({
 			classification, lifecycle: members.every((member) => member.lifecycle === 'COMPLETED') ? 'COMPLETED' : null,
 			elapsedMs, commands, agents: agentReports,
 			evidence: evidenceSummary(directory, evidenceResult.fileEvidence, protocolAudit),
-			timings: timingSummary(profile, evidenceResult.fileEvidence, protocolAudit, elapsedMs),
-			metrics: performanceMetrics(profile, evidenceResult.fileEvidence, protocolAudit, null, { minecraftMspt }),
+			timings: timingSummary(profile, aggregateEvidence, aggregateAudit, elapsedMs),
+			metrics: performanceMetrics(profile, aggregateEvidence, aggregateAudit, exactAgentIds, { minecraftMspt }),
 			cleanup: { status: 'PENDING' },
 		});
 		try { await closeResources(rcon, providerTurnRecorder); }
@@ -692,7 +695,7 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
 }
 
-async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll }) {
+async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll, scenario, generatedName }) {
 	for (const assertion of assertions) {
 		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
 		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
@@ -700,20 +703,38 @@ async function collectHeadlessEvidence({ directory, readFile, tailReader, protoc
 	}
 	let attempt = 0;
 	const currentAudit = () => auditRows(protocolAudit).slice(protocolAuditOffset);
-	let fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
-	let evidence = makeEvidence({ terminalState, protocolAudit: currentAudit(), ...fileEvidence, rcon: rconEvidence });
-	let assertionResult = evaluateHeadlessAssertions(assertions, evidence);
+	let fileEvidence;
+	let scopedEvidence;
+	let scopedAudit;
+	let identity;
+	let evidence;
+	let assertionResult;
+	const evaluate = async () => {
+		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
+		identity = resolveExactSnapshotAgentId(fileEvidence, currentAudit(), scenario, generatedName);
+		if (identity.authoritative) {
+			scopedEvidence = isolateFileEvidence(fileEvidence, identity.agentId, generatedName);
+			scopedAudit = currentAudit().filter((row) => rowMatchesAgent(row, identity.agentId)).slice(-256);
+		} else if (identity.legacy) {
+			scopedEvidence = isolateLegacyFileEvidence(fileEvidence);
+			scopedAudit = currentAudit().filter((row) => !rowHasAgentIdentity(row)).slice(-256);
+		} else {
+			scopedEvidence = emptyFileEvidence(fileEvidence);
+			scopedAudit = [];
+		}
+		evidence = makeEvidence({ terminalState, protocolAudit: scopedAudit, ...scopedEvidence, rcon: rconEvidence });
+		assertionResult = evaluateHeadlessAssertions(assertions, evidence);
+	};
+	await evaluate();
 	const waitsForFiles = assertions.some((assertion) => assertion.type !== 'lifecycle' && assertion.type !== 'rcon');
 	while (!assertionResult.passed && waitsForFiles && logicalNow(now, startedAt, attempt) < deadline) {
 		try {
 			await withDeadline(() => poll({ phase: 'evidence', attempt, deadline, evidence, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
 		} catch (error) { if (error?.code === 'HEADLESS_TIMEOUT') break; throw error; }
 		attempt += 1;
-		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
-		evidence = makeEvidence({ terminalState, protocolAudit: currentAudit(), ...fileEvidence, rcon: rconEvidence });
-		assertionResult = evaluateHeadlessAssertions(assertions, evidence);
+		await evaluate();
 	}
-	return { fileEvidence, evidence, assertionResult };
+	return { fileEvidence, scopedEvidence, scopedAudit, identity, evidence, assertionResult };
 }
 
 async function resolveConcurrentAgentIds({ members, scenario, directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, deadline, now, startedAt, poll }) {
@@ -770,17 +791,21 @@ function resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, gene
 	const rows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)].map(unwrapAuditRow).filter(Boolean);
 	const snapshots = rows.filter((row) => row.type === 'agent_snapshot');
 	if (snapshots.length === 0) {
-		const legacyId = (fileEvidence.providerTurnSummaries ?? []).some((row) => row.agentId === generatedName) ? generatedName : null;
-		return { agentId: legacyId, authoritative: false, error: null };
+		const labelled = rows.some(rowHasAgentIdentity)
+			|| (fileEvidence.traceRows ?? []).some(rowHasAgentIdentity)
+			|| (fileEvidence.providerTurnSummaries ?? []).some(rowHasAgentIdentity);
+		return labelled
+			? { agentId: null, authoritative: false, legacy: false, error: 'Authoritative agent snapshot identity was unavailable for labelled evidence' }
+			: { agentId: null, authoritative: false, legacy: true, error: null };
 	}
 	const ids = [...new Set(snapshots.filter((row) => row.payload?.name === generatedName
 		&& row.payload?.provider === scenario.provider && row.payload?.model === scenario.model
 		&& row.payload?.reasoningEffort === scenario.reasoningEffort && row.payload?.serviceTier === scenario.serviceTier)
 		.map(authoritativeAgentId).filter(Boolean))];
-	if (ids.length === 1) return { agentId: ids[0], authoritative: true, error: null };
+	if (ids.length === 1) return { agentId: ids[0], authoritative: true, legacy: false, error: null };
 	return {
 		agentId: null,
-		authoritative: false,
+		authoritative: false, legacy: false,
 		error: ids.length > 1 ? 'Authoritative agent snapshot identity was ambiguous' : 'Authoritative agent snapshot identity was unavailable for the exact requested profile',
 	};
 }
@@ -831,9 +856,42 @@ function isolateFileEvidence(fileEvidence, agentId, generatedName) {
 	};
 }
 
+function isolateRosterFileEvidence(fileEvidence, members) {
+	const ids = new Set(members.map((member) => member.agentId).filter(Boolean));
+	const labels = [...ids, ...members.map((member) => member.generatedName)];
+	const matches = (row) => [...ids].some((agentId) => rowMatchesAgent(row, agentId));
+	const limit = 256 * Math.max(1, ids.size);
+	const providerTurnSummaries = (fileEvidence.providerTurnSummaries ?? []).filter((row) => ids.has(row.agentId)).slice(-limit);
+	const lines = String(fileEvidence.serverLog ?? '').split(/\r?\n/).filter((line) => labels.some((value) => line.includes(value))).slice(-limit);
+	return {
+		protocolRows: (fileEvidence.protocolRows ?? []).filter(matches).slice(-limit),
+		traceRows: (fileEvidence.traceRows ?? []).filter(matches).slice(-limit),
+		serverLog: lines.join('\n'), paths: fileEvidence.paths,
+		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
+	};
+}
+
+function isolateLegacyFileEvidence(fileEvidence) {
+	const providerTurnSummaries = (fileEvidence.providerTurnSummaries ?? []).filter((row) => !rowHasAgentIdentity(row)).slice(-256);
+	return {
+		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => !rowHasAgentIdentity(row)).slice(-256),
+		traceRows: (fileEvidence.traceRows ?? []).filter((row) => !rowHasAgentIdentity(row)).slice(-256),
+		serverLog: fileEvidence.serverLog, paths: fileEvidence.paths,
+		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
+	};
+}
+
+function emptyFileEvidence(fileEvidence) {
+	return { protocolRows: [], traceRows: [], serverLog: '', paths: fileEvidence.paths, providerTurnsRows: 0, providerTurnSummaries: [] };
+}
+
 function rowMatchesAgent(row, agentId) {
 	if (!row || typeof row !== 'object') return false;
 	return row.agentId === agentId || row.envelope?.agentId === agentId || row.payload?.agentId === agentId || row.envelope?.payload?.agentId === agentId;
+}
+
+function rowHasAgentIdentity(row) {
+	return boundedAgentId(row?.agentId ?? row?.envelope?.agentId ?? row?.payload?.agentId ?? row?.envelope?.payload?.agentId) !== null;
 }
 
 async function readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath = null, offsets = {}) {
@@ -899,8 +957,9 @@ function timingSummary(profile, fileEvidence, protocolAudit, scenarioElapsedMs) 
 }
 
 function performanceMetrics(profile, fileEvidence, protocolAudit, agentId = null, runtimeResources = {}) {
+	const agentIds = Array.isArray(agentId) ? new Set(agentId) : null;
 	const turns = (fileEvidence.providerTurnSummaries ?? []).filter((turn) => turn.provider === profile.provider && turn.model === profile.model
-		&& (agentId === null ? turn.agentId === undefined : turn.agentId === agentId));
+		&& (agentIds === null ? (agentId === null ? turn.agentId === undefined : turn.agentId === agentId) : agentIds.has(turn.agentId)));
 	const rawRows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)];
 	const envelopes = rawRows.map(unwrapAuditRow).filter(Boolean);
 	const queue = turns.map((turn) => turn.queueWaitMs).filter(Number.isFinite);
@@ -1012,10 +1071,25 @@ function providerTurnSummary(row) {
 	}
 	if (row.rateLimited !== undefined) summary.rateLimited = row.rateLimited === true;
 	if (row.compaction !== undefined) summary.compaction = row.compaction === true;
-	if (row.error && typeof row.error === 'object' && !Array.isArray(row.error)) {
-		summary.error = { code: boundedScalar(row.error.code), message: redactReportText(row.error.message, 512) };
-	}
+	if (row.error && typeof row.error === 'object' && !Array.isArray(row.error)) summary.error = safeProviderError(row.error);
 	return summary;
+}
+
+const PROVIDER_ERROR_CATEGORIES = new Set(['decision_parse', 'rate_limit', 'timeout', 'cancelled', 'transport', 'provider']);
+
+function safeProviderError(value) {
+	const rawCode = typeof value?.code === 'string' && /^[A-Z0-9_]{1,128}$/.test(value.code) ? value.code : 'PROVIDER_ERROR';
+	const category = PROVIDER_ERROR_CATEGORIES.has(value?.category) ? value.category : providerErrorCategory(rawCode);
+	return { code: rawCode, category };
+}
+
+function providerErrorCategory(code) {
+	if (/DECISION|PLANNER_OUTPUT/.test(code)) return 'decision_parse';
+	if (/RATE|LIMIT/.test(code)) return 'rate_limit';
+	if (/TIMEOUT/.test(code)) return 'timeout';
+	if (/CANCEL|STALE/.test(code)) return 'cancelled';
+	if (/RPC|TRANSPORT|PROCESS|SPAWN/.test(code)) return 'transport';
+	return 'provider';
 }
 
 function metricSummary(value, keys) {

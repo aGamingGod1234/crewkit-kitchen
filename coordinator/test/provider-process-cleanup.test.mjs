@@ -196,6 +196,29 @@ test('Gemini ACP preserves bounded structured 429 metadata without retaining pro
 	await transport.stop();
 });
 
+test('ACP RPC fallback never stringifies provider error data', async () => {
+	const child = new UncooperativeChild();
+	const requests = [];
+	child.stdin.write = (line) => requests.push(JSON.parse(String(line).trim()));
+	const transport = new AcpStdioTransport(
+		{ provider: 'gemini' },
+		{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
+	);
+	await transport.start();
+
+	const request = transport.request('session/prompt', {}, { timeoutMs: SETTLE_TIMEOUT_MS });
+	child.stdout.emit('data', `${JSON.stringify({ id: requests[0].id, error: {
+		code: 429, data: { prompt: 'ARBITRARY_RPC_PROMPT_SECRET', httpStatusCode: 429 },
+	} })}\n`);
+
+	await assert.rejects(request, (error) => {
+		assert.doesNotMatch(error.message, /ARBITRARY_RPC_PROMPT_SECRET|httpStatusCode|\{"code"/);
+		assert.deepEqual({ rpcCode: error.rpcCode, httpStatusCode: error.httpStatusCode, rateLimited: error.rateLimited }, { rpcCode: 429, httpStatusCode: 429, rateLimited: true });
+		return true;
+	});
+	await transport.stop();
+});
+
 test('Windows cleanup terminates the complete provider process tree', async () => {
 	const child = new UncooperativeChild();
 	child.pid = 4_242;

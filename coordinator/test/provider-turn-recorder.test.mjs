@@ -173,18 +173,18 @@ test('serializes records and swallows public sink failures without blocking clos
 	assert.deepEqual(writes.map((row) => row.attempt), [1, 2]);
 });
 
-test('error rows contain typed bounded provider errors without stack, paths, or environment values', async () => {
+test('error rows retain only allowlisted structured fields', async () => {
 	const rows = [];
 	const recorder = new ProviderTurnRecorder({
 		runId: 'run', scenarioId: 'scenario', privatePath: 'private.jsonl', appendFile: async (_path, text) => rows.push(JSON.parse(text)),
 	});
-	const error = Object.assign(new Error('failed at C:\\Users\\lucas\\secret\\provider.js token=env-value'), { code: 'PROVIDER_UNAVAILABLE', stack: 'Error\n at C:\\Users\\lucas\\secret\\provider.js' });
+	const error = Object.assign(new Error('ARBITRARY_PROVIDER_SECRET at C:\\Users\\lucas\\secret\\provider.js token=env-value'), { code: 'PROVIDER_UNAVAILABLE', category: 'provider', stack: 'Error\n at C:\\Users\\lucas\\secret\\provider.js' });
 	await recorder.record({ provider: 'gemini', model: 'm', reasoningEffort: 'high', goalRevision: 2, attempt: 1, retry: false, input: 'prompt', output: 'partial output', error });
 	await recorder.close();
 	assert.equal(rows[0].outcome, 'error');
 	assert.equal(rows[0].error.code, 'PROVIDER_UNAVAILABLE');
-	assert.equal(typeof rows[0].error.message, 'string');
-	assert.equal(Object.hasOwn(rows[0].error, 'stack'), false);
+	assert.deepEqual(rows[0].error, { code: 'PROVIDER_UNAVAILABLE', category: 'provider' });
+	assert.equal(JSON.stringify(rows[0]).includes('ARBITRARY_PROVIDER_SECRET'), false);
 	assert.equal(JSON.stringify(rows[0]).includes('C:\\Users\\lucas\\secret'), false);
 	assert.equal(JSON.stringify(rows[0]).includes('env-value'), false);
 });
