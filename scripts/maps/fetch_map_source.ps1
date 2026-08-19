@@ -53,6 +53,27 @@ function Test-ReparsePath([string]$Path, [string]$StopAt) {
     }
 }
 
+function Assert-SafeRegularFile([string]$Path, [string]$Description) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Description must be a regular, non-reparse file: $Path"
+    }
+}
+
+function Remove-StaleAcquisitionPartials([string]$DestinationPath, [string]$ArchiveFilename) {
+    $archivePartialPattern = '^\.' + [System.Text.RegularExpressions.Regex]::Escape($ArchiveFilename) + '\.[0-9a-f]{32}\.partial$'
+    $evidencePartialPattern = '^' + [System.Text.RegularExpressions.Regex]::Escape("$ArchiveFilename.sha256.json") + '\.[0-9a-f]{32}\.partial$'
+    foreach ($item in Get-ChildItem -LiteralPath $DestinationPath -Force) {
+        if ($item.Name -notmatch $archivePartialPattern -and $item.Name -notmatch $evidencePartialPattern) {
+            continue
+        }
+        if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Stale acquisition partial must be a regular, non-reparse file: $($item.FullName)"
+        }
+        Remove-Item -LiteralPath $item.FullName -Force
+    }
+}
+
 function Enter-MapAcquisitionLock([string]$LockPath, [int]$TimeoutMilliseconds = 30000) {
     $waitTimer = [System.Diagnostics.Stopwatch]::StartNew()
     while ($true) {
@@ -125,6 +146,26 @@ $archivePath = Join-Path $destinationPath ([string]$source.archive.filename)
 $evidencePath = "$archivePath.sha256.json"
 $archiveExistedBefore = Test-Path -LiteralPath $archivePath
 $evidenceExistedBefore = Test-Path -LiteralPath $evidencePath
+$evidenceOrphanAwaitingReplacement = $false
+if ($archiveExistedBefore) {
+    Assert-SafeRegularFile -Path $archivePath -Description 'Expected archive path'
+}
+if ($evidenceExistedBefore) {
+    Assert-SafeRegularFile -Path $evidencePath -Description 'Expected evidence path'
+}
+if ($archiveExistedBefore -xor $evidenceExistedBefore) {
+    Remove-StaleAcquisitionPartials -DestinationPath $destinationPath -ArchiveFilename ([string]$source.archive.filename)
+    if ($archiveExistedBefore) {
+        Remove-Item -LiteralPath $archivePath -Force
+        $archiveExistedBefore = $false
+    } else {
+        # Keep the orphan evidence until the new archive has promoted. This
+        # preserves it if acquisition fails before replacement, but it is not
+        # read or trusted as checksum evidence for this run.
+        $evidenceOrphanAwaitingReplacement = $true
+        $evidenceExistedBefore = $false
+    }
+}
 $lockedSha256 = if ($null -ne $source.archive.sha256) { ([string]$source.archive.sha256).ToLowerInvariant() } else { $null }
 $existingEvidence = $null
 if ($evidenceExistedBefore) {
@@ -198,6 +239,10 @@ try {
     $archivePromotionAttemptedByThisRun = $true
     Move-Item -LiteralPath $partialPath -Destination $archivePath
     if ($publishEvidence) {
+        if ($evidenceOrphanAwaitingReplacement) {
+            Assert-SafeRegularFile -Path $evidencePath -Description 'Interrupted evidence path'
+            Remove-Item -LiteralPath $evidencePath -Force
+        }
         $evidencePromotionAttemptedByThisRun = $true
         Move-Item -LiteralPath $partialEvidencePath -Destination $evidencePath
     }
