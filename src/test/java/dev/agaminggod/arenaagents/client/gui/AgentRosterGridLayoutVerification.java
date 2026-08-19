@@ -11,6 +11,7 @@ public final class AgentRosterGridLayoutVerification {
 		assertions += verifyRowsAndPagerReservation();
 		assertions += verifyTargetScreenRegions();
 		assertions += verifyContainmentAndValidation();
+		assertions += verifyOverflowSafetyAndConstructionInvariants();
 		return assertions;
 	}
 
@@ -151,6 +152,121 @@ public final class AgentRosterGridLayoutVerification {
 		expectFailure(() -> AgentRosterGridLayout.calculate(0, 0, 54, 47, 3),
 				"overflowing roster without grid and pager target height");
 		return 16;
+	}
+
+	private static int verifyOverflowSafetyAndConstructionInvariants() {
+		AgentRosterGridLayout extreme = AgentRosterGridLayout.calculate(
+				Integer.MIN_VALUE, Integer.MIN_VALUE, -1, -1, 16
+		);
+		assertEquals(4, extreme.rows(), "accepted extreme dimensions retain four readable rows");
+		assertTrue(!extreme.hasPager(), "accepted extreme height does not overflow into a false pager");
+		assertEquals(64, extreme.tileHeight(), "accepted extreme height still respects the concise tile cap");
+		assertTrue(extreme.gridBounds().width() > 0, "accepted extreme width retains positive bounds");
+
+		expectFailure(
+				() -> new AgentRosterGridLayout.Bounds(Integer.MIN_VALUE, 0, Integer.MAX_VALUE, 1),
+				"bounds with overflowing width"
+		);
+		expectFailure(
+				() -> new AgentRosterGridLayout.Bounds(0, Integer.MIN_VALUE, 1, Integer.MAX_VALUE),
+				"bounds with overflowing height"
+		);
+
+		AgentRosterGridLayout.Bounds empty = new AgentRosterGridLayout.Bounds(0, 0, 0, 0);
+		AgentRosterGridLayout.Bounds emptyLine = new AgentRosterGridLayout.Bounds(0, 0, 10, 0);
+		expectFailure(
+				() -> new AgentRosterGridLayout(emptyLine, 0, 0, 0, 0, 0, empty, false),
+				"empty roster with non-point grid bounds"
+		);
+		AgentRosterGridLayout validSingle = new AgentRosterGridLayout(
+				new AgentRosterGridLayout.Bounds(0, 0, 240, 72), 1, 1, 240, 72, 1, empty, false
+		);
+		assertEquals(72, validSingle.tileHeight(), "single enlarged tile may use its distinct 72 pixel cap");
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						validSingle.gridBounds(), 1, 1, 240, 72, 1, emptyLine, false
+				),
+				"inactive pager with non-point bounds"
+		);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						new AgentRosterGridLayout.Bounds(0, 0, 240, 73), 1, 1, 240, 73, 1, empty, false
+				),
+				"single tile above its height cap"
+		);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						new AgentRosterGridLayout.Bounds(0, 0, 241, 72), 1, 1, 241, 72, 1, empty, false
+				),
+				"single tile above its width cap"
+		);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						new AgentRosterGridLayout.Bounds(0, 0, 54, 65), 2, 1, 24, 65, 2, empty, false
+				),
+				"multi-entry tile above its height cap"
+		);
+
+		AgentRosterGridLayout paged = AgentRosterGridLayout.calculate(0, 0, 420, 102, 9);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						paged.gridBounds(), paged.columns(), paged.rows(), paged.tileWidth(), paged.tileHeight(),
+						paged.pageSize(),
+						new AgentRosterGridLayout.Bounds(
+								paged.pagerBounds().left() + 1, paged.pagerBounds().top(),
+								paged.pagerBounds().right() + 1, paged.pagerBounds().bottom()
+						),
+						true
+				),
+				"pager shifted away from grid alignment"
+		);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						paged.gridBounds(), paged.columns(), paged.rows(), paged.tileWidth(), paged.tileHeight(),
+						paged.pageSize(),
+						new AgentRosterGridLayout.Bounds(
+								paged.gridBounds().left(), paged.gridBounds().bottom() + 5,
+								paged.gridBounds().right(), paged.gridBounds().bottom() + 23
+						),
+						true
+				),
+				"pager below the reserved six pixel separation"
+		);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						paged.gridBounds(), paged.columns(), paged.rows(), paged.tileWidth(), paged.tileHeight(),
+						paged.pageSize(),
+						new AgentRosterGridLayout.Bounds(
+								paged.gridBounds().left(), paged.gridBounds().bottom() - 1,
+								paged.gridBounds().right(), paged.gridBounds().bottom() + 17
+						),
+						true
+				),
+				"overlapping pager"
+		);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						paged.gridBounds(), paged.columns(), paged.rows(), paged.tileWidth(), paged.tileHeight(),
+						1, paged.pagerBounds(), true
+				),
+				"paged layout without a full page capacity"
+		);
+
+		AgentRosterGridLayout full = AgentRosterGridLayout.calculate(0, 0, 420, 210, 16);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						full.gridBounds(), full.columns(), full.rows(), full.tileWidth(), full.tileHeight(),
+						4, full.pagerBounds(), false
+				),
+				"unpaged layout with excess empty rows"
+		);
+		expectFailure(
+				() -> new AgentRosterGridLayout(
+						new AgentRosterGridLayout.Bounds(0, 0, 84, 24), 3, 1, 24, 24, 3, empty, false
+				),
+				"unsupported three-column layout"
+		);
+		return 18;
 	}
 
 	private static AgentRosterGridLayout fromCanvas(AgentControlLayout shell, int totalEntries) {

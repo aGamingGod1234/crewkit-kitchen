@@ -32,24 +32,38 @@ public record AgentRosterGridLayout(
 		}
 		if (pageSize == 0) {
 			if (columns != 0 || rows != 0 || tileWidth != 0 || tileHeight != 0
-					|| !gridBounds.isEmpty() || hasPager || !pagerBounds.isEmpty()) {
+					|| !gridBounds.isPoint() || hasPager || !pagerBounds.isPoint()) {
 				throw new IllegalArgumentException("Empty roster geometry must be non-interactive");
 			}
 		} else {
-			if (columns == 0 || rows == 0 || rows > MAXIMUM_ROWS
+			if ((columns != 1 && columns != 2 && columns != 4) || rows == 0 || rows > MAXIMUM_ROWS
 					|| tileWidth < MINIMUM_TARGET_SIZE || tileHeight < MINIMUM_TARGET_SIZE
-					|| pageSize > columns * rows || gridBounds.isEmpty()) {
+					|| pageSize > columns * rows || rows != divideRoundUp(pageSize, columns)
+					|| gridBounds.isEmpty()) {
 				throw new IllegalArgumentException("Roster grid geometry is inconsistent");
 			}
-			if (gridBounds.width() != columns * tileWidth + (columns - 1) * TILE_GAP
-					|| gridBounds.height() != rows * tileHeight + (rows - 1) * TILE_GAP) {
+			boolean singleEntry = columns == 1;
+			if (singleEntry
+					? rows != 1 || pageSize != 1 || hasPager
+							|| tileWidth > SINGLE_TILE_MAXIMUM_WIDTH || tileHeight > SINGLE_TILE_MAXIMUM_HEIGHT
+					: pageSize < 2 || tileHeight > MAXIMUM_TILE_HEIGHT) {
+				throw new IllegalArgumentException("Roster tile shape is inconsistent with its entry mode");
+			}
+			long expectedWidth = (long) columns * tileWidth + (long) (columns - 1) * TILE_GAP;
+			long expectedHeight = (long) rows * tileHeight + (long) (rows - 1) * TILE_GAP;
+			if (gridBounds.width() != expectedWidth || gridBounds.height() != expectedHeight) {
 				throw new IllegalArgumentException("Roster tiles must consume their active grid bounds exactly");
 			}
-			if (hasPager != !pagerBounds.isEmpty()) {
+			if (hasPager ? pagerBounds.isEmpty() : !pagerBounds.isPoint()) {
 				throw new IllegalArgumentException("Pager signal and bounds must agree");
 			}
 			if (hasPager && pagerBounds.height() != PAGER_HEIGHT) {
 				throw new IllegalArgumentException("Pager must use the fixed height");
+			}
+			if (hasPager && (pageSize != columns * rows
+					|| pagerBounds.left() != gridBounds.left() || pagerBounds.right() != gridBounds.right()
+					|| (long) pagerBounds.top() - gridBounds.bottom() < PAGER_GAP)) {
+				throw new IllegalArgumentException("Pager must align below a full roster page");
 			}
 		}
 	}
@@ -148,7 +162,10 @@ public record AgentRosterGridLayout(
 		if (height < PREFERRED_TILE_HEIGHT) {
 			return 1;
 		}
-		return Math.min(MAXIMUM_ROWS, (height + TILE_GAP) / (PREFERRED_TILE_HEIGHT + TILE_GAP));
+		return Math.min(
+				MAXIMUM_ROWS,
+				(int) (((long) height + TILE_GAP) / (PREFERRED_TILE_HEIGHT + TILE_GAP))
+		);
 	}
 
 	private static int divideRoundUp(int value, int divisor) {
@@ -173,8 +190,11 @@ public record AgentRosterGridLayout(
 	/** Integer rectangle with inclusive left/top and exclusive right/bottom edges. */
 	public record Bounds(int left, int top, int right, int bottom) {
 		public Bounds {
-			if (right < left || bottom < top) {
-				throw new IllegalArgumentException("Bounds cannot be inverted");
+			long measuredWidth = (long) right - left;
+			long measuredHeight = (long) bottom - top;
+			if (measuredWidth < 0 || measuredHeight < 0
+					|| measuredWidth > Integer.MAX_VALUE || measuredHeight > Integer.MAX_VALUE) {
+				throw new IllegalArgumentException("Bounds cannot be inverted or exceed integer dimensions");
 			}
 		}
 
@@ -188,6 +208,10 @@ public record AgentRosterGridLayout(
 
 		public boolean isEmpty() {
 			return right == left || bottom == top;
+		}
+
+		private boolean isPoint() {
+			return right == left && bottom == top;
 		}
 
 		public boolean contains(double x, double y) {
