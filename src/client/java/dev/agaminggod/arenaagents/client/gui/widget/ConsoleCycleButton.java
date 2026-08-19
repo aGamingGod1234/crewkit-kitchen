@@ -10,6 +10,7 @@ import java.util.function.Function;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
+import net.minecraft.client.gui.narration.NarratedElementType;
 import net.minecraft.client.gui.narration.NarrationElementOutput;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
@@ -18,12 +19,7 @@ import org.lwjgl.glfw.GLFW;
 
 /** Compact, keyboard-accessible value selector for the Arena Agents command console. */
 public final class ConsoleCycleButton<T> extends AbstractWidget implements ConsoleFocusTarget {
-	private static final int BORDER = 0xFF46515F;
-	private static final int FILL = 0xFF1E2731;
-	private static final int HOVER_FILL = 0xFF2A3643;
 	private static final int LABEL = 0xFF9DA9B6;
-	private static final int VALUE = 0xFFF2F5F8;
-	private static final int ACCENT = 0xFFF2BC57;
 	private final Font font;
 	private final Component label;
 	private final List<T> values;
@@ -57,19 +53,34 @@ public final class ConsoleCycleButton<T> extends AbstractWidget implements Conso
 
 	@Override
 	protected void extractWidgetRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
-		int fill = isHoveredOrFocused() ? HOVER_FILL : FILL;
-		graphics.fill(getX(), getY(), getRight(), getBottom(), isFocused() ? ConsoleTheme.FOCUS : isHovered() ? ACCENT : BORDER);
-		int inset = isFocused() ? 2 : 1;
-		graphics.fill(getX() + inset, getY() + inset, getRight() - inset, getBottom() - inset, fill);
+		Presentation style = presentation(active, isFocused(), isHovered());
+		graphics.fill(getX(), getY(), getRight(), getBottom(), style.border());
+		graphics.fill(getX() + style.inset(), getY() + style.inset(),
+				getRight() - style.inset(), getBottom() - style.inset(), style.fill());
 		int textY = getY() + (getHeight() - 9) / 2;
-		ConsoleText.text(graphics, font, "<", getX() + 7, textY, ACCENT);
+		ConsoleText.text(graphics, font, "<", getX() + 7, textY, style.arrow());
 		ConsoleText.text(graphics, font, label, getX() + 19, textY, LABEL);
 		Component value = fittedValue();
 		int rightReserve = 20;
 		int valueX = Math.max(getX() + 19 + ConsoleText.width(font, label) + 8,
 				getRight() - rightReserve - ConsoleText.width(font, value));
-		ConsoleText.text(graphics, font, value, valueX, textY, VALUE);
-		ConsoleText.text(graphics, font, ">", getRight() - 8, textY, ACCENT);
+		ConsoleText.text(graphics, font, value, valueX, textY, style.text());
+		ConsoleText.text(graphics, font, ">", getRight() - 8, textY, style.arrow());
+	}
+
+	public static Presentation presentation(boolean active, boolean focused, boolean hovered) {
+		int border = !active ? ConsoleTheme.BORDER
+				: focused ? ConsoleTheme.FOCUS
+				: hovered ? ConsoleTheme.ROSTER_FOCUS : ConsoleTheme.BORDER;
+		int fill = !active ? ConsoleTheme.TRACK
+				: hovered || focused ? ConsoleTheme.SURFACE_HOVER : ConsoleTheme.SURFACE;
+		int text = active ? ConsoleTheme.TEXT : ConsoleTheme.MUTED;
+		int arrow = active && (hovered || focused) ? ConsoleTheme.TEXT : ConsoleTheme.MUTED;
+		return new Presentation(border, fill, text, arrow, 1);
+	}
+
+	public static String cycleNarrationKey() {
+		return "screen.arenaagents.control.cycle_hint";
 	}
 
 	private Component fittedValue() {
@@ -115,6 +126,7 @@ public final class ConsoleCycleButton<T> extends AbstractWidget implements Conso
 	@Override
 	protected void updateWidgetNarration(NarrationElementOutput output) {
 		defaultButtonNarrationText(output);
+		output.add(NarratedElementType.HINT, Component.translatable(cycleNarrationKey()));
 	}
 
 	private void cycle(int direction) {
@@ -130,5 +142,8 @@ public final class ConsoleCycleButton<T> extends AbstractWidget implements Conso
 	@Override
 	public String consoleFocusIdentity() {
 		return "cycle:" + label.getString();
+	}
+
+	public record Presentation(int border, int fill, int text, int arrow, int inset) {
 	}
 }

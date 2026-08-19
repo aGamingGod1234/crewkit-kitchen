@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.client.gui.scenario;
 
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentModelNames;
 import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.client.gui.AgentControlScreen;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGrid;
@@ -27,7 +28,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -37,6 +37,7 @@ import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
 
 /** Responsive Arena tab for the in-game command center. */
 public final class ScenarioSetupScreen extends Screen {
@@ -57,6 +58,7 @@ public final class ScenarioSetupScreen extends Screen {
 	private List<AgentRosterEntry> rosterEntries = List.of();
 	private Map<String, AgentVisualIdentity.Resolved> rosterVisuals = Map.of();
 	private AgentRosterGrid rosterGrid;
+	private AgentRosterPage visibleRosterPage;
 	private boolean compactEditorOpen;
 	private boolean queuedInspectorRebuild;
 	private int compactEditorSection;
@@ -97,6 +99,7 @@ public final class ScenarioSetupScreen extends Screen {
 	protected void init() {
 		nameInput = null;
 		rosterGrid = null;
+		visibleRosterPage = null;
 		refreshDraftRoster();
 		if (firstInitialization) {
 			firstInitialization = false;
@@ -116,6 +119,93 @@ public final class ScenarioSetupScreen extends Screen {
 			case ROSTER -> initRoster(layout);
 			case REVIEW -> initReview(layout);
 		}
+	}
+
+	@Override
+	public Component getNarrationMessage() {
+		MutableComponent narration = getTitle().copy();
+		if (launchPending) {
+			appendBuildNarration(narration,
+					AgentControlClient.buildProgressState().progress().orElse(null));
+		} else {
+			switch (state.step()) {
+				case ARENA -> appendArenaNarration(narration);
+				case ROSTER -> appendRosterNarration(narration);
+				case REVIEW -> appendReviewNarration(narration);
+			}
+		}
+		if (!feedback.isBlank()) appendNarration(narration, Component.literal(feedback));
+		return narration;
+	}
+
+	private void appendArenaNarration(MutableComponent narration) {
+		ScenarioPreset preset = state.selectedScenario();
+		appendNarration(narration, Component.literal(preset.title() + ", " + preset.category() + ", "
+				+ preset.duration() + ", " + preset.minimumAgents() + " to "
+				+ preset.maximumAgents() + " agents, " + state.placementMode().displayName()));
+	}
+
+	private void appendRosterNarration(MutableComponent narration) {
+		appendNarration(narration, Component.translatable("screen.arenaagents.roster.event_capacity",
+				state.roster().size(), state.selectedScenario().maximumAgents()));
+		ScenarioAgentConfig focused = selectedConfig();
+		if (focused != null) {
+			String reason = state.unavailableReasonAt(state.selectedIndex());
+			appendNarration(narration, Component.literal("Agent " + (state.selectedIndex() + 1) + " of "
+					+ state.roster().size() + ", " + state.displayNameAt(state.selectedIndex()) + ", "
+					+ capitalize(focused.provider()) + ", "
+					+ AgentModelNames.displayName(focused.provider(), focused.model()) + ", "
+					+ (reason.isBlank() ? "Ready" : "Unavailable")));
+			if (!reason.isBlank()) {
+				appendNarration(narration,
+						Component.translatable("screen.arenaagents.roster.unavailable", reason));
+			}
+		}
+		appendRosterPageNarration(narration, visibleRosterPage);
+	}
+
+	private void appendReviewNarration(MutableComponent narration) {
+		ScenarioPreset preset = state.selectedScenario();
+		appendNarration(narration, Component.literal(preset.title() + ", "
+				+ state.placementMode().displayName() + ", "
+				+ (state.deterministicEvents() ? "Deterministic" : "Randomized")));
+		appendNarration(narration, Component.translatable("screen.arenaagents.roster.event_capacity",
+				state.roster().size(), preset.maximumAgents()));
+		String blocker = !ScenarioLaunchRegistry.isAvailable()
+				? "Launch blocked: arena launches are unavailable"
+				: state.validationErrors().isEmpty() ? "Ready to launch"
+				: "Launch blocked: " + state.validationErrors().getFirst();
+		appendNarration(narration, Component.literal(blocker));
+		if (!state.roster().isEmpty()) {
+			appendNarration(narration, Component.literal("Focused lineup entry, "
+					+ state.displayNameAt(state.selectedIndex())));
+		}
+	}
+
+	private static void appendBuildNarration(MutableComponent narration, ScenarioBuildProgress progress) {
+		if (progress == null) {
+			appendNarration(narration, Component.literal("Build request sent"));
+			return;
+		}
+		String status = switch (progress.status()) {
+			case BUILDING -> "Building arena";
+			case READY -> "Arena ready";
+			case FAILED -> "Build failed";
+		};
+		appendNarration(narration, Component.literal(status + ", " + progress.percent() + "%, "
+				+ progress.humanPhase() + ", " + progress.completed() + " of " + progress.total()));
+		if (!progress.detail().isBlank()) appendNarration(narration, Component.literal(progress.detail()));
+	}
+
+	private static void appendRosterPageNarration(MutableComponent narration, AgentRosterPage page) {
+		if (page == null || page.totalFiltered() == 0) return;
+		appendNarration(narration, Component.translatable("screen.arenaagents.roster.page",
+				page.firstIndex(), page.lastIndex(), page.totalFiltered()));
+	}
+
+	private static void appendNarration(MutableComponent narration, Component context) {
+		if (context == null || context.getString().isBlank()) return;
+		narration.append(". ").append(context);
 	}
 
 	@Override
@@ -194,7 +284,7 @@ public final class ScenarioSetupScreen extends Screen {
 			return;
 		}
 		int x = layout.contentLeft();
-		String[] labels = {"AGENTS", "GROUP", "LIVE", "BUILD"};
+		String[] labels = {"Agents", "Group", "Live", "Build"};
 		Runnable[] actions = {this::openAgents, this::openGroup, this::openLiveArena, () -> { }};
 		int available = layout.contentWidth() - GAP * 3;
 		int buttonWidth = available / 4;
@@ -248,10 +338,10 @@ public final class ScenarioSetupScreen extends Screen {
 			addRenderableWidget(new ConsoleScenarioTile(
 					font, x, y, cardWidth, cardHeight,
 					Component.literal(String.valueOf(preset.letter())), Component.literal(preset.title()),
-					Component.literal(preset.category() + "  |  " + preset.duration()),
+					Component.literal(preset.category() + ", " + preset.duration()),
 					selected, preset.accentColor(), () -> {
 						selectScenario(preset);
-						setFeedback(preset.category() + " | " + preset.duration(), false);
+						setFeedback(preset.category() + ", " + preset.duration(), false);
 						rebuildWidgets();
 					}
 			));
@@ -302,18 +392,18 @@ public final class ScenarioSetupScreen extends Screen {
 	private void addBuildFooter(ScenarioSetupLayout layout) {
 		ScenarioBuildProgress progress = AgentControlClient.buildProgressState().progress().orElse(null);
 		int buttonWidth = layout.footerButtonWidth();
-		addRenderableWidget(consoleButton("CLOSE", layout.contentLeft(), layout.footerY(), buttonWidth,
+		addRenderableWidget(consoleButton("Close", layout.contentLeft(), layout.footerY(), buttonWidth,
 				ROW_HEIGHT, false, this::onClose));
 		if (progress != null && progress.status() == ScenarioBuildProgress.Status.FAILED) {
 			addRenderableWidget(new ConsoleButton(font, layout.contentRight() - buttonWidth, layout.footerY(), buttonWidth,
-					ROW_HEIGHT, Component.literal("RETRY BUILD"), false, GOLD, ConsoleButton.Tone.PRIMARY, () -> {
+					ROW_HEIGHT, Component.literal("Retry build"), false, GOLD, ConsoleButton.Tone.PRIMARY, () -> {
 				launchPending = false;
 				setFeedback("Review the setup, then retry the arena build.", false);
 				rebuildWidgets();
 			}));
 		} else {
 			addRenderableWidget(new ConsoleButton(font, layout.contentRight() - buttonWidth, layout.footerY(), buttonWidth,
-					ROW_HEIGHT, Component.literal("OPEN LIVE ARENA"), false, GOLD, ConsoleButton.Tone.PRIMARY,
+					ROW_HEIGHT, Component.literal("Open live arena"), false, GOLD, ConsoleButton.Tone.PRIMARY,
 					this::openLiveArena));
 		}
 	}
@@ -321,8 +411,9 @@ public final class ScenarioSetupScreen extends Screen {
 	private void addLineupControls(ScenarioSetupLayout.Bounds bounds) {
 		int buttonWidth = (bounds.width() - GAP * 2) / 3;
 		String countLabel = bounds.width() >= 420
-				? "Event team " + state.roster().size() + " / " + state.selectedScenario().maximumAgents()
-				: state.roster().size() + " / " + state.selectedScenario().maximumAgents();
+				? Component.translatable("screen.arenaagents.roster.event_capacity", state.roster().size(),
+						state.selectedScenario().maximumAgents()).getString()
+				: state.roster().size() + " of " + state.selectedScenario().maximumAgents();
 		ConsoleButton count = consoleButton(countLabel, bounds.left(), bounds.top(), buttonWidth,
 				ROW_HEIGHT, false, () -> { });
 		count.active = false;
@@ -341,7 +432,8 @@ public final class ScenarioSetupScreen extends Screen {
 	private void addRosterFilters(ScenarioSetupLayout.Bounds bounds) {
 		int controlWidth = (bounds.width() - GAP * 2) / 3;
 		ConsoleEditBox query = new ConsoleEditBox(font, bounds.left(), bounds.top(), controlWidth, ROW_HEIGHT,
-				Component.literal("Search agents"), Component.literal("Name, provider, or model"),
+				Component.translatable("screen.arenaagents.roster.search"),
+				Component.translatable("screen.arenaagents.roster.search_hint"),
 				"scenario-roster-query");
 		query.setMaxLength(80);
 		query.setValue(rosterFilter.query());
@@ -351,14 +443,20 @@ public final class ScenarioSetupScreen extends Screen {
 
 		List<String> providers = providerOptions();
 		addRenderableWidget(new ConsoleCycleButton<>(font, bounds.left() + controlWidth + GAP, bounds.top(),
-				controlWidth, ROW_HEIGHT, Component.literal("Provider"), providers, rosterFilter.provider(),
-				value -> Component.literal(value.isBlank() ? "All" : capitalize(value)),
+				controlWidth, ROW_HEIGHT,
+				Component.translatable("screen.arenaagents.roster.filter.provider"), providers, rosterFilter.provider(),
+				value -> value.isBlank()
+						? Component.translatable("screen.arenaagents.roster.filter.all_providers")
+						: Component.literal(capitalize(value)),
 				value -> applyRosterFilter(
 						new AgentRosterFilter(rosterFilter.query(), value, rosterFilter.state()))));
 		int statusX = bounds.left() + (controlWidth + GAP) * 2;
 		addRenderableWidget(new ConsoleCycleButton<>(font, statusX, bounds.top(), bounds.right() - statusX,
-				ROW_HEIGHT, Component.literal("Status"), List.of("", "Ready", "Unavailable"), rosterFilter.state(),
-				value -> Component.literal(value.isBlank() ? "All" : value),
+				ROW_HEIGHT, Component.translatable("screen.arenaagents.roster.filter.status"),
+				List.of("", "Ready", "Unavailable"), rosterFilter.state(),
+				value -> value.isBlank()
+						? Component.translatable("screen.arenaagents.roster.filter.all_statuses")
+						: Component.literal(value),
 				value -> applyRosterFilter(
 						new AgentRosterFilter(rosterFilter.query(), rosterFilter.provider(), value))));
 	}
@@ -369,6 +467,7 @@ public final class ScenarioSetupScreen extends Screen {
 				bounds.left(), bounds.top(), bounds.right(), bounds.bottom(), filteredCount());
 		int pageSize = gridLayout.pageSize() == 0 ? 1 : gridLayout.pageSize();
 		AgentRosterPage page = rosterView.page(pageSize);
+		visibleRosterPage = page;
 		Set<String> includedSlots = new LinkedHashSet<>();
 		for (AgentRosterEntry entry : rosterEntries) includedSlots.add(entry.id());
 		rosterGrid = new AgentRosterGrid(
@@ -554,16 +653,16 @@ public final class ScenarioSetupScreen extends Screen {
 			String previousLabel = state.step() == ScenarioWizardStep.ROSTER && layout.compactRoster()
 					&& compactEditorOpen ? "Back to lineup"
 					: state.step() == ScenarioWizardStep.ROSTER ? "Back to arena" : "Back to lineup";
-			addRenderableWidget(consoleButton(previousLabel.toUpperCase(Locale.ROOT), left, layout.footerY(),
+			addRenderableWidget(consoleButton(previousLabel, left, layout.footerY(),
 					buttonWidth, ROW_HEIGHT, false, this::goPrevious));
 		} else {
-			addRenderableWidget(consoleButton("AGENTS", left, layout.footerY(), buttonWidth, ROW_HEIGHT,
+			addRenderableWidget(consoleButton("Agents", left, layout.footerY(), buttonWidth, ROW_HEIGHT,
 					false, this::openAgents));
 		}
-		addRenderableWidget(consoleButton("CANCEL", right - buttonWidth * 2 - GAP, layout.footerY(),
+		addRenderableWidget(consoleButton("Cancel", right - buttonWidth * 2 - GAP, layout.footerY(),
 				buttonWidth, ROW_HEIGHT, false, this::onClose));
 		ConsoleButton action = new ConsoleButton(font, right - buttonWidth, layout.footerY(), buttonWidth,
-				ROW_HEIGHT, Component.literal(primaryLabel.toUpperCase(Locale.ROOT)), false, GOLD,
+				ROW_HEIGHT, Component.literal(primaryLabel), false, GOLD,
 				ConsoleButton.Tone.PRIMARY, () -> {
 			if (state.step() == ScenarioWizardStep.REVIEW) launch();
 			else goNext();
@@ -605,15 +704,15 @@ public final class ScenarioSetupScreen extends Screen {
 			int navigationRight = layout.contentLeft() - 14;
 			graphics.fill(layout.panelLeft(), layout.panelTop(), navigationRight, layout.panelBottom(), 0xFF111820);
 			graphics.fill(navigationRight, layout.panelTop(), navigationRight + 1, layout.panelBottom(), PANEL_EDGE);
-			graphics.text(font, "ARENA", layout.panelLeft() + 14, layout.panelTop() + 8, GOLD, false);
-			graphics.text(font, "AGENTS", layout.panelLeft() + 14, layout.panelTop() + 19, TEXT, false);
-			graphics.text(font, "FIELD CONSOLE", layout.panelLeft() + 14, layout.panelTop() + 35, MUTED, false);
-			graphics.text(font, "OPERATIONS", layout.panelLeft() + 14, layout.navigationTop() - 15, MUTED, false);
+			graphics.text(font, "Arena", layout.panelLeft() + 14, layout.panelTop() + 8, GOLD, false);
+			graphics.text(font, "Agents", layout.panelLeft() + 14, layout.panelTop() + 19, TEXT, false);
+			graphics.text(font, "Field Console", layout.panelLeft() + 14, layout.panelTop() + 35, MUTED, false);
+			graphics.text(font, "Operations", layout.panelLeft() + 14, layout.navigationTop() - 15, MUTED, false);
 			return;
 		}
 		graphics.fill(layout.panelLeft(), layout.panelTop(), layout.panelRight(), layout.panelTop() + 37, 0xFF111820);
 		graphics.fill(layout.panelLeft(), layout.panelTop() + 37, layout.panelRight(), layout.panelTop() + 38, PANEL_EDGE);
-		graphics.text(font, "ARENA AGENTS", layout.panelLeft() + 14, layout.panelTop() + 10, TEXT, false);
+		graphics.text(font, "Arena Agents", layout.panelLeft() + 14, layout.panelTop() + 10, TEXT, false);
 	}
 
 	private void renderArenaDetails(GuiGraphicsExtractor graphics, ScenarioSetupLayout layout, int x, int width) {
@@ -622,16 +721,16 @@ public final class ScenarioSetupScreen extends Screen {
 			int y = layout.contentTop() + ROW_HEIGHT + 3;
 			int bottom = layout.contentBottom() - ROW_HEIGHT - 3;
 			graphics.fill(x, y, x + width, bottom, SURFACE_COLOR);
-			graphics.text(font, preset.letter() + " | " + fit(preset.title(), width - 34), x + 7, y + 5,
+			graphics.text(font, preset.letter() + ", " + fit(preset.title(), width - 34), x + 7, y + 5,
 					preset.accentColor(), false);
-			graphics.text(font, fit(preset.category() + " | " + preset.duration() + " | "
+			graphics.text(font, fit(preset.category() + ", " + preset.duration() + ", "
 					+ preset.minimumAgents() + "-" + preset.maximumAgents() + " agents", width - 14),
 					x + 7, y + 18, MUTED, false);
 			return;
 		}
 		int y = layout.contentBottom() - 35;
 		graphics.fill(x, y, x + width, y + 35, SURFACE_COLOR);
-		graphics.text(font, preset.category() + " | " + preset.duration() + " | "
+		graphics.text(font, preset.category() + ", " + preset.duration() + ", "
 				+ preset.minimumAgents() + "-" + preset.maximumAgents() + " agents", x + 7, y + 5, TEXT, false);
 		String description = fit(preset.description(), width - 14);
 		graphics.text(font, description, x + 7, y + 19, MUTED, false);
@@ -678,13 +777,13 @@ public final class ScenarioSetupScreen extends Screen {
 				: progress.status() == ScenarioBuildProgress.Status.READY ? SUCCESS : GOLD;
 		graphics.fill(x, y, x + width, layout.contentBottom(), SURFACE_COLOR);
 		if (progress == null) {
-			graphics.text(font, "BUILD REQUEST SENT", x + 12, y + 12, GOLD, false);
+			graphics.text(font, "Build request sent", x + 12, y + 12, GOLD, false);
 			graphics.text(font, "Waiting for the server to publish the build location and first progress update.",
 					x + 12, y + 31, TEXT, false);
 			return;
 		}
-		String heading = progress.status() == ScenarioBuildProgress.Status.BUILDING ? "BUILDING ARENA"
-				: progress.status() == ScenarioBuildProgress.Status.READY ? "ARENA READY" : "BUILD FAILED";
+		String heading = progress.status() == ScenarioBuildProgress.Status.BUILDING ? "Building arena"
+				: progress.status() == ScenarioBuildProgress.Status.READY ? "Arena ready" : "Build failed";
 		graphics.text(font, heading, x + 12, y + 12, color, false);
 		graphics.text(font, fit(progress.scenarioTitle(), width - 100), x + 12, y + 27, TEXT, false);
 		String percentage = progress.percent() + "%";
@@ -693,7 +792,7 @@ public final class ScenarioSetupScreen extends Screen {
 		int barRight = x + width - 12;
 		graphics.fill(barLeft, y + 43, barRight, y + 49, 0xFF0D1319);
 		graphics.fill(barLeft, y + 43, barLeft + (barRight - barLeft) * progress.percent() / 100, y + 49, color);
-		graphics.text(font, progress.humanPhase() + " | " + progress.completed() + " / " + progress.total(),
+		graphics.text(font, progress.humanPhase() + ", " + progress.completed() + " of " + progress.total(),
 				x + 12, y + 58, TEXT, false);
 		graphics.text(font, "World changes made: " + progress.changedBlocks(), x + 12, y + 72, MUTED, false);
 		graphics.text(font, "Build location: " + progress.originLabel(), x + 12, y + 86, MUTED, false);
@@ -714,7 +813,7 @@ public final class ScenarioSetupScreen extends Screen {
 			}
 		} else if (message.isBlank() && state.step() == ScenarioWizardStep.ROSTER) {
 			message = "Editing agent " + (state.selectedIndex() + 1) + " of " + state.roster().size()
-					+ " | " + state.displayNameAt(state.selectedIndex());
+					+ ", " + state.displayNameAt(state.selectedIndex());
 			color = MUTED;
 		} else if (message.isBlank() && state.step() == ScenarioWizardStep.REVIEW) {
 			if (!ScenarioLaunchRegistry.isAvailable()) {
@@ -724,7 +823,7 @@ public final class ScenarioSetupScreen extends Screen {
 				message = "Launch blocked: " + state.validationErrors().getFirst();
 				color = ERROR;
 			} else {
-				message = "Ready | exact model settings preserved | no silent fallback";
+				message = "Ready, exact model settings preserved, no silent fallback";
 				color = SUCCESS;
 			}
 		}
@@ -809,7 +908,7 @@ public final class ScenarioSetupScreen extends Screen {
 			operation.run();
 			refreshDraftRoster();
 			setFeedback("Agent " + (state.selectedIndex() + 1) + " of " + state.roster().size()
-					+ " updated | " + state.displayNameAt(state.selectedIndex()), false);
+					+ " updated, " + state.displayNameAt(state.selectedIndex()), false);
 		} catch (IllegalArgumentException | IllegalStateException exception) {
 			setFeedback(exception.getMessage(), true);
 		}
