@@ -38,6 +38,10 @@ public final class AgentIdentity {
 				+ " " + encodedOperatorId(id));
 	}
 
+	static String canonicalIdentityKey(String value) {
+		return Objects.requireNonNull(value, "identity value must not be null").toLowerCase(Locale.ROOT);
+	}
+
 	private static String encodedOperatorId(AgentId id) {
 		ByteBuffer bytes = ByteBuffer.allocate(Long.BYTES * 2);
 		bytes.putLong(id.value().getMostSignificantBits());

@@ -6,7 +6,6 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -389,11 +388,11 @@ public final class AgentRegistry {
 			// A command selector may be a short ID or user name instead of a full UUID.
 		}
 
-		String folded = checked.toLowerCase(Locale.ROOT);
+		String folded = AgentIdentity.canonicalIdentityKey(checked);
 		List<AgentRecord> matches = records.values().stream()
 				.filter(record -> record.agentId().startsWith(checked)
-						|| AgentIdentity.displayName(record.agentId(), record.profile())
-								.toLowerCase(Locale.ROOT).equals(folded))
+						|| AgentIdentity.canonicalIdentityKey(
+								AgentIdentity.displayName(record.agentId(), record.profile())).equals(folded))
 				.toList();
 		if (matches.isEmpty()) {
 			throw new AgentDomainException("AGENT_NOT_FOUND", "Unknown agent: " + checked);
@@ -442,9 +441,11 @@ public final class AgentRegistry {
 	}
 
 	private void requireUniqueDisplayName(String proposedName) {
+		String proposedKey = AgentIdentity.canonicalIdentityKey(proposedName);
 		boolean duplicate = records.values().stream()
 				.map(record -> AgentIdentity.displayName(record.agentId(), record.profile()))
-				.anyMatch(existing -> existing.equalsIgnoreCase(proposedName));
+				.map(AgentIdentity::canonicalIdentityKey)
+				.anyMatch(proposedKey::equals);
 		if (duplicate) {
 			throw new AgentDomainException("DUPLICATE_AGENT_NAME", "Agent name is already in use: " + proposedName);
 		}
@@ -452,11 +453,13 @@ public final class AgentRegistry {
 
 	private boolean identityAvailable(AgentId id, AgentProfile profile) {
 		if (records.containsKey(id)) return false;
-		String displayName = AgentIdentity.displayName(id, profile);
-		String playerName = AgentIdentity.playerName(id, profile);
+		String displayKey = AgentIdentity.canonicalIdentityKey(AgentIdentity.displayName(id, profile));
+		String playerKey = AgentIdentity.canonicalIdentityKey(AgentIdentity.playerName(id, profile));
 		return records.values().stream().noneMatch(record ->
-				AgentIdentity.displayName(record.agentId(), record.profile()).equalsIgnoreCase(displayName)
-						|| AgentIdentity.playerName(record.agentId(), record.profile()).equalsIgnoreCase(playerName));
+				AgentIdentity.canonicalIdentityKey(
+						AgentIdentity.displayName(record.agentId(), record.profile())).equals(displayKey)
+						|| AgentIdentity.canonicalIdentityKey(
+								AgentIdentity.playerName(record.agentId(), record.profile())).equals(playerKey));
 	}
 
 	private static void validateUniqueIdentities(Collection<AgentRecord> records) {
@@ -464,12 +467,12 @@ public final class AgentRegistry {
 		HashSet<String> playerNames = new HashSet<>();
 		for (AgentRecord record : records) {
 			String displayName = AgentIdentity.displayName(record.agentId(), record.profile());
-			if (!displayNames.add(displayName.toLowerCase(Locale.ROOT))) {
+			if (!displayNames.add(AgentIdentity.canonicalIdentityKey(displayName))) {
 				throw new AgentDomainException(
 						"DUPLICATE_AGENT_NAME", "Duplicate agent name in snapshot: " + displayName);
 			}
 			String playerName = AgentIdentity.playerName(record.agentId(), record.profile());
-			if (!playerNames.add(playerName.toLowerCase(Locale.ROOT))) {
+			if (!playerNames.add(AgentIdentity.canonicalIdentityKey(playerName))) {
 				throw new AgentDomainException(
 						"DUPLICATE_AGENT_PLAYER_NAME", "Duplicate technical player name in snapshot: " + playerName);
 			}

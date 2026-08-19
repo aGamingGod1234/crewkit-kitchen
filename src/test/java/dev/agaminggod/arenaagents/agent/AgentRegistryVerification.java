@@ -20,6 +20,7 @@ public final class AgentRegistryVerification {
 		assertions += verifyQueueAndSteeringBounds();
 		assertions += verifyIdentityResolution();
 		assertions += verifyIdentityUniqueness();
+		assertions += verifyCanonicalIdentityKeys();
 		assertions += verifyPersistenceRecovery();
 		assertions += verifyProviderPersistenceAndMigration();
 		assertions += verifyEntityLocationPersistenceAndMigration();
@@ -197,6 +198,25 @@ public final class AgentRegistryVerification {
 				AgentConstants.DEFAULT_QUEUE_LIMIT,
 				List.of(records)
 		);
+	}
+
+	private static int verifyCanonicalIdentityKeys() {
+		AgentRegistry registry = AgentRegistry.createDefault(() -> { }, transition -> { });
+		AgentRecord named = registry.create(
+				"codex", "gpt-5.6-sol", "high", Optional.of("\u0130"), START_TIME);
+		assertEquals(named.agentId(), registry.resolve("i\u0307").agentId(),
+				"selector matching uses the canonical identity key");
+		expectFailure(
+				() -> registry.create("codex", "gpt-5.6-sol", "high", Optional.of("i\u0307"),
+						START_TIME + 1L),
+				"DUPLICATE_AGENT_NAME"
+		);
+		registry.create("kimi", "kimi-code/k3", "max", Optional.empty(), START_TIME + 2L);
+		AgentRegistry restored = AgentRegistry.restore(
+				registry.snapshot(), () -> { }, transition -> { }, START_TIME + 3L);
+		assertEquals(registry.records(), restored.records(),
+				"every successfully created identity remains valid when its snapshot restores");
+		return 3;
 	}
 
 	private static int verifyPersistenceRecovery() {
