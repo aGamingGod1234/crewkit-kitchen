@@ -60,8 +60,11 @@ function Test-BindFailure([string] $ServerLogPath, [string] $ServerStderrPath) {
 	return $text -match '(?i)(address already in use|failed to bind|could not bind|bind.+failed|port.+already)'
 }
 
-function Test-CoordinatorHandshake([string] $ProtocolAuditPath) {
-	return (Read-Text $ProtocolAuditPath) -match '"direction"\s*:\s*"server_to_coordinator"[^\r\n]*"type"\s*:\s*"hello_ack"'
+function Test-CoordinatorReady([string] $ProtocolAuditPath) {
+	$text = Read-Text $ProtocolAuditPath
+	$authenticated = $text -match '"direction"\s*:\s*"server_to_coordinator"[^\r\n]*"type"\s*:\s*"hello_ack"'
+	$catalogPublished = $text -match '"direction"\s*:\s*"coordinator_to_server"[^\r\n]*"type"\s*:\s*"catalog_snapshot"'
+	return $authenticated -and $catalogPublished
 }
 
 function Protect-LocalFile([string] $Path) {
@@ -256,6 +259,13 @@ function Write-BoundedJson([string] $Path, [object] $Value, [int] $MaximumBytes,
 	[IO.File]::WriteAllText($Path, $json, $encoding)
 }
 
+function Read-BoundedJson([string] $Path, [int] $MaximumBytes, [string] $Label) {
+	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Missing $Label at $Path" }
+	$item = Get-Item -LiteralPath $Path
+	if ($item.Length -gt $MaximumBytes) { throw "$Label exceeds the bounded size of $MaximumBytes bytes" }
+	return (Read-Text $Path) | ConvertFrom-Json
+}
+
 function New-Secret() {
 	$bytes = New-Object byte[] 48
 	$generator = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -287,7 +297,7 @@ function Set-ServerProperties([string] $Path, [hashtable] $Values) {
 }
 
 function Remove-ScenarioArtifacts([string] $ScenarioDirectory) {
-	foreach ($relativePath in @('server', 'provider-workspaces', 'traces', 'logs', 'rcon-password.txt', 'coordinator-config.json', 'coordinator.jsonl', 'protocol.jsonl', 'provider-turns.private.jsonl')) {
+	foreach ($relativePath in @('server', 'provider-workspaces', 'traces', 'logs', 'rcon-password.txt', 'coordinator-config.json', 'coordinator.jsonl', 'coordinator-private.jsonl', 'protocol.jsonl', 'provider-turns.private.jsonl')) {
 		$target = Join-Path $ScenarioDirectory $relativePath
 		if (-not (Test-Path -LiteralPath $target)) { continue }
 		$extendedTarget = if ($target.StartsWith('\\')) { '\\?\UNC\' + $target.Substring(2) } else { '\\?\' + [IO.Path]::GetFullPath($target) }
@@ -417,6 +427,8 @@ function New-ScenarioConfig([string] $Source, [string] $Destination, [int] $Brid
 
 function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [string] $Template, [string] $MatrixFile, [string] $Java, [string] $Node, [string] $BuiltJar, [switch] $Keep) {
 	$scenarioId = [string] $Scenario.id
+	$serviceTier = 'priority'
+	if ($null -ne $Scenario.PSObject.Properties['serviceTier'] -and $null -ne $Scenario.serviceTier) { $serviceTier = [string] $Scenario.serviceTier }
 	$scenarioDirectory = Join-Path $RunDirectory ("$(ConvertTo-SafePathSegment $scenarioId)-$([Guid]::NewGuid().ToString('N').Substring(0, 8))")
 	$setupStarted = $false
 	$secretCreated = $false
@@ -458,14 +470,16 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$protocolAudit = Join-Path $scenarioDirectory 'protocol.jsonl'
 	$providerTurns = Join-Path $scenarioDirectory 'provider-turns.private.jsonl'
 	$coordinatorTrace = Join-Path $scenarioDirectory 'coordinator.jsonl'
+	$coordinatorPrivateTrace = Join-Path $scenarioDirectory 'coordinator-private.jsonl'
 	[IO.File]::WriteAllText($coordinatorTrace, '', [Text.UTF8Encoding]::new($false))
+	Write-PrivateText $coordinatorPrivateTrace ''
 	$coordinatorConfig = Join-Path $scenarioDirectory 'coordinator-config.json'
 	$sourceConfig = Join-Path $Project 'coordinator\config\dynamic-agents.json'
 	if (-not (Test-Path -LiteralPath $sourceConfig -PathType Leaf)) { throw "Missing coordinator config: $sourceConfig" }
 	New-ScenarioConfig $sourceConfig $coordinatorConfig $bridgePort $providerWorkspace
 	$manifest = [pscustomobject]@{
 		runId = [IO.Path]::GetFileName($RunDirectory); scenarioId = $scenarioId; provider = [string] $Scenario.provider
-		model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; serviceTier = [string] $Scenario.serviceTier
+		model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; serviceTier = $serviceTier
 		serverDirectory = $serverDirectory; providerWorkspace = $providerWorkspace; protocolAudit = $protocolAudit; providerTurns = $providerTurns
 		ports = [pscustomobject]@{ minecraft = $serverPort; rcon = $rconPort; bridge = $bridgePort }; levelName = $worldName
 	}
@@ -500,6 +514,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$runnerHandle = $null
 	$failure = $null
 	$runnerExit = $null
+	$runnerReport = $null
 	$cleanupFailure = $null
 	$processIds = [System.Collections.Generic.List[int]]::new()
 	try {
@@ -545,13 +560,14 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			$coordinatorEnvironment = @{
 				ARENA_AGENT_BRIDGE_SECRET = $secret; ARENA_HEADLESS_RUN_ID = [IO.Path]::GetFileName($RunDirectory); ARENA_HEADLESS_SCENARIO_ID = $scenarioId
 				ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns; ARENA_HEADLESS_TRACE_PATH = $coordinatorTrace
+				ARENA_HEADLESS_PRIVATE_TRACE_PATH = $coordinatorPrivateTrace
 				ARENA_HEADLESS_BRIDGE_PORT = $bridgePort; ARENA_HEADLESS_RCON_PORT = $rconPort; ARENA_HEADLESS_MINECRAFT_PORT = $serverPort
 			}
 			$coordinatorHandle = Start-RedirectedProcess $Node $coordinatorArgs (Join-Path $Project 'coordinator') $coordinatorStdoutPath $coordinatorStderrPath $coordinatorEnvironment
 			try {
 				Wait-Condition {
 					if ($coordinatorHandle.Process.HasExited) { throw "Coordinator exited before bridge readiness: $(ConvertTo-BoundedText (Read-Text $coordinatorStderrPath) $MaxDiagnosticText)" }
-					(Test-Port $bridgePort) -and (Test-CoordinatorHandshake $protocolAudit)
+					(Test-Port $bridgePort) -and (Test-CoordinatorReady $protocolAudit)
 				} $StartupTimeoutSeconds 'Coordinator bridge did not become ready'
 				$coordinatorReady = $true
 			} catch {
@@ -593,6 +609,10 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		if (-not $runnerHandle.Process.WaitForExit(([int] $Scenario.timeoutMs + ($RunnerGraceSeconds * 1000)))) { throw "Scenario '$scenarioId' timed out" }
 		$runnerExit = $runnerHandle.Process.ExitCode
 		Complete-RedirectedProcess $runnerHandle
+		$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'report.json') $MaxMatrixReportBytes 'runner scenario report'
+		if ([string] $runnerReport.scenarioId -ne $scenarioId -or @('PASSED', 'FAILED', 'SKIPPED') -notcontains [string] $runnerReport.status) {
+			throw "Runner scenario report for '$scenarioId' is invalid"
+		}
 		if ($runnerExit -ne 0) { throw "Scenario '$scenarioId' failed with runner exit code $runnerExit" }
 	} catch {
 		$failure = $_
@@ -617,9 +637,29 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	if (-not $Keep) {
 		try { Remove-ScenarioArtifacts $scenarioDirectory } catch { $cleanupFailure = $_; if ($null -eq $failure) { $failure = $_ } }
 	}
-	$status = if ($null -eq $failure) { 'PASSED' } else { 'FAILED' }
+	$status = if ($null -ne $failure) { 'FAILED' } elseif ($null -ne $runnerReport) { [string] $runnerReport.status } else { 'FAILED' }
 	$cleanupStatus = if ($null -eq $cleanupFailure) { 'CLEAN' } else { 'FAILED' }
-	$report = [pscustomobject]@{ status = $status; scenarioId = (ConvertTo-BoundedText $scenarioId); provider = (ConvertTo-BoundedText $Scenario.provider); model = (ConvertTo-BoundedText $Scenario.model); reasoningEffort = (ConvertTo-BoundedText $Scenario.reasoningEffort); exitCode = $runnerExit; cleanup = [pscustomobject]@{ status = $cleanupStatus; processIds = @($processIds); diagnostics = if ($null -eq $cleanupFailure) { $null } else { ConvertTo-BoundedText $cleanupFailure.Exception.Message $MaxDiagnosticText } }; artifacts = $manifest; artifactsKept = [bool] $Keep; diagnostics = if ($null -eq $failure) { $null } else { ConvertTo-BoundedText $failure.Exception.Message $MaxDiagnosticText } }
+	$reportFields = [ordered]@{}
+	if ($null -ne $runnerReport) {
+		foreach ($property in $runnerReport.PSObject.Properties) { $reportFields[$property.Name] = $property.Value }
+	}
+	$reportFields['status'] = $status
+	$reportFields['scenarioId'] = ConvertTo-BoundedText $scenarioId
+	$reportFields['exitCode'] = $runnerExit
+	$reportFields['cleanup'] = [pscustomobject]@{
+		status = $cleanupStatus
+		runner = if ($null -eq $runnerReport) { $null } else { $runnerReport.cleanup }
+		processIds = @($processIds)
+		diagnostics = if ($null -eq $cleanupFailure) { $null } else { ConvertTo-BoundedText $cleanupFailure.Exception.Message $MaxDiagnosticText }
+	}
+	$reportFields['artifacts'] = $manifest
+	$reportFields['artifactsKept'] = [bool] $Keep
+	if ($null -ne $failure) {
+		$wrapperDiagnostics = ConvertTo-BoundedText $failure.Exception.Message $MaxDiagnosticText
+		$reportFields['wrapperDiagnostics'] = $wrapperDiagnostics
+		if (-not $reportFields.Contains('diagnostics') -or [string]::IsNullOrWhiteSpace([string] $reportFields['diagnostics'])) { $reportFields['diagnostics'] = $wrapperDiagnostics }
+	}
+	$report = [pscustomobject] $reportFields
 	Write-BoundedJson (Join-Path $scenarioDirectory 'report.json') $report $MaxMatrixReportBytes 'scenario report'
 	return $report
 }

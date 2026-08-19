@@ -199,6 +199,35 @@ test('classifies skipped profiles as failures only with --require-all', async ()
 	assert.equal(required.exitCode, 1);
 });
 
+test('isolates append-only evidence between unselected direct-CLI scenarios', async () => {
+	const protocolPath = 'C:/runs/all/protocol.jsonl';
+	let protocolText = '';
+	let summonCount = 0;
+	const matrix = { version: 1, scenarios: ['first', 'second'].map((id) => ({
+		id, provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
+		assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'chat', message: 'ONLY_FIRST' }],
+	})) };
+	const result = await runHeadlessMatrix({
+		configPath: 'C:/matrix.json', runDirectory: 'C:/runs/all', rconPort: 25575,
+		rconPasswordFile: 'C:/runs/password.txt', protocolAuditPath: protocolPath,
+		readFile: async (file) => file.endsWith('matrix.json') ? JSON.stringify(matrix) : 'password',
+		readTail: async (file, _limit, offset = 0) => file === protocolPath ? Buffer.from(protocolText).subarray(offset).toString('utf8') : '',
+		fileSize: async (file) => file === protocolPath ? Buffer.byteLength(protocolText) : 0,
+		writeFile: async () => {}, mkdir: async () => {}, rconFactory: () => ({
+			connect: async () => {},
+			command: async (command) => {
+				if (command.includes('summon-configured') && summonCount++ === 0) {
+					protocolText += `${JSON.stringify({ envelope: { type: 'chat', payload: { message: 'ONLY_FIRST' } } })}\n`;
+				}
+				return { text: command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
+			},
+			close: async () => {},
+		}),
+	});
+	assert.equal(result.report.scenarios[0].status, 'PASSED');
+	assert.equal(result.report.scenarios[1].classification, 'ASSERTION_MISMATCH');
+});
+
 test('help is secret-free and importing the module has no execution side effects', () => {
 	const modulePath = path.resolve('src/headless-matrix.mjs');
 	const help = spawnSync(process.execPath, [modulePath, '--help'], { encoding: 'utf8' });

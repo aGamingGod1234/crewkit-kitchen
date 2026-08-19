@@ -894,7 +894,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return payload;
 	}
 
-	private static String operation(AgentTransition transition) {
+	static String operation(AgentTransition transition) {
 		if (transition.after().queuedGoals().size() > transition.before().queuedGoals().size()) return "queue";
 		if (transition.after().goalRevision() <= transition.before().goalRevision()) return null;
 		if (transition.before().state() == AgentLifecycleState.DEAD

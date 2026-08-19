@@ -308,7 +308,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 			payload: { secret: this.#secret },
 		});
 		const encoded = encodeJsonLine(hello);
-		this.#invokeAudit('coordinator_to_server', hello);
+		this.#invokeAudit('coordinator_to_server', { ...hello, payload: { secret: '[REDACTED]' } });
 		socket.write(encoded);
 	}
 

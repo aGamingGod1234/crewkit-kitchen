@@ -151,6 +151,7 @@ export async function runHeadlessScenario({
 	now = Date.now,
 	readFile = defaultReadFile,
 	readTail = null,
+	fileSize = defaultFileSize,
 	writeFile = defaultWriteFile,
 	protocolAudit = null,
 	providerTurnsPath = null,
@@ -159,7 +160,7 @@ export async function runHeadlessScenario({
 } = {}) {
 	if (!scenario || typeof scenario !== 'object') throw new TypeError('scenario must be an object');
 	if (!rcon || typeof rcon.command !== 'function') throw new TypeError('rcon.command must be a function');
-	if (typeof now !== 'function' || typeof readFile !== 'function' || typeof writeFile !== 'function' || typeof poll !== 'function') throw new TypeError('runner dependencies must be functions');
+	if (typeof now !== 'function' || typeof readFile !== 'function' || typeof writeFile !== 'function' || typeof poll !== 'function' || typeof fileSize !== 'function') throw new TypeError('runner dependencies must be functions');
 	const directory = normalizeRunDirectory(runDirectory);
 	const assertions = scenario.assertions ?? scenario.assert ?? [];
 	validateRunnerScenario(scenario, assertions);
@@ -183,7 +184,10 @@ export async function runHeadlessScenario({
 	const deadline = startedAt + timeoutMs;
 	const tailReader = readTail ?? (readFile === defaultReadFile
 		? defaultReadTail
-		: async (file, limit) => boundedTailText(await readFile(file, 'utf8'), limit));
+		: async (file, limit, offset = 0) => boundedTailText(Buffer.from(await readFile(file, 'utf8')).subarray(offset), limit));
+	const evidencePaths = resolveEvidencePaths(directory, protocolAudit, providerTurnsPath);
+	const evidenceOffsets = await captureEvidenceOffsets(evidencePaths, fileSize);
+	const protocolAuditOffset = auditRows(protocolAudit).length;
 	let terminalState = null;
 	let classification = null;
 	let diagnostics = '';
@@ -244,7 +248,7 @@ export async function runHeadlessScenario({
 		if (classification === null && terminalState === 'DEAD') classification = 'DEAD';
 		if (classification === null && terminalState === null) classification = 'TIMEOUT';
 		const evidenceResult = await collectHeadlessEvidence({
-			directory, readFile, tailReader, protocolAudit, providerTurnsPath, assertions, terminalState, rconEvidence,
+			directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence,
 			readOnlyCommand: (value) => command(value, { readOnly: true, attempt: 0 }),
 			deadline, now, startedAt, poll,
 		});
@@ -334,9 +338,10 @@ export async function runHeadlessMatrix({
 	configPath, scenarioId = null, runDirectory, rconHost = '127.0.0.1', rconPort, rconPasswordFile,
 	protocolAuditPath = null, providerTurnsPath = null, requireAll = false,
 	readFile = defaultReadFile, writeFile = defaultWriteFile, mkdir = defaultMkdir,
+	readTail = null, fileSize = defaultFileSize,
 	rconFactory = (options) => new HeadlessRconClient(options),
 } = {}) {
-	if (typeof readFile !== 'function' || typeof writeFile !== 'function' || typeof mkdir !== 'function' || typeof rconFactory !== 'function') throw new TypeError('headless CLI dependencies must be functions');
+	if (typeof readFile !== 'function' || typeof writeFile !== 'function' || typeof mkdir !== 'function' || typeof rconFactory !== 'function' || (readTail !== null && typeof readTail !== 'function') || typeof fileSize !== 'function') throw new TypeError('headless CLI dependencies must be functions');
 	const matrix = normalizeHeadlessMatrix(JSON.parse(await readFile(configPath, 'utf8')));
 	const scenarios = selectHeadlessScenarios(matrix, scenarioId);
 	if (scenarios.length > MAX_SCENARIOS) throw new RangeError(`selected scenario count exceeds bounded maximum of ${MAX_SCENARIOS}`);
@@ -356,6 +361,8 @@ export async function runHeadlessMatrix({
 				runDirectory: scenarioDirectory,
 				rcon,
 				readFile,
+				readTail,
+				fileSize,
 				writeFile,
 				protocolAudit: protocolAuditPath,
 				providerTurnsPath,
@@ -461,15 +468,16 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 	return { lifecycle: terminalState, terminalState, chats, actions, program, rcon };
 }
 
-async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll }) {
+async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll }) {
 	for (const assertion of assertions) {
 		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
 		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
 		catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; }
 	}
 	let attempt = 0;
-	let fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath);
-	let evidence = makeEvidence({ terminalState, protocolAudit, ...fileEvidence, rcon: rconEvidence });
+	const currentAudit = () => auditRows(protocolAudit).slice(protocolAuditOffset);
+	let fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
+	let evidence = makeEvidence({ terminalState, protocolAudit: currentAudit(), ...fileEvidence, rcon: rconEvidence });
 	let assertionResult = evaluateHeadlessAssertions(assertions, evidence);
 	const waitsForFiles = assertions.some((assertion) => assertion.type !== 'lifecycle' && assertion.type !== 'rcon');
 	while (!assertionResult.passed && waitsForFiles && logicalNow(now, startedAt, attempt) < deadline) {
@@ -477,21 +485,18 @@ async function collectHeadlessEvidence({ directory, readFile, tailReader, protoc
 			await withDeadline(() => poll({ phase: 'evidence', attempt, deadline, evidence, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
 		} catch (error) { if (error?.code === 'HEADLESS_TIMEOUT') break; throw error; }
 		attempt += 1;
-		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath);
-		evidence = makeEvidence({ terminalState, protocolAudit, ...fileEvidence, rcon: rconEvidence });
+		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
+		evidence = makeEvidence({ terminalState, protocolAudit: currentAudit(), ...fileEvidence, rcon: rconEvidence });
 		assertionResult = evaluateHeadlessAssertions(assertions, evidence);
 	}
 	return { fileEvidence, evidence, assertionResult };
 }
 
-async function readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath = null) {
-	const protocolPath = typeof protocolAudit === 'string' ? protocolAudit : path.join(directory, 'protocol.jsonl');
-	const coordinatorPath = path.join(directory, 'coordinator.jsonl');
-	const serverPath = path.join(directory, 'server.log');
-	const providerTurns = typeof providerTurnsPath === 'string' ? providerTurnsPath : null;
+async function readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath = null, offsets = {}) {
+	const { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath, providerTurns } = resolveEvidencePaths(directory, protocolAudit, providerTurnsPath);
 	const [protocolText, coordinatorText, serverLog, providerTurnsText] = await Promise.all([
-		readBoundedTail(tailReader, protocolPath), readBoundedTail(tailReader, coordinatorPath), readBoundedTail(tailReader, serverPath),
-		providerTurns === null ? '' : readBoundedTail(tailReader, providerTurns),
+		readBoundedTail(tailReader, protocolPath, offsets.protocol), readBoundedTail(tailReader, coordinatorPath, offsets.coordinator), readBoundedTail(tailReader, serverPath, offsets.server),
+		providerTurns === null ? '' : readBoundedTail(tailReader, providerTurns, offsets.providerTurns),
 	]);
 	return {
 		protocolRows: parseJsonl(protocolText), traceRows: parseJsonl(coordinatorText), serverLog,
@@ -500,13 +505,33 @@ async function readEvidence(directory, readFile, tailReader, protocolAudit, prov
 	};
 }
 
+function resolveEvidencePaths(directory, protocolAudit, providerTurnsPath) {
+	return {
+		protocol: typeof protocolAudit === 'string' ? protocolAudit : path.join(directory, 'protocol.jsonl'),
+		coordinator: path.join(directory, 'coordinator.jsonl'),
+		server: path.join(directory, 'server.log'),
+		providerTurns: typeof providerTurnsPath === 'string' ? providerTurnsPath : null,
+	};
+}
+
+async function captureEvidenceOffsets(paths, fileSize) {
+	const entries = await Promise.all(Object.entries(paths).map(async ([key, file]) => {
+		if (file === null) return [key, 0];
+		try {
+			const size = Number(await fileSize(file));
+			return [key, Number.isSafeInteger(size) && size >= 0 ? size : 0];
+		} catch { return [key, 0]; }
+	}));
+	return Object.fromEntries(entries);
+}
+
 function evidenceSummary(directory, fileEvidence, protocolAudit) {
 	const paths = fileEvidence.paths ?? { protocol: path.join(directory, 'protocol.jsonl'), coordinator: path.join(directory, 'coordinator.jsonl'), server: path.join(directory, 'server.log') };
 	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: fileEvidence.protocolRows?.length ?? auditRows(protocolAudit).length, providerTurnsRows: fileEvidence.providerTurnsRows ?? 0 };
 }
 
-async function readBoundedTail(readTail, file) {
-	try { return boundedTailText(await readTail(file, MAX_EVIDENCE_BYTES), MAX_EVIDENCE_BYTES); } catch { return ''; }
+async function readBoundedTail(readTail, file, offset = 0) {
+	try { return boundedTailText(await readTail(file, MAX_EVIDENCE_BYTES, offset), MAX_EVIDENCE_BYTES); } catch { return ''; }
 }
 
 function parseJsonl(value) {
@@ -552,7 +577,7 @@ function parseLifecycle(value) {
 }
 
 function isFailedResponse(value) { return /(?:\bERROR\b|\bFAILED\b|unknown agent|unable to|rejected)/i.test(String(value ?? '')); }
-function isSkippedResponse(value) { return /(?:SKIP|unavailable|not logged in|not installed|profile unavailable|catalog unavailable)/i.test(String(value ?? '')); }
+function isSkippedResponse(value) { return /(?:SKIP|unavailable|not logged in|not installed|profile unavailable|catalog unavailable|catalog\s+rejected)/i.test(String(value ?? '')); }
 function isAcceptedResponse(value) { return String(value ?? '').trim().length > 0; }
 function isReadOnlyRcon(value) {
 	const source = String(value ?? '');
@@ -636,13 +661,23 @@ async function withDeadline(operation, deadline, currentTime, code = 'HEADLESS_T
 	finally { clearTimeout(timer); }
 }
 
-async function defaultReadTail(file, maxBytes) {
+async function defaultFileSize(file) {
+	const handle = await defaultOpen(file, 'r');
+	try { return Number((await handle.stat()).size); }
+	finally { await handle.close(); }
+}
+
+async function defaultReadTail(file, maxBytes, startOffset = 0) {
 	const handle = await defaultOpen(file, 'r');
 	try {
 		const stats = await handle.stat();
-		const size = Math.min(Number(stats.size), maxBytes);
+		const end = Number(stats.size);
+		const requested = Number.isSafeInteger(startOffset) && startOffset >= 0 ? startOffset : 0;
+		const minimum = requested <= end ? requested : 0;
+		const position = Math.max(minimum, end - maxBytes);
+		const size = end - position;
 		const buffer = Buffer.alloc(size);
-		if (size > 0) await handle.read(buffer, 0, size, Number(stats.size) - size);
+		if (size > 0) await handle.read(buffer, 0, size, position);
 		return buffer.toString('utf8');
 	} finally { await handle.close(); }
 }

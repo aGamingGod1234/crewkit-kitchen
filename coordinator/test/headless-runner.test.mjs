@@ -225,7 +225,7 @@ test('classifies timeout, terminal ERROR/DEAD, skipped profiles, assertion misma
 	const make = async (statusText, overrides = {}) => {
 		let clock = 0;
 		const rcon = {
-			command: async (command) => command.includes('codex summon-configured') ? { text: 'Created agent. ready' } : command.startsWith('codex start') ? { text: 'started' } : { text: statusText },
+			command: async (command) => command.includes('codex summon-configured') ? { text: overrides.summonText ?? 'Created agent. ready' } : command.startsWith('codex start') ? { text: 'started' } : { text: statusText },
 			close: overrides.close ?? (async () => {}),
 		};
 		const selectedScenario = overrides.scenario ? { ...scenario(), ...overrides.scenario } : scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] });
@@ -239,6 +239,9 @@ test('classifies timeout, terminal ERROR/DEAD, skipped profiles, assertion misma
 	assert.equal((await make('state=ERROR')).classification, 'ERROR');
 	assert.equal((await make('state=DEAD')).classification, 'DEAD');
 	assert.equal((await make('state=COMPLETED', { scenario: { ...scenario(), skip: true, skipReason: 'profile unavailable' } })).status, 'SKIPPED');
+	const catalogRejected = await make('state=COMPLETED', { summonText: 'Coordinator catalog rejected codex/m/high (provider profiles: 0)' });
+	assert.equal(catalogRejected.status, 'SKIPPED');
+	assert.equal(catalogRejected.classification, 'SKIPPED_PROFILE');
 	assert.equal((await make('state=COMPLETED', { scenario: { assert: [{ type: 'chat', message: 'missing' }] } })).classification, 'ASSERTION_MISMATCH');
 	assert.equal((await make('state=COMPLETED', { close: async () => { throw new Error('port still open'); } })).classification, 'CLEANUP_FAILURE');
 	await t.test('reports remain serializable', () => assert.doesNotThrow(() => JSON.stringify({ status: 'PASSED' })));

@@ -238,7 +238,7 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.completeGoal(require(id), revision, nowEpochMs));
 	}
 
-	/** Applies a coordinator-owned terminal state without revising or echoing the goal. */
+	/** Applies a coordinator-owned completion while preserving terminal revisions and promoting queued work. */
 	public synchronized AgentRecord coordinatorCompleted(AgentId id, long revision, long nowEpochMs) {
 		AgentRecord current = require(id);
 		if (current.goalRevision() != revision) {
@@ -248,6 +248,9 @@ public final class AgentRegistry {
 		if (!current.state().isActive()) {
 			throw new AgentDomainException("INVALID_AGENT_STATE", "Coordinator completion requires an active agent");
 		}
+		if (!current.queuedGoals().isEmpty()) {
+			return apply(AgentLifecycleReducer.completeGoal(current, revision, nowEpochMs)).after();
+		}
 		AgentRecord completed = current.withLifecycle(
 				AgentLifecycleState.COMPLETED,
 				current.currentGoal(),
@@ -256,9 +259,7 @@ public final class AgentRegistry {
 				nowEpochMs,
 				""
 		);
-		records.put(id, completed);
-		onChange.run();
-		return completed;
+		return apply(new AgentTransition(current, completed, true, true)).after();
 	}
 
 	public synchronized AgentTransition fail(AgentId id, String message, long nowEpochMs) {

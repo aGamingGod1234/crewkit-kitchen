@@ -34,11 +34,13 @@ function New-Fixture([string] $Root) {
 	New-Item -ItemType Directory -Path (Split-Path -Parent $fakeCodex) -Force | Out-Null
 @'
 import readline from 'node:readline';
+import { existsSync } from 'node:fs';
 const input = readline.createInterface({ input: process.stdin });
 input.on('line', (line) => {
     try {
         const request = JSON.parse(line);
         if (!Number.isInteger(request.id)) return;
+        if (request.method === 'model/list' && existsSync(`${process.env.APPDATA}/no-catalog`)) return;
         const result = request.method === 'model/list' ? { data: [], nextCursor: null } : {};
         process.stdout.write(`${JSON.stringify({ id: request.id, result })}\n`);
     } catch {}
@@ -136,7 +138,8 @@ public final class FakeServer {
                 int id = readLittleEndian(payload, 0);
                 int type = readLittleEndian(payload, 4);
                 String command = new String(payload, 8, length - 10, StandardCharsets.UTF_8);
-                String response = type == 3 ? "" : command.contains("summon-configured") ? "OK" : command.startsWith("codex status") ? "state=COMPLETED" : "OK";
+                String summonResponse = System.getenv("ARENA_HEADLESS_FAKE_SUMMON_RESPONSE");
+                String response = type == 3 ? "" : command.contains("summon-configured") ? (summonResponse == null ? "OK" : summonResponse) : command.startsWith("codex status") ? "state=COMPLETED" : "OK";
                 writeResponse(output, id, type == 3 ? 2 : 0, response);
                 output.flush();
             }
@@ -321,6 +324,15 @@ try {
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Coordinator bridge did not become ready'
 	Set-TestEnvironment 'ARENA_HEADLESS_FAKE_NO_HELLO_ACK' $null
 	Write-Output 'PASS open bridge port without authenticated handshake is not ready'
+	$catalogMatrix = Join-Path $fixture 'catalog-matrix.json'
+	Set-Content -LiteralPath $catalogMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
+	Set-Content -LiteralPath (Join-Path $fixture 'fake-appdata\no-catalog') -Value 'hold model/list' -NoNewline
+	try {
+		Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $catalogMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Coordinator bridge did not become ready'
+	} finally {
+		Remove-Item -LiteralPath (Join-Path $fixture 'fake-appdata\no-catalog') -Force -ErrorAction SilentlyContinue
+	}
+	Write-Output 'PASS authenticated bridge waits for catalog publication before runner startup'
 	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '5'
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'ready|timed out|failed|required'
 	if (-not (Test-PortClosed 39165) -or -not (Test-PortClosed 39166) -or -not (Test-PortClosed 39167)) { throw 'Allocated ports remained open after timeout cleanup' }
@@ -341,11 +353,12 @@ try {
 	if (Test-Path -LiteralPath (Join-Path $defaultScenarioDirectory 'rcon-password.txt')) { throw 'Default cleanup retained the RCON credential' }
 	if (Test-Path -LiteralPath (Join-Path $defaultScenarioDirectory 'server')) { throw 'Default cleanup retained the copied server' }
 	if (Test-Path -LiteralPath (Join-Path $defaultScenarioDirectory 'provider-workspaces')) { throw 'Default cleanup retained provider workspaces' }
+	if (Test-Path -LiteralPath (Join-Path $defaultScenarioDirectory 'coordinator-private.jsonl')) { throw 'Default cleanup retained the private coordinator trace' }
 
 	# Exercise a successful normal path with the same fake server and verify the
 	# wrapper's graceful-stop snapshot also removes the server's child helper.
 	$successMatrix = Join-Path $fixture 'success-matrix.json'
-	Set-Content -LiteralPath $successMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","serviceTier":"fast","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
+	Set-Content -LiteralPath $successMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"fixture","reasoningEffort":"low","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
 	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39168'
 	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39169'
 	Set-TestEnvironment 'ARENA_HEADLESS_BRIDGE_PORT' '39170'
@@ -353,8 +366,25 @@ try {
 	$successMatrixReportPath = Join-Path (Get-ChildItem -LiteralPath $runRoot -Directory | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).FullName 'matrix-report.json'
 	$successMatrixReport = Get-Content -Raw -LiteralPath $successMatrixReportPath | ConvertFrom-Json
 	if ($successMatrixReport.status -ne 'PASSED' -or $successMatrixReport.scenarios[0].status -ne 'PASSED' -or $successMatrixReport.scenarios[0].cleanup.status -ne 'CLEAN') { throw 'Successful normal-cleanup fixture did not pass cleanly' }
+	if ($successMatrixReport.scenarios[0].profile.serviceTier -ne 'priority') { throw 'Omitted serviceTier did not default to priority through the wrapper' }
 	if (@(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'FakeServer|Start-Sleep -Seconds 3' }).Count -gt 0) { throw 'Successful normal cleanup left dummy server descendants running' }
 	Write-Output 'PASS successful normal cleanup and descendant verification'
+
+	$skipMatrix = Join-Path $fixture 'skip-matrix.json'
+	Set-Content -LiteralPath $skipMatrix -Value '{"version":1,"scenarios":[{"id":"fixture","provider":"codex","model":"missing","reasoningEffort":"low","task":"fixture","timeoutMs":1000,"assert":[{"type":"lifecycle","state":"COMPLETED"}]}]}' -NoNewline
+	Set-TestEnvironment 'ARENA_HEADLESS_FAKE_SUMMON_RESPONSE' 'Coordinator catalog rejected codex/missing/low (provider profiles: 0)'
+	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39171'
+	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39172'
+	Set-TestEnvironment 'ARENA_HEADLESS_BRIDGE_PORT' '39173'
+	try {
+		& $scriptPath -ProjectRoot $fixture -MatrixPath $skipMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') | Out-Null
+	} finally {
+		Set-TestEnvironment 'ARENA_HEADLESS_FAKE_SUMMON_RESPONSE' $null
+	}
+	$skipReportPath = Join-Path (Get-ChildItem -LiteralPath $runRoot -Directory | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).FullName 'matrix-report.json'
+	$skipReport = Get-Content -Raw -LiteralPath $skipReportPath | ConvertFrom-Json
+	if ($skipReport.status -ne 'SKIPPED' -or $skipReport.scenarios[0].status -ne 'SKIPPED' -or $skipReport.scenarios[0].classification -ne 'SKIPPED_PROFILE') { throw 'Wrapper did not preserve the runner SKIPPED classification' }
+	Write-Output 'PASS optional catalog rejection remains SKIPPED through wrapper reporting'
 
 	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39168'
 	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39169'
@@ -366,6 +396,10 @@ try {
 	$keptScenarioDirectory = Split-Path -Parent $keptScenarioReport.FullName
 	if (-not (Test-Path -LiteralPath (Join-Path $keptScenarioDirectory 'rcon-password.txt'))) { throw 'KeepArtifacts did not retain the RCON credential artifact' }
 	if (-not (Test-Path -LiteralPath (Join-Path $keptScenarioDirectory 'coordinator.jsonl'))) { throw 'KeepArtifacts did not retain the coordinator evidence trace at the runner path' }
+	if (-not (Test-Path -LiteralPath (Join-Path $keptScenarioDirectory 'coordinator-private.jsonl'))) { throw 'KeepArtifacts did not retain the derived private coordinator trace' }
+	$keptSecret = (Get-Content -Raw -LiteralPath (Join-Path $keptScenarioDirectory 'rcon-password.txt')).Trim()
+	$keptAudit = Get-Content -Raw -LiteralPath (Join-Path $keptScenarioDirectory 'protocol.jsonl')
+	if ($keptAudit.Contains($keptSecret)) { throw 'Protocol audit retained the bridge/RCON secret' }
 	$properties = Get-Content -Raw -LiteralPath (Join-Path $keptScenarioDirectory 'server\server.properties')
 	if ($properties -notmatch '(?m)^rcon\.ip=127\.0\.0\.1\r?$') { throw "RCON loopback binding was not configured: $properties" }
 	Write-Output 'PASS matrix report forwarding, cleanup retention, KeepArtifacts, and loopback RCON'
@@ -393,7 +427,7 @@ try {
 	}
 	Write-Output 'PASS timeout cleanup, port verification, child-tree cleanup, and provider isolation hooks'
 } finally {
-	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_FAKE_NO_HELLO_ACK','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS','ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS','ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS')) { Set-TestEnvironment $name $null }
+	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_FAKE_NO_HELLO_ACK','ARENA_HEADLESS_FAKE_SUMMON_RESPONSE','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS','ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS','ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS')) { Set-TestEnvironment $name $null }
 	if (Test-Path -LiteralPath $project) {
 		$extendedProject = if ($project.StartsWith('\\')) { '\\?\UNC\' + $project.Substring(2) } else { '\\?\' + [IO.Path]::GetFullPath($project) }
 		[IO.Directory]::Delete($extendedProject, $true)

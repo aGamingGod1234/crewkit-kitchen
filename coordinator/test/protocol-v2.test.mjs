@@ -372,6 +372,9 @@ test('multiplexed bridge audits validated detached inbound and outbound envelope
 		['coordinator_to_server', 'coordinator-v2-2', 'agent_ready', 'agent-a'],
 		['coordinator_to_server', 'coordinator-v2-3', 'action_command', 'agent-a'],
 	]);
+	assert.equal(JSON.parse(socket.writes[0]).payload.secret, SECRET);
+	assert.equal(audit[0].envelope.payload.secret, '[REDACTED]');
+	assert.doesNotMatch(JSON.stringify(audit), new RegExp(SECRET));
 	audit[2].envelope.payload.position.x = 999;
 	assert.equal(receivedObservation.payload.position.x, 10.5);
 	bridge.stop();

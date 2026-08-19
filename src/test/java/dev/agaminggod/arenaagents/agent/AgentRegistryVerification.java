@@ -86,10 +86,20 @@ public final class AgentRegistryVerification {
 		assertEquals(AgentLifecycleState.COMPLETED, completed.state(), "coordinator completion state");
 		assertEquals(1L, completed.goalRevision(), "coordinator completion preserves goal revision");
 		assertEquals("Finish this task", completed.currentGoal().orElseThrow().prompt(), "coordinator completion preserves current goal");
-		assertEquals(2, transitions.size(), "coordinator completion does not echo a synthetic lifecycle transition");
+		assertEquals(3, transitions.size(), "coordinator completion dispatches a local lifecycle transition");
+		assertEquals(AgentLifecycleState.COMPLETED, transitions.getLast().after().state(), "coordinator completion transition exposes DONE locally");
 		assertEquals(AgentLifecycleState.COMPLETED, registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 4L).state(), "repeated coordinator completion is idempotent");
 		expectFailure(() -> registry.coordinatorCompleted(created.agentId(), 0L, START_TIME + 5L), "STALE_REVISION");
-		return 6;
+
+		AgentRecord queued = registry.create("gpt-5.6-sol", "high", Optional.of("Queued"), START_TIME + 6L);
+		registry.start(queued.agentId(), "First task", START_TIME + 7L);
+		registry.queue(queued.agentId(), "Second task", START_TIME + 8L);
+		AgentRecord promoted = registry.coordinatorCompleted(queued.agentId(), 1L, START_TIME + 9L);
+		assertEquals(AgentLifecycleState.STARTING, promoted.state(), "coordinator completion promotes queued work");
+		assertEquals("Second task", promoted.currentGoal().orElseThrow().prompt(), "coordinator completion installs the queued goal");
+		assertEquals(2L, promoted.goalRevision(), "queued promotion advances the goal revision");
+		assertEquals(0, promoted.queuedGoals().size(), "queued promotion consumes the queue head");
+		return 11;
 	}
 
 	private static int verifyQueueAndSteeringBounds() {
