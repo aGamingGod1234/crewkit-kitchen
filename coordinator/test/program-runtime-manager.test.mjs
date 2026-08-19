@@ -303,6 +303,30 @@ test('does not turn an ordinary active-action observation into unmatched attenti
 	assert.equal(run.requests.length, 0);
 });
 
+test('refreshes authored watcher facts across two hundred quiet movement observations without provider turns', async () => {
+	const run = harness();
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Watch movement and health.', directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().x >= 200 && player.state().health === 20, { mode: "boundary" }, async () => { await player.wait(7); }); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	const first = run.sent[0];
+	for (let index = 1; index <= 200; index += 1) {
+		const sequence = index + 1;
+		const snapshot = await run.manager.onObservation(run.registry.get('agent-a'), {
+			observation: observation({ player: { x: index, y: 64, z: index / 2, health: 20 } }),
+			eventSequence: sequence,
+			attention: false,
+		});
+		assert.equal(snapshot.factsSequence, sequence, `quiet observation ${sequence} refreshes local facts`);
+	}
+	assert.equal(run.requests.length, 0, 'two hundred quiet fact updates request no provider turn');
+	await run.manager.onActionResult(run.registry.get('agent-a'), {
+		actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 202,
+	});
+	assert.equal(run.sent.at(-1).payload.arguments.durationMs, 7, 'the authored movement and health watcher uses refreshed facts locally');
+	assert.equal(run.sent.at(-1).payload.provenance.eventSequence, 201, 'the watcher retains the exact triggering observation sequence');
+});
+
 test('keeps versions and external action identities monotonic across remove and recreate', async () => {
 	const run = harness();
 	await run.manager.installDecision(run.registry.get('agent-a'), { summary: 'Wait.', directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });

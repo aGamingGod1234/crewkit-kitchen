@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 import net.minecraft.world.phys.Vec3;
 
 public final class ObservationBudgetVerification {
@@ -25,8 +26,8 @@ public final class ObservationBudgetVerification {
 		assertEquals(7L, delta.eventSequence(), "event sequence is retained exactly");
 		assertTrue(delta.changedFacts().contains("player.health"), "health delta is factual");
 		assertTrue(delta.changedFacts().contains("player.onFire"), "fire delta is factual");
-		assertTrue(delta.changedFacts().contains("player.fallDistance"), "fall delta is factual");
-		assertTrue(delta.changedFacts().contains("currentAction"), "action delta is factual");
+		assertFalse(delta.changedFacts().contains("player.fallDistance"), "fall progress stays quiet");
+		assertFalse(delta.changedFacts().contains("currentAction"), "ordinary action progress stays quiet");
 		assertFalse(delta.changedFacts().stream().anyMatch(path -> path.contains("danger") || path.contains("flee") || path.contains("fight")),
 				"deltas do not invent tactical labels");
 		JsonObject factualBefore = observation(20.0D, false, 0.0D, "idle");
@@ -42,8 +43,9 @@ public final class ObservationBudgetVerification {
 		assertTrue(worldDelta.changedFacts().contains("inventory"), "inventory changes are eligible without action progress");
 		assertTrue(worldDelta.changedFacts().contains("entities.00000000-0000-0000-0000-000000000001"),
 				"entity changes are eligible without action progress");
-		assertTrue(worldDelta.changedFacts().contains("blocks.1,64,0"), "block changes are eligible without action progress");
-		assertTrue(worldDelta.changedFacts().contains("world"), "weather changes are eligible without action progress");
+		assertFalse(worldDelta.changedFacts().stream().anyMatch(path -> path.startsWith("blocks")),
+				"block visibility churn stays quiet");
+		assertFalse(worldDelta.changedFacts().contains("world"), "weather changes stay quiet");
 		AttentionFactDelta initialDelta = AttentionFactDelta.between(null, current, 1L, 123L);
 		assertFalse(initialDelta.attention(), "initial observation is not attention");
 		assertEquals(List.of(), initialDelta.changedFacts(), "initial observation has no changed facts");
@@ -55,9 +57,9 @@ public final class ObservationBudgetVerification {
 		assertEquals(List.of(), timeOnly.changedFacts(), "world clock heartbeat has no changed facts");
 		JsonObject crowdedBefore = observation(20.0D, false, 0.0D, "idle");
 		JsonObject crowdedAfter = observation(20.0D, false, 0.0D, "idle");
-		for (int index = 0; index < 64; index++) {
+		for (int index = 0; index < 300; index++) {
 			crowdedBefore.getAsJsonArray("entities").add(entity(index));
-			crowdedAfter.getAsJsonArray("entities").add(entity(index + 64));
+			crowdedAfter.getAsJsonArray("entities").add(entity(index + 300));
 		}
 		for (int index = 0; index < 128; index++) {
 			crowdedBefore.getAsJsonArray("blocks").add(block(index));
@@ -66,7 +68,117 @@ public final class ObservationBudgetVerification {
 		AttentionFactDelta crowded = AttentionFactDelta.between(crowdedBefore, crowdedAfter, 9L, 125L);
 		assertTrue(crowded.changedFacts().size() <= 256, "changed facts remain protocol bounded at maximum disjoint entity and block changes");
 		assertTrue(crowded.changedFacts().contains("entities"), "entity overflow coalesces to a factual aggregate");
-		assertTrue(crowded.changedFacts().contains("blocks"), "block overflow coalesces to a factual aggregate");
+		assertFalse(crowded.changedFacts().contains("blocks"), "block visibility changes do not request model attention");
+
+		JsonObject movementBefore = signalObservation();
+		JsonObject movingEntity = entity(1);
+		movingEntity.addProperty("distance", 4.0D);
+		movingEntity.add("position", vector(4.0D, 64.0D, 0.0D));
+		movementBefore.getAsJsonArray("entities").add(movingEntity);
+		for (int index = 1; index <= 200; index++) {
+			JsonObject movementAfter = movementBefore.deepCopy();
+			movementAfter.add("position", vector(index, 64.0D, index / 2.0D));
+			movementAfter.add("velocity", vector(0.1D, 0.0D, 0.05D));
+			movementAfter.getAsJsonObject("view").addProperty("yaw", index);
+			movementAfter.getAsJsonObject("view").addProperty("pitch", index % 30);
+			movementAfter.getAsJsonObject("world").addProperty("gameTime", index);
+			movementAfter.getAsJsonObject("world").addProperty("dayTime", index);
+			movementAfter.getAsJsonObject("world").addProperty("raining", index % 2 == 0);
+			JsonObject movedEntity = movementAfter.getAsJsonArray("entities").get(0).getAsJsonObject();
+			movedEntity.addProperty("distance", Math.max(0.0D, 4.0D - index / 100.0D));
+			movedEntity.add("position", vector(4.0D + index / 10.0D, 64.0D, 0.0D));
+			AttentionFactDelta movement = AttentionFactDelta.between(
+					movementBefore, movementAfter, 1_000L + index, 2_000L + index);
+			assertFalse(movement.attention(), "movement update " + index + " does not request a provider turn");
+			assertEquals(List.of(), movement.changedFacts(), "movement update " + index + " emits no attention facts");
+			movementBefore = movementAfter;
+		}
+
+		JsonObject signalBefore = signalObservation();
+		assertAttentionFact(signalBefore, changed(signalBefore, value ->
+				value.getAsJsonObject("player").addProperty("health", 19.0D)), "player.health");
+		assertAttentionFact(signalBefore, changed(signalBefore, value ->
+				value.getAsJsonObject("player").addProperty("onFire", true)), "player.onFire");
+		assertAttentionFact(signalBefore, changed(signalBefore, value -> value.addProperty("ready", false)), "ready");
+		assertAttentionFact(signalBefore, changed(signalBefore, value -> value.addProperty("status", "PLAYER_DEAD")), "status");
+		assertAttentionFact(signalBefore, changed(signalBefore, value ->
+				value.getAsJsonObject("player").addProperty("air", 60)), "player.air");
+		assertAttentionFact(signalBefore, changed(signalBefore, value ->
+				value.getAsJsonObject("player").addProperty("foodLevel", 6)), "player.foodLevel");
+		assertAttentionFact(signalBefore, changed(signalBefore, value ->
+				value.getAsJsonObject("player").addProperty("suffocating", true)), "player.suffocating");
+		assertAttentionFact(signalBefore, changed(signalBefore, value -> {
+			JsonObject item = new JsonObject();
+			item.addProperty("itemId", "minecraft:torch");
+			item.addProperty("count", 4);
+			item.addProperty("slot", 0);
+			value.getAsJsonObject("inventory").getAsJsonArray("items").add(item);
+		}), "inventory");
+		JsonObject inventoryBefore = changed(signalBefore, value -> {
+			JsonObject item = new JsonObject();
+			item.addProperty("itemId", "minecraft:torch");
+			item.addProperty("count", 4);
+			item.addProperty("slot", 0);
+			value.getAsJsonObject("inventory").getAsJsonArray("items").add(item);
+		});
+		assertAttentionFact(inventoryBefore, changed(inventoryBefore, value ->
+				value.getAsJsonObject("inventory").getAsJsonArray("items").get(0).getAsJsonObject()
+						.addProperty("count", 3)), "inventory");
+		assertAttentionFact(signalBefore, changed(signalBefore, value ->
+				value.getAsJsonArray("entities").add(entity(2))),
+				"entities.00000000-0000-0000-0000-000000000002");
+		JsonObject entityBefore = changed(signalBefore, value -> value.getAsJsonArray("entities").add(entity(5)));
+		assertAttentionFact(entityBefore, changed(entityBefore, value ->
+				value.getAsJsonArray("entities").remove(0)),
+				"entities.00000000-0000-0000-0000-000000000005");
+		assertAttentionFact(signalBefore, changed(signalBefore, value -> {
+			JsonObject result = value.getAsJsonObject("lastResult");
+			result.addProperty("present", true);
+			result.addProperty("actionId", "action-1");
+			result.addProperty("state", "FAILED");
+			result.addProperty("reasonCode", "PATH_BLOCKED");
+		}), "lastResult");
+		assertAttentionFact(signalBefore, changed(signalBefore, value -> {
+			JsonObject result = value.getAsJsonObject("lastResult");
+			result.addProperty("present", true);
+			result.addProperty("actionId", "action-2");
+			result.addProperty("state", "TIMED_OUT");
+			result.addProperty("reasonCode", "ACTION_TIMEOUT");
+		}), "lastResult");
+		assertAttentionFact(signalBefore, changed(signalBefore, value ->
+				value.getAsJsonObject("world").addProperty("dimension", "minecraft:the_nether")), "world.dimension");
+
+		assertQuiet(signalBefore, changed(signalBefore, value ->
+				value.getAsJsonObject("player").addProperty("health", 21.0D)), "healing");
+		assertQuiet(signalBefore, changed(signalBefore, value -> {
+			JsonObject action = value.getAsJsonObject("currentAction");
+			action.addProperty("active", true);
+			action.addProperty("actionType", "navigate_to");
+			action.addProperty("progress", 0.5D);
+		}), "ordinary action progress");
+		assertQuiet(signalBefore, changed(signalBefore, value -> {
+			JsonObject result = value.getAsJsonObject("lastResult");
+			result.addProperty("present", true);
+			result.addProperty("actionId", "action-3");
+			result.addProperty("state", "SUCCEEDED");
+			result.addProperty("reasonCode", "DONE");
+		}), "successful result");
+		assertQuiet(signalBefore, changed(signalBefore, value -> {
+			value.getAsJsonObject("view").addProperty("yaw", 90.0D);
+			value.getAsJsonArray("entities").add(entity(3));
+		}), "view-cone membership change");
+		assertQuiet(signalBefore, changed(signalBefore, value -> {
+			value.add("position", vector(1.0D, 64.0D, 0.0D));
+			value.getAsJsonArray("entities").add(entity(4));
+		}), "movement membership change");
+		AttentionFactDelta sorted = AttentionFactDelta.between(signalBefore, changed(signalBefore, value -> {
+			value.addProperty("ready", false);
+			value.addProperty("status", "PLAYER_DEAD");
+			value.getAsJsonObject("player").addProperty("health", 0.0D);
+			value.getAsJsonObject("world").addProperty("dimension", "minecraft:the_end");
+		}), 52L, 52L);
+		assertEquals(List.of("player.health", "ready", "status", "world.dimension"), sorted.changedFacts(),
+				"attention fact paths are deterministic and sorted");
 		MultiplexedServerBridge.PublishedObservationState publication = new MultiplexedServerBridge.PublishedObservationState(16);
 		AgentId retryAgent = AgentId.parse("01234567-89ab-cdef-0123-456789abcdef");
 		publication.commit(retryAgent, previous);
@@ -220,7 +332,7 @@ public final class ObservationBudgetVerification {
 		assertEquals("v3", invalidationCache.getOrCompute(unrelated, 2L,
 				() -> value("v" + invalidationLoads.incrementAndGet())).get("value").getAsString(),
 				"agent-scoped invalidation preserves unrelated raw candidates");
-		return 70;
+		return 509;
 	}
 
 	private static List<AgentRecord> activeRecords(int count) {
@@ -234,6 +346,56 @@ public final class ObservationBudgetVerification {
 			records.add(AgentLifecycleReducer.start(idle, "work " + index, 2_000L + index).after());
 		}
 		return List.copyOf(records);
+	}
+
+	private static JsonObject signalObservation() {
+		JsonObject value = observation(20.0D, false, 0.0D, "idle");
+		value.addProperty("ready", true);
+		value.addProperty("status", "ACTING");
+		value.add("position", vector(0.0D, 64.0D, 0.0D));
+		value.add("velocity", vector(0.0D, 0.0D, 0.0D));
+		JsonObject view = new JsonObject();
+		view.addProperty("yaw", 0.0D);
+		view.addProperty("pitch", 0.0D);
+		value.add("view", view);
+		JsonObject player = value.getAsJsonObject("player");
+		player.addProperty("air", 300);
+		player.addProperty("maxAir", 300);
+		player.addProperty("foodLevel", 20);
+		player.addProperty("suffocating", false);
+		value.getAsJsonObject("inventory").add("items", new com.google.gson.JsonArray());
+		value.getAsJsonObject("inventory").addProperty("selectedItem", "minecraft:air");
+		value.add("nearbyContainers", new com.google.gson.JsonArray());
+		JsonObject result = new JsonObject();
+		result.addProperty("present", false);
+		value.add("lastResult", result);
+		return value;
+	}
+
+	private static JsonObject changed(JsonObject source, Consumer<JsonObject> mutation) {
+		JsonObject value = source.deepCopy();
+		mutation.accept(value);
+		return value;
+	}
+
+	private static void assertAttentionFact(JsonObject previous, JsonObject current, String expectedFact) {
+		AttentionFactDelta delta = AttentionFactDelta.between(previous, current, 50L, 50L);
+		assertTrue(delta.attention(), expectedFact + " requests attention");
+		assertTrue(delta.changedFacts().contains(expectedFact), expectedFact + " is reported exactly");
+	}
+
+	private static void assertQuiet(JsonObject previous, JsonObject current, String label) {
+		AttentionFactDelta delta = AttentionFactDelta.between(previous, current, 51L, 51L);
+		assertFalse(delta.attention(), label + " stays quiet");
+		assertEquals(List.of(), delta.changedFacts(), label + " emits no attention facts");
+	}
+
+	private static JsonObject vector(double x, double y, double z) {
+		JsonObject value = new JsonObject();
+		value.addProperty("x", x);
+		value.addProperty("y", y);
+		value.addProperty("z", z);
+		return value;
 	}
 
 	private static JsonObject observation(double health, boolean onFire, double fallDistance, String actionType) {

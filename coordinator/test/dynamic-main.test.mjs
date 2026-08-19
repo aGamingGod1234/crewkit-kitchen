@@ -210,6 +210,41 @@ test('real protocol-v2 observations adapt before ArenaScript facts normalization
 	} finally { await run.coordinator.stop(); }
 });
 
+test('accepts two hundred quiet wire observations without another provider turn', async () => {
+	const run = await start();
+	try {
+		run.planner.requestPlan = async (request) => {
+			run.planner.requests.push(request);
+			return {
+				summary: 'Watch movement and health.', directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().x >= 200 && player.state().health === 20, { mode: "boundary" }, async () => { await player.wait(7); }); await player.wait(1);',
+			};
+		};
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Watch movement.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1, attention: false,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		const first = run.bridge.sent.find((message) => message.type === 'action_command');
+		for (let index = 1; index <= 200; index += 1) {
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+				goalRevision: 1, eventSequence: index + 1, attention: false,
+				observation: { player: { x: index, y: 64, z: index / 2, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+			} });
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		assert.equal(run.planner.requests.length, 1, 'only the initial planning turn reaches the selected provider');
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
+			goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 202,
+		} });
+		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
+		const watcher = run.bridge.sent.filter((message) => message.type === 'action_command').at(-1);
+		assert.equal(watcher.payload.arguments.durationMs, 7, 'wire updates reach the authored watcher in order');
+		assert.equal(watcher.payload.provenance.eventSequence, 201, 'the watcher uses the final accepted quiet fact sequence');
+	} finally { await run.coordinator.stop(); }
+});
+
 test('records program authority and typed command diagnostics for the selected model', async () => {
 	const rows = [];
 	const diagnostics = [];
