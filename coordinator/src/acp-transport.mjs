@@ -43,6 +43,15 @@ export function buildAcpLaunch(provider, profile = {}, dependencies = {}) {
 			}
 		}
 	}
+	if (normalizedProvider === 'kimi' && (dependencies.platform ?? process.platform) === 'win32') {
+		const appData = environment.APPDATA;
+		if (typeof appData === 'string') {
+			const entrypoint = path.join(appData, 'npm', 'node_modules', '@moonshot-ai', 'kimi-code', 'dist', 'main.mjs');
+			if ((dependencies.existsSync ?? existsSync)(entrypoint)) {
+				return { command: dependencies.execPath ?? process.execPath, args: [entrypoint, 'acp'], options };
+			}
+		}
+	}
 	return { command: normalizedProvider, args: normalizedProvider === 'gemini' ? ['--acp'] : ['acp'], options };
 }
 

@@ -4,10 +4,23 @@ import test from 'node:test';
 
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
-import { createDynamicCoordinator } from '../src/dynamic-main.mjs';
+import { createDynamicCoordinator, normalizeDynamicConfig } from '../src/dynamic-main.mjs';
+import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
+
+test('dynamic config exposes the native Cursor model families and genuine settings', () => {
+	const config = normalizeDynamicConfig({
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+	}, { LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local' });
+	assert.equal(config.cursor.provider, 'cursor');
+	assert.equal(config.cursor.executable, 'C:\\Users\\tester\\AppData\\Local\\cursor-agent\\agent.ps1');
+	assert.deepEqual(config.cursor.models, ['composer-2.5', 'grok-4.5', 'grok-4.6']);
+	assert.deepEqual(config.cursor.modelReasoningEfforts['composer-2.5'], ['high']);
+	assert.deepEqual(config.cursor.modelReasoningEfforts['grok-4.6'], ['low', 'medium', 'high', 'xhigh']);
+});
 
 class FakeBridge extends EventEmitter {
 	ready = false;
@@ -79,12 +92,42 @@ async function start(dependencies = {}) {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
-	const coordinator = createDynamicCoordinator({ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } }, { bridge, registry, planner, codexService: new FakeProvider(), ...dependencies });
+	const scheduler = dependencies.scheduler ?? new PlanningScheduler();
+	const coordinator = createDynamicCoordinator({ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } }, { bridge, registry, planner, scheduler, codexService: new FakeProvider(), ...dependencies });
 	await coordinator.start();
 	bridge.emit('ready', { serverInstanceId: 'test', registry: [record()] });
 	await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready'));
-	return { bridge, registry, planner, coordinator };
+	return { bridge, registry, planner, scheduler, coordinator };
 }
+
+test('dynamic coordinator forwards protocol audit to its constructed bridge', () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	assert.throws(() => createDynamicCoordinator({
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+	}, {
+		registry, planner, scheduler: new PlanningScheduler(), codexService: new FakeProvider(),
+		protocolAudit: 'invalid audit callback',
+	}), /audit must be a function or null/);
+});
+
+test('does not submit a duplicate initial plan while the agent already has a scheduled turn', async () => {
+	let release;
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });
+	const blocker = new Promise((resolve) => { release = resolve; });
+	const run = await start({ scheduler });
+	try {
+		scheduler.schedule('agent-a', async () => blocker);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.planner.requests.length, 0);
+	} finally {
+		release();
+		await run.coordinator.stop();
+	}
+});
 
 test('installs a selected-model program and continues its next primitive without another provider turn', async () => {
 	const run = await start();
@@ -98,6 +141,32 @@ test('installs a selected-model program and continues its next primitive without
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
 		assert.equal(run.planner.requests.length, 1);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('publishes completed program state back to the server registry', async () => {
+	const run = await start();
+	run.planner.requestPlan = async (request) => {
+		run.planner.requests.push(request);
+		return {
+			summary: 'Wait, then finish.',
+			directive: 'replace',
+			source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");',
+		};
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait, then finish.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		const command = run.bridge.sent.find((message) => message.type === 'action_command');
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'goal_completed'));
+		const stateMessages = run.bridge.sent.filter((message) => message.type === 'goal_completed');
+		assert.deepEqual(stateMessages.at(-1), {
+			type: 'goal_completed',
+			agentId: 'agent-a',
+			payload: { goalRevision: 1 },
+		});
 	} finally { await run.coordinator.stop(); }
 });
 

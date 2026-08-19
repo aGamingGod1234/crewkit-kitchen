@@ -36,6 +36,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'coordinator_status',
 	'agent_ready',
 	'planning_state',
+	'goal_completed',
 	'action_command',
 	'action_cancel',
 	'agent_error',
@@ -58,7 +59,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
 const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'action_progress', 'action_result']);
-const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'action_command', 'action_cancel', 'agent_error']);
+const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'action_command', 'action_cancel', 'agent_error']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
@@ -158,6 +159,9 @@ export function validateProtocolV2Payload(type, value) {
 		case 'planning_state':
 			exactKeys(value, ['goalRevision', 'state'], ['goalRevision', 'state'], type);
 			return { goalRevision: revision(value.goalRevision, 'goalRevision'), state: boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH) };
+		case 'goal_completed':
+			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
+			return { goalRevision: revision(value.goalRevision, 'goalRevision') };
 		case 'action_command':
 			return normalizeActionCommand(value);
 		case 'action_cancel':
@@ -200,6 +204,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#connectionQueueCap;
 	#agentQueueCap;
 	#messageIds;
+	#audit;
 	#socket = null;
 	#decoder = null;
 	#running = false;
@@ -214,7 +219,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#knownAgentIds = new Set();
 	#observedRevisions = new Map();
 
-	constructor(config, dependencies = {}) {
+	constructor(config, { audit = null, ...dependencies } = {}) {
 		super();
 		if (!isPlainObject(config)) throw new TypeError('multiplexed bridge config must be an object');
 		this.#host = config.host ?? LOOPBACK_HOST;
@@ -234,6 +239,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#connectionQueueCap = positiveInteger(config.connectionQueueCap ?? DEFAULT_CONNECTION_QUEUE_CAP, 'connectionQueueCap');
 		this.#agentQueueCap = positiveInteger(config.agentQueueCap ?? DEFAULT_AGENT_MESSAGE_QUEUE_CAP, 'agentQueueCap');
 		this.#messageIds = dependencies.messageIds ?? new MessageIdGenerator('coordinator-v2');
+		if (audit !== null && typeof audit !== 'function') throw new TypeError('audit must be a function or null');
+		this.#audit = audit;
 	}
 
 	get ready() { return this.#ready; }
@@ -300,7 +307,9 @@ export class MultiplexedServerBridge extends EventEmitter {
 			messageId,
 			payload: { secret: this.#secret },
 		});
-		socket.write(encodeJsonLine(hello));
+		const encoded = encodeJsonLine(hello);
+		this.#invokeAudit('coordinator_to_server', { ...hello, payload: { secret: '[REDACTED]' } });
+		socket.write(encoded);
 	}
 
 	#onData(socket, chunk) {
@@ -324,6 +333,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 
 	#accept(value) {
 		const envelope = validateProtocolV2Envelope(value, { direction: 'server_to_coordinator' });
+		this.#invokeAudit('server_to_coordinator', envelope);
 		if (this.#inboundMessageIds.has(envelope.messageId)) throw new ProtocolV2Error('DUPLICATE_MESSAGE', `Duplicate message ID '${envelope.messageId}'`);
 		rememberBounded(this.#inboundMessageIds, envelope.messageId, MAX_TRACKED_MESSAGE_IDS);
 		if (!this.#ready) {
@@ -447,13 +457,30 @@ export class MultiplexedServerBridge extends EventEmitter {
 			const entry = this.#outboundQueue.shift();
 			this.#decrementQueued(entry.envelope.agentId);
 			let writable;
-			try { writable = socket.write(entry.encoded); } catch (error) { entry.reject(error); this.#fail(error); return; }
+			try {
+				this.#invokeAudit('coordinator_to_server', entry.envelope);
+				writable = socket.write(entry.encoded);
+			} catch (error) { entry.reject(error); this.#fail(error); return; }
 			entry.resolve(entry.envelope.messageId);
 			if (!writable) {
 				this.#writeBlocked = true;
 				return;
 			}
 		}
+	}
+
+	#invokeAudit(direction, envelope) {
+		if (this.#audit === null) return;
+		let result;
+		try { result = this.#audit(direction, structuredClone(envelope)); }
+		catch (error) { this.#reportAuditError(error); return; }
+		if (result !== null && result !== undefined && typeof result.then === 'function') {
+			Promise.resolve(result).catch((error) => this.#reportAuditError(error));
+		}
+	}
+
+	#reportAuditError(error) {
+		try { this.emit('auditError', error); } catch {}
 	}
 
 	#decrementQueued(agentId) {
@@ -632,7 +659,7 @@ function normalizeCatalogSnapshot(value) {
 
 function normalizeProvider(value, field) {
 	const provider = requireIdentifier(value, field);
-	if (!['codex', 'gemini', 'kimi'].includes(provider)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be codex, gemini, or kimi`);
+	if (!['codex', 'gemini', 'kimi', 'cursor'].includes(provider)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be codex, gemini, kimi, or cursor`);
 	return provider;
 }
 

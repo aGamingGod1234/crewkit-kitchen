@@ -106,6 +106,28 @@ test('Codex service accepts the streamed agent-message contract when no complete
 	await service.stop();
 });
 
+test('Codex malformed output records one final error row for the attempt', async () => {
+	const transport = new FakeSharedTransport();
+	transport.complete = function (threadId, turnId) {
+		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: 'not-json' } } });
+		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'completed' } } });
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-malformed-record'));
+	await agent.setGoalRevision(1);
+	const rows = [];
+	const turnRecorder = { async record(row) { rows.push(row); } };
+	await assert.rejects(agent.decide('Observation.', { goalRevision: 1, turnRecorder, attempt: 3, retry: true }), (error) => error?.code === 'MALFORMED_DECISION');
+	assert.equal(rows.length, 1);
+	assert.equal(rows[0].error?.code, 'MALFORMED_DECISION');
+	assert.equal(rows[0].output, 'not-json');
+	assert.equal(rows[0].attempt, 3);
+	assert.ok(rows[0].timing.durationMs >= 0);
+	assert.equal(rows[0].timing.apiDurationMs, null);
+	assert.equal(rows[0].retry, true);
+	await service.stop();
+});
+
 test('Codex service cancels an over-budget streamed planner decision before parsing it', async () => {
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;

@@ -40,6 +40,10 @@ export class PlanningScheduler {
 	get activeAgentIds() { return [...this.#active.keys()]; }
 	get pendingAgentIds() { return [...this.#order]; }
 	get pressureSnapshot() { return this.#snapshot(); }
+	hasScheduled(agentIdValue) {
+		const agentId = requireAgentId(agentIdValue);
+		return this.#pending.has(agentId) || this.#active.has(agentId);
+	}
 
 	schedule(agentIdValue, task) {
 		const agentId = requireAgentId(agentIdValue);
@@ -89,14 +93,19 @@ export class PlanningScheduler {
 			this.#active.set(agentId, { controller });
 			Promise.resolve()
 				.then(() => entry.task({ agentId, signal: controller.signal }))
-				.then(entry.resolve, entry.reject)
-				.finally(() => {
-					const active = this.#active.get(agentId);
-					if (active?.controller === controller) this.#active.delete(agentId);
-					this.#drain();
-				});
+				.then(
+					(value) => { this.#release(agentId, controller); entry.resolve(value); },
+					(error) => { this.#release(agentId, controller); entry.reject(error); },
+				);
 		}
 		this.#notifyPressure();
+	}
+
+	#release(agentId, controller) {
+		const active = this.#active.get(agentId);
+		if (active?.controller !== controller) return;
+		this.#active.delete(agentId);
+		this.#drain();
 	}
 
 	#snapshot() {

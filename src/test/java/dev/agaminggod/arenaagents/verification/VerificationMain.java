@@ -41,6 +41,7 @@ import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.GoalControlVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorLaunchPolicyVerification;
 import dev.agaminggod.arenaagents.server.AgentModelArgumentVerification;
 import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayersVerification;
@@ -179,6 +180,7 @@ public final class VerificationMain {
 		passedAssertions += BoundedServerTaskQueueVerification.verify();
 		passedAssertions += ProgramActionLedgerVerification.verify();
 		passedAssertions += CoordinatorStatusVerification.verify();
+		passedAssertions += CoordinatorLaunchPolicyVerification.verify();
 		passedAssertions += MultiplexedServerBridgeVerification.verify();
 		passedAssertions += GoalReceiverVerification.verify();
 		verifyObservationContracts(codec);

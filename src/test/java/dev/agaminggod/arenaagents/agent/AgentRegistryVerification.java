@@ -14,6 +14,7 @@ public final class AgentRegistryVerification {
 	public static int verify() {
 		int assertions = 0;
 		assertions += verifyLifecycleAndRevisions();
+		assertions += verifyCoordinatorCompletion();
 		assertions += verifyQueueAndSteeringBounds();
 		assertions += verifyIdentityResolution();
 		assertions += verifyPersistenceRecovery();
@@ -73,6 +74,32 @@ public final class AgentRegistryVerification {
 		AgentTransition resumedAfterDisconnect = registry.resume(created.agentId(), START_TIME + 8L);
 		assertEquals(AgentLifecycleState.STARTING, resumedAfterDisconnect.after().state(), "resume after coordinator reconnect");
 		return 23;
+	}
+
+	private static int verifyCoordinatorCompletion() {
+		ArrayList<AgentTransition> transitions = new ArrayList<>();
+		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transitions::add);
+		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("Coordinator"), START_TIME);
+		registry.start(created.agentId(), "Finish this task", START_TIME + 1L);
+		registry.beginPlanning(created.agentId(), START_TIME + 2L);
+		AgentRecord completed = registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 3L);
+		assertEquals(AgentLifecycleState.COMPLETED, completed.state(), "coordinator completion state");
+		assertEquals(1L, completed.goalRevision(), "coordinator completion preserves goal revision");
+		assertEquals("Finish this task", completed.currentGoal().orElseThrow().prompt(), "coordinator completion preserves current goal");
+		assertEquals(3, transitions.size(), "coordinator completion dispatches a local lifecycle transition");
+		assertEquals(AgentLifecycleState.COMPLETED, transitions.getLast().after().state(), "coordinator completion transition exposes DONE locally");
+		assertEquals(AgentLifecycleState.COMPLETED, registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 4L).state(), "repeated coordinator completion is idempotent");
+		expectFailure(() -> registry.coordinatorCompleted(created.agentId(), 0L, START_TIME + 5L), "STALE_REVISION");
+
+		AgentRecord queued = registry.create("gpt-5.6-sol", "high", Optional.of("Queued"), START_TIME + 6L);
+		registry.start(queued.agentId(), "First task", START_TIME + 7L);
+		registry.queue(queued.agentId(), "Second task", START_TIME + 8L);
+		AgentRecord promoted = registry.coordinatorCompleted(queued.agentId(), 1L, START_TIME + 9L);
+		assertEquals(AgentLifecycleState.STARTING, promoted.state(), "coordinator completion promotes queued work");
+		assertEquals("Second task", promoted.currentGoal().orElseThrow().prompt(), "coordinator completion installs the queued goal");
+		assertEquals(2L, promoted.goalRevision(), "queued promotion advances the goal revision");
+		assertEquals(0, promoted.queuedGoals().size(), "queued promotion consumes the queue head");
+		return 11;
 	}
 
 	private static int verifyQueueAndSteeringBounds() {
@@ -144,7 +171,19 @@ public final class AgentRegistryVerification {
 
 		String legacy = codec.encode(snapshot).replace("\"provider\":\"kimi\",", "");
 		assertEquals("codex", codec.decode(legacy).records().getFirst().profile().provider(), "legacy provider migration");
-		return 3;
+		AgentProfile cursor = new AgentProfile(
+				"cursor", "composer-2.5", "high", "fast", Optional.empty(), 1, AgentGameMode.SURVIVAL);
+		AgentRegistry.Snapshot cursorSnapshot = new AgentRegistry.Snapshot(
+				AgentConstants.SCHEMA_VERSION,
+				AgentConstants.DEFAULT_AGENT_LIMIT,
+				AgentConstants.DEFAULT_QUEUE_LIMIT,
+				List.of(AgentRecord.create(AgentId.random(), cursor, START_TIME))
+		);
+		AgentProfile decodedCursor = codec.decode(codec.encode(cursorSnapshot)).records().getFirst().profile();
+		assertEquals("cursor", decodedCursor.provider(), "Cursor provider round-trip");
+		assertEquals("composer-2.5", decodedCursor.model(), "Cursor model round-trip");
+		assertEquals("fast", decodedCursor.serviceTier(), "Cursor native fast mode round-trip");
+		return 5;
 	}
 
 	private static int verifyEntityLocationPersistenceAndMigration() {

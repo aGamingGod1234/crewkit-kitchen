@@ -25,6 +25,7 @@ npm-debug.log*
 run/
 runtime/*
 !runtime/README.md
+.worktrees/
 
 # Logs, traces, crash reports, and diagnostics
 logs/

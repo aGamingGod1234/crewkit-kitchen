@@ -59,6 +59,12 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 	}), /field/i);
 });
 
+test('protocol v2 carries a coordinator goal completion update', () => {
+	const payload = { goalRevision: 4 };
+	assert.deepEqual(validateProtocolV2Payload('goal_completed', payload), payload);
+	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, unexpected: true }), /field/i);
+});
+
 test('protocol v2 requires immutable provenance on every action command form', () => {
 	const payload = {
 		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
@@ -337,6 +343,60 @@ test('multiplexed bridge authenticates once and learns the complete registry sna
 	bridge.stop();
 });
 
+test('multiplexed bridge audits validated detached inbound and outbound envelopes', async () => {
+	const socket = new FakeSocket();
+	const audit = [];
+	let receivedObservation;
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		audit: (direction, envelope) => audit.push({ direction, envelope }),
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4,
+	});
+	bridge.start();
+	bridge.on('observation', (envelope) => { receivedObservation = envelope; });
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+	socket.emit('data', `${JSON.stringify(serverEnvelope('observation', 'agent-a', 'server-2', readyServerObservation(4)))}\n`);
+	await bridge.send('agent_ready', 'agent-a', { goalRevision: 4 });
+	await bridge.send('action_command', 'agent-a', {
+		goalRevision: 4, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
+	});
+	assert.deepEqual(audit.map(({ direction, envelope }) => [direction, envelope.messageId, envelope.type, envelope.agentId]), [
+		['coordinator_to_server', 'coordinator-v2-1', 'hello', 'server'],
+		['server_to_coordinator', 'server-1', 'hello_ack', 'server'],
+		['server_to_coordinator', 'server-2', 'observation', 'agent-a'],
+		['coordinator_to_server', 'coordinator-v2-2', 'agent_ready', 'agent-a'],
+		['coordinator_to_server', 'coordinator-v2-3', 'action_command', 'agent-a'],
+	]);
+	assert.equal(JSON.parse(socket.writes[0]).payload.secret, SECRET);
+	assert.equal(audit[0].envelope.payload.secret, '[REDACTED]');
+	assert.doesNotMatch(JSON.stringify(audit), new RegExp(SECRET));
+	audit[2].envelope.payload.position.x = 999;
+	assert.equal(receivedObservation.payload.position.x, 10.5);
+	bridge.stop();
+});
+
+test('audit callback failures never interrupt bridge delivery', async () => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		audit: async () => { throw new Error('audit unavailable'); },
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4,
+	});
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
+	await ready;
+	await bridge.send('agent_ready', 'agent-a', { goalRevision: 4 });
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'agent_ready');
+	bridge.stop();
+});
+
 test('multiplexed bridge rejects stale revisions before writing', async () => {
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
@@ -503,6 +563,7 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
+		['goal_completed', { goalRevision: 1 }],
 		['action_command', { goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],
@@ -513,6 +574,17 @@ test('strict payload validators accept every current wire shape and reject unkno
 	assert.deepEqual(validateProtocolV2Payload('agent_ready', { goalRevision: 2 }), { goalRevision: 2 });
 	for (const [type, payload] of messages) assert.throws(() => validateProtocolV2Payload(type, { ...payload, unexpected: true }), (error) => error.code === 'INVALID_PAYLOAD_FIELD', type);
 	assert.throws(() => validateProtocolV2Payload('hello_ack', { replyTo: 'x', authenticated: true, registry: Array(1_025).fill(registeredRecord()) }), /at most 1024/);
+});
+
+test('catalog snapshots carry Cursor Composer and Grok profiles', () => {
+	const model = {
+		provider: 'cursor', id: 'cursor:composer-2.5', model: 'composer-2.5', displayName: 'Composer 2.5',
+		reasoningEfforts: ['low', 'high'], serviceTiers: ['priority', 'fast'],
+	};
+	assert.deepEqual(
+		validateProtocolV2Payload('catalog_snapshot', { refreshedAtEpochMs: 1, models: [model] }).models,
+		[model],
+	);
 });
 
 test('action cancellation requires an exact goal revision and action identity', () => {

@@ -73,6 +73,24 @@ test('Gemini ACP sessions apply the exact model and thinking level and parse pla
 	await service.stop();
 });
 
+test('ACP malformed output records one final error row for the attempt', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.message = 'not-json';
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-malformed-record', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	const turnRecorder = { async record(row) { rows.push(row); } };
+	await assert.rejects(agent.decide('authoritative state', { goalRevision: 2, turnRecorder, attempt: 4, retry: true }), (error) => error?.code === 'MALFORMED_DECISION');
+	assert.equal(rows.length, 1);
+	assert.equal(rows[0].error?.code, 'MALFORMED_DECISION');
+	assert.equal(rows[0].attempt, 4);
+	assert.equal(rows[0].retry, true);
+	assert.ok(rows[0].timing.durationMs >= 0);
+	assert.equal(rows[0].timing.apiDurationMs, null);
+	await service.stop();
+});
+
 test('ACP processes and sessions use the same per-agent workspace', async () => {
 	const transport = new FakeAcpTransport(options());
 	let launchProfile = null;
@@ -102,14 +120,16 @@ test('ACP processes and sessions use the same per-agent workspace', async () => 
 
 test('Kimi launches one effort-isolated process and applies the exact ACP thinking level', async () => {
 	const launch = buildAcpLaunch('kimi', { reasoningEffort: 'max' }, {
+		platform: 'win32', execPath: 'C:\\node.exe', existsSync: (value) => value === 'C:\\appdata\\npm\\node_modules\\@moonshot-ai\\kimi-code\\dist\\main.mjs',
 		env: {
 			PATH: 'test',
+			APPDATA: 'C:\\appdata',
 			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
 			ARENA_AGENT_BRIDGE_SECRET_FILE: 'C:\\runtime\\bridge.secret',
 		},
 	});
-	assert.equal(launch.command, 'kimi');
-	assert.deepEqual(launch.args, ['acp']);
+	assert.equal(launch.command, 'C:\\node.exe');
+	assert.deepEqual(launch.args, ['C:\\appdata\\npm\\node_modules\\@moonshot-ai\\kimi-code\\dist\\main.mjs', 'acp']);
 	assert.equal(launch.options.env.KIMI_MODEL_THINKING_EFFORT, 'max');
 	assert.equal(launch.options.env.PATH, 'test');
 	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET, undefined, 'provider child cannot inherit the bridge secret');

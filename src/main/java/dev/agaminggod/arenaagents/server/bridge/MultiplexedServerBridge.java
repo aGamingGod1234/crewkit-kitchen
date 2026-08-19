@@ -75,7 +75,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "action_command", "action_cancel", "agent_error", "heartbeat"
+			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "action_command", "action_cancel", "agent_error", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -101,7 +101,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private volatile boolean catalogLoaded;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
-		this(manager, DEFAULT_PORT, configuredSecretPath());
+		this(manager, configuredPort(), configuredSecretPath());
 	}
 
 	public MultiplexedServerBridge(CodexAgentManager manager, int port, Path secretPath) {
@@ -343,6 +343,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "catalog_snapshot" -> acceptCatalog(envelope.payload());
 			case "coordinator_status" -> acceptCoordinatorStatus(envelope.payload());
 			case "agent_ready", "planning_state" -> plannerReady(envelope);
+			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "action_command" -> acceptAction(envelope);
 			case "action_cancel" -> acceptActionCancel(envelope);
 			case "agent_error" -> acceptAgentError(envelope);
@@ -426,6 +427,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		String message = requiredString(envelope.payload(), "message");
 		AgentTransition transition = router.plannerFailed(agentId, goalRevision, message);
 		AgentChatReporter.failed(manager, transition.after(), code, message);
+	}
+
+	private void acceptGoalCompleted(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("goalRevision"), "goal_completed");
+		long goalRevision = requiredLong(payload, "goalRevision");
+		router.coordinatorCompleted(agentId, goalRevision);
 	}
 
 	private void requestActiveDisconnect() {
@@ -885,7 +894,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return payload;
 	}
 
-	private static String operation(AgentTransition transition) {
+	static String operation(AgentTransition transition) {
 		if (transition.after().queuedGoals().size() > transition.before().queuedGoals().size()) return "queue";
 		if (transition.after().goalRevision() <= transition.before().goalRevision()) return null;
 		if (transition.before().state() == AgentLifecycleState.DEAD
@@ -926,6 +935,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		String configured = System.getProperty("arenaagents.bridgeSecretFile");
 		if (configured == null || configured.isBlank()) configured = System.getenv("ARENA_AGENT_BRIDGE_SECRET_FILE");
 		return configured == null || configured.isBlank() ? Paths.get("runtime", "bridge-secret.txt") : Paths.get(configured);
+	}
+
+	static int configuredPort() {
+		String configured = System.getProperty("arenaagents.bridgePort");
+		if (configured == null || configured.isBlank()) return DEFAULT_PORT;
+		final int parsed;
+		try {
+			parsed = Integer.parseInt(configured);
+		} catch (NumberFormatException exception) {
+			throw new IllegalArgumentException("arenaagents.bridgePort must be an integer from 1 to 65535", exception);
+		}
+		if (parsed < 1 || parsed > 65_535) {
+			throw new IllegalArgumentException("arenaagents.bridgePort must be an integer from 1 to 65535");
+		}
+		return parsed;
 	}
 
 	private static String readSecret(Path path) {

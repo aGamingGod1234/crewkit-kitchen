@@ -159,5 +159,7 @@ test('legacy registry snapshots migrate to the Codex provider while explicit pro
 	assert.equal(decodeAgentRegistrySnapshot(legacy)[0].provider, 'codex');
 	const encoded = encodeAgentRegistrySnapshot([record('kimi', { provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max' })]);
 	assert.equal(decodeAgentRegistrySnapshot(encoded)[0].provider, 'kimi');
+	const cursor = encodeAgentRegistrySnapshot([record('cursor', { provider: 'cursor', model: 'composer-2.5', reasoningEffort: 'high' })]);
+	assert.equal(decodeAgentRegistrySnapshot(cursor)[0].provider, 'cursor');
 	assert.throws(() => normalizeAgentRecord(record('bad', { provider: 'unknown' })), /provider/i);
 });

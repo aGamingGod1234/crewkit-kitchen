@@ -357,6 +357,62 @@ test('provider circuit rejects work before allocating a provider session', async
 	assert.equal(registry.states.at(-1).options.error.code, 'PROVIDER_CIRCUIT_OPEN');
 });
 
+test('passes the exact optional turn recorder to the selected provider without changing the decision attempt', async () => {
+	const registry = new FakeRegistry();
+	const recorder = { record: async () => { throw new Error('recorder unavailable'); } };
+	const optionsSeen = [];
+	let attempts = 0;
+	const agent = {
+		async setGoalRevision() {},
+		async decide(input, options) {
+			attempts += 1;
+			optionsSeen.push({ input, options });
+			try { await options.turnRecorder.record({ input }); } catch { /* provider hooks are observational */ }
+			return VALID_DECISION;
+		},
+	};
+	const planner = new AgentPlanner({
+		registry,
+		turnRecorder: recorder,
+		scheduler: { schedule(_id, operation) { return operation({ signal: new AbortController().signal }); }, cancel() { return false; } },
+		codexService: { async createAgent() { return agent; }, getAgent() { return null; }, async removeAgent() { return false; } },
+	});
+
+	const result = await planner.requestPlan({ agentId: AGENT_ID, input: 'state', goalRevision: GOAL_REVISION });
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.equal(attempts, 1);
+	assert.equal(optionsSeen[0].options.turnRecorder, recorder);
+});
+
+test('preserves attempt and retry metadata through corrective provider retries', async () => {
+	const registry = new FakeRegistry();
+	const records = [];
+	const recorder = { async record(row) { records.push(row); } };
+	let calls = 0;
+	const invalid = Object.assign(new Error('bad decision'), { code: 'MALFORMED_DECISION' });
+	const agent = {
+		async setGoalRevision() {},
+		async decide(input, options) {
+			await options.turnRecorder.record({ attempt: options.attempt, retry: options.retry, input });
+			calls += 1;
+			if (calls === 1) throw invalid;
+			return VALID_DECISION;
+		},
+	};
+	const planner = new AgentPlanner({
+		registry,
+		turnRecorder: recorder,
+		scheduler: { schedule(_id, operation) { return operation({ signal: new AbortController().signal }); }, cancel() { return false; } },
+		codexService: { async createAgent() { return agent; }, getAgent() { return null; }, async removeAgent() { return false; } },
+	});
+
+	await planner.requestPlan({ agentId: AGENT_ID, input: 'state', goalRevision: GOAL_REVISION });
+	assert.deepEqual(records.map(({ attempt, retry }) => ({ attempt, retry })), [
+		{ attempt: 1, retry: false },
+		{ attempt: 2, retry: true },
+	]);
+});
+
 function createPlanner(registry, agent, invalidDecisionRetries) {
 	return createPlannerForService(registry, {
 		async createAgent() { return agent; },

@@ -7,6 +7,9 @@ import dev.agaminggod.arenaagents.agent.AgentDeathSnapshot;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
+import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
@@ -24,6 +27,16 @@ public final class MultiplexedServerBridgeVerification {
 	}
 
 	public static int verify() {
+		String previousBridgePort = System.getProperty("arenaagents.bridgePort");
+		try {
+			System.setProperty("arenaagents.bridgePort", "25571");
+			assertEquals(25_571, MultiplexedServerBridge.configuredPort(), "headless bridge port property");
+			System.setProperty("arenaagents.bridgePort", "70000");
+			assertThrows(IllegalArgumentException.class, MultiplexedServerBridge::configuredPort, "out-of-range bridge port property");
+		} finally {
+			if (previousBridgePort == null) System.clearProperty("arenaagents.bridgePort");
+			else System.setProperty("arenaagents.bridgePort", previousBridgePort);
+		}
 		List<AgentRecord> registered = new ArrayList<>();
 		for (int index = 0; index <= AgentConstants.DEFAULT_AGENT_LIMIT; index++) {
 			registered.add(AgentRecord.create(
@@ -62,6 +75,11 @@ public final class MultiplexedServerBridgeVerification {
 		);
 		assertEquals(List.of("publication", "action", "state"), events,
 				"respawn scenario success and PAUSED/IDLE state follow committed paired publication");
+		AgentRecord terminalBefore = AgentLifecycleReducer.start(registered.getFirst(), "finish", 2_000L).after();
+		AgentRecord terminalAfter = terminalBefore.withLifecycle(AgentLifecycleState.COMPLETED, terminalBefore.currentGoal(),
+				terminalBefore.goalRevision(), terminalBefore.queuedGoals(), 2_001L, "");
+		assertTrue(MultiplexedServerBridge.operation(new AgentTransition(terminalBefore, terminalAfter, true, true)) == null,
+				"coordinator-owned terminal completion does not echo goal_control");
 		List<String> committed = new ArrayList<>();
 		MultiplexedServerBridge.publishRespawnScenarioEvents(
 				() -> committed.add("paired-messages-and-commit"),
@@ -74,7 +92,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyRealBridgeSessionLifecycle();
-		return 35;
+		return 38;
 	}
 
 	private static void verifyDeathFacts() {

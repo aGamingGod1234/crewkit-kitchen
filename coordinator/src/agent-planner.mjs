@@ -35,6 +35,7 @@ export class AgentPlanner {
 	#healthRegistry;
 	#telemetrySink;
 	#now;
+	#turnRecorder;
 
 	constructor({
 		registry,
@@ -44,6 +45,7 @@ export class AgentPlanner {
 		healthRegistry = new ProviderHealthRegistry(),
 		telemetrySink = () => {},
 		now = () => performance.now(),
+		turnRecorder = null,
 	}) {
 		if (registry === null || registry === undefined) throw new TypeError('registry is required');
 		if (scheduler === null || scheduler === undefined) throw new TypeError('scheduler is required');
@@ -54,6 +56,7 @@ export class AgentPlanner {
 		if (typeof healthRegistry?.canAttempt !== 'function' || typeof healthRegistry?.record !== 'function') throw new TypeError('healthRegistry must provide canAttempt and record');
 		if (typeof telemetrySink !== 'function') throw new TypeError('telemetrySink must be a function');
 		if (typeof now !== 'function') throw new TypeError('now must be a function');
+		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
 		this.#registry = registry;
 		this.#scheduler = scheduler;
 		this.#codexService = codexService;
@@ -61,6 +64,7 @@ export class AgentPlanner {
 		this.#healthRegistry = healthRegistry;
 		this.#telemetrySink = telemetrySink;
 		this.#now = now;
+		this.#turnRecorder = turnRecorder;
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
@@ -110,7 +114,9 @@ export class AgentPlanner {
 						const attempt = retryCount + providerRetryCount + 1;
 						const decision = await this.#providerAttempt(record, {
 							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1,
-						}, () => agent.decide(plannerInput, { goalRevision, signal }));
+						}, () => this.#turnRecorder === null
+							? agent.decide(plannerInput, { goalRevision, signal })
+							: agent.decide(plannerInput, { goalRevision, signal, turnRecorder: this.#turnRecorder, attempt, retry: attempt > 1 }));
 						this.#registry.assertCurrentRevision(agentId, goalRevision);
 						return { ...decision, goalRevision };
 					} catch (error) {

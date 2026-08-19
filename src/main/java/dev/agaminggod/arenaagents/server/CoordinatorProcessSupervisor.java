@@ -28,8 +28,12 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	CoordinatorProcessSupervisor(Path gameDirectory) {
 		this.gameDirectory = gameDirectory.toAbsolutePath().normalize();
-		this.packageRoot = findPackageRoot(this.gameDirectory);
+		this.packageRoot = autoStartEnabled() ? findPackageRoot(this.gameDirectory) : null;
 		this.createdAtEpochMs = System.currentTimeMillis();
+	}
+
+	private static boolean autoStartEnabled() {
+		return !"false".equalsIgnoreCase(System.getProperty("arenaagents.coordinatorAutoStart"));
 	}
 
 	synchronized boolean configured() {
