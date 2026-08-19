@@ -1,0 +1,118 @@
+{
+  "schemaVersion": 1,
+  "researchRoot": "runtime/map-research",
+  "policy": {
+    "bundledGeometryRequiresRetainedPermissionText": true,
+    "rawArchivesTracked": false,
+    "provisionalSourcesMayProduceBundledGeometry": false
+  },
+  "sources": {
+    "re-structured": {
+      "title": "Re-Structured",
+      "author": "RonosMods",
+      "platform": "modrinth",
+      "projectId": "ShB7QWuY",
+      "versionId": "NNsq5KuW",
+      "version": "1.2",
+      "officialLandingUrl": "https://modrinth.com/datapack/re-structured/version/NNsq5KuW",
+      "repositoryUrl": "https://github.com/RonosMods/Re-Structured",
+      "metadataApiUrls": [
+        "https://api.modrinth.com/v2/project/ShB7QWuY",
+        "https://api.modrinth.com/v2/version/NNsq5KuW",
+        "https://api.github.com/repos/RonosMods/Re-Structured/contents/LICENSE?ref=main"
+      ],
+      "verifiedAt": "2026-08-19",
+      "licenseStatus": "verified",
+      "bundleEligible": true,
+      "license": {
+        "spdx": "MIT",
+        "sourceUrl": "https://raw.githubusercontent.com/RonosMods/Re-Structured/main/LICENSE",
+        "sourceBlobSha1": "f4410372b4b8c6922d48be9bbaf967c24127bc9c",
+        "retainedText": "maps/licenses/re-structured-MIT.txt",
+        "sha256": "a6814afbcf66038d02c80d905d4969b944f1d89b872bf89bc9699c7d1391ef31"
+      },
+      "archive": {
+        "url": "https://cdn.modrinth.com/data/ShB7QWuY/versions/NNsq5KuW/re-structured.zip",
+        "filename": "re-structured.zip",
+        "size": 97543,
+        "sha1": "a84fae627045ba7d48ef0a4bfd018ce29c66083e",
+        "sha512": "c1743d9738410c0a3448e7e6ad99259f6f26943a95d55725dadf96b12a1efbc456352f7a8117d6ef899ba0a141e4eb84159bafbd57a82dc0e0cf4ce34f83e897",
+        "sha256": null,
+        "retrievedAtUtc": null
+      },
+      "declaredMinecraftVersions": [
+        "1.21",
+        "1.21.1"
+      ],
+      "originalDataVersion": null,
+      "inspectionReport": null,
+      "derivedModules": []
+    },
+    "parkour-masters": {
+      "title": "Parkour Masters",
+      "author": "Nordic_Studios",
+      "platform": "curseforge",
+      "projectId": "1020454",
+      "fileId": "5353095",
+      "officialLandingUrl": "https://www.curseforge.com/minecraft/worlds/parkour-masters/files/5353095",
+      "verifiedAt": "2026-08-19",
+      "declaredPlatformLicense": "MIT",
+      "licenseStatus": "declared-platform-awaiting-retained-text",
+      "bundleEligible": false,
+      "license": null,
+      "archive": {
+        "url": null,
+        "filename": null,
+        "sha256": null,
+        "retrievedAtUtc": null
+      },
+      "originalDataVersion": null,
+      "inspectionReport": null,
+      "derivedModules": []
+    },
+    "minegpt-worlds": {
+      "title": "BigYous' MineGPT worlds",
+      "author": "YOUSY0US3F",
+      "platform": "curseforge",
+      "projectId": "1092626",
+      "fileId": "5798831",
+      "officialLandingUrl": "https://www.curseforge.com/minecraft/worlds/bigyous-minegpt-worlds/files/5798831",
+      "verifiedAt": "2026-08-19",
+      "declaredPlatformLicense": "MIT",
+      "licenseStatus": "declared-platform-awaiting-retained-text",
+      "bundleEligible": false,
+      "license": null,
+      "archive": {
+        "url": null,
+        "filename": null,
+        "sha256": null,
+        "retrievedAtUtc": null
+      },
+      "originalDataVersion": null,
+      "inspectionReport": null,
+      "derivedModules": []
+    },
+    "bunker-survival": {
+      "title": "Bunker Survival",
+      "author": "Nordic_Studios",
+      "platform": "curseforge",
+      "projectId": "1010696",
+      "fileId": "5300058",
+      "officialLandingUrl": "https://www.curseforge.com/minecraft/worlds/bunker-survival/files/5300058",
+      "verifiedAt": "2026-08-19",
+      "declaredPlatformLicense": "MIT",
+      "licenseStatus": "declared-platform-awaiting-retained-text",
+      "bundleEligible": false,
+      "license": null,
+      "archive": {
+        "url": null,
+        "filename": null,
+        "sha256": null,
+        "retrievedAtUtc": null
+      },
+      "originalDataVersion": null,
+      "inspectionReport": null,
+      "derivedModules": []
+    }
+  }
+}
