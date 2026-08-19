@@ -5,14 +5,17 @@ public final class AgentControlLayoutVerification {
 	}
 
 	public static int verify() {
+		int assertions = 0;
 		AgentControlLayout wide = AgentControlLayout.calculate(960, 540);
 		assertTrue(wide.sideNavigation(), "wide command center keeps persistent side navigation");
+		assertions++;
 		assertTrue(wide.splitWorkspace(), "wide command center reserves a readable context rail");
 		assertTrue(wide.canvasWidth() >= 420, "wide command center keeps a useful primary canvas");
 		assertTrue(wide.contextWidth() >= 180, "wide command center context rail remains readable");
 		assertTrue(wide.navigationTop() - wide.panelTop() >= 57,
 				"wide navigation leaves breathing room below the console header");
 		assertTrue(wide.contentBottom() < wide.footerY(), "wide content never collides with footer actions");
+		assertions += 5;
 
 		AgentControlLayout compact = AgentControlLayout.calculate(320, 240);
 		assertTrue(!compact.sideNavigation(), "compact command center reflows navigation above the canvas");
@@ -24,17 +27,68 @@ public final class AgentControlLayoutVerification {
 		assertTrue(compact.footerY() + AgentControlLayout.CONTROL_HEIGHT <= compact.panelBottom(),
 				"compact footer remains fully on screen");
 		assertTrue(compact.minimumTargetHeight() >= 24, "custom controls meet the minimum target-height contract");
+		assertions += 7;
 
 		AgentControlLayout mid = AgentControlLayout.calculate(700, 360);
 		assertTrue(mid.sideNavigation(), "medium screens preserve stable side navigation when space permits");
 		assertTrue(!mid.splitWorkspace(), "medium screens avoid cramped three-column layouts");
 		assertTrue(mid.canvasWidth() > 500, "medium workspace uses the freed context-rail width");
+		assertions += 3;
+
+		assertTrue(!AgentControlLayout.rosterFiltersVisible(8), "eight agents keep roster filters hidden");
+		assertTrue(AgentControlLayout.rosterFiltersVisible(9), "nine agents reveal roster filters");
+		assertions += 2;
+
+		assertRosterGeometry(wide, 1, false, 1, 48, false, "wide single agent");
+		assertRosterGeometry(wide, 8, false, 4, 48, false, "wide eight agents");
+		assertRosterGeometry(wide, 16, true, 4, 48, false, "wide filtered sixteen agents");
+		assertRosterGeometry(mid, 1, false, 1, 48, false, "medium single agent");
+		assertRosterGeometry(mid, 8, false, 4, 48, false, "medium eight agents");
+		assertRosterGeometry(mid, 16, true, 4, 48, false, "medium filtered sixteen agents");
+		assertRosterGeometry(compact, 1, false, 1, 48, false, "compact single agent");
+		assertRosterGeometry(compact, 8, false, 2, 24, true, "compact eight agents");
+		assertRosterGeometry(compact, 16, true, 2, 24, true, "compact filtered sixteen agents");
+		assertions += 45;
+
+		AgentControlLayout.Bounds compactSelection = compact.rosterBounds(true, true);
+		AgentControlLayout.Bounds compactActions = compact.workspaceActionBounds();
+		AgentControlLayout.Bounds compactComposer = compact.composerBounds();
+		assertTrue(compactSelection.bottom() <= compactActions.top(),
+				"compact selection grid remains disjoint from Compose and Clear actions");
+		assertTrue(compactComposer.bottom() <= compactActions.top(),
+				"compact composer remains disjoint from Start Queue Adjust and Back actions");
+		assertTrue(compactActions.bottom() <= compact.contentBottom(),
+				"compact workspace actions remain above the global footer");
+		assertions += 3;
 
 		assertThrows(IllegalArgumentException.class, () -> AgentControlLayout.calculate(319, 240),
 				"unsupported widths fail explicitly instead of creating negative widgets");
 		assertThrows(IllegalArgumentException.class, () -> AgentControlLayout.calculate(320, 239),
 				"unsupported heights fail explicitly instead of creating overlapping widgets");
-		return 17;
+		assertions += 2;
+		return assertions;
+	}
+
+	private static void assertRosterGeometry(
+			AgentControlLayout shell,
+			int entries,
+			boolean filters,
+			int expectedColumns,
+			int minimumTileHeight,
+			boolean expectedPager,
+			String label
+	) {
+		AgentControlLayout.Bounds region = shell.rosterBounds(filters, !shell.sideNavigation());
+		AgentRosterGridLayout grid = AgentRosterGridLayout.calculate(
+				region.left(), region.top(), region.right(), region.bottom(), entries);
+		assertTrue(grid.columns() == expectedColumns, label + " uses the intended column count");
+		assertTrue(grid.tileHeight() >= minimumTileHeight, label + " keeps a readable tile height");
+		assertTrue(grid.hasPager() == expectedPager, label + " reserves paging only when needed");
+		assertTrue(grid.gridBounds().left() >= region.left() && grid.gridBounds().right() <= region.right()
+				&& grid.gridBounds().top() >= region.top() && grid.gridBounds().bottom() <= region.bottom(),
+				label + " stays inside its roster region");
+		assertTrue(!grid.hasPager() || grid.gridBounds().bottom() <= grid.pagerBounds().top(),
+				label + " keeps tiles disjoint from its pager");
 	}
 
 	private static void assertTrue(boolean condition, String label) {

@@ -31,6 +31,8 @@ public record AgentControlLayout(
 	private static final int CONTEXT_RAIL_BREAKPOINT = 700;
 	private static final int CONTEXT_RAIL_WIDTH = 208;
 	private static final int REGION_GAP = 12;
+	private static final int ROSTER_FILTER_HEIGHT = 30;
+	private static final int WORKSPACE_ACTION_GAP = 6;
 
 	public static AgentControlLayout calculate(int screenWidth, int screenHeight) {
 		if (screenWidth < MINIMUM_WIDTH || screenHeight < MINIMUM_HEIGHT) {
@@ -85,5 +87,40 @@ public record AgentControlLayout(
 
 	public int minimumTargetHeight() {
 		return CONTROL_HEIGHT;
+	}
+
+	public static boolean rosterFiltersVisible(int authoritativeCount) {
+		if (authoritativeCount < 0) {
+			throw new IllegalArgumentException("Authoritative roster count cannot be negative");
+		}
+		return authoritativeCount >= 9;
+	}
+
+	public Bounds rosterBounds(boolean filtersVisible, boolean reserveActionRow) {
+		int top = contentTop + (filtersVisible ? ROSTER_FILTER_HEIGHT : 0);
+		int bottom = contentBottom - (reserveActionRow ? CONTROL_HEIGHT + WORKSPACE_ACTION_GAP : 0);
+		return new Bounds(canvasLeft, top, canvasRight, bottom);
+	}
+
+	public Bounds composerBounds() {
+		return new Bounds(contentLeft, contentTop, contentRight, workspaceActionBounds().top);
+	}
+
+	public Bounds workspaceActionBounds() {
+		return new Bounds(contentLeft, contentBottom - CONTROL_HEIGHT, contentRight, contentBottom);
+	}
+
+	public record Bounds(int left, int top, int right, int bottom) {
+		public Bounds {
+			if (right < left || bottom < top) throw new IllegalArgumentException("Layout bounds cannot be inverted");
+		}
+
+		public int width() {
+			return right - left;
+		}
+
+		public int height() {
+			return bottom - top;
+		}
 	}
 }

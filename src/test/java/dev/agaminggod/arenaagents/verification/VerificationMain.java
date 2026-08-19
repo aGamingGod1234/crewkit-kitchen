@@ -10,6 +10,7 @@ import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGridVerification;
+import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.ConsoleThemeVerification;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupStateVerification;
 import dev.agaminggod.arenaagents.client.action.ActionExecutorVerification;
@@ -152,6 +153,7 @@ public final class VerificationMain {
 		passedAssertions += AgentIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
 		passedAssertions += AgentRosterViewStateVerification.verify();
+		passedAssertions += AgentControlLayoutVerification.verify();
 		passedAssertions += BlockObservationOrderingVerification.verify();
 		passedAssertions += InventoryObservationSlotsVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();

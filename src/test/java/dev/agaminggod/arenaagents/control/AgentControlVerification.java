@@ -361,6 +361,50 @@ public final class AgentControlVerification {
 		assertTrue(!AgentControlActions.supports(idle, "respawn"), "living agent has no respawn action");
 		assertTrue(!AgentControlActions.everySupports(List.of(paused, acting), "resume"),
 				"batch action is disabled when any selected agent is incompatible");
+		assertEquals(Optional.of(acting), AgentControlActions.firstUnsupported(List.of(paused, acting), "resume"),
+				"batch preflight returns the first incompatible agent in snapshot order");
+		assertEquals("Acting", AgentControlActions.firstUnsupported(List.of(paused, acting), "resume")
+				.orElseThrow().displayName(), "batch blocker keeps its exact custom display name");
+		assertEquals(Optional.empty(), AgentControlActions.firstUnsupported(List.of(paused, disconnected), "resume"),
+				"fully compatible scope has no blocker");
+		assertEquals(Optional.empty(), AgentControlActions.firstUnsupported(List.of(), "resume"),
+				"empty scope has no individual blocker");
+		assertTrue(!AgentControlActions.everySupports(List.of(), "resume"),
+				"batch compatibility still rejects empty scope");
+		assertEquals("Accepted: Idle, Paused. Rejected: Acting.",
+				AgentControlActions.deliverySummary(List.of("Idle", "Paused"), List.of("Acting")),
+				"partial delivery names every accepted and rejected agent in order");
+		assertEquals("Accepted: Idle, Paused.",
+				AgentControlActions.deliverySummary(List.of("Idle", "Paused"), List.of()),
+				"all-accepted delivery has concise exact-name feedback");
+		assertEquals("Rejected: Acting, Dead.",
+				AgentControlActions.deliverySummary(List.of(), List.of("Acting", "Dead")),
+				"all-rejected delivery has concise exact-name feedback");
+		assertEquals("No commands were delivered.", AgentControlActions.deliverySummary(List.of(), List.of()),
+				"empty delivery feedback is explicit");
+		expectNullFailure(() -> AgentControlActions.firstUnsupported(null, "resume"),
+				"batch preflight rejects a null list");
+		expectNullFailure(() -> AgentControlActions.firstUnsupported(List.of(paused), null),
+				"batch preflight rejects a null operation");
+		expectNullFailure(() -> AgentControlActions.deliverySummary(null, List.of()),
+				"delivery feedback rejects a null accepted list");
+		expectNullFailure(() -> AgentControlActions.deliverySummary(List.of(), null),
+				"delivery feedback rejects a null rejected list");
+		expectNullFailure(() -> AgentControlActions.firstUnsupported(
+				java.util.Arrays.asList(paused, null), "resume"),
+				"batch preflight rejects a null agent element");
+		expectNullFailure(() -> AgentControlActions.deliverySummary(
+				java.util.Arrays.asList("Idle", null), List.of()),
+				"delivery feedback rejects a null name element");
+		java.util.ArrayList<AgentControlAgent> mutableScope = new java.util.ArrayList<>(List.of(paused, acting));
+		Optional<AgentControlAgent> copiedBlocker = AgentControlActions.firstUnsupported(mutableScope, "resume");
+		mutableScope.clear();
+		assertEquals(Optional.of(acting), copiedBlocker, "batch preflight result is stable after caller mutation");
+		java.util.ArrayList<String> mutableAccepted = new java.util.ArrayList<>(List.of("Idle"));
+		String copiedSummary = AgentControlActions.deliverySummary(mutableAccepted, List.of("Acting"));
+		mutableAccepted.set(0, "Changed");
+		assertEquals("Accepted: Idle. Rejected: Acting.", copiedSummary,
+				"delivery feedback is stable after caller mutation");
 		assertEquals("Starting up...", AgentControlPresentation.stateLabel("STARTING"),
 				"technical starting state is presented as plain language");
 		assertEquals("Working", AgentControlPresentation.stateLabel("ACTING"),
@@ -373,7 +417,7 @@ public final class AgentControlVerification {
 				"fast service tier has a human-readable label");
 		assertEquals("Normal", AgentControlPresentation.speedLabel("priority"),
 				"provider-native priority tier is presented as the normal player speed");
-		return 12;
+		return 29;
 	}
 
 	private static int verifySnapshotOrdering() {
@@ -418,6 +462,15 @@ public final class AgentControlVerification {
 			operation.run();
 			throw new AssertionError(label + " should fail");
 		} catch (IllegalArgumentException expected) {
+			// Expected.
+		}
+	}
+
+	private static void expectNullFailure(Runnable operation, String label) {
+		try {
+			operation.run();
+			throw new AssertionError(label + " should fail");
+		} catch (NullPointerException expected) {
 			// Expected.
 		}
 	}
