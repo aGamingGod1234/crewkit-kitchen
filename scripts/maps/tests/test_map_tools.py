@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -21,15 +22,24 @@ from scripts.maps.archive_reader import ArchiveLimits, ArchiveSafetyError, safe_
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 class LocalHttpSource:
-    def __init__(self, payload: bytes) -> None:
+    def __init__(self, payload: bytes, wait_for_archive_requests: int | None = None) -> None:
         self.payload = payload
         self.requests: dict[str, int] = {}
+        self.wait_for_archive_requests = wait_for_archive_requests
+        self._request_condition = threading.Condition()
 
         source = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self) -> None:
-                source.requests[self.path] = source.requests.get(self.path, 0) + 1
+                with source._request_condition:
+                    source.requests[self.path] = source.requests.get(self.path, 0) + 1
+                    source._request_condition.notify_all()
+                    if self.path == "/archive" and source.wait_for_archive_requests is not None:
+                        source._request_condition.wait_for(
+                            lambda: source.requests.get("/archive", 0) >= source.wait_for_archive_requests,
+                            timeout=2,
+                        )
                 if self.path == "/redirect":
                     self.send_response(302)
                     self.send_header("Location", source.url("/target"))
@@ -414,6 +424,65 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertIn("False", first.stdout)
                 self.assertIn("True", second.stdout)
 
+    def test_concurrent_same_destination_serializes_initial_acquisition(self) -> None:
+        payload = b"concurrent map archive"
+        with LocalHttpSource(payload, wait_for_archive_requests=2) as source:
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "concurrent"
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(
+                            self.run_isolated_fetch,
+                            repository,
+                            script_path,
+                            destination,
+                            source.url("/archive"),
+                        )
+                        for _ in range(2)
+                    ]
+                    results = [future.result(timeout=20) for future in futures]
+
+                archive_path = destination / "fixture.zip"
+                evidence_path = destination / "fixture.zip.sha256.json"
+                self.assertTrue(archive_path.is_file())
+                self.assertTrue(evidence_path.is_file())
+                self.assertEqual(payload, archive_path.read_bytes())
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                self.assertEqual(hashlib.sha256(payload).hexdigest(), evidence["sha256"])
+                self.assertEqual([0, 0], sorted(result.returncode for result in results))
+                self.assertEqual(1, source.requests.get("/archive", 0))
+                self.assertEqual([], list(destination.glob("*.partial")))
+                self.assertEqual([], list(destination.glob(".*.partial")))
+
+    def test_concurrent_different_destinations_acquire_independently(self) -> None:
+        payload = b"independent map archive"
+        with LocalHttpSource(payload, wait_for_archive_requests=2) as source:
+            with isolated_fetch_repository("https://approved.invalid/archive", payload) as (repository, script_path):
+                destinations = [
+                    repository / "runtime" / "map-research" / "destination-a",
+                    repository / "runtime" / "map-research" / "destination-b",
+                ]
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(
+                            self.run_isolated_fetch,
+                            repository,
+                            script_path,
+                            destination,
+                            source.url("/archive"),
+                        )
+                        for destination in destinations
+                    ]
+                    results = [future.result(timeout=20) for future in futures]
+
+                self.assertEqual([0, 0], sorted(result.returncode for result in results))
+                self.assertEqual(2, source.requests.get("/archive", 0))
+                for destination in destinations:
+                    self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
+                    self.assertTrue((destination / "fixture.zip.sha256.json").is_file())
+
     def test_rejects_redirect_without_contacting_unapproved_target(self) -> None:
         payload = b"redirected map archive"
         with LocalHttpSource(payload) as source:
@@ -429,6 +498,11 @@ class FetchMapSourceTests(unittest.TestCase):
                 self.assertFalse((destination / "fixture.zip.sha256.json").exists())
                 self.assertEqual([], list(destination.glob("*.partial")))
                 self.assertEqual([], list(destination.glob(".*.partial")))
+
+                retry = self.run_isolated_fetch(repository, script_path, destination, source.url("/archive"))
+                self.assertEqual(0, retry.returncode, retry.stderr)
+                self.assertEqual(payload, (destination / "fixture.zip").read_bytes())
+                self.assertTrue((destination / "fixture.zip.sha256.json").is_file())
 
     def test_evidence_promotion_failure_rolls_back_entire_pair(self) -> None:
         payload = b"transaction map archive"

@@ -53,6 +53,37 @@ function Test-ReparsePath([string]$Path, [string]$StopAt) {
     }
 }
 
+function Enter-MapAcquisitionLock([string]$LockPath, [int]$TimeoutMilliseconds = 30000) {
+    $waitTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        if (Test-Path -LiteralPath $LockPath) {
+            $lockItem = Get-Item -LiteralPath $LockPath -Force
+            if (($lockItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Acquisition lock path is a link or reparse point: $LockPath"
+            }
+        }
+        try {
+            # The marker persists, but only the OS FileShare.None handle grants
+            # ownership. A crashed process therefore cannot leave a stale lock.
+            return [System.IO.File]::Open(
+                $LockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+        } catch [System.IO.IOException] {
+            $win32Error = $_.Exception.HResult -band 0xFFFF
+            if ($win32Error -ne 32 -and $win32Error -ne 33) {
+                throw
+            }
+            if ($waitTimer.ElapsedMilliseconds -ge $TimeoutMilliseconds) {
+                throw "Timed out after $TimeoutMilliseconds ms waiting for the map acquisition lock: $LockPath"
+            }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $ledgerPath = Join-Path $repositoryRoot 'maps\source-ledger.json'
 $ledger = Get-Content -LiteralPath $ledgerPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -87,6 +118,9 @@ if (-not $destinationPath.StartsWith($researchPrefix, [System.StringComparison]:
 Test-ReparsePath -Path $destinationPath -StopAt $repositoryRoot
 New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
 
+$lockPath = Join-Path $destinationPath '.arenaagents-acquisition.lock'
+$acquisitionLock = Enter-MapAcquisitionLock -LockPath $lockPath
+try {
 $archivePath = Join-Path $destinationPath ([string]$source.archive.filename)
 $evidencePath = "$archivePath.sha256.json"
 $archiveExistedBefore = Test-Path -LiteralPath $archivePath
@@ -195,4 +229,7 @@ try {
     if (Test-Path -LiteralPath $partialEvidencePath) {
         Remove-Item -LiteralPath $partialEvidencePath -Force
     }
+}
+} finally {
+    $acquisitionLock.Dispose()
 }
