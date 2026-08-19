@@ -4,9 +4,7 @@ import dev.agaminggod.arenaagents.client.control.AgentControlClient;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
 import dev.agaminggod.arenaagents.control.AgentWorldNamePolicy;
-import java.nio.charset.StandardCharsets;
 import java.util.Optional;
-import java.util.UUID;
 import net.minecraft.client.renderer.entity.state.AvatarRenderState;
 import net.minecraft.client.renderer.entity.player.AvatarRenderer;
 import net.minecraft.network.chat.Component;
@@ -33,7 +31,10 @@ abstract class AvatarRendererMixin {
 				if (hasExpectedOfflineUuid(avatar, snapshotAgent.orElseThrow())) callback.setReturnValue(false);
 				return;
 			}
-			if (AgentIdentity.skinForPlayerName(name).isPresent()) callback.setReturnValue(false);
+			if (AgentIdentity.skinForPlayerName(name).isPresent()
+					&& avatar.getUUID().equals(AgentIdentity.offlinePlayerUuid(name))) {
+				callback.setReturnValue(false);
+			}
 		});
 	}
 
@@ -64,8 +65,6 @@ abstract class AvatarRendererMixin {
 	}
 
 	private static boolean hasExpectedOfflineUuid(Avatar avatar, AgentControlAgent agent) {
-		UUID expected = UUID.nameUUIDFromBytes(
-				("OfflinePlayer:" + agent.playerName()).getBytes(StandardCharsets.UTF_8));
-		return avatar.getUUID().equals(expected);
+		return avatar.getUUID().equals(AgentIdentity.offlinePlayerUuid(agent.playerName()));
 	}
 }

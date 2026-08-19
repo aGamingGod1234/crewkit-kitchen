@@ -1,10 +1,12 @@
 package dev.agaminggod.arenaagents.agent;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -77,6 +79,12 @@ public final class AgentIdentity {
 			throw new IllegalStateException("Manifest transport code cannot form a valid Minecraft player name: " + identity);
 		}
 		return playerName;
+	}
+
+	/** Returns Minecraft's deterministic offline UUID for the exact technical player name. */
+	public static UUID offlinePlayerUuid(String technicalName) {
+		String checkedName = Objects.requireNonNull(technicalName, "technicalName must not be null");
+		return UUID.nameUUIDFromBytes(("OfflinePlayer:" + checkedName).getBytes(StandardCharsets.UTF_8));
 	}
 
 	public static Optional<SkinIdentity> skinForPlayerName(String playerName) {

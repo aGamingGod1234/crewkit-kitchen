@@ -5,8 +5,6 @@ import dev.agaminggod.arenaagents.client.render.CodexAgentRenderer;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
-import java.nio.charset.StandardCharsets;
-import java.util.UUID;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.core.ClientAsset;
 import net.minecraft.resources.Identifier;
@@ -24,11 +22,11 @@ abstract class AbstractClientPlayerMixin {
 		AbstractClientPlayer player = (AbstractClientPlayer) (Object) this;
 		String profileName = player.getGameProfile().name();
 		AgentControlAgent agent = AgentControlClient.agentForPlayer(profileName).orElse(null);
-		if (agent != null && !player.getUUID().equals(UUID.nameUUIDFromBytes(
-				("OfflinePlayer:" + agent.playerName()).getBytes(StandardCharsets.UTF_8)))) return;
+		if (agent != null && !player.getUUID().equals(AgentIdentity.offlinePlayerUuid(agent.playerName()))) return;
 		AgentIdentity.SkinIdentity fallback = agent == null
 				? AgentIdentity.skinForPlayerName(profileName).orElse(null) : null;
 		if (agent == null && fallback == null) return;
+		if (fallback != null && !player.getUUID().equals(AgentIdentity.offlinePlayerUuid(profileName))) return;
 
 		AgentVisualIdentity.Resolved identity;
 		if (agent != null) {

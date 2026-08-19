@@ -34,6 +34,18 @@ public final class AgentIdentityVerification {
 				"fake-player username stays within Minecraft's limit");
 		assertTrue(AgentIdentity.playerName(id, sol).matches("[A-Za-z0-9_]+"),
 				"fake-player username uses Minecraft-safe characters");
+		String currentTechnicalName = "c02_193A9ADD";
+		UUID currentOfflineUuid = AgentIdentity.offlinePlayerUuid(currentTechnicalName);
+		assertEquals(UUID.fromString("6eb46a0e-9bd1-33e1-8fa7-d1280f08577c"), currentOfflineUuid,
+				"current transport name derives the exact Minecraft offline UUID");
+		assertTrue(!UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").equals(currentOfflineUuid),
+				"current transport-looking name with a genuine player UUID fails provenance");
+		String legacyTechnicalName = "SolEmer_193A9ADD";
+		UUID legacyOfflineUuid = AgentIdentity.offlinePlayerUuid(legacyTechnicalName);
+		assertEquals(UUID.fromString("c0bbfc41-28e0-331c-9c45-53e6a002905e"), legacyOfflineUuid,
+				"legacy transport name derives the exact Minecraft offline UUID");
+		assertTrue(!UUID.fromString("11111111-2222-3333-8444-555555555555").equals(legacyOfflineUuid),
+				"legacy transport-looking name with a genuine player UUID fails provenance");
 		assertEquals(new AgentIdentity.SkinIdentity("codex", "sol", 2),
 				AgentIdentity.skinForPlayerName("c02_193A9ADD").orElseThrow(),
 				"manifest player names expose the exact family and variant before the first client snapshot");
@@ -201,7 +213,7 @@ public final class AgentIdentityVerification {
 				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
 				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
 				"project-owned codex entity texture", "non-project manifest texture rejected");
-		return 1146;
+		return 1150;
 	}
 
 	private static byte[] readTexture(String texturePath) {
