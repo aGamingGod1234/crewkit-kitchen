@@ -23,6 +23,7 @@ public final class ConsoleTheme {
 	public static final int ERROR = 0xFFFF737A;
 	public static final int CODEX = 0xFF42D39B;
 	public static final int GEMINI = 0xFF8E86FF;
+	public static final int ROSTER_GEMINI = 0xFF8E88FF;
 	public static final int KIMI = 0xFFFFB45E;
 	public static final int CURSOR = 0xFF70B9F2;
 
@@ -43,6 +44,14 @@ public final class ConsoleTheme {
 			case "kimi" -> KIMI;
 			case "cursor" -> CURSOR;
 			default -> TEXT;
+		};
+	}
+
+	public static int rosterProviderColor(String provider) {
+		if (provider == null) return TEXT;
+		return switch (provider.toLowerCase(Locale.ROOT)) {
+			case "gemini", "antigravity" -> ROSTER_GEMINI;
+			default -> providerColor(provider);
 		};
 	}
 

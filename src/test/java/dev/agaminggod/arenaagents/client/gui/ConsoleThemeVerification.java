@@ -39,6 +39,23 @@ public final class ConsoleThemeVerification {
 				&& ConsoleTheme.CURSOR != ConsoleTheme.GEMINI
 				&& ConsoleTheme.CURSOR != ConsoleTheme.KIMI,
 				"Cursor provider color is distinct from every other provider");
+		int[] providerColors = {
+				ConsoleTheme.rosterProviderColor("codex"),
+				ConsoleTheme.rosterProviderColor("gemini"),
+				ConsoleTheme.rosterProviderColor("kimi"),
+				ConsoleTheme.rosterProviderColor("cursor")
+		};
+		int[] rosterSurfaces = {
+				ConsoleTheme.SURFACE,
+				ConsoleTheme.ROSTER_SELECTED_SURFACE,
+				ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE
+		};
+		for (int providerColor : providerColors) {
+			for (int rosterSurface : rosterSurfaces) {
+				assertTrue(ConsoleTheme.contrastRatio(providerColor, rosterSurface) >= 4.5D,
+						"provider identity text clears normal-text contrast on every roster surface");
+			}
+		}
 		assertTrue(ConsoleFocusIdentity.normalize("Provider: Codex").equals("provider"),
 				"cycle controls keep focus when their value changes");
 		assertTrue(ConsoleFocusIdentity.normalize("Selected: Builder").equals("builder"),
@@ -51,7 +68,7 @@ public final class ConsoleThemeVerification {
 				"the visible left arrow cycles backward");
 		assertTrue(ConsoleCycleButton.clickDirection(150.0D, 100, 120) == 1,
 				"the value and visible right arrow cycle forward");
-		return 21;
+		return 33;
 	}
 
 	private static void assertTrue(boolean condition, String label) {

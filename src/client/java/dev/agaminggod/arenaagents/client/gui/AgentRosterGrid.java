@@ -12,6 +12,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.function.ToIntFunction;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -46,6 +47,7 @@ public final class AgentRosterGrid {
 		this.font = Objects.requireNonNull(font, "font must not be null");
 		this.page = Objects.requireNonNull(page, "page must not be null");
 		this.layout = Objects.requireNonNull(layout, "layout must not be null");
+		validatePageLayout(page, layout);
 		this.selectedIds = immutableSelectedSnapshot(selectedIds);
 		Objects.requireNonNull(mode, "mode must not be null");
 		Objects.requireNonNull(contextFocusedById, "context focus lookup must not be null");
@@ -98,11 +100,13 @@ public final class AgentRosterGrid {
 	public void extractRenderState(GuiGraphicsExtractor graphics) {
 		Objects.requireNonNull(graphics, "graphics must not be null");
 		if (!hasPager(layout, page)) return;
-		Bounds bounds = layout.pagerBounds();
+		Bounds bounds = pagerLabelBounds(layout);
+		String label = pagerDisplayLabel(page, layout, value -> ConsoleText.width(font, value));
+		if (label.isEmpty()) return;
 		ConsoleText.centered(
 				graphics,
 				font,
-				pagerLabel(page),
+				label,
 				bounds.left() + bounds.width() / 2,
 				bounds.top() + (bounds.height() - 9) / 2,
 				ConsoleTheme.MUTED
@@ -201,6 +205,59 @@ public final class AgentRosterGrid {
 	public static String pagerLabel(AgentRosterPage page) {
 		Objects.requireNonNull(page, "page must not be null");
 		return page.firstIndex() + "–" + page.lastIndex() + " of " + page.totalFiltered();
+	}
+
+	public static Bounds pagerLabelBounds(AgentRosterGridLayout layout) {
+		Objects.requireNonNull(layout, "layout must not be null");
+		if (!layout.hasPager()) throw new IllegalArgumentException("Roster layout has no pager");
+		Bounds previous = pagerMetrics(layout, false).interactionBounds();
+		Bounds next = pagerMetrics(layout, true).interactionBounds();
+		return new Bounds(previous.right(), layout.pagerBounds().top(), next.left(), layout.pagerBounds().bottom());
+	}
+
+	public static String pagerDisplayLabel(
+			AgentRosterPage page,
+			AgentRosterGridLayout layout,
+			ToIntFunction<String> measure
+	) {
+		Objects.requireNonNull(page, "page must not be null");
+		Objects.requireNonNull(measure, "measure must not be null");
+		int available = pagerLabelBounds(layout).width();
+		String full = pagerLabel(page);
+		if (measure.applyAsInt(full) <= available) return full;
+		String shortLabel = page.page() + "/" + page.pageCount();
+		return measure.applyAsInt(shortLabel) <= available ? shortLabel : "";
+	}
+
+	public static void validatePageLayout(AgentRosterPage page, AgentRosterGridLayout layout) {
+		Objects.requireNonNull(page, "page must not be null");
+		Objects.requireNonNull(layout, "layout must not be null");
+		if (page.totalFiltered() < 0 || page.page() < 1 || page.pageCount() < 1
+				|| page.page() > page.pageCount() || page.hiddenSelectedCount() < 0) {
+			throw new IllegalArgumentException("Roster page metadata cannot be negative or out of range");
+		}
+		int pageSize = layout.pageSize();
+		if (page.totalFiltered() == 0) {
+			if (pageSize != 0 || !page.entries().isEmpty() || page.firstIndex() != 0 || page.lastIndex() != 0
+					|| page.page() != 1 || page.pageCount() != 1 || layout.hasPager()) {
+				throw new IllegalArgumentException("Empty roster page must match empty layout geometry");
+			}
+			return;
+		}
+		if (pageSize < 1) throw new IllegalArgumentException("Non-empty roster requires visible layout capacity");
+		int expectedPageCount = (int) (((long) page.totalFiltered() + pageSize - 1L) / pageSize);
+		boolean expectedPager = expectedPageCount > 1;
+		if (page.pageCount() != expectedPageCount || layout.hasPager() != expectedPager
+				|| (!expectedPager && pageSize != page.totalFiltered())) {
+			throw new IllegalArgumentException("Roster total, page count, and pager geometry disagree");
+		}
+		int expectedFirst = (int) ((long) (page.page() - 1) * pageSize + 1L);
+		int expectedLast = (int) Math.min((long) page.page() * pageSize, page.totalFiltered());
+		int expectedEntries = expectedLast - expectedFirst + 1;
+		if (page.firstIndex() != expectedFirst || page.lastIndex() != expectedLast
+				|| page.entries().size() != expectedEntries || page.entries().size() > pageSize) {
+			throw new IllegalArgumentException("Roster page range does not match layout capacity");
+		}
 	}
 
 	public static PagerMetrics pagerMetrics(AgentRosterGridLayout layout, boolean next) {

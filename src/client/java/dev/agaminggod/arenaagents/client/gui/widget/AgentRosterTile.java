@@ -2,10 +2,12 @@ package dev.agaminggod.arenaagents.client.gui.widget;
 
 import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGrid;
+import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayout.Bounds;
 import dev.agaminggod.arenaagents.client.gui.ConsoleFocusTarget;
 import dev.agaminggod.arenaagents.client.gui.ConsoleText;
 import dev.agaminggod.arenaagents.client.gui.ConsoleTheme;
 import dev.agaminggod.arenaagents.control.AgentRosterEntry;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -29,7 +31,9 @@ public final class AgentRosterTile extends AbstractWidget implements ConsoleFocu
 	private static final String ELLIPSIS = "…";
 	private static final int FACE_MAXIMUM = 32;
 	private static final int TEXT_GAP = 7;
-	private static final int CHECK_RESERVE = 14;
+	private static final int MINIMUM_TILE_SIZE = 24;
+	private static final int CHECK_WIDTH = 7;
+	private static final int CHECK_HEIGHT = 6;
 
 	private final Font font;
 	private final AgentRosterEntry entry;
@@ -80,6 +84,7 @@ public final class AgentRosterTile extends AbstractWidget implements ConsoleFocu
 			int mouseY,
 			float partialTick
 	) {
+		ContentMetrics metrics = contentMetrics(getX(), getY(), getWidth(), getHeight(), selected);
 		int surface = selected ? ConsoleTheme.ROSTER_SELECTED_SURFACE
 				: entry.selectable() ? ConsoleTheme.SURFACE : ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE;
 		if (isHovered() && !selected && entry.selectable()) {
@@ -92,50 +97,59 @@ public final class AgentRosterTile extends AbstractWidget implements ConsoleFocu
 						? ConsoleTheme.ROSTER_FOCUS : ConsoleTheme.BORDER
 		);
 
-		int portraitSize = Math.min(FACE_MAXIMUM, Math.max(16, getHeight() - 12));
-		int portraitX = getX() + 6;
-		int portraitY = getY() + (getHeight() - portraitSize) / 2;
+		Bounds portrait = metrics.portraitBounds();
 		PlayerFaceExtractor.extractRenderState(
 				graphics,
 				texture,
-				portraitX,
-				portraitY,
-				portraitSize,
+				portrait.left(),
+				portrait.top(),
+				portrait.width(),
 				true,
 				false,
 				0xFFFFFFFF
 		);
 
-		int textX = portraitX + portraitSize + TEXT_GAP;
-		int textRight = getRight() - 6 - (selected ? CHECK_RESERVE : 0);
-		int availableTextWidth = Math.max(0, textRight - textX);
-		String fittedName = ellipsize(entry.name(), availableTextWidth, value -> ConsoleText.width(font, value));
-		int nameY = getY() + Math.max(5, (getHeight() - 22) / 2);
-		ConsoleText.text(graphics, font, fittedName, textX, nameY, ConsoleTheme.TEXT);
-		String fittedModel = ellipsize(
-				entry.modelLabel(), availableTextWidth - 10, value -> ConsoleText.width(font, value));
-		ConsoleText.text(graphics, font, fittedModel, textX + 10, nameY + 12, ConsoleTheme.MUTED);
-		drawStateCue(graphics, textX, nameY + 14, entry.state());
-		if (selected) {
-			ConsoleText.text(graphics, font, "✓", getRight() - 13, nameY, ConsoleTheme.ACCENT);
+		if (metrics.showPrimaryText()) {
+			Bounds primary = metrics.primaryTextBounds();
+			String fittedName = ellipsize(
+					entry.name(), primary.width(), value -> ConsoleText.width(font, value));
+			ConsoleText.text(graphics, font, fittedName, primary.left(), primary.top(), ConsoleTheme.TEXT);
+		}
+		if (metrics.showSecondaryText()) {
+			Bounds secondary = metrics.secondaryTextBounds();
+			String fittedModel = ellipsize(
+					entry.modelLabel(), secondary.width(), value -> ConsoleText.width(font, value));
+			ConsoleText.text(graphics, font, fittedModel, secondary.left(), secondary.top(), ConsoleTheme.MUTED);
+			drawStateCue(graphics, metrics.stateCueBounds(), entry.state());
+		}
+		if (metrics.showCheck()) {
+			drawSelectionCheck(graphics, metrics.checkBounds());
 		}
 	}
 
-	private static void drawStateCue(GuiGraphicsExtractor graphics, int x, int y, String state) {
+	private static void drawStateCue(GuiGraphicsExtractor graphics, Bounds bounds, String state) {
 		int color = stateColor(state);
 		switch (stateCue(state)) {
-			case BAR -> graphics.fill(x, y, x + 6, y + 2, color);
-			case SQUARE -> graphics.outline(x, y - 1, 5, 5, color);
+			case BAR -> graphics.fill(
+					bounds.left(), bounds.top() + 2, bounds.right(), bounds.bottom() - 1, color);
+			case SQUARE -> graphics.outline(
+					bounds.left(), bounds.top(), bounds.width(), bounds.height(), color);
 			case PAUSE -> {
-				graphics.fill(x, y - 1, x + 2, y + 4, color);
-				graphics.fill(x + 4, y - 1, x + 6, y + 4, color);
+				graphics.fill(bounds.left(), bounds.top(), bounds.left() + 2, bounds.bottom(), color);
+				graphics.fill(bounds.right() - 2, bounds.top(), bounds.right(), bounds.bottom(), color);
 			}
 			case CROSS -> {
-				graphics.fill(x, y - 1, x + 2, y + 1, color);
-				graphics.fill(x + 4, y - 1, x + 6, y + 1, color);
-				graphics.fill(x + 2, y + 1, x + 4, y + 3, color);
+				graphics.fill(bounds.left(), bounds.top(), bounds.left() + 2, bounds.top() + 2, color);
+				graphics.fill(bounds.right() - 2, bounds.top(), bounds.right(), bounds.top() + 2, color);
+				graphics.fill(bounds.left() + 2, bounds.top() + 2, bounds.right() - 2, bounds.bottom(), color);
 			}
 		}
+	}
+
+	private static void drawSelectionCheck(GuiGraphicsExtractor graphics, Bounds bounds) {
+		graphics.fill(bounds.left(), bounds.top() + 3, bounds.left() + 2, bounds.top() + 5, ConsoleTheme.ACCENT);
+		graphics.fill(bounds.left() + 2, bounds.top() + 4, bounds.left() + 4, bounds.bottom(), ConsoleTheme.ACCENT);
+		graphics.fill(bounds.left() + 4, bounds.top() + 1, bounds.right(), bounds.top() + 5, ConsoleTheme.ACCENT);
 	}
 
 	private static StateCue stateCue(String state) {
@@ -191,6 +205,55 @@ public final class AgentRosterTile extends AbstractWidget implements ConsoleFocu
 
 	public static boolean focusVisible(boolean keyboardFocused, boolean contextFocused) {
 		return keyboardFocused || contextFocused;
+	}
+
+	public static ContentMetrics contentMetrics(int x, int y, int width, int height, boolean selected) {
+		if (width < MINIMUM_TILE_SIZE || height < MINIMUM_TILE_SIZE) {
+			throw new IllegalArgumentException("Roster tile must meet the 24-pixel interaction minimum");
+		}
+		int padding = Math.min(6, Math.max(4, Math.min(width, height) / 8));
+		int portraitSize = Math.min(FACE_MAXIMUM, Math.min(width - padding * 2, height - padding * 2));
+		int portraitX = x + padding;
+		int portraitY = y + (height - portraitSize) / 2;
+		Bounds portrait = new Bounds(
+				portraitX, portraitY, portraitX + portraitSize, portraitY + portraitSize);
+
+		Bounds hidden = new Bounds(x, y, x, y);
+		Bounds check = hidden;
+		if (selected) {
+			int checkLeft = x + width - padding - CHECK_WIDTH;
+			check = new Bounds(checkLeft, y + padding, checkLeft + CHECK_WIDTH, y + padding + CHECK_HEIGHT);
+		}
+
+		int textLeft = portrait.right() + TEXT_GAP;
+		int textRight = selected ? check.left() - 3 : x + width - padding;
+		int textWidth = Math.max(0, textRight - textLeft);
+		int primaryY = y + Math.max(padding, (height - 22) / 2);
+		boolean showPrimary = textWidth >= 12 && primaryY + 9 <= y + height - padding;
+		Bounds primary = showPrimary
+				? new Bounds(textLeft, primaryY, textRight, primaryY + 9) : hidden;
+
+		int stateWidth = 6;
+		int stateHeight = 5;
+		int secondaryY = primaryY + 12;
+		int secondaryLeft = textLeft + stateWidth + 4;
+		boolean showSecondary = showPrimary && textRight - secondaryLeft >= 12
+				&& secondaryY + 9 <= y + height - padding;
+		Bounds secondary = showSecondary
+				? new Bounds(secondaryLeft, secondaryY, textRight, secondaryY + 9) : hidden;
+		Bounds state = showSecondary
+				? new Bounds(textLeft, secondaryY + 1, textLeft + stateWidth, secondaryY + 1 + stateHeight)
+				: hidden;
+
+		ArrayList<Bounds> painted = new ArrayList<>();
+		painted.add(portrait);
+		if (showPrimary) painted.add(primary);
+		if (showSecondary) {
+			painted.add(secondary);
+			painted.add(state);
+		}
+		if (selected) painted.add(check);
+		return new ContentMetrics(portrait, primary, secondary, state, check, List.copyOf(painted));
 	}
 
 	private void emit(IntentType type) {
@@ -297,6 +360,40 @@ public final class AgentRosterTile extends AbstractWidget implements ConsoleFocu
 		public Intent {
 			Objects.requireNonNull(type, "intent type must not be null");
 			Objects.requireNonNull(agentId, "agent ID must not be null");
+		}
+	}
+
+	public record ContentMetrics(
+			Bounds portraitBounds,
+			Bounds primaryTextBounds,
+			Bounds secondaryTextBounds,
+			Bounds stateCueBounds,
+			Bounds checkBounds,
+			List<Bounds> paintedBounds
+	) {
+		public ContentMetrics {
+			Objects.requireNonNull(portraitBounds, "portrait bounds must not be null");
+			Objects.requireNonNull(primaryTextBounds, "primary text bounds must not be null");
+			Objects.requireNonNull(secondaryTextBounds, "secondary text bounds must not be null");
+			Objects.requireNonNull(stateCueBounds, "state cue bounds must not be null");
+			Objects.requireNonNull(checkBounds, "check bounds must not be null");
+			paintedBounds = List.copyOf(Objects.requireNonNull(paintedBounds, "painted bounds must not be null"));
+		}
+
+		public boolean showPrimaryText() {
+			return !primaryTextBounds.isEmpty();
+		}
+
+		public boolean showSecondaryText() {
+			return !secondaryTextBounds.isEmpty();
+		}
+
+		public boolean showStateCue() {
+			return !stateCueBounds.isEmpty();
+		}
+
+		public boolean showCheck() {
+			return !checkBounds.isEmpty();
 		}
 	}
 

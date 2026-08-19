@@ -3,7 +3,9 @@ package dev.agaminggod.arenaagents.client.gui;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGrid.Direction;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGrid.Mode;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGrid.PagerMetrics;
+import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayout.Bounds;
 import dev.agaminggod.arenaagents.client.gui.widget.AgentRosterTile;
+import dev.agaminggod.arenaagents.client.gui.widget.AgentRosterTile.ContentMetrics;
 import dev.agaminggod.arenaagents.client.gui.widget.AgentRosterTile.IntentType;
 import dev.agaminggod.arenaagents.control.AgentRosterEntry;
 import dev.agaminggod.arenaagents.control.AgentRosterPage;
@@ -24,6 +26,8 @@ public final class AgentRosterGridVerification {
 		assertions += verifyDirectionalMovement();
 		assertions += verifyWheelContainment();
 		assertions += verifyPagerContract();
+		assertions += verifyCompactContentBounds();
+		assertions += verifyPageLayoutValidation();
 		assertions += verifyImmutableSnapshots();
 		return assertions;
 	}
@@ -164,9 +168,11 @@ public final class AgentRosterGridVerification {
 		AgentRosterGridLayout layout = AgentRosterGridLayout.calculate(20, 20, 500, 260, 17);
 		AgentRosterPage middle = page(2, 3);
 		assertTrue(AgentRosterGrid.hasPager(layout, middle), "pager appears only for multi-page pager geometry");
-		assertTrue(!AgentRosterGrid.hasPager(layout, page(1, 1)), "single-page rosters omit pager controls");
-		assertEquals("9–16 of 16", AgentRosterGrid.pagerLabel(
-				new AgentRosterPage(entries(8), 9, 16, 16, 2, 2, 0)),
+		AgentRosterGridLayout singlePageLayout = AgentRosterGridLayout.calculate(20, 20, 500, 260, 16);
+		assertTrue(!AgentRosterGrid.hasPager(singlePageLayout, validPage(singlePageLayout, 1, 16)),
+				"single-page rosters omit pager controls");
+		assertEquals("9–16 of 17", AgentRosterGrid.pagerLabel(
+				new AgentRosterPage(entries(8), 9, 16, 17, 2, 3, 0)),
 				"pager label reports the concise visible range");
 		PagerMetrics previous = AgentRosterGrid.pagerMetrics(layout, false);
 		PagerMetrics next = AgentRosterGrid.pagerMetrics(layout, true);
@@ -182,6 +188,108 @@ public final class AgentRosterGridVerification {
 				"pager interaction claims exactly the six-pixel reserve above the band");
 		assertTrue(previous.interactionBounds().right() <= next.interactionBounds().left(),
 				"pager hit targets never overlap");
+		AgentRosterGridLayout minimum = AgentRosterGridLayout.calculate(0, 0, 54, 240, 17);
+		Bounds minimumLabel = AgentRosterGrid.pagerLabelBounds(minimum);
+		assertEquals(6, minimumLabel.width(), "minimum roster leaves only the strict gap between pager controls");
+		assertEquals(AgentRosterGrid.pagerMetrics(minimum, false).interactionBounds().right(), minimumLabel.left(),
+				"pager label begins after the previous control");
+		assertEquals(AgentRosterGrid.pagerMetrics(minimum, true).interactionBounds().left(), minimumLabel.right(),
+				"pager label ends before the next control");
+		assertEquals("", AgentRosterGrid.pagerDisplayLabel(
+				validPage(minimum, 1, 17), minimum, value -> value.length() * 6),
+				"minimum-width pager omits copy that cannot fit between controls");
+		AgentRosterGridLayout intermediate = AgentRosterGridLayout.calculate(0, 0, 80, 240, 17);
+		assertEquals("1/3", AgentRosterGrid.pagerDisplayLabel(
+				validPage(intermediate, 1, 17), intermediate, value -> value.length() * 6),
+				"pager falls back to page count when the full range cannot fit");
+		AgentRosterGridLayout normal = AgentRosterGridLayout.calculate(0, 0, 480, 240, 17);
+		assertEquals("1–16 of 17", AgentRosterGrid.pagerDisplayLabel(
+				validPage(normal, 1, 17), normal, value -> value.length() * 6),
+				"normal pager retains its full concise range");
+		return 16;
+	}
+
+	private static int verifyCompactContentBounds() {
+		Bounds compactTile = new Bounds(10, 20, 34, 44);
+		ContentMetrics compact = AgentRosterTile.contentMetrics(
+				compactTile.left(), compactTile.top(), compactTile.width(), compactTile.height(), true);
+		assertEquals(2, compact.paintedBounds().size(), "compact selected tile paints only portrait and check");
+		for (Bounds painted : compact.paintedBounds()) {
+			assertTrue(contains(compactTile, painted), "every compact painted bound remains inside its legal tile");
+		}
+		assertTrue(!compact.showPrimaryText(), "24-pixel tile omits primary text that cannot fit");
+		assertTrue(!compact.showSecondaryText(), "24-pixel tile omits secondary text that cannot fit");
+		assertTrue(!compact.showStateCue(), "24-pixel tile omits its secondary state cue");
+		assertTrue(compact.showCheck(), "24-pixel selected tile retains an in-bounds amber check");
+		assertTrue(compact.portraitBounds().width() <= 16 && compact.portraitBounds().height() <= 16,
+				"compact portrait derives its size from both width and height");
+
+		Bounds narrowTallTile = new Bounds(3, 4, 27, 68);
+		ContentMetrics narrowTall = AgentRosterTile.contentMetrics(
+				narrowTallTile.left(), narrowTallTile.top(), narrowTallTile.width(), narrowTallTile.height(), true);
+		assertEquals(2, narrowTall.paintedBounds().size(),
+				"narrow tall selected tile paints only portrait and check");
+		for (Bounds painted : narrowTall.paintedBounds()) {
+			assertTrue(contains(narrowTallTile, painted), "narrow tall tile never paints outside its width");
+		}
+		assertTrue(!narrowTall.showSecondaryText(), "narrow tall tile does not infer detail space from height alone");
+
+		Bounds normalTile = new Bounds(0, 0, 120, 48);
+		ContentMetrics normal = AgentRosterTile.contentMetrics(0, 0, 120, 48, true);
+		assertEquals(5, normal.paintedBounds().size(),
+				"normal selected tile publishes portrait, two text rows, state cue, and check");
+		assertTrue(normal.showPrimaryText(), "normal tile shows its primary agent name");
+		assertTrue(normal.showSecondaryText(), "normal tile shows its short model detail");
+		assertTrue(normal.showStateCue(), "normal tile shows its state shape");
+		for (Bounds painted : normal.paintedBounds()) {
+			assertTrue(contains(normalTile, painted), "every normal painted bound remains inside its tile");
+		}
+		return 21;
+	}
+
+	private static int verifyPageLayoutValidation() {
+		AgentRosterGridLayout emptyLayout = AgentRosterGridLayout.calculate(0, 0, 480, 240, 0);
+		assertDoesNotThrow(() -> AgentRosterGrid.validatePageLayout(
+				new AgentRosterPage(List.of(), 0, 0, 0, 1, 1, 0), emptyLayout),
+				"empty page metadata matches empty layout");
+
+		AgentRosterGridLayout pagedLayout = AgentRosterGridLayout.calculate(0, 0, 480, 240, 33);
+		assertDoesNotThrow(() -> AgentRosterGrid.validatePageLayout(validPage(pagedLayout, 2, 33), pagedLayout),
+				"full middle page metadata is accepted");
+		assertDoesNotThrow(() -> AgentRosterGrid.validatePageLayout(validPage(pagedLayout, 3, 33), pagedLayout),
+				"partial last page metadata is accepted");
+		assertDoesNotThrow(() -> AgentRosterGrid.validatePageLayout(
+				new AgentRosterPage(
+						entries(15),
+						2_147_483_633,
+						Integer.MAX_VALUE,
+						Integer.MAX_VALUE,
+						134_217_728,
+						134_217_728,
+						0
+				),
+				pagedLayout
+		), "maximum filtered total keeps final-page arithmetic exact");
+
+		AgentRosterGridLayout unpagedLayout = AgentRosterGridLayout.calculate(0, 0, 480, 240, 16);
+		assertRejects(() -> AgentRosterGrid.validatePageLayout(
+				new AgentRosterPage(entries(16), 1, 16, 17, 1, 2, 0), unpagedLayout),
+				"multi-page metadata requires pager geometry");
+		assertRejects(() -> AgentRosterGrid.validatePageLayout(
+				new AgentRosterPage(entries(16), 2, 17, 33, 1, 3, 0), pagedLayout),
+				"first index must match page and page size");
+		assertRejects(() -> AgentRosterGrid.validatePageLayout(
+				new AgentRosterPage(entries(16), 17, 31, 33, 2, 3, 0), pagedLayout),
+				"last index must match the exact visible entry count");
+		assertRejects(() -> AgentRosterGrid.validatePageLayout(
+				new AgentRosterPage(entries(16), 17, 32, 34, 2, 2, 0), pagedLayout),
+				"total must agree with layout page capacity and page count");
+		assertRejects(() -> AgentRosterGrid.validatePageLayout(
+				new AgentRosterPage(entries(15), 17, 32, 33, 2, 3, 0), pagedLayout),
+				"middle pages must contain the full layout page size");
+		assertRejects(() -> AgentRosterGrid.validatePageLayout(
+				new AgentRosterPage(List.of(), 0, 0, 0, 1, 1, -1), emptyLayout),
+				"hidden selected count cannot be negative");
 		return 10;
 	}
 
@@ -219,7 +327,22 @@ public final class AgentRosterGridVerification {
 	}
 
 	private static AgentRosterPage page(int page, int pageCount) {
-		return new AgentRosterPage(entries(8), 1, 8, pageCount * 8, page, pageCount, 0);
+		AgentRosterGridLayout layout = AgentRosterGridLayout.calculate(20, 20, 500, 260, 33);
+		int total = pageCount == 1 ? layout.pageSize() : (pageCount - 1) * layout.pageSize() + 1;
+		return validPage(layout, page, total);
+	}
+
+	private static AgentRosterPage validPage(AgentRosterGridLayout layout, int page, int total) {
+		int pageSize = layout.pageSize();
+		int pageCount = total == 0 ? 1 : (total + pageSize - 1) / pageSize;
+		int first = total == 0 ? 0 : (page - 1) * pageSize + 1;
+		int last = total == 0 ? 0 : Math.min(page * pageSize, total);
+		return new AgentRosterPage(entries(Math.max(0, last - first + 1)), first, last, total, page, pageCount, 0);
+	}
+
+	private static boolean contains(Bounds outer, Bounds inner) {
+		return inner.left() >= outer.left() && inner.top() >= outer.top()
+				&& inner.right() <= outer.right() && inner.bottom() <= outer.bottom();
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {
@@ -239,5 +362,22 @@ public final class AgentRosterGridVerification {
 			return;
 		}
 		throw new AssertionError(label);
+	}
+
+	private static void assertRejects(Runnable action, String label) {
+		try {
+			action.run();
+		} catch (IllegalArgumentException expected) {
+			return;
+		}
+		throw new AssertionError(label);
+	}
+
+	private static void assertDoesNotThrow(Runnable action, String label) {
+		try {
+			action.run();
+		} catch (RuntimeException exception) {
+			throw new AssertionError(label, exception);
+		}
 	}
 }
