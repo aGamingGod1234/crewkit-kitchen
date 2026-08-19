@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import http.server
 import io
 import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -1008,6 +1011,452 @@ class FetchMapSourceTests(unittest.TestCase):
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn("sha512", result.stderr.lower())
+
+
+def mutf8(value: str) -> bytes:
+    encoded = bytearray()
+    utf16 = value.encode("utf-16-be")
+    for offset in range(0, len(utf16), 2):
+        unit = int.from_bytes(utf16[offset : offset + 2], "big")
+        if 0x0001 <= unit <= 0x007F:
+            encoded.append(unit)
+        elif unit <= 0x07FF:
+            encoded.extend((0xC0 | unit >> 6, 0x80 | unit & 0x3F))
+        else:
+            encoded.extend((0xE0 | unit >> 12, 0x80 | unit >> 6 & 0x3F, 0x80 | unit & 0x3F))
+    return struct.pack(">H", len(encoded)) + bytes(encoded)
+
+
+def nbt_named(tag_id: int, name: str, payload: bytes) -> bytes:
+    return bytes((tag_id,)) + mutf8(name) + payload
+
+
+def nbt_compound(entries: list[tuple[int, str, bytes]]) -> bytes:
+    return b"".join(nbt_named(tag_id, name, payload) for tag_id, name, payload in entries) + b"\x00"
+
+
+def nbt_list(element_tag: int, payloads: list[bytes]) -> bytes:
+    return bytes((element_tag,)) + struct.pack(">i", len(payloads)) + b"".join(payloads)
+
+
+def nbt_structure(
+    *,
+    data_version: int = 4790,
+    size: tuple[int, int, int] = (2, 2, 1),
+    palette: list[tuple[str, dict[str, str]]] | None = None,
+    blocks: list[tuple[tuple[int, int, int], int, bytes | None]] | None = None,
+    entities: list[bytes] | None = None,
+    use_palettes: bool = False,
+) -> bytes:
+    palette = palette or [("minecraft:stone", {})]
+    blocks = blocks or [((0, 0, 0), 0, None)]
+    palette_payloads = []
+    for block_id, properties in palette:
+        entries = [(8, "Name", mutf8(block_id))]
+        if properties:
+            entries.append(
+                (10, "Properties", nbt_compound([(8, key, mutf8(value)) for key, value in properties.items()]))
+            )
+        palette_payloads.append(nbt_compound(entries))
+    block_payloads = []
+    for position, state, block_nbt in blocks:
+        entries = [
+            (9, "pos", nbt_list(3, [struct.pack(">i", value) for value in position])),
+            (3, "state", struct.pack(">i", state)),
+        ]
+        if block_nbt is not None:
+            entries.append((10, "nbt", block_nbt))
+        block_payloads.append(nbt_compound(entries))
+    root_entries = [
+        (3, "DataVersion", struct.pack(">i", data_version)),
+        (9, "size", nbt_list(3, [struct.pack(">i", value) for value in size])),
+        (9, "blocks", nbt_list(10, block_payloads)),
+        (9, "entities", nbt_list(10, entities or [])),
+    ]
+    if use_palettes:
+        root_entries.append((9, "palettes", nbt_list(9, [nbt_list(10, palette_payloads)])))
+    else:
+        root_entries.append((9, "palette", nbt_list(10, palette_payloads)))
+    return nbt_named(10, "structure", nbt_compound(root_entries))
+
+
+class BoundedNbtReaderTests(unittest.TestCase):
+    def read(self, payload: bytes, **limit_overrides: int):
+        from scripts.maps.nbt_reader import NbtLimits, read_bounded
+
+        return read_bounded(io.BytesIO(payload), NbtLimits(**limit_overrides))
+
+    def test_reads_raw_and_single_member_gzip_equivalently(self) -> None:
+        payload = nbt_named(10, "root", nbt_compound([(3, "value", struct.pack(">i", 42))]))
+
+        self.assertEqual(self.read(payload), self.read(gzip.compress(payload, mtime=0)))
+
+    def test_preserves_every_supported_tag_type_and_modified_utf8(self) -> None:
+        entries = [
+            (1, "byte", struct.pack(">b", -2)),
+            (2, "short", struct.pack(">h", -300)),
+            (3, "int", struct.pack(">i", 123456)),
+            (4, "long", struct.pack(">q", -123456789)),
+            (5, "float", struct.pack(">f", 1.25)),
+            (6, "double", struct.pack(">d", -2.5)),
+            (7, "bytes", struct.pack(">i", 3) + b"\x00\x7f\xff"),
+            (8, "text", mutf8("nul\x00 emoji \U0001f642")),
+            (9, "list", nbt_list(2, [struct.pack(">h", 7), struct.pack(">h", 8)])),
+            (10, "compound", nbt_compound([(8, "nested", mutf8("yes"))])),
+            (11, "ints", struct.pack(">i", 2) + struct.pack(">ii", -1, 2)),
+            (12, "longs", struct.pack(">i", 2) + struct.pack(">qq", -3, 4)),
+        ]
+
+        root = self.read(nbt_named(10, "root", nbt_compound(entries)))
+
+        self.assertEqual(10, root.tag_id)
+        self.assertEqual("nul\x00 emoji \U0001f642", root.value["text"].value)
+        self.assertEqual(bytes((0, 127, 255)), root.value["bytes"].value)
+        self.assertEqual((-1, 2), root.value["ints"].value)
+        self.assertEqual((-3, 4), root.value["longs"].value)
+        self.assertEqual(2, root.value["list"].value.element_tag_id)
+
+    def test_rejects_malformed_roots_lengths_duplicates_and_nonfinite_numbers(self) -> None:
+        from scripts.maps.nbt_reader import NbtError
+
+        malformed = {
+            "named end": nbt_named(0, "bad", b""),
+            "truncated": nbt_named(10, "root", b""),
+            "duplicate": nbt_named(
+                10,
+                "root",
+                nbt_compound([(3, "x", struct.pack(">i", 1)), (3, "x", struct.pack(">i", 2))]),
+            ),
+            "negative array": nbt_named(10, "root", nbt_compound([(7, "x", struct.pack(">i", -1))])),
+            "nonzero end list": nbt_named(10, "root", nbt_compound([(9, "x", nbt_list(0, [b""]))])),
+            "nan": nbt_named(10, "root", nbt_compound([(5, "x", struct.pack(">f", float("nan")))])),
+            "bad mutf8": b"\x0a\x00\x01\x00\x00",
+            "trailing root": nbt_named(10, "root", b"\x00") + nbt_named(10, "two", b"\x00"),
+        }
+        for name, payload in malformed.items():
+            with self.subTest(name=name), self.assertRaises(NbtError):
+                self.read(payload)
+
+    def test_rejects_corrupt_or_concatenated_gzip(self) -> None:
+        from scripts.maps.nbt_reader import NbtError
+
+        payload = nbt_named(10, "root", b"\x00")
+        corrupt = bytearray(gzip.compress(payload, mtime=0))
+        corrupt[-1] ^= 0xFF
+        for compressed in (bytes(corrupt), gzip.compress(payload, mtime=0) + gzip.compress(payload, mtime=0)):
+            with self.assertRaises(NbtError):
+                self.read(compressed)
+
+    def test_enforces_depth_node_string_list_compound_array_and_total_byte_limits(self) -> None:
+        from scripts.maps.nbt_reader import NbtError
+
+        cases = [
+            (nbt_named(10, "root", nbt_compound([(8, "x", mutf8("abcd"))])), {"max_string_bytes": 3}),
+            (nbt_named(10, "root", nbt_compound([(9, "x", nbt_list(1, [b"\x01", b"\x02"]))])), {"max_list_elements": 1}),
+            (nbt_named(10, "root", nbt_compound([(1, "a", b"\x01"), (1, "b", b"\x02")])), {"max_compound_entries": 1}),
+            (nbt_named(10, "root", nbt_compound([(7, "x", struct.pack(">i", 2) + b"ab")])), {"max_array_payload_bytes": 1}),
+            (nbt_named(10, "root", nbt_compound([(11, "x", struct.pack(">i", 2) + struct.pack(">ii", 1, 2))])), {"max_array_elements": 1}),
+            (nbt_named(10, "root", nbt_compound([(1, "a", b"\x01"), (1, "b", b"\x02")])), {"max_nodes": 2}),
+            (nbt_named(10, "root", nbt_compound([(10, "x", nbt_compound([(10, "y", b"\x00")]))])), {"max_depth": 2}),
+        ]
+        for payload, limits in cases:
+            with self.subTest(limits=limits), self.assertRaises(NbtError):
+                self.read(payload, **limits)
+
+
+class MapConversionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "source"
+        self.source.mkdir()
+        self.output_root = self.root / "output"
+        self.output_root.mkdir()
+        self.catalog = self.root / "catalog.json"
+        self.catalog.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "minecraftVersion": "26.1.2",
+                    "dataVersion": 4790,
+                    "states": [
+                        "minecraft:air",
+                        "minecraft:chest[facing=north,type=single,waterlogged=false]",
+                        "minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]",
+                        "minecraft:stone",
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.ledger = self.root / "source-ledger.json"
+        self.ledger.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "sources": {
+                        "project-owned-fixtures": {
+                            "origin": "project-owned",
+                            "bundleEligible": True,
+                            "licenseStatus": "project-owned",
+                            "archive": None,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def write_case(
+        self,
+        payload: bytes,
+        *,
+        selection_changes: dict[str, object] | None = None,
+        filename: str = "room.nbt",
+    ) -> tuple[Path, Path]:
+        source_path = self.source / filename
+        source_path.write_bytes(payload)
+        selection = {
+            "schemaVersion": 1,
+            "id": "test-room",
+            "version": 1,
+            "sourceKey": "project-owned-fixtures",
+            "input": {"path": filename, "sha256": hashlib.sha256(payload).hexdigest()},
+            "difficulty": 1,
+            "bounds": {"min": [0, 0, 0], "max": [1, 1, 0]},
+            "allowedTransforms": ["identity", "rotate_90"],
+            "containerPolicy": "none",
+            "spectatorPolicy": "separated",
+            "expectedRemoved": {"entities": 0, "blockEntities": 0},
+            "anchors": [
+                {"id": "spawn-1", "type": "spawn", "position": [0, 1, 0]},
+                {"id": "goal-1", "type": "goal", "position": [1, 1, 0]},
+            ],
+        }
+        if selection_changes:
+            selection.update(selection_changes)
+        selection_path = self.root / "selection.json"
+        selection_path.write_text(json.dumps(selection), encoding="utf-8")
+        return selection_path, self.output_root / "module.json"
+
+    def convert(self, selection_path: Path, output_path: Path):
+        from scripts.maps.convert_map_module import convert_selection
+
+        return convert_selection(
+            selection_path,
+            self.source,
+            output_path,
+            repository_root=self.root,
+            output_root=self.output_root,
+            catalog_path=self.catalog,
+            ledger_path=self.ledger,
+        )
+
+    def test_converts_to_canonical_block_only_json_and_verifies_hash(self) -> None:
+        payload = nbt_structure(
+            palette=[("minecraft:air", {}), ("minecraft:stone", {})],
+            blocks=[((1, 0, 0), 1, None), ((0, 0, 0), 0, None)],
+        )
+        selection, output = self.write_case(
+            payload,
+            selection_changes={
+                "allowedTransforms": ["identity", "rotate_90", "rotate_180", "rotate_270"]
+            },
+        )
+
+        module = self.convert(selection, output)
+
+        self.assertEqual([{"id": "minecraft:stone", "properties": {}}], module["palette"])
+        self.assertEqual([{"state": 0, "x": 1, "y": 0, "z": 0}], module["placements"])
+        self.assertEqual(
+            ["identity", "rotate_90", "rotate_180", "rotate_270"],
+            module["allowedTransforms"],
+        )
+        expected_hash = hashlib.sha256(b"1,0,0=minecraft:stone\n").hexdigest()
+        self.assertEqual(expected_hash, module["geometrySha256"])
+        self.assertEqual(b"\n", output.read_bytes()[-1:])
+        self.assertNotIn("nbt", output.read_text(encoding="utf-8").lower())
+
+        from scripts.maps.verify_map_modules import verify_module
+
+        verify_module(output, self.catalog)
+
+    def test_equivalent_palette_compound_and_block_order_is_byte_identical(self) -> None:
+        first = nbt_structure(
+            palette=[("minecraft:stone", {}), ("minecraft:air", {})],
+            blocks=[((1, 0, 0), 0, None), ((0, 0, 0), 1, None)],
+        )
+        second = nbt_structure(
+            palette=[("minecraft:air", {}), ("minecraft:stone", {})],
+            blocks=[((0, 0, 0), 0, None), ((1, 0, 0), 1, None)],
+        )
+        selection, output = self.write_case(first)
+        self.convert(selection, output)
+        first_bytes = output.read_bytes()
+        selection, output = self.write_case(second)
+        self.convert(selection, output)
+
+        self.assertEqual(first_bytes, output.read_bytes())
+
+    def test_requires_exact_data_version_input_hash_and_removed_counts_atomically(self) -> None:
+        cases = [
+            (nbt_structure(data_version=4789), {}, "DataVersion"),
+            (nbt_structure(), {"input": {"path": "room.nbt", "sha256": "0" * 64}}, "sha256"),
+            (
+                nbt_structure(blocks=[((0, 0, 0), 0, nbt_compound([(8, "note", mutf8("owned"))]))]),
+                {},
+                "blockEntities",
+            ),
+            (nbt_structure(entities=[nbt_compound([])]), {}, "entities"),
+        ]
+        for payload, changes, message in cases:
+            with self.subTest(message=message):
+                selection, output = self.write_case(payload, selection_changes=changes)
+                output.write_text("sentinel", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, message):
+                    self.convert(selection, output)
+                self.assertEqual("sentinel", output.read_text(encoding="utf-8"))
+
+    def test_rejects_anvil_world_multi_palette_duplicate_coordinates_and_bad_palette_index(self) -> None:
+        cases = [
+            (nbt_structure(), "region.mca", "Anvil"),
+            (nbt_structure(use_palettes=True), "room.nbt", "multi-palette"),
+            (nbt_structure(blocks=[((0, 0, 0), 0, None), ((0, 0, 0), 0, None)]), "room.nbt", "duplicate"),
+            (nbt_structure(blocks=[((0, 0, 0), 4, None)]), "room.nbt", "palette index"),
+        ]
+        for payload, filename, message in cases:
+            with self.subTest(message=message):
+                selection, output = self.write_case(payload, filename=filename)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.convert(selection, output)
+
+        directory = self.source / "world"
+        directory.mkdir()
+        selection, output = self.write_case(nbt_structure(), selection_changes={"input": {"path": "world", "sha256": "0" * 64}})
+        with self.assertRaisesRegex(ValueError, "world director"):
+            self.convert(selection, output)
+
+    def test_rejects_unknown_partial_or_impossible_states_and_control_blocks(self) -> None:
+        states = [
+            ("minecraft:not_real", {}, "catalog"),
+            ("minecraft:oak_stairs", {"facing": "north"}, "exact complete"),
+            (
+                "minecraft:oak_stairs",
+                {"facing": "up", "half": "bottom", "shape": "straight", "waterlogged": "false"},
+                "catalog",
+            ),
+            ("minecraft:command_block", {"conditional": "false", "facing": "north"}, "control block"),
+        ]
+        for block_id, properties, message in states:
+            with self.subTest(block_id=block_id):
+                selection, output = self.write_case(nbt_structure(palette=[(block_id, properties)]))
+                with self.assertRaisesRegex(ValueError, message):
+                    self.convert(selection, output)
+
+    def test_enforces_container_policy_selection_paths_bounds_and_anchors(self) -> None:
+        chest = nbt_structure(
+            palette=[("minecraft:chest", {"facing": "north", "type": "single", "waterlogged": "false"})]
+        )
+        selection, output = self.write_case(chest)
+        with self.assertRaisesRegex(ValueError, "containerPolicy"):
+            self.convert(selection, output)
+
+        for changes, message in [
+            ({"input": {"path": "../room.nbt", "sha256": "0" * 64}}, "relative"),
+            ({"bounds": {"min": [0, 0, 0], "max": [4, 1, 0]}}, "bounds"),
+            (
+                {"anchors": [{"id": "spawn-1", "type": "spawn", "position": [5, 1, 0]}]},
+                "anchor",
+            ),
+        ]:
+            selection, output = self.write_case(nbt_structure(), selection_changes=changes)
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                self.convert(selection, output)
+
+        selection, output = self.write_case(
+            nbt_structure(),
+            selection_changes={
+                "anchors": [
+                    {"id": "spawn-1", "type": "spawn", "position": [0, 1, 0]},
+                    {"id": "goal-1", "type": "goal", "position": [0, 1, 0]},
+                ]
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "anchor position"):
+            self.convert(selection, output)
+
+    def test_rejects_duplicate_json_keys_and_external_sources_without_locked_evidence(self) -> None:
+        selection, output = self.write_case(nbt_structure())
+        selection.write_text('{"schemaVersion":1,"schemaVersion":1}', encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            self.convert(selection, output)
+
+        selection, output = self.write_case(nbt_structure(), selection_changes={"sourceKey": "external"})
+        ledger = json.loads(self.ledger.read_text(encoding="utf-8"))
+        ledger["sources"]["external"] = {
+            "origin": "external",
+            "bundleEligible": True,
+            "licenseStatus": "verified",
+            "archive": {"sha256": "1" * 64},
+        }
+        self.ledger.write_text(json.dumps(ledger), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "archive evidence"):
+            self.convert(selection, output)
+
+    def test_map_tool_scripts_are_directly_executable(self) -> None:
+        for script in ("inspect_map_source.py", "convert_map_module.py", "verify_map_modules.py"):
+            result = subprocess.run(
+                [sys.executable, str(REPOSITORY_ROOT / "scripts" / "maps" / script), "--help"],
+                cwd=REPOSITORY_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            with self.subTest(script=script):
+                self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_module_verifier_rejects_metadata_policy_anchor_and_bound_drift(self) -> None:
+        from scripts.maps.verify_map_modules import verify_module
+
+        selection, output = self.write_case(nbt_structure())
+        module = self.convert(selection, output)
+        mutations = [
+            ("id", lambda value: value.update(id="Bad ID")),
+            ("version", lambda value: value.update(version=0)),
+            ("sourceKey", lambda value: value.update(sourceKey="../source")),
+            ("difficulty", lambda value: value.update(difficulty=6)),
+            ("allowedTransforms", lambda value: value.update(allowedTransforms=["rotate_90", "identity"])),
+            ("allowedTransforms", lambda value: value.update(allowedTransforms=["identity", "warp"])),
+            ("containerPolicy", lambda value: value.update(containerPolicy="all")),
+            ("spectatorPolicy", lambda value: value.update(spectatorPolicy="unsafe")),
+            ("bounds", lambda value: value.update(bounds={"min": [0, 0, 0], "max": [192, 1, 0]})),
+            ("bounds", lambda value: value.update(bounds={"min": [1, 0, 0], "max": [0, 1, 0]})),
+            ("bounds", lambda value: value.update(bounds={"min": [0, 0, 0], "max": [1.5, 1, 0]})),
+            (
+                "anchor position",
+                lambda value: value.update(
+                    anchors=[
+                        {"id": "spawn-1", "type": "spawn", "position": [0, 1, 0]},
+                        {"id": "goal-1", "type": "goal", "position": [0, 1, 0]},
+                    ]
+                ),
+            ),
+            (
+                "anchor",
+                lambda value: value.update(
+                    anchors=[{"id": "spawn-1", "type": "unknown", "position": [0, 1, 0]}]
+                ),
+            ),
+        ]
+        for message, mutate in mutations:
+            candidate = json.loads(json.dumps(module))
+            mutate(candidate)
+            output.write_text(json.dumps(candidate), encoding="utf-8")
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                verify_module(output, self.catalog)
 
 
 if __name__ == "__main__":

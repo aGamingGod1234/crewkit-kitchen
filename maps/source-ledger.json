@@ -7,6 +7,28 @@
     "provisionalSourcesMayProduceBundledGeometry": false
   },
   "sources": {
+    "project-owned-fixtures": {
+      "title": "Arena Agents deterministic map fixtures",
+      "author": "Arena Agents contributors",
+      "platform": "project-owned",
+      "verifiedAt": "2026-08-19",
+      "origin": "project-owned",
+      "licenseStatus": "project-owned",
+      "bundleEligible": true,
+      "license": {
+        "spdx": "LicenseRef-Project-Owned",
+        "retainedText": "LICENSE"
+      },
+      "archive": null,
+      "declaredMinecraftVersions": [
+        "26.1.2"
+      ],
+      "originalDataVersion": 4790,
+      "inspectionReport": "maps/selections/fixtures/tiny-owned-room.json",
+      "derivedModules": [
+        "tiny-owned-room"
+      ]
+    },
     "re-structured": {
       "title": "Re-Structured",
       "author": "RonosMods",
