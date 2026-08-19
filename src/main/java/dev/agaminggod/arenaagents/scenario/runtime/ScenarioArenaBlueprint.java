@@ -49,6 +49,16 @@ public final class ScenarioArenaBlueprint {
 		return new ScenarioArenaBlueprint(origin, builder.placements);
 	}
 
+	/** Creates a deterministic blueprint from already validated, absolute block placements. */
+	public static ScenarioArenaBlueprint fromPlacements(BlockPos origin, List<Placement> placements) {
+		Objects.requireNonNull(origin, "origin must not be null");
+		Objects.requireNonNull(placements, "placements must not be null");
+		if (placements.stream().anyMatch(Objects::isNull)) {
+			throw new IllegalArgumentException("placements must not contain null");
+		}
+		return new ScenarioArenaBlueprint(origin, placements);
+	}
+
 	public BlockPos origin() {
 		return origin;
 	}
