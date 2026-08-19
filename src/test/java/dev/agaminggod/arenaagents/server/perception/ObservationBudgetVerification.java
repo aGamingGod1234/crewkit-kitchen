@@ -3,9 +3,13 @@ package dev.agaminggod.arenaagents.server.perception;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
+import dev.agaminggod.arenaagents.agent.AgentProfile;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.world.phys.Vec3;
 
@@ -138,7 +142,7 @@ public final class ObservationBudgetVerification {
 				"a distant side target is outside the bounded visual cone");
 		ObservationDispatchQueue<String> burst = new ObservationDispatchQueue<>(
 				AgentConstants.DEFAULT_AGENT_LIMIT,
-				AgentConstants.DEFAULT_AGENT_LIMIT
+				2
 		);
 		for (int index = 0; index < 16; index++) {
 			String agentId = "agent-" + index;
@@ -147,9 +151,89 @@ public final class ObservationBudgetVerification {
 		}
 		List<String> burstFirst = new ArrayList<>();
 		burst.drain(burstFirst::add);
-		assertEquals(AgentConstants.DEFAULT_AGENT_LIMIT, burstFirst.size(), "one drain serves the sixteen-agent tick budget");
-		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in one drain");
-		return 51;
+		assertEquals(List.of("agent-0", "agent-1"), burstFirst,
+				"one drain serves exactly two full observations");
+		assertEquals(14, burst.pendingCount(), "remaining observation work stays bounded for fair later drains");
+		assertTrue(burst.offerFirst("agent-10"), "urgent pending work is promoted without duplication");
+		List<String> urgentDrain = new ArrayList<>();
+		burst.drain(urgentDrain::add);
+		assertEquals(List.of("agent-10", "agent-2"), urgentDrain,
+				"urgent result or vital work is included in the next two-observation drain");
+
+		List<AgentRecord> active = activeRecords(16);
+		ObservationCadencePolicy cadence = new ObservationCadencePolicy();
+		List<AgentId> rotation = new ArrayList<>();
+		for (long tick = 0L; tick < 8L; tick++) {
+			List<AgentId> due = cadence.due(active, List.of(), tick, 2);
+			assertEquals(2, due.size(), "active cadence uses exactly two full slots per tick");
+			rotation.addAll(due);
+		}
+		assertEquals(active.stream().map(AgentRecord::agentId).toList(), rotation,
+				"sixteen active agents receive one fair observation across eight ticks");
+		AgentId urgent = active.get(9).agentId();
+		List<AgentId> urgentDue = cadence.due(active, List.of(urgent), 8L, 2);
+		assertTrue(urgentDue.contains(urgent), "urgent result or vital change displaces routine rotation work");
+		assertEquals(2, urgentDue.size(), "urgent work remains inside the two-observation budget");
+
+		ObservationCadencePolicy heartbeatCadence = new ObservationCadencePolicy();
+		List<AgentRecord> idle = active.stream().limit(2)
+				.map(record -> AgentRecord.create(record.agentId(), record.profile(), 10_000L))
+				.toList();
+		assertEquals(idle.stream().map(AgentRecord::agentId).toList(), heartbeatCadence.due(idle, List.of(), 0L, 2),
+				"idle agents receive an initial factual observation");
+		assertEquals(List.of(), heartbeatCadence.due(idle, List.of(), 19L, 2),
+				"idle heartbeat does not run before twenty ticks");
+		assertEquals(idle.stream().map(AgentRecord::agentId).toList(), heartbeatCadence.due(idle, List.of(), 20L, 2),
+				"idle agents receive a twenty-tick heartbeat");
+
+		RawSpatialObservation.Key facingA = new RawSpatialObservation.Key(retryAgent,
+				"minecraft:overworld", 4, 64, -2);
+		RawSpatialObservation.Key facingB = new RawSpatialObservation.Key(retryAgent,
+				"minecraft:overworld", 4, 64, -2);
+		assertEquals(facingA, facingB, "raw spatial cache identity excludes yaw and pitch");
+		ObservationSectionCache<RawSpatialObservation.Key, JsonObject> tenTickCache =
+				new ObservationSectionCache<>(2, 10L, JsonObject::deepCopy);
+		AtomicInteger tenTickLoads = new AtomicInteger();
+		tenTickCache.getOrCompute(facingA, 100L, () -> value("v" + tenTickLoads.incrementAndGet()));
+		assertEquals("v1", tenTickCache.getOrCompute(facingB, 110L,
+				() -> value("v" + tenTickLoads.incrementAndGet())).get("value").getAsString(),
+				"raw spatial candidates are reused through the ten-tick cache window");
+		assertEquals("v2", tenTickCache.getOrCompute(facingB, 111L,
+				() -> value("v" + tenTickLoads.incrementAndGet())).get("value").getAsString(),
+				"raw spatial candidates reload after the ten-tick window");
+		AgentId otherAgent = AgentId.parse("fedcba98-7654-3210-fedc-ba9876543210");
+		RawSpatialObservation.Key moved = new RawSpatialObservation.Key(retryAgent,
+				"minecraft:overworld", 5, 64, -2);
+		RawSpatialObservation.Key unrelated = new RawSpatialObservation.Key(otherAgent,
+				"minecraft:overworld", 4, 64, -2);
+		ObservationSectionCache<RawSpatialObservation.Key, JsonObject> invalidationCache =
+				new ObservationSectionCache<>(3, 10L, JsonObject::deepCopy);
+		AtomicInteger invalidationLoads = new AtomicInteger();
+		invalidationCache.getOrCompute(facingA, 1L, () -> value("v" + invalidationLoads.incrementAndGet()));
+		invalidationCache.getOrCompute(moved, 1L, () -> value("v" + invalidationLoads.incrementAndGet()));
+		invalidationCache.getOrCompute(unrelated, 1L, () -> value("v" + invalidationLoads.incrementAndGet()));
+		assertEquals(2, invalidationCache.invalidateMatching(key -> key.agentId().equals(retryAgent)),
+				"world-changing success invalidates every cached position for that agent");
+		assertEquals("v4", invalidationCache.getOrCompute(facingA, 2L,
+				() -> value("v" + invalidationLoads.incrementAndGet())).get("value").getAsString(),
+				"agent-scoped invalidation reloads its raw candidates immediately");
+		assertEquals("v3", invalidationCache.getOrCompute(unrelated, 2L,
+				() -> value("v" + invalidationLoads.incrementAndGet())).get("value").getAsString(),
+				"agent-scoped invalidation preserves unrelated raw candidates");
+		return 70;
+	}
+
+	private static List<AgentRecord> activeRecords(int count) {
+		List<AgentRecord> records = new ArrayList<>();
+		for (int index = 0; index < count; index++) {
+			AgentRecord idle = AgentRecord.create(
+					AgentId.parse(String.format("10000000-0000-0000-0000-%012d", index + 1)),
+					new AgentProfile("codex", "gpt-5.6-sol", "high", Optional.empty(), index),
+					1_000L + index
+			);
+			records.add(AgentLifecycleReducer.start(idle, "work " + index, 2_000L + index).after());
+		}
+		return List.copyOf(records);
 	}
 
 	private static JsonObject observation(double health, boolean onFire, double fallDistance, String actionType) {
