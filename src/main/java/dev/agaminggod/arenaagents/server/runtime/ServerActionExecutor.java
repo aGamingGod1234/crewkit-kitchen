@@ -662,11 +662,12 @@ public final class ServerActionExecutor {
 		} else {
 			List<AgentRecord> records = managerRecords(level);
 			ServerPlayer named = level.getServer().getPlayerList().getPlayerByName(normalized);
-			String ordinaryPlayerName = named != null && named != player && named.isAlive()
+			boolean eligibleNamedPlayer = named != null && named != player && named.isAlive();
+			String ordinaryPlayerName = eligibleNamedPlayer
 					? named.getGameProfile().name()
 					: null;
 			Optional<NamedTargetIdentity> identity = resolveNamedTargetIdentity(
-					normalized, records, ordinaryPlayerName);
+					normalized, records, ordinaryPlayerName, eligibleNamedPlayer ? named.getUUID() : null);
 			if (identity.isPresent()) {
 				NamedTargetIdentity resolved = identity.orElseThrow();
 				if (resolved.ordinaryPlayerName().isPresent()) return named;
@@ -697,18 +698,20 @@ public final class ServerActionExecutor {
 	static Optional<NamedTargetIdentity> resolveNamedTargetIdentity(
 			String normalized,
 			List<AgentRecord> records,
-			String matchedPlayerName
+			String matchedPlayerName,
+			UUID matchedPlayerUuid
 	) {
 		String checked = Objects.requireNonNull(normalized, "normalized must not be null");
 		List<AgentRecord> checkedRecords = List.copyOf(Objects.requireNonNull(records, "records must not be null"));
 		List<AgentRecord> agentMatches = checkedRecords.stream()
-				.filter(record -> AgentIdentity.displayName(record.agentId(), record.profile()).equalsIgnoreCase(checked)
-						|| record.profile().userName().filter(name -> name.equalsIgnoreCase(checked)).isPresent())
+				.filter(record -> AgentIdentity.sameIdentity(
+						AgentIdentity.displayName(record.agentId(), record.profile()), checked)
+						|| record.profile().userName().filter(name -> AgentIdentity.sameIdentity(name, checked)).isPresent())
 				.toList();
-		boolean hiddenTechnicalPlayer = matchedPlayerName != null && checkedRecords.stream()
-				.anyMatch(record -> AgentIdentity.playerName(record.agentId(), record.profile())
-						.equalsIgnoreCase(matchedPlayerName));
-		String ordinaryPlayerName = hiddenTechnicalPlayer ? null : matchedPlayerName;
+		boolean matchedFakePlayer = matchedPlayerUuid != null && checkedRecords.stream()
+				.anyMatch(record -> OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile())
+						.equals(matchedPlayerUuid));
+		String ordinaryPlayerName = matchedFakePlayer ? null : matchedPlayerName;
 		if (agentMatches.size() > 1 || (!agentMatches.isEmpty() && ordinaryPlayerName != null)) {
 			throw new AgentDomainException("AMBIGUOUS_TARGET", "Target selector is ambiguous: " + checked);
 		}

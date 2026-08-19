@@ -59,9 +59,15 @@ public final class AgentControlVerification {
 				record("493a9add-1234-5678-9abc-123456789abc", "cursor", "composer-2.5", "high", 0)
 		);
 		AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(true, NOW_EPOCH_MS, records);
-		AgentControlSnapshot decoded = AgentControlSnapshotCodec.decode(AgentControlSnapshotCodec.encode(snapshot));
+		String encoded = AgentControlSnapshotCodec.encode(snapshot);
+		AgentControlSnapshot decoded = AgentControlSnapshotCodec.decode(encoded);
 		AgentControlAgent agent = decoded.agents().getFirst();
 		AgentControlAgent unnamed = decoded.agents().get(1);
+		AgentControlAgent normalizedLegacyVariant = AgentControlSnapshot.fromRecords(
+				true,
+				NOW_EPOCH_MS,
+				List.of(record("593a9add-1234-5678-9abc-123456789abc", "codex", "gpt-5.6-sol", "high", 6))
+		).agents().getFirst();
 
 		assertEquals(snapshot, decoded, "snapshot JSON round trip");
 		assertEquals(6, decoded.schemaVersion(), "schema 6 identity snapshot round trip");
@@ -71,6 +77,8 @@ public final class AgentControlVerification {
 		assertEquals("Sol GTqa3RI0VniavBI0VniavA", unnamed.displayName(),
 				"unnamed snapshot carries the stable ID-aware canonical display name");
 		assertEquals("", unnamed.friendlyName(), "unnamed snapshot carries a blank explicit friendly name");
+		assertEquals(2, normalizedLegacyVariant.skinVariant(),
+				"legacy persisted variants normalize before crossing the control snapshot boundary");
 		assertEquals(List.of("kimi", "codex", "gemini", "kimi", "cursor"),
 				decoded.agents().stream().map(AgentControlAgent::provider).toList(),
 				"schema 6 round-trips all four providers without changing the named record");
@@ -81,10 +89,26 @@ public final class AgentControlVerification {
 		assertTrue(decoded.automationAvailable(), "legacy ready snapshot reports available automation");
 		assertEquals("Automation ready", decoded.automationStatus(), "snapshot carries a human-readable readiness message");
 		expectFailure(
-				() -> AgentControlSnapshotCodec.decode(AgentControlSnapshotCodec.encode(snapshot)
+				() -> AgentControlSnapshotCodec.decode(encoded
 						.replaceFirst("\\\"schemaVersion\\\":6", "\\\"schemaVersion\\\":5")),
 				"schema 5 control snapshot"
 		);
+		expectFailure(
+				() -> AgentControlSnapshotCodec.decode(encoded
+						.replaceFirst("\\\"schemaVersion\\\":6", "\\\"schemaVersion\\\":\\\"6\\\"")),
+				"string control snapshot schema"
+		);
+		expectFailure(
+				() -> AgentControlSnapshotCodec.decode(encoded
+						.replaceFirst("\\\"schemaVersion\\\":6", "\\\"schemaVersion\\\":6.9")),
+				"fractional control snapshot schema"
+		);
+		expectFailure(
+				() -> AgentControlSnapshotCodec.decode(encoded
+						.replaceFirst("\\\"schemaVersion\\\":6", "\\\"schemaVersion\\\":4294967302")),
+				"overflowing control snapshot schema"
+		);
+		expectFailure(() -> AgentControlSnapshotCodec.decode("{}"), "missing control snapshot schema");
 		expectFailure(() -> AgentControlSnapshotCodec.decode("{\"schemaVersion\":999}"), "unsupported snapshot schema");
 		expectFailure(
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
@@ -96,7 +120,7 @@ public final class AgentControlVerification {
 				agent.currentGoal(), agent.queuedGoalCount(), agent.lastSummary(), agent.lastError(),
 				agent.automaticProgress(), agent.entityPresent()
 		), "manifest skin variant bound");
-		return 17;
+		return 22;
 	}
 
 	private static AgentRecord record(

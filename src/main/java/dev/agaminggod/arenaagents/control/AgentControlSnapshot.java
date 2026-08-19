@@ -110,7 +110,7 @@ public record AgentControlSnapshot(
 				record.profile().model(),
 				record.profile().reasoning(),
 				AgentIdentity.playerName(record.agentId(), record.profile()),
-				record.profile().skinVariant(),
+				record.profile().visualIdentity().individualVariant(),
 				record.state().name(),
 				AgentControlAgent.truncate(currentGoal, AgentControlAgent.MAX_CURRENT_GOAL_LENGTH),
 				record.queuedGoals().size(),

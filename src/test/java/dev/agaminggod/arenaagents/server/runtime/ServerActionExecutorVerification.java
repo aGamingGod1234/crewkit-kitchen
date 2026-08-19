@@ -11,6 +11,7 @@ import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
+import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -194,24 +195,48 @@ public final class ServerActionExecutorVerification {
 				"12345678-1234-5678-9abc-123456789abc", Optional.of("Rook"));
 		AgentRecord unnamedTarget = targetRecord(
 				"193a9add-1234-5678-9abc-123456789abc", Optional.empty());
+		AgentRecord localeSensitiveTarget = targetRecord(
+				"22345678-1234-5678-9abc-123456789abc", Optional.of("\u0130"));
+		AgentRecord technicalFriendlyTarget = targetRecord(
+				"32345678-1234-5678-9abc-123456789abc", Optional.of("c02_193A9ADD"));
 		assertEquals(namedTarget.agentId(), ServerActionExecutor.resolveNamedTargetIdentity(
-				"rook", List.of(namedTarget, unnamedTarget), null).orElseThrow().agentId().orElseThrow(),
+				"rook", List.of(namedTarget, unnamedTarget), null, null).orElseThrow().agentId().orElseThrow(),
 				"explicit friendly names resolve agent action targets case-insensitively");
 		assertEquals(unnamedTarget.agentId(), ServerActionExecutor.resolveNamedTargetIdentity(
-				"Sol GTqa3RI0VniavBI0VniavA", List.of(namedTarget, unnamedTarget), null)
+				"Sol GTqa3RI0VniavBI0VniavA", List.of(namedTarget, unnamedTarget), null, null)
 						.orElseThrow().agentId().orElseThrow(),
 				"ID-aware canonical display names resolve unnamed agent action targets");
+		assertEquals(localeSensitiveTarget.agentId(), ServerActionExecutor.resolveNamedTargetIdentity(
+				"i\u0307", List.of(localeSensitiveTarget), null, null).orElseThrow().agentId().orElseThrow(),
+				"Locale.ROOT canonical identity matches dotted capital I to i plus combining dot");
 		assertTrue(ServerActionExecutor.resolveNamedTargetIdentity(
-				"c02_193A9ADD", List.of(namedTarget, unnamedTarget), "c02_193A9ADD").isEmpty(),
-				"hidden technical player names never resolve as action selectors");
+				"i", List.of(localeSensitiveTarget), null, null).isEmpty(),
+				"Locale.ROOT canonical identity does not collapse dotted capital I to plain i");
+		assertTrue(ServerActionExecutor.resolveNamedTargetIdentity(
+				"c02_193A9ADD", List.of(namedTarget, unnamedTarget), "c02_193A9ADD",
+				OfflineAgentPlayers.offlineUuid(unnamedTarget.agentId(), unnamedTarget.profile())).isEmpty(),
+				"actual fake-player provenance suppresses the hidden technical selector");
+		UUID genuinePlayerUuid = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+		assertEquals("c02_193A9ADD", ServerActionExecutor.resolveNamedTargetIdentity(
+				"c02_193A9ADD", List.of(namedTarget, unnamedTarget), "c02_193A9ADD", genuinePlayerUuid)
+						.orElseThrow().ordinaryPlayerName().orElseThrow(),
+				"a genuine player sharing an offline agent technical name remains an ordinary target");
+		AgentDomainException technicalCollision = assertThrows(AgentDomainException.class,
+				() -> ServerActionExecutor.resolveNamedTargetIdentity(
+						"c02_193A9ADD", List.of(unnamedTarget, technicalFriendlyTarget),
+						"c02_193A9ADD", genuinePlayerUuid),
+				"a genuine player matching an agent friendly name remains ambiguous despite the technical-looking text");
+		assertEquals("AMBIGUOUS_TARGET", technicalCollision.code(),
+				"technical-looking genuine-player collision retains the ambiguity domain reason");
 		AgentDomainException ambiguous = assertThrows(AgentDomainException.class,
 				() -> ServerActionExecutor.resolveNamedTargetIdentity(
-						"Rook", List.of(namedTarget, unnamedTarget), "Rook"),
+						"Rook", List.of(namedTarget, unnamedTarget), "Rook", genuinePlayerUuid),
 				"an ordinary player sharing an agent friendly name is rejected as ambiguous");
 		assertEquals("AMBIGUOUS_TARGET", ambiguous.code(),
 				"ambiguous ordinary-player and agent selectors retain a precise domain reason");
 		assertEquals("Lucas", ServerActionExecutor.resolveNamedTargetIdentity(
-				"Lucas", List.of(namedTarget, unnamedTarget), "Lucas").orElseThrow().ordinaryPlayerName().orElseThrow(),
+				"Lucas", List.of(namedTarget, unnamedTarget), "Lucas", genuinePlayerUuid)
+						.orElseThrow().ordinaryPlayerName().orElseThrow(),
 				"unambiguous ordinary player names retain their existing selector behavior");
 		assertEquals("TARGET_OCCUPIED",
 				ServerActionExecutor.failureReason(new dev.agaminggod.arenaagents.agent.AgentDomainException(
@@ -219,7 +244,7 @@ public final class ServerActionExecutorVerification {
 				"runtime revalidation preserves a precise recoverable domain reason");
 		assertEquals("ACTION_EXCEPTION", ServerActionExecutor.failureReason(new IllegalStateException("broken")),
 				"unexpected runtime exceptions remain isolated");
-		return 46;
+		return 51;
 	}
 
 	private static AgentRecord targetRecord(String id, Optional<String> friendlyName) {

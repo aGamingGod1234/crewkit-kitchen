@@ -42,6 +42,10 @@ public final class AgentIdentity {
 		return Objects.requireNonNull(value, "identity value must not be null").toLowerCase(Locale.ROOT);
 	}
 
+	public static boolean sameIdentity(String first, String second) {
+		return canonicalIdentityKey(first).equals(canonicalIdentityKey(second));
+	}
+
 	private static String encodedOperatorId(AgentId id) {
 		ByteBuffer bytes = ByteBuffer.allocate(Long.BYTES * 2);
 		bytes.putLong(id.value().getMostSignificantBits());
