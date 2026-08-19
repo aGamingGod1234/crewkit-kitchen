@@ -37,9 +37,29 @@ public final class AgentIdentityVerification {
 		assertEquals(new AgentIdentity.SkinIdentity("codex", "sol", 2),
 				AgentIdentity.skinForPlayerName("c02_193A9ADD").orElseThrow(),
 				"manifest player names expose the exact family and variant before the first client snapshot");
+		AgentIdentity.SkinIdentity currentTransport = AgentIdentity.skinForPlayerName("r22_193A9ADD").orElseThrow();
+		AgentVisualIdentity.Resolved currentTransportResolved = AgentVisualIdentity.resolveFamily(
+				currentTransport.provider(), currentTransport.modelFamily(), currentTransport.variant());
+		assertEquals("grok_46", currentTransportResolved.modelFamilyKey(),
+				"current transport identity retains its exact manifest family");
+		assertEquals("arenaagents:textures/entity/cursor_grok_46_agent_2.png",
+				currentTransportResolved.texturePath(),
+				"current transport identity resolves the exact family and individual texture");
 		assertEquals(new AgentIdentity.SkinIdentity("codex", 2),
 				AgentIdentity.skinForPlayerName("SolEmer_193A9ADD").orElseThrow(),
 				"legacy player names retain pre-snapshot skin fallback");
+		AgentIdentity.SkinIdentity legacyTransport = AgentIdentity.skinForPlayerName("SolEmer_193A9ADD").orElseThrow();
+		assertEquals("", legacyTransport.modelFamily(), "historical player names carry an explicit blank family");
+		AgentVisualIdentity.Resolved legacyFallback = AgentVisualIdentity.resolveProviderFallback(
+				legacyTransport.provider(), legacyTransport.variant());
+		assertEquals("spark", legacyFallback.modelFamilyKey(),
+				"historical blank-family Codex names use the documented provider fallback");
+		assertEquals("arenaagents:textures/entity/codex_spark_agent_2.png", legacyFallback.texturePath(),
+				"historical blank-family fallback keeps its individual variant");
+		expectIllegalArgument(
+				() -> AgentVisualIdentity.resolveFamily("cursor", "not_a_family", 2),
+				"malformed nonblank family is rejected instead of becoming a provider fallback"
+		);
 		assertEquals(new AgentIdentity.SkinIdentity("kimi", 2),
 				AgentIdentity.skinForPlayerName("K3Orch_193A9ADD").orElseThrow(),
 				"known digit-bearing legacy K3 names retain pre-snapshot skin fallback");
@@ -58,6 +78,10 @@ public final class AgentIdentityVerification {
 				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(), 6, AgentGameMode.SURVIVAL);
 		assertEquals("c02_193A9ADD", AgentIdentity.playerName(id, legacyVariant),
 				"legacy persisted variants normalize through the canonical manifest count");
+		assertEquals(2, AgentVisualIdentity.normalizedVariant(6),
+				"legacy entity variants normalize through the manifest-owned variant count");
+		assertEquals(3, AgentVisualIdentity.normalizedVariant(-1),
+				"negative legacy entity variants normalize through the manifest-owned variant count");
 		AgentProfile named = new AgentProfile("codex", "gpt-5.6-sol", "low", "priority", Optional.of("Rook"), 0,
 				AgentGameMode.SURVIVAL);
 		assertEquals("Rook", AgentIdentity.displayName(id, named), "explicit names remain authoritative");
@@ -177,7 +201,7 @@ public final class AgentIdentityVerification {
 				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
 				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
 				"project-owned codex entity texture", "non-project manifest texture rejected");
-		return 1138;
+		return 1146;
 	}
 
 	private static byte[] readTexture(String texturePath) {
@@ -241,6 +265,15 @@ public final class AgentIdentityVerification {
 			throw new AssertionError(label + " threw " + exception.getClass().getSimpleName(), exception);
 		}
 		throw new AssertionError(label + ": expected invalid manifest rejection");
+	}
+
+	private static void expectIllegalArgument(Runnable operation, String label) {
+		try {
+			operation.run();
+			throw new AssertionError(label + ": expected rejection");
+		} catch (IllegalArgumentException expected) {
+			// Expected.
+		}
 	}
 
 	private record ModelCase(String provider, String slug, String chassis, String family) {

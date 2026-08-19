@@ -1,11 +1,21 @@
 package dev.agaminggod.arenaagents.client.mixin;
 
 import dev.agaminggod.arenaagents.client.control.AgentControlClient;
+import dev.agaminggod.arenaagents.agent.AgentIdentity;
+import dev.agaminggod.arenaagents.control.AgentControlAgent;
+import dev.agaminggod.arenaagents.control.AgentWorldNamePolicy;
+import java.nio.charset.StandardCharsets;
+import java.util.Optional;
+import java.util.UUID;
+import net.minecraft.client.renderer.entity.state.AvatarRenderState;
 import net.minecraft.client.renderer.entity.player.AvatarRenderer;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.entity.EntityAttachment;
 import net.minecraft.world.entity.Avatar;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /** Keeps generated offline-player identifiers out of the world view for known Arena Agents. */
@@ -17,8 +27,45 @@ abstract class AvatarRendererMixin {
 			cancellable = true
 	)
 	private void arenaagents$hideAgentName(Avatar avatar, double distance, CallbackInfoReturnable<Boolean> callback) {
-		avatar.getProfile().name()
-				.filter(AgentControlClient::isAgentPlayer)
-				.ifPresent(ignored -> callback.setReturnValue(false));
+		avatar.getProfile().name().ifPresent(name -> {
+			Optional<AgentControlAgent> snapshotAgent = AgentControlClient.agentForPlayer(name);
+			if (snapshotAgent.isPresent()) {
+				if (hasExpectedOfflineUuid(avatar, snapshotAgent.orElseThrow())) callback.setReturnValue(false);
+				return;
+			}
+			if (AgentIdentity.skinForPlayerName(name).isPresent()) callback.setReturnValue(false);
+		});
+	}
+
+	@Inject(
+			method = "extractRenderState(Lnet/minecraft/world/entity/Avatar;Lnet/minecraft/client/renderer/entity/state/AvatarRenderState;F)V",
+			at = @At("RETURN")
+	)
+	private void arenaagents$extractFriendlyName(
+			Avatar avatar,
+			AvatarRenderState state,
+			float partialTick,
+			CallbackInfo callback
+	) {
+		AgentControlAgent agent = avatar.getProfile().name()
+				.flatMap(AgentControlClient::agentForPlayer)
+				.filter(candidate -> hasExpectedOfflineUuid(avatar, candidate))
+				.orElse(null);
+		if (agent == null) return;
+
+		state.nameTag = null;
+		state.nameTagAttachment = null;
+		if (state.distanceToCameraSq > 4096.0D) return;
+		AgentWorldNamePolicy.tag(agent).ifPresent(tag -> {
+			state.nameTag = Component.literal(tag);
+			state.nameTagAttachment = avatar.getAttachments().getNullable(
+					EntityAttachment.NAME_TAG, 0, avatar.getYRot());
+		});
+	}
+
+	private static boolean hasExpectedOfflineUuid(Avatar avatar, AgentControlAgent agent) {
+		UUID expected = UUID.nameUUIDFromBytes(
+				("OfflinePlayer:" + agent.playerName()).getBytes(StandardCharsets.UTF_8));
+		return avatar.getUUID().equals(expected);
 	}
 }

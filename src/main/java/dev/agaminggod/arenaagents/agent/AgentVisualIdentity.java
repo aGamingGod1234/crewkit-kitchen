@@ -39,14 +39,42 @@ public final class AgentVisualIdentity {
 	}
 
 	public static Resolved resolve(String provider, String exactModelSlug, int variant) {
-		String providerKey = requireText(provider, "provider").toLowerCase(Locale.ROOT);
+		ProviderIdentity providerIdentity = requireProvider(provider);
 		String modelSlug = requireText(exactModelSlug, "model slug").toLowerCase(Locale.ROOT);
-		if (variant < 0 || variant >= INDIVIDUAL_VARIANT_COUNT) {
-			throw new IllegalArgumentException("individual variant must be between 0 and 3");
-		}
-		ProviderIdentity providerIdentity = MANIFEST.providers().get(providerKey);
-		if (providerIdentity == null) throw new IllegalArgumentException("Unsupported provider: " + providerKey);
+		requireVariant(variant);
 		FamilyIdentity family = providerIdentity.models().getOrDefault(modelSlug, providerIdentity.fallback());
+		return resolved(providerIdentity, family, variant);
+	}
+
+	/** Resolves a manifest family key without silently accepting malformed nonblank family data. */
+	public static Resolved resolveFamily(String provider, String family, int variant) {
+		ProviderIdentity providerIdentity = requireProvider(provider);
+		String familyKey = requireText(family, "model family").toLowerCase(Locale.ROOT);
+		requireVariant(variant);
+		FamilyIdentity familyIdentity = providerIdentity.families().get(familyKey);
+		if (familyIdentity == null) {
+			throw new IllegalArgumentException(
+					"Unsupported model family for provider " + providerIdentity.key() + ": " + familyKey);
+		}
+		return resolved(providerIdentity, familyIdentity, variant);
+	}
+
+	/** Explicit compatibility path for historical transport names that did not encode a family. */
+	public static Resolved resolveProviderFallback(String provider, int variant) {
+		ProviderIdentity providerIdentity = requireProvider(provider);
+		requireVariant(variant);
+		return resolved(providerIdentity, providerIdentity.fallback(), variant);
+	}
+
+	public static int normalizedVariant(int variant) {
+		return Math.floorMod(variant, INDIVIDUAL_VARIANT_COUNT);
+	}
+
+	private static Resolved resolved(
+			ProviderIdentity providerIdentity,
+			FamilyIdentity family,
+			int variant
+	) {
 		VariantIdentity visualVariant = family.variants().get(variant);
 		return new Resolved(
 				providerIdentity.key(),
@@ -58,6 +86,19 @@ public final class AgentVisualIdentity {
 				providerIdentity.glyph(),
 				visualVariant.transportCode()
 		);
+	}
+
+	private static ProviderIdentity requireProvider(String provider) {
+		String providerKey = requireText(provider, "provider").toLowerCase(Locale.ROOT);
+		ProviderIdentity providerIdentity = MANIFEST.providers().get(providerKey);
+		if (providerIdentity == null) throw new IllegalArgumentException("Unsupported provider: " + providerKey);
+		return providerIdentity;
+	}
+
+	private static void requireVariant(int variant) {
+		if (variant < 0 || variant >= INDIVIDUAL_VARIANT_COUNT) {
+			throw new IllegalArgumentException("individual variant must be between 0 and 3");
+		}
 	}
 
 	public static Optional<Resolved> resolveTransportCode(String code) {
@@ -155,7 +196,7 @@ public final class AgentVisualIdentity {
 		FamilyIdentity fallback = byFamily.get(fallbackFamily);
 		if (fallback == null) throw invalid("provider " + key + " has an unknown fallback family");
 		ProviderIdentity provider = new ProviderIdentity(
-				key, chassis, glyph, Map.copyOf(byModel), fallback);
+				key, chassis, glyph, Map.copyOf(byFamily), Map.copyOf(byModel), fallback);
 		for (PendingTransportIdentity pending : transportIdentities) {
 			TransportIdentity identity = new TransportIdentity(provider, pending.family(), pending.variant());
 			if (byTransportCode.putIfAbsent(pending.code(), identity) != null) {
@@ -293,6 +334,7 @@ public final class AgentVisualIdentity {
 			String key,
 			String chassis,
 			String glyph,
+			Map<String, FamilyIdentity> families,
 			Map<String, FamilyIdentity> models,
 			FamilyIdentity fallback
 	) {

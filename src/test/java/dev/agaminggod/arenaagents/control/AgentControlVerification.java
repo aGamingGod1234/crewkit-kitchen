@@ -22,6 +22,7 @@ public final class AgentControlVerification {
 	public static int verify() {
 		int assertions = 0;
 		assertions += verifySnapshotRoundTripAndBounds();
+		assertions += verifyWorldNamePolicy();
 		assertions += verifyProviderPresets();
 		assertions += verifyRuntimeCatalogBecomesAuthoritative();
 		assertions += verifyCommandConstruction();
@@ -29,6 +30,55 @@ public final class AgentControlVerification {
 		assertions += verifyActionSafety();
 		assertions += verifySnapshotOrdering();
 		return assertions;
+	}
+
+	private static int verifyWorldNamePolicy() {
+		assertEquals(Optional.of("⌁ Rook · Sol"),
+				AgentWorldNamePolicy.tag(worldAgent("Rook", "codex", "gpt-5.6-sol", 0)),
+				"named Codex agent gets a friendly world tag");
+		assertEquals(Optional.of("⌁ Rook · Sol WM"),
+				AgentWorldNamePolicy.tag(worldAgent("Rook", "codex", "gpt-5.6-sol-wm", 0)),
+				"world tag uses the canonical exact-model short label rather than only its visual family");
+		assertEquals(Optional.of("✦ Astra · 3.1 Pro"),
+				AgentWorldNamePolicy.tag(worldAgent("Astra", "gemini", "gemini-3.1-pro", 1)),
+				"named Gemini agent gets a provider-specific world tag");
+		assertEquals(Optional.of("☾ Luna · K3 256K"),
+				AgentWorldNamePolicy.tag(worldAgent("Luna", "kimi", "kimi-code/k3-256k", 2)),
+				"named Kimi agent gets the exact family label");
+		assertEquals(Optional.of("➤ Dash · Grok 4.6"),
+				AgentWorldNamePolicy.tag(worldAgent("Dash", "cursor", "grok-4.6", 3)),
+				"named Cursor agent keeps Cursor identity");
+		assertTrue(AgentWorldNamePolicy.tag(worldAgent("", "codex", "gpt-5.6-sol", 0)).isEmpty(),
+				"empty friendly name stays hidden");
+		assertTrue(AgentWorldNamePolicy.tag(worldAgent("   ", "cursor", "composer-2.5", 0)).isEmpty(),
+				"whitespace-only friendly name stays hidden");
+		return 7;
+	}
+
+	private static AgentControlAgent worldAgent(
+			String friendlyName,
+			String provider,
+			String model,
+			int skinVariant
+	) {
+		return new AgentControlAgent(
+				AGENT_UUID,
+				AGENT_UUID.substring(0, 8),
+				friendlyName.isBlank() ? "Agent" : friendlyName,
+				friendlyName,
+				provider,
+				model,
+				"high",
+				"c00_12345678",
+				skinVariant,
+				"IDLE",
+				"",
+				0,
+				"",
+				"",
+				true,
+				true
+		);
 	}
 
 	private static int verifySnapshotRoundTripAndBounds() {

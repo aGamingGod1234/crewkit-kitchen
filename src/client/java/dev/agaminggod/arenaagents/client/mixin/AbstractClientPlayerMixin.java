@@ -3,7 +3,10 @@ package dev.agaminggod.arenaagents.client.mixin;
 import dev.agaminggod.arenaagents.client.control.AgentControlClient;
 import dev.agaminggod.arenaagents.client.render.CodexAgentRenderer;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
+import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.core.ClientAsset;
 import net.minecraft.resources.Identifier;
@@ -21,13 +24,22 @@ abstract class AbstractClientPlayerMixin {
 		AbstractClientPlayer player = (AbstractClientPlayer) (Object) this;
 		String profileName = player.getGameProfile().name();
 		AgentControlAgent agent = AgentControlClient.agentForPlayer(profileName).orElse(null);
+		if (agent != null && !player.getUUID().equals(UUID.nameUUIDFromBytes(
+				("OfflinePlayer:" + agent.playerName()).getBytes(StandardCharsets.UTF_8)))) return;
 		AgentIdentity.SkinIdentity fallback = agent == null
 				? AgentIdentity.skinForPlayerName(profileName).orElse(null) : null;
 		if (agent == null && fallback == null) return;
 
-		Identifier texture = agent != null
-				? CodexAgentRenderer.textureFor(agent.provider(), agent.skinVariant())
-				: CodexAgentRenderer.textureFor(fallback.provider(), fallback.variant());
+		AgentVisualIdentity.Resolved identity;
+		if (agent != null) {
+			identity = AgentVisualIdentity.resolve(agent.provider(), agent.model(), agent.skinVariant());
+		} else if (fallback.modelFamily().isBlank()) {
+			identity = AgentVisualIdentity.resolveProviderFallback(fallback.provider(), fallback.variant());
+		} else {
+			identity = AgentVisualIdentity.resolveFamily(
+					fallback.provider(), fallback.modelFamily(), fallback.variant());
+		}
+		Identifier texture = CodexAgentRenderer.textureFor(identity);
 		ClientAsset.Texture body = new ClientAsset.ResourceTexture(texture, texture);
 		callback.setReturnValue(new PlayerSkin(body, null, null, PlayerModelType.WIDE, false));
 	}
