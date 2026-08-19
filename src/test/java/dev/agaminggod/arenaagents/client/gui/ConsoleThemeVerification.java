@@ -25,6 +25,20 @@ public final class ConsoleThemeVerification {
 				"Gemini uses the shared provider color");
 		assertTrue(ConsoleTheme.providerColor("kimi") == ConsoleTheme.KIMI,
 				"Kimi uses the shared provider color");
+		assertTrue(ConsoleTheme.ROSTER_FOCUS != ConsoleTheme.ACCENT,
+				"roster focus remains visually distinct from amber selection");
+		assertTrue(ConsoleTheme.ROSTER_SELECTED_SURFACE != ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE,
+				"selected and unavailable roster surfaces remain distinct");
+		assertTrue(ConsoleTheme.contrastRatio(ConsoleTheme.TEXT, ConsoleTheme.ROSTER_SELECTED_SURFACE) >= 4.5D,
+				"selected roster surface preserves normal-text contrast");
+		assertTrue(ConsoleTheme.contrastRatio(ConsoleTheme.TEXT, ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE) >= 4.5D,
+				"unavailable roster surface preserves normal-text contrast");
+		assertTrue(ConsoleTheme.providerColor("cursor") == ConsoleTheme.CURSOR,
+				"Cursor uses the shared provider color");
+		assertTrue(ConsoleTheme.CURSOR != ConsoleTheme.CODEX
+				&& ConsoleTheme.CURSOR != ConsoleTheme.GEMINI
+				&& ConsoleTheme.CURSOR != ConsoleTheme.KIMI,
+				"Cursor provider color is distinct from every other provider");
 		assertTrue(ConsoleFocusIdentity.normalize("Provider: Codex").equals("provider"),
 				"cycle controls keep focus when their value changes");
 		assertTrue(ConsoleFocusIdentity.normalize("Selected: Builder").equals("builder"),
@@ -37,7 +51,7 @@ public final class ConsoleThemeVerification {
 				"the visible left arrow cycles backward");
 		assertTrue(ConsoleCycleButton.clickDirection(150.0D, 100, 120) == 1,
 				"the value and visible right arrow cycle forward");
-		return 15;
+		return 21;
 	}
 
 	private static void assertTrue(boolean condition, String label) {

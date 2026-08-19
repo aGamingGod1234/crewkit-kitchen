@@ -16,11 +16,15 @@ public final class ConsoleTheme {
 	public static final int TEXT = 0xFFF2F5F8;
 	public static final int MUTED = 0xFFAEB8C4;
 	public static final int ACCENT = 0xFFF2BD58;
+	public static final int ROSTER_FOCUS = 0xFFCAD2DC;
+	public static final int ROSTER_SELECTED_SURFACE = 0xFF332F28;
+	public static final int ROSTER_UNAVAILABLE_SURFACE = 0xFF1B222B;
 	public static final int SUCCESS = 0xFF66D9A3;
 	public static final int ERROR = 0xFFFF737A;
 	public static final int CODEX = 0xFF42D39B;
 	public static final int GEMINI = 0xFF8E86FF;
 	public static final int KIMI = 0xFFFFB45E;
+	public static final int CURSOR = 0xFF70B9F2;
 
 	private ConsoleTheme() {
 	}
@@ -37,6 +41,7 @@ public final class ConsoleTheme {
 			case "codex" -> CODEX;
 			case "gemini", "antigravity" -> GEMINI;
 			case "kimi" -> KIMI;
+			case "cursor" -> CURSOR;
 			default -> TEXT;
 		};
 	}
