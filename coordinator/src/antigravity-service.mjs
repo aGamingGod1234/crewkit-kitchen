@@ -170,7 +170,7 @@ class AntigravityAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `gemini agent '${this.agentId}' is disposed`);
 		if (this.#activeOperation !== null) throw new AcpProtocolError('TURN_IN_PROGRESS', `gemini agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -218,17 +218,19 @@ class AntigravityAgent {
 			}
 			outputHandled = true;
 			await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
-				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
 			});
 			if (parseError !== null) throw parseError;
 			return decision;
 		} catch (error) {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
-				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
 			});
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal', { cause: error });
@@ -252,6 +254,8 @@ class AntigravityAgent {
 		await this.interrupt();
 	}
 }
+
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
 
 export function buildAntigravityLaunch(profile, configValue = {}, dependencies = {}) {
 	const config = validateServiceConfig({

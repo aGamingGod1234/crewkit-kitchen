@@ -116,7 +116,7 @@ export class AgentPlanner {
 							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1,
 						}, () => this.#turnRecorder === null
 							? agent.decide(plannerInput, { goalRevision, signal })
-							: agent.decide(plannerInput, { goalRevision, signal, turnRecorder: this.#turnRecorder, attempt, retry: attempt > 1 }));
+							: agent.decide(plannerInput, { goalRevision, signal, turnRecorder: this.#turnRecorder, attempt, retry: attempt > 1, queueWaitMs }));
 						this.#registry.assertCurrentRevision(agentId, goalRevision);
 						return { ...decision, goalRevision };
 					} catch (error) {

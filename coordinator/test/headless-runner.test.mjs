@@ -31,7 +31,7 @@ $ErrorActionPreference = 'Stop'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('${wrapper}', [ref] $tokens, [ref] $errors)
 if ($errors.Count -gt 0) { throw $errors[0].Message }
-$required = @('Get-ProcessTreeIds', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit')
+$required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit')
 $definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name }, $true))
 foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Text }
 $script:PollMilliseconds = 10
@@ -46,6 +46,38 @@ $peak | ConvertTo-Json -Compress
 	const peak = JSON.parse(result.stdout.trim());
 	assert.ok(peak.processCount >= 1, result.stdout);
 	assert.ok(peak.peakRssBytes > 0, result.stdout);
+});
+
+test('PowerShell process tracking rejects a reused PID before sampling or cleanup', () => {
+	const wrapper = path.resolve('../scripts/run-headless-provider-matrix.ps1').replaceAll("'", "''");
+	const script = `
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('${wrapper}', [ref] $tokens, [ref] $errors)
+if ($errors.Count -gt 0) { throw $errors[0].Message }
+$required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Stop-TrackedProcessIds', 'Assert-TrackedProcessIdsGone')
+$definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name }, $true))
+foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Text }
+$script:CleanupTimeoutSeconds = 1
+$script:PollMilliseconds = 1
+$script:stopped = @()
+$script:currentCreation = 'NEW'
+$script:currentParent = 1
+function Get-CimInstance { [pscustomobject]@{ ProcessId = 4242; ParentProcessId = $script:currentParent; CreationDate = $script:currentCreation; WorkingSetSize = 9999 } }
+function Stop-Process { param([int] $Id) $script:stopped += $Id }
+$tracked = [System.Collections.Generic.List[object]]::new()
+$tracked.Add([pscustomobject]@{ ProcessId = 4242; ParentProcessId = 1; CreationDate = 'OLD' })
+$sample = Get-TrackedResourceSnapshot $tracked
+$script:currentCreation = 'OLD'
+$script:currentParent = 999
+$ancestrySample = Get-TrackedResourceSnapshot $tracked
+Stop-TrackedProcessIds $tracked
+Assert-TrackedProcessIdsGone $tracked
+[pscustomobject]@{ count = $sample.processCount; rss = $sample.rssBytes; ancestryCount = $ancestrySample.processCount; stopped = @($script:stopped) } | ConvertTo-Json -Compress
+`;
+	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
+	assert.equal(result.status, 0, result.stderr || result.stdout);
+	assert.deepEqual(JSON.parse(result.stdout.trim()), { count: 0, rss: 0, ancestryCount: 0, stopped: [] });
 });
 
 test('runs a real-provider scenario with exact RCON sequence and injected evidence', async () => {
@@ -303,6 +335,91 @@ test('binds single-agent metrics to the authoritative snapshot ID instead of the
 		readFile: async (file) => files.get(String(file).replace('C:/', '')) ?? '', writeFile: async () => {}, poll: async () => {},
 	});
 	assert.deepEqual(report.metrics.latencyMs.inference, { count: 1, p50: 10, p95: 10, p99: 10 });
+});
+
+test('fails closed when single-agent authoritative snapshot identity is missing', async () => {
+	const generatedName = 'headless_runner_case_2s';
+	const files = new Map([
+		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'unrelated', payload: {
+			agentId: 'unrelated', name: 'someone-else', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+		} } }])],
+		['provider.jsonl', jsonl([{ agentId: 'unrelated', provider: 'codex', model: 'gpt-5.6-sol', timing: { durationMs: 900, apiDurationMs: 900 } }])],
+	]);
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/single-missing',
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? `Created ${generatedName}. It is ready for a task.` : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		now: () => 100, providerTurnsPath: 'C:/provider.jsonl', protocolAudit: 'C:/protocol.jsonl',
+		readFile: async (file) => files.get(String(file).replace('C:/', '')) ?? '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.status, 'FAILED');
+	assert.match(report.diagnostics, /authoritative.*unavailable|snapshot.*identity/i);
+	assert.equal(report.metrics.latencyMs.inference.count, 0, 'labelled unrelated turns are never legacy evidence');
+});
+
+test('fails closed when single-agent authoritative snapshot identity is ambiguous', async () => {
+	const generatedName = 'headless_runner_case_2s';
+	const snapshots = ['first-id', 'second-id'].map((agentId) => ({ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId, payload: {
+		agentId, name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+	} } }));
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/single-ambiguous',
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? `Created ${generatedName}. It is ready for a task.` : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		now: () => 100, protocolAudit: 'C:/protocol.jsonl', readFile: async (file) => String(file).endsWith('protocol.jsonl') ? jsonl(snapshots) : '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.status, 'FAILED');
+	assert.match(report.diagnostics, /ambiguous/i);
+});
+
+test('redacts arbitrary task text and secrets from public command records', async () => {
+	const secretTask = 'Find obsidian with phrase ULTRA_PRIVATE_PROMPT and api_key=sk-arbitrary-secret';
+	const report = await runHeadlessScenario({
+		scenario: scenario({ task: secretTask, assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/public-command-redaction',
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? 'Created agent. It is ready for a task.' : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		now: () => 100, readFile: async () => '', writeFile: async () => {}, poll: async () => {},
+	});
+	const publicText = JSON.stringify(report);
+	assert.equal(publicText.includes('ULTRA_PRIVATE_PROMPT'), false);
+	assert.equal(publicText.includes('sk-arbitrary-secret'), false);
+	assert.ok(report.commands.some((entry) => entry.operation === 'agent_start'));
+});
+
+test('does not pass a roster scenario when any requested profile member is skipped', async () => {
+	const names = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ rosterSize: 8, assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/partial-profile-skip',
+		rcon: { command: async (command) => {
+			if (command.includes('summon-configured')) { const name = command.split(' ').at(-1); names.push(name); return { text: names.length === 8 ? 'profile unavailable' : `Created ${name}. It is ready for a task.` }; }
+			return { text: command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
+		}, close: async () => {} },
+		now: () => 100, readFile: async (file) => String(file).endsWith('protocol.jsonl') ? jsonl(names.slice(0, 7).map((name, index) => ({
+			direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `launched-${index}`, payload: { agentId: `launched-${index}`, name, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } },
+		}))) : '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.status, 'FAILED');
+	const skipped = report.agents.find((agent) => agent.classification === 'SKIPPED_PROFILE');
+	assert.equal(skipped.status, 'SKIPPED');
+	assert.match(skipped.diagnostics, /unavailable/i);
+});
+
+test('isolates early agent evidence before applying row bounds across more than 300 rows', async () => {
+	const names = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ rosterSize: 16, assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'chat', message: 'EARLY_EVIDENCE' }] }), runDirectory: 'C:/runs/many-evidence-rows',
+		rcon: { command: async (command) => {
+			if (command.includes('summon-configured')) { const name = command.split(' ').at(-1); names.push(name); return { text: `Created ${name}. It is ready for a task.` }; }
+			return { text: command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
+		}, close: async () => {} },
+		now: () => 100, readFile: async (file) => {
+			if (!String(file).endsWith('protocol.jsonl')) return '';
+			return jsonl(names.flatMap((name, index) => [
+				{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `many-${index}`, payload: { agentId: `many-${index}`, name, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } } },
+				{ direction: 'server_to_coordinator', envelope: { type: 'chat', agentId: `many-${index}`, payload: { agentId: `many-${index}`, message: 'EARLY_EVIDENCE' } } },
+				...Array.from({ length: 18 }, (_value, row) => ({ direction: 'server_to_coordinator', envelope: { type: 'observation', agentId: `many-${index}`, payload: { agentId: `many-${index}`, eventSequence: row } } })),
+			]));
+		}, writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.status, 'PASSED');
+	assert.ok(report.agents.every((agent) => agent.assertions.every((assertion) => assertion.passed)));
 });
 
 test('releases the temporary spawn chunk when summon fails', async () => {

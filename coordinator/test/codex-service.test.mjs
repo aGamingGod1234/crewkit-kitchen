@@ -128,6 +128,58 @@ test('Codex malformed output records one final error row for the attempt', async
 	await service.stop();
 });
 
+test('Codex records authoritative identity, scheduler wait, native token usage, and compaction', async () => {
+	const transport = new FakeSharedTransport();
+	transport.complete = function (threadId, turnId) {
+		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: '{"summary":"Done","directive":"finish","status":"completed"}' } } });
+		this.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId, turnId, tokenUsage: { last: {
+			inputTokens: 101, outputTokens: 23, reasoningOutputTokens: 7, cachedInputTokens: 41, cacheWriteInputTokens: 5, totalTokens: 131,
+		} } } });
+		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'contextCompaction' } } });
+		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'completed' } } });
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-native-metrics'));
+	await agent.setGoalRevision(1);
+	const rows = [];
+	await agent.decide('Observation.', { goalRevision: 1, queueWaitMs: 37, turnRecorder: { async record(row) { rows.push(row); } } });
+	assert.equal(rows[0].agentId, 'agent-native-metrics');
+	assert.equal(rows[0].timing.queueWaitMs, 37);
+	assert.deepEqual(rows[0].tokens, { input: 101, output: 23, reasoning: 7, cached: 41, cacheWrite: 5 });
+	assert.equal(rows[0].compaction, true);
+	await service.stop();
+});
+
+test('Codex marks an explicit provider 429 as rate limited without inventing token usage', async () => {
+	const transport = new FakeSharedTransport();
+	transport.complete = function (threadId, turnId) {
+		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded', message: 'quota unavailable' } } } });
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-rate-limited'));
+	await agent.setGoalRevision(1);
+	const rows = [];
+	await assert.rejects(agent.decide('Observation.', { goalRevision: 1, attempt: 2, retry: true, turnRecorder: { async record(row) { rows.push(row); } } }));
+	assert.equal(rows[0].rateLimited, true);
+	assert.equal(rows[0].retry, true);
+	assert.equal(Object.hasOwn(rows[0], 'tokens'), false);
+	await service.stop();
+});
+
+test('Codex does not label overloaded or prose-only failures as rate limited', async () => {
+	const transport = new FakeSharedTransport();
+	transport.complete = function (threadId, turnId) {
+		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'failed', error: { codexErrorInfo: 'serverOverloaded', message: 'prose mentions HTTP 429 and too many requests' } } } });
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-not-rate-limited'));
+	await agent.setGoalRevision(1);
+	const rows = [];
+	await assert.rejects(agent.decide('Observation.', { goalRevision: 1, turnRecorder: { async record(row) { rows.push(row); } } }));
+	assert.equal(Object.hasOwn(rows[0], 'rateLimited'), false);
+	await service.stop();
+});
+
 test('Codex service cancels an over-budget streamed planner decision before parsing it', async () => {
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;

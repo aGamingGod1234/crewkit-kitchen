@@ -127,6 +127,7 @@ export function scenarioReport(status, scenario, fields = {}) {
 	for (const [key, value] of Object.entries(fields)) {
 		if (key === 'status') continue;
 		if (key === 'diagnostics' || key === 'error') report[key] = redactReportText(value, MAX_DIAGNOSTICS);
+		else if (key === 'commands') report[key] = publicCommandRecords(value);
 		else report[key] = boundReportValue(value);
 	}
 	return freeze(report);
@@ -137,6 +138,24 @@ function boundReportValue(value, depth = 0) {
 	if (value === null || typeof value !== 'object') return typeof value === 'string' ? redactReportText(value, MAX_DIAGNOSTICS) : value;
 	if (Array.isArray(value)) return value.slice(0, 64).map((entry) => boundReportValue(entry, depth + 1));
 	return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, entry]) => [key.slice(0, 128), SENSITIVE_REPORT_KEY.test(key) && !safeTokenCounts(key, entry) ? '[REDACTED]' : boundReportValue(entry, depth + 1)]));
+}
+
+function publicCommandRecords(value) {
+	if (!Array.isArray(value)) return [];
+	return value.slice(0, 64).map((command) => {
+		if (command && typeof command === 'object' && /^[a-z0-9_]{1,64}$/.test(command.operation)) return { operation: command.operation };
+		const source = String(command ?? '').trim();
+		let operation = 'rcon_command';
+		if (/\bforceload\s+add\b/i.test(source)) operation = 'arena_forceload_add';
+		else if (/\bforceload\s+remove\b/i.test(source)) operation = 'arena_forceload_remove';
+		else if (/\brun\s+fill\b/i.test(source)) operation = 'arena_prepare';
+		else if (/\bcodex\s+summon-configured\b/i.test(source)) operation = 'agent_summon';
+		else if (/^codex\s+start\b/i.test(source)) operation = 'agent_start';
+		else if (/^codex\s+status\b/i.test(source)) operation = 'agent_status';
+		else if (/^tick\s+query$/i.test(source)) operation = 'minecraft_tick_query';
+		else if (isReadOnlyRcon(source)) operation = 'read_only_assertion';
+		return { operation };
+	});
 }
 
 function safeTokenCounts(key, value) {
@@ -273,16 +292,23 @@ export async function runHeadlessScenario({
 			deadline, now, startedAt, poll,
 		});
 		const { fileEvidence, evidence, assertionResult } = evidenceResult;
-		const resolvedAgentId = resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, generatedName);
+		const identity = resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, generatedName);
+		const resolvedAgentId = identity.agentId;
+		if (identity.error !== null) {
+			classification = 'ERROR';
+			diagnostics = identity.error;
+		}
 		if (classification === null && !assertionResult.passed) classification = 'ASSERTION_MISMATCH';
 		if (classification === null) classification = 'PASSED';
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
 		const elapsedMs = Math.max(0, Number(now()) - startedAt);
+		const scopedEvidence = identity.authoritative ? isolateFileEvidence(fileEvidence, resolvedAgentId, generatedName) : fileEvidence;
+		const scopedAudit = identity.authoritative ? auditRows(protocolAudit).filter((row) => rowMatchesAgent(row, resolvedAgentId)).slice(-256) : protocolAudit;
 		const report = scenarioReport(status, scenario, {
 			classification, generatedName, lifecycle: terminalState, elapsedMs,
 			commands, assertions: assertionResult.results, evidence: evidenceSummary(directory, fileEvidence, protocolAudit),
-			timings: timingSummary(profile, fileEvidence, protocolAudit, elapsedMs),
-			metrics: performanceMetrics(profile, fileEvidence, protocolAudit, resolvedAgentId, { minecraftMspt }),
+			timings: timingSummary(profile, scopedEvidence, scopedAudit, elapsedMs),
+			metrics: performanceMetrics(profile, scopedEvidence, scopedAudit, resolvedAgentId, { minecraftMspt }),
 			diagnostics,
 			cleanup: { status: 'PENDING' },
 		});
@@ -372,7 +398,10 @@ async function runConcurrentHeadlessScenario({
 				if (result.status === 'rejected') {
 					member.classification = result.reason?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR';
 					member.diagnostics = boundedText(result.reason?.message ?? result.reason, MAX_DIAGNOSTICS);
-				} else if (isSkippedResponse(result.value.text)) member.classification = 'SKIPPED_PROFILE';
+				} else if (isSkippedResponse(result.value.text)) {
+					member.classification = 'SKIPPED_PROFILE';
+					member.diagnostics = result.value.text;
+				}
 				else if (!isAcceptedResponse(result.value.text)) {
 					member.classification = 'ERROR';
 					member.diagnostics = result.value.text;
@@ -449,9 +478,12 @@ async function runConcurrentHeadlessScenario({
 			});
 		});
 		const failed = agentReports.some((member) => member.status === 'FAILED');
+		const skipped = agentReports.some((member) => member.status === 'SKIPPED');
 		const passed = agentReports.some((member) => member.status === 'PASSED');
-		const status = failed ? 'FAILED' : passed ? 'PASSED' : 'SKIPPED';
-		const classification = failed ? (agentReports.some((member) => member.classification === 'ASSERTION_MISMATCH') ? 'ASSERTION_MISMATCH' : 'ERROR') : passed ? 'PASSED' : 'SKIPPED_PROFILE';
+		const status = failed || skipped ? 'FAILED' : passed ? 'PASSED' : 'FAILED';
+		const classification = failed
+			? (agentReports.some((member) => member.classification === 'ASSERTION_MISMATCH') ? 'ASSERTION_MISMATCH' : 'ERROR')
+			: skipped ? 'SKIPPED_PROFILE' : passed ? 'PASSED' : 'ERROR';
 		const elapsedMs = Math.max(0, Number(now()) - startedAt);
 		let report = scenarioReport(status, scenario, {
 			classification, lifecycle: members.every((member) => member.lifecycle === 'COMPLETED') ? 'COMPLETED' : null,
@@ -736,11 +768,21 @@ function authoritativeAgentId(row) {
 
 function resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, generatedName) {
 	const rows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)].map(unwrapAuditRow).filter(Boolean);
-	const ids = [...new Set(rows.filter((row) => row.type === 'agent_snapshot' && row.payload?.name === generatedName
+	const snapshots = rows.filter((row) => row.type === 'agent_snapshot');
+	if (snapshots.length === 0) {
+		const legacyId = (fileEvidence.providerTurnSummaries ?? []).some((row) => row.agentId === generatedName) ? generatedName : null;
+		return { agentId: legacyId, authoritative: false, error: null };
+	}
+	const ids = [...new Set(snapshots.filter((row) => row.payload?.name === generatedName
 		&& row.payload?.provider === scenario.provider && row.payload?.model === scenario.model
 		&& row.payload?.reasoningEffort === scenario.reasoningEffort && row.payload?.serviceTier === scenario.serviceTier)
 		.map(authoritativeAgentId).filter(Boolean))];
-	return ids.length === 1 ? ids[0] : null;
+	if (ids.length === 1) return { agentId: ids[0], authoritative: true, error: null };
+	return {
+		agentId: null,
+		authoritative: false,
+		error: ids.length > 1 ? 'Authoritative agent snapshot identity was ambiguous' : 'Authoritative agent snapshot identity was unavailable for the exact requested profile',
+	};
 }
 
 function boundedAgentId(value) {
@@ -779,11 +821,11 @@ async function collectConcurrentHeadlessEvidence({ members, directory, readFile,
 }
 
 function isolateFileEvidence(fileEvidence, agentId, generatedName) {
-	const providerTurnSummaries = (fileEvidence.providerTurnSummaries ?? []).filter((row) => row.agentId === agentId);
-	const lines = String(fileEvidence.serverLog ?? '').split(/\r?\n/).filter((line) => line.includes(agentId) || line.includes(generatedName));
+	const providerTurnSummaries = (fileEvidence.providerTurnSummaries ?? []).filter((row) => row.agentId === agentId).slice(-256);
+	const lines = String(fileEvidence.serverLog ?? '').split(/\r?\n/).filter((line) => line.includes(agentId) || line.includes(generatedName)).slice(-256);
 	return {
-		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => rowMatchesAgent(row, agentId)),
-		traceRows: (fileEvidence.traceRows ?? []).filter((row) => rowMatchesAgent(row, agentId)),
+		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => rowMatchesAgent(row, agentId)).slice(-256),
+		traceRows: (fileEvidence.traceRows ?? []).filter((row) => rowMatchesAgent(row, agentId)).slice(-256),
 		serverLog: lines.join('\n'), paths: fileEvidence.paths,
 		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
 	};
@@ -858,7 +900,7 @@ function timingSummary(profile, fileEvidence, protocolAudit, scenarioElapsedMs) 
 
 function performanceMetrics(profile, fileEvidence, protocolAudit, agentId = null, runtimeResources = {}) {
 	const turns = (fileEvidence.providerTurnSummaries ?? []).filter((turn) => turn.provider === profile.provider && turn.model === profile.model
-		&& (agentId === null || turn.agentId === undefined || turn.agentId === agentId));
+		&& (agentId === null ? turn.agentId === undefined : turn.agentId === agentId));
 	const rawRows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)];
 	const envelopes = rawRows.map(unwrapAuditRow).filter(Boolean);
 	const queue = turns.map((turn) => turn.queueWaitMs).filter(Number.isFinite);
@@ -994,12 +1036,12 @@ async function readBoundedTail(readTail, file, offset = 0) {
 }
 
 function parseJsonl(value) {
-	return String(value ?? '').split(/\r?\n/).filter(Boolean).slice(-256).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
+	return String(value ?? '').split(/\r?\n/).filter(Boolean).flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
 }
 
 function auditRows(source) {
-	if (Array.isArray(source)) return source.slice(-256);
-	if (source && Array.isArray(source.rows)) return source.rows.slice(-256);
+	if (Array.isArray(source)) return source;
+	if (source && Array.isArray(source.rows)) return source.rows;
 	return [];
 }
 

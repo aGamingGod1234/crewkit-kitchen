@@ -169,7 +169,7 @@ class AcpAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `${this.provider} agent '${this.agentId}' is disposed`);
 		if (this.#active) throw new AcpProtocolError('TURN_IN_PROGRESS', `${this.provider} agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -225,18 +225,23 @@ class AcpAgent {
 				);
 			}
 			outputHandled = true;
+			const tokens = acpTokenUsage(response?.usage) ?? (this.provider === 'gemini' ? geminiQuotaTokenUsage(response?._meta) : null);
 			await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
-				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(tokens === null ? {} : { tokens }),
 			});
 			if (parseError !== null) throw parseError;
 			return decision;
 		} catch (error) {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
-				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(isRateLimitError(error) ? { rateLimited: true } : {}),
 			});
 			throw error;
 		} finally {
@@ -248,6 +253,26 @@ class AcpAgent {
 
 	interrupt() { if (this.#sessionId !== null) this.#transport.notify('session/cancel', { sessionId: this.#sessionId }); }
 	async dispose() { if (this.#disposed) return; this.#disposed = true; if (this.#active) this.interrupt(); await this.#transport.stop(); }
+}
+
+function acpTokenUsage(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+	return {
+		input: nativeToken(value.inputTokens), output: nativeToken(value.outputTokens), reasoning: nativeToken(value.thoughtTokens),
+		cached: nativeToken(value.cachedReadTokens), cacheWrite: nativeToken(value.cachedWriteTokens),
+	};
+}
+
+function nativeToken(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
+function geminiQuotaTokenUsage(value) {
+	const counts = value?.quota?.token_count;
+	if (counts === null || typeof counts !== 'object' || Array.isArray(counts)) return null;
+	return { input: nativeToken(counts.input_tokens), output: nativeToken(counts.output_tokens), reasoning: null, cached: null, cacheWrite: null };
+}
+
+function isRateLimitError(error) {
+	return [error?.code, error?.status, error?.statusCode, error?.httpStatusCode, error?.data?.status, error?.data?.httpStatusCode].some((value) => value === 429);
 }
 
 function decisionExcerpt(value) {

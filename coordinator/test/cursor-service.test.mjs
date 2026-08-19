@@ -115,6 +115,7 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 			child.stdout.emit('data', Buffer.from(JSON.stringify({
 				type: 'result', subtype: 'success', is_error: false, result: DECISION,
 				session_id: 'cursor-session-1', duration_ms: 1_234, duration_api_ms: 987,
+				usage: { inputTokens: 90, outputTokens: 14, cacheReadTokens: 22, cacheWriteTokens: 3 },
 			})));
 			child.exitCode = 0;
 			child.emit('close', 0, null);
@@ -130,7 +131,7 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	await agent.setGoalRevision(7);
 	const turns = [];
 	const turnRecorder = { async record(row) { turns.push(row); } };
-	const first = await agent.decide('authoritative state', { goalRevision: 7, turnRecorder });
+	const first = await agent.decide('authoritative state', { goalRevision: 7, turnRecorder, queueWaitMs: 11 });
 	const second = await agent.decide('compiler correction', { goalRevision: 7, turnRecorder, attempt: 2, retry: true });
 
 	assert.equal(first.directive, 'replace');
@@ -139,7 +140,9 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	assert.match(children[0].stdin.chunks.join(''), /authoritative state/);
 	assert.deepEqual(calls[1].args.slice(-2), ['--resume', 'cursor-session-1']);
 	assert.equal(turns.length, 2);
-	assert.deepEqual(turns[0].timing, { durationMs: 1_234, apiDurationMs: 987 });
+	assert.deepEqual(turns[0].timing, { durationMs: 1_234, apiDurationMs: 987, queueWaitMs: 11 });
+	assert.equal(turns[0].agentId, 'cursor-a');
+	assert.deepEqual(turns[0].tokens, { input: 90, output: 14, reasoning: null, cached: 22, cacheWrite: 3 });
 	assert.equal(turns[1].attempt, 2);
 	assert.equal(turns[1].retry, true);
 	await service.stop();

@@ -18,6 +18,7 @@ class FakeAcpTransport extends EventEmitter {
 		this.calls = [];
 		this.started = false;
 		this.message = DECISION;
+		this.promptResponse = { stopReason: 'end_turn' };
 	}
 
 	async start() { this.started = true; }
@@ -39,7 +40,7 @@ class FakeAcpTransport extends EventEmitter {
 				params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: this.message } } },
 			}));
 			await new Promise((resolve) => setImmediate(resolve));
-			return { stopReason: 'end_turn' };
+			return this.promptResponse;
 		}
 		throw new Error(`Unexpected ACP method ${method}`);
 	}
@@ -88,6 +89,49 @@ test('ACP malformed output records one final error row for the attempt', async (
 	assert.equal(rows[0].retry, true);
 	assert.ok(rows[0].timing.durationMs >= 0);
 	assert.equal(rows[0].timing.apiDurationMs, null);
+	await service.stop();
+});
+
+test('ACP records authoritative identity, scheduler wait, and native per-turn usage categories', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.promptResponse = { stopReason: 'end_turn', usage: {
+		inputTokens: 80, outputTokens: 12, cachedReadTokens: 30, cachedWriteTokens: 4, thoughtTokens: 6, totalTokens: 98,
+	} };
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-native-metrics', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	await agent.decide('authoritative state', { goalRevision: 2, queueWaitMs: 29, turnRecorder: { async record(row) { rows.push(row); } } });
+	assert.equal(rows[0].agentId, 'gemini-native-metrics');
+	assert.equal(rows[0].timing.queueWaitMs, 29);
+	assert.deepEqual(rows[0].tokens, { input: 80, output: 12, reasoning: 6, cached: 30, cacheWrite: 4 });
+	await service.stop();
+});
+
+test('Gemini ACP uses exact native quota counts only when standard ACP usage is absent', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.promptResponse = { stopReason: 'end_turn', _meta: { quota: { token_count: { input_tokens: 44, output_tokens: 9 } } } };
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-quota', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	await agent.decide('state', { goalRevision: 2, turnRecorder: { async record(row) { rows.push(row); } } });
+	assert.deepEqual(rows[0].tokens, { input: 44, output: 9, reasoning: null, cached: null, cacheWrite: null });
+	await service.stop();
+});
+
+test('ACP does not label prose as a rate limit without a structured 429', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.request = async function (method, params) {
+		if (method !== 'session/prompt') return FakeAcpTransport.prototype.request.call(this, method, params);
+		throw Object.assign(new Error('incidental prose: too many blocks near rate limit HTTP 429'), { code: 'PROVIDER_UNAVAILABLE' });
+	};
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-prose', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	await assert.rejects(agent.decide('state', { goalRevision: 2, turnRecorder: { async record(row) { rows.push(row); } } }));
+	assert.equal(Object.hasOwn(rows[0], 'rateLimited'), false);
 	await service.stop();
 });
 

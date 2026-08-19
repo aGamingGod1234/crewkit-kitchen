@@ -168,6 +168,34 @@ test('Codex request timeout preserves the shared transport and unrelated request
 	await transport.stop();
 });
 
+test('Gemini ACP preserves bounded structured 429 metadata without retaining provider data', async () => {
+	const child = new UncooperativeChild();
+	const requests = [];
+	child.stdin.write = (line) => requests.push(JSON.parse(String(line).trim()));
+	const transport = new AcpStdioTransport(
+		{ provider: 'gemini' },
+		{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
+	);
+	await transport.start();
+
+	const request = transport.request('session/prompt', {}, { timeoutMs: SETTLE_TIMEOUT_MS });
+	child.stdout.emit('data', `${JSON.stringify({
+		id: requests[0].id,
+		error: { code: -32_000, message: 'quota exhausted', data: { httpStatusCode: 429, prompt: 'arbitrary-secret-prompt' } },
+	})}\n`);
+
+	await assert.rejects(request, (error) => {
+		assert.equal(error.code, 'RPC_ERROR');
+		assert.equal(error.rpcCode, -32_000);
+		assert.equal(error.httpStatusCode, 429);
+		assert.equal(error.rateLimited, true);
+		assert.equal(Object.hasOwn(error, 'data'), false);
+		assert.doesNotMatch(JSON.stringify(error), /arbitrary-secret-prompt/);
+		return true;
+	});
+	await transport.stop();
+});
+
 test('Windows cleanup terminates the complete provider process tree', async () => {
 	const child = new UncooperativeChild();
 	child.pid = 4_242;

@@ -151,7 +151,7 @@ class CursorAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `cursor agent '${this.agentId}' is disposed`);
 		if (this.#activeOperation !== null) throw new AcpProtocolError('TURN_IN_PROGRESS', `cursor agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -180,7 +180,7 @@ class CursorAgent {
 		try {
 			const result = await operation.promise;
 			rawOutput = result.result;
-			timing = { durationMs: result.durationMs, apiDurationMs: result.apiDurationMs };
+			timing = providerTiming(result.durationMs, result.apiDurationMs, queueWaitMs);
 			if (signal?.aborted || goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_PLAN', 'cursor result belongs to an obsolete goal');
 			let decision;
 			let parseError = null;
@@ -190,14 +190,17 @@ class CursorAgent {
 			}
 			outputHandled = true;
 			await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: 'cursor', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: result.result, error: parseError, timing,
+				...(result.tokens === null ? {} : { tokens: result.tokens }),
 			});
 			if (parseError !== null) throw parseError;
 			this.#sessionId = result.sessionId;
 			return decision;
 		} catch (error) {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: 'cursor', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error, timing,
 			});
@@ -219,6 +222,8 @@ class CursorAgent {
 		await this.interrupt();
 	}
 }
+
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
 
 export function buildCursorLaunch(profile, configValue = {}, dependencies = {}) {
 	const platform = dependencies.platform ?? process.platform;
@@ -411,7 +416,26 @@ function parseCursorResult(output) {
 		sessionId: requireSessionId(document.session_id),
 		durationMs: duration(document.duration_ms, 'duration_ms'),
 		apiDurationMs: duration(document.duration_api_ms, 'duration_api_ms'),
+		tokens: cursorTokenUsage(document.usage),
 	};
+}
+
+function cursorTokenUsage(value) {
+	if (value === null || value === undefined) return null;
+	if (typeof value !== 'object' || Array.isArray(value)) throw new AcpProtocolError('INVALID_PROVIDER_OUTPUT', 'Cursor usage must be an object');
+	return {
+		input: optionalNativeToken(value.inputTokens, 'usage.inputTokens'),
+		output: optionalNativeToken(value.outputTokens, 'usage.outputTokens'),
+		reasoning: null,
+		cached: optionalNativeToken(value.cacheReadTokens, 'usage.cacheReadTokens'),
+		cacheWrite: optionalNativeToken(value.cacheWriteTokens, 'usage.cacheWriteTokens'),
+	};
+}
+
+function optionalNativeToken(value, field) {
+	if (value === null || value === undefined) return null;
+	if (!Number.isSafeInteger(value) || value < 0) throw new AcpProtocolError('INVALID_PROVIDER_OUTPUT', `Cursor ${field} must be a nonnegative safe integer`);
+	return value;
 }
 
 function buildCursorCommand(config, platform, cliArgs) {

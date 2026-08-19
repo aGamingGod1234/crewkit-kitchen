@@ -201,7 +201,7 @@ export class SharedCodexAgent {
 		if (this.#active !== null && this.#active.goalRevision !== revision) await this.interrupt();
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
 		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -275,17 +275,25 @@ export class SharedCodexAgent {
 			}
 			outputHandled = true;
 			await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: text, error: parseError,
-				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(collector.tokens === null ? {} : { tokens: collector.tokens }),
+				...(collector.compaction ? { compaction: true } : {}),
+				...(isRateLimitError(parseError) ? { rateLimited: true } : {}),
 			});
 			if (parseError !== null) throw parseError;
 			return decision;
 		} catch (error) {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
 				provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: rawOutput, error,
-				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(collector.tokens === null ? {} : { tokens: collector.tokens }),
+				...(collector.compaction ? { compaction: true } : {}),
+				...(isRateLimitError(error) ? { rateLimited: true } : {}),
 			});
 			if (error?.code === 'PLANNING_TIMEOUT' || error?.code === 'TURN_OUTPUT_LIMIT') {
 				try { await this.interrupt(); } catch { /* original timeout remains authoritative */ }
@@ -328,6 +336,8 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 	let streamedMessageBytes = 0;
 	let outputLimitError = null;
 	let bufferedNotifications = [];
+	let tokens = null;
+	let compaction = false;
 	let resolvePromise;
 	let rejectPromise;
 	const promise = new Promise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
@@ -355,8 +365,14 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 			streamedMessage = '';
 			streamedMessageBytes = 0;
 		}
+		if (method === 'thread/tokenUsage/updated') tokens = codexTokenUsage(params?.tokenUsage?.last);
+		if (method === 'thread/compacted' || method === 'item/completed' && params?.item?.type === 'contextCompaction') compaction = true;
 		if (method === 'turn/completed') {
-			if (params?.turn?.status === 'failed') rejectPromise(new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex turn failed'));
+			if (params?.turn?.status === 'failed') {
+				const error = new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex turn failed');
+				error.codexErrorInfo = params.turn.error?.codexErrorInfo ?? null;
+				rejectPromise(error);
+			}
 			else if (lastMessage === null && streamedMessage.length === 0) rejectPromise(new CodexProtocolError('MISSING_AGENT_MESSAGE', 'Codex turn completed without an agent message'));
 			else resolvePromise(lastMessage ?? streamedMessage);
 		}
@@ -378,6 +394,8 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 	transport.on('notification', onNotification);
 	return {
 		promise,
+		get tokens() { return tokens; },
+		get compaction() { return compaction; },
 		setTurnId(value) {
 			expectedTurnId = value;
 			const buffered = bufferedNotifications;
@@ -389,6 +407,25 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 			transport.off('notification', onNotification);
 		},
 	};
+}
+
+function codexTokenUsage(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+	return {
+		input: nativeToken(value.inputTokens), output: nativeToken(value.outputTokens),
+		reasoning: nativeToken(value.reasoningOutputTokens), cached: nativeToken(value.cachedInputTokens),
+		cacheWrite: nativeToken(value.cacheWriteInputTokens),
+	};
+}
+
+function nativeToken(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
+function isRateLimitError(error) {
+	const info = error?.codexErrorInfo;
+	if (info === 'usageLimitExceeded') return true;
+	if (info === null || typeof info !== 'object' || Array.isArray(info)) return false;
+	return ['httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected', 'responseTooManyFailedAttempts']
+		.some((key) => info[key]?.httpStatusCode === 429);
 }
 
 function notificationTurnId(params) {
