@@ -174,6 +174,7 @@ public final class AgentRegistrySnapshotCodec {
 		json.addProperty("provider", profile.provider());
 		json.addProperty("model", profile.model());
 		json.addProperty("reasoning", profile.reasoning());
+		json.addProperty("service_tier", profile.serviceTier());
 		profile.userName().ifPresentOrElse(
 				name -> json.addProperty("user_name", name),
 				() -> json.add("user_name", null)
@@ -188,6 +189,7 @@ public final class AgentRegistrySnapshotCodec {
 				json.has("provider") ? requireString(json, "provider") : "codex",
 				requireString(json, "model"),
 				requireString(json, "reasoning"),
+				json.has("service_tier") ? requireString(json, "service_tier") : "priority",
 				optionalString(json, "user_name"),
 				requireInt(json, "skin_variant"),
 				json.has("game_mode")

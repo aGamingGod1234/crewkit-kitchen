@@ -28,6 +28,10 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	let clock = 100;
 	let recorderClosed = 0;
 	const files = new Map([
+		['protocol.jsonl', jsonl([{ direction: 'outbound', envelope: { type: 'coordinator_status', payload: {
+			circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 321, p95Ms: 654, failureRate: 0, circuit: 'closed' }],
+			latencies: [{ operation: 'observation_to_plan', count: 1, p50Ms: 700, p95Ms: 700 }],
+		} } }])],
 		['coordinator.jsonl', jsonl([
 			{ event: 'program_step', actionType: 'move', arguments: { x: 1, y: 0, z: 0 }, result: { state: 'SUCCEEDED', reasonCode: 'DONE' } },
 			{ event: 'program_step', actionType: 'chat', arguments: { message: 'HEADLESS_PASS' }, result: null },
@@ -71,6 +75,8 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	assert.equal(report.assertions.every((result) => result.passed), true);
 	assert.deepEqual(report.assertions.find((result) => result.type === 'chat').actual, ['HEADLESS_PASS']);
 	assert.ok(report.evidence.paths.protocol);
+	assert.deepEqual(report.timings.health, [{ operation: 'decide', count: 2, p50Ms: 321, p95Ms: 654, failureRate: 0, circuit: 'closed' }]);
+	assert.deepEqual(report.timings.control, [{ operation: 'observation_to_plan', count: 1, p50Ms: 700, p95Ms: 700 }]);
 });
 
 test('releases the temporary spawn chunk when summon fails', async () => {
@@ -102,6 +108,38 @@ test('releases the temporary spawn chunk when summon fails', async () => {
 	assert.equal(commands.some((command) => command.startsWith('codex start ')), false);
 });
 
+test('bounds generated agent selectors to the Java profile limit', async () => {
+	const commands = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ id: 'this-is-an-intentionally-very-long-headless-scenario-identifier', assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }),
+		runDirectory: 'C:/runs/bounded-name', now: () => 1,
+		rcon: {
+			command: async (command) => {
+				commands.push(command);
+				if (command.includes('summon-configured')) return { text: 'Created bounded agent. It is ready for a task.' };
+				return { text: command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
+			},
+			close: async () => {},
+		},
+		readFile: async () => '', writeFile: async () => {}, poll: async () => {},
+	});
+	const summon = commands.find((command) => command.includes('summon-configured'));
+	const generatedName = summon.split(' ').at(-1);
+	assert.ok(generatedName.length <= 32, generatedName);
+	assert.equal(report.status, 'PASSED');
+});
+
+test('fails immediately when summon lacks the exact Java success response', async () => {
+	const commands = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/summon-validation',
+		rcon: { command: async (command) => { commands.push(command); return { text: command.includes('summon-configured') ? 'name must be at most 32 characters' : 'ok' }; }, close: async () => {} },
+		readFile: async () => '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.classification, 'ERROR');
+	assert.equal(commands.some((command) => command.startsWith('codex start')), false);
+});
+
 test('parses the exact Java codex status lifecycle strings', async () => {
 	for (const [statusText, expected] of [
 		['runner | Task complete. Goal finished.', 'PASSED'],
@@ -113,7 +151,7 @@ test('parses the exact Java codex status lifecycle strings', async () => {
 			scenario: scenario({ assert: [{ type: 'lifecycle', state: expected === 'PASSED' ? 'COMPLETED' : expected }] }),
 			runDirectory: 'C:/runs/status-shapes',
 			rcon: {
-				command: async (command) => { commands.push(command); return { text: command.startsWith('codex status') ? statusText : 'ok' }; },
+				command: async (command) => { commands.push(command); return { text: command.includes('summon-configured') ? 'Created test agent. It is ready for a task.' : command.startsWith('codex status') ? statusText : 'ok' }; },
 				close: async () => {},
 			},
 			now: () => 1,
@@ -131,7 +169,7 @@ test('polls beyond the old 256-attempt cap until a long-deadline terminal state'
 		scenario: scenario({ timeoutMs: 20_000, assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }),
 		runDirectory: 'C:/runs/long-poll',
 		rcon: {
-		command: async (command) => ({ text: command.startsWith('codex status') ? (++statusReads > 300 ? 'runner | Task complete. Goal finished.' : 'runner | Working.') : 'ok' }),
+		command: async (command) => ({ text: command.includes('summon-configured') ? 'Created test agent. It is ready for a task.' : command.startsWith('codex status') ? (++statusReads > 300 ? 'runner | Task complete. Goal finished.' : 'runner | Working.') : 'ok' }),
 		close: async () => {},
 	},
 	now: () => clock,
@@ -150,7 +188,7 @@ test('continues evidence polling for late markers and reads bounded tails', asyn
 		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'chat', message: 'LATE_PASS' }] }),
 		runDirectory: 'C:/runs/late-evidence',
 		rcon: {
-		command: async (command) => ({ text: command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }),
+		command: async (command) => ({ text: command.includes('summon-configured') ? 'Created test agent. It is ready for a task.' : command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }),
 		close: async () => {},
 	},
 	now: () => 1,
@@ -168,7 +206,7 @@ test('redacts secret-bearing diagnostics and RCON evidence from serialized repor
 		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'rcon', command: 'list', match: 'missing' }] }),
 		runDirectory: 'C:/runs/redaction',
 		rcon: {
-		command: async (command) => command === 'list' ? { text: '{"password":"shh-secret", "token":"tok-secret"}' } : { text: command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' },
+		command: async (command) => command === 'list' ? { text: '{"password":"shh-secret", "token":"tok-secret"}' } : { text: command.includes('summon-configured') ? 'Created test agent. It is ready for a task.' : command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' },
 		close: async () => {},
 	},
 	 now: () => 1, readFile: async () => '', poll: async () => {},
@@ -185,7 +223,7 @@ test('rejects mutation-capable RCON assertion commands using a conservative allo
 		const report = await runHeadlessScenario({
 			scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'rcon', command: unsafe, match: 'never' }] }),
 			runDirectory: 'C:/runs/rcon-deny',
-			rcon: { command: async (command) => { forwarded = forwarded || command === unsafe; return { text: command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }; }, close: async () => {} },
+			rcon: { command: async (command) => { forwarded = forwarded || command === unsafe; return { text: command.includes('summon-configured') ? 'Created test agent. It is ready for a task.' : command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }; }, close: async () => {} },
 			now: () => 1, readFile: async () => '', poll: async () => {}, writeFile: async () => {},
 		});
 		assert.equal(forwarded, false);
@@ -197,7 +235,7 @@ test('returns cleanup failure even when cleanup report writing also fails', asyn
 	const report = await runHeadlessScenario({
 		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }),
 		runDirectory: 'C:/runs/cleanup-write',
-		rcon: { command: async (command) => ({ text: command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }), close: async () => { throw new Error('port still open password=secret'); } },
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? 'Created test agent. It is ready for a task.' : command.startsWith('codex status') ? 'runner | Task complete. Goal finished.' : 'ok' }), close: async () => { throw new Error('port still open password=secret'); } },
 		now: () => 1, readFile: async () => '', poll: async () => {}, writeFile: async () => { throw new Error('disk unavailable token=secret'); },
 	});
 	assert.equal(report.classification, 'CLEANUP_FAILURE');
@@ -225,7 +263,7 @@ test('classifies timeout, terminal ERROR/DEAD, skipped profiles, assertion misma
 	const make = async (statusText, overrides = {}) => {
 		let clock = 0;
 		const rcon = {
-			command: async (command) => command.includes('codex summon-configured') ? { text: overrides.summonText ?? 'Created agent. ready' } : command.startsWith('codex start') ? { text: 'started' } : { text: statusText },
+			command: async (command) => command.includes('codex summon-configured') ? { text: overrides.summonText ?? 'Created test agent. It is ready for a task.' } : command.startsWith('codex start') ? { text: 'started' } : { text: statusText },
 			close: overrides.close ?? (async () => {}),
 		};
 		const selectedScenario = overrides.scenario ? { ...scenario(), ...overrides.scenario } : scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] });

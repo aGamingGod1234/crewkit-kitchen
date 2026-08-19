@@ -4,13 +4,13 @@ import { fileURLToPath } from 'node:url';
 import { HeadlessRconClient } from './headless-rcon.mjs';
 import { redact as redactTrace } from './trace-writer.mjs';
 
-const PROVIDERS = new Set(['codex', 'gemini', 'kimi']);
+const PROVIDERS = new Set(['codex', 'gemini', 'kimi', 'cursor']);
 const MAX_TIMEOUT_MS = 900_000;
 const MAX_DIAGNOSTICS = 4096;
 const MAX_TEXT = 4096;
 const MAX_ASSERTION_ARGS = 8192;
 const MAX_EVIDENCE_BYTES = 16_384;
-const MAX_SCENARIOS = 16;
+const MAX_SCENARIOS = 24;
 const MAX_MATRIX_REPORT_BYTES = 262_144;
 const POLL_INTERVAL_MS = 50;
 const SENSITIVE_REPORT_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
@@ -219,8 +219,11 @@ export async function runHeadlessScenario({
 			classification = 'ERROR';
 			diagnostics = summon.text;
 		}
+		if (classification === null && !isAcceptedResponse(summon.text)) {
+			classification = 'ERROR';
+			diagnostics = summon.text;
+		}
 		if (classification === null) {
-			if (!isAcceptedResponse(summon.text)) await withDeadline(() => poll({ phase: 'summon', attempt: 0, deadline, response: summon.text, now }), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT');
 			await command(`codex start ${generatedName} ${scenario.task}`, { attempt: 0 });
 			let attempts = 0;
 			while (terminalState === null) {
@@ -256,9 +259,11 @@ export async function runHeadlessScenario({
 		if (classification === null && !assertionResult.passed) classification = 'ASSERTION_MISMATCH';
 		if (classification === null) classification = 'PASSED';
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
+		const elapsedMs = Math.max(0, Number(now()) - startedAt);
 		const report = scenarioReport(status, scenario, {
-			classification, generatedName, lifecycle: terminalState, elapsedMs: Math.max(0, Number(now()) - startedAt),
+			classification, generatedName, lifecycle: terminalState, elapsedMs,
 			commands, assertions: assertionResult.results, evidence: evidenceSummary(directory, fileEvidence, protocolAudit),
+			timings: timingSummary(profile, fileEvidence, protocolAudit, elapsedMs),
 			diagnostics,
 			cleanup: { status: 'PENDING' },
 		});
@@ -498,10 +503,12 @@ async function readEvidence(directory, readFile, tailReader, protocolAudit, prov
 		readBoundedTail(tailReader, protocolPath, offsets.protocol), readBoundedTail(tailReader, coordinatorPath, offsets.coordinator), readBoundedTail(tailReader, serverPath, offsets.server),
 		providerTurns === null ? '' : readBoundedTail(tailReader, providerTurns, offsets.providerTurns),
 	]);
+	const providerTurnRows = providerTurns === null ? [] : parseJsonl(providerTurnsText);
 	return {
 		protocolRows: parseJsonl(protocolText), traceRows: parseJsonl(coordinatorText), serverLog,
 		paths: { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath, ...(providerTurns === null ? {} : { providerTurns }) },
-		providerTurnsRows: providerTurns === null ? 0 : parseJsonl(providerTurnsText).length,
+		providerTurnsRows: providerTurnRows.length,
+		providerTurnSummaries: providerTurnRows.map(providerTurnSummary).filter(Boolean),
 	};
 }
 
@@ -528,6 +535,58 @@ async function captureEvidenceOffsets(paths, fileSize) {
 function evidenceSummary(directory, fileEvidence, protocolAudit) {
 	const paths = fileEvidence.paths ?? { protocol: path.join(directory, 'protocol.jsonl'), coordinator: path.join(directory, 'coordinator.jsonl'), server: path.join(directory, 'server.log') };
 	return { paths, excerpts: { server: boundedText(fileEvidence.serverLog ?? '', 1024) }, auditRows: fileEvidence.protocolRows?.length ?? auditRows(protocolAudit).length, providerTurnsRows: fileEvidence.providerTurnsRows ?? 0 };
+}
+
+function timingSummary(profile, fileEvidence, protocolAudit, scenarioElapsedMs) {
+	const rows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)].map(unwrapAuditRow).filter(Boolean);
+	const healthByOperation = new Map();
+	let control = [];
+	for (const row of rows) {
+		if (row.type !== 'coordinator_status' || !row.payload || typeof row.payload !== 'object') continue;
+		for (const circuit of Array.isArray(row.payload.circuits) ? row.payload.circuits : []) {
+			if (circuit?.provider !== profile.provider || circuit?.model !== profile.model || typeof circuit.operation !== 'string') continue;
+			healthByOperation.set(circuit.operation, metricSummary(circuit, ['operation', 'count', 'p50Ms', 'p95Ms', 'failureRate', 'circuit']));
+		}
+		if (Array.isArray(row.payload.latencies) && row.payload.latencies.length > 0) {
+			control = row.payload.latencies.slice(0, 32).map((entry) => metricSummary(entry, ['operation', 'count', 'p50Ms', 'p95Ms']));
+		}
+	}
+	return {
+		scenarioElapsedMs: finiteMetric(scenarioElapsedMs),
+		turns: (fileEvidence.providerTurnSummaries ?? []).filter((turn) => turn.provider === profile.provider && turn.model === profile.model).slice(0, 64),
+		health: [...healthByOperation.values()].slice(0, 32),
+		control,
+	};
+}
+
+function providerTurnSummary(row) {
+	if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+	const summary = {
+		provider: boundedScalar(row.provider), model: boundedScalar(row.model), reasoningEffort: boundedScalar(row.reasoningEffort),
+		attempt: Number.isSafeInteger(row.attempt) ? row.attempt : null, retry: row.retry === true,
+		timestamp: Number.isFinite(row.timestamp) ? Math.round(row.timestamp) : null, outcome: boundedScalar(row.outcome),
+	};
+	if (row.timing && typeof row.timing === 'object' && !Array.isArray(row.timing)) {
+		summary.durationMs = finiteMetric(row.timing.durationMs);
+		summary.apiDurationMs = finiteMetric(row.timing.apiDurationMs);
+	}
+	if (row.error && typeof row.error === 'object' && !Array.isArray(row.error)) {
+		summary.error = { code: boundedScalar(row.error.code), message: redactReportText(row.error.message, 512) };
+	}
+	return summary;
+}
+
+function metricSummary(value, keys) {
+	const summary = {};
+	for (const key of keys) {
+		if (key === 'operation' || key === 'circuit') summary[key] = boundedScalar(value?.[key]);
+		else summary[key] = finiteMetric(value?.[key]);
+	}
+	return summary;
+}
+
+function finiteMetric(value) {
+	return Number.isFinite(value) && value >= 0 ? Math.round(value * 1000) / 1000 : null;
 }
 
 async function readBoundedTail(readTail, file, offset = 0) {
@@ -563,7 +622,7 @@ function normalizeRunDirectory(value) {
 
 function generatedAgentName(scenario, timestamp) {
 	const id = String(scenario.id ?? 'scenario').replace(/[^A-Za-z0-9_]/g, '_').slice(0, 32) || 'scenario';
-	return `headless_${id}_${Math.abs(Number(timestamp) || 0).toString(36)}`.slice(0, 40);
+	return `headless_${id}_${Math.abs(Number(timestamp) || 0).toString(36)}`.slice(0, 32);
 }
 
 function parseLifecycle(value) {
@@ -578,7 +637,7 @@ function parseLifecycle(value) {
 
 function isFailedResponse(value) { return /(?:\bERROR\b|\bFAILED\b|unknown agent|unable to|rejected)/i.test(String(value ?? '')); }
 function isSkippedResponse(value) { return /(?:SKIP|unavailable|not logged in|not installed|profile unavailable|catalog unavailable|catalog\s+rejected)/i.test(String(value ?? '')); }
-function isAcceptedResponse(value) { return String(value ?? '').trim().length > 0; }
+function isAcceptedResponse(value) { return /^Created .+\. It is ready for a task\.$/i.test(String(value ?? '').trim()); }
 function isReadOnlyRcon(value) {
 	const source = String(value ?? '');
 	if (/[\u0000-\u001f\u007f;&|`]/.test(source)) return false;

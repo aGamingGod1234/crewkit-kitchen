@@ -78,6 +78,7 @@ function normalizeRecord(fields, runId, scenarioId, timestamp) {
 		retry: fields.retry === true,
 		timestamp,
 		outcome: error === null ? 'success' : 'error',
+		...(fields.timing === null || fields.timing === undefined ? {} : { timing: normalizeTiming(fields.timing) }),
 		input: normalizeText(fields.input),
 		output: normalizeText(fields.output),
 		...(error === null ? {} : { error }),
@@ -104,12 +105,25 @@ function publicRecord(row) {
 		retry: row.retry,
 		timestamp: row.timestamp,
 		outcome: row.outcome,
+		...(row.timing === undefined ? {} : { timing: row.timing }),
 		inputHash: hash(row.input),
 		outputHash: hash(row.output),
 		inputExcerpt: redactAndBound(row.input, MAX_PUBLIC_EXCERPT_BYTES),
 		outputExcerpt: redactAndBound(row.output, MAX_PUBLIC_EXCERPT_BYTES),
 		...(row.error === undefined ? {} : { error: { code: row.error.code, message: redactAndBound(row.error.message, MAX_PUBLIC_EXCERPT_BYTES) } }),
 	};
+}
+
+function normalizeTiming(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('provider turn timing must be an object');
+	const durationMs = boundedDuration(value.durationMs, 'durationMs');
+	const apiDurationMs = value.apiDurationMs === null || value.apiDurationMs === undefined ? null : boundedDuration(value.apiDurationMs, 'apiDurationMs');
+	return { durationMs, apiDurationMs };
+}
+
+function boundedDuration(value, field) {
+	if (!Number.isFinite(value) || value < 0) throw new TypeError(`${field} must be a nonnegative finite number`);
+	return Math.round(value);
 }
 
 function normalizeError(value) {

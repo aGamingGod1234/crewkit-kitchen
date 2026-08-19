@@ -30,7 +30,7 @@ if ([int]::TryParse([Environment]::GetEnvironmentVariable('ARENA_HEADLESS_OUTPUT
 $MaxPortAttempts = 30
 $StartupBindRetries = 2
 $CoordinatorBindRetries = 2
-$MaxSelectedScenarios = 16
+$MaxSelectedScenarios = 24
 $MaxManifestBytes = 65536
 $MaxMatrixReportBytes = 262144
 $MaxDiagnosticText = 4096
@@ -372,6 +372,7 @@ function Get-ProviderCommand([string] $Provider) {
 		'codex' { return 'codex' }
 		'gemini' { return 'agy' }
 		'kimi' { return 'kimi' }
+		'cursor' { return (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'cursor-agent\agent.ps1') }
 		default { throw "Unsupported provider '$Provider'" }
 	}
 }

@@ -33,22 +33,27 @@ test('wires provider-turn capture into scenario evidence paths', async () => {
 				id: 'case', provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
 				assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
 			}] });
-			if (file === providerTurnsPath) return '{"row":1,"providerOutput":"private-provider-text"}\n{"row":2}\n';
+			if (file === providerTurnsPath) return '{"provider":"codex","model":"m","reasoningEffort":"low","attempt":1,"retry":false,"timestamp":123,"outcome":"success","timing":{"durationMs":120,"apiDurationMs":80},"input":"private-prompt-text","output":"private-provider-text"}\n';
 			return 'password';
 		},
 		writeFile: async () => {}, mkdir: async () => {}, rconFactory: () => ({
 			connect: async () => {},
-			command: async (command) => command.startsWith('codex status') ? { text: 'state=COMPLETED' } : { text: 'ok' },
+			command: async (command) => command.includes('summon-configured') ? { text: 'Created test agent. It is ready for a task.' } : command.startsWith('codex status') ? { text: 'state=COMPLETED' } : { text: 'ok' },
 			close: async () => {},
 		}),
 	});
 	assert.equal(result.report.scenarios[0].evidence.paths.providerTurns, providerTurnsPath);
-	assert.equal(result.report.scenarios[0].evidence.providerTurnsRows, 2);
+	assert.equal(result.report.scenarios[0].evidence.providerTurnsRows, 1);
+	assert.deepEqual(result.report.scenarios[0].timings.turns, [{
+		provider: 'codex', model: 'm', reasoningEffort: 'low', attempt: 1, retry: false,
+		timestamp: 123, outcome: 'success', durationMs: 120, apiDurationMs: 80,
+	}]);
 	assert.doesNotMatch(JSON.stringify(result.report), /private-provider-text/);
+	assert.doesNotMatch(JSON.stringify(result.report), /private-prompt-text/);
 });
 
 test('rejects a selected matrix larger than the bounded scenario limit', async () => {
-	const scenarios = Array.from({ length: 17 }, (_, index) => ({
+	const scenarios = Array.from({ length: 25 }, (_, index) => ({
 		id: `case-${index}`, provider: 'codex', model: 'm', reasoningEffort: 'low', task: 't', timeoutMs: 1000,
 		assert: [{ type: 'lifecycle', state: 'COMPLETED' }],
 	}));
@@ -56,7 +61,7 @@ test('rejects a selected matrix larger than the bounded scenario limit', async (
 		configPath: 'C:/matrix.json', runDirectory: 'C:/runs/cases', rconPort: 25575,
 		rconPasswordFile: 'C:/runs/password.txt',
 		readFile: async () => JSON.stringify({ version: 1, scenarios }),
-	}), /16|scenario/i);
+	}), (error) => /bounded maximum of 24/i.test(error.message));
 });
 
 test('rejects a matrix report that exceeds the bounded byte limit', async () => {
@@ -128,7 +133,7 @@ test('runs a selected matrix scenario through the injected RCON client and forwa
 		connect: async () => fakeRcon,
 		command: async (command) => {
 			commands.push(command);
-			if (command.includes('summon-configured')) return { text: 'Created agent. ready' };
+			if (command.includes('summon-configured')) return { text: 'Created test agent. It is ready for a task.' };
 			if (command.startsWith('codex start')) return { text: 'started' };
 			return { text: command.startsWith('codex status') ? 'state=ERROR' : 'ok' };
 		},
@@ -156,7 +161,7 @@ test('runs only the selected scenario', async () => {
 		connect: async () => fakeRcon,
 		command: async (command) => {
 			if (command.includes('summon-configured')) summoned.push(command);
-			if (command.includes('summon-configured')) return { text: 'Created agent. ready' };
+			if (command.includes('summon-configured')) return { text: 'Created test agent. It is ready for a task.' };
 			if (command.startsWith('codex status')) return { text: 'state=COMPLETED' };
 			return { text: 'started' };
 		},
@@ -219,7 +224,7 @@ test('isolates append-only evidence between unselected direct-CLI scenarios', as
 				if (command.includes('summon-configured') && summonCount++ === 0) {
 					protocolText += `${JSON.stringify({ envelope: { type: 'chat', payload: { message: 'ONLY_FIRST' } } })}\n`;
 				}
-				return { text: command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
+				return { text: command.includes('summon-configured') ? 'Created test agent. It is ready for a task.' : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' };
 			},
 			close: async () => {},
 		}),

@@ -13,6 +13,7 @@ test('records bounded redacted private turns and hash/excerpt-only public rows',
 	});
 	await recorder.record({
 		provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', goalRevision: 4, attempt: 2, retry: true,
+		timing: { durationMs: 1234, apiDurationMs: 987 },
 		input: 'prompt authorization: Bearer abc123 token=secret-token password=hunter2 SECRET_SHAPED=supersecret ' + '🙂'.repeat(100_000),
 		output: '{"directive":"finish"}' + '漢'.repeat(40_000),
 	});
@@ -31,6 +32,7 @@ test('records bounded redacted private turns and hash/excerpt-only public rows',
 	assert.equal(privateRow.retry, true);
 	assert.equal(privateRow.outcome, 'success');
 	assert.equal(privateRow.timestamp, 1234);
+	assert.deepEqual(privateRow.timing, { durationMs: 1234, apiDurationMs: 987 });
 	assert.match(privateRow.output, /^\{"directive":"finish"\}/);
 	assert.ok(Buffer.byteLength(JSON.stringify(privateRow), 'utf8') <= 262_144);
 	assert.ok(Buffer.byteLength(privateRow.input, 'utf8') <= 65_536);
@@ -45,6 +47,7 @@ test('records bounded redacted private turns and hash/excerpt-only public rows',
 	assert.ok(Buffer.byteLength(publicRows[0].inputExcerpt, 'utf8') <= 512);
 	assert.ok(Buffer.byteLength(publicRows[0].outputExcerpt, 'utf8') <= 512);
 	assert.equal(Object.hasOwn(publicRows[0], 'input'), false);
+	assert.deepEqual(publicRows[0].timing, { durationMs: 1234, apiDurationMs: 987 });
 	assert.equal(JSON.stringify(publicRows[0]).includes('secret-token'), false);
 });
 
@@ -68,6 +71,17 @@ test('redacts quoted JSON credential keys and values in both private and public 
 	assert.equal(JSON.stringify(publicRows[0]).includes('PASSSECRET'), false);
 	assert.equal(JSON.stringify(publicRows[0]).includes('CLIENTSECRET'), false);
 	assert.equal(JSON.stringify(publicRows[0]).includes('BEARERSECRET'), false);
+});
+
+test('preserves wall-clock timing when a provider has no native API duration', async () => {
+	const rows = [];
+	const recorder = new ProviderTurnRecorder({
+		runId: 'run-timing', scenarioId: 'scenario-timing', privatePath: 'private.jsonl',
+		appendFile: async (_path, text) => rows.push(JSON.parse(text)),
+	});
+	await recorder.record({ provider: 'codex', model: 'm', reasoningEffort: 'low', timing: { durationMs: 42, apiDurationMs: null } });
+	await recorder.close();
+	assert.deepEqual(rows[0].timing, { durationMs: 42, apiDurationMs: null });
 });
 
 test('redacts escaped and delimiter-rich quoted JSON credential values', async () => {

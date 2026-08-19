@@ -122,6 +122,8 @@ test('Codex malformed output records one final error row for the attempt', async
 	assert.equal(rows[0].error?.code, 'MALFORMED_DECISION');
 	assert.equal(rows[0].output, 'not-json');
 	assert.equal(rows[0].attempt, 3);
+	assert.ok(rows[0].timing.durationMs >= 0);
+	assert.equal(rows[0].timing.apiDurationMs, null);
 	assert.equal(rows[0].retry, true);
 	await service.stop();
 });

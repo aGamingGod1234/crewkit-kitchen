@@ -576,6 +576,17 @@ test('strict payload validators accept every current wire shape and reject unkno
 	assert.throws(() => validateProtocolV2Payload('hello_ack', { replyTo: 'x', authenticated: true, registry: Array(1_025).fill(registeredRecord()) }), /at most 1024/);
 });
 
+test('catalog snapshots carry Cursor Composer and Grok profiles', () => {
+	const model = {
+		provider: 'cursor', id: 'cursor:composer-2.5', model: 'composer-2.5', displayName: 'Composer 2.5',
+		reasoningEfforts: ['low', 'high'], serviceTiers: ['priority', 'fast'],
+	};
+	assert.deepEqual(
+		validateProtocolV2Payload('catalog_snapshot', { refreshedAtEpochMs: 1, models: [model] }).models,
+		[model],
+	);
+});
+
 test('action cancellation requires an exact goal revision and action identity', () => {
 	assert.deepEqual(
 		validateProtocolV2Payload('action_cancel', { goalRevision: 4, actionId: 'action-9' }),

@@ -4,11 +4,23 @@ import test from 'node:test';
 
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
-import { createDynamicCoordinator } from '../src/dynamic-main.mjs';
+import { createDynamicCoordinator, normalizeDynamicConfig } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
+
+test('dynamic config exposes the native Cursor model families and genuine settings', () => {
+	const config = normalizeDynamicConfig({
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		codex: { launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+	}, { LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local' });
+	assert.equal(config.cursor.provider, 'cursor');
+	assert.equal(config.cursor.executable, 'C:\\Users\\tester\\AppData\\Local\\cursor-agent\\agent.ps1');
+	assert.deepEqual(config.cursor.models, ['composer-2.5', 'grok-4.5', 'grok-4.6']);
+	assert.deepEqual(config.cursor.modelReasoningEfforts['composer-2.5'], ['high']);
+	assert.deepEqual(config.cursor.modelReasoningEfforts['grok-4.6'], ['low', 'medium', 'high', 'xhigh']);
+});
 
 class FakeBridge extends EventEmitter {
 	ready = false;

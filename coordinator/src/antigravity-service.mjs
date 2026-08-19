@@ -176,6 +176,7 @@ class AntigravityAgent {
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
 		if (goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled');
+		const turnStartedAt = performance.now();
 
 		const prompt = `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`;
 		const launch = buildAntigravityLaunch(this.#profile, this.#config, {
@@ -219,6 +220,7 @@ class AntigravityAgent {
 			await recordProviderTurn(turnRecorder, {
 				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
+				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
 			});
 			if (parseError !== null) throw parseError;
 			return decision;
@@ -226,6 +228,7 @@ class AntigravityAgent {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
 				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
+				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
 			});
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal', { cause: error });

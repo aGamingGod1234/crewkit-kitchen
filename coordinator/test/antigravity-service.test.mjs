@@ -160,6 +160,8 @@ test('Antigravity malformed output records one final error row for the attempt',
 	assert.equal(rows[0].error?.code, 'MALFORMED_DECISION');
 	assert.equal(rows[0].attempt, 5);
 	assert.equal(rows[0].retry, true);
+	assert.ok(rows[0].timing.durationMs >= 0);
+	assert.equal(rows[0].timing.apiDurationMs, null);
 	await service.stop();
 });
 

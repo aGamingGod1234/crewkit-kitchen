@@ -14,7 +14,7 @@ public record AgentControlModelOption(
 		List<String> serviceTiers
 ) {
 	public static final int MAX_OPTIONS = 128;
-	private static final Set<String> PROVIDERS = Set.of("codex", "gemini", "kimi");
+	private static final Set<String> PROVIDERS = Set.of("codex", "gemini", "kimi", "cursor");
 
 	public AgentControlModelOption {
 		provider = identifier(provider, "provider", 24).toLowerCase(Locale.ROOT);

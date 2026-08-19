@@ -10,6 +10,13 @@ $scriptPath = Join-Path $PSScriptRoot 'run-headless-provider-matrix.ps1'
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
 	throw 'Expected lifecycle wrapper to exist'
 }
+$wrapperSource = Get-Content -Raw -LiteralPath $scriptPath
+if ($wrapperSource -notmatch "'cursor'\s*\{\s*return") {
+	throw 'Expected lifecycle wrapper to preflight the native Cursor agent'
+}
+if ($wrapperSource -notmatch '\$MaxSelectedScenarios\s*=\s*24') {
+	throw 'Expected lifecycle wrapper to allow the complete 18-profile provider matrix within a 24-scenario bound'
+}
 
 function Assert-Fails([scriptblock] $Action, [string] $Pattern) {
 	try {
@@ -289,7 +296,7 @@ try {
 	}
 	Write-Output 'PASS Windows-invalid scenario ID characters are rejected before setup'
 	$largeMatrix = Join-Path $fixture 'large-matrix.json'
-	$largeScenarios = @(1..17 | ForEach-Object { [pscustomobject]@{ id = "fixture-$_"; provider = 'codex'; model = 'fixture'; reasoningEffort = 'low'; serviceTier = 'fast'; task = 'fixture'; timeoutMs = 1000; assert = @([pscustomobject]@{ type = 'lifecycle'; state = 'COMPLETED' }) } })
+	$largeScenarios = @(1..25 | ForEach-Object { [pscustomobject]@{ id = "fixture-$_"; provider = 'codex'; model = 'fixture'; reasoningEffort = 'low'; serviceTier = 'fast'; task = 'fixture'; timeoutMs = 1000; assert = @([pscustomobject]@{ type = 'lifecycle'; state = 'COMPLETED' }) } })
 	Set-Content -LiteralPath $largeMatrix -Value ([pscustomobject]@{ version = 1; scenarios = $largeScenarios } | ConvertTo-Json -Depth 8) -NoNewline
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath $largeMatrix -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Selected scenario count|bounded maximum|maximum'
 	Write-Output 'PASS selected scenario count is bounded'

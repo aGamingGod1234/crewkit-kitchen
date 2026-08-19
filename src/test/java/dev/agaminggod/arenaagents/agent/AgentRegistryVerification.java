@@ -171,7 +171,19 @@ public final class AgentRegistryVerification {
 
 		String legacy = codec.encode(snapshot).replace("\"provider\":\"kimi\",", "");
 		assertEquals("codex", codec.decode(legacy).records().getFirst().profile().provider(), "legacy provider migration");
-		return 3;
+		AgentProfile cursor = new AgentProfile(
+				"cursor", "composer-2.5", "high", "fast", Optional.empty(), 1, AgentGameMode.SURVIVAL);
+		AgentRegistry.Snapshot cursorSnapshot = new AgentRegistry.Snapshot(
+				AgentConstants.SCHEMA_VERSION,
+				AgentConstants.DEFAULT_AGENT_LIMIT,
+				AgentConstants.DEFAULT_QUEUE_LIMIT,
+				List.of(AgentRecord.create(AgentId.random(), cursor, START_TIME))
+		);
+		AgentProfile decodedCursor = codec.decode(codec.encode(cursorSnapshot)).records().getFirst().profile();
+		assertEquals("cursor", decodedCursor.provider(), "Cursor provider round-trip");
+		assertEquals("composer-2.5", decodedCursor.model(), "Cursor model round-trip");
+		assertEquals("fast", decodedCursor.serviceTier(), "Cursor native fast mode round-trip");
+		return 5;
 	}
 
 	private static int verifyEntityLocationPersistenceAndMigration() {

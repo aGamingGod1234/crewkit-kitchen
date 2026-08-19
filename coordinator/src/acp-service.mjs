@@ -175,6 +175,7 @@ class AcpAgent {
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
 		if (goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled');
+		const turnStartedAt = performance.now();
 		const chunks = [];
 		let decisionBytes = 0;
 		let outputLimitError = null;
@@ -227,6 +228,7 @@ class AcpAgent {
 			await recordProviderTurn(turnRecorder, {
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
+				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
 			});
 			if (parseError !== null) throw parseError;
 			return decision;
@@ -234,6 +236,7 @@ class AcpAgent {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
+				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
 			});
 			throw error;
 		} finally {

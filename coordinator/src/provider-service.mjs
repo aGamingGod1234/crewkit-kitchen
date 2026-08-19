@@ -1,4 +1,4 @@
-const PROVIDERS = Object.freeze(['codex', 'gemini', 'kimi']);
+const PROVIDERS = Object.freeze(['codex', 'gemini', 'kimi', 'cursor']);
 
 export class ProviderService {
 	#services;

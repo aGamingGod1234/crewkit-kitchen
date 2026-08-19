@@ -72,10 +72,17 @@ public final class AgentControlVerification {
 	}
 
 	private static int verifyProviderPresets() {
-		assertEquals(List.of("codex", "gemini", "kimi"), AgentControlCatalog.providers(), "provider order");
+		assertEquals(List.of("codex", "gemini", "kimi", "cursor"), AgentControlCatalog.providers(), "provider order");
 		assertEquals("gpt-5.6-sol", AgentControlCatalog.defaultModel("codex"), "Codex model default");
 		assertEquals("gemini-3.1-pro", AgentControlCatalog.defaultModel("gemini"), "Gemini model default");
 		assertEquals("kimi-code/k3", AgentControlCatalog.defaultModel("kimi"), "Kimi model default");
+		assertEquals("composer-2.5", AgentControlCatalog.defaultModel("cursor"), "Cursor model default");
+		assertEquals(List.of("low", "medium", "high", "xhigh"), AgentControlCatalog.reasoningEfforts("cursor", "grok-4.6"),
+				"Cursor Grok effort choices");
+		assertEquals(List.of("high"), AgentControlCatalog.reasoningEfforts("cursor", "composer-2.5"),
+				"Composer exposes speed without inventing a thinking control");
+		assertTrue(AgentControlCatalog.hasSpeedMode("cursor", "composer-2.5"),
+				"Cursor exposes its native fast model override");
 		assertEquals(List.of("high", "low"), AgentControlCatalog.reasoningEfforts("gemini", "gemini-3.1-pro"),
 				"Gemini Pro efforts");
 		assertEquals(List.of("high", "medium", "low"),
@@ -100,7 +107,7 @@ public final class AgentControlVerification {
 		assertTrue(!AgentControlCatalog.hasSpeedMode("gemini", "gemini-3.1-pro"),
 				"providers without a speed capability do not show a fake speed choice");
 		expectFailure(() -> AgentControlCatalog.defaultModel("unknown"), "unknown provider");
-		return 15;
+		return 18;
 	}
 
 	private static int verifyCommandConstruction() {

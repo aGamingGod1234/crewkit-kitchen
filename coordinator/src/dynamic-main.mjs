@@ -9,6 +9,7 @@ import { AgentWorkspaceManager } from './agent-workspace.mjs';
 import { AcpProviderService } from './acp-service.mjs';
 import { AntigravityProviderService } from './antigravity-service.mjs';
 import { CodexService } from './codex-service.mjs';
+import { CursorProviderService } from './cursor-service.mjs';
 import { ControlLatencyRegistry } from './control-latency-registry.mjs';
 import { FactLedger } from './fact-ledger.mjs';
 import { ProviderService } from './provider-service.mjs';
@@ -495,6 +496,12 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 			workspaceManager,
 		}),
 		kimi: new AcpProviderService({ ...config.kimi, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transportFactory: dependencies.kimiTransportFactory, workspaceManager }),
+		cursor: new CursorProviderService({ ...config.cursor, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, {
+			spawn: dependencies.cursorSpawn,
+			terminate: dependencies.terminateProviderProcess,
+			platform: dependencies.platform,
+			workspaceManager,
+		}),
 	}, { turnRecorder: providerTurnRecorder });
 	const healthRegistry = dependencies.healthRegistry ?? dependencies.planner?.healthRegistry ?? new ProviderHealthRegistry({ now: dependencies.healthNow ?? Date.now });
 	const latencyRegistry = dependencies.latencyRegistry ?? new ControlLatencyRegistry();
@@ -598,6 +605,21 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 			models: ['kimi-code/k3', 'kimi-code/k3-256k', 'kimi-code/kimi-for-coding', 'kimi-code/kimi-for-coding-highspeed'],
 			reasoningEfforts: ['low', 'high', 'max'],
 			...(value.kimi ?? {}),
+		},
+		cursor: {
+			provider: 'cursor',
+			cwd,
+			executable: process.platform === 'win32' && typeof environment.LOCALAPPDATA === 'string' && environment.LOCALAPPDATA.trim() !== ''
+				? path.join(environment.LOCALAPPDATA, 'cursor-agent', 'agent.ps1')
+				: 'agent',
+			catalogDiscovery: true,
+			models: ['composer-2.5', 'grok-4.5', 'grok-4.6'],
+			modelReasoningEfforts: {
+				'composer-2.5': ['high'],
+				'grok-4.5': ['low', 'medium', 'high'],
+				'grok-4.6': ['low', 'medium', 'high', 'xhigh'],
+			},
+			...(value.cursor ?? {}),
 		},
 		limits: {
 			agentCap,

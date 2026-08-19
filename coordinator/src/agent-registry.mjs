@@ -191,7 +191,7 @@ export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP,
 
 function requireProvider(value) {
 	const provider = requireIdentifier(value, 'provider').toLowerCase();
-	if (!['codex', 'gemini', 'kimi'].includes(provider)) throw new TypeError(`provider must be one of codex, gemini, or kimi`);
+	if (!['codex', 'gemini', 'kimi', 'cursor'].includes(provider)) throw new TypeError(`provider must be one of codex, gemini, kimi, or cursor`);
 	return provider;
 }
 

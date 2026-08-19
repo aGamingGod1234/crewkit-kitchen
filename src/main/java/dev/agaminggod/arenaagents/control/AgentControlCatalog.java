@@ -115,6 +115,9 @@ public final class AgentControlCatalog {
 		}
 		add(values, "kimi", "kimi-code/kimi-for-coding", "K2.7 Coding", List.of("high"), false);
 		add(values, "kimi", "kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed", List.of("high"), false);
+		add(values, "cursor", "composer-2.5", "Composer 2.5", List.of("high"), true);
+		add(values, "cursor", "grok-4.5", "Grok 4.5", List.of("low", "medium", "high"), true);
+		add(values, "cursor", "grok-4.6", "Grok 4.6", List.of("low", "medium", "high", "xhigh"), true);
 		return List.copyOf(values);
 	}
 

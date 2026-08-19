@@ -659,7 +659,7 @@ function normalizeCatalogSnapshot(value) {
 
 function normalizeProvider(value, field) {
 	const provider = requireIdentifier(value, field);
-	if (!['codex', 'gemini', 'kimi'].includes(provider)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be codex, gemini, or kimi`);
+	if (!['codex', 'gemini', 'kimi', 'cursor'].includes(provider)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be codex, gemini, kimi, or cursor`);
 	return provider;
 }
 

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
 	normalizeHeadlessMatrix,
@@ -19,6 +20,28 @@ test('normalizes one bounded real-provider scenario', () => {
 	assert.equal(matrix.version, 1);
 	assert.ok(Object.isFrozen(matrix));
 	assert.ok(Object.isFrozen(matrix.scenarios[0]));
+});
+
+test('accepts Cursor Composer and Grok scenarios through the same matrix schema', () => {
+	const matrix = normalizeHeadlessMatrix({ version: 1, scenarios: [
+		validScenario({ id: 'cursor-composer', provider: 'cursor', model: 'composer-2.5', reasoningEffort: 'high', serviceTier: 'priority' }),
+		validScenario({ id: 'cursor-grok', provider: 'cursor', model: 'grok-4.6', reasoningEffort: 'high', serviceTier: 'fast' }),
+	] });
+	assert.deepEqual(matrix.scenarios.map((scenario) => scenario.provider), ['cursor', 'cursor']);
+});
+
+test('checked-in live matrix covers every provider with real model and setting combinations', () => {
+	const matrix = normalizeHeadlessMatrix(JSON.parse(readFileSync(new URL('../config/headless-provider-matrix.json', import.meta.url), 'utf8')));
+	assert.equal(matrix.scenarios.length, 18);
+	for (const provider of ['codex', 'gemini', 'kimi', 'cursor']) {
+		const scenarios = matrix.scenarios.filter((scenario) => scenario.provider === provider);
+		assert.ok(new Set(scenarios.map((scenario) => scenario.model)).size >= 2, `${provider} needs at least two models`);
+		for (const model of new Set(scenarios.map((scenario) => scenario.model))) {
+			assert.ok(new Set(scenarios.filter((scenario) => scenario.model === model).map((scenario) => `${scenario.reasoningEffort}/${scenario.serviceTier}`)).size >= 2, `${provider}/${model} needs two settings`);
+		}
+		assert.ok(scenarios.every((scenario) => ['chat', 'action', 'program'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
+	}
+	assert.deepEqual([...new Set(matrix.scenarios.filter((scenario) => scenario.provider === 'cursor').map((scenario) => scenario.model))], ['composer-2.5', 'grok-4.5', 'grok-4.6']);
 });
 
 test('rejects duplicate IDs, unknown assertion types, and unbounded timeouts', () => {

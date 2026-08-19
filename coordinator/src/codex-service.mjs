@@ -208,6 +208,7 @@ export class SharedCodexAgent {
 		requireRevision(goalRevision);
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new CodexProtocolError('TURN_INTERRUPTED', 'Planning turn was interrupted');
+		const turnStartedAt = performance.now();
 		const collector = createTurnCollector(this.#transport, this.#threadId, this.#maxDecisionBytes);
 		void collector.promise.catch(() => { /* observed immediately; the decision awaits the original promise after turn/start */ });
 		let lifecycleSettled = false;
@@ -276,6 +277,7 @@ export class SharedCodexAgent {
 			await recordProviderTurn(turnRecorder, {
 				provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: text, error: parseError,
+				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
 			});
 			if (parseError !== null) throw parseError;
 			return decision;
@@ -283,6 +285,7 @@ export class SharedCodexAgent {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
 				provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: rawOutput, error,
+				timing: { durationMs: Math.max(0, performance.now() - turnStartedAt), apiDurationMs: null },
 			});
 			if (error?.code === 'PLANNING_TIMEOUT' || error?.code === 'TURN_OUTPUT_LIMIT') {
 				try { await this.interrupt(); } catch { /* original timeout remains authoritative */ }
