@@ -140,7 +140,7 @@ public final class AgentRegistry {
 		do {
 			id = AgentId.random();
 		} while (records.containsKey(id));
-		int skinVariant = Math.floorMod(id.value().hashCode(), AgentConstants.DEFAULT_SKIN_VARIANT_COUNT);
+		int skinVariant = Math.floorMod(id.value().hashCode(), AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT);
 		AgentProfile profile = new AgentProfile(provider, model, reasoning, serviceTier, checkedName, skinVariant, gameMode);
 		AgentRecord created = AgentRecord.create(id, profile, nowEpochMs);
 		records.put(id, created);
@@ -390,7 +390,8 @@ public final class AgentRegistry {
 		String folded = checked.toLowerCase(Locale.ROOT);
 		List<AgentRecord> matches = records.values().stream()
 				.filter(record -> record.agentId().startsWith(checked)
-						|| record.profile().userName().map(name -> name.toLowerCase(Locale.ROOT).equals(folded)).orElse(false))
+						|| AgentIdentity.displayName(record.agentId(), record.profile())
+								.toLowerCase(Locale.ROOT).equals(folded))
 				.toList();
 		if (matches.isEmpty()) {
 			throw new AgentDomainException("AGENT_NOT_FOUND", "Unknown agent: " + checked);
@@ -411,7 +412,7 @@ public final class AgentRegistry {
 		ArrayList<String> selectors = new ArrayList<>();
 		for (AgentRecord record : records()) {
 			selectors.add(record.agentId().shortValue());
-			record.profile().userName().ifPresent(selectors::add);
+			selectors.add(AgentIdentity.displayName(record.agentId(), record.profile()));
 		}
 		return List.copyOf(selectors);
 	}

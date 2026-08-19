@@ -20,25 +20,38 @@ public final class AgentIdentityVerification {
 		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
 		AgentProfile sol = new AgentProfile("codex", "gpt-5.6-sol", "high", "fast", Optional.empty(), 2,
 				AgentGameMode.SURVIVAL);
-		assertEquals("Sol High | Emerald", AgentIdentity.displayName(sol),
-				"default identity names the model, effort, and visual variant");
-		assertEquals("SolEmer_193A9ADD", AgentIdentity.playerName(id, sol),
-				"fake-player username is readable, unique, and within Minecraft's limit");
+		assertEquals("Sol 193a", AgentIdentity.displayName(id, sol),
+				"default operator name combines the canonical short model label and stable short ID");
+		assertEquals("c02_193A9ADD", AgentIdentity.playerName(id, sol),
+				"fake-player username carries the exact manifest transport identity");
+		assertTrue(AgentIdentity.playerName(id, sol).length() <= 16,
+				"fake-player username stays within Minecraft's limit");
+		assertTrue(AgentIdentity.playerName(id, sol).matches("[A-Za-z0-9_]+"),
+				"fake-player username uses Minecraft-safe characters");
+		assertEquals(new AgentIdentity.SkinIdentity("codex", "sol", 2),
+				AgentIdentity.skinForPlayerName("c02_193A9ADD").orElseThrow(),
+				"manifest player names expose the exact family and variant before the first client snapshot");
 		assertEquals(new AgentIdentity.SkinIdentity("codex", 2),
 				AgentIdentity.skinForPlayerName("SolEmer_193A9ADD").orElseThrow(),
-				"offline player names expose the intended skin before the first client snapshot");
+				"legacy player names retain pre-snapshot skin fallback");
 		assertTrue(AgentIdentity.skinForPlayerName("ordinary_player").isEmpty(),
 				"ordinary player names are not mistaken for arena identities");
-		AgentProfile kimiCoding = new AgentProfile(
-				"kimi", "kimi-for-coding", "high", "priority", Optional.empty(), 0, AgentGameMode.SURVIVAL);
-		String kimiPlayerName = AgentIdentity.playerName(id, kimiCoding);
-		assertEquals(new AgentIdentity.SkinIdentity("kimi", 0),
-				AgentIdentity.skinForPlayerName(kimiPlayerName).orElseThrow(),
-				"truncated Kimi Coding player identities still resolve their custom skin");
-		AgentProfile named = new AgentProfile("kimi", "kimi-code/k3", "low", "priority", Optional.of("Dune Scout"), 0,
+		AgentProfile kimiLong = new AgentProfile(
+				"kimi", "kimi-code/k3-256k", "max", "priority", Optional.empty(), 1, AgentGameMode.SURVIVAL);
+		assertEquals("k11_193A9ADD", AgentIdentity.playerName(id, kimiLong),
+				"digit-bearing model families remain regex-safe and exact");
+		assertEquals(new AgentIdentity.SkinIdentity("kimi", "k3_long", 1),
+				AgentIdentity.skinForPlayerName(AgentIdentity.playerName(id, kimiLong)).orElseThrow(),
+				"digit-bearing manifest identity round-trips");
+		AgentProfile legacyVariant = new AgentProfile(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(), 6, AgentGameMode.SURVIVAL);
+		assertEquals("c02_193A9ADD", AgentIdentity.playerName(id, legacyVariant),
+				"legacy persisted variants normalize through the canonical manifest count");
+		AgentProfile named = new AgentProfile("codex", "gpt-5.6-sol", "low", "priority", Optional.of("Rook"), 0,
 				AgentGameMode.SURVIVAL);
-		assertEquals("Dune Scout", AgentIdentity.displayName(named), "explicit names remain authoritative");
-		assertEquals("Kimi K3 Low | Moon", named.nameTag(), "profile fallback name is provider and skin aware");
+		assertEquals("Rook", AgentIdentity.displayName(id, named), "explicit names remain authoritative");
+		assertEquals(Optional.of("⌁ Rook · Sol"), AgentIdentity.worldTag(named), "explicit world tag");
+		assertTrue(AgentIdentity.worldTag(sol).isEmpty(), "unnamed agents have no world tag");
 
 		assertEquals("GPT 5.6 Sol WM", AgentModelNames.displayName("codex", "gpt-5.6-sol-wm"),
 				"Codex display name is canonical");
@@ -143,7 +156,7 @@ public final class AgentIdentityVerification {
 				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
 				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
 				"project-owned codex entity texture", "non-project manifest texture rejected");
-		return 488;
+		return 494;
 	}
 
 	private static String manifestWith(Consumer<JsonObject> mutation) {

@@ -131,11 +131,16 @@ public final class AgentRegistryVerification {
 		AgentRecord named = registry.create("gpt-5.5", "high", Optional.of("Scout"), START_TIME);
 		assertEquals(named.agentId(), registry.resolve("scout").agentId(), "case-insensitive name resolution");
 		assertEquals(named.agentId(), registry.resolve(named.agentId().shortValue()).agentId(), "short ID resolution");
+		AgentRecord unnamed = registry.create("kimi", "kimi-code/k3-256k", "max", Optional.empty(), START_TIME + 1L);
+		String generatedName = AgentIdentity.displayName(unnamed.agentId(), unnamed.profile());
+		assertEquals(unnamed.agentId(), registry.resolve(generatedName.toUpperCase()).agentId(),
+				"generated operator name resolves case-insensitively");
+		assertTrue(registry.selectors().contains(generatedName), "generated operator name is offered as a selector");
 		expectFailure(
-				() -> registry.create("gpt-5.6-sol", "high", Optional.of("SCOUT"), START_TIME + 1L),
+				() -> registry.create("gpt-5.6-sol", "high", Optional.of("SCOUT"), START_TIME + 2L),
 				"DUPLICATE_AGENT_NAME"
 		);
-		return 3;
+		return 5;
 	}
 
 	private static int verifyPersistenceRecovery() {
@@ -157,8 +162,11 @@ public final class AgentRegistryVerification {
 
 	private static int verifyProviderPersistenceAndMigration() {
 		AgentRegistrySnapshotCodec codec = new AgentRegistrySnapshotCodec();
-		AgentProfile kimi = new AgentProfile("kimi", "kimi-code/k3", "max", Optional.empty(), 2);
-		AgentRecord record = AgentRecord.create(AgentId.random(), kimi, START_TIME);
+		AgentId persistedId = new AgentId(UUID.fromString("abcdef01-1234-5678-9abc-123456789abc"));
+		AgentProfile kimi = new AgentProfile(
+				"kimi", "kimi-code/k3-256k", "max", "priority", Optional.of("Rook"), 2,
+				AgentGameMode.CREATIVE);
+		AgentRecord record = AgentRecord.create(persistedId, kimi, START_TIME);
 		AgentRegistry.Snapshot snapshot = new AgentRegistry.Snapshot(
 				AgentConstants.SCHEMA_VERSION,
 				AgentConstants.DEFAULT_AGENT_LIMIT,
@@ -167,7 +175,19 @@ public final class AgentRegistryVerification {
 		);
 		AgentProfile decoded = codec.decode(codec.encode(snapshot)).records().getFirst().profile();
 		assertEquals("kimi", decoded.provider(), "provider round-trip");
-		assertEquals("Kimi K3 Max | Orchid", decoded.nameTag(), "provider and skin aware name tag");
+		assertEquals("kimi-code/k3-256k", decoded.model(), "model round-trip");
+		assertEquals("max", decoded.reasoning(), "reasoning round-trip");
+		assertEquals("priority", decoded.serviceTier(), "service tier round-trip");
+		assertEquals(Optional.of("Rook"), decoded.userName(), "friendly name round-trip");
+		assertEquals(AgentGameMode.CREATIVE, decoded.gameMode(), "game mode round-trip");
+		assertEquals(
+				AgentVisualIdentity.resolve(kimi.provider(), kimi.model(), kimi.skinVariant()),
+				AgentVisualIdentity.resolve(decoded.provider(), decoded.model(), decoded.skinVariant()),
+				"resolved visual and transport identity round-trip");
+		assertEquals("Rook", AgentIdentity.displayName(persistedId, decoded),
+				"resolved operator identity round-trip");
+		assertEquals(Optional.of("☾ Rook · K3 256K"), AgentIdentity.worldTag(decoded),
+				"resolved friendly world identity round-trip");
 
 		String legacy = codec.encode(snapshot).replace("\"provider\":\"kimi\",", "");
 		assertEquals("codex", codec.decode(legacy).records().getFirst().profile().provider(), "legacy provider migration");
@@ -183,7 +203,7 @@ public final class AgentRegistryVerification {
 		assertEquals("cursor", decodedCursor.provider(), "Cursor provider round-trip");
 		assertEquals("composer-2.5", decodedCursor.model(), "Cursor model round-trip");
 		assertEquals("fast", decodedCursor.serviceTier(), "Cursor native fast mode round-trip");
-		return 5;
+		return 13;
 	}
 
 	private static int verifyEntityLocationPersistenceAndMigration() {

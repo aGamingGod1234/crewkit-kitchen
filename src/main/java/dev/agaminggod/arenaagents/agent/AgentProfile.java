@@ -44,4 +44,9 @@ public record AgentProfile(
 	public String nameTag() {
 		return AgentIdentity.defaultDisplayName(this);
 	}
+
+	public AgentVisualIdentity.Resolved visualIdentity() {
+		return AgentVisualIdentity.resolve(
+				provider, model, Math.floorMod(skinVariant, AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT));
+	}
 }

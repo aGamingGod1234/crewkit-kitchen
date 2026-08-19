@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.control;
 
+import dev.agaminggod.arenaagents.agent.AgentModelNames;
 import java.util.Locale;
 import java.util.Objects;
 
@@ -24,20 +25,7 @@ public final class AgentControlPresentation {
 
 	public static String profileLabel(AgentControlAgent agent) {
 		Objects.requireNonNull(agent, "agent must not be null");
-		return readableModel(agent.model()) + " | " + capitalize(agent.reasoning());
-	}
-
-	public static String readableModel(String model) {
-		String value = Objects.requireNonNull(model, "model must not be null");
-		if (value.startsWith("kimi-code/")) value = value.substring("kimi-code/".length());
-		StringBuilder result = new StringBuilder();
-		for (String part : value.replace('_', '-').split("-")) {
-			if (part.isBlank()) continue;
-			if (!result.isEmpty()) result.append(' ');
-			if (part.equalsIgnoreCase("gpt")) result.append("GPT");
-			else result.append(capitalize(part));
-		}
-		return result.isEmpty() ? value : result.toString();
+		return AgentModelNames.displayName(agent.provider(), agent.model()) + " | " + capitalize(agent.reasoning());
 	}
 
 	public static String speedLabel(String serviceTier) {

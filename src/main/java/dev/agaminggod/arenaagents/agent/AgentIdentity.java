@@ -9,7 +9,8 @@ import java.util.regex.Pattern;
 /** Deterministic, human-readable identity shared by fake players, UI, chat, and skins. */
 public final class AgentIdentity {
 	private static final int PLAYER_NAME_LIMIT = 16;
-	private static final Pattern PLAYER_NAME = Pattern.compile("^([A-Za-z]{3,7})_[0-9A-Fa-f]{8}$");
+	private static final int OPERATOR_ID_LENGTH = 4;
+	private static final Pattern PLAYER_NAME = Pattern.compile("^([A-Za-z][A-Za-z0-9]{1,6})_[0-9A-Fa-f]{8}$");
 	private static final String[][] SKIN_TOKENS = {
 			{"codex", "cyan", "viol", "emer", "ambe"},
 			{"gemini", "azur", "crim", "sola", "verd"},
@@ -19,32 +20,55 @@ public final class AgentIdentity {
 	private AgentIdentity() {
 	}
 
+	/** Compatibility formatter for call sites that do not yet carry the stable agent ID. */
 	public static String displayName(AgentProfile profile) {
 		Objects.requireNonNull(profile, "profile must not be null");
 		return profile.userName().orElseGet(() -> defaultDisplayName(profile));
 	}
 
+	public static String displayName(AgentId id, AgentProfile profile) {
+		Objects.requireNonNull(id, "id must not be null");
+		Objects.requireNonNull(profile, "profile must not be null");
+		return profile.userName().orElseGet(() -> AgentModelNames.shortLabel(profile.provider(), profile.model())
+				+ " " + id.shortValue().substring(0, OPERATOR_ID_LENGTH));
+	}
+
+	public static Optional<String> worldTag(AgentProfile profile) {
+		Objects.requireNonNull(profile, "profile must not be null");
+		return profile.userName().map(name -> {
+			AgentVisualIdentity.Resolved identity = profile.visualIdentity();
+			return identity.providerGlyph() + " " + name + " · "
+					+ AgentModelNames.shortLabel(profile.provider(), profile.model());
+		});
+	}
+
 	public static String defaultDisplayName(AgentProfile profile) {
 		Objects.requireNonNull(profile, "profile must not be null");
-		return modelName(profile.provider(), profile.model()) + " " + title(profile.reasoning())
-				+ " | " + skinName(profile.provider(), profile.skinVariant());
+		return AgentModelNames.shortLabel(profile.provider(), profile.model()) + " " + title(profile.reasoning());
 	}
 
 	public static String playerName(AgentId id, AgentProfile profile) {
 		Objects.requireNonNull(id, "id must not be null");
 		Objects.requireNonNull(profile, "profile must not be null");
-		String identity = compactModel(profile.provider(), profile.model())
-				+ compactSkin(profile.provider(), profile.skinVariant());
+		String identity = profile.visualIdentity().transportCode();
 		String suffix = "_" + id.shortValue().toUpperCase(Locale.ROOT);
-		int maximumIdentityLength = PLAYER_NAME_LIMIT - suffix.length();
-		if (identity.length() > maximumIdentityLength) identity = identity.substring(0, maximumIdentityLength);
-		return identity + suffix;
+		String playerName = identity + suffix;
+		if (playerName.length() > PLAYER_NAME_LIMIT || !PLAYER_NAME.matcher(playerName).matches()) {
+			throw new IllegalStateException("Manifest transport code cannot form a valid Minecraft player name: " + identity);
+		}
+		return playerName;
 	}
 
 	public static Optional<SkinIdentity> skinForPlayerName(String playerName) {
 		Matcher matcher = PLAYER_NAME.matcher(Objects.requireNonNullElse(playerName, ""));
 		if (!matcher.matches()) return Optional.empty();
 		String identity = matcher.group(1).toLowerCase(Locale.ROOT);
+		Optional<AgentVisualIdentity.Resolved> resolved = AgentVisualIdentity.resolveTransportCode(identity);
+		if (resolved.isPresent()) {
+			AgentVisualIdentity.Resolved value = resolved.orElseThrow();
+			return Optional.of(new SkinIdentity(
+					value.providerKey(), value.modelFamilyKey(), value.individualVariant()));
+		}
 		if (identity.startsWith("kimi")) {
 			String token = identity.substring(4);
 			String[] compactTokens = {"moo", "ice", "orc", "sun"};
@@ -64,62 +88,19 @@ public final class AgentIdentity {
 		return Optional.empty();
 	}
 
-	public record SkinIdentity(String provider, int variant) {
+	public record SkinIdentity(String provider, String modelFamily, int variant) {
+		public SkinIdentity(String provider, int variant) {
+			this(provider, "", variant);
+		}
+
 		public SkinIdentity {
 			provider = normalizedProvider(provider);
-			if (variant < 0 || variant >= 4) throw new IllegalArgumentException("skin variant is out of range");
+			modelFamily = Objects.requireNonNull(modelFamily, "modelFamily must not be null")
+					.toLowerCase(Locale.ROOT);
+			if (variant < 0 || variant >= AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT) {
+				throw new IllegalArgumentException("skin variant is out of range");
+			}
 		}
-	}
-
-	public static String skinName(String provider, int variant) {
-		String[] names = switch (normalizedProvider(provider)) {
-			case "gemini" -> new String[]{"Azure", "Crimson", "Solar", "Verdant"};
-			case "kimi" -> new String[]{"Moon", "Ice", "Orchid", "Sunrise"};
-			default -> new String[]{"Cyan", "Violet", "Emerald", "Amber"};
-		};
-		return names[Math.floorMod(variant, names.length)];
-	}
-
-	private static String compactModel(String provider, String model) {
-		String lower = model.toLowerCase(Locale.ROOT);
-		if (lower.contains("sol")) return "Sol";
-		if (lower.contains("terra")) return "Ter";
-		if (lower.contains("luna")) return "Lun";
-		if (lower.contains("k3")) return "K3";
-		if (normalizedProvider(provider).equals("kimi")) return "Kimi";
-		if (normalizedProvider(provider).equals("gemini")) return "Gem";
-		return "GPT";
-	}
-
-	private static String compactSkin(String provider, int variant) {
-		String name = skinName(provider, variant);
-		return name.substring(0, Math.min(4, name.length()));
-	}
-
-	private static String modelName(String provider, String model) {
-		String lower = model.toLowerCase(Locale.ROOT);
-		if (lower.equals("gpt-5.6-sol")) return "Sol";
-		if (lower.equals("gpt-5.6-sol-wm")) return "Sol WM";
-		if (lower.equals("gpt-5.6-terra")) return "Terra";
-		if (lower.equals("gpt-5.6-luna")) return "Luna";
-		if (lower.endsWith("/k3")) return "Kimi K3";
-		if (lower.endsWith("/k3-256k")) return "Kimi K3 256K";
-		if (lower.contains("kimi-for-coding-highspeed")) return "Kimi Coding Fast";
-		if (lower.contains("kimi-for-coding")) return "Kimi Coding";
-		if (lower.startsWith("gemini-")) return readable(model);
-		String readable = readable(model);
-		return normalizedProvider(provider).equals("codex") ? readable : title(provider) + " " + readable;
-	}
-
-	private static String readable(String model) {
-		String value = model.startsWith("kimi-code/") ? model.substring("kimi-code/".length()) : model;
-		StringBuilder result = new StringBuilder();
-		for (String part : value.replace('_', '-').split("-")) {
-			if (part.isBlank()) continue;
-			if (!result.isEmpty()) result.append(' ');
-			result.append(part.equalsIgnoreCase("gpt") ? "GPT" : title(part));
-		}
-		return result.isEmpty() ? model : result.toString();
 	}
 
 	private static String normalizedProvider(String provider) {
