@@ -6,6 +6,8 @@ import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.control.AgentRosterEntry;
+import dev.agaminggod.arenaagents.control.AgentRosterFilter;
+import dev.agaminggod.arenaagents.control.AgentRosterViewState;
 import dev.agaminggod.arenaagents.scenario.ScenarioPlacementMode;
 import java.util.Arrays;
 import java.util.List;
@@ -20,9 +22,93 @@ public final class ScenarioSetupStateVerification {
 		assertions += verifyExactSlotIdentityAndCapacity();
 		assertions += verifyOrderedDraftMutation();
 		assertions += verifyCatalogSafeEntriesAndRepair();
+		assertions += verifyAddFromRemovedFocusedTemplate();
+		assertions += verifyLockedModeRepairKeepsCatalogTemplate();
+		assertions += verifyEmptyCatalogRepairDeclinesAtomically();
+		assertions += verifyRefreshPreservesInspectorUnderQuery();
 		assertions += verifyPreviewIdentityAndLaunchBoundary();
 		assertions += verifyExistingWizardContract();
 		return assertions;
+	}
+
+	private static int verifyLockedModeRepairKeepsCatalogTemplate() {
+		ScenarioLaunchPlan plan = new ScenarioLaunchPlan(
+				ScenarioPreset.LAST_VALLEY.id(),
+				ScenarioPreset.LAST_VALLEY.title(),
+				ScenarioPreset.LAST_VALLEY.mapVersion(),
+				true,
+				ScenarioPlacementMode.IN_FRONT_OF_PLAYER,
+				List.of(new ScenarioLaunchPlan.Agent(
+						1, "Template", "codex", "gpt-5.6-terra", "high", "priority", "Gold",
+						AgentGameMode.CREATIVE))
+		);
+		ScenarioSetupState state = ScenarioSetupState.fromLaunchPlan(plan);
+		assertTrue(state.addDraftSlot(), "locked-mode-only incompatibility still permits append");
+		ScenarioAgentConfig appended = state.roster().getLast();
+		assertEquals("gpt-5.6-terra", appended.model(),
+				"locked-mode-only append preserves the current valid model family");
+		assertEquals("Gold", appended.team(), "locked-mode-only append preserves template team");
+		assertEquals(AgentGameMode.SURVIVAL, appended.gameMode(),
+				"locked-mode-only append repairs only the required game mode");
+		return 4;
+	}
+
+	private static int verifyRefreshPreservesInspectorUnderQuery() {
+		ScenarioSetupState state = ScenarioSetupState.defaults();
+		state.setAgentCount(2);
+		state.selectOnly(0);
+		state.renameSelected("Query One");
+		state.selectOnly(1);
+		state.renameSelected("Query Two");
+		AgentRosterFilter query = new AgentRosterFilter("Query", "", "");
+		AgentRosterViewState view = new AgentRosterViewState();
+		view.reconcile(state.rosterEntries());
+		view.setFilter(query);
+		view.focus("scenario-slot:2");
+
+		state.renameSelected("Edited");
+		List<AgentRosterEntry> refreshed = state.rosterEntries();
+		view.reconcile(refreshed);
+		view.setFilter(query);
+		ScenarioSetupScreen.restoreRefreshFocus(state, view, refreshed);
+
+		assertEquals(1, state.selectedIndex(), "rename refresh keeps the editor on its actual focused slot");
+		assertEquals("scenario-slot:2", view.focusedId(),
+				"rename refresh keeps grid and inspector focus aligned even while the slot is query-hidden");
+		return 2;
+	}
+
+	private static int verifyEmptyCatalogRepairDeclinesAtomically() {
+		ScenarioSetupState state = ScenarioSetupState.defaults();
+		state.renameSelected("Keeper");
+		state.applyTeam("Blue");
+		List<ScenarioAgentConfig> before = state.roster();
+		int focusedBefore = state.selectedIndex();
+		assertTrue(!state.repairFocusedSlot(List.of()), "empty catalog repair safely declines");
+		assertEquals(before, state.roster(), "empty catalog repair leaves the draft byte-for-byte unchanged");
+		assertEquals(focusedBefore, state.selectedIndex(), "empty catalog repair leaves inspector focus unchanged");
+		return 3;
+	}
+
+	private static int verifyAddFromRemovedFocusedTemplate() {
+		List<AgentControlModelOption> original = AgentControlCatalog.currentOptions();
+		try {
+			ScenarioSetupState state = ScenarioSetupState.defaults();
+			state.renameSelected("Original");
+			String removedModel = state.roster().getFirst().model();
+			AgentControlCatalog.installRuntimeCatalog(original.stream()
+					.filter(option -> !option.provider().equals("codex") || !option.model().equals(removedModel))
+					.toList());
+			assertTrue(state.addDraftSlot(), "removed focused template still permits a current-catalog append");
+			assertEquals(1, state.selectedIndex(), "valid replacement append focuses only the new tail slot");
+			assertEquals("Original", state.roster().getFirst().name(),
+					"valid replacement append does not mutate the unavailable source slot");
+			assertEquals("", state.unavailableReasonAt(1),
+					"valid replacement append adopts a complete current-catalog configuration");
+			return 4;
+		} finally {
+			AgentControlCatalog.installRuntimeCatalog(original);
+		}
 	}
 
 	private static int verifyExactSlotIdentityAndCapacity() {

@@ -840,19 +840,19 @@ public final class ScenarioSetupScreen extends Screen {
 		Map<String, AgentVisualIdentity.Resolved> publishedVisuals = Map.copyOf(candidateVisuals);
 		rosterView.reconcile(publishedEntries);
 		rosterView.setFilter(rosterFilter);
-		String preferredFocus = state.slotIdAt(state.selectedIndex());
-		AgentRosterEntry preferredEntry = publishedEntries.stream()
-				.filter(entry -> entry.id().equals(preferredFocus)).findFirst().orElseThrow();
-		if (rosterFilter.matches(preferredEntry)) {
-			rosterView.focus(preferredFocus);
-		} else {
-			publishedEntries.stream().filter(rosterFilter::matches).findFirst().ifPresent(entry -> {
-				rosterView.focus(entry.id());
-				state.selectSlot(entry.id());
-			});
-		}
+		restoreRefreshFocus(state, rosterView, publishedEntries);
 		rosterEntries = publishedEntries;
 		rosterVisuals = publishedVisuals;
+	}
+
+	static void restoreRefreshFocus(
+			ScenarioSetupState state,
+			AgentRosterViewState rosterView,
+			List<AgentRosterEntry> entries
+	) {
+		String preferredFocus = state.slotIdAt(state.selectedIndex());
+		entries.stream().filter(entry -> entry.id().equals(preferredFocus)).findFirst().orElseThrow();
+		rosterView.focus(preferredFocus);
 	}
 
 	private void focusSlot(String id) {

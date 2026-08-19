@@ -85,11 +85,7 @@ public final class AgentRosterTile extends AbstractWidget implements ConsoleFocu
 			float partialTick
 	) {
 		ContentMetrics metrics = contentMetrics(getX(), getY(), getWidth(), getHeight(), selected);
-		int surface = selected ? ConsoleTheme.ROSTER_SELECTED_SURFACE
-				: entry.selectable() ? ConsoleTheme.SURFACE : ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE;
-		if (isHovered() && !selected && entry.selectable()) {
-			surface = ConsoleTheme.SURFACE_HOVER;
-		}
+		int surface = surfaceColor(selected, entry.selectable(), isHovered());
 		graphics.fill(getX(), getY(), getRight(), getBottom(), surface);
 		graphics.outline(
 				getX(), getY(), getWidth(), getHeight(),
@@ -125,6 +121,12 @@ public final class AgentRosterTile extends AbstractWidget implements ConsoleFocu
 		if (metrics.showCheck()) {
 			drawSelectionCheck(graphics, metrics.checkBounds());
 		}
+	}
+
+	public static int surfaceColor(boolean selected, boolean selectable, boolean hovered) {
+		if (!selectable) return ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE;
+		if (selected) return ConsoleTheme.ROSTER_SELECTED_SURFACE;
+		return hovered ? ConsoleTheme.SURFACE_HOVER : ConsoleTheme.SURFACE;
 	}
 
 	private static void drawStateCue(GuiGraphicsExtractor graphics, Bounds bounds, String state) {

@@ -4,6 +4,7 @@ import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentModelNames;
 import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.control.AgentRosterEntry;
 import dev.agaminggod.arenaagents.scenario.ScenarioPlacementMode;
 import java.util.ArrayList;
@@ -157,7 +158,21 @@ public final class ScenarioSetupState {
 
 	public boolean addDraftSlot() {
 		if (roster.size() >= selectedScenario.maximumAgents()) return false;
-		ScenarioAgentConfig template = roster.get(selectedIndex).withName("");
+		ScenarioAgentConfig current = roster.get(selectedIndex);
+		ScenarioAgentConfig template;
+		if (catalogSupports(current)) {
+			template = current.withName("");
+		} else {
+			List<AgentControlModelOption> options = AgentControlCatalog.currentOptions();
+			if (options.isEmpty()) return false;
+			AgentControlModelOption option = options.getFirst();
+			String reasoning = option.reasoningEfforts().contains("high")
+					? "high" : option.reasoningEfforts().getFirst();
+			String serviceTier = option.serviceTiers().contains("priority") ? "priority"
+					: option.serviceTiers().isEmpty() ? "priority" : option.serviceTiers().getFirst();
+			template = new ScenarioAgentConfig(
+					option.provider(), option.model(), reasoning, serviceTier, "", current.team(), current.gameMode());
+		}
 		roster.add(selectedScenario.gameModeLocked()
 				? template.withGameMode(selectedScenario.defaultGameMode())
 				: template);
@@ -275,16 +290,28 @@ public final class ScenarioSetupState {
 	}
 
 	public boolean repairFocusedSlot() {
+		return repairFocusedSlot(AgentControlCatalog.currentOptions());
+	}
+
+	boolean repairFocusedSlot(List<AgentControlModelOption> options) {
+		List<AgentControlModelOption> available = List.copyOf(
+				Objects.requireNonNull(options, "catalog options must not be null"));
+		if (available.isEmpty()) return false;
 		if (unavailableReasonAt(selectedIndex).isEmpty()) return false;
 		ScenarioAgentConfig current = roster.get(selectedIndex);
-		String provider = AgentControlCatalog.providers().contains(current.provider())
-				? current.provider() : AgentControlCatalog.providers().getFirst();
-		List<String> models = AgentControlCatalog.models(provider);
-		String model = models.contains(current.model()) ? current.model() : models.getFirst();
-		List<String> reasoningEfforts = AgentControlCatalog.reasoningEfforts(provider, model);
+		String provider = available.stream().anyMatch(option -> option.provider().equals(current.provider()))
+				? current.provider() : available.getFirst().provider();
+		List<AgentControlModelOption> providerOptions = available.stream()
+				.filter(option -> option.provider().equals(provider)).toList();
+		AgentControlModelOption selectedOption = providerOptions.stream()
+				.filter(option -> option.model().equals(current.model()))
+				.findFirst().orElse(providerOptions.getFirst());
+		String model = selectedOption.model();
+		List<String> reasoningEfforts = selectedOption.reasoningEfforts();
 		String reasoning = reasoningEfforts.contains(current.reasoning())
-				? current.reasoning() : AgentControlCatalog.defaultReasoning(provider, model);
-		List<String> serviceTiers = AgentControlCatalog.serviceTiers(provider, model);
+				? current.reasoning() : reasoningEfforts.contains("high") ? "high" : reasoningEfforts.getFirst();
+		List<String> serviceTiers = selectedOption.serviceTiers().isEmpty()
+				? List.of("priority") : selectedOption.serviceTiers();
 		String serviceTier = serviceTiers.contains(current.serviceTier()) ? current.serviceTier()
 				: serviceTiers.contains("priority") ? "priority" : serviceTiers.getFirst();
 		AgentGameMode gameMode = selectedScenario.gameModeLocked()
@@ -345,6 +372,15 @@ public final class ScenarioSetupState {
 			return AgentControlCatalog.displayName(config.provider(), config.model());
 		}
 		return AgentModelNames.displayName(config.provider(), config.model());
+	}
+
+	private static boolean catalogSupports(ScenarioAgentConfig config) {
+		if (!AgentControlCatalog.providers().contains(config.provider())) return false;
+		if (!AgentControlCatalog.models(config.provider()).contains(config.model())) return false;
+		if (!AgentControlCatalog.reasoningEfforts(config.provider(), config.model()).contains(config.reasoning())) {
+			return false;
+		}
+		return AgentControlCatalog.serviceTiers(config.provider(), config.model()).contains(config.serviceTier());
 	}
 
 	private void updateSelected(ScenarioAgentConfig config) {

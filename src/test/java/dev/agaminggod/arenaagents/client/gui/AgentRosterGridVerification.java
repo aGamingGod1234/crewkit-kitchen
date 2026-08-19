@@ -27,9 +27,21 @@ public final class AgentRosterGridVerification {
 		assertions += verifyWheelContainment();
 		assertions += verifyPagerContract();
 		assertions += verifyCompactContentBounds();
+		assertions += verifyUnavailableSelectionSurface();
 		assertions += verifyPageLayoutValidation();
 		assertions += verifyImmutableSnapshots();
 		return assertions;
+	}
+
+	private static int verifyUnavailableSelectionSurface() {
+		assertEquals(ConsoleTheme.ROSTER_UNAVAILABLE_SURFACE,
+				AgentRosterTile.surfaceColor(true, false, false),
+				"selected unavailable tile keeps the unavailable surface instead of impersonating ready selection");
+		ContentMetrics compact = AgentRosterTile.contentMetrics(0, 0, 28, 28, true);
+		assertTrue(compact.showCheck(), "compact unavailable inclusion still retains its selected check");
+		assertTrue(!compact.showSecondaryText() && !compact.showStateCue(),
+				"compact unavailable inclusion does not depend on an omitted secondary state cue");
+		return 3;
 	}
 
 	private static int verifyTileIdentityAndNarration() {
