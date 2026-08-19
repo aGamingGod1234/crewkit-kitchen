@@ -20,8 +20,11 @@ public final class AgentIdentityVerification {
 		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
 		AgentProfile sol = new AgentProfile("codex", "gpt-5.6-sol", "high", "fast", Optional.empty(), 2,
 				AgentGameMode.SURVIVAL);
-		assertEquals("Sol 193a", AgentIdentity.displayName(id, sol),
-				"default operator name combines the canonical short model label and stable short ID");
+		assertEquals("Sol GTqa3RI0VniavBI0VniavA", AgentIdentity.displayName(id, sol),
+				"default operator name combines the canonical short model label and full encoded ID");
+		AgentId samePrefixId = new AgentId(UUID.fromString("193a9add-2222-2222-9abc-123456789abc"));
+		assertTrue(!AgentIdentity.displayName(id, sol).equalsIgnoreCase(AgentIdentity.displayName(samePrefixId, sol)),
+				"same-model IDs sharing their first eight hex characters keep distinct operator names");
 		assertEquals("c02_193A9ADD", AgentIdentity.playerName(id, sol),
 				"fake-player username carries the exact manifest transport identity");
 		assertTrue(AgentIdentity.playerName(id, sol).length() <= 16,
@@ -34,6 +37,11 @@ public final class AgentIdentityVerification {
 		assertEquals(new AgentIdentity.SkinIdentity("codex", 2),
 				AgentIdentity.skinForPlayerName("SolEmer_193A9ADD").orElseThrow(),
 				"legacy player names retain pre-snapshot skin fallback");
+		assertEquals(new AgentIdentity.SkinIdentity("kimi", 2),
+				AgentIdentity.skinForPlayerName("K3Orch_193A9ADD").orElseThrow(),
+				"known digit-bearing legacy K3 names retain pre-snapshot skin fallback");
+		assertTrue(AgentIdentity.skinForPlayerName("a1ice_12345678").isEmpty(),
+				"ordinary digit-bearing names with a legacy token suffix are rejected");
 		assertTrue(AgentIdentity.skinForPlayerName("ordinary_player").isEmpty(),
 				"ordinary player names are not mistaken for arena identities");
 		AgentProfile kimiLong = new AgentProfile(
@@ -156,7 +164,7 @@ public final class AgentIdentityVerification {
 				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
 				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
 				"project-owned codex entity texture", "non-project manifest texture rejected");
-		return 494;
+		return 497;
 	}
 
 	private static String manifestWith(Consumer<JsonObject> mutation) {

@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.agent;
 
+import java.nio.ByteBuffer;
+import java.util.Base64;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
@@ -9,13 +11,16 @@ import java.util.regex.Pattern;
 /** Deterministic, human-readable identity shared by fake players, UI, chat, and skins. */
 public final class AgentIdentity {
 	private static final int PLAYER_NAME_LIMIT = 16;
-	private static final int OPERATOR_ID_LENGTH = 4;
+	private static final Base64.Encoder OPERATOR_ID_ENCODER = Base64.getUrlEncoder().withoutPadding();
 	private static final Pattern PLAYER_NAME = Pattern.compile("^([A-Za-z][A-Za-z0-9]{1,6})_[0-9A-Fa-f]{8}$");
-	private static final String[][] SKIN_TOKENS = {
-			{"codex", "cyan", "viol", "emer", "ambe"},
-			{"gemini", "azur", "crim", "sola", "verd"},
-			{"kimi", "moon", "ice", "orch", "sunr"}
-	};
+	private static final String[] CODEX_LEGACY_MODELS = {"sol", "ter", "lun", "gpt"};
+	private static final String[] CODEX_LEGACY_VARIANTS = {"cyan", "viol", "emer", "ambe"};
+	private static final String[] GEMINI_LEGACY_MODELS = {"gem"};
+	private static final String[] GEMINI_LEGACY_VARIANTS = {"azur", "crim", "sola", "verd"};
+	private static final String[] KIMI_K3_LEGACY_MODELS = {"k3"};
+	private static final String[] KIMI_K3_LEGACY_VARIANTS = {"moon", "ice", "orch", "sunr"};
+	private static final String[] KIMI_LEGACY_MODELS = {"kimi"};
+	private static final String[] KIMI_LEGACY_VARIANTS = {"moo", "ice", "orc", "sun"};
 
 	private AgentIdentity() {
 	}
@@ -30,7 +35,14 @@ public final class AgentIdentity {
 		Objects.requireNonNull(id, "id must not be null");
 		Objects.requireNonNull(profile, "profile must not be null");
 		return profile.userName().orElseGet(() -> AgentModelNames.shortLabel(profile.provider(), profile.model())
-				+ " " + id.shortValue().substring(0, OPERATOR_ID_LENGTH));
+				+ " " + encodedOperatorId(id));
+	}
+
+	private static String encodedOperatorId(AgentId id) {
+		ByteBuffer bytes = ByteBuffer.allocate(Long.BYTES * 2);
+		bytes.putLong(id.value().getMostSignificantBits());
+		bytes.putLong(id.value().getLeastSignificantBits());
+		return OPERATOR_ID_ENCODER.encodeToString(bytes.array());
 	}
 
 	public static Optional<String> worldTag(AgentProfile profile) {
@@ -69,19 +81,24 @@ public final class AgentIdentity {
 			return Optional.of(new SkinIdentity(
 					value.providerKey(), value.modelFamilyKey(), value.individualVariant()));
 		}
-		if (identity.startsWith("kimi")) {
-			String token = identity.substring(4);
-			String[] compactTokens = {"moo", "ice", "orc", "sun"};
-			for (int variant = 0; variant < compactTokens.length; variant++) {
-				if (token.equals(compactTokens[variant])) {
-					return Optional.of(new SkinIdentity("kimi", variant));
-				}
-			}
-		}
-		for (String[] family : SKIN_TOKENS) {
-			for (int variant = 0; variant < family.length - 1; variant++) {
-				if (identity.endsWith(family[variant + 1])) {
-					return Optional.of(new SkinIdentity(family[0], variant));
+		return legacySkin(identity, "codex", CODEX_LEGACY_MODELS, CODEX_LEGACY_VARIANTS)
+				.or(() -> legacySkin(identity, "gemini", GEMINI_LEGACY_MODELS, GEMINI_LEGACY_VARIANTS))
+				.or(() -> legacySkin(identity, "kimi", KIMI_K3_LEGACY_MODELS, KIMI_K3_LEGACY_VARIANTS))
+				.or(() -> legacySkin(identity, "kimi", KIMI_LEGACY_MODELS, KIMI_LEGACY_VARIANTS));
+	}
+
+	private static Optional<SkinIdentity> legacySkin(
+			String identity,
+			String provider,
+			String[] modelTokens,
+			String[] variantTokens
+	) {
+		for (String modelToken : modelTokens) {
+			if (!identity.startsWith(modelToken)) continue;
+			String variantToken = identity.substring(modelToken.length());
+			for (int variant = 0; variant < variantTokens.length; variant++) {
+				if (variantToken.equals(variantTokens[variant])) {
+					return Optional.of(new SkinIdentity(provider, variant));
 				}
 			}
 		}

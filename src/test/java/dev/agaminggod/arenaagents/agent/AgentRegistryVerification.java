@@ -1,7 +1,9 @@
 package dev.agaminggod.arenaagents.agent;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -17,6 +19,7 @@ public final class AgentRegistryVerification {
 		assertions += verifyCoordinatorCompletion();
 		assertions += verifyQueueAndSteeringBounds();
 		assertions += verifyIdentityResolution();
+		assertions += verifyIdentityUniqueness();
 		assertions += verifyPersistenceRecovery();
 		assertions += verifyProviderPersistenceAndMigration();
 		assertions += verifyEntityLocationPersistenceAndMigration();
@@ -137,10 +140,63 @@ public final class AgentRegistryVerification {
 				"generated operator name resolves case-insensitively");
 		assertTrue(registry.selectors().contains(generatedName), "generated operator name is offered as a selector");
 		expectFailure(
-				() -> registry.create("gpt-5.6-sol", "high", Optional.of("SCOUT"), START_TIME + 2L),
+				() -> registry.create("codex", "gpt-5.6-sol", "high", Optional.of(generatedName.toUpperCase()),
+						START_TIME + 2L),
 				"DUPLICATE_AGENT_NAME"
 		);
-		return 5;
+		expectFailure(
+				() -> registry.create("gpt-5.6-sol", "high", Optional.of("SCOUT"), START_TIME + 3L),
+				"DUPLICATE_AGENT_NAME"
+		);
+		for (int index = 0; index < 8; index++) {
+			registry.create("codex", "gpt-5.6-sol", "high", Optional.empty(), START_TIME + 4L + index);
+		}
+		assertEquals(registry.records().size(), new HashSet<>(registry.records().stream()
+				.map(record -> AgentIdentity.displayName(record.agentId(), record.profile()).toLowerCase(Locale.ROOT))
+				.toList()).size(), "create preserves case-insensitive display-name uniqueness");
+		assertEquals(registry.records().size(), new HashSet<>(registry.records().stream()
+				.map(record -> AgentIdentity.playerName(record.agentId(), record.profile()).toLowerCase(Locale.ROOT))
+				.toList()).size(), "create preserves case-insensitive technical-name uniqueness");
+		return 8;
+	}
+
+	private static int verifyIdentityUniqueness() {
+		AgentId first = new AgentId(UUID.fromString("193a9add-1111-1111-9abc-123456789abc"));
+		AgentId second = new AgentId(UUID.fromString("193a9add-2222-2222-9abc-123456789abc"));
+		AgentProfile unnamed = new AgentProfile("codex", "gpt-5.6-sol", "high", Optional.empty(), 0);
+		AgentRecord firstRecord = AgentRecord.create(first, unnamed, START_TIME);
+		AgentRecord secondRecord = AgentRecord.create(second, unnamed, START_TIME + 1L);
+		assertTrue(!AgentIdentity.displayName(first, unnamed).equalsIgnoreCase(
+				AgentIdentity.displayName(second, unnamed)), "full IDs distinguish same-prefix generated names");
+		assertEquals(AgentIdentity.playerName(first, unnamed), AgentIdentity.playerName(second, unnamed),
+				"technical collision fixture shares its lossy transport name");
+		expectFailure(
+				() -> AgentRegistry.restore(snapshot(firstRecord, secondRecord), () -> { }, transition -> { },
+						START_TIME + 2L),
+				"DUPLICATE_AGENT_PLAYER_NAME"
+		);
+
+		String generatedName = AgentIdentity.displayName(first, unnamed);
+		AgentId namedId = new AgentId(UUID.fromString("abcdef01-3333-3333-9abc-123456789abc"));
+		AgentProfile named = new AgentProfile(
+				"cursor", "composer-2.5", "high", "fast", Optional.of(generatedName.toUpperCase()), 1,
+				AgentGameMode.SURVIVAL);
+		expectFailure(
+				() -> AgentRegistry.restore(
+						snapshot(firstRecord, AgentRecord.create(namedId, named, START_TIME + 1L)),
+						() -> { }, transition -> { }, START_TIME + 2L),
+				"DUPLICATE_AGENT_NAME"
+		);
+		return 4;
+	}
+
+	private static AgentRegistry.Snapshot snapshot(AgentRecord... records) {
+		return new AgentRegistry.Snapshot(
+				AgentConstants.SCHEMA_VERSION,
+				AgentConstants.DEFAULT_AGENT_LIMIT,
+				AgentConstants.DEFAULT_QUEUE_LIMIT,
+				List.of(records)
+		);
 	}
 
 	private static int verifyPersistenceRecovery() {

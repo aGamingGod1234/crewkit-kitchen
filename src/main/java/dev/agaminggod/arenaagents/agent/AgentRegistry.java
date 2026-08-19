@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.agent;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -47,7 +48,7 @@ public final class AgentRegistry {
 		}
 		this.onChange = Objects.requireNonNull(onChange, "onChange must not be null");
 		this.transitionSink = Objects.requireNonNull(transitionSink, "transitionSink must not be null");
-		validateUniqueNames(records.values());
+		validateUniqueIdentities(records.values());
 	}
 
 	public static AgentRegistry createDefault(Runnable onChange, Consumer<AgentTransition> transitionSink) {
@@ -135,13 +136,14 @@ public final class AgentRegistry {
 		}
 		Optional<String> checkedName = Objects.requireNonNull(userName, "userName must not be null")
 				.map(AgentValidators::requireUserName);
-		checkedName.ifPresent(this::requireUniqueName);
+		checkedName.ifPresent(this::requireUniqueDisplayName);
 		AgentId id;
+		AgentProfile profile;
 		do {
 			id = AgentId.random();
-		} while (records.containsKey(id));
-		int skinVariant = Math.floorMod(id.value().hashCode(), AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT);
-		AgentProfile profile = new AgentProfile(provider, model, reasoning, serviceTier, checkedName, skinVariant, gameMode);
+			int skinVariant = Math.floorMod(id.value().hashCode(), AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT);
+			profile = new AgentProfile(provider, model, reasoning, serviceTier, checkedName, skinVariant, gameMode);
+		} while (!identityAvailable(id, profile));
 		AgentRecord created = AgentRecord.create(id, profile, nowEpochMs);
 		records.put(id, created);
 		onChange.run();
@@ -439,26 +441,38 @@ public final class AgentRegistry {
 		return transition;
 	}
 
-	private void requireUniqueName(String proposedName) {
-		String folded = proposedName.toLowerCase(Locale.ROOT);
+	private void requireUniqueDisplayName(String proposedName) {
 		boolean duplicate = records.values().stream()
-				.flatMap(record -> record.profile().userName().stream())
-				.anyMatch(existing -> existing.toLowerCase(Locale.ROOT).equals(folded));
+				.map(record -> AgentIdentity.displayName(record.agentId(), record.profile()))
+				.anyMatch(existing -> existing.equalsIgnoreCase(proposedName));
 		if (duplicate) {
 			throw new AgentDomainException("DUPLICATE_AGENT_NAME", "Agent name is already in use: " + proposedName);
 		}
 	}
 
-	private static void validateUniqueNames(Collection<AgentRecord> records) {
-		ArrayList<String> names = new ArrayList<>();
+	private boolean identityAvailable(AgentId id, AgentProfile profile) {
+		if (records.containsKey(id)) return false;
+		String displayName = AgentIdentity.displayName(id, profile);
+		String playerName = AgentIdentity.playerName(id, profile);
+		return records.values().stream().noneMatch(record ->
+				AgentIdentity.displayName(record.agentId(), record.profile()).equalsIgnoreCase(displayName)
+						|| AgentIdentity.playerName(record.agentId(), record.profile()).equalsIgnoreCase(playerName));
+	}
+
+	private static void validateUniqueIdentities(Collection<AgentRecord> records) {
+		HashSet<String> displayNames = new HashSet<>();
+		HashSet<String> playerNames = new HashSet<>();
 		for (AgentRecord record : records) {
-			record.profile().userName().ifPresent(name -> {
-				String folded = name.toLowerCase(Locale.ROOT);
-				if (names.contains(folded)) {
-					throw new AgentDomainException("DUPLICATE_AGENT_NAME", "Duplicate agent name in snapshot: " + name);
-				}
-				names.add(folded);
-			});
+			String displayName = AgentIdentity.displayName(record.agentId(), record.profile());
+			if (!displayNames.add(displayName.toLowerCase(Locale.ROOT))) {
+				throw new AgentDomainException(
+						"DUPLICATE_AGENT_NAME", "Duplicate agent name in snapshot: " + displayName);
+			}
+			String playerName = AgentIdentity.playerName(record.agentId(), record.profile());
+			if (!playerNames.add(playerName.toLowerCase(Locale.ROOT))) {
+				throw new AgentDomainException(
+						"DUPLICATE_AGENT_PLAYER_NAME", "Duplicate technical player name in snapshot: " + playerName);
+			}
 		}
 	}
 
