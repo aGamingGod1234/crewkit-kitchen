@@ -10,6 +10,7 @@ const MAX_DIAGNOSTICS = 4096;
 const MAX_TEXT = 4096;
 const MAX_ASSERTION_ARGS = 8192;
 const MAX_EVIDENCE_BYTES = 16_384;
+const MAX_EVIDENCE_TAIL_BYTES = 262_144;
 const MAX_SCENARIOS = 24;
 const MAX_MATRIX_REPORT_BYTES = 262_144;
 const POLL_INTERVAL_MS = 50;
@@ -17,7 +18,7 @@ const SENSITIVE_REPORT_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refr
 const REPORT_SECRET_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 const REPORT_BEARER_TEXT = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const REPORT_QUOTED_SECRET_KEY = /(["'])(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\1\s*:\s*(["'])/gi;
-const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'assert', 'assertions']);
+const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'rosterSize', 'assert', 'assertions']);
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
 	chat: new Set(['type', 'message']),
@@ -89,10 +90,12 @@ export function normalizeHeadlessScenario(value, index = 0) {
 	if (!Array.isArray(assertions) || assertions.length === 0) throw new TypeError('scenario requires one or more assertions');
 	const timeoutMs = value.timeoutMs;
 	if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMEOUT_MS) throw new RangeError('timeoutMs must be between 1 and 900000');
+	const rosterSize = value.rosterSize ?? 1;
+	if (![1, 8, 16].includes(rosterSize)) throw new RangeError('rosterSize must be one of 1, 8, or 16');
 	const scenario = {
 		id: text(value.id, `scenarios[${index}].id`), provider: text(value.provider, `scenarios[${index}].provider`),
 		model: text(value.model, `scenarios[${index}].model`), reasoningEffort: text(value.reasoningEffort, `scenarios[${index}].reasoningEffort`),
-		serviceTier: text(value.serviceTier ?? 'priority', `scenarios[${index}].serviceTier`), task: text(value.task, `scenarios[${index}].task`), timeoutMs,
+		serviceTier: text(value.serviceTier ?? 'priority', `scenarios[${index}].serviceTier`), task: text(value.task, `scenarios[${index}].task`), timeoutMs, rosterSize,
 		assertions: assertions.map(normalizeAssertion),
 	};
 	if (!PROVIDERS.has(scenario.provider)) throw new TypeError(`unsupported provider '${scenario.provider}'`);
@@ -120,7 +123,7 @@ export function selectHeadlessScenarios(matrix, selector) {
 
 export function scenarioReport(status, scenario, fields = {}) {
 	const normalizedStatus = text(status, 'status').toUpperCase();
-	const report = { status: normalizedStatus, scenarioId: scenario.id, profile: { provider: scenario.provider, model: scenario.model, reasoningEffort: scenario.reasoningEffort, serviceTier: scenario.serviceTier } };
+	const report = { status: normalizedStatus, scenarioId: scenario.id, rosterSize: scenario.rosterSize ?? 1, profile: { provider: scenario.provider, model: scenario.model, reasoningEffort: scenario.reasoningEffort, serviceTier: scenario.serviceTier } };
 	for (const [key, value] of Object.entries(fields)) {
 		if (key === 'status') continue;
 		if (key === 'diagnostics' || key === 'error') report[key] = redactReportText(value, MAX_DIAGNOSTICS);
@@ -133,7 +136,13 @@ function boundReportValue(value, depth = 0) {
 	if (depth > 6) return '[TRUNCATED]';
 	if (value === null || typeof value !== 'object') return typeof value === 'string' ? redactReportText(value, MAX_DIAGNOSTICS) : value;
 	if (Array.isArray(value)) return value.slice(0, 64).map((entry) => boundReportValue(entry, depth + 1));
-	return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, entry]) => [key.slice(0, 128), SENSITIVE_REPORT_KEY.test(key) ? '[REDACTED]' : boundReportValue(entry, depth + 1)]));
+	return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, entry]) => [key.slice(0, 128), SENSITIVE_REPORT_KEY.test(key) && !safeTokenCounts(key, entry) ? '[REDACTED]' : boundReportValue(entry, depth + 1)]));
+}
+
+function safeTokenCounts(key, value) {
+	if (key !== 'tokens' || !value || typeof value !== 'object' || Array.isArray(value)) return false;
+	const categories = new Set(['input', 'output', 'reasoning', 'cached', 'cacheWrite']);
+	return Object.entries(value).every(([category, count]) => categories.has(category) && (count === null || Number.isSafeInteger(count) && count >= 0));
 }
 
 /** Evaluate only evidence that was observed from the server/protocol path. */
@@ -164,6 +173,12 @@ export async function runHeadlessScenario({
 	const directory = normalizeRunDirectory(runDirectory);
 	const assertions = scenario.assertions ?? scenario.assert ?? [];
 	validateRunnerScenario(scenario, assertions);
+	if ((scenario.rosterSize ?? 1) > 1) {
+		return runConcurrentHeadlessScenario({
+			scenario, directory, rcon, now, readFile, readTail, fileSize, writeFile, protocolAudit,
+			providerTurnsPath, providerTurnRecorder, poll,
+		});
+	}
 	const profile = {
 		provider: boundedScalar(scenario.provider), model: boundedScalar(scenario.model),
 		reasoningEffort: boundedScalar(scenario.reasoningEffort), serviceTier: boundedScalar(scenario.serviceTier),
@@ -175,11 +190,11 @@ export async function runHeadlessScenario({
 		const report = scenarioReport(cleanup.status === 'FAILED' ? 'FAILED' : 'SKIPPED', scenario, { classification: cleanup.status === 'FAILED' ? 'CLEANUP_FAILURE' : 'SKIPPED_PROFILE', reason: scenario.skipReason ?? scenario.reason ?? 'provider profile unavailable', cleanup });
 		return await persistReportOrFailure(scenario, report, directory, writeFile);
 	}
-	const generatedName = generatedAgentName(scenario, now);
 	const commands = [];
 	const rconEvidence = [];
 	const startedAt = Number(now());
 	if (!Number.isFinite(startedAt)) throw new TypeError('now must return a finite number');
+	const generatedName = generatedAgentName(scenario, startedAt);
 	const timeoutMs = scenario.timeoutMs;
 	const deadline = startedAt + timeoutMs;
 	const tailReader = readTail ?? (readFile === defaultReadFile
@@ -191,6 +206,7 @@ export async function runHeadlessScenario({
 	let terminalState = null;
 	let classification = null;
 	let diagnostics = '';
+	let minecraftMspt = null;
 	let closed = false;
 	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
 		const commandText = String(value);
@@ -250,12 +266,14 @@ export async function runHeadlessScenario({
 		if (classification === null && terminalState === 'ERROR') classification = 'ERROR';
 		if (classification === null && terminalState === 'DEAD') classification = 'DEAD';
 		if (classification === null && terminalState === null) classification = 'TIMEOUT';
+		try { minecraftMspt = parseMinecraftMspt((await command('tick query', { attempt: 0 })).text); } catch { /* optional server metric */ }
 		const evidenceResult = await collectHeadlessEvidence({
 			directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence,
 			readOnlyCommand: (value) => command(value, { readOnly: true, attempt: 0 }),
 			deadline, now, startedAt, poll,
 		});
 		const { fileEvidence, evidence, assertionResult } = evidenceResult;
+		const resolvedAgentId = resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, generatedName);
 		if (classification === null && !assertionResult.passed) classification = 'ASSERTION_MISMATCH';
 		if (classification === null) classification = 'PASSED';
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
@@ -264,6 +282,7 @@ export async function runHeadlessScenario({
 			classification, generatedName, lifecycle: terminalState, elapsedMs,
 			commands, assertions: assertionResult.results, evidence: evidenceSummary(directory, fileEvidence, protocolAudit),
 			timings: timingSummary(profile, fileEvidence, protocolAudit, elapsedMs),
+			metrics: performanceMetrics(profile, fileEvidence, protocolAudit, resolvedAgentId, { minecraftMspt }),
 			diagnostics,
 			cleanup: { status: 'PENDING' },
 		});
@@ -287,6 +306,174 @@ export async function runHeadlessScenario({
 			generatedName, commands, cleanup: cleanupError === null ? { status: 'CLEAN' } : { status: 'FAILED', diagnostics: cleanupError?.message ?? String(cleanupError) },
 		});
 		return await persistReportOrFailure(scenario, report, directory, writeFile);
+	}
+}
+
+async function runConcurrentHeadlessScenario({
+	scenario, directory, rcon, now, readFile, readTail, fileSize, writeFile, protocolAudit,
+	providerTurnsPath, providerTurnRecorder, poll,
+}) {
+	const assertions = scenario.assertions ?? scenario.assert ?? [];
+	const profile = {
+		provider: boundedScalar(scenario.provider), model: boundedScalar(scenario.model),
+		reasoningEffort: boundedScalar(scenario.reasoningEffort), serviceTier: boundedScalar(scenario.serviceTier),
+	};
+	if (scenario.skip === true || scenario.skipped === true || scenario.profileAvailable === false) {
+		let cleanup = { status: 'NOT_REQUIRED' };
+		try { await closeResources(rcon, providerTurnRecorder); } catch (error) { cleanup = { status: 'FAILED', diagnostics: boundedText(error?.message ?? error, MAX_DIAGNOSTICS) }; }
+		return persistReportOrFailure(scenario, scenarioReport(cleanup.status === 'FAILED' ? 'FAILED' : 'SKIPPED', scenario, {
+			classification: cleanup.status === 'FAILED' ? 'CLEANUP_FAILURE' : 'SKIPPED_PROFILE',
+			reason: scenario.skipReason ?? scenario.reason ?? 'provider profile unavailable', cleanup,
+		}), directory, writeFile);
+	}
+	const startedAt = Number(now());
+	if (!Number.isFinite(startedAt)) throw new TypeError('now must return a finite number');
+	const deadline = startedAt + scenario.timeoutMs;
+	const tailReader = readTail ?? (readFile === defaultReadFile
+		? defaultReadTail
+		: async (file, limit, offset = 0) => boundedTailText(Buffer.from(await readFile(file, 'utf8')).subarray(offset), limit));
+	const evidencePaths = resolveEvidencePaths(directory, protocolAudit, providerTurnsPath);
+	const evidenceOffsets = await captureEvidenceOffsets(evidencePaths, fileSize);
+	const protocolAuditOffset = auditRows(protocolAudit).length;
+	const members = Array.from({ length: scenario.rosterSize }, (_, index) => ({
+		index,
+		generatedName: generatedAgentName(scenario, startedAt, index),
+		agentId: null,
+		lifecycle: null,
+		classification: null,
+		diagnostics: '',
+		started: false,
+	}));
+	const commands = [];
+	const rconEvidence = [];
+	const command = async (value, { readOnly = false, deadlineMs = deadline, attempt = 0 } = {}) => {
+		const commandText = String(value);
+		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
+		commands.push(commandText);
+		const result = await withDeadline(() => rcon.command(commandText), deadlineMs, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT');
+		const textValue = boundedText(result?.text ?? result, MAX_EVIDENCE_BYTES);
+		if (readOnly) rconEvidence.push({ command: commandText, text: textValue });
+		return { result, text: textValue };
+	};
+	try {
+		await command('execute in minecraft:overworld run forceload add 0 0');
+		try {
+			const floor = await command('execute in minecraft:overworld run fill -8 200 -8 8 200 8 minecraft:stone');
+			if (isFailedResponse(floor.text)) throw new Error('Could not prepare the headless arena floor');
+			const clearance = await command('execute in minecraft:overworld run fill -8 201 -8 8 204 8 minecraft:air');
+			if (isFailedResponse(clearance.text)) throw new Error('Could not clear the headless arena spawn');
+			const summons = await Promise.allSettled(members.map((member) => {
+				const position = rosterPosition(member.index);
+				return command(`execute in minecraft:overworld positioned ${position.x} 201 ${position.z} run codex summon-configured ${scenario.provider} ${scenario.model} ${scenario.reasoningEffort} ${scenario.serviceTier ?? 'priority'} survival ${member.generatedName}`);
+			}));
+			for (let index = 0; index < summons.length; index += 1) {
+				const result = summons[index];
+				const member = members[index];
+				if (result.status === 'rejected') {
+					member.classification = result.reason?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR';
+					member.diagnostics = boundedText(result.reason?.message ?? result.reason, MAX_DIAGNOSTICS);
+				} else if (isSkippedResponse(result.value.text)) member.classification = 'SKIPPED_PROFILE';
+				else if (!isAcceptedResponse(result.value.text)) {
+					member.classification = 'ERROR';
+					member.diagnostics = result.value.text;
+				}
+			}
+		} finally {
+			const cleanupDeadline = Math.max(deadline, Number(now()) + 10_000);
+			await command('execute in minecraft:overworld run forceload remove 0 0', { deadlineMs: cleanupDeadline });
+		}
+
+		await resolveConcurrentAgentIds({
+			members: members.filter((member) => member.classification === null), scenario, directory, readFile, tailReader,
+			protocolAudit, providerTurnsPath, evidenceOffsets, deadline, now, startedAt, poll,
+		});
+		const startable = members.filter((member) => member.classification === null && member.agentId !== null);
+		const starts = await Promise.allSettled(startable.map((member) => command(`codex start ${member.generatedName} ${scenario.task}`)));
+		for (let index = 0; index < starts.length; index += 1) {
+			const member = startable[index];
+			const result = starts[index];
+			if (result.status === 'rejected' || isFailedResponse(result.value?.text)) {
+				member.classification = result.status === 'rejected' && result.reason?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR';
+				member.diagnostics = boundedText(result.status === 'rejected' ? result.reason?.message ?? result.reason : result.value.text, MAX_DIAGNOSTICS);
+			} else member.started = true;
+		}
+		let attempt = 0;
+		while (members.some((member) => member.started && member.lifecycle === null && member.classification === null)) {
+			if (logicalNow(now, startedAt, attempt) >= deadline) break;
+			const active = members.filter((member) => member.started && member.lifecycle === null && member.classification === null);
+			const statuses = await Promise.allSettled(active.map((member) => command(`codex status ${member.generatedName}`, { attempt })));
+			for (let index = 0; index < statuses.length; index += 1) {
+				const member = active[index];
+				const result = statuses[index];
+				if (result.status === 'rejected') {
+					member.classification = result.reason?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR';
+					member.diagnostics = boundedText(result.reason?.message ?? result.reason, MAX_DIAGNOSTICS);
+					continue;
+				}
+				const state = parseLifecycle(result.value.text);
+				if (LIFECYCLE_STATES.has(state)) member.lifecycle = state;
+			}
+			if (!members.some((member) => member.started && member.lifecycle === null && member.classification === null)) break;
+			try { await withDeadline(() => poll({ phase: 'status', attempt, deadline, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT'); }
+			catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; break; }
+			attempt += 1;
+		}
+		for (const member of members) {
+			if (member.classification !== null) continue;
+			if (member.lifecycle === 'ERROR') member.classification = 'ERROR';
+			else if (member.lifecycle === 'DEAD') member.classification = 'DEAD';
+			else if (member.lifecycle === null) member.classification = 'TIMEOUT';
+		}
+		let minecraftMspt = null;
+		try { minecraftMspt = parseMinecraftMspt((await command('tick query')).text); } catch { /* optional server metric */ }
+		const evidenceResult = await collectConcurrentHeadlessEvidence({
+			members, directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset,
+			assertions, rconEvidence, readOnlyCommand: (value) => command(value, { readOnly: true }), deadline, now, startedAt, poll,
+		});
+		for (const member of members) {
+			const isolated = evidenceResult.byAgent.get(member.agentId);
+			if (member.classification === null && isolated !== undefined && !isolated.assertionResult.passed) member.classification = 'ASSERTION_MISMATCH';
+			if (member.classification === null) member.classification = 'PASSED';
+		}
+		const agentReports = members.map((member) => {
+			const isolated = evidenceResult.byAgent.get(member.agentId);
+			return boundReportValue({
+				agentId: member.agentId,
+				generatedName: member.generatedName,
+				status: member.classification === 'PASSED' ? 'PASSED' : member.classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED',
+				classification: member.classification,
+				lifecycle: member.lifecycle,
+				assertions: isolated?.assertionResult.results ?? [],
+				evidence: isolated === undefined ? null : evidenceSummary(directory, isolated.fileEvidence, protocolAudit),
+				diagnostics: member.diagnostics,
+			});
+		});
+		const failed = agentReports.some((member) => member.status === 'FAILED');
+		const passed = agentReports.some((member) => member.status === 'PASSED');
+		const status = failed ? 'FAILED' : passed ? 'PASSED' : 'SKIPPED';
+		const classification = failed ? (agentReports.some((member) => member.classification === 'ASSERTION_MISMATCH') ? 'ASSERTION_MISMATCH' : 'ERROR') : passed ? 'PASSED' : 'SKIPPED_PROFILE';
+		const elapsedMs = Math.max(0, Number(now()) - startedAt);
+		let report = scenarioReport(status, scenario, {
+			classification, lifecycle: members.every((member) => member.lifecycle === 'COMPLETED') ? 'COMPLETED' : null,
+			elapsedMs, commands, agents: agentReports,
+			evidence: evidenceSummary(directory, evidenceResult.fileEvidence, protocolAudit),
+			timings: timingSummary(profile, evidenceResult.fileEvidence, protocolAudit, elapsedMs),
+			metrics: performanceMetrics(profile, evidenceResult.fileEvidence, protocolAudit, null, { minecraftMspt }),
+			cleanup: { status: 'PENDING' },
+		});
+		try { await closeResources(rcon, providerTurnRecorder); }
+		catch (error) { return finishReport(scenario, report, directory, writeFile, 'CLEANUP_FAILURE', error); }
+		report = scenarioReport(report.status, scenario, { ...report, cleanup: { status: 'CLEAN' } });
+		return persistReportOrFailure(scenario, report, directory, writeFile);
+	} catch (error) {
+		let cleanupError = null;
+		try { await closeResources(rcon, providerTurnRecorder); } catch (failure) { cleanupError = failure; }
+		return persistReportOrFailure(scenario, scenarioReport('FAILED', scenario, {
+			classification: cleanupError === null ? (error?.code === 'HEADLESS_TIMEOUT' ? 'TIMEOUT' : 'ERROR') : 'CLEANUP_FAILURE',
+			diagnostics: cleanupError?.message ?? error?.message ?? String(error), commands,
+			agents: members.map((member) => ({ agentId: member.agentId, generatedName: member.generatedName, classification: member.classification ?? 'ERROR', lifecycle: member.lifecycle })),
+			cleanup: cleanupError === null ? { status: 'CLEAN' } : { status: 'FAILED', diagnostics: cleanupError.message },
+		}), directory, writeFile);
 	}
 }
 
@@ -497,6 +684,116 @@ async function collectHeadlessEvidence({ directory, readFile, tailReader, protoc
 	return { fileEvidence, evidence, assertionResult };
 }
 
+async function resolveConcurrentAgentIds({ members, scenario, directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, deadline, now, startedAt, poll }) {
+	let attempt = 0;
+	while (members.some((member) => member.agentId === null && member.classification === null)) {
+		const fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
+		const rows = [...fileEvidence.protocolRows, ...auditRows(protocolAudit)].map(unwrapAuditRow).filter(Boolean);
+		for (const member of members) {
+			if (member.agentId !== null || member.classification !== null) continue;
+			const candidates = rows.filter((row) => row.type === 'agent_snapshot' && row.payload?.name === member.generatedName);
+			if (candidates.length === 0) continue;
+			const exact = candidates.filter((row) => row.payload?.provider === scenario.provider
+				&& row.payload?.model === scenario.model
+				&& row.payload?.reasoningEffort === scenario.reasoningEffort
+				&& row.payload?.serviceTier === scenario.serviceTier);
+			const ids = [...new Set(exact.map(authoritativeAgentId).filter(Boolean))];
+			if (ids.length !== 1) {
+				member.classification = 'ERROR';
+				member.diagnostics = ids.length === 0 ? 'Authoritative agent snapshot did not preserve the exact requested profile' : 'Authoritative agent snapshot identity was ambiguous';
+			} else member.agentId = ids[0];
+		}
+		const assigned = new Map();
+		for (const member of members.filter((entry) => entry.agentId !== null)) {
+			const prior = assigned.get(member.agentId);
+			if (prior === undefined) assigned.set(member.agentId, member);
+			else {
+				prior.classification = 'ERROR';
+				prior.diagnostics = 'Authoritative agent snapshot identity was duplicated';
+				member.classification = 'ERROR';
+				member.diagnostics = 'Authoritative agent snapshot identity was duplicated';
+			}
+		}
+		if (!members.some((member) => member.agentId === null && member.classification === null)) break;
+		if (logicalNow(now, startedAt, attempt) >= deadline) break;
+		try { await withDeadline(() => poll({ phase: 'identity', attempt, deadline, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT'); }
+		catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; break; }
+		attempt += 1;
+	}
+	for (const member of members) {
+		if (member.agentId === null && member.classification === null) {
+			member.classification = 'ERROR';
+			member.diagnostics = 'Authoritative agent snapshot identity was unavailable before the deadline';
+		}
+	}
+}
+
+function authoritativeAgentId(row) {
+	const envelopeId = boundedAgentId(row?.agentId);
+	const payloadId = boundedAgentId(row?.payload?.agentId);
+	return envelopeId !== null && envelopeId === payloadId ? envelopeId : null;
+}
+
+function resolveExactSnapshotAgentId(fileEvidence, protocolAudit, scenario, generatedName) {
+	const rows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)].map(unwrapAuditRow).filter(Boolean);
+	const ids = [...new Set(rows.filter((row) => row.type === 'agent_snapshot' && row.payload?.name === generatedName
+		&& row.payload?.provider === scenario.provider && row.payload?.model === scenario.model
+		&& row.payload?.reasoningEffort === scenario.reasoningEffort && row.payload?.serviceTier === scenario.serviceTier)
+		.map(authoritativeAgentId).filter(Boolean))];
+	return ids.length === 1 ? ids[0] : null;
+}
+
+function boundedAgentId(value) {
+	return typeof value === 'string' && value.length > 0 && value.length <= 128 && !/[\u0000-\u001f\u007f]/.test(value) ? value : null;
+}
+
+async function collectConcurrentHeadlessEvidence({ members, directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll }) {
+	for (const assertion of assertions) {
+		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
+		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
+		catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; }
+	}
+	let attempt = 0;
+	const currentAudit = () => auditRows(protocolAudit).slice(protocolAuditOffset);
+	let fileEvidence;
+	let byAgent;
+	const evaluate = async () => {
+		fileEvidence = await readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets);
+		byAgent = new Map();
+		for (const member of members.filter((entry) => entry.agentId !== null)) {
+			const isolated = isolateFileEvidence(fileEvidence, member.agentId, member.generatedName);
+			const audit = currentAudit().filter((row) => rowMatchesAgent(row, member.agentId));
+			const evidence = makeEvidence({ terminalState: member.lifecycle, protocolAudit: audit, ...isolated, rcon: rconEvidence });
+			byAgent.set(member.agentId, { fileEvidence: isolated, evidence, assertionResult: evaluateHeadlessAssertions(assertions, evidence) });
+		}
+	};
+	await evaluate();
+	const waitsForFiles = assertions.some((assertion) => assertion.type !== 'lifecycle' && assertion.type !== 'rcon');
+	while (waitsForFiles && [...byAgent.values()].some((entry) => !entry.assertionResult.passed) && logicalNow(now, startedAt, attempt) < deadline) {
+		try { await withDeadline(() => poll({ phase: 'evidence', attempt, deadline, now }), deadline, () => logicalNow(now, startedAt, attempt), 'HEADLESS_TIMEOUT'); }
+		catch (error) { if (error?.code === 'HEADLESS_TIMEOUT') break; throw error; }
+		attempt += 1;
+		await evaluate();
+	}
+	return { fileEvidence, byAgent };
+}
+
+function isolateFileEvidence(fileEvidence, agentId, generatedName) {
+	const providerTurnSummaries = (fileEvidence.providerTurnSummaries ?? []).filter((row) => row.agentId === agentId);
+	const lines = String(fileEvidence.serverLog ?? '').split(/\r?\n/).filter((line) => line.includes(agentId) || line.includes(generatedName));
+	return {
+		protocolRows: (fileEvidence.protocolRows ?? []).filter((row) => rowMatchesAgent(row, agentId)),
+		traceRows: (fileEvidence.traceRows ?? []).filter((row) => rowMatchesAgent(row, agentId)),
+		serverLog: lines.join('\n'), paths: fileEvidence.paths,
+		providerTurnsRows: providerTurnSummaries.length, providerTurnSummaries,
+	};
+}
+
+function rowMatchesAgent(row, agentId) {
+	if (!row || typeof row !== 'object') return false;
+	return row.agentId === agentId || row.envelope?.agentId === agentId || row.payload?.agentId === agentId || row.envelope?.payload?.agentId === agentId;
+}
+
 async function readEvidence(directory, readFile, tailReader, protocolAudit, providerTurnsPath = null, offsets = {}) {
 	const { protocol: protocolPath, coordinator: coordinatorPath, server: serverPath, providerTurns } = resolveEvidencePaths(directory, protocolAudit, providerTurnsPath);
 	const [protocolText, coordinatorText, serverLog, providerTurnsText] = await Promise.all([
@@ -559,6 +856,100 @@ function timingSummary(profile, fileEvidence, protocolAudit, scenarioElapsedMs) 
 	};
 }
 
+function performanceMetrics(profile, fileEvidence, protocolAudit, agentId = null, runtimeResources = {}) {
+	const turns = (fileEvidence.providerTurnSummaries ?? []).filter((turn) => turn.provider === profile.provider && turn.model === profile.model
+		&& (agentId === null || turn.agentId === undefined || turn.agentId === agentId));
+	const rawRows = [...(fileEvidence.protocolRows ?? []), ...auditRows(protocolAudit)];
+	const envelopes = rawRows.map(unwrapAuditRow).filter(Boolean);
+	const queue = turns.map((turn) => turn.queueWaitMs).filter(Number.isFinite);
+	const inference = turns.map((turn) => Number.isFinite(turn.apiDurationMs) ? turn.apiDurationMs : turn.durationMs).filter(Number.isFinite);
+	const observation = envelopes.flatMap((row) => {
+		const value = row.type === 'observation' ? row.payload?.metrics?.collectionMs ?? row.payload?.metrics?.observationMs : null;
+		return Number.isFinite(value) && value >= 0 ? [value] : [];
+	});
+	const authoritativeResult = actionResultObservationLatencies(rawRows);
+	const result = authoritativeResult.length > 0 ? authoritativeResult : (fileEvidence.traceRows ?? []).flatMap((row) => {
+		const value = row?.event === 'program_step' && row?.result !== null ? row?.timing?.bridgeSendToCompletionMs : null;
+		return Number.isFinite(value) && value >= 0 ? [value] : [];
+	});
+	const tokenRows = turns.map((turn) => turn.tokens ?? null);
+	return {
+		latencyMs: {
+			queue: latencyPercentiles(queue), inference: latencyPercentiles(inference),
+			observation: latencyPercentiles(observation), result: latencyPercentiles(result),
+		},
+		tokens: Object.fromEntries(['input', 'output', 'reasoning', 'cached', 'cacheWrite'].map((category) => [category, completeTokenTotal(tokenRows, category)])),
+		retries: turns.filter((turn) => turn.retry).length,
+		rateLimits: turns.filter((turn) => turn.rateLimited || /RATE.?LIMIT|\b429\b/i.test(turn.error?.code ?? '')).length,
+		compactions: turns.filter((turn) => turn.compaction).length,
+		resources: { ...resourceMetrics(envelopes),
+			...(Number.isFinite(runtimeResources.minecraftMspt) && runtimeResources.minecraftMspt >= 0 ? { minecraftMspt: finiteMetric(runtimeResources.minecraftMspt) } : {}) },
+	};
+}
+
+function latencyPercentiles(values) {
+	const sorted = values.filter((value) => Number.isFinite(value) && value >= 0).map(finiteMetric).sort((left, right) => left - right);
+	return {
+		count: sorted.length,
+		p50: sorted.length === 0 ? null : nearestRank(sorted, 0.5),
+		p95: sorted.length === 0 ? null : nearestRank(sorted, 0.95),
+		p99: sorted.length === 0 ? null : nearestRank(sorted, 0.99),
+	};
+}
+
+function nearestRank(sorted, fraction) {
+	return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)];
+}
+
+function completeTokenTotal(rows, category) {
+	if (rows.length === 0 || rows.some((row) => row === null || !Number.isSafeInteger(row[category]) || row[category] < 0)) return null;
+	const total = rows.reduce((sum, row) => sum + row[category], 0);
+	return Number.isSafeInteger(total) ? total : null;
+}
+
+function actionResultObservationLatencies(rows) {
+	const events = rows.flatMap((row) => {
+		const envelope = unwrapAuditRow(row);
+		const timestamp = finiteTimestamp(row?.timestamp ?? envelope?.timestamp);
+		const agentId = boundedAgentId(envelope?.agentId ?? envelope?.payload?.agentId);
+		return timestamp === null || agentId === null || !['action_result', 'observation'].includes(envelope?.type) ? [] : [{ timestamp, agentId, type: envelope.type }];
+	}).sort((left, right) => left.timestamp - right.timestamp);
+	const values = [];
+	for (let index = 0; index < events.length; index += 1) {
+		const event = events[index];
+		if (event.type !== 'action_result') continue;
+		const next = events.slice(index + 1).find((candidate) => candidate.agentId === event.agentId && candidate.type === 'observation' && candidate.timestamp >= event.timestamp);
+		if (next !== undefined) values.push(next.timestamp - event.timestamp);
+	}
+	return values;
+}
+
+function finiteTimestamp(value) {
+	return Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function resourceMetrics(rows) {
+	const candidates = rows.flatMap((row) => {
+		const value = row.type === 'headless_resource_metrics' ? row.payload : row.payload?.resources;
+		return value && typeof value === 'object' && !Array.isArray(value) ? [value] : [];
+	});
+	return {
+		processCount: maximumMetric(candidates, 'processCount', true),
+		peakRssBytes: maximumMetric(candidates, 'peakRssBytes', true),
+		minecraftMspt: maximumMetric(candidates, 'minecraftMspt', false),
+	};
+}
+
+function maximumMetric(rows, key, integer) {
+	const values = rows.map((row) => row[key]).filter((value) => Number.isFinite(value) && value >= 0 && (!integer || Number.isSafeInteger(value)));
+	return values.length === 0 ? null : finiteMetric(Math.max(...values));
+}
+
+function parseMinecraftMspt(value) {
+	const match = String(value ?? '').match(/([0-9]+(?:\.[0-9]+)?)\s*(?:mspt|ms\s+per\s+tick)/i);
+	return match === null ? null : finiteMetric(Number(match[1]));
+}
+
 function providerTurnSummary(row) {
 	if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
 	const summary = {
@@ -566,10 +957,19 @@ function providerTurnSummary(row) {
 		attempt: Number.isSafeInteger(row.attempt) ? row.attempt : null, retry: row.retry === true,
 		timestamp: Number.isFinite(row.timestamp) ? Math.round(row.timestamp) : null, outcome: boundedScalar(row.outcome),
 	};
+	const agentId = boundedAgentId(row.agentId);
+	if (agentId !== null) summary.agentId = agentId;
 	if (row.timing && typeof row.timing === 'object' && !Array.isArray(row.timing)) {
 		summary.durationMs = finiteMetric(row.timing.durationMs);
 		summary.apiDurationMs = finiteMetric(row.timing.apiDurationMs);
+		if (Number.isFinite(row.timing.queueWaitMs) && row.timing.queueWaitMs >= 0) summary.queueWaitMs = finiteMetric(row.timing.queueWaitMs);
 	}
+	if (row.tokens && typeof row.tokens === 'object' && !Array.isArray(row.tokens)) {
+		summary.tokens = Object.fromEntries(['input', 'output', 'reasoning', 'cached', 'cacheWrite'].map((category) => [category,
+			Number.isSafeInteger(row.tokens[category]) && row.tokens[category] >= 0 ? row.tokens[category] : null]));
+	}
+	if (row.rateLimited !== undefined) summary.rateLimited = row.rateLimited === true;
+	if (row.compaction !== undefined) summary.compaction = row.compaction === true;
 	if (row.error && typeof row.error === 'object' && !Array.isArray(row.error)) {
 		summary.error = { code: boundedScalar(row.error.code), message: redactReportText(row.error.message, 512) };
 	}
@@ -590,7 +990,7 @@ function finiteMetric(value) {
 }
 
 async function readBoundedTail(readTail, file, offset = 0) {
-	try { return boundedTailText(await readTail(file, MAX_EVIDENCE_BYTES, offset), MAX_EVIDENCE_BYTES); } catch { return ''; }
+	try { return boundedTailText(await readTail(file, MAX_EVIDENCE_TAIL_BYTES, offset), MAX_EVIDENCE_TAIL_BYTES); } catch { return ''; }
 }
 
 function parseJsonl(value) {
@@ -620,9 +1020,17 @@ function normalizeRunDirectory(value) {
 	return path.resolve(value);
 }
 
-function generatedAgentName(scenario, timestamp) {
+function generatedAgentName(scenario, timestamp, rosterIndex = null) {
 	const id = String(scenario.id ?? 'scenario').replace(/[^A-Za-z0-9_]/g, '_').slice(0, 32) || 'scenario';
-	return `headless_${id}_${Math.abs(Number(timestamp) || 0).toString(36)}`.slice(0, 32);
+	const suffix = rosterIndex === null ? '' : `_${String(rosterIndex + 1).padStart(2, '0')}`;
+	const base = `headless_${id}_${Math.abs(Number(timestamp) || 0).toString(36)}`;
+	return `${base.slice(0, 32 - suffix.length)}${suffix}`;
+}
+
+function rosterPosition(index) {
+	const column = index % 4;
+	const row = Math.floor(index / 4);
+	return { x: -5.5 + column * 4, z: -5.5 + row * 4 };
 }
 
 function parseLifecycle(value) {
@@ -650,6 +1058,7 @@ function validateRunnerScenario(scenario, assertions) {
 		if (typeof value !== 'string' || value.trim() === '' || value.length > MAX_TEXT || /[\u0000-\u001f\u007f]/.test(value)) throw new TypeError(`scenario.${field} must be bounded text without control characters`);
 	}
 	if (!Number.isSafeInteger(scenario.timeoutMs) || scenario.timeoutMs <= 0 || scenario.timeoutMs > MAX_TIMEOUT_MS) throw new RangeError('scenario.timeoutMs is out of bounds');
+	if (![1, 8, 16].includes(scenario.rosterSize ?? 1)) throw new RangeError('scenario.rosterSize is out of bounds');
 	if (!Array.isArray(assertions) || assertions.length === 0) throw new TypeError('scenario requires assertions');
 }
 function boundedScalar(value) { return value === null || value === undefined ? null : String(value).slice(0, MAX_TEXT); }

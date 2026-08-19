@@ -70,6 +70,7 @@ function normalizeRecord(fields, runId, scenarioId, timestamp) {
 	return {
 		runId,
 		scenarioId,
+		...(fields.agentId === null || fields.agentId === undefined ? {} : { agentId: boundedMeta(fields.agentId) }),
 		provider: boundedMeta(fields.provider),
 		model: boundedMeta(fields.model),
 		reasoningEffort: boundedMeta(fields.reasoningEffort),
@@ -79,6 +80,9 @@ function normalizeRecord(fields, runId, scenarioId, timestamp) {
 		timestamp,
 		outcome: error === null ? 'success' : 'error',
 		...(fields.timing === null || fields.timing === undefined ? {} : { timing: normalizeTiming(fields.timing) }),
+		...(fields.tokens === null || fields.tokens === undefined ? {} : { tokens: normalizeTokens(fields.tokens) }),
+		...(fields.rateLimited === undefined ? {} : { rateLimited: fields.rateLimited === true }),
+		...(fields.compaction === undefined ? {} : { compaction: fields.compaction === true }),
 		input: normalizeText(fields.input),
 		output: normalizeText(fields.output),
 		...(error === null ? {} : { error }),
@@ -97,6 +101,7 @@ function publicRecord(row) {
 	return {
 		runId: row.runId,
 		scenarioId: row.scenarioId,
+		...(row.agentId === undefined ? {} : { agentId: row.agentId }),
 		provider: row.provider,
 		model: row.model,
 		reasoningEffort: row.reasoningEffort,
@@ -106,6 +111,9 @@ function publicRecord(row) {
 		timestamp: row.timestamp,
 		outcome: row.outcome,
 		...(row.timing === undefined ? {} : { timing: row.timing }),
+		...(row.tokens === undefined ? {} : { tokens: row.tokens }),
+		...(row.rateLimited === undefined ? {} : { rateLimited: row.rateLimited }),
+		...(row.compaction === undefined ? {} : { compaction: row.compaction }),
 		inputHash: hash(row.input),
 		outputHash: hash(row.output),
 		inputExcerpt: redactAndBound(row.input, MAX_PUBLIC_EXCERPT_BYTES),
@@ -118,7 +126,22 @@ function normalizeTiming(value) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('provider turn timing must be an object');
 	const durationMs = boundedDuration(value.durationMs, 'durationMs');
 	const apiDurationMs = value.apiDurationMs === null || value.apiDurationMs === undefined ? null : boundedDuration(value.apiDurationMs, 'apiDurationMs');
-	return { durationMs, apiDurationMs };
+	const queueWaitMs = value.queueWaitMs === null || value.queueWaitMs === undefined ? undefined : boundedDuration(value.queueWaitMs, 'queueWaitMs');
+	return { durationMs, apiDurationMs, ...(queueWaitMs === undefined ? {} : { queueWaitMs }) };
+}
+
+const TOKEN_CATEGORIES = ['input', 'output', 'reasoning', 'cached', 'cacheWrite'];
+
+function normalizeTokens(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('provider turn tokens must be an object');
+	const result = {};
+	for (const category of TOKEN_CATEGORIES) {
+		const count = value[category];
+		if (count === null || count === undefined) result[category] = null;
+		else if (!Number.isSafeInteger(count) || count < 0) throw new TypeError(`${category} tokens must be a nonnegative safe integer or null`);
+		else result[category] = count;
+	}
+	return result;
 }
 
 function boundedDuration(value, field) {

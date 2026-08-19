@@ -9,6 +9,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CODEX_SOL_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CODEX_SOL_LOW" },
@@ -24,6 +25,7 @@
       "serviceTier": "fast",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CODEX_SOL_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 8,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CODEX_SOL_HIGH" },
@@ -39,6 +41,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CODEX_LUNA_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 16,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CODEX_LUNA_LOW" },
@@ -54,6 +57,7 @@
       "serviceTier": "fast",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CODEX_LUNA_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CODEX_LUNA_HIGH" },
@@ -69,6 +73,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_GEMINI_PRO_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_GEMINI_PRO_LOW" },
@@ -84,6 +89,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_GEMINI_PRO_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 8,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_GEMINI_PRO_HIGH" },
@@ -99,6 +105,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_GEMINI_FLASH_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 16,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_GEMINI_FLASH_LOW" },
@@ -114,6 +121,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_GEMINI_FLASH_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_GEMINI_FLASH_HIGH" },
@@ -129,6 +137,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_KIMI_K3_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_KIMI_K3_LOW" },
@@ -144,6 +153,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_KIMI_K3_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 8,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_KIMI_K3_HIGH" },
@@ -159,6 +169,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_KIMI_256K_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 16,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_KIMI_256K_LOW" },
@@ -174,6 +185,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_KIMI_256K_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_KIMI_256K_HIGH" },
@@ -189,6 +201,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_COMPOSER_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CURSOR_COMPOSER_LOW" },
@@ -204,6 +217,7 @@
       "serviceTier": "fast",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_COMPOSER_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 8,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CURSOR_COMPOSER_HIGH" },
@@ -219,6 +233,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_GROK45_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 16,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CURSOR_GROK45_LOW" },
@@ -234,6 +249,7 @@
       "serviceTier": "fast",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_GROK45_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 1,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CURSOR_GROK45_HIGH" },
@@ -249,6 +265,7 @@
       "serviceTier": "priority",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_GROK46_LOW, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 8,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CURSOR_GROK46_LOW" },
@@ -264,6 +281,7 @@
       "serviceTier": "fast",
       "task": "Move to x=1.5 y=201 z=0.5 using a move_to action, send exactly one chat message MATRIX_CURSOR_GROK46_HIGH, then finish the goal.",
       "timeoutMs": 240000,
+      "rosterSize": 16,
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CURSOR_GROK46_HIGH" },

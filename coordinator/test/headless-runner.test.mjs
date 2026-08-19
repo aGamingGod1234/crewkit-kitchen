@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import path from 'node:path';
 import test from 'node:test';
 import {
 	evaluateHeadlessAssertions,
@@ -21,6 +23,30 @@ const scenario = (overrides = {}) => normalizeHeadlessScenario({
 });
 
 const jsonl = (rows) => rows.map((row) => JSON.stringify(row)).join('\n') + '\n';
+
+test('PowerShell wrapper samples a fast-exit tracked runner before completion', () => {
+	const wrapper = path.resolve('../scripts/run-headless-provider-matrix.ps1').replaceAll("'", "''");
+	const script = `
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('${wrapper}', [ref] $tokens, [ref] $errors)
+if ($errors.Count -gt 0) { throw $errors[0].Message }
+$required = @('Get-ProcessTreeIds', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit')
+$definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name }, $true))
+foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Text }
+$script:PollMilliseconds = 10
+$runner = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Milliseconds 150' -PassThru
+$ids = [System.Collections.Generic.List[int]]::new()
+Add-ProcessTreeSnapshot $ids $runner.Id
+$peak = Measure-RunnerResourcesUntilExit @{ Process = $runner } @(@{ Process = $runner }) $ids ([DateTime]::UtcNow.AddSeconds(5))
+$peak | ConvertTo-Json -Compress
+`;
+	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
+	assert.equal(result.status, 0, result.stderr || result.stdout);
+	const peak = JSON.parse(result.stdout.trim());
+	assert.ok(peak.processCount >= 1, result.stdout);
+	assert.ok(peak.peakRssBytes > 0, result.stdout);
+});
 
 test('runs a real-provider scenario with exact RCON sequence and injected evidence', async () => {
 	const commands = [];
@@ -77,6 +103,206 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	assert.ok(report.evidence.paths.protocol);
 	assert.deepEqual(report.timings.health, [{ operation: 'decide', count: 2, p50Ms: 321, p95Ms: 654, failureRate: 0, circuit: 'closed' }]);
 	assert.deepEqual(report.timings.control, [{ operation: 'observation_to_plan', count: 1, p50Ms: 700, p95Ms: 700 }]);
+});
+
+test('summons, starts, and polls an eight-agent exact-profile roster concurrently with isolated evidence', async () => {
+	const commands = [];
+	const names = [];
+	const activeByPhase = new Map();
+	const maxActiveByPhase = new Map();
+	const pendingByPhase = new Map();
+	const phaseBarrier = async (phase, expected) => {
+		const active = (activeByPhase.get(phase) ?? 0) + 1;
+		activeByPhase.set(phase, active);
+		maxActiveByPhase.set(phase, Math.max(maxActiveByPhase.get(phase) ?? 0, active));
+		if (!pendingByPhase.has(phase)) pendingByPhase.set(phase, []);
+		await new Promise((resolve) => {
+			pendingByPhase.get(phase).push(resolve);
+			if (pendingByPhase.get(phase).length === expected) {
+				for (const release of pendingByPhase.get(phase)) release();
+			}
+		});
+		activeByPhase.set(phase, activeByPhase.get(phase) - 1);
+	};
+	const rcon = {
+		command: async (command) => {
+			commands.push(command);
+			if (command.includes('summon-configured')) {
+				const name = command.split(' ').at(-1);
+				names.push(name);
+				await phaseBarrier('summon', 8);
+				return { text: `Created ${name}. It is ready for a task.` };
+			}
+			if (command.startsWith('codex start ')) { await phaseBarrier('start', 8); return { text: 'started' }; }
+			if (command.startsWith('codex status ')) { await phaseBarrier('status', 8); return { text: 'state=COMPLETED' }; }
+			return { text: 'ok' };
+		},
+		close: async () => {},
+	};
+	const report = await runHeadlessScenario({
+		scenario: scenario({ rosterSize: 8, assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'chat', message: 'HEADLESS_PASS' }] }),
+		runDirectory: 'C:/runs/eight-agents', rcon, now: () => 100,
+		readFile: async (file) => {
+			if (String(file).endsWith('protocol.jsonl')) return jsonl(names.map((name, index) => ({
+				direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `agent-id-${index + 1}`, payload: {
+					agentId: `agent-id-${index + 1}`, name, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+				} },
+			})));
+			if (String(file).endsWith('coordinator.jsonl')) return jsonl(names.map((_name, index) => ({ agentId: `agent-id-${index + 1}`, event: 'chat', message: 'HEADLESS_PASS' })));
+			return '';
+		},
+		writeFile: async () => {}, poll: async () => {},
+	});
+
+	assert.equal(report.status, 'PASSED');
+	assert.equal(report.rosterSize, 8);
+	assert.equal(report.agents.length, 8);
+	assert.deepEqual(report.agents.map((agent) => agent.agentId), Array.from({ length: 8 }, (_value, index) => `agent-id-${index + 1}`));
+	assert.ok(report.agents.every((agent) => agent.assertions.every((assertion) => assertion.passed)));
+	assert.equal(maxActiveByPhase.get('summon'), 8);
+	assert.equal(maxActiveByPhase.get('start'), 8);
+	assert.equal(maxActiveByPhase.get('status'), 8);
+	const summons = commands.filter((command) => command.includes('summon-configured'));
+	assert.equal(summons.length, 8);
+	assert.ok(summons.every((command) => command.includes(' codex gpt-5.6-sol high priority survival ')));
+	assert.equal(new Set(summons.map((command) => command.match(/positioned ([^ ]+ [^ ]+ [^ ]+)/)?.[1])).size, 8);
+});
+
+test('does not let one agent satisfy another agent evidence assertion', async () => {
+	const names = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ rosterSize: 8, timeoutMs: 1, assert: [{ type: 'lifecycle', state: 'COMPLETED' }, { type: 'chat', message: 'ONLY_ONE' }] }),
+		runDirectory: 'C:/runs/evidence-isolation',
+		rcon: {
+			command: async (command) => {
+				if (command.includes('summon-configured')) { const name = command.split(' ').at(-1); names.push(name); return { text: `Created ${name}. It is ready for a task.` }; }
+				return { text: command.startsWith('codex status ') ? 'state=COMPLETED' : 'ok' };
+			},
+			close: async () => {},
+		},
+		now: () => 10,
+		readFile: async (file) => {
+			if (String(file).endsWith('protocol.jsonl')) return jsonl(names.map((name, index) => ({
+				direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `isolated-${index + 1}`, payload: {
+					agentId: `isolated-${index + 1}`, name, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+				} },
+			})));
+			if (String(file).endsWith('coordinator.jsonl') && names.length > 0) return jsonl([{ agentId: 'isolated-1', event: 'chat', message: 'ONLY_ONE' }]);
+			return '';
+		},
+		writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.classification, 'ASSERTION_MISMATCH');
+	assert.equal(report.agents.filter((agent) => agent.assertions.every((assertion) => assertion.passed)).length, 1);
+});
+
+test('fails only the roster member whose authoritative identity or status command fails', async () => {
+	const names = [];
+	const started = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ rosterSize: 8, timeoutMs: 1, assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }),
+		runDirectory: 'C:/runs/partial-roster-failure',
+		rcon: {
+			command: async (command) => {
+				if (command.includes('summon-configured')) { const name = command.split(' ').at(-1); names.push(name); return { text: `Created ${name}. It is ready for a task.` }; }
+				if (command.startsWith('codex start ')) { started.push(command.split(' ')[2]); return { text: 'started' }; }
+				if (command.startsWith('codex status ') && command.endsWith(names[3])) throw new Error('one status read failed');
+				return { text: command.startsWith('codex status ') ? 'state=COMPLETED' : 'ok' };
+			},
+			close: async () => {},
+		},
+		now: () => 10,
+		readFile: async (file) => String(file).endsWith('protocol.jsonl') ? jsonl(names.slice(0, 7).map((name, index) => ({
+			direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `partial-${index + 1}`, payload: {
+				agentId: `partial-${index + 1}`, name, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+			} },
+		}))) : '',
+		writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.status, 'FAILED');
+	assert.equal(report.agents.length, 8);
+	assert.equal(report.agents.filter((agent) => agent.classification === 'ERROR').length, 2);
+	assert.equal(report.agents.filter((agent) => agent.lifecycle === 'COMPLETED').length, 6);
+	assert.equal(started.length, 7, 'the member without an authoritative ID is not started');
+});
+
+test('keeps a sixteen-agent report bounded with one isolated lifecycle per authoritative ID', async () => {
+	const names = [];
+	const report = await runHeadlessScenario({
+		scenario: scenario({ rosterSize: 16, assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }),
+		runDirectory: 'C:/runs/sixteen-agents',
+		rcon: {
+			command: async (command) => {
+				if (command.includes('summon-configured')) { const name = command.split(' ').at(-1); names.push(name); return { text: `Created ${name}. It is ready for a task.` }; }
+				return { text: command.startsWith('codex status ') ? 'state=COMPLETED' : 'ok' };
+			},
+			close: async () => {},
+		},
+		now: () => 100,
+		readFile: async (file) => String(file).endsWith('protocol.jsonl') ? jsonl(names.map((name, index) => ({
+			direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: `sixteen-${index + 1}`, payload: {
+				agentId: `sixteen-${index + 1}`, name, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+			} },
+		}))) : '',
+		writeFile: async () => {}, poll: async () => {},
+	});
+	assert.equal(report.status, 'PASSED');
+	assert.equal(report.agents.length, 16);
+	assert.ok(report.agents.every((agent) => agent.agentId?.startsWith('sixteen-') && agent.lifecycle === 'COMPLETED'));
+	assert.ok(Buffer.byteLength(JSON.stringify(report), 'utf8') < 262_144);
+});
+
+test('reports bounded p50 p95 p99 metrics and null provider-native token categories', async () => {
+	const agentId = 'headless_runner_case_2s';
+	const providerRows = [
+		{ agentId, provider: 'codex', model: 'gpt-5.6-sol', retry: false, outcome: 'success', timing: { queueWaitMs: 1, durationMs: 10, apiDurationMs: 8 }, tokens: { input: 10, output: 2, reasoning: 1, cached: 3, cacheWrite: null } },
+		{ agentId, provider: 'codex', model: 'gpt-5.6-sol', retry: true, outcome: 'error', error: { code: 'RATE_LIMITED', message: 'bounded' }, rateLimited: true, compaction: true, timing: { queueWaitMs: 9, durationMs: 90, apiDurationMs: 80 }, tokens: { input: 20, output: 4, reasoning: 2, cached: 6, cacheWrite: null } },
+	];
+	const protocolRows = [1, 5, 9].flatMap((value, index) => [
+		{ timestamp: index * 100, direction: 'server_to_coordinator', envelope: { type: 'observation', agentId, payload: { metrics: { collectionMs: value } } } },
+		{ timestamp: index * 100 + 20, direction: 'server_to_coordinator', envelope: { type: 'action_result', agentId, payload: {} } },
+		{ timestamp: index * 100 + 20 + value, direction: 'server_to_coordinator', envelope: { type: 'observation', agentId, payload: {} } },
+	]);
+	const files = new Map([
+		['provider.jsonl', jsonl(providerRows)],
+		['protocol.jsonl', jsonl(protocolRows)],
+	]);
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/metrics',
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? 'Created agent. It is ready for a task.' : command.startsWith('codex status') ? 'state=COMPLETED' : command === 'tick query' ? 'The server averages 4.25 ms per tick' : 'ok' }), close: async () => {} },
+		now: () => 100, providerTurnsPath: 'C:/provider.jsonl', protocolAudit: 'C:/protocol.jsonl',
+		readFile: async (file) => files.get(String(file).replace('C:/', '')) ?? '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.deepEqual(report.metrics.latencyMs.queue, { count: 2, p50: 1, p95: 9, p99: 9 });
+	assert.deepEqual(report.metrics.latencyMs.inference, { count: 2, p50: 8, p95: 80, p99: 80 });
+	assert.deepEqual(report.metrics.latencyMs.observation, { count: 3, p50: 5, p95: 9, p99: 9 });
+	assert.deepEqual(report.metrics.latencyMs.result, { count: 3, p50: 5, p95: 9, p99: 9 });
+	assert.deepEqual(report.metrics.tokens, { input: 30, output: 6, reasoning: 3, cached: 9, cacheWrite: null });
+	assert.equal(report.metrics.retries, 1);
+	assert.equal(report.metrics.rateLimits, 1);
+	assert.equal(report.metrics.compactions, 1);
+	assert.deepEqual(report.metrics.resources, { processCount: null, peakRssBytes: null, minecraftMspt: 4.25 });
+	assert.ok(Buffer.byteLength(JSON.stringify(report.metrics), 'utf8') < 16_384);
+});
+
+test('binds single-agent metrics to the authoritative snapshot ID instead of the generated selector', async () => {
+	const generatedName = 'headless_runner_case_2s';
+	const files = new Map([
+		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'authoritative-single', payload: {
+			agentId: 'authoritative-single', name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
+		} } }])],
+		['provider.jsonl', jsonl([
+			{ agentId: 'unrelated', provider: 'codex', model: 'gpt-5.6-sol', timing: { durationMs: 900, apiDurationMs: 900 } },
+			{ agentId: 'authoritative-single', provider: 'codex', model: 'gpt-5.6-sol', timing: { durationMs: 12, apiDurationMs: 10 } },
+		])],
+	]);
+	const report = await runHeadlessScenario({
+		scenario: scenario({ assert: [{ type: 'lifecycle', state: 'COMPLETED' }] }), runDirectory: 'C:/runs/single-authoritative',
+		rcon: { command: async (command) => ({ text: command.includes('summon-configured') ? `Created ${generatedName}. It is ready for a task.` : command.startsWith('codex status') ? 'state=COMPLETED' : 'ok' }), close: async () => {} },
+		now: () => 100, providerTurnsPath: 'C:/provider.jsonl', protocolAudit: 'C:/protocol.jsonl',
+		readFile: async (file) => files.get(String(file).replace('C:/', '')) ?? '', writeFile: async () => {}, poll: async () => {},
+	});
+	assert.deepEqual(report.metrics.latencyMs.inference, { count: 1, p50: 10, p95: 10, p99: 10 });
 });
 
 test('releases the temporary spawn chunk when summon fails', async () => {

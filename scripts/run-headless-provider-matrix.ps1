@@ -145,6 +145,44 @@ function Add-ProcessTreeSnapshot([System.Collections.Generic.List[int]] $Process
 	}
 }
 
+function Get-TrackedResourceSnapshot([System.Collections.Generic.List[int]] $ProcessIds) {
+	# Sampling is bounded to one scenario and each pass refreshes descendants from
+	# the still-live tracked roots before these short-lived PIDs enter cleanup.
+	$liveCount = 0
+	[long] $rssBytes = 0
+	foreach ($id in @($ProcessIds.ToArray() | Select-Object -Unique)) {
+		$process = Get-Process -Id ([int] $id) -ErrorAction SilentlyContinue
+		if ($null -eq $process) { continue }
+		try {
+			$liveCount += 1
+			$rssBytes += [long] $process.WorkingSet64
+		} catch { }
+	}
+	return [pscustomobject]@{ processCount = $liveCount; rssBytes = $rssBytes }
+}
+
+function Measure-RunnerResourcesUntilExit(
+	$RunnerHandle,
+	[object[]] $TrackedHandles,
+	[System.Collections.Generic.List[int]] $ProcessIds,
+	[DateTime] $Deadline
+) {
+	$peakProcessCount = 0
+	[long] $peakRssBytes = 0
+	while ($true) {
+		foreach ($handle in $TrackedHandles) {
+			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIds $handle.Process.Id }
+		}
+		$sample = Get-TrackedResourceSnapshot $ProcessIds
+		$peakProcessCount = [Math]::Max($peakProcessCount, [int] $sample.processCount)
+		$peakRssBytes = [Math]::Max($peakRssBytes, [long] $sample.rssBytes)
+		if ($RunnerHandle.Process.HasExited) { break }
+		if ($RunnerHandle.Process.WaitForExit($PollMilliseconds)) { break }
+		if ([DateTime]::UtcNow -ge $Deadline) { throw 'Scenario runner timed out' }
+	}
+	return [pscustomobject]@{ processCount = $peakProcessCount; peakRssBytes = $peakRssBytes }
+}
+
 function Get-ProcessChildrenSnapshot() {
 	$childrenByParent = @{}
 	foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
@@ -481,6 +519,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$manifest = [pscustomobject]@{
 		runId = [IO.Path]::GetFileName($RunDirectory); scenarioId = $scenarioId; provider = [string] $Scenario.provider
 		model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; serviceTier = $serviceTier
+		rosterSize = if ($null -eq $Scenario.PSObject.Properties['rosterSize']) { 1 } else { [int] $Scenario.rosterSize }
 		serverDirectory = $serverDirectory; providerWorkspace = $providerWorkspace; protocolAudit = $protocolAudit; providerTurns = $providerTurns
 		ports = [pscustomobject]@{ minecraft = $serverPort; rcon = $rconPort; bridge = $bridgePort }; levelName = $worldName
 	}
@@ -518,6 +557,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$runnerReport = $null
 	$cleanupFailure = $null
 	$processIds = [System.Collections.Generic.List[int]]::new()
+	$peakProcessCount = 0
+	[long] $peakRssBytes = 0
 	try {
 		$serverStdoutPath = Join-Path $logsDirectory 'fabric.stdout.log'
 		$serverStderrPath = Join-Path $logsDirectory 'fabric.stderr.log'
@@ -607,7 +648,15 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		Add-ProcessTreeSnapshot $processIds $serverHandle.Process.Id
 		Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Process.Id
 		Add-ProcessTreeSnapshot $processIds $runnerHandle.Process.Id
-		if (-not $runnerHandle.Process.WaitForExit(([int] $Scenario.timeoutMs + ($RunnerGraceSeconds * 1000)))) { throw "Scenario '$scenarioId' timed out" }
+		$runnerDeadline = [DateTime]::UtcNow.AddMilliseconds([int] $Scenario.timeoutMs + ($RunnerGraceSeconds * 1000))
+		try {
+			$resourcePeak = Measure-RunnerResourcesUntilExit $runnerHandle @($serverHandle, $coordinatorHandle, $runnerHandle) $processIds $runnerDeadline
+		} catch {
+			if ($_.Exception.Message -eq 'Scenario runner timed out') { throw "Scenario '$scenarioId' timed out" }
+			throw
+		}
+		$peakProcessCount = [int] $resourcePeak.processCount
+		$peakRssBytes = [long] $resourcePeak.peakRssBytes
 		$runnerExit = $runnerHandle.Process.ExitCode
 		Complete-RedirectedProcess $runnerHandle
 		$runnerReport = Read-BoundedJson (Join-Path $scenarioDirectory 'report.json') $MaxMatrixReportBytes 'runner scenario report'
@@ -644,6 +693,19 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	if ($null -ne $runnerReport) {
 		foreach ($property in $runnerReport.PSObject.Properties) { $reportFields[$property.Name] = $property.Value }
 	}
+	$metricFields = [ordered]@{}
+	if ($null -ne $runnerReport -and $null -ne $runnerReport.PSObject.Properties['metrics'] -and $null -ne $runnerReport.metrics) {
+		foreach ($property in $runnerReport.metrics.PSObject.Properties) { $metricFields[$property.Name] = $property.Value }
+	}
+	$resourceFields = [ordered]@{}
+	if ($metricFields.Contains('resources') -and $null -ne $metricFields['resources']) {
+		foreach ($property in $metricFields['resources'].PSObject.Properties) { $resourceFields[$property.Name] = $property.Value }
+	}
+	$resourceFields['processCount'] = $peakProcessCount
+	$resourceFields['peakRssBytes'] = $peakRssBytes
+	if (-not $resourceFields.Contains('minecraftMspt')) { $resourceFields['minecraftMspt'] = $null }
+	$metricFields['resources'] = [pscustomobject] $resourceFields
+	$reportFields['metrics'] = [pscustomobject] $metricFields
 	$reportFields['status'] = $status
 	$reportFields['scenarioId'] = ConvertTo-BoundedText $scenarioId
 	$reportFields['exitCode'] = $runnerExit
@@ -704,6 +766,7 @@ $manifestScenarios = @(
 			model = ConvertTo-BoundedText $scenario.model
 			reasoningEffort = ConvertTo-BoundedText $scenario.reasoningEffort
 			serviceTier = $serviceTier
+			rosterSize = if ($null -eq $scenario.PSObject.Properties['rosterSize']) { 1 } else { [int] $scenario.rosterSize }
 			timeoutMs = if ($null -ne $scenario.PSObject.Properties['timeoutMs']) { [int] $scenario.timeoutMs } else { $null }
 			assertionTypes = @($assertionTypes)
 		}

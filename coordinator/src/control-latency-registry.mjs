@@ -41,6 +41,14 @@ export class ControlLatencyRegistry {
 	}
 
 	snapshot() {
+		return this.#summaries(false);
+	}
+
+	performanceSnapshot() {
+		return this.#summaries(true);
+	}
+
+	#summaries(includeP99) {
 		return [...this.#samples.entries()]
 			.sort(([left], [right]) => left.localeCompare(right))
 			.map(([operation, values]) => {
@@ -50,6 +58,7 @@ export class ControlLatencyRegistry {
 					count: sorted.length,
 					p50Ms: percentile(sorted, 0.5),
 					p95Ms: percentile(sorted, 0.95),
+					...(includeP99 ? { p99Ms: percentile(sorted, 0.99) } : {}),
 				});
 			});
 	}
