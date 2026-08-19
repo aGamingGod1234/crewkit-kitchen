@@ -4,7 +4,6 @@ import hashlib
 import http.server
 import io
 import json
-import os
 import shutil
 import stat
 import subprocess
@@ -365,12 +364,22 @@ class FetchMapSourceTests(unittest.TestCase):
         destination: Path,
         transport_url: str,
         *,
-        fail_evidence_promotion: bool = False,
+        fail_after_move: int | None = None,
     ) -> subprocess.CompletedProcess[str]:
         escaped_script = str(script_path).replace("'", "''")
         escaped_destination = str(destination).replace("'", "''")
         escaped_transport_url = transport_url.replace("'", "''")
-        command = (
+        move_interceptor = ""
+        if fail_after_move is not None:
+            move_interceptor = (
+                "$global:MapTestMoveCount = 0; "
+                "function Move-Item { param([string]$LiteralPath, [string]$Destination); "
+                "$global:MapTestMoveCount++; "
+                "Microsoft.PowerShell.Management\\Move-Item @PSBoundParameters; "
+                f"if ($global:MapTestMoveCount -eq {fail_after_move}) {{ "
+                "throw 'Injected failure after move side effect.' } }; "
+            )
+        command = move_interceptor + (
             "function Invoke-WebRequest { param([switch]$UseBasicParsing, [int]$MaximumRedirection, "
             "[uri]$Uri, [string]$OutFile); "
             f"$parameters = @{{ UseBasicParsing = $true; Uri = '{escaped_transport_url}'; "
@@ -380,10 +389,6 @@ class FetchMapSourceTests(unittest.TestCase):
             "Microsoft.PowerShell.Utility\\Invoke-WebRequest @parameters }; "
             f"& '{escaped_script}' -SourceKey local-test -Destination '{escaped_destination}'"
         )
-        environment = os.environ.copy()
-        environment.pop("ARENAAGENTS_MAP_FETCH_FAIL_EVIDENCE_PROMOTION", None)
-        if fail_evidence_promotion:
-            environment["ARENAAGENTS_MAP_FETCH_FAIL_EVIDENCE_PROMOTION"] = "1"
         return subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
             cwd=repository,
@@ -391,7 +396,6 @@ class FetchMapSourceTests(unittest.TestCase):
             text=True,
             timeout=20,
             check=False,
-            env=environment,
         )
 
     def test_local_acquisition_publishes_pair_and_reuses_it(self) -> None:
@@ -437,13 +441,48 @@ class FetchMapSourceTests(unittest.TestCase):
                     script_path,
                     destination,
                     source.url("/archive"),
-                    fail_evidence_promotion=True,
+                    fail_after_move=2,
                 )
 
                 self.assertNotEqual(0, result.returncode)
-                self.assertIn("evidence promotion", (result.stdout + result.stderr).lower())
+                self.assertIn("after move side effect", (result.stdout + result.stderr).lower())
                 self.assertFalse((destination / "fixture.zip").exists())
                 self.assertFalse((destination / "fixture.zip.sha256.json").exists())
+                self.assertEqual([], list(destination.glob("*.partial")))
+                self.assertEqual([], list(destination.glob(".*.partial")))
+
+    def test_archive_promotion_failure_preserves_preexisting_evidence(self) -> None:
+        payload = b"preexisting evidence archive"
+        approved_url = "https://approved.invalid/archive"
+        with LocalHttpSource(payload) as source:
+            with isolated_fetch_repository(approved_url, payload) as (repository, script_path):
+                destination = repository / "runtime" / "map-research" / "preexisting"
+                destination.mkdir(parents=True)
+                evidence_path = destination / "fixture.zip.sha256.json"
+                evidence_bytes = json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "sourceKey": "local-test",
+                        "url": approved_url,
+                        "filename": "fixture.zip",
+                        "retrievedAtUtc": "2026-08-19T00:00:00Z",
+                        "size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                ).encode()
+                evidence_path.write_bytes(evidence_bytes)
+
+                result = self.run_isolated_fetch(
+                    repository,
+                    script_path,
+                    destination,
+                    source.url("/archive"),
+                    fail_after_move=1,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse((destination / "fixture.zip").exists())
+                self.assertEqual(evidence_bytes, evidence_path.read_bytes())
                 self.assertEqual([], list(destination.glob("*.partial")))
                 self.assertEqual([], list(destination.glob(".*.partial")))
 

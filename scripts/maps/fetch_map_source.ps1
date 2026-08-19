@@ -89,9 +89,11 @@ New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
 
 $archivePath = Join-Path $destinationPath ([string]$source.archive.filename)
 $evidencePath = "$archivePath.sha256.json"
+$archiveExistedBefore = Test-Path -LiteralPath $archivePath
+$evidenceExistedBefore = Test-Path -LiteralPath $evidencePath
 $lockedSha256 = if ($null -ne $source.archive.sha256) { ([string]$source.archive.sha256).ToLowerInvariant() } else { $null }
 $existingEvidence = $null
-if (Test-Path -LiteralPath $evidencePath) {
+if ($evidenceExistedBefore) {
     $existingEvidence = Get-Content -LiteralPath $evidencePath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($existingEvidence.sourceKey -ne $SourceKey -or $existingEvidence.url -ne $source.archive.url) {
         throw "Existing checksum evidence does not match source '$SourceKey' and its approved URL."
@@ -103,7 +105,7 @@ if (Test-Path -LiteralPath $evidencePath) {
     $lockedSha256 = $evidenceSha256
 }
 
-if (Test-Path -LiteralPath $archivePath) {
+if ($archiveExistedBefore) {
     if ($null -eq $lockedSha256) {
         throw "An archive exists without a locked checksum. Move it aside before acquiring '$SourceKey'."
     }
@@ -129,9 +131,9 @@ if (Test-Path -LiteralPath $archivePath) {
 $acquisitionId = [System.Guid]::NewGuid().ToString('N')
 $partialPath = Join-Path $destinationPath ('.' + [string]$source.archive.filename + '.' + $acquisitionId + '.partial')
 $partialEvidencePath = "$evidencePath.$acquisitionId.partial"
-$publishEvidence = -not (Test-Path -LiteralPath $evidencePath)
-$archivePublishedByThisRun = $false
-$evidencePublishedByThisRun = $false
+$publishEvidence = -not $evidenceExistedBefore
+$archivePromotionAttemptedByThisRun = $false
+$evidencePromotionAttemptedByThisRun = $false
 $publishSucceeded = $false
 try {
     Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -Uri $approvedUri.AbsoluteUri -OutFile $partialPath
@@ -159,14 +161,11 @@ try {
     if ($publishEvidence) {
         [System.IO.File]::WriteAllText($partialEvidencePath, (($evidence | ConvertTo-Json -Depth 4) + "`n"), $utf8WithoutBom)
     }
+    $archivePromotionAttemptedByThisRun = $true
     Move-Item -LiteralPath $partialPath -Destination $archivePath
-    $archivePublishedByThisRun = $true
     if ($publishEvidence) {
-        if ($env:ARENAAGENTS_MAP_FETCH_FAIL_EVIDENCE_PROMOTION -eq '1') {
-            throw "Injected evidence promotion failure."
-        }
+        $evidencePromotionAttemptedByThisRun = $true
         Move-Item -LiteralPath $partialEvidencePath -Destination $evidencePath
-        $evidencePublishedByThisRun = $true
     }
     $publishSucceeded = $true
 
@@ -179,11 +178,15 @@ try {
     }
 } finally {
     if (-not $publishSucceeded) {
-        if ($evidencePublishedByThisRun -and (Test-Path -LiteralPath $evidencePath)) {
-            Remove-Item -LiteralPath $evidencePath -Force
+        if ($evidencePromotionAttemptedByThisRun -and -not $evidenceExistedBefore) {
+            if (Test-Path -LiteralPath $evidencePath) {
+                Remove-Item -LiteralPath $evidencePath -Force
+            }
         }
-        if ($archivePublishedByThisRun -and (Test-Path -LiteralPath $archivePath)) {
-            Remove-Item -LiteralPath $archivePath -Force
+        if ($archivePromotionAttemptedByThisRun -and -not $archiveExistedBefore) {
+            if (Test-Path -LiteralPath $archivePath) {
+                Remove-Item -LiteralPath $archivePath -Force
+            }
         }
     }
     if (Test-Path -LiteralPath $partialPath) {
