@@ -33,6 +33,7 @@ import dev.agaminggod.arenaagents.client.navigation.NavigationMovementVerificati
 import dev.agaminggod.arenaagents.client.navigation.MinecraftWalkabilityViewVerification;
 import dev.agaminggod.arenaagents.client.network.GoalReceiverVerification;
 import dev.agaminggod.arenaagents.control.AgentControlVerification;
+import dev.agaminggod.arenaagents.control.AgentRosterViewStateVerification;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
 import dev.agaminggod.arenaagents.protocol.ActionState;
@@ -147,6 +148,7 @@ public final class VerificationMain {
 		passedAssertions += AgentRegistryVerification.verify();
 		passedAssertions += AgentIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
+		passedAssertions += AgentRosterViewStateVerification.verify();
 		passedAssertions += BlockObservationOrderingVerification.verify();
 		passedAssertions += InventoryObservationSlotsVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
