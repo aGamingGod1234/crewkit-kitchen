@@ -1,5 +1,8 @@
 package dev.agaminggod.arenaagents.client.gui;
 
+import dev.agaminggod.arenaagents.control.AgentRosterFilter;
+import java.util.Objects;
+
 /** Responsive geometry for the field console, independent from Minecraft rendering state. */
 public record AgentControlLayout(
 		int panelLeft,
@@ -94,6 +97,34 @@ public record AgentControlLayout(
 			throw new IllegalArgumentException("Authoritative roster count cannot be negative");
 		}
 		return authoritativeCount >= 9;
+	}
+
+	public static int rosterPageAfterFilterUpdate(
+			AgentRosterFilter currentFilter,
+			AgentRosterFilter nextFilter,
+			int currentPage
+	) {
+		Objects.requireNonNull(currentFilter, "current filter must not be null");
+		Objects.requireNonNull(nextFilter, "next filter must not be null");
+		if (currentPage < 1) throw new IllegalArgumentException("Roster page must be positive");
+		return currentFilter.equals(nextFilter) ? currentPage : 1;
+	}
+
+	public static String groupScopeLabel(int selectedCount, int hiddenSelectedCount) {
+		if (selectedCount < 0 || hiddenSelectedCount < 0 || hiddenSelectedCount > selectedCount) {
+			throw new IllegalArgumentException("Group scope counts are invalid");
+		}
+		String selected = selectedCount + " selected";
+		return hiddenSelectedCount == 0
+				? selected
+				: selected + " \u00b7 " + hiddenSelectedCount + " hidden";
+	}
+
+	public Bounds groupScopeBounds() {
+		if (sideNavigation) {
+			return new Bounds(contentLeft, Math.max(panelTop, contentTop - 14), contentRight, contentTop);
+		}
+		return new Bounds(contentLeft, panelTop + 19, contentRight, Math.min(navigationTop, panelTop + 34));
 	}
 
 	public Bounds rosterBounds(boolean filtersVisible, boolean reserveActionRow) {

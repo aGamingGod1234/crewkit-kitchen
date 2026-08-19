@@ -762,7 +762,9 @@ public final class AgentControlScreen extends Screen {
 			graphics.fill(left, layout.panelTop(), layout.panelRight(), layout.panelTop() + 37, NAV_SURFACE);
 			graphics.fill(left, layout.panelTop() + 37, layout.panelRight(), layout.panelTop() + 38, PANEL_EDGE);
 			graphics.text(font, "ARENA AGENTS", left + 14, layout.panelTop() + 10, TEXT, false);
-			graphics.text(font, "FIELD CONSOLE", left + 14, layout.panelTop() + 22, MUTED, false);
+			if (page != Page.GROUP) {
+				graphics.text(font, "FIELD CONSOLE", left + 14, layout.panelTop() + 22, MUTED, false);
+			}
 		}
 		String connection = snapshot == null ? "SYNCING" : snapshot.canControl() ? "LINK ONLINE" : "VIEW ONLY";
 		int connectionColor = snapshot != null && snapshot.canControl() ? SUCCESS : ACCENT;
@@ -802,13 +804,17 @@ public final class AgentControlScreen extends Screen {
 
 	private void renderGroup(GuiGraphicsExtractor graphics) {
 		AgentControlLayout layout = layout();
-		if (!layout.sideNavigation()) return;
 		int count = rosterState.selectedIds().size();
 		int hidden = rosterState.page(1).hiddenSelectedCount();
+		String scope = AgentControlLayout.groupScopeLabel(count, hidden);
+		AgentControlLayout.Bounds scopeBounds = layout.groupScopeBounds();
+		if (!layout.sideNavigation()) {
+			graphics.text(font, fit(scope, scopeBounds.width()), scopeBounds.left(), scopeBounds.top() + 3,
+					count == 0 ? MUTED : ACCENT, false);
+			return;
+		}
 		graphics.text(font, "Group prompt", contentLeft(), layout.panelTop() + 9, TEXT, false);
-		String scope = count + (count == 1 ? " selected" : " selected")
-				+ (hidden > 0 ? " · " + hidden + " hidden" : "");
-		graphics.text(font, scope, contentLeft(), layout.contentTop() - 11,
+		graphics.text(font, scope, scopeBounds.left(), scopeBounds.top() + 3,
 				count == 0 ? MUTED : ACCENT, false);
 		if (contentWidth() >= 560) {
 			graphics.text(font, "Group selection changes messaging only. Configure agents one at a time.",
@@ -1221,9 +1227,12 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private void setRosterFilterWithoutRebuild(AgentRosterFilter filter) {
-		rosterFilter = Objects.requireNonNull(filter, "roster filter must not be null");
+		AgentRosterFilter nextFilter = Objects.requireNonNull(filter, "roster filter must not be null");
+		int currentPage = rosterState.page(1).page();
+		int nextPage = AgentControlLayout.rosterPageAfterFilterUpdate(rosterFilter, nextFilter, currentPage);
+		rosterFilter = nextFilter;
 		rosterState.setFilter(rosterFilter);
-		rosterState.setPage(1, 1);
+		if (nextPage != currentPage) rosterState.setPage(nextPage, 1);
 		boolean focusVisible = rosterEntries.stream()
 				.anyMatch(entry -> entry.id().equals(rosterState.focusedId()) && rosterFilter.matches(entry));
 		if (!focusVisible) {

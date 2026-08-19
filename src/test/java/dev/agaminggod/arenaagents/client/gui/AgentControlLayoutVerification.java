@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.client.gui;
 
+import dev.agaminggod.arenaagents.control.AgentRosterFilter;
+
 public final class AgentControlLayoutVerification {
 	private AgentControlLayoutVerification() {
 	}
@@ -61,6 +63,30 @@ public final class AgentControlLayoutVerification {
 				"compact workspace actions remain above the global footer");
 		assertions += 3;
 
+		AgentRosterFilter all = AgentRosterFilter.all();
+		AgentRosterFilter working = new AgentRosterFilter("", "", "Working");
+		assertTrue(AgentControlLayout.rosterPageAfterFilterUpdate(all, all, 3) == 3,
+				"unchanged heartbeat filter preserves the current roster page");
+		assertTrue(AgentControlLayout.rosterPageAfterFilterUpdate(working,
+				new AgentRosterFilter("", "", "Working"), 2) == 2,
+				"equal normalized filter values preserve the current roster page");
+		assertTrue(AgentControlLayout.rosterPageAfterFilterUpdate(working, all, 3) == 1,
+				"an effective filter change returns the roster to page one");
+		assertions += 3;
+
+		assertEquals("3 selected \u00b7 2 hidden", AgentControlLayout.groupScopeLabel(3, 2),
+				"group scope names selected and hidden agents");
+		assertEquals("3 selected", AgentControlLayout.groupScopeLabel(3, 0),
+				"group scope stays concise when no selected agents are hidden");
+		AgentControlLayout.Bounds compactScope = compact.groupScopeBounds();
+		assertTrue(compactScope.top() >= compact.panelTop() + 19,
+				"compact scope starts below the primary header title");
+		assertTrue(compactScope.bottom() <= compact.navigationTop(),
+				"compact scope remains above navigation");
+		assertTrue(compactScope.bottom() <= compact.contentTop(),
+				"compact scope remains above roster and composer content");
+		assertions += 5;
+
 		assertThrows(IllegalArgumentException.class, () -> AgentControlLayout.calculate(319, 240),
 				"unsupported widths fail explicitly instead of creating negative widgets");
 		assertThrows(IllegalArgumentException.class, () -> AgentControlLayout.calculate(320, 239),
@@ -93,6 +119,12 @@ public final class AgentControlLayoutVerification {
 
 	private static void assertTrue(boolean condition, String label) {
 		if (!condition) throw new AssertionError(label);
+	}
+
+	private static void assertEquals(Object expected, Object actual, String label) {
+		if (!expected.equals(actual)) {
+			throw new AssertionError(label + ": expected " + expected + " but was " + actual);
+		}
 	}
 
 	private static void assertThrows(Class<? extends Throwable> expected, Runnable action, String label) {
