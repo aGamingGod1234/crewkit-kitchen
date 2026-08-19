@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
 import dev.agaminggod.arenaagents.server.AgentDeathCaptureVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
+import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupStateVerification;
 import dev.agaminggod.arenaagents.client.action.ActionExecutorVerification;
 import dev.agaminggod.arenaagents.client.action.CombatInteractionVerification;
@@ -177,6 +178,7 @@ public final class VerificationMain {
 		passedAssertions += ArenaSpectatorSnapshotVerification.verify();
 		passedAssertions += ArenaSpectatorStateVerification.verify();
 		passedAssertions += ArenaAgentsClientBootstrapVerification.verify();
+		passedAssertions += AgentRosterGridLayoutVerification.verify();
 		passedAssertions += ScenarioSetupStateVerification.verify();
 		passedAssertions += BridgeEnvelopeCodecVerification.verify();
 		passedAssertions += BoundedServerTaskQueueVerification.verify();
