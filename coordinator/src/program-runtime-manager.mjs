@@ -70,6 +70,16 @@ export class ProgramRuntimeManager {
 			};
 			this.#recordMinecraftPublication(receiptEpochMs, payload.observedAtEpochMs);
 		}
+		if (state.pendingServerResult !== null && eventSequence >= state.pendingServerResult.barrierEventSequence) {
+			const pending = state.pendingServerResult;
+			state.pendingServerResult = null;
+			state.engine.ingestActionResult({
+				actionId: pending.internalActionId,
+				state: pending.state,
+				reasonCode: pending.reasonCode,
+				eventSequence,
+			});
+		}
 		state.engine.ingestObservation({ observation, eventSequence, attention: payload.attention === true });
 		this.#syncState(record, state);
 		return state.engine.snapshot();
@@ -80,8 +90,6 @@ export class ProgramRuntimeManager {
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return false;
 		const active = state.engine.snapshot().activeActionId;
 		if (active === null || state.actionIds.get(payload.actionId) !== active) return false;
-		const eventSequence = this.#actionEventSequence(state, payload.eventSequence);
-		if (eventSequence === null) return false;
 		const timing = state.actionTiming.get(payload.actionId);
 		if (timing && timing.firstProgressAt === null) {
 			timing.firstProgressAt = this.#safeNow();
@@ -96,8 +104,7 @@ export class ProgramRuntimeManager {
 		const active = state.engine.snapshot().activeActionId;
 		const internalActionId = state.actionIds.get(payload.actionId);
 		if (active === null || internalActionId !== active) return false;
-		const eventSequence = this.#actionEventSequence(state, payload.eventSequence);
-		if (eventSequence === null) return false;
+		const barrierEventSequence = (state.lastServerEventSequence ?? 0) + 1;
 		const timing = state.actionTiming.get(payload.actionId);
 		const metadata = state.actionMetadata.get(payload.actionId);
 		const completedAt = this.#safeNow();
@@ -109,7 +116,7 @@ export class ProgramRuntimeManager {
 				programId: metadata.command.provenance.programId,
 				version: metadata.command.provenance.version,
 				sourceStepId: metadata.command.provenance.stepId,
-				eventSequence,
+				eventSequence: barrierEventSequence,
 				authority: metadata.command.provenance,
 				actionType: metadata.command.action.type,
 				arguments: metadata.command.action.arguments,
@@ -121,16 +128,15 @@ export class ProgramRuntimeManager {
 				},
 			});
 		}
-		state.engine.ingestActionResult({
-			actionId: internalActionId,
+		state.pendingServerResult = {
+			internalActionId,
 			state: payload.state,
 			reasonCode: payload.reasonCode ?? '',
-			eventSequence,
-		});
+			barrierEventSequence,
+		};
 		state.actionIds.delete(payload.actionId);
 		state.actionTiming.delete(payload.actionId);
 		state.actionMetadata.delete(payload.actionId);
-		if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
 		this.#syncState(record, state);
 		return true;
 	}
@@ -148,6 +154,7 @@ export class ProgramRuntimeManager {
 		const state = this.#states.get(record.agentId);
 		if (!state) return;
 		state.disposed = true;
+		state.pendingServerResult = null;
 		state.engine.dispose();
 		this.#states.delete(record.agentId);
 	}
@@ -156,6 +163,7 @@ export class ProgramRuntimeManager {
 		const state = this.#states.get(agentId);
 		if (!state) return;
 		state.disposed = true;
+		state.pendingServerResult = null;
 		state.engine.dispose();
 		this.#states.delete(agentId);
 	}
@@ -201,6 +209,7 @@ export class ProgramRuntimeManager {
 			lastReceiptEpochMs: null,
 			reactiveRequest: null,
 			reactiveRequestActive: false,
+			pendingServerResult: null,
 			engine: null,
 		};
 		state.engine = new ArenaScriptEngine({
@@ -423,7 +432,7 @@ export class ProgramRuntimeManager {
 		if (state.disposed || state.actionIds.get(externalActionId) !== internalActionId) return;
 		const active = state.engine.snapshot().activeActionId;
 		if (active !== internalActionId) return;
-		const eventSequence = this.#actionEventSequence(state);
+		const eventSequence = this.#localActionEventSequence(state);
 		const metadata = state.actionMetadata.get(externalActionId);
 		const timing = state.actionTiming.get(externalActionId);
 		state.actionIds.delete(externalActionId);
@@ -469,7 +478,7 @@ export class ProgramRuntimeManager {
 		return candidate;
 	}
 
-	#actionEventSequence(state, candidate = undefined) {
+	#localActionEventSequence(state, candidate = undefined) {
 		if (candidate === undefined || candidate === null) return ++state.sequence;
 		if (!Number.isSafeInteger(candidate) || candidate <= state.sequence) return null;
 		state.sequence = candidate;

@@ -63,6 +63,16 @@ test('collects eight logs across two trees using measured pickup range and prove
 	assert.ok(harness.bridge.validatedInbound >= 8, 'progress, observation, and result traffic used protocol-v2 translation');
 	assert.deepEqual(harness.movementEvidence.map((move) => move.target), [{ x: 8, y: 64, z: 0 }, { x: 8, y: 64, z: 0 }]);
 	assert.ok(harness.movementEvidence.every((move) => move.pickupDistance <= PICKUP_RADIUS));
+	for (let index = 1; index < commands.length; index += 1) {
+		const previousResult = harness.bridge.traffic.findIndex((entry) =>
+				entry.type === 'action_result' && entry.actionId === commands[index - 1].actionId);
+		const authoritativeObservation = harness.bridge.traffic.findIndex((entry, trafficIndex) =>
+				trafficIndex > previousResult && entry.type === 'observation');
+		const nextCommand = harness.bridge.traffic.findIndex((entry) =>
+				entry.type === 'action_command' && entry.actionId === commands[index].actionId);
+		assert.ok(previousResult >= 0 && previousResult < authoritativeObservation && authoritativeObservation < nextCommand,
+				`command ${index + 1} follows result then authoritative observation`);
+	}
 	recordScenario('eight_logs_two_trees', harness);
 });
 

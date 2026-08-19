@@ -42,7 +42,10 @@ test('installs a model-authored program and dispatches its next primitive withou
 	assert.deepEqual(wire.provenance, { ...run.sent[0].payload.provenance });
 	assert.match(wire.provenance.sourceStepId, /^step-\d+-\d+$/);
 	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: run.sent[0].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
+	assert.equal(run.sent.length, 1, 'a terminal result alone cannot resume the program');
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: false });
 	assert.equal(run.sent.length, 2);
+	assert.equal(run.sent[1].payload.provenance.eventSequence, 2, 'the continuation uses the post-action observation sequence');
 	assert.equal(run.requests.length, 0, 'pre-authored continuation must not call the provider');
 });
 
@@ -56,8 +59,67 @@ test('reports a completed ArenaScript program after its final action result', as
 	}, { observation: observation(), eventSequence: 1 });
 	const command = run.sent[0];
 	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
+	assert.equal(run.registry.get('agent-a').state, DynamicAgentState.ACTING, 'a terminal result alone cannot complete the program');
+	assert.equal(changes.length, 0, 'completion is not published before authoritative facts arrive');
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: false });
 	assert.equal(run.registry.get('agent-a').state, DynamicAgentState.COMPLETED);
 	assert.equal(changes.at(-1)?.state, DynamicAgentState.COMPLETED, 'terminal state is reported to the bridge owner');
+});
+
+test('failed and timed-out results remain pending until authoritative facts arrive', async () => {
+	for (const [state, reasonCode] of [['FAILED', 'PATH_BLOCKED'], ['TIMED_OUT', 'PATH_TIMEOUT']]) {
+		const run = harness();
+		await run.manager.installDecision(run.registry.get('agent-a'), {
+			summary: 'Checkpoint failures.', directive: 'replace',
+			source: 'program.onUnhandledAttention("continue_and_notify"); const result = await tryResult(player.wait(1)); if (!result.succeeded) program.checkpoint(result.reason); program.finish("done");',
+		}, { observation: observation(), eventSequence: 1 });
+		const first = run.sent[0];
+		assert.equal(await run.manager.onActionResult(run.registry.get('agent-a'), {
+			actionId: first.payload.actionId, state, reasonCode,
+		}), true);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.ACTING, `${state} alone does not advance control`);
+		await run.manager.onObservation(run.registry.get('agent-a'), {
+			observation: observation(), eventSequence: 2, attention: false,
+		});
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.PAUSED, `${state} is applied after fresh facts`);
+	}
+});
+
+test('retains one terminal result across duplicates and releases it on a jumped observation sequence', async () => {
+	const run = harness();
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Wait twice.', directive: 'replace', source: SOURCE,
+	}, { observation: observation(), eventSequence: 1 });
+	const first = run.sent[0];
+	assert.equal(await run.manager.onActionResult(run.registry.get('agent-a'), {
+		actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 99,
+	}), true);
+	assert.equal(await run.manager.onActionResult(run.registry.get('agent-a'), {
+		actionId: first.payload.actionId, state: 'FAILED', reasonCode: 'DUPLICATE', eventSequence: 100,
+	}), false, 'a duplicate cannot replace the retained result');
+	assert.equal(run.sent.length, 1);
+	await run.manager.onObservation(run.registry.get('agent-a'), {
+		observation: observation({ player: { x: 9, y: 64, z: 0, health: 20 } }), eventSequence: 9, attention: false,
+	});
+	assert.equal(run.sent.length, 2, 'a jumped authoritative sequence releases the retained result once');
+	assert.equal(run.sent[1].payload.provenance.eventSequence, 9);
+});
+
+test('goal replacement clears a retained terminal result', async () => {
+	const run = harness();
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Wait twice.', directive: 'replace', source: SOURCE,
+	}, { observation: observation(), eventSequence: 1 });
+	const first = run.sent[0];
+	await run.manager.onActionResult(run.registry.get('agent-a'), {
+		actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE',
+	});
+	run.manager.onGoalControl(run.registry.get('agent-a'), 'steer');
+	assert.equal(await run.manager.onObservation(run.registry.get('agent-a'), {
+		observation: observation(), eventSequence: 2, attention: false,
+	}), null);
+	assert.equal(run.sent.filter((message) => message.type === 'action_command').length, 1,
+			'disposed pending work cannot dispatch under a replacement goal');
 });
 
 test('emits a provenance-bearing coordinate-free respawn primitive only from authored player code', async () => {
@@ -128,6 +190,8 @@ test('uses an authored watcher before asking the provider for unmatched attentio
 	const first = run.sent[0];
 	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 37, attention: true });
 	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 38 });
+	assert.equal(run.sent.length, 1, 'latched watcher waits for post-action facts');
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 38, attention: false });
 	assert.equal(run.sent.at(-1).payload.arguments.durationMs, 9);
 	assert.equal(run.sent.at(-1).payload.provenance.eventSequence, 37, 'watcher command repeats the triggering server event identity');
 	assert.equal(run.requests.length, 0);
@@ -276,12 +340,14 @@ test('telemetry clock faults omit samples without interrupting program control',
 	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(1); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: sent[0].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: false });
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: sent[1].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3, attention: false });
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(sent.length, 3, 'NaN, negative, regressing, and throwing clock reads cannot stop commands');
 	assert.ok(await manager.onObservation(registry.get('agent-a'), {
-		observation: observation(), eventSequence: 2, attention: true,
+		observation: observation(), eventSequence: 4, attention: true,
 		receiptMonotonicMs: -1, receiptEpochMs: Number.NaN, observedAtEpochMs: 1,
 	}), 'invalid receipt timestamps cannot reject a valid observation');
 });
@@ -322,6 +388,12 @@ test('refreshes authored watcher facts across two hundred quiet movement observa
 	assert.equal(run.requests.length, 0, 'two hundred quiet fact updates request no provider turn');
 	await run.manager.onActionResult(run.registry.get('agent-a'), {
 		actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 202,
+	});
+	assert.equal(run.sent.length, 1, 'the result still waits after two hundred prior fact updates');
+	await run.manager.onObservation(run.registry.get('agent-a'), {
+		observation: observation({ player: { x: 200, y: 64, z: 100, health: 20 } }),
+		eventSequence: 202,
+		attention: false,
 	});
 	assert.equal(run.sent.at(-1).payload.arguments.durationMs, 7, 'the authored movement and health watcher uses refreshed facts locally');
 	assert.equal(run.sent.at(-1).payload.provenance.eventSequence, 201, 'the watcher retains the exact triggering observation sequence');

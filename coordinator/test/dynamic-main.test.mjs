@@ -139,7 +139,11 @@ test('installs a selected-model program and continues its next primitive without
 		assert.equal(run.planner.requests[0].agentId, 'agent-a');
 		assert.equal(first.payload.provenance.programId, 'program-1-1');
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'action_command').length, 1, 'result alone sends no continuation');
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, attention: false, observation: { player: { x: 1, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'action_command').at(-1).payload.provenance.eventSequence, 2);
 		assert.equal(run.planner.requests.length, 1);
 	} finally { await run.coordinator.stop(); }
 });
@@ -160,6 +164,9 @@ test('publishes completed program state back to the server registry', async () =
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
 		const command = run.bridge.sent.find((message) => message.type === 'action_command');
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'goal_completed'), false, 'result alone cannot publish completion');
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, attention: false, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'goal_completed'));
 		const stateMessages = run.bridge.sent.filter((message) => message.type === 'goal_completed');
 		assert.deepEqual(stateMessages.at(-1), {
@@ -238,6 +245,12 @@ test('accepts two hundred quiet wire observations without another provider turn'
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
 			goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 202,
 		} });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'action_command').length, 1, 'result waits for one more authoritative wire observation');
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 202, attention: false,
+			observation: { player: { x: 200, y: 64, z: 100, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
 		const watcher = run.bridge.sent.filter((message) => message.type === 'action_command').at(-1);
 		assert.equal(watcher.payload.arguments.durationMs, 7, 'wire updates reach the authored watcher in order');
@@ -295,6 +308,7 @@ test('injects coordinator latency telemetry into program reaction timing', async
 		assert.equal(latencyRegistry.snapshot().some((entry) => entry.operation === 'event_receipt_to_branch'), false, 'heartbeats never create reaction timing');
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 12, eventSequence: 3, attention: true, observation: { player: { x: 0, y: 64, z: 0, health: 19 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 4 } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 13, eventSequence: 4, attention: false, observation: { player: { x: 0, y: 64, z: 0, health: 19 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => latencyRegistry.snapshot().some((entry) => entry.operation === 'event_receipt_to_branch'));
 		publishStatus();
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'coordinator_status' && message.payload.latencies.some((entry) => entry.operation === 'event_receipt_to_branch')));
@@ -458,6 +472,7 @@ test('throwing telemetry clocks cannot block action results or disconnect cleanu
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 1);
 		const first = run.bridge.sent.find((message) => message.type === 'action_command');
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, attention: false, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command').length === 2);
 		run.bridge.emit('disconnected');
 		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DISCONNECTED);

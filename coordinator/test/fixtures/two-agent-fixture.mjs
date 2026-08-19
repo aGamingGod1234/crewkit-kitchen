@@ -85,7 +85,10 @@ class FakeBridge extends EventEmitter {
 		if (type === 'action_command') {
 			const sequence = (this.#eventSequence.get(agentId) ?? 1) + 1;
 			this.#eventSequence.set(agentId, sequence);
-			setImmediate(() => this.emit('action_result', { agentId, payload: { goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } }));
+			setImmediate(() => {
+				this.emit('action_result', { agentId, payload: { goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } });
+				this.emit('observation', observation(agentId, payload.goalRevision, sequence, false));
+			});
 		}
 	}
 }
@@ -125,8 +128,8 @@ class FixtureProvider {
 	}
 }
 
-function observation(agentId, goalRevision, eventSequence) {
-	return { agentId, payload: { goalRevision, observedAtEpochMs: 1, ready: true, status: 'ready', eventSequence, attention: true, changedFacts: [], position: { x: 0, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 }, player: { health: 20, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5, gameMode: 'survival', onGround: true, inWater: false, onFire: false, air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [] }, inventory: { items: [], selectedItem: 'minecraft:air' }, entities: [], blocks: [], nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false }, currentAction: { active: false }, lastResult: { present: false } } };
+function observation(agentId, goalRevision, eventSequence, attention = true) {
+	return { agentId, payload: { goalRevision, observedAtEpochMs: 1, ready: true, status: 'ready', eventSequence, attention, changedFacts: [], position: { x: 0, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 }, player: { health: 20, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5, gameMode: 'survival', onGround: true, inWater: false, onFire: false, air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [] }, inventory: { items: [], selectedItem: 'minecraft:air' }, entities: [], blocks: [], nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false }, currentAction: { active: false }, lastResult: { present: false } } };
 }
 
 async function eventually(predicate, message) {
