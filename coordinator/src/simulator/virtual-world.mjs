@@ -495,12 +495,12 @@ export class VirtualWorld extends EventEmitter {
 					return { done: true, state: 'FAILED', reasonCode: 'PLACEMENT_UNSUPPORTED', changed: false };
 				}
 				const inventoryBefore = clone(player.inventory);
-				if (!this.removeInventoryItem(agentId, args.itemId, 1)) return { done: true, state: 'FAILED', reasonCode: 'ITEM_NOT_FOUND', changed: false };
-				const block = normalizeBlock({ x: args.x, y: args.y, z: args.z, blockId: args.itemId, desiredState: args.desiredState });
 				try {
+					const block = normalizeBlock({ x: args.x, y: args.y, z: args.z, blockId: args.itemId, desiredState: args.desiredState });
+					if (!this.removeInventoryItem(agentId, args.itemId, 1)) return { done: true, state: 'FAILED', reasonCode: 'ITEM_NOT_FOUND', changed: false };
 					this.#insertBlock(block);
 					const placed = this.blockAt(args.x, args.y, args.z);
-					if (placed?.blockId !== args.itemId || (args.desiredState !== undefined && placed.desiredState !== args.desiredState)) {
+					if (placed?.blockId !== args.itemId || (args.desiredState !== undefined && args.desiredState !== null && placed.desiredState !== args.desiredState)) {
 						this.#blocks.delete(targetKey);
 						player.inventory = inventoryBefore;
 						return { done: true, state: 'FAILED', reasonCode: 'PLACEMENT_STATE_MISMATCH', changed: false };
@@ -796,7 +796,7 @@ function normalizeBlock(value) {
 		y: Math.trunc(position.y),
 		z: Math.trunc(position.z),
 		blockId: identifier(source.blockId ?? source.id ?? 'minecraft:stone', 'blockId'),
-		...(source.desiredState === undefined ? {} : { desiredState: desiredState(source.desiredState) }),
+		...(source.desiredState === undefined || source.desiredState === null ? {} : { desiredState: desiredState(source.desiredState) }),
 		...(source.tags === undefined ? {} : { tags: normalizeTags(source.tags, 'block.tags') }),
 	};
 }

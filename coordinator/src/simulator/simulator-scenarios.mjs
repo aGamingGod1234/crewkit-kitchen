@@ -21,23 +21,46 @@ const scenarioList = [
 		id: 'obstacle-navigation',
 		title: 'Navigate around a solid obstacle',
 		agentId: 'navigation-agent',
-		goal: 'Navigate to the marked position without crossing the obstacle.',
-		world: baseWorld({ agentId: 'navigation-agent', blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 2, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 1, z: 2, blockId: 'minecraft:stone' }] }),
-		commands: [{ actionId: 'navigate-obstacle', actionType: 'navigate_to', arguments: { x: 2, y: 1, z: 1, tolerance: 0.2, sprint: false, timeoutMs: 5_000 } }],
+		goal: 'Navigate around the solid obstacle using the declared waypoints.',
+		world: baseWorld({ agentId: 'navigation-agent', blocks: [
+			{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 2, y: 0, z: 0, blockId: 'minecraft:stone' },
+			{ x: 0, y: 0, z: 1, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 1, blockId: 'minecraft:stone' }, { x: 2, y: 0, z: 1, blockId: 'minecraft:stone' },
+			{ x: 0, y: 0, z: 2, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 2, blockId: 'minecraft:stone' }, { x: 2, y: 0, z: 2, blockId: 'minecraft:stone' }, { x: 3, y: 0, z: 2, blockId: 'minecraft:stone' },
+			{ x: 3, y: 0, z: 1, blockId: 'minecraft:stone' }, { x: 3, y: 0, z: 0, blockId: 'minecraft:stone' },
+			{ x: 1, y: 1, z: 0, blockId: 'minecraft:stone' },
+		] }),
+		commands: [
+			{ actionId: 'navigate-obstacle-waypoint-1', actionType: 'navigate_to', arguments: { x: 0, y: 1, z: 2, tolerance: 0.2, sprint: false, timeoutMs: 2_000 } },
+			{ actionId: 'navigate-obstacle-waypoint-2', actionType: 'navigate_to', arguments: { x: 3, y: 1, z: 2, tolerance: 0.2, sprint: false, timeoutMs: 2_000 } },
+			{ actionId: 'navigate-obstacle-waypoint-3', actionType: 'navigate_to', arguments: { x: 3, y: 1, z: 0, tolerance: 0.2, sprint: false, timeoutMs: 2_000 } },
+		],
 		events: [],
-		expected: { actionIds: ['navigate-obstacle'], target: { x: 2, y: 1, z: 1 }, tolerance: 0.2 },
-		success: (state) => resultsSucceeded(state, ['navigate-obstacle']) && atTarget(state, { x: 2, y: 1, z: 1 }, 0.2),
+		expected: {
+			actionIds: ['navigate-obstacle-waypoint-1', 'navigate-obstacle-waypoint-2', 'navigate-obstacle-waypoint-3'],
+			obstacle: { x: 1, y: 1, z: 0, blockId: 'minecraft:stone' },
+			waypoints: [{ x: 0, y: 1, z: 2 }, { x: 3, y: 1, z: 2 }, { x: 3, y: 1, z: 0 }],
+			tolerance: 0.2,
+		},
+		success: (state) => resultsSucceeded(state, ['navigate-obstacle-waypoint-1', 'navigate-obstacle-waypoint-2', 'navigate-obstacle-waypoint-3']) && obstacleRouteMatches(state, {
+			obstacle: { x: 1, y: 1, z: 0, blockId: 'minecraft:stone' },
+			waypoints: [{ x: 0, y: 1, z: 2 }, { x: 3, y: 1, z: 2 }, { x: 3, y: 1, z: 0 }],
+		}),
 	},
 	{
 		id: 'inventory-crafting',
 		title: 'Craft an exact inventory count',
 		agentId: 'craft-agent',
-		goal: 'Craft exactly eight oak planks from two oak logs.',
+		goal: 'Craft planks in inventory, craft a table, place it, then craft sticks at the table.',
 		world: baseWorld({ agentId: 'craft-agent', inventory: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0 }] }),
-		commands: [{ actionId: 'craft-exact', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:planks', count: 8, timeoutMs: 1_000 } }],
+		commands: [
+			{ actionId: 'craft-planks', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:planks', count: 8, timeoutMs: 1_000 } },
+			{ actionId: 'craft-table', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:crafting_table', count: 1, timeoutMs: 1_000 } },
+			{ actionId: 'place-table', actionType: 'place_block', arguments: { x: 1, y: 1, z: 0, face: 'up', itemId: 'minecraft:crafting_table', desiredState: null } },
+			{ actionId: 'craft-sticks-at-table', actionType: 'craft_table', arguments: { recipeId: 'minecraft:sticks', x: 1, y: 1, z: 0, count: 1, timeoutMs: 1_000 } },
+		],
 		events: [],
-		expected: { actionIds: ['craft-exact'], outputItemId: 'minecraft:oak_planks', outputCount: 8, consumedItemId: 'minecraft:oak_log', consumedCount: 2 },
-		success: (state) => resultsSucceeded(state, ['craft-exact']) && exactInventoryDelta(state, 'minecraft:oak_log', -2) && exactInventoryDelta(state, 'minecraft:oak_planks', 8),
+		expected: { actionIds: ['craft-planks', 'craft-table', 'place-table', 'craft-sticks-at-table'], outputItemId: 'minecraft:oak_planks', outputCount: 8, consumedItemId: 'minecraft:oak_log', consumedCount: 2, tableBlock: { x: 1, y: 1, z: 0, blockId: 'minecraft:crafting_table' }, stickItemId: 'minecraft:stick', stickCount: 1, finalPlanks: 2 },
+		success: (state) => resultsSucceeded(state, ['craft-planks', 'craft-table', 'place-table', 'craft-sticks-at-table']) && exactInventoryDelta(state, 'minecraft:oak_log', -2) && exactInventoryDelta(state, 'minecraft:oak_planks', 2) && exactInventoryDelta(state, 'minecraft:stick', 1) && state.state?.block?.x === 1 && state.state.block.y === 1 && state.state.block.z === 0 && state.state.block.blockId === 'minecraft:crafting_table',
 	},
 	{
 		id: 'block-placement',
@@ -72,8 +95,8 @@ const scenarioList = [
 			{ actionId: 'lava-leave', actionType: 'navigate_to', arguments: { x: 3, y: 1, z: 1, tolerance: 0.2, sprint: true, timeoutMs: 2_000 } },
 		],
 		events: [{ eventId: 'lava-hazard-1', type: 'hazard', hazardType: 'lava', position: { x: 0, y: 0, z: 1 } }],
-		expected: { actionIds: ['lava-wait', 'lava-leave'], hazardEventId: 'lava-hazard-1', hazardType: 'lava', reaction: 'leave_hazard' },
-		success: (state) => resultsSucceeded(state, ['lava-wait', 'lava-leave']) && state.state?.hazard?.eventId === 'lava-hazard-1' && state.state.hazard.hazardType === 'lava' && state.state.reaction === 'leave_hazard' && atTarget(state, { x: 3, y: 1, z: 1 }, 0.2),
+		expected: { actionIds: ['lava-wait', 'lava-leave'], hazardEventId: 'lava-hazard-1', hazardType: 'lava', reaction: 'leave_hazard', healthBefore: 20, requiresDamage: true },
+		success: (state) => resultsSucceeded(state, ['lava-wait', 'lava-leave']) && state.state?.hazard?.eventId === 'lava-hazard-1' && state.state.hazard.hazardType === 'lava' && state.state.hazard.healthAfter < state.state.hazard.healthBefore && state.state.reaction === 'leave_hazard' && atTarget(state, { x: 3, y: 1, z: 1 }, 0.2),
 	},
 	{
 		id: 'checkpoint-respawn',
@@ -162,6 +185,12 @@ function exactInventoryDelta(state, itemId, expectedDelta) {
 function atTarget(state, target, tolerance) {
 	const position = state?.state?.position ?? state?.position;
 	return Boolean(position) && Math.hypot(position.x - target.x, position.y - target.y, position.z - target.z) <= tolerance;
+}
+function obstacleRouteMatches(state, expected) {
+	const waypoints = state?.state?.waypoints ?? state?.waypoints;
+	const obstacle = state?.state?.obstacle ?? state?.obstacle;
+	if (!Array.isArray(waypoints) || waypoints.length !== expected.waypoints.length || !samePosition(obstacle, expected.obstacle) || obstacle.blockId !== expected.obstacle.blockId) return false;
+	return expected.waypoints.every((waypoint, index) => samePosition(waypoints[index], waypoint) && !samePosition(waypoints[index], expected.obstacle));
 }
 function samePosition(left, right) { return Boolean(left && right) && left.x === right.x && left.y === right.y && left.z === right.z; }
 function hasMatchingMessageEvent(state, expected) {

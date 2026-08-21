@@ -129,6 +129,19 @@ test('action setup rollback clears runtime and bridge state after a world setup 
 	assert.equal(bridge.actionRuntimeSnapshot().bridgeActiveAgentIds.length, 0);
 });
 
+test('accepted event listener failure rolls back the accepted trace with active state', async () => {
+	const world = VirtualWorld.fromScenario(scenario());
+	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
+	bridge.on('accepted', () => { throw new Error('accepted listener failed'); });
+	await assert.rejects(bridge.send('action_command', 'alice', command('accepted-event-fails', 'wait', { durationMs: 1 })), /accepted listener failed/);
+	assert.equal(bridge.events.some((event) => event.type === 'accepted' && event.envelope.payload.actionId === 'accepted-event-fails'), false);
+	assert.deepEqual(bridge.activeActionIds, []);
+	assert.deepEqual(bridge.actionRuntimeSnapshot().runtime.active, []);
+	assert.equal(world.playerState('alice').activeAction, null);
+	bridge.removeAllListeners('accepted');
+	await assert.doesNotReject(bridge.send('action_command', 'alice', command('accepted-event-recovers', 'wait', { durationMs: 1 })));
+});
+
 test('a recorded agent missing from the world cannot leak an accepted action', async () => {
 	const world = VirtualWorld.fromScenario({ agents: { bob: { position: { x: 0, y: 1, z: 0 } } } });
 	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 }, bob: { agentId: 'bob', goalRevision: 1 } } });

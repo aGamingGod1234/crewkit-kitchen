@@ -245,7 +245,12 @@ export class VirtualMinecraftBridge extends EventEmitter {
 	#recordEvent(type, envelope, eventSequence = undefined) {
 		const event = { type, envelope, ...(eventSequence === undefined ? {} : { eventSequence }) };
 		this.events.push(event);
-		this.emit(type, event);
+		try { this.emit(type, event); }
+		catch (error) {
+			const index = this.events.lastIndexOf(event);
+			if (index >= 0) this.events.splice(index, 1);
+			throw error;
+		}
 	}
 
 	#enqueue(callback) {

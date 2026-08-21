@@ -67,12 +67,26 @@ test('every command-bearing fixture reaches a deterministic terminal result in V
 });
 
 test('scenario success predicates require authoritative postconditions, not provider prose', () => {
+	const obstacle = getSimulatorScenario('obstacle-navigation');
+	assert.equal(runScenarioSuccess(obstacle, {
+		results: obstacle.expected.actionIds.map((actionId) => ({ actionId, state: 'SUCCEEDED' })),
+		state: { waypoints: obstacle.expected.waypoints, obstacle: obstacle.expected.obstacle },
+	}), true);
+	assert.equal(runScenarioSuccess(obstacle, {
+		results: obstacle.expected.actionIds.map((actionId) => ({ actionId, state: 'SUCCEEDED' })),
+		state: { position: obstacle.expected.waypoints.at(-1), obstacle: obstacle.expected.obstacle },
+	}), false);
+
 	const craft = getSimulatorScenario('inventory-crafting');
 	assert.equal(runScenarioSuccess(craft, {
-		result: { actionId: 'craft-exact', state: 'SUCCEEDED' },
-		state: { inventoryBefore: [{ itemId: 'minecraft:oak_log', count: 2 }], inventoryAfter: [{ itemId: 'minecraft:oak_planks', count: 8 }] },
+		results: craft.expected.actionIds.map((actionId) => ({ actionId, state: 'SUCCEEDED' })),
+		state: {
+			inventoryBefore: [{ itemId: 'minecraft:oak_log', count: 2 }],
+			inventoryAfter: [{ itemId: 'minecraft:oak_planks', count: 2 }, { itemId: 'minecraft:stick', count: 1 }],
+			block: { x: 1, y: 1, z: 0, blockId: 'minecraft:crafting_table' },
+		},
 	}), true);
-	assert.equal(runScenarioSuccess(craft, { result: { actionId: 'craft-exact', state: 'SUCCEEDED' }, state: { inventoryAfter: [{ itemId: 'minecraft:oak_planks', count: 7 }] } }), false);
+	assert.equal(runScenarioSuccess(craft, { results: craft.expected.actionIds.map((actionId) => ({ actionId, state: 'SUCCEEDED' })), state: { inventoryAfter: [{ itemId: 'minecraft:oak_planks', count: 7 }] } }), false);
 
 	const placement = getSimulatorScenario('block-placement');
 	assert.equal(runScenarioSuccess(placement, {
@@ -92,4 +106,14 @@ test('scenario success predicates require authoritative postconditions, not prov
 	const correction = getSimulatorScenario('invalid-decision-correction');
 	assert.equal(runScenarioSuccess(correction, { events: [{ invalidDecisionId: correction.expected.invalidDecisionId, correctedDecisionId: correction.expected.correctedDecisionId, accepted: true }] }), true);
 	assert.equal(runScenarioSuccess(correction, { events: [{ invalidDecisionId: 'other', correctedDecisionId: correction.expected.correctedDecisionId, accepted: true }] }), false);
+
+	const lava = getSimulatorScenario('lava-damage-reaction');
+	assert.equal(runScenarioSuccess(lava, {
+		results: lava.expected.actionIds.map((actionId) => ({ actionId, state: 'SUCCEEDED' })),
+		state: { hazard: { eventId: lava.expected.hazardEventId, hazardType: 'lava', healthBefore: 20, healthAfter: 19 }, reaction: 'leave_hazard', position: { x: 3, y: 1, z: 1 } },
+	}), true);
+	assert.equal(runScenarioSuccess(lava, {
+		results: lava.expected.actionIds.map((actionId) => ({ actionId, state: 'SUCCEEDED' })),
+		state: { hazard: { eventId: lava.expected.hazardEventId, hazardType: 'lava', healthBefore: 20, healthAfter: 20 }, reaction: 'leave_hazard', position: { x: 3, y: 1, z: 1 } },
+	}), false);
 });

@@ -214,6 +214,32 @@ test('placement requires solid face support and an authoritative desired state w
 	assert.equal(mismatchWorld.inventories(PLAYER).items.find((item) => item.itemId === 'minecraft:cobblestone')?.count, 1);
 });
 
+test('placement treats null desiredState as absent and rolls back normalize or insert failures exactly', () => {
+	const simulationWorld = world({ agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: [{ itemId: 'minecraft:cobblestone', count: 1, slot: 0 }] } } } });
+	const runtime = new ActionRuntime();
+	runtime.accept(command('place-null-state', 'place_block', { x: 1, y: 1, z: 0, face: 'up', itemId: 'minecraft:cobblestone', desiredState: null }));
+	const result = run(runtime, simulationWorld, 'place-null-state');
+	assert.equal(result.state, 'SUCCEEDED');
+	assert.equal(simulationWorld.blockAt(1, 1, 0).desiredState, undefined);
+	assert.equal(simulationWorld.inventories(PLAYER).items.find((item) => item.itemId === 'minecraft:cobblestone')?.count ?? 0, 0);
+
+	const invalidWorld = world({ agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: [{ itemId: 'minecraft:cobblestone', count: 1, slot: 0 }] } } } });
+	const beforeInvalid = invalidWorld.inventories(PLAYER);
+	assert.throws(() => invalidWorld.performSimulationAction(PLAYER, { type: 'place_block', arguments: { x: 1, y: 1, z: 0, face: 'up', itemId: 'minecraft:cobblestone', desiredState: '' } }), /desiredState/);
+	assert.deepEqual(invalidWorld.inventories(PLAYER), beforeInvalid);
+	assert.equal(invalidWorld.blockAt(1, 1, 0), null);
+
+	const fullWorld = world({
+		agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: [{ itemId: 'minecraft:cobblestone', count: 1, slot: 0 }] } } },
+		blocks: Array.from({ length: 256 }, (_, index) => ({ x: index, y: 0, z: 0, blockId: 'minecraft:stone' })),
+	});
+	const beforeInsert = fullWorld.inventories(PLAYER);
+	const insertResult = fullWorld.performSimulationAction(PLAYER, { type: 'place_block', arguments: { x: 255, y: 1, z: 0, face: 'up', itemId: 'minecraft:cobblestone', desiredState: null } });
+	assert.equal(insertResult.reasonCode, 'WORLD_CAPACITY_EXCEEDED');
+	assert.deepEqual(fullWorld.inventories(PLAYER), beforeInsert);
+	assert.equal(fullWorld.blockAt(255, 1, 0), null);
+});
+
 test('direct messages accept the production code-point maximum and reject one beyond it', () => {
 	const simulationWorld = world();
 	const maximum = '😀'.repeat(MAX_CONVERSATION_LENGTH);
