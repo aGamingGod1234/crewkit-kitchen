@@ -17,7 +17,27 @@ $script:ExcludedDirectoryNames = @(
     'logs',
     '.playwright-cli',
     'output',
-    'credentials'
+    'credentials',
+    'node_modules',
+    '.superpowers'
+)
+
+$script:ExcludedFileNamePatterns = @(
+    '*.env',
+    '*.env.*',
+    '*credentials*',
+    '*oauth*',
+    '*api-key*',
+    '*api_key*',
+    '*apikey*',
+    '*token*',
+    '*bridge-secret*',
+    '*bridgesecret*',
+    '*provider-login*',
+    '*providerlogin*',
+    '*client-secret*',
+    '*clientsecret*',
+    '*secret*'
 )
 
 function Invoke-GitCommand {
@@ -111,14 +131,11 @@ function Test-ExcludedRelativePath {
         if ($script:ExcludedDirectoryNames -contains $segment) {
             return $true
         }
-    }
-
-    $fileName = $segments[$segments.Count - 1]
-    if ($fileName -match '(?i)^\.env(?:\..*)?$') {
-        return $true
-    }
-    if ($fileName -match '(?i)credentials') {
-        return $true
+        foreach ($pattern in $script:ExcludedFileNamePatterns) {
+            if ($segment -like $pattern) {
+                return $true
+            }
+        }
     }
 
     return $false
@@ -160,54 +177,22 @@ function Get-SnapshotPathspecs {
     [CmdletBinding()]
     param()
 
-    $excludedPathspecs = @(
-        ':(exclude,glob).git/**',
-        ':(exclude,glob)**/.git/**',
-        ':(exclude,glob).worktrees',
-        ':(exclude,glob).worktrees/**',
-        ':(exclude,glob)**/.worktrees',
-        ':(exclude,glob)**/.worktrees/**',
-        ':(exclude,glob).gradle',
-        ':(exclude,glob).gradle/**',
-        ':(exclude,glob)**/.gradle',
-        ':(exclude,glob)**/.gradle/**',
-        ':(exclude,glob)build',
-        ':(exclude,glob)build/**',
-        ':(exclude,glob)**/build',
-        ':(exclude,glob)**/build/**',
-        ':(exclude,glob)run',
-        ':(exclude,glob)run/**',
-        ':(exclude,glob)**/run',
-        ':(exclude,glob)**/run/**',
-        ':(exclude,glob)runtime',
-        ':(exclude,glob)runtime/**',
-        ':(exclude,glob)**/runtime',
-        ':(exclude,glob)**/runtime/**',
-        ':(exclude,glob)logs',
-        ':(exclude,glob)logs/**',
-        ':(exclude,glob)**/logs',
-        ':(exclude,glob)**/logs/**',
-        ':(exclude,glob).playwright-cli',
-        ':(exclude,glob).playwright-cli/**',
-        ':(exclude,glob)**/.playwright-cli',
-        ':(exclude,glob)**/.playwright-cli/**',
-        ':(exclude,glob)output',
-        ':(exclude,glob)output/**',
-        ':(exclude,glob)**/output',
-        ':(exclude,glob)**/output/**',
-        ':(exclude,glob)credentials',
-        ':(exclude,glob)credentials/**',
-        ':(exclude,glob)**/credentials',
-        ':(exclude,glob)**/credentials/**',
-        ':(exclude,glob)**/*credentials*',
-        ':(exclude,glob).env',
-        ':(exclude,glob).env.*',
-        ':(exclude,glob)**/.env',
-        ':(exclude,glob)**/.env.*'
-    )
+    $excludedPathspecs = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($directoryName in $script:ExcludedDirectoryNames) {
+        $excludedPathspecs.Add(":(exclude,glob,icase)$directoryName")
+        $excludedPathspecs.Add(":(exclude,glob,icase)$directoryName/**")
+        $excludedPathspecs.Add(":(exclude,glob,icase)**/$directoryName")
+        $excludedPathspecs.Add(":(exclude,glob,icase)**/$directoryName/**")
+    }
+    foreach ($fileNamePattern in $script:ExcludedFileNamePatterns) {
+        $excludedPathspecs.Add(":(exclude,glob,icase)$fileNamePattern")
+        $excludedPathspecs.Add(":(exclude,glob,icase)**/$fileNamePattern")
+        $excludedPathspecs.Add(":(exclude,glob,icase)$fileNamePattern/**")
+        $excludedPathspecs.Add(":(exclude,glob,icase)**/$fileNamePattern/**")
+    }
 
     $pathspecs = @('.')
-    $pathspecs += $excludedPathspecs
+    $pathspecs += @($excludedPathspecs)
     return $pathspecs
 }
 
@@ -278,14 +263,6 @@ function New-LatencyExperimentCopies {
         if ([string]::IsNullOrWhiteSpace($snapshotId)) {
             throw 'Git did not return a snapshot commit ID.'
         }
-
-        if ($null -eq $previousIndexFile) {
-            Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
-        }
-        else {
-            $env:GIT_INDEX_FILE = $previousIndexFile
-        }
-        $temporaryIndexActive = $false
 
         $null = Invoke-GitCommand -Repository $resolvedProjectRoot -Arguments @('worktree', 'add', '--quiet', '--detach', $baselinePath, $snapshotId)
         $createdWorktrees.Add($baselinePath) | Out-Null
