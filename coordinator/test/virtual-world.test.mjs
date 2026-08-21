@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { VirtualWorld } from '../src/simulator/virtual-world.mjs';
+import { VirtualWorld, MAX_PLAYER_INVENTORY_ITEMS, MAX_WORLD_BLOCKS, MAX_WORLD_ENTITIES, MAX_WORLD_ITEMS } from '../src/simulator/virtual-world.mjs';
 
 function scenario(overrides = {}) {
 	return {
@@ -111,4 +111,67 @@ test('scenario input is immutable and start/stop use an idempotent injected sche
 	assert.equal(scheduled, 1);
 	assert.equal(cancelled, 1);
 	assert.deepEqual(input, original);
+});
+
+test('unsupported but protocol-valid actions fail with a typed simulator reason', () => {
+	const world = VirtualWorld.fromScenario(scenario());
+	const result = world.performAction('alice', {
+		type: 'craft_inventory',
+		arguments: { recipeId: 'minecraft:stick', count: 1, timeoutMs: 1_000 },
+	});
+	assert.deepEqual(result, {
+		done: true,
+		state: 'FAILED',
+		reasonCode: 'SIMULATOR_UNSUPPORTED_ACTION',
+		changed: false,
+	});
+});
+
+test('observation-bound effects, attacker, and tags are normalized before publication', () => {
+	const world = VirtualWorld.fromScenario(scenario({
+		agents: {
+			alice: {
+				position: { x: 0, y: 1, z: 0 },
+				effects: [{ effectId: 'minecraft:speed', amplifier: 1, durationTicks: 20 }],
+			},
+		},
+		blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone', tags: ['#minecraft:mineable/pickaxe'] }],
+		entities: [{ id: 'mob-1', type: 'minecraft:zombie', name: 'zombie', position: { x: 2, y: 1, z: 0 }, tags: ['#minecraft:hostile'] }],
+	}));
+	world.damage('alice', 1, { uuid: 'mob-1', type: 'minecraft:zombie', distance: 2 });
+	const observation = world.observation('alice');
+	assert.deepEqual(observation.player.effects, [{ effectId: 'minecraft:speed', amplifier: 1, duration: 20 }]);
+	assert.deepEqual(observation.player.lastAttacker, { uuid: 'mob-1', type: 'minecraft:zombie', distance: 2 });
+	assert.deepEqual(observation.blocks[0].tags, ['#minecraft:mineable/pickaxe']);
+	assert.deepEqual(observation.entities[0].tags, ['#minecraft:hostile']);
+	assert.throws(() => world.damage('alice', 1, { uuid: 'mob-1' }), /lastAttacker|attacker/);
+	assert.throws(() => VirtualWorld.fromScenario(scenario({ agents: { alice: { position: { x: 0, y: 1, z: 0 }, effects: [{ effectId: 'minecraft:speed', amplifier: 1, duration: 'bad' }] } } })), /effects\[0\]\.duration/);
+	assert.throws(() => VirtualWorld.fromScenario(scenario({ blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone', tags: ['not-a-tag'] }] })), /tag identifier/);
+});
+
+test('world insertion APIs reject bounded-capacity overflow without relying on observation slicing', () => {
+	const blocks = Array.from({ length: MAX_WORLD_BLOCKS }, (_, index) => ({ x: index, y: 0, z: 0, blockId: 'minecraft:stone' }));
+	const items = Array.from({ length: MAX_WORLD_ITEMS }, (_, index) => ({ id: `item-${index}`, itemId: 'minecraft:stick', count: 1, position: { x: index, y: 1, z: 0 } }));
+	const entities = Array.from({ length: MAX_WORLD_ENTITIES }, (_, index) => ({ id: `entity-${index}`, type: 'minecraft:zombie', position: { x: index, y: 1, z: 0 } }));
+	const world = VirtualWorld.fromScenario(scenario({ blocks, items, entities }));
+	assert.throws(() => world.addBlock({ x: MAX_WORLD_BLOCKS + 1, y: 0, z: 0, blockId: 'minecraft:stone' }), (error) => error.code === 'WORLD_CAPACITY_EXCEEDED');
+	assert.throws(() => world.addItem({ id: 'overflow-item', itemId: 'minecraft:stick', count: 1, position: { x: 0, y: 1, z: 0 } }), (error) => error.code === 'WORLD_CAPACITY_EXCEEDED');
+	assert.throws(() => world.addEntity({ id: 'overflow-entity', type: 'minecraft:zombie', position: { x: 0, y: 1, z: 0 } }), (error) => error.code === 'WORLD_CAPACITY_EXCEEDED');
+
+	const inventory = Array.from({ length: MAX_PLAYER_INVENTORY_ITEMS + 1 }, (_, slot) => ({ itemId: 'minecraft:stick', count: 1, slot }));
+	assert.throws(() => VirtualWorld.fromScenario(scenario({ agents: { alice: { position: { x: 0, y: 1, z: 0 }, inventory: { items: inventory } } } })), (error) => error.code === 'WORLD_CAPACITY_EXCEEDED');
+});
+
+test('a captured scheduler callback cannot advance the world after stop', () => {
+	let callback;
+	let nextHandle = 0;
+	const scheduler = {
+		setInterval(next) { callback = next; return ++nextHandle; },
+		clearInterval() {},
+	};
+	const world = VirtualWorld.fromScenario(scenario(), { scheduler });
+	world.start();
+	world.stop();
+	callback();
+	assert.equal(world.tickCount, 0);
 });

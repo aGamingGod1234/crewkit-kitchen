@@ -1,10 +1,15 @@
 import { EventEmitter } from 'node:events';
 
+import { MAX_EFFECTS, MAX_INVENTORY_SUMMARIES, MAX_OBSERVATION_TAGS, MAX_TAG_COUNT_ENTRIES } from '../constants.mjs';
 import { SeededRandom } from './seeded-random.mjs';
 
 export const VIRTUAL_TICK_HZ = 20;
 export const VIRTUAL_TICK_MS = 1_000 / VIRTUAL_TICK_HZ;
 export const DEFAULT_PICKUP_RADIUS = 1.5;
+export const MAX_WORLD_BLOCKS = 256;
+export const MAX_WORLD_ITEMS = 128;
+export const MAX_WORLD_ENTITIES = 64;
+export const MAX_PLAYER_INVENTORY_ITEMS = MAX_INVENTORY_SUMMARIES;
 
 const PLAYER_HALF_WIDTH = 0.3;
 const PLAYER_HEIGHT = 1.8;
@@ -34,6 +39,8 @@ export class VirtualWorld extends EventEmitter {
 	#timeMs = 0;
 	#scheduler;
 	#intervalHandle = null;
+	#schedulerGeneration = 0;
+	#started = false;
 	#randomEvents;
 	#raining;
 	#thundering;
@@ -63,27 +70,38 @@ export class VirtualWorld extends EventEmitter {
 		this.#randomEvents = normalizeArray(source.randomEvents ?? source.random?.events);
 		for (const [agentId, value] of entries(source.agents ?? source.players, 'agents')) this.#addPlayer(agentId, value);
 		if (this.#players.size === 0) throw new TypeError('scenario must declare at least one agent');
-		for (const block of normalizeBlocks(source.blocks)) this.#blocks.set(blockKey(block.x, block.y, block.z), block);
-		for (const entity of normalizeEntities(source.entities)) this.#entities.set(entity.id, entity);
-		for (const item of normalizeItems(source.items ?? source.drops)) this.#items.set(item.id, item);
+		for (const block of normalizeBlocks(source.blocks)) this.#insertBlock(block);
+		for (const entity of normalizeEntities(source.entities)) this.#insertEntity(entity);
+		for (const item of normalizeItems(source.items ?? source.drops)) this.#insertItem(item);
 	}
 
 	get tickCount() { return this.#tickCount; }
 	get timeMs() { return this.#timeMs; }
-	get running() { return this.#intervalHandle !== null; }
+	get running() { return this.#started; }
 	get seed() { return this.#seed; }
 	get agentIds() { return [...this.#players.keys()]; }
 
 	start() {
-		if (this.#intervalHandle !== null) return this;
-		this.#intervalHandle = this.#scheduler.setInterval(() => this.tick(), VIRTUAL_TICK_MS);
+		if (this.#started) return this;
+		this.#started = true;
+		const generation = ++this.#schedulerGeneration;
+		let handle = null;
+		const callback = () => {
+			if (handle === null || !this.#started || this.#schedulerGeneration !== generation || this.#intervalHandle !== handle) return;
+			this.tick();
+		};
+		try { handle = this.#scheduler.setInterval(callback, VIRTUAL_TICK_MS); }
+		catch (error) { this.#started = false; throw error; }
+		this.#intervalHandle = handle;
 		return this;
 	}
 
 	stop() {
-		if (this.#intervalHandle === null) return this;
+		if (!this.#started) return this;
+		this.#schedulerGeneration += 1;
 		this.#scheduler.clearInterval(this.#intervalHandle);
 		this.#intervalHandle = null;
+		this.#started = false;
 		return this;
 	}
 
@@ -246,7 +264,7 @@ export class VirtualWorld extends EventEmitter {
 
 	setLastResult(agentId, result = null) {
 		const player = this.#requirePlayer(agentId);
-		player.lastResult = result === null ? null : clone(result);
+		player.lastResult = normalizeLastResult(result);
 		return this;
 	}
 
@@ -255,7 +273,7 @@ export class VirtualWorld extends EventEmitter {
 		const damageAmount = finiteNonnegative(amount, 'damage');
 		if (player.dead || damageAmount === 0) return player.health;
 		player.health = Math.max(0, player.health - damageAmount);
-		if (source !== undefined) player.lastAttacker = clone(source);
+		if (source !== undefined) player.lastAttacker = normalizeAttacker(source);
 		if (player.health === 0) this.#kill(player);
 		return player.health;
 	}
@@ -329,32 +347,40 @@ export class VirtualWorld extends EventEmitter {
 			}
 			case 'place_block': {
 				const block = normalizeBlock({ x: args.x, y: args.y, z: args.z, blockId: args.itemId });
-				this.#blocks.set(blockKey(block.x, block.y, block.z), block);
+				try { this.#insertBlock(block); }
+				catch (error) { if (error.code === 'WORLD_CAPACITY_EXCEEDED') return { done: true, state: 'FAILED', reasonCode: error.code, changed: false }; throw error; }
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'PLACED', changed: true };
 			}
 			case 'drop_item': {
 				const held = player.inventory.items.find((item) => item.slot === args.slot && item.count >= args.count);
 				if (!held) return { done: true, state: 'FAILED', reasonCode: 'ITEM_NOT_FOUND', changed: false };
+				if (this.#items.size >= MAX_WORLD_ITEMS) return { done: true, state: 'FAILED', reasonCode: 'WORLD_CAPACITY_EXCEEDED', changed: false };
 				held.count -= args.count;
 				if (held.count === 0) player.inventory.items = player.inventory.items.filter((item) => item !== held);
 				const id = `drop-${agentId}-${this.#tickCount}-${this.#items.size + 1}`;
-				this.#items.set(id, { id, itemId: held.itemId, count: args.count, position: clone(player.position) });
+				this.#insertItem({ id, itemId: held.itemId, count: args.count, position: clone(player.position) });
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'DROPPED', changed: true };
 			}
 			default:
-				return { done: true, state: 'SUCCEEDED', reasonCode: 'DONE', changed: false };
+				return { done: true, state: 'FAILED', reasonCode: 'SIMULATOR_UNSUPPORTED_ACTION', changed: false };
 		}
 	}
 
 	addItem(item) {
 		const normalized = normalizeItem(item, this.#items.size + 1);
-		this.#items.set(normalized.id, normalized);
+		this.#insertItem(normalized);
 		return normalized.id;
 	}
 
 	addBlock(block) {
 		const normalized = normalizeBlock(block);
-		this.#blocks.set(blockKey(normalized.x, normalized.y, normalized.z), normalized);
+		this.#insertBlock(normalized);
+		return this;
+	}
+
+	addEntity(entity) {
+		const normalized = normalizeEntity(entity, this.#entities.size);
+		this.#insertEntity(normalized);
 		return this;
 	}
 
@@ -387,8 +413,8 @@ export class VirtualWorld extends EventEmitter {
 			maxAir: nonnegativeInteger(source.maxAir ?? 300, 'agent.maxAir'),
 			suffocating: false,
 			fallDistance: finiteNonnegative(source.fallDistance ?? 0, 'agent.fallDistance'),
-			effects: normalizeArray(source.effects).map(clone),
-			lastAttacker: source.lastAttacker === undefined ? undefined : clone(source.lastAttacker),
+			effects: normalizeEffects(source.effects),
+			lastAttacker: source.lastAttacker === undefined ? undefined : normalizeAttacker(source.lastAttacker),
 			selectedItem: identifier(source.selectedItem ?? inventory.selectedItem, 'agent.selectedItem'),
 			inventory,
 			dead: source.dead === true || (source.health ?? maxHealth) <= 0,
@@ -406,7 +432,7 @@ export class VirtualWorld extends EventEmitter {
 				if (positions.length === 0) continue;
 				const position = clone(this.#random.pick(positions));
 				const id = identifier(event.id ?? `random-${this.#tickCount}-${this.#items.size + 1}`, 'random item id');
-				this.#items.set(id, {
+				this.#insertItem({
 					id,
 					itemId: identifier(event.itemId ?? 'minecraft:stone', 'random itemId'),
 					count: positiveInteger(event.count ?? 1, 'random item count'),
@@ -500,7 +526,10 @@ export class VirtualWorld extends EventEmitter {
 			if (distance(player.position, item.position) > this.#pickupRadius) continue;
 			const existing = player.inventory.items.find((entry) => entry.itemId === item.itemId);
 			if (existing) existing.count += item.count;
-			else player.inventory.items.push({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: nextInventorySlot(player.inventory.items) });
+			else {
+				if (player.inventory.items.length >= MAX_PLAYER_INVENTORY_ITEMS) continue;
+				player.inventory.items.push({ itemId: item.itemId, count: item.count, damage: 0, maxDamage: 0, slot: nextInventorySlot(player.inventory.items) });
+			}
 			this.#items.delete(id);
 		}
 	}
@@ -511,6 +540,22 @@ export class VirtualWorld extends EventEmitter {
 		player.velocity = { x: 0, y: 0, z: 0 };
 		player.onGround = false;
 		player.activeAction = null;
+	}
+
+	#insertBlock(block) {
+		const key = blockKey(block.x, block.y, block.z);
+		if (!this.#blocks.has(key) && this.#blocks.size >= MAX_WORLD_BLOCKS) throw capacityError('blocks', MAX_WORLD_BLOCKS);
+		this.#blocks.set(key, block);
+	}
+
+	#insertItem(item) {
+		if (!this.#items.has(item.id) && this.#items.size >= MAX_WORLD_ITEMS) throw capacityError('items', MAX_WORLD_ITEMS);
+		this.#items.set(item.id, item);
+	}
+
+	#insertEntity(entity) {
+		if (!this.#entities.has(entity.id) && this.#entities.size >= MAX_WORLD_ENTITIES) throw capacityError('entities', MAX_WORLD_ENTITIES);
+		this.#entities.set(entity.id, entity);
 	}
 
 	#requirePlayer(agentId) {
@@ -540,7 +585,12 @@ function vector(value, field, fallback = undefined) {
 	if (!isRecord(source)) throw new TypeError(`${field} must be an object`);
 	return { x: finite(source.x, `${field}.x`), y: finite(source.y, `${field}.y`), z: finite(source.z, `${field}.z`) };
 }
-function normalizeArray(value) { return value === undefined || value === null ? [] : Array.isArray(value) ? value : []; }
+function normalizeArray(value, field = 'array') {
+	if (value === undefined || value === null) return [];
+	if (!Array.isArray(value)) throw new TypeError(`${field} must be an array`);
+	for (let index = 0; index < value.length; index += 1) if (!Object.hasOwn(value, index)) throw new TypeError(`${field} must not contain holes`);
+	return value;
+}
 function entries(value, field) {
 	if (value === undefined || value === null) return [];
 	if (Array.isArray(value)) return value.map((entry, index) => [entry?.agentId ?? entry?.id ?? `agent-${index + 1}`, entry]);
@@ -550,9 +600,10 @@ function entries(value, field) {
 function blockKey(x, y, z) { return `${x},${y},${z}`; }
 function parsePosition(value, fallback = { x: 0, y: 0, z: 0 }) { return vector(value?.position ?? value, 'position', fallback); }
 function normalizeBlock(value) {
-	const source = isRecord(value) ? value : {};
+	if (!isRecord(value)) throw new TypeError('block must be an object');
+	const source = value;
 	const position = parsePosition(source);
-	return { x: Math.trunc(position.x), y: Math.trunc(position.y), z: Math.trunc(position.z), blockId: identifier(source.blockId ?? source.id ?? 'minecraft:stone', 'blockId'), ...(source.tags === undefined ? {} : { tags: [...normalizeArray(source.tags)] }) };
+	return { x: Math.trunc(position.x), y: Math.trunc(position.y), z: Math.trunc(position.z), blockId: identifier(source.blockId ?? source.id ?? 'minecraft:stone', 'blockId'), ...(source.tags === undefined ? {} : { tags: normalizeTags(source.tags, 'block.tags') }) };
 }
 function normalizeBlocks(value) {
 	if (value === undefined || value === null) return [];
@@ -564,22 +615,89 @@ function normalizeBlocks(value) {
 	throw new TypeError('blocks must be an array or object');
 }
 function normalizeEntity(value, index) {
-	const source = isRecord(value) ? value : {};
-	return { id: identifier(source.id ?? source.uuid ?? `entity-${index + 1}`, 'entity.id'), type: identifier(source.type ?? 'minecraft:zombie', 'entity.type'), name: identifier(source.name ?? source.type ?? 'entity', 'entity.name'), position: parsePosition(source), ...(source.isPlayer === undefined ? {} : { isPlayer: source.isPlayer === true }), ...(source.tags === undefined ? {} : { tags: [...normalizeArray(source.tags)] }) };
+	if (!isRecord(value)) throw new TypeError('entity must be an object');
+	const source = value;
+	if (source.isPlayer !== undefined && typeof source.isPlayer !== 'boolean') throw new TypeError('entity.isPlayer must be boolean');
+	return { id: identifier(source.id ?? source.uuid ?? `entity-${index + 1}`, 'entity.id'), type: identifier(source.type ?? 'minecraft:zombie', 'entity.type'), name: identifier(source.name ?? source.type ?? 'entity', 'entity.name'), position: parsePosition(source), ...(source.isPlayer === undefined ? {} : { isPlayer: source.isPlayer }), ...(source.tags === undefined ? {} : { tags: normalizeTags(source.tags, 'entity.tags') }) };
 }
-function normalizeEntities(value) { return normalizeArray(value).map(normalizeEntity); }
+function normalizeEntities(value) { return normalizeArray(value, 'entities').map(normalizeEntity); }
 function normalizeItem(value, index) {
-	const source = isRecord(value) ? value : {};
+	if (!isRecord(value)) throw new TypeError('item must be an object');
+	const source = value;
 	return { id: identifier(source.id ?? source.uuid ?? source.stableId ?? `item-${index}`, 'item.id'), itemId: identifier(source.itemId ?? 'minecraft:stone', 'item.itemId'), count: positiveInteger(source.count ?? 1, 'item.count'), position: parsePosition(source) };
 }
-function normalizeItems(value) { return normalizeArray(value).map((item, index) => normalizeItem(item, index + 1)); }
+function normalizeItems(value) { return normalizeArray(value, 'items').map((item, index) => normalizeItem(item, index + 1)); }
 function normalizeInventory(value) {
-	const source = isRecord(value) ? value : {};
-	const items = normalizeArray(source.items).map((item, index) => {
-		const entry = isRecord(item) ? item : {};
-		return { itemId: identifier(entry.itemId ?? 'minecraft:air', 'inventory.itemId'), count: nonnegativeInteger(entry.count ?? 0, 'inventory.count'), damage: nonnegativeInteger(entry.damage ?? 0, 'inventory.damage'), maxDamage: nonnegativeInteger(entry.maxDamage ?? 0, 'inventory.maxDamage'), slot: Number.isSafeInteger(entry.slot) ? entry.slot : index };
+	if (value !== undefined && value !== null && !isRecord(value)) throw new TypeError('inventory must be an object');
+	const source = value ?? {};
+	const rawItems = normalizeArray(source.items, 'inventory.items');
+	if (rawItems.length > MAX_PLAYER_INVENTORY_ITEMS) throw capacityError('inventory items', MAX_PLAYER_INVENTORY_ITEMS);
+	const items = rawItems.map((item, index) => {
+		if (!isRecord(item)) throw new TypeError(`inventory.items[${index}] must be an object`);
+		const entry = item;
+		const slot = entry.slot === undefined ? index : nonnegativeInteger(entry.slot, `inventory.items[${index}].slot`);
+		return { itemId: identifier(entry.itemId ?? 'minecraft:air', 'inventory.itemId'), count: nonnegativeInteger(entry.count ?? 0, 'inventory.count'), damage: nonnegativeInteger(entry.damage ?? 0, 'inventory.damage'), maxDamage: nonnegativeInteger(entry.maxDamage ?? 0, 'inventory.maxDamage'), slot, ...(entry.tags === undefined ? {} : { tags: normalizeTags(entry.tags, `inventory.items[${index}].tags`) }) };
 	});
-	return { items, selectedItem: identifier(source.selectedItem ?? items[0]?.itemId ?? 'minecraft:air', 'inventory.selectedItem'), tagCounts: isRecord(source.tagCounts) ? clone(source.tagCounts) : {} };
+	return { items, selectedItem: identifier(source.selectedItem ?? items[0]?.itemId ?? 'minecraft:air', 'inventory.selectedItem'), tagCounts: normalizeTagCounts(source.tagCounts) };
+}
+function normalizeEffects(value) {
+	const effects = normalizeArray(value, 'effects');
+	if (effects.length > MAX_EFFECTS) throw capacityError('effects', MAX_EFFECTS);
+	return effects.map((effect, index) => {
+		if (!isRecord(effect)) throw new TypeError(`effects[${index}] must be an object`);
+		return {
+			effectId: identifier(effect.effectId, `effects[${index}].effectId`),
+			amplifier: nonnegativeInteger(effect.amplifier, `effects[${index}].amplifier`),
+			duration: nonnegativeInteger(effect.duration ?? effect.durationTicks, `effects[${index}].duration`),
+		};
+	});
+}
+function normalizeAttacker(value) {
+	if (!isRecord(value)) throw new TypeError('lastAttacker must be an object');
+	return {
+		uuid: identifier(value.uuid, 'lastAttacker.uuid'),
+		type: identifier(value.type, 'lastAttacker.type'),
+		distance: finiteNonnegative(value.distance, 'lastAttacker.distance'),
+	};
+}
+function normalizeLastResult(value) {
+	if (value === null || value === undefined) return null;
+	if (!isRecord(value)) throw new TypeError('lastResult must be an object');
+	if (value.present === false) return null;
+	if (value.present !== true) throw new TypeError('lastResult.present must be boolean');
+	return {
+		present: true,
+		actionId: identifier(value.actionId, 'lastResult.actionId'),
+		actionType: identifier(value.actionType, 'lastResult.actionType'),
+		state: identifier(value.state, 'lastResult.state'),
+		reasonCode: identifier(value.reasonCode, 'lastResult.reasonCode'),
+		message: typeof value.message === 'string' ? value.message.slice(0, 2_048) : (() => { throw new TypeError('lastResult.message must be a string'); })(),
+	};
+}
+function normalizeTags(value, field) {
+	const tags = normalizeArray(value, field);
+	if (tags.length > MAX_OBSERVATION_TAGS) throw capacityError(field, MAX_OBSERVATION_TAGS);
+	const normalized = tags.map((tag, index) => {
+		if (typeof tag !== 'string' || !tag.startsWith('#') || tag.length < 2 || tag.length > 256) throw new TypeError(`${field}[${index}] must be a tag identifier`);
+		return tag;
+	});
+	if (new Set(normalized).size !== normalized.length) throw new TypeError(`${field} must contain unique tags`);
+	return normalized;
+}
+function normalizeTagCounts(value) {
+	if (value === undefined || value === null) return {};
+	if (!isRecord(value)) throw new TypeError('inventory.tagCounts must be an object');
+	const keys = Object.keys(value);
+	if (keys.length > MAX_TAG_COUNT_ENTRIES) throw capacityError('inventory.tagCounts', MAX_TAG_COUNT_ENTRIES);
+	const normalized = {};
+	for (const key of keys) {
+		if (!key.startsWith('#') || key.length < 2 || key.length > 256) throw new TypeError('inventory.tagCounts keys must be tag identifiers');
+		normalized[key] = nonnegativeInteger(value[key], `inventory.tagCounts.${key}`);
+	}
+	return normalized;
+}
+function capacityError(resource, maximum) {
+	return Object.assign(new RangeError(`${resource} capacity ${maximum} exceeded`), { code: 'WORLD_CAPACITY_EXCEEDED', resource, maximum });
 }
 function nextInventorySlot(items) { const used = new Set(items.map((item) => item.slot)); for (let slot = 0; slot < 36; slot += 1) if (!used.has(slot)) return slot; return 35; }
 function normalizeInput(value) { const source = isRecord(value) ? value : {}; return { forward: finite(source.forward ?? 0, 'input.forward'), strafe: finite(source.strafe ?? 0, 'input.strafe'), jump: source.jump === true, sprint: source.sprint === true, yaw: source.yaw === undefined ? undefined : finite(source.yaw, 'input.yaw'), pitch: source.pitch === undefined ? undefined : finite(source.pitch, 'input.pitch') }; }

@@ -108,10 +108,12 @@ export class VirtualMinecraftBridge extends EventEmitter {
 		if (this.#closed) return;
 		for (const [agentId, active] of [...this.#active]) {
 			if (this.#active.get(agentId) !== active) continue;
+			const generation = active.generation;
 			if (!active.progressSent) {
 				active.progressSent = true;
 				this.#progress(active);
 			}
+			if (this.#active.get(agentId) !== active || active.generation !== generation) continue;
 			const action = {
 				type: active.command.actionType,
 				arguments: active.command.arguments,
@@ -128,7 +130,7 @@ export class VirtualMinecraftBridge extends EventEmitter {
 
 	#cancel(record, payload) {
 		const active = this.#active.get(record.agentId);
-		if (!active || active.command.actionId !== payload.actionId) return;
+		if (!active || active.command.actionId !== payload.actionId || active.command.goalRevision !== payload.goalRevision) return;
 		this.#active.delete(record.agentId);
 		this.#world.setActiveAction(record.agentId, null);
 		this.#complete(active, { state: 'CANCELLED', reasonCode: 'CANCELLED', changedFacts: ['currentAction'] });
@@ -149,7 +151,12 @@ export class VirtualMinecraftBridge extends EventEmitter {
 		};
 		const envelope = this.#inbound(active.agentId, 'action_progress', payload);
 		this.#recordEvent('progress', envelope, eventSequence);
-		this.#enqueue(async () => this.#manager?.onActionProgress(active.record, { ...envelope.payload, eventSequence }));
+		try {
+			const result = this.#manager?.onActionProgress(active.record, { ...envelope.payload, eventSequence });
+			if (result && typeof result.then === 'function') this.#enqueue(async () => result);
+		} catch (error) {
+			this.emit('deliveryError', error);
+		}
 	}
 
 	#complete(active, outcome) {
