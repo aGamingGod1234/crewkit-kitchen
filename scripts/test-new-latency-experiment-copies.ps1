@@ -97,6 +97,7 @@ try {
         'BUILD\artifact.txt',
         'Run\pid.txt',
         'Runtime\bridge-secret.txt',
+        'Runtime\state.dat',
         'LOGS\server.log',
         '.PLAYWRIGHT-CLI\trace.json',
         'OUTPUT\result.json',
@@ -126,6 +127,8 @@ try {
     Invoke-FixtureGit -Repository $projectRoot -Arguments @('add', 'staged.txt') | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot 'src\voice-addon') | Out-Null
     Set-Content -LiteralPath (Join-Path $projectRoot 'src\voice-addon\untracked-source.mjs') -Value "export const fixtureSource = true;`n"
+    New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot 'src\main\java\dev\example\runtime') | Out-Null
+    Set-Content -LiteralPath (Join-Path $projectRoot 'src\main\java\dev\example\runtime\Fixture.java') -Value "package dev.example.runtime;`n"
 
     $indexPath = Join-Path $projectRoot '.git\index'
     $indexBefore = Get-ByteString -Path $indexPath
@@ -133,6 +136,7 @@ try {
         'tracked.txt',
         'staged.txt',
         'src\voice-addon\untracked-source.mjs',
+        'src\main\java\dev\example\runtime\Fixture.java',
         'Runtime\bridge-secret.txt'
     )
     $workingBytesBefore = @{}
@@ -161,6 +165,7 @@ try {
         Assert-Fixture ((Get-Content -Raw -LiteralPath (Join-Path $copyPath 'tracked.txt')).TrimEnd([char[]] @("`r", "`n")) -eq 'tracked working edit') 'Tracked edit was not copied.'
         Assert-Fixture ((Get-Content -Raw -LiteralPath (Join-Path $copyPath 'staged.txt')).TrimEnd([char[]] @("`r", "`n")) -eq 'staged working edit') 'Pre-staged file content was not copied.'
         Assert-Fixture (Test-Path -LiteralPath (Join-Path $copyPath 'src\voice-addon\untracked-source.mjs') -PathType Leaf) 'Untracked source file was not copied.'
+        Assert-Fixture (Test-Path -LiteralPath (Join-Path $copyPath 'src\main\java\dev\example\runtime\Fixture.java') -PathType Leaf) 'Source package runtime directory was not copied.'
         foreach ($relativePath in $excludedPaths) {
             Assert-Fixture (-not (Test-Path -LiteralPath (Join-Path $copyPath $relativePath))) "Excluded path was copied: $relativePath"
         }

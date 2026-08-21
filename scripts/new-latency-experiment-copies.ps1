@@ -13,13 +13,16 @@ $script:ExcludedDirectoryNames = @(
     '.gradle',
     'build',
     'run',
-    'runtime',
     'logs',
     '.playwright-cli',
     'output',
     'credentials',
     'node_modules',
     '.superpowers'
+)
+
+$script:ExcludedRootDirectoryNames = @(
+    'runtime'
 )
 
 $script:ExcludedFileNamePatterns = @(
@@ -127,6 +130,9 @@ function Test-ExcludedRelativePath {
 
     $normalizedPath = $RelativePath.Replace('\', '/')
     $segments = $normalizedPath -split '/'
+    if ($segments.Count -gt 0 -and $script:ExcludedRootDirectoryNames -contains $segments[0]) {
+        return $true
+    }
     foreach ($segment in $segments) {
         if ($script:ExcludedDirectoryNames -contains $segment) {
             return $true
@@ -193,6 +199,12 @@ function Get-SnapshotPathspecs {
 
     $pathspecs = @('.')
     $pathspecs += @($excludedPathspecs)
+    foreach ($directoryName in $script:ExcludedRootDirectoryNames) {
+        $pathspecs += @(
+            ":(exclude,glob,icase)$directoryName",
+            ":(exclude,glob,icase)$directoryName/**"
+        )
+    }
     return $pathspecs
 }
 
