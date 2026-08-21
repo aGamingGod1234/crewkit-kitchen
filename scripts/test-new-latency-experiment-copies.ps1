@@ -77,6 +77,7 @@ $projectRoot = Join-Path $fixtureRoot 'project'
 $destinationRoot = Join-Path $fixtureRoot 'destination'
 $worktreePaths = New-Object 'System.Collections.Generic.List[string]'
 $originalGitIndexFile = $env:GIT_INDEX_FILE
+Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
 
 try {
     New-Item -ItemType Directory -Force -Path $projectRoot, $destinationRoot | Out-Null
@@ -154,6 +155,7 @@ try {
     $optimizedPath = [IO.Path]::GetFullPath([string]$result.OptimizedPath)
     $worktreePaths.Add($baselinePath)
     $worktreePaths.Add($optimizedPath)
+    Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
     foreach ($copyPath in @($baselinePath, $optimizedPath)) {
         Assert-Fixture (Test-Path -LiteralPath $copyPath -PathType Container) "Snapshot worktree is missing: $copyPath"
         Assert-Fixture ((Get-Content -Raw -LiteralPath (Join-Path $copyPath 'tracked.txt')).TrimEnd([char[]] @("`r", "`n")) -eq 'tracked working edit') 'Tracked edit was not copied.'
@@ -162,6 +164,11 @@ try {
         foreach ($relativePath in $excludedPaths) {
             Assert-Fixture (-not (Test-Path -LiteralPath (Join-Path $copyPath $relativePath))) "Excluded path was copied: $relativePath"
         }
+        $trackedFiles = @(Invoke-FixtureGit -Repository $copyPath -Arguments @('ls-files', '--error-unmatch', '--', 'tracked.txt', 'staged.txt'))
+        Assert-Fixture ($trackedFiles.Count -eq 2) "Snapshot worktree index is missing tracked files: $copyPath"
+        $statusOutput = [string]::Join("`n", [string[]]@(Invoke-FixtureGit -Repository $copyPath -Arguments @('status', '--porcelain')))
+        Assert-Fixture ([string]::IsNullOrWhiteSpace($statusOutput)) "Snapshot worktree is dirty: $copyPath"
+        Invoke-FixtureGit -Repository $copyPath -Arguments @('diff', '--exit-code') | Out-Null
     }
     Assert-Fixture ([string]$result.BaselineSourceHash -eq [string]$result.OptimizedSourceHash) 'Snapshot source hashes do not match.'
     Assert-Fixture (-not [string]::IsNullOrWhiteSpace([string]$result.SnapshotId)) 'Snapshot ID is missing.'
@@ -172,7 +179,7 @@ try {
         Assert-Fixture ((Get-ByteString -Path (Join-Path $projectRoot $relativePath)) -eq $workingBytesBefore[$relativePath]) "Original working file changed: $relativePath"
     }
 
-    $env:GIT_INDEX_FILE = $originalGitIndexFile
+    Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
     foreach ($worktreePath in @($baselinePath, $optimizedPath)) {
         Invoke-FixtureGit -Repository $projectRoot -Arguments @('worktree', 'remove', '--force', '--', $worktreePath) | Out-Null
     }

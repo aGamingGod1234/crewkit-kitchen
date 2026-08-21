@@ -264,6 +264,10 @@ function New-LatencyExperimentCopies {
             throw 'Git did not return a snapshot commit ID.'
         }
 
+        # Worktree checkout must create its own index from the snapshot. Do not restore the
+        # caller's custom index yet, and do not let the temporary staging index leak into it.
+        Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
+
         $null = Invoke-GitCommand -Repository $resolvedProjectRoot -Arguments @('worktree', 'add', '--quiet', '--detach', $baselinePath, $snapshotId)
         $createdWorktrees.Add($baselinePath) | Out-Null
         $null = Invoke-GitCommand -Repository $resolvedProjectRoot -Arguments @('worktree', 'add', '--quiet', '--detach', $optimizedPath, $snapshotId)
