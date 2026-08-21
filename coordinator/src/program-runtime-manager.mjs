@@ -22,8 +22,9 @@ export class ProgramRuntimeManager {
 	#trace;
 	#onCompleted;
 	#plannerContext;
+	#recorder;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance) } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
@@ -41,8 +42,11 @@ export class ProgramRuntimeManager {
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
 		if (latencyRegistry !== null && typeof latencyRegistry.record !== 'function') throw new TypeError('latencyRegistry.record must be a function');
 		if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+		const selectedRecorder = recorder ?? benchmarkRecorder;
+		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		this.#latencyRegistry = latencyRegistry;
 		this.#clock = clock;
+		this.#recorder = selectedRecorder;
 	}
 
 	async installDecision(record, decision, { observation, eventSequence } = {}) {
@@ -63,6 +67,7 @@ export class ProgramRuntimeManager {
 		const eventSequence = this.#acceptServerEvent(state, payload.eventSequence);
 		if (eventSequence === null) return state.engine.snapshot();
 		const observation = payload.observation ?? payload;
+		this.#record('observation_received', record, { eventSequence, attention: payload.attention === true });
 		state.observation = observation;
 		const receiptMonotonicMs = advancingTimestamp(state, 'lastReceiptMonotonicMs', payload.receiptMonotonicMs);
 		const receiptEpochMs = advancingTimestamp(state, 'lastReceiptEpochMs', payload.receiptEpochMs);
@@ -90,6 +95,7 @@ export class ProgramRuntimeManager {
 		if (timing && timing.firstProgressAt === null) {
 			timing.firstProgressAt = this.#safeNow();
 			if (timing.firstProgressAt !== null && timing.bridgeSentAt !== null) this.#recordLatency('command_to_first_progress', timing.firstProgressAt - timing.bridgeSentAt);
+			this.#record('action_progress', record, { actionId: payload.actionId, eventSequence, durationMs: elapsedOrNull(timing.bridgeSentAt, timing.firstProgressAt) });
 		}
 		return true;
 	}
@@ -108,6 +114,13 @@ export class ProgramRuntimeManager {
 		if (timing !== undefined) {
 			if (completedAt !== null && timing.bridgeSentAt !== null) this.#recordLatency('action_completion', completedAt - timing.bridgeSentAt);
 		}
+		this.#record('action_completed', record, {
+			actionId: payload.actionId,
+			eventSequence,
+			state: payload.state,
+			reasonCode: payload.reasonCode ?? '',
+			durationMs: elapsedOrNull(timing?.bridgeSentAt, completedAt),
+		});
 		if (metadata !== undefined) {
 			this.#traceState(state, 'program_step', {
 				programId: metadata.command.provenance.programId,
@@ -224,6 +237,7 @@ export class ProgramRuntimeManager {
 	async #installSource(state, record, source, observation, eventSequence) {
 		let compiled;
 		try {
+			this.#record('program_compile_started', record, { eventSequence });
 			compiled = parseArenaScript(source);
 		} catch (error) {
 			this.#traceState(state, 'program_sandbox_error', {
@@ -249,6 +263,7 @@ export class ProgramRuntimeManager {
 			eventSequence: sequence,
 		});
 		this.#traceProgramInstall(state, record, source, version, sequence);
+		this.#record('program_compiled', record, { eventSequence: sequence, version });
 		this.#syncState(record, state);
 		return installed;
 	}
@@ -411,6 +426,7 @@ export class ProgramRuntimeManager {
 			actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
 			state.actionIds.set(actionId, command.actionId);
 			state.actionMetadata.set(actionId, { command, branchSelectedAt });
+			this.#record('action_dispatch_started', record, { actionId, actionType: command.action.type, eventSequence: command.provenance.eventSequence });
 			this.#traceState(state, 'program_step', {
 				programId: command.provenance.programId,
 				version: command.provenance.version,
@@ -429,6 +445,7 @@ export class ProgramRuntimeManager {
 			});
 			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command));
 			const bridgeSentAt = this.#safeNow();
+			this.#record('action_command_sent', record, { actionId, actionType: command.action.type, eventSequence: command.provenance.eventSequence, durationMs: elapsedOrNull(branchSelectedAt, bridgeSentAt) });
 			state.actionTiming.set(actionId, { bridgeSentAt, firstProgressAt: null });
 			const metadata = state.actionMetadata.get(actionId);
 			if (metadata !== undefined) metadata.bridgeSentAt = bridgeSentAt;
@@ -578,6 +595,20 @@ export class ProgramRuntimeManager {
 		if (!Number.isFinite(duration) || duration <= 0) return;
 		try { this.#latencyRegistry.record(operation, duration); }
 		catch { /* local telemetry cannot interrupt agent control */ }
+	}
+
+	#record(stage, record, fields = {}) {
+		if (this.#recorder === null) return;
+		try {
+			this.#recorder.record(stage, {
+				agentId: record.agentId,
+				provider: record.provider,
+				model: record.model,
+				reasoningEffort: record.reasoningEffort,
+				serviceTier: record.serviceTier ?? 'priority',
+				goalRevision: record.goalRevision,
+			}, fields);
+		} catch { /* benchmark telemetry cannot affect program execution */ }
 	}
 
 	#recordMinecraftPublication(receiptEpochMs, observedAtEpochMs) {

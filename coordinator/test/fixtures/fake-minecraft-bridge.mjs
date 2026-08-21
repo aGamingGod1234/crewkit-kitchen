@@ -28,6 +28,7 @@ export class FakeMinecraftBridge {
 	#observation;
 	#eventSequence;
 	#clock;
+	#recorder;
 	#pending = new Map();
 	#messageSequence = 0;
 	#serverInstanceId = 'task10-fake-server';
@@ -38,10 +39,12 @@ export class FakeMinecraftBridge {
 	validatedInbound = 0;
 	validatedOutbound = 0;
 
-	constructor({ record, initialObservation = observation(), onAction = () => ({}), onCancel = () => ({}) } = {}) {
+	constructor({ record, initialObservation = observation(), onAction = () => ({}), onCancel = () => ({}), recorder = null, benchmarkRecorder = null } = {}) {
 		this.#record = record;
 		this.#onAction = onAction;
 		this.#onCancel = onCancel;
+		this.#recorder = recorder ?? benchmarkRecorder;
+		if (this.#recorder !== null && typeof this.#recorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		this.#observation = adaptObservation(validateProtocolV2Payload('observation', toWireObservation(initialObservation, record.goalRevision, 1, false, 1)));
 		this.#eventSequence = 1;
 		this.#clock = 1;
@@ -71,6 +74,7 @@ export class FakeMinecraftBridge {
 		validateProtocolV2Envelope(envelope, { direction: 'coordinator_to_server' });
 		this.validatedOutbound += 1;
 		const normalized = envelope.payload;
+		this.#recordBenchmark('bridge_command_accepted', { type, actionType: normalized.actionType ?? null, actionId: normalized.actionId ?? null });
 		if (type === 'action_command') {
 			this.sent.push(envelope);
 			queueMicrotask(() => { void this.#execute(normalized); });
@@ -95,6 +99,7 @@ export class FakeMinecraftBridge {
 		const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
 		this.validatedInbound += 1;
 		this.#observation = adaptObservation(normalized.payload);
+		this.#recordBenchmark('observation_published', { eventSequence: normalized.payload.eventSequence, attention: normalized.payload.attention === true });
 		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
 		if (!this.#manager) throw new Error('FakeMinecraftBridge is not attached to a manager');
 		return this.#manager.onObservation(this.#record, {
@@ -155,6 +160,7 @@ export class FakeMinecraftBridge {
 			reasonCode: plan.reasonCode ?? 'DONE',
 		};
 		this.results.push(result);
+		this.#recordBenchmark('bridge_action_completed', { actionId: result.actionId, actionType: command.actionType, eventSequence: observationSequence, state: result.state, reasonCode: result.reasonCode });
 		if (this.#manager) {
 			const inbound = createProtocolV2Envelope({ serverInstanceId: this.#serverInstanceId, agentId: this.#record.agentId, type: 'action_result', messageId: `in-${++this.#messageSequence}`, payload: {
 				...result,
@@ -173,6 +179,12 @@ export class FakeMinecraftBridge {
 	#nextSequence() {
 		this.#eventSequence += 1;
 		return this.#eventSequence;
+	}
+
+	#recordBenchmark(stage, fields) {
+		if (this.#recorder === null) return;
+		try { this.#recorder.record(stage, { agentId: this.#record.agentId, goalRevision: this.#record.goalRevision }, fields); }
+		catch { /* benchmark telemetry cannot affect fixture execution */ }
 	}
 }
 

@@ -17,19 +17,25 @@ export class PlanningScheduler {
 	#order = [];
 	#active = new Map();
 	#closed = false;
+	#recorder;
 
 	constructor({
 		maxConcurrent = DEFAULT_PLANNING_CONCURRENCY,
 		maxPending = Math.max(0, DEFAULT_AGENT_CAP - maxConcurrent),
 		onPressure = () => {},
+		recorder = null,
+		benchmarkRecorder = null,
 	} = {}) {
 		if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) throw new TypeError('maxConcurrent must be a positive safe integer');
 		if (!Number.isSafeInteger(maxPending) || maxPending < 0) throw new TypeError('maxPending must be a non-negative safe integer');
 		if (maxConcurrent + maxPending > DEFAULT_AGENT_CAP) throw new TypeError(`planning capacity must not exceed ${DEFAULT_AGENT_CAP}`);
 		if (typeof onPressure !== 'function') throw new TypeError('onPressure must be a function');
+		const selectedRecorder = recorder ?? benchmarkRecorder;
+		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		this.#maxConcurrent = maxConcurrent;
 		this.#maxPending = maxPending;
 		this.#onPressure = onPressure;
+		this.#recorder = selectedRecorder;
 	}
 
 	get maxConcurrent() { return this.#maxConcurrent; }
@@ -48,16 +54,18 @@ export class PlanningScheduler {
 	schedule(agentIdValue, task) {
 		const agentId = requireAgentId(agentIdValue);
 		if (typeof task !== 'function') throw new TypeError('planning task must be a function');
-		if (this.#closed) return Promise.reject(new PlanningSchedulerError('SCHEDULER_CLOSED', 'Planning scheduler is closed'));
-		if (this.#pending.has(agentId)) return Promise.reject(new PlanningSchedulerError('PLAN_ALREADY_QUEUED', `Agent '${agentId}' already has a queued planning turn`));
-		if (this.#active.has(agentId)) return Promise.reject(new PlanningSchedulerError('PLAN_ALREADY_ACTIVE', `Agent '${agentId}' already has an active planning turn`));
+		this.#record('scheduler_admission_requested', agentId, this.#snapshot());
+		if (this.#closed) return this.#reject('SCHEDULER_CLOSED', 'Planning scheduler is closed', agentId);
+		if (this.#pending.has(agentId)) return this.#reject('PLAN_ALREADY_QUEUED', `Agent '${agentId}' already has a queued planning turn`, agentId);
+		if (this.#active.has(agentId)) return this.#reject('PLAN_ALREADY_ACTIVE', `Agent '${agentId}' already has an active planning turn`, agentId);
 		if (this.#active.size + this.#pending.size >= this.totalCapacity) {
-			return Promise.reject(new PlanningSchedulerError('SCHEDULER_CAPACITY', `Planning scheduler capacity ${this.totalCapacity} is full`));
+			return this.#reject('SCHEDULER_CAPACITY', `Planning scheduler capacity ${this.totalCapacity} is full`, agentId);
 		}
 		const promise = new Promise((resolve, reject) => {
 			this.#pending.set(agentId, { agentId, task, resolve, reject });
 			this.#order.push(agentId);
 		});
+		this.#record('scheduler_queued', agentId, this.#snapshot());
 		this.#drain();
 		this.#notifyPressure();
 		return promise;
@@ -91,6 +99,7 @@ export class PlanningScheduler {
 			this.#pending.delete(agentId);
 			const controller = new AbortController();
 			this.#active.set(agentId, { controller });
+			this.#record('scheduler_admitted', agentId, this.#snapshot());
 			Promise.resolve()
 				.then(() => entry.task({ agentId, signal: controller.signal }))
 				.then(
@@ -105,6 +114,7 @@ export class PlanningScheduler {
 		const active = this.#active.get(agentId);
 		if (active?.controller !== controller) return;
 		this.#active.delete(agentId);
+		this.#record('scheduler_released', agentId, this.#snapshot());
 		this.#drain();
 	}
 
@@ -126,7 +136,19 @@ export class PlanningScheduler {
 		const snapshot = this.#snapshot();
 		if (snapshot.warning === this.#warning) return;
 		this.#warning = snapshot.warning;
+		this.#record('scheduler_pressure', null, snapshot);
 		try { this.#onPressure(snapshot); } catch { /* monitoring cannot break scheduling */ }
+	}
+
+	#reject(code, message, agentId) {
+		this.#record('scheduler_rejected', agentId, { errorCode: code, ...this.#snapshot() });
+		return Promise.reject(new PlanningSchedulerError(code, message));
+	}
+
+	#record(stage, agentId, fields = {}) {
+		if (this.#recorder === null) return;
+		try { this.#recorder.record(stage, agentId === null ? {} : { agentId }, fields); }
+		catch { /* benchmark telemetry cannot affect scheduling */ }
 	}
 }
 

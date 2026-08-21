@@ -35,6 +35,7 @@ export class AgentPlanner {
 	#healthRegistry;
 	#telemetrySink;
 	#now;
+	#recorder;
 
 	constructor({
 		registry,
@@ -44,6 +45,8 @@ export class AgentPlanner {
 		healthRegistry = new ProviderHealthRegistry(),
 		telemetrySink = () => {},
 		now = () => performance.now(),
+		recorder = null,
+		benchmarkRecorder = null,
 	}) {
 		if (registry === null || registry === undefined) throw new TypeError('registry is required');
 		if (scheduler === null || scheduler === undefined) throw new TypeError('scheduler is required');
@@ -54,6 +57,8 @@ export class AgentPlanner {
 		if (typeof healthRegistry?.canAttempt !== 'function' || typeof healthRegistry?.record !== 'function') throw new TypeError('healthRegistry must provide canAttempt and record');
 		if (typeof telemetrySink !== 'function') throw new TypeError('telemetrySink must be a function');
 		if (typeof now !== 'function') throw new TypeError('now must be a function');
+		const selectedRecorder = recorder ?? benchmarkRecorder;
+		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		this.#registry = registry;
 		this.#scheduler = scheduler;
 		this.#codexService = codexService;
@@ -61,6 +66,7 @@ export class AgentPlanner {
 		this.#healthRegistry = healthRegistry;
 		this.#telemetrySink = telemetrySink;
 		this.#now = now;
+		this.#recorder = selectedRecorder;
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
@@ -68,8 +74,10 @@ export class AgentPlanner {
 	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
 		const queuedAt = this.#now();
+		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
 			const queueWaitMs = elapsed(queuedAt, this.#now());
+			this.#record('planner_admitted', record, { operation: 'plan', queueWaitMs, preserveState });
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
 			try {
@@ -112,6 +120,7 @@ export class AgentPlanner {
 							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1,
 						}, () => agent.decide(plannerInput, { goalRevision, signal }));
 						this.#registry.assertCurrentRevision(agentId, goalRevision);
+						this.#record('planner_decision_completed', record, { operation: 'decide', attempt, queueWaitMs, directive: decision?.directive ?? null });
 						return { ...decision, goalRevision };
 					} catch (error) {
 						if (
@@ -138,6 +147,7 @@ export class AgentPlanner {
 					}
 				}
 			} catch (error) {
+				this.#record('planner_failed', record, { operation: 'plan', errorCode: error?.code ?? 'PLANNING_FAILED', retry: true });
 				if (
 					error?.code !== 'STALE_PLAN'
 					&& error?.code !== 'PLAN_CANCELLED'
@@ -160,27 +170,33 @@ export class AgentPlanner {
 		if (!this.#healthRegistry.canAttempt(healthIdentity)) {
 			const error = new Error(`Provider circuit is open for '${record.provider}/${record.model}/${fields.operation}'`);
 			error.code = 'PROVIDER_CIRCUIT_OPEN';
+			this.#record('provider_attempt_rejected', record, { ...fields, operation: fields.operation, errorCode: error.code });
 			throw error;
 		}
 		const startedAt = this.#now();
+		this.#record('provider_request_started', record, { ...fields, operation: fields.operation });
 		try {
 			const result = await operation();
+			const durationMs = elapsed(startedAt, this.#now());
+			this.#record('provider_response_completed', record, { ...fields, operation: fields.operation, durationMs, errorCode: null });
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
 				...fields,
-				durationMs: elapsed(startedAt, this.#now()),
+				durationMs,
 				errorCode: null,
 				timeout: false,
 				restart: false,
 			}));
 			return result;
 		} catch (error) {
+			const durationMs = elapsed(startedAt, this.#now());
+			this.#record('provider_response_failed', record, { ...fields, operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
 				...fields,
-				durationMs: elapsed(startedAt, this.#now()),
+				durationMs,
 				error,
 				timeout: error?.code === 'PLANNING_TIMEOUT',
 				restart: false,
@@ -192,6 +208,20 @@ export class AgentPlanner {
 	#publishTelemetry(telemetry) {
 		this.#healthRegistry.record(telemetry);
 		try { this.#telemetrySink(telemetry); } catch { /* telemetry consumers cannot fail planning */ }
+	}
+
+	#record(stage, record, fields = {}) {
+		if (this.#recorder === null) return;
+		try {
+			this.#recorder.record(stage, {
+				agentId: record.agentId,
+				provider: record.provider,
+				model: record.model,
+				reasoningEffort: record.reasoningEffort,
+				serviceTier: record.serviceTier ?? 'priority',
+				goalRevision: record.goalRevision,
+			}, fields);
+		} catch { /* benchmark telemetry cannot affect planning */ }
 	}
 
 	async interrupt(agentId, reason = 'Agent planning interrupted') {
