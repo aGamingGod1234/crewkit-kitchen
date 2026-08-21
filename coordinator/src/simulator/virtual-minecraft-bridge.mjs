@@ -2,17 +2,18 @@ import { EventEmitter } from 'node:events';
 
 import { adaptObservation } from '../observation-adapter.mjs';
 import { createProtocolV2Envelope, validateProtocolV2Envelope } from '../protocol-v2.mjs';
+import { ActionRuntime } from './action-runtime.mjs';
 import { VIRTUAL_TICK_MS } from './virtual-world.mjs';
 
 /**
- * Deterministic protocol-v2 bridge backed by VirtualWorld. It deliberately executes
- * only a small action slice; the broader action matrix is owned by later benchmark tasks.
+ * Deterministic protocol-v2 bridge backed by VirtualWorld and the complete action runtime.
  */
 export class VirtualMinecraftBridge extends EventEmitter {
 	#world;
 	#serverInstanceId;
 	#records = new Map();
 	#manager = null;
+	#actionRuntime;
 	#messageSequence = 0;
 	#eventSequences = new Map();
 	#active = new Map();
@@ -25,10 +26,12 @@ export class VirtualMinecraftBridge extends EventEmitter {
 	validatedInbound = 0;
 	validatedOutbound = 0;
 
-	constructor({ world, agentRecords = undefined, record = undefined, serverInstanceId = 'virtual-server' } = {}) {
+	constructor({ world, agentRecords = undefined, record = undefined, serverInstanceId = 'virtual-server', actionRuntime = undefined } = {}) {
 		super();
 		if (!world || typeof world.observation !== 'function' || typeof world.on !== 'function') throw new TypeError('world must be a VirtualWorld-like event emitter');
 		this.#world = world;
+		this.#actionRuntime = actionRuntime ?? new ActionRuntime();
+		if (typeof this.#actionRuntime.accept !== 'function' || typeof this.#actionRuntime.tick !== 'function' || typeof this.#actionRuntime.cancel !== 'function') throw new TypeError('actionRuntime must provide accept, tick, and cancel');
 		this.#serverInstanceId = requireIdentifier(serverInstanceId, 'serverInstanceId');
 		const source = agentRecords ?? (record === undefined ? undefined : { [record.agentId]: record });
 		if (source !== undefined) {
@@ -42,6 +45,7 @@ export class VirtualMinecraftBridge extends EventEmitter {
 	get world() { return this.#world; }
 	get serverInstanceId() { return this.#serverInstanceId; }
 	get activeActionIds() { return [...this.#active.keys()]; }
+	get actionRuntime() { return this.#actionRuntime; }
 
 	attach(manager) {
 		if (manager !== null && manager !== undefined) {
@@ -67,6 +71,7 @@ export class VirtualMinecraftBridge extends EventEmitter {
 		if (type === 'action_command') {
 			if (this.#active.has(agentId)) throw Object.assign(new Error(`agent '${agentId}' already has an active action`), { code: 'ACTION_BUSY' });
 			const command = normalized.payload;
+			this.#actionRuntime.accept({ agentId, ...command });
 			const active = {
 				agentId,
 				record,
@@ -98,6 +103,7 @@ export class VirtualMinecraftBridge extends EventEmitter {
 		this.#world.off?.('tick', this.#worldTickListener);
 		for (const [agentId, active] of this.#active) {
 			this.#active.delete(agentId);
+			this.#actionRuntime.cancel(active.command.actionId);
 			this.#world.setActiveAction(agentId, null);
 			this.#complete(active, { state: 'CANCELLED', reasonCode: 'BRIDGE_STOPPED', changedFacts: ['currentAction'] });
 		}
@@ -114,17 +120,15 @@ export class VirtualMinecraftBridge extends EventEmitter {
 				this.#progress(active);
 			}
 			if (this.#active.get(agentId) !== active || active.generation !== generation) continue;
-			const action = {
-				type: active.command.actionType,
-				arguments: active.command.arguments,
-			};
-			const outcome = this.#world.performAction(agentId, action, { elapsedTicks: active.elapsedTicks });
-			active.elapsedTicks += 1;
-			if (outcome.done) {
-				this.#active.delete(agentId);
-				this.#world.setActiveAction(agentId, null);
-				this.#complete(active, outcome);
-			}
+		}
+		const results = this.#actionRuntime.tick(this.#world, { advanceWorld: false });
+		for (const result of results) {
+			const active = this.#active.get(result.agentId);
+			if (!active || active.command.actionId !== result.actionId) continue;
+			active.elapsedTicks = result.elapsedTicks;
+			this.#active.delete(result.agentId);
+			this.#world.setActiveAction(result.agentId, null);
+			this.#complete(active, result);
 		}
 	}
 
@@ -132,6 +136,7 @@ export class VirtualMinecraftBridge extends EventEmitter {
 		const active = this.#active.get(record.agentId);
 		if (!active || active.command.actionId !== payload.actionId || active.command.goalRevision !== payload.goalRevision) return;
 		this.#active.delete(record.agentId);
+		this.#actionRuntime.cancel(active.command.actionId);
 		this.#world.setActiveAction(record.agentId, null);
 		this.#complete(active, { state: 'CANCELLED', reasonCode: 'CANCELLED', changedFacts: ['currentAction'] });
 	}

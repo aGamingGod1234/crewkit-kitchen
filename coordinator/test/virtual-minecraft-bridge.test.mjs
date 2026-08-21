@@ -126,7 +126,7 @@ test('publish validates and adapts normalized observation-bound scenario data', 
 	assert.equal(bridge.validatedInbound, 1);
 });
 
-test('bridge returns a terminal typed failure for a protocol-valid action outside Task 3 scope', async () => {
+test('bridge routes a protocol-valid missing recipe through the complete runtime', async () => {
 	const world = VirtualWorld.fromScenario(scenario());
 	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
 	const manager = managerEvents();
@@ -136,5 +136,27 @@ test('bridge returns a terminal typed failure for a protocol-valid action outsid
 	await bridge.flush();
 	const result = manager.events.find((event) => event.type === 'result');
 	assert.equal(result.payload.state, 'FAILED');
-	assert.equal(result.payload.reasonCode, 'SIMULATOR_UNSUPPORTED_ACTION');
+	assert.equal(result.payload.reasonCode, 'RECIPE_NOT_FOUND');
+});
+
+test('bridge executes a Task 4 mining action over multiple virtual ticks', async () => {
+	const world = VirtualWorld.fromScenario({
+		...scenario(),
+		blocks: [
+			{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' },
+			{ x: 1, y: 1, z: 0, blockId: 'minecraft:stone' },
+		],
+	});
+	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
+	const manager = managerEvents();
+	bridge.attach(manager);
+	await bridge.send('action_command', 'alice', command('mine-1', 'break_block', { x: 1, y: 1, z: 0, timeoutMs: 1_000 }));
+	world.stepTicks(1);
+	assert.ok(world.blockAt(1, 1, 0), 'the block must remain while mining is in progress');
+	world.stepTicks(5);
+	await bridge.flush();
+	const result = manager.events.find((event) => event.type === 'result');
+	assert.equal(result.payload.state, 'SUCCEEDED');
+	assert.equal(world.blockAt(1, 1, 0), null);
+	assert.equal(world.observation('alice').inventory.items.find((item) => item.itemId === 'minecraft:cobblestone')?.count, 1);
 });

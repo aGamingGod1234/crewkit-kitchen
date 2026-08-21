@@ -35,6 +35,7 @@ export class VirtualWorld extends EventEmitter {
 	#items = new Map();
 	#inputs = new Map();
 	#observationSequences = new Map();
+	#conversationEvents = [];
 	#tickCount = 0;
 	#timeMs = 0;
 	#scheduler;
@@ -229,6 +230,89 @@ export class VirtualWorld extends EventEmitter {
 		return clone(player);
 	}
 
+	blockAt(x, y, z) {
+		const block = this.#blocks.get(blockKey(Math.trunc(x), Math.trunc(y), Math.trunc(z)));
+		return block === undefined ? null : clone(block);
+	}
+
+	entityState(entityId) {
+		const id = identifier(entityId, 'entityId');
+		const entity = this.#entities.get(id);
+		if (entity === undefined) throw new RangeError(`unknown entity '${id}'`);
+		return clone(entity);
+	}
+
+	damageEntity(entityId, amount, source = undefined) {
+		const id = identifier(entityId, 'entityId');
+		const entity = this.#entities.get(id);
+		if (entity === undefined) throw new RangeError(`unknown entity '${id}'`);
+		const damageAmount = finiteNonnegative(amount, 'entity damage');
+		if (entity.dead || damageAmount === 0) return entity.health;
+		entity.health = Math.max(0, entity.health - damageAmount);
+		if (source !== undefined) entity.lastAttacker = clone(source);
+		if (entity.health === 0) entity.dead = true;
+		return entity.health;
+	}
+
+	inventories(agentId) {
+		return clone(this.#requirePlayer(agentId).inventory);
+	}
+
+	countInventoryItem(agentId, itemId) {
+		const id = identifier(itemId, 'itemId');
+		return this.#requirePlayer(agentId).inventory.items
+			.filter((item) => item.itemId === id)
+			.reduce((total, item) => total + item.count, 0);
+	}
+
+	removeInventoryItem(agentId, itemId, count, slot = undefined) {
+		const player = this.#requirePlayer(agentId);
+		const id = identifier(itemId, 'itemId');
+		const quantity = positiveInteger(count, 'count');
+		if (this.countInventoryItem(agentId, id) < quantity) return false;
+		let remaining = quantity;
+		for (const item of player.inventory.items) {
+			if (item.itemId !== id || (slot !== undefined && item.slot !== slot) || remaining === 0) continue;
+			const used = Math.min(item.count, remaining);
+			item.count -= used;
+			remaining -= used;
+		}
+		player.inventory.items = player.inventory.items.filter((item) => item.count > 0);
+		return remaining === 0;
+	}
+
+	addInventoryItem(agentId, itemId, count) {
+		const player = this.#requirePlayer(agentId);
+		const id = identifier(itemId, 'itemId');
+		const quantity = positiveInteger(count, 'count');
+		const existing = player.inventory.items.find((item) => item.itemId === id);
+		if (existing) existing.count += quantity;
+		else {
+			if (player.inventory.items.length >= MAX_PLAYER_INVENTORY_ITEMS) throw capacityError('inventory items', MAX_PLAYER_INVENTORY_ITEMS);
+			player.inventory.items.push({ itemId: id, count: quantity, damage: 0, maxDamage: 0, slot: nextInventorySlot(player.inventory.items) });
+		}
+		return this.countInventoryItem(agentId, id);
+	}
+
+	setShield(agentId, active) {
+		const player = this.#requirePlayer(agentId);
+		player.shieldActive = active === true;
+		return player.shieldActive;
+	}
+
+	isShielding(agentId) { return this.#requirePlayer(agentId).shieldActive === true; }
+
+	recordDirectMessage(agentId, recipientId, message) {
+		const sender = identifier(agentId, 'agentId');
+		const recipient = identifier(recipientId, 'recipientId');
+		const text = identifier(message, 'message');
+		const event = Object.freeze({ tick: this.#tickCount, senderId: sender, recipientId: recipient, message: text });
+		this.#conversationEvents.push(event);
+		return event;
+	}
+
+	conversationEvents() { return clone(this.#conversationEvents); }
+
 	setVelocity(agentId, velocity) {
 		const player = this.#requirePlayer(agentId);
 		player.velocity = vector(velocity, 'velocity');
@@ -270,7 +354,8 @@ export class VirtualWorld extends EventEmitter {
 
 	damage(agentId, amount, source = undefined) {
 		const player = this.#requirePlayer(agentId);
-		const damageAmount = finiteNonnegative(amount, 'damage');
+		const rawDamage = finiteNonnegative(amount, 'damage');
+		const damageAmount = player.shieldActive ? rawDamage * 0.5 : rawDamage;
 		if (player.dead || damageAmount === 0) return player.health;
 		player.health = Math.max(0, player.health - damageAmount);
 		if (source !== undefined) player.lastAttacker = normalizeAttacker(source);
@@ -288,13 +373,23 @@ export class VirtualWorld extends EventEmitter {
 		player.onGround = false;
 		player.onFire = false;
 		player.fallDistance = 0;
+		player.shieldActive = false;
 		player.lastAttacker = undefined;
 		player.lastResult = null;
 		return true;
 	}
 
-	/** Executes one deterministic slice of a bridge action and reports whether it is terminal. */
-	performAction(agentId, action, { elapsedTicks = 0 } = {}) {
+	/** Keeps the Task 3 bridge contract stable while the richer runtime uses the simulator entry point below. */
+	performAction(agentId, action, options = {}) {
+		const normalized = normalizeAction(action);
+		if (normalized.type === 'craft_inventory' || normalized.type === 'craft_table') {
+			return { done: true, state: 'FAILED', reasonCode: 'SIMULATOR_UNSUPPORTED_ACTION', changed: false };
+		}
+		return this.performSimulationAction(agentId, action, options);
+	}
+
+	/** Executes one deterministic slice of a complete simulator action. */
+	performSimulationAction(agentId, action, { elapsedTicks = 0 } = {}) {
 		const player = this.#requirePlayer(agentId);
 		const normalized = normalizeAction(action);
 		if (player.dead && normalized.type !== 'respawn') return { done: true, state: 'FAILED', reasonCode: 'PLAYER_DEAD', changed: false };
@@ -313,7 +408,7 @@ export class VirtualWorld extends EventEmitter {
 				player.velocity.x = ((target.x - player.position.x) / horizontal) * speed;
 				player.velocity.z = ((target.z - player.position.z) / horizontal) * speed;
 				if (Math.abs(target.y - player.position.y) > args.tolerance && player.onGround && target.y > player.position.y) player.velocity.y = 0.42;
-				player.yaw = Math.atan2(target.z - player.position.z, target.x - player.position.x) * 180 / Math.PI - 90;
+				player.yaw = approachAngle(player.yaw, Math.atan2(target.z - player.position.z, target.x - player.position.x) * 180 / Math.PI - 90, 12);
 				return { done: false, changed: true };
 			}
 			case 'look_at': {
@@ -325,12 +420,28 @@ export class VirtualWorld extends EventEmitter {
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'LOOKED', changed: true };
 			}
 			case 'wait':
-			case 'use_item':
-			case 'block_with_shield': {
+			case 'use_item': {
 				const requiredTicks = Math.max(1, Math.ceil(args.durationMs / VIRTUAL_TICK_MS));
 				return elapsedTicks + 1 >= requiredTicks
 					? { done: true, state: 'SUCCEEDED', reasonCode: 'DONE', changed: false }
 					: { done: false, changed: false };
+			}
+			case 'block_with_shield': {
+				player.shieldActive = true;
+				const requiredTicks = Math.max(1, Math.ceil(args.durationMs / VIRTUAL_TICK_MS));
+				if (elapsedTicks + 1 < requiredTicks) return { done: false, changed: false };
+				player.shieldActive = false;
+				return { done: true, state: 'SUCCEEDED', reasonCode: 'SHIELDING_DONE', changed: true };
+			}
+			case 'attack': {
+				const entity = this.#entities.get(args.targetId);
+				if (entity === undefined) return { done: true, state: 'FAILED', reasonCode: 'TARGET_NOT_FOUND', changed: false };
+				if (entity.dead) return { done: true, state: 'FAILED', reasonCode: 'TARGET_DEAD', changed: false };
+				if (distance(player.position, entity.position) > 4.5) return { done: true, state: 'FAILED', reasonCode: 'TARGET_OUT_OF_RANGE', changed: false };
+				if (entity.cooldownUntilTick > this.#tickCount) return { done: false, changed: false };
+				entity.cooldownUntilTick = this.#tickCount + 10;
+				this.damageEntity(entity.id, 3, { uuid: player.id, type: 'minecraft:player', distance: distance(player.position, entity.position) });
+				return { done: true, state: 'SUCCEEDED', reasonCode: entity.dead ? 'TARGET_DEFEATED' : 'HIT', changed: true };
 			}
 			case 'respawn':
 				return this.respawn(agentId)
@@ -341,15 +452,43 @@ export class VirtualWorld extends EventEmitter {
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'SELECTED', changed: true };
 			case 'break_block': {
 				const key = blockKey(args.x, args.y, args.z);
-				if (!this.#blocks.has(key)) return { done: true, state: 'FAILED', reasonCode: 'BLOCK_NOT_FOUND', changed: false };
+				const block = this.#blocks.get(key);
+				if (!block) return { done: true, state: 'FAILED', reasonCode: 'BLOCK_NOT_FOUND', changed: false };
+				if (elapsedTicks + 1 < miningDurationTicks(block.blockId)) return { done: false, changed: false };
 				this.#blocks.delete(key);
+				this.addInventoryItem(agentId, blockDrop(block.blockId), 1);
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'BROKEN', changed: true };
 			}
 			case 'place_block': {
+				if (this.#blocks.has(blockKey(args.x, args.y, args.z))) return { done: true, state: 'FAILED', reasonCode: 'BLOCK_OCCUPIED', changed: false };
+				if (!this.removeInventoryItem(agentId, args.itemId, 1)) return { done: true, state: 'FAILED', reasonCode: 'ITEM_NOT_FOUND', changed: false };
 				const block = normalizeBlock({ x: args.x, y: args.y, z: args.z, blockId: args.itemId });
 				try { this.#insertBlock(block); }
-				catch (error) { if (error.code === 'WORLD_CAPACITY_EXCEEDED') return { done: true, state: 'FAILED', reasonCode: error.code, changed: false }; throw error; }
+				catch (error) {
+					this.addInventoryItem(agentId, args.itemId, 1);
+					if (error.code === 'WORLD_CAPACITY_EXCEEDED') return { done: true, state: 'FAILED', reasonCode: error.code, changed: false };
+					throw error;
+				}
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'PLACED', changed: true };
+			}
+			case 'craft_inventory':
+			case 'craft_table': {
+				if (normalized.type === 'craft_table' && this.#blocks.get(blockKey(args.x, args.y, args.z))?.blockId !== 'minecraft:crafting_table') {
+					return { done: true, state: 'FAILED', reasonCode: 'CRAFTING_TABLE_NOT_FOUND', changed: false };
+				}
+				const recipe = craftRecipe(args.recipeId, args.count);
+				if (!recipe) return { done: true, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND', changed: false };
+				for (const [itemId, count] of Object.entries(recipe.inputs)) {
+					if (this.countInventoryItem(agentId, itemId) < count) return { done: true, state: 'FAILED', reasonCode: 'INGREDIENTS_MISSING', changed: false };
+				}
+				if (elapsedTicks + 1 < 2) return { done: false, changed: false };
+				for (const [itemId, count] of Object.entries(recipe.inputs)) this.removeInventoryItem(agentId, itemId, count);
+				this.addInventoryItem(agentId, recipe.output, args.count);
+				return { done: true, state: 'SUCCEEDED', reasonCode: 'CRAFTED', changed: true };
+			}
+			case 'chat': {
+				if ((args.audience ?? 'public') === 'direct') this.recordDirectMessage(agentId, args.recipientId, args.message);
+				return { done: true, state: 'SUCCEEDED', reasonCode: 'MESSAGE_SENT', changed: true };
 			}
 			case 'drop_item': {
 				const held = player.inventory.items.find((item) => item.slot === args.slot && item.count >= args.count);
@@ -417,6 +556,7 @@ export class VirtualWorld extends EventEmitter {
 			lastAttacker: source.lastAttacker === undefined ? undefined : normalizeAttacker(source.lastAttacker),
 			selectedItem: identifier(source.selectedItem ?? inventory.selectedItem, 'agent.selectedItem'),
 			inventory,
+			shieldActive: source.shieldActive === true,
 			dead: source.dead === true || (source.health ?? maxHealth) <= 0,
 			activeAction: null,
 			lastResult: null,
@@ -466,7 +606,6 @@ export class VirtualWorld extends EventEmitter {
 
 	#integratePlayer(player) {
 		if (!player.onGround) player.velocity.y -= GRAVITY;
-		const wasFalling = player.velocity.y < 0;
 		const next = clone(player.position);
 		let onGround = false;
 		for (const axis of ['x', 'y', 'z']) {
@@ -485,7 +624,7 @@ export class VirtualWorld extends EventEmitter {
 			}
 		}
 		player.position = next;
-		player.onGround = onGround || (wasFalling && this.#hasSupport(player));
+		player.onGround = onGround || this.#hasSupport(player);
 		if (player.onGround && player.velocity.y < 0) player.velocity.y = 0;
 		player.velocity.x *= AIR_DRAG;
 		player.velocity.z *= AIR_DRAG;
@@ -618,7 +757,20 @@ function normalizeEntity(value, index) {
 	if (!isRecord(value)) throw new TypeError('entity must be an object');
 	const source = value;
 	if (source.isPlayer !== undefined && typeof source.isPlayer !== 'boolean') throw new TypeError('entity.isPlayer must be boolean');
-	return { id: identifier(source.id ?? source.uuid ?? `entity-${index + 1}`, 'entity.id'), type: identifier(source.type ?? 'minecraft:zombie', 'entity.type'), name: identifier(source.name ?? source.type ?? 'entity', 'entity.name'), position: parsePosition(source), ...(source.isPlayer === undefined ? {} : { isPlayer: source.isPlayer }), ...(source.tags === undefined ? {} : { tags: normalizeTags(source.tags, 'entity.tags') }) };
+	const maxHealth = finitePositive(source.maxHealth ?? 20, 'entity.maxHealth');
+	const health = finiteNonnegative(source.health ?? maxHealth, 'entity.health');
+	return {
+		id: identifier(source.id ?? source.uuid ?? `entity-${index + 1}`, 'entity.id'),
+		type: identifier(source.type ?? 'minecraft:zombie', 'entity.type'),
+		name: identifier(source.name ?? source.type ?? 'entity', 'entity.name'),
+		position: parsePosition(source),
+		health,
+		maxHealth,
+		dead: source.dead === true || health <= 0,
+		cooldownUntilTick: nonnegativeInteger(source.cooldownUntilTick ?? 0, 'entity.cooldownUntilTick'),
+		...(source.isPlayer === undefined ? {} : { isPlayer: source.isPlayer }),
+		...(source.tags === undefined ? {} : { tags: normalizeTags(source.tags, 'entity.tags') }),
+	};
 }
 function normalizeEntities(value) { return normalizeArray(value, 'entities').map(normalizeEntity); }
 function normalizeItem(value, index) {
@@ -708,6 +860,35 @@ function normalizeAction(action) {
 	return { type, arguments: args };
 }
 function distance(left, right) { return Math.hypot(left.x - right.x, left.y - right.y, left.z - right.z); }
+function approachAngle(current, target, maximumDelta) {
+	let delta = ((target - current + 540) % 360) - 180;
+	if (delta > maximumDelta) delta = maximumDelta;
+	if (delta < -maximumDelta) delta = -maximumDelta;
+	return current + delta;
+}
+function miningDurationTicks(blockId) {
+	if (blockId.includes('obsidian')) return 40;
+	if (blockId.includes('stone') || blockId.includes('ore')) return 5;
+	if (blockId.includes('log') || blockId.includes('wood')) return 4;
+	return 3;
+}
+function blockDrop(blockId) {
+	if (blockId === 'minecraft:stone') return 'minecraft:cobblestone';
+	if (blockId === 'minecraft:coal_ore') return 'minecraft:coal';
+	return blockId;
+}
+function craftRecipe(recipeId, count) {
+	const recipes = {
+		'minecraft:planks': { output: 'minecraft:oak_planks', inputs: { 'minecraft:oak_log': Math.ceil(count / 4) } },
+		'minecraft:oak_planks': { output: 'minecraft:oak_planks', inputs: { 'minecraft:oak_log': Math.ceil(count / 4) } },
+		'minecraft:sticks': { output: 'minecraft:stick', inputs: { 'minecraft:oak_planks': Math.ceil(count / 4) * 2 } },
+		'minecraft:crafting_table': { output: 'minecraft:crafting_table', inputs: { 'minecraft:oak_planks': count * 4 } },
+		'minecraft:stone_pickaxe': { output: 'minecraft:stone_pickaxe', inputs: { 'minecraft:cobblestone': count * 3, 'minecraft:stick': count * 2 } },
+		'minecraft:stone_axe': { output: 'minecraft:stone_axe', inputs: { 'minecraft:cobblestone': count * 3, 'minecraft:stick': count * 2 } },
+		'minecraft:stone_sword': { output: 'minecraft:stone_sword', inputs: { 'minecraft:cobblestone': count * 2, 'minecraft:stick': count } },
+	};
+	return recipes[recipeId] ?? null;
+}
 function isSolid(blockId) { return !SOLID_EXCEPTIONS.has(blockId); }
 function playerIntersectsBlock(position, block) {
 	return position.x + PLAYER_HALF_WIDTH > block.x && position.x - PLAYER_HALF_WIDTH < block.x + 1
