@@ -1,0 +1,37 @@
+package dev.agaminggod.arenaagents.server.runtime;
+
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.protocol.ActionType;
+import java.util.Objects;
+
+public record ServerActionResult(
+		AgentId agentId,
+		long goalRevision,
+		String actionId,
+		ActionType actionType,
+		ServerActionState state,
+		String reasonCode,
+		String message,
+		long elapsedMs,
+		long observedAtEpochMs
+) {
+	public ServerActionResult {
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Objects.requireNonNull(actionId, "actionId must not be null");
+		Objects.requireNonNull(actionType, "actionType must not be null");
+		Objects.requireNonNull(state, "state must not be null");
+		if (!state.terminal()) {
+			throw new IllegalArgumentException("Result state must be terminal");
+		}
+		reasonCode = bounded(reasonCode, 128);
+		message = bounded(message, 2_048);
+		if (elapsedMs < 0L || observedAtEpochMs <= 0L) {
+			throw new IllegalArgumentException("Result timestamps are invalid");
+		}
+	}
+
+	private static String bounded(String value, int maximum) {
+		String safe = value == null ? "" : value;
+		return safe.length() <= maximum ? safe : safe.substring(0, maximum);
+	}
+}
