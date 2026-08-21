@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { redact } from '../trace-writer.mjs';
@@ -41,6 +41,7 @@ export class BenchmarkRecorder {
 			writeFile: deps.writeFile ?? writeFile,
 			rename: deps.rename ?? rename,
 			unlink: deps.unlink ?? unlink,
+			access: deps.access ?? access,
 			randomUUID: deps.randomUUID ?? randomUUID,
 		};
 		for (const [name, fn] of Object.entries(this.#write)) if (typeof fn !== 'function') throw new TypeError(`benchmark recorder ${name} dependency must be a function`);
@@ -98,20 +99,60 @@ export class BenchmarkRecorder {
 		const nonce = this.#write.randomUUID();
 		const eventsTempPath = path.join(targetDirectory, `.${BENCHMARK_EVENTS_FILENAME}.${process.pid}.${nonce}.tmp`);
 		const summaryTempPath = path.join(targetDirectory, `.${BENCHMARK_SUMMARY_FILENAME}.${process.pid}.${nonce}.tmp`);
+		const eventsBackupPath = path.join(targetDirectory, `.${BENCHMARK_EVENTS_FILENAME}.${process.pid}.${nonce}.bak`);
+		const summaryBackupPath = path.join(targetDirectory, `.${BENCHMARK_SUMMARY_FILENAME}.${process.pid}.${nonce}.bak`);
 		const events = this.snapshot();
 		const summary = summarizeBenchmark(events);
 		const jsonl = events.length === 0 ? '' : `${events.map((event) => JSON.stringify(event)).join('\n')}\n`;
+		const state = {
+			events: { backupPath: eventsBackupPath, backedUp: false, published: false },
+			summary: { backupPath: summaryBackupPath, backedUp: false, published: false },
+		};
 		try {
 			await this.#write.mkdir(targetDirectory, { recursive: true });
 			await this.#write.writeFile(eventsTempPath, jsonl, { encoding: 'utf8' });
 			await this.#write.writeFile(summaryTempPath, `${JSON.stringify(summary, null, 2)}\n`, { encoding: 'utf8' });
+			await this.#backup(eventsPath, state.events);
+			await this.#backup(summaryPath, state.summary);
 			await this.#write.rename(eventsTempPath, eventsPath);
+			state.events.published = true;
 			await this.#write.rename(summaryTempPath, summaryPath);
+			state.summary.published = true;
+			await Promise.allSettled([this.#write.unlink(eventsBackupPath), this.#write.unlink(summaryBackupPath)]);
 			return Object.freeze({ eventsPath, summaryPath, eventCount: events.length, droppedEvents: events.droppedEvents });
 		} catch (error) {
-			await Promise.allSettled([this.#write.unlink(eventsTempPath), this.#write.unlink(summaryTempPath)]);
+			await this.#rollback(eventsPath, eventsTempPath, state.events);
+			await this.#rollback(summaryPath, summaryTempPath, state.summary);
 			throw error;
 		}
+	}
+
+	async #backup(finalPath, state) {
+		if (!await this.#exists(finalPath)) return;
+		await this.#write.rename(finalPath, state.backupPath);
+		state.backedUp = true;
+	}
+
+	async #rollback(finalPath, tempPath, state) {
+		if (state.published) await this.#safeUnlink(finalPath);
+		if (state.backedUp) {
+			if (await this.#exists(finalPath)) await this.#safeUnlink(finalPath);
+			try { await this.#write.rename(state.backupPath, finalPath); }
+			catch { /* preserve the backup when the filesystem cannot restore it */ }
+		} else if (state.published) {
+			await this.#safeUnlink(finalPath);
+		}
+		await this.#safeUnlink(tempPath);
+		if (!state.backedUp || await this.#exists(finalPath)) await this.#safeUnlink(state.backupPath);
+	}
+
+	async #safeUnlink(filePath) {
+		try { await this.#write.unlink(filePath); } catch { /* cleanup is best effort */ }
+	}
+
+	async #exists(filePath) {
+		try { await this.#write.access(filePath); return true; }
+		catch { return false; }
 	}
 
 	#timestamp() {
@@ -152,7 +193,7 @@ function boundTree(value, identityLimit, fieldStringLimit, key = null, depth = 0
 	if (key !== null && isSensitiveKey(key)) return REDACTED;
 	if (typeof value === 'string') {
 		const limit = key !== null && isIdentityKey(key) ? identityLimit : fieldStringLimit;
-		return value.slice(0, limit);
+		return sanitizeCredentialText(value).slice(0, limit);
 	}
 	if (value === null || typeof value !== 'object') return value;
 	if (Array.isArray(value)) return value.map((child) => boundTree(child, identityLimit, fieldStringLimit, key, depth + 1));
@@ -168,6 +209,13 @@ function isIdentityKey(key) {
 
 function isSensitiveKey(key) {
 	return /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|cookie|token|credential|oauth|bearer|login)/i.test(key);
+}
+
+function sanitizeCredentialText(value) {
+	return value
+		.replace(/\b(cookie|authorization|provider[-_ ]?login|oauth)(?:\s+(?:token|bearer))?\s*(?::|=|\s)\s*([^\s,;)}\]"']+)/gi, (_match, label) => `${label}: [REDACTED]`)
+		.replace(/\bBearer\s+([A-Za-z0-9._~+/=-]+)/gi, 'Bearer [REDACTED]')
+		.replace(/\bsk-(?:fish-)?[A-Za-z0-9][A-Za-z0-9._~+/=-]{8,}/g, '[REDACTED]');
 }
 
 function deepFreeze(value, seen = new WeakSet()) {

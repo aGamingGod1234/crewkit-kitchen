@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rename as fsRename, writeFile as fsWriteFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -8,6 +8,8 @@ import { BenchmarkRecorder, summarizeBenchmark } from '../src/benchmark/benchmar
 import { classifyBenchmarkError } from '../src/benchmark/benchmark-report.mjs';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
+import { AgentPlanner } from '../src/agent-planner.mjs';
+import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { FakeMinecraftBridge, commandPayloads, observation } from './fixtures/fake-minecraft-bridge.mjs';
 
 function context(overrides = {}) {
@@ -78,6 +80,34 @@ test('recursively redacts credential-shaped keys and values', () => {
 	assert.match(encoded, /REDACTED/);
 });
 
+test('redacts credential-shaped values even when their keys are ordinary', () => {
+	const recorder = new BenchmarkRecorder({ clock: () => 1 });
+	recorder.record('provider_response', context(), {
+		message: 'cookie=fixture_cookie_secret_not_real',
+		header: 'Cookie: fixture_cookie_header_not_real',
+		fish: 'sk-fish-fixture-key-not-real',
+		openai: 'sk-fixture-key-not-real',
+		login: 'provider-login=fixture_login_secret_not_real',
+		loginText: 'provider-login fixture_login_text_secret_not_real',
+		oauthText: 'OAuth token=fixture_oauth_secret_not_real',
+		oauthBearerText: 'OAuth bearer fixture_oauth_bearer_secret_not_real',
+		bearerText: 'Bearer fixture_bearer_secret_not_real',
+	});
+
+	const encoded = JSON.stringify(recorder.snapshot());
+	for (const secret of [
+		'fixture_cookie_secret_not_real',
+		'fixture_cookie_header_not_real',
+		'sk-fish-fixture-key-not-real',
+		'sk-fixture-key-not-real',
+		'fixture_login_secret_not_real',
+		'fixture_login_text_secret_not_real',
+		'fixture_oauth_secret_not_real',
+		'fixture_oauth_bearer_secret_not_real',
+		'fixture_bearer_secret_not_real',
+	]) assert.equal(encoded.includes(secret), false, `credential-shaped value ${secret} is absent`);
+});
+
 test('summarizes raw duration samples with deterministic p50, p95, and p99', () => {
 	const events = [1, 2, 3, 4, 5].map((durationMs, index) => ({
 		stage: 'action_completion', sequence: index + 1, monotonicMs: index, durationMs,
@@ -120,8 +150,72 @@ test('cleans both staging files when an atomic rename fails', async () => {
 	recorder.record('tick', context(), { durationMs: 50 });
 	const directory = await mkdtemp(path.join(tmpdir(), 'benchmark-recorder-failure-'));
 	await assert.rejects(() => recorder.writeArtifacts(directory), /fixture rename failure/);
-	assert.equal(unlinked.length, 2);
-	assert.ok(unlinked.every((filePath) => filePath.endsWith('.tmp')));
+	assert.equal(unlinked.length, 4);
+	assert.equal(unlinked.filter((filePath) => filePath.endsWith('.tmp')).length, 2);
+	assert.equal(unlinked.filter((filePath) => filePath.endsWith('.bak')).length, 2);
+});
+
+test('restores the exact prior artifact pair when the second publish rename fails', async () => {
+	const directory = await mkdtemp(path.join(tmpdir(), 'benchmark-recorder-transaction-'));
+	const eventsPath = path.join(directory, 'benchmark-events.jsonl');
+	const summaryPath = path.join(directory, 'benchmark-summary.json');
+	const oldEvents = '{"old":"events"}\n';
+	const oldSummary = '{"old":"summary"}\n';
+	await fsWriteFile(eventsPath, oldEvents, 'utf8');
+	await fsWriteFile(summaryPath, oldSummary, 'utf8');
+	let publishSummaryAttempts = 0;
+	const recorder = new BenchmarkRecorder({
+		clock: () => 1,
+		dependencies: {
+			rename: async (from, to) => {
+				if (to === summaryPath && from.endsWith('.tmp')) {
+					publishSummaryAttempts += 1;
+					throw new Error('fixture second publish failure');
+				}
+				return fsRename(from, to);
+			},
+		},
+	});
+	recorder.record('tick', context(), { durationMs: 50 });
+
+	await assert.rejects(() => recorder.writeArtifacts(directory), /fixture second publish failure/);
+	assert.equal(publishSummaryAttempts, 1);
+	assert.equal(await readFile(eventsPath, 'utf8'), oldEvents);
+	assert.equal(await readFile(summaryPath, 'utf8'), oldSummary);
+	assert.deepEqual((await readdir(directory)).filter((name) => name.includes('.tmp') || name.includes('.bak')), []);
+});
+
+test('a throwing recorder never changes planner, scheduler, or runtime behavior', async () => {
+	const recorder = { record() { throw new Error('telemetry fixture failure'); } };
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0, recorder });
+	const registry = new AgentRegistry();
+	const record = { agentId: 'agent-a', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'wait', queue: [] };
+	registry.register(record);
+	const planner = new AgentPlanner({
+		registry,
+		scheduler,
+		recorder,
+		codexService: {
+			async createAgent() {
+				return {
+					async setGoalRevision() {},
+					async decide() { return { directive: 'continue', summary: 'continue' }; },
+				};
+			},
+		},
+	});
+	assert.deepEqual(await planner.requestPlan({ agentId: 'agent-a', input: 'fixture', goalRevision: 1 }), { directive: 'continue', summary: 'continue', goalRevision: 1 });
+
+	const sent = [];
+	const runtime = new ProgramRuntimeManager({
+		registry,
+		recorder,
+		bridge: { send: async (...args) => sent.push(args) },
+		planner: { requestPlan: async () => ({ directive: 'continue' }) },
+	});
+	await runtime.installDecision(record, { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
+	assert.equal(sent.length, 1);
+	scheduler.close();
 });
 
 test('enabled telemetry does not alter fixture action command bytes', async () => {
