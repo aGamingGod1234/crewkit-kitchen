@@ -45,7 +45,10 @@ export class VirtualMinecraftBridge extends EventEmitter {
 	get world() { return this.#world; }
 	get serverInstanceId() { return this.#serverInstanceId; }
 	get activeActionIds() { return [...this.#active.keys()]; }
-	get actionRuntime() { return this.#actionRuntime; }
+	actionRuntimeSnapshot() {
+		const runtime = typeof this.#actionRuntime.snapshot === 'function' ? this.#actionRuntime.snapshot() : { activeActionIds: [] };
+		return structuredClone({ runtime, bridgeActiveAgentIds: this.activeActionIds });
+	}
 
 	attach(manager) {
 		if (manager !== null && manager !== undefined) {
@@ -70,8 +73,8 @@ export class VirtualMinecraftBridge extends EventEmitter {
 		this.sent.push(normalized);
 		if (type === 'action_command') {
 			if (this.#active.has(agentId)) throw Object.assign(new Error(`agent '${agentId}' already has an active action`), { code: 'ACTION_BUSY' });
+			if (!(this.#world.agentIds ?? []).includes(agentId)) throw Object.assign(new Error(`unknown world agent '${agentId}'`), { code: 'UNKNOWN_AGENT' });
 			const command = normalized.payload;
-			this.#actionRuntime.accept({ agentId, ...command });
 			const active = {
 				agentId,
 				record,
@@ -80,9 +83,23 @@ export class VirtualMinecraftBridge extends EventEmitter {
 				elapsedTicks: 0,
 				progressSent: false,
 			};
-			this.#active.set(agentId, active);
-			this.#world.setActiveAction(agentId, command.actionId, command.actionType);
-			this.#recordEvent('accepted', normalized);
+			let accepted = false;
+			try {
+				this.#actionRuntime.accept({ agentId, ...command });
+				accepted = true;
+				this.#world.setActiveAction(agentId, command.actionId, command.actionType);
+				this.#active.set(agentId, active);
+				this.#recordEvent('accepted', normalized);
+			} catch (error) {
+				if (this.#active.get(agentId) === active) this.#active.delete(agentId);
+				if (accepted) {
+					try { this.#actionRuntime.cancel(command.actionId); }
+					catch { /* rollback must preserve the original setup failure */ }
+				}
+				try { this.#world.setActiveAction(agentId, null); }
+				catch { /* the world may have rejected the initial setup */ }
+				throw error;
+			}
 			return;
 		}
 		if (type === 'action_cancel') this.#cancel(record, normalized.payload);

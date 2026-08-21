@@ -108,6 +108,39 @@ test('cancellation requires the exact goal revision of the active action', async
 	assert.equal(manager.events.at(-1).payload.state, 'CANCELLED');
 });
 
+test('action setup rollback clears runtime and bridge state after a world setup failure', async () => {
+	const world = VirtualWorld.fromScenario(scenario());
+	const originalSetActiveAction = world.setActiveAction.bind(world);
+	let failSetup = true;
+	world.setActiveAction = (agentId, actionId, actionType) => {
+		if (failSetup) {
+			failSetup = false;
+			throw new Error('simulated active-action setup failure');
+		}
+		return originalSetActiveAction(agentId, actionId, actionType);
+	};
+	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
+	await assert.rejects(bridge.send('action_command', 'alice', command('setup-fails', 'wait', { durationMs: 1 })), /simulated active-action setup failure/);
+	assert.deepEqual(bridge.activeActionIds, []);
+	assert.deepEqual(bridge.actionRuntimeSnapshot().runtime.active, []);
+	await bridge.send('action_command', 'alice', command('setup-succeeds', 'wait', { durationMs: 1 }));
+	world.stepTicks(1);
+	await bridge.flush();
+	assert.equal(bridge.actionRuntimeSnapshot().bridgeActiveAgentIds.length, 0);
+});
+
+test('a recorded agent missing from the world cannot leak an accepted action', async () => {
+	const world = VirtualWorld.fromScenario({ agents: { bob: { position: { x: 0, y: 1, z: 0 } } } });
+	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 }, bob: { agentId: 'bob', goalRevision: 1 } } });
+	await assert.rejects(bridge.send('action_command', 'alice', command('missing-world', 'wait', { durationMs: 1 })), (error) => error.code === 'UNKNOWN_AGENT');
+	assert.deepEqual(bridge.activeActionIds, []);
+	assert.deepEqual(bridge.actionRuntimeSnapshot().runtime.active, []);
+	await bridge.send('action_command', 'bob', command('valid-world', 'wait', { durationMs: 1 }));
+	world.stepTicks(1);
+	await bridge.flush();
+	assert.deepEqual(bridge.activeActionIds, []);
+});
+
 test('publish validates and adapts normalized observation-bound scenario data', async () => {
 	const world = VirtualWorld.fromScenario({
 		agents: {

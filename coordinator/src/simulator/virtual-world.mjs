@@ -1,6 +1,13 @@
 import { EventEmitter } from 'node:events';
 
-import { MAX_EFFECTS, MAX_INVENTORY_SUMMARIES, MAX_OBSERVATION_TAGS, MAX_TAG_COUNT_ENTRIES } from '../constants.mjs';
+import {
+	MAX_CONVERSATION_LENGTH,
+	MAX_DESIRED_STATE_LENGTH,
+	MAX_EFFECTS,
+	MAX_INVENTORY_SUMMARIES,
+	MAX_OBSERVATION_TAGS,
+	MAX_TAG_COUNT_ENTRIES,
+} from '../constants.mjs';
 import { SeededRandom } from './seeded-random.mjs';
 
 export const VIRTUAL_TICK_HZ = 20;
@@ -305,8 +312,21 @@ export class VirtualWorld extends EventEmitter {
 	recordDirectMessage(agentId, recipientId, message) {
 		const sender = identifier(agentId, 'agentId');
 		const recipient = identifier(recipientId, 'recipientId');
-		const text = identifier(message, 'message');
-		const event = Object.freeze({ tick: this.#tickCount, senderId: sender, recipientId: recipient, message: text });
+		const text = conversationText(message);
+		const sequence = this.#conversationEvents.length + 1;
+		const event = Object.freeze({
+			eventId: `conversation-${sequence}`,
+			sequence,
+			tick: this.#tickCount,
+			kind: 'agent_message',
+			scope: 'direct',
+			sourceId: sender,
+			senderId: sender,
+			recipientId: recipient,
+			message: text,
+			wakeAcknowledged: true,
+			processed: true,
+		});
 		this.#conversationEvents.push(event);
 		return event;
 	}
@@ -455,17 +475,39 @@ export class VirtualWorld extends EventEmitter {
 				const block = this.#blocks.get(key);
 				if (!block) return { done: true, state: 'FAILED', reasonCode: 'BLOCK_NOT_FOUND', changed: false };
 				if (elapsedTicks + 1 < miningDurationTicks(block.blockId)) return { done: false, changed: false };
-				this.#blocks.delete(key);
-				this.addInventoryItem(agentId, blockDrop(block.blockId), 1);
+				const inventoryBefore = clone(player.inventory);
+				try {
+					this.#blocks.delete(key);
+					this.addInventoryItem(agentId, blockDrop(block.blockId), 1);
+				} catch (error) {
+					this.#blocks.set(key, block);
+					player.inventory = inventoryBefore;
+					if (error.code === 'WORLD_CAPACITY_EXCEEDED') return { done: true, state: 'FAILED', reasonCode: error.code, changed: false };
+					throw error;
+				}
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'BROKEN', changed: true };
 			}
 			case 'place_block': {
-				if (this.#blocks.has(blockKey(args.x, args.y, args.z))) return { done: true, state: 'FAILED', reasonCode: 'BLOCK_OCCUPIED', changed: false };
+				const targetKey = blockKey(args.x, args.y, args.z);
+				if (this.#blocks.has(targetKey)) return { done: true, state: 'FAILED', reasonCode: 'BLOCK_OCCUPIED', changed: false };
+				const support = placementSupport(args.x, args.y, args.z, args.face);
+				if (support === null || !isSolid(this.#blocks.get(blockKey(support.x, support.y, support.z))?.blockId)) {
+					return { done: true, state: 'FAILED', reasonCode: 'PLACEMENT_UNSUPPORTED', changed: false };
+				}
+				const inventoryBefore = clone(player.inventory);
 				if (!this.removeInventoryItem(agentId, args.itemId, 1)) return { done: true, state: 'FAILED', reasonCode: 'ITEM_NOT_FOUND', changed: false };
-				const block = normalizeBlock({ x: args.x, y: args.y, z: args.z, blockId: args.itemId });
-				try { this.#insertBlock(block); }
-				catch (error) {
-					this.addInventoryItem(agentId, args.itemId, 1);
+				const block = normalizeBlock({ x: args.x, y: args.y, z: args.z, blockId: args.itemId, desiredState: args.desiredState });
+				try {
+					this.#insertBlock(block);
+					const placed = this.blockAt(args.x, args.y, args.z);
+					if (placed?.blockId !== args.itemId || (args.desiredState !== undefined && placed.desiredState !== args.desiredState)) {
+						this.#blocks.delete(targetKey);
+						player.inventory = inventoryBefore;
+						return { done: true, state: 'FAILED', reasonCode: 'PLACEMENT_STATE_MISMATCH', changed: false };
+					}
+				} catch (error) {
+					this.#blocks.delete(targetKey);
+					player.inventory = inventoryBefore;
 					if (error.code === 'WORLD_CAPACITY_EXCEEDED') return { done: true, state: 'FAILED', reasonCode: error.code, changed: false };
 					throw error;
 				}
@@ -482,8 +524,15 @@ export class VirtualWorld extends EventEmitter {
 					if (this.countInventoryItem(agentId, itemId) < count) return { done: true, state: 'FAILED', reasonCode: 'INGREDIENTS_MISSING', changed: false };
 				}
 				if (elapsedTicks + 1 < 2) return { done: false, changed: false };
-				for (const [itemId, count] of Object.entries(recipe.inputs)) this.removeInventoryItem(agentId, itemId, count);
-				this.addInventoryItem(agentId, recipe.output, args.count);
+				const inventoryBefore = clone(player.inventory);
+				try {
+					for (const [itemId, count] of Object.entries(recipe.inputs)) this.removeInventoryItem(agentId, itemId, count);
+					this.addInventoryItem(agentId, recipe.output, args.count);
+				} catch (error) {
+					player.inventory = inventoryBefore;
+					if (error.code === 'WORLD_CAPACITY_EXCEEDED') return { done: true, state: 'FAILED', reasonCode: error.code, changed: false };
+					throw error;
+				}
 				return { done: true, state: 'SUCCEEDED', reasonCode: 'CRAFTED', changed: true };
 			}
 			case 'chat': {
@@ -742,7 +791,14 @@ function normalizeBlock(value) {
 	if (!isRecord(value)) throw new TypeError('block must be an object');
 	const source = value;
 	const position = parsePosition(source);
-	return { x: Math.trunc(position.x), y: Math.trunc(position.y), z: Math.trunc(position.z), blockId: identifier(source.blockId ?? source.id ?? 'minecraft:stone', 'blockId'), ...(source.tags === undefined ? {} : { tags: normalizeTags(source.tags, 'block.tags') }) };
+	return {
+		x: Math.trunc(position.x),
+		y: Math.trunc(position.y),
+		z: Math.trunc(position.z),
+		blockId: identifier(source.blockId ?? source.id ?? 'minecraft:stone', 'blockId'),
+		...(source.desiredState === undefined ? {} : { desiredState: desiredState(source.desiredState) }),
+		...(source.tags === undefined ? {} : { tags: normalizeTags(source.tags, 'block.tags') }),
+	};
 }
 function normalizeBlocks(value) {
 	if (value === undefined || value === null) return [];
@@ -877,6 +933,28 @@ function blockDrop(blockId) {
 	if (blockId === 'minecraft:coal_ore') return 'minecraft:coal';
 	return blockId;
 }
+function placementSupport(x, y, z, face) {
+	const offsets = {
+		down: { x: 0, y: 1, z: 0 },
+		up: { x: 0, y: -1, z: 0 },
+		north: { x: 0, y: 0, z: 1 },
+		south: { x: 0, y: 0, z: -1 },
+		west: { x: 1, y: 0, z: 0 },
+		east: { x: -1, y: 0, z: 0 },
+	};
+	const offset = offsets[face];
+	return offset === undefined ? null : { x: Math.trunc(x) + offset.x, y: Math.trunc(y) + offset.y, z: Math.trunc(z) + offset.z };
+}
+function desiredState(value) {
+	if (typeof value !== 'string' || value.length === 0) throw new TypeError('block.desiredState must be a non-empty string');
+	if ([...value].length > MAX_DESIRED_STATE_LENGTH) throw capacityError('block.desiredState', MAX_DESIRED_STATE_LENGTH);
+	return value;
+}
+function conversationText(value) {
+	if (typeof value !== 'string' || value.length === 0) throw new TypeError('message must be a non-empty string');
+	if ([...value].length > MAX_CONVERSATION_LENGTH) throw Object.assign(new RangeError(`MESSAGE_TOO_LARGE: message exceeds ${MAX_CONVERSATION_LENGTH} code points`), { code: 'MESSAGE_TOO_LARGE' });
+	return value;
+}
 function craftRecipe(recipeId, count) {
 	const recipes = {
 		'minecraft:planks': { output: 'minecraft:oak_planks', inputs: { 'minecraft:oak_log': Math.ceil(count / 4) } },
@@ -889,7 +967,7 @@ function craftRecipe(recipeId, count) {
 	};
 	return recipes[recipeId] ?? null;
 }
-function isSolid(blockId) { return !SOLID_EXCEPTIONS.has(blockId); }
+function isSolid(blockId) { return typeof blockId === 'string' && !SOLID_EXCEPTIONS.has(blockId); }
 function playerIntersectsBlock(position, block) {
 	return position.x + PLAYER_HALF_WIDTH > block.x && position.x - PLAYER_HALF_WIDTH < block.x + 1
 		&& position.y + PLAYER_HEIGHT > block.y && position.y < block.y + 1

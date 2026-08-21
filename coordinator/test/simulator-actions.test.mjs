@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ACTION_FIELDS } from '../src/constants.mjs';
-import { ActionRuntime } from '../src/simulator/action-runtime.mjs';
-import { VirtualWorld } from '../src/simulator/virtual-world.mjs';
+import { ACTION_FIELDS, MAX_CONVERSATION_LENGTH } from '../src/constants.mjs';
+import { validateAction } from '../src/schema.mjs';
+import { ActionRuntime, SUPPORTED_SIMULATOR_ACTIONS } from '../src/simulator/action-runtime.mjs';
+import { MAX_PLAYER_INVENTORY_ITEMS, VirtualWorld } from '../src/simulator/virtual-world.mjs';
 
 const PLAYER = 'alice';
 const MOB = '00000000-0000-4000-8000-000000000001';
@@ -159,4 +160,113 @@ test('cancellation fences stale completion and unsupported actions fail explicit
 	runtime.accept(command('unknown', 'set_door', { x: 1, y: 1, z: 0, open: true }));
 	runtime.tick(simulationWorld);
 	assert.equal(runtime.resultFor('unknown').reasonCode, 'SIMULATOR_UNSUPPORTED_ACTION');
+});
+
+test('mining keeps the target block and inventory bytes unchanged when its drop cannot fit', () => {
+	const inventory = Array.from({ length: MAX_PLAYER_INVENTORY_ITEMS }, (_, slot) => ({ itemId: `minecraft:fixture_${slot}`, count: 1, slot }));
+	const simulationWorld = world({
+		agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: inventory } } },
+		blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 1, z: 0, blockId: 'minecraft:stone' }],
+	});
+	const before = simulationWorld.inventories(PLAYER);
+	const runtime = new ActionRuntime();
+	runtime.accept(command('full-mine', 'break_block', { x: 1, y: 1, z: 0, timeoutMs: 1_000 }));
+	const result = run(runtime, simulationWorld, 'full-mine');
+	assert.equal(result.state, 'FAILED');
+	assert.equal(result.reasonCode, 'WORLD_CAPACITY_EXCEEDED');
+	assert.deepEqual(simulationWorld.blockAt(1, 1, 0).blockId, 'minecraft:stone');
+	assert.deepEqual(simulationWorld.inventories(PLAYER), before);
+});
+
+test('crafting restores exact inventory bytes when output insertion fails at capacity', () => {
+	const inventory = [{ itemId: 'minecraft:oak_log', count: 1, slot: 0 }, ...Array.from({ length: MAX_PLAYER_INVENTORY_ITEMS - 1 }, (_, index) => ({ itemId: `minecraft:fixture_${index}`, count: 1, slot: index + 1 }))];
+	const simulationWorld = world({ agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: inventory } } } });
+	const before = simulationWorld.inventories(PLAYER);
+	const originalAdd = simulationWorld.addInventoryItem.bind(simulationWorld);
+	simulationWorld.addInventoryItem = (agentId, itemId, count) => itemId === 'minecraft:oak_planks' ? (() => { throw Object.assign(new Error('fixture output capacity'), { code: 'WORLD_CAPACITY_EXCEEDED' }); })() : originalAdd(agentId, itemId, count);
+	const runtime = new ActionRuntime();
+	runtime.accept(command('full-craft', 'craft_inventory', { recipeId: 'minecraft:planks', count: 4, timeoutMs: 1_000 }));
+	const result = run(runtime, simulationWorld, 'full-craft');
+	assert.equal(result.state, 'FAILED');
+	assert.deepEqual(simulationWorld.inventories(PLAYER), before);
+});
+
+test('placement requires solid face support and an authoritative desired state without consuming on failure', () => {
+	const simulationWorld = world({ agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: [{ itemId: 'minecraft:cobblestone', count: 1, slot: 0 }] } } } });
+	const before = simulationWorld.inventories(PLAYER);
+	const unsupported = new ActionRuntime();
+	unsupported.accept(command('bad-support', 'place_block', { x: 4, y: 1, z: 0, face: 'up', itemId: 'minecraft:cobblestone' }));
+	const unsupportedResult = run(unsupported, simulationWorld, 'bad-support');
+	assert.equal(unsupportedResult.reasonCode, 'PLACEMENT_UNSUPPORTED');
+	assert.deepEqual(simulationWorld.inventories(PLAYER), before);
+
+	const mismatchWorld = world({ agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: [{ itemId: 'minecraft:cobblestone', count: 1, slot: 0 }] } } } });
+	const originalBlockAt = mismatchWorld.blockAt.bind(mismatchWorld);
+	mismatchWorld.blockAt = (...args) => {
+		const block = originalBlockAt(...args);
+		return block?.blockId === 'minecraft:cobblestone' ? { ...block, desiredState: 'mismatch' } : block;
+	};
+	const mismatch = new ActionRuntime();
+	mismatch.accept(command('bad-state', 'place_block', { x: 1, y: 1, z: 0, face: 'up', itemId: 'minecraft:cobblestone', desiredState: 'facing=north' }));
+	const mismatchResult = run(mismatch, mismatchWorld, 'bad-state');
+	assert.equal(mismatchResult.reasonCode, 'PLACEMENT_STATE_MISMATCH');
+	assert.equal(mismatchWorld.blockAt(1, 1, 0), null);
+	assert.equal(mismatchWorld.inventories(PLAYER).items.find((item) => item.itemId === 'minecraft:cobblestone')?.count, 1);
+});
+
+test('direct messages accept the production code-point maximum and reject one beyond it', () => {
+	const simulationWorld = world();
+	const maximum = '😀'.repeat(MAX_CONVERSATION_LENGTH);
+	assert.equal([...maximum].length, MAX_CONVERSATION_LENGTH);
+	const action = { type: 'chat', message: maximum, audience: 'direct', recipientId: MOB };
+	const overMaximum = `${maximum}${[...maximum][0]}`;
+	assert.doesNotThrow(() => validateAction(action));
+	assert.throws(() => validateAction({ ...action, message: overMaximum }), /OUT_OF_RANGE|MAX_CONVERSATION_LENGTH|message/);
+	assert.equal(simulationWorld.recordDirectMessage(PLAYER, 'bob', maximum).message, maximum);
+	assert.throws(() => simulationWorld.recordDirectMessage(PLAYER, 'bob', `${maximum}😀`), /MESSAGE_TOO_LARGE/);
+});
+
+test('every production action type is implemented or terminates with an explicit simulator failure', () => {
+	const uuid = MOB;
+	const validArguments = {
+		move_to: { x: 1, y: 1, z: 0, tolerance: 0.1, sprint: false },
+		look_at: { x: 1, y: 1, z: 0 },
+		attack: { targetId: uuid, timeoutMs: 1_000 },
+		select_item: { itemId: 'minecraft:stick' },
+		use_item: { durationMs: 1 },
+		break_block: { x: 1, y: 1, z: 0, timeoutMs: 1_000 },
+		place_block: { x: 1, y: 1, z: 0, face: 'up', itemId: 'minecraft:cobblestone' },
+		chat: { message: 'hi', audience: 'direct', recipientId: uuid },
+		wait: { durationMs: 1 },
+		set_door: { x: 1, y: 1, z: 0, open: true },
+		drop_item: { slot: 0, count: 1 },
+		navigate_to: { x: 1, y: 1, z: 0, tolerance: 0.1, sprint: false, timeoutMs: 1_000 },
+		transfer_container: { x: 1, y: 1, z: 0, sourceKind: 'player', sourceSlot: 0, destinationKind: 'container', destinationSlot: 0, count: 1, expectedItemId: 'minecraft:stick', timeoutMs: 1_000 },
+		craft_inventory: { recipeId: 'minecraft:planks', count: 1, timeoutMs: 1_000 },
+		craft_table: { recipeId: 'minecraft:planks', x: 1, y: 0, z: 0, count: 1, timeoutMs: 1_000 },
+		furnace_transaction: { x: 1, y: 0, z: 0, operation: 'insert_input', inventorySlot: 0, count: 1, expectedItemId: 'minecraft:stick', timeoutMs: 1_000 },
+		equip_item: { sourceSlot: 0, targetSlot: 'head', expectedItemId: 'minecraft:stick' },
+		select_tool: { sourceSlot: 0, hotbarSlot: 0, expectedItemId: 'minecraft:stick', minRemainingDurability: 0 },
+		block_with_shield: { durationMs: 1 },
+		use_ranged: { targetId: uuid, drawDurationMs: 1, timeoutMs: 1_000 },
+		interact_block: { x: 1, y: 0, z: 0, face: 'up', hand: 'main', expectedItemId: 'minecraft:stick' },
+		interact_entity: { targetId: uuid, hand: 'main', expectedItemId: 'minecraft:stick' },
+		dismount: {},
+		start_fall_flying: {},
+		menu_transfer: { menuId: 'menu', sourceSlot: 0, destinationSlot: 1, count: 1, expectedItemId: 'minecraft:stick', timeoutMs: 1_000 },
+		menu_button: { menuId: 'menu', buttonId: 0, timeoutMs: 1_000 },
+		anvil_rename: { menuId: 'menu', name: 'name', timeoutMs: 1_000 },
+		respawn: {},
+	};
+	for (const actionType of Object.keys(ACTION_FIELDS)) {
+		const simulationWorld = world({ entities: [{ id: uuid, type: 'minecraft:zombie', position: { x: 1, y: 1, z: 0 }, health: 3, maxHealth: 3 }], blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 1, y: 0, z: 0, blockId: 'minecraft:crafting_table' }, { x: 1, y: 1, z: 0, blockId: 'minecraft:stone' }], agents: { [PLAYER]: { position: { x: 0, y: 1, z: 0 }, onGround: true, inventory: { items: [{ itemId: 'minecraft:stick', count: 4, slot: 0 }, { itemId: 'minecraft:cobblestone', count: 4, slot: 1 }, { itemId: 'minecraft:oak_log', count: 4, slot: 2 }] } } } });
+		const runtime = new ActionRuntime();
+		const actionId = `coverage-${actionType}`;
+		runtime.accept(command(actionId, actionType, validArguments[actionType]));
+		runtime.tick(simulationWorld);
+		if (runtime.resultFor(actionId) === undefined) runtime.cancel(actionId);
+		const result = runtime.resultFor(actionId);
+		assert.ok(result && ['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT'].includes(result.state), `${actionType} must terminate or be explicitly cancellable`);
+		if (!SUPPORTED_SIMULATOR_ACTIONS.includes(actionType)) assert.equal(result.reasonCode, 'SIMULATOR_UNSUPPORTED_ACTION', `${actionType} must not silently succeed`);
+	}
 });
