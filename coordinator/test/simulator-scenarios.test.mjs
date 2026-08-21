@@ -30,4 +30,3 @@ test('scenario lookup rejects unknown manifests and success is authoritative', (
 	const correction = getSimulatorScenario('invalid-decision-correction');
 	assert.equal(runScenarioSuccess(correction, { correctionCount: 1 }), true);
 });
-
