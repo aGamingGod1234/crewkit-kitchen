@@ -3,6 +3,7 @@ import { types as nodeTypes } from 'node:util';
 import { DEFAULT_ARENA_SCRIPT_LIMITS, normalizeArenaScriptLimits } from './limits.mjs';
 import { PLAYER_MEMBER_PRIMITIVES } from './minecraft-api.mjs';
 import { filterObserved, markObservedCandidateSet, nearestFromCurrent } from './facts.mjs';
+import { MAX_LINE_BYTES } from '../constants.mjs';
 
 const CAPABILITY_NAMES = new Set(['program', 'player', 'world', 'inventory']);
 const CAPABILITY_MEMBERS = Object.freeze({
@@ -13,8 +14,16 @@ const CAPABILITY_MEMBERS = Object.freeze({
 });
 const FORBIDDEN_MEMBER_NAMES = new Set(['__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__', '__proto__', 'arguments', 'callee', 'caller', 'constructor', 'eval', 'prototype']);
 const ACTION_RESULT_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
+const DETERMINISTIC_FAILURE_CODES = new Set([
+	'CRAFT_COUNT_UNSUPPORTED',
+	'INVALID_ACTION',
+	'INVALID_ARENA_SCRIPT_COMMAND',
+	'PATH_LIMIT_REACHED',
+	'RECIPE_NOT_FOUND',
+	'RECIPE_NOT_UNLOCKED',
+]);
 const PLAYER_PRIMITIVES = PLAYER_MEMBER_PRIMITIVES;
-const CANONICAL_LIMITS = Object.freeze({ depth: 256, nodes: 4_096, keys: 4_096, stringBytes: 16_384, arrayLength: 256, outputBytes: 4_096, resultBytes: 4_096, watcherIdBytes: 128 });
+const CANONICAL_LIMITS = Object.freeze({ depth: 256, nodes: 4_096, keys: 4_096, stringBytes: 16_384, factBytes: MAX_LINE_BYTES * 2, arrayLength: 256, outputBytes: 4_096, resultBytes: 4_096, watcherIdBytes: 128 });
 const IDLE_YIELD = frozenRecord({ kind: 'idle' });
 
 /** Deterministically executes a compiled ArenaScript AST without evaluating source JavaScript. */
@@ -37,6 +46,7 @@ export class ArenaScriptInterpreter {
 	#loopIterations = 0;
 	#watcherEvaluation = false;
 	#deferredCommand = null;
+	#deterministicFailure = null;
 
 	constructor(compiled, bindings, { limits = DEFAULT_ARENA_SCRIPT_LIMITS } = {}) {
 		if (!compiled?.ast || compiled.ast.type !== 'Program') throw executionError('INVALID_PROGRAM', 'ArenaScript INVALID_PROGRAM: compiled program is required');
@@ -62,6 +72,11 @@ export class ArenaScriptInterpreter {
 		if (normalizedResult.stateToken !== this.#waiting.stateToken) throw executionError('STALE_STATE_TOKEN', 'ArenaScript STALE_STATE_TOKEN: action result does not match the pending command');
 		const normalizedFacts = freezeFacts(facts);
 		this.#context.facts = normalizedFacts;
+		const repeatedFailure = this.#trackDeterministicFailure(this.#waiting, normalizedResult);
+		if (repeatedFailure !== null) {
+			this.#waiting = null;
+			return this.#replanAtFailure(repeatedFailure);
+		}
 		this.#waiting.environment.setResult(normalizedResult);
 		this.#waiting = null;
 		this.#beginSlice();
@@ -188,6 +203,7 @@ export class ArenaScriptInterpreter {
 		this.#yield = null;
 		this.#lifecycle = 'ACTIVE';
 		this.#loopIterations = 0;
+		this.#deterministicFailure = null;
 	}
 
 	#beginSlice() {
@@ -486,12 +502,20 @@ export class ArenaScriptInterpreter {
 		if (this.#commands >= this.#limits.commandsPerProgram) throw this.#error('COMMAND_LIMIT', `ArenaScript COMMAND_LIMIT: exceeded ${this.#limits.commandsPerProgram} commands`, node);
 		this.#commands += 1;
 		const stateToken = `arena-state-${++this.#sequence}`;
+		const commandArguments = freezeOutput(args.length === 1 ? args[0] : args);
 		this.#frames.push({ type: 'pending-result', environment });
-		this.#waiting = { environment, stateToken };
+		this.#waiting = {
+			environment,
+			stateToken,
+			stepId: stepIdFor(node),
+			primitive: binding.primitive,
+			arguments: commandArguments,
+			signature: JSON.stringify([binding.primitive, commandArguments]),
+		};
 		this.#yield = frozenRecord({
 			kind: 'command',
 			stepId: stepIdFor(node),
-			call: frozenRecord({ primitive: binding.primitive, arguments: freezeOutput(args.length === 1 ? args[0] : args) }),
+			call: frozenRecord({ primitive: binding.primitive, arguments: commandArguments }),
 			stateToken,
 		});
 	}
@@ -504,6 +528,47 @@ export class ArenaScriptInterpreter {
 		this.#yield = kind === 'finish'
 			? frozenRecord({ kind, stepId: stepIdFor(node), summary: value })
 			: frozenRecord({ kind, stepId: stepIdFor(node), reason: value });
+	}
+
+	#replanAtFailure(failure) {
+		this.#terminal = true;
+		this.#lifecycle = 'PAUSED';
+		this.#frames = [];
+		this.#values = [];
+		return frozenRecord({
+			kind: 'replan',
+			stepId: failure.stepId,
+			reason: `repeated_action_failure:${failure.reasonCode}`,
+			failure: frozenRecord({
+				actionType: failure.actionType,
+				arguments: failure.arguments,
+				state: failure.state,
+				reasonCode: failure.reasonCode,
+			}),
+		});
+	}
+
+	#trackDeterministicFailure(waiting, result) {
+		const deterministic = result.state === 'TIMED_OUT'
+			|| (result.state === 'FAILED' && DETERMINISTIC_FAILURE_CODES.has(result.reasonCode));
+		if (!deterministic) {
+			this.#deterministicFailure = null;
+			return null;
+		}
+		const sameFailure = this.#deterministicFailure?.stepId === waiting.stepId
+			&& this.#deterministicFailure.signature === waiting.signature
+			&& this.#deterministicFailure.state === result.state
+			&& this.#deterministicFailure.reasonCode === result.reasonCode;
+		this.#deterministicFailure = {
+			stepId: waiting.stepId,
+			signature: waiting.signature,
+			actionType: waiting.primitive,
+			arguments: waiting.arguments,
+			state: result.state,
+			reasonCode: result.reasonCode,
+			count: sameFailure ? this.#deterministicFailure.count + 1 : 1,
+		};
+		return this.#deterministicFailure.count < 2 ? null : this.#deterministicFailure;
 	}
 
 	#registerWatcher(node, args) {
@@ -835,11 +900,11 @@ function freezeFacts(facts) {
 
 function freezeDataList(value, label) {
 	if (!Array.isArray(value)) throw executionError('INVALID_FACTS', `ArenaScript INVALID_FACTS: ${label} must be an array`);
-	return canonicalize(value, { errorCode: 'FACT_LIMIT', invalidCode: 'INVALID_FACTS', label, maxBytes: CANONICAL_LIMITS.stringBytes });
+	return canonicalize(value, { errorCode: 'FACT_LIMIT', invalidCode: 'INVALID_FACTS', label, maxBytes: CANONICAL_LIMITS.factBytes });
 }
 
 function freezeDataRecord(value, label) {
-	return canonicalize(value, { errorCode: 'FACT_LIMIT', invalidCode: 'INVALID_FACTS', label, maxBytes: CANONICAL_LIMITS.stringBytes });
+	return canonicalize(value, { errorCode: 'FACT_LIMIT', invalidCode: 'INVALID_FACTS', label, maxBytes: CANONICAL_LIMITS.factBytes });
 }
 
 function hoistFunctionDeclarations(statements, environment) {

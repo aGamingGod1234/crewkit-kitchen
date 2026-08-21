@@ -35,7 +35,7 @@ public record AgentRecord(
 
 	public static AgentRecord create(AgentId id, AgentProfile profile, long nowEpochMs) {
 		return new AgentRecord(AgentConstants.SCHEMA_VERSION, id, Optional.empty(), Optional.empty(), profile,
-				AgentLifecycleState.IDLE, Optional.empty(), 0L, List.of(), "", "", true, RespawnPolicy.PAUSE_UNTIL_RESPAWN,
+				AgentLifecycleState.IDLE, Optional.empty(), 0L, List.of(), "", "", true, RespawnPolicy.RESPAWN_AUTOMATICALLY,
 				Optional.empty(), nowEpochMs, nowEpochMs, "");
 	}
 

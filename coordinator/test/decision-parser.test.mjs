@@ -74,18 +74,29 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /ArenaScript source inside the JSON envelope/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /exactly one.*onUnhandledAttention/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /observed facts only/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /player\.moveTo\(\{ x, y, z \}\)/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.moveTo\(\{ x, y, z, tolerance, sprint \}\)/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /multi-tree and pickup example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /watcher example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /compiler diagnostics.*correct/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /do not use Math/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /no bracket.*computed.*optional member access/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /do not iterate factual candidate arrays/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /world\.nearest.*\.length/i);
+	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /for \(const candidate of candidates\)/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /string concatenation.*both operands.*strings/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /do not concatenate numeric candidate fields/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /coordinate-free player\.respawn\(\)/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /valid only while the authoritative player facts report dead/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /respawnDimensionId.*respawnX.*respawnY.*respawnZ.*respawnYaw.*respawnPitch.*respawnForced.*gameMode/s);
 	assert.match(PLANNER_SYSTEM_PROMPT, /never invent.*respawn/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*exact registered recipe id/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*count.*minimum output.*one recipe execution/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /never retry the same action signature after a deterministic failure/i);
 	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), [
-		'attack', 'block_with_shield', 'break_block', 'chat', 'craft_inventory', 'craft_table', 'drop_item',
-		'equip_item', 'furnace_transaction', 'look_at', 'move_to', 'navigate_to', 'place_block', 'respawn',
-		'select_item', 'select_tool', 'set_door', 'transfer_container', 'use_item', 'use_ranged', 'wait',
+		'anvil_rename', 'attack', 'block_with_shield', 'break_block', 'chat', 'craft_inventory', 'craft_table', 'dismount',
+		'drop_item', 'equip_item', 'furnace_transaction', 'interact_block', 'interact_entity', 'look_at',
+		'menu_button', 'menu_transfer', 'move_to', 'navigate_to', 'place_block', 'respawn', 'select_item', 'select_tool', 'set_door',
+		'start_fall_flying', 'transfer_container', 'use_item', 'use_ranged', 'wait',
 	]);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /default priority framework|preserve life before|prefer cooked food/i);
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.required, ['summary', 'directive', 'source', 'status']);

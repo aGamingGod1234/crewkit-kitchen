@@ -4,12 +4,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AgentPlanner } from './agent-planner.mjs';
-import { AgentRegistry, DynamicAgentState } from './agent-registry.mjs';
+import { AgentRegistry, AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
 import { AgentWorkspaceManager } from './agent-workspace.mjs';
 import { AcpProviderService } from './acp-service.mjs';
 import { AntigravityProviderService } from './antigravity-service.mjs';
 import { CodexService } from './codex-service.mjs';
 import { ControlLatencyRegistry } from './control-latency-registry.mjs';
+import { ConversationMemory } from './conversation-memory.mjs';
 import { FactLedger } from './fact-ledger.mjs';
 import { ProviderService } from './provider-service.mjs';
 import {
@@ -26,6 +27,10 @@ import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { TraceWriter } from './trace-writer.mjs';
+import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
+import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
+import { createVoiceHttpServer } from './voice/voice-http-server.mjs';
+import { loadPersistentVoiceProfileStore } from './voice/voice-profile-store.mjs';
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const COORDINATOR_DIRECTORY = path.resolve(SOURCE_DIRECTORY, '..');
@@ -33,7 +38,14 @@ const PROJECT_DIRECTORY = path.resolve(COORDINATOR_DIRECTORY, '..');
 const DEFAULT_DYNAMIC_CONFIG_PATH = path.join(COORDINATOR_DIRECTORY, 'config', 'dynamic-agents.json');
 const DEFAULT_INVALID_DECISION_RETRIES = 1;
 const EMPTY_TURN_RETRY_DELAY_MS = 1_000;
-const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set(['MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE']);
+const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set(['MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE', 'REQUEST_TIMEOUT']);
+const QUIET_LIFECYCLE_ERRORS = new Set(['PLAN_CANCELLED', 'STALE_PLAN', 'STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION']);
+const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
+const DEFAULT_VOICE_PORT = 8_766;
+const DEFAULT_VOICE_MAX_CONCURRENT = 5;
+const DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH = path.join('runtime', 'voice-profile-assignments.json');
+const DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE = 'FISH_AUDIO_API_KEY';
+const DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE = 'DEEPGRAM_API_KEY';
 
 export class DynamicCoordinator extends EventEmitter {
 	#registry;
@@ -46,6 +58,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#lifecycleGenerations = new Map();
 	#providerRetryAfter = new Map();
 	#factLedgers = new Map();
+	#conversationMemories = new Map();
+	#conversationWakeTransactions = new Map();
 	#programRuntime;
 	#reconciliation = Promise.resolve();
 	#started = false;
@@ -84,8 +98,13 @@ export class DynamicCoordinator extends EventEmitter {
 			bridge: this.#bridge,
 			planner: this.#planner,
 			reportError: (agentId, error) => this.#reportAgentError(agentId, error),
+			onCompleted: (record) => this.#publishGoalCompleted(record),
 			latencyRegistry: this.#latencyRegistry,
 			trace: (event, fields) => this.#writeTrace(event, fields),
+			plannerContext: (agentId) => ({
+				untrustedFacts: this.#ledger(agentId).toPlannerFacts(),
+				conversationContext: this.#conversationMemory(agentId).toPlannerContext(),
+			}),
 			clock: () => this.#controlNow(),
 		});
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
@@ -128,6 +147,9 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#lifecycleGenerations.clear();
 		this.#programRuntime.disposeAll();
 		this.#providerRetryAfter.clear();
+		this.#factLedgers.clear();
+		this.#conversationMemories.clear();
+		this.#conversationWakeTransactions.clear();
 		if (this.#traceWriter !== null && typeof this.#traceWriter.close === 'function') await this.#traceWriter.close();
 		await this.#codexService.stop();
 		this.#started = false;
@@ -137,12 +159,20 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#bindBridge() {
 		this.#listen('ready', ({ serverInstanceId, registry }) => {
-			if (this.#serverInstanceId !== null && serverInstanceId !== this.#serverInstanceId) this.#healthRegistry.reset();
+			if (this.#serverInstanceId !== null && serverInstanceId !== this.#serverInstanceId) {
+				this.#healthRegistry.reset();
+				this.#conversationMemories.clear();
+				this.#conversationWakeTransactions.clear();
+			}
 			this.#serverInstanceId = serverInstanceId;
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
-			this.#reconciliation = Promise.resolve().then(async () => {
-			const reconciliation = await this.#planner.reconcile(registry);
+			const startedReconciliation = this.#planner.beginReconcile(registry);
+			const reconciliation = Promise.resolve().then(async () => {
+			if (typeof this.#codexService.bootstrapCatalog === 'function') {
+				await this.#publishCatalog(await this.#codexService.bootstrapCatalog());
+			}
+			const reconciliation = await startedReconciliation.complete;
 			const providers = reconciliation.providers ?? reconciliation.codex;
 			await this.#publishCatalog(providers.catalog);
 			for (const profile of providers.valid) {
@@ -161,7 +191,10 @@ export class DynamicCoordinator extends EventEmitter {
 			await this.#publishStatus();
 			this.emit('reconciled', reconciliation);
 			});
-			this.#reconciliation.catch((error) => this.emit('runtimeError', error));
+			this.#reconciliation = reconciliation.catch((error) => {
+				this.#emitRuntimeError(error);
+				return null;
+			});
 		});
 		this.#listen('catalog_request', () => this.#run(async () => {
 			await this.#reconciliation;
@@ -185,6 +218,8 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#lifecycleGenerations.delete(message.agentId);
 			this.#providerRetryAfter.delete(message.agentId);
 			this.#factLedgers.delete(message.agentId);
+			this.#conversationMemories.delete(message.agentId);
+			this.#forgetConversationWakes(message.agentId);
 			this.#supportedAgentIds.delete(message.agentId);
 			await this.#publishStatus();
 		}));
@@ -215,6 +250,52 @@ export class DynamicCoordinator extends EventEmitter {
 				this.emit('goalControl', record);
 			});
 		});
+		this.#listen('conversation_event', (message) => {
+			this.#enqueueAgent(message.agentId, async () => {
+				this.#conversationMemory(message.agentId).ingest(message.payload);
+				this.emit('conversationEvent', message);
+			}, { waitForReconciliation: false });
+		});
+		this.#listen('conversation_wake', (message) => {
+			this.#enqueueAgent(message.agentId, async () => {
+				const fingerprint = JSON.stringify({ agentId: message.agentId, event: message.payload.event, control: message.payload.control });
+				const existing = this.#conversationWakeTransactions.get(message.payload.transactionId);
+				if (existing !== undefined) {
+					if (existing.fingerprint !== fingerprint) {
+						throw new ProtocolV2Error('TRANSACTION_COLLISION', `Conversation wake '${message.payload.transactionId}' changed during replay`);
+					}
+					const record = this.#registry.applyConversationWake(message.agentId, message.payload.control);
+					this.#providerRetryAfter.delete(message.agentId);
+					await this.#bridge.send('conversation_wake_ack', message.agentId, {
+						transactionId: message.payload.transactionId,
+						goalRevision: record.goalRevision,
+					});
+					await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
+					return;
+				}
+				const controlMessage = { agentId: message.agentId, payload: message.payload.control };
+				this.#invalidateLifecycleWork(controlMessage);
+				const previous = this.#registry.get(message.agentId);
+				this.#conversationMemory(message.agentId).ingest(message.payload.event);
+				let record;
+				try {
+					record = this.#registry.applyConversationWake(message.agentId, message.payload.control);
+				} catch (error) {
+					if (error instanceof AgentRegistryError && ['STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION', 'INVALID_AGENT_STATE'].includes(error.code)) return;
+					throw error;
+				}
+				if (previous !== null && record.goalRevision > previous.goalRevision) this.#programRuntime.onGoalControl(previous, 'start');
+				this.#providerRetryAfter.delete(message.agentId);
+				this.#rememberConversationWake(message.payload.transactionId, message.agentId, fingerprint);
+				await this.#bridge.send('conversation_wake_ack', record.agentId, {
+					transactionId: message.payload.transactionId,
+					goalRevision: record.goalRevision,
+				});
+				await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
+				this.emit('conversationEvent', { ...message, payload: message.payload.event });
+				this.emit('goalControl', record);
+			}, { waitForReconciliation: false });
+		});
 		this.#listen('observation', (message) => {
 			const receiptMonotonicMs = safeClockRead(this.#controlNow);
 			const receiptEpochMs = safeClockRead(this.#epochNow);
@@ -236,6 +317,7 @@ export class DynamicCoordinator extends EventEmitter {
 					observedAtEpochMs: message.payload.observedAtEpochMs,
 				});
 				if (installed !== null) return;
+				if (this.#scheduler.hasScheduled(record.agentId)) return;
 				if (receiptMonotonicMs !== null && (this.#providerRetryAfter.get(record.agentId) ?? 0) > receiptMonotonicMs) return;
 				await this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING });
 				const decision = await this.#planner.requestPlan({
@@ -245,7 +327,10 @@ export class DynamicCoordinator extends EventEmitter {
 					input: buildPlannerInput({
 						agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
 						goal: record.currentGoal, goalRevision: record.goalRevision, observation,
-					}, { untrustedFacts: ledger.toPlannerFacts() }),
+					}, {
+						untrustedFacts: ledger.toPlannerFacts(),
+						conversationContext: this.#conversationMemory(record.agentId).toPlannerContext(),
+					}),
 				});
 				if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
 				const runtime = await this.#programRuntime.installDecision(record, decision, { observation, eventSequence: message.payload.eventSequence });
@@ -298,6 +383,7 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #installDeadStatePlan(record, death) {
 		if (death === null || death === undefined) throw new ProtocolV2Error('MISSING_FIELD', `DEAD agent '${record.agentId}' requires death facts`);
+		if (record.currentGoal === null) return;
 		if (this.#programRuntime.hasCurrent(record)) return;
 		const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
 		const decision = await this.#planner.requestPlan({
@@ -357,9 +443,11 @@ export class DynamicCoordinator extends EventEmitter {
 		return this.#lifecycleGeneration(agentId) === generation;
 	}
 
-	#enqueueAgent(agentId, operation) {
+	#enqueueAgent(agentId, operation, { waitForReconciliation = true } = {}) {
 		const previous = this.#agentOperations.get(agentId) ?? Promise.resolve();
-		const current = previous.catch(() => {}).then(() => this.#reconciliation).then(operation);
+		const current = previous.catch(() => {})
+			.then(() => waitForReconciliation ? this.#reconciliation : undefined)
+			.then(operation);
 		this.#agentOperations.set(agentId, current);
 		current.catch((error) => this.#reportAgentError(agentId, error)).finally(() => {
 			if (this.#agentOperations.get(agentId) === current) this.#agentOperations.delete(agentId);
@@ -373,7 +461,7 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #reportAgentError(agentId, error) {
 		try {
-			if (['PLAN_CANCELLED', 'STALE_PLAN'].includes(error?.code)) return;
+			if (QUIET_LIFECYCLE_ERRORS.has(error?.code)) return;
 			if (QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)) {
 				// App-server transport silence is retried from the next fresh observation.
 				// It is not a world-action failure that the player or agent must repair.
@@ -392,7 +480,7 @@ export class DynamicCoordinator extends EventEmitter {
 					message: String(error?.message ?? error).slice(0, 2_048),
 				});
 			} catch (reportError) {
-				this.#emitRuntimeError(reportError);
+				if (!QUIET_LIFECYCLE_ERRORS.has(reportError?.code)) this.#emitRuntimeError(reportError);
 			}
 		} catch (reportFailure) {
 			this.#emitRuntimeError(reportFailure);
@@ -414,6 +502,11 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #publishCatalog(snapshot) {
 		await this.#bridge.send('catalog_snapshot', 'server', snapshot);
+	}
+
+	async #publishGoalCompleted(record) {
+		if (!this.#bridge.ready || !this.#supportedAgentIds.has(record.agentId)) return;
+		await this.#bridge.send('goal_completed', record.agentId, { goalRevision: record.goalRevision });
 	}
 
 	async #publishStatus() {
@@ -452,6 +545,29 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#factLedgers.set(agentId, ledger);
 		}
 		return ledger;
+	}
+
+	#conversationMemory(agentId) {
+		let memory = this.#conversationMemories.get(agentId);
+		if (memory === undefined) {
+			memory = new ConversationMemory();
+			this.#conversationMemories.set(agentId, memory);
+		}
+		return memory;
+	}
+
+	#rememberConversationWake(transactionId, agentId, fingerprint) {
+		this.#forgetConversationWakes(agentId);
+		this.#conversationWakeTransactions.set(transactionId, { agentId, fingerprint });
+		while (this.#conversationWakeTransactions.size > MAX_CONVERSATION_WAKE_TRANSACTIONS) {
+			this.#conversationWakeTransactions.delete(this.#conversationWakeTransactions.keys().next().value);
+		}
+	}
+
+	#forgetConversationWakes(agentId) {
+		for (const [transactionId, transaction] of this.#conversationWakeTransactions) {
+			if (transaction.agentId === agentId) this.#conversationWakeTransactions.delete(transactionId);
+		}
 	}
 
 }
@@ -532,6 +648,7 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('dynamic coordinator config must be an object');
 	if (value.bridge === null || typeof value.bridge !== 'object' || Array.isArray(value.bridge)) throw new TypeError('dynamic coordinator bridge config must be an object');
 	if (value.codex === null || typeof value.codex !== 'object' || Array.isArray(value.codex)) throw new TypeError('dynamic coordinator Codex config must be an object');
+	if (value.voice !== undefined && (value.voice === null || typeof value.voice !== 'object' || Array.isArray(value.voice))) throw new TypeError('dynamic coordinator voice config must be an object');
 	const secret = value.bridge.secret ?? environment[value.bridge.secretEnvironmentVariable ?? 'ARENA_AGENT_BRIDGE_SECRET'];
 	const cwd = value.codex.cwd ?? PROJECT_DIRECTORY;
 	const workspaceRoot = path.resolve(PROJECT_DIRECTORY, value.workspaceRoot ?? path.join('runtime', 'agent-workspaces'));
@@ -539,9 +656,11 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	const planningConcurrency = positiveInteger(value.limits?.planningConcurrency ?? DEFAULT_PLANNING_CONCURRENCY, 'limits.planningConcurrency');
 	if (agentCap > 16) throw new TypeError('limits.agentCap must not exceed 16');
 	if (planningConcurrency > agentCap) throw new TypeError('limits.planningConcurrency must not exceed limits.agentCap');
+	const voice = normalizeVoiceConfig(value.voice, environment);
 	return {
 		bridge: { ...value.bridge, secret },
 		workspaceRoot,
+		voice,
 		codex: {
 			...value.codex,
 			cwd,
@@ -579,11 +698,16 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 
 async function runCli() {
 	const { configPath } = parseDynamicCliArguments(process.argv.slice(2));
+	const config = await loadDynamicConfig(configPath);
 	const traceRoot = path.join(PROJECT_DIRECTORY, 'runtime', 'traces');
 	const traceWriter = new TraceWriter(path.join(traceRoot, 'coordinator.jsonl'), {
 		diagnosticFilePath: path.join(traceRoot, 'coordinator-private.jsonl'),
 	});
-	const coordinator = createDynamicCoordinator(await loadDynamicConfig(configPath), { traceWriter });
+	const coordinator = createDynamicCoordinator(config, { traceWriter });
+	let voiceWorker = await startVoiceWorker(config, process.env).catch((error) => {
+		process.stderr.write(`[voice-worker] ${error?.message ?? error}; proximity speech will fall back to text\n`);
+		return null;
+	});
 	coordinator.on('runtimeError', (error) => {
 		const summary = `[dynamic-coordinator] ${error?.code ?? 'ERROR'}: ${error?.message ?? String(error)}`;
 		const stack = typeof error?.stack === 'string' && !error.stack.startsWith(summary)
@@ -591,13 +715,96 @@ async function runCli() {
 			: '';
 		process.stderr.write(`${summary}${stack}\n`);
 	});
-	await coordinator.start();
+	try {
+		await coordinator.start();
+	} catch (error) {
+		await Promise.allSettled([coordinator.stop(), voiceWorker?.close()]);
+		throw error;
+	}
+	let shutdownPromise = null;
 	const shutdown = async () => {
-		await coordinator.stop();
+		shutdownPromise ??= Promise.allSettled([coordinator.stop(), voiceWorker?.close()]);
+		await shutdownPromise;
 		process.exitCode = 0;
 	};
 	process.once('SIGINT', shutdown);
 	process.once('SIGTERM', shutdown);
+}
+
+export async function startVoiceWorker(config, environment = process.env, dependencies = {}) {
+	if (config === null || typeof config !== 'object' || Array.isArray(config)) throw new TypeError('voice worker config must be an object');
+	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) throw new TypeError('voice worker environment must be an object');
+	const voice = config.voice ?? {};
+	const fishApiKey = firstNonBlank(
+		environment[voice.fishApiKeyEnvironmentVariable ?? DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE],
+		environment.FISH_API_KEY,
+	);
+	if (fishApiKey === null) return null;
+	const profilePath = dependencies.profilePath
+		?? voice.profileAssignmentsPath
+		?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
+	const loadProfileStore = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
+	const createTtsProvider = dependencies.createTtsProvider ?? ((options) => new FishTtsProvider(options));
+	const createSttProvider = dependencies.createSttProvider ?? ((options) => new DeepgramSttProvider(options));
+	const createServer = dependencies.createVoiceServer ?? createVoiceHttpServer;
+	if (typeof loadProfileStore !== 'function') throw new TypeError('loadProfileStore must be a function');
+	if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
+	if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
+	const profiles = await loadProfileStore(profilePath);
+	if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
+		throw new TypeError('loadProfileStore must return a profile store');
+	}
+	const deepgramApiKey = firstNonBlank(
+		environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
+	);
+	if (deepgramApiKey !== null && typeof createSttProvider !== 'function') throw new TypeError('createSttProvider must be a function when Deepgram is configured');
+	const worker = createServer({
+		provider: createTtsProvider({ apiKey: fishApiKey }),
+		sttProvider: deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey }),
+		profileStore: typeof profiles.flush === 'function' ? Object.assign(profiles.store, { flush: profiles.flush }) : profiles.store,
+		secret: config.bridge?.secret,
+		port: voice.port ?? DEFAULT_VOICE_PORT,
+		maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT,
+	});
+	if (worker === null || typeof worker !== 'object' || typeof worker.start !== 'function' || typeof worker.close !== 'function') {
+		throw new TypeError('createVoiceServer must return a voice worker');
+	}
+	try {
+		await worker.start();
+		return worker;
+	} catch (error) {
+		await Promise.allSettled([worker.close()]);
+		throw error;
+	}
+}
+
+function normalizeVoiceConfig(value, environment) {
+	const source = value ?? {};
+	const configuredPort = environment.ARENA_AGENT_VOICE_PORT === undefined
+		? source.port ?? DEFAULT_VOICE_PORT
+		: Number(environment.ARENA_AGENT_VOICE_PORT);
+	if (!Number.isSafeInteger(configuredPort) || configuredPort < 0 || configuredPort > 65_535) throw new TypeError('voice.port must be an integer between 0 and 65535');
+	const maxConcurrent = positiveInteger(source.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT, 'voice.maxConcurrent');
+	if (maxConcurrent > 5) throw new TypeError('voice.maxConcurrent must not exceed 5');
+	const profileAssignmentsPath = path.resolve(PROJECT_DIRECTORY, source.profileAssignmentsPath ?? DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
+	return {
+		...source,
+		port: configuredPort,
+		maxConcurrent,
+		profileAssignmentsPath,
+		fishApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.fishApiKeyEnvironmentVariable ?? DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE, 'voice.fishApiKeyEnvironmentVariable'),
+		deepgramApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE, 'voice.deepgramApiKeyEnvironmentVariable'),
+	};
+}
+
+function firstNonBlank(...values) {
+	for (const value of values) if (typeof value === 'string' && value.trim() !== '') return value;
+	return null;
+}
+
+function requireEnvironmentVariableName(value, field) {
+	if (typeof value !== 'string' || !/^[A-Z_][A-Z0-9_]*$/.test(value)) throw new TypeError(`${field} must be an environment variable name`);
+	return value;
 }
 
 function requireDependency(value, name) {

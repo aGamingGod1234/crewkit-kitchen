@@ -39,13 +39,29 @@ test('factual views are immutable and nearest breaks distance ties by stable id'
 test('inventory helpers measure only observed inventory and tag facts', () => {
 	const facts = createFactView(observation({
 		inventory: {
-			items: [{ itemId: 'minecraft:oak_log', count: 5 }, { itemId: 'minecraft:dirt', count: 2 }],
+			items: [
+				{ itemId: 'minecraft:oak_log', count: 5, slot: 0, tags: ['#minecraft:logs'] },
+				{ itemId: 'minecraft:dirt', count: 2, slot: 1 },
+			],
 			tagCounts: { '#minecraft:logs': 5 },
 		},
 	}));
 	assert.equal(facts.inventory.count('minecraft:oak_log'), 5);
 	assert.equal(facts.inventory.countTag('#minecraft:logs'), 5);
 	assert.equal(facts.inventory.countTag('#minecraft:unknown'), 0);
+});
+
+test('preserves the observed attacker for model-authored damage watchers', () => {
+	const facts = createFactView(observation({
+		player: {
+			health: 18,
+			lastAttacker: { uuid: 'mob-1', type: 'minecraft:zombie', distance: 2.5 },
+		},
+	}));
+	assert.equal(facts.player.lastAttacker.uuid, 'mob-1');
+	assert.equal(facts.player.lastAttacker.type, 'minecraft:zombie');
+	assert.equal(facts.player.lastAttacker.distance, 2.5);
+	assert.throws(() => { facts.player.lastAttacker.type = 'minecraft:creeper'; }, TypeError);
 });
 
 test('rejects hostile observation records and synthetic nearest candidate arrays', () => {

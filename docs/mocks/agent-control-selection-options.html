@@ -1,0 +1,1179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arena Agents control selection concepts</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: oklch(17% 0.012 250);
+      --shell: oklch(22% 0.014 250);
+      --surface: oklch(28% 0.016 250);
+      --surface-2: oklch(25% 0.014 250);
+      --selected: oklch(34% 0.026 250);
+      --track: oklch(19% 0.012 250);
+      --border: oklch(43% 0.018 250 / .58);
+      --text: oklch(94% 0.008 250);
+      --muted: oklch(73% 0.018 250);
+      --amber: oklch(78% 0.115 79);
+      --mint: oklch(78% 0.105 160);
+      --coral: oklch(72% 0.14 24);
+      --codex: oklch(76% 0.11 198);
+      --gemini: oklch(76% 0.11 255);
+      --kimi: oklch(76% 0.1 315);
+      --focus: oklch(96% 0.006 250);
+      --unit: 4px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background: var(--page);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      line-height: 1.35;
+    }
+
+    button,
+    input { font: inherit; }
+
+    button { color: inherit; }
+
+    .page {
+      width: min(1320px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 72px;
+    }
+
+    .intro {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(260px, .6fr);
+      gap: 32px;
+      align-items: end;
+      padding-bottom: 26px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .eyebrow,
+    .section-tag,
+    .label,
+    .status,
+    .scope,
+    .shortcut {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .045em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow,
+    .section-tag { color: var(--amber); }
+
+    h1,
+    h2,
+    h3,
+    p { margin: 0; }
+
+    h1 {
+      max-width: 760px;
+      margin-top: 8px;
+      font-size: 42px;
+      line-height: 1.08;
+      letter-spacing: -.035em;
+    }
+
+    .intro p,
+    .concept-copy,
+    .helper { color: var(--muted); }
+
+    .intro-note {
+      padding-left: 18px;
+      border-left: 3px solid var(--amber);
+    }
+
+    .intro-note strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+
+    .concept {
+      margin-top: 56px;
+    }
+
+    .concept-head {
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: start;
+      margin-bottom: 18px;
+    }
+
+    .concept-letter {
+      display: grid;
+      place-items: center;
+      width: 56px;
+      height: 56px;
+      border: 1px solid color-mix(in oklch, var(--amber), transparent 22%);
+      border-radius: 10px;
+      color: var(--amber);
+      font-size: 25px;
+      font-weight: 750;
+    }
+
+    h2 {
+      font-size: clamp(22px, 3vw, 34px);
+      letter-spacing: -.025em;
+    }
+
+    .concept-copy {
+      max-width: 760px;
+      margin-top: 5px;
+      font-size: 14px;
+    }
+
+    .recommendation {
+      padding: 7px 10px;
+      border: 1px solid var(--amber);
+      border-radius: 999px;
+      color: var(--amber);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .035em;
+    }
+
+    .mock-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 18px;
+      align-items: center;
+      padding: 10px 12px;
+      background: color-mix(in oklch, var(--surface-2), var(--page) 12%);
+      border: 1px solid var(--border);
+      border-bottom: 0;
+      border-radius: 12px 12px 0 0;
+    }
+
+    .control-group {
+      display: flex;
+      gap: 5px;
+      align-items: center;
+    }
+
+    .control-group .label { margin-right: 4px; color: var(--muted); }
+
+    .chip,
+    .nav-button,
+    .action,
+    .filter,
+    .page-button,
+    .group-key {
+      min-height: 28px;
+      padding: 5px 9px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: color-mix(in oklch, var(--surface), transparent 16%);
+      cursor: pointer;
+      transition: transform 120ms ease, background-color 120ms ease, border-color 120ms ease;
+    }
+
+    .chip:hover,
+    .nav-button:hover,
+    .action:hover,
+    .filter:hover,
+    .page-button:hover,
+    .group-key:hover { border-color: var(--text); }
+
+    .chip:active,
+    .nav-button:active,
+    .action:active,
+    .filter:active,
+    .page-button:active,
+    .group-key:active { transform: translateY(1px); }
+
+    .chip.active,
+    .filter.active,
+    .nav-button.active,
+    .group-key.active {
+      border-color: color-mix(in oklch, var(--amber), transparent 20%);
+      background: color-mix(in oklch, var(--selected), transparent 8%);
+      color: var(--amber);
+    }
+
+    .mock-frame {
+      width: 100%;
+      min-height: 540px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 0 0 14px 14px;
+      background: oklch(63% 0.045 132);
+      transition: max-width 180ms ease, min-height 180ms ease;
+    }
+
+    .mock-frame.compact {
+      max-width: 320px;
+      min-height: 240px;
+    }
+
+    .console {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      width: calc(100% - 24px);
+      min-height: 510px;
+      margin: 12px;
+      background: color-mix(in oklch, var(--shell), transparent 3%);
+      border: 1px solid color-mix(in oklch, var(--border), transparent 8%);
+      border-radius: 10px;
+      box-shadow: 0 10px 28px oklch(10% 0.015 250 / .22);
+    }
+
+    .mock-frame.compact .console {
+      width: calc(100% - 8px);
+      min-height: 232px;
+      margin: 4px;
+    }
+
+    .console-top {
+      display: flex;
+      min-height: 50px;
+      align-items: center;
+      gap: 14px;
+      padding: 9px 13px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .console-brand {
+      font-weight: 750;
+      letter-spacing: -.01em;
+      white-space: nowrap;
+    }
+
+    .console-context {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .connection {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      margin-left: auto;
+      color: var(--mint);
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      background: currentColor;
+    }
+
+    .console-main {
+      display: grid;
+      grid-template-columns: 126px minmax(0, 1fr);
+      min-height: 0;
+    }
+
+    .console-nav {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 12px;
+      border-right: 1px solid color-mix(in oklch, var(--border), transparent 28%);
+    }
+
+    .nav-button {
+      width: 100%;
+      min-height: 34px;
+      border-radius: 7px;
+      text-align: left;
+      font-weight: 650;
+    }
+
+    .nav-button.active::before {
+      content: "";
+      display: inline-block;
+      width: 4px;
+      height: 4px;
+      margin-right: 7px;
+      background: var(--amber);
+      border-radius: 50%;
+    }
+
+    .console-workspace {
+      min-width: 0;
+      padding: 14px;
+    }
+
+    .console-footer {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 48px;
+      padding: 9px 13px;
+      border-top: 1px solid color-mix(in oklch, var(--border), transparent 28%);
+      background: color-mix(in oklch, var(--surface-2), var(--shell) 30%);
+    }
+
+    .selection-summary { font-weight: 650; }
+    .selection-summary small { display: block; color: var(--muted); font-weight: 500; }
+
+    .footer-actions {
+      display: flex;
+      gap: 6px;
+      margin-left: auto;
+    }
+
+    .action.primary {
+      border-color: var(--amber);
+      background: var(--amber);
+      color: var(--shell);
+      font-weight: 700;
+    }
+
+    .action.danger { color: var(--coral); }
+    .action:disabled { cursor: not-allowed; opacity: .4; }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 7px;
+      margin-bottom: 12px;
+    }
+
+    .workspace-title { margin-right: auto; }
+    .workspace-title h3 { font-size: 17px; }
+    .workspace-title p { margin-top: 2px; color: var(--muted); font-size: 11px; }
+
+    .search {
+      width: min(190px, 32vw);
+      min-height: 29px;
+      border: 1px solid color-mix(in oklch, var(--border), transparent 16%);
+      border-radius: 7px;
+      background: var(--track);
+      color: var(--text);
+      padding: 5px 8px;
+      outline: none;
+    }
+
+    .search:focus { border-color: var(--focus); box-shadow: inset 0 0 0 1px var(--focus); }
+
+    .a-layout {
+      display: grid;
+      grid-template-columns: minmax(320px, 1.25fr) minmax(220px, .75fr);
+      gap: 12px;
+    }
+
+    .roster-panel,
+    .inspector,
+    .mode-panel,
+    .live-panel,
+    .event-panel {
+      min-width: 0;
+      border-top: 1px solid color-mix(in oklch, var(--border), transparent 24%);
+    }
+
+    .roster-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(76px, 1fr));
+      gap: 6px;
+      padding-top: 9px;
+    }
+
+    .agent-tile {
+      position: relative;
+      display: grid;
+      grid-template-rows: 39px auto auto;
+      min-height: 85px;
+      padding: 7px;
+      overflow: hidden;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: color-mix(in oklch, var(--surface-2), transparent 10%);
+      cursor: pointer;
+      text-align: left;
+      transition: transform 120ms ease, border-color 120ms ease, background-color 120ms ease;
+    }
+
+    .agent-tile:hover { border-color: color-mix(in oklch, var(--muted), transparent 52%); transform: translateY(-1px); }
+    .agent-tile.selected { border-color: color-mix(in oklch, var(--amber), transparent 20%); background: color-mix(in oklch, var(--selected), transparent 6%); }
+    .agent-tile.focused { outline: 1px solid var(--focus); outline-offset: -3px; }
+
+    .check {
+      position: absolute;
+      top: 5px;
+      right: 5px;
+      display: none;
+      width: 15px;
+      height: 15px;
+      place-items: center;
+      background: var(--amber);
+      color: var(--shell);
+      font-size: 10px;
+      border-radius: 50%;
+      font-weight: 750;
+    }
+
+    .agent-tile.selected .check { display: grid; }
+
+    .avatar {
+      position: relative;
+      width: 31px;
+      height: 35px;
+      border: 1px solid currentColor;
+      border-radius: 6px;
+      background: var(--track);
+      color: var(--codex);
+    }
+
+    .avatar::before,
+    .avatar::after { content: ""; position: absolute; }
+
+    .avatar::before {
+      left: 5px;
+      right: 5px;
+      top: 8px;
+      height: 5px;
+      background: currentColor;
+    }
+
+    .avatar::after {
+      left: 8px;
+      right: 8px;
+      bottom: 4px;
+      height: 10px;
+      border: 1px solid currentColor;
+      border-radius: 2px;
+    }
+
+    .avatar.gemini { color: var(--gemini); border-radius: 50% 50% 2px 2px; }
+    .avatar.gemini::before { transform: rotate(45deg); width: 8px; left: 9px; top: 7px; }
+    .avatar.kimi { color: var(--kimi); border-radius: 12px 12px 2px 2px; }
+    .avatar.kimi::after { border-left: 0; border-radius: 0 10px 10px 0; }
+
+    .agent-name {
+      margin-top: 4px;
+      overflow: hidden;
+      font-size: 12px;
+      font-weight: 650;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .agent-meta {
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .state-mark {
+      position: absolute;
+      right: 6px;
+      bottom: 6px;
+      width: 8px;
+      height: 8px;
+      border: 1px solid var(--shell);
+      border-radius: 50%;
+      background: var(--mint);
+    }
+
+    .state-mark.working { background: var(--amber); }
+    .state-mark.error { background: var(--coral); border-radius: 50%; }
+
+    .pager {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 9px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .page-button { min-width: 28px; padding: 3px 7px; }
+
+    .inspector { padding: 12px 0 0 12px; }
+    .inspector-name { margin: 9px 0 2px; font-size: 20px; }
+    .inspector-model { color: var(--muted); font-size: 12px; }
+
+    .profile-line {
+      display: grid;
+      grid-template-columns: 78px minmax(0, 1fr);
+      gap: 8px;
+      padding: 7px 0;
+      border-bottom: 1px solid color-mix(in oklch, var(--border), transparent 40%);
+      font-size: 12px;
+    }
+
+    .profile-line span:first-child { color: var(--muted); }
+    .profile-line.error strong { color: var(--coral); }
+
+    .command-box {
+      margin-top: 10px;
+      padding: 9px;
+      border: 1px solid color-mix(in oklch, var(--border), transparent 18%);
+      border-radius: 8px;
+      background: var(--track);
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .b-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 265px;
+      gap: 12px;
+    }
+
+    .mode-tabs {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 5px;
+      margin-bottom: 10px;
+    }
+
+    .scope-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      margin-bottom: 8px;
+      padding: 7px 9px;
+      border: 1px solid color-mix(in oklch, var(--amber), transparent 60%);
+      border-radius: 8px;
+      background: color-mix(in oklch, var(--amber), transparent 94%);
+    }
+
+    .scope-bar strong { font-size: 13px; }
+    .scope-bar span { color: var(--muted); font-size: 11px; }
+
+    .roster-list { border-top: 1px solid color-mix(in oklch, var(--border), transparent 34%); }
+
+    .agent-row {
+      display: grid;
+      grid-template-columns: 28px minmax(90px, 1fr) minmax(100px, 1fr) 82px 24px;
+      gap: 8px;
+      align-items: center;
+      min-height: 42px;
+      padding: 6px 8px;
+      border-bottom: 1px solid color-mix(in oklch, var(--border), transparent 44%);
+      border-radius: 6px;
+      background: transparent;
+      cursor: pointer;
+    }
+
+    .agent-row:nth-child(even) { background: color-mix(in oklch, var(--surface), transparent 84%); }
+    .agent-row.selected { background: color-mix(in oklch, var(--selected), transparent 16%); box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--amber), transparent 38%); }
+    .agent-row.focused { outline: 1px solid var(--focus); outline-offset: -3px; }
+    .row-name { overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .row-task { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .row-state { font-size: 10px; font-weight: 650; }
+    .row-state.error { color: var(--coral); }
+    .row-state.working { color: var(--amber); }
+    .row-state.idle { color: var(--mint); }
+
+    .lineup {
+      min-height: 100%;
+      padding: 10px;
+      border: 1px solid color-mix(in oklch, var(--border), transparent 22%);
+      border-radius: 9px;
+      background: color-mix(in oklch, var(--surface-2), transparent 8%);
+    }
+
+    .lineup-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid color-mix(in oklch, var(--border), transparent 32%);
+    }
+
+    .lineup-slot {
+      display: grid;
+      grid-template-columns: 24px minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 35px;
+      padding: 5px 0;
+      border-bottom: 1px solid color-mix(in oklch, var(--border), transparent 48%);
+      font-size: 11px;
+    }
+
+    .lineup-slot.empty { color: var(--muted); }
+    .slot-number { color: var(--amber); font-weight: 700; }
+    .remove { color: var(--coral); font-weight: 700; }
+
+    .group-keys {
+      display: flex;
+      gap: 5px;
+      margin-top: 9px;
+    }
+
+    .group-key { min-width: 31px; font-weight: 700; text-align: center; }
+
+    .c-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(235px, .65fr);
+      gap: 12px;
+    }
+
+    .standing-head,
+    .standing-row {
+      display: grid;
+      grid-template-columns: 34px minmax(90px, 1fr) 84px 66px 54px;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .standing-head {
+      min-height: 28px;
+      color: var(--muted);
+      font-size: 9px;
+      font-weight: 650;
+    }
+
+    .standing-row {
+      min-height: 37px;
+      padding: 5px 0;
+      border-top: 1px solid color-mix(in oklch, var(--border), transparent 44%);
+      cursor: pointer;
+    }
+
+    .standing-row.focused { background: color-mix(in oklch, var(--selected), transparent 18%); outline: 1px solid color-mix(in oklch, var(--focus), transparent 24%); outline-offset: -2px; border-radius: 6px; }
+    .rank { color: var(--amber); font-weight: 700; }
+    .score { font-variant-numeric: tabular-nums; font-weight: 650; }
+
+    .health {
+      height: 6px;
+      background: var(--track);
+    }
+
+    .health span { display: block; height: 100%; background: var(--mint); }
+    .health.low span { background: var(--coral); }
+
+    .event-panel { padding-top: 8px; }
+    .event-list { margin-top: 8px; border-top: 1px solid color-mix(in oklch, var(--border), transparent 36%); }
+
+    .event {
+      position: relative;
+      padding: 8px 7px 8px 18px;
+      border-bottom: 1px solid color-mix(in oklch, var(--border), transparent 48%);
+      font-size: 11px;
+    }
+
+    .event::before {
+      content: "";
+      position: absolute;
+      left: 4px;
+      top: 12px;
+      width: 6px;
+      height: 6px;
+      border: 1px solid var(--amber);
+      border-radius: 50%;
+    }
+
+    .event time { display: block; margin-top: 2px; color: var(--muted); font-size: 9px; }
+
+    .recommendation-panel {
+      margin-top: 10px;
+      padding: 9px;
+      border: 1px solid color-mix(in oklch, var(--amber), transparent 44%);
+      border-radius: 8px;
+      background: color-mix(in oklch, var(--amber), transparent 95%);
+    }
+
+    .recommendation-panel strong { display: block; margin: 4px 0; font-size: 12px; }
+    .recommendation-panel p { color: var(--muted); font-size: 10px; }
+
+    .interaction-notes {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+      padding: 11px 12px;
+      border-top: 1px solid color-mix(in oklch, var(--border), transparent 38%);
+      background: transparent;
+    }
+
+    .note { color: var(--muted); font-size: 11px; }
+    .note strong { display: block; margin-bottom: 3px; color: var(--text); }
+
+    .mock-frame.compact .console-top { min-height: 38px; padding: 6px 8px; }
+    .mock-frame.compact .console-brand { font-size: 11px; }
+    .mock-frame.compact .console-context,
+    .mock-frame.compact .connection span,
+    .mock-frame.compact .console-nav { display: none; }
+    .mock-frame.compact .console-main { grid-template-columns: 1fr; }
+    .mock-frame.compact .console-workspace { padding: 7px; }
+    .mock-frame.compact .console-footer { min-height: 38px; padding: 5px 7px; }
+    .mock-frame.compact .selection-summary { font-size: 10px; }
+    .mock-frame.compact .selection-summary small { display: none; }
+    .mock-frame.compact .action { min-height: 26px; padding: 4px 6px; font-size: 10px; }
+    .mock-frame.compact .action.secondary,
+    .mock-frame.compact .action.danger { display: none; }
+    .mock-frame.compact .toolbar { margin-bottom: 7px; }
+    .mock-frame.compact .workspace-title p,
+    .mock-frame.compact .search,
+    .mock-frame.compact .filter { display: none; }
+    .mock-frame.compact .a-layout,
+    .mock-frame.compact .b-layout,
+    .mock-frame.compact .c-layout { display: block; }
+    .mock-frame.compact .inspector,
+    .mock-frame.compact .lineup,
+    .mock-frame.compact .event-panel { display: none; }
+    .mock-frame.compact .roster-grid { grid-template-columns: repeat(2, 1fr); }
+    .mock-frame.compact .agent-tile { min-height: 69px; grid-template-rows: 29px auto auto; padding: 5px; }
+    .mock-frame.compact .avatar { width: 24px; height: 27px; }
+    .mock-frame.compact .agent-name { font-size: 10px; }
+    .mock-frame.compact .agent-meta { font-size: 8px; }
+    .mock-frame.compact .pager { margin-top: 5px; }
+    .mock-frame.compact .mode-tabs { margin-bottom: 6px; }
+    .mock-frame.compact .scope-bar { min-height: 31px; margin-bottom: 5px; padding: 4px 6px; }
+    .mock-frame.compact .scope-bar span { display: none; }
+    .mock-frame.compact .agent-row { grid-template-columns: 24px minmax(0, 1fr) 66px 18px; min-height: 34px; padding: 3px 5px; }
+    .mock-frame.compact .row-task { display: none; }
+    .mock-frame.compact .standing-head,
+    .mock-frame.compact .standing-row { grid-template-columns: 28px minmax(0, 1fr) 52px 48px; }
+    .mock-frame.compact .standing-head > :nth-child(3),
+    .mock-frame.compact .standing-row > :nth-child(3) { display: none; }
+    .mock-frame.compact .standing-row { min-height: 31px; }
+
+    @media (max-width: 760px) {
+      .page { width: min(100% - 20px, 1320px); padding-top: 18px; }
+      .intro { grid-template-columns: 1fr; gap: 18px; }
+      .concept-head { grid-template-columns: 46px minmax(0, 1fr); }
+      .concept-letter { width: 46px; height: 46px; }
+      .recommendation { grid-column: 2; justify-self: start; }
+      .interaction-notes { grid-template-columns: 1fr; }
+      .mock-frame:not(.compact) .console-main { grid-template-columns: 104px minmax(0, 1fr); }
+      .mock-frame:not(.compact) .a-layout,
+      .mock-frame:not(.compact) .b-layout,
+      .mock-frame:not(.compact) .c-layout { grid-template-columns: 1fr; }
+      .mock-frame:not(.compact) .inspector,
+      .mock-frame:not(.compact) .lineup,
+      .mock-frame:not(.compact) .event-panel { padding-left: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="intro">
+      <div>
+        <div class="eyebrow">Arena Agents field console</div>
+        <h1>Control every agent, clearly.</h1>
+      </div>
+      <div class="intro-note">
+        <strong>Decision mock, not production UI</strong>
+        <p>Compare 1, 8, and 16 agents in wide or compact view.</p>
+      </div>
+    </header>
+
+    <section class="concept" data-concept="a">
+      <div class="concept-head">
+        <div class="concept-letter">A</div>
+        <div>
+          <h2>Roster grid with focused inspector</h2>
+          <p class="concept-copy">A visual roster for fast selection, with precise controls for the focused agent.</p>
+        </div>
+        <div class="recommendation">Recommended base</div>
+      </div>
+      <div class="mock-controls">
+        <div class="control-group" aria-label="A roster size">
+          <span class="label">Roster</span>
+          <button class="chip" data-size="1">1</button>
+          <button class="chip active" data-size="8">8</button>
+          <button class="chip" data-size="16">16</button>
+        </div>
+        <div class="control-group" aria-label="A viewport size">
+          <span class="label">Frame</span>
+          <button class="chip active" data-frame="wide">Wide</button>
+          <button class="chip" data-frame="compact">320 × 240</button>
+        </div>
+      </div>
+      <div class="mock-frame" data-frame-root>
+        <div class="console">
+          <div class="console-top">
+            <div class="console-brand">Field Console</div>
+            <div class="console-context">Agents / Command roster</div>
+            <div class="connection"><i class="dot"></i><span>Ready</span></div>
+          </div>
+          <div class="console-main">
+            <nav class="console-nav" aria-label="Concept A navigation">
+              <button class="nav-button active">Agents</button>
+              <button class="nav-button">Group</button>
+              <button class="nav-button">Live</button>
+              <button class="nav-button">Build</button>
+            </nav>
+            <div class="console-workspace">
+              <div class="toolbar">
+                <div class="workspace-title">
+                  <h3 data-agent-count>Agents 8 / 16</h3>
+                  <p>Focus one. Select several only when the action supports it.</p>
+                </div>
+                <input class="search" placeholder="Search agents" aria-label="Search agents">
+                <button class="filter active" data-filter="all">All</button>
+                <button class="filter" data-filter="idle">Idle</button>
+                <button class="filter" data-filter="working">Working</button>
+                <button class="filter" data-filter="error">Needs help</button>
+              </div>
+              <div class="a-layout">
+                <div class="roster-panel">
+                  <div class="roster-grid" data-roster-grid></div>
+                  <div class="pager"><button class="page-button">‹</button><span data-range>1–8 of 8</span><button class="page-button">›</button><span class="shortcut">Arrows move focus</span></div>
+                </div>
+                <aside class="inspector" data-inspector></aside>
+              </div>
+            </div>
+          </div>
+          <footer class="console-footer">
+            <div class="selection-summary"><span data-selection-count>3 selected</span><small data-hidden-count>Selection remains active across filters</small></div>
+            <div class="footer-actions">
+              <button class="action secondary">Pause</button>
+              <button class="action danger">Clear</button>
+              <button class="action primary">Command selected</button>
+            </div>
+          </footer>
+        </div>
+      </div>
+      <div class="interaction-notes">
+        <div class="note"><strong>Best for everyday control</strong>Strong at 1 to 16 agents without turning the console into an admin table.</div>
+        <div class="note"><strong>Selection model</strong>Arrows move focus. Space toggles selection. Enter opens the focused agent.</div>
+        <div class="note"><strong>Event behavior</strong>The inspector becomes an event lineup when the operator enters event setup.</div>
+      </div>
+    </section>
+
+    <section class="concept" data-concept="b">
+      <div class="concept-head">
+        <div class="concept-letter">B</div>
+        <div>
+          <h2>Mode-first command workspace</h2>
+          <p class="concept-copy">Clear modes keep individual, group, and event actions safely separated.</p>
+        </div>
+      </div>
+      <div class="mock-controls">
+        <div class="control-group" aria-label="B roster size">
+          <span class="label">Roster</span>
+          <button class="chip" data-size="1">1</button>
+          <button class="chip active" data-size="8">8</button>
+          <button class="chip" data-size="16">16</button>
+        </div>
+        <div class="control-group" aria-label="B viewport size">
+          <span class="label">Frame</span>
+          <button class="chip active" data-frame="wide">Wide</button>
+          <button class="chip" data-frame="compact">320 × 240</button>
+        </div>
+      </div>
+      <div class="mock-frame" data-frame-root>
+        <div class="console">
+          <div class="console-top">
+            <div class="console-brand">Field Console</div>
+            <div class="console-context">Group / Event lineup</div>
+            <div class="connection"><i class="dot"></i><span>Draft</span></div>
+          </div>
+          <div class="console-main">
+            <nav class="console-nav" aria-label="Concept B navigation">
+              <button class="nav-button">Agents</button>
+              <button class="nav-button active">Group</button>
+              <button class="nav-button">Live</button>
+              <button class="nav-button">Build</button>
+            </nav>
+            <div class="console-workspace">
+              <div class="mode-tabs">
+                <button class="nav-button">One agent</button>
+                <button class="nav-button">Command group</button>
+                <button class="nav-button active">Event lineup</button>
+              </div>
+              <div class="scope-bar"><div><strong data-scope-title>Event team 4 / 8</strong><span data-scope-help>Choose available agents. Busy agents stay visible with a reason.</span></div></div>
+              <div class="b-layout">
+                <div class="mode-panel">
+                  <div class="toolbar">
+                    <div class="workspace-title"><h3 data-agent-count>Available agents 8</h3><p>Selections survive search and filters.</p></div>
+                    <input class="search" placeholder="Search roster" aria-label="Search roster">
+                    <button class="filter active">All</button>
+                    <button class="filter">Ready</button>
+                  </div>
+                  <div class="roster-list" data-roster-list></div>
+                  <div class="pager"><button class="page-button">‹</button><span data-range>1–8 of 8</span><button class="page-button">›</button><span class="shortcut">Space adds to lineup</span></div>
+                </div>
+                <aside class="lineup">
+                  <div class="lineup-head"><strong>Thinking Tower</strong><span class="scope" data-lineup-count>3 / 8</span></div>
+                  <div data-lineup></div>
+                  <div class="group-keys" aria-label="Saved groups">
+                    <button class="group-key active">1</button>
+                    <button class="group-key">2</button>
+                    <button class="group-key">3</button>
+                    <button class="group-key">4</button>
+                  </div>
+                  <p class="helper" style="margin-top:8px;font-size:10px">Ctrl + number saves a group. Number recalls it.</p>
+                </aside>
+              </div>
+            </div>
+          </div>
+          <footer class="console-footer">
+            <div class="selection-summary"><span data-selection-count>4 in event</span><small>Changes remain a draft until confirmed</small></div>
+            <div class="footer-actions"><button class="action danger">Cancel</button><button class="action secondary">Auto-fill</button><button class="action primary">Confirm lineup</button></div>
+          </footer>
+        </div>
+      </div>
+      <div class="interaction-notes">
+        <div class="note"><strong>Best for scope safety</strong>It is difficult to accidentally command one agent when an event roster is active.</div>
+        <div class="note"><strong>Selection model</strong>Choosing an available row adds it to the visible lineup. Unavailable rows explain why.</div>
+        <div class="note"><strong>Tradeoff</strong>More mode switching than A for ordinary moment-to-moment agent control.</div>
+      </div>
+    </section>
+
+    <section class="concept" data-concept="c">
+      <div class="concept-head">
+        <div class="concept-letter">C</div>
+        <div>
+          <h2>Live-first event command table</h2>
+          <p class="concept-copy">Standings and event activity stay readable without losing direct agent focus.</p>
+        </div>
+      </div>
+      <div class="mock-controls">
+        <div class="control-group" aria-label="C roster size">
+          <span class="label">Roster</span>
+          <button class="chip" data-size="1">1</button>
+          <button class="chip active" data-size="8">8</button>
+          <button class="chip" data-size="16">16</button>
+        </div>
+        <div class="control-group" aria-label="C viewport size">
+          <span class="label">Frame</span>
+          <button class="chip active" data-frame="wide">Wide</button>
+          <button class="chip" data-frame="compact">320 × 240</button>
+        </div>
+      </div>
+      <div class="mock-frame" data-frame-root>
+        <div class="console">
+          <div class="console-top">
+            <div class="console-brand">Field Console</div>
+            <div class="console-context">Live / Citadel Collapse / Open Conflict</div>
+            <div class="connection"><i class="dot"></i><span>Live</span></div>
+          </div>
+          <div class="console-main">
+            <nav class="console-nav" aria-label="Concept C navigation">
+              <button class="nav-button">Agents</button>
+              <button class="nav-button">Group</button>
+              <button class="nav-button active">Live</button>
+              <button class="nav-button">Build</button>
+            </nav>
+            <div class="console-workspace">
+              <div class="toolbar">
+                <div class="workspace-title"><h3 data-agent-count>8 contestants</h3><p>12:47 remaining · Outer sectors stable</p></div>
+                <button class="filter active">Standings</button>
+                <button class="filter">Teams</button>
+                <button class="filter">Needs help</button>
+              </div>
+              <div class="c-layout">
+                <div class="live-panel">
+                  <div class="standing-head"><span>Rank</span><span>Agent</span><span>Model</span><span>Health</span><span>Score</span></div>
+                  <div data-standings></div>
+                  <div class="pager"><button class="page-button">‹</button><span data-range>1–8 of 8</span><button class="page-button">›</button><span class="shortcut">Enter opens agent</span></div>
+                </div>
+                <aside class="event-panel">
+                  <div class="section-tag">Event timeline</div>
+                  <div class="event-list">
+                    <div class="event">Kestrel secured the east vault<time>Tick 8,420 · objective +4.7</time></div>
+                    <div class="event">Morrow disengaged at low health<time>Tick 8,276 · recovery +2.1</time></div>
+                    <div class="event">Outer sector warning issued<time>Tick 8,110 · world event</time></div>
+                  </div>
+                  <div class="recommendation-panel">
+                    <div class="section-tag">Director recommendation</div>
+                    <strong>Follow Rook at the lower gate</strong>
+                    <p>High-priority encounter likely within 18 seconds. Read-only recommendation.</p>
+                  </div>
+                </aside>
+              </div>
+            </div>
+          </div>
+          <footer class="console-footer">
+            <div class="selection-summary"><span data-selection-count>Rook focused</span><small>Live rows focus agents but do not change the event roster</small></div>
+            <div class="footer-actions"><button class="action secondary">Open agent</button><button class="action primary">Follow in world</button></div>
+          </footer>
+        </div>
+      </div>
+      <div class="interaction-notes">
+        <div class="note"><strong>Best for active events</strong>Sixteen contestants and meaningful match events remain independently scrollable.</div>
+        <div class="note"><strong>Selection model</strong>One focused row controls inspector and camera context. Event membership is changed elsewhere.</div>
+        <div class="note"><strong>Tradeoff</strong>Too dense to serve as the default screen when the operator is simply creating or commanding agents.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const AGENTS = [
+      { name: "Rook", provider: "codex", model: "Sol · High", state: "working", task: "Secure the lower gate", health: 82, score: 18.7 },
+      { name: "Kestrel", provider: "gemini", model: "Gemini 3.1 Pro · High", state: "idle", task: "Awaiting task", health: 100, score: 22.4 },
+      { name: "Morrow", provider: "kimi", model: "K2.7 Coding · High", state: "error", task: "Path blocked at vault", health: 27, score: 14.1 },
+      { name: "Lumen", provider: "codex", model: "Terra · Medium", state: "working", task: "Craft iron pickaxe", health: 91, score: 12.8 },
+      { name: "Juniper", provider: "gemini", model: "Gemini 3.5 Flash · Low", state: "idle", task: "Awaiting task", health: 100, score: 11.6 },
+      { name: "Vanta", provider: "kimi", model: "K3 256K · High", state: "working", task: "Scout the western ridge", health: 76, score: 10.9 },
+      { name: "Palisade", provider: "codex", model: "Luna · Low", state: "idle", task: "Awaiting task", health: 100, score: 8.3 },
+      { name: "Oriole", provider: "gemini", model: "Gemini 3.1 Pro · Medium", state: "working", task: "Return to checkpoint", health: 64, score: 7.8 },
+      { name: "Cairn", provider: "kimi", model: "K2.7 Coding Fast · Medium", state: "idle", task: "Awaiting task", health: 100, score: 7.1 },
+      { name: "Solace", provider: "codex", model: "Sol · Medium", state: "working", task: "Bridge the ravine", health: 88, score: 6.7 },
+      { name: "Tessellate", provider: "gemini", model: "Gemini 3.5 Flash · Medium", state: "error", task: "Needs a reachable target", health: 53, score: 5.2 },
+      { name: "Drift", provider: "kimi", model: "K3 · Low", state: "idle", task: "Awaiting task", health: 100, score: 4.8 },
+      { name: "Havoc", provider: "codex", model: "Terra · High", state: "working", task: "Defend the supply route", health: 71, score: 4.3 },
+      { name: "Sable", provider: "gemini", model: "Gemini 3.1 Pro · High", state: "idle", task: "Awaiting task", health: 100, score: 3.9 },
+      { name: "Quarry", provider: "kimi", model: "K2.7 Coding · Medium", state: "working", task: "Mine the iron outcrop", health: 93, score: 3.1 },
+      { name: "Northstar Assembly Agent 16", provider: "codex", model: "Sol WM · Maximum reasoning", state: "error", task: "Waiting for a safer recovery route around the collapsed outer sector", health: 19, score: 2.6 }
+    ];
+
+    const escapeHtml = value => value.replace(/[&<>"]/g, character => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;"
+    })[character]);
+
+    const stateLabel = state => state === "error" ? "Needs help" : state === "working" ? "Working" : "Idle";
+
+    function avatar(agent) {
+      return `<span class="avatar ${agent.provider}" aria-hidden="true"></span>`;
+    }
+
+    function setupConcept(section) {
+      let size = 8;
+      let filter = "all";
+      let selected = new Set([0, 1, 3]);
+      let focused = 0;
+      const frame = section.querySelector("[data-frame-root]");
+
+      section.querySelectorAll("[data-size]").forEach(button => button.addEventListener("click", () => {
+        size = Number(button.dataset.size);
+        selected = new Set([...selected].filter(index => index < size));
+        if (size === 1) selected = new Set([0]);
+        focused = Math.min(focused, size - 1);
+        section.querySelectorAll("[data-size]").forEach(candidate => candidate.classList.toggle("active", candidate === button));
+        render();
+      }));
+
+      section.querySelectorAll("[data-frame]").forEach(button => button.addEventListener("click", () => {
+        const compact = button.dataset.frame === "compact";
+        frame.classList.toggle("compact", compact);
+        section.querySelectorAll("[data-frame]").forEach(candidate => candidate.classList.toggle("active", candidate === button));
+      }));
+
+      section.querySelectorAll("[data-filter]").forEach(button => button.addEventListener("click", () => {
+        filter = button.dataset.filter;
+        section.querySelectorAll("[data-filter]").forEach(candidate => candidate.classList.toggle("active", candidate === button));
+        render();
+      }));
+
+      function visibleAgents() {
+        return AGENTS.slice(0, size)
+          .map((agent, index) => ({ agent, index }))
+          .filter(entry => filter === "all" || entry.agent.state === filter);
+      }
+
+      function toggle(index) {
+        focused = index;
+        if (selected.has(index)) selected.delete(index); else selected.add(index);
+        render();
+      }
+
+      function renderA() {
+        const entries = visibleAgents();
+        const grid = section.querySelector("[data-roster-grid]");
+        if (!grid) return;
+        grid.innerHTML = entries.map(({ agent, index }) => `
+          <button class="agent-tile ${selected.has(index) ? "selected" : ""} ${focused === index ? "focused" : ""}" data-index="${index}" aria-label="${escapeHtml(agent.name)}, ${stateLabel(agent.state)}">
+            <span class="check">✓</span>
+            ${avatar(agent)}
+            <span class="agent-name">${escapeHtml(agent.name)}</span>
+            <span class="agent-meta">${escapeHtml(agent.model)}</span>
+            <span class="state-mark ${agent.state}" title="${stateLabel(agent.state)}"></span>
+          </button>
+        `).join("");
+        grid.querySelectorAll("[data-index]").forEach(button => button.addEventListener("click", () => toggle(Number(button.dataset.index))));
+        const agent = AGENTS[focused];
+        section.querySelector("[data-inspector]").innerHTML = `
+          <div class="section-tag">Focused agent</div>
+          ${avatar(agent)}
+          <h3 class="inspector-name">${escapeHtml(agent.name)}</h3>
+          <p class="inspector-model">${escapeHtml(agent.model)} · ${escapeHtml(agent.provider)}</p>
+          <div class="profile-line"><span>Status</span><strong>${stateLabel(agent.state)}</strong></div>
+          <div class="profile-line"><span>Current task</span><strong>${escapeHtml(agent.task)}</strong></div>
+          <div class="profile-line ${agent.state === "error" ? "error" : ""}"><span>Attention</span><strong>${agent.state === "error" ? "Choose a recovery action" : "No blocking issue"}</strong></div>
+          <div class="command-box">Write one outcome for ${escapeHtml(agent.name)}. Group commands remain in Group mode.</div>
+        `;
+      }
+
+      function renderB() {
+        const list = section.querySelector("[data-roster-list]");
+        if (!list) return;
+        const entries = visibleAgents();
+        list.innerHTML = entries.map(({ agent, index }) => `
+          <div class="agent-row ${selected.has(index) ? "selected" : ""} ${focused === index ? "focused" : ""}" data-index="${index}" role="button" tabindex="0">
+            ${avatar(agent)}
+            <span class="row-name">${escapeHtml(agent.name)}</span>
+            <span class="row-task">${escapeHtml(agent.task)}</span>
+            <span class="row-state ${agent.state}">${stateLabel(agent.state)}</span>
+            <span>${selected.has(index) ? "✓" : "+"}</span>
+          </div>
+        `).join("");
+        list.querySelectorAll("[data-index]").forEach(row => row.addEventListener("click", () => toggle(Number(row.dataset.index))));
+        const lineup = section.querySelector("[data-lineup]");
+        const selectedIndexes = [...selected].filter(index => index < size).slice(0, 8);
+        lineup.innerHTML = Array.from({ length: Math.max(4, Math.min(8, size)) }, (_, slot) => {
+          const index = selectedIndexes[slot];
+          return index === undefined
+            ? `<div class="lineup-slot empty"><span class="slot-number">${slot + 1}</span><span>Empty slot</span><span></span></div>`
+            : `<div class="lineup-slot"><span class="slot-number">${slot + 1}</span><strong>${escapeHtml(AGENTS[index].name)}</strong><span class="remove">×</span></div>`;
+        }).join("");
+        const scope = `${selectedIndexes.length} / ${Math.max(4, Math.min(8, size))}`;
+        section.querySelector("[data-scope-title]").textContent = `Event team ${scope}`;
+        section.querySelector("[data-lineup-count]").textContent = scope;
+      }
+
+      function renderC() {
+        const standings = section.querySelector("[data-standings]");
+        if (!standings) return;
+        standings.innerHTML = AGENTS.slice(0, size).map((agent, index) => `
+          <div class="standing-row ${focused === index ? "focused" : ""}" data-index="${index}" role="button" tabindex="0">
+            <span class="rank">#${index + 1}</span>
+            <span class="row-name">${escapeHtml(agent.name)}</span>
+            <span class="agent-meta">${escapeHtml(agent.model.split(" · ")[0])}</span>
+            <span class="health ${agent.health < 40 ? "low" : ""}" title="${agent.health}% health"><span style="width:${agent.health}%"></span></span>
+            <span class="score">${agent.score.toFixed(1)}</span>
+          </div>
+        `).join("");
+        standings.querySelectorAll("[data-index]").forEach(row => row.addEventListener("click", () => {
+          focused = Number(row.dataset.index);
+          render();
+        }));
+      }
+
+      function render() {
+        const entries = visibleAgents();
+        const count = section.querySelector("[data-agent-count]");
+        if (count) count.textContent = section.dataset.concept === "c" ? `${size} contestant${size === 1 ? "" : "s"}` : section.dataset.concept === "b" ? `Available agents ${size}` : `Agents ${size} / 16`;
+        const range = section.querySelector("[data-range]");
+        if (range) range.textContent = entries.length ? `1–${Math.min(entries.length, frame.classList.contains("compact") ? 4 : 8)} of ${entries.length}` : "No matching agents";
+        const selectedCount = [...selected].filter(index => index < size).length;
+        const selectionLabel = section.querySelector("[data-selection-count]");
+        if (selectionLabel) selectionLabel.textContent = section.dataset.concept === "c" ? `${AGENTS[focused].name} focused` : section.dataset.concept === "b" ? `${selectedCount} in event` : `${selectedCount} selected`;
+        const hidden = section.querySelector("[data-hidden-count]");
+        if (hidden) {
+          const hiddenSelected = [...selected].filter(index => index < size && !entries.some(entry => entry.index === index)).length;
+          hidden.textContent = hiddenSelected ? `${hiddenSelected} selected, hidden by filters` : "Selection remains active across filters";
+        }
+        renderA();
+        renderB();
+        renderC();
+      }
+
+      render();
+    }
+
+    document.querySelectorAll("[data-concept]").forEach(setupConcept);
+  </script>
+</body>
+</html>

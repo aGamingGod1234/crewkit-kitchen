@@ -208,10 +208,15 @@ export class AgentPlanner {
 	}
 
 	async reconcile(snapshot) {
+		return (await this.beginReconcile(snapshot).complete);
+	}
+
+	beginReconcile(snapshot) {
 		const result = this.#registry.reconcile(snapshot);
 		for (const agentId of result.removed) this.#scheduler.cancel(agentId, 'Agent absent from reconciled server snapshot');
-		const providers = await this.#codexService.reconcile(result.records);
-		return { registry: result, providers, codex: providers };
+		const complete = Promise.resolve(this.#codexService.reconcile(result.records)).then((providers) =>
+			({ registry: result, providers, codex: providers }));
+		return { registry: result, complete };
 	}
 
 	#isCurrent(agentId, goalRevision) {

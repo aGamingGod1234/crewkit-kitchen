@@ -26,7 +26,7 @@ public final class ObservationVisibility {
 				&& observer.hasLineOfSight(entity);
 	}
 
-	static boolean canSeeBlock(ServerLevel level, ServerPlayer observer, BlockPos position) {
+	public static boolean canSeeBlock(ServerLevel level, ServerPlayer observer, BlockPos position) {
 		Objects.requireNonNull(level, "level must not be null");
 		Objects.requireNonNull(observer, "observer must not be null");
 		Objects.requireNonNull(position, "position must not be null");

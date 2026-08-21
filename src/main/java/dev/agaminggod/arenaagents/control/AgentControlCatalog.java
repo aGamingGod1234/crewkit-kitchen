@@ -25,12 +25,21 @@ public final class AgentControlCatalog {
 	}
 
 	public static String defaultModel(String provider) {
-		return models(provider).getFirst();
+		String checked = requireProvider(provider);
+		String preferred = checked.equals(CODEX) ? "gpt-5.6-luna" : null;
+		List<String> available = models(checked);
+		return preferred != null && available.contains(preferred) ? preferred : available.getFirst();
 	}
 
 	public static String defaultReasoning(String provider, String model) {
 		List<String> efforts = reasoningEfforts(provider, model);
+		if (CODEX.equals(provider) && "gpt-5.6-luna".equals(model) && efforts.contains("xhigh")) return "xhigh";
 		return efforts.contains("high") ? "high" : efforts.getFirst();
+	}
+
+	public static String defaultServiceTier(String provider, String model) {
+		List<String> tiers = serviceTiers(provider, model);
+		return CODEX.equals(provider) && tiers.contains("fast") ? "fast" : "priority";
 	}
 
 	public static String displayName(String provider, String model) {
@@ -91,10 +100,10 @@ public final class AgentControlCatalog {
 
 	private static List<AgentControlModelOption> buildFallbackOptions() {
 		ArrayList<AgentControlModelOption> values = new ArrayList<>();
+		add(values, CODEX, "gpt-5.6-luna", "GPT 5.6 Luna", List.of("low", "medium", "high", "xhigh", "max"), true);
 		add(values, CODEX, "gpt-5.6-sol", "GPT 5.6 Sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		add(values, CODEX, "gpt-5.6-sol-wm", "GPT 5.6 Sol WM", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		add(values, CODEX, "gpt-5.6-terra", "GPT 5.6 Terra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		add(values, CODEX, "gpt-5.6-luna", "GPT 5.6 Luna", List.of("low", "medium", "high", "xhigh", "max"), true);
 		for (String model : List.of("gpt-5.5", "gpt-5.4")) {
 			add(values, CODEX, model, readable(model), List.of("low", "medium", "high", "xhigh"), true);
 		}

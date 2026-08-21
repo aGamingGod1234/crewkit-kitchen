@@ -40,6 +40,7 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'break_block', x: 1, y: 64, z: 2, timeoutMs: 5_000 },
 		{ type: 'place_block', x: 1, y: 64, z: 2, face: 'up', itemId: 'minecraft:stone' },
 		{ type: 'chat', message: 'Ready.' },
+		{ type: 'chat', message: 'Meet behind the tower.', audience: 'direct', recipientId: '00000000-0000-0000-0000-000000000001' },
 		{ type: 'wait', durationMs: 50 },
 		{ type: 'set_door', x: 1, y: 64, z: 2, open: true },
 		{ type: 'drop_item', slot: 0, count: 1 },
@@ -56,6 +57,13 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'select_tool', sourceSlot: 5, hotbarSlot: 1, expectedItemId: 'minecraft:iron_pickaxe', minRemainingDurability: 32 },
 		{ type: 'block_with_shield', durationMs: 750 },
 		{ type: 'use_ranged', targetId: '00000000-0000-0000-0000-000000000001', drawDurationMs: 1_000, timeoutMs: 5_000 },
+		{ type: 'interact_block', x: 1, y: 64, z: 2, face: 'north', hand: 'main', expectedItemId: 'minecraft:air' },
+		{ type: 'interact_entity', targetId: '00000000-0000-0000-0000-000000000001', hand: 'off', expectedItemId: 'minecraft:lead' },
+		{ type: 'dismount' },
+		{ type: 'start_fall_flying' },
+		{ type: 'menu_transfer', menuId: 'minecraft:smithing', sourceSlot: 3, destinationSlot: 4, count: 1, expectedItemId: 'minecraft:netherite_sword', timeoutMs: 5_000 },
+		{ type: 'menu_button', menuId: 'minecraft:enchantment', buttonId: 1, timeoutMs: 5_000 },
+		{ type: 'anvil_rename', menuId: 'minecraft:anvil', name: 'Explorer', timeoutMs: 5_000 },
 	];
 	for (const action of actions) assert.deepEqual(validateAction(action), action);
 });
@@ -67,7 +75,12 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 	assert.throws(() => validateAction({ type: 'break_block', x: 1.1, y: 0, z: 0, timeoutMs: 1 }), /32-bit integer/);
 	assert.throws(() => validateAction({ type: 'wait', durationMs: 0 }), /between 1 and 600000/);
 	assert.throws(() => validateAction({ type: 'drop_item', slot: 36, count: 1 }), /between 0 and 35/);
-	assert.throws(() => validateAction({ type: 'chat', message: 'x'.repeat(257) }), /at most 256/);
+	assert.equal(validateAction({ type: 'chat', message: '\ud83d\ude80'.repeat(512) }).message, '\ud83d\ude80'.repeat(512));
+	assert.throws(() => validateAction({ type: 'chat', message: '\ud83d\ude80'.repeat(513) }), /at most 512 code points/);
+	assert.throws(() => validateAction({ type: 'chat', message: 'Missing target.', audience: 'direct' }), /recipientId/);
+	assert.throws(() => validateAction({ type: 'chat', message: 'Wrong target.', audience: 'public', recipientId: '00000000-0000-0000-0000-000000000001' }), /recipientId/);
+	assert.equal(validateAction({ type: 'chat', message: 'v'.repeat(280), audience: 'proximity' }).message.length, 280);
+	assert.throws(() => validateAction({ type: 'chat', message: 'v'.repeat(281), audience: 'proximity' }), /at most 280 code points/);
 	const validTransfer = {
 		type: 'transfer_container', x: 1, y: 64, z: -2,
 		sourceKind: 'player', sourceSlot: 0, destinationKind: 'container', destinationSlot: 4,
@@ -77,6 +90,9 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 	assert.throws(() => validateAction({ ...validTransfer, count: 0 }), /count/);
 	assert.throws(() => validateAction({ ...validTransfer, extra: true }), /Unknown/);
 	assert.throws(() => validateAction({ type: 'equip_item', sourceSlot: 5, targetSlot: 'mainhand', expectedItemId: 'minecraft:iron_chestplate' }), /targetSlot/);
+	assert.throws(() => validateAction({ type: 'interact_entity', targetId: 'nearest_player', hand: 'main', expectedItemId: 'minecraft:air' }), /UUID/);
+	assert.throws(() => validateAction({ type: 'interact_block', x: 1, y: 64, z: 2, face: 'north', hand: 'third', expectedItemId: 'minecraft:air' }), /hand/);
+	assert.throws(() => validateAction({ type: 'menu_button', menuId: 'minecraft:enchantment', buttonId: 256, timeoutMs: 5_000 }), /buttonId/);
 	for (const type of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
 		assert.throws(() => validateAction({ type }), /Unsupported action/);
 	}

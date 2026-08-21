@@ -59,6 +59,36 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 	}), /field/i);
 });
 
+test('protocol v2 carries a coordinator goal completion update', () => {
+	const payload = { goalRevision: 4 };
+	assert.deepEqual(validateProtocolV2Payload('goal_completed', payload), payload);
+	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, unexpected: true }), /field/i);
+});
+
+test('protocol v2 carries one acknowledged conversation wake transaction', () => {
+	const event = {
+		sequence: 7, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+		text: 'Can you respond?', goalRevision: 3, observedAtEpochMs: 20,
+	};
+	const control = { operation: 'start', goalRevision: 4, updatedAtEpochMs: 21, goal: 'Respond to the player.' };
+	const payload = { transactionId: 'wake-00000001', event, control };
+	assert.deepEqual(validateProtocolV2Payload('conversation_wake', payload), payload);
+	assert.deepEqual(
+		validateProtocolV2Payload('conversation_wake_ack', { transactionId: payload.transactionId, goalRevision: 4 }),
+		{ transactionId: payload.transactionId, goalRevision: 4 },
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('conversation_wake', { ...payload, control: { ...control, goalRevision: 5 } }),
+		/revision/i,
+		'composite wake revisions must be consecutive',
+	);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('conversation_wake', 'agent-b', 'wake-1', payload), { direction: 'server_to_coordinator' }),
+		/recipientId|scope/i,
+		'the nested conversation recipient must match the envelope agent',
+	);
+});
+
 test('protocol v2 requires immutable provenance on every action command form', () => {
 	const payload = {
 		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
@@ -238,6 +268,25 @@ function readyServerObservation(goalRevision = 4) {
 				distance: 3.25,
 			},
 			effects: [{ effectId: 'minecraft:speed', amplifier: 1, duration: 120 }],
+		},
+		interaction: {
+			mainHandItemId: 'minecraft:bread',
+			offHandItemId: 'minecraft:shield',
+			usingItem: false,
+			activeHand: 'none',
+			useRemainingTicks: 0,
+			attackCooldown: 1,
+			input: {
+				active: true, forward: 1, strafe: 0, jump: false, sneak: false, sprint: true,
+				attack: false, use: false, yaw: 90, pitch: 0, selectedSlot: 2, hand: 'main_hand',
+			},
+			menu: {
+				type: 'minecraft:inventory',
+				cursor: { itemId: 'minecraft:air', count: 0 },
+				slots: [{ slot: 0, itemId: 'minecraft:air', count: 0 }],
+				capabilities: [],
+			},
+			rayTarget: { type: 'block', x: 11, y: 64, z: -3, face: 'north', blockId: 'minecraft:oak_log' },
 		},
 		inventory: {
 			items: [
@@ -503,6 +552,7 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
+		['goal_completed', { goalRevision: 1 }],
 		['action_command', { goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],
@@ -615,6 +665,8 @@ test('accepts the exact rich ready observation emitted by ServerObservationColle
 	assert.equal(normalized.player.foodLevel, 14);
 	assert.equal(normalized.player.lastAttacker.type, 'minecraft:zombie');
 	assert.equal(normalized.player.effects[0].duration, 120);
+	assert.equal(normalized.interaction.input.sprint, true);
+	assert.equal(normalized.interaction.rayTarget.blockId, 'minecraft:oak_log');
 	assert.equal(normalized.inventory.items[0].slot, 'chest');
 	assert.equal(normalized.inventory.items[1].slot, 2);
 	assert.equal(normalized.inventory.selectedItem, 'minecraft:bread');
@@ -717,4 +769,80 @@ test('malformed action results fail before terminal-result tracking or delivery'
 	const [error] = await failed;
 	assert.equal(error.code, 'INVALID_PAYLOAD_FIELD');
 	assert.equal(delivered, false);
+});
+
+test('validates strict targeted conversation events with Unicode code-point limits', () => {
+	const payload = {
+		sequence: 18,
+		kind: 'agent_message',
+		sourceId: 'agent-source',
+		recipientId: 'agent-a',
+		scope: 'direct',
+		text: '\ud83d\ude80'.repeat(512),
+		goalRevision: 4,
+		observedAtEpochMs: 1_787_184_000_000,
+	};
+	assert.deepEqual(validateProtocolV2Payload('conversation_event', payload), payload);
+	assert.throws(() => validateProtocolV2Payload('conversation_event', { ...payload, text: '\ud83d\ude80'.repeat(513) }), /512 code points/);
+	assert.throws(() => validateProtocolV2Payload('conversation_event', { ...payload, extra: true }), /Unknown/);
+	assert.throws(() => validateProtocolV2Payload('conversation_event', { ...payload, sequence: -1 }), /sequence/);
+	assert.throws(() => validateProtocolV2Envelope(serverEnvelope('conversation_event', 'agent-a', 'server-2', { ...payload, recipientId: 'agent-b' }), { direction: 'server_to_coordinator' }), /recipientId/);
+});
+
+test('delivers a conversation event once through an authenticated bridge', async () => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge(
+		{ port: 25570, secret: SECRET },
+		{ socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4 },
+	);
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
+	await ready;
+	const payload = {
+		sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+		text: 'Meet at spawn.', goalRevision: 4, observedAtEpochMs: 1_787_184_000_000,
+	};
+	const delivered = once(bridge, 'conversation_event');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('conversation_event', 'agent-a', 'server-2', payload))}\n`);
+	const [message] = await delivered;
+	assert.deepEqual(message.payload, payload);
+	bridge.stop();
+});
+
+test('authenticated bridge accepts same-revision conversation wake replay and its acknowledgement', async () => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 1,
+	});
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId,
+		authenticated: true,
+		registry: [{ ...registeredRecord(), state: 'STARTING', currentGoal: 'Respond.', goalRevision: 1 }],
+	}))}\n`);
+	await ready;
+	const payload = {
+		transactionId: 'wake-replay-1',
+		event: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Hello?', goalRevision: 0, observedAtEpochMs: 10,
+		},
+		control: { operation: 'start', goalRevision: 1, updatedAtEpochMs: 11, goal: 'Respond.' },
+	};
+	const delivered = once(bridge, 'conversation_wake');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('conversation_wake', 'agent-a', 'server-2', payload))}\n`);
+	assert.deepEqual((await delivered)[0].payload, payload);
+	await bridge.send('conversation_wake_ack', 'agent-a', { transactionId: payload.transactionId, goalRevision: 1 });
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'conversation_wake_ack');
+	assert.equal(socket.destroyed, false);
+	bridge.stop();
 });

@@ -5,7 +5,8 @@ public final class ProtocolConstants {
 	public static final int PROTOCOL_VERSION = 1;
 	public static final int MAX_LINE_BYTES = 65_536;
 	public static final int MAX_COMMAND_ID_LENGTH = 128;
-	public static final int MAX_CHAT_LENGTH = 256;
+	public static final int MAX_CHAT_LENGTH = 512;
+	public static final int MAX_VOICE_TEXT_LENGTH = 280;
 	public static final int MAX_SUMMARY_LENGTH = 2_048;
 	public static final int MAX_IDENTIFIER_LENGTH = 256;
 	public static final int MAX_TARGET_SELECTOR_LENGTH = 256;

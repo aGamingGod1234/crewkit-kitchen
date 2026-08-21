@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Arena Agents: player parity, DMs, and spatial voice</title>
+  <style>
+    :root {
+      --bg: #f5f6f3;
+      --paper: #ffffff;
+      --text: #18201c;
+      --muted: #59635d;
+      --line: #d9ded9;
+      --accent: #176b43;
+      --accent-soft: #e4f2e9;
+      --warn: #8a4e00;
+      --warn-soft: #fff2d7;
+      --code: #111714;
+      --code-text: #e9f3ed;
+      --max: 1060px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1411;
+        --paper: #151c18;
+        --text: #edf4ef;
+        --muted: #aebbb3;
+        --line: #334038;
+        --accent: #6fd39d;
+        --accent-soft: #173528;
+        --warn: #f5bd62;
+        --warn-soft: #372a13;
+        --code: #090d0b;
+        --code-text: #e9f3ed;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.58 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    code {
+      padding: 0.12rem 0.3rem;
+      border-radius: 4px;
+      background: var(--accent-soft);
+      font-size: 0.9em;
+    }
+    pre {
+      overflow-x: auto;
+      margin: 1rem 0;
+      padding: 1rem;
+      border-radius: 8px;
+      background: var(--code);
+      color: var(--code-text);
+      font-size: 0.84rem;
+      line-height: 1.55;
+      white-space: pre;
+    }
+    pre code { padding: 0; background: transparent; color: inherit; }
+    header, main, footer { width: min(calc(100% - 32px), var(--max)); margin-inline: auto; }
+    header { padding: 64px 0 36px; }
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 750;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    h1 {
+      max-width: 820px;
+      margin: 0;
+      font-size: clamp(2rem, 5.4vw, 4.4rem);
+      line-height: 1.02;
+      letter-spacing: -0.045em;
+    }
+    .lede {
+      max-width: 760px;
+      margin: 22px 0 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.2rem);
+    }
+    .meta {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0;
+      margin-top: 34px;
+      border-block: 1px solid var(--line);
+    }
+    .meta div { padding: 16px 18px 16px 0; }
+    .meta strong { display: block; margin-bottom: 2px; font-size: 0.82rem; }
+    .meta span { color: var(--muted); font-size: 0.9rem; }
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      border-block: 1px solid var(--line);
+      background: color-mix(in srgb, var(--bg) 92%, transparent);
+      backdrop-filter: blur(12px);
+    }
+    nav .inner {
+      display: flex;
+      width: min(calc(100% - 32px), var(--max));
+      margin-inline: auto;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    nav a {
+      flex: 0 0 auto;
+      padding: 12px 18px 12px 0;
+      color: var(--muted);
+      font-size: 0.86rem;
+      font-weight: 650;
+      text-decoration: none;
+    }
+    nav a:hover { color: var(--accent); }
+    main { padding: 24px 0 80px; }
+    section { scroll-margin-top: 58px; padding: 40px 0; border-bottom: 1px solid var(--line); }
+    h2 { margin: 0 0 18px; font-size: clamp(1.45rem, 3vw, 2.15rem); letter-spacing: -0.025em; }
+    h3 { margin: 30px 0 10px; font-size: 1.13rem; }
+    h4 { margin: 22px 0 8px; font-size: 0.95rem; }
+    p { max-width: 820px; margin: 0 0 14px; }
+    ul, ol { max-width: 850px; margin: 10px 0 18px; padding-left: 1.25rem; }
+    li { margin: 7px 0; }
+    .callout {
+      max-width: 850px;
+      margin: 18px 0;
+      padding: 15px 18px;
+      border-left: 3px solid var(--accent);
+      background: var(--accent-soft);
+    }
+    .warning { border-left-color: var(--warn); background: var(--warn-soft); }
+    .table-wrap { overflow-x: auto; margin: 18px 0; }
+    table { width: 100%; min-width: 680px; border-collapse: collapse; }
+    th, td { padding: 12px 14px 12px 0; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 0.78rem; letter-spacing: 0.04em; text-transform: uppercase; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      margin: 22px 0;
+      border: 1px solid var(--line);
+      background: var(--line);
+    }
+    .flow div { min-height: 112px; padding: 16px; background: var(--paper); }
+    .flow strong { display: block; margin-bottom: 7px; color: var(--accent); font-size: 0.8rem; }
+    details { border-top: 1px solid var(--line); }
+    details:last-child { border-bottom: 1px solid var(--line); }
+    summary {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      padding: 18px 0;
+      cursor: pointer;
+      font-weight: 760;
+      list-style: none;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::before { content: "+"; width: 18px; color: var(--accent); font-size: 1.2rem; }
+    details[open] summary::before { content: "−"; }
+    .task-body { padding: 0 0 30px 30px; }
+    .deliverable { color: var(--muted); }
+    .checks { padding-left: 0; list-style: none; }
+    .checks li { position: relative; padding-left: 26px; }
+    .checks li::before { position: absolute; left: 0; content: "□"; color: var(--accent); font-weight: 800; }
+    .gate {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px dashed var(--line);
+      font-weight: 670;
+    }
+    .small { color: var(--muted); font-size: 0.88rem; }
+    footer { padding: 28px 0 56px; color: var(--muted); font-size: 0.85rem; }
+
+    @media (max-width: 760px) {
+      header { padding-top: 42px; }
+      .meta { grid-template-columns: 1fr 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .flow div { min-height: auto; }
+      section { padding: 32px 0; }
+      .task-body { padding-left: 0; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <p class="eyebrow">Implementation plan</p>
+    <h1>Player-like agents with private DMs and spatial voice</h1>
+    <p class="lede">Build near-complete server-side player control, private agent communication visible to operators, and proximity voice where agents and humans hear one another. Fish Audio's free TTS endpoint is the first provider.</p>
+    <div class="meta" aria-label="Plan status">
+      <div><strong>Status</strong><span>Ready for implementation</span></div>
+      <div><strong>Updated</strong><span>20 August 2026</span></div>
+      <div><strong>Target</strong><span>Minecraft 26.1.2</span></div>
+      <div><strong>Capacity</strong><span>16 concurrent agents</span></div>
+    </div>
+  </header>
+
+  <nav aria-label="Plan sections">
+    <div class="inner">
+      <a href="#goal">Goal</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#decisions">Decisions</a>
+      <a href="#files">Files</a>
+      <a href="#tasks">Tasks</a>
+      <a href="#acceptance">Acceptance</a>
+      <a href="#risks">Risks</a>
+    </div>
+  </nav>
+
+  <main>
+    <section id="goal">
+      <h2>Goal and scope</h2>
+      <p>Agents should perform the meaningful actions a real player can perform, communicate privately, speak with stable identities, and react to nearby human speech. The server remains authoritative. Model-authored actions stay bounded and validated.</p>
+      <div class="callout"><strong>Execution rule.</strong> Use <code>superpowers:subagent-driven-development</code> or <code>superpowers:executing-plans</code> when this plan is implemented. Each task has its own review and test gate. Shared files have one owner at a time.</div>
+
+      <h3>Included</h3>
+      <ul>
+        <li>Agent-to-agent and player-to-agent DMs, with an exact-once mirror to every authorized online operator.</li>
+        <li>Separate conversational messages and steering commands. Ordinary DMs never cancel work.</li>
+        <li>Proximity voice through an optional Simple Voice Chat addon.</li>
+        <li>Fish Audio <code>s2.1-pro-free</code> TTS behind a provider interface.</li>
+        <li>One distinct, persistent synthetic voice profile per agent.</li>
+        <li>One realtime STT stream per speaking human UUID, then server-side range fan-out to nearby agents.</li>
+        <li>A complete input-state engine plus targeted interaction and vanilla menu coverage.</li>
+        <li>Focused tests, one live conformance fixture, and a physical 16-agent soak.</li>
+      </ul>
+
+      <h3>Not included in the first release</h3>
+      <ul>
+        <li>Sixteen real or headless Minecraft clients in production.</li>
+        <li>Offline DM delivery, group channels, call recording, or durable transcript history.</li>
+        <li>Arbitrary packets exposed to models or generic support for unknown modded menus.</li>
+        <li>Celebrity, streamer, or unlicensed human voice cloning.</li>
+      </ul>
+    </section>
+
+    <section id="architecture">
+      <h2>Architecture</h2>
+      <p>Core Arena Agents owns gameplay, permissions, conversation routing, bounded metadata, and a provider-neutral voice interface. A separate Fabric addon owns Simple Voice Chat. The coordinator hosts a loopback-only voice service that calls Fish Audio and later Deepgram. Raw audio never enters the existing JSONL bridge.</p>
+
+      <div class="flow" aria-label="System flow">
+        <div><strong>1. Intent</strong>The model chooses public text, direct text, proximity speech, or a gameplay action.</div>
+        <div><strong>2. Authority</strong>The server validates recipient, range, permission, goal revision, target provenance, and current action ownership.</div>
+        <div><strong>3. Delivery</strong>Text uses the conversation router. Audio uses the optional voice addon and the loopback binary HTTP or WebSocket service.</div>
+        <div><strong>4. Memory</strong>Each agent receives only bounded direct or nearby conversation events. Public facts remain separate.</div>
+      </div>
+
+      <pre><code>Human microphone
+  -&gt; Simple Voice Chat MicrophonePacketEvent
+  -&gt; one Opus/STT stream for that human UUID
+  -&gt; final transcript returned to the server
+  -&gt; dimension and distance filter
+  -&gt; nearby agent conversation memories
+
+Agent speak(text)
+  -&gt; text routed directly to nearby agents
+  -&gt; Fish Audio s2.1-pro-free generates PCM once
+  -&gt; resample to 48 kHz mono
+  -&gt; EntityAudioChannel plays to nearby humans</code></pre>
+    </section>
+
+    <section id="decisions">
+      <h2>Locked decisions</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Area</th><th>Decision</th><th>Reason</th></tr></thead>
+          <tbody>
+            <tr><td>Player entities</td><td>Keep Carpet fake <code>ServerPlayer</code> instances.</td><td>They already participate in server physics and inventory state without sixteen client processes.</td></tr>
+            <tr><td>Model control</td><td>Keep semantic ArenaScript actions.</td><td>Validation, provenance checks, postconditions, and cancellation already work.</td></tr>
+            <tr><td>Motor control</td><td>Add one leased input state per agent under semantic actions.</td><td>This fills strafe, reverse, sneak, held-button, hand, and release gaps.</td></tr>
+            <tr><td>DM visibility</td><td>Native server mirror using <code>GoalControl.mayControl</code>.</td><td>Social-spy mods only guarantee visibility for vanilla command paths.</td></tr>
+            <tr><td>Voice transport</td><td>Optional Simple Voice Chat addon.</td><td>It has entity audio channels and incoming microphone packet events for Minecraft 26.1.x.</td></tr>
+            <tr><td>TTS</td><td>Fish Audio <code>s2.1-pro-free</code>.</td><td>No usage fee at the current developer tier, streaming support, custom voice IDs, and suitable quality.</td></tr>
+            <tr><td>STT</td><td>Provider interface with Deepgram Flux first.</td><td>Realtime raw Opus ingestion and turn detection fit proximity chat. A disabled adapter keeps voice optional.</td></tr>
+            <tr><td>Audio transport</td><td>Loopback binary HTTP/WebSocket service on a separate port.</td><td>The existing bridge has 64 KiB JSON frames and should carry metadata only.</td></tr>
+            <tr><td>Persistence</td><td>Persist voice profiles, not audio or transcripts.</td><td>Stable identities survive restarts without retaining private speech.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="files">
+      <h2>File ownership map</h2>
+      <p>Parallel work is allowed only across different rows. The bridge, runtime bootstrap, build files, and control screen are shared integration files. Assign each one to a single worker until its task merges.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Workstream</th><th>Create</th><th>Modify</th></tr></thead>
+          <tbody>
+            <tr><td>Conversation</td><td><code>server/conversation/AgentConversationRouter.java</code><br><code>coordinator/src/conversation-memory.mjs</code></td><td><code>ServerActionExecutor.java</code><br><code>ProtocolCodec.java</code><br><code>protocol-v2.mjs</code><br><code>dynamic-main.mjs</code></td></tr>
+            <tr><td>Input and interactions</td><td><code>runtime/input/AgentInputState.java</code><br><code>runtime/input/ServerInputController.java</code><br><code>runtime/menu/MenuCapabilityRegistry.java</code></td><td><code>ServerActionExecutor.java</code><br><code>ServerNavigationController.java</code><br><code>AdvancedInteractionService.java</code><br><code>ServerObservationCollector.java</code></td></tr>
+            <tr><td>Voice core</td><td><code>voice/VoiceSubsystem.java</code><br><code>voice/NoVoiceSubsystem.java</code><br><code>voice/VoiceSubsystemRegistry.java</code></td><td><code>ArenaAgents.java</code><br><code>CodexAgentServerRuntime.java</code><br><code>CodexAgentManager.java</code></td></tr>
+            <tr><td>Voice addon</td><td><code>voice-addon/</code> Gradle module<br><code>SimpleVoiceChatSubsystem.java</code><br><code>VoiceWorkerClient.java</code></td><td><code>settings.gradle</code><br><code>build.gradle</code><br><code>gradle.properties</code></td></tr>
+            <tr><td>Speech service</td><td><code>coordinator/src/voice/voice-http-server.mjs</code><br><code>fish-tts-provider.mjs</code><br><code>deepgram-stt-provider.mjs</code><br><code>voice-profile-store.mjs</code></td><td><code>coordinator/src/dynamic-main.mjs</code><br><code>coordinator/package.json</code></td></tr>
+            <tr><td>Operator UI</td><td><code>docs/mocks/agent-comms-voice-options.html</code><br><code>VoiceControlSnapshot.java</code></td><td><code>AgentControlScreen.java</code><br><code>AgentControlSync.java</code><br><code>AgentControlCommandBuilder.java</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="tasks">
+      <h2>Implementation tasks</h2>
+      <p class="small">Every task ends in a testable state. Commit commands are local checkpoints only. Do not push or open a pull request without Lucas asking.</p>
+
+      <details open>
+        <summary>Task 0. Restore the executable baseline</summary>
+        <div class="task-body">
+          <p class="deliverable">A captured baseline where Node tests pass and Gradle runs with Java 25 before feature code starts.</p>
+          <h4>Files</h4>
+          <p><code>gradle.properties</code>, optional local Java toolchain configuration, <code>docs/live-qa/2026-08-20-player-parity-voice-baseline.md</code>.</p>
+          <ul class="checks">
+            <li>Point Gradle at an installed Java 25 runtime without committing a machine-specific absolute path.</li>
+            <li>Run <code>npm --prefix coordinator test</code>. Record the test count and failures.</li>
+            <li>Run <code>.\gradlew.bat check</code>. Fix only environment or baseline breakage approved for this project.</li>
+            <li>Start one development server and verify a fake agent can spawn, move, attack, use, break, place, open a chest, craft, die, and respawn.</li>
+          </ul>
+          <pre><code>java -version
+npm --prefix coordinator test
+.\gradlew.bat check
+.\gradlew.bat runServer</code></pre>
+          <p class="gate">Gate: no feature work begins until the Java and Node baselines are reproducible.</p>
+        </div>
+      </details>
+
+      <details open>
+        <summary>Task 1. Add native DMs and the operator mirror</summary>
+        <div class="task-body">
+          <p class="deliverable">Agents and players can exchange direct messages. Every authorized operator sees one mirrored copy. Public chat remains backward compatible.</p>
+          <h4>Contract</h4>
+          <pre><code>enum ConversationAudience { PUBLIC, DIRECT, PROXIMITY }
+enum ConversationKind { AGENT_MESSAGE, PLAYER_MESSAGE, PLAYER_STEER, PROXIMITY_SPEECH }
+
+record ConversationEvent(
+  AgentId agentId,
+  String sourceId,
+  String recipientId,
+  ConversationAudience audience,
+  ConversationKind kind,
+  String text,
+  long goalRevision,
+  long observedAtEpochMs,
+  long sequence
+) {}
+
+interface AgentConversationRouter {
+  DeliveryReceipt deliver(ConversationEvent event);
+}</code></pre>
+          <h4>Files</h4>
+          <p>Create <code>server/conversation/*</code> and <code>AgentConversationRouterVerification.java</code>. Modify <code>ServerActionExecutor.java</code>, <code>ProtocolCodec.java</code>, <code>CodexAgentCommands.java</code>, <code>GoalControl.java</code>, <code>constants.mjs</code>, <code>schema.mjs</code>, and <code>minecraft-api.mjs</code>.</p>
+          <ul class="checks">
+            <li>Write failing tests for direct recipient delivery, operator mirroring, deduplication, offline failure, dimension/range filtering, and 512-code-point truncation.</li>
+            <li>Extend <code>player.chat</code> with <code>audience</code> and optional authoritative <code>recipientId</code>. Keep <code>PUBLIC</code> as the omitted default.</li>
+            <li>Add <code>/codex dm &lt;agent&gt; &lt;message&gt;</code>. Add vanilla <code>/msg</code> integration only after the native route passes tests.</li>
+            <li>Route direct messages to the recipient plus every online player accepted by <code>GoalControl.mayControl</code>. Never use <code>AgentChatReporter.report</code> for the mirror.</li>
+            <li>Keep <code>player_message</code> conversational. Keep <code>player_steer</code> on the existing lifecycle reducer so it increments the goal revision exactly once.</li>
+          </ul>
+          <p class="gate">Gate: public messages, direct messages, and steering pass exact-once tests, and no DM enters spectator or scenario output.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 2. Add bounded conversation events and memory</summary>
+        <div class="task-body">
+          <p class="deliverable">The coordinator receives ordered conversations without polluting factual observations or retaining unbounded provider history.</p>
+          <h4>Wire payload</h4>
+          <pre><code>{
+  "type": "conversation_event",
+  "agentId": "agent-07",
+  "payload": {
+    "sequence": 18,
+    "kind": "agent_dm",
+    "sourceId": "agent-03",
+    "recipientId": "agent-07",
+    "scope": "direct",
+    "text": "Meet behind the tower.",
+    "goalRevision": 4,
+    "observedAtEpochMs": 1787184000000
+  }
+}</code></pre>
+          <h4>Files</h4>
+          <p>Create <code>coordinator/src/conversation-memory.mjs</code> and its tests. Modify <code>MultiplexedServerBridge.java</code>, <code>BridgeEnvelopeCodec.java</code>, <code>protocol-v2.mjs</code>, <code>dynamic-main.mjs</code>, <code>prompts.mjs</code>, and provider session tests.</p>
+          <ul class="checks">
+            <li>Write failing protocol tests for strict keys, 512-code-point text, bounded IDs, sequencing, stale sessions, reconnect, and unknown-field rejection.</li>
+            <li>Give conversation events their own per-agent sequence and bounded queue. DMs use reliable ordered delivery. Proximity speech may coalesce under pressure.</li>
+            <li>Implement per-agent memory capped at 32 entries and 8 KiB UTF-8. Retain newest entries and isolate agents.</li>
+            <li>Quote conversation text in the planner prompt as untrusted data. Do not add it to <code>FactLedger</code> or <code>changedFacts</code>.</li>
+            <li>Rotate or reseed provider sessions on goal revision and when their bounded context epoch rolls.</li>
+          </ul>
+          <pre><code>npm --prefix coordinator test -- \
+  test/protocol-v2.test.mjs \
+  test/conversation-memory.test.mjs \
+  test/dynamic-main.test.mjs</code></pre>
+          <p class="gate">Gate: hostile message text remains quoted, one agent cannot see another agent's unrelated memory, and reconnect does not duplicate a DM.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 3. Build the leased input-state engine</summary>
+        <div class="task-body">
+          <p class="deliverable">Semantic actions compile into complete player-like motor state without controllers fighting over held inputs.</p>
+          <h4>Contract</h4>
+          <pre><code>record AgentInputState(
+  float forward,
+  float strafe,
+  boolean jump,
+  boolean sneak,
+  boolean sprint,
+  boolean attack,
+  boolean use,
+  float yaw,
+  float pitch,
+  int selectedSlot,
+  InteractionHand hand
+) {}
+
+interface ServerInputController {
+  InputLease acquire(AgentId agentId, InputOwner owner, int priority);
+  void apply(InputLease lease, AgentInputState state);
+  void release(InputLease lease);
+  void clear(AgentId agentId);
+}</code></pre>
+          <h4>Files</h4>
+          <p>Create <code>runtime/input/*</code> and <code>InputStateVerification.java</code>. Modify <code>OfflineAgentPlayers.java</code>, <code>ServerActionExecutor.java</code>, navigation, combat, ranged-use, cancellation, death, and respawn paths.</p>
+          <ul class="checks">
+            <li>Write reducer tests for forward, reverse, strafe, jump, sneak, sprint, attack/use press and release, selected slot, hand, and look state.</li>
+            <li>Write lease tests proving higher-priority combat or transaction control cannot leave navigation inputs stuck.</li>
+            <li>Map the state to Carpet <code>EntityPlayerActionPack</code>. Keep all world mutation on the server tick.</li>
+            <li>Compile navigation, combat, block breaking, ranged use, and cancellation through the input controller.</li>
+            <li>Clear all inputs on completion, cancellation, death, removal, disconnect, and respawn.</li>
+          </ul>
+          <p class="gate">Gate: every press has a tested release path and no agent remains moving, attacking, or using after cancellation.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 4. Fill high-value interaction and observation gaps</summary>
+        <div class="task-body">
+          <p class="deliverable">Agents can perform the remaining common vanilla actions with explicit targets and observable postconditions.</p>
+          <h4>Files</h4>
+          <p>Create <code>runtime/menu/MenuCapabilityRegistry.java</code> and focused adapters. Modify <code>schema.mjs</code>, <code>minecraft-api.mjs</code>, <code>ServerActionExecutor.java</code>, <code>AdvancedInteractionService.java</code>, and <code>ServerObservationCollector.java</code>.</p>
+          <ul class="checks">
+            <li>Add targeted use with explicit hand, observed block or entity ID, hit face, expected held item, reach, and postcondition.</li>
+            <li>Add eat, drink, throw, charge/release, sleep, mount/dismount, swim, climb, boat, and elytra behavior only through semantic actions.</li>
+            <li>Add vanilla menu adapters for villagers, enchanting, anvil, smithing, brewing, loom, and stonecutter. Unknown modded menus fail with <code>UNSUPPORTED_MENU</code>.</li>
+            <li>Expose bounded current hand, use state, attack cooldown, input state, open menu type, cursor stack, and exact ray target in observations.</li>
+            <li>Use one to four real or Mineflayer clients as a conformance test for packet and menu outcomes. Do not replace Carpet in production.</li>
+          </ul>
+          <p class="gate">Gate: each new action has a precondition, timeout, cancellation path, postcondition, and conservation check where items move.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 5. Add the optional voice module boundary</summary>
+        <div class="task-body">
+          <p class="deliverable">Core runs unchanged without voice. Installing the addon activates voice channels for live agents.</p>
+          <h4>Core interface</h4>
+          <pre><code>interface VoiceSubsystem extends AutoCloseable {
+  boolean available();
+  void registerAgent(AgentId agentId, UUID entityId);
+  void unregisterAgent(AgentId agentId);
+  CompletionStage&lt;VoiceReceipt&gt; speak(VoiceRequest request);
+  void stop(AgentId agentId);
+}
+
+record VoiceRequest(
+  AgentId agentId,
+  String text,
+  String profileId,
+  int radius,
+  long conversationSequence
+) {}</code></pre>
+          <h4>Files</h4>
+          <p>Create the core <code>voice/*</code> package and a separate <code>voice-addon</code> Gradle subproject with its own <code>fabric.mod.json</code>. Modify <code>settings.gradle</code>, root build configuration, runtime lifecycle, and agent create/remove/respawn hooks.</p>
+          <ul class="checks">
+            <li>Write core tests for <code>NoVoiceSubsystem</code>, lifecycle registration, cancellation, and text fallback.</li>
+            <li>Load implementations through a Fabric entrypoint. Core must not import Simple Voice Chat types.</li>
+            <li>Add Simple Voice Chat API 2.6.20 to the addon and test against the external 2.6.22+26.1.2 mod.</li>
+            <li>Create one entity audio channel per live agent and one serialized audio player per channel.</li>
+            <li>When voice is absent, deliver proximity text and return <code>DEGRADED_TO_TEXT</code> without stopping gameplay.</li>
+          </ul>
+          <p class="gate">Gate: removing the addon still permits a clean core launch, all gameplay tests, DMs, and text fallback.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 6. Connect Fish Audio's free TTS endpoint</summary>
+        <div class="task-body">
+          <p class="deliverable">An agent can choose to speak, and nearby players hear its assigned Fish voice at the entity's position.</p>
+          <h4>Provider interface</h4>
+          <pre><code>interface TtsProvider {
+  synthesize({ text, voiceId, signal }): Promise&lt;PcmStream&gt;;
+}
+
+type PcmStream = {
+  sampleRateHz: 44100;
+  channels: 1;
+  sampleFormat: "s16le";
+  body: AsyncIterable&lt;Uint8Array&gt;;
+};</code></pre>
+          <h4>Files</h4>
+          <p>Create <code>coordinator/src/voice/voice-http-server.mjs</code>, <code>fish-tts-provider.mjs</code>, <code>tts-cache.mjs</code>, addon <code>VoiceWorkerClient.java</code>, and focused Node and Java tests.</p>
+          <ul class="checks">
+            <li>Bind the voice service to loopback only on a dedicated port. Require bearer authentication sourced from a secret file, never a client payload.</li>
+            <li>Call Fish <code>POST /v1/tts</code> with model <code>s2.1-pro-free</code>, <code>format: pcm</code>, <code>sample_rate: 44100</code>, mono output, and the agent's <code>reference_id</code>.</li>
+            <li>Stream binary PCM outside the JSONL bridge. Resample 44.1 kHz to 48 kHz and feed 960-sample, 20 ms frames to Simple Voice Chat.</li>
+            <li>Cap synthesis at five concurrent requests, one active utterance per agent, 280 code points per utterance, and 20 seconds of playback.</li>
+            <li>Cache immutable output by provider, model, voice ID, profile revision, normalized text, prosody, format, and sample rate.</li>
+            <li>Handle timeout, cancellation, rate limit, malformed audio, worker exit, agent death, and addon removal. Text behavior must continue.</li>
+          </ul>
+          <p class="gate">Gate: no API key or PCM appears in JSON bridge logs, traces, client payloads, or saved agent data.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 7. Give every agent a stable, recognizable voice</summary>
+        <div class="task-body">
+          <p class="deliverable">Sixteen immutable voice profiles remain recognizable across restarts and provider changes.</p>
+          <h4>Profile fields</h4>
+          <pre><code>{
+  "schemaVersion": 1,
+  "profileId": "voice.moss.v1",
+  "agentId": "agent-07",
+  "provider": "fish",
+  "model": "s2.1-pro-free",
+  "voiceId": "fish-reference-id",
+  "locale": "en-US",
+  "identityAnchors": ["low-mid pitch", "dry", "deliberate"],
+  "avoid": ["breathy", "fast", "bright"],
+  "speed": 0.94,
+  "revision": 1,
+  "provenance": "synthetic-design"
+}</code></pre>
+          <h4>Files</h4>
+          <p>Create addon-owned <code>AgentVoiceProfile.java</code>, <code>VoiceProfileSavedData.java</code>, coordinator profile validation, and a fixed voice probe script.</p>
+          <ul class="checks">
+            <li>Define three to five identity anchors and two to four rejected traits for every agent.</li>
+            <li>Create at least two candidate voices per agent, then select a roster whose voices remain distinct with game audio and overlap.</li>
+            <li>Persist only profile metadata and provider IDs. Do not persist source recordings, generated audio in world data, or transcripts.</li>
+            <li>Pre-render greetings, alerts, names, and combat barks after roster approval.</li>
+            <li>Require consent metadata for any human-derived voice. Reject recognizable unlicensed impersonation.</li>
+          </ul>
+          <p class="gate">Gate: blind listeners identify each agent at least 90 percent of the time across neutral, urgent, amused, and overlapping samples.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 8. Let nearby agents hear human voice</summary>
+        <div class="task-body">
+          <p class="deliverable">A human speaks once and every nearby agent receives the same final transcript with correct identity, range, and ordering.</p>
+          <h4>Files</h4>
+          <p>Create addon microphone capture, loopback STT WebSocket, <code>deepgram-stt-provider.mjs</code>, <code>NoSttProvider</code>, and transcript routing tests.</p>
+          <ul class="checks">
+            <li>Capture <code>MicrophonePacketEvent</code>, copy Opus bytes into a bounded per-player queue, and hand Minecraft state checks back to the server thread.</li>
+            <li>Open one Deepgram Flux stream per active human UUID. Never open one stream per listening agent.</li>
+            <li>Return only final transcripts to the addon in the first release. Include sender UUID, utterance sequence, whisper flag, and timestamps.</li>
+            <li>Ask the server conversation router to calculate same-dimension distance at delivery time and fan the transcript out to nearby agents.</li>
+            <li>Drop or coalesce stale proximity speech under pressure. Never drop a DM or steer command.</li>
+            <li>Disable microphone capture and close decoders on player disconnect, server stop, missing consent, or missing STT configuration.</li>
+          </ul>
+          <p class="gate">Gate: moving outside range before transcript completion prevents delivery, and overlapping speakers retain distinct Minecraft UUID identities.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 9. Add operator controls after UI mocks</summary>
+        <div class="task-body">
+          <p class="deliverable">Operators can message, steer, inspect mirrored DMs, mute, stop speech, and assign voice profiles without exposing private conversations publicly.</p>
+          <h4>Files</h4>
+          <p>Create <code>docs/mocks/agent-comms-voice-options.html</code> with A, B, and C concepts before editing real components. After Lucas chooses, modify <code>AgentControlScreen.java</code>, <code>AgentControlSync.java</code>, <code>AgentControlCommandBuilder.java</code>, and add a bounded <code>VoiceControlSnapshot</code>.</p>
+          <ul class="checks">
+            <li>Mock three concise arrangements for message versus steer, live DM mirror, voice state, mute, stop, profile assignment, and range.</li>
+            <li>Pause implementation for Lucas to choose one mock.</li>
+            <li>Keep <code>Send message</code> and <code>Steer</code> separate. Steering retains gamemaster permission and existing goal-revision behavior.</li>
+            <li>Show live operator-only DM copies. Keep transcript history out of <code>ArenaSpectatorSnapshot</code> and public match artifacts.</li>
+            <li>Add voice capability, state, current speaker, stop, mute, and profile ID to a separate bounded payload.</li>
+          </ul>
+          <p class="gate">Gate: unauthorized players cannot steer, monitor DMs, change profiles, or stop another agent's speech.</p>
+        </div>
+      </details>
+
+      <details>
+        <summary>Task 10. Optimize observations and run live release gates</summary>
+        <div class="task-body">
+          <p class="deliverable">Sixteen agents retain 20 TPS while acting, messaging, and speaking in a real Fabric server.</p>
+          <h4>Files</h4>
+          <p>Modify <code>ObservationSectionCache.java</code>, <code>ServerObservationCollector.java</code>, telemetry, soak fixtures, and create <code>docs/live-qa/2026-08-20-player-parity-dms-spatial-voice.md</code>.</p>
+          <ul class="checks">
+            <li>Add timers for observation collection, line-of-sight clipping, pathfinding, server tasks, conversation queues, TTS time-to-first-audio, and audio underruns.</li>
+            <li>Replace exact yaw/pitch one-tick spatial caching with section data plus coarse view buckets. Test two to ten tick ages and block-change invalidation.</li>
+            <li>Run the full Node and Gradle suites after each shared integration change.</li>
+            <li>Run a one-human, two-agent live conformance matrix covering DM, operator mirror, message versus steer, range boundaries, death, respawn, cancellation, voice fallback, and distinct voices.</li>
+            <li>Run a 30-minute physical 16-agent soak with simultaneous actions, five TTS requests, overlapping human speech, reconnects, and one forced voice-worker restart.</li>
+          </ul>
+          <pre><code>npm --prefix coordinator test
+.\gradlew.bat check
+.\gradlew.bat runServer</code></pre>
+          <p class="gate">Gate: release only after all acceptance criteria below pass and the live QA report records measurements, failures, and exact versions.</p>
+        </div>
+      </details>
+    </section>
+
+    <section id="acceptance">
+      <h2>Release acceptance</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Area</th><th>Required result</th></tr></thead>
+          <tbody>
+            <tr><td>DMs</td><td>One recipient delivery and one copy per authorized operator. No public or spectator leak.</td></tr>
+            <tr><td>Steering</td><td>Only explicit steer changes goal revision and cancels work. A normal DM never does.</td></tr>
+            <tr><td>Control</td><td>Every held input releases on completion, cancellation, death, removal, disconnect, and respawn.</td></tr>
+            <tr><td>Interactions</td><td>Every supported action has validation, timeout, cancellation, postcondition, and item conservation where relevant.</td></tr>
+            <tr><td>Voice</td><td>Nearby humans hear entity-positioned audio. Nearby agents receive the original text once. Missing voice falls back to text.</td></tr>
+            <tr><td>Human speech</td><td>One STT stream per human UUID. Range and dimension are checked on the server after final transcription.</td></tr>
+            <tr><td>Identity</td><td>At least 90 percent blind identification across the sixteen-agent roster.</td></tr>
+            <tr><td>Latency</td><td>Fish time-to-first-audio p95 at or below 1.5 seconds from the Singapore server path, measured with short gameplay lines.</td></tr>
+            <tr><td>Tick health</td><td>30-minute soak sustains 20 TPS, p95 tick below 45 ms, and no sustained tick above 50 ms.</td></tr>
+            <tr><td>Bounds</td><td>32 conversation entries and 8 KiB per agent, five TTS generations, one utterance per agent, and bounded audio/STT queues.</td></tr>
+            <tr><td>Privacy</td><td>No raw microphone retention, transcript persistence, public DM output, or API secret in client or bridge data.</td></tr>
+            <tr><td>Failure</td><td>Fish, Deepgram, Simple Voice Chat, or the local voice service can fail without stopping gameplay, text communication, or operator control.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="risks">
+      <h2>Risks and controls</h2>
+      <ul>
+        <li><strong>Fish's free tier can change.</strong> Keep <code>TtsProvider</code> provider-neutral, record usage, cache audio, and keep ElevenLabs as a configuration-only fallback.</li>
+        <li><strong>Simple Voice Chat is an external dependency.</strong> Ship the integration as a separate addon and do not bundle its All Rights Reserved mod.</li>
+        <li><strong>Client installation and UDP configuration can fail.</strong> Detect capability, expose status to operators, document UDP 24454, and fall back to proximity text.</li>
+        <li><strong>Speech is prompt-injection input.</strong> Quote it as untrusted conversation data and keep lifecycle control in explicit commands.</li>
+        <li><strong>Sixteen voices can become noise.</strong> Limit utterance length, active speakers, cooldowns, and overlap. Agents should speak only when another player would find it useful.</li>
+        <li><strong>Observation work already risks tick time.</strong> Optimize and instrument it before treating the 16-agent soak as passed.</li>
+        <li><strong>Voice cloning has consent and licensing risk.</strong> Use synthetic-designed voices and store provenance with each profile.</li>
+      </ul>
+
+      <h3>Official references</h3>
+      <ul>
+        <li><a href="https://docs.fish.audio/developer-guide/models-pricing/pricing-and-rate-limits">Fish Audio pricing and rate limits</a></li>
+        <li><a href="https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech">Fish Audio TTS API</a></li>
+        <li><a href="https://github.com/fishaudio/fish-speech/blob/main/LICENSE">Fish Speech model license</a></li>
+        <li><a href="https://modrepo.de/minecraft/voicechat/api/getting_started">Simple Voice Chat API</a></li>
+        <li><a href="https://voicechat.modrepo.de/de/maxhenkel/voicechat/api/events/MicrophonePacketEvent.html">Simple Voice Chat microphone event</a></li>
+        <li><a href="https://developers.deepgram.com/docs/encoding">Deepgram streaming encodings</a></li>
+        <li><a href="https://github.com/gnembon/fabric-carpet/tree/26.1">Fabric Carpet 26.1 source</a></li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    Arena Agents implementation plan. This page contains no credentials, private keys, raw voice data, or private conversation content.
+  </footer>
+</body>
+</html>

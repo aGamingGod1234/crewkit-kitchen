@@ -21,13 +21,41 @@ function wireObservation(overrides = {}) {
 
 test('adapts protocol entities and blocks into bounded factual candidate records', () => {
 	const adapted = adaptObservation(wireObservation());
-	assert.deepEqual(adapted.player, { x: 0, y: 64, z: 0, yaw: 10, pitch: -2, health: 20, hunger: 18, air: 300, fire: false, fallDistance: 0 });
+	assert.deepEqual(adapted.player, { x: 0, y: 64, z: 0, yaw: 10, pitch: -2, dead: false, health: 20, hunger: 18, air: 300, fire: false, fallDistance: 0 });
 	assert.deepEqual(adapted.items, [{ stableId: '00000000-0000-0000-0000-000000000001', itemId: 'minecraft:oak_log', count: 1, distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0 }]);
 	assert.deepEqual(adapted.entities, [{ stableId: '00000000-0000-0000-0000-000000000001', type: 'minecraft:item', distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0, itemId: 'minecraft:oak_log', count: 1 }]);
 	assert.deepEqual(adapted.blocks, [{ stableId: '4,64,0', blockId: 'minecraft:oak_log', tags: ['#minecraft:logs'], x: 4, y: 64, z: 0 }]);
 	assert.deepEqual(adapted.inventory, { items: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0, tags: ['#minecraft:logs'] }], tagCounts: { '#minecraft:logs': 2 } });
 	assert.equal(Object.hasOwn(adapted.items[0], 'reachable'), false);
 	assert.deepEqual(adapted.items[0].tags, ['#minecraft:item']);
+});
+
+test('preserves the authoritative last attacker for damage watchers', () => {
+	const adapted = adaptObservation(wireObservation({
+		player: {
+			health: 18,
+			foodLevel: 18,
+			onFire: false,
+			air: 300,
+			fallDistance: 0,
+			lastAttacker: { uuid: 'mob-1', type: 'minecraft:zombie', distance: 2.5 },
+		},
+	}));
+	assert.deepEqual(adapted.player.lastAttacker, {
+		uuid: 'mob-1',
+		type: 'minecraft:zombie',
+		distance: 2.5,
+	});
+	assert.throws(() => adaptObservation(wireObservation({
+		player: {
+			health: 18,
+			foodLevel: 18,
+			onFire: false,
+			air: 300,
+			fallDistance: 0,
+			lastAttacker: { uuid: 'mob-1', type: 'minecraft:zombie', distance: Number.NaN },
+		},
+	})), /finite number/);
 });
 
 test('rejects malformed, duplicate, and over-bound authoritative tags', () => {

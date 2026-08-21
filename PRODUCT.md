@@ -20,7 +20,7 @@ Purposeful, legible, alive. The product should feel like a dedicated operations 
 
 - A pile of default Minecraft buttons with no hierarchy.
 - Tiny glyphs as the only selection signal.
-- Configuration and group messaging bundled into one crowded surface.
+- Configuration and saved-group management bundled into one crowded surface.
 - Technical slugs, IDs, revisions, and internal state names presented as primary copy.
 - Progress messages that do not correspond to visible or measurable world changes.
 
@@ -28,7 +28,7 @@ Purposeful, legible, alive. The product should feel like a dedicated operations 
 
 1. Runtime truth first. Every status must describe observable work, a wait condition, or an actionable failure.
 2. One agent at a time for setup. Configuration is sequential and preserves each agent independently.
-3. Groups only where groups help. Multi-selection belongs to messaging and group control.
+3. Groups only where groups help. Multi-selection belongs to saved rosters and group control.
 4. Selection must be unmistakable. Use a full-row treatment, explicit label, count, and detail context.
 5. Keep the world in context. Arena placement defaults to 80 blocks in front of the operator, exposes exact coordinates before launch, and paces visible construction.
 

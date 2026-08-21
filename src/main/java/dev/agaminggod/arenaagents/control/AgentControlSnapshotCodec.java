@@ -35,6 +35,7 @@ public final class AgentControlSnapshotCodec {
 					snapshot.automationStatus(),
 					snapshot.generatedAtEpochMs(),
 					snapshot.agents(),
+					snapshot.groups(),
 					snapshot.catalog()
 			);
 		} catch (RuntimeException exception) {

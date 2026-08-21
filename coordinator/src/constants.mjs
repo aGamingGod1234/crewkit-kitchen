@@ -3,6 +3,8 @@ export const MULTIPLEXED_PROTOCOL_VERSION = 2;
 export const MAX_LINE_BYTES = 65_536;
 export const MAX_COMMAND_ID_LENGTH = 128;
 export const MAX_CHAT_LENGTH = 256;
+export const MAX_CONVERSATION_LENGTH = 512;
+export const MAX_VOICE_TEXT_LENGTH = 280;
 export const MAX_SUMMARY_LENGTH = 2_048;
 export const MAX_GOAL_LENGTH = 4_096;
 export const MAX_IDENTIFIER_LENGTH = 256;
@@ -47,7 +49,7 @@ export const ACTION_FIELDS = Object.freeze({
 	use_item: Object.freeze(['durationMs']),
 	break_block: Object.freeze(['x', 'y', 'z', 'timeoutMs']),
 	place_block: Object.freeze(['x', 'y', 'z', 'face', 'itemId', 'desiredState']),
-	chat: Object.freeze(['message']),
+	chat: Object.freeze(['message', 'audience', 'recipientId']),
 	wait: Object.freeze(['durationMs']),
 	set_door: Object.freeze(['x', 'y', 'z', 'open']),
 	drop_item: Object.freeze(['slot', 'count']),
@@ -60,6 +62,13 @@ export const ACTION_FIELDS = Object.freeze({
 	select_tool: Object.freeze(['sourceSlot', 'hotbarSlot', 'expectedItemId', 'minRemainingDurability']),
 	block_with_shield: Object.freeze(['durationMs']),
 	use_ranged: Object.freeze(['targetId', 'drawDurationMs', 'timeoutMs']),
+	interact_block: Object.freeze(['x', 'y', 'z', 'face', 'hand', 'expectedItemId']),
+	interact_entity: Object.freeze(['targetId', 'hand', 'expectedItemId']),
+	dismount: Object.freeze([]),
+	start_fall_flying: Object.freeze([]),
+	menu_transfer: Object.freeze(['menuId', 'sourceSlot', 'destinationSlot', 'count', 'expectedItemId', 'timeoutMs']),
+	menu_button: Object.freeze(['menuId', 'buttonId', 'timeoutMs']),
+	anvil_rename: Object.freeze(['menuId', 'name', 'timeoutMs']),
 	respawn: Object.freeze([]),
 });
 

@@ -5,11 +5,13 @@ import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import java.util.Locale;
+import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Objects;
 import java.util.Set;
 
 public final class AgentControlCommandBuilder {
-	private static final Set<String> AGENT_OPERATIONS = Set.of("stop", "resume", "remove", "status");
+	private static final Set<String> AGENT_OPERATIONS = Set.of("stop", "resume", "respawn", "remove", "status", "auto");
 	private static final Set<String> PROMPT_OPERATIONS = Set.of("start", "queue", "steer");
 
 	private AgentControlCommandBuilder() {
@@ -26,7 +28,8 @@ public final class AgentControlCommandBuilder {
 			String optionalName,
 			AgentGameMode gameMode
 	) {
-		return summon(provider, model, reasoning, "priority", optionalName, gameMode);
+		return summon(provider, model, reasoning,
+				AgentControlCatalog.defaultServiceTier(provider, model), optionalName, gameMode);
 	}
 
 	public static String summon(
@@ -65,6 +68,32 @@ public final class AgentControlCommandBuilder {
 	public static String prompt(String operation, String agentId, String prompt) {
 		String checkedOperation = requireOperation(operation, PROMPT_OPERATIONS);
 		return "codex " + checkedOperation + " " + AgentId.parse(agentId) + " " + normalizePrompt(prompt);
+	}
+
+	public static String saveGroup(String name, List<String> agentIds) {
+		String checkedName = StringArgumentType.escapeIfRequired(AgentControlGroup.normalizeName(name));
+		List<String> checkedIds = List.copyOf(Objects.requireNonNull(agentIds, "agentIds must not be null"));
+		if (checkedIds.isEmpty() || checkedIds.size() > AgentControlGroup.MAX_MEMBERS) {
+			throw new IllegalArgumentException("A saved group must contain 1 to 16 agents");
+		}
+		List<String> canonicalIds = checkedIds.stream().map(value -> AgentId.parse(value).toString()).toList();
+		if (new LinkedHashSet<>(canonicalIds).size() != canonicalIds.size()) {
+			throw new IllegalArgumentException("A saved group cannot contain the same agent twice");
+		}
+		return "codex group save " + checkedName + " " + String.join(" ", canonicalIds);
+	}
+
+	public static String spawnGroup(String name) {
+		return groupOperation("spawn", name);
+	}
+
+	public static String deleteGroup(String name) {
+		return groupOperation("delete", name);
+	}
+
+	private static String groupOperation(String operation, String name) {
+		return "codex group " + operation + " "
+				+ StringArgumentType.escapeIfRequired(AgentControlGroup.normalizeName(name));
 	}
 
 	private static String requireOperation(String operation, Set<String> allowed) {

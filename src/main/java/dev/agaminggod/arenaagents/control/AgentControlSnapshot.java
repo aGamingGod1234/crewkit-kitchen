@@ -14,14 +14,15 @@ public record AgentControlSnapshot(
 		String automationStatus,
 		long generatedAtEpochMs,
 		List<AgentControlAgent> agents,
+		List<AgentControlGroup> groups,
 		List<AgentControlModelOption> catalog
 ) {
-	public static final int SCHEMA_VERSION = 5;
+	public static final int SCHEMA_VERSION = 6;
 	public static final int MAX_AGENTS = AgentConstants.DEFAULT_AGENT_LIMIT;
 
 	public AgentControlSnapshot(boolean canControl, long generatedAtEpochMs, List<AgentControlAgent> agents) {
 		this(SCHEMA_VERSION, canControl, true, "Automation ready", generatedAtEpochMs, agents,
-				AgentControlCatalog.currentOptions());
+				List.of(), AgentControlCatalog.currentOptions());
 	}
 
 	public AgentControlSnapshot(
@@ -32,7 +33,20 @@ public record AgentControlSnapshot(
 			List<AgentControlAgent> agents
 	) {
 		this(SCHEMA_VERSION, canControl, automationAvailable, automationStatus, generatedAtEpochMs, agents,
-				AgentControlCatalog.currentOptions());
+				List.of(), AgentControlCatalog.currentOptions());
+	}
+
+	public AgentControlSnapshot(
+			int schemaVersion,
+			boolean canControl,
+			boolean automationAvailable,
+			String automationStatus,
+			long generatedAtEpochMs,
+			List<AgentControlAgent> agents,
+			List<AgentControlModelOption> catalog
+	) {
+		this(schemaVersion, canControl, automationAvailable, automationStatus, generatedAtEpochMs,
+				agents, List.of(), catalog);
 	}
 
 	public AgentControlSnapshot {
@@ -47,12 +61,16 @@ public record AgentControlSnapshot(
 			throw new IllegalArgumentException("automationStatus must contain 1 to 160 characters");
 		}
 		agents = List.copyOf(Objects.requireNonNull(agents, "agents must not be null"));
+		groups = List.copyOf(Objects.requireNonNull(groups, "groups must not be null"));
 		catalog = List.copyOf(Objects.requireNonNull(catalog, "catalog must not be null"));
 		if (agents.size() > MAX_AGENTS) {
 			throw new IllegalArgumentException("Control snapshot exceeds the supported agent limit");
 		}
 		if (catalog.isEmpty() || catalog.size() > AgentControlModelOption.MAX_OPTIONS) {
 			throw new IllegalArgumentException("Control snapshot catalog has an invalid item count");
+		}
+		if (groups.size() > AgentControlGroup.MAX_GROUPS) {
+			throw new IllegalArgumentException("Control snapshot exceeds the saved-group limit");
 		}
 	}
 
@@ -93,7 +111,23 @@ public record AgentControlSnapshot(
 		AgentControlSnapshot ready = fromRecords(canControl, generatedAtEpochMs, records);
 		return new AgentControlSnapshot(
 				SCHEMA_VERSION, canControl, automationAvailable, automationStatus,
-				generatedAtEpochMs, ready.agents(), catalog
+				generatedAtEpochMs, ready.agents(), List.of(), catalog
+		);
+	}
+
+	public static AgentControlSnapshot fromRecords(
+			boolean canControl,
+			boolean automationAvailable,
+			String automationStatus,
+			long generatedAtEpochMs,
+			List<AgentRecord> records,
+			List<AgentControlGroup> groups,
+			List<AgentControlModelOption> catalog
+	) {
+		AgentControlSnapshot ready = fromRecords(canControl, generatedAtEpochMs, records);
+		return new AgentControlSnapshot(
+				SCHEMA_VERSION, canControl, automationAvailable, automationStatus,
+				generatedAtEpochMs, ready.agents(), groups, catalog
 		);
 	}
 

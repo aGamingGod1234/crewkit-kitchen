@@ -15,7 +15,7 @@ public final class ScenarioSetupStateVerification {
 		assertEquals(ScenarioWizardStep.ARENA, state.step(), "arena tab starts at preset selection");
 		assertEquals(ScenarioPreset.LAST_VALLEY, state.selectedScenario(), "survival preset is the safe default");
 		assertEquals(1, state.roster().size(), "wizard starts with one agent");
-		assertEquals("GPT 5.6 Sol", state.displayNameAt(0), "default model has a readable name");
+		assertEquals("GPT 5.6 Luna", state.displayNameAt(0), "default model has a readable name");
 		assertEquals(AgentGameMode.SURVIVAL, state.roster().getFirst().gameMode(), "survival is the default game mode");
 		assertions += 5;
 
@@ -33,8 +33,8 @@ public final class ScenarioSetupStateVerification {
 
 		state.selectScenario(ScenarioPreset.CITADEL_COLLAPSE);
 		assertEquals(2, state.roster().size(), "PvP enforces its two-agent minimum");
-		assertEquals("GPT 5.6 Sol", state.displayNameAt(0), "first duplicate has no suffix");
-		assertEquals("GPT 5.6 Sol (1)", state.displayNameAt(1), "second duplicate starts at one");
+		assertEquals("GPT 5.6 Luna", state.displayNameAt(0), "first duplicate has no suffix");
+		assertEquals("GPT 5.6 Luna (1)", state.displayNameAt(1), "second duplicate starts at one");
 		assertions += 3;
 
 		state.setAgentCount(4);

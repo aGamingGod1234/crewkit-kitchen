@@ -63,18 +63,43 @@ public final class AgentControlVerification {
 		assertTrue(agent.entityPresent(), "snapshot carries entity presence");
 		assertTrue(decoded.automationAvailable(), "legacy ready snapshot reports available automation");
 		assertEquals("Automation ready", decoded.automationStatus(), "snapshot carries a human-readable readiness message");
+		AgentControlGroup group = new AgentControlGroup("Builders", List.of(AGENT_UUID));
+		AgentControlGroup canonicalGroup = new AgentControlGroup(
+				"Canonical", List.of(AGENT_UUID.toUpperCase(java.util.Locale.ROOT))
+		);
+		assertEquals(List.of(AGENT_UUID), canonicalGroup.memberIds(),
+				"saved group canonicalizes persistent identity spelling");
+		expectFailure(() -> new AgentControlGroup(
+				"Duplicate identities", List.of(AGENT_UUID, AGENT_UUID.toUpperCase(java.util.Locale.ROOT))
+		), "saved group rejects UUID casing duplicates");
+		AgentControlSnapshot grouped = new AgentControlSnapshot(
+				AgentControlSnapshot.SCHEMA_VERSION,
+				true,
+				true,
+				"Automation ready",
+				NOW_EPOCH_MS,
+				List.of(agent),
+				List.of(group),
+				AgentControlCatalog.currentOptions()
+		);
+		assertEquals(List.of(group), AgentControlSnapshotCodec.decode(
+				AgentControlSnapshotCodec.encode(grouped)).groups(), "snapshot carries saved identity groups");
 		expectFailure(() -> AgentControlSnapshotCodec.decode("{\"schemaVersion\":999}"), "unsupported snapshot schema");
 		expectFailure(
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
 				"snapshot agent bound"
 		);
-		return 11;
+		return 14;
 	}
 
 	private static int verifyProviderPresets() {
 		assertEquals(List.of("codex", "gemini", "kimi"), AgentControlCatalog.providers(), "provider order");
-		assertEquals("gpt-5.6-sol", AgentControlCatalog.defaultModel("codex"), "Codex model default");
+		assertEquals("gpt-5.6-luna", AgentControlCatalog.defaultModel("codex"), "Codex model default");
+		assertEquals("xhigh", AgentControlCatalog.defaultReasoning("codex", "gpt-5.6-luna"), "Codex reasoning default");
+		assertEquals("fast", AgentControlCatalog.defaultServiceTier("codex", "gpt-5.6-luna"), "Codex speed default");
 		assertEquals("gemini-3.1-pro", AgentControlCatalog.defaultModel("gemini"), "Gemini model default");
+		assertEquals("priority", AgentControlCatalog.defaultServiceTier("gemini", "gemini-3.1-pro"),
+				"non-Codex speed default");
 		assertEquals("kimi-code/k3", AgentControlCatalog.defaultModel("kimi"), "Kimi model default");
 		assertEquals(List.of("high", "low"), AgentControlCatalog.reasoningEfforts("gemini", "gemini-3.1-pro"),
 				"Gemini Pro efforts");
@@ -100,12 +125,12 @@ public final class AgentControlVerification {
 		assertTrue(!AgentControlCatalog.hasSpeedMode("gemini", "gemini-3.1-pro"),
 				"providers without a speed capability do not show a fake speed choice");
 		expectFailure(() -> AgentControlCatalog.defaultModel("unknown"), "unknown provider");
-		return 15;
+		return 18;
 	}
 
 	private static int verifyCommandConstruction() {
 		assertEquals(
-				"codex summon-configured codex gpt-5.6-sol high priority survival \"Builder One\"",
+				"codex summon-configured codex gpt-5.6-sol high fast survival \"Builder One\"",
 				AgentControlCommandBuilder.summon("codex", "gpt-5.6-sol", "high", "Builder One"),
 				"Codex summon command"
 		);
@@ -130,19 +155,29 @@ public final class AgentControlVerification {
 				AgentControlCommandBuilder.agent("stop", AGENT_UUID),
 				"agent lifecycle command"
 		);
+		assertEquals(
+				"codex respawn " + AGENT_UUID,
+				AgentControlCommandBuilder.agent("respawn", AGENT_UUID),
+				"dead-agent respawn command"
+		);
+		assertEquals(
+				"codex group save Builders " + AGENT_UUID,
+				AgentControlCommandBuilder.saveGroup("Builders", List.of(AGENT_UUID)),
+				"saved group command"
+		);
+		assertEquals("codex group spawn Builders", AgentControlCommandBuilder.spawnGroup("Builders"),
+				"spawn saved group command");
+		assertEquals("codex group delete Builders", AgentControlCommandBuilder.deleteGroup("Builders"),
+				"delete saved group command");
 		expectFailure(
 				() -> AgentControlCommandBuilder.agent("remove;op", AGENT_UUID),
 				"operation allowlist"
 		);
 		expectFailure(
-				() -> AgentControlCommandBuilder.agent("respawn", AGENT_UUID),
-				"respawn is model-only"
-		);
-		expectFailure(
 				() -> AgentControlCommandBuilder.prompt("start", AGENT_UUID, " "),
 				"blank prompt"
 		);
-		return 7;
+		return 11;
 	}
 
 	private static int verifySelectionStability() {
@@ -164,7 +199,20 @@ public final class AgentControlVerification {
 		assertEquals(second.agentId(), AgentControlSelection.resolveSelected(
 				"missing", java.util.Set.of(second.agentId()), List.of(first, second)
 		), "snapshot refresh keeps the visual anchor inside the command selection");
-		return 8;
+		List<AgentControlGroup> groups = List.of(
+				new AgentControlGroup("Builders", List.of(first.agentId(), second.agentId())),
+				new AgentControlGroup("Scouts", List.of(second.agentId()))
+		);
+		assertEquals("Builders", AgentControlGroupSelection.resolve("", groups),
+				"first saved group is selected initially");
+		assertEquals("Scouts", AgentControlGroupSelection.resolve("Scouts", groups),
+				"saved group selection survives snapshot refresh");
+		assertEquals("Builders", AgentControlGroupSelection.resolve("Deleted", groups),
+				"deleted saved group falls back to the first roster");
+		assertEquals(List.of(first.agentId(), second.agentId()),
+				AgentControlGroupSelection.members("Builders", groups),
+				"loading a saved group restores its ordered persistent identities");
+		return 12;
 	}
 
 	private static int verifyRuntimeCatalogBecomesAuthoritative() {
@@ -196,7 +244,7 @@ public final class AgentControlVerification {
 		} finally {
 			AgentControlCatalog.resetRuntimeCatalog();
 		}
-		assertEquals("gpt-5.6-sol", AgentControlCatalog.defaultModel("codex"),
+		assertEquals("gpt-5.6-luna", AgentControlCatalog.defaultModel("codex"),
 				"disconnect reset restores the safe fallback catalog");
 		return 7;
 	}
@@ -220,7 +268,7 @@ public final class AgentControlVerification {
 		assertTrue(AgentControlActions.supports(acting, "steer"), "active goal can be steered");
 		assertTrue(AgentControlActions.supports(paused, "resume"), "paused agent can resume");
 		assertTrue(AgentControlActions.supports(disconnected, "resume"), "disconnected agent can resume after coordinator recovery");
-		assertTrue(!AgentControlActions.supports(dead, "respawn"), "dead agent has no operator respawn action");
+		assertTrue(AgentControlActions.supports(dead, "respawn"), "dead agent exposes operator respawn");
 		assertTrue(!AgentControlActions.supports(idle, "respawn"), "living agent has no respawn action");
 		assertTrue(!AgentControlActions.everySupports(List.of(paused, acting), "resume"),
 				"batch action is disabled when any selected agent is incompatible");
@@ -228,8 +276,8 @@ public final class AgentControlVerification {
 				"technical starting state is presented as plain language");
 		assertEquals("Working", AgentControlPresentation.stateLabel("ACTING"),
 				"technical acting state is presented as plain language");
-		assertEquals("Dead - awaiting model", AgentControlPresentation.stateLabel("DEAD"),
-				"dead state does not advertise an operator respawn affordance");
+		assertEquals("Dead - ready to respawn", AgentControlPresentation.stateLabel("DEAD"),
+				"dead state advertises the operator respawn affordance");
 		assertEquals("GPT 5.6 Sol | High", AgentControlPresentation.profileLabel(idle),
 				"agent profile copy is human readable");
 		assertEquals("Fast mode", AgentControlPresentation.speedLabel("fast"),

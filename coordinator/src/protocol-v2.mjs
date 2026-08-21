@@ -10,6 +10,7 @@ import {
 	MAX_BRIDGE_SECRET_LENGTH,
 	MAX_BLOCKS,
 	MAX_CHAT_LENGTH,
+	MAX_CONVERSATION_LENGTH,
 	MAX_COMMAND_ID_LENGTH,
 	MAX_EFFECTS,
 	MAX_ENTITIES,
@@ -36,6 +37,9 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'coordinator_status',
 	'agent_ready',
 	'planning_state',
+	'goal_completed',
+	'conversation_wake_ack',
+	'conversation_wake_request',
 	'action_command',
 	'action_cancel',
 	'agent_error',
@@ -49,6 +53,8 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'agent_removed',
 	'goal_control',
 	'observation',
+	'conversation_event',
+	'conversation_wake',
 	'action_progress',
 	'action_result',
 	'heartbeat',
@@ -57,8 +63,8 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
-const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'action_progress', 'action_result']);
-const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'action_command', 'action_cancel', 'agent_error']);
+const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'conversation_event', 'action_progress', 'action_result']);
+const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'conversation_wake_request', 'action_command', 'action_cancel', 'agent_error']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
@@ -113,6 +119,12 @@ export function validateProtocolV2Envelope(value, { direction } = {}) {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use agentId 'server'`);
 	}
 	const payload = validateProtocolV2Payload(type, value.payload);
+	if (type === 'conversation_event' && payload.recipientId !== agentId) {
+		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', 'conversation_event recipientId must match the envelope agentId');
+	}
+	if (type === 'conversation_wake' && payload.event.recipientId !== agentId) {
+		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', 'conversation_wake event recipientId must match the envelope agentId');
+	}
 	return { protocolVersion: MULTIPLEXED_PROTOCOL_VERSION, serverInstanceId, agentId, type, messageId, payload };
 }
 
@@ -146,6 +158,10 @@ export function validateProtocolV2Payload(type, value) {
 			return normalizeGoalControl(value);
 		case 'observation':
 			return normalizeObservation(value);
+		case 'conversation_event':
+			return normalizeConversationEvent(value);
+		case 'conversation_wake':
+			return normalizeConversationWake(value);
 		case 'action_progress':
 			return normalizeActionProgress(value);
 		case 'action_result':
@@ -158,6 +174,23 @@ export function validateProtocolV2Payload(type, value) {
 		case 'planning_state':
 			exactKeys(value, ['goalRevision', 'state'], ['goalRevision', 'state'], type);
 			return { goalRevision: revision(value.goalRevision, 'goalRevision'), state: boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH) };
+		case 'goal_completed':
+			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
+			return { goalRevision: revision(value.goalRevision, 'goalRevision') };
+		case 'conversation_wake_ack':
+			exactKeys(value, ['transactionId', 'goalRevision'], ['transactionId', 'goalRevision'], type);
+			return {
+				transactionId: requireIdentifier(value.transactionId, 'transactionId'),
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
+			};
+		case 'conversation_wake_request': {
+			exactKeys(value, ['goalRevision', 'kind'], ['goalRevision', 'kind'], type);
+			const kind = requireIdentifier(value.kind, 'kind');
+			if (!['player_message', 'proximity_speech'].includes(kind)) {
+				throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake_request kind is invalid');
+			}
+			return { goalRevision: revision(value.goalRevision, 'goalRevision'), kind };
+		}
 		case 'action_command':
 			return normalizeActionCommand(value);
 		case 'action_cancel':
@@ -378,19 +411,20 @@ export class MultiplexedServerBridge extends EventEmitter {
 			this.#observedRevisions.set(envelope.agentId, envelope.payload.goalRevision);
 			return;
 		}
-		if (envelope.type !== 'goal_control') return;
-		const next = envelope.payload.goalRevision;
+		if (envelope.type !== 'goal_control' && envelope.type !== 'conversation_wake') return;
+		const control = envelope.type === 'conversation_wake' ? envelope.payload.control : envelope.payload;
+		const next = control.goalRevision;
 		const current = this.#trackedRevision(envelope.agentId);
 		if (current !== null && current !== undefined) {
-			if (envelope.payload.operation === 'queue' && next !== current) {
+			if (control.operation === 'queue' && next !== current) {
 				throw new ProtocolV2Error('STALE_GOAL_REVISION', `Queued goal revision ${next} does not match current revision ${current}`);
 			}
-			if (envelope.payload.operation !== 'queue' && next < current) {
+			if (control.operation !== 'queue' && next < current) {
 				throw new ProtocolV2Error('STALE_GOAL_REVISION', `Goal revision ${next} moved backwards from ${current}`);
 			}
 		}
 		this.#observedRevisions.set(envelope.agentId, next);
-		if (envelope.payload.operation !== 'queue' && (current === null || current === undefined || next > current)) {
+		if (control.operation !== 'queue' && (current === null || current === undefined || next > current)) {
 			this.#dropSupersededQueuedMessages(envelope.agentId, next);
 		}
 	}
@@ -681,8 +715,52 @@ function normalizeDeath(value) {
 	});
 }
 
+function normalizeConversationEvent(value) {
+	exactKeys(
+		value,
+		['sequence', 'kind', 'sourceId', 'recipientId', 'scope', 'text', 'goalRevision', 'observedAtEpochMs'],
+		['sequence', 'kind', 'sourceId', 'recipientId', 'scope', 'text', 'goalRevision', 'observedAtEpochMs'],
+		'conversation_event',
+	);
+	const kind = requireIdentifier(value.kind, 'conversation_event.kind');
+	if (!['agent_message', 'player_message', 'player_steer', 'proximity_speech'].includes(kind)) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_event.kind is invalid');
+	}
+	const scope = requireIdentifier(value.scope, 'conversation_event.scope');
+	if (!['public', 'direct', 'proximity'].includes(scope)) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_event.scope is invalid');
+	}
+	return {
+		sequence: nonnegativeInteger(value.sequence, 'conversation_event.sequence'),
+		kind,
+		sourceId: boundedText(value.sourceId, 'conversation_event.sourceId', MAX_IDENTIFIER_LENGTH),
+		recipientId: boundedText(value.recipientId, 'conversation_event.recipientId', MAX_IDENTIFIER_LENGTH),
+		scope,
+		text: boundedCodePointText(value.text, 'conversation_event.text', MAX_CONVERSATION_LENGTH),
+		goalRevision: revision(value.goalRevision, 'conversation_event.goalRevision'),
+		observedAtEpochMs: nonnegativeInteger(value.observedAtEpochMs, 'conversation_event.observedAtEpochMs'),
+	};
+}
+
+function normalizeConversationWake(value) {
+	exactKeys(value, ['transactionId', 'event', 'control'], ['transactionId', 'event', 'control'], 'conversation_wake');
+	const event = normalizeConversationEvent(value.event);
+	const control = normalizeGoalControl(value.control);
+	if (control.operation !== 'start') {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake control must be start');
+	}
+	if (event.goalRevision === Number.MAX_SAFE_INTEGER || control.goalRevision !== event.goalRevision + 1) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake control revision must immediately follow the event revision');
+	}
+	return {
+		transactionId: requireIdentifier(value.transactionId, 'transactionId'),
+		event,
+		control,
+	};
+}
+
 function normalizeObservation(value) {
-	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult'];
+	const allowed = ['goalRevision', 'observedAtEpochMs', 'ready', 'status', 'eventSequence', 'attention', 'changedFacts', 'position', 'velocity', 'view', 'player', 'inventory', 'entities', 'blocks', 'nearbyContainers', 'world', 'currentAction', 'lastResult', 'interaction'];
 	exactKeys(value, allowed, ['goalRevision', 'observedAtEpochMs', 'ready', 'status'], 'observation');
 	const normalized = {
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
@@ -698,7 +776,7 @@ function normalizeObservation(value) {
 		if (normalized.attention === false && normalized.changedFacts?.length > 0) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Non-attention observation cannot contain changed facts');
 		return normalized;
 	}
-	for (const key of allowed.slice(4)) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
+	for (const key of allowed.slice(4).filter((field) => field !== 'interaction')) if (!Object.hasOwn(value, key)) throw new ProtocolV2Error('MISSING_FIELD', `observation field '${key}' is required when ready`);
 	normalized.eventSequence = positiveInteger(value.eventSequence, 'eventSequence');
 	normalized.attention = boolean(value.attention, 'attention');
 	normalized.changedFacts = changedFactPaths(value.changedFacts);
@@ -714,7 +792,91 @@ function normalizeObservation(value) {
 	normalized.world = worldObservation(value.world);
 	normalized.currentAction = currentActionObservation(value.currentAction);
 	normalized.lastResult = lastResultObservation(value.lastResult);
+	if (value.interaction !== undefined) normalized.interaction = interactionObservation(value.interaction);
 	return normalized;
+}
+
+function interactionObservation(value) {
+	exactKeys(
+		value,
+		['mainHandItemId', 'offHandItemId', 'usingItem', 'activeHand', 'useRemainingTicks', 'attackCooldown', 'input', 'menu', 'rayTarget'],
+		['mainHandItemId', 'offHandItemId', 'usingItem', 'activeHand', 'useRemainingTicks', 'attackCooldown', 'input', 'menu', 'rayTarget'],
+		'interaction',
+	);
+	const activeHand = requireIdentifier(value.activeHand, 'interaction.activeHand');
+	if (!['none', 'main_hand', 'off_hand'].includes(activeHand)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'interaction.activeHand is invalid');
+	exactKeys(
+		value.input,
+		['active', 'forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand'],
+		['active', 'forward', 'strafe', 'jump', 'sneak', 'sprint', 'attack', 'use', 'yaw', 'pitch', 'selectedSlot', 'hand'],
+		'interaction.input',
+	);
+	const hand = requireIdentifier(value.input.hand, 'interaction.input.hand');
+	if (!['main_hand', 'off_hand'].includes(hand)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'interaction.input.hand is invalid');
+	const selectedSlot = nonnegativeInteger(value.input.selectedSlot, 'interaction.input.selectedSlot');
+	if (selectedSlot > 8) throw new ProtocolV2Error('INVALID_PAYLOAD', 'interaction.input.selectedSlot must be in [0, 8]');
+	exactKeys(value.menu, ['type', 'cursor', 'slots', 'capabilities'], ['type', 'cursor', 'slots', 'capabilities'], 'interaction.menu');
+	exactKeys(value.menu.cursor, ['itemId', 'count'], ['itemId', 'count'], 'interaction.menu.cursor');
+	const menuSlots = boundedArray(value.menu.slots, 'interaction.menu.slots', 64).map((slot, index) => {
+		exactKeys(slot, ['slot', 'itemId', 'count'], ['slot', 'itemId', 'count'], `interaction.menu.slots[${index}]`);
+		const slotIndex = nonnegativeInteger(slot.slot, `interaction.menu.slots[${index}].slot`);
+		if (slotIndex > 255) throw new ProtocolV2Error('INVALID_PAYLOAD', `interaction.menu.slots[${index}].slot must be at most 255`);
+		return {
+			slot: slotIndex,
+			itemId: requireIdentifier(slot.itemId, `interaction.menu.slots[${index}].itemId`),
+			count: nonnegativeInteger(slot.count, `interaction.menu.slots[${index}].count`),
+		};
+	});
+	const menuCapabilities = boundedArray(value.menu.capabilities, 'interaction.menu.capabilities', 8)
+		.map((capability, index) => requireIdentifier(capability, `interaction.menu.capabilities[${index}]`));
+	const rayAllowed = ['type', 'x', 'y', 'z', 'face', 'blockId'];
+	exactKeys(value.rayTarget, rayAllowed, ['type'], 'interaction.rayTarget');
+	const rayType = requireIdentifier(value.rayTarget.type, 'interaction.rayTarget.type');
+	if (!['miss', 'block', 'entity'].includes(rayType)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'interaction.rayTarget.type is invalid');
+	if (rayType === 'block') {
+		for (const field of ['x', 'y', 'z', 'face', 'blockId']) if (!Object.hasOwn(value.rayTarget, field)) throw new ProtocolV2Error('MISSING_FIELD', `interaction.rayTarget.${field} is required for a block`);
+	} else if (Object.keys(value.rayTarget).length !== 1) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'non-block ray targets must not contain block fields');
+	}
+	return {
+		mainHandItemId: requireIdentifier(value.mainHandItemId, 'interaction.mainHandItemId'),
+		offHandItemId: requireIdentifier(value.offHandItemId, 'interaction.offHandItemId'),
+		usingItem: boolean(value.usingItem, 'interaction.usingItem'),
+		activeHand,
+		useRemainingTicks: nonnegativeInteger(value.useRemainingTicks, 'interaction.useRemainingTicks'),
+		attackCooldown: finiteNumber(value.attackCooldown, 'interaction.attackCooldown'),
+		input: {
+			active: boolean(value.input.active, 'interaction.input.active'),
+			forward: finiteNumber(value.input.forward, 'interaction.input.forward'),
+			strafe: finiteNumber(value.input.strafe, 'interaction.input.strafe'),
+			jump: boolean(value.input.jump, 'interaction.input.jump'),
+			sneak: boolean(value.input.sneak, 'interaction.input.sneak'),
+			sprint: boolean(value.input.sprint, 'interaction.input.sprint'),
+			attack: boolean(value.input.attack, 'interaction.input.attack'),
+			use: boolean(value.input.use, 'interaction.input.use'),
+			yaw: finiteNumber(value.input.yaw, 'interaction.input.yaw'),
+			pitch: finiteNumber(value.input.pitch, 'interaction.input.pitch'),
+			selectedSlot,
+			hand,
+		},
+		menu: {
+			type: requireIdentifier(value.menu.type, 'interaction.menu.type'),
+			cursor: {
+				itemId: requireIdentifier(value.menu.cursor.itemId, 'interaction.menu.cursor.itemId'),
+				count: nonnegativeInteger(value.menu.cursor.count, 'interaction.menu.cursor.count'),
+			},
+			slots: menuSlots,
+			capabilities: menuCapabilities,
+		},
+		rayTarget: rayType === 'block' ? {
+			type: rayType,
+			x: integer(value.rayTarget.x, 'interaction.rayTarget.x'),
+			y: integer(value.rayTarget.y, 'interaction.rayTarget.y'),
+			z: integer(value.rayTarget.z, 'interaction.rayTarget.z'),
+			face: requireIdentifier(value.rayTarget.face, 'interaction.rayTarget.face'),
+			blockId: requireIdentifier(value.rayTarget.blockId, 'interaction.rayTarget.blockId'),
+		} : { type: rayType },
+	};
 }
 
 function changedFactPaths(value) {
@@ -1036,6 +1198,13 @@ function isExactArray(value) {
 
 function boundedText(value, field, maximum, minimum = 1) {
 	if (typeof value !== 'string' || value.length < minimum || value.length > maximum || (minimum > 0 && value.trim().length === 0)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must contain ${minimum} to ${maximum} characters`);
+	return value;
+}
+
+function boundedCodePointText(value, field, maximum) {
+	if (typeof value !== 'string') throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a string`);
+	if (value.trim().length === 0) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must not be blank`);
+	if ([...value].length > maximum) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must contain at most ${maximum} code points`);
 	return value;
 }
 

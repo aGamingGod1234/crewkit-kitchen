@@ -116,6 +116,33 @@ test('coalesces unmatched continue policy notifications and ignores stale events
 	assert.deepEqual(dispatched.map((row) => row.action.type), ['wait']);
 });
 
+test('requests one selected-model recovery after an identical deterministic action failure repeats', () => {
+	const { engine, dispatched, modelRequests } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		await program.repeatUntil(() => false, { maxIterations: 8 }, async () => {
+			await player.craftInventory({ recipeId: "minecraft:planks", count: 1, timeoutMs: 5000 });
+		});
+	`);
+	const first = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: first.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND', eventSequence: 2 });
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: false });
+	const second = dispatched.at(-1);
+	assert.notEqual(second.actionId, first.actionId);
+	engine.ingestActionResult({ actionId: second.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND', eventSequence: 3 });
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: false });
+	assert.equal(dispatched.length, 2, 'the failed command is not dispatched a third time');
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	assert.equal(modelRequests.length, 1);
+	assert.equal(modelRequests[0].decisionContext, 'program_action_failure');
+	assert.deepEqual({ ...modelRequests[0].actionFailure, arguments: { ...modelRequests[0].actionFailure.arguments } }, {
+		sourceStepId: second.provenance.stepId,
+		actionType: 'craft_inventory',
+		arguments: { recipeId: 'minecraft:planks', count: 1, timeoutMs: 5000 },
+		state: 'FAILED',
+		reasonCode: 'RECIPE_NOT_FOUND',
+	});
+});
+
 test('fences a replacement behind cancellation and rejects an old action result by generation', () => {
 	const { engine, dispatched, cancelled } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
 	const old = dispatched.at(-1);

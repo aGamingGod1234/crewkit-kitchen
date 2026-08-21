@@ -140,9 +140,10 @@ class AcpAgent {
 		let currentOptions = configOptions;
 		if (this.#profile.model !== 'auto') {
 			const model = findOption(currentOptions, 'model');
-			assertOptionValue(model, this.#profile.model, 'UNSUPPORTED_MODEL', `${this.provider} model`);
-			if (model.currentValue !== this.#profile.model) {
-				currentOptions = await this.#setConfig(model.id, this.#profile.model, currentOptions);
+			const requestedModel = resolveKimiApiKeyModel(this.provider, this.#profile.model, model);
+			assertOptionValue(model, requestedModel, 'UNSUPPORTED_MODEL', `${this.provider} model`);
+			if (model.currentValue !== requestedModel) {
+				currentOptions = await this.#setConfig(model.id, requestedModel, currentOptions);
 			}
 		}
 		const thinking = findOption(currentOptions, 'thought_level', { optional: this.provider === 'kimi' });
@@ -207,6 +208,12 @@ class AcpAgent {
 			if (signal?.aborted || goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_PLAN', `${this.provider} result belongs to an obsolete goal`);
 			if (response?.stopReason !== 'end_turn') throw new AcpProtocolError('INCOMPLETE_TURN', `${this.provider} ACP stopped with '${String(response?.stopReason)}'`);
 			const decisionText = chunks.join('');
+			if (this.provider === 'kimi' && decisionText.trim().length === 0) {
+				throw new AcpProtocolError(
+					'PROVIDER_UNAVAILABLE',
+					'Kimi ended the turn without a response. Verify the Kimi CLI login and membership entitlement.',
+				);
+			}
 			try {
 				return parseDecision(decisionText);
 			} catch (error) {
@@ -225,6 +232,20 @@ class AcpAgent {
 
 	interrupt() { if (this.#sessionId !== null) this.#transport.notify('session/cancel', { sessionId: this.#sessionId }); }
 	async dispose() { if (this.#disposed) return; this.#disposed = true; if (this.#active) this.interrupt(); await this.#transport.stop(); }
+}
+
+function resolveKimiApiKeyModel(provider, requestedModel, modelOption) {
+	if (provider !== 'kimi') return requestedModel;
+	const apiKeyModel = {
+		'kimi-code/k3': 'moonshot-ai/kimi-k3',
+		'kimi-code/kimi-for-coding': 'moonshot-ai/kimi-k2.7-code',
+		'kimi-code/kimi-for-coding-highspeed': 'moonshot-ai/kimi-k2.7-code-highspeed',
+	}[requestedModel];
+	if (apiKeyModel === undefined) return requestedModel;
+	return Array.isArray(modelOption?.options)
+		&& modelOption.options.some((option) => option?.value === apiKeyModel)
+		? apiKeyModel
+		: requestedModel;
 }
 
 function decisionExcerpt(value) {

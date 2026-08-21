@@ -14,6 +14,8 @@ import dev.agaminggod.arenaagents.control.AgentControlActions;
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlCommandBuilder;
+import dev.agaminggod.arenaagents.control.AgentControlGroup;
+import dev.agaminggod.arenaagents.control.AgentControlGroupSelection;
 import dev.agaminggod.arenaagents.control.AgentControlPresentation;
 import dev.agaminggod.arenaagents.control.AgentControlSelection;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
@@ -24,6 +26,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -57,10 +60,12 @@ public final class AgentControlScreen extends Screen {
 	private String provider;
 	private String model;
 	private String reasoning;
-	private String serviceTier = "priority";
+	private String serviceTier;
 	private AgentGameMode gameMode = AgentGameMode.SURVIVAL;
 	private String name = "";
 	private String prompt = "";
+	private String savedGroupName = "";
+	private String selectedSavedGroupName = "";
 	private String feedback = "";
 	private boolean feedbackError;
 	private boolean selectNewlySummonedAgent;
@@ -68,6 +73,7 @@ public final class AgentControlScreen extends Screen {
 	private int liveScroll;
 	private Page page = Page.OVERVIEW;
 	private ConsoleEditBox nameInput;
+	private ConsoleEditBox groupNameInput;
 	private MultiLineEditBox promptInput;
 
 	public AgentControlScreen() {
@@ -96,8 +102,12 @@ public final class AgentControlScreen extends Screen {
 		if (!AgentControlCatalog.reasoningEfforts(provider, model).contains(reasoning)) {
 			reasoning = AgentControlCatalog.defaultReasoning(provider, model);
 		}
+		serviceTier = AgentControlCatalog.defaultServiceTier(provider, model);
 		snapshot = AgentControlClient.snapshot().orElse(null);
-		if (snapshot != null) selectedAgentId = AgentControlSelection.resolve("", snapshot.agents());
+		if (snapshot != null) {
+			selectedAgentId = AgentControlSelection.resolve("", snapshot.agents());
+			selectSavedGroup(AgentControlGroupSelection.resolve("", snapshot.groups()));
+		}
 	}
 
 	public static AgentControlScreen live(Screen parent) {
@@ -115,6 +125,8 @@ public final class AgentControlScreen extends Screen {
 			feedback = "";
 		}
 		groupSelectedAgentIds.retainAll(snapshot.agents().stream().map(AgentControlAgent::agentId).toList());
+		String resolvedGroup = AgentControlGroupSelection.resolve(selectedSavedGroupName, snapshot.groups());
+		if (!resolvedGroup.equals(selectedSavedGroupName)) selectSavedGroup(resolvedGroup);
 		if (selectNewlySummonedAgent) {
 			for (AgentControlAgent agent : snapshot.agents()) {
 				boolean existed = previous != null && previous.agents().stream()
@@ -136,6 +148,7 @@ public final class AgentControlScreen extends Screen {
 	@Override
 	protected void init() {
 		nameInput = null;
+		groupNameInput = null;
 		promptInput = null;
 		addNavigation();
 		switch (page) {
@@ -300,7 +313,11 @@ public final class AgentControlScreen extends Screen {
 	private void initGroup() {
 		AgentControlLayout layout = layout();
 		int top = layout.contentTop() + (layout.sideNavigation() ? 24 : 0);
-		boolean columns = layout.splitWorkspace() || layout.contentWidth() >= 500;
+		boolean toolbarInFooter = layout.groupToolbarInFooter();
+		int bodyTop = toolbarInFooter
+				? top
+				: addSavedGroupToolbar(layout.contentLeft(), top, layout.contentWidth());
+		boolean columns = layout.groupColumns();
 		if (columns) {
 			int listX = layout.canvasLeft();
 			int listWidth = layout.splitWorkspace()
@@ -310,21 +327,69 @@ public final class AgentControlScreen extends Screen {
 					? layout.contextLeft()
 					: listX + listWidth + 12;
 			int controlWidth = layout.contentRight() - controlX;
-			addGroupRows(listX, top, listWidth);
-			promptInput = multiLineInput(controlX, top, controlWidth, 66,
+			addGroupRows(listX, bodyTop, listWidth);
+			promptInput = multiLineInput(controlX, bodyTop, controlWidth, 66,
 					"Group task", "Describe one shared outcome for the selected agents");
 			addRenderableWidget(promptInput);
-			addVerticalGroupActions(controlX, top + 74, controlWidth);
+			addVerticalGroupActions(controlX, bodyTop + 74, controlWidth);
 		} else {
-			addGroupRows(layout.contentLeft(), top, layout.contentWidth());
-			int promptY = top + 43;
+			addGroupRows(layout.contentLeft(), bodyTop, layout.contentWidth());
+			int promptY = bodyTop + 43;
 			int promptHeight = Math.max(30, layout.contentBottom() - promptY - ROW_HEIGHT - GAP);
 			promptInput = multiLineInput(layout.contentLeft(), promptY, layout.contentWidth(), promptHeight,
 					"Group task", "Tell the selected group what to do");
 			addRenderableWidget(promptInput);
 			addHorizontalGroupActions(layout.contentLeft(), layout.contentBottom() - ROW_HEIGHT, layout.contentWidth());
 		}
-		addOverviewFooter();
+		if (toolbarInFooter) {
+			addSavedGroupToolbar(layout.contentLeft(), layout.footerY(), layout.contentWidth());
+		} else {
+			addOverviewFooter();
+		}
+	}
+
+	private int addSavedGroupToolbar(int x, int y, int width) {
+		List<AgentControlGroup> groups = snapshot == null ? List.of() : snapshot.groups();
+		int gapCount = groups.isEmpty() ? 3 : 4;
+		int available = width - GAP * gapCount;
+		int selectorWidth = groups.isEmpty() ? 0 : Math.max(64, available * 28 / 100);
+		int nameWidth = Math.max(68, available * 28 / 100);
+		int buttonWidth = Math.max(32, (available - selectorWidth - nameWidth) / 3);
+		int cursor = x;
+		if (!groups.isEmpty()) {
+			AgentControlGroup selected = selectedSavedGroup().orElse(groups.getFirst());
+			addRenderableWidget(new ConsoleCycleButton<>(
+					font, cursor, y, selectorWidth, ROW_HEIGHT, Component.literal("Saved"),
+					groups, selected, group -> Component.literal(group.name()), group -> {
+						selectSavedGroup(group.name());
+						rebuildWidgets();
+					}
+			));
+			cursor += selectorWidth + GAP;
+		}
+		groupNameInput = consoleEditBox(
+				cursor, y, nameWidth, ROW_HEIGHT, "saved-group-name", Component.literal("Group name")
+		);
+		groupNameInput.setMaxLength(AgentControlGroup.MAX_NAME_CODE_POINTS);
+		groupNameInput.setValue(savedGroupName);
+		groupNameInput.setResponder(value -> savedGroupName = value);
+		addRenderableWidget(groupNameInput);
+		cursor += nameWidth + GAP;
+
+		ConsoleButton save = primaryButton("SAVE", cursor, y, buttonWidth, ROW_HEIGHT, this::saveSelectedGroup);
+		save.active = canControl() && !groupSelectedAgentIds.isEmpty();
+		addRenderableWidget(save);
+		cursor += buttonWidth + GAP;
+		ConsoleButton spawn = consoleButton("SPAWN", cursor, y, buttonWidth, ROW_HEIGHT, false, this::spawnSelectedGroup);
+		spawn.active = canControl() && selectedSavedGroup().isPresent();
+		addRenderableWidget(spawn);
+		cursor += buttonWidth + GAP;
+		ConsoleButton delete = dangerButton(
+				"DELETE", cursor, y, x + width - cursor, ROW_HEIGHT, this::deleteSelectedGroup
+		);
+		delete.active = canControl() && selectedSavedGroup().isPresent();
+		addRenderableWidget(delete);
+		return y + ROW_HEIGHT + GAP;
 	}
 
 	private void addVerticalGroupActions(int x, int y, int width) {
@@ -370,6 +435,58 @@ public final class AgentControlScreen extends Screen {
 	private void clearGroupSelection() {
 		groupSelectedAgentIds.clear();
 		rebuildWidgets();
+	}
+
+	private void selectSavedGroup(String name) {
+		selectedSavedGroupName = Objects.requireNonNullElse(name, "");
+		if (selectedSavedGroupName.isBlank()) {
+			savedGroupName = "";
+			return;
+		}
+		savedGroupName = selectedSavedGroupName;
+		if (snapshot == null) return;
+		Set<String> presentIds = snapshot.agents().stream()
+				.map(AgentControlAgent::agentId)
+				.collect(java.util.stream.Collectors.toSet());
+		groupSelectedAgentIds.clear();
+		AgentControlGroupSelection.members(selectedSavedGroupName, snapshot.groups()).stream()
+				.filter(presentIds::contains)
+				.forEach(groupSelectedAgentIds::add);
+	}
+
+	private Optional<AgentControlGroup> selectedSavedGroup() {
+		if (snapshot == null || selectedSavedGroupName.isBlank()) return Optional.empty();
+		return snapshot.groups().stream()
+				.filter(group -> group.name().equalsIgnoreCase(selectedSavedGroupName))
+				.findFirst();
+	}
+
+	private void saveSelectedGroup() {
+		try {
+			String normalizedName = AgentControlGroup.normalizeName(savedGroupName);
+			if (groupSelectedAgentIds.isEmpty()) throw new IllegalArgumentException("Select at least one agent");
+			selectedSavedGroupName = normalizedName;
+			savedGroupName = normalizedName;
+			send(AgentControlCommandBuilder.saveGroup(normalizedName, List.copyOf(groupSelectedAgentIds)),
+					"Saving group " + normalizedName + "...");
+		} catch (IllegalArgumentException exception) {
+			setFeedback(exception.getMessage(), true);
+		}
+	}
+
+	private void spawnSelectedGroup() {
+		selectedSavedGroup().ifPresentOrElse(
+				group -> send(AgentControlCommandBuilder.spawnGroup(group.name()), "Restoring group " + group.name() + "..."),
+				() -> setFeedback("Choose a saved group first", true)
+		);
+	}
+
+	private void deleteSelectedGroup() {
+		selectedSavedGroup().ifPresentOrElse(group -> {
+			send(AgentControlCommandBuilder.deleteGroup(group.name()), "Deleting saved group " + group.name() + "...");
+			selectedSavedGroupName = "";
+			savedGroupName = "";
+		}, () -> setFeedback("Choose a saved group first", true));
 	}
 
 	private void addGroupRows(int x, int y, int width) {
@@ -440,6 +557,7 @@ public final class AgentControlScreen extends Screen {
 					provider = value;
 					model = AgentControlCatalog.defaultModel(provider);
 					reasoning = AgentControlCatalog.defaultReasoning(provider, model);
+					serviceTier = AgentControlCatalog.defaultServiceTier(provider, model);
 					rememberPreferences();
 					rebuildWidgets();
 				}));
@@ -448,6 +566,7 @@ public final class AgentControlScreen extends Screen {
 				value -> Component.literal(AgentControlCatalog.displayName(provider, value)), value -> {
 					model = value;
 					reasoning = AgentControlCatalog.defaultReasoning(provider, model);
+					serviceTier = AgentControlCatalog.defaultServiceTier(provider, model);
 					rememberPreferences();
 					rebuildWidgets();
 				}));
@@ -458,7 +577,9 @@ public final class AgentControlScreen extends Screen {
 					reasoning = value;
 					rememberPreferences();
 				}));
-		if (!AgentControlCatalog.serviceTiers(provider, model).contains(serviceTier)) serviceTier = "priority";
+		if (!AgentControlCatalog.serviceTiers(provider, model).contains(serviceTier)) {
+			serviceTier = AgentControlCatalog.defaultServiceTier(provider, model);
+		}
 		if (AgentControlCatalog.hasSpeedMode(provider, model)) {
 			addRenderableWidget(new ConsoleCycleButton<>(font, x + half + GAP, y, half, ROW_HEIGHT,
 					Component.literal("Speed mode"), AgentControlCatalog.serviceTiers(provider, model), serviceTier,
@@ -542,10 +663,10 @@ public final class AgentControlScreen extends Screen {
 		int x = layout.contentLeft();
 		int width = layout.contentWidth();
 		int top = layout.contentTop() + (layout.sideNavigation() ? 28 : 0);
-		int buttonWidth = (width - GAP) / 2;
-		for (int index = 0; index < 2; index++) {
-			String operation = List.of("stop", "resume").get(index);
-			String label = List.of("Pause work", "Resume work").get(index);
+		int buttonWidth = (width - GAP * 2) / 3;
+		for (int index = 0; index < 3; index++) {
+			String operation = List.of("stop", "resume", "respawn").get(index);
+			String label = List.of("Pause work", "Resume work", "Respawn").get(index);
 			ConsoleButton action = consoleButton(label.toUpperCase(Locale.ROOT),
 					x + index * (buttonWidth + GAP), top, buttonWidth, ROW_HEIGHT, false,
 					() -> submitAgentOperation(operation));
@@ -651,9 +772,18 @@ public final class AgentControlScreen extends Screen {
 		graphics.text(font, count + (count == 1 ? " agent selected" : " agents selected"), contentLeft(), layout.contentTop() + 4,
 				count == 0 ? MUTED : ACCENT, false);
 		if (contentWidth() >= 560) {
-			graphics.text(font, "Group selection changes messaging only. Configure agents one at a time.",
+			graphics.text(font, "Saved groups restore the same characters without creating duplicates.",
 					contentLeft() + 126, layout.contentTop() + 4, MUTED, false);
 		}
+		selectedSavedGroup().ifPresent(group -> {
+			Set<String> presentIds = snapshot.agents().stream().map(AgentControlAgent::agentId)
+					.collect(java.util.stream.Collectors.toSet());
+			long missing = group.memberIds().stream().filter(id -> !presentIds.contains(id)).count();
+			if (missing > 0L) {
+				graphics.text(font, missing + (missing == 1L ? " saved member is missing" : " saved members are missing"),
+						contentLeft(), layout.contentTop() + 16, ERROR, false);
+			}
+		});
 		if (snapshot == null || snapshot.agents().isEmpty()) {
 			graphics.text(font, "Create agents before building a control group.", contentLeft(), layout.contentTop() + 28, MUTED, false);
 		}
@@ -1098,6 +1228,7 @@ public final class AgentControlScreen extends Screen {
 	private int visibleRows() {
 		AgentControlLayout layout = layout();
 		int top = layout.contentTop() + (page == Page.GROUP && !layout.sideNavigation() ? 0 : 24);
+		if (page == Page.GROUP) top += ROW_HEIGHT + GAP;
 		if (page == Page.GROUP && !(layout.splitWorkspace() || layout.contentWidth() >= 500)) return 1;
 		int bottom = page == Page.OVERVIEW && !layout.splitWorkspace()
 				? layout.contentBottom() - ROW_HEIGHT - GAP

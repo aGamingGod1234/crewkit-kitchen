@@ -18,6 +18,9 @@ public record AttentionFactDelta(long eventSequence, boolean attention, List<Str
 			"health", "maxHealth", "armor", "foodLevel", "saturation", "gameMode", "onGround", "inWater",
 			"onFire", "air", "maxAir", "suffocating", "fallDistance", "lastAttacker", "effects"
 	);
+	private static final Set<String> ACTIVE_ACTION_PLAYER_FACTS = Set.of(
+			"health", "maxHealth", "gameMode", "onFire", "suffocating"
+	);
 
 	public AttentionFactDelta {
 		if (eventSequence < 1L) throw new IllegalArgumentException("eventSequence must be positive");
@@ -30,17 +33,40 @@ public record AttentionFactDelta(long eventSequence, boolean attention, List<Str
 		Objects.requireNonNull(current, "current must not be null");
 		if (previous == null) return new AttentionFactDelta(eventSequence, false, List.of(), observedAtEpochMs);
 		TreeSet<String> facts = new TreeSet<>();
-		for (String key : List.of("ready", "status", "position", "velocity", "view", "inventory", "nearbyContainers", "currentAction", "lastResult")) {
-			if (!same(previous.get(key), current.get(key))) facts.add(key);
+		if (!same(previous.get("ready"), current.get("ready"))) facts.add("ready");
+		boolean activeActionWindow = activeAction(previous) || activeAction(current);
+		if (!activeActionWindow) {
+			for (String key : List.of("position", "velocity", "view", "inventory", "nearbyContainers")) {
+				if (!same(previous.get(key), current.get(key))) facts.add(key);
+			}
 		}
 		if (worldMateriallyChanged(previous.getAsJsonObject("world"), current.getAsJsonObject("world"))) facts.add("world");
-		for (String field : PLAYER_FACTS) {
+		for (String field : activeActionWindow ? ACTIVE_ACTION_PLAYER_FACTS : PLAYER_FACTS) {
 			if (!same(objectValue(previous, "player", field), objectValue(current, "player", field))) facts.add("player." + field);
 		}
-		TreeSet<String> entityChanges = entityChanges(previous.getAsJsonArray("entities"), current.getAsJsonArray("entities"));
-		TreeSet<String> blockChanges = blockChanges(previous.getAsJsonArray("blocks"), current.getAsJsonArray("blocks"));
-		addSpatialChanges(facts, entityChanges, blockChanges);
+		if (activeActionWindow && attackerAppearedOrChanged(previous, current)) facts.add("player.lastAttacker");
+		if (!activeActionWindow) {
+			TreeSet<String> entityChanges = entityChanges(previous.getAsJsonArray("entities"), current.getAsJsonArray("entities"));
+			TreeSet<String> blockChanges = blockChanges(previous.getAsJsonArray("blocks"), current.getAsJsonArray("blocks"));
+			addSpatialChanges(facts, entityChanges, blockChanges);
+		}
 		return new AttentionFactDelta(eventSequence, !facts.isEmpty(), List.copyOf(facts), observedAtEpochMs);
+	}
+
+	private static boolean activeAction(JsonObject observation) {
+		if (observation == null || !observation.has("currentAction")
+				|| !observation.get("currentAction").isJsonObject()) return false;
+		JsonObject action = observation.getAsJsonObject("currentAction");
+		return action.has("active") && action.get("active").isJsonPrimitive() && action.get("active").getAsBoolean();
+	}
+
+	private static boolean attackerAppearedOrChanged(JsonObject previous, JsonObject current) {
+		JsonElement before = objectValue(previous, "player", "lastAttacker");
+		JsonElement after = objectValue(current, "player", "lastAttacker");
+		if (after == null || !after.isJsonObject()) return false;
+		if (before == null || !before.isJsonObject()) return true;
+		return !same(before.getAsJsonObject().get("uuid"), after.getAsJsonObject().get("uuid"))
+				|| !same(before.getAsJsonObject().get("type"), after.getAsJsonObject().get("type"));
 	}
 
 	private static TreeSet<String> entityChanges(JsonArray previous, JsonArray current) {

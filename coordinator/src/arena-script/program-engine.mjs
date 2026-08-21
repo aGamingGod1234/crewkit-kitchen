@@ -226,12 +226,13 @@ export class ArenaScriptEngine {
 		} else this.#handleYield(this.#vm.runWatcherHandler(latch.watcherId, latch.facts), watcherExecution(latch));
 	}
 
-	#requestModel() {
-		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts);
-		this.#emitTrace('attention_unhandled', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version });
+	#requestModel(actionFailure = null) {
+		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts, actionFailure);
 		if (this.#pendingRequest) { this.#coalescedRequest = context; return; }
 		this.#pendingRequest = context;
 		this.#coalescedRequest = context;
+		if (actionFailure === null) this.#emitTrace('attention_unhandled', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version });
+		else this.#emitTrace('program_action_failure', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version, actionFailure });
 		this.#callbacks.requestModel(context);
 		if (this.#program.compiled.unhandledPolicy === 'pause_and_notify') this.#suspendUnhandledAttention();
 	}
@@ -290,6 +291,18 @@ export class ArenaScriptEngine {
 			});
 			return;
 		}
+		if (yielded.kind === 'replan') {
+			if (this.#deferredBase) { this.#vm.discardDeferredCommand(); this.#deferredBase = null; }
+			this.#status = 'SUSPENDED';
+			this.#requestModel(freezeRecord({
+				sourceStepId: yielded.stepId,
+				actionType: yielded.failure.actionType,
+				arguments: yielded.failure.arguments,
+				state: yielded.failure.state,
+				reasonCode: yielded.failure.reasonCode,
+			}));
+			return;
+		}
 		if (yielded.kind === 'idle' && !this.#active && this.#boundary.length > 0) return this.#runBoundary();
 		if (yielded.kind === 'idle' && this.#deferredBase) {
 			if (this.#boundary.length > 0) return this.#runBoundary();
@@ -327,7 +340,23 @@ function installationRelation(next, current) {
 	return next.eventSequence > current.eventSequence ? 0 : -1;
 }
 function sameImmutableProgram(next, current) { return next.agentId === current.agentId && next.modelIdentity === current.modelIdentity && next.programId === current.programId && next.compiled === current.compiled && next.compiled.source === current.compiled.source; }
-function requestContext(program, generation, lifecycleEpoch, continuationEpoch, activeActionId, eventSequence, factsSequence, observation) { return freezeRecord({ agentId: program.agentId, goalRevision: program.goalRevision, modelIdentity: program.modelIdentity, programId: program.programId, version: program.version, generation, lifecycleEpoch, continuationEpoch, activeActionId, eventSequence, factsSequence, observation }); }
+function requestContext(program, generation, lifecycleEpoch, continuationEpoch, activeActionId, eventSequence, factsSequence, observation, actionFailure = null) {
+	return freezeRecord({
+		agentId: program.agentId,
+		goalRevision: program.goalRevision,
+		modelIdentity: program.modelIdentity,
+		programId: program.programId,
+		version: program.version,
+		generation,
+		lifecycleEpoch,
+		continuationEpoch,
+		activeActionId,
+		eventSequence,
+		factsSequence,
+		observation,
+		...(actionFailure === null ? {} : { decisionContext: 'program_action_failure', actionFailure }),
+	});
+}
 function sameRequest(value, request) { return value && ['agentId', 'goalRevision', 'modelIdentity', 'programId', 'version', 'generation', 'lifecycleEpoch', 'continuationEpoch', 'activeActionId', 'eventSequence', 'factsSequence'].every((key) => value[key] === request[key]); }
 function watcherExecution(authority, executionFactsSequence = authority.eventSequence) { return freezeRecord({ authority, executionFactsSequence }); }
 function watcherMode(compiled, index) { const watches = []; for (const statement of compiled.ast.body) { const call = statement.type === 'ExpressionStatement' ? statement.expression : null; if (call?.type === 'CallExpression' && call.callee.type === 'MemberExpression' && call.callee.object.name === 'program' && call.callee.property.name === 'watch') watches.push(call); } return watches[index]?.arguments[1]?.properties?.find((property) => property.key.name === 'mode')?.value?.value ?? 'boundary'; }

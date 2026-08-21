@@ -13,6 +13,8 @@ public final class AgentControlLayoutVerification {
 		assertTrue(wide.navigationTop() - wide.panelTop() >= 57,
 				"wide navigation leaves breathing room below the console header");
 		assertTrue(wide.contentBottom() < wide.footerY(), "wide content never collides with footer actions");
+		assertTrue(!wide.groupToolbarInFooter(), "tall group workspaces keep saved-group controls inline");
+		assertTrue(wide.groupColumns(), "wide and tall group workspaces use roster and task columns");
 
 		AgentControlLayout compact = AgentControlLayout.calculate(320, 240);
 		assertTrue(!compact.sideNavigation(), "compact command center reflows navigation above the canvas");
@@ -24,6 +26,8 @@ public final class AgentControlLayoutVerification {
 		assertTrue(compact.footerY() + AgentControlLayout.CONTROL_HEIGHT <= compact.panelBottom(),
 				"compact footer remains fully on screen");
 		assertTrue(compact.minimumTargetHeight() >= 24, "custom controls meet the minimum target-height contract");
+		assertTrue(compact.groupToolbarInFooter(), "compact group controls move to the footer instead of overlapping tasks");
+		assertTrue(!compact.groupColumns(), "short group workspaces use the compact horizontal task layout");
 
 		AgentControlLayout mid = AgentControlLayout.calculate(700, 360);
 		assertTrue(mid.sideNavigation(), "medium screens preserve stable side navigation when space permits");
@@ -34,7 +38,7 @@ public final class AgentControlLayoutVerification {
 				"unsupported widths fail explicitly instead of creating negative widgets");
 		assertThrows(IllegalArgumentException.class, () -> AgentControlLayout.calculate(320, 239),
 				"unsupported heights fail explicitly instead of creating overlapping widgets");
-		return 17;
+		return 21;
 	}
 
 	private static void assertTrue(boolean condition, String label) {

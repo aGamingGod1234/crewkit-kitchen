@@ -1,0 +1,103 @@
+package dev.agaminggod.arenaagents.voiceaddon;
+
+import de.maxhenkel.voicechat.api.VoicechatServerApi;
+import de.maxhenkel.voicechat.api.audiochannel.EntityAudioChannel;
+import de.maxhenkel.voicechat.api.audiochannel.AudioPlayer;
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.server.voice.VoiceReceipt;
+import dev.agaminggod.arenaagents.server.voice.VoiceRequest;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystem;
+import java.nio.charset.StandardCharsets;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.CompletionStage;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.entity.Entity;
+
+final class SimpleVoiceChatSubsystem implements VoiceSubsystem {
+	private final MinecraftServer server;
+	private final VoicePlaybackCoordinator playback;
+
+	SimpleVoiceChatSubsystem(MinecraftServer server, VoiceWorkerClient worker) {
+		this.server = Objects.requireNonNull(server, "server must not be null");
+		Objects.requireNonNull(worker, "worker must not be null");
+		this.playback = new VoicePlaybackCoordinator(worker::synthesize, server::execute, new SimpleVoiceTransport());
+	}
+
+	@Override
+	public boolean available() {
+		return playback.available();
+	}
+
+	@Override
+	public void registerAgent(AgentId agentId, UUID entityId) {
+		playback.registerAgent(agentId, entityId);
+	}
+
+	@Override
+	public void unregisterAgent(AgentId agentId) {
+		playback.unregisterAgent(agentId);
+	}
+
+	@Override
+	public CompletionStage<VoiceReceipt> speak(VoiceRequest request) {
+		return playback.speak(request);
+	}
+
+	private Entity findEntity(UUID entityId) {
+		if (entityId == null) return null;
+		for (var level : server.getAllLevels()) {
+			Entity entity = level.getEntity(entityId);
+			if (entity != null && entity.isAlive()) return entity;
+		}
+		return null;
+	}
+
+	@Override
+	public void stop(AgentId agentId) {
+		playback.stop(agentId);
+	}
+
+	@Override
+	public void close() {
+		playback.close();
+	}
+
+	private final class SimpleVoiceTransport implements VoicePlaybackCoordinator.Transport {
+		@Override
+		public boolean available() {
+			return ArenaAgentsVoiceChatPlugin.serverApi() != null;
+		}
+
+		@Override
+		public VoicePlaybackCoordinator.Playback create(
+				AgentId agentId,
+				UUID entityId,
+				int radius,
+				short[] samples,
+				Runnable onStopped
+		) {
+			VoicechatServerApi api = ArenaAgentsVoiceChatPlugin.serverApi();
+			if (api == null) throw new VoicePlaybackCoordinator.UnavailableException("Voice channel is unavailable");
+			Entity entity = findEntity(entityId);
+			if (entity == null) throw new VoicePlaybackCoordinator.UnavailableException("Agent entity is unavailable");
+			UUID channelId = UUID.nameUUIDFromBytes(
+					("arenaagents-voice:" + agentId).getBytes(StandardCharsets.UTF_8)
+			);
+			EntityAudioChannel channel = api.createEntityAudioChannel(channelId, api.fromEntity(entity));
+			if (channel == null) {
+				throw new VoicePlaybackCoordinator.UnavailableException("Simple Voice Chat rejected the entity channel");
+			}
+			channel.setDistance(radius);
+			AudioPlayer audioPlayer = api.createAudioPlayer(channel, api.createEncoder(), samples);
+			if (audioPlayer == null) {
+				throw new VoicePlaybackCoordinator.UnavailableException("Simple Voice Chat rejected the audio player");
+			}
+			audioPlayer.setOnStopped(onStopped);
+			return new VoicePlaybackCoordinator.Playback() {
+				@Override public void start() { audioPlayer.startPlaying(); }
+				@Override public void stop() { audioPlayer.stopPlaying(); }
+			};
+		}
+	}
+}

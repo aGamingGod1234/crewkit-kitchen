@@ -9,6 +9,7 @@ import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 import java.util.UUID;
@@ -98,6 +99,7 @@ public final class OfflineAgentPlayers {
 	}
 
 	public static void stop(ServerPlayer player) {
+		AgentInputRuntime.clear(player);
 		actions(player).stopAll();
 		player.stopUsingItem();
 	}

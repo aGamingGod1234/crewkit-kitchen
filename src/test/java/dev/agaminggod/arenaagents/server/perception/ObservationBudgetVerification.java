@@ -21,10 +21,17 @@ public final class ObservationBudgetVerification {
 		assertEquals(7L, delta.eventSequence(), "event sequence is retained exactly");
 		assertTrue(delta.changedFacts().contains("player.health"), "health delta is factual");
 		assertTrue(delta.changedFacts().contains("player.onFire"), "fire delta is factual");
-		assertTrue(delta.changedFacts().contains("player.fallDistance"), "fall delta is factual");
-		assertTrue(delta.changedFacts().contains("currentAction"), "action delta is factual");
+		assertFalse(delta.changedFacts().contains("player.fallDistance"),
+				"routine action motion is not a reactive interruption");
+		assertFalse(delta.changedFacts().contains("currentAction"),
+				"action lifecycle is delivered by typed action events instead of attention");
 		assertFalse(delta.changedFacts().stream().anyMatch(path -> path.contains("danger") || path.contains("flee") || path.contains("fight")),
 				"deltas do not invent tactical labels");
+		JsonObject movingBefore = movingObservation(0.0D, 0.0D, "minecraft:air", 8.0D);
+		JsonObject movingAfter = movingObservation(1.0D, 15.0D, "minecraft:wooden_pickaxe", 7.0D);
+		AttentionFactDelta movementDelta = AttentionFactDelta.between(movingBefore, movingAfter, 8L, 124L);
+		assertFalse(movementDelta.attention(), "an active action does not interrupt itself with movement observations");
+		assertEquals(List.of(), movementDelta.changedFacts(), "self-generated action churn has no attention facts");
 		JsonObject factualBefore = observation(20.0D, false, 0.0D, "idle");
 		JsonObject factualAfter = factualBefore.deepCopy();
 		factualAfter.getAsJsonObject("player").addProperty("health", 18.0D);
@@ -149,7 +156,50 @@ public final class ObservationBudgetVerification {
 		burst.drain(burstFirst::add);
 		assertEquals(AgentConstants.DEFAULT_AGENT_LIMIT, burstFirst.size(), "one drain serves the sixteen-agent tick budget");
 		assertEquals(0, burst.pendingCount(), "sixteen-agent burst clears in one drain");
-		return 51;
+		return 53;
+	}
+
+	private static JsonObject movingObservation(double x, double yaw, String selectedItem, double entityDistance) {
+		JsonObject value = observation(20.0D, false, 0.0D, "navigate_to");
+		value.addProperty("status", x == 0.0D ? "PLANNING" : "ACTING");
+		JsonObject position = new JsonObject();
+		position.addProperty("x", x);
+		position.addProperty("y", 64.0D);
+		position.addProperty("z", 0.0D);
+		value.add("position", position);
+		JsonObject velocity = new JsonObject();
+		velocity.addProperty("x", x == 0.0D ? 0.0D : 0.1D);
+		velocity.addProperty("y", 0.0D);
+		velocity.addProperty("z", 0.0D);
+		value.add("velocity", velocity);
+		JsonObject view = new JsonObject();
+		view.addProperty("yaw", yaw);
+		view.addProperty("pitch", 0.0D);
+		value.add("view", view);
+		JsonObject player = value.getAsJsonObject("player");
+		player.addProperty("onGround", x == 0.0D);
+		player.addProperty("foodLevel", x == 0.0D ? 20 : 19);
+		player.addProperty("fallDistance", x);
+		JsonObject lastAttacker = new JsonObject();
+		lastAttacker.addProperty("uuid", "00000000-0000-0000-0000-000000000002");
+		lastAttacker.addProperty("type", "minecraft:zombie");
+		lastAttacker.addProperty("distance", entityDistance);
+		player.add("lastAttacker", lastAttacker);
+		JsonObject effect = new JsonObject();
+		effect.addProperty("effectId", "minecraft:speed");
+		effect.addProperty("amplifier", 0);
+		effect.addProperty("duration", x == 0.0D ? 100 : 99);
+		com.google.gson.JsonArray effects = new com.google.gson.JsonArray();
+		effects.add(effect);
+		player.add("effects", effects);
+		value.getAsJsonObject("inventory").addProperty("selectedItem", selectedItem);
+		JsonObject nearbyEntity = entity(1);
+		nearbyEntity.addProperty("distance", entityDistance);
+		value.getAsJsonArray("entities").add(nearbyEntity);
+		JsonObject lastResult = new JsonObject();
+		lastResult.addProperty("present", x != 0.0D);
+		value.add("lastResult", lastResult);
+		return value;
 	}
 
 	private static JsonObject observation(double health, boolean onFire, double fallDistance, String actionType) {

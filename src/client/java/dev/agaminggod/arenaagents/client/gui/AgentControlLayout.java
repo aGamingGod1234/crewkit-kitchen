@@ -31,6 +31,8 @@ public record AgentControlLayout(
 	private static final int CONTEXT_RAIL_BREAKPOINT = 700;
 	private static final int CONTEXT_RAIL_WIDTH = 208;
 	private static final int REGION_GAP = 12;
+	private static final int GROUP_INLINE_TOOLBAR_HEIGHT = 157;
+	private static final int GROUP_COLUMN_HEIGHT = 245;
 
 	public static AgentControlLayout calculate(int screenWidth, int screenHeight) {
 		if (screenWidth < MINIMUM_WIDTH || screenHeight < MINIMUM_HEIGHT) {
@@ -85,5 +87,13 @@ public record AgentControlLayout(
 
 	public int minimumTargetHeight() {
 		return CONTROL_HEIGHT;
+	}
+
+	public boolean groupToolbarInFooter() {
+		return contentHeight() < GROUP_INLINE_TOOLBAR_HEIGHT;
+	}
+
+	public boolean groupColumns() {
+		return (splitWorkspace || contentWidth() >= 500) && contentHeight() >= GROUP_COLUMN_HEIGHT;
 	}
 }

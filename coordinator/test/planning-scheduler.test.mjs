@@ -65,6 +65,13 @@ test('scheduler permits at most one active or pending turn per agent', async () 
 	assert.equal(await active, 'done');
 });
 
+test('scheduler releases a completed slot before resolving its promise', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });
+	assert.equal(await scheduler.schedule('agent-a', async () => 'first'), 'first');
+	assert.equal(scheduler.activeCount, 0);
+	assert.equal(await scheduler.schedule('agent-a', async () => 'second'), 'second');
+});
+
 test('cancelling an active turn aborts its dependency-injected signal', async () => {
 	const scheduler = new PlanningScheduler();
 	let signal;

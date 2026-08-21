@@ -32,6 +32,13 @@ public enum ActionType {
 	SELECT_TOOL("select_tool"),
 	BLOCK_WITH_SHIELD("block_with_shield"),
 	USE_RANGED("use_ranged"),
+	INTERACT_BLOCK("interact_block"),
+	INTERACT_ENTITY("interact_entity"),
+	DISMOUNT("dismount"),
+	START_FALL_FLYING("start_fall_flying"),
+	MENU_TRANSFER("menu_transfer"),
+	MENU_BUTTON("menu_button"),
+	ANVIL_RENAME("anvil_rename"),
 	RESPAWN("respawn"),
 	COMPLETE_GOAL("complete_goal");
 

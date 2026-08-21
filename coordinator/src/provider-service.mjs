@@ -16,6 +16,9 @@ export class ProviderService {
 
 	async start() { for (const service of this.#services.values()) await service.start(); }
 	async stop() { await Promise.allSettled([...this.#services.values()].map((service) => service.stop())); this.#assignments.clear(); }
+	async bootstrapCatalog() {
+		return this.catalog.refresh();
+	}
 
 	async createAgent(profileValue, options) {
 		const profile = { ...profileValue, provider: normalizeProvider(profileValue?.provider) };
@@ -43,8 +46,8 @@ export class ProviderService {
 		if (!Array.isArray(records)) throw new TypeError('provider reconciliation records must be an array');
 		const groups = new Map(PROVIDERS.map((provider) => [provider, []]));
 		for (const record of records) groups.get(normalizeProvider(record?.provider)).push({ ...record, provider: normalizeProvider(record?.provider) });
-		const results = [];
-		for (const provider of PROVIDERS) results.push(await this.#services.get(provider).reconcile(groups.get(provider)));
+		const results = await Promise.all(PROVIDERS.map((provider) =>
+			this.#services.get(provider).reconcile(groups.get(provider))));
 		this.#assignments.clear();
 		for (const result of results) for (const profile of result.valid ?? []) this.#assignments.set(profile.agentId, normalizeProvider(profile.provider));
 		return {

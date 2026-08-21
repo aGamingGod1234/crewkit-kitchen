@@ -155,7 +155,7 @@ The entire row is the target. It shows a friendly name, readable model label, cu
 - **Do** reserve amber for current selection, active progress, and the primary action.
 - **Do** show exact arena coordinates and placement mode before applying blocks.
 - **Do** show changed block count, remaining block count, and current construction region during arena work.
-- **Do** keep single-agent setup and multi-agent messaging in different workspaces.
+- **Do** keep single-agent setup and saved-group management in different workspaces.
 - **Do** expose a readable failure with a recovery action when planning stalls.
 
 ### Don't:

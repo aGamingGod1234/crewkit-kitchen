@@ -5,15 +5,23 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
+import dev.agaminggod.arenaagents.server.runtime.input.SafetyInputRuntime;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
+import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.UUID;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,6 +43,8 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STARTED.register(CodexAgentServerRuntime::start);
 		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::tick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
+		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
+				VoiceConsentRegistry.revoke(server, handler.getPlayer().getUUID()));
 		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) -> {
 			if (!(entity instanceof net.minecraft.server.level.ServerPlayer player)) return true;
 			return AgentDeathCapture.allowVanillaDeath(
@@ -49,6 +59,7 @@ public final class CodexAgentServerRuntime {
 		if (BRIDGES.containsKey(server)) {
 			return;
 		}
+		VoiceSubsystemRuntime.start(server);
 		try {
 			CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor();
 			if (supervisor.configured()) {
@@ -76,8 +87,10 @@ public final class CodexAgentServerRuntime {
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		MultiplexedServerBridge bridge = BRIDGES.get(server);
 		if (supervisor != null) supervisor.tick(bridge != null && bridge.authenticated());
-		manager.maintainChunkTickets();
 		manager.reconcileDeaths();
+		manager.maintainChunkTickets();
+		SafetyInputRuntime.tick(server);
+		VoiceSubsystemRuntime.tick(server);
 		maintainPlanningProgress(manager);
 		if (bridge != null) {
 			bridge.tick();
@@ -126,11 +139,59 @@ public final class CodexAgentServerRuntime {
 		}
 	}
 
+	public static DeliveryReceipt sendDirectMessage(
+			MinecraftServer server,
+			ServerPlayer source,
+			AgentId recipientAgentId,
+			String text
+	) {
+		requireAutomation(server);
+		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		if (bridge == null) throw new AgentDomainException("AUTOMATION_UNAVAILABLE", automationStatus(server));
+		return bridge.sendPlayerDirectMessage(source, recipientAgentId, text);
+	}
+
+	public static DeliveryReceipt sendNativeDirectMessage(
+			MinecraftServer server,
+			ServerPlayer source,
+			AgentId recipientAgentId,
+			String text
+	) {
+		requireAutomation(server);
+		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		if (bridge == null) throw new AgentDomainException("AUTOMATION_UNAVAILABLE", automationStatus(server));
+		return bridge.sendNativePlayerDirectMessage(source, recipientAgentId, text);
+	}
+
+	public static DeliveryReceipt deliverHumanSpeech(
+			MinecraftServer server,
+			UUID sourcePlayerId,
+			String transcript,
+			boolean whispering
+	) {
+		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		if (bridge == null || !bridge.authenticated()) return new DeliveryReceipt(List.of(), List.of());
+		ServerPlayer source = server.getPlayerList().getPlayer(sourcePlayerId);
+		if (source == null) return new DeliveryReceipt(List.of(), List.of());
+		for (var record : CodexAgentManager.get(server).records()) {
+			if (record.entityUuid().filter(sourcePlayerId::equals).isPresent()) {
+				return new DeliveryReceipt(List.of(), List.of());
+			}
+		}
+		return bridge.sendPlayerProximitySpeech(source, transcript, whispering);
+	}
+
+	public static boolean hasVoiceConsent(MinecraftServer server, UUID playerId) {
+		return VoiceConsentRegistry.granted(server, playerId);
+	}
+
 	private static void stop(MinecraftServer server) {
 		PLANNING_UPDATES.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		MultiplexedServerBridge bridge = BRIDGES.remove(server);
 		try {
+			VoiceSubsystemRuntime.close(server);
+			VoiceConsentRegistry.clear(server);
 			CodexAgentManager.release(server);
 		} finally {
 			ScenarioRuntimeService.release(server);

@@ -28,8 +28,25 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	CoordinatorProcessSupervisor(Path gameDirectory) {
 		this.gameDirectory = gameDirectory.toAbsolutePath().normalize();
+		try {
+			if (BundledCoordinatorInstaller.installBundled(this.gameDirectory.resolve("arena-agents-runtime"))) {
+				LOGGER.info("Installed the bundled Arena Agents coordinator runtime");
+			}
+		} catch (IOException exception) {
+			LOGGER.error("Could not install the bundled Arena Agents coordinator runtime", exception);
+		}
 		this.packageRoot = findPackageRoot(this.gameDirectory);
+		configureSharedBridgeSecretPath(this.packageRoot);
 		this.createdAtEpochMs = System.currentTimeMillis();
+	}
+
+	private static void configureSharedBridgeSecretPath(Path packageRoot) {
+		if (packageRoot == null) return;
+		String configured = System.getProperty("arenaagents.bridgeSecretFile");
+		String environment = System.getenv("ARENA_AGENT_BRIDGE_SECRET_FILE");
+		if ((configured == null || configured.isBlank()) && (environment == null || environment.isBlank())) {
+			System.setProperty("arenaagents.bridgeSecretFile", packageRoot.resolve("runtime/bridge-secret.txt").toString());
+		}
 	}
 
 	synchronized boolean configured() {

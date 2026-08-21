@@ -2,7 +2,7 @@ import {
 	ACTION_FIELDS,
 	BLOCK_FACES,
 	MAX_BLOCKS,
-	MAX_CHAT_LENGTH,
+	MAX_CONVERSATION_LENGTH,
 	MAX_COMMAND_ID_LENGTH,
 	MAX_DESIRED_STATE_LENGTH,
 	MAX_DURATION_MS,
@@ -16,6 +16,7 @@ import {
 	MAX_RESULT_MESSAGE_LENGTH,
 	MAX_TARGET_SELECTOR_LENGTH,
 	MAX_TARGET_ID_LENGTH,
+	MAX_VOICE_TEXT_LENGTH,
 	MIN_DURATION_MS,
 	MIN_MOVEMENT_TOLERANCE,
 	PROTOCOL_VERSION,
@@ -43,7 +44,7 @@ export function validateAction(value) {
 	if (!ACTION_TYPES.has(type)) throw invalid('UNKNOWN_ACTION', `Unsupported action '${type}'`);
 	const requiredFields = type === 'place_block'
 		? ACTION_FIELDS[type].filter((field) => field !== 'desiredState')
-		: ACTION_FIELDS[type];
+		: type === 'chat' ? ['message'] : ACTION_FIELDS[type];
 	requireKeys(action, ['type', ...ACTION_FIELDS[type]], 'action', ['type', ...requiredFields]);
 
 	switch (type) {
@@ -133,7 +134,48 @@ export function validateAction(value) {
 			}
 			break;
 		case 'chat':
-			requireText(action.message, 'action.message', MAX_CHAT_LENGTH);
+			requireCodePointText(action.message, 'action.message', MAX_CONVERSATION_LENGTH);
+			{
+				const audience = action.audience ?? 'public';
+				requireOneOf(audience, 'action.audience', ['public', 'direct', 'proximity']);
+				if (audience === 'proximity') requireCodePointText(action.message, 'action.message', MAX_VOICE_TEXT_LENGTH);
+				if (audience === 'direct') requireTargetId(action.recipientId, 'action.recipientId');
+				else if (action.recipientId !== undefined && action.recipientId !== null) {
+					throw invalid('INVALID_FIELD', 'action.recipientId is only valid for direct chat');
+				}
+			}
+			break;
+		case 'interact_block':
+			requireCoordinates(action, true, 'action');
+			if (!FACES.has(action.face)) throw invalid('INVALID_FIELD', `action.face must be one of ${BLOCK_FACES.join(', ')}`);
+			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
+			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+			break;
+		case 'interact_entity':
+			requireTargetId(action.targetId, 'action.targetId');
+			requireOneOf(action.hand, 'action.hand', ['main', 'off']);
+			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+			break;
+		case 'dismount':
+		case 'start_fall_flying':
+			break;
+		case 'menu_transfer':
+			requireText(action.menuId, 'action.menuId', MAX_IDENTIFIER_LENGTH);
+			requireIntRange(action.sourceSlot, 'action.sourceSlot', 0, 255);
+			requireIntRange(action.destinationSlot, 'action.destinationSlot', 0, 255);
+			requireIntRange(action.count, 'action.count', 1, 64);
+			requireText(action.expectedItemId, 'action.expectedItemId', MAX_IDENTIFIER_LENGTH);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'menu_button':
+			requireText(action.menuId, 'action.menuId', MAX_IDENTIFIER_LENGTH);
+			requireIntRange(action.buttonId, 'action.buttonId', 0, 255);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
+			break;
+		case 'anvil_rename':
+			requireText(action.menuId, 'action.menuId', MAX_IDENTIFIER_LENGTH);
+			requireText(action.name, 'action.name', 50);
+			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
 		case 'set_door':
 			requireCoordinates(action, true, 'action');
@@ -416,6 +458,13 @@ function requireText(value, path, maximum, emptyAllowed = false) {
 	if (typeof value !== 'string') throw invalid('INVALID_FIELD', `${path} must be a string`);
 	if (!emptyAllowed && isProtocolBlank(value)) throw invalid('INVALID_FIELD', `${path} must not be blank`);
 	if (value.length > maximum) throw invalid('OUT_OF_RANGE', `${path} must contain at most ${maximum} characters`);
+	return value;
+}
+
+function requireCodePointText(value, path, maximum) {
+	if (typeof value !== 'string') throw invalid('INVALID_FIELD', `${path} must be a string`);
+	if (isProtocolBlank(value)) throw invalid('INVALID_FIELD', `${path} must not be blank`);
+	if ([...value].length > maximum) throw invalid('OUT_OF_RANGE', `${path} must contain at most ${maximum} code points`);
 	return value;
 }
 

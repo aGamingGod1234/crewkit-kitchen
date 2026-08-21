@@ -37,6 +37,10 @@ public final class AgentRuntimeRouter {
 		return registry.completeGoal(agentId, goalRevision, System.currentTimeMillis());
 	}
 
+	public AgentRecord coordinatorCompleted(AgentId agentId, long goalRevision) {
+		return registry.coordinatorCompleted(agentId, goalRevision, System.currentTimeMillis());
+	}
+
 	public AgentTransition plannerFailed(AgentId agentId, long goalRevision, String error) {
 		requireCurrentRevision(agentId, goalRevision);
 		return registry.fail(agentId, error, System.currentTimeMillis());

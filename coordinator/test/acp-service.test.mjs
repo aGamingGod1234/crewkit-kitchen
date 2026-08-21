@@ -180,6 +180,56 @@ test('Kimi ACP accepts sessions that expose no thinking control because effort i
 	await service.stop();
 });
 
+test('Kimi K3 uses the API-key-backed Moonshot alias when it is available', async () => {
+	const transport = new FakeAcpTransport([
+		{
+			id: 'model', category: 'model', type: 'select', currentValue: 'moonshot-ai/kimi-k3',
+			options: [
+				{ value: 'kimi-code/k3', name: 'K3 OAuth' },
+				{ value: 'moonshot-ai/kimi-k3', name: 'K3 API' },
+			],
+		},
+	]);
+	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
+	await service.createAgent({ agentId: 'kimi-api-k3', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'high' });
+	assert.equal(transport.calls.some((call) => call.params?.configId === 'model'), false);
+	await service.stop();
+});
+
+test('Kimi K2.7 coding aliases use their API-key-backed Moonshot equivalents', async () => {
+	for (const [requested, routed] of [
+		['kimi-code/kimi-for-coding', 'moonshot-ai/kimi-k2.7-code'],
+		['kimi-code/kimi-for-coding-highspeed', 'moonshot-ai/kimi-k2.7-code-highspeed'],
+	]) {
+		const transport = new FakeAcpTransport([{
+			id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3',
+			options: [{ value: requested, name: 'OAuth' }, { value: routed, name: 'API' }],
+		}]);
+		const service = new AcpProviderService({
+			provider: 'kimi', cwd: 'C:\\workspace', models: [requested], reasoningEfforts: ['high'],
+			modelReasoningEfforts: { [requested]: ['high'] },
+		}, { transportFactory: () => transport });
+		await service.createAgent({ agentId: `route-${requested}`, provider: 'kimi', model: requested, reasoningEffort: 'high' });
+		assert.equal(transport.calls.find((call) => call.params?.configId === 'model')?.params.value, routed);
+		await service.stop();
+	}
+});
+
+test('Kimi empty turns surface provider availability instead of a misleading planner parse error', async () => {
+	const transport = new FakeAcpTransport([
+		{ id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3', options: [{ value: 'kimi-code/k3', name: 'K3' }] },
+	]);
+	transport.message = '';
+	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'kimi-empty', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'high' });
+	await agent.setGoalRevision(1);
+	await assert.rejects(
+		agent.decide('authoritative state', { goalRevision: 1 }),
+		(error) => error?.code === 'PROVIDER_UNAVAILABLE' && /login and membership entitlement/i.test(error.message),
+	);
+	await service.stop();
+});
+
 test('ACP refreshes dependent capabilities after changing the model', async () => {
 	const transport = new FakeAcpTransport([
 		{ id: 'model', category: 'model', type: 'select', currentValue: 'auto', options: [{ value: 'auto', name: 'Auto' }, { value: 'kimi-code/k3', name: 'K3' }] },

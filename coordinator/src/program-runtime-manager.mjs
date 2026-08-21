@@ -20,17 +20,23 @@ export class ProgramRuntimeManager {
 	#clock;
 	#lastClockReading = null;
 	#trace;
+	#onCompleted;
+	#plannerContext;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance) } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance) } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
 		if (typeof trace !== 'function') throw new TypeError('trace must be a function');
+		if (typeof onCompleted !== 'function') throw new TypeError('onCompleted must be a function');
+		if (typeof plannerContext !== 'function') throw new TypeError('plannerContext must be a function');
 		this.#registry = registry;
 		this.#bridge = bridge;
 		this.#planner = planner;
 		this.#reportError = reportError;
 		this.#trace = trace;
+		this.#onCompleted = onCompleted;
+		this.#plannerContext = plannerContext;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
 		if (latencyRegistry !== null && typeof latencyRegistry.record !== 'function') throw new TypeError('latencyRegistry.record must be a function');
@@ -68,6 +74,7 @@ export class ProgramRuntimeManager {
 			this.#recordMinecraftPublication(receiptEpochMs, payload.observedAtEpochMs);
 		}
 		state.engine.ingestObservation({ observation, eventSequence, attention: payload.attention === true });
+		this.#flushDeferredProgramTrace(state);
 		this.#syncState(record, state);
 		return state.engine.snapshot();
 	}
@@ -124,10 +131,12 @@ export class ProgramRuntimeManager {
 			reasonCode: payload.reasonCode ?? '',
 			eventSequence,
 		});
+		this.#flushDeferredProgramTrace(state);
 		state.actionIds.delete(payload.actionId);
 		state.actionTiming.delete(payload.actionId);
 		state.actionMetadata.delete(payload.actionId);
 		if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
+		this.#flushDeferredProgramTrace(state);
 		this.#syncState(record, state);
 		return true;
 	}
@@ -196,6 +205,9 @@ export class ProgramRuntimeManager {
 			branchReceipt: null,
 			lastReceiptMonotonicMs: null,
 			lastReceiptEpochMs: null,
+			reactiveRequest: null,
+			reactiveRequestActive: false,
+			pendingReplacementTrace: null,
 			engine: null,
 		};
 		state.engine = new ArenaScriptEngine({
@@ -226,7 +238,6 @@ export class ProgramRuntimeManager {
 		this.#versions.set(versionKey(record), version);
 		const sequence = this.#installationSequence(state, eventSequence);
 		state.observation = observation;
-		this.#traceProgramInstall(state, record, source, version, sequence);
 		const installed = state.engine.install({
 			agentId: record.agentId,
 			goalRevision: record.goalRevision,
@@ -237,6 +248,8 @@ export class ProgramRuntimeManager {
 			observation,
 			eventSequence: sequence,
 		});
+		this.#traceProgramInstall(state, record, source, version, sequence);
+		this.#syncState(record, state);
 		return installed;
 	}
 
@@ -266,6 +279,12 @@ export class ProgramRuntimeManager {
 			if (context === null) return this.#installSource(state, record, decision.source, observation, eventSequence);
 			if (!sameEngineRequest(state.engine.snapshot(), context)) {
 				state.engine.failDirectiveRequest(context);
+				this.#traceState(state, 'program_replacement_rejected', {
+					programId: context.programId,
+					version: context.version,
+					eventSequence: context.eventSequence,
+					result: { code: 'STALE_MODEL_REQUEST' },
+				});
 				return null;
 			}
 			let compiled;
@@ -296,6 +315,26 @@ export class ProgramRuntimeManager {
 	}
 
 	async #requestReactiveDecision(state, context) {
+		state.reactiveRequest = context;
+		if (state.reactiveRequestActive) return;
+		state.reactiveRequestActive = true;
+		try {
+			while (!state.disposed && state.reactiveRequest !== null) {
+				const request = state.reactiveRequest;
+				state.reactiveRequest = null;
+				await this.#runReactiveDecision(state, request);
+				// Give planner cleanup a turn before starting the newest coalesced request.
+				if (state.reactiveRequest !== null) await Promise.resolve();
+			}
+		} finally {
+			const pending = state.disposed ? null : state.reactiveRequest;
+			state.reactiveRequest = null;
+			state.reactiveRequestActive = false;
+			if (pending !== null) void this.#requestReactiveDecision(state, pending);
+		}
+	}
+
+	async #runReactiveDecision(state, context) {
 		const record = this.#registry.get(state.agentId);
 		if (state.disposed || record === null || record.goalRevision !== state.goalRevision) return;
 		try {
@@ -307,15 +346,26 @@ export class ProgramRuntimeManager {
 					agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
 					goal: record.currentGoal,
 					goalRevision: record.goalRevision,
-					decisionContext: 'program_attention',
+					decisionContext: context.decisionContext ?? 'program_attention',
 					programId: context.programId,
 					programVersion: context.version,
 					eventSequence: context.eventSequence,
+					...(context.actionFailure === undefined ? {} : { actionFailure: context.actionFailure }),
 					observation: context.observation,
-				}),
+				}, this.#plannerContext(record.agentId)),
 			});
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return;
 			if (decision?.directive === 'replace') {
+				if (!sameEngineRequest(state.engine.snapshot(), context)) {
+					state.engine.failDirectiveRequest(context);
+					this.#traceState(state, 'program_replacement_rejected', {
+						programId: context.programId,
+						version: context.version,
+						eventSequence: context.eventSequence,
+						result: { code: 'STALE_MODEL_REQUEST' },
+					});
+					return;
+				}
 				let compiled;
 				try { compiled = parseArenaScript(decision.source); }
 				catch (error) {
@@ -420,14 +470,22 @@ export class ProgramRuntimeManager {
 				bridgeSendToCompletionMs: null,
 			},
 		});
-		state.engine.ingestActionResult({
-			actionId: internalActionId,
-			state: 'FAILED',
-			reasonCode: stableFailureCode(error),
-			eventSequence,
-		});
-		if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
-		this.#syncState(record, state);
+		try {
+			state.engine.ingestActionResult({
+				actionId: internalActionId,
+				state: 'FAILED',
+				reasonCode: stableFailureCode(error),
+				eventSequence,
+			});
+			this.#flushDeferredProgramTrace(state);
+			if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
+			this.#flushDeferredProgramTrace(state);
+			this.#syncState(record, state);
+		} catch (programError) {
+			state.engine.suspend(`execution_error:${stableFailureCode(programError)}`);
+			this.#syncState(record, state);
+			this.#reportError(state.agentId, programError);
+		}
 	}
 
 	async #cancel(state, actionId) {
@@ -487,7 +545,32 @@ export class ProgramRuntimeManager {
 	#traceProgramInstall(state, record, source, version, eventSequence) {
 		const programId = `program-${record.goalRevision}-${version}`;
 		this.#traceState(state, 'program_compiled', { programId, version, source, eventSequence });
-		this.#traceState(state, 'program_replaced', { programId, version, source, eventSequence });
+		const snapshot = state.engine.snapshot();
+		if (snapshot.programId === programId && snapshot.version === version) {
+			state.pendingReplacementTrace = null;
+			this.#traceState(state, 'program_replaced', { programId, version, source, eventSequence });
+			return;
+		}
+		state.pendingReplacementTrace = { programId, version, source, eventSequence };
+		this.#traceState(state, 'program_replacement_deferred', state.pendingReplacementTrace);
+	}
+
+	#flushDeferredProgramTrace(state) {
+		const pending = state.pendingReplacementTrace;
+		if (pending === null) return;
+		const snapshot = state.engine.snapshot();
+		if (snapshot.programId === pending.programId && snapshot.version === pending.version) {
+			state.pendingReplacementTrace = null;
+			this.#traceState(state, 'program_replaced', pending);
+			return;
+		}
+		if (Number.isSafeInteger(snapshot.version) && snapshot.version >= pending.version) {
+			state.pendingReplacementTrace = null;
+			this.#traceState(state, 'program_replacement_rejected', {
+				...pending,
+				result: { code: 'REPLACEMENT_SUPERSEDED' },
+			});
+		}
 	}
 
 	#recordLatency(operation, duration) {
@@ -520,8 +603,16 @@ export class ProgramRuntimeManager {
 
 	#setTerminalState(record, state) {
 		const current = this.#registry.get(record.agentId);
-		if (current === null || current.goalRevision !== record.goalRevision || current.state === state) return;
-		this.#registry.setState(record.agentId, state, { goalRevision: record.goalRevision });
+		if (current === null || current.goalRevision !== record.goalRevision
+			|| current.state === DynamicAgentState.DEAD || current.state === state) return;
+		const updated = this.#registry.setState(record.agentId, state, { goalRevision: record.goalRevision });
+		if (state === DynamicAgentState.COMPLETED) {
+			try {
+				Promise.resolve(this.#onCompleted(updated)).catch((error) => this.#reportError(record.agentId, error));
+			} catch (error) {
+				this.#reportError(record.agentId, error);
+			}
+		}
 	}
 }
 

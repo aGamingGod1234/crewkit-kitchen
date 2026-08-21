@@ -9,6 +9,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
@@ -65,15 +66,39 @@ public final class AgentRegistry {
 			Consumer<AgentTransition> transitionSink,
 			long nowEpochMs
 	) {
+		return restore(snapshot, onChange, transitionSink, nowEpochMs, Set.of());
+	}
+
+	public static AgentRegistry restore(
+			Snapshot snapshot,
+			Runnable onChange,
+			Consumer<AgentTransition> transitionSink,
+			long nowEpochMs,
+			Set<AgentId> pendingConversationWakeAgents
+	) {
 		Objects.requireNonNull(snapshot, "snapshot must not be null");
+		Set<AgentId> wakeAgents = Set.copyOf(Objects.requireNonNull(
+				pendingConversationWakeAgents, "pendingConversationWakeAgents must not be null"
+		));
 		LinkedHashMap<AgentId, AgentRecord> recovered = new LinkedHashMap<>();
 		for (AgentRecord record : snapshot.records()) {
-			AgentRecord revised = AgentLifecycleReducer.recoverAfterReload(record, nowEpochMs);
+			AgentRecord revised = wakeAgents.contains(record.agentId())
+					? recoverConversationWake(record, nowEpochMs)
+					: AgentLifecycleReducer.recoverAfterReload(record, nowEpochMs);
 			if (recovered.put(revised.agentId(), revised) != null) {
 				throw new AgentDomainException("DUPLICATE_AGENT_ID", "Duplicate agent ID in snapshot: " + revised.agentId());
 			}
 		}
 		return new AgentRegistry(snapshot.maxAgents(), snapshot.queueLimit(), recovered, onChange, transitionSink);
+	}
+
+	private static AgentRecord recoverConversationWake(AgentRecord record, long nowEpochMs) {
+		if (!record.state().isReloadUncertain() || record.currentGoal().isEmpty()) {
+			throw new AgentDomainException("INVALID_CONVERSATION_WAKE", "Pending conversation wake does not own recoverable active work");
+		}
+		return record.withLifecycle(
+				AgentLifecycleState.STARTING, record.currentGoal(), record.goalRevision(), record.queuedGoals(), nowEpochMs, ""
+		);
 	}
 
 	public synchronized int availableCapacity() {
@@ -175,6 +200,15 @@ public final class AgentRegistry {
 		return revised;
 	}
 
+	public synchronized AgentRecord detachEntity(AgentId id, long nowEpochMs) {
+		AgentRecord current = require(id);
+		if (current.entityUuid().isEmpty()) return current;
+		AgentRecord revised = current.withEntityUuid(Optional.empty(), nowEpochMs);
+		records.put(id, revised);
+		onChange.run();
+		return revised;
+	}
+
 	public synchronized AgentRecord updateEntityLocation(
 			AgentId id,
 			AgentEntityLocation entityLocation,
@@ -204,6 +238,18 @@ public final class AgentRegistry {
 
 	public synchronized AgentTransition start(AgentId id, String prompt, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.start(require(id), prompt, nowEpochMs));
+	}
+
+	/** Commits a prepared start only after its publication barrier succeeds. */
+	public synchronized AgentTransition startAtomically(
+			AgentId id,
+			String prompt,
+			long nowEpochMs,
+			BiConsumer<AgentTransition, Runnable> barrier
+	) {
+		Objects.requireNonNull(barrier, "barrier must not be null");
+		AgentTransition transition = AgentLifecycleReducer.start(require(id), prompt, nowEpochMs);
+		return applyAtomically(transition, barrier, "start");
 	}
 
 	public synchronized AgentTransition queue(AgentId id, String prompt, long nowEpochMs) {
@@ -238,12 +284,63 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.completeGoal(require(id), revision, nowEpochMs));
 	}
 
+	/** Applies a coordinator-owned terminal state, promoting queued work when present. */
+	public synchronized AgentRecord coordinatorCompleted(AgentId id, long revision, long nowEpochMs) {
+		AgentRecord current = require(id);
+		if (current.goalRevision() != revision) {
+			throw new AgentDomainException("STALE_REVISION", "Coordinator completion revision is stale");
+		}
+		if (current.state() == AgentLifecycleState.COMPLETED) return current;
+		if (!current.state().isActive()) {
+			throw new AgentDomainException("INVALID_AGENT_STATE", "Coordinator completion requires an active agent");
+		}
+		if (!current.queuedGoals().isEmpty()) {
+			return apply(AgentLifecycleReducer.completeGoal(current, revision, nowEpochMs)).after();
+		}
+		AgentRecord completed = current.withLifecycle(
+				AgentLifecycleState.COMPLETED,
+				current.currentGoal(),
+				current.goalRevision(),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		);
+		return apply(new AgentTransition(current, completed, false, false)).after();
+	}
+
 	public synchronized AgentTransition fail(AgentId id, String message, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.fail(require(id), message, nowEpochMs));
 	}
 
 	public synchronized AgentTransition disconnect(AgentId id, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.disconnect(require(id), nowEpochMs));
+	}
+
+	/** Re-arms a durable wake after transport loss without manufacturing a new goal revision. */
+	public synchronized AgentTransition rearmConversationWake(
+			AgentId id,
+			long goalRevision,
+			UUID goalId,
+			long nowEpochMs
+	) {
+		AgentRecord current = require(id);
+		if (current.goalRevision() != goalRevision
+				|| current.currentGoal().map(goal -> !goal.goalId().equals(goalId)).orElse(true)) {
+			throw new AgentDomainException("STALE_REVISION", "Pending conversation wake no longer owns the current goal");
+		}
+		if (current.state() == AgentLifecycleState.STARTING) {
+			return new AgentTransition(current, current, false, false);
+		}
+		if (!current.state().isActive() && current.state() != AgentLifecycleState.PAUSED
+				&& current.state() != AgentLifecycleState.DISCONNECTED) {
+			throw new AgentDomainException("INVALID_AGENT_STATE", "Pending conversation wake cannot re-arm " + current.state());
+		}
+		AgentRecord rearmed = current.withLifecycle(
+				AgentLifecycleState.STARTING, current.currentGoal(), current.goalRevision(), current.queuedGoals(), nowEpochMs, ""
+		);
+		records.put(id, rearmed);
+		onChange.run();
+		return new AgentTransition(current, rearmed, current.state() != AgentLifecycleState.STARTING, true);
 	}
 
 	public synchronized AgentTransition die(AgentId id, AgentDeathSnapshot deathSnapshot, long nowEpochMs) {
@@ -263,7 +360,7 @@ public final class AgentRegistry {
 	) {
 		Objects.requireNonNull(barrier, "barrier must not be null");
 		AgentTransition transition = AgentLifecycleReducer.respawn(require(id), entityUuid, nowEpochMs);
-		return respawnAtomically(transition, barrier);
+		return applyAtomically(transition, barrier, "respawn");
 	}
 
 	public synchronized AgentTransition respawnAtomically(
@@ -280,17 +377,18 @@ public final class AgentRegistry {
 				lifecycle.before(), lifecycle.after().withEntityLocation(entityLocation, nowEpochMs),
 				lifecycle.cancelAction(), lifecycle.interruptPlanner()
 		);
-		return respawnAtomically(located, barrier);
+		return applyAtomically(located, barrier, "respawn");
 	}
 
-	private AgentTransition respawnAtomically(
+	private AgentTransition applyAtomically(
 			AgentTransition transition,
-			BiConsumer<AgentTransition, Runnable> barrier
+			BiConsumer<AgentTransition, Runnable> barrier,
+			String operation
 	) {
 		AgentId id = transition.after().agentId();
 		boolean[] committed = { false };
 		Runnable commit = () -> {
-			if (committed[0]) throw new IllegalStateException("respawn transition was already committed");
+			if (committed[0]) throw new IllegalStateException(operation + " transition was already committed");
 			records.put(id, transition.after());
 			try {
 				onChange.run();
@@ -302,7 +400,7 @@ public final class AgentRegistry {
 		};
 		try {
 			barrier.accept(transition, commit);
-			if (!committed[0]) throw new IllegalStateException("respawn barrier did not commit the transition");
+			if (!committed[0]) throw new IllegalStateException(operation + " barrier did not commit the transition");
 			return transition;
 		} catch (RuntimeException exception) {
 			if (committed[0]) {

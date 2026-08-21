@@ -60,3 +60,42 @@ test('combined catalog refreshes independent provider CLIs concurrently', async 
 	for (const release of releases.values()) release();
 	await refreshing;
 });
+
+test('reconciles independent providers concurrently', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const started = [];
+	const releases = new Map();
+	for (const [provider, service] of Object.entries(services)) {
+		service.reconcile = (records) => new Promise((resolve) => {
+			started.push(provider);
+			releases.set(provider, () => resolve({ valid: records, invalid: [], removed: [], catalog: { models: [] } }));
+		});
+	}
+	const router = new ProviderService(services);
+	const reconciling = router.reconcile([
+		{ agentId: 'c', provider: 'codex' }, { agentId: 'g', provider: 'gemini' }, { agentId: 'k', provider: 'kimi' },
+	]);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(started, ['codex', 'gemini', 'kimi']);
+	for (const release of releases.values()) release();
+	const result = await reconciling;
+	assert.deepEqual(result.valid.map((profile) => profile.agentId), ['c', 'g', 'k']);
+});
+
+test('bootstrap catalog is complete before mixed-provider profiles can be accepted', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	for (const [provider, service] of Object.entries(services)) {
+		service.catalog.refresh = async () => ({
+			refreshedAtEpochMs: 42,
+			models: [{ id: `${provider}-model`, model: `${provider}-model` }],
+		});
+	}
+	const router = new ProviderService(services);
+
+	const snapshot = await router.bootstrapCatalog();
+	assert.deepEqual(snapshot.models.map((model) => [model.provider, model.id]), [
+		['codex', 'codex-model'],
+		['gemini', 'gemini-model'],
+		['kimi', 'kimi-model'],
+	]);
+});
