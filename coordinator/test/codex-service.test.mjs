@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { CodexService } from '../src/codex-service.mjs';
 import { profileFingerprint } from '../src/provider-session.mjs';
+import { finishDecisionJson } from './provider-decision-fixtures.mjs';
 
 const MODEL = {
 	id: 'gpt-5.6-sol',
@@ -46,7 +47,7 @@ class FakeSharedTransport extends EventEmitter {
 	}
 
 	complete(threadId, turnId) {
-		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: '{"summary":"Done","directive":"finish","status":"completed"}' } } });
+		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: finishDecisionJson() } } });
 		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'completed' } } });
 	}
 }
@@ -154,7 +155,7 @@ test('Codex service accepts the streamed agent-message contract when no complete
 	await agent.setGoalRevision(1);
 	const decisionPromise = agent.decide('Observation.', { goalRevision: 1 });
 	await Promise.resolve();
-	const text = '{"summary":"Done","directive":"finish","status":"completed"}';
+	const text = finishDecisionJson();
 	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: text } });
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
 	assert.equal((await decisionPromise).status, 'completed');
@@ -318,12 +319,12 @@ test('a late prior-turn completion cannot satisfy a new turn before its ID is kn
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
-	const staleText = '{"summary":"Stale prior turn","directive":"finish","status":"completed"}';
+	const staleText = finishDecisionJson({ summary: 'Stale prior turn' });
 	transport.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-old', item: { type: 'agentMessage', text: staleText } } });
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-old', turn: { id: 'turn-old', status: 'completed' } } });
 	transport.turnStartResolvers[0]({ turn: { id: 'turn-new' } });
 	await new Promise((resolve) => setImmediate(resolve));
-	const currentText = '{"summary":"Current turn","directive":"finish","status":"completed"}';
+	const currentText = finishDecisionJson({ summary: 'Current turn' });
 	transport.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-new', item: { type: 'agentMessage', text: currentText } } });
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-new', turn: { id: 'turn-new', status: 'completed' } } });
 	assert.equal((await decision).summary, 'Current turn');

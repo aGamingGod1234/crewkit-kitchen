@@ -13,15 +13,16 @@ import {
 	verifyReplayDecision,
 } from '../src/benchmark/provider-replay.mjs';
 import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
+import { replaceDecision } from './provider-decision-fixtures.mjs';
 
 const PROFILE = Object.freeze({
 	provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast',
 });
 const SCENARIO = Object.freeze({ id: 'wait', seed: 42, commands: [{ actionType: 'wait', arguments: { durationMs: 1 } }] });
-const DECISION = Object.freeze({
-	summary: 'wait', directive: 'replace',
+const DECISION = Object.freeze(replaceDecision({
+	summary: 'wait',
 	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
-});
+}));
 
 function record(overrides = {}) {
 	return createReplayRecord({
@@ -120,9 +121,9 @@ test('projects shipped function-bearing manifests without serializing executable
 });
 
 test('replays exact independent decision sequences for translated agents in one load', async () => {
-	const decisionA1 = { summary: 'a1', directive: 'replace', source: SOURCE_FOR('a1') };
+	const decisionA1 = replaceDecision({ summary: 'a1', source: SOURCE_FOR('a1') });
 	const decisionA2 = { summary: 'a2', directive: 'continue' };
-	const decisionB1 = { summary: 'b1', directive: 'replace', source: SOURCE_FOR('b1') };
+	const decisionB1 = replaceDecision({ summary: 'b1', source: SOURCE_FOR('b1') });
 	const decisionB2 = { summary: 'b2', directive: 'continue' };
 	const recordingA = createReplayRecord({
 		trialId: 'multi-turn-load-2', agentId: 'agent-a', agentLoad: 2, prompt: 'a-turn-1',

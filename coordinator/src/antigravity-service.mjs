@@ -219,10 +219,11 @@ class AntigravityAgent {
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
-			this.#hasConversation = true;
-			this.#sessionState = 'warm';
 			try {
-				return parseDecision(decisionText.trim());
+				const decision = parseDecision(decisionText.trim());
+				this.#hasConversation = true;
+				this.#sessionState = 'warm';
+				return decision;
 			} catch (error) {
 				throw new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',

@@ -4,12 +4,9 @@ import test from 'node:test';
 
 import { AcpProviderService, buildAcpLaunch } from '../src/acp-service.mjs';
 import { profileFingerprint } from '../src/provider-session.mjs';
+import { replaceDecisionJson } from './provider-decision-fixtures.mjs';
 
-const DECISION = JSON.stringify({
-	summary: 'Wait safely.',
-	directive: 'replace',
-	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);',
-});
+const DECISION = replaceDecisionJson();
 
 class FakeAcpTransport extends EventEmitter {
 	constructor(configOptions, { configOptionsAfterModel = null } = {}) {

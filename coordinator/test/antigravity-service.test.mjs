@@ -8,6 +8,7 @@ import {
 } from '../src/antigravity-service.mjs';
 import { buildPlannerInput } from '../src/prompts.mjs';
 import { profileFingerprint } from '../src/provider-session.mjs';
+import { replaceDecisionJson } from './provider-decision-fixtures.mjs';
 
 test('Antigravity catalog retains the last discovered aliases when a later CLI refresh fails', async () => {
 	let fail = false;
@@ -39,11 +40,7 @@ test('Antigravity fallback configuration accepts the installed Gemini 3.7 Flash 
 	await service.stop();
 });
 
-const DECISION = JSON.stringify({
-	summary: 'Wait safely.',
-	directive: 'replace',
-	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);',
-});
+const DECISION = replaceDecisionJson();
 
 class FakeChild extends EventEmitter {
 	constructor() {
@@ -221,6 +218,35 @@ test('Antigravity exposes explicit best-effort continuation status without claim
 	assert.equal(first.profileFingerprint, profileFingerprint(selected));
 	assert.deepEqual(second, first);
 	assert.equal(spawnCalls[1].args.includes('--continue'), true);
+	await service.stop();
+});
+
+test('Antigravity does not warm a session when decision parsing fails', async () => {
+	const spawnCalls = [];
+	let attempt = 0;
+	const service = new AntigravityProviderService(config(), {
+		spawn: (command, args, options) => {
+			spawnCalls.push({ command, args, options });
+			const child = new FakeChild();
+			attempt += 1;
+			queueMicrotask(() => {
+				const output = attempt === 1
+					? '{"summary":"Wait safely.","directive":"replace","source":"program.onUnhandledAttention(\\"continue_and_notify\\"); await player.wait(25);"}'
+					: DECISION;
+				child.stdout.emit('data', Buffer.from(output));
+				child.exitCode = 0;
+				child.emit('close', 0, null);
+			});
+			return child;
+		},
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(1);
+	await assert.rejects(agent.decide('state', { goalRevision: 1 }), (error) => error?.code === 'DECISION_FIELD_MISMATCH');
+	assert.equal(agent.sessionMetadata().sessionState, 'cold');
+	await agent.decide('state', { goalRevision: 1 });
+	assert.equal(spawnCalls[1].args.includes('--continue'), false);
+	assert.equal(agent.sessionMetadata().sessionState, 'warm');
 	await service.stop();
 });
 
