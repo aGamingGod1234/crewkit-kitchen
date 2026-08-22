@@ -2,9 +2,12 @@ package dev.agaminggod.arenaagents.server;
 
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.function.IntPredicate;
 
 final class AgentRecoverySpawnPolicy {
 	private static final int MAX_SEARCH_SPAN = 48;
+	private static final int MAX_VERTICAL_DISTANCE = 32;
 
 	private AgentRecoverySpawnPolicy() {
 	}
@@ -54,6 +57,19 @@ final class AgentRecoverySpawnPolicy {
 			}
 		}
 		return Optional.ofNullable(selected);
+	}
+
+	static OptionalInt selectNearestSafeY(int preferredY, int minY, int maxY, IntPredicate safe) {
+		Objects.requireNonNull(safe, "safe must not be null");
+		if (minY > maxY) throw new IllegalArgumentException("vertical search bounds must not be inverted");
+		int center = Math.max(minY, Math.min(maxY, preferredY));
+		for (int distance = 0; distance <= MAX_VERTICAL_DISTANCE; distance++) {
+			int lower = center - distance;
+			if (lower >= minY && safe.test(lower)) return OptionalInt.of(lower);
+			int upper = center + distance;
+			if (distance > 0 && upper <= maxY && safe.test(upper)) return OptionalInt.of(upper);
+		}
+		return OptionalInt.empty();
 	}
 
 	record Position(int x, int y, int z) {

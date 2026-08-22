@@ -1391,6 +1391,14 @@ test('dynamic config exposes the native Cursor model families and genuine settin
 	assert.deepEqual(config.cursor.modelReasoningEfforts['grok-4.6'], ['low', 'medium', 'high', 'xhigh']);
 });
 
+test('dynamic config rejects an ephemeral voice port that the addon cannot discover', () => {
+	assert.throws(() => normalizeDynamicConfig({
+		bridge: { port: 25570, secret: 's'.repeat(32) },
+		voice: { port: 0 },
+		codex: { launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+	}, {}), /voice\.port must be an integer between 1 and 65535/);
+});
+
 test('dynamic coordinator forwards protocol audit to its constructed bridge', () => {
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);

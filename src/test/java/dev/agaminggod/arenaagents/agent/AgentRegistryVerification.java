@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.agent;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.UUID;
 
@@ -270,7 +271,7 @@ public final class AgentRegistryVerification {
 				START_TIME
 		).withEntity(
 				Optional.of(UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")),
-				Optional.of(new AgentEntityLocation("minecraft:the_nether", 12, -8)),
+				Optional.of(new AgentEntityLocation("minecraft:the_nether", 12, -8, OptionalInt.of(71))),
 				START_TIME + 1L
 		);
 		AgentRegistry.Snapshot snapshot = new AgentRegistry.Snapshot(
@@ -283,9 +284,10 @@ public final class AgentRegistryVerification {
 		String encoded = codec.encode(snapshot);
 		AgentRecord decoded = codec.decode(encoded).records().getFirst();
 		assertEquals(record.entityLocation(), decoded.entityLocation(), "entity location round-trip");
+		assertTrue(encoded.contains("\"block_y\":71"), "entity recovery height is persisted");
 
 		String legacy = encoded.replace(
-				",\"entity_location\":{\"dimension\":\"minecraft:the_nether\",\"chunk_x\":12,\"chunk_z\":-8}",
+				",\"entity_location\":{\"dimension\":\"minecraft:the_nether\",\"chunk_x\":12,\"chunk_z\":-8,\"block_y\":71}",
 				""
 		);
 		AgentRecord migrated = codec.decode(legacy).records().getFirst();
@@ -296,7 +298,7 @@ public final class AgentRegistryVerification {
 		AgentRecord detached = registry.detachEntity(record.agentId(), START_TIME + 3L);
 		assertEquals(Optional.empty(), detached.entityUuid(), "missing physical player clears stale entity UUID");
 		assertEquals(Optional.empty(), detached.entityLocation(), "missing physical player clears stale entity location");
-		return 5;
+		return 6;
 	}
 
 	private static int verifyAutomaticProgressPersistence() {

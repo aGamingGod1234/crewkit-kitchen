@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server;
 
 import java.util.Optional;
+import java.util.OptionalInt;
 
 public final class AgentRecoverySpawnPolicyVerification {
 	private AgentRecoverySpawnPolicyVerification() {
@@ -45,6 +46,15 @@ public final class AgentRecoverySpawnPolicyVerification {
 						0, 0, Integer.MIN_VALUE, Integer.MAX_VALUE, 0, 0, (x, z) -> safeLand),
 				"corrupted recovery bounds are rejected before an overflowing scan"
 		);
+		assertions++;
+
+		assertEquals(OptionalInt.of(61), AgentRecoverySpawnPolicy.selectNearestSafeY(
+				64, -64, 319, y -> y == 61 || y == 128),
+				"recovery selects playable body space near the persisted height instead of the Nether roof");
+		assertions++;
+		assertEquals(OptionalInt.empty(), AgentRecoverySpawnPolicy.selectNearestSafeY(
+				64, -64, 319, y -> y == 128),
+				"recovery rejects safe-looking terrain outside the bounded persisted-height search");
 		assertions++;
 		return assertions;
 	}

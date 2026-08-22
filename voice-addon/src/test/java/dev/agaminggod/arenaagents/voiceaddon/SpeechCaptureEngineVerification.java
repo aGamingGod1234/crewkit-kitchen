@@ -24,6 +24,8 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyWhisperChangeSplitsAndSequencesUtterances();
 		assertions += verifyMaximumDurationBoundsDecodedSamples();
 		assertions += verifyMalformedPacketDoesNotWedgeLaterSpeech();
+		assertions += verifyTranscriptsDeliverInUtteranceOrder();
+		assertions += verifyUnavailableSttDisablesFurtherCapture();
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		return assertions;
 	}
@@ -121,6 +123,45 @@ final class SpeechCaptureEngineVerification {
 		return 3;
 	}
 
+	private static int verifyTranscriptsDeliverInUtteranceOrder() {
+		ControlledTranscriber transcriber = new ControlledTranscriber();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 5_000L, 1);
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine.TranscriptDelivery delivery = (playerId, text, whispering) ->
+				delivered.add(new Delivered(playerId, text, whispering));
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run, delivery);
+		engine.accept(PLAYER, true, new byte[] { 2 }, RecordingDecoder::new, Runnable::run, delivery);
+
+		transcriber.complete(2L, "second");
+		assertEquals(List.of(), delivered, "later transcript waits for the prior utterance");
+		transcriber.complete(1L, "first");
+		assertEquals(
+				List.of(new Delivered(PLAYER, "first", false), new Delivered(PLAYER, "second", true)),
+				delivered,
+				"transcripts deliver in captured utterance order"
+		);
+		engine.close();
+		return 2;
+	}
+
+	private static int verifyUnavailableSttDisablesFurtherCapture() {
+		int[] transcriptions = { 0 };
+		SpeechCaptureEngine engine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
+			transcriptions[0]++;
+			return CompletableFuture.failedFuture(new VoiceWorkerClient.VoiceWorkerException(
+					"STT_UNAVAILABLE", "Speech recognition is not configured"
+			));
+		}, scheduler(), 5_000L, 1);
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { });
+		engine.accept(PLAYER, false, new byte[] { 2 }, () -> {
+			throw new AssertionError("disabled capture must not create another decoder");
+		}, Runnable::run, (playerId, text, whispering) -> { });
+		assertEquals(1, transcriptions[0], "STT_UNAVAILABLE permanently disables this capture engine");
+		engine.close();
+		return 1;
+	}
+
 	private static int verifyCloseDiscardsPartialSpeechAndClosesDecoder() {
 		RecordingTranscriber transcriber = new RecordingTranscriber();
 		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 5_000L, 32);
@@ -170,6 +211,27 @@ final class SpeechCaptureEngineVerification {
 		) {
 			captured.add(new Captured(playerId, utteranceSequence, whispering, samples.clone()));
 			return CompletableFuture.completedFuture(new SpeechWorkerClient.Transcript("heard " + samples.length, 0.9));
+		}
+	}
+
+	private static final class ControlledTranscriber implements SpeechCaptureEngine.Transcriber {
+		private final java.util.Map<Long, CompletableFuture<SpeechWorkerClient.Transcript>> pending =
+				new java.util.LinkedHashMap<>();
+
+		@Override
+		public CompletableFuture<SpeechWorkerClient.Transcript> transcribe(
+				UUID playerId,
+				long utteranceSequence,
+				boolean whispering,
+				short[] samples
+		) {
+			CompletableFuture<SpeechWorkerClient.Transcript> future = new CompletableFuture<>();
+			pending.put(utteranceSequence, future);
+			return future;
+		}
+
+		private void complete(long sequence, String text) {
+			pending.get(sequence).complete(new SpeechWorkerClient.Transcript(text, 0.9));
 		}
 	}
 

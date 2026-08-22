@@ -1519,7 +1519,7 @@ function normalizeVoiceConfig(value, environment) {
 	const configuredPort = environment.ARENA_AGENT_VOICE_PORT === undefined
 		? source.port ?? DEFAULT_VOICE_PORT
 		: Number(environment.ARENA_AGENT_VOICE_PORT);
-	if (!Number.isSafeInteger(configuredPort) || configuredPort < 0 || configuredPort > 65_535) throw new TypeError('voice.port must be an integer between 0 and 65535');
+	if (!Number.isSafeInteger(configuredPort) || configuredPort < 1 || configuredPort > 65_535) throw new TypeError('voice.port must be an integer between 1 and 65535');
 	const maxConcurrent = positiveInteger(source.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT, 'voice.maxConcurrent');
 	if (maxConcurrent > 5) throw new TypeError('voice.maxConcurrent must not exceed 5');
 	const profileAssignmentsPath = path.resolve(PROJECT_DIRECTORY, source.profileAssignmentsPath ?? DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);

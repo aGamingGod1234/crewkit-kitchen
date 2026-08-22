@@ -59,6 +59,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 						? BundledCoordinatorInstaller.prepare(discoveredRoot)
 						: BundledCoordinatorInstaller.validate(discoveredRoot);
 				configureSharedBridgeSecretPath(prepared.secret());
+				configureSharedVoiceEndpoint(prepared.config());
 				located = NodeRuntimeLocator.locate(prepared.root());
 			}
 		} catch (NodeRuntimeLocator.NodeRuntimeFailure exception) {
@@ -200,6 +201,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 		System.setProperty("arenaagents.bridgeSecretFile", canonical.toString());
 		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
+	}
+
+	private void configureSharedVoiceEndpoint(Path configPath) throws IOException {
+		String configured = System.getProperty("arenaagents.voiceUrl");
+		if (configured != null && !configured.isBlank()) return;
+		CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
+				.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
 	}
 
 	private static String firstNonblank(String first, String second) {

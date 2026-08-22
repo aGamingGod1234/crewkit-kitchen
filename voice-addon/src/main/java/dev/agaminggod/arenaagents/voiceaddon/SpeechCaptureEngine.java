@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
@@ -20,7 +21,9 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	private final int maxSamples;
 	private final Map<UUID, Utterance> utterances = new LinkedHashMap<>();
 	private final Map<UUID, Long> sequences = new LinkedHashMap<>();
+	private final Map<UUID, TranscriptQueue> transcriptQueues = new LinkedHashMap<>();
 	private boolean closed;
+	private boolean sttUnavailable;
 
 	SpeechCaptureEngine(
 			Transcriber transcriber,
@@ -51,7 +54,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		Objects.requireNonNull(delivery, "delivery must not be null");
 		List<CompletedUtterance> completed = new ArrayList<>(2);
 		synchronized (this) {
-			if (closed) return;
+			if (closed || sttUnavailable) return;
 			Utterance utterance = utterances.get(playerId);
 			if (utterance != null && utterance.whispering != whispering) {
 				completed.add(finishLocked(playerId, utterance));
@@ -72,7 +75,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			try {
 				decoded = Objects.requireNonNull(utterance.decoder.decode(opus), "decoder returned null");
 			} catch (RuntimeException ignored) {
-				discardLocked(playerId, utterance);
+				completed.add(discardLocked(playerId, utterance));
 				decoded = null;
 			}
 			if (decoded != null) {
@@ -111,17 +114,28 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		);
 	}
 
-	private void discardLocked(UUID playerId, Utterance utterance) {
+	private CompletedUtterance discardLocked(UUID playerId, Utterance utterance) {
 		utterances.remove(playerId, utterance);
 		if (utterance.timeout != null) utterance.timeout.cancel(false);
 		try {
 			utterance.decoder.close();
 		} catch (RuntimeException ignored) {
 		}
+		return new CompletedUtterance(
+				playerId,
+				utterance.sequence,
+				utterance.whispering,
+				new short[0],
+				utterance.deliveryExecutor,
+				utterance.delivery
+		);
 	}
 
 	private void transcribe(CompletedUtterance utterance) {
-		if (utterance.samples.length == 0) return;
+		if (utterance.samples.length == 0) {
+			completeTranscription(utterance, null, null);
+			return;
+		}
 		CompletionStage<SpeechWorkerClient.Transcript> stage;
 		try {
 			stage = Objects.requireNonNull(transcriber.transcribe(
@@ -130,19 +144,64 @@ final class SpeechCaptureEngine implements AutoCloseable {
 					utterance.whispering,
 					utterance.samples
 			), "transcriber returned null");
-		} catch (RuntimeException ignored) {
+		} catch (RuntimeException failure) {
+			completeTranscription(utterance, null, failure);
 			return;
 		}
-		stage.whenComplete((transcript, failure) -> {
-			if (failure != null || transcript == null || transcript.text().isBlank()) return;
-			try {
-				utterance.deliveryExecutor.execute(() -> utterance.delivery.deliver(
-						utterance.playerId, transcript.text(), utterance.whispering
-				));
-			} catch (RuntimeException ignored) {
-				// The Minecraft server may be stopping while transcription completes.
+		stage.whenComplete((transcript, failure) -> completeTranscription(utterance, transcript, failure));
+	}
+
+	private void completeTranscription(
+			CompletedUtterance utterance,
+			SpeechWorkerClient.Transcript transcript,
+			Throwable failure
+	) {
+		List<TranscriptOutcome> ready = new ArrayList<>();
+		synchronized (this) {
+			if (closed) return;
+			if (isSttUnavailable(failure)) {
+				sttUnavailable = true;
+				for (Utterance active : utterances.values()) {
+					if (active.timeout != null) active.timeout.cancel(false);
+					try {
+						active.decoder.close();
+					} catch (RuntimeException ignored) {
+					}
+				}
+				utterances.clear();
+				transcriptQueues.clear();
+				return;
 			}
-		});
+			TranscriptQueue queue = transcriptQueues.computeIfAbsent(utterance.playerId, ignored -> new TranscriptQueue());
+			queue.completed.put(utterance.sequence, new TranscriptOutcome(utterance, failure == null ? transcript : null));
+			while (true) {
+				TranscriptOutcome outcome = queue.completed.remove(queue.nextSequence);
+				if (outcome == null) break;
+				queue.nextSequence++;
+				if (outcome.transcript != null && !outcome.transcript.text().isBlank()) ready.add(outcome);
+			}
+		}
+		if (ready.isEmpty()) return;
+		try {
+			ready.getFirst().utterance.deliveryExecutor.execute(() -> {
+				for (TranscriptOutcome outcome : ready) {
+					outcome.utterance.delivery.deliver(
+							outcome.utterance.playerId,
+							outcome.transcript.text(),
+							outcome.utterance.whispering
+					);
+				}
+			});
+		} catch (RuntimeException ignored) {
+			// The Minecraft server may be stopping while transcription completes.
+		}
+	}
+
+	private static boolean isSttUnavailable(Throwable failure) {
+		Throwable current = failure;
+		while (current instanceof CompletionException && current.getCause() != null) current = current.getCause();
+		return current instanceof VoiceWorkerClient.VoiceWorkerException workerFailure
+				&& workerFailure.code().equals("STT_UNAVAILABLE");
 	}
 
 	@Override
@@ -154,6 +213,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			utterance.decoder.close();
 		}
 		utterances.clear();
+		transcriptQueues.clear();
 		scheduler.shutdownNow();
 	}
 
@@ -230,6 +290,17 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			short[] samples,
 			Executor deliveryExecutor,
 			TranscriptDelivery delivery
+	) {
+	}
+
+	private static final class TranscriptQueue {
+		private long nextSequence = 1L;
+		private final Map<Long, TranscriptOutcome> completed = new LinkedHashMap<>();
+	}
+
+	private record TranscriptOutcome(
+			CompletedUtterance utterance,
+			SpeechWorkerClient.Transcript transcript
 	) {
 	}
 }

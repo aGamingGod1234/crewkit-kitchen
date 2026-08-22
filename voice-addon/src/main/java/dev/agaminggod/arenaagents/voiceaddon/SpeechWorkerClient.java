@@ -56,9 +56,7 @@ final class SpeechWorkerClient {
 		return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
 				.thenApply(response -> {
 					if (response.statusCode() != 200) {
-						throw new VoiceWorkerClient.VoiceWorkerException(
-								"STT_WORKER_HTTP", "Speech worker returned HTTP " + response.statusCode()
-						);
+						throw workerHttpFailure(response);
 					}
 					try {
 						String contentType = response.headers().firstValue("Content-Type").orElse("")
@@ -89,6 +87,26 @@ final class SpeechWorkerClient {
 						);
 					}
 				});
+	}
+
+	private static VoiceWorkerClient.VoiceWorkerException workerHttpFailure(HttpResponse<String> response) {
+		String code = "STT_WORKER_HTTP";
+		String contentType = response.headers().firstValue("Content-Type").orElse("")
+				.toLowerCase(Locale.ROOT).split(";", 2)[0].strip();
+		if (contentType.equals("application/json")) {
+			try {
+				JsonObject payload = JsonParser.parseString(response.body()).getAsJsonObject();
+				if (payload.has("code") && payload.get("code").isJsonPrimitive()
+						&& payload.get("code").getAsString().equals("STT_UNAVAILABLE")) {
+					code = "STT_UNAVAILABLE";
+				}
+			} catch (RuntimeException ignored) {
+				// Invalid error bodies remain a generic bounded HTTP failure.
+			}
+		}
+		return new VoiceWorkerClient.VoiceWorkerException(
+				code, "Speech worker returned HTTP " + response.statusCode()
+		);
 	}
 
 	private static HttpClient defaultClient() {

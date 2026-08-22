@@ -35,6 +35,7 @@ final class VoiceWorkerClientsVerification {
 		assertions += verifyTtsClientRejectsMalformedAudioAndHttpFailure();
 		assertions += verifySttClientSendsPcmMetadataAndBoundsTranscript();
 		assertions += verifySttClientRejectsMalformedInputAndResponse();
+		assertions += verifySttUnavailablePreservesWorkerCode();
 		assertions += verifyClientsRejectWrongResponseMediaTypes();
 		return assertions;
 	}
@@ -148,6 +149,25 @@ final class VoiceWorkerClientsVerification {
 			malformed.assertHealthy();
 		}
 		return 2;
+	}
+
+	private static int verifySttUnavailablePreservesWorkerCode() throws Exception {
+		try (WorkerServer unavailable = new WorkerServer(exchange -> respond(
+				exchange,
+				503,
+				"{\"code\":\"STT_UNAVAILABLE\",\"message\":\"Speech recognition is not configured\"}"
+						.getBytes(StandardCharsets.UTF_8),
+				"application/json"
+		))) {
+			SpeechWorkerClient client = new SpeechWorkerClient(
+					HttpClient.newHttpClient(), unavailable.uri("/v1/stt"), SECRET
+			);
+			assertWorkerFailure("STT_UNAVAILABLE", () -> client.transcribe(
+					PLAYER, 1L, false, new short[] { 1 }
+			).join(), "STT unavailable response");
+			unavailable.assertHealthy();
+		}
+		return 1;
 	}
 
 	private static VoiceRequest request() {
