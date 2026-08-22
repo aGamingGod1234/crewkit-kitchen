@@ -282,7 +282,9 @@ test('retries a queued urgent trigger after a failed initial provider turn', asy
 		await eventually(() => run.planner.requests.length === 2);
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
 		assert.equal(run.planner.requests[1].planningPriority, 'urgent');
+		assert.equal(run.bridge.sent.find((message) => message.type === 'action_command').payload.goalRevision, 1);
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.ACTING);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false, 'urgent recovery must not advance the authoritative server revision');
 		assert.equal(runtimeErrors.some((error) => error.code === 'ILLEGAL_STATE_TRANSITION'), false);
 	} finally {
 		release();
@@ -317,6 +319,24 @@ test('flushes conversation attention that arrived during initial planning after 
 		assert.match(run.planner.requests[1].input, /Please answer now\./);
 	} finally {
 		release();
+		await run.coordinator.stop();
+	}
+});
+
+test('reports a non-quiet initial provider failure when no urgent recovery is pending', async () => {
+	const run = await start();
+	const runtimeErrors = [];
+	run.coordinator.on('runtimeError', (error) => runtimeErrors.push(error));
+	run.planner.requestPlan = async (request) => {
+		run.planner.requests.push(request);
+		throw Object.assign(new Error('Provider unavailable'), { code: 'PROVIDER_DOWN' });
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_error'));
+		assert.equal(runtimeErrors.some((error) => error.code === 'PROVIDER_DOWN'), true);
+	} finally {
 		await run.coordinator.stop();
 	}
 });

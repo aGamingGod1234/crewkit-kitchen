@@ -564,8 +564,9 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#providerWork.delete(work.agentId);
 		const current = this.#registry.get(work.agentId);
 		const stale = current?.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
-		if (!stale) await this.#reportAgentError(record.agentId, error);
-		if (pending?.priority === 'urgent' || stale) this.#reschedulePendingProviderPlan(pending);
+		const urgentRecovery = pending?.priority === 'urgent';
+		if (!stale && !urgentRecovery) await this.#reportAgentError(record.agentId, error);
+		if (urgentRecovery || stale) this.#reschedulePendingProviderPlan(pending);
 		return null;
 	}
 
