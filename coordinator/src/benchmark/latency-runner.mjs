@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import { createDynamicCoordinator } from '../dynamic-main.mjs';
 import { DynamicAgentState } from '../agent-registry.mjs';
 import { VirtualMinecraftBridge } from '../simulator/virtual-minecraft-bridge.mjs';
-import { VirtualWorld } from '../simulator/virtual-world.mjs';
+import { VIRTUAL_TICK_MS, VirtualWorld } from '../simulator/virtual-world.mjs';
 import { getSimulatorScenario } from '../simulator/simulator-scenarios.mjs';
 import { createReplayProvider } from './provider-replay.mjs';
 import { BenchmarkRecorder } from './benchmark-recorder.mjs';
@@ -212,7 +212,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		for (const agentId of scenario.agentIds) bridge.startAgent(agentId, scenario.goal ?? `Complete ${trial.scenarioId}`);
 		await Promise.resolve();
 		for (const agentId of scenario.agentIds) await runWithDeadline(() => bridge.publish(agentId), deadline);
-		await runWithDeadline(() => runVirtualTicks({ world, bridge, coordinator, records, cap: trial.turnCap, deadline, metrics }), deadline);
+		await runVirtualTicks({ world, bridge, coordinator, records, cap: trial.turnCap, deadline, mode: trial.mode, pacing: options.virtualTickPacing, metrics });
 		const statuses = records.map((record) => coordinator.registry.get(record.agentId)?.state);
 		const runtimeError = runtimeErrors.find((entry) => entry.code);
 		const runtimeTimedOut = isTimeoutErrorCode(runtimeError?.code);
@@ -259,17 +259,88 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	return result;
 }
 
-async function runVirtualTicks({ world, bridge, coordinator, records, cap, deadline, metrics = null }) {
-	for (let tick = 0; tick < 10_000; tick += 1) {
-		const tickStartedAt = metrics?.beginTick();
-		world.tick();
-		metrics?.endTick(tickStartedAt, world);
-		await new Promise((resolve) => setImmediate(resolve));
-		const states = records.map((record) => coordinator.registry.get(record.agentId)?.state);
-		if (states.every((state) => [DynamicAgentState.COMPLETED, DynamicAgentState.ERROR, DynamicAgentState.PAUSED].includes(state))) return;
-		if (performance.now() > deadline) throw coded('TRIAL_TIMEOUT', 'trial budget elapsed');
+async function runVirtualTicks({ world, bridge, coordinator, records, cap, deadline, mode = 'instant', pacing, metrics = null }) {
+	const pacer = createVirtualTickPacer({ mode, pacing, deadline });
+	try {
+		for (let tick = 0; tick < 10_000; tick += 1) {
+			await pacer?.wait(tick);
+			if (performance.now() >= deadline) throw coded('TRIAL_TIMEOUT', 'trial budget elapsed');
+			const tickStartedAt = metrics?.beginTick();
+			world.tick();
+			metrics?.endTick(tickStartedAt, world);
+			await new Promise((resolve) => setImmediate(resolve));
+			const states = records.map((record) => coordinator.registry.get(record.agentId)?.state);
+			if (states.every((state) => [DynamicAgentState.COMPLETED, DynamicAgentState.ERROR, DynamicAgentState.PAUSED].includes(state))) return;
+			if (performance.now() >= deadline) throw coded('TRIAL_TIMEOUT', 'trial budget elapsed');
+		}
+		throw coded('TRIAL_TIMEOUT', 'trial did not reach a terminal state before its budget');
+	} finally {
+		pacer?.close();
 	}
-	throw coded('TRIAL_TIMEOUT', 'trial did not reach a terminal state before its budget');
+}
+
+function createVirtualTickPacer({ mode, pacing, deadline }) {
+	if (!['replay', 'live'].includes(mode)) return null;
+	const configuration = pacing === undefined ? {} : pacing;
+	if (!isRecord(configuration)) throw new TypeError('virtualTickPacing must be an object');
+	const now = configuration.now ?? (() => performance.now());
+	if (typeof now !== 'function') throw new TypeError('virtualTickPacing.now must be a function');
+	const timer = configuration.timer ?? globalThis;
+	if (!isRecord(timer) || typeof timer.setTimeout !== 'function' || typeof timer.clearTimeout !== 'function') throw new TypeError('virtualTickPacing.timer must provide setTimeout and clearTimeout');
+	const tickMs = configuration.tickMs ?? VIRTUAL_TICK_MS;
+	if (!Number.isFinite(tickMs) || tickMs <= 0) throw new TypeError('virtualTickPacing.tickMs must be a positive finite number');
+	const sleep = configuration.sleep;
+	if (sleep !== undefined && typeof sleep !== 'function') throw new TypeError('virtualTickPacing.sleep must be a function');
+	let anchor = readPacingClock(now);
+	const pending = new Set();
+	return {
+		async wait(tick) {
+			let current = readPacingClock(now);
+			let target = anchor + tick * tickMs;
+			if (current - target > tickMs) {
+				anchor = current - tick * tickMs;
+				target = current;
+			}
+			const delay = target - current;
+			if (delay > 0) {
+				const remaining = deadline - performance.now();
+				if (remaining <= 0) throw coded('TRIAL_TIMEOUT', 'trial budget elapsed');
+				await (sleep ? sleep(Math.min(delay, remaining)) : waitWithPacingTimer(Math.min(delay, remaining), timer, pending));
+				if (performance.now() >= deadline) throw coded('TRIAL_TIMEOUT', 'trial budget elapsed');
+			}
+		},
+		close() {
+			for (const handle of pending) {
+				try { timer.clearTimeout(handle); } catch {}
+			}
+			pending.clear();
+		},
+	};
+}
+
+function readPacingClock(now) {
+	let value;
+	try { value = now(); } catch { value = performance.now(); }
+	return Number.isFinite(value) ? value : performance.now();
+}
+
+function waitWithPacingTimer(delay, timer, pending) {
+	return new Promise((resolve, reject) => {
+		let handle = null;
+		let settled = false;
+		const finish = (callback, value) => {
+			if (settled) return;
+			settled = true;
+			if (handle !== null) pending.delete(handle);
+			callback(value);
+		};
+		try {
+			handle = timer.setTimeout(() => finish(resolve), delay);
+			pending.add(handle);
+		} catch (error) {
+			finish(reject, error);
+		}
+	});
 }
 
 class VirtualMinecraftBridgeAdapter extends EventEmitter {
@@ -341,6 +412,7 @@ class LatencyMetricsTracker {
 	#goals = new Map();
 	#initialObservations = new Map();
 	#acceptances = new Map();
+	#movementActions = new Map();
 	#displacements = new Map();
 	#hazards = new Map();
 	#directMessages = new Map();
@@ -522,6 +594,7 @@ class LatencyMetricsTracker {
 		}
 		this.#push(this.#raw.actionCommandAcceptance, value);
 		if (!this.#acceptances.has(agentId)) this.#acceptances.set(agentId, value);
+		if (isPhysicalMovementAction(value.actionType)) this.#movementActions.set(agentId, { ...value, completedTick: null });
 		this.#advancePlanning(agentId, wallTimestampMs, true);
 		this.#recordReaction(agentId, value);
 	}
@@ -529,6 +602,9 @@ class LatencyMetricsTracker {
 	#onResult(event) {
 		const agentId = event?.envelope?.agentId;
 		if (typeof agentId !== 'string') return;
+		const payload = event?.envelope?.payload;
+		const movement = this.#movementActions.get(agentId);
+		if (movement && payload?.actionId === movement.actionId) movement.completedTick = Number.isSafeInteger(this.#world?.tickCount) ? this.#world.tickCount : null;
 		this.#advancePlanning(agentId, this.#now(), false);
 	}
 
@@ -539,19 +615,24 @@ class LatencyMetricsTracker {
 			const initial = this.#initialObservations.get(agentId);
 			const acceptance = this.#acceptances.get(agentId);
 			const baseline = this.#baseline.get(agentId);
-			if (initial && acceptance && baseline && !this.#displacements.has(agentId) && distanceBetween(baseline.position, state.position) > 1e-9) {
+			const movement = this.#movementActions.get(agentId);
+			const movementActive = movement !== undefined && (this.#virtual?.activeActionIds?.includes(agentId) === true || movement.completedTick === world?.tickCount);
+			if (initial && acceptance && baseline && movementActive && !this.#displacements.has(agentId) && distanceBetween(baseline.position, state.position) > 1e-9) {
 				const value = {
 					agentId,
+					actionId: movement.actionId,
+					actionType: movement.actionType,
 					wallTimestampMs,
 					virtualTimestampMs,
 					wallLatencyMs: Math.max(0, wallTimestampMs - initial.wallTimestampMs),
 					virtualLatencyMs: Math.max(0, virtualTimestampMs - initial.virtualTimestampMs),
-					fromAcceptanceWallLatencyMs: Math.max(0, wallTimestampMs - acceptance.wallTimestampMs),
-					fromAcceptanceVirtualLatencyMs: Math.max(0, virtualTimestampMs - acceptance.virtualTimestampMs),
+					fromAcceptanceWallLatencyMs: Math.max(0, wallTimestampMs - movement.wallTimestampMs),
+					fromAcceptanceVirtualLatencyMs: Math.max(0, virtualTimestampMs - movement.virtualTimestampMs),
 				};
 				this.#displacements.set(agentId, value);
 				this.#push(this.#raw.physicalDisplacement, value);
 			}
+			if (movement?.completedTick !== null && movement?.completedTick !== world?.tickCount) this.#movementActions.delete(agentId);
 			this.#observeDeclaredEvents(agentId, state, wallTimestampMs, virtualTimestampMs, initial);
 		}
 		for (const event of world?.conversationEvents?.() ?? []) {
@@ -579,19 +660,26 @@ class LatencyMetricsTracker {
 	#recordReaction(agentId, acceptance) {
 		for (const value of this.#hazards.values()) {
 			if (value.agentId !== agentId || value.reactionWallLatencyMs !== null || acceptance.wallTimestampMs < value.wallTimestampMs) continue;
+			if (!isProtectiveReactionAction(acceptance.actionType)) continue;
 			value.reactionWallLatencyMs = Math.max(0, acceptance.wallTimestampMs - value.wallTimestampMs);
 			value.reactionVirtualLatencyMs = Math.max(0, acceptance.virtualTimestampMs - value.virtualTimestampMs);
+			value.reactionActionId = acceptance.actionId;
+			value.reactionActionType = acceptance.actionType;
 		}
 		for (const value of this.#directMessages.values()) {
-			if ((value.agentId !== agentId && value.recipientId !== agentId) || value.reactionWallLatencyMs !== null || acceptance.wallTimestampMs < value.wallTimestampMs) continue;
+			if (value.recipientId !== agentId || value.reactionWallLatencyMs !== null || acceptance.wallTimestampMs < value.wallTimestampMs) continue;
 			value.reactionWallLatencyMs = Math.max(0, acceptance.wallTimestampMs - value.wallTimestampMs);
 			value.reactionVirtualLatencyMs = Math.max(0, acceptance.virtualTimestampMs - value.virtualTimestampMs);
+			value.reactionActionId = acceptance.actionId;
+			value.reactionActionType = acceptance.actionType;
 		}
 		for (const row of this.#raw.directMessageReaction) {
 			const event = this.#directMessages.get(row.eventId);
 			if (event && event.reactionWallLatencyMs !== undefined) {
 				row.reactionWallLatencyMs = event.reactionWallLatencyMs;
 				row.reactionVirtualLatencyMs = event.reactionVirtualLatencyMs;
+				if (event.reactionActionId !== undefined) row.reactionActionId = event.reactionActionId;
+				if (event.reactionActionType !== undefined) row.reactionActionType = event.reactionActionType;
 			}
 		}
 	}
@@ -637,8 +725,10 @@ class LatencyMetricsTracker {
 	#buildMetrics(world, agentIds) {
 		const initialObservation = this.#firstInitialObservation(agentIds);
 		const goal = this.#firstGoal(agentIds);
-		const acceptance = [...this.#acceptances.values()][0] ?? null;
-		const displacement = [...this.#displacements.values()][0] ?? null;
+		const acceptances = [...this.#acceptances.values()].slice(0, this.#maxSamples);
+		const displacements = [...this.#displacements.values()].slice(0, this.#maxSamples);
+		const acceptance = acceptances[0] ?? null;
+		const displacement = displacements[0] ?? null;
 		const planningIdleWallDurationMs = this.#raw.planningIntervals.reduce((sum, row) => sum + row.planningIdleWallDurationMs, 0);
 		const localActiveWallDurationMs = this.#raw.planningIntervals.reduce((sum, row) => sum + row.localActiveWallDurationMs, 0);
 		const tick = summarizeTickDurations(this.#tickDurations, this.#raw.ticks);
@@ -658,8 +748,10 @@ class LatencyMetricsTracker {
 			firstActionCommandAcceptanceVirtualLatencyMs: acceptance?.virtualLatencyMs ?? null,
 			firstActionCommandAcceptanceGoalWallLatencyMs: acceptance?.goalWallLatencyMs ?? null,
 			firstActionCommandAcceptanceGoalVirtualLatencyMs: acceptance?.goalVirtualLatencyMs ?? null,
+			actionCommandAcceptance: summarizeLatencyRows(acceptances),
 			firstAuthoritativePhysicalDisplacementWallLatencyMs: displacement?.wallLatencyMs ?? null,
 			firstAuthoritativePhysicalDisplacementVirtualLatencyMs: displacement?.virtualLatencyMs ?? null,
+			authoritativePhysicalDisplacement: summarizeLatencyRows(displacements),
 			taskCompletionWallDurationMs: this.#taskCompletion?.wallDurationMs ?? null,
 			taskCompletionGoalWallDurationMs: this.#taskCompletion?.goalWallDurationMs ?? null,
 			taskCompletionVirtualDurationMs: this.#taskCompletion?.virtualDurationMs ?? null,
@@ -720,6 +812,24 @@ function summarizePlanningWait(rows) {
 	};
 }
 
+function summarizeLatencyRows(rows) {
+	const wall = rows.map((row) => row.wallLatencyMs).filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+	const virtual = rows.map((row) => row.virtualLatencyMs).filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+	return {
+		count: rows.length,
+		wallLatencySamplesMs: rows.map((row) => finiteOrNull(row.wallLatencyMs)),
+		wallLatencyP50Ms: percentile(wall, 0.50),
+		wallLatencyP95Ms: percentile(wall, 0.95),
+		wallLatencyP99Ms: percentile(wall, 0.99),
+		wallLatencyMaxMs: wall.length === 0 ? null : wall.at(-1),
+		virtualLatencySamplesMs: rows.map((row) => finiteOrNull(row.virtualLatencyMs)),
+		virtualLatencyP50Ms: percentile(virtual, 0.50),
+		virtualLatencyP95Ms: percentile(virtual, 0.95),
+		virtualLatencyP99Ms: percentile(virtual, 0.99),
+		virtualLatencyMaxMs: virtual.length === 0 ? null : virtual.at(-1),
+	};
+}
+
 function cloneMetricTree(value) {
 	try { return structuredClone(value); } catch { return {}; }
 }
@@ -728,6 +838,8 @@ function firstValue(map) { return map.values().next().value ?? null; }
 function safePlayerState(world, agentId) { try { return world?.playerState?.(agentId) ?? null; } catch { return null; } }
 function distanceBetween(left, right) { return left && right ? Math.hypot((left.x ?? 0) - (right.x ?? 0), (left.y ?? 0) - (right.y ?? 0), (left.z ?? 0) - (right.z ?? 0)) : 0; }
 function finiteOrNull(value) { return Number.isFinite(value) ? value : null; }
+function isPhysicalMovementAction(actionType) { return actionType === 'move_to' || actionType === 'navigate_to'; }
+function isProtectiveReactionAction(actionType) { return isPhysicalMovementAction(actionType) || actionType === 'respawn'; }
 
 function createInjectedProviderService(provider, trial, budget, deadline, incrementTurn, stopProvider = async () => provider.stop?.(), stopProviderAfterTimeout = stopProvider) {
 	const sessions = new Map();

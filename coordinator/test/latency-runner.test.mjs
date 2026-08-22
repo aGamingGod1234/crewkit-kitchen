@@ -8,6 +8,7 @@ import { runLatencyMatrix, normalizeLatencyMatrix } from '../src/benchmark/laten
 import { BenchmarkRecorder } from '../src/benchmark/benchmark-recorder.mjs';
 import { createReplayProvider, createReplayRecord } from '../src/benchmark/provider-replay.mjs';
 import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
+import { VIRTUAL_TICK_MS } from '../src/simulator/virtual-world.mjs';
 
 const PROFILE = Object.freeze({ provider: 'instant', model: 'deterministic-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");';
@@ -117,6 +118,32 @@ test('reports explicit injected wall-clock and virtual-clock measurements', asyn
 	assert.ok(metrics.raw.providerPlanningWait.length > 0);
 });
 
+test('aggregates acceptance and physical displacement across every agent at load four', async () => {
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'movement-load-four', scenarioId: 'fixture-movement', agentLoad: 4 }] }),
+		scenarioResolver: () => movementScenario(),
+		providerFactories: { instant: () => movementProvider() },
+		artifactDirectory: null,
+	});
+	const metrics = result.trials[0].metrics;
+	assert.equal(result.trials[0].status, 'PASSED');
+	assert.equal(metrics.raw.actionCommandAcceptance.length, 4);
+	assert.equal(metrics.raw.physicalDisplacement.length, 4);
+	assert.equal(metrics.result.actionCommandAcceptance.count, 4);
+	assert.equal(metrics.result.actionCommandAcceptance.wallLatencySamplesMs.length, 4);
+	assert.ok(metrics.result.actionCommandAcceptance.wallLatencyP50Ms !== null);
+	assert.ok(metrics.result.actionCommandAcceptance.wallLatencyP95Ms !== null);
+	assert.ok(metrics.result.actionCommandAcceptance.wallLatencyP99Ms !== null);
+	assert.ok(metrics.result.actionCommandAcceptance.wallLatencyMaxMs !== null);
+	assert.equal(metrics.result.authoritativePhysicalDisplacement.count, 4);
+	assert.equal(metrics.result.authoritativePhysicalDisplacement.wallLatencySamplesMs.length, 4);
+	assert.ok(metrics.result.authoritativePhysicalDisplacement.wallLatencyP50Ms !== null);
+	assert.ok(metrics.result.firstActionCommandAcceptance.agentId);
+	assert.ok(metrics.result.firstAuthoritativePhysicalDisplacement.agentId);
+	assert.ok(metrics.result.firstAuthoritativePhysicalDisplacement.actionId);
+	assert.ok(['move_to', 'navigate_to'].includes(metrics.result.firstAuthoritativePhysicalDisplacement.actionType));
+});
+
 test('preserves bounded pairing context and reports per-trial process deltas', async () => {
 	const processSamples = [
 		{ cpuUserMs: 10, cpuSystemMs: 4, rssBytes: 100, heapUsedBytes: 50 },
@@ -161,10 +188,41 @@ test('records only declared hazard and direct-message event timing', async () =>
 	assert.equal(lava.status, 'PASSED');
 	assert.equal(lava.metrics.raw.hazardReaction.length, 1);
 	assert.equal(lava.metrics.raw.hazardReaction[0].eventId, 'lava-hazard-1');
+	assert.equal(lava.metrics.result.hazardReaction.reactionActionType, 'navigate_to');
 	assert.equal(lava.metrics.raw.hazardReaction[0].reactionWallLatencyMs, 0);
 	assert.equal(message.status, 'PASSED');
 	assert.equal(message.metrics.result.directMessageReaction.eventId, 'conversation-1');
 	assert.equal(message.metrics.result.directMessageReaction.reactionWallLatencyMs, null);
+	const respawnScenario = {
+		id: 'respawn-metrics-fixture', agentId: 'respawn-agent', goal: 'Respawn.',
+		world: { seed: 42, agents: { 'respawn-agent': { position: { x: 0, y: 1, z: 0 }, health: 0, dead: true, checkpoint: { x: 3, y: 1, z: 3 } } }, blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }] },
+		commands: [], events: [], expected: {},
+	};
+	const respawn = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...base, id: 'respawn-metrics', scenarioId: respawnScenario.id }] }),
+		scenarioResolver: () => respawnScenario,
+		providerFactories: { instant: () => ({ available: true, async createAgent() { return { async setGoalRevision() {}, async decide() { return { summary: 'respawn', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn(); program.finish("done");' }; } }; } }) },
+		artifactDirectory: null,
+	});
+	assert.equal(respawn.status, 'PASSED');
+	assert.equal(respawn.trials[0].metrics.raw.physicalDisplacement.length, 0);
+});
+
+test('does not attribute a sender follow-up action as a direct-message recipient reaction', async () => {
+	const base = getSimulatorScenario('direct-message-wake');
+	const scenario = {
+		...base,
+		id: 'sender-only-direct-message',
+		commands: [...base.commands, { actionId: 'sender-follow-up', actionType: 'wait', arguments: { durationMs: 50 } }],
+		expected: { ...base.expected, actionIds: ['direct-message-1', 'sender-follow-up'] },
+	};
+	const trial = { ...matrix().trials[0], id: 'sender-only-direct-message', scenarioId: scenario.id, turnCap: 20 };
+	const result = await runLatencyMatrix({ matrix: matrix({ trials: [trial] }), scenarioResolver: () => scenario, artifactDirectory: null });
+	const reaction = result.trials[0].metrics.result.directMessageReaction;
+	assert.equal(result.trials[0].status, 'PASSED');
+	assert.equal(reaction.eventId, 'conversation-1');
+	assert.equal(reaction.reactionWallLatencyMs, null);
+	assert.equal(reaction.reactionVirtualLatencyMs, null);
 });
 
 test('measurement instrumentation does not change authoritative action command bytes', async () => {
@@ -439,4 +497,56 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 		providerFactories: { codex: () => createReplayProvider({ recording, trialId: 'replay-path', prompt: `${prompt}-drift`, providerProfile: profile, scenario, protocolVersion: 2 }) }, artifactDirectory: null,
 	});
 	assert.equal(drift.trials[0].error.code, 'REPLAY_IDENTITY_MISMATCH');
+});
+
+test('paces delayed replay ticks against wall time instead of racing virtual time ahead', async () => {
+	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	const scenario = fixtureScenario();
+	const trial = { ...matrix().trials[0], id: 'paced-replay', mode: 'replay', providerProfile: profile, trialBudgetMs: 1_000, turnBudgetMs: 500 };
+	const decision = { summary: 'done', directive: 'replace', source: SOURCE };
+	let prompt = null;
+	const liveProvider = () => ({
+		available: true,
+		provider: profile.provider,
+		model: profile.model,
+		reasoningEffort: profile.reasoningEffort,
+		serviceTier: profile.serviceTier,
+		providerProfile: profile,
+		async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return decision; } }; },
+		async stop() {},
+	});
+	const live = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...trial, mode: 'live' }] }),
+		scenarioResolver: () => scenario,
+		providerFactories: { codex: liveProvider },
+		artifactDirectory: null,
+	});
+	assert.equal(live.trials[0].status, 'PASSED');
+	const recording = createReplayRecord({ trialId: trial.id, prompt, providerProfile: profile, scenario, protocolVersion: 2, decision, delayMs: 75 });
+	const pacingHandles = new Set();
+	const pacingTimer = {
+		setTimeout(callback, delay) {
+			let handle;
+			handle = setTimeout(() => { pacingHandles.delete(handle); callback(); }, delay);
+			pacingHandles.add(handle);
+			return handle;
+		},
+		clearTimeout(handle) { pacingHandles.delete(handle); clearTimeout(handle); },
+	};
+	const startedAt = performance.now();
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [trial] }),
+		scenarioResolver: () => scenario,
+		providerFactories: { codex: () => createReplayProvider({ recording, trialId: trial.id, prompt, providerProfile: profile, scenario, protocolVersion: 2 }) },
+		virtualTickPacing: { timer: pacingTimer },
+		artifactDirectory: null,
+	});
+	const elapsedWallMs = performance.now() - startedAt;
+	const completed = result.trials[0];
+	assert.equal(completed.status, 'PASSED');
+	assert.ok(completed.metrics.result.taskCompletionWallDurationMs >= VIRTUAL_TICK_MS);
+	assert.ok(completed.metrics.result.totalVirtualWorldDurationMs < 500);
+	assert.ok(completed.metrics.result.totalVirtualWorldDurationMs <= completed.metrics.result.taskCompletionWallDurationMs + VIRTUAL_TICK_MS * 2);
+	assert.ok(elapsedWallMs < 900);
+	assert.equal(pacingHandles.size, 0);
 });
