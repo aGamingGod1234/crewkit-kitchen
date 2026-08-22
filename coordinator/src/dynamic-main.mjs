@@ -402,7 +402,6 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
 			this.#programRuntime.disposeAll();
-			this.#providerWork.clear();
 			this.#pendingAttention.clear();
 			this.#attentionFlushes.clear();
 			this.#providerRetryAfter.clear();
@@ -560,14 +559,50 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #failProviderPlan(work, record, error) {
 		if (this.#providerWork.get(work.agentId) !== work) return null;
-		const pending = work.pending;
-		this.#providerWork.delete(work.agentId);
 		const current = this.#registry.get(work.agentId);
 		const stale = current?.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
+		this.#promotePendingAttention(work, current);
+		const pending = work.pending;
+		this.#providerWork.delete(work.agentId);
 		const urgentRecovery = pending?.priority === 'urgent';
+		const quietRetry = QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code);
 		if (!stale && !urgentRecovery) await this.#reportAgentError(record.agentId, error);
+		if (!stale && quietRetry && current?.state === DynamicAgentState.ERROR) {
+			try {
+				this.#registry.setState(record.agentId, DynamicAgentState.STARTING, { goalRevision: record.goalRevision });
+			} catch (stateError) {
+				void this.#reportAgentError(record.agentId, stateError);
+				return null;
+			}
+		}
 		if (urgentRecovery || stale) this.#reschedulePendingProviderPlan(pending);
 		return null;
+	}
+
+	#promotePendingAttention(work, record) {
+		const attention = this.#pendingAttention.get(work.agentId);
+		if (record === null || attention?.goalRevision !== work.goalRevision) return;
+		const request = work.request;
+		const input = buildPlannerInput({
+			agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
+			goal: record.currentGoal,
+			goalRevision: record.goalRevision,
+			attentionPriority: 'urgent',
+			attentionTrigger: attention.trigger,
+			observation: request.observation,
+		}, {
+			untrustedFacts: this.#ledger(record.agentId).toPlannerFacts(),
+			conversationContext: this.#conversationMemory(record.agentId).toPlannerContext(),
+		});
+		work.pending = mergePlannerRequest(work.pending, {
+			...request,
+			attention: true,
+			priority: 'urgent',
+			trigger: attention.trigger,
+			preserveState: false,
+			input,
+		});
+		this.#pendingAttention.delete(work.agentId);
 	}
 
 	#reschedulePendingProviderPlan(request) {

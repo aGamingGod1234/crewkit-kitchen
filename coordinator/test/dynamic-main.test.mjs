@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
+import { AgentPlanner } from '../src/agent-planner.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { createDynamicCoordinator } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
@@ -81,15 +82,27 @@ async function eventually(predicate) {
 }
 
 async function start(dependencies = {}) {
-	const bridge = new FakeBridge();
-	const registry = new AgentRegistry();
-	const planner = new FakePlanner(registry);
+	const bridge = dependencies.bridge ?? new FakeBridge();
+	const registry = dependencies.registry ?? new AgentRegistry();
+	const planner = dependencies.planner ?? new FakePlanner(registry);
 	const scheduler = dependencies.scheduler ?? new PlanningScheduler();
-	const coordinator = createDynamicCoordinator({ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } }, { bridge, registry, planner, scheduler, codexService: new FakeProvider(), ...dependencies });
+	const codexService = dependencies.codexService ?? new FakeProvider();
+	const coordinator = createDynamicCoordinator({ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } }, { bridge, registry, planner, scheduler, codexService, ...dependencies });
 	await coordinator.start();
 	bridge.emit('ready', { serverInstanceId: 'test', registry: dependencies.initialRegistry ?? [record()] });
 	await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready'));
 	return { bridge, registry, planner, scheduler, coordinator };
+}
+
+function realPlannerProvider(decide) {
+	const provider = new FakeProvider();
+	provider.reconcile = async (records) => ({ valid: records, invalid: [], catalog: { models: [] } });
+	provider.createAgent = async (record) => ({
+		setGoalRevision: async () => {},
+		decide: (input, options) => decide(input, options, record),
+	});
+	provider.removeAgent = async () => {};
+	return provider;
 }
 
 test('publishes a bootstrap catalog before slower full reconciliation completes', async () => {
@@ -339,6 +352,64 @@ test('reports a non-quiet initial provider failure when no urgent recovery is pe
 	} finally {
 		await run.coordinator.stop();
 	}
+});
+
+test('recovers a conversation captured during a real planner failure without advancing the server revision', async () => {
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	let attempts = 0;
+	let firstStarted;
+	const firstStartedPromise = new Promise((resolve) => { firstStarted = resolve; });
+	const provider = realPlannerProvider(async (input) => {
+		attempts += 1;
+		if (attempts === 1) {
+			firstStarted();
+			await gate;
+			throw Object.assign(new Error('Provider unavailable'), { code: 'PROVIDER_DOWN' });
+		}
+		assert.match(input, /Urgent: respond/);
+		return { summary: 'Recovered.', directive: 'replace', source: SOURCE };
+	});
+	const registry = new AgentRegistry();
+	const scheduler = new PlanningScheduler();
+	const planner = new AgentPlanner({ registry, scheduler, codexService: provider });
+	const run = await start({ registry, scheduler, planner, codexService: provider });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
+		await firstStartedPromise;
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: 'Urgent: respond', goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 } });
+		release();
+		await eventually(() => attempts === 2 && run.bridge.sent.some((message) => message.type === 'action_command'));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+		assert.equal(run.bridge.sent.find((message) => message.type === 'action_command').payload.goalRevision, 1);
+	} finally {
+		release();
+		await run.coordinator.stop();
+	}
+});
+
+test('keeps REQUEST_TIMEOUT retryable with a real planner and retries after backoff', async () => {
+	let now = 100;
+	let attempts = 0;
+	const provider = realPlannerProvider(async () => {
+		attempts += 1;
+		throw Object.assign(new Error('request timed out'), { code: 'REQUEST_TIMEOUT' });
+	});
+	const registry = new AgentRegistry();
+	const scheduler = new PlanningScheduler();
+	const planner = new AgentPlanner({ registry, scheduler, codexService: provider });
+	const run = await start({ registry, scheduler, planner, codexService: provider, controlNow: () => now });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
+		await eventually(() => attempts === 1);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING);
+		now = 1_200;
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, observation: { player: { x: 1, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
+		await eventually(() => attempts === 2);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+	} finally { await run.coordinator.stop(); }
 });
 
 test('installs a selected-model program and continues its next primitive without another provider turn', async () => {
