@@ -88,6 +88,7 @@ public final class LocalPathfinder implements PathPlanner {
 		if (view == null || start == null || destination == null || budget == null) {
 			return PathPlan.failed(PathOutcome.INVALID, 0);
 		}
+		int expandedAtStart = budget.expandedNodes();
 		if (!isStandable(view, start) || !isStandable(view, destination)) {
 			return PathPlan.failed(PathOutcome.INVALID, 0);
 		}
@@ -106,7 +107,7 @@ public final class LocalPathfinder implements PathPlanner {
 
 		while (!open.isEmpty()) {
 			if (budget.timeExceeded()) {
-				return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes());
+				return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
 			}
 			SearchNode current = open.remove();
 			Long currentBestCost = bestCosts.get(current.position());
@@ -114,10 +115,10 @@ public final class LocalPathfinder implements PathPlanner {
 				continue;
 			}
 			if (current.position().equals(destination)) {
-				return reconstruct(start, destination, parents, budget.expandedNodes());
+				return reconstruct(start, destination, parents, budget.expandedNodes() - expandedAtStart);
 			}
 			if (!budget.tryExpand()) {
-				return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes());
+				return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
 			}
 			closed.add(current.position());
 
@@ -144,10 +145,7 @@ public final class LocalPathfinder implements PathPlanner {
 			}
 		}
 
-		if (budget.exhaustedIfNodeLimit()) {
-			return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes());
-		}
-		return PathPlan.failed(PathOutcome.NO_PATH, budget.expandedNodes());
+		return PathPlan.failed(PathOutcome.NO_PATH, budget.expandedNodes() - expandedAtStart);
 	}
 
 	private static List<Neighbor> neighbors(WalkabilityView view, GridPosition current) {
@@ -381,13 +379,6 @@ public final class LocalPathfinder implements PathPlanner {
 				return false;
 			}
 			expandedNodes++;
-			return true;
-		}
-
-		private boolean exhaustedIfNodeLimit() {
-			if (expandedNodes < maximumExpandedNodes) return false;
-			exhausted = true;
-			exhaustionOutcome = PathOutcome.NODE_LIMIT;
 			return true;
 		}
 	}

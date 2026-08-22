@@ -27,6 +27,8 @@ public final class LocalPathfinderVerification {
 		assertions += verifyStartEqualsGoal();
 		assertions += verifyPathIsImmutableAndAcyclic();
 		assertions += verifySharedBudgetIsAggregate();
+		assertions += verifySharedBudgetReportsPerRequestDeltas();
+		assertions += verifyOpenSetExhaustionAtNodeBoundIsNoPath();
 		return assertions;
 	}
 
@@ -231,9 +233,61 @@ public final class LocalPathfinderVerification {
 
 		assertEquals(PathOutcome.FOUND, first.outcome(), "shared budget first request is served");
 		assertEquals(PathOutcome.NODE_LIMIT, second.outcome(), "shared budget defers the next request");
+		assertEquals(1, first.expandedNodes(), "first request reports its own expansion count");
+		assertEquals(0, second.expandedNodes(), "deferred request reports no local expansions");
 		assertEquals(1, budget.expandedNodes(), "shared budget counts expansions once across requests");
 		assertTrue(budget.exhausted(), "shared budget reports aggregate exhaustion");
-		return 4;
+		return 6;
+	}
+
+	private static int verifySharedBudgetReportsPerRequestDeltas() {
+		TestWorld world = new TestWorld()
+				.standable(position(0, 64, 0))
+				.standable(position(1, 64, 0))
+				.standable(position(0, 64, 1))
+				.standable(position(1, 64, 1));
+		LocalPathfinder.SearchBudget budget = new LocalPathfinder.SearchBudget(
+				2,
+				TEST_TIME_BUDGET_NANOS,
+				() -> 0L
+		);
+		LocalPathfinder pathfinder = new LocalPathfinder();
+		PathPlan first = pathfinder.findPath(
+				world,
+				position(0, 64, 0),
+				position(1, 64, 0),
+				budget
+		);
+		PathPlan second = pathfinder.findPath(
+				world,
+				position(0, 64, 1),
+				position(1, 64, 1),
+				budget
+		);
+
+		assertEquals(PathOutcome.FOUND, first.outcome(), "first shared request finds its path");
+		assertEquals(PathOutcome.FOUND, second.outcome(), "second shared request finds its path");
+		assertEquals(1, first.expandedNodes(), "first shared request reports a local delta");
+		assertEquals(1, second.expandedNodes(), "second shared request reports a local delta");
+		assertEquals(2, budget.expandedNodes(), "shared budget still reports aggregate expansions");
+		return 5;
+	}
+
+	private static int verifyOpenSetExhaustionAtNodeBoundIsNoPath() {
+		GridPosition start = position(0, 64, 0);
+		GridPosition destination = position(4, 64, 0);
+		TestWorld world = new TestWorld().standable(start).standable(destination);
+		PathPlan plan = new LocalPathfinder().findPath(
+				world,
+				start,
+				destination,
+				1,
+				TEST_TIME_BUDGET_NANOS,
+				() -> 0L
+		);
+		assertEquals(PathOutcome.NO_PATH, plan.outcome(), "an empty open set at the node bound is no path");
+		assertEquals(1, plan.expandedNodes(), "the isolated search reports its one expansion");
+		return 2;
 	}
 
 	private static PathPlan find(TestWorld world, GridPosition start, GridPosition destination) {
