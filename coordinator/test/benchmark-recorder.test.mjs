@@ -11,6 +11,7 @@ import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { FakeMinecraftBridge, commandPayloads, observation } from './fixtures/fake-minecraft-bridge.mjs';
+import { withCompletionContract } from './fixtures/completion-contract.mjs';
 
 function context(overrides = {}) {
 	return {
@@ -213,7 +214,7 @@ test('a throwing recorder never changes planner, scheduler, or runtime behavior'
 		bridge: { send: async (...args) => sent.push(args) },
 		planner: { requestPlan: async () => ({ directive: 'continue' }) },
 	});
-	await runtime.installDecision(record, { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
+	await runtime.installDecision(record, withCompletionContract({ directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);' }), { observation: observation(), eventSequence: 1 });
 	assert.equal(sent.length, 1);
 	scheduler.close();
 });
@@ -231,7 +232,7 @@ test('enabled telemetry does not alter fixture action command bytes', async () =
 			recorder,
 		});
 		bridge.attach(manager);
-		await manager.installDecision(record, { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);' }, { observation: observation(), eventSequence: 1 });
+		await manager.installDecision(record, withCompletionContract({ directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);' }), { observation: observation(), eventSequence: 1 });
 		await manager.onActionResult(record, { actionId: bridge.sent[0].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
 		await new Promise((resolve) => setImmediate(resolve));
 		return { bytes: JSON.stringify(commandPayloads(bridge)), events: recorder?.snapshot() ?? [] };
