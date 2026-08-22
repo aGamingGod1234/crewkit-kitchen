@@ -4,6 +4,7 @@ import test from 'node:test';
 import { generateReplayRecordings } from '../src/benchmark/replay-fixture-generator.mjs';
 import { runLatencyMatrix, normalizeLatencyMatrix } from '../src/benchmark/latency-runner.mjs';
 import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
+import { VirtualMinecraftBridge } from '../src/simulator/virtual-minecraft-bridge.mjs';
 
 const PROFILE = Object.freeze({ provider: 'replay', model: 'capture-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
 const SEED = 20260821;
@@ -29,6 +30,53 @@ function matrix(loads = [1, 4]) {
 			providerAvailabilityRequired: true,
 		})),
 	});
+}
+
+function activeActionHazardMatrix() {
+	const base = matrix([4]);
+	return normalizeLatencyMatrix({
+		...base,
+		trials: base.trials.map((trial) => ({
+			...trial,
+			id: 'active-action-lava-replay-4',
+			scenarioId: 'active-action-lava-attention',
+			turnBudgetMs: 2_000,
+		})),
+	});
+}
+
+function activeActionHazardScenario() {
+	return {
+		...getSimulatorScenario('lava-damage-reaction'),
+		id: 'active-action-lava-attention',
+		success: (state) => ['lava-wait', 'lava-leave'].every((actionId) =>
+			state.results?.some((result) => result.actionId === actionId && result.state === 'SUCCEEDED')),
+	};
+}
+
+async function withLavaAttentionDuringActiveWait(callback) {
+	const originalEmit = VirtualMinecraftBridge.prototype.emit;
+	const errors = [];
+	const triggered = new WeakMap();
+	VirtualMinecraftBridge.prototype.emit = function emitWithHazardAttention(type, entry) {
+		const emitted = originalEmit.call(this, type, entry);
+		if (type === 'progress' && entry?.envelope?.payload?.actionType === 'wait') {
+			const agentId = entry.envelope.agentId;
+			const agents = triggered.get(this) ?? new Set();
+			triggered.set(this, agents);
+			if (!agents.has(agentId)) {
+				agents.add(agentId);
+				void this.publish(agentId, { attention: true, changedFacts: ['player.health'] }).catch((error) => errors.push(error));
+			}
+		}
+		return emitted;
+	};
+	try {
+		return await callback();
+	} finally {
+		VirtualMinecraftBridge.prototype.emit = originalEmit;
+		assert.deepEqual(errors, []);
+	}
 }
 
 test('captures exact translated-agent decisions as redacted records for loads 1 and 4', async () => {
@@ -67,14 +115,14 @@ test('generated records replay successfully through the production runner at loa
 	assert.equal(replay.cleanup.ok, true);
 });
 
-test('paces capture turns so nonzero multi-turn records replay without prompt drift', async () => {
+test('ordinary delayed stone records remain single-turn and replay without prompt drift', async () => {
 	const delayedMatrix = matrix([4]);
 	const fixture = await generateReplayRecordings({
 		matrix: delayedMatrix,
 		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
 		delayMs: 75,
 	});
-	assert.ok(fixture.recordings.some((record) => record.decisions.length > 1));
+	assert.ok(fixture.recordings.every((record) => record.decisions.length === 1));
 
 	const replay = await runLatencyMatrix({
 		matrix: delayedMatrix,
@@ -89,27 +137,29 @@ test('paces capture turns so nonzero multi-turn records replay without prompt dr
 	assert.equal(replay.cleanup.ok, true);
 });
 
-test('records a cleanup-aborted pending continuation so delayed stone replay is not exhausted', async () => {
-	const delayedMatrix = matrix([4]);
-	const fixture = await generateReplayRecordings({
-		matrix: delayedMatrix,
-		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
-		delayMs: 125,
-	});
-	assert.ok(fixture.recordings.every((record) => record.decisions.length >= 2));
+test('records a cleanup-aborted continuation after hazard attention during an active action', async () => {
+	const delayedMatrix = activeActionHazardMatrix();
+	await withLavaAttentionDuringActiveWait(async () => {
+		const fixture = await generateReplayRecordings({
+			matrix: delayedMatrix,
+			scenarioResolver: () => activeActionHazardScenario(),
+			delayMs: ({ turnIndex }) => turnIndex === 0 ? 10 : 500,
+		});
+		assert.ok(fixture.recordings.every((record) => record.decisions.length >= 2));
 
-	const replay = await runLatencyMatrix({
-		matrix: delayedMatrix,
-		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
-		replayRecordings: fixture.recordings,
-		artifactDirectory: null,
-	});
+		const replay = await runLatencyMatrix({
+			matrix: delayedMatrix,
+			scenarioResolver: () => activeActionHazardScenario(),
+			replayRecordings: fixture.recordings,
+			artifactDirectory: null,
+		});
 
-	assert.equal(replay.status, 'PASSED');
-	assert.equal(replay.trials[0].status, 'PASSED');
-	assert.notEqual(replay.trials[0].error?.code, 'REPLAY_EXHAUSTED');
-	assert.notEqual(replay.trials[0].error?.code, 'REPLAY_PROMPT_MISMATCH');
-	assert.equal(replay.cleanup.ok, true);
+		assert.equal(replay.status, 'PASSED', JSON.stringify(replay.trials.map((trial) => trial.error)));
+		assert.equal(replay.trials[0].status, 'PASSED');
+		assert.notEqual(replay.trials[0].error?.code, 'REPLAY_EXHAUSTED');
+		assert.notEqual(replay.trials[0].error?.code, 'REPLAY_PROMPT_MISMATCH');
+		assert.equal(replay.cleanup.ok, true);
+	});
 });
 
 test('cancels and clears a pending capture delay when the provider turn times out', async () => {
