@@ -157,6 +157,53 @@ test('retries one transient provider failure without changing authoritative inpu
 	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
 });
 
+test('routes planning through the provider lane and preserves priority and provider identity across retries', async () => {
+	const registry = new FakeRegistry();
+	const scheduleCalls = [];
+	const createdRecords = [];
+	const transient = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
+	let decideAttempts = 0;
+	const planner = new AgentPlanner({
+		registry,
+		scheduler: {
+			schedule(agentId, operation, options) {
+				scheduleCalls.push({ agentId, options });
+				return operation({ signal: new AbortController().signal });
+			},
+			cancel() { return false; },
+		},
+		codexService: {
+			async createAgent(record) {
+				createdRecords.push(record);
+				return {
+					async setGoalRevision() {},
+					async decide() {
+						decideAttempts += 1;
+						if (decideAttempts === 1) throw transient;
+						return VALID_DECISION;
+					},
+				};
+			},
+			getAgent() { return null; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	const result = await planner.requestPlan({
+		agentId: AGENT_ID,
+		input: 'authoritative state',
+		goalRevision: GOAL_REVISION,
+		priority: 'urgent',
+	});
+
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.deepEqual(scheduleCalls, [{ agentId: AGENT_ID, options: { lane: RECORD.provider, priority: 'urgent' } }]);
+	assert.equal(createdRecords.length, 1);
+	assert.equal(createdRecords[0].provider, RECORD.provider);
+	assert.equal(createdRecords[0].model, RECORD.model);
+	assert.equal(decideAttempts, 2);
+});
+
 test('retries one empty Codex turn without changing authoritative input', async () => {
 	const registry = new FakeRegistry();
 	const inputs = [];

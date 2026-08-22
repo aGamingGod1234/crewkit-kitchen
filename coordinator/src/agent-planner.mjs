@@ -71,13 +71,14 @@ export class AgentPlanner {
 
 	get healthRegistry() { return this.#healthRegistry; }
 
-	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false }) {
+	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
+		const selectedPriority = planningPriority ?? priority ?? record.planningPriority ?? record.priority ?? 'ordinary';
 		const queuedAt = this.#now();
-		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false });
+		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false, lane: record.provider, priority: selectedPriority });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
 			const queueWaitMs = elapsed(queuedAt, this.#now());
-			this.#record('planner_admitted', record, { operation: 'plan', queueWaitMs, preserveState });
+			this.#record('planner_admitted', record, { operation: 'plan', queueWaitMs, preserveState, lane: record.provider, priority: selectedPriority });
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
 			try {
@@ -162,7 +163,7 @@ export class AgentPlanner {
 				}
 				throw error;
 			}
-		});
+		}, { lane: record.provider, priority: selectedPriority });
 	}
 
 	async #providerAttempt(record, fields, operation) {
