@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { CodexService } from '../src/codex-service.mjs';
+import { profileFingerprint } from '../src/provider-session.mjs';
 
 const MODEL = {
 	id: 'gpt-5.6-sol',
@@ -86,6 +87,8 @@ test('Codex recovery reuses one exact profile and session and rejects profile mu
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
 	const selected = profile('agent-profile');
 	const agent = await service.createAgent(selected, { recoverySummary: 'recover through the same session' });
+	assert.equal(agent.sessionGeneration, 1);
+	assert.equal(agent.profileFingerprint, profileFingerprint({ ...selected, provider: 'codex' }));
 	assert.equal(await service.createAgent(selected, { recoverySummary: 'same profile retry' }), agent);
 	for (const mutation of [
 		{ model: 'gpt-5.6-other' },
@@ -100,6 +103,36 @@ test('Codex recovery reuses one exact profile and session and rejects profile mu
 		);
 	}
 	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 1);
+	await service.stop();
+});
+
+test('Codex session metadata stays warm on the same exact profile across sequential turns', async () => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const selected = profile('agent-session');
+	const agent = await service.createAgent(selected);
+	await agent.setGoalRevision(1);
+	await agent.decide('first authoritative state', { goalRevision: 1 });
+	const first = agent.sessionMetadata();
+	await agent.decide('second authoritative state', { goalRevision: 1 });
+	const second = agent.sessionMetadata();
+	assert.equal(first.sessionGeneration, 1);
+	assert.equal(first.sessionState, 'warm');
+	assert.equal(first.continuation, 'durable');
+	assert.deepEqual(second, first);
+	await service.stop();
+});
+
+test('Codex session replacement increments generation and reports a reset reason without changing profile', async () => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const selected = profile('agent-reset');
+	const first = await service.createAgent(selected);
+	await service.removeAgent(selected.agentId);
+	const replacement = await service.createAgent(selected);
+	assert.equal(replacement.sessionGeneration, 2);
+	assert.equal(replacement.profileFingerprint, first.profileFingerprint);
+	assert.equal(replacement.sessionMetadata().resetReason, 'session_replaced');
 	await service.stop();
 });
 

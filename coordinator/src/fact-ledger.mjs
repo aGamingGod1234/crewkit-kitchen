@@ -9,6 +9,9 @@ export class FactLedger {
 	#maximumBytes;
 	#entries = [];
 	#sequence = 0;
+	#revision = 0;
+	#history = [];
+	#historyLimit;
 	#lastTick = 0;
 	#lastDimension = 'minecraft:overworld';
 
@@ -17,6 +20,7 @@ export class FactLedger {
 		if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 128) throw new TypeError('maximumBytes must be at least 128');
 		this.#maximumEntries = maximumEntries;
 		this.#maximumBytes = maximumBytes;
+		this.#historyLimit = Math.max(2, maximumEntries * 2);
 	}
 
 	add(value) {
@@ -27,10 +31,14 @@ export class FactLedger {
 		if (!Number.isSafeInteger(value.tick) || value.tick < 0) throw new TypeError('fact tick must be a non-negative safe integer');
 		if (!Number.isSafeInteger(value.expiresAtTick) || value.expiresAtTick <= value.tick) throw new TypeError('expiresAtTick must be after tick');
 		if (!Number.isFinite(value.confidence) || value.confidence < 0 || value.confidence > 1) throw new TypeError('confidence must be in [0, 1]');
+		this.#purgeExpired(value.tick);
 		const key = typeof value.key === 'string' && value.key.length > 0 ? value.key : `fact:${++this.#sequence}`;
-		this.#entries = this.#entries.filter((entry) => entry.key !== key);
-		this.#entries.push(Object.freeze({ key, fact, source: value.source, tick: value.tick, dimension, expiresAtTick: value.expiresAtTick, confidence: value.confidence }));
-		this.#entries = ordered(this.#entries.filter((entry) => entry.expiresAtTick > value.tick)).slice(0, this.#maximumEntries);
+		const next = Object.freeze({ key, fact, source: value.source, tick: value.tick, dimension, expiresAtTick: value.expiresAtTick, confidence: value.confidence });
+		const previousKeys = new Set(this.#entries.map((entry) => entry.key));
+		this.#entries = ordered([...this.#entries.filter((entry) => entry.key !== key), next]).slice(0, this.#maximumEntries);
+		const retainedKeys = new Set(this.#entries.map((entry) => entry.key));
+		for (const removedKey of previousKeys) if (!retainedKeys.has(removedKey)) this.#recordRemoval(removedKey);
+		if (retainedKeys.has(key)) this.#recordUpsert(this.#entries.find((entry) => entry.key === key));
 	}
 
 	ingest(source, payload) {
@@ -97,7 +105,7 @@ export class FactLedger {
 
 	snapshot(nowTick = this.#lastTick) {
 		if (!Number.isSafeInteger(nowTick) || nowTick < 0) throw new TypeError('nowTick must be a non-negative safe integer');
-		this.#entries = ordered(this.#entries.filter((entry) => entry.expiresAtTick > nowTick)).slice(0, this.#maximumEntries);
+		this.#purgeExpired(nowTick);
 		return this.#entries.map(({ key: _key, ...entry }) => Object.freeze(entry));
 	}
 
@@ -110,6 +118,76 @@ export class FactLedger {
 		}
 		return `${PREFIX}${JSON.stringify(selected)}`;
 	}
+
+	/** Return a bounded keyed revision projection, falling back to a full baseline when needed. */
+	delta(baseRevision = null, nowTick = this.#lastTick) {
+		this.snapshot(nowTick);
+		const nextRevision = this.#revision;
+		if (baseRevision === null || !Number.isSafeInteger(baseRevision) || baseRevision < 0 || baseRevision > nextRevision) {
+			return this.#fullDelta(nextRevision);
+		}
+		const oldestRevision = this.#history[0]?.revision ?? nextRevision + 1;
+		if (baseRevision < oldestRevision - 1) return this.#fullDelta(nextRevision);
+		const upserts = new Map();
+		const removals = new Set();
+		for (const change of this.#history) {
+			if (change.revision <= baseRevision) continue;
+			if (change.type === 'remove') {
+				upserts.delete(change.key);
+				removals.add(change.key);
+			} else {
+				removals.delete(change.key);
+				upserts.set(change.key, change.entry);
+			}
+		}
+		return {
+			fullBaseline: false,
+			baseRevision,
+			nextRevision,
+			upserts: ordered([...upserts.values()]).map(cloneEntryWithKey),
+			removals: [...removals],
+		};
+	}
+
+	toPlannerDelta(baseRevision = null, nowTick = this.#lastTick) { return this.delta(baseRevision, nowTick); }
+
+	reset() {
+		for (const entry of this.#entries) this.#recordRemoval(entry.key);
+		this.#entries = [];
+		this.#sequence = 0;
+		this.#lastTick = 0;
+		this.#lastDimension = 'minecraft:overworld';
+	}
+
+	#fullDelta(nextRevision) {
+		return {
+			fullBaseline: true,
+			baseRevision: null,
+			nextRevision,
+			upserts: ordered(this.#entries).map(cloneEntryWithKey),
+			removals: [],
+		};
+	}
+
+	#purgeExpired(nowTick) {
+		const retained = this.#entries.filter((entry) => entry.expiresAtTick > nowTick);
+		if (retained.length === this.#entries.length) return;
+		const retainedKeys = new Set(retained.map((entry) => entry.key));
+		for (const entry of this.#entries) if (!retainedKeys.has(entry.key)) this.#recordRemoval(entry.key);
+		this.#entries = retained;
+	}
+
+	#recordUpsert(entry) {
+		this.#record({ type: 'upsert', key: entry.key, entry: cloneEntryWithKey(entry) });
+	}
+
+	#recordRemoval(key) { this.#record({ type: 'remove', key }); }
+
+	#record(change) {
+		this.#revision += 1;
+		this.#history.push({ revision: this.#revision, ...change });
+		if (this.#history.length > this.#historyLimit) this.#history.splice(0, this.#history.length - this.#historyLimit);
+	}
 }
 
 function ordered(entries) {
@@ -119,6 +197,10 @@ function ordered(entries) {
 		|| left.source.localeCompare(right.source)
 		|| left.dimension.localeCompare(right.dimension)
 		|| left.fact.localeCompare(right.fact));
+}
+
+function cloneEntryWithKey(entry) {
+	return structuredClone(entry);
 }
 
 function boundedText(value, field, maximumCodePoints) {

@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { AcpProviderService, buildAcpLaunch } from '../src/acp-service.mjs';
+import { profileFingerprint } from '../src/provider-session.mjs';
 
 const DECISION = JSON.stringify({
 	summary: 'Wait safely.',
@@ -81,6 +82,8 @@ test('ACP keeps the exact service profile for recovery and rejects profile mutat
 	);
 	const selected = { agentId: 'gemini-profile', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'fast' };
 	const agent = await service.createAgent(selected, { recoverySummary: 'recover through the same session' });
+	assert.equal(agent.sessionGeneration, 1);
+	assert.equal(agent.profileFingerprint, profileFingerprint(selected));
 	assert.equal(await service.createAgent(selected, { recoverySummary: 'same profile retry' }), agent);
 	for (const mutation of [
 		{ model: 'auto' },
@@ -95,6 +98,23 @@ test('ACP keeps the exact service profile for recovery and rejects profile mutat
 		);
 	}
 	assert.equal(transport.calls.filter((call) => call.method === 'session/new').length, 1);
+	await service.stop();
+});
+
+test('ACP session metadata stays warm and durable across sequential prompts', async () => {
+	const transport = new FakeAcpTransport(options());
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const selected = { agentId: 'gemini-session', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'priority' };
+	const agent = await service.createAgent(selected);
+	await agent.setGoalRevision(2);
+	await agent.decide('first authoritative state', { goalRevision: 2 });
+	const first = agent.sessionMetadata();
+	await agent.decide('second authoritative state', { goalRevision: 2 });
+	const second = agent.sessionMetadata();
+	assert.equal(first.sessionGeneration, 1);
+	assert.equal(first.sessionState, 'warm');
+	assert.equal(first.continuation, 'durable');
+	assert.deepEqual(second, first);
 	await service.stop();
 });
 

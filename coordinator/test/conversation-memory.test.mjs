@@ -47,3 +47,37 @@ test('conversation memory rejects out-of-order delivery', () => {
 	memory.ingest(event(4));
 	assert.throws(() => memory.ingest(event(3)), /sequence/i);
 });
+
+test('conversation memory projects only new messages after a sequence cursor', () => {
+	const memory = new ConversationMemory({ maximumEntries: 4 });
+	memory.ingest(event(1));
+	memory.ingest(event(2));
+	const baseline = memory.delta(null);
+	assert.equal(baseline.fullBaseline, true);
+	assert.equal(baseline.nextSequence, 2);
+
+	memory.ingest(event(3));
+	const delta = memory.delta(baseline.nextSequence);
+	assert.equal(delta.fullBaseline, false);
+	assert.equal(delta.baseSequence, 2);
+	assert.deepEqual(delta.entries.map((entry) => entry.sequence), [3]);
+
+	assert.deepEqual(memory.delta(3).entries, []);
+});
+
+test('conversation memory falls back to a full baseline after ring eviction or reset', () => {
+	const memory = new ConversationMemory({ maximumEntries: 2 });
+	memory.ingest(event(1));
+	const cursor = 0;
+	memory.ingest(event(2));
+	memory.ingest(event(3));
+	const evicted = memory.delta(cursor);
+	assert.equal(evicted.fullBaseline, true);
+	assert.equal(evicted.baseSequence, null);
+	assert.deepEqual(evicted.entries.map((entry) => entry.sequence), [2, 3]);
+
+	memory.reset();
+	const reset = memory.delta(3);
+	assert.equal(reset.fullBaseline, true);
+	assert.deepEqual(reset.entries, []);
+});

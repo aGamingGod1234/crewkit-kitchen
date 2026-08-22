@@ -3,6 +3,7 @@ import { DEFAULT_SERVICE_TIER } from './constants.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { ModelCatalogCache } from './model-catalog-cache.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
@@ -18,6 +19,7 @@ export class CodexService {
 	#catalog;
 	#workspaceManager;
 	#agents = new Map();
+	#sessionGenerations = new Map();
 	#creating = new Map();
 	#started = false;
 	#starting = null;
@@ -83,11 +85,15 @@ export class CodexService {
 			developerInstructions: recoveryInstructions(recoverySummary),
 		}, { timeoutMs: THREAD_START_TIMEOUT_MS });
 		const threadId = requireNestedId(response, 'thread', 'thread/start');
+	const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
+		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
 	const agent = new SharedCodexAgent(profile, threadId, this.#transport, {
 			planningTimeoutMs: this.#config.planningTimeoutMs,
 			maxDecisionBytes: this.#config.maxDecisionBytes,
 			schedule: this.#config.schedule,
 			cancelSchedule: this.#config.cancelSchedule,
+			sessionGeneration,
+			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 		});
 		this.#agents.set(profile.agentId, agent);
 		return agent;
@@ -170,6 +176,9 @@ export class SharedCodexAgent {
 	#schedule;
 	#cancelSchedule;
 	#goalRevision = 0;
+	#sessionGeneration;
+	#sessionState = 'cold';
+	#resetReason;
 	#active = null;
 	#disposed = false;
 
@@ -181,6 +190,8 @@ export class SharedCodexAgent {
 		this.#maxDecisionBytes = dependencies.maxDecisionBytes ?? DEFAULT_MAX_DECISION_BYTES;
 		this.#schedule = dependencies.schedule ?? setTimeout;
 		this.#cancelSchedule = dependencies.cancelSchedule ?? clearTimeout;
+		this.#sessionGeneration = dependencies.sessionGeneration ?? 1;
+		this.#resetReason = dependencies.resetReason ?? null;
 	}
 
 	get agentId() { return this.#profile.agentId; }
@@ -188,6 +199,11 @@ export class SharedCodexAgent {
 	get reasoningEffort() { return this.#profile.reasoningEffort; }
 	get goalRevision() { return this.#goalRevision; }
 	get planning() { return this.#active !== null; }
+	get sessionGeneration() { return this.#sessionGeneration; }
+	get profileFingerprint() { return profileFingerprint(this.#profile); }
+	sessionMetadata() {
+		return createSessionMetadata(this.#profile, { sessionGeneration: this.#sessionGeneration, sessionState: this.#sessionState, continuation: 'durable', durability: 'proven', resetReason: this.#resetReason });
+	}
 
 	matchesProfile(profile) {
 		return profilesMatch(this.#profile, profile);
@@ -262,7 +278,9 @@ export class SharedCodexAgent {
 			}
 			const text = await withTimeout(Promise.race([collector.promise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex result belongs to an obsolete goal revision');
-			return parseDecision(text);
+			const decision = parseDecision(text);
+			this.#sessionState = 'warm';
+			return decision;
 		} catch (error) {
 			if (error?.code === 'PLANNING_TIMEOUT' || error?.code === 'TURN_OUTPUT_LIMIT') {
 				try { await this.interrupt(); } catch { /* original timeout remains authoritative */ }

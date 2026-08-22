@@ -44,6 +44,39 @@ export class ConversationMemory {
 	toPlannerContext() {
 		return `${PREFIX}${JSON.stringify(this.#entries)}`;
 	}
+
+	/** Return only retained messages after a sequence cursor, or a full baseline when it is stale. */
+	delta(afterSequence = null) {
+		const nextSequence = this.#lastSequence;
+		if (afterSequence === null || !Number.isSafeInteger(afterSequence) || afterSequence < -1 || afterSequence > nextSequence) {
+			return this.#fullDelta(nextSequence);
+		}
+		const firstSequence = this.#entries[0]?.sequence;
+		if (firstSequence !== undefined && afterSequence < firstSequence - 1) return this.#fullDelta(nextSequence);
+		if (firstSequence === undefined && afterSequence !== -1) return this.#fullDelta(nextSequence);
+		return {
+			fullBaseline: false,
+			baseSequence: afterSequence,
+			nextSequence,
+			entries: this.#entries.filter((entry) => entry.sequence > afterSequence).map((entry) => structuredClone(entry)),
+		};
+	}
+
+	toPlannerDelta(afterSequence = null) { return this.delta(afterSequence); }
+
+	reset() {
+		this.#entries = [];
+		this.#lastSequence = -1;
+	}
+
+	#fullDelta(nextSequence) {
+		return {
+			fullBaseline: true,
+			baseSequence: null,
+			nextSequence,
+			entries: this.snapshot(),
+		};
+	}
 }
 
 function byteLength(entries) {

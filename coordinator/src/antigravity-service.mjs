@@ -6,6 +6,7 @@ import { parseDecision } from './decision-parser.mjs';
 import { discoverAntigravityCatalog } from './provider-catalog-discovery.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 
 const DEFAULT_EXECUTABLE = 'agy';
 const DEFAULT_PLANNING_TIMEOUT_MS = 120_000;
@@ -29,6 +30,7 @@ export class AntigravityProviderService {
 	#workspaceManager;
 	#agents = new Map();
 	#creating = new Map();
+	#sessionGenerations = new Map();
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -89,10 +91,14 @@ export class AntigravityProviderService {
 				{ cause: error },
 			);
 		}
+		const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
+		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
 		const agent = new AntigravityAgent(profile, cwd, {
 			...this.#dependencies,
 			config: this.#config,
 			recoverySummary: normalizeRecoverySummary(recoverySummary),
+			sessionGeneration,
+			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 		});
 		this.#agents.set(profile.agentId, agent);
 		return agent;
@@ -149,9 +155,12 @@ class AntigravityAgent {
 	#goalRevision = 0;
 	#activeOperation = null;
 	#hasConversation = false;
+	#sessionGeneration;
+	#sessionState = 'cold';
+	#resetReason;
 	#disposed = false;
 
-	constructor(profile, cwd, { config, spawn, terminate, platform, recoverySummary }) {
+	constructor(profile, cwd, { config, spawn, terminate, platform, recoverySummary, sessionGeneration = 1, resetReason = null }) {
 		this.#profile = structuredClone(profile);
 		this.#cwd = cwd;
 		this.#config = config;
@@ -159,11 +168,18 @@ class AntigravityAgent {
 		this.#terminate = terminate;
 		this.#platform = platform;
 		this.#recoverySummary = recoverySummary;
+		this.#sessionGeneration = sessionGeneration;
+		this.#resetReason = resetReason;
 	}
 
 	get agentId() { return this.#profile.agentId; }
 	get provider() { return this.#profile.provider; }
 	get serviceTier() { return this.#profile.serviceTier; }
+	get sessionGeneration() { return this.#sessionGeneration; }
+	get profileFingerprint() { return profileFingerprint(this.#profile); }
+	sessionMetadata() {
+		return createSessionMetadata(this.#profile, { sessionGeneration: this.#sessionGeneration, sessionState: this.#sessionState, continuation: 'best_effort', durability: 'unverified', resetReason: this.#resetReason });
+	}
 	matchesProfile(profile) { return profilesMatch(this.#profile, profile); }
 
 	async setGoalRevision(revision) {
@@ -204,6 +220,7 @@ class AntigravityAgent {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
 			this.#hasConversation = true;
+			this.#sessionState = 'warm';
 			try {
 				return parseDecision(decisionText.trim());
 			} catch (error) {

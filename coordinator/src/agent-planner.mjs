@@ -130,7 +130,7 @@ export class AgentPlanner {
 						const attempt = retryCount + providerRetryCount + 1;
 						const decision = await this.#providerAttempt(record, {
 							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1, traceId,
-						}, () => agent.decide(plannerInput, { goalRevision, signal }));
+						}, () => agent.decide(plannerInput, { goalRevision, signal }), agent);
 						this.#registry.assertCurrentRevision(agentId, goalRevision);
 						const parseBoundary = this.#now();
 						if (!trace.phasesRecorded) {
@@ -185,7 +185,7 @@ export class AgentPlanner {
 		}, { lane: record.provider, priority: selectedPriority });
 	}
 
-	async #providerAttempt(record, fields, operation) {
+	async #providerAttempt(record, fields, operation, sessionAgent = null) {
 		const healthIdentity = { provider: record.provider, model: record.model, operation: fields.operation };
 		if (!this.#healthRegistry.canAttempt(healthIdentity)) {
 			const error = new Error(`Provider circuit is open for '${record.provider}/${record.model}/${fields.operation}'`);
@@ -197,12 +197,14 @@ export class AgentPlanner {
 		this.#record('provider_request_started', record, { ...fields, operation: fields.operation });
 		try {
 			const result = await operation();
+			const sessionFields = readSessionFields(sessionAgent ?? result);
 			const durationMs = elapsed(startedAt, this.#now());
-			this.#record('provider_response_completed', record, { ...fields, operation: fields.operation, durationMs, errorCode: null });
+			this.#record('provider_response_completed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: null });
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
 				...fields,
+				...sessionFields,
 				durationMs,
 				errorCode: null,
 				retryReason: fields.retryReason,
@@ -211,12 +213,14 @@ export class AgentPlanner {
 			}));
 			return result;
 		} catch (error) {
+			const sessionFields = readSessionFields(sessionAgent);
 			const durationMs = elapsed(startedAt, this.#now());
-			this.#record('provider_response_failed', record, { ...fields, operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
+			this.#record('provider_response_failed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
 				...fields,
+				...sessionFields,
 				durationMs,
 				error,
 				retryReason: error?.code ?? 'ERROR',
@@ -318,6 +322,21 @@ export class AgentPlanner {
 			throw error;
 		}
 	}
+}
+
+function readSessionFields(agent) {
+	if (agent === null || agent === undefined || typeof agent.sessionMetadata !== 'function') return {};
+	try {
+		const metadata = agent.sessionMetadata();
+		return {
+			...(metadata?.profileFingerprint === undefined ? {} : { profileFingerprint: metadata.profileFingerprint }),
+			...(metadata?.sessionGeneration === undefined ? {} : { sessionGeneration: metadata.sessionGeneration }),
+			...(metadata?.sessionReuse === undefined ? {} : { sessionReuse: metadata.sessionReuse }),
+			...(metadata?.sessionState === undefined ? {} : { sessionState: metadata.sessionState }),
+			...(metadata?.continuation === undefined ? {} : { continuation: metadata.continuation }),
+			...(metadata?.resetReason === undefined ? {} : { resetReason: metadata.resetReason }),
+		};
+	} catch { return {}; }
 }
 
 function defaultTraceId(agentId, goalRevision) {

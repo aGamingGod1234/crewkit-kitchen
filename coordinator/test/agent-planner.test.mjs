@@ -442,7 +442,13 @@ test('records strict provider-attempt telemetry without planner input or output'
 		},
 		codexService: {
 			async createAgent() {
-				return { async setGoalRevision() {}, async decide() { return VALID_DECISION; } };
+				return {
+					async setGoalRevision() {},
+					async decide() { return VALID_DECISION; },
+						sessionMetadata() {
+						return { profileFingerprint: `sha256:${'a'.repeat(64)}`, sessionGeneration: 3, sessionState: 'warm', sessionReuse: true, resetReason: null };
+					},
+				};
 			},
 			getAgent() { return null; },
 			async removeAgent() { return false; },
@@ -454,6 +460,8 @@ test('records strict provider-attempt telemetry without planner input or output'
 	assert.ok(telemetry.every((row) => row.provider === 'kimi' && row.model === 'kimi-code/k3'));
 	assert.equal(JSON.stringify(telemetry).includes('private prompt value'), false);
 	assert.ok(telemetry.every((row) => row.durationMs >= 0 && row.queueWaitMs >= 0));
+	assert.ok(telemetry.every((row) => row.profileFingerprint === `sha256:${'a'.repeat(64)}` && row.sessionGeneration === 3));
+	assert.equal(telemetry.find((row) => row.operation === 'decide').sessionReuse, true);
 });
 
 test('feeds redacted provider telemetry to the scheduler after health recording', async () => {

@@ -87,3 +87,37 @@ test('structured ingestion accepts the live protocol-v2 observation shape', () =
 	assert.match(rendered, /distanceSquared/);
 	assert.match(rendered, /minecraft:the_nether/);
 });
+
+test('fact ledger projects keyed upserts and replacement deltas from a revision cursor', () => {
+	const ledger = new FactLedger({ maximumEntries: 4 });
+	ledger.add({ key: 'ore', fact: 'iron nearby', source: 'observation', tick: 1, dimension: 'minecraft:overworld', expiresAtTick: 20, confidence: 0.8 });
+	const first = ledger.delta(null, 1);
+	assert.equal(first.fullBaseline, true);
+	assert.equal(first.baseRevision, null);
+	assert.equal(first.upserts[0].key, 'ore');
+
+	ledger.add({ key: 'ore', fact: 'gold nearby', source: 'observation', tick: 2, dimension: 'minecraft:overworld', expiresAtTick: 20, confidence: 0.9 });
+	const changed = ledger.delta(first.nextRevision, 2);
+	assert.deepEqual(changed.removals, []);
+	assert.equal(changed.upserts.length, 1);
+	assert.deepEqual(changed.upserts[0], { key: 'ore', fact: 'gold nearby', source: 'observation', tick: 2, dimension: 'minecraft:overworld', expiresAtTick: 20, confidence: 0.9 });
+	assert.equal(changed.baseRevision, first.nextRevision);
+	assert.equal(changed.nextRevision > changed.baseRevision, true);
+});
+
+test('fact ledger emits expiry tombstones and falls back when a revision base is evicted', () => {
+	const ledger = new FactLedger({ maximumEntries: 1 });
+	ledger.add({ key: 'short', fact: 'temporary', source: 'observation', tick: 1, dimension: 'minecraft:overworld', expiresAtTick: 2, confidence: 1 });
+	const cursor = ledger.delta(null, 1).nextRevision;
+	const expired = ledger.delta(cursor, 2);
+	assert.deepEqual(expired.removals, ['short']);
+	assert.equal(expired.upserts.length, 0);
+
+	ledger.add({ key: 'one', fact: 'one', source: 'observation', tick: 3, dimension: 'minecraft:overworld', expiresAtTick: 30, confidence: 1 });
+	ledger.add({ key: 'two', fact: 'two', source: 'observation', tick: 4, dimension: 'minecraft:overworld', expiresAtTick: 30, confidence: 1 });
+	const fallback = ledger.delta(cursor, 4);
+	assert.equal(fallback.fullBaseline, true);
+	assert.equal(fallback.baseRevision, null);
+	assert.deepEqual(fallback.removals, []);
+	assert.equal(fallback.upserts.every((entry) => typeof entry.key === 'string'), true);
+});

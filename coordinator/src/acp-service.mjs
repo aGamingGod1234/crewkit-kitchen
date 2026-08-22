@@ -2,6 +2,7 @@ import { AcpProtocolError, AcpStdioTransport, buildAcpLaunch } from './acp-trans
 import { parseDecision } from './decision-parser.mjs';
 import { discoverKimiCatalog } from './provider-catalog-discovery.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
@@ -19,6 +20,7 @@ export class AcpProviderService {
 	#workspaceManager;
 	#agents = new Map();
 	#creating = new Map();
+	#sessionGenerations = new Map();
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -61,10 +63,14 @@ export class AcpProviderService {
 			? this.#config.cwd
 			: await this.#workspaceManager.prepare(profile.provider, profile.agentId);
 		const transport = this.#transportFactory({ ...profile, cwd });
+		const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
+		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
 		const agent = new AcpAgent(profile, transport, {
 			planningTimeoutMs: this.#config.planningTimeoutMs,
 			maxDecisionBytes: this.#config.maxDecisionBytes,
 			recoverySummary: normalizeRecoverySummary(recoverySummary),
+			sessionGeneration,
+			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 		});
 		try { await agent.start(cwd); } catch (error) {
 			await transport.stop();
@@ -112,22 +118,32 @@ class AcpAgent {
 	#planningTimeoutMs;
 	#maxDecisionBytes;
 	#recoverySummary;
+	#sessionGeneration;
+	#sessionState = 'cold';
+	#resetReason;
 	#sessionId = null;
 	#goalRevision = 0;
 	#active = false;
 	#disposed = false;
 
-	constructor(profile, transport, { planningTimeoutMs, maxDecisionBytes, recoverySummary }) {
+	constructor(profile, transport, { planningTimeoutMs, maxDecisionBytes, recoverySummary, sessionGeneration = 1, resetReason = null }) {
 		this.#profile = structuredClone(profile);
 		this.#transport = transport;
 		this.#planningTimeoutMs = planningTimeoutMs;
 		this.#maxDecisionBytes = maxDecisionBytes;
 		this.#recoverySummary = recoverySummary;
+		this.#sessionGeneration = sessionGeneration;
+		this.#resetReason = resetReason ?? null;
 	}
 
 	get agentId() { return this.#profile.agentId; }
 	get provider() { return this.#profile.provider; }
 	get serviceTier() { return this.#profile.serviceTier; }
+	get sessionGeneration() { return this.#sessionGeneration; }
+	get profileFingerprint() { return profileFingerprint(this.#profile); }
+	sessionMetadata() {
+		return createSessionMetadata(this.#profile, { sessionGeneration: this.#sessionGeneration, sessionState: this.#sessionState, continuation: 'durable', durability: 'proven', resetReason: this.#resetReason });
+	}
 	matchesProfile(profile) { return profilesMatch(this.#profile, profile); }
 
 	async start(cwd) {
@@ -219,7 +235,9 @@ class AcpAgent {
 				);
 			}
 			try {
-				return parseDecision(decisionText);
+				const decision = parseDecision(decisionText);
+				this.#sessionState = 'warm';
+				return decision;
 			} catch (error) {
 				throw new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
