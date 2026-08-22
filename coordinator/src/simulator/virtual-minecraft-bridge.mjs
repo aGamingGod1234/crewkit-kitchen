@@ -68,9 +68,6 @@ export class VirtualMinecraftBridge extends EventEmitter {
 	async send(type, agentId, payload) {
 		if (this.#closed) throw Object.assign(new Error('virtual bridge is stopped'), { code: 'BRIDGE_STOPPED' });
 		const record = this.#recordFor(agentId);
-		if (type === 'action_command' && (payload?.traceId === undefined || payload?.traceId === null)) {
-			payload = { ...payload, traceId: `legacy-${agentId}-${payload.actionId}`.slice(0, 128) };
-		}
 		const envelope = createProtocolV2Envelope({
 			serverInstanceId: this.#serverInstanceId,
 			agentId,
@@ -221,6 +218,8 @@ export class VirtualMinecraftBridge extends EventEmitter {
 			state,
 			reasonCode,
 			message: reasonCode,
+			executionStarted: true,
+			physicalAttempted: true,
 			elapsedMs: Math.trunc(active.elapsedTicks * VIRTUAL_TICK_MS),
 			observedAtEpochMs: this.#world.timeMs,
 		};

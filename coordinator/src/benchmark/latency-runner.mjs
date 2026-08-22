@@ -13,6 +13,7 @@ import { createReplayProvider } from './provider-replay.mjs';
 import { BenchmarkRecorder } from './benchmark-recorder.mjs';
 import { summarizeBenchmark } from './benchmark-report.mjs';
 import { PlanningScheduler } from '../planning-scheduler.mjs';
+import { ControlLatencyRegistry } from '../control-latency-registry.mjs';
 import { SystemSampler } from './system-sampler.mjs';
 import { createLiveProviderFactory } from './live-provider-factories.mjs';
 import { buildAuthoritativeScenarioOutcome, captureScenarioInitialSnapshot, compileScenarioDecision, runAuthoritativeScenarioSuccess } from './scenario-program.mjs';
@@ -124,6 +125,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	let providerCleanupRegistered = false;
 	let trialRecorder = null;
 	let scheduler = null;
+	const latencyRegistry = new ControlLatencyRegistry({ traceCap: Math.max(64, trial.agentLoad * 2) });
 	let systemSummary = null;
 	const metrics = new LatencyMetricsTracker({ wallClock, wallClockBasis, enabled: measurementsEnabled, maxSamples: options.maxMetricSamples, context: measurementContext });
 	const cleanupTimeoutMs = 1_000;
@@ -189,10 +191,12 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			bridge,
 			scheduler,
 			benchmarkRecorder: trialRecorder,
+			latencyRegistry,
 			...(providerService ? { providerService } : {}),
 			setStatusInterval: () => null,
 			clearStatusInterval: () => {},
 			controlNow: () => world.timeMs,
+			plannerNow: () => world.timeMs,
 			epochNow: () => world.timeMs,
 		});
 		const runtimeListener = (error) => { if (runtimeErrors.length < 64) runtimeErrors.push({ code: error?.code, message: boundedError(error?.message) }); };
@@ -226,7 +230,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		metrics.markTaskCompletion({ status, agentIds: scenario.agentIds });
 		const outcomeHash = hash({ trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, providerProfile: trial.providerProfile, statuses, turnCount, scenarioDigest });
 		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler), measurementContext);
-		result.benchmark = { eventCount: trialRecorder?.count ?? 0 };
+		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
 		result.debug = { statuses, turnCount, runtimeErrors, scenarioPassed, scenarioDigest, scenarioEvidence: scenarioEvidence(virtual, scenario.agentIds), actionCommandHash: hash(authoritativeCommands(virtual)) };
 	} catch (error) {
 		if (error?.code === 'TRIAL_TIMEOUT') await new Promise((resolve) => setImmediate(resolve));
@@ -237,7 +241,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			if (runtimeError) typed = coded(runtimeError.code, runtimeError.message);
 		}
 		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext);
-		result.benchmark = { eventCount: trialRecorder?.count ?? 0 };
+		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
 		result.debug = { runtimeErrors, turnCount, actionCommandHash: null };
 	} finally {
 		try { sampler?.sample?.(); } catch {}

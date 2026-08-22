@@ -33,6 +33,7 @@ function harness(options = {}) {
 		planner: { requestPlan: async (request) => { requests.push(request); return { summary: 'Continue.', directive: 'continue' }; } },
 		onCompleted: options.onCompleted,
 		benchmarkRecorder: options.benchmarkRecorder,
+		latencyRegistry: options.latencyRegistry,
 	});
 	return { manager, registry, sent, requests };
 }
@@ -61,6 +62,24 @@ test('retains the planning trace through program dispatch and first world action
 	const verification = rows.find((row) => row.stage === 'completion_verification');
 	assert.equal(verification?.fields.outcome, 'skipped');
 	assert.equal(verification?.fields.retryReason, 'VERIFIER_NOT_INSTALLED');
+});
+
+test('bridge pre-execution rejection does not count as first world action', async () => {
+	const rows = [];
+	const latencyRegistry = new ControlLatencyRegistry();
+	const run = harness({ latencyRegistry, benchmarkRecorder: { record(stage, context, fields) { rows.push({ stage, context, fields }); } } });
+	const traceId = 'trace-rejected-before-execution';
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Wait once.', directive: 'replace', traceId,
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	const command = run.sent.find((message) => message.type === 'action_command');
+	await run.manager.onActionResult(run.registry.get('agent-a'), {
+		traceId, actionId: command.payload.actionId, eventSequence: 2, state: 'FAILED', reasonCode: 'STALE_REVISION',
+		executionStarted: false, physicalAttempted: false,
+	});
+	assert.equal(rows.some((row) => row.stage === 'first_world_action'), false);
+	assert.equal(latencyRegistry.completeTrace(traceId).phases.some((phase) => phase.phase === 'first_world_action'), false);
 });
 
 test('installs a model-authored program and dispatches its next primitive without a provider turn', async () => {

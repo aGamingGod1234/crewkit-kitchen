@@ -664,7 +664,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			JsonObject validatedArguments = ProtocolCodec.validateActionArguments(actionType, arguments);
 			String traceId = requiredTraceId(payload, "traceId");
 			ActionProvenance provenance = decodeActionProvenance(payload);
-			if (provenance.traceId() != null && !provenance.traceId().equals(traceId)) {
+			if (provenance.traceId() == null || !provenance.traceId().equals(traceId)) {
 				throw new BridgeProtocolException("INVALID_TRACE_ID", "provenance.traceId must match traceId");
 			}
 			return new ServerActionRequest(agentId, requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"), actionType, validatedArguments, provenance, traceId);
@@ -696,6 +696,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		result.addProperty("message", boundedRejectionMessage(exception.getMessage()));
 		result.addProperty("elapsedMs", 0L);
 		result.addProperty("observedAtEpochMs", System.currentTimeMillis());
+		result.addProperty("executionStarted", false);
+		result.addProperty("physicalAttempted", false);
 		send("action_result", identity.agentId(), result);
 		return true;
 	}
@@ -921,6 +923,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("message", result.message());
 		payload.addProperty("elapsedMs", result.elapsedMs());
 		payload.addProperty("observedAtEpochMs", result.observedAtEpochMs());
+		payload.addProperty("executionStarted", result.executionStarted());
+		payload.addProperty("physicalAttempted", result.physicalAttempted());
 		return payload;
 	}
 

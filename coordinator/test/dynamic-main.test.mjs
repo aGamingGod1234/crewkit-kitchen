@@ -246,6 +246,22 @@ test('retains an urgent observation while an ordinary provider turn is queued be
 	}
 });
 
+test('binds the provider work trace to runtime dispatch when the planner omits a decision echo', async () => {
+	const run = await start();
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		const workTraceId = run.planner.requests[0].traceId;
+		const command = run.bridge.sent.find((message) => message.type === 'action_command').payload;
+		assert.equal(typeof workTraceId, 'string');
+		assert.equal(command.traceId, workTraceId);
+		assert.equal(command.provenance.traceId, workTraceId);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('keeps lifecycle intake responsive while an initial provider turn is pending', async () => {
 	let release;
 	const gate = new Promise((resolve) => { release = resolve; });

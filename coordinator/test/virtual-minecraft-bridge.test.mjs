@@ -14,6 +14,7 @@ function scenario() {
 
 function command(actionId, actionType = 'move_to', args = { x: 1, y: 1, z: 0, tolerance: 0.1, sprint: false }) {
 	return {
+		traceId: 'trace-alice',
 		goalRevision: 1,
 		actionId,
 		actionType,
@@ -27,6 +28,7 @@ function command(actionId, actionType = 'move_to', args = { x: 1, y: 1, z: 0, to
 			programVersion: 1,
 			sourceStepId: 'step-1',
 			eventSequence: 1,
+			traceId: 'trace-alice',
 		},
 	};
 }
@@ -55,6 +57,12 @@ test('accepted command produces RUNNING, changed observation, then one terminal 
 	assert.ok(manager.events[1].payload.observation.player.x > 0);
 	assert.equal(bridge.validatedOutbound, 1);
 	assert.equal(bridge.validatedInbound, 3);
+});
+
+test('missing action trace is rejected instead of synthesized by the virtual bridge', async () => {
+	const world = VirtualWorld.fromScenario(scenario());
+	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
+	await assert.rejects(bridge.send('action_command', 'alice', { ...command('missing-trace'), traceId: undefined }), /trace/i);
 });
 
 test('routine completion keeps its authoritative observation non-attentive before action_result', async () => {

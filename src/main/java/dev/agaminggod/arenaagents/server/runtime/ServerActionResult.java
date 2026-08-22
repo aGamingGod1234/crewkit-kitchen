@@ -14,7 +14,9 @@ public record ServerActionResult(
 		String reasonCode,
 		String message,
 		long elapsedMs,
-		long observedAtEpochMs
+		long observedAtEpochMs,
+		boolean executionStarted,
+		boolean physicalAttempted
 ) {
 	public ServerActionResult {
 		Objects.requireNonNull(agentId, "agentId must not be null");
@@ -28,6 +30,9 @@ public record ServerActionResult(
 		if (!state.terminal()) {
 			throw new IllegalArgumentException("Result state must be terminal");
 		}
+		if (physicalAttempted && !executionStarted) {
+			throw new IllegalArgumentException("physicalAttempted requires executionStarted");
+		}
 		reasonCode = bounded(reasonCode, 128);
 		message = bounded(message, 2_048);
 		if (elapsedMs < 0L || observedAtEpochMs <= 0L) {
@@ -39,7 +44,14 @@ public record ServerActionResult(
 			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
 			ServerActionState state, String reasonCode, String message, long elapsedMs, long observedAtEpochMs
 	) {
-		this(agentId, goalRevision, actionId, actionType, null, state, reasonCode, message, elapsedMs, observedAtEpochMs);
+		this(agentId, goalRevision, actionId, actionType, null, state, reasonCode, message, elapsedMs, observedAtEpochMs, true, true);
+	}
+
+	public ServerActionResult(
+			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
+			String traceId, ServerActionState state, String reasonCode, String message, long elapsedMs, long observedAtEpochMs
+	) {
+		this(agentId, goalRevision, actionId, actionType, traceId, state, reasonCode, message, elapsedMs, observedAtEpochMs, true, true);
 	}
 
 	private static String bounded(String value, int maximum) {

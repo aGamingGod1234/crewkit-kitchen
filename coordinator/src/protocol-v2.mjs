@@ -914,13 +914,13 @@ function normalizeActionProgress(value) {
 }
 
 function normalizeActionResult(value) {
-	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'];
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted'];
 	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'], 'action_result');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
 	const state = boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH);
 	if (!TERMINAL_ACTION_STATES.has(state)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported terminal action state '${state}'`);
-	return {
+	const normalized = {
 		traceId: requireTraceId(value.traceId),
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
 		actionId,
@@ -932,6 +932,16 @@ function normalizeActionResult(value) {
 		elapsedMs: nonnegativeInteger(value.elapsedMs, 'elapsedMs'),
 		observedAtEpochMs: nonnegativeInteger(value.observedAtEpochMs, 'observedAtEpochMs'),
 	};
+	if (value.executionStarted !== undefined) {
+		if (typeof value.executionStarted !== 'boolean') throw new ProtocolV2Error('INVALID_PAYLOAD', 'executionStarted must be a boolean');
+		normalized.executionStarted = value.executionStarted;
+	}
+	if (value.physicalAttempted !== undefined) {
+		if (typeof value.physicalAttempted !== 'boolean') throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted must be a boolean');
+		normalized.physicalAttempted = value.physicalAttempted;
+	}
+	if (normalized.physicalAttempted === true && normalized.executionStarted !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted requires executionStarted');
+	return normalized;
 }
 
 function normalizeActionCommand(value) {

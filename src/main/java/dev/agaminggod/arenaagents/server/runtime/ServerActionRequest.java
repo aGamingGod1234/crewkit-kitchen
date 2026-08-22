@@ -26,6 +26,9 @@ public record ServerActionRequest(
 		arguments = Objects.requireNonNull(arguments, "arguments must not be null").deepCopy();
 		provenance = Objects.requireNonNull(provenance, "provenance must not be null");
 		if (traceId != null) traceId = boundedTraceId(traceId);
+		if (!Objects.equals(traceId, provenance.traceId())) {
+			throw new IllegalArgumentException("request.traceId must match provenance.traceId");
+		}
 	}
 
 	public ServerActionRequest(

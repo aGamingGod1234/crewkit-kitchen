@@ -50,8 +50,11 @@ export class ProgramRuntimeManager {
 		this.#recorder = selectedRecorder;
 	}
 
-	async installDecision(record, decision, { observation, eventSequence } = {}) {
-		const state = this.#state(record, observation, eventSequence, decision?.traceId);
+	async installDecision(record, decision, { observation, eventSequence, traceId = undefined } = {}) {
+		if (traceId !== undefined && decision?.traceId !== undefined && decision.traceId !== traceId) {
+			throw codedError('TRACE_ID_MISMATCH', 'Planner decision traceId must match the coordinator work traceId');
+		}
+		const state = this.#state(record, observation, eventSequence, traceId ?? decision?.traceId);
 		if (decision?.directive === 'finish') {
 			this.#setTerminalState(record, decision.status === 'completed' ? DynamicAgentState.COMPLETED : DynamicAgentState.ERROR);
 			return state.engine?.snapshot() ?? null;
@@ -143,7 +146,9 @@ export class ProgramRuntimeManager {
 			durationMs: elapsedOrNull(timing?.bridgeSentAt, completedAt),
 			traceId: actionTraceId,
 		});
-		if (timing?.firstProgressAt === null || timing === undefined) {
+		const executionStarted = payload.executionStarted === true || payload.physicalAttempted === true;
+		const legacyExecutionResult = payload.executionStarted === undefined && payload.physicalAttempted === undefined;
+		if ((timing?.firstProgressAt === null || timing === undefined) && (executionStarted || legacyExecutionResult)) {
 			this.#recordTracePhase(state, record, 'first_world_action', completedAt, completedAt, 'completed', null, actionTraceId);
 		}
 		this.#recordTracePhase(state, record, 'completion_verification', completedAt, completedAt, 'skipped', 'VERIFIER_NOT_INSTALLED', actionTraceId);
@@ -657,9 +662,21 @@ export class ProgramRuntimeManager {
 
 	#recordTracePhase(state, record, phase, startMs, endMs, outcome, retryReason = null, traceIdOverride = null) {
 		const traceId = traceIdOverride ?? state?.traceId;
-		if (state === null || traceId === null || !Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+		if (state === null || traceId === null) return;
+		if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+			try { this.#latencyRegistry?.invalidateTrace?.(traceId); } catch { /* telemetry cannot interrupt action routing */ }
+			return;
+		}
 		if (phase === 'first_world_action' && state.worldActionTraceIds.has(traceId)) return;
 		if (phase === 'completion_verification' && state.verificationTraceIds.has(traceId)) return;
+		let normalizedRetryReason = null;
+		if (retryReason !== null) {
+			try { normalizedRetryReason = normalizeRetryReason(retryReason); }
+			catch {
+				try { this.#latencyRegistry?.invalidateTrace?.(traceId); } catch { /* telemetry cannot interrupt action routing */ }
+				return;
+			}
+		}
 		const fields = {
 			traceId,
 			phase,
@@ -667,20 +684,21 @@ export class ProgramRuntimeManager {
 			endMonotonicMs: endMs,
 			durationMs: Math.max(0, endMs - startMs),
 			outcome,
-			...(retryReason === null ? {} : { retryReason: normalizeRetryReason(retryReason) }),
+			...(normalizedRetryReason === null ? {} : { retryReason: normalizedRetryReason }),
 		};
+		if (this.#latencyRegistry !== null) {
+			try {
+				this.#latencyRegistry.recordTracePhase(traceId, phase, {
+					startMs,
+					endMs,
+					outcome,
+					...(normalizedRetryReason === null ? {} : { retryReason: normalizedRetryReason }),
+				});
+			} catch { return; }
+		}
 		this.#record(phase, record, fields);
 		if (phase === 'first_world_action') state.worldActionTraceIds.add(traceId);
 		if (phase === 'completion_verification') state.verificationTraceIds.add(traceId);
-		if (this.#latencyRegistry === null) return;
-		try {
-			this.#latencyRegistry.recordTracePhase(traceId, phase, {
-				startMs,
-				endMs,
-				outcome,
-				...(retryReason === null ? {} : { retryReason }),
-			});
-		} catch { /* telemetry must never interrupt action routing */ }
 	}
 
 	#record(stage, record, fields = {}) {

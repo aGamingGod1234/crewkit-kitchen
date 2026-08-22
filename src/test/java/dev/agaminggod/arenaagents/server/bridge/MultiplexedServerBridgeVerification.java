@@ -21,6 +21,7 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -105,6 +106,9 @@ public final class MultiplexedServerBridgeVerification {
 		ActionProvenance provenance = new ActionProvenance(
 				"codex", "gpt-5.6-sol", "high", "priority", "program-1-1", 1L, "step-1", 1L
 		);
+		ActionProvenance tracedProvenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-1-1", 1L, "step-1", 1L, traceId
+		);
 		JsonObject payload = new JsonObject();
 		payload.addProperty("traceId", traceId);
 		payload.addProperty("goalRevision", 1L);
@@ -132,6 +136,10 @@ public final class MultiplexedServerBridgeVerification {
 		ServerActionResult result = new ServerActionResult(agent, 1L, "action-1", ActionType.WAIT, traceId, ServerActionState.SUCCEEDED, "DONE", "", 2L, 3L);
 		assertEquals(traceId, progress.traceId(), "first progress retains the action trace ID");
 		assertEquals(traceId, result.traceId(), "terminal result retains the action trace ID");
+		assertThrows(IllegalArgumentException.class, () -> new ServerActionRequest(agent, 1L, "action-1", ActionType.WAIT, arguments, tracedProvenance, "trace-other"),
+				"direct request construction rejects mismatched top-level and provenance traces");
+		ServerActionRequest legacy = new ServerActionRequest(agent, 1L, "action-legacy", ActionType.WAIT, arguments, provenance);
+		assertThrowsCode(() -> new ServerActionExecutor(uninitializedManager(), ignored -> { }).submitProgramPrimitive(legacy), "MISSING_TRACE_ID");
 		JsonObject mismatched = payload.deepCopy();
 		mismatched.getAsJsonObject("provenance").addProperty("traceId", "trace-other");
 		assertThrows(BridgeProtocolException.class, () -> MultiplexedServerBridge.decodeActionRequest(

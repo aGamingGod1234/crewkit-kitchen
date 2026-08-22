@@ -229,6 +229,9 @@ public final class ServerActionExecutor {
 	/** Executes only a model-authored physical primitive received through the coordinator bridge. */
 	public synchronized void submitProgramPrimitive(ServerActionRequest request) {
 		Objects.requireNonNull(request, "request must not be null");
+		if (request.traceId() == null || request.provenance().traceId() == null) {
+			throw new AgentDomainException("MISSING_TRACE_ID", "Model-authored actions require a non-null trace ID");
+		}
 		requireArenaScriptPrimitive(request.type());
 		submitLegacy(request);
 	}

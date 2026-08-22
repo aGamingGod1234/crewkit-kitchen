@@ -26,6 +26,24 @@ export const REQUIRED_TRACE_PHASES = Object.freeze(TRACE_PHASES.slice(0, 6));
 export const TRACE_OUTCOMES = Object.freeze(['completed', 'failed', 'skipped']);
 const TRACE_PHASE_INDEX = new Map(TRACE_PHASES.map((phase, index) => [phase, index]));
 const TRACE_OUTCOME_SET = new Set(TRACE_OUTCOMES);
+const RETRY_REASON_CODES = new Set([
+	'ERROR', 'MALFORMED_DECISION', 'INVALID_DECISION', 'EMPTY_DECISION',
+	'UNKNOWN_DECISION_FIELD', 'MISSING_DECISION_FIELD', 'DECISION_FIELD_MISMATCH',
+	'DUPLICATE_DECISION_FIELD', 'PLANNING_TIMEOUT', 'PROVIDER_UNAVAILABLE',
+	'SPAWN_FAILED', 'MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE',
+	'PROVIDER_CIRCUIT_OPEN', 'VERIFIER_NOT_INSTALLED', 'STALE_PLAN', 'PLAN_CANCELLED',
+	'AUTHENTICATION_REQUIRED', 'PROVIDER_DOWN', 'REQUEST_TIMEOUT', 'PROVIDER_EXIT',
+	'TURN_TIMEOUT', 'TURN_CAP', 'RPC_ERROR', 'SYNTAX_ERROR', 'INVALID_SESSION', 'TURN_FAILED',
+]);
+const RETRY_REASON_ALIASES = Object.freeze([
+	['MISSING_DECISION_FIELD', 'MISSING_DECISION_FIELD'],
+	['UNKNOWN_DECISION_FIELD', 'UNKNOWN_DECISION_FIELD'],
+	['DECISION_FIELD_MISMATCH', 'DECISION_FIELD_MISMATCH'],
+	['DUPLICATE_DECISION_FIELD', 'DUPLICATE_DECISION_FIELD'],
+	['MALFORMED_DECISION', 'MALFORMED_DECISION'],
+	['INVALID_DECISION', 'INVALID_DECISION'],
+	['EMPTY_DECISION', 'EMPTY_DECISION'],
+]);
 
 export class ControlLatencyRegistry {
 	#windowSize;
@@ -68,41 +86,45 @@ export class ControlLatencyRegistry {
 	/** Records one disjoint monotonic span in the fixed task trace. */
 	recordTracePhase(traceIdValue, phaseValue, spanValue) {
 		const traceId = requireTraceId(traceIdValue);
-		const phase = requireTracePhase(phaseValue);
-		if (!isPlainObject(spanValue)) throw new TypeError('trace phase span must be an object');
-		const startMs = requireTimestamp(spanValue.startMs, 'startMs');
-		const endMs = requireTimestamp(spanValue.endMs, 'endMs');
-		if (endMs < startMs) throw new TypeError('trace phase timestamps must be monotonic');
-		const outcome = requireOutcome(spanValue.outcome ?? 'completed');
-		const retryReason = spanValue.retryReason === undefined || spanValue.retryReason === null
-			? undefined
-			: normalizeRetryReason(spanValue.retryReason);
+		const trace = this.#ensureTrace(traceId);
+		try {
+			const phase = requireTracePhase(phaseValue);
+			if (!isPlainObject(spanValue)) throw new TypeError('trace phase span must be an object');
+			const startMs = requireTimestamp(spanValue.startMs, 'startMs');
+			const endMs = requireTimestamp(spanValue.endMs, 'endMs');
+			if (endMs < startMs) throw new TypeError('trace phase timestamps must be monotonic');
+			const outcome = requireOutcome(spanValue.outcome ?? 'completed');
+			const retryReason = spanValue.retryReason === undefined || spanValue.retryReason === null
+				? undefined
+				: normalizeRetryReason(spanValue.retryReason);
 
-		let trace = this.#traces.get(traceId);
-		if (trace === undefined) {
-			if (this.#traces.size >= this.#traceCap) {
-				this.#traces.delete(this.#traces.keys().next().value);
-			}
-			trace = { phases: new Map(), lastPhaseIndex: -1, lastEndMs: null };
-			this.#traces.set(traceId, trace);
+			if (trace.phases.has(phase)) throw new TypeError(`trace phase '${phase}' is duplicate`);
+			const phaseIndex = TRACE_PHASE_INDEX.get(phase);
+			if (phaseIndex <= trace.lastPhaseIndex) throw new TypeError(`trace phase '${phase}' is out of order`);
+			if (trace.lastEndMs !== null && startMs < trace.lastEndMs) throw new TypeError('trace phases must not overlap or move backwards monotonically');
+
+			const span = {
+				phase,
+				startMs,
+				endMs,
+				durationMs: endMs - startMs,
+				outcome,
+				...(retryReason === undefined ? {} : { retryReason }),
+			};
+			trace.phases.set(phase, Object.freeze(span));
+			trace.lastPhaseIndex = phaseIndex;
+			trace.lastEndMs = endMs;
+			return span;
+		} catch (error) {
+			trace.invalid = true;
+			throw error;
 		}
-		if (trace.phases.has(phase)) throw new TypeError(`trace phase '${phase}' is duplicate`);
-		const phaseIndex = TRACE_PHASE_INDEX.get(phase);
-		if (phaseIndex <= trace.lastPhaseIndex) throw new TypeError(`trace phase '${phase}' is out of order`);
-		if (trace.lastEndMs !== null && startMs < trace.lastEndMs) throw new TypeError('trace phases must not overlap or move backwards monotonically');
+	}
 
-		const span = {
-			phase,
-			startMs,
-			endMs,
-			durationMs: endMs - startMs,
-			outcome,
-			...(retryReason === undefined ? {} : { retryReason }),
-		};
-		trace.phases.set(phase, Object.freeze(span));
-		trace.lastPhaseIndex = phaseIndex;
-		trace.lastEndMs = endMs;
-		return span;
+	/** Marks a trace incomplete when a producer detects an invalid span before recording it. */
+	invalidateTrace(traceIdValue) {
+		const traceId = requireTraceId(traceIdValue);
+		this.#ensureTrace(traceId).invalid = true;
 	}
 
 	// Alias used by producers that already call ordinary spans "recordPhase".
@@ -120,7 +142,7 @@ export class ControlLatencyRegistry {
 		const phases = orderedPhases(trace);
 		const missing = TRACE_PHASES.some((phase) => !trace.phases.has(phase));
 		const failed = REQUIRED_TRACE_PHASES.some((phase) => trace.phases.get(phase)?.outcome !== 'completed');
-		const complete = !missing && !failed;
+		const complete = !trace.invalid && !missing && !failed;
 		return Object.freeze({
 			traceId,
 			complete,
@@ -137,7 +159,7 @@ export class ControlLatencyRegistry {
 		return this.traceSnapshot();
 	}
 
-	snapshot() {
+		snapshot() {
 		return [...this.#samples.entries()]
 			.sort(([left], [right]) => left.localeCompare(right))
 			.map(([operation, values]) => {
@@ -150,6 +172,16 @@ export class ControlLatencyRegistry {
 				});
 			});
 	}
+
+	#ensureTrace(traceId) {
+		let trace = this.#traces.get(traceId);
+		if (trace === undefined) {
+			if (this.#traces.size >= this.#traceCap) this.#traces.delete(this.#traces.keys().next().value);
+			trace = { phases: new Map(), lastPhaseIndex: -1, lastEndMs: null, invalid: false };
+			this.#traces.set(traceId, trace);
+		}
+		return trace;
+	}
 }
 
 export function validateTraceId(value) {
@@ -158,19 +190,21 @@ export function validateTraceId(value) {
 
 export function normalizeRetryReason(value) {
 	if (typeof value !== 'string') throw new TypeError('retryReason must be a string');
-	let text = value.trim();
+	const text = value.trim();
 	if (text.length === 0) throw new TypeError('retryReason must be nonblank');
-	// Keep only a stable error-code-like prefix. Never retain provider output,
-	// exception text, prompt text, or credential-shaped material.
-	text = text
-		.replace(/\b(?:sk|key|token|secret|password|credential)[-_]?[A-Za-z0-9._~+/=-]{4,}/gi, ' ')
-		.replace(/\b(?:prompt|output|exception|stack|traceback)\b[\s\S]*$/i, ' ');
 	const normalized = text.toUpperCase()
 		.replace(/[^A-Z0-9]+/g, '_')
-		.replace(/^_+|_+$/g, '')
-		.slice(0, MAX_RETRY_REASON_LENGTH);
-	if (normalized.length === 0) throw new TypeError('retryReason must contain an error code');
-	return normalized;
+		.replace(/^_+|_+$/g, '');
+	if (RETRY_REASON_CODES.has(normalized)) return normalized;
+	for (const [prefix, code] of RETRY_REASON_ALIASES) {
+		if (normalized === prefix || normalized.startsWith(`${prefix}_`)) return code;
+	}
+	if (/(?:^|_)(?:API_KEY|PASSWORD|BEARER|TOKEN|SECRET|CREDENTIAL)(?:_|$)/.test(normalized)
+		|| /(?:^|_)(?:PROMPT|PROVIDER_OUTPUT|EXCEPTION|STACK|TRACEBACK|JAVA_LANG)(?:_|$)/.test(normalized)) {
+		throw new TypeError('retryReason must not contain provider output, exception text, or credential-shaped material');
+	}
+	if (/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(normalized) && normalized.length <= MAX_RETRY_REASON_LENGTH) return 'ERROR';
+	throw new TypeError(`retryReason must be one stable internal code of at most ${MAX_RETRY_REASON_LENGTH} characters`);
 }
 
 function requireOperation(value) {

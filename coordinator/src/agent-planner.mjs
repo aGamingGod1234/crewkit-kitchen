@@ -233,7 +233,15 @@ export class AgentPlanner {
 	}
 
 	#recordTracePhase(record, traceId, phase, startMs, endMs, outcome, retryReason = null) {
-		if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+		if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+			this.#invalidateTrace(traceId);
+			return;
+		}
+		let normalizedRetryReason = null;
+		if (retryReason !== null) {
+			try { normalizedRetryReason = normalizeRetryReason(retryReason); }
+			catch { this.#invalidateTrace(traceId); return; }
+		}
 		const fields = {
 			traceId,
 			phase,
@@ -241,12 +249,18 @@ export class AgentPlanner {
 			endMonotonicMs: endMs,
 			durationMs: Math.max(0, endMs - startMs),
 			outcome,
-			...(retryReason === null ? {} : { retryReason: normalizeRetryReason(retryReason) }),
+			...(normalizedRetryReason === null ? {} : { retryReason: normalizedRetryReason }),
 		};
+		if (this.#latencyRegistry !== null) {
+			try {
+				this.#latencyRegistry.recordTracePhase(traceId, phase, { startMs, endMs, outcome, ...(normalizedRetryReason === null ? {} : { retryReason: normalizedRetryReason }) });
+			} catch { return; }
+		}
 		this.#record(phase, record, fields);
-		if (this.#latencyRegistry === null) return;
-		try { this.#latencyRegistry.recordTracePhase(traceId, phase, { startMs, endMs, outcome, ...(retryReason === null ? {} : { retryReason }) }); }
-		catch { /* a bounded telemetry sink cannot interrupt planning */ }
+	}
+
+	#invalidateTrace(traceId) {
+		try { this.#latencyRegistry?.invalidateTrace?.(traceId); } catch { /* telemetry cannot interrupt planning */ }
 	}
 
 	#record(stage, record, fields = {}) {

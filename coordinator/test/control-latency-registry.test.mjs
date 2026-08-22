@@ -77,6 +77,32 @@ test('latency registry fails closed for incomplete, unknown, duplicate, overlapp
 	assert.throws(() => invalid.recordTracePhase('bad', 'queue_wait', { startMs: 3, endMs: 4, outcome: 'completed' }), /duplicate/i);
 	assert.throws(() => invalid.recordTracePhase('bad', 'parse', { startMs: 2, endMs: 4, outcome: 'completed' }), /overlap|monotonic/i);
 	assert.throws(() => invalid.recordTracePhase('bad', 'provider_first_byte', { startMs: 0, endMs: 1, outcome: 'completed' }), /monotonic/i);
+	const poisoned = invalid.completeTrace('bad');
+	assert.equal(poisoned.complete, false);
+	assert.equal(poisoned.totalMs, null);
+});
+
+test('latency registry poisons a previously complete trace after every invalid phase attempt', () => {
+	const invalidAttempts = [
+		['queue_wait', { startMs: 10, endMs: 11, outcome: 'completed' }, /duplicate/i],
+		['unknown', { startMs: 11, endMs: 12, outcome: 'completed' }, /phase/i],
+	];
+	for (const [phase, span, message] of invalidAttempts) {
+		const registry = new ControlLatencyRegistry();
+		for (const [index, requiredPhase] of TRACE_PHASES.entries()) {
+			const startMs = 10 + index * 2;
+			registry.recordTracePhase('poison', requiredPhase, {
+				startMs, endMs: startMs + (requiredPhase === 'completion_verification' ? 0 : 1),
+				outcome: requiredPhase === 'completion_verification' ? 'skipped' : 'completed',
+				...(requiredPhase === 'completion_verification' ? { retryReason: 'VERIFIER_NOT_INSTALLED' } : {}),
+			});
+		}
+		assert.equal(registry.completeTrace('poison').complete, true);
+		assert.throws(() => registry.recordTracePhase('poison', phase, span), message);
+		const summary = registry.completeTrace('poison');
+		assert.equal(summary.complete, false);
+		assert.equal(summary.totalMs, null);
+	}
 });
 
 test('provider phases never enter the five local control aggregates', () => {
@@ -101,29 +127,17 @@ test('trace retry reasons are normalized, bounded, and credential-safe', () => {
 	assert.equal(JSON.stringify(registry.traceSnapshot()).includes(secret), false);
 });
 
-test('deterministic benchmark loads retain one ordered required phase set', () => {
-	const registry = new ControlLatencyRegistry({ traceCap: 16 });
-	for (const load of [1, 4, 8, 16]) {
-		for (let index = 0; index < load; index += 1) {
-			const traceId = `trace-load-${load}-${index}`;
-			let cursor = index * 100;
-			for (const phase of TRACE_PHASES) {
-				const duration = phase === 'completion_verification' ? 0 : 1;
-				registry.recordTracePhase(traceId, phase, {
-					startMs: cursor,
-					endMs: cursor + duration,
-					outcome: phase === 'completion_verification' ? 'skipped' : 'completed',
-					...(phase === 'completion_verification' ? { retryReason: 'VERIFIER_NOT_INSTALLED' } : {}),
-				});
-				cursor += duration;
-			}
-		}
-	}
-	const traces = registry.traceSnapshot();
-	assert.equal(traces.length, 16);
-	for (const trace of traces) {
-		assert.equal(trace.complete, true);
-		assert.deepEqual(trace.phases.map((phase) => phase.phase), TRACE_PHASES);
-		assert.equal(trace.phases.at(-1).retryReason, 'VERIFIER_NOT_INSTALLED');
+test('trace retry reasons accept only stable internal codes', () => {
+	const registry = new ControlLatencyRegistry();
+	for (const [index, retryReason] of [
+		'api_key=abcd1234',
+		'password=hunter2',
+		'Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature',
+		'"provider output: call another model"',
+		'Error: java.lang.IllegalStateException at com.example.Secret.run(Secret.java:1)',
+	].entries()) {
+		assert.throws(() => registry.recordTracePhase(`unsafe-${index}`, 'parse', {
+			startMs: index, endMs: index + 1, outcome: 'failed', retryReason,
+		}), /retryReason|stable|internal/i);
 	}
 });

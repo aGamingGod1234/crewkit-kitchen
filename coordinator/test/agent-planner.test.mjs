@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { DynamicAgentState } from '../src/agent-registry.mjs';
+import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 
 const AGENT_ID = 'agent-1';
 const GOAL_REVISION = 7;
@@ -94,6 +95,34 @@ test('keeps one trace across a malformed decision retry and records queue/provid
 		'queue_wait', 'provider_first_byte', 'provider_final_byte', 'parse',
 	]);
 	assert.equal(rows.find((row) => row.stage === 'parse').fields.retryReason, 'MALFORMED_DECISION');
+});
+
+test('clock regression never emits a regressing raw phase and poisons the trace', async () => {
+	const registry = new FakeRegistry();
+	const latencyRegistry = new ControlLatencyRegistry();
+	const rows = [];
+	const times = [100, 90, 91, 92, 93, 94];
+	const planner = new AgentPlanner({
+		registry,
+		latencyRegistry,
+		now: () => times.shift(),
+		benchmarkRecorder: { record(stage, context, fields) { rows.push({ stage, context, fields }); } },
+		scheduler: {
+			schedule(_agentId, operation) { return operation({ signal: new AbortController().signal }); },
+			cancel() { return false; },
+		},
+		codexService: {
+			async createAgent() { return { async setGoalRevision() {}, async decide() { return VALID_DECISION; } }; },
+			getAgent() { return null; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	await planner.requestPlan({ agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION, traceId: 'trace-clock-regression' });
+	assert.equal(rows.some((row) => row.stage === 'queue_wait' && row.fields.startMonotonicMs > row.fields.endMonotonicMs), false);
+	const summary = latencyRegistry.completeTrace('trace-clock-regression');
+	assert.equal(summary.complete, false);
+	assert.equal(summary.totalMs, null);
 });
 
 test('retries compact envelope validation mismatches with corrective feedback', async () => {

@@ -90,6 +90,16 @@ test('runs deterministic instant full-path trials at every declared load', async
 	assert.deepEqual(result.trials.map((trial) => trial.agentLoad), [1, 4, 8, 16]);
 	assert.ok(result.trials.every((trial) => trial.status === 'PASSED'));
 	assert.ok(result.trials.every((trial) => trial.outcomeHash.startsWith('sha256:')));
+	for (const trial of result.trials) {
+		assert.equal(trial.benchmark.traces.length, trial.agentLoad);
+		for (const trace of trial.benchmark.traces) {
+			assert.equal(trace.complete, true);
+			assert.deepEqual(trace.phases.map((phase) => phase.phase), [
+				'queue_wait', 'provider_first_byte', 'provider_final_byte', 'parse',
+				'first_command_dispatch', 'first_world_action', 'completion_verification',
+			]);
+		}
+	}
 	assert.equal(result.cleanup.ok, true);
 });
 

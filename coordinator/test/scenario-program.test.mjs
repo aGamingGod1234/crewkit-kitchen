@@ -42,14 +42,16 @@ async function executeManifest(manifest, commandIndexes = manifest.commands.map(
 	const world = VirtualWorld.fromScenario(manifest.world);
 	const bridge = new VirtualMinecraftBridge({ world, actionRuntime: new ActionRuntime() });
 	const initialSnapshot = captureScenarioInitialSnapshot({ manifest, world });
+	const traceId = `scenario-${manifest.agentId}`;
 	for (const index of commandIndexes) {
 		const command = manifest.commands[index];
 		await bridge.send('action_command', manifest.agentId, {
+			traceId,
 			goalRevision: 1,
 			actionId: `provider-generated-${index + 1}`,
 			actionType: command.actionType,
 			arguments: command.arguments,
-			provenance: { provider: 'fixture', model: 'fixture', reasoningEffort: 'none', serviceTier: 'fixture', programId: 'scenario', programVersion: 1, sourceStepId: `step-${index + 1}`, eventSequence: index + 1 },
+			provenance: { provider: 'fixture', model: 'fixture', reasoningEffort: 'none', serviceTier: 'fixture', programId: 'scenario', programVersion: 1, sourceStepId: `step-${index + 1}`, eventSequence: index + 1, traceId },
 		});
 		for (let tick = 0; tick < 200 && bridge.activeActionIds.length > 0; tick += 1) world.stepTicks(1);
 		await bridge.flush();

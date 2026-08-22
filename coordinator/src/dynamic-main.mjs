@@ -528,6 +528,7 @@ export class DynamicCoordinator extends EventEmitter {
 			runtime = await this.#programRuntime.installDecision(record, decision, {
 				observation: work.request.observation,
 				eventSequence: work.request.eventSequence,
+				traceId: work.traceId,
 			});
 		} catch (error) {
 			this.#providerWork.delete(work.agentId);
@@ -870,6 +871,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		invalidDecisionRetries: config.limits.invalidDecisionRetries,
 		healthRegistry,
 		latencyRegistry,
+		now: dependencies.plannerNow ?? dependencies.now,
 		telemetrySink: dependencies.telemetrySink,
 		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
