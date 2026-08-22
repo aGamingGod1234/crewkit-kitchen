@@ -22,6 +22,7 @@ const MODES = new Set(['instant', 'replay', 'live']);
 const PROVIDERS = new Set(['codex', 'gemini', 'kimi', 'instant', 'replay']);
 const MAX_TRIALS = 4_096;
 const MAX_REPETITIONS = 1_024;
+const MAX_METRIC_SAMPLES = 4_096;
 
 /** Strictly validate and freeze a latency matrix before executing it. */
 export function normalizeLatencyMatrix(value) {
@@ -70,14 +71,18 @@ export async function runLatencyMatrix(options = {}) {
 	if (typeof scenarioResolver !== 'function') throw new TypeError('scenarioResolver must be a function');
 	const providerFactories = options.providerFactories ?? {};
 	if (!isRecord(providerFactories)) throw new TypeError('providerFactories must be an object');
-	const recorder = options.recorder ?? new BenchmarkRecorder({ maxEvents: options.maxEvents ?? 10_000 });
+	const measurementContext = normalizeBenchmarkContext(options);
+	const wallClockBasis = options.wallClock !== undefined || options.wallNow !== undefined ? 'injected_monotonic_ms' : 'process_monotonic_ms';
+	const wallClock = createMonotonicClock(options.wallClock ?? options.wallNow ?? (() => performance.now()), 'wall clock');
+	const measurementsEnabled = options.measurements !== false && options.instrumentation !== false && options.collectMetrics !== false;
+	const recorder = options.recorder ?? new BenchmarkRecorder({ maxEvents: options.maxEvents ?? 10_000, baseContext: measurementContext, clock: options.recorderClock ?? wallClock });
 	const results = [];
 	let requiredFailure = null;
 	const cleanups = [];
 	try {
 		for (const trial of matrix.trials) {
 			for (let repetition = 1; repetition <= trial.repetitions; repetition += 1) {
-				const result = await runTrial({ ...options, matrix, trial, repetition, scenarioResolver, providerFactories, recorder });
+				const result = await runTrial({ ...options, matrix, trial, repetition, scenarioResolver, providerFactories, recorder, measurementContext, wallClock, wallClockBasis, measurementsEnabled });
 				results.push(result);
 				if (result.status === 'FAILED' && result.error?.code === 'PROVIDER_UNAVAILABLE' && trial.providerAvailabilityRequired) requiredFailure = result.error;
 			}
@@ -88,19 +93,20 @@ export async function runLatencyMatrix(options = {}) {
 	const status = requiredFailure ? 'FAILED' : results.some((trial) => ['FAILED', 'TIMED_OUT'].includes(trial.status) || trial.cleanup?.ok === false) ? 'FAILED' : 'PASSED';
 	const output = {
 		status,
+		...(Object.keys(measurementContext).length > 0 ? { context: measurementContext } : {}),
 		matrix: { version: matrix.version, benchmarkVersion: matrix.benchmarkVersion, protocolVersion: matrix.protocolVersion },
 		trials: results,
 		cleanup: { ok: results.every((trial) => trial.cleanup?.ok !== false), activeActions: results.reduce((sum, trial) => sum + (trial.cleanup?.activeActions ?? 0), 0), listeners: results.reduce((sum, trial) => sum + (trial.cleanup?.listeners ?? 0), 0) },
 		summary: recorder.snapshot ? recorder.snapshot().length : 0,
 		benchmarkSummary: summarizeBenchmark(recorder.snapshot ? recorder.snapshot() : []),
 	};
-	if (requiredFailure) throw Object.assign(new Error(requiredFailure.message), requiredFailure, { result: output });
 	if (options.artifactDirectory) await writeArtifacts(options.artifactDirectory, output, recorder, options.artifactFs);
+	if (requiredFailure) throw Object.assign(new Error(requiredFailure.message), requiredFailure, { result: output });
 	return deepFreeze(output);
 }
 
 
-async function runTrial({ matrix, trial, repetition, scenarioResolver, providerFactories, recorder, ...options }) {
+async function runTrial({ matrix, trial, repetition, scenarioResolver, providerFactories, recorder, measurementContext = {}, wallClock, wallClockBasis = 'process_monotonic_ms', measurementsEnabled = true, ...options }) {
 	const startedAt = performance.now();
 	const deadline = startedAt + trial.trialBudgetMs;
 	let provider = null;
@@ -119,6 +125,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	let trialRecorder = null;
 	let scheduler = null;
 	let systemSummary = null;
+	const metrics = new LatencyMetricsTracker({ wallClock, wallClockBasis, enabled: measurementsEnabled, maxSamples: options.maxMetricSamples, context: measurementContext });
 	const cleanupTimeoutMs = 1_000;
 	try {
 		const rawScenario = await runWithDeadline(() => scenarioResolver(trial.scenarioId, trial), deadline);
@@ -151,7 +158,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		registerProviderCleanup();
 		if (provider === null || provider === undefined || provider.available === false) {
 			const error = coded('PROVIDER_UNAVAILABLE', boundedError(provider?.reason ?? 'provider is unavailable'));
-			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null);
+			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null, measurementContext);
 			return result;
 		}
 		if (trial.mode === 'replay' && !provider.createAgent) provider = createReplayProvider({ ...options, ...trial.replay, recordings: options.replayRecordings, trialId: trial.id, providerProfile: trial.providerProfile, scenario: rawScenario, prompt: trial.prompt ?? options.replayPrompt ?? 'latency-replay-prompt', protocolVersion: matrix.protocolVersion });
@@ -165,11 +172,15 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, goalRevision: 0, queue: [] }));
 		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: scenario.goal ?? `Complete ${trial.scenarioId}`, goalRevision: 1 }));
 		world = new VirtualWorld(scenario.world, { scheduler: manualScheduler() });
+		metrics.attachWorld(world, scenario, scenario.agentIds);
 		initialSnapshots = new Map(scenario.agentIds.map((agentId) => [agentId, captureScenarioInitialSnapshot({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, agentId })]));
 		const virtual = new VirtualMinecraftBridge({ world, agentRecords: virtualRecords, serverInstanceId: `latency-${trial.id}-${repetition}` });
 		bridge = new VirtualMinecraftBridgeAdapter(virtual, records);
+		metrics.attachVirtualBridge(virtual);
+		metrics.attachBridgeAdapter(bridge);
+		cleanup.push(() => metrics.close());
 		cleanup.push(() => bridge?.stop());
-		trialRecorder = createTrialRecorder(recorder, { trial, repetition });
+		trialRecorder = createTrialRecorder(recorder, { trial, repetition, measurementContext, metrics });
 		scheduler = createTrialScheduler(trial, trialRecorder, options);
 		cleanup.push(() => scheduler?.close?.('latency trial cleanup'));
 		const providerService = factory !== null ? createInjectedProviderService(provider, trial, turnBudget(trial), deadline, () => ++turnCount, stopProvider, stopProviderAfterTimeout) : null;
@@ -201,7 +212,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		for (const agentId of scenario.agentIds) bridge.startAgent(agentId, scenario.goal ?? `Complete ${trial.scenarioId}`);
 		await Promise.resolve();
 		for (const agentId of scenario.agentIds) await runWithDeadline(() => bridge.publish(agentId), deadline);
-		await runWithDeadline(() => runVirtualTicks({ world, bridge, coordinator, records, cap: trial.turnCap, deadline }), deadline);
+		await runWithDeadline(() => runVirtualTicks({ world, bridge, coordinator, records, cap: trial.turnCap, deadline, metrics }), deadline);
 		const statuses = records.map((record) => coordinator.registry.get(record.agentId)?.state);
 		const runtimeError = runtimeErrors.find((entry) => entry.code);
 		const runtimeTimedOut = isTimeoutErrorCode(runtimeError?.code);
@@ -212,10 +223,11 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const scenarioDigest = scenarioOutcomes.length > 0 ? hash(scenarioOutcomes.map(normalizeScenarioOutcome)) : null;
 		const status = runtimeError ? (runtimeTimedOut ? 'TIMED_OUT' : 'FAILED') : registryStatus === 'PASSED' && scenarioPassed ? 'PASSED' : registryStatus === 'TIMED_OUT' ? 'TIMED_OUT' : 'FAILED';
 		const error = runtimeError ? coded(runtimeError.code, runtimeError.message) : status === 'TIMED_OUT' ? coded('TURN_CAP', `trial exceeded the ${trial.turnCap}-turn cap`) : !scenarioPassed ? coded('SCENARIO_ASSERTION_FAILED', 'authoritative scenario outcome did not satisfy its success predicate') : null;
+		metrics.markTaskCompletion({ status, agentIds: scenario.agentIds });
 		const outcomeHash = hash({ trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, providerProfile: trial.providerProfile, statuses, turnCount, scenarioDigest });
-		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler));
+		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler), measurementContext);
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0 };
-		result.debug = { statuses, turnCount, runtimeErrors, scenarioPassed, scenarioDigest, scenarioEvidence: scenarioEvidence(virtual, scenario.agentIds) };
+		result.debug = { statuses, turnCount, runtimeErrors, scenarioPassed, scenarioDigest, scenarioEvidence: scenarioEvidence(virtual, scenario.agentIds), actionCommandHash: hash(authoritativeCommands(virtual)) };
 	} catch (error) {
 		if (error?.code === 'TRIAL_TIMEOUT') await new Promise((resolve) => setImmediate(resolve));
 		let typed = normalizeTrialError(error);
@@ -224,9 +236,9 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			const runtimeError = providerError ?? runtimeErrors.find((entry) => entry.code && !['TRIAL_TIMEOUT'].includes(entry.code));
 			if (runtimeError) typed = coded(runtimeError.code, runtimeError.message);
 		}
-		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler));
+		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext);
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0 };
-		result.debug = { runtimeErrors, turnCount };
+		result.debug = { runtimeErrors, turnCount, actionCommandHash: null };
 	} finally {
 		try { sampler?.sample?.(); } catch {}
 		for (const close of cleanup.reverse()) {
@@ -237,6 +249,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			try { systemSummary = summarizeTrialSystem(sampler); } catch { systemSummary = null; }
 			result.cleanup = cleanupSnapshot(bridge, sampler, cleanupErrors);
 			result.systemSummary = systemSummary;
+			result.metrics = metrics.finalize({ world, agentIds: world?.agentIds ?? [] });
 			if (!result.cleanup.ok) {
 				result.status = 'FAILED';
 				result.error = { code: 'CLEANUP_FAILED', message: 'trial cleanup left resources or reported an error' };
@@ -246,9 +259,11 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	return result;
 }
 
-async function runVirtualTicks({ world, bridge, coordinator, records, cap, deadline }) {
+async function runVirtualTicks({ world, bridge, coordinator, records, cap, deadline, metrics = null }) {
 	for (let tick = 0; tick < 10_000; tick += 1) {
+		const tickStartedAt = metrics?.beginTick();
 		world.tick();
+		metrics?.endTick(tickStartedAt, world);
 		await new Promise((resolve) => setImmediate(resolve));
 		const states = records.map((record) => coordinator.registry.get(record.agentId)?.state);
 		if (states.every((state) => [DynamicAgentState.COMPLETED, DynamicAgentState.ERROR, DynamicAgentState.PAUSED].includes(state))) return;
@@ -295,6 +310,424 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 	startAgent(agentId, goal) { this.emit('goal_control', { agentId, payload: { operation: 'start', goalRevision: 1, goal, updatedAtEpochMs: 0 } }); }
 	get activeActionIds() { return this.#virtual.activeActionIds; }
 }
+
+/**
+ * Measurement-only state for one trial. All timestamps are monotonic wall-clock
+ * readings supplied by the runner; world timestamps remain virtual-world time.
+ */
+class LatencyMetricsTracker {
+	#wallClock;
+	#enabled;
+	#maxSamples;
+	#wallClockBasis;
+	#context;
+	#world = null;
+	#scenario = null;
+	#virtual = null;
+	#agentIds = [];
+	#cleanups = [];
+	#raw = {
+		goals: [],
+		initialObservations: [],
+		providerPlanningWait: [],
+		actionCommandAcceptance: [],
+		physicalDisplacement: [],
+		taskCompletion: [],
+		hazardReaction: [],
+		directMessageReaction: [],
+		ticks: [],
+		planningIntervals: [],
+	};
+	#goals = new Map();
+	#initialObservations = new Map();
+	#acceptances = new Map();
+	#displacements = new Map();
+	#hazards = new Map();
+	#directMessages = new Map();
+	#planning = new Map();
+	#baseline = new Map();
+	#seenConversationEvents = new Set();
+	#tickDurations = [];
+	#taskCompletion = null;
+	#lastTimestamp = null;
+	#finalized = false;
+
+	constructor({ wallClock, wallClockBasis = 'process_monotonic_ms', enabled = true, maxSamples = MAX_METRIC_SAMPLES, context = {} } = {}) {
+		if (typeof wallClock !== 'function') throw new TypeError('latency metrics wall clock must be a function');
+		if (!Number.isSafeInteger(maxSamples) || maxSamples < 1 || maxSamples > MAX_METRIC_SAMPLES) throw new TypeError(`maxMetricSamples must be between 1 and ${MAX_METRIC_SAMPLES}`);
+		this.#wallClock = wallClock;
+		this.#wallClockBasis = boundedText(wallClockBasis, 64) ?? 'process_monotonic_ms';
+		this.#enabled = enabled === true;
+		this.#maxSamples = maxSamples;
+		this.#context = context;
+	}
+
+	attachWorld(world, scenario, agentIds) {
+		if (!this.#enabled) return;
+		this.#world = world;
+		this.#scenario = scenario;
+		this.#agentIds = [...agentIds];
+		for (const agentId of this.#agentIds) {
+			const state = safePlayerState(world, agentId);
+			if (state !== null) {
+				this.#baseline.set(agentId, state);
+			}
+		}
+	}
+
+	attachVirtualBridge(virtual) {
+		if (!this.#enabled || !virtual?.on) return;
+		const listeners = [
+			['accepted', (event) => this.#onAccepted(event)],
+			['observation', (event) => this.#onObservation(event)],
+			['result', (event) => this.#onResult(event)],
+		];
+		for (const [event, listener] of listeners) { virtual.on(event, listener); this.#cleanups.push(() => virtual.off?.(event, listener)); }
+		this.#virtual = virtual;
+	}
+
+	attachBridgeAdapter(bridge) {
+		if (!this.#enabled || !bridge?.on) return;
+		const listener = (event) => this.#onGoal(event);
+		bridge.on('goal_control', listener);
+		this.#cleanups.push(() => bridge.off?.('goal_control', listener));
+	}
+
+	close() {
+		for (const cleanup of this.#cleanups.splice(0).reverse()) {
+			try { cleanup(); } catch { /* measurement cleanup cannot affect the trial */ }
+		}
+	}
+
+	beginTick() { return this.#enabled ? this.#now() : null; }
+
+	endTick(startedAt, world) {
+		if (!this.#enabled || startedAt === null) return;
+		const endedAt = this.#now();
+		const durationMs = Math.max(0, endedAt - startedAt);
+		const tick = Number.isSafeInteger(world?.tickCount) ? world.tickCount : this.#raw.ticks.length + 1;
+		const virtualTimestampMs = finiteOrNull(world?.timeMs);
+		this.#push(this.#raw.ticks, { tick, wallDurationMs: durationMs, cpuWallDurationMs: durationMs, virtualTimestampMs });
+		this.#push(this.#tickDurations, durationMs);
+		this.#observeWorld(world, endedAt, virtualTimestampMs);
+	}
+
+	observeRecorderStage(stage, context = {}, fields = {}) {
+		if (!this.#enabled) return;
+		const timestamp = this.#now();
+		const agentId = typeof context.agentId === 'string' ? context.agentId : null;
+		if (stage === 'planner_requested' && agentId !== null) {
+			this.#startPlanning(agentId, timestamp, context.goalRevision);
+			return;
+		}
+		if (agentId === null) return;
+		const plan = this.#planning.get(agentId);
+		if (stage === 'scheduler_admitted') {
+			if (plan) plan.admittedWallTimestampMs = timestamp;
+			return;
+		}
+		if (stage === 'provider_request_started') {
+			if (plan) plan.providerStartedWallTimestampMs = timestamp;
+			return;
+		}
+		if (stage === 'provider_response_completed' || stage === 'provider_response_failed') {
+			if (plan?.providerStartedWallTimestampMs !== null && plan?.providerStartedWallTimestampMs !== undefined) {
+				const providerWaitWallMs = Math.max(0, timestamp - plan.providerStartedWallTimestampMs);
+				this.#push(this.#raw.providerPlanningWait, {
+					agentId,
+					goalRevision: context.goalRevision ?? null,
+					operation: boundedText(fields.operation, 64),
+					requestWallTimestampMs: plan.providerStartedWallTimestampMs,
+					responseWallTimestampMs: timestamp,
+					schedulerWaitWallMs: plan.admittedWallTimestampMs === null ? null : Math.max(0, plan.admittedWallTimestampMs - plan.startedWallTimestampMs),
+					planningWaitWallMs: Math.max(0, plan.providerStartedWallTimestampMs - plan.startedWallTimestampMs),
+					providerWaitWallMs,
+					totalPlanningWallMs: Math.max(0, timestamp - plan.startedWallTimestampMs),
+					errorCode: stage === 'provider_response_failed' ? boundedText(fields.errorCode, 64) : null,
+				});
+				plan.providerStartedWallTimestampMs = null;
+			}
+			return;
+		}
+		if (stage === 'planner_decision_completed' || stage === 'planner_failed') this.#finishPlanning(agentId, timestamp, stage === 'planner_failed' ? boundedText(fields.errorCode, 64) : null);
+	}
+
+	markTaskCompletion({ status, agentIds = this.#agentIds } = {}) {
+		if (!this.#enabled || status !== 'PASSED' || this.#taskCompletion !== null) return;
+		const wallTimestampMs = this.#now();
+		const virtualTimestampMs = finiteOrNull(this.#world?.timeMs);
+		const initial = this.#firstInitialObservation(agentIds);
+		if (initial === null || virtualTimestampMs === null) return;
+		const value = {
+			wallTimestampMs,
+			virtualTimestampMs,
+			wallDurationMs: Math.max(0, wallTimestampMs - initial.wallTimestampMs),
+			virtualDurationMs: Math.max(0, virtualTimestampMs - initial.virtualTimestampMs),
+			goalWallDurationMs: this.#firstGoal(agentIds) === null ? null : Math.max(0, wallTimestampMs - this.#firstGoal(agentIds).wallTimestampMs),
+		};
+		this.#taskCompletion = value;
+		this.#push(this.#raw.taskCompletion, value);
+	}
+
+	finalize({ world = this.#world, agentIds = this.#agentIds } = {}) {
+		if (this.#finalized) return this.#buildMetrics(world, agentIds);
+		if (this.#enabled) {
+			const timestamp = this.#now();
+			for (const agentId of [...this.#planning.keys()]) this.#finishPlanning(agentId, timestamp, null);
+		}
+		this.#finalized = true;
+		return this.#buildMetrics(world, agentIds);
+	}
+
+	#onGoal(event) {
+		const agentId = event?.agentId;
+		if (typeof agentId !== 'string' || this.#goals.has(agentId)) return;
+		const wallTimestampMs = this.#now();
+		const value = { agentId, wallTimestampMs, virtualTimestampMs: finiteOrNull(this.#world?.timeMs) ?? 0 };
+		this.#goals.set(agentId, value);
+		this.#push(this.#raw.goals, value);
+	}
+
+	#onObservation(event) {
+		const payload = event?.envelope?.payload;
+		const agentId = event?.envelope?.agentId;
+		if (typeof agentId !== 'string' || !payload || this.#initialObservations.has(agentId)) return;
+		const wallTimestampMs = this.#now();
+		const value = { agentId, wallTimestampMs, virtualTimestampMs: finiteOrNull(payload.observedAtEpochMs) ?? finiteOrNull(this.#world?.timeMs) ?? 0 };
+		this.#initialObservations.set(agentId, value);
+		this.#push(this.#raw.initialObservations, value);
+	}
+
+	#onAccepted(event) {
+		const payload = event?.envelope?.payload;
+		const agentId = event?.envelope?.agentId;
+		if (typeof agentId !== 'string' || !payload) return;
+		const wallTimestampMs = this.#now();
+		const value = {
+			agentId,
+			actionId: boundedText(payload.actionId, 128),
+			actionType: boundedText(payload.actionType, 64),
+			wallTimestampMs,
+			virtualTimestampMs: finiteOrNull(this.#world?.timeMs) ?? 0,
+		};
+		const initial = this.#initialObservations.get(agentId);
+		if (initial !== undefined) {
+			value.wallLatencyMs = Math.max(0, wallTimestampMs - initial.wallTimestampMs);
+			value.virtualLatencyMs = Math.max(0, value.virtualTimestampMs - initial.virtualTimestampMs);
+		}
+		const goal = this.#goals.get(agentId);
+		if (goal !== undefined) {
+			value.goalWallLatencyMs = Math.max(0, wallTimestampMs - goal.wallTimestampMs);
+			value.goalVirtualLatencyMs = Math.max(0, value.virtualTimestampMs - goal.virtualTimestampMs);
+		}
+		this.#push(this.#raw.actionCommandAcceptance, value);
+		if (!this.#acceptances.has(agentId)) this.#acceptances.set(agentId, value);
+		this.#advancePlanning(agentId, wallTimestampMs, true);
+		this.#recordReaction(agentId, value);
+	}
+
+	#onResult(event) {
+		const agentId = event?.envelope?.agentId;
+		if (typeof agentId !== 'string') return;
+		this.#advancePlanning(agentId, this.#now(), false);
+	}
+
+	#observeWorld(world, wallTimestampMs, virtualTimestampMs) {
+		for (const agentId of this.#agentIds) {
+			const state = safePlayerState(world, agentId);
+			if (state === null) continue;
+			const initial = this.#initialObservations.get(agentId);
+			const acceptance = this.#acceptances.get(agentId);
+			const baseline = this.#baseline.get(agentId);
+			if (initial && acceptance && baseline && !this.#displacements.has(agentId) && distanceBetween(baseline.position, state.position) > 1e-9) {
+				const value = {
+					agentId,
+					wallTimestampMs,
+					virtualTimestampMs,
+					wallLatencyMs: Math.max(0, wallTimestampMs - initial.wallTimestampMs),
+					virtualLatencyMs: Math.max(0, virtualTimestampMs - initial.virtualTimestampMs),
+					fromAcceptanceWallLatencyMs: Math.max(0, wallTimestampMs - acceptance.wallTimestampMs),
+					fromAcceptanceVirtualLatencyMs: Math.max(0, virtualTimestampMs - acceptance.virtualTimestampMs),
+				};
+				this.#displacements.set(agentId, value);
+				this.#push(this.#raw.physicalDisplacement, value);
+			}
+			this.#observeDeclaredEvents(agentId, state, wallTimestampMs, virtualTimestampMs, initial);
+		}
+		for (const event of world?.conversationEvents?.() ?? []) {
+			if (!event?.eventId || this.#seenConversationEvents.has(event.eventId)) continue;
+			const declared = this.#declaredEvent(event.eventId, event.kind ?? event.type);
+			if (!declared || !/message|agent_message|direct/i.test(String(declared.kind ?? declared.type ?? event.kind ?? event.type))) continue;
+			this.#seenConversationEvents.add(event.eventId);
+			const initial = this.#firstInitialObservation(this.#agentIds);
+			const value = { eventId: boundedText(event.eventId, 128), agentId: event.sourceId ?? null, recipientId: event.recipientId ?? null, wallTimestampMs, virtualTimestampMs, wallLatencyMs: initial ? Math.max(0, wallTimestampMs - initial.wallTimestampMs) : null, virtualLatencyMs: initial ? Math.max(0, virtualTimestampMs - initial.virtualTimestampMs) : null, reactionWallLatencyMs: null, reactionVirtualLatencyMs: null };
+			this.#directMessages.set(event.eventId, value);
+			this.#push(this.#raw.directMessageReaction, { ...value, reactionWallLatencyMs: null, reactionVirtualLatencyMs: null });
+		}
+	}
+
+	#observeDeclaredEvents(agentId, state, wallTimestampMs, virtualTimestampMs, initial) {
+		const hazard = this.#declaredEvents().find((event) => (event?.type ?? event?.kind) === 'hazard' && (event.hazardType === undefined || String(event.hazardType).toLowerCase() === 'lava'));
+		if (!hazard || this.#hazards.has(hazard.eventId)) return;
+		const baseline = this.#baseline.get(agentId);
+		if (!baseline || !(state.health < baseline.health || state.onFire === true && baseline.onFire !== true)) return;
+		const value = { eventId: boundedText(hazard.eventId, 128), agentId, hazardType: boundedText(hazard.hazardType ?? hazard.type, 64), wallTimestampMs, virtualTimestampMs, wallLatencyMs: initial ? Math.max(0, wallTimestampMs - initial.wallTimestampMs) : null, virtualLatencyMs: initial ? Math.max(0, virtualTimestampMs - initial.virtualTimestampMs) : null, reactionWallLatencyMs: null, reactionVirtualLatencyMs: null };
+		this.#hazards.set(hazard.eventId, value);
+		this.#push(this.#raw.hazardReaction, value);
+	}
+
+	#recordReaction(agentId, acceptance) {
+		for (const value of this.#hazards.values()) {
+			if (value.agentId !== agentId || value.reactionWallLatencyMs !== null || acceptance.wallTimestampMs < value.wallTimestampMs) continue;
+			value.reactionWallLatencyMs = Math.max(0, acceptance.wallTimestampMs - value.wallTimestampMs);
+			value.reactionVirtualLatencyMs = Math.max(0, acceptance.virtualTimestampMs - value.virtualTimestampMs);
+		}
+		for (const value of this.#directMessages.values()) {
+			if ((value.agentId !== agentId && value.recipientId !== agentId) || value.reactionWallLatencyMs !== null || acceptance.wallTimestampMs < value.wallTimestampMs) continue;
+			value.reactionWallLatencyMs = Math.max(0, acceptance.wallTimestampMs - value.wallTimestampMs);
+			value.reactionVirtualLatencyMs = Math.max(0, acceptance.virtualTimestampMs - value.virtualTimestampMs);
+		}
+		for (const row of this.#raw.directMessageReaction) {
+			const event = this.#directMessages.get(row.eventId);
+			if (event && event.reactionWallLatencyMs !== undefined) {
+				row.reactionWallLatencyMs = event.reactionWallLatencyMs;
+				row.reactionVirtualLatencyMs = event.reactionVirtualLatencyMs;
+			}
+		}
+	}
+
+	#startPlanning(agentId, wallTimestampMs, goalRevision) {
+		if (this.#planning.has(agentId)) this.#finishPlanning(agentId, wallTimestampMs, 'superseded');
+		this.#planning.set(agentId, { agentId, goalRevision: goalRevision ?? null, startedWallTimestampMs: wallTimestampMs, lastWallTimestampMs: wallTimestampMs, localActiveWallDurationMs: 0, planningIdleWallDurationMs: 0, active: this.#isActive(agentId), admittedWallTimestampMs: null, providerStartedWallTimestampMs: null });
+	}
+
+	#finishPlanning(agentId, wallTimestampMs, reasonCode) {
+		const plan = this.#planning.get(agentId);
+		if (!plan) return;
+		this.#advancePlanning(agentId, wallTimestampMs, this.#isActive(agentId));
+		this.#planning.delete(agentId);
+		this.#push(this.#raw.planningIntervals, { agentId, goalRevision: plan.goalRevision, startedWallTimestampMs: plan.startedWallTimestampMs, endedWallTimestampMs: wallTimestampMs, planningWallDurationMs: Math.max(0, wallTimestampMs - plan.startedWallTimestampMs), localActiveWallDurationMs: plan.localActiveWallDurationMs, planningIdleWallDurationMs: plan.planningIdleWallDurationMs, ...(reasonCode ? { reasonCode } : {}) });
+	}
+
+	#advancePlanning(agentId, wallTimestampMs, active) {
+		const plan = this.#planning.get(agentId);
+		if (!plan) return;
+		const elapsedMs = Math.max(0, wallTimestampMs - plan.lastWallTimestampMs);
+		if (plan.active) plan.localActiveWallDurationMs += elapsedMs;
+		else plan.planningIdleWallDurationMs += elapsedMs;
+		plan.active = active === true;
+		plan.lastWallTimestampMs = wallTimestampMs;
+	}
+
+	#isActive(agentId) { return this.#virtual?.activeActionIds?.includes(agentId) === true; }
+
+	#declaredEvents() { return Array.isArray(this.#scenario?.events) ? this.#scenario.events : []; }
+	#declaredEvent(eventId, kind) { return this.#declaredEvents().find((event) => event?.eventId === eventId || (event?.kind ?? event?.type) === kind) ?? null; }
+	#firstInitialObservation(agentIds) { return [...agentIds].map((agentId) => this.#initialObservations.get(agentId)).find(Boolean) ?? null; }
+	#firstGoal(agentIds) { return [...agentIds].map((agentId) => this.#goals.get(agentId)).find(Boolean) ?? null; }
+	#now() {
+		let value;
+		try { value = this.#wallClock(); } catch { value = this.#lastTimestamp ?? 0; }
+		if (!Number.isFinite(value) || value < 0) value = this.#lastTimestamp ?? 0;
+		if (this.#lastTimestamp !== null && value < this.#lastTimestamp) value = this.#lastTimestamp;
+		this.#lastTimestamp = value;
+		return value;
+	}
+	#push(target, value) { if (target.length < this.#maxSamples) target.push(value); }
+	#buildMetrics(world, agentIds) {
+		const initialObservation = this.#firstInitialObservation(agentIds);
+		const goal = this.#firstGoal(agentIds);
+		const acceptance = [...this.#acceptances.values()][0] ?? null;
+		const displacement = [...this.#displacements.values()][0] ?? null;
+		const planningIdleWallDurationMs = this.#raw.planningIntervals.reduce((sum, row) => sum + row.planningIdleWallDurationMs, 0);
+		const localActiveWallDurationMs = this.#raw.planningIntervals.reduce((sum, row) => sum + row.localActiveWallDurationMs, 0);
+		const tick = summarizeTickDurations(this.#tickDurations, this.#raw.ticks);
+		const providerPlanningWait = summarizePlanningWait(this.#raw.providerPlanningWait);
+		const totalVirtualWorldDurationMs = finiteOrNull(world?.timeMs) ?? 0;
+		const result = {
+			goal: goal ? { ...goal } : null,
+			initialObservation: initialObservation ? { ...initialObservation } : null,
+			firstActionCommandAcceptance: acceptance ? { ...acceptance } : null,
+			firstAuthoritativePhysicalDisplacement: displacement ? { ...displacement } : null,
+			taskCompletion: this.#taskCompletion ? { ...this.#taskCompletion } : null,
+			goalWallTimestampMs: goal?.wallTimestampMs ?? null,
+			goalVirtualTimestampMs: goal?.virtualTimestampMs ?? null,
+			initialObservationWallTimestampMs: initialObservation?.wallTimestampMs ?? null,
+			initialObservationVirtualTimestampMs: initialObservation?.virtualTimestampMs ?? null,
+			firstActionCommandAcceptanceWallLatencyMs: acceptance?.wallLatencyMs ?? null,
+			firstActionCommandAcceptanceVirtualLatencyMs: acceptance?.virtualLatencyMs ?? null,
+			firstActionCommandAcceptanceGoalWallLatencyMs: acceptance?.goalWallLatencyMs ?? null,
+			firstActionCommandAcceptanceGoalVirtualLatencyMs: acceptance?.goalVirtualLatencyMs ?? null,
+			firstAuthoritativePhysicalDisplacementWallLatencyMs: displacement?.wallLatencyMs ?? null,
+			firstAuthoritativePhysicalDisplacementVirtualLatencyMs: displacement?.virtualLatencyMs ?? null,
+			taskCompletionWallDurationMs: this.#taskCompletion?.wallDurationMs ?? null,
+			taskCompletionGoalWallDurationMs: this.#taskCompletion?.goalWallDurationMs ?? null,
+			taskCompletionVirtualDurationMs: this.#taskCompletion?.virtualDurationMs ?? null,
+			totalVirtualWorldDurationMs,
+			providerPlanningWait,
+			hazardReaction: firstValue(this.#hazards),
+			directMessageReaction: firstValue(this.#directMessages),
+			tick,
+			planningIdle: { localActiveWallDurationMs, planningIdleWallDurationMs, intervals: this.#raw.planningIntervals.slice() },
+		};
+		return {
+			version: 1,
+			enabled: this.#enabled,
+			context: { ...this.#context },
+			clockBasis: { wall: this.#wallClockBasis, virtual: 'virtual_world_ms' },
+			raw: cloneMetricTree(this.#raw),
+			result,
+		};
+	}
+}
+
+function summarizeTickDurations(values, rawTicks) {
+	const sorted = [...values].sort((left, right) => left - right);
+	const maxMs = sorted.length === 0 ? null : sorted.at(-1);
+	return {
+		count: sorted.length,
+		wallDurationSamplesMs: rawTicks.map((row) => row.wallDurationMs),
+		cpuWallDurationP50Ms: percentile(sorted, 0.50),
+		cpuWallDurationP95Ms: percentile(sorted, 0.95),
+		cpuWallDurationP99Ms: percentile(sorted, 0.99),
+		cpuWallDurationMaxMs: maxMs,
+		p50Ms: percentile(sorted, 0.50),
+		p95Ms: percentile(sorted, 0.95),
+		p99Ms: percentile(sorted, 0.99),
+		maxMs,
+		over50MsCount: sorted.filter((value) => value > 50).length,
+	};
+}
+
+function summarizePlanningWait(rows) {
+	const planning = rows.map((row) => row.planningWaitWallMs).filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+	const provider = rows.map((row) => row.providerWaitWallMs).filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+	const scheduler = rows.map((row) => row.schedulerWaitWallMs).filter((value) => Number.isFinite(value)).sort((left, right) => left - right);
+	return {
+		count: rows.length,
+		schedulerWaitWallDurationSamplesMs: rows.map((row) => row.schedulerWaitWallMs),
+		planningWaitWallDurationSamplesMs: rows.map((row) => row.planningWaitWallMs),
+		providerWaitWallDurationSamplesMs: rows.map((row) => row.providerWaitWallMs),
+		schedulerWaitWallP50Ms: percentile(scheduler, 0.50),
+		schedulerWaitWallP95Ms: percentile(scheduler, 0.95),
+		schedulerWaitWallP99Ms: percentile(scheduler, 0.99),
+		planningWaitWallP50Ms: percentile(planning, 0.50),
+		planningWaitWallP95Ms: percentile(planning, 0.95),
+		planningWaitWallP99Ms: percentile(planning, 0.99),
+		providerWaitWallP50Ms: percentile(provider, 0.50),
+		providerWaitWallP95Ms: percentile(provider, 0.95),
+		providerWaitWallP99Ms: percentile(provider, 0.99),
+	};
+}
+
+function cloneMetricTree(value) {
+	try { return structuredClone(value); } catch { return {}; }
+}
+
+function firstValue(map) { return map.values().next().value ?? null; }
+function safePlayerState(world, agentId) { try { return world?.playerState?.(agentId) ?? null; } catch { return null; } }
+function distanceBetween(left, right) { return left && right ? Math.hypot((left.x ?? 0) - (right.x ?? 0), (left.y ?? 0) - (right.y ?? 0), (left.z ?? 0) - (right.z ?? 0)) : 0; }
+function finiteOrNull(value) { return Number.isFinite(value) ? value : null; }
 
 function createInjectedProviderService(provider, trial, budget, deadline, incrementTurn, stopProvider = async () => provider.stop?.(), stopProviderAfterTimeout = stopProvider) {
 	const sessions = new Map();
@@ -435,6 +868,45 @@ function normalizeProfile(value, id) {
 	if (!PROVIDERS.has(provider)) throw new TypeError(`${id}.providerProfile.provider is unsupported`);
 	return Object.freeze({ provider, model: identifier(value.model, `${id}.providerProfile.model`), reasoningEffort: identifier(value.reasoningEffort, `${id}.providerProfile.reasoningEffort`), serviceTier: identifier(value.serviceTier, `${id}.providerProfile.serviceTier`) });
 }
+
+function normalizeBenchmarkContext(options) {
+	if (options.baseContext !== undefined && !isRecord(options.baseContext)) throw new TypeError('baseContext must be an object');
+	if (options.context !== undefined && !isRecord(options.context)) throw new TypeError('context must be an object');
+	const source = isRecord(options.baseContext) ? options.baseContext : isRecord(options.context) ? options.context : {};
+	const result = {};
+	for (const key of ['arm', 'runId', 'sourceHash', 'configHash', 'pairingKey']) {
+		const value = options[key] ?? source[key];
+		if (value === undefined || value === null) continue;
+		if (typeof value !== 'string' || value.trim().length === 0 || value.length > 256) throw new TypeError(`${key} must be a bounded nonblank string`);
+		result[key] = boundedContextText(value);
+	}
+	return result;
+}
+
+function boundedContextText(value) {
+	return String(value)
+		.replace(/(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+/gi, '$1=[REDACTED]')
+		.slice(0, 256);
+}
+
+function createMonotonicClock(clock, field) {
+	if (typeof clock !== 'function') throw new TypeError(`${field} must be a function`);
+	let last = null;
+	return () => {
+		let value;
+		try { value = clock(); } catch { value = last ?? 0; }
+		if (!Number.isFinite(value) || value < 0) value = last ?? 0;
+		if (last !== null && value < last) value = last;
+		last = value;
+		return value;
+	};
+}
+
+function percentile(sorted, fraction) {
+	if (sorted.length === 0) return null;
+	return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)];
+}
+
 function normalizedSeeds(value) { if (!Array.isArray(value) || value.length === 0) throw new TypeError('fixedSeeds must be a non-empty array'); return [...new Set(value.map((seed) => safeInt(seed, 'fixedSeeds')))].sort((a, b) => a - b); }
 function normalizedLoads(value) { if (!Array.isArray(value) || value.length === 0 || new Set(value).size !== value.length || value.some((load) => !LOADS.includes(load))) throw new TypeError('agentLoads must contain unique values from 1, 4, 8, 16'); return [...value]; }
 async function loadMatrix(value) { if (value === undefined) return JSON.parse(await readFile(new URL('../../config/latency-matrix.json', import.meta.url), 'utf8')); if (typeof value === 'string') return JSON.parse(await readFile(value, 'utf8')); return value; }
@@ -444,11 +916,13 @@ function runWithDeadline(task, deadline, code = 'TRIAL_TIMEOUT') {
 	if (remaining <= 0) return Promise.reject(coded(code, 'trial deadline elapsed'));
 	return withTimeout(Promise.resolve().then(task), remaining, code);
 }
-function createTrialRecorder(recorder, { trial, repetition }) {
+function createTrialRecorder(recorder, { trial, repetition, measurementContext = {}, metrics = null }) {
 	let count = 0;
 	return {
 		record(stage, context = {}, fields = {}) {
-			const row = recorder.record(stage, { trialId: trial.id, repetition, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, synthetic: trial.mode !== 'live', provider: trial.providerProfile.provider, model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, ...context }, fields);
+			const eventContext = { ...measurementContext, trialId: trial.id, repetition, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, synthetic: trial.mode !== 'live', provider: trial.providerProfile.provider, model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, ...context };
+			metrics?.observeRecorderStage(stage, eventContext, fields);
+			const row = recorder.record(stage, eventContext, fields);
 			if (row !== null) count += 1;
 			return row;
 		},
@@ -467,8 +941,40 @@ function summarizeTrialSystem(sampler) {
 	const summary = sampler?.summary?.() ?? null;
 	if (summary === null || typeof summary !== 'object' || Array.isArray(summary)) return summary;
 	const samples = typeof sampler?.snapshot === 'function' ? sampler.snapshot() : [];
-	return { ...summary, immediateSample: samples[0] ?? null, finalSample: samples.at(-1) ?? null };
+	const immediateSample = samples[0] ?? null;
+	const finalSample = samples.at(-1) ?? null;
+	const cpuSeries = summary.cpu;
+	const memorySeries = summary.memory;
+	const cpuDelta = {
+		basis: 'process_resource_usage_delta_ms',
+		userMs: deltaMetric(finalSample?.cpu?.userMs, immediateSample?.cpu?.userMs),
+		systemMs: deltaMetric(finalSample?.cpu?.systemMs, immediateSample?.cpu?.systemMs),
+		totalMs: deltaMetric(finalSample?.cpu?.totalMs, immediateSample?.cpu?.totalMs),
+	};
+	return {
+		...summary,
+		cpu: { ...cpuSeries, interpretation: 'cumulative process sample values; use cpuDelta for this trial' },
+		memory: { ...memorySeries, interpretation: 'process memory sample series; use memoryDelta and memoryPeak for this trial' },
+		processCpuSeries: cpuSeries,
+		processMemorySeries: memorySeries,
+		cpuDelta,
+		memoryDelta: {
+			basis: 'process_memory_sample_delta_bytes',
+			rssBytes: signedDeltaMetric(finalSample?.memory?.rssBytes, immediateSample?.memory?.rssBytes),
+			heapUsedBytes: signedDeltaMetric(finalSample?.memory?.heapUsedBytes, immediateSample?.memory?.heapUsedBytes),
+		},
+		memoryPeak: {
+			rssBytes: maxMetric(samples.map((sample) => sample?.memory?.rssBytes)),
+			heapUsedBytes: maxMetric(samples.map((sample) => sample?.memory?.heapUsedBytes)),
+		},
+		immediateSample,
+		finalSample,
+		rawSamples: samples.map((sample) => ({ ...sample })),
+	};
 }
+function deltaMetric(finalValue, initialValue) { return Number.isFinite(finalValue) && Number.isFinite(initialValue) ? Math.max(0, finalValue - initialValue) : null; }
+function signedDeltaMetric(finalValue, initialValue) { return Number.isFinite(finalValue) && Number.isFinite(initialValue) ? finalValue - initialValue : null; }
+function maxMetric(values) { const finite = values.filter((value) => Number.isFinite(value)); return finite.length === 0 ? null : Math.max(...finite); }
 function validateProviderIdentity(provider, trial) {
 	const expected = trial.providerProfile;
 	if (trial.mode !== 'live') {
@@ -481,7 +987,7 @@ function validateProviderIdentity(provider, trial) {
 	}
 	if (provider.provider !== expected.provider) throw coded('PROVIDER_MISMATCH', `Provider '${String(provider.provider)}' does not match selected '${expected.provider}'`);
 	for (const field of ['model', 'reasoningEffort', 'serviceTier']) {
-		if (provider[field] !== undefined && provider[field] !== expected[field]) throw coded('PROVIDER_MISMATCH', `Live provider ${field} does not match selected profile`);
+		if (typeof provider[field] !== 'string' || provider[field].trim().length === 0 || provider[field] !== expected[field]) throw coded('PROVIDER_MISMATCH', `Live provider ${field} does not match selected profile`);
 	}
 	if (provider.providerProfile !== undefined) {
 		if (!isRecord(provider.providerProfile)) throw coded('PROVIDER_MISMATCH', 'Live provider profile identity is invalid');
@@ -542,7 +1048,7 @@ function cleanupSnapshot(bridge, sampler, cleanupErrors = []) {
 	const samplerErrors = sampler?.errors?.length ?? 0;
 	return { ok: activeActions === 0 && listeners === 0 && relays === 0 && pendingObservations === 0 && !samplerActive && cleanupErrors.length === 0, activeActions, listeners, relays, pendingObservations, samplerActive, samplerErrors, errors: cleanupErrors.slice(0, 16) };
 }
-function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup) { return { trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' }, ...(outcomeHash ? { outcomeHash } : {}), ...(error ? { error: { code: error.code, message: boundedError(error.message) } } : {}), cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 }, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) }; }
+function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}) { return { ...context, trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' }, ...(outcomeHash ? { outcomeHash } : {}), ...(error ? { error: { code: error.code, message: boundedError(error.message) } } : {}), cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 }, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) }; }
 function cleanupError() { return null; }
 async function writeArtifacts(directory, output, recorder, artifactFs = {}) {
 	const fs = { mkdir, rename, rm, writeFile, ...artifactFs };

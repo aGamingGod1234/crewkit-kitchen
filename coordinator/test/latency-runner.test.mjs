@@ -7,6 +7,7 @@ import test from 'node:test';
 import { runLatencyMatrix, normalizeLatencyMatrix } from '../src/benchmark/latency-runner.mjs';
 import { BenchmarkRecorder } from '../src/benchmark/benchmark-recorder.mjs';
 import { createReplayProvider, createReplayRecord } from '../src/benchmark/provider-replay.mjs';
+import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
 
 const PROFILE = Object.freeze({ provider: 'instant', model: 'deterministic-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");';
@@ -46,6 +47,25 @@ function fixtureScenario() {
 	};
 }
 
+function movementScenario() {
+	return {
+		id: 'fixture-movement', seed: 42, agentId: 'agent-a', goal: 'Move.',
+		world: { seed: 42, agents: { 'agent-a': { position: { x: 0, y: 1, z: 0 }, onGround: true } }, blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }] },
+		commands: [{ actionId: 'move-1', actionType: 'move_to', arguments: { x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false } }], events: [], expected: {},
+	};
+}
+
+function movementProvider() {
+	return {
+		available: true,
+		async start() {},
+		async stop() {},
+		async createAgent() {
+			return { async setGoalRevision() {}, async decide() { return { summary: 'move', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false }); program.finish("done");' }; } };
+		},
+	};
+}
+
 test('strictly normalizes matrix identity, budgets, loads, and unique trial IDs', () => {
 	const normalized = normalizeLatencyMatrix(matrix());
 	assert.deepEqual(normalized.agentLoads, [1, 4, 8, 16]);
@@ -69,6 +89,98 @@ test('runs deterministic instant full-path trials at every declared load', async
 	assert.ok(result.trials.every((trial) => trial.status === 'PASSED'));
 	assert.ok(result.trials.every((trial) => trial.outcomeHash.startsWith('sha256:')));
 	assert.equal(result.cleanup.ok, true);
+});
+
+test('reports explicit injected wall-clock and virtual-clock measurements', async () => {
+	let wall = 0;
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'measurement', scenarioId: 'fixture-movement', agentLoad: 1 }] }),
+		scenarioResolver: () => movementScenario(),
+		providerFactories: { instant: () => movementProvider() },
+		wallClock: () => (wall += 100),
+		artifactDirectory: null,
+	});
+	const metrics = result.trials[0].metrics;
+	assert.equal(result.status, 'PASSED');
+	assert.deepEqual(metrics.clockBasis, { wall: 'injected_monotonic_ms', virtual: 'virtual_world_ms' });
+	assert.ok(Number.isFinite(metrics.result.goalWallTimestampMs));
+	assert.ok(Number.isFinite(metrics.result.initialObservationWallTimestampMs));
+	assert.ok(metrics.result.firstActionCommandAcceptanceWallLatencyMs >= 0);
+	assert.ok(metrics.result.firstAuthoritativePhysicalDisplacementWallLatencyMs >= 0);
+	assert.ok(metrics.result.firstAuthoritativePhysicalDisplacementVirtualLatencyMs >= 0);
+	assert.ok(metrics.result.taskCompletionWallDurationMs >= 0);
+	assert.ok(metrics.result.taskCompletionVirtualDurationMs > 0);
+	assert.ok(metrics.result.totalVirtualWorldDurationMs >= metrics.result.taskCompletionVirtualDurationMs);
+	assert.equal(metrics.result.tick.over50MsCount, metrics.result.tick.count);
+	assert.equal(metrics.result.tick.maxMs >= 50, true);
+	assert.ok(metrics.raw.ticks.length > 0);
+	assert.ok(metrics.raw.providerPlanningWait.length > 0);
+});
+
+test('preserves bounded pairing context and reports per-trial process deltas', async () => {
+	const processSamples = [
+		{ cpuUserMs: 10, cpuSystemMs: 4, rssBytes: 100, heapUsedBytes: 50 },
+		{ cpuUserMs: 17, cpuSystemMs: 6, rssBytes: 130, heapUsedBytes: 70 },
+	];
+	const recorder = new BenchmarkRecorder({ clock: () => 1 });
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'context' }] }),
+		scenarioResolver: () => fixtureScenario(),
+		providerFactories: { instant: () => instantProvider() },
+		baseContext: { arm: 'baseline', runId: 'run-1', sourceHash: 'sha256:source', configHash: 'sha256:config', pairingKey: 'pair-1', ignored: 'not-public' },
+		recorder,
+		systemSamplerOptions: { processReader: () => processSamples.shift() ?? { cpuUserMs: 17, cpuSystemMs: 6, rssBytes: 130, heapUsedBytes: 70 } },
+		artifactDirectory: null,
+	});
+	const trial = result.trials[0];
+	assert.equal(trial.arm, 'baseline');
+	assert.equal(trial.runId, 'run-1');
+	assert.equal(trial.sourceHash, 'sha256:source');
+	assert.equal(trial.configHash, 'sha256:config');
+	assert.equal(trial.pairingKey, 'pair-1');
+	assert.equal(trial.ignored, undefined);
+	assert.ok(recorder.snapshot().every((event) => event.arm === 'baseline' && event.runId === 'run-1' && event.sourceHash === 'sha256:source' && event.configHash === 'sha256:config' && event.pairingKey === 'pair-1'));
+	assert.deepEqual(trial.systemSummary.cpuDelta, { basis: 'process_resource_usage_delta_ms', userMs: 7, systemMs: 2, totalMs: 9 });
+	assert.deepEqual(trial.systemSummary.memoryDelta, { basis: 'process_memory_sample_delta_bytes', rssBytes: 30, heapUsedBytes: 20 });
+	assert.equal(trial.systemSummary.memoryPeak.rssBytes, 130);
+});
+
+test('records only declared hazard and direct-message event timing', async () => {
+	const base = matrix().trials[0];
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [
+			{ ...base, id: 'lava-metrics', scenarioId: 'lava-damage-reaction', turnCap: 20 },
+			{ ...base, id: 'message-metrics', scenarioId: 'direct-message-wake', turnCap: 20 },
+		] }),
+		scenarioResolver: (id) => getSimulatorScenario(id),
+		wallClock: () => 1,
+		artifactDirectory: null,
+	});
+	const lava = result.trials.find((trial) => trial.scenarioId === 'lava-damage-reaction');
+	const message = result.trials.find((trial) => trial.scenarioId === 'direct-message-wake');
+	assert.equal(lava.status, 'PASSED');
+	assert.equal(lava.metrics.raw.hazardReaction.length, 1);
+	assert.equal(lava.metrics.raw.hazardReaction[0].eventId, 'lava-hazard-1');
+	assert.equal(lava.metrics.raw.hazardReaction[0].reactionWallLatencyMs, 0);
+	assert.equal(message.status, 'PASSED');
+	assert.equal(message.metrics.result.directMessageReaction.eventId, 'conversation-1');
+	assert.equal(message.metrics.result.directMessageReaction.reactionWallLatencyMs, null);
+});
+
+test('measurement instrumentation does not change authoritative action command bytes', async () => {
+	const run = (measurements) => runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: measurements ? 'metrics-on' : 'metrics-off', scenarioId: 'fixture-movement', agentLoad: 1 }] }),
+		scenarioResolver: () => movementScenario(),
+		providerFactories: { instant: () => movementProvider() },
+		measurements,
+		artifactDirectory: null,
+	});
+	const enabled = await run(true);
+	const disabled = await run(false);
+	assert.match(enabled.trials[0].debug.actionCommandHash, /^sha256:/);
+	assert.match(disabled.trials[0].debug.actionCommandHash, /^sha256:/);
+	assert.equal(enabled.trials[0].debug.actionCommandHash, disabled.trials[0].debug.actionCommandHash);
+	assert.equal(enabled.trials[0].status, disabled.trials[0].status);
 });
 
 test('marks synthetic identity and returns scoped benchmark and system summaries', async () => {
@@ -108,6 +220,23 @@ test('skips optional unavailable providers, fails required providers, and never 
 	assert.equal(optional.trials[0].status, 'SKIPPED');
 	assert.equal(optional.trials[0].providerProfile.provider, 'codex');
 	await assert.rejects(() => runLatencyMatrix({ matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'required', mode: 'live', providerProfile: { provider: 'codex', model: 'fixture', reasoningEffort: 'high', serviceTier: 'fast' }, providerAvailabilityRequired: true }] }), scenarioResolver: () => fixtureScenario(), providerFactories: { codex: unavailable }, artifactDirectory: null }), (error) => error.code === 'PROVIDER_UNAVAILABLE');
+});
+
+test('writes artifacts before throwing for a required unavailable provider', async () => {
+	const directory = await mkdtemp(path.join(os.tmpdir(), 'latency-required-artifacts-'));
+	try {
+		await assert.rejects(() => runLatencyMatrix({
+			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'required-artifact', providerAvailabilityRequired: true }] }),
+			scenarioResolver: () => fixtureScenario(),
+			providerFactories: { instant: () => ({ available: false, reason: 'fixture unavailable' }) },
+			artifactDirectory: directory,
+		}), (error) => error.code === 'PROVIDER_UNAVAILABLE' && error.result?.status === 'FAILED');
+		const manifest = JSON.parse(await readFile(path.join(directory, 'latency-manifest.json'), 'utf8'));
+		assert.equal(manifest.status, 'FAILED');
+		assert.equal(manifest.trials[0].error.code, 'PROVIDER_UNAVAILABLE');
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
 });
 
 test('requires an exact declared identity for live providers', async () => {
@@ -294,7 +423,7 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 	let prompt = null;
 	const scenario = fixtureScenario();
 	const liveMatrix = matrix({ trials: [{ ...matrix().trials[0], id: 'replay-path', mode: 'live', providerProfile: profile }] });
-	const providerFactory = () => ({ available: true, provider: 'codex', async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return { summary: 'done', directive: 'replace', source }; } }; }, async stop() {} });
+	const providerFactory = () => ({ available: true, provider: 'codex', model: profile.model, reasoningEffort: profile.reasoningEffort, serviceTier: profile.serviceTier, providerProfile: profile, async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return { summary: 'done', directive: 'replace', source }; } }; }, async stop() {} });
 	const first = await runLatencyMatrix({ matrix: liveMatrix, scenarioResolver: () => scenario, providerFactories: { codex: providerFactory }, artifactDirectory: null });
 	assert.equal(first.trials[0].status, 'PASSED');
 	const recording = createReplayRecord({ trialId: 'replay-path', prompt, providerProfile: profile, scenario, protocolVersion: 2, decision: { summary: 'done', directive: 'replace', source } });
