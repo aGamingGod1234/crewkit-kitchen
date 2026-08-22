@@ -261,12 +261,12 @@ test('corrects invalid source through the same selected model', async () => {
 test('rejects a physical command without model-program provenance before bridge acceptance', async () => {
 	const harness = createHarness();
 	await assert.rejects(
-		() => harness.bridge.send('action_command', SELECTED_PROFILE.agentId, { goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
+		() => harness.bridge.send('action_command', SELECTED_PROFILE.agentId, { traceId: 'trace-unauthorised', goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
 		(error) => /provenance|MISSING_FIELD/i.test(error.message),
 	);
 	assert.equal(commandPayloads(harness.bridge).length, 0);
 	assert.throws(
-		() => validateProtocolV2Payload('action_command', { goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
+		() => validateProtocolV2Payload('action_command', { traceId: 'trace-unauthorised', goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
 		/provenance|MISSING_FIELD/i,
 	);
 	scenarioResults.push({ name: 'provenance_rejection', passed: true });

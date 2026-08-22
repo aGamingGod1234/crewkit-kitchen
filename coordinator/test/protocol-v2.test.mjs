@@ -5,6 +5,7 @@ import test from 'node:test';
 import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
 const SECRET = 's'.repeat(32);
+const TRACE_ID = 'trace-wire-1';
 const DESIRED_OAK_STAIRS_STATE = 'minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]';
 const PROVENANCE = Object.freeze({
 	provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
@@ -91,14 +92,20 @@ test('protocol v2 carries one acknowledged conversation wake transaction', () =>
 
 test('protocol v2 requires immutable provenance on every action command form', () => {
 	const payload = {
-		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
 	};
 	const normalized = validateProtocolV2Payload('action_command', payload);
 	assert.deepEqual(normalized.provenance, PROVENANCE);
 	assert.throws(() => { normalized.provenance.programId = 'forged'; }, TypeError);
 	assert.equal(PROVENANCE.programId, 'program-1-1');
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, provenance: { ...PROVENANCE, traceId: 'trace-other' } }),
+		(error) => error.code === 'INVALID_PAYLOAD' && /traceId/.test(error.message),
+		'provenance trace IDs cannot diverge from the command trace',
+	);
 	assert.throws(() => validateProtocolV2Payload('action_command', { ...payload, provenance: undefined }), /provenance/);
 	assert.throws(() => validateProtocolV2Payload('action_command', {
+		traceId: TRACE_ID,
 		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 },
 	}), /provenance/);
 	for (const alias of ['commandId', 'command', 'type', 'action']) {
@@ -127,9 +134,35 @@ test('protocol v2 requires immutable provenance on every action command form', (
 	);
 });
 
+test('traced action commands, progress, and results round-trip one bounded trace ID', () => {
+	const traceId = 'trace-wire-1';
+	const command = validateProtocolV2Payload('action_command', {
+		traceId, goalRevision: 1, actionId: 'action-trace-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
+	});
+	const progress = validateProtocolV2Payload('action_progress', {
+		traceId, goalRevision: 1, actionId: 'action-trace-1', commandId: 'action-trace-1', actionType: 'wait', state: 'RUNNING', progress: 0.5,
+	});
+	const result = validateProtocolV2Payload('action_result', {
+		traceId, goalRevision: 1, actionId: 'action-trace-1', commandId: 'action-trace-1', actionType: 'wait', state: 'SUCCEEDED', reasonCode: 'DONE', message: '', elapsedMs: 10, observedAtEpochMs: 20,
+	});
+	assert.equal(command.traceId, traceId);
+	assert.equal(progress.traceId, traceId);
+	assert.equal(result.traceId, traceId);
+	for (const type of ['action_command', 'action_progress', 'action_result']) {
+		const payload = type === 'action_command' ? { traceId, goalRevision: 1, actionId: 'action-trace-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }
+			: type === 'action_progress' ? { traceId, goalRevision: 1, actionId: 'action-trace-1', state: 'RUNNING' }
+			: { traceId, goalRevision: 1, actionId: 'action-trace-1', commandId: 'action-trace-1', actionType: 'wait', state: 'SUCCEEDED', reasonCode: 'DONE', message: '', elapsedMs: 10, observedAtEpochMs: 20 };
+		assert.throws(() => validateProtocolV2Payload(type, { ...payload, traceId: '' }), /traceId/i, `${type} rejects blank trace IDs`);
+		assert.throws(() => validateProtocolV2Payload(type, { ...payload, traceId: '🙂'.repeat(40) }), /traceId/i, `${type} rejects overlong UTF-8 trace IDs`);
+	}
+	assert.throws(() => validateProtocolV2Payload('action_command', {
+		traceId: undefined, goalRevision: 1, actionId: 'action-trace-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
+	}), /traceId/i);
+});
+
 test('protocol v2 accepts only coordinate-free respawn arguments', () => {
 	const payload = {
-		goalRevision: 7, actionId: 'respawn-1', actionType: 'respawn', arguments: {}, provenance: PROVENANCE,
+		traceId: TRACE_ID, goalRevision: 7, actionId: 'respawn-1', actionType: 'respawn', arguments: {}, provenance: PROVENANCE,
 	};
 	assert.deepEqual(validateProtocolV2Payload('action_command', payload).arguments, {});
 	assert.throws(
@@ -224,6 +257,7 @@ function registeredRecord(agentId = 'agent-a') {
 
 function actionResult(actionId, goalRevision = 4) {
 	return {
+		traceId: `trace-${actionId}`,
 		goalRevision,
 		actionId,
 		commandId: actionId,
@@ -401,6 +435,7 @@ test('multiplexed bridge rejects stale revisions before writing', async () => {
 	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
 	await ready;
 	await assert.rejects(bridge.send('action_command', 'agent-a', {
+		traceId: TRACE_ID,
 		goalRevision: 8,
 		actionId: 'action-1',
 		actionType: 'wait',
@@ -487,6 +522,7 @@ test('a newer lifecycle revision removes queued stale action commands under back
 	socket.writable = false;
 	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
 	const staleCommand = bridge.send('action_command', 'agent-a', {
+		traceId: TRACE_ID,
 		goalRevision: 1,
 		actionId: 'action-stale',
 		actionType: 'wait',
@@ -548,12 +584,12 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['agent_removed', { goalRevision: 1 }],
 		['goal_control', { operation: 'start', goalRevision: 1, updatedAtEpochMs: 2, goal: 'Build shelter.' }],
 		['observation', { goalRevision: 1, observedAtEpochMs: 2, ready: false, status: 'ENTITY_UNAVAILABLE' }],
-		['action_progress', { goalRevision: 1, actionId: 'action-1', state: 'RUNNING', progress: 0.5 }],
+		['action_progress', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', state: 'RUNNING', progress: 0.5 }],
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
 		['goal_completed', { goalRevision: 1 }],
-		['action_command', { goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
+		['action_command', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],
 		['heartbeat', {}],
@@ -587,6 +623,7 @@ test('protocol v2 validates raw transaction arguments before normalizing action 
 		count: 3, expectedItemId: 'minecraft:oak_log', timeoutMs: 5_000,
 	};
 	const normalized = validateProtocolV2Payload('action_command', {
+		traceId: TRACE_ID,
 		goalRevision: 4,
 		actionId: 'action-transaction-1',
 		actionType: 'transfer_container',
@@ -596,6 +633,7 @@ test('protocol v2 validates raw transaction arguments before normalizing action 
 	assert.deepEqual(normalized.arguments, validTransfer);
 	assert.throws(
 		() => validateProtocolV2Payload('action_command', {
+			traceId: TRACE_ID,
 			goalRevision: 4,
 			actionId: 'action-transaction-2',
 			actionType: 'transfer_container',
@@ -611,6 +649,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 		x: 1, y: 64, z: -2, face: 'up', itemId: 'minecraft:oak_stairs', desiredState: DESIRED_OAK_STAIRS_STATE,
 	};
 	const normalized = validateProtocolV2Payload('action_command', {
+		traceId: TRACE_ID,
 		goalRevision: 4,
 		actionId: 'action-place-1',
 		actionType: 'place_block',
@@ -620,6 +659,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 	assert.deepEqual(normalized.arguments, placeArguments);
 	assert.equal(
 		validateProtocolV2Payload('action_command', {
+			traceId: TRACE_ID,
 			goalRevision: 4, actionId: 'action-place-2', actionType: 'place_block',
 			arguments: { ...placeArguments, desiredState: null },
 			provenance: PROVENANCE,
@@ -628,6 +668,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 	);
 	assert.equal(
 		validateProtocolV2Payload('action_command', {
+			traceId: TRACE_ID,
 			goalRevision: 4, actionId: 'action-place-3', actionType: 'place_block',
 			arguments: { ...placeArguments, desiredState: 'minecraft:stone[facing=north]' },
 			provenance: PROVENANCE,
@@ -636,6 +677,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 	);
 	assert.throws(
 		() => validateProtocolV2Payload('action_command', {
+			traceId: TRACE_ID,
 			goalRevision: 4, actionId: 'action-place-4', actionType: 'place_block',
 			arguments: { ...placeArguments, desiredState: 'x'.repeat(513) },
 			provenance: PROVENANCE,
@@ -648,6 +690,7 @@ test('protocol v2 rejects retired high-level controller action types', () => {
 	for (const actionType of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
 		assert.throws(
 			() => validateProtocolV2Payload('action_command', {
+				traceId: TRACE_ID,
 				goalRevision: 4, actionId: `retired-${actionType}`, actionType, arguments: {}, provenance: PROVENANCE,
 			}),
 			(error) => error.code === 'INVALID_ACTION' && /Unsupported action/.test(error.message),

@@ -4,6 +4,7 @@ import { DynamicAgentState } from './agent-registry.mjs';
 import { ArenaScriptError } from './arena-script/errors.mjs';
 import { parseArenaScript } from './arena-script/parser.mjs';
 import { ArenaScriptEngine } from './arena-script/program-engine.mjs';
+import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { buildPlannerInput } from './prompts.mjs';
 
 /** Coordinates model-authored ArenaScript programs for independent agents. */
@@ -50,7 +51,7 @@ export class ProgramRuntimeManager {
 	}
 
 	async installDecision(record, decision, { observation, eventSequence } = {}) {
-		const state = this.#state(record, observation, eventSequence);
+		const state = this.#state(record, observation, eventSequence, decision?.traceId);
 		if (decision?.directive === 'finish') {
 			this.#setTerminalState(record, decision.status === 'completed' ? DynamicAgentState.COMPLETED : DynamicAgentState.ERROR);
 			return state.engine?.snapshot() ?? null;
@@ -104,13 +105,16 @@ export class ProgramRuntimeManager {
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return false;
 		const active = state.engine.snapshot().activeActionId;
 		if (active === null || state.actionIds.get(payload.actionId) !== active) return false;
+		const actionTraceId = state.actionTraceIds.get(payload.actionId) ?? state.traceId;
+		if (payload.traceId !== undefined && payload.traceId !== actionTraceId) return false;
 		const eventSequence = this.#actionEventSequence(state, payload.eventSequence);
 		if (eventSequence === null) return false;
 		const timing = state.actionTiming.get(payload.actionId);
 		if (timing && timing.firstProgressAt === null) {
 			timing.firstProgressAt = this.#safeNow();
 			if (timing.firstProgressAt !== null && timing.bridgeSentAt !== null) this.#recordLatency('command_to_first_progress', timing.firstProgressAt - timing.bridgeSentAt);
-			this.#record('action_progress', record, { actionId: payload.actionId, eventSequence, durationMs: elapsedOrNull(timing.bridgeSentAt, timing.firstProgressAt) });
+			this.#record('action_progress', record, { actionId: payload.actionId, eventSequence, durationMs: elapsedOrNull(timing.bridgeSentAt, timing.firstProgressAt), traceId: actionTraceId });
+			this.#recordTracePhase(state, record, 'first_world_action', timing.firstProgressAt, timing.firstProgressAt, 'completed', null, actionTraceId);
 		}
 		return true;
 	}
@@ -121,6 +125,8 @@ export class ProgramRuntimeManager {
 		const active = state.engine.snapshot().activeActionId;
 		const internalActionId = state.actionIds.get(payload.actionId);
 		if (active === null || internalActionId !== active) return false;
+		const actionTraceId = state.actionTraceIds.get(payload.actionId) ?? state.traceId;
+		if (payload.traceId !== undefined && payload.traceId !== actionTraceId) return false;
 		const eventSequence = this.#actionEventSequence(state, payload.eventSequence);
 		if (eventSequence === null) return false;
 		const timing = state.actionTiming.get(payload.actionId);
@@ -135,7 +141,12 @@ export class ProgramRuntimeManager {
 			state: payload.state,
 			reasonCode: payload.reasonCode ?? '',
 			durationMs: elapsedOrNull(timing?.bridgeSentAt, completedAt),
+			traceId: actionTraceId,
 		});
+		if (timing?.firstProgressAt === null || timing === undefined) {
+			this.#recordTracePhase(state, record, 'first_world_action', completedAt, completedAt, 'completed', null, actionTraceId);
+		}
+		this.#recordTracePhase(state, record, 'completion_verification', completedAt, completedAt, 'skipped', 'VERIFIER_NOT_INSTALLED', actionTraceId);
 		if (metadata !== undefined) {
 			this.#traceState(state, 'program_step', {
 				programId: metadata.command.provenance.programId,
@@ -161,6 +172,7 @@ export class ProgramRuntimeManager {
 		});
 		this.#flushDeferredProgramTrace(state);
 		state.actionIds.delete(payload.actionId);
+		state.actionTraceIds.delete(payload.actionId);
 		state.actionTiming.delete(payload.actionId);
 		state.actionMetadata.delete(payload.actionId);
 		if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
@@ -203,10 +215,11 @@ export class ProgramRuntimeManager {
 		return state !== undefined && !state.disposed && state.goalRevision === record.goalRevision;
 	}
 
-	#state(record, observation, eventSequence) {
+	#state(record, observation, eventSequence, traceId = null) {
 		const existing = this.#states.get(record.agentId);
 		if (existing && !existing.disposed && existing.goalRevision === record.goalRevision) {
 			existing.observation = observation;
+			if (traceId !== null && traceId !== undefined) this.#setTrace(existing, traceId);
 			this.#installationSequence(existing, eventSequence);
 			return existing;
 		}
@@ -218,6 +231,8 @@ export class ProgramRuntimeManager {
 			provider: record.provider,
 			reasoningEffort: record.reasoningEffort,
 			serviceTier: record.serviceTier ?? 'priority',
+			traceId: traceId === null || traceId === undefined ? defaultTraceId(record.agentId, record.goalRevision, 1) : validateTraceId(traceId),
+			planningSequence: 1,
 			version: this.#versions.get(versionKey(record)) ?? 0,
 			lifecycle: (this.#lifecycles.get(record.agentId) ?? 0) + 1,
 			sequence: Number.isSafeInteger(eventSequence) && eventSequence >= 0 ? eventSequence : 0,
@@ -225,6 +240,7 @@ export class ProgramRuntimeManager {
 			observation,
 			disposed: false,
 			actionIds: new Map(),
+			actionTraceIds: new Map(),
 			actionTiming: new Map(),
 			actionMetadata: new Map(),
 			commands: 0,
@@ -236,6 +252,9 @@ export class ProgramRuntimeManager {
 			reactiveRequest: null,
 			reactiveRequestActive: false,
 			pendingReplacementTrace: null,
+			dispatchTraceRecorded: false,
+			worldActionTraceIds: new Set(),
+			verificationTraceIds: new Set(),
 			engine: null,
 		};
 		state.engine = new ArenaScriptEngine({
@@ -304,6 +323,7 @@ export class ProgramRuntimeManager {
 					observation: observation ?? {},
 					...(context === null ? {} : { attentionPriority: context.priority, attentionTrigger: context.trigger }),
 				}),
+				traceId: state.traceId,
 				planningPriority: context?.priority,
 				priority: context?.priority,
 			});
@@ -388,10 +408,12 @@ export class ProgramRuntimeManager {
 					...(context.actionFailure === undefined ? {} : { actionFailure: context.actionFailure }),
 					observation: context.observation,
 				}, this.#plannerContext(record.agentId)),
+				traceId: nextTraceId(state),
 				planningPriority: context.priority,
 				priority: context.priority,
 			});
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return;
+			if (decision?.traceId !== undefined) this.#setTrace(state, decision.traceId);
 			if (decision?.directive === 'replace') {
 				if (!sameEngineRequest(state.engine.snapshot(), context)) {
 					state.engine.failDirectiveRequest(context);
@@ -447,8 +469,9 @@ export class ProgramRuntimeManager {
 			this.#ensureActing(record);
 			actionId = `${state.agentId}:${state.goalRevision}:${state.lifecycle}:${++state.commands}:${command.actionId}`;
 			state.actionIds.set(actionId, command.actionId);
+			state.actionTraceIds.set(actionId, state.traceId);
 			state.actionMetadata.set(actionId, { command, branchSelectedAt });
-			this.#record('action_dispatch_started', record, { actionId, actionType: command.action.type, eventSequence: command.provenance.eventSequence });
+			this.#record('action_dispatch_started', record, { actionId, actionType: command.action.type, eventSequence: command.provenance.eventSequence, traceId: state.traceId });
 			this.#traceState(state, 'program_step', {
 				programId: command.provenance.programId,
 				version: command.provenance.version,
@@ -465,9 +488,13 @@ export class ProgramRuntimeManager {
 					bridgeSendToCompletionMs: null,
 				},
 			});
-			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command));
+			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command, state.traceId));
 			const bridgeSentAt = this.#safeNow();
-			this.#record('action_command_sent', record, { actionId, actionType: command.action.type, eventSequence: command.provenance.eventSequence, durationMs: elapsedOrNull(branchSelectedAt, bridgeSentAt) });
+			this.#record('action_command_sent', record, { actionId, actionType: command.action.type, eventSequence: command.provenance.eventSequence, durationMs: elapsedOrNull(branchSelectedAt, bridgeSentAt), traceId: state.traceId });
+			if (!state.dispatchTraceRecorded) {
+				this.#recordTracePhase(state, record, 'first_command_dispatch', bridgeSentAt, bridgeSentAt, 'completed');
+				state.dispatchTraceRecorded = true;
+			}
 			state.actionTiming.set(actionId, { bridgeSentAt, firstProgressAt: null });
 			const metadata = state.actionMetadata.get(actionId);
 			if (metadata !== undefined) metadata.bridgeSentAt = bridgeSentAt;
@@ -491,6 +518,7 @@ export class ProgramRuntimeManager {
 		const metadata = state.actionMetadata.get(externalActionId);
 		const timing = state.actionTiming.get(externalActionId);
 		state.actionIds.delete(externalActionId);
+		state.actionTraceIds.delete(externalActionId);
 		state.actionTiming.delete(externalActionId);
 		state.actionMetadata.delete(externalActionId);
 		if (metadata !== undefined) this.#traceState(state, 'program_step', {
@@ -574,6 +602,7 @@ export class ProgramRuntimeManager {
 				reasoningEffort: state.reasoningEffort,
 				serviceTier: state.serviceTier,
 				goalRevision: state.goalRevision,
+				traceId: state.traceId,
 				programId: fields.programId ?? snapshot.programId,
 				version: fields.version ?? snapshot.version,
 				...fields,
@@ -619,6 +648,41 @@ export class ProgramRuntimeManager {
 		catch { /* local telemetry cannot interrupt agent control */ }
 	}
 
+	#setTrace(state, value) {
+		const traceId = validateTraceId(value);
+		if (state.traceId === traceId) return;
+		state.traceId = traceId;
+		state.dispatchTraceRecorded = false;
+	}
+
+	#recordTracePhase(state, record, phase, startMs, endMs, outcome, retryReason = null, traceIdOverride = null) {
+		const traceId = traceIdOverride ?? state?.traceId;
+		if (state === null || traceId === null || !Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+		if (phase === 'first_world_action' && state.worldActionTraceIds.has(traceId)) return;
+		if (phase === 'completion_verification' && state.verificationTraceIds.has(traceId)) return;
+		const fields = {
+			traceId,
+			phase,
+			startMonotonicMs: startMs,
+			endMonotonicMs: endMs,
+			durationMs: Math.max(0, endMs - startMs),
+			outcome,
+			...(retryReason === null ? {} : { retryReason: normalizeRetryReason(retryReason) }),
+		};
+		this.#record(phase, record, fields);
+		if (phase === 'first_world_action') state.worldActionTraceIds.add(traceId);
+		if (phase === 'completion_verification') state.verificationTraceIds.add(traceId);
+		if (this.#latencyRegistry === null) return;
+		try {
+			this.#latencyRegistry.recordTracePhase(traceId, phase, {
+				startMs,
+				endMs,
+				outcome,
+				...(retryReason === null ? {} : { retryReason }),
+			});
+		} catch { /* telemetry must never interrupt action routing */ }
+	}
+
 	#record(stage, record, fields = {}) {
 		if (this.#recorder === null) return;
 		try {
@@ -629,6 +693,7 @@ export class ProgramRuntimeManager {
 				reasoningEffort: record.reasoningEffort,
 				serviceTier: record.serviceTier ?? 'priority',
 				goalRevision: record.goalRevision,
+				traceId: fields.traceId ?? this.#states.get(record.agentId)?.traceId ?? defaultTraceId(record.agentId, record.goalRevision, 1),
 			}, fields);
 		} catch { /* benchmark telemetry cannot affect program execution */ }
 	}
@@ -676,13 +741,14 @@ function advancingTimestamp(state, field, value) {
 	if (timestamp !== null) state[field] = timestamp;
 	return timestamp;
 }
-function wireActionCommand(record, actionId, command) {
+function wireActionCommand(record, actionId, command, traceId) {
 	const action = command?.action;
 	const provenance = command?.provenance;
 	if (!action || typeof action.type !== 'string') {
 		throw codedError('INVALID_ARENA_SCRIPT_COMMAND', 'ArenaScript command has no exact action shape');
 	}
 	return Object.freeze({
+		traceId: validateTraceId(traceId),
 		goalRevision: record.goalRevision,
 		actionId,
 		actionType: action.type,
@@ -692,12 +758,22 @@ function wireActionCommand(record, actionId, command) {
 			model: record.model,
 			reasoningEffort: record.reasoningEffort,
 			serviceTier: record.serviceTier ?? 'priority',
+			traceId: validateTraceId(traceId),
 			programId: provenance.programId,
 			programVersion: provenance.version,
 			sourceStepId: provenance.stepId,
 			eventSequence: provenance.authorizingEventSequence ?? provenance.eventSequence,
 		}),
 	});
+}
+
+function defaultTraceId(agentId, goalRevision, sequence) {
+	return `trace-${String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_')}-${goalRevision}-${sequence}`.slice(0, 128);
+}
+
+function nextTraceId(state) {
+	state.planningSequence += 1;
+	return defaultTraceId(state.agentId, state.goalRevision, state.planningSequence);
 }
 function actionArguments(type, value) {
 	if (value !== null && typeof value === 'object' && !Array.isArray(value)) return structuredClone(value);

@@ -631,6 +631,7 @@ public final class ServerActionExecutor {
 				request.goalRevision(),
 				request.actionId(),
 				request.type(),
+				request.traceId(),
 				state,
 				reasonCode,
 				message == null ? "" : message,
@@ -658,7 +659,7 @@ public final class ServerActionExecutor {
 	}
 
 	private static ServerActionResult result(ServerActionRequest request, ServerActionState state, String reasonCode, String message, long elapsedMs) {
-		return new ServerActionResult(request.agentId(), request.goalRevision(), request.actionId(), request.type(), state,
+		return new ServerActionResult(request.agentId(), request.goalRevision(), request.actionId(), request.type(), request.traceId(), state,
 				reasonCode, message == null ? "" : message, Math.max(0L, elapsedMs), System.currentTimeMillis());
 	}
 
@@ -1210,7 +1211,7 @@ public final class ServerActionExecutor {
 					if (placement.desiredState() == null) arguments.add("desiredState", com.google.gson.JsonNull.INSTANCE);
 					else arguments.addProperty("desiredState", placement.desiredState());
 					child = createAction(new ServerActionRequest(
-							parent.agentId(), parent.goalRevision(), parent.actionId(), ActionType.PLACE_BLOCK, arguments, parent.provenance()
+							parent.agentId(), parent.goalRevision(), parent.actionId(), ActionType.PLACE_BLOCK, arguments, parent.provenance(), parent.traceId()
 					), player);
 				}
 				ServerActionResult result = child.tick(nowEpochMs);
@@ -1545,6 +1546,7 @@ public final class ServerActionExecutor {
 					request.goalRevision(),
 					request.actionId(),
 					request.type(),
+					request.traceId(),
 					bounded,
 					Math.max(0L, now - startedAt),
 					now
@@ -1630,6 +1632,7 @@ public final class ServerActionExecutor {
 					request.goalRevision(),
 					request.actionId(),
 					request.type(),
+					request.traceId(),
 					state,
 					reasonCode,
 					message,

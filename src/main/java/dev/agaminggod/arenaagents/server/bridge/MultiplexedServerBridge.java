@@ -662,7 +662,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		try {
 			JsonObject validatedArguments = ProtocolCodec.validateActionArguments(actionType, arguments);
-			return new ServerActionRequest(agentId, requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"), actionType, validatedArguments, decodeActionProvenance(payload));
+			String traceId = requiredTraceId(payload, "traceId");
+			ActionProvenance provenance = decodeActionProvenance(payload);
+			if (provenance.traceId() != null && !provenance.traceId().equals(traceId)) {
+				throw new BridgeProtocolException("INVALID_TRACE_ID", "provenance.traceId must match traceId");
+			}
+			return new ServerActionRequest(agentId, requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"), actionType, validatedArguments, provenance, traceId);
 		} catch (ProtocolException exception) {
 			throw new BridgeProtocolException(exception.code(), exception.getMessage(), exception);
 		} catch (IllegalArgumentException exception) {
@@ -671,8 +676,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private static void requireActionCommandKeys(JsonObject payload) {
-		Set<String> expected = Set.of("goalRevision", "actionId", "actionType", "arguments", "provenance");
-		for (String field : expected) if (!payload.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		Set<String> expected = Set.of("traceId", "goalRevision", "actionId", "actionType", "arguments", "provenance");
+		for (String field : Set.of("goalRevision", "actionId", "actionType", "arguments", "provenance")) if (!payload.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
 		for (String field : payload.keySet()) if (!expected.contains(field)) throw new BridgeProtocolException("INVALID_FIELD", "action_command");
 	}
 
@@ -685,6 +690,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		result.addProperty("actionId", identity.actionId());
 		result.addProperty("commandId", identity.actionId());
 		result.addProperty("actionType", identity.actionType());
+		result.addProperty("traceId", identity.traceId());
 		result.addProperty("state", "FAILED");
 		result.addProperty("reasonCode", exception instanceof BridgeProtocolException protocol ? protocol.code() : ((AgentDomainException) exception).code());
 		result.addProperty("message", boundedRejectionMessage(exception.getMessage()));
@@ -698,13 +704,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		JsonObject payload = envelope.payload();
 		try {
 			AgentId.parse(envelope.agentId());
-			return new RejectionIdentity(envelope.agentId(), requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"), requiredString(payload, "actionType"));
+			return new RejectionIdentity(envelope.agentId(), requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"), requiredString(payload, "actionType"), requiredTraceId(payload, "traceId"));
 		} catch (RuntimeException exception) {
 			return null;
 		}
 	}
 
-	private record RejectionIdentity(String agentId, long goalRevision, String actionId, String actionType) { }
+	private record RejectionIdentity(String agentId, long goalRevision, String actionId, String actionType, String traceId) { }
 
 	static String boundedRejectionMessage(String message) {
 		String fallback = "Action rejected";
@@ -750,9 +756,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private static ActionProvenance decodeActionProvenance(JsonObject payload) {
 		JsonObject provenance = requiredObject(payload, "provenance");
-		requireKeys(provenance, Set.of(
-				"provider", "model", "reasoningEffort", "serviceTier", "programId", "programVersion", "sourceStepId", "eventSequence"
-		), "provenance");
+		Set<String> expected = Set.of(
+				"provider", "model", "reasoningEffort", "serviceTier", "programId", "programVersion", "sourceStepId", "eventSequence", "traceId"
+		);
+		for (String field : provenance.keySet()) if (!expected.contains(field)) throw new BridgeProtocolException("INVALID_FIELD", "provenance");
+		for (String field : Set.of("provider", "model", "reasoningEffort", "serviceTier", "programId", "programVersion", "sourceStepId", "eventSequence")) {
+			if (!provenance.has(field)) throw new BridgeProtocolException("MISSING_FIELD", "provenance." + field);
+		}
 		try {
 			return new ActionProvenance(
 					requiredProvenanceString(provenance, "provider"),
@@ -762,7 +772,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					requiredProvenanceString(provenance, "programId"),
 					requiredSafeLong(provenance, "programVersion"),
 					requiredProvenanceString(provenance, "sourceStepId"),
-					requiredSafeLong(provenance, "eventSequence")
+					requiredSafeLong(provenance, "eventSequence"),
+				provenance.has("traceId") ? requiredTraceId(provenance, "traceId") : null
 			);
 		} catch (IllegalArgumentException exception) {
 			throw new BridgeProtocolException("INVALID_PROVENANCE", exception.getMessage(), exception);
@@ -904,6 +915,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("actionId", result.actionId());
 		payload.addProperty("commandId", result.actionId());
 		payload.addProperty("actionType", result.actionType().wireName());
+		if (result.traceId() != null) payload.addProperty("traceId", result.traceId());
 		payload.addProperty("state", result.state().name());
 		payload.addProperty("reasonCode", result.reasonCode());
 		payload.addProperty("message", result.message());
@@ -973,6 +985,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("actionId", progress.actionId());
 		payload.addProperty("commandId", progress.actionId());
 		payload.addProperty("actionType", progress.actionType().wireName());
+		if (progress.traceId() != null) payload.addProperty("traceId", progress.traceId());
 		payload.addProperty("state", "RUNNING");
 		payload.addProperty("progress", progress.progress());
 		payload.addProperty("elapsedMs", progress.elapsedMs());
@@ -1182,6 +1195,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		String value = object.get(field).getAsString();
 		if (value.isBlank() || value.length() > 256) throw new BridgeProtocolException("INVALID_FIELD", field + " must be nonblank and bounded");
+		return value;
+	}
+
+	private static String requiredTraceId(JsonObject object, String field) {
+		String value = requiredString(object, field);
+		if (value.getBytes(StandardCharsets.UTF_8).length > 128
+				|| value.codePoints().anyMatch(codePoint -> codePoint < 0x20 || codePoint == 0x7f)) {
+			throw new BridgeProtocolException("INVALID_TRACE_ID", field + " must be at most 128 UTF-8 bytes");
+		}
 		return value;
 	}
 

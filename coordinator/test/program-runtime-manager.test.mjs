@@ -32,9 +32,36 @@ function harness(options = {}) {
 		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
 		planner: { requestPlan: async (request) => { requests.push(request); return { summary: 'Continue.', directive: 'continue' }; } },
 		onCompleted: options.onCompleted,
+		benchmarkRecorder: options.benchmarkRecorder,
 	});
 	return { manager, registry, sent, requests };
 }
+
+test('retains the planning trace through program dispatch and first world action without fabricating verification', async () => {
+	const rows = [];
+	const run = harness({ benchmarkRecorder: { record(stage, context, fields) { rows.push({ stage, context, fields }); } } });
+	const traceId = 'trace-runtime-1';
+	const decision = {
+		summary: 'Wait once.', directive: 'replace', traceId,
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	};
+	await run.manager.installDecision(run.registry.get('agent-a'), decision, { observation: observation(), eventSequence: 1 });
+	const command = run.sent.find((message) => message.type === 'action_command');
+	assert.equal(command.payload.traceId, traceId);
+	assert.equal(command.payload.provenance.traceId, traceId);
+	await run.manager.onActionProgress(run.registry.get('agent-a'), {
+		traceId, actionId: command.payload.actionId, eventSequence: 2, state: 'RUNNING', progress: 0.1,
+	});
+	await run.manager.onActionResult(run.registry.get('agent-a'), {
+		traceId, actionId: command.payload.actionId, eventSequence: 3, state: 'SUCCEEDED', reasonCode: 'DONE',
+	});
+	assert.equal(rows.every((row) => row.context.traceId === traceId), true);
+	assert.equal(rows.some((row) => row.stage === 'first_command_dispatch'), true);
+	assert.equal(rows.some((row) => row.stage === 'first_world_action'), true);
+	const verification = rows.find((row) => row.stage === 'completion_verification');
+	assert.equal(verification?.fields.outcome, 'skipped');
+	assert.equal(verification?.fields.retryReason, 'VERIFIER_NOT_INSTALLED');
+});
 
 test('installs a model-authored program and dispatches its next primitive without a provider turn', async () => {
 	const run = harness();

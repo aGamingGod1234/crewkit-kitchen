@@ -494,6 +494,7 @@ export class DynamicCoordinator extends EventEmitter {
 			preserveState,
 			request,
 			pending: null,
+			traceId: request.traceId ?? planningTraceId(record.agentId, record.goalRevision, lifecycleGeneration, kind),
 			promise: null,
 		};
 		this.#providerWork.set(record.agentId, work);
@@ -503,9 +504,10 @@ export class DynamicCoordinator extends EventEmitter {
 			preserveState,
 			recoverySummary: record.lastSummary,
 			input: request.input,
+			traceId: work.traceId,
 			planningPriority: request.priority,
-			priority: request.priority,
-		};
+					priority: request.priority,
+				};
 		work.promise = Promise.resolve()
 			.then(() => this.#planner.requestPlan(providerRequest))
 			.then((decision) => this.#completeProviderPlan(work, decision), (error) => this.#failProviderPlan(work, record, error));
@@ -867,6 +869,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		codexService,
 		invalidDecisionRetries: config.limits.invalidDecisionRetries,
 		healthRegistry,
+		latencyRegistry,
 		telemetrySink: dependencies.telemetrySink,
 		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
@@ -1131,6 +1134,11 @@ function mergePlannerRequest(previous, next) {
 	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
 	const winner = next.priority === priority ? next : previous;
 	return { ...next, priority, trigger: winner.trigger };
+}
+
+function planningTraceId(agentId, goalRevision, lifecycleGeneration, kind) {
+	const identity = String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_');
+	return `trace-${identity}-${goalRevision}-${lifecycleGeneration}-${kind}`.slice(0, 128);
 }
 
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -64,6 +64,9 @@ export class FakeMinecraftBridge {
 
 	async send(type, agentId, payload) {
 		if (agentId !== this.#record.agentId) throw new Error(`unexpected agent ${agentId}`);
+		if (type === 'action_command' && (payload?.traceId === undefined || payload?.traceId === null)) {
+			payload = { ...payload, traceId: `legacy-${agentId}-${payload.actionId}`.slice(0, 128) };
+		}
 		const envelope = createProtocolV2Envelope({
 			serverInstanceId: this.#serverInstanceId,
 			agentId,
@@ -137,6 +140,7 @@ export class FakeMinecraftBridge {
 		this.progress.push({ actionId: command.actionId, eventSequence: progressSequence });
 		if (this.#manager) {
 			const inbound = createProtocolV2Envelope({ serverInstanceId: this.#serverInstanceId, agentId: this.#record.agentId, type: 'action_progress', messageId: `in-${++this.#messageSequence}`, payload: {
+				traceId: command.traceId,
 				goalRevision: command.goalRevision,
 				actionId: command.actionId,
 				commandId: command.actionId,
@@ -164,6 +168,7 @@ export class FakeMinecraftBridge {
 		if (this.#manager) {
 			const inbound = createProtocolV2Envelope({ serverInstanceId: this.#serverInstanceId, agentId: this.#record.agentId, type: 'action_result', messageId: `in-${++this.#messageSequence}`, payload: {
 				...result,
+				traceId: command.traceId,
 				commandId: result.actionId,
 				actionType: command.actionType,
 				message: result.reasonCode,

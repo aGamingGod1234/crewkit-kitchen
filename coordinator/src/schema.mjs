@@ -437,8 +437,9 @@ export function validateActionProvenance(value) {
 	const provenance = requireObject(value, 'provenance');
 	requireKeys(
 		provenance,
-		['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'programVersion', 'sourceStepId', 'eventSequence'],
+		['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'programVersion', 'sourceStepId', 'eventSequence', 'traceId'],
 		'provenance',
+		['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'programVersion', 'sourceStepId', 'eventSequence'],
 	);
 	requirePositiveSafeInteger(provenance.programVersion, 'provenance.programVersion');
 	requireNonNegativeSafeInteger(provenance.eventSequence, 'provenance.eventSequence');
@@ -451,7 +452,15 @@ export function validateActionProvenance(value) {
 		programVersion: provenance.programVersion,
 		sourceStepId: requireText(provenance.sourceStepId, 'provenance.sourceStepId', MAX_PROVENANCE_TEXT_LENGTH),
 		eventSequence: provenance.eventSequence,
+		...(provenance.traceId === undefined ? {} : { traceId: requireTraceId(provenance.traceId) }),
 	});
+}
+
+function requireTraceId(value) {
+	const traceId = requireText(value, 'provenance.traceId', MAX_PROVENANCE_TEXT_LENGTH);
+	if (Buffer.byteLength(traceId, 'utf8') > 128) throw invalid('OUT_OF_RANGE', 'provenance.traceId must contain at most 128 UTF-8 bytes');
+	if ([...traceId].some((character) => /[\u0000-\u001f\u007f]/u.test(character))) throw invalid('INVALID_FIELD', 'provenance.traceId contains control characters');
+	return traceId;
 }
 
 function requireText(value, path, maximum, emptyAllowed = false) {

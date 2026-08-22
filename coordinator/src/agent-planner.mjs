@@ -1,4 +1,5 @@
 import { AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
+import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
 
@@ -33,6 +34,7 @@ export class AgentPlanner {
 	#codexService;
 	#invalidDecisionRetries;
 	#healthRegistry;
+	#latencyRegistry;
 	#telemetrySink;
 	#now;
 	#recorder;
@@ -43,6 +45,7 @@ export class AgentPlanner {
 		codexService,
 		invalidDecisionRetries = DEFAULT_INVALID_DECISION_RETRIES,
 		healthRegistry = new ProviderHealthRegistry(),
+		latencyRegistry = null,
 		telemetrySink = () => {},
 		now = () => performance.now(),
 		recorder = null,
@@ -55,6 +58,7 @@ export class AgentPlanner {
 			throw new TypeError('invalidDecisionRetries must be a non-negative safe integer');
 		}
 		if (typeof healthRegistry?.canAttempt !== 'function' || typeof healthRegistry?.record !== 'function') throw new TypeError('healthRegistry must provide canAttempt and record');
+		if (latencyRegistry !== null && typeof latencyRegistry.recordTracePhase !== 'function') throw new TypeError('latencyRegistry.recordTracePhase must be a function');
 		if (typeof telemetrySink !== 'function') throw new TypeError('telemetrySink must be a function');
 		if (typeof now !== 'function') throw new TypeError('now must be a function');
 		const selectedRecorder = recorder ?? benchmarkRecorder;
@@ -64,6 +68,7 @@ export class AgentPlanner {
 		this.#codexService = codexService;
 		this.#invalidDecisionRetries = invalidDecisionRetries;
 		this.#healthRegistry = healthRegistry;
+		this.#latencyRegistry = latencyRegistry;
 		this.#telemetrySink = telemetrySink;
 		this.#now = now;
 		this.#recorder = selectedRecorder;
@@ -71,14 +76,19 @@ export class AgentPlanner {
 
 	get healthRegistry() { return this.#healthRegistry; }
 
-	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null }) {
+	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null, traceId: requestedTraceId = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
+		const traceIdProvided = requestedTraceId !== null;
+		const traceId = traceIdProvided ? validateTraceId(requestedTraceId) : defaultTraceId(agentId, goalRevision);
 		const selectedPriority = planningPriority ?? priority ?? record.planningPriority ?? record.priority ?? 'ordinary';
 		const queuedAt = this.#now();
-		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false, lane: record.provider, priority: selectedPriority });
+		const trace = { retryReason: null, phasesRecorded: false };
+		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false, lane: record.provider, priority: selectedPriority, traceId });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
-			const queueWaitMs = elapsed(queuedAt, this.#now());
-			this.#record('planner_admitted', record, { operation: 'plan', queueWaitMs, preserveState, lane: record.provider, priority: selectedPriority });
+			const admittedAt = this.#now();
+			const queueWaitMs = elapsed(queuedAt, admittedAt);
+			this.#record('planner_admitted', record, { operation: 'plan', queueWaitMs, preserveState, lane: record.provider, priority: selectedPriority, traceId });
+			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
 			try {
@@ -91,6 +101,7 @@ export class AgentPlanner {
 							attempt: initializationRetryCount + 1,
 							queueWaitMs,
 							retry: initializationRetryCount > 0,
+							traceId,
 						}, async () => {
 							const created = await this.#codexService.createAgent(record, { recoverySummary });
 							await created.setGoalRevision(goalRevision);
@@ -118,11 +129,18 @@ export class AgentPlanner {
 					try {
 						const attempt = retryCount + providerRetryCount + 1;
 						const decision = await this.#providerAttempt(record, {
-							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1,
+							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1, traceId,
 						}, () => agent.decide(plannerInput, { goalRevision, signal }));
 						this.#registry.assertCurrentRevision(agentId, goalRevision);
-						this.#record('planner_decision_completed', record, { operation: 'decide', attempt, queueWaitMs, directive: decision?.directive ?? null });
-						return { ...decision, goalRevision };
+						const parseBoundary = this.#now();
+						if (!trace.phasesRecorded) {
+							this.#recordTracePhase(record, traceId, 'provider_first_byte', parseBoundary, parseBoundary, 'completed');
+							this.#recordTracePhase(record, traceId, 'provider_final_byte', parseBoundary, parseBoundary, 'completed');
+							this.#recordTracePhase(record, traceId, 'parse', parseBoundary, parseBoundary, 'completed', trace.retryReason);
+							trace.phasesRecorded = true;
+						}
+						this.#record('planner_decision_completed', record, { operation: 'decide', attempt, queueWaitMs, directive: decision?.directive ?? null, traceId });
+						return { ...decision, goalRevision, ...(traceIdProvided ? { traceId } : {}) };
 					} catch (error) {
 						if (
 							RETRYABLE_DECISION_ERRORS.has(error?.code)
@@ -131,6 +149,7 @@ export class AgentPlanner {
 							&& !signal.aborted
 						) {
 							retryCount += 1;
+							trace.retryReason = normalizeRetryReason(error?.code ?? 'INVALID_DECISION');
 							plannerInput = buildCorrectiveRetryInput(input, error, retryCount);
 							continue;
 						}
@@ -148,7 +167,7 @@ export class AgentPlanner {
 					}
 				}
 			} catch (error) {
-				this.#record('planner_failed', record, { operation: 'plan', errorCode: error?.code ?? 'PLANNING_FAILED', retry: true });
+				this.#record('planner_failed', record, { operation: 'plan', errorCode: error?.code ?? 'PLANNING_FAILED', retry: true, traceId });
 				if (
 					error?.code !== 'STALE_PLAN'
 					&& error?.code !== 'PLAN_CANCELLED'
@@ -186,6 +205,7 @@ export class AgentPlanner {
 				...fields,
 				durationMs,
 				errorCode: null,
+				retryReason: fields.retryReason,
 				timeout: false,
 				restart: false,
 			}));
@@ -199,6 +219,7 @@ export class AgentPlanner {
 				...fields,
 				durationMs,
 				error,
+				retryReason: error?.code ?? 'ERROR',
 				timeout: error?.code === 'PLANNING_TIMEOUT',
 				restart: false,
 			}));
@@ -211,17 +232,36 @@ export class AgentPlanner {
 		try { this.#telemetrySink(telemetry); } catch { /* telemetry consumers cannot fail planning */ }
 	}
 
+	#recordTracePhase(record, traceId, phase, startMs, endMs, outcome, retryReason = null) {
+		if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return;
+		const fields = {
+			traceId,
+			phase,
+			startMonotonicMs: startMs,
+			endMonotonicMs: endMs,
+			durationMs: Math.max(0, endMs - startMs),
+			outcome,
+			...(retryReason === null ? {} : { retryReason: normalizeRetryReason(retryReason) }),
+		};
+		this.#record(phase, record, fields);
+		if (this.#latencyRegistry === null) return;
+		try { this.#latencyRegistry.recordTracePhase(traceId, phase, { startMs, endMs, outcome, ...(retryReason === null ? {} : { retryReason }) }); }
+		catch { /* a bounded telemetry sink cannot interrupt planning */ }
+	}
+
 	#record(stage, record, fields = {}) {
 		if (this.#recorder === null) return;
 		try {
-			this.#recorder.record(stage, {
+			const context = {
 				agentId: record.agentId,
 				provider: record.provider,
 				model: record.model,
 				reasoningEffort: record.reasoningEffort,
 				serviceTier: record.serviceTier ?? 'priority',
 				goalRevision: record.goalRevision,
-			}, fields);
+				...(fields.traceId === undefined ? {} : { traceId: fields.traceId }),
+			};
+			this.#recorder.record(stage, context, fields);
 		} catch { /* benchmark telemetry cannot affect planning */ }
 	}
 
@@ -259,6 +299,10 @@ export class AgentPlanner {
 			throw error;
 		}
 	}
+}
+
+function defaultTraceId(agentId, goalRevision) {
+	return `trace-${String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_')}-${goalRevision}`.slice(0, 128);
 }
 
 function elapsed(startedAt, finishedAt) {

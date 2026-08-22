@@ -16,6 +16,12 @@ import dev.agaminggod.arenaagents.server.conversation.ConversationEvent;
 import dev.agaminggod.arenaagents.server.conversation.ConversationKind;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWakeCodec;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
+import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
+import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
+import dev.agaminggod.arenaagents.protocol.ActionType;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
@@ -82,6 +88,7 @@ public final class MultiplexedServerBridgeVerification {
 		assertEquals(List.of("paired-messages-and-commit", "action-attempted", "state-after-telemetry-failure"), committed,
 				"scenario callback failure cannot escape or roll back committed respawn publication");
 		verifyDeathFacts();
+		verifyTraceWireValidation();
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
 		verifyConversationAttention(registered.getFirst().agentId());
 		verifyObservationCadence(candidates);
@@ -90,6 +97,48 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyConversationWakeRequestCannotStartGoal();
 		return 56;
+	}
+
+	private static void verifyTraceWireValidation() {
+		AgentId agent = AgentId.parse("00000000-0000-0000-0000-000000000001");
+		String traceId = "trace-java-1";
+		ActionProvenance provenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-1-1", 1L, "step-1", 1L
+		);
+		JsonObject payload = new JsonObject();
+		payload.addProperty("traceId", traceId);
+		payload.addProperty("goalRevision", 1L);
+		payload.addProperty("actionId", "action-1");
+		payload.addProperty("actionType", "wait");
+		JsonObject arguments = new JsonObject();
+		arguments.addProperty("durationMs", 1L);
+		payload.add("arguments", arguments);
+		JsonObject wireProvenance = new JsonObject();
+		wireProvenance.addProperty("provider", "codex");
+		wireProvenance.addProperty("model", "gpt-5.6-sol");
+		wireProvenance.addProperty("reasoningEffort", "high");
+		wireProvenance.addProperty("serviceTier", "priority");
+		wireProvenance.addProperty("programId", "program-1-1");
+		wireProvenance.addProperty("programVersion", 1L);
+		wireProvenance.addProperty("sourceStepId", "step-1");
+		wireProvenance.addProperty("eventSequence", 1L);
+		wireProvenance.addProperty("traceId", traceId);
+		payload.add("provenance", wireProvenance);
+		ServerActionRequest request = MultiplexedServerBridge.decodeActionRequest(
+				new BridgeEnvelope(2, "server-instance", agent.toString(), "action_command", "message-1", payload)
+		);
+		assertEquals(traceId, request.traceId(), "action request retains the trace ID");
+		ServerActionProgress progress = new ServerActionProgress(agent, 1L, "action-1", ActionType.WAIT, traceId, 0.5D, 1L, 2L);
+		ServerActionResult result = new ServerActionResult(agent, 1L, "action-1", ActionType.WAIT, traceId, ServerActionState.SUCCEEDED, "DONE", "", 2L, 3L);
+		assertEquals(traceId, progress.traceId(), "first progress retains the action trace ID");
+		assertEquals(traceId, result.traceId(), "terminal result retains the action trace ID");
+		JsonObject mismatched = payload.deepCopy();
+		mismatched.getAsJsonObject("provenance").addProperty("traceId", "trace-other");
+		assertThrows(BridgeProtocolException.class, () -> MultiplexedServerBridge.decodeActionRequest(
+				new BridgeEnvelope(2, "server-instance", agent.toString(), "action_command", "message-mismatch", mismatched)),
+				"mismatched wire trace IDs fail closed");
+		assertThrows(IllegalArgumentException.class, () -> new ServerActionRequest(agent, 1L, "action-1", ActionType.WAIT, arguments, provenance, ""), "blank trace ID is typed validation");
+		assertThrows(IllegalArgumentException.class, () -> new ServerActionRequest(agent, 1L, "action-1", ActionType.WAIT, arguments, provenance, "🙂".repeat(40)), "overlong UTF-8 trace ID is typed validation");
 	}
 
 	private static void verifyConversationWakeRequestCannotStartGoal() {

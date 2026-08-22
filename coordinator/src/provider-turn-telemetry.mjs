@@ -1,3 +1,5 @@
+import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
+
 const MAX_IDENTITY_LENGTH = 128;
 
 export function createProviderTurnTelemetry(value) {
@@ -14,6 +16,10 @@ export function createProviderTurnTelemetry(value) {
 		timeout: Boolean(input.timeout),
 		retry: Boolean(input.retry),
 		restart: Boolean(input.restart),
+		...(input.traceId === undefined ? {} : { traceId: validateTraceId(input.traceId) }),
+		...(input.retryReason === undefined || input.retryReason === null
+			? {}
+			: { retryReason: normalizeRetryReason(input.retryReason) }),
 	});
 }
 

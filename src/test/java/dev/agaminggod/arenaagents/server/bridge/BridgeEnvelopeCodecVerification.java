@@ -72,6 +72,7 @@ public final class BridgeEnvelopeCodecVerification {
 	}
 
 	private static JsonObject actionPayload(String actionId, String type, JsonObject arguments) {
+		String traceId = "trace-" + actionId;
 		JsonObject provenance = new JsonObject();
 		provenance.addProperty("provider", "codex");
 		provenance.addProperty("model", "gpt-5.6-sol");
@@ -81,7 +82,9 @@ public final class BridgeEnvelopeCodecVerification {
 		provenance.addProperty("programVersion", 1L);
 		provenance.addProperty("sourceStepId", "step-80-126");
 		provenance.addProperty("eventSequence", 4L);
+		provenance.addProperty("traceId", traceId);
 		JsonObject payload = new JsonObject();
+		payload.addProperty("traceId", traceId);
 		payload.addProperty("goalRevision", 1L);
 		payload.addProperty("actionId", actionId);
 		payload.addProperty("actionType", type);

@@ -85,7 +85,7 @@ class FakeBridge extends EventEmitter {
 		if (type === 'action_command') {
 			const sequence = (this.#eventSequence.get(agentId) ?? 1) + 1;
 			this.#eventSequence.set(agentId, sequence);
-			setImmediate(() => this.emit('action_result', { agentId, payload: { goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } }));
+			setImmediate(() => this.emit('action_result', { agentId, payload: { traceId: payload.traceId, goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } }));
 		}
 	}
 }

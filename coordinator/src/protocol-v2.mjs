@@ -898,11 +898,11 @@ function isFactualChangedPath(path) {
 }
 
 function normalizeActionProgress(value) {
-	const allowed = ['goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'message', 'progress', 'elapsedMs', 'observedAtEpochMs'];
-	exactKeys(value, allowed, ['goalRevision', 'actionId'], 'action_progress');
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'message', 'progress', 'elapsedMs', 'observedAtEpochMs'];
+	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId'], 'action_progress');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== undefined && value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
-	const normalized = { goalRevision: revision(value.goalRevision, 'goalRevision'), actionId };
+	const normalized = { traceId: requireTraceId(value.traceId), goalRevision: revision(value.goalRevision, 'goalRevision'), actionId };
 	if (value.commandId !== undefined) normalized.commandId = actionId;
 	if (value.actionType !== undefined) normalized.actionType = requireIdentifier(value.actionType, 'actionType');
 	if (value.state !== undefined) normalized.state = boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH);
@@ -914,13 +914,14 @@ function normalizeActionProgress(value) {
 }
 
 function normalizeActionResult(value) {
-	const allowed = ['goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'];
-	exactKeys(value, allowed, ['goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'], 'action_result');
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'];
+	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'], 'action_result');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
 	const state = boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH);
 	if (!TERMINAL_ACTION_STATES.has(state)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported terminal action state '${state}'`);
 	return {
+		traceId: requireTraceId(value.traceId),
 		goalRevision: revision(value.goalRevision, 'goalRevision'),
 		actionId,
 		commandId: actionId,
@@ -934,9 +935,10 @@ function normalizeActionResult(value) {
 }
 
 function normalizeActionCommand(value) {
-	const allowed = ['goalRevision', 'actionId', 'actionType', 'arguments', 'provenance'];
-	exactKeys(value, allowed, ['goalRevision', 'actionId', 'arguments', 'provenance'], 'action_command');
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'actionType', 'arguments', 'provenance'];
+	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId', 'arguments', 'provenance'], 'action_command');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
+	const traceId = requireTraceId(value.traceId);
 	const type = requireIdentifier(value.actionType, 'actionType');
 	if (!isPlainObject(value.arguments)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'action_command arguments must be an object');
 	for (const key of Reflect.ownKeys(value.arguments)) {
@@ -951,8 +953,11 @@ function normalizeActionCommand(value) {
 		action,
 		provenance: value.provenance,
 	});
+	if (command.provenance.traceId !== undefined && command.provenance.traceId !== traceId) {
+		throw new ProtocolV2Error('INVALID_PAYLOAD', 'provenance.traceId must match traceId');
+	}
 	const { type: actionType, ...argumentsValue } = action;
-	const normalized = { goalRevision: command.goalRevision, actionId, actionType, arguments: argumentsValue, provenance: command.provenance };
+	const normalized = { traceId, goalRevision: command.goalRevision, actionId, actionType, arguments: argumentsValue, provenance: command.provenance };
 	return deepFreeze(normalized);
 }
 
@@ -1287,6 +1292,13 @@ function requireIdentifier(value, field) {
 
 function requireText(value, field, maximum) {
 	if (typeof value !== 'string' || value.trim().length === 0 || value.length > maximum) throw new ProtocolV2Error('INVALID_FIELD', `${field} must be nonblank and at most ${maximum} characters`);
+	return value;
+}
+
+function requireTraceId(value) {
+	if (typeof value !== 'string' || value.trim().length === 0) throw new ProtocolV2Error('INVALID_FIELD', 'traceId must be nonblank');
+	if (Buffer.byteLength(value, 'utf8') > 128) throw new ProtocolV2Error('INVALID_FIELD', 'traceId must be at most 128 UTF-8 bytes');
+	if ([...value].some((character) => /[\u0000-\u001f\u007f]/u.test(character))) throw new ProtocolV2Error('INVALID_FIELD', 'traceId contains control characters');
 	return value;
 }
 

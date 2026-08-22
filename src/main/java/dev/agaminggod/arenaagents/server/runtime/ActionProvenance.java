@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.runtime;
 
 import java.util.Objects;
+import java.nio.charset.StandardCharsets;
 
 /** Immutable identity of the model-authored ArenaScript step that issued an action. */
 public record ActionProvenance(
@@ -8,10 +9,11 @@ public record ActionProvenance(
 		String model,
 		String reasoningEffort,
 		String serviceTier,
-		String programId,
-		long programVersion,
-		String sourceStepId,
-		long eventSequence
+	String programId,
+	long programVersion,
+	String sourceStepId,
+	long eventSequence,
+	String traceId
 ) {
 	public static final int MAX_TEXT_LENGTH = 256;
 	public static final long MAX_SAFE_INTEGER = 9_007_199_254_740_991L;
@@ -29,6 +31,14 @@ public record ActionProvenance(
 		if (eventSequence < 0L || eventSequence > MAX_SAFE_INTEGER) {
 			throw new IllegalArgumentException("eventSequence must be a nonnegative safe integer");
 		}
+		if (traceId != null) traceId = boundedTraceId(traceId);
+	}
+
+	public ActionProvenance(
+			String provider, String model, String reasoningEffort, String serviceTier,
+			String programId, long programVersion, String sourceStepId, long eventSequence
+	) {
+		this(provider, model, reasoningEffort, serviceTier, programId, programVersion, sourceStepId, eventSequence, null);
 	}
 
 	private static String boundedNonblank(String value, String field) {
@@ -41,5 +51,13 @@ public record ActionProvenance(
 
 	private static boolean isProtocolWhitespace(int codePoint) {
 		return Character.isWhitespace(codePoint) || Character.isSpaceChar(codePoint) || codePoint == 0xfeff;
+	}
+
+	private static String boundedTraceId(String value) {
+		if (value.isBlank() || StandardCharsets.UTF_8.encode(value).remaining() > 128
+				|| value.codePoints().anyMatch(codePoint -> codePoint < 0x20 || codePoint == 0x7f)) {
+			throw new IllegalArgumentException("traceId must be nonblank and at most 128 UTF-8 bytes");
+		}
+		return value;
 	}
 }

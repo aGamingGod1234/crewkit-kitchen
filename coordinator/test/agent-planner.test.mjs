@@ -48,6 +48,54 @@ test('retries one malformed planner decision with bounded corrective feedback', 
 	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
 });
 
+test('keeps one trace across a malformed decision retry and records queue/provider/parse boundaries once', async () => {
+	const registry = new FakeRegistry();
+	const rows = [];
+	const times = [100, 104, 110, 118, 121, 130, 136, 140, 141];
+	let attempt = 0;
+	const invalid = Object.assign(new Error('invalid output'), { code: 'MALFORMED_DECISION' });
+	const agent = {
+		async setGoalRevision() {},
+		async decide() {
+			attempt += 1;
+			if (attempt === 1) throw invalid;
+			return VALID_DECISION;
+		},
+	};
+	const planner = new AgentPlanner({
+		registry,
+		invalidDecisionRetries: 1,
+		now: () => times.shift(),
+		benchmarkRecorder: { record(stage, context, fields) { rows.push({ stage, context, fields }); } },
+		scheduler: {
+			schedule(_agentId, operation) { return operation({ signal: new AbortController().signal }); },
+			cancel() { return false; },
+		},
+		codexService: {
+			async createAgent() { return agent; },
+			getAgent() { return null; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	const result = await planner.requestPlan({
+		agentId: AGENT_ID,
+		input: 'authoritative state',
+		goalRevision: GOAL_REVISION,
+		traceId: 'trace-planner-retry',
+	});
+
+	assert.equal(result.traceId, 'trace-planner-retry');
+	assert.equal(new Set(rows.map((row) => row.context.traceId)).size, 1);
+	assert.equal(rows.every((row) => row.context.traceId === 'trace-planner-retry'), true);
+	assert.equal(rows.filter((row) => row.stage === 'queue_wait').length, 1);
+	const phases = new Set(['queue_wait', 'provider_first_byte', 'provider_final_byte', 'parse']);
+	assert.deepEqual(rows.filter((row) => phases.has(row.stage)).map((row) => row.stage), [
+		'queue_wait', 'provider_first_byte', 'provider_final_byte', 'parse',
+	]);
+	assert.equal(rows.find((row) => row.stage === 'parse').fields.retryReason, 'MALFORMED_DECISION');
+});
+
 test('retries compact envelope validation mismatches with corrective feedback', async () => {
 	for (const invalid of [
 		{ code: 'DECISION_FIELD_MISMATCH', message: 'replace directive requires nonblank source' },
