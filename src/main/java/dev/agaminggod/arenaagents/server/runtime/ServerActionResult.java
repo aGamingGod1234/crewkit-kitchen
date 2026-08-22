@@ -44,14 +44,14 @@ public record ServerActionResult(
 			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
 			ServerActionState state, String reasonCode, String message, long elapsedMs, long observedAtEpochMs
 	) {
-		this(agentId, goalRevision, actionId, actionType, null, state, reasonCode, message, elapsedMs, observedAtEpochMs, true, true);
+		this(agentId, goalRevision, actionId, actionType, null, state, reasonCode, message, elapsedMs, observedAtEpochMs, false, false);
 	}
 
 	public ServerActionResult(
 			AgentId agentId, long goalRevision, String actionId, ActionType actionType,
 			String traceId, ServerActionState state, String reasonCode, String message, long elapsedMs, long observedAtEpochMs
 	) {
-		this(agentId, goalRevision, actionId, actionType, traceId, state, reasonCode, message, elapsedMs, observedAtEpochMs, true, true);
+		this(agentId, goalRevision, actionId, actionType, traceId, state, reasonCode, message, elapsedMs, observedAtEpochMs, false, false);
 	}
 
 	private static String bounded(String value, int maximum) {

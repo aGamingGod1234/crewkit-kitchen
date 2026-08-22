@@ -185,7 +185,7 @@ public final class ServerActionExecutor {
 					System.currentTimeMillis()
 			);
 			AgentChatReporter.completed(manager, record, string(request.arguments(), "summary"));
-			emit(request, ServerActionState.SUCCEEDED, "GOAL_COMPLETED", string(request.arguments(), "summary"), 0L);
+			emit(request, ServerActionState.SUCCEEDED, "GOAL_COMPLETED", string(request.arguments(), "summary"), 0L, false, false);
 			router.goalCompleted(request.agentId(), request.goalRevision());
 			return;
 		}
@@ -208,7 +208,7 @@ public final class ServerActionExecutor {
 				router.actionFinished(request.agentId(), request.goalRevision());
 			} catch (AgentDomainException stale) { }
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "ACTION_REJECTED";
-			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L);
+			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L, false, false);
 		}
 	}
 
@@ -222,7 +222,7 @@ public final class ServerActionExecutor {
 			));
 		} catch (RuntimeException exception) {
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
-			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L);
+			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L, false, false);
 		}
 	}
 
@@ -294,7 +294,7 @@ public final class ServerActionExecutor {
 				return;
 			}
 			if (!manager.verifyVanillaRespawn(pending.attempt(), now)) return;
-			ServerActionResult result = result(pending.request(), ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", now - pending.startedAtEpochMs());
+			ServerActionResult result = result(pending.request(), ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED", "Respawned at the vanilla target", now - pending.startedAtEpochMs(), true, true);
 			manager.commitVanillaRespawn(pending.attempt(), (transition, commit) -> publishRespawn(result, transition, commit));
 			pendingRespawns.remove(pending.request().agentId(), pending);
 		} catch (RuntimeException exception) {
@@ -303,7 +303,7 @@ public final class ServerActionExecutor {
 			if (!isCurrentCoordinatorGeneration(pending.coordinatorGeneration(), coordinatorGeneration)
 					|| isCoordinatorDisconnected(exception)) return;
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
-			emit(pending.request(), ServerActionState.FAILED, reason, safeMessage(exception), now - pending.startedAtEpochMs());
+			emit(pending.request(), ServerActionState.FAILED, reason, safeMessage(exception), now - pending.startedAtEpochMs(), false, false);
 		}
 	}
 
@@ -336,7 +336,7 @@ public final class ServerActionExecutor {
 		PendingRespawn respawn = pendingRespawns.remove(agentId);
 		if (respawn != null) {
 			manager.rollbackVanillaRespawn(respawn.attempt());
-			emit(respawn.request(), ServerActionState.CANCELLED, "ACTION_CANCELLED", reason == null ? "Action cancelled" : reason, System.currentTimeMillis() - respawn.startedAtEpochMs());
+			emit(respawn.request(), ServerActionState.CANCELLED, "ACTION_CANCELLED", reason == null ? "Action cancelled" : reason, System.currentTimeMillis() - respawn.startedAtEpochMs(), false, false);
 			return true;
 		}
 		ActiveAction action = active.get(agentId);
@@ -627,7 +627,9 @@ public final class ServerActionExecutor {
 			ServerActionState state,
 			String reasonCode,
 			String message,
-			long elapsedMs
+			long elapsedMs,
+			boolean executionStarted,
+			boolean physicalAttempted
 	) {
 		publish(new ServerActionResult(
 				request.agentId(),
@@ -639,7 +641,9 @@ public final class ServerActionExecutor {
 				reasonCode,
 				message == null ? "" : message,
 				elapsedMs,
-				System.currentTimeMillis()
+				System.currentTimeMillis(),
+				executionStarted,
+				physicalAttempted
 		));
 	}
 
@@ -661,9 +665,17 @@ public final class ServerActionExecutor {
 		} catch (AgentDomainException ignored) { }
 	}
 
-	private static ServerActionResult result(ServerActionRequest request, ServerActionState state, String reasonCode, String message, long elapsedMs) {
+	private static ServerActionResult result(
+			ServerActionRequest request,
+			ServerActionState state,
+			String reasonCode,
+			String message,
+			long elapsedMs,
+			boolean executionStarted,
+			boolean physicalAttempted
+	) {
 		return new ServerActionResult(request.agentId(), request.goalRevision(), request.actionId(), request.type(), request.traceId(), state,
-				reasonCode, message == null ? "" : message, Math.max(0L, elapsedMs), System.currentTimeMillis());
+				reasonCode, message == null ? "" : message, Math.max(0L, elapsedMs), System.currentTimeMillis(), executionStarted, physicalAttempted);
 	}
 
 	@FunctionalInterface
@@ -1284,7 +1296,8 @@ public final class ServerActionExecutor {
 		private int initialPlacementItemCount;
 		private String resourceLeaseKey;
 		private int placementAttempts;
-		private boolean started;
+		private boolean executionStarted;
+		private boolean physicalAttempted;
 		private double lastProgress;
 		private InputLease inputLease;
 
@@ -1425,17 +1438,27 @@ public final class ServerActionExecutor {
 		ServerActionResult tick(long now) {
 			if (!player.isAlive()) return result(ServerActionState.FAILED, "AGENT_DEAD", "Agent player died", now);
 			long elapsed = Math.max(0L, now - startedAt);
-			if (!started) {
-				started = true;
-					switch (mode) {
-						case IMMEDIATE -> immediate.run();
-						case MOVE -> applyLookingInput(InputOwner.NAVIGATION, 100, destination, 1.0F, true, false, false);
-						case USE -> applyCurrentLookInput(InputOwner.INTERACTION, 300, false, true);
-						case BREAK -> {
-							if (player.distanceToSqr(Vec3.atCenterOf(block)) > MAX_INTERACTION_DISTANCE_SQUARED) {
-								throw new AgentDomainException("TARGET_TOO_FAR", "Block is out of reach");
-							}
-							applyLookingInput(InputOwner.INTERACTION, 300, Vec3.atCenterOf(block), 0.0F, false, true, false);
+			if (!executionStarted) {
+				executionStarted = true;
+				switch (mode) {
+					case IMMEDIATE -> {
+						physicalAttempted = true;
+						immediate.run();
+					}
+					case MOVE -> {
+						physicalAttempted = true;
+						applyLookingInput(InputOwner.NAVIGATION, 100, destination, 1.0F, true, false, false);
+					}
+					case USE -> {
+						physicalAttempted = true;
+						applyCurrentLookInput(InputOwner.INTERACTION, 300, false, true);
+					}
+					case BREAK -> {
+						if (player.distanceToSqr(Vec3.atCenterOf(block)) > MAX_INTERACTION_DISTANCE_SQUARED) {
+							throw new AgentDomainException("TARGET_TOO_FAR", "Block is out of reach");
+						}
+						physicalAttempted = true;
+						applyLookingInput(InputOwner.INTERACTION, 300, Vec3.atCenterOf(block), 0.0F, false, true, false);
 					}
 					case PLACE -> {
 					}
@@ -1452,6 +1475,7 @@ public final class ServerActionExecutor {
 			if (mode == Mode.MOVE) {
 				double distance = player.position().distanceTo(destination);
 				lastProgress = progress.progress(distance);
+				physicalAttempted = true;
 				applyLookingInput(InputOwner.NAVIGATION, 100, destination, 1.0F, true, false, false);
 				if (distance <= tolerance) {
 					return result(ServerActionState.SUCCEEDED, "DESTINATION_REACHED", "Destination reached", now);
@@ -1494,6 +1518,7 @@ public final class ServerActionExecutor {
 							"Block placement was not confirmed"), now);
 				}
 				if (BlockPlacementAttemptPolicy.shouldAttempt(elapsed, placementAttempts)) {
+					physicalAttempted = true;
 					immediate.run();
 					placementAttempts += 1;
 				}
@@ -1501,6 +1526,7 @@ public final class ServerActionExecutor {
 				return result(ServerActionState.SUCCEEDED, "ACTION_COMPLETED", "Action completed", now);
 			}
 			if (mode == Mode.CONTROLLER) {
+				physicalAttempted = true;
 				ServerController.TickResult controllerResult = requireControllerResult(
 						controller.tick(player, now), lastProgress, controller.getClass().getSimpleName());
 				lastProgress = controllerResult.progress();
@@ -1521,6 +1547,7 @@ public final class ServerActionExecutor {
 				};
 			}
 			if (mode == Mode.TRANSACTION) {
+				physicalAttempted = true;
 				ServerTransactionAdapter.TickResult transactionResult = transaction.tick(now);
 				lastProgress = timedProgress(elapsed);
 				return switch (transactionResult.state()) {
@@ -1640,7 +1667,9 @@ public final class ServerActionExecutor {
 					reasonCode,
 					message,
 					Math.max(0L, now - startedAt),
-					now
+					now,
+					executionStarted,
+					physicalAttempted
 			);
 		}
 	}

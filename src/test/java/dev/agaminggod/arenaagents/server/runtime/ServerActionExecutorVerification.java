@@ -2,11 +2,19 @@ package dev.agaminggod.arenaagents.server.runtime;
 
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
+import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.server.AgentSavedData;
+import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.core.BlockPos;
@@ -200,6 +208,7 @@ public final class ServerActionExecutorVerification {
 				"runtime revalidation preserves a precise recoverable domain reason");
 		assertEquals("ACTION_EXCEPTION", ServerActionExecutor.failureReason(new IllegalStateException("broken")),
 				"unexpected runtime exceptions remain isolated");
+		verifySetupFailureDoesNotClaimPhysicalExecution();
 		assertEquals(0, ServerActionExecutor.roundRobinStart(0L, 16),
 				"round-robin starts with the first active agent");
 		assertEquals(1, ServerActionExecutor.roundRobinStart(1L, 16),
@@ -213,6 +222,43 @@ public final class ServerActionExecutorVerification {
 			admitted[start] = true;
 		}
 		return 44;
+	}
+
+	private static void verifySetupFailureDoesNotClaimPhysicalExecution() {
+		CodexAgentManager manager = uninitializedManager();
+		AgentRecord agent = manager.registry().create(
+				"codex", "gpt-5.6-sol", "high", Optional.of("SetupFailureTarget"), AgentGameMode.SURVIVAL, 1_000L
+		);
+		manager.start(agent.agentId().toString(), "Run the setup failure test");
+		manager.registry().setAutomaticProgress(agent.agentId(), false, 1_001L);
+		ActionProvenance provenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-setup", 1L, "step-setup", 1L, "trace-setup"
+		);
+		JsonObject arguments = new JsonObject();
+		arguments.addProperty("durationMs", 1L);
+		ServerActionRequest request = new ServerActionRequest(
+				agent.agentId(), agent.goalRevision() + 1L, "action-setup", ActionType.WAIT, arguments, provenance, "trace-setup"
+		);
+		List<ServerActionResult> results = new ArrayList<>();
+		new ServerActionExecutor(manager, results::add).submitProgramPrimitive(request);
+		assertEquals(1, results.size(), "missing player setup failure emits one terminal result");
+		ServerActionResult result = results.getFirst();
+		assertFalse(result.executionStarted(), "setup failure does not claim execution started");
+		assertFalse(result.physicalAttempted(), "setup failure does not claim a physical attempt");
+	}
+
+	private static CodexAgentManager uninitializedManager() {
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+			CodexAgentManager manager = (CodexAgentManager) unsafe.allocateInstance(CodexAgentManager.class);
+			Field savedData = CodexAgentManager.class.getDeclaredField("savedData");
+			unsafe.putObject(manager, unsafe.objectFieldOffset(savedData), new AgentSavedData());
+			return manager;
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not allocate setup-failure manager", exception);
+		}
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

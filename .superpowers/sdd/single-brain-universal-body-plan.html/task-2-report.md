@@ -131,3 +131,19 @@ The fix closes the review findings by poisoning traces on every invalid phase at
 The final coordinator run passed 538 tests with 0 failures. The required full automated verification script then passed in one run: Gradle 6,370 protocol/bridge assertions, 77 voice-addon assertions, and coordinator 538 tests, 0 failures. The earlier direct Gradle invocation without the pinned project JDK was intentionally not counted because it failed during Java toolchain initialization (`release version 25 not supported`).
 
 Fix-round concerns: legacy Java record constructors remain available for explicitly out-of-band callers, but `submitProgramPrimitive` rejects their null trace. Older direct coordinator unit calls that omit execution markers retain a compatibility fallback; all protocol bridge/simulator results now carry explicit authoritative markers, and a marker pair of `false, false` is fail-closed.
+
+## Fix round 2/5 evidence
+
+The rereview left one executor marker seam: setup failures after action acceptance were still constructed through compatibility results that defaulted to `executionStarted:true` and `physicalAttempted:true`. A focused Java RED check reproduced a missing-player setup failure emitting those false physical claims.
+
+The fix makes compatibility `ServerActionResult` constructors fail closed, requires executor `emit` callers to provide explicit markers, and sends `false,false` for setup/rejection/rollback paths. Active actions now retain explicit execution and physical-attempt state, and genuine physical attempts construct terminal results with the recorded markers. Verified respawn completion remains explicitly `true,true` only after authoritative verification.
+
+Focused TDD evidence:
+
+```text
+RED: pinned-Java verifyCore failed at the new missing-player setup assertion because the pre-fix result reported executionStarted:true.
+GREEN: pinned-Java verifyCore passed with 6,396 protocol and bridge assertions.
+GREEN: node --test coordinator/test/program-runtime-manager.test.mjs coordinator/test/protocol-v2.test.mjs coordinator/test/virtual-minecraft-bridge.test.mjs passed 70 tests.
+```
+
+No full verification or live-provider run was performed in this speed-batch rereview round.
