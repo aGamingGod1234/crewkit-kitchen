@@ -67,6 +67,59 @@ test('generated records replay successfully through the production runner at loa
 	assert.equal(replay.cleanup.ok, true);
 });
 
+test('paces capture turns so nonzero multi-turn records replay without prompt drift', async () => {
+	const delayedMatrix = matrix([4]);
+	const fixture = await generateReplayRecordings({
+		matrix: delayedMatrix,
+		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
+		delayMs: 75,
+	});
+	assert.ok(fixture.recordings.some((record) => record.decisions.length > 1));
+
+	const replay = await runLatencyMatrix({
+		matrix: delayedMatrix,
+		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
+		replayRecordings: fixture.recordings,
+		artifactDirectory: null,
+	});
+
+	assert.equal(replay.status, 'PASSED');
+	assert.equal(replay.trials[0].status, 'PASSED');
+	assert.notEqual(replay.trials[0].error?.code, 'REPLAY_PROMPT_MISMATCH');
+	assert.equal(replay.cleanup.ok, true);
+});
+
+test('cancels and clears a pending capture delay when the provider turn times out', async () => {
+	const handles = new Set();
+	let scheduled = 0;
+	const delayTimer = {
+		setTimeout(callback, milliseconds) {
+			scheduled += 1;
+			let handle;
+			handle = setTimeout(() => { handles.delete(handle); callback(); }, milliseconds);
+			handles.add(handle);
+			return handle;
+		},
+		clearTimeout(handle) { handles.delete(handle); clearTimeout(handle); },
+	};
+	const timedOutMatrix = normalizeLatencyMatrix({
+		...matrix([1]),
+		trials: [{ ...matrix([1]).trials[0], turnBudgetMs: 20, trialBudgetMs: 250 }],
+	});
+
+	await assert.rejects(
+		() => generateReplayRecordings({
+			matrix: timedOutMatrix,
+			scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
+			delayMs: 500,
+			delayTimer,
+		}),
+		(error) => error.code === 'REPLAY_FIXTURE_CAPTURE_FAILED',
+	);
+	assert.ok(scheduled > 0);
+	assert.equal(handles.size, 0);
+});
+
 test('bounds fixture generation and rejects non-replay matrices', async () => {
 	await assert.rejects(() => generateReplayRecordings({ matrix: matrix(), maxRecords: 4 }), /record count/i);
 	await assert.rejects(() => generateReplayRecordings({ matrix: { ...matrix(), trials: [{ ...matrix().trials[0], mode: 'instant', providerProfile: { provider: 'instant', model: 'fixture', reasoningEffort: 'fixed', serviceTier: 'local' } }] } }), /replay trials/i);

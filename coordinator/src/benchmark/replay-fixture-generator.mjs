@@ -16,6 +16,7 @@ export async function generateReplayRecordings(input, options = {}) {
 	const request = normalizeRequest(input, options);
 	const matrix = normalizeReplayMatrix(request.matrix);
 	const limits = normalizeLimits(request);
+	const delaySchedule = normalizeDelaySchedule(request, limits);
 	const plannedRecords = matrix.trials.reduce((total, trial) => total + trial.agentLoad, 0);
 	if (matrix.trials.length > limits.maxTrials) throw captureError('REPLAY_FIXTURE_LIMIT', `replay fixture trial count exceeds ${limits.maxTrials}`);
 	if (matrix.trials.some((trial) => trial.repetitions !== 1)) throw captureError('REPLAY_FIXTURE_REPETITIONS', 'replay fixture generation requires repetitions: 1 for every trial');
@@ -25,7 +26,7 @@ export async function generateReplayRecordings(input, options = {}) {
 	const providerNames = new Set(matrix.trials.map((trial) => trial.providerProfile.provider));
 	const providerFactories = Object.fromEntries([...providerNames].map((providerName) => [
 		providerName,
-		(profile, context) => captureProvider({ profile, context, captures, maxTurns: limits.maxTurns }),
+		(profile, context) => captureProvider({ profile, context, captures, maxTurns: limits.maxTurns, delaySchedule }),
 	]));
 	const runnerOptions = {
 		...request,
@@ -39,6 +40,7 @@ export async function generateReplayRecordings(input, options = {}) {
 	delete runnerOptions.maxTurns;
 	delete runnerOptions.maxRecords;
 	delete runnerOptions.maxDelayMs;
+	delete runnerOptions.delayTimer;
 	let run;
 	try {
 		run = await runLatencyMatrix(runnerOptions);
@@ -60,19 +62,13 @@ export async function generateReplayRecordings(input, options = {}) {
 				const turns = capture.turns.get(agentId) ?? [];
 				if (turns.length === 0) throw captureError('REPLAY_FIXTURE_CAPTURE_MISSING', `no planner turn was captured for '${trial.id}/${agentId}'`);
 				if (turns.length > limits.maxTurns) throw captureError('REPLAY_FIXTURE_LIMIT', `planner turn count exceeds ${limits.maxTurns}`);
-				const delaysMs = turns.map((turn, turnIndex) => resolveDelay(request, {
-					trial,
-					repetition: 1,
-					agentId,
-					turnIndex,
-				}, limits.maxDelayMs));
 				recordings.push(createReplayRecord({
 					trialId: trial.id,
 					agentId,
 					agentLoad: trial.agentLoad,
 					prompts: turns.map((turn) => turn.input),
 					decisions: turns.map((turn) => turn.decision),
-					delaysMs,
+					delaysMs: turns.map((turn) => turn.delayMs),
 					providerProfile: trial.providerProfile,
 					scenario: capture.scenario,
 					protocolVersion: matrix.protocolVersion,
@@ -91,7 +87,7 @@ export async function generateReplayRecordings(input, options = {}) {
 
 export const generateReplayRecords = generateReplayRecordings;
 
-function captureProvider({ profile, context, captures, maxTurns }) {
+function captureProvider({ profile, context, captures, maxTurns, delaySchedule }) {
 	const trial = context?.trial;
 	const repetition = context?.repetition ?? 1;
 	if (!trial || typeof trial.id !== 'string') throw new TypeError('capture provider requires a trial context');
@@ -104,6 +100,7 @@ function captureProvider({ profile, context, captures, maxTurns }) {
 		return [agentId, compileScenarioDecision(manifest)];
 	}));
 	const initialized = new Set();
+	const delayController = createDelayController(delaySchedule.timer);
 	const key = captureKey(trial.id, repetition);
 	const capture = { trialId: trial.id, repetition, scenario: context.scenario, agentIds: [...loadScenario.agentIds], turns: new Map() };
 	captures.set(key, capture);
@@ -116,7 +113,7 @@ function captureProvider({ profile, context, captures, maxTurns }) {
 		serviceTier: profile.serviceTier,
 		providerProfile: { ...profile },
 		async start() {},
-		async stop() {},
+		async stop() { delayController.close(); },
 		async createAgent(record) {
 			const agentId = record?.agentId;
 			if (!decisions.has(agentId)) throw captureError('REPLAY_FIXTURE_AGENT_MISSING', `no compiled decision exists for '${trial.id}/${agentId}'`);
@@ -124,13 +121,16 @@ function captureProvider({ profile, context, captures, maxTurns }) {
 			capture.turns.set(agentId, turns);
 			return {
 				async setGoalRevision() {},
-				async decide(input) {
+				async decide(input, options = {}) {
 					if (turns.length >= maxTurns) throw captureError('REPLAY_FIXTURE_LIMIT', `planner turn count exceeds ${maxTurns}`);
 					if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('capture planner input must be a nonblank string');
+					const turnIndex = turns.length;
+					const delayMs = resolveDelay(delaySchedule, { trial, repetition, agentId, turnIndex });
+					await delayController.wait(delayMs, options.signal);
 					const initialDecision = !initialized.has(agentId);
 					initialized.add(agentId);
 					const decision = initialDecision ? decisions.get(agentId) : CONTINUE_DECISION;
-					turns.push({ input, decision });
+					turns.push({ input, decision, delayMs });
 					return decision;
 				},
 			};
@@ -161,11 +161,70 @@ function normalizeLimits(options) {
 	return { maxTrials, maxTurns, maxRecords, maxDelayMs };
 }
 
-function resolveDelay(options, context, maxDelayMs) {
+function normalizeDelaySchedule(options, limits) {
 	const source = options.delayForTurn ?? options.delayMs ?? 0;
-	const value = typeof source === 'function' ? source(context) : Array.isArray(source) ? source[context.turnIndex] ?? 0 : source;
-	if (!Number.isFinite(value) || value < 0 || value > maxDelayMs) throw new TypeError(`delayMs must be finite and within [0, ${maxDelayMs}]`);
+	if (typeof source !== 'function' && !Array.isArray(source)) validateDelay(source, limits.maxDelayMs);
+	if (Array.isArray(source)) {
+		if (source.length > limits.maxTurns) throw new TypeError(`delayMs must contain at most ${limits.maxTurns} turns`);
+		for (const value of source) validateDelay(value, limits.maxDelayMs);
+	}
+	const timer = options.delayTimer ?? globalThis;
+	if (!timer || typeof timer.setTimeout !== 'function' || typeof timer.clearTimeout !== 'function') throw new TypeError('delayTimer must provide setTimeout and clearTimeout');
+	return { source, maxDelayMs: limits.maxDelayMs, timer };
+}
+
+function resolveDelay(schedule, context) {
+	const value = typeof schedule.source === 'function'
+		? schedule.source(context)
+		: Array.isArray(schedule.source) ? schedule.source[context.turnIndex] ?? 0 : schedule.source;
+	validateDelay(value, schedule.maxDelayMs);
 	return value;
+}
+
+function validateDelay(value, maxDelayMs) {
+	if (!Number.isFinite(value) || value < 0 || value > maxDelayMs) throw new TypeError(`delayMs must be finite and within [0, ${maxDelayMs}]`);
+}
+
+function createDelayController(timer) {
+	const pending = new Set();
+	let closed = false;
+	return {
+		wait(milliseconds, signal) {
+			if (signal?.aborted) return Promise.reject(cancellationReason(signal));
+			if (closed) return Promise.reject(captureError('PROVIDER_STOPPED', 'capture provider is stopped'));
+			if (milliseconds === 0) return Promise.resolve();
+			return new Promise((resolve, reject) => {
+				const entry = { handle: null, settled: false, cancel: null };
+				const finish = (callback, value) => {
+					if (entry.settled) return;
+					entry.settled = true;
+					pending.delete(entry);
+					signal?.removeEventListener('abort', abort);
+					if (entry.handle !== null) {
+						try { timer.clearTimeout(entry.handle); } catch {}
+					}
+					callback(value);
+				};
+				const abort = () => finish(reject, cancellationReason(signal));
+				entry.cancel = (reason) => finish(reject, reason);
+				pending.add(entry);
+				signal?.addEventListener('abort', abort, { once: true });
+				if (signal?.aborted) { abort(); return; }
+				try { entry.handle = timer.setTimeout(() => finish(resolve), milliseconds); }
+				catch (error) { finish(reject, error); }
+			});
+		},
+		close() {
+			if (closed) return;
+			closed = true;
+			const reason = captureError('PLAN_CANCELLED', 'capture provider was stopped');
+			for (const entry of [...pending]) entry.cancel(reason);
+		},
+	};
+}
+
+function cancellationReason(signal) {
+	return signal?.reason ?? captureError('PLAN_CANCELLED', 'capture decision was cancelled');
 }
 
 function positiveBound(value, name) {
