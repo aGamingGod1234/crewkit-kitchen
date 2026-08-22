@@ -98,6 +98,16 @@ public final class ServerActionExecutorVerification {
 				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L
 		);
 		assertEquals("program-7-1", provenance.programId(), "provenance retains program identity");
+		ActionProvenance watcherProvenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L, "trace-watcher-1", "watcher-0"
+		);
+		assertEquals("watcher-0", watcherProvenance.watcherId(), "watcher provenance retains its authorizing identity");
+		assertThrows(IllegalArgumentException.class, () -> new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L, null, "watcher-0"
+		), "watcher provenance requires a trace identity");
+		assertThrows(IllegalArgumentException.class, () -> new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L, "trace-watcher-1", "x".repeat(129)
+		), "watcher provenance remains bounded");
 		assertThrows(IllegalArgumentException.class, () -> new ActionProvenance(
 				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "\u00a0", 4L
 		), "provenance rejects non-breaking blank source steps");

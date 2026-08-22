@@ -101,14 +101,14 @@ test('runs a registered watcher only when its condition is true', () => {
 		program.watch(
 			() => player.state().health < 10,
 			{ mode: "boundary" },
-			async () => { program.finish("heal"); }
+			async () => { await player.wait(1); }
 		);
 	`);
 	assert.equal(vm.start(facts()).kind, 'idle');
 	assert.equal(vm.runWatcher('watcher-0', facts()).kind, 'idle');
 	const fired = vm.runWatcher('watcher-0', facts({ player: { health: 8 } }));
-	assert.equal(fired.kind, 'finish');
-	assert.equal(fired.summary, 'heal');
+	assert.equal(fired.kind, 'command');
+	assert.equal(fired.call.primitive, 'wait');
 });
 
 test('executes local functions, safe local records, bounded iteration, and repeatUntil', () => {
@@ -244,7 +244,7 @@ test('keeps finished and checkpointed programs inactive for watcher execution', 
 	for (const terminal of ['program.finish("done")', 'program.checkpoint("paused")']) {
 		const vm = interpreter(`
 			program.onUnhandledAttention("continue_and_notify");
-			program.watch(() => true, { mode: "boundary" }, async () => { program.finish("watch"); });
+			program.watch(() => true, { mode: "boundary" }, async () => { await player.wait(1); });
 			${terminal};
 		`);
 		vm.start(facts());
@@ -381,7 +381,7 @@ test('accepts a full bounded Minecraft block observation above the old 16 KiB fa
 test('pauses execution errors and blocks watcher activation afterward', () => {
 	const vm = interpreter(`
 		program.onUnhandledAttention("continue_and_notify");
-		program.watch(() => true, { mode: "boundary" }, async () => { program.finish("watch"); });
+		program.watch(() => true, { mode: "boundary" }, async () => { await player.wait(1); });
 		for (let index = 0; index < 2; index += 1) { }
 	`, { loopIterationsPerYield: 1 });
 	assert.throws(() => vm.start(facts()), (error) => error.code === 'LOOP_LIMIT');

@@ -293,8 +293,12 @@ export class ProgramRuntimeManager {
 		state.observation = observation;
 		const installed = state.engine.install({
 			agentId: record.agentId,
+			provider: record.provider,
 			goalRevision: record.goalRevision,
 			modelIdentity: record.model,
+			reasoningEffort: record.reasoningEffort,
+			serviceTier: record.serviceTier ?? state.serviceTier,
+			traceId: state.traceId,
 			programId: `program-${record.goalRevision}-${version}`,
 			version,
 			compiled,
@@ -363,7 +367,7 @@ export class ProgramRuntimeManager {
 			const version = state.version + 1;
 			state.version = version;
 			this.#versions.set(versionKey(record), version);
-			state.engine.applyDirective({ ...context, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
+			state.engine.applyDirective({ ...context, traceId: decision.traceId ?? state.traceId, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
 			this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			return state.engine.snapshot();
 		} catch (requestError) {
@@ -401,7 +405,7 @@ export class ProgramRuntimeManager {
 				goalRevision: record.goalRevision,
 				preserveState: true,
 				input: buildPlannerInput({
-					agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
+					agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort, serviceTier: record.serviceTier ?? state.serviceTier },
 					goal: record.currentGoal,
 					goalRevision: record.goalRevision,
 					decisionContext: context.decisionContext ?? 'program_attention',
@@ -449,7 +453,7 @@ export class ProgramRuntimeManager {
 				const version = state.version + 1;
 				state.version = version;
 				this.#versions.set(versionKey(record), version);
-				state.engine.applyDirective({ ...context, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
+				state.engine.applyDirective({ ...context, traceId: decision.traceId ?? state.traceId, directive: 'replace', install: { programId: `program-${record.goalRevision}-${version}`, version, compiled } });
 				this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			} else {
 				const accepted = sameEngineRequest(state.engine.snapshot(), context);
@@ -563,7 +567,20 @@ export class ProgramRuntimeManager {
 	async #cancel(state, actionId) {
 		const externalActionId = [...state.actionIds].find(([, internal]) => internal === actionId)?.[0] ?? `${state.agentId}:${actionId}`;
 		try { await this.#bridge.send('action_cancel', state.agentId, { goalRevision: state.goalRevision, actionId: externalActionId }); }
-		catch (error) { this.#reportError(state.agentId, error); }
+		catch (error) {
+			const reasonCode = stableFailureCode(error);
+			state.actionIds.delete(externalActionId);
+			state.actionTraceIds.delete(externalActionId);
+			state.actionTiming.delete(externalActionId);
+			state.actionMetadata.delete(externalActionId);
+			state.engine.failCancellation({ actionId, eventSequence: ++state.sequence, reasonCode: 'CANCEL_SEND_FAILED' });
+			const record = this.#registry.get(state.agentId);
+			if (record !== null) this.#syncState(record, state);
+			const reported = error && typeof error === 'object' && typeof error.code === 'string'
+				? error
+				: Object.assign(new Error(String(error?.message ?? error ?? 'cancel transport failed')), { code: reasonCode, cause: error });
+			this.#reportError(state.agentId, reported);
+		}
 	}
 
 	#acceptServerEvent(state, candidate) {
@@ -781,6 +798,7 @@ function wireActionCommand(record, actionId, command, traceId) {
 			programVersion: provenance.version,
 			sourceStepId: provenance.stepId,
 			eventSequence: provenance.authorizingEventSequence ?? provenance.eventSequence,
+			...(provenance.watcherId === null || provenance.watcherId === undefined ? {} : { watcherId: provenance.watcherId }),
 		}),
 	});
 }

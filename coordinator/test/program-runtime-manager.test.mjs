@@ -15,7 +15,7 @@ const DEATH = Object.freeze({
 });
 
 function record(agentId = 'agent-a') {
-	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'wait', queue: [] };
+	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast', state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'wait', queue: [] };
 }
 
 function observation(overrides = {}) {
@@ -216,6 +216,45 @@ test('uses an authored watcher before asking the provider for unmatched attentio
 	assert.equal(run.sent.at(-1).payload.arguments.durationMs, 9);
 	assert.equal(run.sent.at(-1).payload.provenance.eventSequence, 37, 'watcher command repeats the triggering server event identity');
 	assert.equal(run.requests.length, 0);
+});
+
+test('wires full watcher provenance and preserves the exact profile on reactive wake', async () => {
+	const run = harness();
+	const traceId = 'trace-watcher-1';
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Watch health.', directive: 'replace', traceId,
+		source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	const first = run.sent[0].payload;
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 2, attention: true });
+	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: first.actionId, traceId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3 });
+	const watcher = run.sent.at(-1).payload;
+	assert.equal(watcher.provenance.provider, 'codex');
+	assert.equal(watcher.provenance.model, 'gpt-5.6-sol');
+	assert.equal(watcher.provenance.reasoningEffort, 'high');
+	assert.equal(watcher.provenance.serviceTier, 'fast');
+	assert.equal(watcher.provenance.traceId, traceId);
+	assert.equal(watcher.provenance.watcherId, 'watcher-0');
+});
+
+test('cancel-send rejection pauses an unmatched urgent wake and fences late results', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [];
+	const errors = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => { sent.push({ type, agentId, payload }); if (type === 'action_cancel') throw Object.assign(new Error('cancel unavailable'), { code: 'CANCEL_UNAVAILABLE' }); } },
+		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
+		reportError: (_agentId, error) => errors.push(error),
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: 'program.onUnhandledAttention("pause_and_notify"); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
+	const active = sent[0].payload;
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage' });
+	for (let attempt = 0; attempt < 5 && registry.get('agent-a').state !== DynamicAgentState.PAUSED; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.PAUSED);
+	assert.equal(sent.filter((message) => message.type === 'action_cancel').length, 1);
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3 }), false);
+	assert.equal(errors.at(-1)?.code, 'CANCEL_UNAVAILABLE');
 });
 
 test('replans from bounded failed-action context instead of pausing after a repeated deterministic failure', async () => {

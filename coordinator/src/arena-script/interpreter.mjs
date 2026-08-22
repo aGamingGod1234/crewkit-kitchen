@@ -45,6 +45,7 @@ export class ArenaScriptInterpreter {
 	#lifecycle = 'READY';
 	#loopIterations = 0;
 	#watcherEvaluation = false;
+	#watcherExecution = false;
 	#deferredCommand = null;
 	#deterministicFailure = null;
 
@@ -95,6 +96,7 @@ export class ArenaScriptInterpreter {
 		this.#frames = [];
 		this.#values = [];
 		this.#terminal = false;
+		this.#watcherExecution = false;
 		this.#yield = null;
 		this.#beginSlice();
 		this.#frames.push({ type: 'watcher-after-condition', watcher });
@@ -104,6 +106,7 @@ export class ArenaScriptInterpreter {
 
 	runWatcherHandler(watcherId, facts) {
 		const watcher = this.#watcherForHandler(watcherId, facts);
+		this.#watcherExecution = true;
 		this.#frames.push({ type: 'watcher-after-handler' });
 		this.#invokeFunction(watcher.handler, []);
 		return this.#run();
@@ -120,6 +123,7 @@ export class ArenaScriptInterpreter {
 		this.#waiting = null;
 		this.#yield = null;
 		this.#terminal = false;
+		this.#watcherExecution = true;
 		this.#beginSlice();
 		this.#frames.push({ type: 'watcher-after-handler' });
 		this.#invokeFunction(watcher.handler, []);
@@ -175,6 +179,7 @@ export class ArenaScriptInterpreter {
 		this.#values = [];
 		this.#yield = null;
 		this.#terminal = false;
+		this.#watcherExecution = false;
 		this.#beginSlice();
 	}
 
@@ -223,6 +228,7 @@ export class ArenaScriptInterpreter {
 					return yielded;
 				}
 			}
+			this.#watcherExecution = false;
 			return IDLE_YIELD;
 		} catch (error) {
 			this.#frames = [];
@@ -496,6 +502,7 @@ export class ArenaScriptInterpreter {
 	}
 
 	#yieldCommand(path, args, node, environment) {
+		if (this.#watcherExecution && path === 'player.chat') throw this.#error('WATCHER_UNAUTHORIZED', 'ArenaScript WATCHER_UNAUTHORIZED: watcher handlers cannot speak', node);
 		validateExactTargetArguments(path, args, node, (message) => this.#error('INVALID_ARGUMENT', `ArenaScript INVALID_ARGUMENT: ${message}`, node));
 		const binding = actionBinding(this.#bindings, path);
 		if (!binding) throw this.#error('UNBOUND_ACTION', `ArenaScript UNBOUND_ACTION: ${path}`, node);
@@ -521,6 +528,7 @@ export class ArenaScriptInterpreter {
 	}
 
 	#terminalYield(kind, node, value) {
+		if (this.#watcherExecution) throw this.#error('WATCHER_UNAUTHORIZED', 'ArenaScript WATCHER_UNAUTHORIZED: watcher handlers cannot change program lifecycle', node);
 		this.#terminal = true;
 		this.#lifecycle = kind === 'finish' ? 'FINISHED' : 'PAUSED';
 		this.#frames = [];

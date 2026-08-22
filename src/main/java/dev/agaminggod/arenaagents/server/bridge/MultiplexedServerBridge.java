@@ -763,11 +763,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static ActionProvenance decodeActionProvenance(JsonObject payload) {
 		JsonObject provenance = requiredObject(payload, "provenance");
 		Set<String> expected = Set.of(
-				"provider", "model", "reasoningEffort", "serviceTier", "programId", "programVersion", "sourceStepId", "eventSequence", "traceId"
+				"provider", "model", "reasoningEffort", "serviceTier", "programId", "programVersion", "sourceStepId", "eventSequence", "traceId", "watcherId"
 		);
 		for (String field : provenance.keySet()) if (!expected.contains(field)) throw new BridgeProtocolException("INVALID_FIELD", "provenance");
 		for (String field : Set.of("provider", "model", "reasoningEffort", "serviceTier", "programId", "programVersion", "sourceStepId", "eventSequence")) {
 			if (!provenance.has(field)) throw new BridgeProtocolException("MISSING_FIELD", "provenance." + field);
+		}
+		if (provenance.has("watcherId") && !provenance.has("traceId")) {
+			throw new BridgeProtocolException("MISSING_FIELD", "provenance.traceId");
 		}
 		try {
 			return new ActionProvenance(
@@ -779,7 +782,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					requiredSafeLong(provenance, "programVersion"),
 					requiredProvenanceString(provenance, "sourceStepId"),
 					requiredSafeLong(provenance, "eventSequence"),
-				provenance.has("traceId") ? requiredTraceId(provenance, "traceId") : null
+					provenance.has("traceId") ? requiredTraceId(provenance, "traceId") : null,
+					provenance.has("watcherId") ? requiredProvenanceString(provenance, "watcherId") : null
 			);
 		} catch (IllegalArgumentException exception) {
 			throw new BridgeProtocolException("INVALID_PROVENANCE", exception.getMessage(), exception);

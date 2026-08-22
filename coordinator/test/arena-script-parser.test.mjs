@@ -81,6 +81,20 @@ test('rejects side-effecting watcher and repeatUntil conditions', () => {
 	]) assert.throws(() => parseArenaScript(source), (error) => error.code === 'UNSUPPORTED_SYNTAX');
 });
 
+test('rejects watcher speech and terminal control, including helper-mediated calls', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => true, { mode: "boundary" }, async () => { await player.chat("hello"); });',
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => true, { mode: "boundary" }, async () => { program.finish("done"); });',
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => true, { mode: "boundary" }, async () => { await speak(); }); const speak = async () => { await player.chat("hello"); };',
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => true, { mode: "boundary" }, async () => { await stop(); }); const stop = async () => { program.finish("done"); };',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.code === 'UNSUPPORTED_SYNTAX' && /watcher/i.test(error.message),
+		);
+	}
+});
+
 test('accepts model-authored locals, conditionals, bounded for loops, and watchers', () => {
 	const compiled = parseArenaScript(`
 		program.onUnhandledAttention("pause_and_notify");

@@ -134,6 +134,23 @@ test('protocol v2 requires immutable provenance on every action command form', (
 	);
 });
 
+test('protocol v2 carries a bounded watcher identity with the selected trace', () => {
+	const payload = {
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-watcher', actionType: 'wait', arguments: { durationMs: 25 },
+		provenance: { ...PROVENANCE, traceId: TRACE_ID, watcherId: 'watcher-0' },
+	};
+	assert.equal(validateProtocolV2Payload('action_command', payload).provenance.watcherId, 'watcher-0');
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, provenance: { ...payload.provenance, traceId: undefined } }),
+		/traceId/i,
+		'watcher provenance must select a trace',
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, provenance: { ...payload.provenance, watcherId: 'x'.repeat(129) } }),
+		/watcherId/i,
+	);
+});
+
 test('traced action commands, progress, and results round-trip one bounded trace ID', () => {
 	const traceId = 'trace-wire-1';
 	const command = validateProtocolV2Payload('action_command', {

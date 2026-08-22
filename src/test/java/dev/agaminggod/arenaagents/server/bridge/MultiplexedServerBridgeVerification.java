@@ -127,11 +127,13 @@ public final class MultiplexedServerBridgeVerification {
 		wireProvenance.addProperty("sourceStepId", "step-1");
 		wireProvenance.addProperty("eventSequence", 1L);
 		wireProvenance.addProperty("traceId", traceId);
+		wireProvenance.addProperty("watcherId", "watcher-0");
 		payload.add("provenance", wireProvenance);
 		ServerActionRequest request = MultiplexedServerBridge.decodeActionRequest(
 				new BridgeEnvelope(2, "server-instance", agent.toString(), "action_command", "message-1", payload)
 		);
 		assertEquals(traceId, request.traceId(), "action request retains the trace ID");
+		assertEquals("watcher-0", request.provenance().watcherId(), "action request retains watcher provenance");
 		ServerActionProgress progress = new ServerActionProgress(agent, 1L, "action-1", ActionType.WAIT, traceId, 0.5D, 1L, 2L);
 		ServerActionResult result = new ServerActionResult(agent, 1L, "action-1", ActionType.WAIT, traceId, ServerActionState.SUCCEEDED, "DONE", "", 2L, 3L);
 		assertEquals(traceId, progress.traceId(), "first progress retains the action trace ID");

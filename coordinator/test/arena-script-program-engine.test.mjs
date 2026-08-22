@@ -89,6 +89,67 @@ test('watchers fire on false-to-true edges and boundary handlers wait for the ac
 	assert.deepEqual(dispatched.map((row) => row.action.type), ['move_to', 'wait']);
 });
 
+test('coalesces one pending latch per watcher and preserves the newest facts sequence', () => {
+	const traces = [];
+	const { engine, dispatched } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); });
+		await player.wait(1);
+	`, { trace: (event, fields) => traces.push({ event, ...fields }) });
+	const base = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation({ player: { health: 19 } }), eventSequence: 2, attention: true });
+	engine.ingestObservation({ observation: observation({ player: { health: 20 } }), eventSequence: 3, attention: false });
+	engine.ingestObservation({ observation: observation({ player: { health: 19 } }), eventSequence: 4, attention: true });
+	engine.ingestActionResult({ actionId: base.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 5 });
+	engine.ingestObservation({ observation: observation({ player: { health: 19 } }), eventSequence: 5, attention: false });
+	assert.deepEqual(dispatched.map((row) => row.action.arguments), [1, 9]);
+	assert.equal(dispatched.at(-1).provenance.authorizingEventSequence, 4);
+	assert.equal(traces.some((entry) => entry.event === 'watcher_coalesced' && entry.watcherId === 'watcher-0'), true);
+});
+
+test('cancellation transport failure converges to a paused fence and ignores late results', () => {
+	const dispatched = [];
+	const cancelled = [];
+	const engine = new ArenaScriptEngine({
+		dispatch: (command) => dispatched.push(command),
+		cancel: (actionId) => cancelled.push(actionId),
+		requestModel() {},
+	});
+	engine.install({
+		agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1,
+		compiled: parseArenaScript('program.onUnhandledAttention("pause_and_notify"); await player.wait(1);'), observation: observation(), eventSequence: 1,
+	});
+	const active = dispatched[0];
+	engine.suspend('operator');
+	assert.deepEqual(cancelled, [active.actionId]);
+	engine.failCancellation({ actionId: active.actionId, eventSequence: 2, reasonCode: 'CANCEL_SEND_FAILED' });
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	assert.equal(engine.snapshot().activeActionId, null);
+	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3 });
+	assert.equal(dispatched.length, 1);
+});
+
+test('carries the exact profile, trace, and watcher identity into watcher commands', () => {
+	const dispatched = [];
+	const engine = new ArenaScriptEngine({ dispatch: (command) => dispatched.push(command), cancel() {}, requestModel() {} });
+	engine.install({
+		agentId: 'agent-a', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast',
+		goalRevision: 1, modelIdentity: 'gpt-5.6-sol', traceId: 'trace-watch-1', programId: 'program-a', version: 1,
+		compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);'),
+		observation: observation(), eventSequence: 1,
+	});
+	const base = dispatched[0];
+	engine.ingestObservation({ observation: observation({ player: { health: 19 } }), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: base.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	const watcher = dispatched.at(-1);
+	assert.equal(watcher.provenance.provider, 'codex');
+	assert.equal(watcher.provenance.model, 'gpt-5.6-sol');
+	assert.equal(watcher.provenance.reasoningEffort, 'high');
+	assert.equal(watcher.provenance.serviceTier, 'fast');
+	assert.equal(watcher.provenance.traceId, 'trace-watch-1');
+	assert.equal(watcher.provenance.watcherId, 'watcher-0');
+});
+
 test('interrupt watchers wait for cancellation acknowledgement and unmatched attention follows the authored policy', () => {
 	const { engine, dispatched, cancelled, modelRequests } = engineFor(`
 		program.onUnhandledAttention("pause_and_notify");

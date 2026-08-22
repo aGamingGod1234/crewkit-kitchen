@@ -435,9 +435,12 @@ export function validateActionCommandPayload(value) {
 
 export function validateActionProvenance(value) {
 	const provenance = requireObject(value, 'provenance');
+	if (provenance.watcherId !== undefined && provenance.traceId === undefined) {
+		throw invalid('MISSING_FIELD', 'Required field provenance.traceId is missing for watcher provenance');
+	}
 	requireKeys(
 		provenance,
-		['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'programVersion', 'sourceStepId', 'eventSequence', 'traceId'],
+		['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'programVersion', 'sourceStepId', 'eventSequence', 'traceId', 'watcherId'],
 		'provenance',
 		['provider', 'model', 'reasoningEffort', 'serviceTier', 'programId', 'programVersion', 'sourceStepId', 'eventSequence'],
 	);
@@ -453,6 +456,7 @@ export function validateActionProvenance(value) {
 		sourceStepId: requireText(provenance.sourceStepId, 'provenance.sourceStepId', MAX_PROVENANCE_TEXT_LENGTH),
 		eventSequence: provenance.eventSequence,
 		...(provenance.traceId === undefined ? {} : { traceId: requireTraceId(provenance.traceId) }),
+		...(provenance.watcherId === undefined ? {} : { watcherId: requireText(provenance.watcherId, 'provenance.watcherId', 128) }),
 	});
 }
 
