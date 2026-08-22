@@ -89,6 +89,29 @@ test('paces capture turns so nonzero multi-turn records replay without prompt dr
 	assert.equal(replay.cleanup.ok, true);
 });
 
+test('records a cleanup-aborted pending continuation so delayed stone replay is not exhausted', async () => {
+	const delayedMatrix = matrix([4]);
+	const fixture = await generateReplayRecordings({
+		matrix: delayedMatrix,
+		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
+		delayMs: 125,
+	});
+	assert.ok(fixture.recordings.every((record) => record.decisions.length >= 2));
+
+	const replay = await runLatencyMatrix({
+		matrix: delayedMatrix,
+		scenarioResolver: () => getSimulatorScenario('stone-tool-gathering'),
+		replayRecordings: fixture.recordings,
+		artifactDirectory: null,
+	});
+
+	assert.equal(replay.status, 'PASSED');
+	assert.equal(replay.trials[0].status, 'PASSED');
+	assert.notEqual(replay.trials[0].error?.code, 'REPLAY_EXHAUSTED');
+	assert.notEqual(replay.trials[0].error?.code, 'REPLAY_PROMPT_MISMATCH');
+	assert.equal(replay.cleanup.ok, true);
+});
+
 test('cancels and clears a pending capture delay when the provider turn times out', async () => {
 	const handles = new Set();
 	let scheduled = 0;

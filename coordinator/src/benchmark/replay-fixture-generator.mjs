@@ -99,7 +99,7 @@ function captureProvider({ profile, context, captures, maxTurns, delaySchedule }
 		if (!manifest) throw captureError('REPLAY_FIXTURE_MANIFEST_MISSING', `manifest is missing for '${trial.id}/${agentId}'`);
 		return [agentId, compileScenarioDecision(manifest)];
 	}));
-	const initialized = new Set();
+	const successfulTurns = new Map();
 	const delayController = createDelayController(delaySchedule.timer);
 	const key = captureKey(trial.id, repetition);
 	const capture = { trialId: trial.id, repetition, scenario: context.scenario, agentIds: [...loadScenario.agentIds], turns: new Map() };
@@ -122,16 +122,25 @@ function captureProvider({ profile, context, captures, maxTurns, delaySchedule }
 			return {
 				async setGoalRevision() {},
 				async decide(input, options = {}) {
-					if (turns.length >= maxTurns) throw captureError('REPLAY_FIXTURE_LIMIT', `planner turn count exceeds ${maxTurns}`);
 					if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('capture planner input must be a nonblank string');
-					const turnIndex = turns.length;
-					const delayMs = resolveDelay(delaySchedule, { trial, repetition, agentId, turnIndex });
-					await delayController.wait(delayMs, options.signal);
-					const initialDecision = !initialized.has(agentId);
-					initialized.add(agentId);
-					const decision = initialDecision ? decisions.get(agentId) : CONTINUE_DECISION;
-					turns.push({ input, decision, delayMs });
-					return decision;
+					const turnIndex = successfulTurns.get(agentId) ?? 0;
+					if (turnIndex >= maxTurns) throw captureError('REPLAY_FIXTURE_LIMIT', `planner turn count exceeds ${maxTurns}`);
+					let turn = turns[turnIndex];
+					if (turn === undefined) {
+						if (turns.length !== turnIndex) throw captureError('REPLAY_FIXTURE_SEQUENCE', `capture turn sequence is inconsistent for '${trial.id}/${agentId}'`);
+						const delayMs = resolveDelay(delaySchedule, { trial, repetition, agentId, turnIndex });
+						const decision = turnIndex === 0 ? decisions.get(agentId) : CONTINUE_DECISION;
+						turn = { input, decision, delayMs };
+						turns.push(turn);
+					} else if (turn.input !== input) {
+						throw captureError('REPLAY_FIXTURE_PROMPT_MISMATCH', `retried planner input changed for '${trial.id}/${agentId}' turn ${turnIndex + 1}`);
+					}
+					await delayController.wait(turn.delayMs, options.signal);
+					if (options.signal?.aborted) throw cancellationReason(options.signal);
+					const completed = successfulTurns.get(agentId) ?? 0;
+					if (completed === turnIndex) successfulTurns.set(agentId, turnIndex + 1);
+					else if (completed !== turnIndex + 1) throw captureError('REPLAY_FIXTURE_SEQUENCE', `capture turn completion is inconsistent for '${trial.id}/${agentId}'`);
+					return turn.decision;
 				},
 			};
 		},
