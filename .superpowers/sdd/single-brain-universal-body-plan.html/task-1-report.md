@@ -225,3 +225,106 @@ Fix-round self-review:
 - Antigravity now preserves and compares `serviceTier` with provider, model, and reasoning effort, with a bounded static conflict message.
 - Active-action lava changes use the factual block observation path and publish through `ObservationPublication`; the boundary test confirms no input lease, applied movement, or body-input clear occurs.
 - `git diff --check` is clean before commit.
+
+## Fix round 2
+
+The rereview found that the boundary test used a controller that was not connected to the publication path. The final fix adds a monotonic input-mutation revision, an `existingController` lookup that never creates input state, and a package-private publication guard used by the real `sendObservation` path. The guard snapshots the existing controller revision, publishes the factual observation, and fails closed if publication mutates input. The server tick is the single-threaded boundary for this snapshot/publication check.
+
+### RED
+
+The focused test was written before adding the revision and guard:
+
+```text
+$taskJdk = (Resolve-Path 'runtime/toolchains/temurin-25/jdk-25.0.3+9').Path
+$env:JAVA_HOME=$taskJdk
+.\gradlew.bat verifyCore
+```
+
+Result:
+
+```text
+> Task :compileTestJava FAILED
+SingleBrainBoundaryVerification.java:26: error: cannot find symbol
+  method publishObservationWithInputGuard(ObservationPublication,Optional<LeasedServerInputController>,AgentId,Object,JsonObject,...)
+SingleBrainBoundaryVerification.java:31: error: cannot find symbol
+  method mutationRevision()
+SingleBrainBoundaryVerification.java:36: error: cannot find symbol
+  method publishObservationWithInputGuard(ObservationPublication,Optional<LeasedServerInputController>,AgentId,Object,JsonObject,...)
+SingleBrainBoundaryVerification.java:46: error: cannot find symbol
+  method mutationRevision()
+4 errors
+BUILD FAILED
+```
+
+This RED is at the Java bridge/input boundary, before production implementation, and does not inspect source text.
+
+### GREEN
+
+Focused Java verification after adding the revision and production guard:
+
+```text
+$taskJdk = (Resolve-Path 'runtime/toolchains/temurin-25/jdk-25.0.3+9').Path
+$env:JAVA_HOME=$taskJdk
+.\gradlew.bat verifyCore
+```
+
+Result:
+
+```text
+PASS: 6370 protocol and bridge assertions
+BUILD SUCCESSFUL
+```
+
+Focused coordinator regression coverage:
+
+```text
+node --test --test-concurrency=1 coordinator/test/provider-service.test.mjs coordinator/test/antigravity-service.test.mjs coordinator/test/codex-service.test.mjs coordinator/test/acp-service.test.mjs coordinator/test/agent-planner.test.mjs
+```
+
+Result:
+
+```text
+tests 66
+pass 66
+fail 0
+cancelled 0
+```
+
+Required full automated verification after the final guard implementation:
+
+```text
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-automated-verification.ps1
+```
+
+Result:
+
+```text
+BUILD SUCCESSFUL
+PASS: 6370 protocol and bridge assertions
+PASS: 77 voice-addon assertions
+tests 525
+pass 525
+fail 0
+cancelled 0
+Automated Java, Fabric, coordinator, and fake-E2E verification passed.
+```
+
+### Files changed
+
+- `src/main/java/dev/agaminggod/arenaagents/server/runtime/input/LeasedServerInputController.java`: exposes a monotonic mutation revision and advances it on acquire, apply, release, and effective clear mutations.
+- `src/main/java/dev/agaminggod/arenaagents/server/runtime/input/AgentInputRuntime.java`: adds `existingController`, an optional lookup that does not create a controller.
+- `src/main/java/dev/agaminggod/arenaagents/server/bridge/MultiplexedServerBridge.java`: adds the package-private revision guard and routes production `sendObservation` through it using the existing controller from `manager.server()`.
+- `src/test/java/dev/agaminggod/arenaagents/server/bridge/SingleBrainBoundaryVerification.java`: invokes the exact guard with a real leased controller and recording sink, then asserts unchanged revision, empty input state, and no sink calls while active-action lava publishes attention.
+
+### Self-review
+
+- The production path calls `AgentInputRuntime.existingController(manager.server())`; it never creates a controller solely for publication guarding.
+- The guard uses the actual existing controller’s revision and checks it in `finally`, including publication failures, then throws a bounded typed bridge error on mutation.
+- The focused test passes the same real `LeasedServerInputController` that owns the `RecordingSink`; its revision and sink assertions are therefore non-vacuous.
+- The only production input operation exposed to the guard is the revision snapshot; the guard cannot acquire, apply, release, or clear input.
+- No body policy, fallback action, synthetic movement, or network/socket lifecycle was added.
+- `git diff --check` is clean before commit.
+
+### Concerns
+
+The guard relies on the documented server-tick single-threaded boundary: input mutations and observation publication are serialized for the revision check. The revision is synchronized so reads remain safe if a lifecycle path inspects it outside the tick.

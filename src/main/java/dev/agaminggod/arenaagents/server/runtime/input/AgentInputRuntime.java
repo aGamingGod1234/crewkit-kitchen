@@ -20,6 +20,12 @@ public final class AgentInputRuntime {
 		return CONTROLLERS.computeIfAbsent(server, ignored -> new LeasedServerInputController(new CarpetInputStateSink(manager)));
 	}
 
+	public static synchronized Optional<LeasedServerInputController> existingController(MinecraftServer server) {
+		return Optional.ofNullable(CONTROLLERS.get(
+				java.util.Objects.requireNonNull(server, "server must not be null")
+		));
+	}
+
 	public static LeasedServerInputController controller(ServerPlayer player) {
 		return controller(player.level().getServer());
 	}

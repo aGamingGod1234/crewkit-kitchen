@@ -37,6 +37,8 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
+import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
@@ -188,6 +190,28 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	ObservationPublication observationPublicationForVerification() {
 		return observationPublication;
+	}
+
+	/** Server ticks serialize input leases with observation publication at this boundary. */
+	static ObservationPublication.Result publishObservationWithInputGuard(
+			ObservationPublication publication,
+			Optional<LeasedServerInputController> inputController,
+			AgentId agentId,
+			Object sourceSession,
+			JsonObject observation,
+			ObservationPublication.Writer writer,
+			boolean allowUnchanged) {
+		Objects.requireNonNull(publication, "publication must not be null");
+		Objects.requireNonNull(inputController, "input controller must not be null");
+		long revision = inputController.map(LeasedServerInputController::mutationRevision).orElse(-1L);
+		try {
+			return publication.publish(agentId, sourceSession, observation, writer, allowUnchanged);
+		} finally {
+			if (inputController.isPresent() && inputController.get().mutationRevision() != revision) {
+				throw new BridgeProtocolException(
+						"INPUT_MUTATED_DURING_OBSERVATION", "Observation publication changed input state");
+			}
+		}
 	}
 
 	int boundPortForVerification() {
@@ -979,8 +1003,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		final JsonObject observation;
 		try {
 			observation = observations.collect(agentId);
-			ObservationPublication.Result result = observationPublication.publish(
-					agentId, source, observation,
+			ObservationPublication.Result result = publishObservationWithInputGuard(
+					observationPublication,
+					AgentInputRuntime.existingController(manager.server()),
+					agentId,
+					source,
+					observation,
 					(ignoredAgent, payload) -> sendObservationEnvelope(source, ignoredAgent, payload),
 					heartbeat
 			);

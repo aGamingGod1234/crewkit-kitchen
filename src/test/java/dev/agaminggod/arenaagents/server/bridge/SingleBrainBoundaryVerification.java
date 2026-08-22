@@ -7,6 +7,7 @@ import dev.agaminggod.arenaagents.server.runtime.input.InputStateSink;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /** Verifies that bridge hazard publication stays factual and never acquires body input. */
 public final class SingleBrainBoundaryVerification {
@@ -17,31 +18,36 @@ public final class SingleBrainBoundaryVerification {
 		AgentId agent = AgentId.parse("00000000-0000-0000-0000-000000000071");
 		MultiplexedServerBridge.ObservationPublication publication =
 				new MultiplexedServerBridge.ObservationPublication(16, 16);
+		RecordingSink sink = new RecordingSink();
+		LeasedServerInputController input = new LeasedServerInputController(sink);
 		Object session = new Object();
 		MultiplexedServerBridge.onSessionAccepted(publication, session);
 		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
-				publication.publish(agent, session, activeObservation(1_000L), (ignoredAgent, ignoredPayload) -> true),
+				MultiplexedServerBridge.publishObservationWithInputGuard(
+						publication, Optional.of(input), agent, session, activeObservation(1_000L),
+						(ignoredAgent, ignoredPayload) -> true, false),
 				"active action establishes a bridge observation baseline");
 
-		RecordingSink sink = new RecordingSink();
-		LeasedServerInputController input = new LeasedServerInputController(sink);
+		long revisionBeforeHazard = input.mutationRevision();
 		List<JsonObject> delivered = new ArrayList<>();
 		JsonObject lavaObservation = activeObservation(1_001L);
 		lavaObservation.getAsJsonArray("blocks").add(block("minecraft:lava"));
 		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
-				publication.publish(agent, session, lavaObservation, (ignoredAgent, payload) -> {
-					delivered.add(payload.deepCopy());
-					return true;
-				}),
+				MultiplexedServerBridge.publishObservationWithInputGuard(
+						publication, Optional.of(input), agent, session, lavaObservation, (ignoredAgent, payload) -> {
+							delivered.add(payload.deepCopy());
+							return true;
+						}, false),
 				"active-action lava publishes through the bridge");
 		JsonObject payload = delivered.getFirst();
 		assertTrue(payload.get("attention").getAsBoolean(), "active-action lava is urgent factual attention");
 		assertTrue(payload.getAsJsonArray("changedFacts").contains(new com.google.gson.JsonPrimitive("blocks.0,64,0")),
 				"active-action lava is published as an observed block fact");
+		assertEquals(revisionBeforeHazard, input.mutationRevision(), "hazard publication does not mutate input revision");
 		assertTrue(input.currentState(agent).isEmpty(), "hazard publication acquires no synthetic input lease");
 		assertEquals(List.of(), sink.applied, "hazard publication emits no synthetic movement input");
 		assertEquals(List.of(), sink.cleared, "hazard publication clears no body input");
-		return 5;
+		return 6;
 	}
 
 	private static JsonObject activeObservation(long observedAtEpochMs) {
