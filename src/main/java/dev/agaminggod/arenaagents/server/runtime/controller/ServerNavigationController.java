@@ -36,6 +36,7 @@ public final class ServerNavigationController implements ServerController {
 	private WaypointProgress progress;
 	private double lastProgressValue;
 	private InputLease inputLease;
+	private AgentInputStates.MotorState motorState;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -100,7 +101,7 @@ public final class ServerNavigationController implements ServerController {
 			waypoint = plan.nodes().get(waypointIndex);
 			target = center(waypoint.position());
 		}
-		drive(player, waypoint, target);
+		drive(player, waypoint, target, nowEpochMs);
 		return TickResult.running(update.progress());
 	}
 
@@ -108,6 +109,7 @@ public final class ServerNavigationController implements ServerController {
 	public void cancel(ServerPlayer player) {
 		if (inputLease == null) {
 			OfflineAgentPlayers.stop(player);
+			motorState = null;
 			return;
 		}
 		try {
@@ -116,6 +118,7 @@ public final class ServerNavigationController implements ServerController {
 			// A lifecycle clear may already have invalidated every lease.
 		}
 		inputLease = null;
+		motorState = null;
 	}
 
 	private TickResult replanOrResult(ServerPlayer player, long nowEpochMs, double remaining) {
@@ -159,23 +162,36 @@ public final class ServerNavigationController implements ServerController {
 		return null;
 	}
 
-	private void drive(ServerPlayer player, PathNode waypoint, Vec3 target) {
+	private void drive(ServerPlayer player, PathNode waypoint, Vec3 target, long nowEpochMs) {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
 		LeasedServerInputController controller = AgentInputRuntime.controller(player);
 		if (inputLease == null) {
 			inputLease = controller.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
 		}
-		controller.apply(inputLease, AgentInputStates.lookingAt(
-				player,
-				target.add(0.0D, 0.85D, 0.0D),
-				1.0F,
-				0.0F,
-				waypoint.traversal() == TraversalType.JUMP_UP || gapJump,
-				false,
-				(sprint || gapJump) && player.getFoodData().getFoodLevel() > 6,
-				false,
-				false,
-				InteractionHand.MAIN_HAND
+		Vec3 lookTarget = target.add(0.0D, 0.85D, 0.0D);
+		Vec3 delta = lookTarget.subtract(player.getEyePosition());
+		double horizontal = Math.sqrt(delta.x * delta.x + delta.z * delta.z);
+		float targetYaw = net.minecraft.util.Mth.wrapDegrees(
+				(float) Math.toDegrees(Math.atan2(-delta.x, delta.z)));
+		float targetPitch = net.minecraft.util.Mth.clamp(
+				(float) -Math.toDegrees(Math.atan2(delta.y, horizontal)), -90.0F, 90.0F);
+		if (motorState == null) motorState = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
+		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(
+				motorState,
+				new AgentInputStates.MotorTarget(
+						targetYaw,
+						targetPitch,
+						true,
+						waypoint.traversal() == TraversalType.JUMP_UP || gapJump,
+						(sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
+				),
+				nowEpochMs
+		);
+		motorState = step.state();
+		controller.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
+				step.forward(), step.strafe(), step.jump(), false, step.sprint(),
+				false, false, step.state().yaw(), step.state().pitch(),
+				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 		));
 	}
 

@@ -6,7 +6,6 @@ import dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates;
 import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
 import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
-import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
@@ -19,6 +18,7 @@ import java.util.Objects;
  */
 public final class ServerCombatController implements ServerController {
 	private static final double ATTACK_REACH = 3.0D;
+	private static final double PURSUIT_REPLAN_DISTANCE_SQUARED = 0.25D;
 
 	private final Entity target;
 	private final CombatIntent intent;
@@ -27,6 +27,7 @@ public final class ServerCombatController implements ServerController {
 	private ServerNavigationController navigation;
 	private Vec3 navigationTarget;
 	private InputLease combatLease;
+	private AgentInputStates.MotorState motorState;
 
 	public ServerCombatController(Entity target, CombatIntent intent, long startedAt) {
 		this.target = Objects.requireNonNull(target, "target must not be null");
@@ -60,10 +61,12 @@ public final class ServerCombatController implements ServerController {
 		);
 		CombatDecision decision = policy.decide(
 				new CombatSnapshot(
-						targetAlive,
-						invulnerable,
-						targetAlive ? distance : 0.0D,
-						player.getAttackStrengthScale(0.5F) >= 0.9F
+					targetAlive,
+					invulnerable,
+					targetAlive ? distance : 0.0D,
+					player.getAttackStrengthScale(0.5F) >= 0.9F,
+					targetAlive && hasLineOfSight(player, target),
+					targetAlive ? aimErrorDegrees(player, target) : 180.0D
 				),
 				effective
 		);
@@ -75,12 +78,12 @@ public final class ServerCombatController implements ServerController {
 					: succeeded(player, "FOLLOW_DISTANCE_REACHED", "Requested follow distance reached");
 			case FACE -> {
 				stopNavigation(player);
-				applyCombatInput(player, false);
+				applyCombatInput(player, false, nowEpochMs);
 				yield TickResult.running(progress(distance));
 			}
 			case ATTACK -> {
 				stopNavigation(player);
-				applyCombatInput(player, true);
+				applyCombatInput(player, true, nowEpochMs);
 				yield TickResult.running(progress(distance));
 			}
 			case APPROACH -> navigate(player, target.position(), policyRange, true, nowEpochMs, distance);
@@ -99,6 +102,7 @@ public final class ServerCombatController implements ServerController {
 	public void cancel(ServerPlayer player) {
 		stopNavigation(player);
 		releaseCombat(player);
+		motorState = null;
 		OfflineAgentPlayers.stop(player);
 	}
 
@@ -112,7 +116,7 @@ public final class ServerCombatController implements ServerController {
 	) {
 		releaseCombat(player);
 		if (navigation == null || navigationTarget == null
-				|| navigationTarget.distanceToSqr(destination) > 4.0D) {
+				|| navigationTarget.distanceToSqr(destination) > PURSUIT_REPLAN_DISTANCE_SQUARED) {
 			stopNavigation(player);
 			navigationTarget = destination;
 			long remainingTimeout = Math.max(1_000L, intent.timeoutMs() - Math.max(0L, nowEpochMs - startedAt));
@@ -145,23 +149,43 @@ public final class ServerCombatController implements ServerController {
 		navigationTarget = null;
 	}
 
-	private void applyCombatInput(ServerPlayer player, boolean attack) {
+	private void applyCombatInput(ServerPlayer player, boolean attack, long nowEpochMs) {
 		LeasedServerInputController controller = AgentInputRuntime.controller(player);
 		if (combatLease == null) {
 			combatLease = controller.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.COMBAT, 200);
 		}
-		controller.apply(combatLease, AgentInputStates.lookingAt(
-				player,
-				target.getEyePosition(),
-				0.0F,
-				0.0F,
-				false,
-				false,
-				false,
-				attack,
-				false,
-				InteractionHand.MAIN_HAND
+		Vec3 lookTarget = target.getEyePosition();
+		Vec3 delta = lookTarget.subtract(player.getEyePosition());
+		double horizontal = Math.sqrt(delta.x * delta.x + delta.z * delta.z);
+		float targetYaw = net.minecraft.util.Mth.wrapDegrees(
+				(float) Math.toDegrees(Math.atan2(-delta.x, delta.z)));
+		float targetPitch = net.minecraft.util.Mth.clamp(
+				(float) -Math.toDegrees(Math.atan2(delta.y, horizontal)), -90.0F, 90.0F);
+		if (motorState == null) motorState = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
+		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(
+				motorState,
+				new AgentInputStates.MotorTarget(targetYaw, targetPitch, false, false, false),
+				nowEpochMs
+		);
+		motorState = step.state();
+		controller.apply(combatLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
+				0.0F, 0.0F, false, false, false, attack, false,
+				step.state().yaw(), step.state().pitch(),
+				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 		));
+	}
+
+	private static boolean hasLineOfSight(ServerPlayer player, Entity target) {
+		return player.level() == target.level() && player.hasLineOfSight(target);
+	}
+
+	private static double aimErrorDegrees(ServerPlayer player, Entity target) {
+		Vec3 offset = target.getEyePosition().subtract(player.getEyePosition());
+		if (offset.lengthSqr() < 1.0E-8D) return 0.0D;
+		Vec3 view = player.getViewVector(1.0F);
+		if (view.lengthSqr() < 1.0E-8D) return 180.0D;
+		double dot = Math.max(-1.0D, Math.min(1.0D, view.normalize().dot(offset.normalize())));
+		return Math.toDegrees(Math.acos(dot));
 	}
 
 	private void releaseCombat(ServerPlayer player) {

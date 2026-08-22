@@ -17,6 +17,7 @@ public final class InputStateVerification {
 		assertions += verifyCompleteInputState();
 		assertions += verifyLeasePreemptionAndRestoration();
 		assertions += verifyClearReleasesEveryPressedInput();
+		assertions += verifyBoundedMotor();
 		return assertions;
 	}
 
@@ -71,6 +72,62 @@ public final class InputStateVerification {
 		return 3;
 	}
 
+	private static int verifyBoundedMotor() {
+		AgentInputStates.MotorState initial = AgentInputStates.MotorState.initial(170.0F, 20.0F);
+		AgentInputStates.MotorStep turn = AgentInputStates.stepMotor(
+				initial,
+				new AgentInputStates.MotorTarget(-170.0F, -20.0F, true, false, true),
+				0L
+		);
+		assertEquals(AgentInputStates.MAX_YAW_STEP_DEGREES,
+				Math.abs(AgentInputStates.shortestAngleDelta(initial.yaw(), turn.state().yaw())),
+				"yaw takes the shortest bounded step across wrap");
+		assertEquals(AgentInputStates.MAX_PITCH_STEP_DEGREES,
+				Math.abs(initial.pitch() - turn.state().pitch()),
+				"pitch takes a bounded step");
+		assertTrue(turn.forward() >= 0.0F, "target-relative motor does not reverse unnecessarily");
+		assertTrue(Math.abs(turn.strafe()) > 0.0F, "target-relative motor supplies useful strafing");
+
+		AgentInputStates.MotorState accelerating = AgentInputStates.MotorState.initial(0.0F, 0.0F);
+		AgentInputStates.MotorStep first = AgentInputStates.stepMotor(
+				accelerating,
+				new AgentInputStates.MotorTarget(0.0F, 0.0F, true, false, true),
+				0L
+		);
+		assertEquals(AgentInputStates.MOVE_ACCELERATION, first.forward(), "motor accelerates by a bounded amount");
+		AgentInputStates.MotorStep braking = AgentInputStates.stepMotor(
+				first.state(),
+				new AgentInputStates.MotorTarget(0.0F, 0.0F, false, false, false),
+				1L
+		);
+		assertEquals(0.0F, braking.forward(), "motor brakes to zero without overshoot");
+
+		AgentInputStates.MotorStep jumped = AgentInputStates.stepMotor(
+				initial,
+				new AgentInputStates.MotorTarget(-170.0F, -20.0F, true, true, true),
+				3L
+		);
+		assertEquals(true, jumped.jump(), "jump request produces an edge pulse");
+		AgentInputStates.MotorStep held = AgentInputStates.stepMotor(
+				jumped.state(),
+				new AgentInputStates.MotorTarget(-170.0F, -20.0F, true, true, true),
+				4L
+		);
+		assertEquals(false, held.jump(), "held jump request does not repeat every tick");
+		AgentInputStates.MotorStep released = AgentInputStates.stepMotor(
+				held.state(),
+				new AgentInputStates.MotorTarget(-170.0F, -20.0F, true, false, true),
+				5L
+		);
+		AgentInputStates.MotorStep repulsed = AgentInputStates.stepMotor(
+				released.state(),
+				new AgentInputStates.MotorTarget(-170.0F, -20.0F, true, true, true),
+				6L
+		);
+		assertEquals(true, repulsed.jump(), "a released jump request can pulse again");
+		return 13;
+	}
+
 	private static AgentInputState state(float forward, boolean attack, boolean use) {
 		return new AgentInputState(
 				forward, 0.0F, false, false, forward > 0.0F, attack, use,
@@ -95,6 +152,10 @@ public final class InputStateVerification {
 
 	private static void assertEquals(Object expected, Object actual, String label) {
 		if (!expected.equals(actual)) throw new AssertionError(label + ": expected <" + expected + "> but was <" + actual + ">");
+	}
+
+	private static void assertTrue(boolean condition, String label) {
+		if (!condition) throw new AssertionError(label);
 	}
 
 	private static void assertThrows(Runnable action, String label) {
