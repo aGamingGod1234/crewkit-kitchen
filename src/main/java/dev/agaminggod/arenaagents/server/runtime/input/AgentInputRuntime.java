@@ -49,7 +49,6 @@ public final class AgentInputRuntime {
 	}
 
 	public static synchronized void release(MinecraftServer server) {
-		SafetyInputRuntime.release(server);
 		CONTROLLERS.remove(server);
 	}
 }

@@ -11,6 +11,7 @@ const RECORD = Object.freeze({
 	provider: 'kimi',
 	model: 'kimi-code/k3',
 	reasoningEffort: 'high',
+	serviceTier: 'fast',
 	goalRevision: GOAL_REVISION,
 });
 const VALID_DECISION = Object.freeze({
@@ -199,8 +200,7 @@ test('routes planning through the provider lane and preserves priority and provi
 	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
 	assert.deepEqual(scheduleCalls, [{ agentId: AGENT_ID, options: { lane: RECORD.provider, priority: 'urgent' } }]);
 	assert.equal(createdRecords.length, 1);
-	assert.equal(createdRecords[0].provider, RECORD.provider);
-	assert.equal(createdRecords[0].model, RECORD.model);
+	assert.deepEqual(createdRecords[0], RECORD, 'urgent provider retry retains the exact selected profile');
 	assert.equal(decideAttempts, 2);
 });
 

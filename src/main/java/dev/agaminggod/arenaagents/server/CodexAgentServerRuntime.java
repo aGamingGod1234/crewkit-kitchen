@@ -7,7 +7,6 @@ import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
-import dev.agaminggod.arenaagents.server.runtime.input.SafetyInputRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
@@ -89,7 +88,6 @@ public final class CodexAgentServerRuntime {
 		if (supervisor != null) supervisor.tick(bridge != null && bridge.authenticated());
 		manager.reconcileDeaths();
 		manager.maintainChunkTickets();
-		SafetyInputRuntime.tick(server);
 		VoiceSubsystemRuntime.tick(server);
 		maintainPlanningProgress(manager);
 		if (bridge != null) {

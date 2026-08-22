@@ -6,6 +6,8 @@ import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
+const DEFAULT_SERVICE_TIER = 'priority';
+const PROFILE_KEYS = Object.freeze(['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier']);
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft AI Agents', version: '2.1.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ fs: { readTextFile: false, writeTextFile: false }, terminal: false });
 
@@ -37,17 +39,18 @@ export class AcpProviderService {
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
 		await this.catalog.refresh();
-		const profile = validateProfile(profileValue, this.#config);
-		const existing = this.#agents.get(profile.agentId);
+		const requested = profileIdentity(profileValue, this.#config);
+		const existing = this.#agents.get(requested.agentId);
 		if (existing !== undefined) {
-			if (!existing.matchesProfile(profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `${profile.provider} agent '${profile.agentId}' already has a different profile`);
+			if (!existing.matchesProfile(requested)) throw profileConflict();
 			return existing;
 		}
-		const creating = this.#creating.get(profile.agentId);
+		const creating = this.#creating.get(requested.agentId);
 		if (creating !== undefined) {
-			if (!profilesMatch(creating.profile, profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `${profile.provider} agent '${profile.agentId}' is being created with a different profile`);
+			if (!profilesMatch(creating.profile, requested)) throw profileConflict();
 			return creating.promise;
 		}
+		const profile = validateProfile(profileValue, this.#config);
 		const promise = this.#createAgentOnce(profile, recoverySummary);
 		this.#creating.set(profile.agentId, { profile, promise });
 		try { return await promise; } finally { this.#creating.delete(profile.agentId); }
@@ -124,7 +127,8 @@ class AcpAgent {
 
 	get agentId() { return this.#profile.agentId; }
 	get provider() { return this.#profile.provider; }
-	matchesProfile(profile) { return ['agentId', 'provider', 'model', 'reasoningEffort'].every((key) => this.#profile[key] === profile[key]); }
+	get serviceTier() { return this.#profile.serviceTier; }
+	matchesProfile(profile) { return profilesMatch(this.#profile, profile); }
 
 	async start(cwd) {
 		await this.#transport.start();
@@ -341,6 +345,7 @@ function validateProfile(value, config) {
 		provider: value.provider ?? 'codex',
 		model: requireText(value.model, 'model'),
 		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
 	};
 	if (profile.provider !== config.provider) throw new AcpProtocolError('PROVIDER_MISMATCH', `Expected ${config.provider} profile, received ${profile.provider}`);
 	if (!config.models.includes(profile.model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `${config.provider} model '${profile.model}' is not configured`);
@@ -351,7 +356,22 @@ function validateProfile(value, config) {
 }
 
 function profilesMatch(left, right) {
-	return ['agentId', 'provider', 'model', 'reasoningEffort'].every((key) => left[key] === right[key]);
+	return PROFILE_KEYS.every((key) => left[key] === right[key]);
+}
+
+function profileIdentity(value, config) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('agent profile must be an object');
+	return {
+		agentId: requireText(value.agentId, 'agentId'),
+		provider: value.provider ?? 'codex',
+		model: requireText(value.model, 'model'),
+		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
+	};
+}
+
+function profileConflict() {
+	return new AcpProtocolError('AGENT_PROFILE_CONFLICT', 'Agent profile is immutable for the active ACP session');
 }
 
 function findOption(options, category, { optional = false } = {}) {

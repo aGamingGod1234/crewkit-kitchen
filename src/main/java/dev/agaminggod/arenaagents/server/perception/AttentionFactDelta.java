@@ -19,7 +19,7 @@ public record AttentionFactDelta(long eventSequence, boolean attention, List<Str
 			"onFire", "air", "maxAir", "suffocating", "fallDistance", "lastAttacker", "effects"
 	);
 	private static final Set<String> ACTIVE_ACTION_PLAYER_FACTS = Set.of(
-			"health", "maxHealth", "gameMode", "onFire", "suffocating"
+			"health", "maxHealth", "gameMode", "onFire", "air", "maxAir", "suffocating", "fallDistance"
 	);
 
 	public AttentionFactDelta {

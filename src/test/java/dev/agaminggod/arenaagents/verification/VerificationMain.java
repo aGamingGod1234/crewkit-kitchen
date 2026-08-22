@@ -68,7 +68,7 @@ import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerificatio
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
 import dev.agaminggod.arenaagents.server.runtime.input.InputStateVerification;
-import dev.agaminggod.arenaagents.server.runtime.input.SafetyInputReflexVerification;
+import dev.agaminggod.arenaagents.server.perception.AttentionHazardVerification;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistryVerification;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVerification;
@@ -176,7 +176,7 @@ public final class VerificationMain {
 		passedAssertions += EquipmentAndUseVerification.verify();
 		passedAssertions += ServerActionExecutorVerification.verify();
 		passedAssertions += InputStateVerification.verify();
-		passedAssertions += SafetyInputReflexVerification.verify();
+		passedAssertions += AttentionHazardVerification.verify();
 		passedAssertions += MenuCapabilityRegistryVerification.verify();
 		passedAssertions += VoiceSubsystemVerification.verify();
 		passedAssertions += ServerPathPlannerVerification.verify();

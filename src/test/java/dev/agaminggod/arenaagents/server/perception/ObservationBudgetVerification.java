@@ -21,8 +21,8 @@ public final class ObservationBudgetVerification {
 		assertEquals(7L, delta.eventSequence(), "event sequence is retained exactly");
 		assertTrue(delta.changedFacts().contains("player.health"), "health delta is factual");
 		assertTrue(delta.changedFacts().contains("player.onFire"), "fire delta is factual");
-		assertFalse(delta.changedFacts().contains("player.fallDistance"),
-				"routine action motion is not a reactive interruption");
+		assertTrue(delta.changedFacts().contains("player.fallDistance"),
+				"falling remains a factual hazard interruption");
 		assertFalse(delta.changedFacts().contains("currentAction"),
 				"action lifecycle is delivered by typed action events instead of attention");
 		assertFalse(delta.changedFacts().stream().anyMatch(path -> path.contains("danger") || path.contains("flee") || path.contains("fight")),
@@ -179,7 +179,7 @@ public final class ObservationBudgetVerification {
 		JsonObject player = value.getAsJsonObject("player");
 		player.addProperty("onGround", x == 0.0D);
 		player.addProperty("foodLevel", x == 0.0D ? 20 : 19);
-		player.addProperty("fallDistance", x);
+		player.addProperty("fallDistance", 0.0D);
 		JsonObject lastAttacker = new JsonObject();
 		lastAttacker.addProperty("uuid", "00000000-0000-0000-0000-000000000002");
 		lastAttacker.addProperty("type", "minecraft:zombie");

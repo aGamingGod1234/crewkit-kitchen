@@ -81,6 +81,28 @@ test('Codex service shares one initialized transport across isolated agent threa
 	await service.stop();
 });
 
+test('Codex recovery reuses one exact profile and session and rejects profile mutation', async () => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const selected = profile('agent-profile');
+	const agent = await service.createAgent(selected, { recoverySummary: 'recover through the same session' });
+	assert.equal(await service.createAgent(selected, { recoverySummary: 'same profile retry' }), agent);
+	for (const mutation of [
+		{ model: 'gpt-5.6-other' },
+		{ reasoningEffort: 'low' },
+		{ serviceTier: 'priority' },
+	]) {
+		await assert.rejects(
+			service.createAgent({ ...selected, ...mutation }),
+			(error) => error?.code === 'AGENT_PROFILE_CONFLICT'
+				&& error?.message.length <= 256
+				&& !error?.message.includes('secret'),
+		);
+	}
+	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 1);
+	await service.stop();
+});
+
 test('Codex service gives concurrent thread creation enough time for a full arena roster', async () => {
 	const transport = new FakeSharedTransport();
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });

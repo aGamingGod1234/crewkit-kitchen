@@ -73,6 +73,31 @@ test('Gemini ACP sessions apply the exact model and thinking level and parse pla
 	await service.stop();
 });
 
+test('ACP keeps the exact service profile for recovery and rejects profile mutation', async () => {
+	const transport = new FakeAcpTransport(options());
+	const service = new AcpProviderService(
+		{ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] },
+		{ transportFactory: () => transport },
+	);
+	const selected = { agentId: 'gemini-profile', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'fast' };
+	const agent = await service.createAgent(selected, { recoverySummary: 'recover through the same session' });
+	assert.equal(await service.createAgent(selected, { recoverySummary: 'same profile retry' }), agent);
+	for (const mutation of [
+		{ model: 'auto' },
+		{ reasoningEffort: 'low' },
+		{ serviceTier: 'priority' },
+	]) {
+		await assert.rejects(
+			service.createAgent({ ...selected, ...mutation }),
+			(error) => error?.code === 'AGENT_PROFILE_CONFLICT'
+				&& error?.message.length <= 256
+				&& !error?.message.includes('secret'),
+		);
+	}
+	assert.equal(transport.calls.filter((call) => call.method === 'session/new').length, 1);
+	await service.stop();
+});
+
 test('ACP processes and sessions use the same per-agent workspace', async () => {
 	const transport = new FakeAcpTransport(options());
 	let launchProfile = null;

@@ -16,6 +16,17 @@ class FakeService {
 	async reconcile(records) { return { valid: records, invalid: [], removed: [], catalog: { provider: this.provider, models: [] } }; }
 }
 
+function profile(provider, overrides = {}) {
+	return {
+		agentId: 'shared-agent',
+		provider,
+		model: `${provider}-model`,
+		reasoningEffort: 'high',
+		serviceTier: 'fast',
+		...overrides,
+	};
+}
+
 test('provider router defaults legacy profiles to Codex and isolates each backend', async () => {
 	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
 	const router = new ProviderService(services);
@@ -28,6 +39,53 @@ test('provider router defaults legacy profiles to Codex and isolates each backen
 	assert.deepEqual(services.kimi.removed, ['k']);
 	await router.stop();
 	assert.equal(services.gemini.stopped, true);
+});
+
+test('provider router rejects every profile mutation for an existing agent ID', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const router = new ProviderService(services);
+	const selected = profile('codex');
+	const agent = await router.createAgent(selected);
+	assert.equal(agent.provider, 'codex');
+
+	for (const mutation of [
+		{ provider: 'gemini' },
+		{ model: 'codex-other-model' },
+		{ reasoningEffort: 'low' },
+		{ serviceTier: 'priority' },
+	]) {
+		await assert.rejects(
+			router.createAgent({ ...selected, ...mutation }),
+			(error) => error?.code === 'AGENT_PROFILE_CONFLICT'
+				&& error?.message.length <= 256
+				&& !error?.message.includes('secret'),
+		);
+	}
+	assert.equal(services.codex.created.length, 1);
+	assert.equal(services.gemini.created.length, 0);
+	assert.equal(services.kimi.created.length, 0);
+	await router.stop();
+});
+
+test('provider router reserves an in-flight agent ID before recovery can mutate its profile', async () => {
+	let release;
+	const pending = new Promise((resolve) => { release = resolve; });
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	services.codex.createAgent = async (value) => {
+		services.codex.created.push(value);
+		await pending;
+		return { agentId: value.agentId, provider: value.provider };
+	};
+	const router = new ProviderService(services);
+	const selected = profile('codex');
+	const creating = router.createAgent(selected, { recoverySummary: 'same brain recovery' });
+	await new Promise((resolve) => setImmediate(resolve));
+	const mutation = router.createAgent({ ...selected, serviceTier: 'priority' }, { recoverySummary: 'mutated recovery' });
+	release();
+	await creating;
+	await assert.rejects(mutation, (error) => error?.code === 'AGENT_PROFILE_CONFLICT');
+	assert.equal(services.codex.created.length, 1);
+	await router.stop();
 });
 
 test('provider reconciliation groups profiles and preserves an unavailable provider as an invalid subset', async () => {

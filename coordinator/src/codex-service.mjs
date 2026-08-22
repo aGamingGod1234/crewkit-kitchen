@@ -8,6 +8,7 @@ const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
 const THREAD_START_TIMEOUT_MS = 60_000;
 const MAX_BUFFERED_TURN_NOTIFICATIONS = 4_096;
+const PROFILE_CONFLICT_MESSAGE = 'Agent profile is immutable for the active Codex session';
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Codex Agents', version: '2.0.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
 
@@ -50,12 +51,12 @@ export class CodexService {
 		const profile = validateProfile(profileValue, this.#config);
 		const existing = this.#agents.get(profile.agentId);
 		if (existing !== undefined) {
-			if (!existing.matchesProfile(profile)) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', `Codex agent '${profile.agentId}' already exists with a different profile`);
+			if (!existing.matchesProfile(profile)) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			return existing;
 		}
 		const creating = this.#creating.get(profile.agentId);
 		if (creating !== undefined) {
-			if (!profilesMatch(creating.profile, profile)) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', `Codex agent '${profile.agentId}' is being created with a different profile`);
+			if (!profilesMatch(creating.profile, profile)) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			return creating.promise;
 		}
 		const promise = this.#createAgentOnce(profile, recoverySummary);
