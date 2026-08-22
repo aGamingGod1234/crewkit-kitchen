@@ -66,7 +66,7 @@ function Get-ProcessCommand([string] $Name) {
 }
 
 function Test-Port([int] $Port) {
-	$connections = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
+	$connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 	return $null -ne ($connections | Select-Object -First 1)
 }
 
@@ -293,6 +293,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$secret = New-Secret
 	$secretPath = Join-Path $scenarioDirectory 'rcon-password.txt'
 	Write-PrivateText $secretPath $secret
+	$bridgeSecretPath = Join-Path $serverDirectory 'arena-agents-runtime\runtime\bridge-secret.txt'
+	Write-PrivateText $bridgeSecretPath $secret
 	$propertiesPath = Join-Path $serverDirectory 'server.properties'
 	Set-ServerProperties $propertiesPath @{
 		'online-mode' = 'false'
@@ -328,7 +330,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$failure = $null
 	$runnerExit = $null
 	try {
-		$serverArgs = "-Darenaagents.bridgeSecretFile=$(Quote-Argument $secretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
+		$serverArgs = "-Darenaagents.bridgeSecretFile=$(Quote-Argument $bridgeSecretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
 		$serverHandle = Start-RedirectedProcess $Java $serverArgs $serverDirectory (Join-Path $logsDirectory 'fabric.stdout.log') (Join-Path $logsDirectory 'fabric.stderr.log') @{}
 		$observedProcessIds += Get-ProcessTreeIds $serverHandle.Process.Id
 		Wait-Condition { (Test-Port $serverPort) -and ((Read-Text $serverLog).Contains('Done (')) } $StartupTimeoutSeconds 'Fabric server did not become ready'
