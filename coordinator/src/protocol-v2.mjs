@@ -28,6 +28,7 @@ import {
 import { encodeJsonLine, JsonlDecoder } from './jsonl.mjs';
 import { MessageIdGenerator } from './message-id.mjs';
 import { ValidationError, validateAction, validateActionCommandPayload } from './schema.mjs';
+import { bindCompletionContract, parseCompletionContract } from './goal-contract.mjs';
 
 const MAX_COORDINATOR_CIRCUITS = 32;
 
@@ -57,13 +58,14 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'conversation_wake',
 	'action_progress',
 	'action_result',
+	'goal_completion_result',
 	'heartbeat',
 	'shutdown',
 ]);
 
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
-const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'conversation_event', 'action_progress', 'action_result']);
+const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'conversation_event', 'action_progress', 'action_result', 'goal_completion_result']);
 const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'conversation_wake_request', 'action_command', 'action_cancel', 'agent_error']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
@@ -175,8 +177,16 @@ export function validateProtocolV2Payload(type, value) {
 			exactKeys(value, ['goalRevision', 'state'], ['goalRevision', 'state'], type);
 			return { goalRevision: revision(value.goalRevision, 'goalRevision'), state: boundedText(value.state, 'state', MAX_REASON_CODE_LENGTH) };
 		case 'goal_completed':
-			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
-			return { goalRevision: revision(value.goalRevision, 'goalRevision') };
+			return normalizeGoalCompletionRequest(value);
+		case 'goal_completion_result':
+			exactKeys(value, ['goalRevision', 'traceId', 'contractHash', 'verified', 'reasonCode'], ['goalRevision', 'traceId', 'contractHash', 'verified', 'reasonCode'], type);
+			return {
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
+				traceId: requireTraceId(value.traceId),
+				contractHash: boundedText(value.contractHash, 'contractHash', 80),
+				verified: boolean(value.verified, 'verified'),
+				reasonCode: boundedText(value.reasonCode, 'reasonCode', MAX_REASON_CODE_LENGTH),
+			};
 		case 'conversation_wake_ack':
 			exactKeys(value, ['transactionId', 'goalRevision'], ['transactionId', 'goalRevision'], type);
 			return {
@@ -967,6 +977,25 @@ function normalizeActionResult(value) {
 	}
 	if (normalized.physicalAttempted === true && normalized.executionStarted !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted requires executionStarted');
 	return normalized;
+}
+
+function normalizeGoalCompletionRequest(value) {
+	const allowed = ['goalRevision', 'completionContract', 'traceId', 'profile', 'contractHash'];
+	if (!Object.hasOwn(value, 'completionContract')) throw new ProtocolV2Error('CONTRACT_REQUIRED', 'goal_completed requires a factual completionContract');
+	exactKeys(value, allowed, allowed, 'goal_completed');
+	if (value.completionContract === null) throw new ProtocolV2Error('CONTRACT_REQUIRED', 'goal_completed requires a factual completionContract');
+	const goalRevision = revision(value.goalRevision, 'goalRevision');
+	const traceId = requireTraceId(value.traceId);
+	const contractHash = boundedText(value.contractHash, 'contractHash', 80);
+	let completionContract;
+	try {
+		completionContract = parseCompletionContract(value.completionContract, { goalRevision });
+		const bound = bindCompletionContract(completionContract, { goalRevision, traceId, profile: value.profile });
+		if (bound.contractHash !== contractHash) throw new Error('contractHash does not match completionContract');
+		return { goalRevision, completionContract, traceId, profile: bound.profile, contractHash };
+	} catch (error) {
+		throw new ProtocolV2Error('INVALID_COMPLETION_CONTRACT', error?.message ?? 'completionContract is invalid', { cause: error });
+	}
 }
 
 function normalizeActionCommand(value) {

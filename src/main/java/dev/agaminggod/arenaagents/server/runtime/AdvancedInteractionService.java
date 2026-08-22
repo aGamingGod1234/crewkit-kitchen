@@ -58,10 +58,21 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	private static final long EQUIPMENT_TIMEOUT_MS = 5_000L;
 	private final ServerProtectionPolicy protection;
 	private final ResourceLeaseManager leases;
+	private final CraftCommitter craftCommitter;
 
 	public AdvancedInteractionService(ServerProtectionPolicy protection, ResourceLeaseManager leases) {
+		this(protection, leases, (menu, player, resultSlot) -> menu.quickMoveStack(player, resultSlot));
+	}
+
+	AdvancedInteractionService(ServerProtectionPolicy protection, ResourceLeaseManager leases, CraftCommitter craftCommitter) {
 		this.protection = Objects.requireNonNull(protection);
 		this.leases = Objects.requireNonNull(leases);
+		this.craftCommitter = Objects.requireNonNull(craftCommitter);
+	}
+
+	@FunctionalInterface
+	interface CraftCommitter {
+		ItemStack quickMove(AbstractContainerMenu menu, ServerPlayer player, int resultSlot);
 	}
 
 	static String canonicalRecipeId(String recipeId) {
@@ -172,6 +183,12 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 
 	static boolean craftOutputSatisfiesRequest(int outputCount, int requestedCount) {
 		return requestedCount > 0 && outputCount >= requestedCount;
+	}
+
+	static String craftPlacementFailureReason(RecipeBookMenu.PostPlaceAction placement) {
+		return placement == RecipeBookMenu.PostPlaceAction.PLACE_GHOST_RECIPE
+				? "RECIPE_INPUTS_UNAVAILABLE"
+				: "RECIPE_PLACEMENT_REJECTED";
 	}
 
 	@Override
@@ -582,6 +599,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			if (!menu.getCarried().isEmpty()) {
 				return TickResult.failed("TRANSACTION_CONFLICT", "Safe crafting requires an empty carried stack");
 			}
+			CraftMenuSnapshot beforeCraft = CraftMenuSnapshot.capture(menu);
 			TransactionSnapshot.CraftPlacementGuard placementGuard =
 					new TransactionSnapshot.CraftPlacementGuard(ownedStacks(player.getInventory(), gridSlots));
 			placementAttempted = true;
@@ -603,7 +621,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				}
 				if (placement != RecipeBookMenu.PostPlaceAction.NOTHING) {
 					return failureAfterPlacement(
-							"RECIPE_PLACEMENT_REJECTED",
+							craftPlacementFailureReason(placement),
 							"Vanilla recipe placement did not place one craft",
 							placementGuard,
 							gridSlots
@@ -697,7 +715,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 					);
 				}
 				try {
-					ItemStack moved = menu.quickMoveStack(player, 0);
+					ItemStack moved = craftCommitter.quickMove(menu, player, 0);
 					menu.broadcastChanges();
 					TransactionPostcondition.Verdict craftVerdict = accounting.verify(
 							ownedStacks(player.getInventory(), gridSlots));
@@ -706,11 +724,17 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 						return TickResult.succeeded("CRAFT_CONFIRMED",
 								"One vanilla recipe transaction completed with remainder handling");
 					}
-					return TickResult.failed("ROLLBACK_FAILED",
-							"Irreversible craft completed without exact ingredient, remainder, and output accounting");
+					return rollbackCommittedCraft(
+							menu, beforeCraft, placementGuard, gridSlots,
+							"CRAFT_POSTCONDITION_FAILED",
+							"Craft result did not satisfy exact ingredient, remainder, and output accounting"
+					);
 				} catch (RuntimeException mutationFailure) {
-					return TickResult.failed("ROLLBACK_FAILED",
-							"Irreversible craft mutation raised an exception: " + safeMessage(mutationFailure));
+					return rollbackCommittedCraft(
+							menu, beforeCraft, placementGuard, gridSlots,
+							"CRAFT_POSTCOMMIT_EXCEPTION",
+							"Craft mutation raised an exception: " + safeMessage(mutationFailure)
+					);
 				}
 			} catch (RuntimeException placementFailure) {
 				return failureAfterPlacement(
@@ -750,9 +774,47 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 					message + "; exact pre-placement ownership restoration was not proved" + suffix);
 		}
 
+		private TickResult rollbackCommittedCraft(
+			AbstractContainerMenu menu,
+			CraftMenuSnapshot beforeCraft,
+			TransactionSnapshot.CraftPlacementGuard placementGuard,
+			List<Slot> gridSlots,
+			String reasonCode,
+			String message
+		) {
+			RuntimeException restoreFailure = null;
+			try {
+				beforeCraft.restore(menu);
+				menu.broadcastChanges();
+			} catch (RuntimeException exception) {
+				restoreFailure = exception;
+			}
+			if (restoreFailure != null) {
+				try { cleanup(); } catch (RuntimeException cleanupFailure) { restoreFailure.addSuppressed(cleanupFailure); }
+				return TickResult.failed("ROLLBACK_FAILED", message + "; exact pre-action inventory restoration failed");
+			}
+			TickResult restored = failureAfterPlacement(reasonCode, message + "; exact pre-action inventory restored", placementGuard, gridSlots);
+			if (restored.reasonCode().equals("ROLLBACK_FAILED")) return restored;
+			return restored;
+		}
+
 		@Override
 		void beforeCleanup() {
 			if (!table && placementAttempted) player.inventoryMenu.removed(player);
+		}
+	}
+
+	static record CraftMenuSnapshot(List<ItemStack> slots, ItemStack carried) {
+		static CraftMenuSnapshot capture(AbstractContainerMenu menu) {
+			List<ItemStack> slots = new ArrayList<>(menu.slots.size());
+			for (int index = 0; index < menu.slots.size(); index++) slots.add(menu.getSlot(index).getItem().copy());
+			return new CraftMenuSnapshot(List.copyOf(slots), menu.getCarried().copy());
+		}
+
+		void restore(AbstractContainerMenu menu) {
+			if (menu.slots.size() != slots.size()) throw new IllegalStateException("Craft menu shape changed during transaction");
+			for (int index = 0; index < slots.size(); index++) menu.getSlot(index).set(slots.get(index).copy());
+			menu.setCarried(carried.copy());
 		}
 	}
 

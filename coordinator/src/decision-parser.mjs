@@ -1,8 +1,9 @@
 import { MAX_SUMMARY_LENGTH } from './constants.mjs';
+import { GoalContractError, parseCompletionContract } from './goal-contract.mjs';
 
 const DIRECTIVES = new Set(['replace', 'continue', 'pause', 'finish']);
 const FINISH_STATUSES = new Set(['completed', 'impossible']);
-const DECISION_KEYS = new Set(['summary', 'directive', 'source', 'status']);
+const DECISION_KEYS = new Set(['summary', 'directive', 'source', 'status', 'completionContract']);
 const MAX_SOURCE_LENGTH = 65_536;
 
 export class DecisionError extends Error {
@@ -31,23 +32,35 @@ export function parseDecision(text) {
 	if (!DIRECTIVES.has(value.directive)) throw new DecisionError('INVALID_DECISION', `Unsupported directive '${String(value.directive)}'`);
 	const hasSource = Object.hasOwn(value, 'source') && value.source !== null;
 	const hasStatus = Object.hasOwn(value, 'status') && value.status !== null;
+	const hasContract = Object.hasOwn(value, 'completionContract') && value.completionContract !== null;
+	let completionContract = null;
+	if (hasContract) {
+		try { completionContract = parseCompletionContract(value.completionContract); }
+		catch (error) {
+			if (error instanceof GoalContractError) throw new DecisionError('INVALID_COMPLETION_CONTRACT', error.message, { cause: error });
+			throw error;
+		}
+	}
 
 	if (value.directive === 'replace') {
 		if (!hasSource || typeof value.source !== 'string' || value.source.trim().length === 0 || Buffer.byteLength(value.source, 'utf8') > MAX_SOURCE_LENGTH) {
 			throw new DecisionError('DECISION_FIELD_MISMATCH', `replace directive requires nonblank source of at most ${MAX_SOURCE_LENGTH} UTF-8 bytes`);
 		}
 		if (hasStatus) throw new DecisionError('DECISION_FIELD_MISMATCH', 'replace directive must not include status');
-		return { summary: value.summary, directive: 'replace', source: value.source };
+		if (!hasContract) throw new DecisionError('DECISION_FIELD_MISMATCH', 'replace directive requires a factual completionContract');
+		return { summary: value.summary, directive: 'replace', source: value.source, completionContract };
 	}
 
 	if (value.directive === 'finish') {
 		if (!hasStatus || !FINISH_STATUSES.has(value.status)) throw new DecisionError('DECISION_FIELD_MISMATCH', 'finish directive requires status completed or impossible');
 		if (hasSource) throw new DecisionError('DECISION_FIELD_MISMATCH', 'finish directive must not include source');
-		return { summary: value.summary, directive: 'finish', status: value.status };
+		if (!hasContract) throw new DecisionError('DECISION_FIELD_MISMATCH', 'finish directive requires a factual completionContract');
+		return { summary: value.summary, directive: 'finish', status: value.status, completionContract };
 	}
 
 	if (hasSource) throw new DecisionError('DECISION_FIELD_MISMATCH', `${value.directive} directive must not include source`);
 	if (hasStatus) throw new DecisionError('DECISION_FIELD_MISMATCH', `${value.directive} directive must not include status`);
+	if (hasContract) throw new DecisionError('DECISION_FIELD_MISMATCH', `${value.directive} directive must not include completionContract`);
 	return { summary: value.summary, directive: value.directive };
 }
 

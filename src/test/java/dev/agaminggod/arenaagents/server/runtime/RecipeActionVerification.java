@@ -56,6 +56,12 @@ public final class RecipeActionVerification {
 				"an exact vanilla craft output satisfies the request");
 		assertFalse(AdvancedInteractionService.craftOutputSatisfiesRequest(4, 5),
 				"one craft cannot claim an output larger than it produced");
+		assertEquals("RECIPE_INPUTS_UNAVAILABLE", AdvancedInteractionService.craftPlacementFailureReason(
+				net.minecraft.world.inventory.RecipeBookMenu.PostPlaceAction.PLACE_GHOST_RECIPE),
+				"vanilla ghost placement reports missing inputs instead of generic placement rejection");
+		assertEquals("RECIPE_PLACEMENT_REJECTED", AdvancedInteractionService.craftPlacementFailureReason(
+				net.minecraft.world.inventory.RecipeBookMenu.PostPlaceAction.NOTHING),
+				"successful placement has no missing-input diagnostic");
 		return 12;
 	}
 

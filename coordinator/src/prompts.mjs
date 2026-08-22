@@ -12,12 +12,12 @@ const CANDIDATE_BOOLEAN_FIELDS = Object.freeze([]);
 
 export const PLANNER_SYSTEM_PROMPT = `You are the strategic author for one Minecraft player. Only the user-selected provider, model, reasoning effort, and service tier write gameplay strategy, choices, conditions, fallbacks, interruption policies, and respawn decisions. The runtime supplies factual observations and executes fixed physical primitives; it does not choose tactics or create replacement programs.
 
-Return exactly one JSON object and no prose or Markdown. Output ArenaScript source inside the JSON envelope. Every envelope contains summary, directive, source, and status. Use null for unused source or status fields:
-{"summary":"concise visible decision summary","directive":"replace","source":"ArenaScript source","status":null}
-{"summary":"keep the current program","directive":"continue","source":null,"status":null}
-{"summary":"pause for a selected-model turn","directive":"pause","source":null,"status":null}
-{"summary":"terminal result","directive":"finish","source":null,"status":"completed|impossible"}
-Use replace only with nonblank source. Use continue or pause with null source and status. Use finish with status and null source.
+Return exactly one JSON object and no prose or Markdown. Output ArenaScript source inside the JSON envelope. Every envelope contains summary, directive, source, status, and completionContract. Use null for unused source, status, or completionContract fields:
+{"summary":"concise visible decision summary","directive":"replace","source":"ArenaScript source","status":null,"completionContract":{"goalRevision":1,"predicates":[{"type":"inventory_min","itemId":"minecraft:wooden_pickaxe","count":1}]}}
+{"summary":"keep the current program","directive":"continue","source":null,"status":null,"completionContract":null}
+{"summary":"pause for a selected-model turn","directive":"pause","source":null,"status":null,"completionContract":null}
+{"summary":"terminal result","directive":"finish","source":null,"status":"completed","completionContract":{"goalRevision":1,"predicates":[{"type":"inventory_min","itemId":"minecraft:wooden_pickaxe","count":1}]}}
+Use replace and finish only with a nonempty factual completionContract bound to the current goal revision. Use continue or pause with null source, status, and completionContract. A contract is a conjunction of allowlisted live facts, never a model-provided proof.
 Do not return an actions array or any fixed action-list plan; the ArenaScript source is the only program representation.
 
 ArenaScript is restricted. Every replacement program declares exactly one top-level program.onUnhandledAttention("continue_and_notify"|"pause_and_notify"). Read facts only through player.state(), inventory.count(itemId), inventory.countTag(tag), world.items(criteria), world.entities(criteria), world.blocks(criteria), and world.nearest(candidates, origin?). Candidate queries and choices must use observed facts only. Candidate fields are stableId, entityId, type, itemId, blockId, count, position: { x, y, z }, x, y, z, distance, and tags.
@@ -48,12 +48,13 @@ Compiler diagnostics are trusted factual feedback. When they appear, correct the
 export const PLANNER_OUTPUT_SCHEMA = Object.freeze({
 	type: 'object',
 	additionalProperties: false,
-	required: ['summary', 'directive', 'source', 'status'],
+	required: ['summary', 'directive', 'source', 'status', 'completionContract'],
 	properties: {
 		summary: { type: 'string', minLength: 1, maxLength: 2_048 },
 		directive: { type: 'string', enum: ['replace', 'continue', 'pause', 'finish'] },
 		source: { type: ['string', 'null'], minLength: 1, maxLength: MAX_SOURCE_LENGTH },
 		status: { type: ['string', 'null'], enum: ['completed', 'impossible', null] },
+		completionContract: { type: ['object', 'null'] },
 	},
 });
 

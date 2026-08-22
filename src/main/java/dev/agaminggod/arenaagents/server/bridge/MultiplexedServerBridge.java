@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.bridge;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentConstants;
@@ -37,6 +38,8 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
+import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContract;
+import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 import java.io.BufferedInputStream;
@@ -508,9 +511,47 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private void acceptGoalCompleted(BridgeEnvelope envelope) {
 		AgentId agentId = AgentId.parse(envelope.agentId());
 		JsonObject payload = envelope.payload();
-		requireKeys(payload, Set.of("goalRevision"), "goal_completed");
+		if (!payload.has("completionContract")) throw new BridgeProtocolException("CONTRACT_REQUIRED", "goal_completed requires a factual completionContract");
+		requireKeys(payload, Set.of("goalRevision", "completionContract", "traceId", "profile", "contractHash"), "goal_completed");
 		long goalRevision = requiredLong(payload, "goalRevision");
-		router.coordinatorCompleted(agentId, goalRevision);
+		AgentRecord record = manager.registry().require(agentId);
+		String traceId = requiredTraceId(payload, "traceId");
+		String contractHash = requiredString(payload, "contractHash");
+		JsonObject profile = requiredObject(payload, "profile");
+		requireKeys(profile, Set.of("provider", "model", "reasoningEffort", "serviceTier"), "goal_completed.profile");
+		if (!record.profile().provider().equals(requiredString(profile, "provider"))
+				|| !record.profile().model().equals(requiredString(profile, "model"))
+				|| !record.profile().reasoning().equals(requiredString(profile, "reasoningEffort"))
+				|| !record.profile().serviceTier().equals(requiredString(profile, "serviceTier"))) {
+			throw new AgentDomainException("STALE_PROVENANCE", "Completion profile does not match the selected model profile");
+		}
+		JsonElement contractElement = payload.get("completionContract");
+		if (!contractElement.isJsonObject()) throw new BridgeProtocolException("MALFORMED_CONTRACT", "completionContract must be an object");
+		GoalCompletionContract contract = GoalCompletionContract.parse(contractElement.getAsJsonObject());
+		if (contract.goalRevision() != goalRevision || !contractHash.equals(hashContract(contract))) {
+			throw new BridgeProtocolException("STALE_CONTRACT", "Completion contract revision or hash does not match");
+		}
+		GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier().verify(
+				record, manager.findAgentPlayer(agentId).orElse(null), contract, actionExecutor.actionSuccessLedger());
+		JsonObject result = new JsonObject();
+		result.addProperty("goalRevision", goalRevision);
+		result.addProperty("traceId", traceId);
+		result.addProperty("contractHash", contractHash);
+		result.addProperty("verified", verification.verified());
+		result.addProperty("reasonCode", verification.reasonCode());
+		send("goal_completion_result", agentId.toString(), result);
+		if (verification.verified()) router.coordinatorCompleted(agentId, goalRevision);
+	}
+
+	private static String hashContract(GoalCompletionContract contract) {
+		try {
+			byte[] digest = MessageDigest.getInstance("SHA-256").digest(contract.toJson().toString().getBytes(StandardCharsets.UTF_8));
+			StringBuilder hex = new StringBuilder("sha256:");
+			for (byte value : digest) hex.append(String.format("%02x", value));
+			return hex.toString();
+		} catch (java.security.NoSuchAlgorithmException exception) {
+			throw new IllegalStateException("SHA-256 unavailable", exception);
+		}
 	}
 
 	private void acceptConversationWakeAck(BridgeEnvelope envelope) {

@@ -3,6 +3,7 @@ import { EventEmitter, once } from 'node:events';
 import test from 'node:test';
 
 import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { completionContractFingerprint } from '../src/goal-contract.mjs';
 
 const SECRET = 's'.repeat(32);
 const TRACE_ID = 'trace-wire-1';
@@ -60,10 +61,25 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 	}), /field/i);
 });
 
-test('protocol v2 carries a coordinator goal completion update', () => {
-	const payload = { goalRevision: 4 };
+test('protocol v2 carries a revision/profile/trace-bound factual goal completion request', () => {
+	const completionContract = { goalRevision: 4, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
+	const payload = {
+		goalRevision: 4,
+		completionContract,
+		traceId: TRACE_ID,
+		profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
+		contractHash: completionContractFingerprint(completionContract),
+	};
 	assert.deepEqual(validateProtocolV2Payload('goal_completed', payload), payload);
-	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, unexpected: true }), /field/i);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_completed', { goalRevision: 4 }),
+		error => error.code === 'CONTRACT_REQUIRED',
+		'goal completion cannot fall back to a revision-only proof',
+	);
+	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, contractHash: 'sha256:wrong' }), /contractHash/i);
+	assert.deepEqual(validateProtocolV2Payload('goal_completion_result', {
+		goalRevision: 4, traceId: TRACE_ID, contractHash: payload.contractHash, verified: false, reasonCode: 'PREDICATE_FAILED',
+	}).verified, false);
 });
 
 test('protocol v2 carries one acknowledged conversation wake transaction', () => {
@@ -592,6 +608,7 @@ test('a newer lifecycle revision removes queued stale agent readiness under back
 
 test('strict payload validators accept every current wire shape and reject unknown fields', () => {
 	const catalog = { refreshedAtEpochMs: 1, models: [{ id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT 5.6 Sol', reasoningEfforts: ['high'], serviceTiers: ['fast'] }] };
+	const completionContract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
 	const messages = [
 		['hello', { secret: SECRET }],
 		['hello_ack', { replyTo: 'coordinator-1', authenticated: true, registry: [registeredRecord()] }],
@@ -605,7 +622,8 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
-		['goal_completed', { goalRevision: 1 }],
+		['goal_completed', { goalRevision: 1, completionContract, traceId: TRACE_ID, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' }, contractHash: completionContractFingerprint(completionContract) }],
+		['goal_completion_result', { goalRevision: 1, traceId: TRACE_ID, contractHash: completionContractFingerprint(completionContract), verified: false, reasonCode: 'PREDICATE_FAILED' }],
 		['action_command', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],

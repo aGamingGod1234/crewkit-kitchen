@@ -6,6 +6,7 @@ import { parseArenaScript } from './arena-script/parser.mjs';
 import { ArenaScriptEngine } from './arena-script/program-engine.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { buildPlannerInput } from './prompts.mjs';
+import { GoalContractError, bindCompletionContract, completionContractFingerprint, parseCompletionContract } from './goal-contract.mjs';
 
 /** Coordinates model-authored ArenaScript programs for independent agents. */
 export class ProgramRuntimeManager {
@@ -22,15 +23,17 @@ export class ProgramRuntimeManager {
 	#lastClockReading = null;
 	#trace;
 	#onCompleted;
+	#onCompletionRequested;
 	#plannerContext;
 	#recorder;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
 		if (typeof trace !== 'function') throw new TypeError('trace must be a function');
 		if (typeof onCompleted !== 'function') throw new TypeError('onCompleted must be a function');
+		if (typeof onCompletionRequested !== 'function') throw new TypeError('onCompletionRequested must be a function');
 		if (typeof plannerContext !== 'function') throw new TypeError('plannerContext must be a function');
 		this.#registry = registry;
 		this.#bridge = bridge;
@@ -38,6 +41,7 @@ export class ProgramRuntimeManager {
 		this.#reportError = reportError;
 		this.#trace = trace;
 		this.#onCompleted = onCompleted;
+		this.#onCompletionRequested = onCompletionRequested;
 		this.#plannerContext = plannerContext;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
@@ -56,13 +60,28 @@ export class ProgramRuntimeManager {
 		}
 		const state = this.#state(record, observation, eventSequence, traceId ?? decision?.traceId);
 		if (decision?.directive === 'finish') {
-			this.#setTerminalState(record, decision.status === 'completed' ? DynamicAgentState.COMPLETED : DynamicAgentState.ERROR);
+			this.#setCompletionContract(state, record, decision.completionContract);
+			if (decision.status === 'completed') this.#requestCompletion(record, state);
+			else this.#setTerminalState(record, DynamicAgentState.ERROR);
 			return state.engine?.snapshot() ?? null;
 		}
 		if (decision?.directive !== 'replace' || typeof decision.source !== 'string') {
 			throw codedError('INVALID_PLANNER_DIRECTIVE', 'Initial model decision must replace with ArenaScript source');
 		}
+		this.#setCompletionContract(state, record, decision.completionContract);
 		return this.#installSource(state, record, decision.source, observation, eventSequence);
+	}
+
+	onCompletionResult(record, payload = {}) {
+		const state = this.#states.get(record.agentId);
+		if (!state || state.disposed || state.goalRevision !== record.goalRevision || !state.completionRequested) return false;
+		if (payload.goalRevision !== state.goalRevision || payload.traceId !== state.traceId || payload.contractHash !== state.completionHash) return false;
+		state.completionResult = { verified: payload.verified === true, reasonCode: payload.reasonCode };
+		const verifiedAt = this.#safeNow() ?? 0;
+		this.#recordTracePhase(state, record, 'completion_verification', verifiedAt, verifiedAt, payload.verified === true ? 'completed' : 'failed', payload.reasonCode);
+		if (payload.verified !== true) return true;
+		this.#setTerminalState(record, DynamicAgentState.COMPLETED);
+		return true;
 	}
 
 	async onObservation(record, payload = {}) {
@@ -251,6 +270,10 @@ export class ProgramRuntimeManager {
 			commands: 0,
 			corrections: new Map(),
 			terminalStatus: null,
+			completionContract: null,
+			completionHash: null,
+			completionRequested: false,
+			completionResult: null,
 			branchReceipt: null,
 			lastReceiptMonotonicMs: null,
 			lastReceiptEpochMs: null,
@@ -338,6 +361,7 @@ export class ProgramRuntimeManager {
 			});
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return null;
 			if (decision?.directive !== 'replace') throw codedError('INVALID_COMPILER_CORRECTION', 'Compiler correction must replace with fresh ArenaScript source');
+			this.#setCompletionContract(state, record, decision.completionContract);
 			if (context === null) return this.#installSource(state, record, decision.source, observation, eventSequence);
 			if (!sameEngineRequest(state.engine.snapshot(), context)) {
 				state.engine.failDirectiveRequest(context);
@@ -424,6 +448,7 @@ export class ProgramRuntimeManager {
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return;
 			if (decision?.traceId !== undefined) this.#setTrace(state, decision.traceId);
 			if (decision?.directive === 'replace') {
+				this.#setCompletionContract(state, record, decision.completionContract);
 				if (!sameEngineRequest(state.engine.snapshot(), context)) {
 					state.engine.failDirectiveRequest(context);
 					this.#traceState(state, 'program_replacement_rejected', {
@@ -458,7 +483,10 @@ export class ProgramRuntimeManager {
 			} else {
 				const accepted = sameEngineRequest(state.engine.snapshot(), context);
 				state.engine.applyDirective({ ...context, directive: decision?.directive, status: decision?.status });
-				if (accepted && decision?.directive === 'finish') state.terminalStatus = decision.status;
+				if (accepted && decision?.directive === 'finish') {
+					this.#setCompletionContract(state, record, decision.completionContract);
+					state.terminalStatus = decision.status;
+				}
 				else if (accepted && ['continue', 'replace'].includes(decision?.directive)) state.terminalStatus = null;
 			}
 			this.#syncState(record, state);
@@ -750,7 +778,10 @@ export class ProgramRuntimeManager {
 	#syncState(record, state) {
 		const snapshot = state.engine.snapshot();
 		if (this.#registry.get(record.agentId)?.state === DynamicAgentState.DEAD) return;
-		if (snapshot.status === 'FINISHED') this.#setTerminalState(record, state.terminalStatus === 'impossible' ? DynamicAgentState.ERROR : DynamicAgentState.COMPLETED);
+		if (snapshot.status === 'FINISHED') {
+			if (state.terminalStatus === 'impossible') this.#setTerminalState(record, DynamicAgentState.ERROR);
+			else this.#requestCompletion(record, state);
+		}
 		if (snapshot.status === 'PAUSED' || snapshot.status === 'SUSPENDED') this.#setTerminalState(record, DynamicAgentState.PAUSED);
 	}
 
@@ -765,6 +796,50 @@ export class ProgramRuntimeManager {
 			} catch (error) {
 				this.#reportError(record.agentId, error);
 			}
+		}
+	}
+
+	#setCompletionContract(state, record, value) {
+		if (value === null || value === undefined) throw codedError('CONTRACT_REQUIRED', 'A factual completionContract is required before a program can finish');
+		let normalized;
+		try { normalized = parseCompletionContract(value, { goalRevision: record.goalRevision }); }
+		catch (error) {
+			if (error instanceof GoalContractError) throw codedError(error.code, error.message);
+			throw error;
+		}
+		const hash = completionContractFingerprint(normalized);
+		if (state.completionHash !== null && state.completionHash !== hash) throw codedError('CONTRACT_MUTATION', 'Completion contract cannot change within a goal revision');
+		bindCompletionContract(normalized, {
+			goalRevision: record.goalRevision,
+			traceId: state.traceId,
+			profile: {
+				provider: record.provider,
+				model: record.model,
+				reasoningEffort: record.reasoningEffort,
+				serviceTier: record.serviceTier ?? 'priority',
+			},
+		});
+		state.completionContract = normalized;
+		state.completionHash = hash;
+	}
+
+	#requestCompletion(record, state) {
+		if (state.completionRequested || state.completionContract === null) return;
+		state.completionRequested = true;
+		const request = {
+			record,
+			completionContract: state.completionContract,
+			traceId: state.traceId,
+			contractHash: state.completionHash,
+		};
+		try {
+			Promise.resolve(this.#onCompletionRequested(request)).catch((error) => {
+				state.completionRequested = false;
+				this.#reportError(record.agentId, error);
+			});
+		} catch (error) {
+			state.completionRequested = false;
+			this.#reportError(record.agentId, error);
 		}
 	}
 }

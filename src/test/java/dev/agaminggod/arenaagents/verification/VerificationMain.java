@@ -70,6 +70,8 @@ import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
+import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContractVerification;
+import dev.agaminggod.arenaagents.server.runtime.ActionSuccessLedgerVerification;
 import dev.agaminggod.arenaagents.server.runtime.input.InputStateVerification;
 import dev.agaminggod.arenaagents.server.perception.AttentionHazardVerification;
 import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistryVerification;
@@ -180,6 +182,8 @@ public final class VerificationMain {
 		passedAssertions += TransactionPostconditionVerification.verify();
 		passedAssertions += EquipmentAndUseVerification.verify();
 		passedAssertions += ServerActionExecutorVerification.verify();
+		passedAssertions += GoalCompletionContractVerification.verify();
+		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();
 		passedAssertions += AttentionHazardVerification.verify();
 		passedAssertions += MenuCapabilityRegistryVerification.verify();

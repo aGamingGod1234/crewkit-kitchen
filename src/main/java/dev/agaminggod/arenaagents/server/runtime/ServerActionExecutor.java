@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.runtime;
 
 import carpet.helpers.EntityPlayerActionPack;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
@@ -92,6 +93,7 @@ public final class ServerActionExecutor {
 	private final ResourceLeaseManager resourceLeases;
 	private final AdvancedInteractionService advancedInteractions;
 	private final ServerAgentConversationRouter conversationRouter;
+	private final ActionSuccessLedger actionSuccessLedger;
 	private final Map<AgentId, ActiveAction> active = new LinkedHashMap<>();
 	private final Map<AgentId, CleanupRetry<ServerActionResult>> pendingCompletions = new LinkedHashMap<>();
 	private final Map<AgentId, PendingRespawn> pendingRespawns = new LinkedHashMap<>();
@@ -165,7 +167,10 @@ public final class ServerActionExecutor {
 		this.resourceLeases = new ResourceLeaseManager();
 		this.advancedInteractions = new AdvancedInteractionService(protection, resourceLeases);
 		this.conversationRouter = Objects.requireNonNull(conversationRouter, "conversationRouter must not be null");
+		this.actionSuccessLedger = new ActionSuccessLedger();
 	}
+
+	public ActionSuccessLedger actionSuccessLedger() { return actionSuccessLedger; }
 
 	/** Legacy scenario/operator path. Model-authored commands must use submitProgramPrimitive. */
 	synchronized void submitLegacy(ServerActionRequest request) {
@@ -179,14 +184,24 @@ public final class ServerActionExecutor {
 		}
 		if (request.type() == ActionType.COMPLETE_GOAL) {
 			var record = manager.registry().require(request.agentId());
-			AgentLifecycleReducer.completeGoal(
-					record,
-					request.goalRevision(),
-					System.currentTimeMillis()
-			);
-			AgentChatReporter.completed(manager, record, string(request.arguments(), "summary"));
-			emit(request, ServerActionState.SUCCEEDED, "GOAL_COMPLETED", string(request.arguments(), "summary"), 0L, false, false);
-			router.goalCompleted(request.agentId(), request.goalRevision());
+			try {
+				JsonElement contractElement = request.arguments().get("completionContract");
+				if (contractElement == null || contractElement.isJsonNull()) throw new AgentDomainException("CONTRACT_REQUIRED", "complete_goal requires a factual completionContract");
+				GoalCompletionContract contract = GoalCompletionContract.parse(contractElement.getAsJsonObject());
+				GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier().verify(
+						record, manager.findAgentPlayer(request.agentId()).orElse(null), contract, actionSuccessLedger);
+				if (!verification.verified()) {
+					emit(request, ServerActionState.FAILED, verification.reasonCode(), "Factual completion verification failed", 0L, false, false);
+					return;
+				}
+				AgentLifecycleReducer.completeGoal(record, request.goalRevision(), System.currentTimeMillis());
+				AgentChatReporter.completed(manager, record, string(request.arguments(), "summary"));
+				emit(request, ServerActionState.SUCCEEDED, "GOAL_COMPLETED", string(request.arguments(), "summary"), 0L, false, false);
+				router.goalCompleted(request.agentId(), request.goalRevision());
+			} catch (RuntimeException exception) {
+				String reason = exception instanceof AgentDomainException domain ? domain.code() : "MALFORMED_CONTRACT";
+				emit(request, ServerActionState.FAILED, reason, "Factual completion contract was rejected", 0L, false, false);
+			}
 			return;
 		}
 
@@ -649,6 +664,7 @@ public final class ServerActionExecutor {
 
 	private void publish(ServerActionResult result) {
 		lastResults.put(result.agentId(), result);
+		actionSuccessLedger.record(result);
 		try {
 			AgentChatReporter.result(manager, manager.registry().require(result.agentId()), result);
 		} catch (AgentDomainException ignored) {

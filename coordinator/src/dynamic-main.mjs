@@ -101,7 +101,7 @@ export class DynamicCoordinator extends EventEmitter {
 			bridge: this.#bridge,
 			planner: this.#planner,
 			reportError: (agentId, error) => this.#reportAgentError(agentId, error),
-			onCompleted: (record) => this.#publishGoalCompleted(record),
+			onCompletionRequested: (request) => this.#publishGoalCompleted(request),
 			latencyRegistry: this.#latencyRegistry,
 			trace: (event, fields) => this.#writeTrace(event, fields),
 			plannerContext: (agentId) => ({
@@ -393,6 +393,14 @@ export class DynamicCoordinator extends EventEmitter {
 				throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
 			}
 			this.emit('actionResult', message);
+			});
+		});
+		this.#listen('goal_completion_result', (message) => {
+			this.#enqueueAgent(message.agentId, async () => {
+				const current = this.#registry.get(message.agentId);
+				if (current === null || current.goalRevision !== message.payload.goalRevision) return;
+				const accepted = this.#programRuntime.onCompletionResult(current, message.payload);
+				if (!accepted) throw new ProtocolV2Error('UNEXPECTED_COMPLETION_RESULT', `Agent '${message.agentId}' has no matching completion request`);
 			});
 		});
 		this.#listen('disconnected', () => {
@@ -766,9 +774,21 @@ export class DynamicCoordinator extends EventEmitter {
 		await this.#bridge.send('catalog_snapshot', 'server', snapshot);
 	}
 
-	async #publishGoalCompleted(record) {
+	async #publishGoalCompleted({ record, completionContract, traceId, contractHash }) {
 		if (!this.#bridge.ready || !this.#supportedAgentIds.has(record.agentId)) return;
-		await this.#bridge.send('goal_completed', record.agentId, { goalRevision: record.goalRevision });
+		const profile = {
+			provider: record.provider,
+			model: record.model,
+			reasoningEffort: record.reasoningEffort,
+			serviceTier: record.serviceTier ?? DEFAULT_SERVICE_TIER,
+		};
+		await this.#bridge.send('goal_completed', record.agentId, {
+			goalRevision: record.goalRevision,
+			completionContract,
+			traceId,
+			profile,
+			contractHash,
+		});
 	}
 
 	async #publishStatus() {
