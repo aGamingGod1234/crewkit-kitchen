@@ -15,6 +15,7 @@ import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistry;
 import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -44,7 +45,8 @@ public final class ServerObservationCollector {
 	public static final int MAX_OBSERVATION_TAGS = 32;
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
-	private static final long SPATIAL_CACHE_TICKS = 1L;
+	/** Spatial block/container scans are expensive; movement and view changes still invalidate the key immediately. */
+	private static final long SPATIAL_CACHE_TICKS = 10L;
 
 	private final CodexAgentManager manager;
 	private final ServerActionExecutor actionExecutor;
@@ -132,22 +134,34 @@ public final class ServerObservationCollector {
 		}
 	}
 
-	/** Returns active agents whose compact factual player state changed since the last sample. */
+	/** Returns loaded agents whose compact factual player or inventory state changed since the last sample. */
 	public List<AgentId> changedActiveAgents() {
 		List<AgentId> changed = new ArrayList<>();
-		Map<AgentId, Boolean> active = new HashMap<>();
-		for (ServerActionRequest request : actionExecutor.activeRequests()) {
-			AgentId agentId = request.agentId();
-			active.put(agentId, true);
+		if (manager.server() == null) {
+			synchronized (lastRawStates) {
+				lastRawStates.clear();
+			}
+			return List.of();
+		}
+		HashSet<AgentId> tracked = new HashSet<>();
+		for (AgentRecord record : manager.records()) {
+			AgentId agentId = record.agentId();
+			tracked.add(agentId);
 			ServerPlayer agent = manager.findAgentPlayer(agentId).orElse(null);
-			if (agent == null || !agent.isAlive()) continue;
+			if (agent == null || !agent.isAlive()) {
+				synchronized (lastRawStates) {
+					lastRawStates.remove(agentId);
+				}
+				continue;
+			}
 			RawPlayerState current = rawPlayerState(agent);
 			synchronized (lastRawStates) {
-				if (!current.equals(lastRawStates.put(agentId, current))) changed.add(agentId);
+				RawPlayerState previous = lastRawStates.put(agentId, current);
+				if (previous != null && !current.equals(previous)) changed.add(agentId);
 			}
 		}
 		synchronized (lastRawStates) {
-			lastRawStates.keySet().removeIf(agentId -> !active.containsKey(agentId));
+			lastRawStates.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
 		return List.copyOf(changed);
 	}
@@ -530,8 +544,32 @@ public final class ServerObservationCollector {
 				agent.isInWall(),
 				agent.onGround(),
 				finite(agent.fallDistance),
-				attacker != null && attacker.isAlive() ? attacker.getUUID() : null
+				attacker != null && attacker.isAlive() ? attacker.getUUID() : null,
+				inventorySignature(agent)
 			);
+	}
+
+	private static String inventorySignature(ServerPlayer agent) {
+		StringBuilder signature = new StringBuilder(512);
+		Inventory inventory = agent.getInventory();
+		signature.append("selected=").append(inventory.getSelectedSlot()).append(';');
+		for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+			appendItemSignature(signature, inventory.getItem(slot));
+		}
+		for (EquipmentSlot slot : EquipmentSlot.values()) appendItemSignature(signature, agent.getItemBySlot(slot));
+		if (agent.containerMenu != null) {
+			appendItemSignature(signature, agent.containerMenu.getCarried());
+			for (int slot = 0; slot < agent.containerMenu.slots.size() && slot < 64; slot++) {
+				appendItemSignature(signature, agent.containerMenu.getSlot(slot).getItem());
+			}
+		}
+		return signature.toString();
+	}
+
+	private static void appendItemSignature(StringBuilder signature, ItemStack stack) {
+		signature.append(itemId(stack)).append(':')
+				.append(stack.isEmpty() ? 0 : stack.getCount()).append(':')
+				.append(stack.isEmpty() ? 0 : stack.getDamageValue()).append(';');
 	}
 
 	private record RawPlayerState(
@@ -544,7 +582,8 @@ public final class ServerObservationCollector {
 		boolean suffocating,
 		boolean onGround,
 		double fallDistance,
-		java.util.UUID lastAttacker
+		java.util.UUID lastAttacker,
+		String inventorySignature
 	) {
 	}
 }

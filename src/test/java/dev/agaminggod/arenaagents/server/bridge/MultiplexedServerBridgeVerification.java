@@ -84,6 +84,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyDeathFacts();
 		verifyExactTargetObservationLedger(registered.getFirst().agentId());
 		verifyConversationAttention(registered.getFirst().agentId());
+		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
@@ -443,6 +444,46 @@ public final class MultiplexedServerBridgeVerification {
 		assertTrue(!freshDeliveries.getFirst().get("attention").getAsBoolean(),
 				"fresh observation starts from an empty reset baseline");
 		assertEquals(1, publication.retainedCount(), "new session baseline is retained after commit");
+	}
+
+	private static void verifyObservationCadence(List<AgentId> agents) {
+		MultiplexedServerBridge.ObservationPublication publication =
+				new MultiplexedServerBridge.ObservationPublication(16, 16);
+		List<AgentId> heartbeats = new ArrayList<>();
+		for (int tick = 0; tick < agents.size(); tick++) {
+			publication.scheduleIdleHeartbeat(agents);
+			List<AgentId> emitted = new ArrayList<>();
+			publication.drain(emitted::add);
+			assertEquals(1, emitted.size(), "idle heartbeat is bounded to one agent per tick");
+			heartbeats.addAll(emitted);
+		}
+		assertEquals(agents, heartbeats, "idle heartbeat rotates through all registered agents");
+
+		Object session = new Object();
+		MultiplexedServerBridge.onSessionAccepted(publication, session);
+		AgentId agent = agents.getFirst();
+		JsonObject first = observation("00000000-0000-0000-0000-000000000002", 1_000L);
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+				publication.publish(agent, session, first, (ignoredAgent, ignoredPayload) -> true, false),
+				"the first urgent observation establishes a delivered baseline");
+		JsonObject unchanged = first.deepCopy();
+		unchanged.addProperty("observedAtEpochMs", 1_001L);
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.SUPPRESSED,
+				publication.publish(agent, session, unchanged, (ignoredAgent, ignoredPayload) -> true, false),
+				"unchanged event-driven observations are suppressed");
+		assertTrue(publication.markAttention(agent), "urgent attention can bypass unchanged suppression");
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+				publication.publish(agent, session, unchanged, (ignoredAgent, ignoredPayload) -> true, false),
+				"urgent attention publishes even when facts are unchanged");
+		JsonObject heartbeat = unchanged.deepCopy();
+		heartbeat.addProperty("observedAtEpochMs", 1_002L);
+		assertEquals(MultiplexedServerBridge.ObservationPublication.Result.COMMITTED,
+				publication.publish(agent, session, heartbeat, (ignoredAgent, ignoredPayload) -> true, true),
+				"a scheduled heartbeat publishes unchanged facts");
+		publication.scheduleIdleHeartbeat(agents);
+		assertTrue(publication.pendingCount() > 0, "heartbeat remains queued before a session reset");
+		MultiplexedServerBridge.onSessionClosed(publication, session);
+		assertEquals(0, publication.pendingCount(), "session cleanup clears pending idle heartbeats");
 	}
 
 	private static JsonObject observation(String targetId, long observedAtEpochMs) {

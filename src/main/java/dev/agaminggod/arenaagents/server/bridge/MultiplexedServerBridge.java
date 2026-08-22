@@ -54,6 +54,7 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -161,9 +162,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 		});
 		actionExecutor.tick();
-		for (AgentId agentId : registeredObservationIds(manager.records())) {
-			queueObservation(agentId);
+		List<AgentId> observationAgents = registeredObservationIds(manager.records());
+		for (AgentId agentId : observations.changedActiveAgents()) {
+			if (!observationAgents.contains(agentId)) continue;
+			observationPublication.markAttention(agentId);
+			queueUrgentObservation(agentId);
 		}
+		observationPublication.scheduleIdleHeartbeat(observationAgents);
 		observationPublication.drain(this::sendObservation);
 	}
 
@@ -259,6 +264,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 			return;
 		}
+		observationPublication.markAttention(transition.after().agentId());
+		queueUrgentObservation(transition.after().agentId());
 		String operation = operation(transition);
 		if (operation == null) {
 			return;
@@ -590,7 +597,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			router.plannerStarted(id);
 		}
 		if ("agent_ready".equals(envelope.type())) {
-			queueObservation(id);
+			observationPublication.markAttention(id);
+			queueUrgentObservation(id);
 		}
 	}
 
@@ -748,9 +756,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 						&& !"TARGET_ALREADY_SATISFIED".equals(result.reasonCode())
 		);
 		send("action_result", result.agentId().toString(), actionResultPayload(result));
-		if (result.actionType() != ActionType.COMPLETE_GOAL) {
-			queueObservation(result.agentId());
-		}
+		observationPublication.markAttention(result.agentId());
+		queueUrgentObservation(result.agentId());
 	}
 
 	void publishConversationEvent(ConversationEvent event, Optional<String> wakeGoal) {
@@ -822,7 +829,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			observationPublication.retainConversationSource(event.agentId(), event.sourceId());
 		}
 		observationPublication.markAttention(event.agentId());
-		queueObservation(event.agentId());
+		queueUrgentObservation(event.agentId());
 	}
 
 	private void publishConversationWakeScenarioState(AgentTransition transition) {
@@ -849,7 +856,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		);
 		programActions.terminal(result);
 		observations.invalidate(result.agentId());
-		queueObservation(result.agentId());
+		observationPublication.markAttention(result.agentId());
+		queueUrgentObservation(result.agentId());
 	}
 
 	static void publishRespawnScenarioEvents(Runnable publication, Runnable actionEvent, Runnable stateEvent) {
@@ -950,28 +958,38 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void queueObservation(AgentId agentId) {
-		observationPublication.offer(agentId);
+		if (!observationPublication.offer(agentId)) {
+			LOGGER.debug("Observation request coalesced or deferred for {}", agentId);
+		}
+	}
+
+	private void queueUrgentObservation(AgentId agentId) {
+		if (!observationPublication.offerUrgent(agentId)) {
+			LOGGER.debug("Urgent observation request deferred for {}", agentId);
+		}
 	}
 
 	private void sendObservation(AgentId agentId) {
+		if (manager.server() == null) return;
 		Session source = session;
 		if (source == null || !source.authenticated.get()) {
-			retryObservation(agentId);
 			return;
 		}
+		boolean heartbeat = observationPublication.takeHeartbeat(agentId);
 		final JsonObject observation;
 		try {
 			observation = observations.collect(agentId);
 			ObservationPublication.Result result = observationPublication.publish(
 					agentId, source, observation,
-					(ignoredAgent, payload) -> sendObservationEnvelope(source, ignoredAgent, payload)
+					(ignoredAgent, payload) -> sendObservationEnvelope(source, ignoredAgent, payload),
+					heartbeat
 			);
-			if (result == ObservationPublication.Result.DELIVERY_RETRY) retryObservation(agentId);
+			if (result == ObservationPublication.Result.DELIVERY_RETRY) retryObservation(agentId, heartbeat);
 			return;
 		} catch (AgentDomainException exception) {
 			LOGGER.debug("Dropping observation for removed agent {}: {}", agentId, exception.code());
 		} catch (BridgeProtocolException exception) {
-			if (isTransientObservationDelivery(exception)) retryObservation(agentId);
+			if (isTransientObservationDelivery(exception)) retryObservation(agentId, heartbeat);
 			else LOGGER.warn("Dropping observation delivery for {}: {}", agentId, exception.getMessage());
 		} catch (RuntimeException exception) {
 			LOGGER.warn("Could not collect observation for {}: {}", agentId, exception.getMessage());
@@ -979,6 +997,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void retryObservation(AgentId agentId) {
+		retryObservation(agentId, false);
+	}
+
+	private void retryObservation(AgentId agentId, boolean heartbeat) {
 		try {
 			manager.registry().require(agentId);
 		} catch (AgentDomainException exception) {
@@ -986,7 +1008,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		if (!observationPublication.markDirty(agentId)) return;
 		try {
-			observationPublication.offer(agentId);
+			if (heartbeat) observationPublication.offerHeartbeat(agentId);
+			else observationPublication.offer(agentId);
 		} catch (RuntimeException exception) {
 			LOGGER.debug("Could not retain observation retry for {}: {}", agentId, exception.getMessage());
 		}
@@ -1215,7 +1238,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	/** Serializes observation delivery with session identity, queue, and baseline lifecycle. */
 	static final class ObservationPublication {
-		enum Result { COMMITTED, STALE_SESSION, DELIVERY_RETRY }
+		enum Result { COMMITTED, SUPPRESSED, STALE_SESSION, DELIVERY_RETRY }
 
 		@FunctionalInterface
 		interface Writer {
@@ -1225,16 +1248,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final Object lifecycleLock = new Object();
 		private final ObservationDispatchQueue<AgentId> queue;
 		private final PublishedObservationState published;
+		private final int queueCapacity;
+		private final int perTickLimit;
+		private final LinkedHashSet<AgentId> urgent = new LinkedHashSet<>();
+		private final Set<AgentId> heartbeatPending = new HashSet<>();
 		private final AtomicLong sequences = new AtomicLong();
 		private Object activeSession;
+		private int heartbeatCursor;
 
 		ObservationPublication(int queueCapacity, int perTickLimit) {
+			this.queueCapacity = queueCapacity;
+			this.perTickLimit = perTickLimit;
 			queue = new ObservationDispatchQueue<>(queueCapacity, perTickLimit);
 			published = new PublishedObservationState(queueCapacity);
 		}
 
 		void activate(Object session) {
 			synchronized (lifecycleLock) {
+				if (activeSession != null && activeSession != session) clearLocked();
 				activeSession = Objects.requireNonNull(session, "session must not be null");
 			}
 		}
@@ -1254,9 +1285,103 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 		}
 
-		void offer(AgentId agentId) { queue.offer(agentId); }
-		void drain(java.util.function.Consumer<AgentId> consumer) { queue.drain(consumer); }
-		void remove(AgentId agentId) { queue.remove(agentId); published.remove(agentId); }
+		boolean offer(AgentId agentId) {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			synchronized (lifecycleLock) {
+				if (urgent.contains(agentId)) return true;
+				heartbeatPending.remove(agentId);
+				try {
+					return queue.offer(agentId);
+				} catch (IllegalStateException exception) {
+					return false;
+				}
+			}
+		}
+
+		boolean offerHeartbeat(AgentId agentId) {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			synchronized (lifecycleLock) {
+				if (urgent.contains(agentId)) return true;
+				try {
+					if (queue.offer(agentId) || queue.contains(agentId)) {
+						heartbeatPending.add(agentId);
+						return true;
+					}
+				} catch (IllegalStateException ignored) {
+					// Backpressure remains bounded; the rotating heartbeat will retry later.
+				}
+				return false;
+			}
+		}
+
+		boolean offerUrgent(AgentId agentId) {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			synchronized (lifecycleLock) {
+				if (urgent.contains(agentId)) return true;
+				if (urgent.size() >= queueCapacity) return false;
+				queue.remove(agentId);
+				heartbeatPending.remove(agentId);
+				urgent.add(agentId);
+				return true;
+			}
+		}
+
+		/** Queues one heartbeat per call and rotates fairly across the supplied roster. */
+		void scheduleIdleHeartbeat(List<AgentId> agents) {
+			Objects.requireNonNull(agents, "agents must not be null");
+			List<AgentId> roster = agents.stream()
+					.map(Objects::requireNonNull)
+					.distinct()
+					.toList();
+			synchronized (lifecycleLock) {
+				if (roster.isEmpty()) {
+					heartbeatCursor = 0;
+					return;
+				}
+				heartbeatCursor %= roster.size();
+				AgentId agentId = roster.get(heartbeatCursor++);
+				if (urgent.contains(agentId)) return;
+				try {
+					if (queue.offer(agentId)) heartbeatPending.add(agentId);
+				} catch (IllegalStateException ignored) {
+					// A full coalescing queue defers this heartbeat to a later rotation.
+				}
+			}
+		}
+
+		boolean takeHeartbeat(AgentId agentId) {
+			synchronized (lifecycleLock) {
+				return heartbeatPending.remove(agentId);
+			}
+		}
+
+		void drain(java.util.function.Consumer<AgentId> consumer) {
+			Objects.requireNonNull(consumer, "consumer must not be null");
+			for (int emitted = 0; emitted < perTickLimit; emitted++) {
+				AgentId agentId;
+				synchronized (lifecycleLock) {
+					var iterator = urgent.iterator();
+					if (iterator.hasNext()) {
+						agentId = iterator.next();
+						iterator.remove();
+					} else {
+						agentId = queue.poll();
+					}
+					if (agentId == null) return;
+				}
+				consumer.accept(agentId);
+			}
+		}
+
+		void remove(AgentId agentId) {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			synchronized (lifecycleLock) {
+				queue.remove(agentId);
+				urgent.remove(agentId);
+				heartbeatPending.remove(agentId);
+				published.remove(agentId);
+			}
+		}
 		boolean markDirty(AgentId agentId) { return published.markDirty(agentId); }
 		boolean markAttention(AgentId agentId) { return published.markAttention(agentId); }
 		void requireObservedTarget(AgentId agentId, long eventSequence, String targetId) {
@@ -1268,7 +1393,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		void requireDirectMessageRecipient(AgentId agentId, long eventSequence, String recipientId) {
 			published.requireDirectMessageRecipient(agentId, eventSequence, recipientId);
 		}
-		int pendingCount() { return queue.pendingCount(); }
+		int pendingCount() {
+			synchronized (lifecycleLock) {
+				return queue.pendingCount() + urgent.size();
+			}
+		}
 		int retainedCount() { return published.retainedCount(); }
 		boolean hasActiveSession() {
 			synchronized (lifecycleLock) {
@@ -1277,6 +1406,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 
 		Result publish(AgentId agentId, Object sourceSession, JsonObject observation, Writer writer) {
+			return publish(agentId, sourceSession, observation, writer, false);
+		}
+
+		Result publish(AgentId agentId, Object sourceSession, JsonObject observation, Writer writer, boolean allowUnchanged) {
 			Objects.requireNonNull(agentId, "agentId must not be null");
 			Objects.requireNonNull(sourceSession, "sourceSession must not be null");
 			Objects.requireNonNull(observation, "observation must not be null");
@@ -1288,6 +1421,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 						agentId, observation, eventSequence,
 						observation.get("observedAtEpochMs").getAsLong()
 				);
+				if (!allowUnchanged && published.hasDelivered(agentId) && !delta.attention()) return Result.SUPPRESSED;
 				observation.addProperty("eventSequence", delta.eventSequence());
 				observation.addProperty("attention", delta.attention());
 				JsonArray changedFacts = new JsonArray();
@@ -1301,6 +1435,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 		private void clearLocked() {
 			queue.clear();
+			urgent.clear();
+			heartbeatPending.clear();
+			heartbeatCursor = 0;
 			published.clear();
 		}
 	}
@@ -1340,6 +1477,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 			dirty.remove(agentId);
 			forcedAttention.remove(agentId);
+		}
+
+		public synchronized boolean hasDelivered(AgentId agentId) {
+			return delivered.containsKey(Objects.requireNonNull(agentId, "agentId must not be null"));
 		}
 
 		/** Requires a target id to be present in the exact bounded observation selected by provenance. */
