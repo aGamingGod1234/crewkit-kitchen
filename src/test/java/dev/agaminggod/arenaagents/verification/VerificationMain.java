@@ -54,6 +54,7 @@ import dev.agaminggod.arenaagents.server.bridge.BoundedServerTaskQueueVerificati
 import dev.agaminggod.arenaagents.server.bridge.ProgramActionLedgerVerification;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusVerification;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridgeVerification;
+import dev.agaminggod.arenaagents.server.bridge.SingleBrainBoundaryVerification;
 import dev.agaminggod.arenaagents.server.AgentRecoverySpawnPolicyVerification;
 import dev.agaminggod.arenaagents.server.AgentRespawnSpawnPolicyVerification;
 import dev.agaminggod.arenaagents.server.perception.BlockObservationOrderingVerification;
@@ -202,6 +203,7 @@ public final class VerificationMain {
 		passedAssertions += AgentRecoverySpawnPolicyVerification.verify();
 		passedAssertions += AgentRespawnSpawnPolicyVerification.verify();
 		passedAssertions += MultiplexedServerBridgeVerification.verify();
+		passedAssertions += SingleBrainBoundaryVerification.verify();
 		passedAssertions += GoalReceiverVerification.verify();
 		verifyObservationContracts(codec);
 		ObservationCollectorVerification.verifyLoadedChunkBoundary();

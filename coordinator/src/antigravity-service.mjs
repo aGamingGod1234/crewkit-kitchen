@@ -13,6 +13,9 @@ const DEFAULT_STDOUT_LIMIT_BYTES = 1_024 * 1_024;
 const DEFAULT_STDERR_LIMIT_BYTES = 64 * 1_024;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const MAX_WINDOWS_PROMPT_CHARS = 24_000;
+const DEFAULT_SERVICE_TIER = 'priority';
+const PROFILE_KEYS = Object.freeze(['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier']);
+const PROFILE_CONFLICT_MESSAGE = 'Agent profile is immutable for the active Gemini session';
 const GEMINI_MODEL_REASONING = Object.freeze({
 	'gemini-3.7-flash': Object.freeze(['high', 'medium', 'low']),
 	'gemini-3.1-pro': Object.freeze(['high', 'low']),
@@ -53,14 +56,14 @@ export class AntigravityProviderService {
 		const existing = this.#agents.get(profile.agentId);
 		if (existing !== undefined) {
 			if (!existing.matchesProfile(profile)) {
-				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `gemini agent '${profile.agentId}' already has a different profile`);
+				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			}
 			return existing;
 		}
 		const creating = this.#creating.get(profile.agentId);
 		if (creating !== undefined) {
 			if (!profilesMatch(creating.profile, profile)) {
-				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `gemini agent '${profile.agentId}' is being created with a different profile`);
+				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			}
 			return creating.promise;
 		}
@@ -160,6 +163,7 @@ class AntigravityAgent {
 
 	get agentId() { return this.#profile.agentId; }
 	get provider() { return this.#profile.provider; }
+	get serviceTier() { return this.#profile.serviceTier; }
 	matchesProfile(profile) { return profilesMatch(this.#profile, profile); }
 
 	async setGoalRevision(revision) {
@@ -465,6 +469,7 @@ function validateProfile(value, config) {
 		provider: value.provider ?? 'codex',
 		model: requireText(value.model, 'model'),
 		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
 	};
 	if (profile.provider !== 'gemini') throw new AcpProtocolError('PROVIDER_MISMATCH', `Expected gemini profile, received ${profile.provider}`);
 	if (!config.models.includes(profile.model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `gemini model '${profile.model}' is not configured`);
@@ -475,7 +480,7 @@ function validateProfile(value, config) {
 }
 
 function profilesMatch(left, right) {
-	return ['agentId', 'provider', 'model', 'reasoningEffort'].every((key) => left[key] === right[key]);
+	return PROFILE_KEYS.every((key) => left[key] === right[key]);
 }
 
 function decisionExcerpt(value) {

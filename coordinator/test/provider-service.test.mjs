@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { AntigravityProviderService } from '../src/antigravity-service.mjs';
 import { ProviderService } from '../src/provider-service.mjs';
 
 class FakeService {
@@ -64,6 +65,34 @@ test('provider router rejects every profile mutation for an existing agent ID', 
 	assert.equal(services.codex.created.length, 1);
 	assert.equal(services.gemini.created.length, 0);
 	assert.equal(services.kimi.created.length, 0);
+	await router.stop();
+});
+
+test('provider reconciliation retains a Gemini fast profile and rejects a tier mutation', async () => {
+	const gemini = new AntigravityProviderService({
+		provider: 'gemini',
+		cwd: 'C:\\workspace',
+		models: ['gemini-3.1-pro'],
+		modelReasoningEfforts: { 'gemini-3.1-pro': ['high', 'low'] },
+	});
+	const router = new ProviderService({
+		codex: new FakeService('codex'),
+		gemini,
+		kimi: new FakeService('kimi'),
+	});
+	const selected = profile('gemini', {
+		agentId: 'gemini-session',
+		model: 'gemini-3.1-pro',
+		serviceTier: 'fast',
+	});
+	const agent = await router.createAgent(selected);
+	const reconciliation = await router.reconcile([selected]);
+	assert.deepEqual(reconciliation.valid, [selected], 'reconciliation preserves the complete Gemini profile');
+	assert.equal(await router.createAgent(selected), agent, 'same profile reuses the existing Gemini session');
+	await assert.rejects(
+		router.createAgent({ ...selected, serviceTier: 'priority' }),
+		(error) => error?.code === 'AGENT_PROFILE_CONFLICT',
+	);
 	await router.stop();
 });
 

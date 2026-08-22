@@ -130,3 +130,98 @@ The full run also completed the fake end-to-end scenarios, including pre-authore
 ## Concerns
 
 ACP transports do not expose a service-tier configuration operation. The selected service tier is still retained and compared as part of the immutable profile at the ACP and provider-router boundaries; no alternate ACP session or provider is created when it changes.
+
+## Fix round 1
+
+The review identified two gaps: Gemini reconciliation could erase `serviceTier` ownership, and the Java hazard test did not exercise bridge publication alongside the input controller. New tests were written first.
+
+### RED
+
+Coordinator review regressions against the previous production code:
+
+```text
+node --test --test-concurrency=1 coordinator/test/provider-service.test.mjs coordinator/test/antigravity-service.test.mjs
+```
+
+Result:
+
+```text
+tests 22
+pass 20
+fail 2
+Antigravity retains service tier in the exact session profile: Missing expected rejection
+provider reconciliation retains a Gemini fast profile and rejects a tier mutation: reconciliation preserves the complete Gemini profile
+```
+
+Java bridge/input regression against the previous production code:
+
+```text
+$taskJdk = (Resolve-Path 'runtime/toolchains/temurin-25/jdk-25.0.3+9').Path
+$env:JAVA_HOME = $taskJdk
+.\gradlew.bat verifyCore
+```
+
+Result:
+
+```text
+java.lang.AssertionError: active-action lava publishes through the bridge: expected <COMMITTED> but was <SUPPRESSED>
+at SingleBrainBoundaryVerification.java:31
+> Task :verifyCore FAILED
+```
+
+### GREEN
+
+Focused coordinator review coverage:
+
+```text
+node --test --test-concurrency=1 coordinator/test/provider-service.test.mjs coordinator/test/antigravity-service.test.mjs coordinator/test/codex-service.test.mjs coordinator/test/acp-service.test.mjs coordinator/test/agent-planner.test.mjs
+```
+
+Result:
+
+```text
+tests 66
+pass 66
+fail 0
+```
+
+Focused Java verification:
+
+```text
+$taskJdk = (Resolve-Path 'runtime/toolchains/temurin-25/jdk-25.0.3+9').Path
+$env:JAVA_HOME = $taskJdk
+.\gradlew.bat verifyCore
+```
+
+Result:
+
+```text
+PASS: 6369 protocol and bridge assertions
+BUILD SUCCESSFUL
+```
+
+Required full verification, run once for this fix round:
+
+```text
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-automated-verification.ps1
+```
+
+Result:
+
+```text
+BUILD SUCCESSFUL in 41s
+PASS: 6369 protocol and bridge assertions
+PASS: 77 voice-addon assertions
+tests 525
+pass 525
+fail 0
+cancelled 0
+Automated Java, Fabric, coordinator, and fake-E2E verification passed.
+```
+
+Fix-round self-review:
+
+- Provider reconciliation now compares every returned profile with the prior immutable ownership record before replacing the assignment map, and retains the prior complete profile object for matching agents.
+- Antigravity now preserves and compares `serviceTier` with provider, model, and reasoning effort, with a bounded static conflict message.
+- Active-action lava changes use the factual block observation path and publish through `ObservationPublication`; the boundary test confirms no input lease, applied movement, or body-input clear occurs.
+- `git diff --check` is clean before commit.

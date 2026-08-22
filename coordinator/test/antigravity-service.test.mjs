@@ -189,6 +189,18 @@ test('Antigravity rejects unsupported model-thinking combinations and profile co
 	await service.stop();
 });
 
+test('Antigravity retains service tier in the exact session profile', async () => {
+	const service = new AntigravityProviderService(config(), { spawn: successfulSpawner([]) });
+	const selected = profile({ serviceTier: 'fast' });
+	const agent = await service.createAgent(selected);
+	assert.equal(await service.createAgent(selected), agent, 'same profile reuses the existing Gemini session');
+	await assert.rejects(
+		service.createAgent({ ...selected, serviceTier: 'priority' }),
+		(error) => error?.code === 'AGENT_PROFILE_CONFLICT',
+	);
+	await service.stop();
+});
+
 test('Antigravity interruption terminates the active process and rejects the turn', async () => {
 	const child = new FakeChild();
 	const terminated = [];

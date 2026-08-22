@@ -84,18 +84,21 @@ export class ProviderService {
 		for (const record of records) groups.get(normalizeProvider(record?.provider)).push({ ...record, provider: normalizeProvider(record?.provider) });
 		const results = await Promise.all(PROVIDERS.map((provider) =>
 			this.#services.get(provider).reconcile(groups.get(provider))));
-		this.#assignments.clear();
+		const previousAssignments = this.#assignments;
+		const nextAssignments = new Map();
 		for (const result of results) {
 			for (const profile of result.valid ?? []) {
 				const normalized = freezeProfile(profile);
-				const existing = this.#assignments.get(normalized.agentId);
+				const existing = previousAssignments.get(normalized.agentId) ?? nextAssignments.get(normalized.agentId);
 				if (existing !== undefined) {
 					assertSameProfile(existing, normalized);
+					nextAssignments.set(normalized.agentId, existing);
 					continue;
 				}
-				this.#assignments.set(normalized.agentId, normalized);
+				nextAssignments.set(normalized.agentId, normalized);
 			}
 		}
+		this.#assignments = nextAssignments;
 		return {
 			valid: results.flatMap((result) => result.valid ?? []),
 			invalid: results.flatMap((result) => result.invalid ?? []),

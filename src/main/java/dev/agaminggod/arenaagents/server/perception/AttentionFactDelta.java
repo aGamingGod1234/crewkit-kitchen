@@ -49,6 +49,8 @@ public record AttentionFactDelta(long eventSequence, boolean attention, List<Str
 			TreeSet<String> entityChanges = entityChanges(previous.getAsJsonArray("entities"), current.getAsJsonArray("entities"));
 			TreeSet<String> blockChanges = blockChanges(previous.getAsJsonArray("blocks"), current.getAsJsonArray("blocks"));
 			addSpatialChanges(facts, entityChanges, blockChanges);
+		} else {
+			addSpatialChanges(facts, Set.of(), lavaChanges(previous.getAsJsonArray("blocks"), current.getAsJsonArray("blocks")));
 		}
 		return new AttentionFactDelta(eventSequence, !facts.isEmpty(), List.copyOf(facts), observedAtEpochMs);
 	}
@@ -97,6 +99,27 @@ public record AttentionFactDelta(long eventSequence, boolean attention, List<Str
 		TreeSet<String> changed = new TreeSet<>();
 		for (String position : positions) if (!same(before.get(position), after.get(position))) changed.add("blocks." + position);
 		return changed;
+	}
+
+	private static TreeSet<String> lavaChanges(JsonArray previous, JsonArray current) {
+		Map<String, JsonElement> before = blocksByPosition(previous);
+		Map<String, JsonElement> after = blocksByPosition(current);
+		Set<String> positions = new HashSet<>(before.keySet());
+		positions.addAll(after.keySet());
+		TreeSet<String> changed = new TreeSet<>();
+		for (String position : positions) {
+			JsonElement beforeBlock = before.get(position);
+			JsonElement afterBlock = after.get(position);
+			if (!isLava(beforeBlock) && !isLava(afterBlock)) continue;
+			if (!same(beforeBlock, afterBlock)) changed.add("blocks." + position);
+		}
+		return changed;
+	}
+
+	private static boolean isLava(JsonElement value) {
+		if (value == null || !value.isJsonObject()) return false;
+		JsonElement blockId = value.getAsJsonObject().get("blockId");
+		return blockId != null && blockId.isJsonPrimitive() && "minecraft:lava".equals(blockId.getAsString());
 	}
 
 	private static void addSpatialChanges(Set<String> facts, Set<String> entityChanges, Set<String> blockChanges) {
