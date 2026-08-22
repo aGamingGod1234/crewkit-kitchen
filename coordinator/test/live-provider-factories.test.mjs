@@ -45,6 +45,11 @@ test('routes an exact provider to only the selected injected service', async () 
 	const provider = await factory(PROFILE);
 
 	assert.equal(provider.available, true);
+	assert.equal(provider.provider, PROFILE.provider);
+	assert.equal(provider.model, PROFILE.model);
+	assert.equal(provider.reasoningEffort, PROFILE.reasoningEffort);
+	assert.equal(provider.serviceTier, PROFILE.serviceTier);
+	assert.deepEqual(provider.providerProfile, PROFILE);
 	assert.equal(selected.provider, 'kimi');
 	assert.equal(selected.environment.ARENA_AGENT_BRIDGE_SECRET, undefined);
 	const createCall = service.calls.find((entry) => Array.isArray(entry) && entry[0] === 'createAgent');

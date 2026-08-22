@@ -85,6 +85,7 @@ export function createLiveProviderFactory(providerValue, options = {}) {
 			succeeded = true;
 			return createAvailableProvider({
 				provider,
+				profile,
 				service,
 				catalogFallback,
 				preflight: { provider, agentId, phase, realAvailability: true, catalogFallback },
@@ -98,10 +99,19 @@ export function createLiveProviderFactory(providerValue, options = {}) {
 	};
 }
 
-function createAvailableProvider({ provider, service, catalogFallback, preflight }) {
+function createAvailableProvider({ provider, profile, service, catalogFallback, preflight }) {
 	return {
 		available: true,
 		provider,
+		model: profile.model,
+		reasoningEffort: profile.reasoningEffort,
+		serviceTier: profile.serviceTier,
+		providerProfile: Object.freeze({
+			provider,
+			model: profile.model,
+			reasoningEffort: profile.reasoningEffort,
+			serviceTier: profile.serviceTier,
+		}),
 		catalogFallback,
 		preflight,
 		catalog: service.catalog,
