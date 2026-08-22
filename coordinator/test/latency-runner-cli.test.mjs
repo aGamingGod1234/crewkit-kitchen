@@ -80,6 +80,7 @@ test('loads private matrix, replay, and prompt files and passes bounded metadata
 		assert.equal(seen[0].sourceHash, 'source-v1');
 		assert.equal(seen[0].configHash, 'config-v1');
 		assert.equal(seen[0].pairingKey, 'private-pairing-key');
+		assert.deepEqual(seen[0].baseContext, { arm: 'baseline', runId: 'run-123', sourceHash: 'source-v1', configHash: 'config-v1', pairingKey: 'private-pairing-key' });
 		assert.equal(seen[0].planningConcurrency, 4);
 		assert.equal(io.stdout.length, 1);
 		const result = JSON.parse(io.stdout[0]);
@@ -222,6 +223,126 @@ test('rejects oversized replay files and malformed JSON before invoking the runn
 		assert.equal(oversizedExit, EXIT_CODES.USAGE);
 		assert.equal(calls, 0);
 		assert.equal(io.stdout.length, 2);
+	} finally {
+		await rm(files.root, { recursive: true, force: true });
+	}
+});
+
+test('derives exact live-provider launch configuration without forwarding private CLI values', async () => {
+	const files = await fixtureFiles();
+	const liveMatrix = {
+		version: 1, fixedSeeds: [42], agentLoads: [1, 4, 8, 16],
+		trials: [
+			{ id: 'live-codex', mode: 'live', scenarioId: 'fixture', seed: 42, agentLoad: 1, providerProfile: { provider: 'codex', model: 'fixture-codex', reasoningEffort: 'high', serviceTier: 'fast' }, repetitions: 1, turnBudgetMs: 100, trialBudgetMs: 500, turnCap: 2, providerAvailabilityRequired: false },
+			{ id: 'live-kimi', mode: 'live', scenarioId: 'fixture', seed: 42, agentLoad: 1, providerProfile: { provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'local' }, repetitions: 1, turnBudgetMs: 250, trialBudgetMs: 500, turnCap: 2, providerAvailabilityRequired: false },
+		],
+	};
+	await writeFile(files.matrix, JSON.stringify(liveMatrix), 'utf8');
+	const io = capture();
+	const seen = [];
+	const privatePrompt = 'private-provider-prompt';
+	const privatePairingKey = 'credential-like-pairing-value';
+	try {
+		const exitCode = await runLatencyRunnerCli([
+			'--matrix', files.matrix, '--artifact-directory', files.artifacts,
+			'--replay-prompt', privatePrompt, '--pairing-key', privatePairingKey,
+			'--planning-timeout-ms', '200',
+		], {
+			runLatencyMatrix: async (options) => {
+				seen.push(options);
+				const cwd = process.cwd();
+				assert.deepEqual(options.liveProviderOptions.config.codex.launchProfile, { model: 'fixture-codex', reasoningEffort: 'high', serviceTier: 'fast' });
+				assert.equal(options.liveProviderOptions.config.codex.cwd, cwd);
+				assert.equal(options.liveProviderOptions.config.kimi.cwd, cwd);
+				assert.equal(options.liveProviderOptions.config.kimi.executable, 'kimi');
+				assert.equal(options.liveProviderOptions.config.kimi.catalogDiscovery, true);
+				assert.deepEqual(options.liveProviderOptions.config.kimi.modelReasoningEfforts, { 'kimi-code/k3': ['max'] });
+				assert.equal(options.liveProviderOptions.config.codex.planningTimeoutMs, 100, 'trial budget bounds CLI timeout');
+				assert.equal(options.preflightTimeoutMs, 100);
+				assert.equal(JSON.stringify(options.liveProviderOptions).includes(privatePrompt), false);
+				assert.equal(JSON.stringify(options.liveProviderOptions).includes(privatePairingKey), false);
+				return { status: 'PASSED', trials: [], cleanup: { ok: true } };
+			},
+			stdout: io.out, stderr: io.err,
+		});
+		assert.equal(exitCode, EXIT_CODES.PASSED);
+		assert.equal(seen.length, 1);
+		assert.equal(JSON.stringify(JSON.parse(io.stdout[0])).includes(privatePrompt), false);
+		assert.equal(JSON.stringify(JSON.parse(io.stdout[0])).includes(privatePairingKey), false);
+	} finally {
+		await rm(files.root, { recursive: true, force: true });
+	}
+});
+
+test('filters one exact trial without mutating the source matrix', async () => {
+	const files = await fixtureFiles();
+	const sourceMatrix = {
+		version: 1, fixedSeeds: [42], agentLoads: [1, 4, 8, 16],
+		trials: [
+			{ id: 'cell-a', mode: 'instant', scenarioId: 'fixture-a', seed: 42, agentLoad: 1 },
+			{ id: 'cell-b', mode: 'instant', scenarioId: 'fixture-b', seed: 42, agentLoad: 4 },
+		],
+	};
+	await writeFile(files.matrix, JSON.stringify(sourceMatrix), 'utf8');
+	const io = capture();
+	try {
+		const exitCode = await runLatencyRunnerCli(['--matrix', files.matrix, '--artifact-directory', files.artifacts, '--trial-id', 'cell-b'], {
+			runLatencyMatrix: async (options) => {
+				assert.deepEqual(options.matrix.trials.map((trial) => trial.id), ['cell-b']);
+				assert.deepEqual(options.matrix.fixedSeeds, sourceMatrix.fixedSeeds);
+				assert.deepEqual(options.matrix.agentLoads, sourceMatrix.agentLoads);
+				options.matrix.trials[0].id = 'mutated-only-in-runner';
+				return { status: 'PASSED', trials: [{ trialId: 'cell-b', status: 'PASSED' }], cleanup: { ok: true } };
+			},
+			stdout: io.out, stderr: io.err,
+		});
+		assert.equal(exitCode, EXIT_CODES.PASSED);
+		assert.equal(JSON.parse(io.stdout[0]).metadata.trialId, 'cell-b');
+		assert.deepEqual(JSON.parse(await readFile(files.matrix, 'utf8')), sourceMatrix);
+	} finally {
+		await rm(files.root, { recursive: true, force: true });
+	}
+});
+
+test('rejects an unknown trial id before invoking the runner', async () => {
+	const files = await fixtureFiles();
+	const io = capture();
+	let calls = 0;
+	try {
+		const exitCode = await runLatencyRunnerCli(['--matrix', files.matrix, '--artifact-directory', files.artifacts, '--trial-id', 'missing'], {
+			runLatencyMatrix: async () => { calls += 1; return { status: 'PASSED' }; }, stdout: io.out, stderr: io.err,
+		});
+		assert.equal(exitCode, EXIT_CODES.USAGE);
+		assert.equal(calls, 0);
+		assert.equal(JSON.parse(io.stdout[0]).error.code, 'CLI_USAGE');
+	} finally {
+		await rm(files.root, { recursive: true, force: true });
+	}
+});
+
+test('publishes bounded numeric metrics and CPU/memory summaries without raw private fields', async () => {
+	const files = await fixtureFiles();
+	const io = capture();
+	try {
+		await runLatencyRunnerCli(['--matrix', files.matrix, '--artifact-directory', files.artifacts], {
+			runLatencyMatrix: async () => ({ status: 'PASSED', trials: [{
+				trialId: 'metrics', status: 'PASSED',
+				metrics: { version: 1, clockBasis: { wall: 'process_monotonic_ms', virtual: 'virtual_world_ms' }, result: { taskCompletionWallDurationMs: 12, tick: { count: 3, p95Ms: 4 }, privateNumber: 99 }, raw: { ticks: [{ prompt: 'secret', wallDurationMs: 2 }] }, context: { pairingKey: 'private' } },
+				systemSummary: { sampleCount: 2, cpu: { totalMs: { p95: 7 }, privateNumber: { p95: 999 } }, memory: { rssBytes: { p95: 100 } }, privateNumber: 999, errors: [{ message: 'provider response' }] },
+			}], cleanup: { ok: true } }),
+			stdout: io.out, stderr: io.err,
+		});
+		const trial = JSON.parse(io.stdout[0]).trials[0];
+		assert.equal(trial.metrics.result.taskCompletionWallDurationMs, 12);
+		assert.equal(trial.metrics.result.tick.p95Ms, 4);
+		assert.equal(trial.metrics.result.privateNumber, undefined);
+		assert.equal(trial.metrics.raw, undefined);
+		assert.equal(trial.systemSummary.sampleCount, 2);
+		assert.equal(trial.systemSummary.cpu.totalMs.p95, 7);
+		assert.equal(trial.systemSummary.memory.rssBytes.p95, 100);
+		assert.equal(trial.systemSummary.cpu.privateNumber, undefined);
+		assert.equal(trial.systemSummary.privateNumber, undefined);
+		assert.equal(JSON.stringify(trial).includes('provider response'), false);
 	} finally {
 		await rm(files.root, { recursive: true, force: true });
 	}

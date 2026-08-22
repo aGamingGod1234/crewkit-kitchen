@@ -21,6 +21,8 @@ const MAX_METADATA_BYTES = 256;
 const MAX_RESULT_BYTES = 262_144;
 const MAX_PUBLIC_TRIALS = 256;
 const DEFAULT_PLANNING_CONCURRENCY = 16;
+const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
+const MAX_PLANNING_TIMEOUT_MS = 900_000;
 
 const FLAG_NAMES = new Map([
 	['--matrix', 'matrixPath'],
@@ -38,6 +40,10 @@ const FLAG_NAMES = new Map([
 	['--pairing-key', 'pairingKey'],
 	['--pairingKey', 'pairingKey'],
 	['--planning-concurrency', 'planningConcurrency'],
+	['--planning-timeout-ms', 'planningTimeoutMs'],
+	['--planningTimeoutMs', 'planningTimeoutMs'],
+	['--trial-id', 'trialId'],
+	['--trialId', 'trialId'],
 ]);
 
 /** Parse the deliberately small CLI surface without touching the filesystem. */
@@ -79,6 +85,8 @@ export function parseLatencyRunnerArgs(argv) {
 		planningConcurrency: values.planningConcurrency === undefined
 			? DEFAULT_PLANNING_CONCURRENCY
 			: boundedPlanningConcurrency(values.planningConcurrency),
+		planningTimeoutMs: values.planningTimeoutMs === undefined ? null : boundedPlanningTimeout(values.planningTimeoutMs),
+		trialId: values.trialId === undefined ? null : boundedMetadata(values.trialId, '--trial-id', true),
 	};
 	if (result.replayPrompt !== null && result.replayPromptFile !== null) throw cliUsage('--replay-prompt and --replay-prompt-file cannot be combined');
 	return Object.freeze(result);
@@ -107,13 +115,17 @@ export async function runLatencyRunnerCli(argv = process.argv.slice(2), dependen
 		let replayPrompt = args.replayPrompt;
 		if (args.replayPromptFile !== null) replayPrompt = await readTextFile(args.replayPromptFile, MAX_PROMPT_BYTES, '--replay-prompt-file', { read, inspect });
 		else if (args.replayPrompt !== null && path.isAbsolute(args.replayPrompt)) replayPrompt = await readPromptArgument(args.replayPrompt, { read, inspect });
+		const selectedMatrix = selectTrial(matrix, args.trialId);
+		const liveConfig = buildLiveProviderOptions(selectedMatrix, args, path.resolve(process.cwd()));
 		const runner = dependencies.runLatencyMatrix ?? defaultRunLatencyMatrix;
 		if (typeof runner !== 'function') throw cliInternal('runLatencyMatrix dependency must be a function');
 		const runnerOptions = {
-			matrix,
+			matrix: selectedMatrix,
 			matrixPath: args.matrixPath,
 			artifactDirectory: args.artifactDirectory,
 			planningConcurrency: args.planningConcurrency,
+			...(publicMetadataContext(args) === null ? {} : { baseContext: publicMetadataContext(args) }),
+			...(liveConfig === null ? {} : { liveProviderOptions: liveConfig.options, preflightTimeoutMs: liveConfig.planningTimeoutMs }),
 			...(replayRecordings === undefined ? {} : { replayRecordings }),
 			...(replayPrompt === null ? {} : { replayPrompt }),
 			...(args.arm === null ? {} : { arm: args.arm }),
@@ -176,6 +188,64 @@ async function readPromptArgument(value, dependencies) {
 	}
 }
 
+function selectTrial(matrix, trialId) {
+	if (trialId === null) return matrix;
+	if (!Array.isArray(matrix?.trials)) throw cliUsage('--trial-id requires a matrix trials array');
+	const matches = matrix.trials.filter((trial) => trial?.id === trialId);
+	if (matches.length !== 1) throw cliUsage(`--trial-id '${trialId}' must identify exactly one matrix trial`);
+	const selected = structuredClone(matrix);
+	selected.trials = [structuredClone(matches[0])];
+	return selected;
+}
+
+function buildLiveProviderOptions(matrix, args, cwd) {
+	const liveProfiles = new Map();
+	for (const trial of matrix?.trials ?? []) {
+		if (trial?.mode !== 'live') continue;
+		const profile = trial.providerProfile;
+		if (!isPlainRecord(profile) || !['codex', 'gemini', 'kimi'].includes(profile.provider)) throw cliUsage('live trial providerProfile is invalid');
+		const normalized = {};
+		for (const field of ['model', 'reasoningEffort', 'serviceTier']) {
+			if (typeof profile[field] !== 'string' || profile[field].trim().length === 0 || Buffer.byteLength(profile[field], 'utf8') > 128) throw cliUsage(`live provider ${field} is invalid`);
+			normalized[field] = profile[field];
+		}
+		const previous = liveProfiles.get(profile.provider);
+		if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(normalized)) throw cliUsage(`live ${profile.provider} trials must use one exact provider profile per invocation`);
+		liveProfiles.set(profile.provider, normalized);
+	}
+	if (liveProfiles.size === 0) return null;
+	const trialBound = liveTrialPlanningTimeout(matrix);
+	const planningTimeoutMs = Math.max(1, Math.min(args.planningTimeoutMs ?? DEFAULT_PLANNING_TIMEOUT_MS, trialBound));
+	const config = { cwd };
+	for (const [provider, profile] of liveProfiles) {
+		if (provider === 'codex') {
+			config.codex = { cwd, planningTimeoutMs, launchProfile: { ...profile } };
+			continue;
+		}
+		const providerConfig = {
+			cwd,
+			planningTimeoutMs,
+			catalogDiscovery: true,
+			models: [profile.model],
+			reasoningEfforts: [profile.reasoningEffort],
+			modelReasoningEfforts: { [profile.model]: [profile.reasoningEffort] },
+		};
+		if (provider === 'kimi') providerConfig.executable = 'kimi';
+		if (provider === 'gemini') providerConfig.executable = 'gemini';
+		config[provider] = providerConfig;
+	}
+	return { planningTimeoutMs, options: { cwd, config, planningTimeoutMs } };
+}
+
+function liveTrialPlanningTimeout(matrix) {
+	const limits = [];
+	for (const trial of matrix?.trials ?? []) {
+		if (trial?.mode !== 'live') continue;
+		for (const value of [trial.turnBudgetMs, trial.trialBudgetMs]) if (Number.isFinite(value) && value > 0) limits.push(Math.floor(value));
+	}
+	return Math.max(1, Math.min(...(limits.length === 0 ? [DEFAULT_PLANNING_TIMEOUT_MS] : limits)));
+}
+
 async function readBoundedFile(filePath, maximumBytes, field, { read, inspect }) {
 	let details;
 	try { details = await inspect(filePath); }
@@ -229,8 +299,67 @@ function publicTrial(trial) {
 		...(typeof trial.outcomeHash === 'string' ? { outcomeHash: boundedPublicText(trial.outcomeHash, 128) } : {}),
 		...(isPlainRecord(trial.error) ? { error: { code: safeCode(trial.error.code) } } : {}),
 		...(isPlainRecord(trial.cleanup) ? { cleanup: publicCleanup(trial.cleanup) } : {}),
+		...(isPlainRecord(trial.metrics) ? { metrics: publicMetrics(trial.metrics) } : {}),
+		...(isPlainRecord(trial.systemSummary) ? { systemSummary: publicSystemSummary(trial.systemSummary) } : {}),
 		durationMs: Number.isFinite(trial.durationMs) && trial.durationMs >= 0 ? Math.min(Math.round(trial.durationMs), Number.MAX_SAFE_INTEGER) : null,
 	};
+}
+
+function publicMetrics(metrics) {
+	const result = isPlainRecord(metrics.result) ? {} : null;
+	if (result !== null) {
+		for (const key of [
+			'goalWallTimestampMs', 'goalVirtualTimestampMs', 'initialObservationWallTimestampMs', 'initialObservationVirtualTimestampMs',
+			'firstActionCommandAcceptanceWallLatencyMs', 'firstActionCommandAcceptanceVirtualLatencyMs',
+			'firstAuthoritativePhysicalDisplacementWallLatencyMs', 'firstAuthoritativePhysicalDisplacementVirtualLatencyMs',
+			'taskCompletionWallDurationMs', 'taskCompletionGoalWallDurationMs', 'taskCompletionVirtualDurationMs', 'totalVirtualWorldDurationMs',
+		]) if (Number.isFinite(metrics.result[key])) result[key] = metrics.result[key];
+		for (const key of ['providerPlanningWait', 'tick', 'planningIdle']) {
+			const source = metrics.result[key];
+			if (!isPlainRecord(source)) continue;
+			const projected = numericFields(source, metricNumericKeys(key));
+			if (Object.keys(projected).length > 0) result[key] = projected;
+		}
+	}
+	return {
+		...(Number.isSafeInteger(metrics.version) ? { version: metrics.version } : {}),
+		...(result !== null ? { result } : {}),
+	};
+}
+
+function publicSystemSummary(summary) {
+	const output = {};
+	for (const key of ['sampleCount', 'droppedSamples', 'maxSamples']) if (Number.isSafeInteger(summary[key]) && summary[key] >= 0) output[key] = summary[key];
+	const summarySeries = {
+		cpu: ['userMs', 'systemMs', 'totalMs'],
+		memory: ['rssBytes', 'heapUsedBytes'],
+		eventLoopDelay: ['meanMs', 'p95Ms', 'maxMs'],
+		scheduler: ['active', 'pending'],
+	};
+	for (const key of Object.keys(summarySeries)) {
+		if (!isPlainRecord(summary[key])) continue;
+		const projected = {};
+		for (const seriesName of summarySeries[key]) {
+			if (!isPlainRecord(summary[key][seriesName])) continue;
+			const values = numericFields(summary[key][seriesName], ['min', 'max', 'p50', 'p95', 'p99']);
+			if (Object.keys(values).length > 0) projected[seriesName] = values;
+		}
+		if (Object.keys(projected).length > 0) output[key] = projected;
+	}
+	if (isPlainRecord(summary.childProcessCount)) output.childProcessCount = numericFields(summary.childProcessCount, ['min', 'max', 'p50', 'p95', 'p99']);
+	return output;
+}
+
+function metricNumericKeys(key) {
+	if (key === 'tick') return ['count', 'cpuWallDurationP50Ms', 'cpuWallDurationP95Ms', 'cpuWallDurationP99Ms', 'cpuWallDurationMaxMs', 'p50Ms', 'p95Ms', 'p99Ms', 'maxMs', 'over50MsCount'];
+	if (key === 'planningIdle') return ['localActiveWallDurationMs', 'planningIdleWallDurationMs'];
+	return ['count', 'schedulerWaitWallP50Ms', 'schedulerWaitWallP95Ms', 'schedulerWaitWallP99Ms', 'planningWaitWallP50Ms', 'planningWaitWallP95Ms', 'planningWaitWallP99Ms', 'providerWaitWallP50Ms', 'providerWaitWallP95Ms', 'providerWaitWallP99Ms'];
+}
+
+function numericFields(value, keys) {
+	const output = {};
+	for (const key of keys) if (Number.isFinite(value[key])) output[key] = value[key];
+	return output;
 }
 
 function publicMetadata(args) {
@@ -239,8 +368,15 @@ function publicMetadata(args) {
 		...(args?.runId ? { runId: args.runId } : {}),
 		...(args?.sourceHash ? { sourceHash: args.sourceHash } : {}),
 		...(args?.configHash ? { configHash: args.configHash } : {}),
+		...(args?.trialId ? { trialId: args.trialId } : {}),
 		planningConcurrency: args?.planningConcurrency ?? DEFAULT_PLANNING_CONCURRENCY,
 	};
+}
+
+function publicMetadataContext(args) {
+	const context = {};
+	for (const key of ['arm', 'runId', 'sourceHash', 'configHash', 'pairingKey']) if (args?.[key]) context[key] = args[key];
+	return Object.keys(context).length === 0 ? null : context;
 }
 
 function publicCleanup(cleanup) {
@@ -332,6 +468,13 @@ function boundedPlanningConcurrency(value) {
 	if (!/^[0-9]+$/.test(value)) throw cliUsage('--planning-concurrency must be an integer from 1 to 16');
 	const parsed = Number(value);
 	if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 16) throw cliUsage('--planning-concurrency must be an integer from 1 to 16');
+	return parsed;
+}
+
+function boundedPlanningTimeout(value) {
+	if (!/^[0-9]+$/.test(value)) throw cliUsage(`--planning-timeout-ms must be an integer from 1 to ${MAX_PLANNING_TIMEOUT_MS}`);
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > MAX_PLANNING_TIMEOUT_MS) throw cliUsage(`--planning-timeout-ms must be an integer from 1 to ${MAX_PLANNING_TIMEOUT_MS}`);
 	return parsed;
 }
 
