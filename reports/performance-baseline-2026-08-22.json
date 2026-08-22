@@ -1,0 +1,165 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-22",
+  "purpose": "Immutable before-implementation baseline for the single-brain performance plan",
+  "sources": {
+    "minipcReport": "https://n5if4c3wso4v.postplan.dev",
+    "desktopReport": "https://pbjmhmdc8ebb.postplan.dev",
+    "implementationSourceBranch": "agent/latency-optimized",
+    "implementationSourceCommit": "3b99ab26f98b54739a5d5868f0d79335951ecd9f"
+  },
+  "minipc": {
+    "environment": "MiniPC deterministic simulator and delayed provider replay",
+    "instant": {
+      "passed": 24,
+      "total": 24,
+      "repetitionsPerCell": 1,
+      "runId": "5020afe948f0"
+    },
+    "controlledDelay": {
+      "passed": 50,
+      "total": 50,
+      "repetitionsPerCellPerArm": 5,
+      "runId": "c395716c6b8c",
+      "baselinePlanningConcurrency": 16,
+      "optimizedPlanningConcurrency": 4,
+      "cells": [
+        {
+          "scenario": "stone",
+          "agents": 4,
+          "baselineCompletionMs": 3091,
+          "optimizedCompletionMs": 3071,
+          "changePercent": -0.65
+        },
+        {
+          "scenario": "direct_message",
+          "agents": 4,
+          "baselineCompletionMs": 2538,
+          "optimizedCompletionMs": 2543,
+          "changePercent": 0.22
+        },
+        {
+          "scenario": "lava_reaction",
+          "agents": 1,
+          "baselineCompletionMs": 1210,
+          "optimizedCompletionMs": 1210,
+          "changePercent": 0.04
+        },
+        {
+          "scenario": "stone",
+          "agents": 16,
+          "baselineCompletionMs": 3184,
+          "optimizedCompletionMs": 10721,
+          "changePercent": 236.7,
+          "baselinePlanningP95Ms": 3.3,
+          "optimizedPlanningP95Ms": 7529
+        },
+        {
+          "scenario": "direct_message",
+          "agents": 16,
+          "baselineCompletionMs": 2640,
+          "optimizedCompletionMs": 10127,
+          "changePercent": 283.6,
+          "baselinePlanningP95Ms": 4.4,
+          "optimizedPlanningP95Ms": 7525
+        }
+      ]
+    },
+    "load16Resources": {
+      "stone": {
+        "baselineRssPeakMb": 137.8,
+        "optimizedRssPeakMb": 126.8,
+        "baselineHeapPeakMb": 46.7,
+        "optimizedHeapPeakMb": 40.8,
+        "baselineMeanCpuMs": 419,
+        "optimizedMeanCpuMs": 553
+      },
+      "directMessage": {
+        "baselineRssPeakMb": 118.3,
+        "optimizedRssPeakMb": 117.2,
+        "baselineHeapPeakMb": 31.8,
+        "optimizedHeapPeakMb": 35.7,
+        "baselineMeanCpuMs": 253,
+        "optimizedMeanCpuMs": 225
+      }
+    },
+    "verification": {
+      "baselineCoordinatorPassed": 504,
+      "optimizedCoordinatorPassed": 519,
+      "optimizedJavaAssertionsPassed": 6376,
+      "voiceAddonAssertionsPassed": 77,
+      "replayFixturesPerArm": 41,
+      "cleanupLeaks": 0
+    },
+    "limitations": [
+      "The code comparison was confounded by different planning concurrency settings.",
+      "Live Codex Luna and Kimi K3 were unavailable to the isolated MiniPC benchmark processes.",
+      "Instant cells used one repetition and are correctness smoke tests rather than stable latency estimates."
+    ]
+  },
+  "desktop": {
+    "environment": "Desktop real headless Fabric server with optimized mod and real Codex Luna app-server",
+    "samplingWindowSeconds": 135,
+    "sampleIntervalSeconds": 1,
+    "task": "Gather wood and craft a wooden pickaxe",
+    "result": "failed_user_objective",
+    "taskTimelineSeconds": {
+      "accepted": 0,
+      "firstVisibleAction": 53,
+      "craftingAttempt": 60,
+      "reportedComplete": 143
+    },
+    "authoritativeInventoryAfterReportedCompletion": {
+      "minecraft:birch_log": 1,
+      "minecraft:stick": 4,
+      "minecraft:birch_planks": 2,
+      "woodenPickaxePresent": false
+    },
+    "movementBlocksApproximate": 2.35,
+    "minecraftTickMs": {
+      "average": 1.6,
+      "p50": 1.6,
+      "p95": 2.2,
+      "p99": 3.1,
+      "samples": 100,
+      "budget": 50
+    },
+    "combinedProcesses": {
+      "names": [
+        "Minecraft Java",
+        "coordinator Node",
+        "Codex app-server"
+      ],
+      "rssStartMb": 987,
+      "rssPeakMb": 1099,
+      "rssNearEndMb": 1089,
+      "cpuSeconds": 15.16,
+      "averagePercentOfOneLogicalCore": 11.2
+    },
+    "startup": {
+      "fabricPlayableSecondsApproximate": 5,
+      "bundledCoordinatorRunningSecondsApproximate": 9
+    },
+    "cleanup": {
+      "normalServerStop": true,
+      "remainingIsolatedProcesses": 0,
+      "remainingTestPorts": 0,
+      "visibleWindowOpened": false,
+      "normalDesktopInstallationModified": false
+    },
+    "limitations": [
+      "This was one instrumented single-agent run and does not establish 8-agent or 16-agent Desktop capacity.",
+      "A prior non-instrumented attempt exceeded the 120-second planning timeout.",
+      "The provider and orchestration path were not phase-separated in this baseline."
+    ]
+  },
+  "cleanImplementationBranchVerification": {
+    "commit": "3470dc6",
+    "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\run-automated-verification.ps1",
+    "exitCode": 0,
+    "javaAssertionsPassed": 6376,
+    "voiceAddonAssertionsPassed": 77,
+    "coordinatorTestsPassed": 519,
+    "coordinatorTestsFailed": 0
+  }
+}
