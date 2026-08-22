@@ -52,6 +52,7 @@ export class HeadlessRconClient {
     this.pending = new Map();
     this.buffer = Buffer.alloc(0);
     this.connectPromise = null;
+    this.connectReject = null;
   }
 
   async connect() {
@@ -61,24 +62,51 @@ export class HeadlessRconClient {
     this.state = 'connecting';
     this.connectPromise = new Promise((resolve, reject) => {
       let settled = false;
-      const fail = error => { if (!settled) { settled = true; reject(error); } };
-      const socket = this.socketFactory ? this.socketFactory() : net.createConnection({ host: this.host, port: this.port });
+      let timer = null;
+      const fail = error => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (this.connectReject === fail) this.connectReject = null;
+        reject(error);
+      };
+      const succeed = () => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (this.connectReject === fail) this.connectReject = null;
+        resolve(this);
+      };
+      this.connectReject = fail;
+      let socket;
+      try {
+        socket = this.socketFactory ? this.socketFactory() : net.createConnection({ host: this.host, port: this.port });
+      } catch (error) {
+        this.state = 'closed';
+        fail(new RconError('RCON_CONNECT_FAILED', error.message || 'RCON socket creation failed'));
+        return;
+      }
       this.socket = socket;
-      const timer = setTimeout(() => {
-        fail(new RconError('RCON_TIMEOUT', 'RCON connection timed out'));
-        this.close();
+      timer = setTimeout(() => {
+        const error = new RconError('RCON_TIMEOUT', 'RCON connection timed out');
+        this.state = 'closed';
+        fail(error);
+        this._rejectAll(error);
+        this._shutdownSocket();
       }, this.connectTimeoutMs);
       const onConnect = async () => {
+        if (this.state === 'closed') return;
         try {
           const response = await this._request(3, this.password);
           if (response.id === -1) throw new RconError('RCON_AUTH_FAILED', 'RCON authentication failed');
+          if (this.state === 'closed') throw new RconError('RCON_CLOSED', 'RCON client closed');
           this.state = 'authenticated';
-          settled = true;
-          clearTimeout(timer);
-          resolve(this);
+          succeed();
         } catch (error) {
-          clearTimeout(timer);
-          this.state = 'new';
+          if (this.state !== 'closed') {
+            this.state = 'closed';
+            this._shutdownSocket();
+          }
           fail(error);
         }
       };
@@ -87,13 +115,15 @@ export class HeadlessRconClient {
       socket.on('error', error => {
         const wrapped = new RconError('RCON_CLOSED', error.message || 'RCON socket error');
         this._rejectAll(wrapped);
+        this.state = 'closed';
         fail(wrapped);
+        this._shutdownSocket();
       });
       socket.on('close', () => {
         const error = new RconError('RCON_CLOSED', 'RCON socket closed');
         this._rejectAll(error);
-        if (!settled) fail(error);
         this.state = 'closed';
+        fail(error);
       });
       if (socket.readyState === 'open') onConnect();
     }).finally(() => { this.connectPromise = null; });
@@ -106,15 +136,12 @@ export class HeadlessRconClient {
   }
 
   async close() {
-    if (this.state === 'closed' && !this.socket) return;
+    if (this.state === 'closed' && !this.socket && !this.connectReject) return;
+    const error = new RconError('RCON_CLOSED', 'RCON client closed');
     this.state = 'closed';
-    this._rejectAll(new RconError('RCON_CLOSED', 'RCON client closed'));
-    const socket = this.socket;
-    this.socket = null;
-    if (socket) {
-      socket.removeAllListeners('data');
-      socket.destroy();
-    }
+    this._rejectAll(error);
+    if (this.connectReject) this.connectReject(error);
+    this._shutdownSocket();
   }
 
   _request(type, text) {
@@ -145,6 +172,11 @@ export class HeadlessRconClient {
       this.buffer = this.buffer.subarray(length + 4);
       const id = payload.readInt32LE(0);
       const type = payload.readInt32LE(4);
+      if (payload[payload.length - 1] !== 0 || payload[payload.length - 2] !== 0) {
+        this._rejectAll(new RconError('RCON_PROTOCOL', 'Malformed RCON string terminators'));
+        this.close();
+        return;
+      }
       const text = boundedUtf8(payload.subarray(8, payload.length - 2).toString('utf8'), this.maxResponseBytes);
       const pending = this.pending.get(id) ?? (id === -1 && this.pending.size === 1 ? this.pending.values().next().value : null);
       if (pending) {
@@ -162,6 +194,15 @@ export class HeadlessRconClient {
       clearTimeout(pending.timer);
       pending.reject(error);
       this.pending.delete(id);
+    }
+  }
+
+  _shutdownSocket() {
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      socket.removeAllListeners('data');
+      socket.destroy();
     }
   }
 }

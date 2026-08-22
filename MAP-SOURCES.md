@@ -1,4 +1,41 @@
-# Authored map references
+# Map sources and acquisition policy
+
+Bundled third-party-derived geometry requires explicit permission to modify and
+redistribute, retained license text, immutable source metadata, and a recorded
+archive checksum. The machine-readable authority is
+[`maps/source-ledger.json`](maps/source-ledger.json). Raw archives and extracted
+worlds stay outside version control under `runtime/map-research/`.
+
+`scripts/maps/fetch_map_source.ps1` accepts a source key from that ledger and a
+source-specific destination under the ignored research root. It has no arbitrary
+URL input. Each successful acquisition records SHA-256 evidence and later runs
+fail if a locked checksum changes. Archives are data only and are never executed.
+
+## Eligible source
+
+Re-Structured v1.2 by RonosMods is the only currently bundle-eligible source.
+Modrinth identifies it as project `ShB7QWuY`, version `NNsq5KuW`, and MIT. Its
+official repository retains the same MIT license. The exact license text and
+source hashes are recorded in the ledger. Eligibility permits review and
+adaptation; it does not mean unreviewed archive content may ship.
+
+## Provisional sources
+
+The official CurseForge pages for Parkour Masters, BigYous' MineGPT worlds, and
+Bunker Survival display MIT as the platform-declared license. Retainable license
+text has not yet been recovered from their authors or archives. They therefore
+remain `bundleEligible: false`; no archive URL is approved, and none of their
+geometry may be downloaded by the task-one tool, derived, or bundled.
+
+## Safe archive inspection
+
+`scripts/maps/archive_reader.py` validates the complete ZIP member table before
+writing. It rejects traversal, rooted or drive-qualified paths, alternate data
+streams, link and reparse-like entries, duplicate outputs, member-count and size
+overflows, and extreme compression ratios. Valid archives are extracted through
+a temporary directory and moved into place only after every member succeeds.
+
+## Previous authored map references
 
 The built-in arenas are deterministic, version-compatible adaptations. They do
 not redistribute third-party world saves.

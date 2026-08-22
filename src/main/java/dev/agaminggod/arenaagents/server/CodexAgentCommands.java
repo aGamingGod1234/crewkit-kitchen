@@ -34,6 +34,7 @@ public final class CodexAgentCommands {
 	private static final String PROVIDER_CODEX = "codex";
 	private static final String PROVIDER_GEMINI = "gemini";
 	private static final String PROVIDER_KIMI = "kimi";
+	private static final String PROVIDER_CURSOR = "cursor";
 	private static final String ARGUMENT_AGENT = "agent";
 	private static final String ARGUMENT_GAME_MODE = "game_mode";
 	private static final String ARGUMENT_GROUP = "group";
@@ -64,6 +65,7 @@ public final class CodexAgentCommands {
 								.executes(context -> summon(context, PROVIDER_CODEX, DEFAULT_MODEL, DEFAULT_REASONING, Optional.empty()))
 								.then(providerSummon(PROVIDER_GEMINI))
 								.then(providerSummon(PROVIDER_KIMI))
+								.then(providerSummon(PROVIDER_CURSOR))
 								.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model())
 										.then(Commands.argument(ARGUMENT_REASONING, StringArgumentType.word())
 												.executes(context -> summon(
@@ -127,7 +129,7 @@ public final class CodexAgentCommands {
 		return Commands.literal("summon-configured").requires(GoalControl::mayControl).then(
 				Commands.argument(ARGUMENT_PROVIDER, StringArgumentType.word())
 						.suggests((context, builder) -> SharedSuggestionProvider.suggest(
-								List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_KIMI), builder))
+								List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_KIMI, PROVIDER_CURSOR), builder))
 						.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model()).then(
 								Commands.argument(ARGUMENT_REASONING, StringArgumentType.word()).then(
 										Commands.argument(ARGUMENT_SERVICE_TIER, StringArgumentType.word())
@@ -511,7 +513,7 @@ public final class CodexAgentCommands {
 
 	private static String formatStatus(AgentRecord record) {
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("none");
-		return record.profile().userName().orElse(record.profile().nameTag())
+		return dev.agaminggod.arenaagents.agent.AgentIdentity.displayName(record.agentId(), record.profile())
 				+ " | " + dev.agaminggod.arenaagents.control.AgentControlPresentation.stateLabel(record.state().name())
 				+ ". Current task: " + currentGoal
 				+ ". Queued tasks: " + record.queuedGoals().size() + ".";

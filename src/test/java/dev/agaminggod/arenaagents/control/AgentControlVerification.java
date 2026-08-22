@@ -93,7 +93,7 @@ public final class AgentControlVerification {
 	}
 
 	private static int verifyProviderPresets() {
-		assertEquals(List.of("codex", "gemini", "kimi"), AgentControlCatalog.providers(), "provider order");
+		assertEquals(List.of("codex", "gemini", "kimi", "cursor"), AgentControlCatalog.providers(), "provider order");
 		assertEquals("gpt-5.6-luna", AgentControlCatalog.defaultModel("codex"), "Codex model default");
 		assertEquals("xhigh", AgentControlCatalog.defaultReasoning("codex", "gpt-5.6-luna"), "Codex reasoning default");
 		assertEquals("fast", AgentControlCatalog.defaultServiceTier("codex", "gpt-5.6-luna"), "Codex speed default");

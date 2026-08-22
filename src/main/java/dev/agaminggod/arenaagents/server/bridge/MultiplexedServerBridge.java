@@ -33,6 +33,7 @@ import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRou
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
+import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudget;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
@@ -88,6 +89,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_CONVERSATION_SOURCES_PER_AGENT = 16;
+	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
 			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "conversation_wake_request", "action_command", "action_cancel", "agent_error", "heartbeat"
@@ -98,10 +100,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ServerActionExecutor actionExecutor;
 	private final ServerAgentConversationRouter conversationRouter;
 	private final ServerObservationCollector observations;
-	private final ObservationPublication observationPublication =
-			new ObservationPublication(AgentConstants.DEFAULT_AGENT_LIMIT, OBSERVATIONS_PER_TICK);
 	private final BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 	private final String serverInstanceId = UUID.randomUUID().toString();
+	private final ObservationPublication observationPublication = new ObservationPublication(
+			AgentConstants.DEFAULT_AGENT_LIMIT,
+			OBSERVATIONS_PER_TICK,
+			(agentId, payload) -> ServerObservationWireBudget.fit(payload, candidate ->
+					codec.encodedBytes(new BridgeEnvelope(
+							2, serverInstanceId, agentId.toString(), "observation",
+							MAX_OBSERVATION_MESSAGE_ID, candidate
+					)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES)
+	);
 	private final String secret;
 	private final int port;
 	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(SERVER_TASK_CAP);
@@ -117,7 +126,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private volatile boolean catalogLoaded;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
-		this(manager, DEFAULT_PORT, configuredSecretPath());
+		this(manager, configuredPort(), configuredSecretPath());
 	}
 
 	public MultiplexedServerBridge(CodexAgentManager manager, Path secretPath) {
@@ -1149,8 +1158,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private boolean sendObservationEnvelope(Session source, AgentId agentId, JsonObject payload) {
 		if (session != source || !source.open.get() || !source.authenticated.get()) return false;
-		source.enqueue(new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
-				"server-" + messageIds.incrementAndGet(), payload));
+		BridgeEnvelope envelope = new BridgeEnvelope(2, serverInstanceId, agentId.toString(), "observation",
+				"server-" + messageIds.incrementAndGet(), payload);
+		if (codec.encodedBytes(envelope) > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
+			throw new BridgeProtocolException("LINE_TOO_LARGE", "Fitted observation exceeds the actual wire envelope");
+		}
+		source.enqueue(envelope);
 		return true;
 	}
 
@@ -1230,6 +1243,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		String configured = System.getProperty("arenaagents.bridgeSecretFile");
 		if (configured == null || configured.isBlank()) configured = System.getenv("ARENA_AGENT_BRIDGE_SECRET_FILE");
 		return configured == null || configured.isBlank() ? Paths.get("runtime", "bridge-secret.txt") : Paths.get(configured);
+	}
+
+	static int configuredPort() {
+		String configured = System.getProperty("arenaagents.bridgePort");
+		if (configured == null || configured.isBlank()) return DEFAULT_PORT;
+		final int parsed;
+		try {
+			parsed = Integer.parseInt(configured);
+		} catch (NumberFormatException exception) {
+			throw new IllegalArgumentException("arenaagents.bridgePort must be an integer from 1 to 65535", exception);
+		}
+		if (parsed < 1 || parsed > 65_535) {
+			throw new IllegalArgumentException("arenaagents.bridgePort must be an integer from 1 to 65535");
+		}
+		return parsed;
 	}
 
 	private static String readSecret(Path path) {
@@ -1362,6 +1390,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final PublishedObservationState published;
 		private final int queueCapacity;
 		private final int perTickLimit;
+		private final java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter;
 		private final LinkedHashSet<AgentId> urgent = new LinkedHashSet<>();
 		private final Set<AgentId> heartbeatPending = new HashSet<>();
 		private final AtomicLong sequences = new AtomicLong();
@@ -1369,10 +1398,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private int heartbeatCursor;
 
 		ObservationPublication(int queueCapacity, int perTickLimit) {
+			this(queueCapacity, perTickLimit,
+					(agentId, observation) -> new ServerObservationWireBudget.Fitted(observation, List.of()));
+		}
+
+		ObservationPublication(
+				int queueCapacity,
+				int perTickLimit,
+				java.util.function.BiFunction<AgentId, JsonObject, ServerObservationWireBudget.Fitted> fitter
+		) {
 			this.queueCapacity = queueCapacity;
 			this.perTickLimit = perTickLimit;
 			queue = new ObservationDispatchQueue<>(queueCapacity, perTickLimit);
 			published = new PublishedObservationState(queueCapacity);
+			this.fitter = Objects.requireNonNull(fitter, "fitter must not be null");
 		}
 
 		void activate(Object session) {
@@ -1529,20 +1568,28 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			synchronized (lifecycleLock) {
 				if (activeSession != sourceSession) return Result.STALE_SESSION;
 				long eventSequence = sequences.incrementAndGet();
-				AttentionFactDelta delta = published.delta(
-						agentId, observation, eventSequence,
-						observation.get("observedAtEpochMs").getAsLong()
-				);
+				long observedAtEpochMs = observation.get("observedAtEpochMs").getAsLong();
+				AttentionFactDelta delta = published.delta(agentId, observation, eventSequence, observedAtEpochMs);
 				if (!allowUnchanged && published.hasDelivered(agentId) && !delta.attention()) return Result.SUPPRESSED;
-				observation.addProperty("eventSequence", delta.eventSequence());
-				observation.addProperty("attention", delta.attention());
-				JsonArray changedFacts = new JsonArray();
-				delta.changedFacts().forEach(changedFacts::add);
-				observation.add("changedFacts", changedFacts);
-				if (!writer.send(agentId, observation)) return Result.DELIVERY_RETRY;
-				published.commit(agentId, observation);
+				JsonObject delivery = observation.deepCopy();
+				attachDelta(delivery, delta);
+				delivery = fitter.apply(agentId, delivery).observation();
+				delta = published.delta(agentId, delivery, eventSequence, observedAtEpochMs);
+				attachDelta(delivery, delta);
+				delivery = fitter.apply(agentId, delivery).observation();
+				attachDelta(delivery, published.delta(agentId, delivery, eventSequence, observedAtEpochMs));
+				if (!writer.send(agentId, delivery)) return Result.DELIVERY_RETRY;
+				published.commit(agentId, delivery);
 				return Result.COMMITTED;
 			}
+		}
+
+		private static void attachDelta(JsonObject observation, AttentionFactDelta delta) {
+			observation.addProperty("eventSequence", delta.eventSequence());
+			observation.addProperty("attention", delta.attention());
+			JsonArray changedFacts = new JsonArray();
+			delta.changedFacts().forEach(changedFacts::add);
+			observation.add("changedFacts", changedFacts);
 		}
 
 		private void clearLocked() {

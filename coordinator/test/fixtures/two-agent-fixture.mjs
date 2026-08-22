@@ -34,7 +34,15 @@ export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) 
 			}
 		},
 		async untilBothComplete() {
-			await eventually(() => PROFILES.every((profile) => registry.get(profile.agentId)?.state === DynamicAgentState.COMPLETED), 'both dynamic agents did not complete');
+			await eventually(
+				() => PROFILES.every((profile) => registry.get(profile.agentId)?.state === DynamicAgentState.COMPLETED),
+				() => `both dynamic agents did not complete: ${JSON.stringify(PROFILES.map((profile) => ({
+					agentId: profile.agentId,
+					state: registry.get(profile.agentId)?.state,
+					actions: bridge.sent.filter((message) => message.type === 'action_command' && message.agentId === profile.agentId).length,
+					plannerAttempts: provider.attempts.get(profile.agentId) ?? 0,
+				})))}`,
+			);
 		},
 		crossAgentMessages: () => bridge.sent.filter((message) => message.agentId !== 'server' && !PROFILES.some((profile) => profile.agentId === message.agentId)).length,
 		models: () => PROFILES.map((profile) => profile.model),
@@ -99,7 +107,10 @@ class FakeBridge extends EventEmitter {
 		if (type === 'action_command') {
 			const sequence = (this.#eventSequence.get(agentId) ?? 1) + 1;
 			this.#eventSequence.set(agentId, sequence);
-			setImmediate(() => this.emit('action_result', { agentId, payload: { traceId: payload.traceId, goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } }));
+			setImmediate(() => {
+				this.emit('action_result', { agentId, payload: { traceId: payload.traceId, goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } });
+				this.emit('observation', observation(agentId, payload.goalRevision, sequence, false));
+			});
 		}
 	}
 }
@@ -139,8 +150,8 @@ class FixtureProvider {
 	}
 }
 
-function observation(agentId, goalRevision, eventSequence) {
-	return { agentId, payload: { goalRevision, observedAtEpochMs: 1, ready: true, status: 'ready', eventSequence, attention: true, changedFacts: [], position: { x: 0, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 }, player: { health: 20, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5, gameMode: 'survival', onGround: true, inWater: false, onFire: false, air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [] }, inventory: { items: [], selectedItem: 'minecraft:air' }, entities: [], blocks: [], nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false }, currentAction: { active: false }, lastResult: { present: false } } };
+function observation(agentId, goalRevision, eventSequence, attention = true) {
+	return { agentId, payload: { goalRevision, observedAtEpochMs: 1, ready: true, status: 'ready', eventSequence, attention, changedFacts: [], position: { x: 0, y: 64, z: 0 }, velocity: { x: 0, y: 0, z: 0 }, view: { yaw: 0, pitch: 0 }, player: { health: 20, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5, gameMode: 'survival', onGround: true, inWater: false, onFire: false, air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [] }, inventory: { items: [], selectedItem: 'minecraft:air' }, entities: [], blocks: [], nearbyContainers: [], world: { dimension: 'minecraft:overworld', gameTime: 1, dayTime: 1, raining: false, thundering: false }, currentAction: { active: false }, lastResult: { present: false } } };
 }
 
 async function eventually(predicate, message) {
@@ -149,5 +160,5 @@ async function eventually(predicate, message) {
 		if (predicate()) return;
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
-	throw new Error(message);
+	throw new Error(typeof message === 'function' ? message() : message);
 }

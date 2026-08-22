@@ -109,6 +109,17 @@ export class ProgramRuntimeManager {
 			};
 			this.#recordMinecraftPublication(receiptEpochMs, payload.observedAtEpochMs);
 		}
+		if (state.pendingServerResult !== null && eventSequence >= state.pendingServerResult.barrierEventSequence) {
+			const pending = state.pendingServerResult;
+			state.pendingServerResult = null;
+			state.engine.ingestActionResult({
+				actionId: pending.internalActionId,
+				state: pending.state,
+				reasonCode: pending.reasonCode,
+				eventSequence,
+			});
+			this.#flushDeferredProgramTrace(state);
+		}
 		state.engine.ingestObservation({
 			observation,
 			eventSequence,
@@ -157,8 +168,8 @@ export class ProgramRuntimeManager {
 		if (active === null || internalActionId !== active) return false;
 		const actionTraceId = state.actionTraceIds.get(payload.actionId) ?? state.traceId;
 		if (payload.traceId !== undefined && payload.traceId !== actionTraceId) return false;
-		const eventSequence = this.#actionEventSequence(state, payload.eventSequence);
-		if (eventSequence === null) return false;
+		const barrierEventSequence = (state.lastServerEventSequence ?? 0) + 1;
+		const resultEventSequence = barrierEventSequence;
 		const timing = state.actionTiming.get(payload.actionId);
 		const metadata = state.actionMetadata.get(payload.actionId);
 		const completedAt = this.#safeNow();
@@ -167,7 +178,7 @@ export class ProgramRuntimeManager {
 		}
 		this.#record('action_completed', record, {
 			actionId: payload.actionId,
-			eventSequence,
+			eventSequence: resultEventSequence,
 			state: payload.state,
 			reasonCode: payload.reasonCode ?? '',
 			durationMs: elapsedOrNull(timing?.bridgeSentAt, completedAt),
@@ -183,7 +194,7 @@ export class ProgramRuntimeManager {
 				programId: metadata.command.provenance.programId,
 				version: metadata.command.provenance.version,
 				sourceStepId: metadata.command.provenance.stepId,
-				eventSequence,
+				eventSequence: resultEventSequence,
 				authority: metadata.command.provenance,
 				actionType: metadata.command.action.type,
 				arguments: metadata.command.action.arguments,
@@ -195,19 +206,16 @@ export class ProgramRuntimeManager {
 				},
 			});
 		}
-		state.engine.ingestActionResult({
-			actionId: internalActionId,
+		state.pendingServerResult = {
+			internalActionId,
 			state: payload.state,
 			reasonCode: payload.reasonCode ?? '',
-			eventSequence,
-		});
-		this.#flushDeferredProgramTrace(state);
+			barrierEventSequence,
+		};
 		state.actionIds.delete(payload.actionId);
 		state.actionTraceIds.delete(payload.actionId);
 		state.actionTiming.delete(payload.actionId);
 		state.actionMetadata.delete(payload.actionId);
-		if (state.observation !== null) state.engine.ingestObservation({ observation: state.observation, eventSequence, attention: false });
-		this.#flushDeferredProgramTrace(state);
 		this.#syncState(record, state);
 		return true;
 	}
@@ -290,6 +298,7 @@ export class ProgramRuntimeManager {
 			dispatchTraceRecorded: false,
 			worldActionTraceIds: new Set(),
 			verificationTraceIds: new Set(),
+			pendingServerResult: null,
 			engine: null,
 		};
 		state.engine = new ArenaScriptEngine({
@@ -795,7 +804,8 @@ export class ProgramRuntimeManager {
 	#setTerminalState(record, state) {
 		const current = this.#registry.get(record.agentId);
 		if (current === null || current.goalRevision !== record.goalRevision
-			|| current.state === DynamicAgentState.DEAD || current.state === state) return;
+			|| current.state === DynamicAgentState.DEAD || current.state === DynamicAgentState.COMPLETED
+			|| current.state === state) return;
 		const updated = this.#registry.setState(record.agentId, state, { goalRevision: record.goalRevision });
 		if (state === DynamicAgentState.COMPLETED) {
 			try {

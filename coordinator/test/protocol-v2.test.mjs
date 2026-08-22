@@ -453,6 +453,63 @@ test('multiplexed bridge authenticates once and learns the complete registry sna
 	bridge.stop();
 });
 
+test('multiplexed bridge audits validated detached inbound and outbound envelopes', async () => {
+	const socket = new FakeSocket();
+	const audit = [];
+	let receivedObservation;
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		audit: (direction, envelope) => audit.push({ direction, envelope }),
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4,
+	});
+	bridge.start();
+	bridge.on('observation', (envelope) => { receivedObservation = envelope; });
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+	socket.emit('data', `${JSON.stringify(serverEnvelope('observation', 'agent-a', 'server-2', readyServerObservation(4)))}\n`);
+	await bridge.send('agent_ready', 'agent-a', { goalRevision: 4 });
+	await bridge.send('action_command', 'agent-a', {
+		traceId: TRACE_ID,
+		goalRevision: 4, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
+	});
+	assert.deepEqual(audit.map(({ direction, envelope }) => [direction, envelope.messageId, envelope.type, envelope.agentId]), [
+		['coordinator_to_server', 'coordinator-v2-1', 'hello', 'server'],
+		['server_to_coordinator', 'server-1', 'hello_ack', 'server'],
+		['server_to_coordinator', 'server-2', 'observation', 'agent-a'],
+		['coordinator_to_server', 'coordinator-v2-2', 'agent_ready', 'agent-a'],
+		['coordinator_to_server', 'coordinator-v2-3', 'action_command', 'agent-a'],
+	]);
+	assert.equal(JSON.parse(socket.writes[0]).payload.secret, SECRET);
+	assert.equal(audit[0].envelope.payload.secret, '[REDACTED]');
+	assert.doesNotMatch(JSON.stringify(audit), new RegExp(SECRET));
+	audit[2].envelope.payload.position.x = 999;
+	assert.equal(receivedObservation.payload.position.x, 10.5);
+	bridge.stop();
+});
+
+test('audit callback failures never interrupt bridge delivery', async () => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		audit: async () => { throw new Error('audit unavailable'); },
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4,
+	});
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+	await bridge.send('agent_ready', 'agent-a', { goalRevision: 4 });
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'agent_ready');
+	bridge.stop();
+});
+
 test('multiplexed bridge rejects stale revisions before writing', async () => {
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
@@ -923,4 +980,16 @@ test('authenticated bridge accepts same-revision conversation wake replay and it
 	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'conversation_wake_ack');
 	assert.equal(socket.destroyed, false);
 	bridge.stop();
+});
+
+
+test('catalog snapshots carry Cursor Composer and Grok profiles', () => {
+	const model = {
+		provider: 'cursor', id: 'cursor:composer-2.5', model: 'composer-2.5', displayName: 'Composer 2.5',
+		reasoningEfforts: ['low', 'high'], serviceTiers: ['priority', 'fast'],
+	};
+	assert.deepEqual(
+		validateProtocolV2Payload('catalog_snapshot', { refreshedAtEpochMs: 1, models: [model] }).models,
+		[model],
+	);
 });

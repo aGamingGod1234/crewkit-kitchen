@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,10 +10,12 @@ import { AgentWorkspaceManager } from './agent-workspace.mjs';
 import { AcpProviderService } from './acp-service.mjs';
 import { AntigravityProviderService } from './antigravity-service.mjs';
 import { CodexService } from './codex-service.mjs';
+import { CursorProviderService } from './cursor-service.mjs';
 import { ControlLatencyRegistry } from './control-latency-registry.mjs';
 import { ConversationMemory } from './conversation-memory.mjs';
 import { FactLedger } from './fact-ledger.mjs';
 import { ProviderService } from './provider-service.mjs';
+import { ProviderTurnRecorder } from './provider-turn-recorder.mjs';
 import {
 	DEFAULT_AGENT_CAP,
 	DEFAULT_GOAL_QUEUE_CAP,
@@ -86,8 +88,9 @@ export class DynamicCoordinator extends EventEmitter {
 	#statusHandle = null;
 	#serverInstanceId = null;
 	#traceWriter;
+	#providerTurnRecorder;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, codexControlProtocol = 'arena_script', traceWriter = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, codexControlProtocol = 'arena_script', traceWriter = null, providerTurnRecorder = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -98,6 +101,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
 		if (traceWriter !== null && typeof traceWriter.write !== 'function') throw new TypeError('traceWriter.write must be a function');
 		this.#traceWriter = traceWriter;
+		if (providerTurnRecorder !== null && typeof providerTurnRecorder.close !== 'function') throw new TypeError('providerTurnRecorder.close must be a function');
+		this.#providerTurnRecorder = providerTurnRecorder;
 		if (!['arena_script', 'native_tools'].includes(codexControlProtocol)) throw new TypeError('codexControlProtocol must be arena_script or native_tools');
 		this.#codexControlProtocol = codexControlProtocol;
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
@@ -178,6 +183,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#contextCursors.clear();
 		this.#conversationWakeTransactions.clear();
 		if (this.#traceWriter !== null && typeof this.#traceWriter.close === 'function') await this.#traceWriter.close();
+		if (this.#providerTurnRecorder !== null) await Promise.resolve(this.#providerTurnRecorder.close()).catch(() => {});
 		await this.#codexService.stop();
 		this.#started = false;
 		this.#stopping = false;
@@ -1219,6 +1225,7 @@ export class DynamicCoordinator extends EventEmitter {
 }
 
 export function createDynamicCoordinator(configValue, dependencies = {}) {
+	const providerTurnRecorder = dependencies.providerTurnRecorder ?? null;
 	const config = normalizeDynamicConfig(configValue, dependencies.env ?? process.env);
 	const providerEnvironment = createProviderChildEnvironment(
 		dependencies.env ?? process.env,
@@ -1249,7 +1256,13 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 			workspaceManager,
 		}),
 		kimi: new AcpProviderService({ ...config.kimi, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transportFactory: dependencies.kimiTransportFactory, workspaceManager }),
-	});
+		cursor: new CursorProviderService({ ...config.cursor, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, {
+			spawn: dependencies.cursorSpawn,
+			terminate: dependencies.terminateProviderProcess,
+			platform: dependencies.platform,
+			workspaceManager,
+		}),
+	}, { turnRecorder: providerTurnRecorder });
 	const healthRegistry = dependencies.healthRegistry ?? dependencies.planner?.healthRegistry ?? new ProviderHealthRegistry({ now: dependencies.healthNow ?? Date.now });
 	const latencyRegistry = dependencies.latencyRegistry ?? new ControlLatencyRegistry();
 	const planner = dependencies.planner ?? new AgentPlanner({
@@ -1262,8 +1275,10 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		now: dependencies.plannerNow ?? dependencies.now,
 		telemetrySink: dependencies.telemetrySink,
 		benchmarkRecorder: dependencies.benchmarkRecorder,
+		turnRecorder: providerTurnRecorder,
 	});
 	const bridge = dependencies.bridge ?? new MultiplexedServerBridge(config.bridge, {
+		audit: dependencies.protocolAudit,
 		socketFactory: dependencies.socketFactory,
 		schedule: dependencies.schedule,
 		cancelSchedule: dependencies.cancelSchedule,
@@ -1279,6 +1294,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		latencyRegistry,
 		codexControlProtocol: config.codex.controlProtocol,
 		traceWriter: dependencies.traceWriter,
+		providerTurnRecorder,
 		controlNow: dependencies.controlNow,
 		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,
@@ -1293,6 +1309,21 @@ export function parseDynamicCliArguments(args) {
 	if (args.length !== 2 || args[0] !== '--config') throw new Error('Usage: node coordinator/src/dynamic-main.mjs [--config <absolute-path>]');
 	if (!path.isAbsolute(args[1])) throw new Error('--config must be an absolute path');
 	return { configPath: args[1] };
+}
+
+export function resolveDynamicCliRuntime(environment = process.env) {
+	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) throw new TypeError('runtime environment must be an object');
+	const tracePath = environment.ARENA_HEADLESS_TRACE_PATH ?? path.join(PROJECT_DIRECTORY, 'runtime', 'traces', 'coordinator.jsonl');
+	const separator = tracePath.includes('\\') ? '\\' : '/';
+	const traceDirectory = tracePath.slice(0, Math.max(0, tracePath.lastIndexOf(separator)));
+	return {
+		tracePath,
+		diagnosticTracePath: environment.ARENA_HEADLESS_PRIVATE_TRACE_PATH ?? `${traceDirectory}${separator}coordinator-private.jsonl`,
+		protocolAuditPath: environment.ARENA_PROTOCOL_AUDIT_PATH ?? null,
+		providerTurnsPath: environment.ARENA_PROVIDER_TURNS_PATH ?? null,
+		runId: environment.ARENA_HEADLESS_RUN_ID ?? 'dynamic-run',
+		scenarioId: environment.ARENA_HEADLESS_SCENARIO_ID ?? 'dynamic',
+	};
 }
 
 export async function loadDynamicConfig(configPath = DEFAULT_DYNAMIC_CONFIG_PATH) {
@@ -1355,6 +1386,21 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 			reasoningEfforts: ['low', 'high', 'max'],
 			...(value.kimi ?? {}),
 		},
+		cursor: {
+			provider: 'cursor',
+			cwd,
+			executable: process.platform === 'win32' && typeof environment.LOCALAPPDATA === 'string' && environment.LOCALAPPDATA.trim() !== ''
+				? path.join(environment.LOCALAPPDATA, 'cursor-agent', 'agent.ps1')
+				: 'agent',
+			catalogDiscovery: true,
+			models: ['composer-2.5', 'grok-4.5', 'grok-4.6'],
+			modelReasoningEfforts: {
+				'composer-2.5': ['high'],
+				'grok-4.5': ['low', 'medium', 'high'],
+				'grok-4.6': ['low', 'medium', 'high', 'xhigh'],
+			},
+			...(value.cursor ?? {}),
+		},
 		limits: {
 			agentCap,
 			goalQueueCap: positiveInteger(value.limits?.goalQueueCap ?? DEFAULT_GOAL_QUEUE_CAP, 'limits.goalQueueCap'),
@@ -1369,11 +1415,16 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 async function runCli() {
 	const { configPath } = parseDynamicCliArguments(process.argv.slice(2));
 	const config = await loadDynamicConfig(configPath);
-	const traceRoot = path.join(PROJECT_DIRECTORY, 'runtime', 'traces');
-	const traceWriter = new TraceWriter(path.join(traceRoot, 'coordinator.jsonl'), {
-		diagnosticFilePath: path.join(traceRoot, 'coordinator-private.jsonl'),
+	const runtime = resolveDynamicCliRuntime(process.env);
+	const traceWriter = new TraceWriter(runtime.tracePath, { diagnosticFilePath: runtime.diagnosticTracePath });
+	const protocolAudit = runtime.protocolAuditPath === null ? null : createJsonlAudit(runtime.protocolAuditPath, { runId: runtime.runId, scenarioId: runtime.scenarioId });
+	if (runtime.providerTurnsPath !== null) await mkdir(path.dirname(path.resolve(runtime.providerTurnsPath)), { recursive: true });
+	const providerTurnRecorder = runtime.providerTurnsPath === null ? null : new ProviderTurnRecorder({
+		runId: runtime.runId,
+		scenarioId: runtime.scenarioId,
+		privatePath: runtime.providerTurnsPath,
 	});
-	const coordinator = createDynamicCoordinator(config, { traceWriter });
+	const coordinator = createDynamicCoordinator(config, { traceWriter, protocolAudit, providerTurnRecorder });
 	let voiceWorker = await startVoiceWorker(config, process.env).catch((error) => {
 		process.stderr.write(`[voice-worker] ${error?.message ?? error}; proximity speech will fall back to text\n`);
 		return null;
@@ -1388,17 +1439,32 @@ async function runCli() {
 	try {
 		await coordinator.start();
 	} catch (error) {
-		await Promise.allSettled([coordinator.stop(), voiceWorker?.close()]);
+		await Promise.allSettled([coordinator.stop(), voiceWorker?.close(), protocolAudit?.close()]);
 		throw error;
 	}
 	let shutdownPromise = null;
 	const shutdown = async () => {
-		shutdownPromise ??= Promise.allSettled([coordinator.stop(), voiceWorker?.close()]);
+		shutdownPromise ??= Promise.allSettled([coordinator.stop(), voiceWorker?.close(), protocolAudit?.close()]);
 		await shutdownPromise;
 		process.exitCode = 0;
 	};
 	process.once('SIGINT', shutdown);
 	process.once('SIGTERM', shutdown);
+}
+
+function createJsonlAudit(filePath, metadata) {
+	if (typeof filePath !== 'string' || filePath.trim() === '') throw new TypeError('protocol audit path must be nonblank');
+	let queue = Promise.resolve();
+	let closed = false;
+	const ready = mkdir(path.dirname(path.resolve(filePath)), { recursive: true });
+	const audit = (direction, envelope) => {
+		if (closed) return Promise.reject(new Error('protocol audit is closed'));
+		const encoded = `${JSON.stringify({ ...metadata, direction, envelope })}\n`;
+		queue = queue.catch(() => {}).then(async () => { await ready; await appendFile(filePath, encoded, { encoding: 'utf8', flag: 'a' }); });
+		return queue;
+	};
+	audit.close = async () => { closed = true; await queue; };
+	return audit;
 }
 
 export async function startVoiceWorker(config, environment = process.env, dependencies = {}) {

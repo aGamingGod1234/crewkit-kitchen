@@ -21,8 +21,8 @@ public final class ObservationBudgetVerification {
 		assertEquals(7L, delta.eventSequence(), "event sequence is retained exactly");
 		assertTrue(delta.changedFacts().contains("player.health"), "health delta is factual");
 		assertTrue(delta.changedFacts().contains("player.onFire"), "fire delta is factual");
-		assertTrue(delta.changedFacts().contains("player.fallDistance"),
-				"falling remains a factual hazard interruption");
+		assertFalse(delta.changedFacts().contains("player.fallDistance"),
+				"ordinary fall progress stays quiet below the hazard threshold");
 		assertFalse(delta.changedFacts().contains("currentAction"),
 				"action lifecycle is delivered by typed action events instead of attention");
 		assertFalse(delta.changedFacts().stream().anyMatch(path -> path.contains("danger") || path.contains("flee") || path.contains("fight")),
@@ -45,8 +45,9 @@ public final class ObservationBudgetVerification {
 		assertTrue(worldDelta.changedFacts().contains("inventory"), "inventory changes are eligible without action progress");
 		assertTrue(worldDelta.changedFacts().contains("entities.00000000-0000-0000-0000-000000000001"),
 				"entity changes are eligible without action progress");
-		assertTrue(worldDelta.changedFacts().contains("blocks.1,64,0"), "block changes are eligible without action progress");
-		assertTrue(worldDelta.changedFacts().contains("world"), "weather changes are eligible without action progress");
+		assertFalse(worldDelta.changedFacts().stream().anyMatch(path -> path.startsWith("blocks")),
+				"ordinary block visibility churn stays quiet");
+		assertFalse(worldDelta.changedFacts().contains("world"), "weather changes stay quiet");
 		AttentionFactDelta initialDelta = AttentionFactDelta.between(null, current, 1L, 123L);
 		assertFalse(initialDelta.attention(), "initial observation is not attention");
 		assertEquals(List.of(), initialDelta.changedFacts(), "initial observation has no changed facts");
@@ -58,9 +59,9 @@ public final class ObservationBudgetVerification {
 		assertEquals(List.of(), timeOnly.changedFacts(), "world clock heartbeat has no changed facts");
 		JsonObject crowdedBefore = observation(20.0D, false, 0.0D, "idle");
 		JsonObject crowdedAfter = observation(20.0D, false, 0.0D, "idle");
-		for (int index = 0; index < 64; index++) {
+		for (int index = 0; index < 300; index++) {
 			crowdedBefore.getAsJsonArray("entities").add(entity(index));
-			crowdedAfter.getAsJsonArray("entities").add(entity(index + 64));
+			crowdedAfter.getAsJsonArray("entities").add(entity(index + 300));
 		}
 		for (int index = 0; index < 128; index++) {
 			crowdedBefore.getAsJsonArray("blocks").add(block(index));
@@ -69,7 +70,7 @@ public final class ObservationBudgetVerification {
 		AttentionFactDelta crowded = AttentionFactDelta.between(crowdedBefore, crowdedAfter, 9L, 125L);
 		assertTrue(crowded.changedFacts().size() <= 256, "changed facts remain protocol bounded at maximum disjoint entity and block changes");
 		assertTrue(crowded.changedFacts().contains("entities"), "entity overflow coalesces to a factual aggregate");
-		assertTrue(crowded.changedFacts().contains("blocks"), "block overflow coalesces to a factual aggregate");
+		assertFalse(crowded.changedFacts().contains("blocks"), "ordinary block visibility changes stay quiet");
 		MultiplexedServerBridge.PublishedObservationState publication = new MultiplexedServerBridge.PublishedObservationState(16);
 		AgentId retryAgent = AgentId.parse("01234567-89ab-cdef-0123-456789abcdef");
 		publication.commit(retryAgent, previous);

@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server.perception;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 
@@ -35,6 +36,13 @@ public final class ObservationSectionCache<K, V> {
 
 	public synchronized void invalidate(K key) {
 		entries.remove(Objects.requireNonNull(key, "key must not be null"));
+	}
+
+	public synchronized int invalidateMatching(Predicate<K> predicate) {
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		int before = entries.size();
+		entries.keySet().removeIf(predicate);
+		return before - entries.size();
 	}
 
 	public synchronized void clear() {

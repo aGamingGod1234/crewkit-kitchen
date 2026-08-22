@@ -29,11 +29,12 @@ function profile(provider, overrides = {}) {
 }
 
 test('provider router defaults legacy profiles to Codex and isolates each backend', async () => {
-	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi', 'cursor'].map((provider) => [provider, new FakeService(provider)]));
 	const router = new ProviderService(services);
 	assert.equal((await router.createAgent({ agentId: 'legacy' })).provider, 'codex');
 	assert.equal((await router.createAgent({ agentId: 'g', provider: 'gemini' })).provider, 'gemini');
 	assert.equal((await router.createAgent({ agentId: 'k', provider: 'kimi' })).provider, 'kimi');
+	assert.equal((await router.createAgent({ agentId: 'u', provider: 'cursor' })).provider, 'cursor');
 	assert.deepEqual(services.codex.created.map((profile) => profile.provider), ['codex']);
 	assert.equal(router.getAgent('g').provider, 'gemini');
 	await router.removeAgent('k');
@@ -121,17 +122,19 @@ test('provider reconciliation groups profiles and preserves an unavailable provi
 	const codex = new FakeService('codex');
 	const gemini = new FakeService('gemini');
 	const kimi = new FakeService('kimi');
+	const cursor = new FakeService('cursor');
 	gemini.reconcile = async (records) => ({ valid: [], invalid: records.map((record) => ({ profile: record, code: 'PROVIDER_UNAVAILABLE', message: 'login rejected' })), removed: [], catalog: { provider: 'gemini', models: [] } });
-	const router = new ProviderService({ codex, gemini, kimi });
+	const router = new ProviderService({ codex, gemini, kimi, cursor });
 	const result = await router.reconcile([
 		{ agentId: 'c', provider: 'codex' }, { agentId: 'g', provider: 'gemini' }, { agentId: 'k', provider: 'kimi' },
+		{ agentId: 'u', provider: 'cursor' },
 	]);
-	assert.deepEqual(result.valid.map((record) => record.agentId), ['c', 'k']);
+	assert.deepEqual(result.valid.map((record) => record.agentId), ['c', 'k', 'u']);
 	assert.deepEqual(result.invalid.map((entry) => entry.profile.agentId), ['g']);
 });
 
 test('combined catalog refreshes independent provider CLIs concurrently', async () => {
-	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi', 'cursor'].map((provider) => [provider, new FakeService(provider)]));
 	const started = [];
 	const releases = new Map();
 	for (const [provider, service] of Object.entries(services)) {
@@ -143,7 +146,7 @@ test('combined catalog refreshes independent provider CLIs concurrently', async 
 	const router = new ProviderService(services);
 	const refreshing = router.catalog.refresh();
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.deepEqual(started, ['codex', 'gemini', 'kimi']);
+	assert.deepEqual(started, ['codex', 'gemini', 'kimi', 'cursor']);
 	for (const release of releases.values()) release();
 	await refreshing;
 });

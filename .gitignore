@@ -21,10 +21,15 @@ bin/
 node_modules/
 npm-debug.log*
 
+# Python tooling
+__pycache__/
+*.py[cod]
+
 # Fabric development runtime and generated launcher state
 run/
 runtime/*
 !runtime/README.md
+runtime/map-research/
 .worktrees/
 
 # Logs, traces, crash reports, and diagnostics

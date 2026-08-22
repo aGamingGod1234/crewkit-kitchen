@@ -243,3 +243,55 @@ test('Windows cleanup accepts a late exit when forced taskkill reports an alread
 	});
 	assert.equal(calls, 2);
 });
+
+
+test('Gemini ACP preserves bounded structured 429 metadata without retaining provider data', async () => {
+	const child = new UncooperativeChild();
+	const requests = [];
+	child.stdin.write = (line) => requests.push(JSON.parse(String(line).trim()));
+	const transport = new AcpStdioTransport(
+		{ provider: 'gemini' },
+		{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
+	);
+	await transport.start();
+
+	const request = transport.request('session/prompt', {}, { timeoutMs: SETTLE_TIMEOUT_MS });
+	child.stdout.emit('data', `${JSON.stringify({
+		id: requests[0].id,
+		error: { code: -32_000, message: 'quota exhausted', data: { httpStatusCode: 429, prompt: 'arbitrary-secret-prompt' } },
+	})}\n`);
+
+	await assert.rejects(request, (error) => {
+		assert.equal(error.code, 'RPC_ERROR');
+		assert.equal(error.rpcCode, -32_000);
+		assert.equal(error.httpStatusCode, 429);
+		assert.equal(error.rateLimited, true);
+		assert.equal(Object.hasOwn(error, 'data'), false);
+		assert.doesNotMatch(JSON.stringify(error), /arbitrary-secret-prompt/);
+		return true;
+	});
+	await transport.stop();
+});
+
+test('ACP RPC fallback never stringifies provider error data', async () => {
+	const child = new UncooperativeChild();
+	const requests = [];
+	child.stdin.write = (line) => requests.push(JSON.parse(String(line).trim()));
+	const transport = new AcpStdioTransport(
+		{ provider: 'gemini' },
+		{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
+	);
+	await transport.start();
+
+	const request = transport.request('session/prompt', {}, { timeoutMs: SETTLE_TIMEOUT_MS });
+	child.stdout.emit('data', `${JSON.stringify({ id: requests[0].id, error: {
+		code: 429, data: { prompt: 'ARBITRARY_RPC_PROMPT_SECRET', httpStatusCode: 429 },
+	} })}\n`);
+
+	await assert.rejects(request, (error) => {
+		assert.doesNotMatch(error.message, /ARBITRARY_RPC_PROMPT_SECRET|httpStatusCode|\{"code"/);
+		assert.deepEqual({ rpcCode: error.rpcCode, httpStatusCode: error.httpStatusCode, rateLimited: error.rateLimited }, { rpcCode: 429, httpStatusCode: 429, rateLimited: true });
+		return true;
+	});
+	await transport.stop();
+});

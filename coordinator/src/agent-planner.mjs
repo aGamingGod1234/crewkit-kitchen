@@ -38,6 +38,7 @@ export class AgentPlanner {
 	#telemetrySink;
 	#now;
 	#recorder;
+	#turnRecorder;
 
 	constructor({
 		registry,
@@ -50,6 +51,7 @@ export class AgentPlanner {
 		now = () => performance.now(),
 		recorder = null,
 		benchmarkRecorder = null,
+		turnRecorder = null,
 	}) {
 		if (registry === null || registry === undefined) throw new TypeError('registry is required');
 		if (scheduler === null || scheduler === undefined) throw new TypeError('scheduler is required');
@@ -63,6 +65,7 @@ export class AgentPlanner {
 		if (typeof now !== 'function') throw new TypeError('now must be a function');
 		const selectedRecorder = recorder ?? benchmarkRecorder;
 		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
+		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
 		this.#registry = registry;
 		this.#scheduler = scheduler;
 		this.#codexService = codexService;
@@ -72,6 +75,7 @@ export class AgentPlanner {
 		this.#telemetrySink = telemetrySink;
 		this.#now = now;
 		this.#recorder = selectedRecorder;
+		this.#turnRecorder = turnRecorder;
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
@@ -193,7 +197,11 @@ export class AgentPlanner {
 						const attempt = retryCount + providerRetryCount + 1;
 						const decision = await this.#providerAttempt(record, {
 							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1, traceId,
-						}, () => agent.decide(plannerInput, { goalRevision, signal }), agent);
+						}, () => agent.decide(plannerInput, {
+							goalRevision,
+							signal,
+							...(this.#turnRecorder === null ? {} : { turnRecorder: this.#turnRecorder, attempt, retry: attempt > 1, queueWaitMs }),
+						}), agent);
 						this.#registry.assertCurrentRevision(agentId, goalRevision);
 						const parseBoundary = this.#now();
 						if (!trace.phasesRecorded) {

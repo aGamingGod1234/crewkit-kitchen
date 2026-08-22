@@ -7,6 +7,7 @@ import { discoverAntigravityCatalog } from './provider-catalog-discovery.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
+import { recordProviderTurn } from './provider-turn-recorder.mjs';
 
 const DEFAULT_EXECUTABLE = 'agy';
 const DEFAULT_PLANNING_TIMEOUT_MS = 120_000;
@@ -189,12 +190,13 @@ class AntigravityAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `gemini agent '${this.agentId}' is disposed`);
 		if (this.#activeOperation !== null) throw new AcpProtocolError('TURN_IN_PROGRESS', `gemini agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
 		if (goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled');
+		const turnStartedAt = performance.now();
 
 		const prompt = `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`;
 		const launch = buildAntigravityLaunch(this.#profile, this.#config, {
@@ -214,24 +216,40 @@ class AntigravityAgent {
 			void operation.cancel(new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled'));
 		};
 		signal?.addEventListener('abort', abort, { once: true });
+		let rawOutput = '';
+		let outputHandled = false;
 		try {
 			const decisionText = await operation.promise;
+			rawOutput = decisionText;
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
-			try {
-				const decision = parseDecision(decisionText.trim());
-				this.#hasConversation = true;
-				this.#sessionState = 'warm';
-				return decision;
-			} catch (error) {
-				throw new AcpProtocolError(
+			let decision;
+			let parseError = null;
+			try { decision = parseDecision(decisionText.trim()); }
+			catch (error) {
+				parseError = new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
 					`gemini returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
 					{ cause: error },
 				);
 			}
+			outputHandled = true;
+			await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId, provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+			});
+			if (parseError !== null) throw parseError;
+			this.#hasConversation = true;
+			this.#sessionState = 'warm';
+			return decision;
 		} catch (error) {
+			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId, provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+			});
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal', { cause: error });
 			}
@@ -253,6 +271,10 @@ class AntigravityAgent {
 		this.#disposed = true;
 		await this.interrupt();
 	}
+}
+
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) {
+	return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) };
 }
 
 export function buildAntigravityLaunch(profile, configValue = {}, dependencies = {}) {

@@ -17,7 +17,7 @@ public record AgentControlSnapshot(
 		List<AgentControlGroup> groups,
 		List<AgentControlModelOption> catalog
 ) {
-	public static final int SCHEMA_VERSION = 6;
+	public static final int SCHEMA_VERSION = 7;
 	public static final int MAX_AGENTS = AgentConstants.DEFAULT_AGENT_LIMIT;
 
 	public AgentControlSnapshot(boolean canControl, long generatedAtEpochMs, List<AgentControlAgent> agents) {
@@ -133,17 +133,18 @@ public record AgentControlSnapshot(
 
 	private static AgentControlAgent fromRecord(AgentRecord record) {
 		Objects.requireNonNull(record, "records must not contain null");
-		String displayName = AgentIdentity.displayName(record.profile());
+		String displayName = AgentIdentity.displayName(record.agentId(), record.profile());
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("");
 		return new AgentControlAgent(
 				record.agentId().toString(),
 				record.agentId().shortValue(),
 				AgentControlAgent.truncate(displayName, AgentControlAgent.MAX_DISPLAY_NAME_LENGTH),
+				record.profile().userName().orElse(""),
 				record.profile().provider(),
 				record.profile().model(),
 				record.profile().reasoning(),
 				AgentIdentity.playerName(record.agentId(), record.profile()),
-				record.profile().skinVariant(),
+				record.profile().visualIdentity().individualVariant(),
 				record.state().name(),
 				AgentControlAgent.truncate(currentGoal, AgentControlAgent.MAX_CURRENT_GOAL_LENGTH),
 				record.queuedGoals().size(),

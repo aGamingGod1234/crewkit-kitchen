@@ -43,6 +43,15 @@ export function buildAcpLaunch(provider, profile = {}, dependencies = {}) {
 			}
 		}
 	}
+	if (normalizedProvider === 'kimi' && (dependencies.platform ?? process.platform) === 'win32') {
+		const appData = environment.APPDATA;
+		if (typeof appData === 'string') {
+			const entrypoint = path.join(appData, 'npm', 'node_modules', '@moonshot-ai', 'kimi-code', 'dist', 'main.mjs');
+			if ((dependencies.existsSync ?? existsSync)(entrypoint)) {
+				return { command: dependencies.execPath ?? process.execPath, args: [entrypoint, 'acp'], options };
+			}
+		}
+	}
 	return { command: normalizedProvider, args: normalizedProvider === 'gemini' ? ['--acp'] : ['acp'], options };
 }
 
@@ -131,7 +140,7 @@ export class AcpStdioTransport extends EventEmitter {
 			if (pending === undefined) return this.emit('protocolError', new AcpProtocolError('UNKNOWN_RESPONSE_ID', `ACP response used unknown id '${String(message.id)}'`));
 			this.#pending.delete(message.id);
 			clearTimeout(pending.timer);
-			if (Object.hasOwn(message, 'error')) pending.reject(new AcpProtocolError('RPC_ERROR', `${pending.method}: ${rpcErrorMessage(message.error)}`));
+			if (Object.hasOwn(message, 'error')) pending.reject(rpcProtocolError(pending.method, message.error));
 			else if (Object.hasOwn(message, 'result')) pending.resolve(message.result);
 			else pending.reject(new AcpProtocolError('INVALID_RESPONSE', `ACP response for '${pending.method}' has no result or error`));
 			return;
@@ -173,7 +182,16 @@ function requireKimiEffort(value) {
 	return value;
 }
 
-function rpcErrorMessage(error) {
-	if (typeof error?.message === 'string') return error.message;
-	return JSON.stringify(error);
+function rpcProtocolError(method, value) {
+	const error = new AcpProtocolError('RPC_ERROR', `${method}: ACP provider returned an RPC error`);
+	error.category = 'transport';
+	if (Number.isSafeInteger(value?.code)) error.rpcCode = value.code;
+	const status = [value?.status, value?.statusCode, value?.httpStatusCode, value?.data?.status, value?.data?.statusCode, value?.data?.httpStatusCode]
+		.find((candidate) => Number.isSafeInteger(candidate) && candidate >= 100 && candidate <= 599);
+	const httpStatusCode = status ?? (Number.isSafeInteger(value?.code) && value.code >= 100 && value.code <= 599 ? value.code : null);
+	if (httpStatusCode !== null) {
+		error.httpStatusCode = httpStatusCode;
+		error.rateLimited = httpStatusCode === 429;
+	}
+	return error;
 }

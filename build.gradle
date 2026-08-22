@@ -164,6 +164,73 @@ tasks.named('test') {
 	failOnNoDiscoveredTests = false
 }
 
+def mapBlockStateCatalog = layout.projectDirectory.file('maps/registries/minecraft-26.1.2-block-states.json')
+def mapCatalogExporterClasses = layout.buildDirectory.dir('classes/java/mapCatalogExporter')
+def mapStructureDataFixerClasses = layout.buildDirectory.dir('classes/java/mapStructureDataFixer')
+
+tasks.register('compileMapBlockStateCatalogExporter', JavaCompile) {
+	dependsOn tasks.named('classes')
+	source = files('src/test/java/dev/agaminggod/arenaagents/scenario/MapBlockStateCatalogExporter.java')
+	classpath = sourceSets.test.compileClasspath + sourceSets.main.output
+	destinationDirectory.set(mapCatalogExporterClasses)
+	options.release = 25
+}
+
+tasks.register('exportMapBlockStateCatalog', JavaExec) {
+	group = 'verification'
+	description = 'Exports the exact Minecraft 26.1.2 vanilla block-state catalog.'
+	dependsOn tasks.named('compileMapBlockStateCatalogExporter')
+	classpath = files(mapCatalogExporterClasses) + sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.scenario.MapBlockStateCatalogExporter')
+	args mapBlockStateCatalog.asFile.absolutePath
+}
+
+tasks.register('verifyMapBlockStateCatalog', JavaExec) {
+	group = 'verification'
+	description = 'Checks the pinned map block-state catalog against Minecraft 26.1.2.'
+	dependsOn tasks.named('compileMapBlockStateCatalogExporter')
+	classpath = files(mapCatalogExporterClasses) + sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.scenario.MapBlockStateCatalogExporter')
+	args mapBlockStateCatalog.asFile.absolutePath, '--check'
+}
+
+tasks.register('exportOwnedMapFixture', JavaExec) {
+	group = 'verification'
+	description = 'Exports the deterministic project-owned structure-template fixture.'
+	dependsOn tasks.named('compileMapBlockStateCatalogExporter')
+	classpath = files(mapCatalogExporterClasses) + sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.scenario.MapBlockStateCatalogExporter')
+	args '--owned-fixture', layout.projectDirectory.file('maps/selections/fixtures/tiny-owned-room.nbt').asFile.absolutePath
+}
+
+tasks.register('compileMapStructureDataFixer', JavaCompile) {
+	dependsOn tasks.named('classes')
+	source = files('src/test/java/dev/agaminggod/arenaagents/scenario/MapStructureDataFixer.java')
+	classpath = sourceSets.test.compileClasspath + sourceSets.main.output
+	destinationDirectory.set(mapStructureDataFixerClasses)
+	options.release = 25
+}
+
+tasks.register('verifyMapStructureDataFixer', JavaExec) {
+	group = 'verification'
+	description = 'Verifies the bounded Minecraft structure-template DataFixer seam.'
+	dependsOn tasks.named('compileMapStructureDataFixer')
+	classpath = files(mapStructureDataFixerClasses) + sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.scenario.MapStructureDataFixer')
+	args '--self-test'
+}
+
+tasks.register('upgradeMapStructure', JavaExec) {
+	group = 'verification'
+	description = 'Upgrades one ignored structure-template NBT with Minecraft STRUCTURE DataFixerUpper.'
+	dependsOn tasks.named('compileMapStructureDataFixer')
+	classpath = files(mapStructureDataFixerClasses) + sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.scenario.MapStructureDataFixer')
+	if (project.hasProperty('mapInput') && project.hasProperty('mapOutput')) {
+		args project.property('mapInput'), project.property('mapOutput')
+	}
+}
+
 tasks.named('check') {
 	dependsOn tasks.named('verifyCore'), tasks.named('verifyEntrypoints'), ':voice-addon:check'
 }

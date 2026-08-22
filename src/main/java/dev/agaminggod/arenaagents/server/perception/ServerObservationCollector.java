@@ -50,9 +50,9 @@ public final class ServerObservationCollector {
 
 	private final CodexAgentManager manager;
 	private final ServerActionExecutor actionExecutor;
-	private final ObservationSectionCache<SpatialCacheKey, JsonObject> spatialCache =
-			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, JsonObject::deepCopy);
-	private final Map<AgentId, SpatialCacheKey> spatialKeys = new HashMap<>();
+	private final ObservationSectionCache<RawSpatialObservation.Key, RawSpatialObservation> spatialCache =
+			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, value -> value);
+	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
 
 	public ServerObservationCollector(CodexAgentManager manager, ServerActionExecutor actionExecutor) {
@@ -127,8 +127,9 @@ public final class ServerObservationCollector {
 	}
 
 	public void invalidate(AgentId agentId) {
-		SpatialCacheKey key = spatialKeys.remove(Objects.requireNonNull(agentId, "agentId must not be null"));
-		if (key != null) spatialCache.invalidate(key);
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		spatialKeys.remove(agentId);
+		spatialCache.invalidateMatching(key -> key.agentId().equals(agentId));
 		synchronized (lastRawStates) {
 			lastRawStates.remove(agentId);
 		}
@@ -168,23 +169,21 @@ public final class ServerObservationCollector {
 
 	private JsonObject spatialObservation(AgentId agentId, ServerLevel level, ServerPlayer agent) {
 		BlockPos position = agent.blockPosition();
-		SpatialCacheKey key = new SpatialCacheKey(
+		RawSpatialObservation.Key key = new RawSpatialObservation.Key(
 				agentId,
 				level.dimension().identifier().toString(),
 				position.getX(),
 				position.getY(),
-				position.getZ(),
-				Float.floatToIntBits(agent.getYRot()),
-				Float.floatToIntBits(agent.getXRot())
+				position.getZ()
 		);
-		SpatialCacheKey previous = spatialKeys.put(agentId, key);
+		RawSpatialObservation.Key previous = spatialKeys.put(agentId, key);
 		if (previous != null && !previous.equals(key)) spatialCache.invalidate(previous);
-		return spatialCache.getOrCompute(key, level.getGameTime(), () -> {
-			JsonObject value = new JsonObject();
-			value.add("blocks", blocks(level, agent, position));
-			value.add("nearbyContainers", nearbyTransactionTargets(level, agent));
-			return value;
-		});
+		RawSpatialObservation raw = spatialCache.getOrCompute(
+				key, level.getGameTime(), () -> rawSpatialObservation(level, agent, position));
+		JsonObject value = new JsonObject();
+		value.add("blocks", blocks(level, agent, raw.blocks()));
+		value.add("nearbyContainers", nearbyTransactionTargets(level, agent, raw.containers()));
+		return value;
 	}
 
 	private JsonObject currentAction(AgentId agentId) {
@@ -397,8 +396,9 @@ public final class ServerObservationCollector {
 		return values;
 	}
 
-	private static JsonArray blocks(ServerLevel level, ServerPlayer agent, BlockPos center) {
+	private static RawSpatialObservation rawSpatialObservation(ServerLevel level, ServerPlayer agent, BlockPos center) {
 		ArrayList<BlockObservationOrdering.Candidate> candidates = new ArrayList<>();
+		ArrayList<RawSpatialObservation.ContainerCandidate> containers = new ArrayList<>();
 		for (int y = -3; y <= 3; y++) {
 			for (int x = -BLOCK_RADIUS; x <= BLOCK_RADIUS; x++) {
 				for (int z = -BLOCK_RADIUS; z <= BLOCK_RADIUS; z++) {
@@ -406,23 +406,47 @@ public final class ServerObservationCollector {
 					if (!level.hasChunkAt(position)) continue;
 					BlockState state = level.getBlockState(position);
 					if (state.isAir()) continue;
+					String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
 					candidates.add(new BlockObservationOrdering.Candidate(
-							x,
-							y,
-							z,
-							BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString()
+							x, y, z, blockId
 					));
+					List<String> capabilities = transactionCapabilities(blockId);
+					if (!capabilities.isEmpty()) {
+						containers.add(new RawSpatialObservation.ContainerCandidate(
+								position.getX(), position.getY(), position.getZ(), blockId, capabilities,
+								agent.distanceToSqr(Vec3.atCenterOf(position))));
+					}
 				}
 			}
 		}
+		List<RawSpatialObservation.BlockCandidate> blocks = BlockObservationOrdering.select(
+				candidates, MAX_BLOCKS * 4, MAX_BLOCKS_PER_TYPE * 4).stream()
+				.map(candidate -> new RawSpatialObservation.BlockCandidate(
+						center.getX() + candidate.x(), center.getY() + candidate.y(), center.getZ() + candidate.z(),
+						candidate.blockId()))
+				.toList();
+		containers.sort(Comparator.comparingDouble(RawSpatialObservation.ContainerCandidate::distanceSquared)
+				.thenComparingInt(RawSpatialObservation.ContainerCandidate::y)
+				.thenComparingInt(RawSpatialObservation.ContainerCandidate::x)
+				.thenComparingInt(RawSpatialObservation.ContainerCandidate::z));
+		return new RawSpatialObservation(blocks,
+				containers.stream().limit(MAX_NEARBY_TRANSACTION_TARGETS * 4L).toList());
+	}
+
+	private static JsonArray blocks(
+			ServerLevel level,
+			ServerPlayer agent,
+			List<RawSpatialObservation.BlockCandidate> candidates
+	) {
 		ArrayList<BlockObservationOrdering.Candidate> visible = new ArrayList<>();
-		for (BlockObservationOrdering.Candidate candidate : BlockObservationOrdering.select(
-				candidates,
-				MAX_BLOCKS * 4,
-				MAX_BLOCKS_PER_TYPE * 4
-		)) {
-			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
-			if (ObservationVisibility.canSeeBlock(level, agent, position)) visible.add(candidate);
+		BlockPos center = agent.blockPosition();
+		for (RawSpatialObservation.BlockCandidate candidate : candidates) {
+			BlockPos position = new BlockPos(candidate.x(), candidate.y(), candidate.z());
+			if (ObservationVisibility.canSeeBlock(level, agent, position)) {
+				visible.add(new BlockObservationOrdering.Candidate(
+						candidate.x() - center.getX(), candidate.y() - center.getY(), candidate.z() - center.getZ(),
+						candidate.blockId()));
+			}
 		}
 		JsonArray values = new JsonArray();
 		for (BlockObservationOrdering.Candidate candidate :
@@ -447,36 +471,24 @@ public final class ServerObservationCollector {
 		return values;
 	}
 
-	private static JsonArray nearbyTransactionTargets(ServerLevel level, ServerPlayer agent) {
-		BlockPos center = agent.blockPosition();
-		ArrayList<TransactionTarget> candidates = new ArrayList<>();
-		for (int y = -3; y <= 3; y++) {
-			for (int x = -BLOCK_RADIUS; x <= BLOCK_RADIUS; x++) {
-				for (int z = -BLOCK_RADIUS; z <= BLOCK_RADIUS; z++) {
-					BlockPos position = center.offset(x, y, z);
-					if (!level.hasChunkAt(position)) continue;
-					String blockId = BuiltInRegistries.BLOCK.getKey(level.getBlockState(position).getBlock()).toString();
-					List<String> capabilities = transactionCapabilities(blockId);
-					if (capabilities.isEmpty()) continue;
-					if (!ObservationVisibility.canSeeBlock(level, agent, position)) continue;
-					candidates.add(new TransactionTarget(position, blockId, capabilities,
-							agent.distanceToSqr(Vec3.atCenterOf(position))));
-				}
-			}
-		}
-		candidates.sort(Comparator.comparingDouble(TransactionTarget::distanceSquared)
-				.thenComparingInt(candidate -> candidate.position().getY())
-				.thenComparingInt(candidate -> candidate.position().getX())
-				.thenComparingInt(candidate -> candidate.position().getZ()));
+	private static JsonArray nearbyTransactionTargets(
+			ServerLevel level,
+			ServerPlayer agent,
+			List<RawSpatialObservation.ContainerCandidate> candidates
+	) {
 		JsonArray values = new JsonArray();
-		for (TransactionTarget candidate : candidates.stream().limit(MAX_NEARBY_TRANSACTION_TARGETS).toList()) {
+		for (RawSpatialObservation.ContainerCandidate candidate : candidates) {
+			if (values.size() == MAX_NEARBY_TRANSACTION_TARGETS) break;
+			BlockPos position = new BlockPos(candidate.x(), candidate.y(), candidate.z());
+			if (!ObservationVisibility.canSeeBlock(level, agent, position)) continue;
+			double distanceSquared = agent.distanceToSqr(Vec3.atCenterOf(position));
 			JsonObject json = new JsonObject();
-			json.addProperty("x", candidate.position().getX());
-			json.addProperty("y", candidate.position().getY());
-			json.addProperty("z", candidate.position().getZ());
+			json.addProperty("x", candidate.x());
+			json.addProperty("y", candidate.y());
+			json.addProperty("z", candidate.z());
 			json.addProperty("blockId", candidate.blockId());
-			json.addProperty("distance", finite(Math.sqrt(candidate.distanceSquared())));
-			json.addProperty("withinInteractionRange", candidate.distanceSquared() <= 36.0D);
+			json.addProperty("distance", finite(Math.sqrt(distanceSquared)));
+			json.addProperty("withinInteractionRange", distanceSquared <= 36.0D);
 			JsonArray capabilities = new JsonArray();
 			candidate.capabilities().forEach(capabilities::add);
 			json.add("capabilities", capabilities);
@@ -499,25 +511,6 @@ public final class ServerObservationCollector {
 			case "minecraft:enchanting_table" -> List.of("menu_transfer", "enchanting");
 			default -> List.of();
 		};
-	}
-
-	private record TransactionTarget(
-			BlockPos position,
-			String blockId,
-			List<String> capabilities,
-			double distanceSquared
-	) {
-	}
-
-	private record SpatialCacheKey(
-			AgentId agentId,
-			String dimension,
-			int x,
-			int y,
-			int z,
-			int yawBits,
-			int pitchBits
-	) {
 	}
 
 	private static JsonObject vector(Vec3 vector) {

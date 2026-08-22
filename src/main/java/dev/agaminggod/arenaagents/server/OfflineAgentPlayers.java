@@ -10,7 +10,6 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
-import java.nio.charset.StandardCharsets;
 import java.util.Optional;
 import java.util.UUID;
 import net.minecraft.network.chat.Component;
@@ -36,8 +35,7 @@ public final class OfflineAgentPlayers {
 	}
 
 	public static UUID offlineUuid(AgentId agentId, AgentProfile profile) {
-		String name = playerName(agentId, profile);
-		return UUID.nameUUIDFromBytes(("OfflinePlayer:" + name).getBytes(StandardCharsets.UTF_8));
+		return AgentIdentity.offlinePlayerUuid(playerName(agentId, profile));
 	}
 
 	public static void spawn(

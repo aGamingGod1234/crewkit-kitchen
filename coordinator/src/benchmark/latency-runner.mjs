@@ -126,6 +126,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	let providerCleanupRegistered = false;
 	let trialRecorder = null;
 	let scheduler = null;
+	let records = [];
 	const latencyRegistry = new ControlLatencyRegistry({ traceCap: Math.max(64, trial.agentLoad * 2) });
 	let systemSummary = null;
 	const metrics = new LatencyMetricsTracker({ wallClock, wallClockBasis, enabled: measurementsEnabled, maxSamples: options.maxMetricSamples, context: measurementContext });
@@ -172,7 +173,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			catch (error) { await stopProviderAfterTimeout(); throw error; }
 		}
 
-		const records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, goalRevision: 0, queue: [] }));
+		records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, goalRevision: 0, queue: [] }));
 		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: scenario.goal ?? `Complete ${trial.scenarioId}`, goalRevision: 1 }));
 		world = new VirtualWorld(scenario.world, { scheduler: manualScheduler() });
 		metrics.attachWorld(world, scenario, scenario.agentIds);
@@ -250,7 +251,12 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		}
 		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler), measurementContext);
 		result.benchmark = { eventCount: trialRecorder?.count ?? 0, traces: latencyRegistry.traceSnapshot() };
-		result.debug = { runtimeErrors, turnCount, actionCommandHash: null };
+		result.debug = {
+			runtimeErrors,
+			turnCount,
+			statuses: records.map((record) => coordinator?.registry?.get?.(record.agentId)?.state ?? null),
+			actionCommandHash: null,
+		};
 	} finally {
 		try { sampler?.sample?.(); } catch {}
 		for (const close of cleanup.reverse()) {
@@ -369,7 +375,7 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 		for (const [event, type] of [['observation', 'observation'], ['progress', 'action_progress'], ['result', 'action_result']]) {
 			const relay = (entry) => {
 				const message = { agentId: entry.envelope.agentId, payload: entry.envelope.payload };
-				if (type === 'observation' && entry.envelope.payload.attention === true && entry.envelope.payload.lastResult?.present === true) {
+				if (type === 'observation' && entry.envelope.payload.lastResult?.present === true) {
 					this.#pendingObservations.set(message.agentId, message);
 					return;
 				}

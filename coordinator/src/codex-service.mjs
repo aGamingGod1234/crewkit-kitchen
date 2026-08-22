@@ -5,6 +5,7 @@ import { ModelCatalogCache } from './model-catalog-cache.mjs';
 import { MINECRAFT_DYNAMIC_TOOLS, NATIVE_AGENT_INSTRUCTIONS, normalizeMinecraftToolCall, toolResultContent } from './native-minecraft-tools.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
+import { recordProviderTurn } from './provider-turn-recorder.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
@@ -242,7 +243,7 @@ export class SharedCodexAgent {
 		if (this.#active !== null && this.#active.goalRevision !== revision) await this.interrupt();
 	}
 
-	async decide(input, { goalRevision, signal } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
 		if (this.#controlProtocol !== 'arena_script') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'Native tool agents must use act()');
 		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
@@ -250,6 +251,7 @@ export class SharedCodexAgent {
 		requireRevision(goalRevision);
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new CodexProtocolError('TURN_INTERRUPTED', 'Planning turn was interrupted');
+		const turnStartedAt = performance.now();
 		const collector = createTurnCollector(this.#transport, this.#threadId, this.#maxDecisionBytes);
 		void collector.promise.catch(() => { /* observed immediately; the decision awaits the original promise after turn/start */ });
 		let lifecycleSettled = false;
@@ -272,6 +274,8 @@ export class SharedCodexAgent {
 			void this.interrupt().catch(() => { /* stale abort races are handled by the decision's signal check */ });
 		};
 		signal?.addEventListener('abort', abort, { once: true });
+		let rawOutput = '';
+		let outputHandled = false;
 		try {
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
@@ -303,11 +307,33 @@ export class SharedCodexAgent {
 				throw new CodexProtocolError('STALE_PLAN', 'Codex turn started after its goal revision became obsolete');
 			}
 			const text = await withTimeout(Promise.race([collector.promise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
+			rawOutput = text;
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex result belongs to an obsolete goal revision');
-			const decision = parseDecision(text);
+			let decision;
+			let parseError = null;
+			try { decision = parseDecision(text); }
+			catch (error) { parseError = error; }
+			outputHandled = true;
+			await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId, provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input, output: text, error: parseError,
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(collector.tokens === null ? {} : { tokens: collector.tokens }),
+				...(collector.compaction ? { compaction: true } : {}),
+				...(isRateLimitError(parseError) ? { rateLimited: true } : {}),
+			});
+			if (parseError !== null) throw parseError;
 			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
+			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId, provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input, output: rawOutput, error,
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(collector.tokens === null ? {} : { tokens: collector.tokens }),
+				...(collector.compaction ? { compaction: true } : {}),
+				...(isRateLimitError(error) ? { rateLimited: true } : {}),
+			});
 			if (error?.code === 'PLANNING_TIMEOUT' || error?.code === 'TURN_OUTPUT_LIMIT') {
 				try { await this.interrupt(); } catch { /* original timeout remains authoritative */ }
 			}
@@ -514,6 +540,8 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 	let streamedMessageBytes = 0;
 	let outputLimitError = null;
 	let bufferedNotifications = [];
+	let tokens = null;
+	let compaction = false;
 	let resolvePromise;
 	let rejectPromise;
 	const promise = new Promise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
@@ -541,8 +569,14 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 			streamedMessage = '';
 			streamedMessageBytes = 0;
 		}
+		if (method === 'thread/tokenUsage/updated') tokens = codexTokenUsage(params?.tokenUsage?.last);
+		if (method === 'thread/compacted' || method === 'item/completed' && params?.item?.type === 'contextCompaction') compaction = true;
 		if (method === 'turn/completed') {
-			if (params?.turn?.status === 'failed') rejectPromise(new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex turn failed'));
+			if (params?.turn?.status === 'failed') {
+				const error = new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex turn failed');
+				error.codexErrorInfo = params.turn.error?.codexErrorInfo ?? null;
+				rejectPromise(error);
+			}
 			else if (lastMessage === null && streamedMessage.length === 0) rejectPromise(new CodexProtocolError('MISSING_AGENT_MESSAGE', 'Codex turn completed without an agent message'));
 			else resolvePromise(lastMessage ?? streamedMessage);
 		}
@@ -564,6 +598,8 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 	transport.on('notification', onNotification);
 	return {
 		promise,
+		get tokens() { return tokens; },
+		get compaction() { return compaction; },
 		setTurnId(value) {
 			expectedTurnId = value;
 			const buffered = bufferedNotifications;
@@ -575,6 +611,25 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 			transport.off('notification', onNotification);
 		},
 	};
+}
+
+function codexTokenUsage(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+	return {
+		input: nativeToken(value.inputTokens), output: nativeToken(value.outputTokens),
+		reasoning: nativeToken(value.reasoningOutputTokens), cached: nativeToken(value.cachedInputTokens),
+		cacheWrite: nativeToken(value.cacheWriteInputTokens),
+	};
+}
+
+function nativeToken(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
+function isRateLimitError(error) {
+	const info = error?.codexErrorInfo;
+	if (info === 'usageLimitExceeded') return true;
+	if (info === null || typeof info !== 'object' || Array.isArray(info)) return false;
+	return ['httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected', 'responseTooManyFailedAttempts']
+		.some((key) => info[key]?.httpStatusCode === 429);
 }
 
 function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool }) {

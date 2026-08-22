@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 
 public final class AgentControlActions {
@@ -45,6 +46,31 @@ public final class AgentControlActions {
 
 	public static boolean everySupports(List<AgentControlAgent> agents, String operation) {
 		List<AgentControlAgent> checkedAgents = List.copyOf(Objects.requireNonNull(agents, "agents must not be null"));
-		return !checkedAgents.isEmpty() && checkedAgents.stream().allMatch(agent -> supports(agent, operation));
+		return !checkedAgents.isEmpty() && firstUnsupported(checkedAgents, operation).isEmpty();
+	}
+
+	public static Optional<AgentControlAgent> firstUnsupported(
+			List<AgentControlAgent> agents,
+			String operation
+	) {
+		List<AgentControlAgent> checkedAgents = List.copyOf(
+				Objects.requireNonNull(agents, "agents must not be null"));
+		String checkedOperation = Objects.requireNonNull(operation, "operation must not be null");
+		return checkedAgents.stream().filter(agent -> !supports(agent, checkedOperation)).findFirst();
+	}
+
+	public static String deliverySummary(List<String> acceptedNames, List<String> rejectedNames) {
+		List<String> accepted = List.copyOf(
+				Objects.requireNonNull(acceptedNames, "accepted names must not be null"));
+		List<String> rejected = List.copyOf(
+				Objects.requireNonNull(rejectedNames, "rejected names must not be null"));
+		if (accepted.isEmpty() && rejected.isEmpty()) return "No commands were delivered.";
+		StringBuilder summary = new StringBuilder();
+		if (!accepted.isEmpty()) summary.append("Accepted: ").append(String.join(", ", accepted)).append('.');
+		if (!rejected.isEmpty()) {
+			if (!summary.isEmpty()) summary.append(' ');
+			summary.append("Rejected: ").append(String.join(", ", rejected)).append('.');
+		}
+		return summary.toString();
 	}
 }

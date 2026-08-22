@@ -104,7 +104,7 @@ public final class CodexAgentEntity extends PathfinderMob {
 	}
 
 	public int getSkinVariant() {
-		return Math.floorMod(entityData.get(SKIN_VARIANT), AgentConstants.DEFAULT_SKIN_VARIANT_COUNT);
+		return AgentVisualIdentity.normalizedVariant(entityData.get(SKIN_VARIANT));
 	}
 
 	public SimpleContainer getAgentInventory() {
@@ -152,10 +152,7 @@ public final class CodexAgentEntity extends PathfinderMob {
 		entityData.set(MODEL, input.getStringOr(SAVE_MODEL, DEFAULT_MODEL));
 		entityData.set(REASONING, input.getStringOr(SAVE_REASONING, DEFAULT_REASONING));
 		entityData.set(GAME_MODE, input.getStringOr(SAVE_GAME_MODE, DEFAULT_GAME_MODE));
-		entityData.set(SKIN_VARIANT, Math.floorMod(
-				input.getIntOr(SAVE_SKIN, 0),
-				AgentConstants.DEFAULT_SKIN_VARIANT_COUNT
-		));
+		entityData.set(SKIN_VARIANT, AgentVisualIdentity.normalizedVariant(input.getIntOr(SAVE_SKIN, 0)));
 		agentInventory.clearContent();
 		int slot = 0;
 		for (ItemStack stack : input.listOrEmpty(SAVE_INVENTORY, ItemStack.OPTIONAL_CODEC)) {
@@ -173,10 +170,7 @@ public final class CodexAgentEntity extends PathfinderMob {
 		entityData.set(MODEL, profile.model());
 		entityData.set(REASONING, profile.reasoning());
 		entityData.set(GAME_MODE, profile.gameMode().wireName());
-		entityData.set(SKIN_VARIANT, Math.floorMod(
-				profile.skinVariant(),
-				AgentConstants.DEFAULT_SKIN_VARIANT_COUNT
-		));
+		entityData.set(SKIN_VARIANT, AgentVisualIdentity.normalizedVariant(profile.skinVariant()));
 		applyGameModeCapabilities();
 		refreshNameTag();
 	}

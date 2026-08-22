@@ -6,6 +6,7 @@ import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
 import dev.agaminggod.arenaagents.protocol.ActionType;
@@ -39,6 +40,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
@@ -749,12 +751,24 @@ public final class ServerActionExecutor {
 		} else if ("nearest_living".equals(normalized)) {
 			predicate = entity -> entity instanceof LivingEntity && entity != player && entity.isAlive();
 		} else {
+			List<AgentRecord> records = managerRecords(level);
 			ServerPlayer named = level.getServer().getPlayerList().getPlayerByName(normalized);
-			if (named != null && named != player && named.isAlive()) return named;
-			for (var record : managerRecords(level)) {
-				if (!AgentIdentity.displayName(record.profile()).equalsIgnoreCase(normalized)) continue;
-				ServerPlayer agentPlayer = OfflineAgentPlayers.find(level.getServer(), record.agentId(), record.profile())
-						.orElse(null);
+			boolean eligibleNamedPlayer = named != null && named != player && named.isAlive();
+			String ordinaryPlayerName = eligibleNamedPlayer
+					? named.getGameProfile().name()
+					: null;
+			Optional<NamedTargetIdentity> identity = resolveNamedTargetIdentity(
+					normalized, records, ordinaryPlayerName, eligibleNamedPlayer ? named.getUUID() : null);
+			if (identity.isPresent()) {
+				NamedTargetIdentity resolved = identity.orElseThrow();
+				if (resolved.ordinaryPlayerName().isPresent()) return named;
+				AgentId agentId = resolved.agentId().orElseThrow();
+				AgentRecord record = records.stream()
+						.filter(candidate -> candidate.agentId().equals(agentId))
+						.findFirst()
+						.orElseThrow();
+				ServerPlayer agentPlayer = OfflineAgentPlayers.find(
+						level.getServer(), record.agentId(), record.profile()).orElse(null);
 				if (agentPlayer != null && agentPlayer != player && agentPlayer.isAlive()) return agentPlayer;
 			}
 			try {
@@ -770,6 +784,45 @@ public final class ServerActionExecutor {
 				.filter(entity -> ObservationVisibility.canSeeEntity(player, entity))
 				.min(Comparator.comparingDouble(player::distanceToSqr))
 				.orElseThrow(() -> new AgentDomainException("TARGET_NOT_FOUND", "No matching target is nearby"));
+	}
+
+	static Optional<NamedTargetIdentity> resolveNamedTargetIdentity(
+			String normalized,
+			List<AgentRecord> records,
+			String matchedPlayerName,
+			UUID matchedPlayerUuid
+	) {
+		String checked = Objects.requireNonNull(normalized, "normalized must not be null");
+		List<AgentRecord> checkedRecords = List.copyOf(Objects.requireNonNull(records, "records must not be null"));
+		List<AgentRecord> agentMatches = checkedRecords.stream()
+				.filter(record -> AgentIdentity.sameIdentity(
+						AgentIdentity.displayName(record.agentId(), record.profile()), checked)
+						|| record.profile().userName().filter(name -> AgentIdentity.sameIdentity(name, checked)).isPresent())
+				.toList();
+		boolean matchedFakePlayer = matchedPlayerUuid != null && checkedRecords.stream()
+				.anyMatch(record -> OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile())
+						.equals(matchedPlayerUuid));
+		String ordinaryPlayerName = matchedFakePlayer ? null : matchedPlayerName;
+		if (agentMatches.size() > 1 || (!agentMatches.isEmpty() && ordinaryPlayerName != null)) {
+			throw new AgentDomainException("AMBIGUOUS_TARGET", "Target selector is ambiguous: " + checked);
+		}
+		if (!agentMatches.isEmpty()) {
+			return Optional.of(NamedTargetIdentity.agent(agentMatches.getFirst().agentId()));
+		}
+		if (ordinaryPlayerName != null) {
+			return Optional.of(NamedTargetIdentity.ordinaryPlayer(ordinaryPlayerName));
+		}
+		return Optional.empty();
+	}
+
+	record NamedTargetIdentity(Optional<AgentId> agentId, Optional<String> ordinaryPlayerName) {
+		private static NamedTargetIdentity agent(AgentId agentId) {
+			return new NamedTargetIdentity(Optional.of(agentId), Optional.empty());
+		}
+
+		private static NamedTargetIdentity ordinaryPlayer(String playerName) {
+			return new NamedTargetIdentity(Optional.empty(), Optional.of(playerName));
+		}
 	}
 
 	private static List<dev.agaminggod.arenaagents.agent.AgentRecord> managerRecords(ServerLevel level) {

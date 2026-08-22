@@ -41,6 +41,11 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		this.gameDirectory = gameDirectory.toAbsolutePath().normalize();
 		this.launchEnvironmentOverrides = Map.copyOf(Objects.requireNonNull(launchEnvironmentOverrides, "launch environment overrides must not be null"));
 		this.createdAtEpochMs = System.currentTimeMillis();
+		if (!autoStartEnabled()) {
+			this.runtimePackage = null;
+			this.node = null;
+			return;
+		}
 		BundledCoordinatorInstaller.RuntimePackage prepared = null;
 		NodeRuntimeLocator.LocatedNode located = null;
 		try {
@@ -67,6 +72,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 		this.runtimePackage = prepared;
 		this.node = located;
+	}
+
+	private static boolean autoStartEnabled() {
+		return !"false".equalsIgnoreCase(System.getProperty("arenaagents.coordinatorAutoStart"));
 	}
 
 	synchronized boolean configured() {

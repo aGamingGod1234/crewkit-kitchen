@@ -36,6 +36,7 @@ export class FakeMinecraftBridge {
 	sent = [];
 	progress = [];
 	results = [];
+	traffic = [];
 	validatedInbound = 0;
 	validatedOutbound = 0;
 
@@ -77,6 +78,7 @@ export class FakeMinecraftBridge {
 		this.#recordBenchmark('bridge_command_accepted', { type, actionType: normalized.actionType ?? null, actionId: normalized.actionId ?? null });
 		if (type === 'action_command') {
 			this.sent.push(envelope);
+			this.traffic.push({ type, actionId: normalized.actionId });
 			queueMicrotask(() => { void this.#execute(normalized); });
 			return;
 		}
@@ -98,6 +100,7 @@ export class FakeMinecraftBridge {
 		});
 		const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
 		this.validatedInbound += 1;
+		this.traffic.push({ type: 'observation', eventSequence: normalized.payload.eventSequence });
 		this.#observation = adaptObservation(normalized.payload);
 		this.#recordBenchmark('observation_published', { eventSequence: normalized.payload.eventSequence, attention: normalized.payload.attention === true });
 		this.#eventSequence = Math.max(this.#eventSequence, eventSequence);
@@ -152,14 +155,13 @@ export class FakeMinecraftBridge {
 			await this.#manager.onActionProgress(this.#record, normalized.payload);
 		}
 		if (plan.observation !== undefined) this.#observation = plan.observation;
-		const observationSequence = this.#nextSequence();
-		await this.publish(this.#observation, { eventSequence: observationSequence, observedAtEpochMs: this.#clock });
 		const result = {
 			goalRevision: command.goalRevision,
 			actionId: command.actionId,
 			state: plan.state ?? 'SUCCEEDED',
 			reasonCode: plan.reasonCode ?? 'DONE',
 		};
+		const observationSequence = this.#nextSequence();
 		this.results.push(result);
 		this.#recordBenchmark('bridge_action_completed', { actionId: result.actionId, actionType: command.actionType, eventSequence: observationSequence, state: result.state, reasonCode: result.reasonCode });
 		if (this.#manager) {
@@ -176,8 +178,10 @@ export class FakeMinecraftBridge {
 			} });
 			const normalized = validateProtocolV2Envelope(inbound, { direction: 'server_to_coordinator' });
 			this.validatedInbound += 1;
+			this.traffic.push({ type: 'action_result', actionId: normalized.payload.actionId });
 			await this.#manager.onActionResult(this.#record, normalized.payload);
 		}
+		await this.publish(this.#observation, { eventSequence: observationSequence, observedAtEpochMs: this.#clock });
 	}
 
 	#nextSequence() {

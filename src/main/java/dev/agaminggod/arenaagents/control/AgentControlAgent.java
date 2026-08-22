@@ -2,12 +2,14 @@ package dev.agaminggod.arenaagents.control;
 
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentVisualIdentity;
 import java.util.Objects;
 
 public record AgentControlAgent(
 		String agentId,
 		String shortId,
 		String displayName,
+		String friendlyName,
 		String provider,
 		String model,
 		String reasoning,
@@ -35,12 +37,13 @@ public record AgentControlAgent(
 			throw new IllegalArgumentException("shortId does not match agentId");
 		}
 		displayName = requireBounded(displayName, "displayName", MAX_DISPLAY_NAME_LENGTH);
+		friendlyName = requireBounded(friendlyName, "friendlyName", AgentConstants.MAX_USER_NAME_LENGTH);
 		provider = requireBounded(provider, "provider", AgentConstants.MAX_REASONING_LENGTH);
 		model = requireBounded(model, "model", AgentConstants.MAX_MODEL_LENGTH);
 		reasoning = requireBounded(reasoning, "reasoning", AgentConstants.MAX_REASONING_LENGTH);
 		playerName = requireBounded(playerName, "playerName", 16);
 		if (playerName.isBlank()) throw new IllegalArgumentException("playerName must not be blank");
-		if (skinVariant < 0 || skinVariant >= AgentConstants.DEFAULT_SKIN_VARIANT_COUNT) {
+		if (skinVariant < 0 || skinVariant >= AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT) {
 			throw new IllegalArgumentException("skinVariant is outside the supported range");
 		}
 		state = requireBounded(state, "state", MAX_STATE_LENGTH);
@@ -50,6 +53,29 @@ public record AgentControlAgent(
 		if (queuedGoalCount < 0 || queuedGoalCount > AgentConstants.DEFAULT_QUEUE_LIMIT) {
 			throw new IllegalArgumentException("queuedGoalCount is outside the supported range");
 		}
+	}
+
+	public AgentControlAgent(
+			String agentId,
+			String shortId,
+			String displayName,
+			String provider,
+			String model,
+			String reasoning,
+			String playerName,
+			int skinVariant,
+			String state,
+			String currentGoal,
+			int queuedGoalCount,
+			String lastSummary,
+			String lastError,
+			boolean automaticProgress,
+			boolean entityPresent
+	) {
+		this(
+				agentId, shortId, displayName, "", provider, model, reasoning, playerName, skinVariant, state,
+				currentGoal, queuedGoalCount, lastSummary, lastError, automaticProgress, entityPresent
+		);
 	}
 
 	static String truncate(String value, int maximumLength) {

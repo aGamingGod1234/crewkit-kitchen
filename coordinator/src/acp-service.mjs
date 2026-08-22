@@ -1,5 +1,6 @@
 import { AcpProtocolError, AcpStdioTransport, buildAcpLaunch } from './acp-transport.mjs';
 import { parseDecision } from './decision-parser.mjs';
+import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { discoverKimiCatalog } from './provider-catalog-discovery.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
@@ -189,12 +190,13 @@ class AcpAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `${this.provider} agent '${this.agentId}' is disposed`);
 		if (this.#active) throw new AcpProtocolError('TURN_IN_PROGRESS', `${this.provider} agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
 		if (goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled');
+		const turnStartedAt = performance.now();
 		const chunks = [];
 		let decisionBytes = 0;
 		let outputLimitError = null;
@@ -220,31 +222,56 @@ class AcpAgent {
 		this.#active = true;
 		this.#transport.on('notification', onNotification);
 		signal?.addEventListener('abort', abort, { once: true });
+		let rawOutput = '';
+		let outputHandled = false;
+		const prompt = `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`;
 		try {
 			const response = await withTimeout(Promise.race([this.#transport.request('session/prompt', {
 				sessionId: this.#sessionId,
-				prompt: [{ type: 'text', text: `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}` }],
+				prompt: [{ type: 'text', text: prompt }],
 			}, { timeoutMs: this.#planningTimeoutMs }), outputLimit]), this.#planningTimeoutMs);
 			if (signal?.aborted || goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_PLAN', `${this.provider} result belongs to an obsolete goal`);
 			if (response?.stopReason !== 'end_turn') throw new AcpProtocolError('INCOMPLETE_TURN', `${this.provider} ACP stopped with '${String(response?.stopReason)}'`);
 			const decisionText = chunks.join('');
+			rawOutput = decisionText;
 			if (this.provider === 'kimi' && decisionText.trim().length === 0) {
 				throw new AcpProtocolError(
 					'PROVIDER_UNAVAILABLE',
 					'Kimi ended the turn without a response. Verify the Kimi CLI login and membership entitlement.',
 				);
 			}
-			try {
-				const decision = parseDecision(decisionText);
-				this.#sessionState = 'warm';
-				return decision;
-			} catch (error) {
-				throw new AcpProtocolError(
+			let decision;
+			let parseError = null;
+			try { decision = parseDecision(decisionText); }
+			catch (error) {
+				parseError = new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
 					`${this.provider} returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
 					{ cause: error },
 				);
+				parseError.category = 'decision_parse';
 			}
+			outputHandled = true;
+			const tokens = acpTokenUsage(response?.usage) ?? (this.provider === 'gemini' ? geminiQuotaTokenUsage(response?._meta) : null);
+			await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
+				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: parseError === null ? decisionText : '', error: structuredProviderError(parseError),
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(tokens === null ? {} : { tokens }),
+			});
+			if (parseError !== null) throw parseError;
+			this.#sessionState = 'warm';
+			return decision;
+		} catch (error) {
+			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+				agentId: this.agentId,
+				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
+				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
+				...(isRateLimitError(error) ? { rateLimited: true } : {}),
+			});
+			throw error;
 		} finally {
 			this.#active = false;
 			this.#transport.off('notification', onNotification);
@@ -272,6 +299,30 @@ function resolveKimiApiKeyModel(provider, requestedModel, modelOption) {
 
 function decisionExcerpt(value) {
 	return JSON.stringify(String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 512));
+}
+
+function acpTokenUsage(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+	return {
+		input: nativeToken(value.inputTokens), output: nativeToken(value.outputTokens), reasoning: nativeToken(value.thoughtTokens),
+		cached: nativeToken(value.cachedReadTokens), cacheWrite: nativeToken(value.cachedWriteTokens),
+	};
+}
+
+function nativeToken(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
+function geminiQuotaTokenUsage(value) {
+	const counts = value?.quota?.token_count;
+	if (counts === null || typeof counts !== 'object' || Array.isArray(counts)) return null;
+	return { input: nativeToken(counts.input_tokens), output: nativeToken(counts.output_tokens), reasoning: null, cached: null, cacheWrite: null };
+}
+
+function isRateLimitError(error) {
+	return [error?.code, error?.status, error?.statusCode, error?.httpStatusCode, error?.data?.status, error?.data?.httpStatusCode].some((value) => value === 429);
+}
+
+function structuredProviderError(error) {
+	return error === null ? null : { code: typeof error.code === 'string' ? error.code : 'PROVIDER_ERROR', category: error.category === 'decision_parse' ? 'decision_parse' : 'provider' };
 }
 
 class AcpCatalog {

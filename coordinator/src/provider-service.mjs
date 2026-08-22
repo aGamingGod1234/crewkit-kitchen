@@ -1,4 +1,4 @@
-const PROVIDERS = Object.freeze(['codex', 'gemini', 'kimi']);
+const PROVIDERS = Object.freeze(['codex', 'gemini', 'kimi', 'cursor']);
 const DEFAULT_SERVICE_TIER = 'priority';
 const PROFILE_KEYS = Object.freeze(['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier']);
 
@@ -14,14 +14,18 @@ export class ProviderService {
 	#services;
 	#assignments = new Map();
 	#creating = new Map();
+	#turnRecorder;
 
-	constructor(services) {
+	constructor(services, { turnRecorder = null } = {}) {
 		if (services === null || typeof services !== 'object') throw new TypeError('provider services are required');
-		this.#services = new Map(PROVIDERS.map((provider) => {
+		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
+		this.#turnRecorder = turnRecorder;
+		this.#services = new Map(PROVIDERS.filter((provider) => services[provider] !== undefined).map((provider) => {
 			const service = services[provider];
 			if (service === null || service === undefined) throw new TypeError(`${provider} service is required`);
 			return [provider, service];
 		}));
+		for (const provider of ['codex', 'gemini', 'kimi']) if (!this.#services.has(provider)) throw new TypeError(`${provider} service is required`);
 		this.catalog = new CombinedProviderCatalog(this.#services);
 	}
 
@@ -48,7 +52,11 @@ export class ProviderService {
 			assertSameProfile(creating.profile, profile);
 			return creating.promise;
 		}
-		const promise = this.#services.get(profile.provider).createAgent(profile, options);
+		const service = this.#services.get(profile.provider);
+		if (service === undefined) throw new TypeError(`${profile.provider} service is unavailable`);
+		const promise = service.createAgent(profile, this.#turnRecorder === null
+			? options
+			: { ...options, turnRecorder: this.#turnRecorder });
 		this.#creating.set(profile.agentId, { profile, promise });
 		try {
 			const agent = await promise;
@@ -80,9 +88,14 @@ export class ProviderService {
 
 	async reconcile(records) {
 		if (!Array.isArray(records)) throw new TypeError('provider reconciliation records must be an array');
-		const groups = new Map(PROVIDERS.map((provider) => [provider, []]));
-		for (const record of records) groups.get(normalizeProvider(record?.provider)).push({ ...record, provider: normalizeProvider(record?.provider) });
-		const results = await Promise.all(PROVIDERS.map((provider) =>
+		const availableProviders = [...this.#services.keys()];
+		const groups = new Map(availableProviders.map((provider) => [provider, []]));
+		for (const record of records) {
+			const provider = normalizeProvider(record?.provider);
+			if (!groups.has(provider)) throw new TypeError(`${provider} service is unavailable`);
+			groups.get(provider).push({ ...record, provider });
+		}
+		const results = await Promise.all(availableProviders.map((provider) =>
 			this.#services.get(provider).reconcile(groups.get(provider))));
 		const previousAssignments = this.#assignments;
 		const nextAssignments = new Map();

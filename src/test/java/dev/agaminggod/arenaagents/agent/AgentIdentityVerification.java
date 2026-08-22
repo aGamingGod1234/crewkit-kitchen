@@ -1,7 +1,19 @@
 package dev.agaminggod.arenaagents.agent;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 
 public final class AgentIdentityVerification {
 	private AgentIdentityVerification() {
@@ -11,26 +23,272 @@ public final class AgentIdentityVerification {
 		AgentId id = new AgentId(UUID.fromString("193a9add-1234-5678-9abc-123456789abc"));
 		AgentProfile sol = new AgentProfile("codex", "gpt-5.6-sol", "high", "fast", Optional.empty(), 2,
 				AgentGameMode.SURVIVAL);
-		assertEquals("Sol High | Emerald", AgentIdentity.displayName(sol),
-				"default identity names the model, effort, and visual variant");
-		assertEquals("SolEmer_193A9ADD", AgentIdentity.playerName(id, sol),
-				"fake-player username is readable, unique, and within Minecraft's limit");
+		assertEquals("Sol GTqa3RI0VniavBI0VniavA", AgentIdentity.displayName(id, sol),
+				"default operator name combines the canonical short model label and full encoded ID");
+		AgentId samePrefixId = new AgentId(UUID.fromString("193a9add-2222-2222-9abc-123456789abc"));
+		assertTrue(!AgentIdentity.displayName(id, sol).equalsIgnoreCase(AgentIdentity.displayName(samePrefixId, sol)),
+				"same-model IDs sharing their first eight hex characters keep distinct operator names");
+		assertEquals("c02_193A9ADD", AgentIdentity.playerName(id, sol),
+				"fake-player username carries the exact manifest transport identity");
+		assertTrue(AgentIdentity.playerName(id, sol).length() <= 16,
+				"fake-player username stays within Minecraft's limit");
+		assertTrue(AgentIdentity.playerName(id, sol).matches("[A-Za-z0-9_]+"),
+				"fake-player username uses Minecraft-safe characters");
+		String currentTechnicalName = "c02_193A9ADD";
+		UUID currentOfflineUuid = AgentIdentity.offlinePlayerUuid(currentTechnicalName);
+		assertEquals(UUID.fromString("6eb46a0e-9bd1-33e1-8fa7-d1280f08577c"), currentOfflineUuid,
+				"current transport name derives the exact Minecraft offline UUID");
+		assertTrue(!UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").equals(currentOfflineUuid),
+				"current transport-looking name with a genuine player UUID fails provenance");
+		String legacyTechnicalName = "SolEmer_193A9ADD";
+		UUID legacyOfflineUuid = AgentIdentity.offlinePlayerUuid(legacyTechnicalName);
+		assertEquals(UUID.fromString("c0bbfc41-28e0-331c-9c45-53e6a002905e"), legacyOfflineUuid,
+				"legacy transport name derives the exact Minecraft offline UUID");
+		assertTrue(!UUID.fromString("11111111-2222-3333-8444-555555555555").equals(legacyOfflineUuid),
+				"legacy transport-looking name with a genuine player UUID fails provenance");
+		assertEquals(new AgentIdentity.SkinIdentity("codex", "sol", 2),
+				AgentIdentity.skinForPlayerName("c02_193A9ADD").orElseThrow(),
+				"manifest player names expose the exact family and variant before the first client snapshot");
+		AgentIdentity.SkinIdentity currentTransport = AgentIdentity.skinForPlayerName("r22_193A9ADD").orElseThrow();
+		AgentVisualIdentity.Resolved currentTransportResolved = AgentVisualIdentity.resolveFamily(
+				currentTransport.provider(), currentTransport.modelFamily(), currentTransport.variant());
+		assertEquals("grok_46", currentTransportResolved.modelFamilyKey(),
+				"current transport identity retains its exact manifest family");
+		assertEquals("arenaagents:textures/entity/cursor_grok_46_agent_2.png",
+				currentTransportResolved.texturePath(),
+				"current transport identity resolves the exact family and individual texture");
 		assertEquals(new AgentIdentity.SkinIdentity("codex", 2),
 				AgentIdentity.skinForPlayerName("SolEmer_193A9ADD").orElseThrow(),
-				"offline player names expose the intended skin before the first client snapshot");
+				"legacy player names retain pre-snapshot skin fallback");
+		AgentIdentity.SkinIdentity legacyTransport = AgentIdentity.skinForPlayerName("SolEmer_193A9ADD").orElseThrow();
+		assertEquals("", legacyTransport.modelFamily(), "historical player names carry an explicit blank family");
+		AgentVisualIdentity.Resolved legacyFallback = AgentVisualIdentity.resolveProviderFallback(
+				legacyTransport.provider(), legacyTransport.variant());
+		assertEquals("spark", legacyFallback.modelFamilyKey(),
+				"historical blank-family Codex names use the documented provider fallback");
+		assertEquals("arenaagents:textures/entity/codex_spark_agent_2.png", legacyFallback.texturePath(),
+				"historical blank-family fallback keeps its individual variant");
+		expectIllegalArgument(
+				() -> AgentVisualIdentity.resolveFamily("cursor", "not_a_family", 2),
+				"malformed nonblank family is rejected instead of becoming a provider fallback"
+		);
+		assertEquals(new AgentIdentity.SkinIdentity("kimi", 2),
+				AgentIdentity.skinForPlayerName("K3Orch_193A9ADD").orElseThrow(),
+				"known digit-bearing legacy K3 names retain pre-snapshot skin fallback");
+		assertTrue(AgentIdentity.skinForPlayerName("a1ice_12345678").isEmpty(),
+				"ordinary digit-bearing names with a legacy token suffix are rejected");
 		assertTrue(AgentIdentity.skinForPlayerName("ordinary_player").isEmpty(),
 				"ordinary player names are not mistaken for arena identities");
-		AgentProfile kimiCoding = new AgentProfile(
-				"kimi", "kimi-for-coding", "high", "priority", Optional.empty(), 0, AgentGameMode.SURVIVAL);
-		String kimiPlayerName = AgentIdentity.playerName(id, kimiCoding);
-		assertEquals(new AgentIdentity.SkinIdentity("kimi", 0),
-				AgentIdentity.skinForPlayerName(kimiPlayerName).orElseThrow(),
-				"truncated Kimi Coding player identities still resolve their custom skin");
-		AgentProfile named = new AgentProfile("kimi", "kimi-code/k3", "low", "priority", Optional.of("Dune Scout"), 0,
+		AgentProfile kimiLong = new AgentProfile(
+				"kimi", "kimi-code/k3-256k", "max", "priority", Optional.empty(), 1, AgentGameMode.SURVIVAL);
+		assertEquals("k11_193A9ADD", AgentIdentity.playerName(id, kimiLong),
+				"digit-bearing model families remain regex-safe and exact");
+		assertEquals(new AgentIdentity.SkinIdentity("kimi", "k3_long", 1),
+				AgentIdentity.skinForPlayerName(AgentIdentity.playerName(id, kimiLong)).orElseThrow(),
+				"digit-bearing manifest identity round-trips");
+		AgentProfile legacyVariant = new AgentProfile(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(), 6, AgentGameMode.SURVIVAL);
+		assertEquals("c02_193A9ADD", AgentIdentity.playerName(id, legacyVariant),
+				"legacy persisted variants normalize through the canonical manifest count");
+		assertEquals(2, AgentVisualIdentity.normalizedVariant(6),
+				"legacy entity variants normalize through the manifest-owned variant count");
+		assertEquals(3, AgentVisualIdentity.normalizedVariant(-1),
+				"negative legacy entity variants normalize through the manifest-owned variant count");
+		AgentProfile named = new AgentProfile("codex", "gpt-5.6-sol", "low", "priority", Optional.of("Rook"), 0,
 				AgentGameMode.SURVIVAL);
-		assertEquals("Dune Scout", AgentIdentity.displayName(named), "explicit names remain authoritative");
-		assertEquals("Kimi K3 Low | Moon", named.nameTag(), "profile fallback name is provider and skin aware");
-		return 7;
+		assertEquals("Rook", AgentIdentity.displayName(id, named), "explicit names remain authoritative");
+		assertEquals(Optional.of("⌁ Rook · Sol"), AgentIdentity.worldTag(named), "explicit world tag");
+		assertTrue(AgentIdentity.worldTag(sol).isEmpty(), "unnamed agents have no world tag");
+
+		assertEquals("GPT 5.6 Sol WM", AgentModelNames.displayName("codex", "gpt-5.6-sol-wm"),
+				"Codex display name is canonical");
+		assertEquals("Sol WM", AgentModelNames.shortLabel("codex", "gpt-5.6-sol-wm"),
+				"Codex short label is canonical");
+		assertEquals("Gemini 3.1 Pro", AgentModelNames.displayName("gemini", "gemini-3.1-pro"),
+				"Gemini display name is canonical");
+		assertEquals("K2.7 Coding Highspeed",
+				AgentModelNames.displayName("kimi", "kimi-code/kimi-for-coding-highspeed"),
+				"Kimi display name is canonical");
+		assertEquals("Composer 2.5", AgentModelNames.displayName("cursor", "composer-2.5"),
+				"Cursor display name is canonical");
+
+		List<ModelCase> models = List.of(
+				new ModelCase("codex", "gpt-5.6-sol", "codex", "sol"),
+				new ModelCase("codex", "gpt-5.6-terra", "codex", "terra"),
+				new ModelCase("codex", "gpt-5.6-luna", "codex", "luna"),
+				new ModelCase("codex", "gpt-5.3-codex-spark", "codex", "spark"),
+				new ModelCase("gemini", "gemini-3.1-pro", "gemini", "pro"),
+				new ModelCase("gemini", "gemini-3.6-flash", "gemini", "flash"),
+				new ModelCase("gemini", "claude-sonnet-4-6", "gemini", "claude"),
+				new ModelCase("gemini", "gpt-oss-120b", "gemini", "oss"),
+				new ModelCase("kimi", "kimi-code/k3", "kimi", "k3"),
+				new ModelCase("kimi", "kimi-code/k3-256k", "kimi", "k3_long"),
+				new ModelCase("kimi", "kimi-code/kimi-for-coding", "kimi", "coding"),
+				new ModelCase("kimi", "kimi-code/kimi-for-coding-highspeed", "kimi", "coding_fast"),
+				new ModelCase("cursor", "composer-2.5", "cursor", "composer"),
+				new ModelCase("cursor", "grok-4.5", "cursor", "grok_45"),
+				new ModelCase("cursor", "grok-4.6", "cursor", "grok_46"),
+				new ModelCase("cursor", "cursor-next", "cursor", "cursor_next")
+		);
+		Set<String> transportCodes = new HashSet<>();
+		Set<String> texturePaths = new HashSet<>();
+		Map<String, Set<String>> textureBytesByProvider = new HashMap<>();
+		for (ModelCase model : models) {
+			for (int variant = 0; variant < AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT; variant++) {
+				AgentVisualIdentity.Resolved resolved = AgentVisualIdentity.resolve(model.provider(), model.slug(), variant);
+				assertEquals(model.provider(), resolved.providerKey(), "provider identity remains distinct");
+				assertEquals(model.chassis(), resolved.providerChassis(), "provider chassis remains distinct");
+				assertEquals(model.family(), resolved.modelFamilyKey(), "model resolves to its named family slot");
+				assertEquals(variant, resolved.individualVariant(), "all four individual variants resolve");
+				assertTrue(resolved.texturePath().startsWith(
+						"arenaagents:textures/entity/" + model.provider() + "_"),
+						"texture stays in the provider's project namespace");
+				assertTrue(transportCodes.add(resolved.transportCode()), "transport codes are globally unique");
+				assertEquals(resolved,
+						AgentVisualIdentity.resolveTransportCode(resolved.transportCode()).orElseThrow(),
+						"transport identity round-trips");
+				assertTrue(texturePaths.add(resolved.texturePath()), "manifest texture paths are globally unique");
+				byte[] textureBytes = readTexture(resolved.texturePath());
+				assertRgbaSkin(textureBytes, resolved.texturePath());
+				assertTrue(textureBytesByProvider
+						.computeIfAbsent(resolved.providerKey(), ignored -> new HashSet<>())
+						.add(Base64.getEncoder().encodeToString(textureBytes)),
+						"provider textures are byte-distinct");
+			}
+		}
+		assertEquals(64, texturePaths.size(), "manifest resolves exactly 64 agent texture artifacts");
+
+		AgentVisualIdentity.Resolved kimiK3 = AgentVisualIdentity.resolve("kimi", "kimi-code/k3", 0);
+		AgentVisualIdentity.Resolved kimiK3256 = AgentVisualIdentity.resolve("kimi", "kimi-code/k3-256k", 0);
+		assertEquals("K3", kimiK3.shortModelLabel(), "Kimi digit-bearing K3 label is preserved");
+		assertEquals("K3 256K", kimiK3256.shortModelLabel(), "Kimi digit-bearing K3 256K label is preserved");
+		assertTrue(!kimiK3.transportCode().equals(kimiK3256.transportCode()),
+				"Kimi digit-bearing families keep distinct transport identities");
+
+		AgentVisualIdentity.Resolved cursor = AgentVisualIdentity.resolve("cursor", "composer-1.5", 2);
+		assertEquals("cursor", cursor.providerKey(), "Cursor keeps its provider identity");
+		assertEquals("cursor", cursor.providerChassis(), "Cursor keeps its distinct chassis");
+		assertTrue(cursor.texturePath().contains("cursor_"), "Cursor never uses Codex art");
+		assertEquals(cursor, AgentVisualIdentity.resolveTransportCode(cursor.transportCode()).orElseThrow(),
+				"Cursor transport identity round-trips");
+
+		AgentVisualIdentity.Resolved unknown = AgentVisualIdentity.resolve("codex", "future-research-model-9", 3);
+		assertEquals("spark", unknown.modelFamilyKey(), "unknown model uses the declared provider fallback family");
+		assertEquals(unknown, AgentVisualIdentity.resolve("codex", "future-research-model-9", 3),
+				"unknown model fallback is deterministic");
+		assertTrue(AgentVisualIdentity.resolveTransportCode("not-a-transport-code").isEmpty(),
+				"unknown transport identity is rejected");
+
+		expectInvalidManifest(manifestWith(root -> root.addProperty("schemaVersion", 1.5D)),
+				"schemaVersion must be an integer", "fractional manifest schema rejected");
+		expectInvalidManifest(manifestWith(root -> root.addProperty("schemaVersion", 2_147_483_648L)),
+				"schemaVersion must be an integer", "out-of-range manifest schema rejected");
+		expectInvalidManifest(manifestWith(root -> root.addProperty("schemaVersion", 2)),
+				"schemaVersion must be 1", "wrong manifest schema rejected");
+		expectInvalidManifest(manifestWith(root -> root.addProperty("unexpected", true)),
+				"unknown keys [unexpected]", "unknown manifest key rejected");
+		expectInvalidManifest(manifestWith(root -> {
+			JsonObject cursorProvider = root.getAsJsonArray("providers").get(3).getAsJsonObject();
+			cursorProvider.addProperty("key", "codex");
+			cursorProvider.getAsJsonArray("families").forEach(family ->
+					family.getAsJsonObject().getAsJsonArray("variants").forEach(variant -> {
+						JsonObject value = variant.getAsJsonObject();
+						value.addProperty("texturePath", value.get("texturePath").getAsString()
+								.replace("cursor_", "codex_"));
+					}));
+		}), "duplicate provider: codex", "duplicate manifest provider rejected");
+		expectInvalidManifest(manifestWith(root -> root.getAsJsonArray("providers").get(0).getAsJsonObject()
+				.getAsJsonArray("families").get(1).getAsJsonObject().addProperty("key", "sol")),
+				"duplicate family sol", "duplicate manifest family rejected");
+		expectInvalidManifest(manifestWith(root -> {
+			var variants = root.getAsJsonArray("providers").get(0).getAsJsonObject()
+					.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants");
+			variants.get(1).getAsJsonObject().addProperty("transportCode",
+					variants.get(0).getAsJsonObject().get("transportCode").getAsString());
+		}), "duplicate transport code: c00", "duplicate manifest transport code rejected");
+		expectInvalidManifest(manifestWith(root -> root.getAsJsonArray("providers").get(0).getAsJsonObject()
+				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").remove(3)),
+				"must declare exactly four variants", "invalid manifest variant count rejected");
+		expectInvalidManifest(manifestWith(root -> root.getAsJsonArray("providers").get(0).getAsJsonObject()
+				.getAsJsonArray("families").get(0).getAsJsonObject().getAsJsonArray("variants").get(0)
+				.getAsJsonObject().addProperty("texturePath", "minecraft:textures/entity/stolen.png")),
+				"project-owned codex entity texture", "non-project manifest texture rejected");
+		return 1150;
+	}
+
+	private static byte[] readTexture(String texturePath) {
+		String[] location = texturePath.split(":", 2);
+		String resourcePath = "assets/" + location[0] + "/" + location[1];
+		try (var stream = AgentIdentityVerification.class.getClassLoader().getResourceAsStream(resourcePath)) {
+			if (stream == null) throw new AssertionError("manifest texture is missing: " + texturePath);
+			return stream.readAllBytes();
+		} catch (IOException exception) {
+			throw new AssertionError("manifest texture could not be read: " + texturePath, exception);
+		}
+	}
+
+	private static void assertRgbaSkin(byte[] bytes, String texturePath) {
+		assertTrue(bytes.length >= 29, texturePath + " contains a complete PNG header");
+		assertTrue(bytes[0] == (byte) 137 && bytes[1] == 80 && bytes[2] == 78 && bytes[3] == 71
+				&& bytes[4] == 13 && bytes[5] == 10 && bytes[6] == 26 && bytes[7] == 10,
+				texturePath + " has a PNG signature");
+		assertEquals(13, readBigEndianInt(bytes, 8), texturePath + " has a complete IHDR payload");
+		assertEquals("IHDR", new String(bytes, 12, 4, StandardCharsets.US_ASCII),
+				texturePath + " begins with IHDR");
+		assertEquals(64, readBigEndianInt(bytes, 16), texturePath + " has 64px width");
+		assertEquals(64, readBigEndianInt(bytes, 20), texturePath + " has 64px height");
+		assertEquals(8, Byte.toUnsignedInt(bytes[24]), texturePath + " uses 8-bit channels");
+		assertEquals(6, Byte.toUnsignedInt(bytes[25]), texturePath + " uses RGBA color");
+	}
+
+	private static int readBigEndianInt(byte[] bytes, int offset) {
+		return (Byte.toUnsignedInt(bytes[offset]) << 24)
+				| (Byte.toUnsignedInt(bytes[offset + 1]) << 16)
+				| (Byte.toUnsignedInt(bytes[offset + 2]) << 8)
+				| Byte.toUnsignedInt(bytes[offset + 3]);
+	}
+
+	private static String manifestWith(Consumer<JsonObject> mutation) {
+		try (var stream = AgentIdentityVerification.class.getClassLoader().getResourceAsStream(
+				"assets/arenaagents/identity/agent_visual_manifest.json")) {
+			if (stream == null) throw new AssertionError("agent visual manifest fixture is missing");
+			JsonObject root = JsonParser.parseString(new String(stream.readAllBytes(), StandardCharsets.UTF_8))
+					.getAsJsonObject();
+			mutation.accept(root);
+			return root.toString();
+		} catch (IOException exception) {
+			throw new AssertionError("agent visual manifest fixture could not be read", exception);
+		}
+	}
+
+	private static void expectInvalidManifest(String manifest, String expectedMessagePart, String label) {
+		String firstMessage = invalidManifestMessage(manifest, label);
+		String secondMessage = invalidManifestMessage(manifest, label);
+		assertTrue(firstMessage.contains(expectedMessagePart), label + " reports its cause");
+		assertEquals(firstMessage, secondMessage, label + " is stable");
+	}
+
+	private static String invalidManifestMessage(String manifest, String label) {
+		try {
+			AgentVisualIdentity.validateManifest(manifest);
+		} catch (IllegalStateException exception) {
+			return exception.getMessage();
+		} catch (RuntimeException exception) {
+			throw new AssertionError(label + " threw " + exception.getClass().getSimpleName(), exception);
+		}
+		throw new AssertionError(label + ": expected invalid manifest rejection");
+	}
+
+	private static void expectIllegalArgument(Runnable operation, String label) {
+		try {
+			operation.run();
+			throw new AssertionError(label + ": expected rejection");
+		} catch (IllegalArgumentException expected) {
+			// Expected.
+		}
+	}
+
+	private record ModelCase(String provider, String slug, String chassis, String family) {
 	}
 
 	private static void assertTrue(boolean value, String label) {
