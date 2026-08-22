@@ -6,7 +6,9 @@
     "minipcReport": "https://n5if4c3wso4v.postplan.dev",
     "desktopReport": "https://pbjmhmdc8ebb.postplan.dev",
     "implementationSourceBranch": "agent/latency-optimized",
-    "implementationSourceCommit": "3b99ab26f98b54739a5d5868f0d79335951ecd9f"
+    "implementationSourceCommit": "3b99ab26f98b54739a5d5868f0d79335951ecd9f",
+    "baselineSourceCommit": "e5fe16cdb39689673c9a1308cf04f3e9aa6e3bbb",
+    "commonMergeBase": "dfd9654c37ea1a71fc7f408c3173113a8bd21cfe"
   },
   "minipc": {
     "environment": "MiniPC deterministic simulator and delayed provider replay",
@@ -99,6 +101,15 @@
   },
   "desktop": {
     "environment": "Desktop real headless Fabric server with optimized mod and real Codex Luna app-server",
+    "arenaAgentsJarSha256": "bb685277033a64dea6afdb1d9325d4999fb8c5c24f6da369d58f0b09163c045c",
+    "profile": {
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "reasoningEffort": "xhigh",
+      "serviceTier": "fast"
+    },
+    "planningConcurrency": 4,
+    "planningTimeoutMs": 120000,
     "samplingWindowSeconds": 135,
     "sampleIntervalSeconds": 1,
     "task": "Gather wood and craft a wooden pickaxe",
