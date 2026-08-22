@@ -251,6 +251,76 @@ test('reissues the newest lifecycle plan after an older provider turn settles', 
 	}
 });
 
+test('retries a queued urgent trigger after a failed initial provider turn', async () => {
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const run = await start();
+	const runtimeErrors = [];
+	run.coordinator.on('runtimeError', (error) => runtimeErrors.push(error));
+	let attempts = 0;
+	run.planner.requestPlan = async (request) => {
+		run.planner.requests.push(request);
+		attempts += 1;
+		if (attempts === 1) {
+			await gate;
+			run.registry.setState('agent-a', DynamicAgentState.ERROR, { goalRevision: 1, error: { code: 'PROVIDER_DOWN', message: 'Provider unavailable' } });
+			throw Object.assign(new Error('Provider unavailable'), { code: 'PROVIDER_DOWN' });
+		}
+		return { summary: 'Recovered.', directive: 'replace', source: SOURCE };
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.planner.requests.length === 1);
+		run.bridge.emit('conversation_event', {
+			agentId: 'agent-a',
+			payload: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: 'Urgent: respond.', goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 },
+		});
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, attention: true, observation: { player: { x: 0, y: 64, z: 0, health: 19 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await new Promise((resolve) => setImmediate(resolve));
+		release();
+		await eventually(() => run.planner.requests.length === 2);
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		assert.equal(run.planner.requests[1].planningPriority, 'urgent');
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.ACTING);
+		assert.equal(runtimeErrors.some((error) => error.code === 'ILLEGAL_STATE_TRANSITION'), false);
+	} finally {
+		release();
+		await run.coordinator.stop();
+	}
+});
+
+test('flushes conversation attention that arrived during initial planning after install', async () => {
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const run = await start();
+	let attempts = 0;
+	run.planner.requestPlan = async (request) => {
+		run.planner.requests.push(request);
+		attempts += 1;
+		if (attempts === 1) await gate;
+		return attempts === 1
+			? { summary: 'Installed.', directive: 'replace', source: SOURCE }
+			: { summary: 'Continue.', directive: 'continue' };
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.planner.requests.length === 1);
+		run.bridge.emit('conversation_event', {
+			agentId: 'agent-a',
+			payload: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: 'Please answer now.', goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 },
+		});
+		release();
+		await eventually(() => run.planner.requests.length === 2);
+		assert.equal(run.planner.requests[1].planningPriority, 'urgent');
+		assert.match(run.planner.requests[1].input, /Please answer now\./);
+	} finally {
+		release();
+		await run.coordinator.stop();
+	}
+});
+
 test('installs a selected-model program and continues its next primitive without another provider turn', async () => {
 	const run = await start();
 	try {

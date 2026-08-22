@@ -535,9 +535,11 @@ export class DynamicCoordinator extends EventEmitter {
 		const pending = work.pending;
 		this.#providerWork.delete(work.agentId);
 		this.#providerRetryAfter.delete(work.agentId);
-		if (runtime === null || pending === null) return runtime;
+		if (runtime === null) return runtime;
 		const latest = this.#registry.get(work.agentId);
 		if (latest === null || latest.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) return runtime;
+		this.#flushPendingAttention(latest);
+		if (pending === null) return runtime;
 		try {
 			if (pending.observation !== undefined) {
 				await this.#programRuntime.onObservation(latest, {
@@ -571,6 +573,14 @@ export class DynamicCoordinator extends EventEmitter {
 		if (request === null || request === undefined) return;
 		const record = this.#registry.get(request.agentId);
 		if (record === null || record.goalRevision !== request.goalRevision || !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		if (record.state === DynamicAgentState.ERROR && request.preserveState !== true) {
+			try {
+				this.#registry.setState(record.agentId, DynamicAgentState.STARTING, { goalRevision: record.goalRevision });
+			} catch (error) {
+				void this.#reportAgentError(record.agentId, error);
+				return;
+			}
+		}
 		void this.#scheduleProviderPlan(record, request, { preserveState: request.preserveState === true, kind: request.kind ?? 'initial' });
 	}
 
@@ -633,14 +643,19 @@ export class DynamicCoordinator extends EventEmitter {
 			const current = this.#registry.get(record.agentId);
 			const pending = this.#pendingAttention.get(record.agentId);
 			if (current === null || pending?.goalRevision !== token.goalRevision || current.goalRevision !== token.goalRevision) return;
-			if (!this.#programRuntime.hasCurrent(current)) return;
-			try {
-				const notified = this.#programRuntime.notifyAttention(current, { priority: pending.priority, trigger: pending.trigger });
-				if (notified !== null) this.#pendingAttention.delete(record.agentId);
-			} catch (error) {
-				void this.#reportAgentError(record.agentId, error);
-			}
+			this.#flushPendingAttention(current);
 		});
+	}
+
+	#flushPendingAttention(record) {
+		const pending = this.#pendingAttention.get(record.agentId);
+		if (pending?.goalRevision !== record.goalRevision || !this.#programRuntime.hasCurrent(record)) return;
+		try {
+			const notified = this.#programRuntime.notifyAttention(record, { priority: pending.priority, trigger: pending.trigger });
+			if (notified !== null) this.#pendingAttention.delete(record.agentId);
+		} catch (error) {
+			void this.#reportAgentError(record.agentId, error);
+		}
 	}
 
 	#isLifecycleGenerationCurrent(agentId, generation) {
