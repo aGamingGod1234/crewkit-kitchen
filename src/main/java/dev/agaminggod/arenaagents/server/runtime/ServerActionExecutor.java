@@ -21,6 +21,7 @@ import dev.agaminggod.arenaagents.server.runtime.controller.CombatIntent;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerCombatController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerNavigationController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerItemPickupController;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerPathPlanner;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
@@ -96,6 +97,7 @@ public final class ServerActionExecutor {
 	private final Map<AgentId, PendingRespawn> pendingRespawns = new LinkedHashMap<>();
 	private final Map<AgentId, ServerActionResult> lastResults = new LinkedHashMap<>();
 	private long coordinatorGeneration;
+	private long pathfindingRoundRobinCursor;
 
 	public ServerActionExecutor(CodexAgentManager manager, Consumer<ServerActionResult> resultSink) {
 		this(manager, resultSink, progress -> { }, ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR);
@@ -243,24 +245,31 @@ public final class ServerActionExecutor {
 
 	public synchronized void tick() {
 		long now = System.currentTimeMillis();
-		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) tickRespawn(pending, now);
-		for (ActiveAction action : new ArrayList<>(active.values())) {
-			CleanupRetry<ServerActionResult> pending = pendingCompletions.get(action.request().agentId());
-			if (pending != null) {
-				finish(action, pending.pending());
-				continue;
-			}
-			ServerActionResult result;
-			try {
-				result = action.tick(now);
-			} catch (RuntimeException exception) {
-				result = action.result(ServerActionState.FAILED, failureReason(exception), safeMessage(exception), now);
-			}
-			if (result != null) {
-				finish(action, result);
-			} else {
-				ServerActionProgress progress = action.progress(now);
-				if (progress != null) publishProgressBestEffort(progressSink, progress);
+		List<ActiveAction> actions = new ArrayList<>(active.values());
+		try (ServerPathPlanner.TickScope ignored = ServerPathPlanner.beginServerTick()) {
+			for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) tickRespawn(pending, now);
+			if (actions.isEmpty()) return;
+			int start = roundRobinStart(pathfindingRoundRobinCursor, actions.size());
+			pathfindingRoundRobinCursor++;
+			for (int offset = 0; offset < actions.size(); offset++) {
+				ActiveAction action = actions.get((start + offset) % actions.size());
+				CleanupRetry<ServerActionResult> pending = pendingCompletions.get(action.request().agentId());
+				if (pending != null) {
+					finish(action, pending.pending());
+					continue;
+				}
+				ServerActionResult result;
+				try {
+					result = action.tick(now);
+				} catch (RuntimeException exception) {
+					result = action.result(ServerActionState.FAILED, failureReason(exception), safeMessage(exception), now);
+				}
+				if (result != null) {
+					finish(action, result);
+				} else {
+					ServerActionProgress progress = action.progress(now);
+					if (progress != null) publishProgressBestEffort(progressSink, progress);
+				}
 			}
 		}
 	}
@@ -302,6 +311,11 @@ public final class ServerActionExecutor {
 
 	static boolean isCurrentCoordinatorGeneration(long actionGeneration, long currentGeneration) {
 		return actionGeneration == currentGeneration;
+	}
+
+	static int roundRobinStart(long cursor, int activeActionCount) {
+		if (activeActionCount <= 0) return 0;
+		return (int) Math.floorMod(cursor, activeActionCount);
 	}
 
 	static void publishProgressBestEffort(

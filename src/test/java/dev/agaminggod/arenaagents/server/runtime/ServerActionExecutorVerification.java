@@ -190,7 +190,19 @@ public final class ServerActionExecutorVerification {
 				"runtime revalidation preserves a precise recoverable domain reason");
 		assertEquals("ACTION_EXCEPTION", ServerActionExecutor.failureReason(new IllegalStateException("broken")),
 				"unexpected runtime exceptions remain isolated");
-		return 40;
+		assertEquals(0, ServerActionExecutor.roundRobinStart(0L, 16),
+				"round-robin starts with the first active agent");
+		assertEquals(1, ServerActionExecutor.roundRobinStart(1L, 16),
+				"round-robin advances one active agent per tick");
+		assertEquals(0, ServerActionExecutor.roundRobinStart(16L, 16),
+				"round-robin wraps after all sixteen active agents");
+		boolean[] admitted = new boolean[16];
+		for (long cursor = 0L; cursor < admitted.length; cursor++) {
+			int start = ServerActionExecutor.roundRobinStart(cursor, admitted.length);
+			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
+			admitted[start] = true;
+		}
+		return 44;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

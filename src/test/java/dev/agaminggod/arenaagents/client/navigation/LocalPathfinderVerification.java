@@ -26,6 +26,7 @@ public final class LocalPathfinderVerification {
 		assertions += verifyTieBreakIsDeterministic();
 		assertions += verifyStartEqualsGoal();
 		assertions += verifyPathIsImmutableAndAcyclic();
+		assertions += verifySharedBudgetIsAggregate();
 		return assertions;
 	}
 
@@ -205,6 +206,36 @@ public final class LocalPathfinderVerification {
 		return 2;
 	}
 
+	private static int verifySharedBudgetIsAggregate() {
+		TestWorld world = new TestWorld();
+		world.standable(position(0, 64, 0)).standable(position(1, 64, 0));
+		LocalPathfinder.SearchBudget budget = new LocalPathfinder.SearchBudget(
+				1,
+				TEST_TIME_BUDGET_NANOS,
+				() -> 0L
+		);
+		LocalPathfinder pathfinder = new LocalPathfinder();
+
+		PathPlan first = pathfinder.findPath(
+				world,
+				position(0, 64, 0),
+				position(1, 64, 0),
+				budget
+		);
+		PathPlan second = pathfinder.findPath(
+				world,
+				position(0, 64, 0),
+				position(1, 64, 0),
+				budget
+		);
+
+		assertEquals(PathOutcome.FOUND, first.outcome(), "shared budget first request is served");
+		assertEquals(PathOutcome.NODE_LIMIT, second.outcome(), "shared budget defers the next request");
+		assertEquals(1, budget.expandedNodes(), "shared budget counts expansions once across requests");
+		assertTrue(budget.exhausted(), "shared budget reports aggregate exhaustion");
+		return 4;
+	}
+
 	private static PathPlan find(TestWorld world, GridPosition start, GridPosition destination) {
 		return new LocalPathfinder().findPath(
 				world,
@@ -223,6 +254,12 @@ public final class LocalPathfinderVerification {
 	private static void assertEquals(Object expected, Object actual, String label) {
 		if (!expected.equals(actual)) {
 			throw new AssertionError(label + ": expected <" + expected + "> but was <" + actual + ">");
+		}
+	}
+
+	private static void assertTrue(boolean condition, String label) {
+		if (!condition) {
+			throw new AssertionError(label);
 		}
 	}
 

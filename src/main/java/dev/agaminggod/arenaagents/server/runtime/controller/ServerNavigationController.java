@@ -145,7 +145,13 @@ public final class ServerNavigationController implements ServerController {
 		if (start == null || goal == null) {
 			return fail(player, "NO_STANDABLE_PATH", "Start or destination has no safe standing position", currentProgress());
 		}
-		PathPlan candidate = planner.findPath(world, start, goal);
+		ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
+		if (planning.deferred()) {
+			// Shared server-tick exhaustion is transient. Keep the action alive so the
+			// fair executor rotation can admit it on a later tick.
+			return TickResult.running(currentProgress());
+		}
+		PathPlan candidate = planning.plan();
 		if (candidate.outcome() != PathOutcome.FOUND || candidate.nodes().size() > DEFAULT_MAX_PATH_LENGTH) {
 			String reason = candidate.outcome() == PathOutcome.NODE_LIMIT
 					|| candidate.outcome() == PathOutcome.TIME_LIMIT
