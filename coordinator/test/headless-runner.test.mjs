@@ -115,3 +115,28 @@ test('writes a bounded plain JSON report to the scenario directory', async () =>
 	assert.equal(writes[0].options.encoding, 'utf8');
 	assert.ok(JSON.parse(writes[0].content).diagnostics.length <= 4096);
 });
+
+test('expands the generated-agent placeholder and requires authoritative factual success', async () => {
+	let inventoryCommand = '';
+	let clock = 0;
+	const factualScenario = normalizeHeadlessScenario({
+		id: 'factual-case', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast', task: 'craft', timeoutMs: 1000,
+		requireFactualSuccess: true, assert: [
+			{ type: 'lifecycle', state: 'COMPLETED' },
+			{ type: 'rcon', command: 'data get entity {agent} Inventory', match: 'minecraft:wooden_pickaxe' },
+		],
+	});
+	const rcon = {
+		command: async (command) => {
+			if (command.startsWith('codex summon-configured')) return { text: 'Created agent. ready' };
+			if (command.startsWith('codex start')) return { text: 'started' };
+			if (command.startsWith('codex status')) return { text: 'state=COMPLETED' };
+			inventoryCommand = command;
+			return { text: 'minecraft:wooden_pickaxe' };
+		}, close: async () => {},
+	};
+	const report = await runHeadlessScenario({ scenario: factualScenario, runDirectory: 'C:/runs/factual', rcon, now: () => clock++, readFile: async () => '', poll: async () => {} });
+	assert.equal(report.status, 'PASSED');
+	assert.equal(report.factualSuccess, true);
+	assert.match(inventoryCommand, /^data get entity headless_factual_case_/);
+});

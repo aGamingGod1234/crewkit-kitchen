@@ -100,6 +100,7 @@ export async function runLatencyMatrix(options = {}) {
 		cleanup: { ok: results.every((trial) => trial.cleanup?.ok !== false), activeActions: results.reduce((sum, trial) => sum + (trial.cleanup?.activeActions ?? 0), 0), listeners: results.reduce((sum, trial) => sum + (trial.cleanup?.listeners ?? 0), 0) },
 		summary: recorder.snapshot ? recorder.snapshot().length : 0,
 		benchmarkSummary: summarizeBenchmark(recorder.snapshot ? recorder.snapshot() : []),
+		...(options.includeRawEvents ? { rawEvents: recorder.snapshot ? recorder.snapshot() : [] } : {}),
 	};
 	if (options.artifactDirectory) await writeArtifacts(options.artifactDirectory, output, recorder, options.artifactFs);
 	if (requiredFailure) throw Object.assign(new Error(requiredFailure.message), requiredFailure, { result: output });

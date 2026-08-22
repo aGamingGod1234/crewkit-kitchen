@@ -1,5 +1,8 @@
 import path from 'node:path';
 import { mkdir as defaultMkdir, readFile as defaultReadFile, writeFile as defaultWriteFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+
+import { HeadlessRconClient } from './headless-rcon.mjs';
 
 const PROVIDERS = new Set(['codex', 'gemini', 'kimi']);
 const MAX_TIMEOUT_MS = 900_000;
@@ -9,7 +12,7 @@ const MAX_ASSERTION_ARGS = 8192;
 const MAX_EVIDENCE_BYTES = 16_384;
 const MAX_POLL_ATTEMPTS = 256;
 const POLL_INTERVAL_MS = 50;
-const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'assert', 'assertions']);
+const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'assert', 'assertions', 'repetitions', 'planningTimeoutMs', 'scenarioTimeoutMs', 'requireFactualSuccess']);
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
 	chat: new Set(['type', 'message']),
@@ -79,6 +82,10 @@ export function normalizeHeadlessScenario(value, index = 0) {
 		id: text(value.id, `scenarios[${index}].id`), provider: text(value.provider, `scenarios[${index}].provider`),
 		model: text(value.model, `scenarios[${index}].model`), reasoningEffort: text(value.reasoningEffort, `scenarios[${index}].reasoningEffort`),
 		serviceTier: text(value.serviceTier ?? 'priority', `scenarios[${index}].serviceTier`), task: text(value.task, `scenarios[${index}].task`), timeoutMs,
+		repetitions: value.repetitions === undefined ? 1 : boundedPositiveInteger(value.repetitions, `scenarios[${index}].repetitions`),
+		planningTimeoutMs: value.planningTimeoutMs === undefined ? null : boundedPositiveInteger(value.planningTimeoutMs, `scenarios[${index}].planningTimeoutMs`),
+		scenarioTimeoutMs: value.scenarioTimeoutMs === undefined ? timeoutMs : boundedPositiveInteger(value.scenarioTimeoutMs, `scenarios[${index}].scenarioTimeoutMs`),
+		requireFactualSuccess: value.requireFactualSuccess === true,
 		assertions: assertions.map(normalizeAssertion),
 	};
 	if (!PROVIDERS.has(scenario.provider)) throw new TypeError(`unsupported provider '${scenario.provider}'`);
@@ -165,13 +172,13 @@ export async function runHeadlessScenario({
 	let classification = null;
 	let diagnostics = '';
 	let closed = false;
-	const command = async (value, { readOnly = false } = {}) => {
+	const command = async (value, { readOnly = false, template = null } = {}) => {
 		const commandText = String(value);
 		if (readOnly && !isReadOnlyRcon(commandText)) throw new Error(`RCON assertion command is not read-only: ${commandText}`);
 		commands.push(commandText);
 		const result = await rcon.command(commandText);
 		const textValue = boundedText(result?.text ?? result, MAX_EVIDENCE_BYTES);
-		if (readOnly) rconEvidence.push({ command: commandText, text: textValue });
+		if (readOnly) rconEvidence.push({ command: template ?? commandText, executedCommand: commandText, text: textValue });
 		return { result, text: textValue };
 	};
 	try {
@@ -202,16 +209,22 @@ export async function runHeadlessScenario({
 		if (classification === null && terminalState === null) classification = 'TIMEOUT';
 		const fileEvidence = await readEvidence(directory, readFile, protocolAudit);
 		for (const assertion of assertions) {
-			if (assertion.type === 'rcon') await command(assertion.command, { readOnly: true });
+			if (assertion.type === 'rcon') {
+				const executedCommand = assertion.command.replaceAll('{agent}', generatedName);
+				await command(executedCommand, { readOnly: true, template: assertion.command });
+			}
 		}
 		const evidence = makeEvidence({ terminalState, protocolAudit, ...fileEvidence, rcon: rconEvidence });
 		const assertionResult = evaluateHeadlessAssertions(assertions, evidence);
+		const factualAssertions = assertions.filter((assertion) => assertion.type === 'rcon');
+		const factualSuccess = factualAssertions.length > 0 && assertionResult.results.filter((result) => result.type === 'rcon').every((result) => result.passed);
 		if (classification === null && !assertionResult.passed) classification = 'ASSERTION_MISMATCH';
+		if (classification === null && scenario.requireFactualSuccess && !factualSuccess) classification = 'FAILED_USER_OBJECTIVE';
 		if (classification === null) classification = 'PASSED';
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
 		const report = scenarioReport(status, scenario, {
 			classification, generatedName, lifecycle: terminalState, elapsedMs: Math.max(0, Number(now()) - startedAt),
-			commands, assertions: assertionResult.results, evidence: evidenceSummary(directory, fileEvidence, protocolAudit),
+			commands, assertions: assertionResult.results, factualSuccess, evidence: evidenceSummary(directory, fileEvidence, protocolAudit),
 			diagnostics,
 			cleanup: { status: 'PENDING' },
 		});
@@ -273,7 +286,7 @@ function evaluateAssertion(assertion, evidence, index) {
 		passed = actual.some((entry) => entry?.event === assertion.event && (assertion.status === undefined || entry.status === assertion.status));
 	}
 	else if (type === 'rcon') {
-		actual = (evidence.rcon ?? []).filter((entry) => entry.command === assertion.command).map((entry) => entry.text);
+		actual = (evidence.rcon ?? []).filter((entry) => entry.command === assertion.command || entry.template === assertion.command).map((entry) => entry.text);
 		passed = actual.some((value) => value.includes(assertion.match));
 	}
 	return { index, type: boundedScalar(type), passed, expected: boundReportValue(assertion), actual: boundReportValue(actual) };
@@ -350,6 +363,60 @@ function normalizeRunDirectory(value) {
 	return path.resolve(value);
 }
 
+export async function runHeadlessMatrix({ config, configPath, scenarioId = null, runDirectory, rconHost = '127.0.0.1', rconPort, rconPasswordFile, protocolAudit = null, requireAll = false, readFile = defaultReadFile } = {}) {
+	const source = config ?? JSON.parse(await readFile(configPath, 'utf8'));
+	const matrix = normalizeHeadlessMatrix(source);
+	const scenarios = selectHeadlessScenarios(matrix, scenarioId);
+	if (!Number.isInteger(rconPort) || rconPort < 1 || rconPort > 65535) throw new TypeError('rconPort must be a valid port');
+	if (typeof rconPasswordFile !== 'string' || rconPasswordFile.trim() === '') throw new TypeError('rconPasswordFile is required');
+	const password = String(await readFile(rconPasswordFile, 'utf8')).trim();
+	if (password.length === 0 || password.length > 512) throw new TypeError('RCON password file is empty or oversized');
+	const reports = [];
+	for (const scenario of scenarios) {
+		const repetitions = scenario.repetitions ?? 1;
+		for (let repetition = 1; repetition <= repetitions; repetition += 1) {
+			const repetitionDirectory = path.join(path.resolve(runDirectory), scenario.id, `repetition-${repetition}`);
+			const rcon = new HeadlessRconClient({ host: rconHost, port: rconPort, password });
+			try {
+				await rcon.connect();
+				const report = await runHeadlessScenario({ scenario, runDirectory: repetitionDirectory, rcon, protocolAudit });
+				reports.push({ ...report, repetition });
+			} catch (error) {
+				reports.push(scenarioReport('FAILED', scenario, { repetition, classification: 'RUNNER_ERROR', diagnostics: boundedText(error?.message ?? error, MAX_DIAGNOSTICS), cleanup: { status: 'FAILED' } }));
+			} finally {
+				try { await rcon.close(); } catch { /* scenario report records cleanup; socket closure is best effort */ }
+			}
+		}
+	}
+	const failed = reports.some((report) => report.status === 'FAILED');
+	const skipped = reports.length > 0 && reports.every((report) => report.status === 'SKIPPED');
+	const status = failed || (requireAll && skipped) ? 'FAILED' : skipped ? 'SKIPPED' : reports.length > 0 && reports.every((report) => report.status === 'PASSED') ? 'PASSED' : 'FAILED';
+	const report = { schemaVersion: 1, status, requireAll: requireAll === true, scenarioCount: reports.length, scenarios: reports };
+	await defaultMkdir(path.resolve(runDirectory), { recursive: true });
+	await defaultWriteFile(path.join(path.resolve(runDirectory), 'matrix-report.json'), `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+	return Object.freeze({ report, exitCode: status === 'PASSED' || status === 'SKIPPED' ? 0 : 1 });
+}
+
+export function parseHeadlessCliArguments(argv) {
+	const values = {};
+	for (let index = 0; index < argv.length; index += 1) {
+		const flag = argv[index];
+		if (flag === '--require-all') { values.requireAll = true; continue; }
+		if (!flag.startsWith('--') || index + 1 >= argv.length) throw new TypeError(`invalid headless CLI argument '${flag}'`);
+		const key = { '--config': 'configPath', '--scenario': 'scenarioId', '--run-directory': 'runDirectory', '--rcon-host': 'rconHost', '--rcon-port': 'rconPort', '--rcon-password-file': 'rconPasswordFile', '--protocol-audit': 'protocolAudit', '--provider-turns': 'providerTurns' }[flag];
+		if (!key) throw new TypeError(`unknown headless CLI argument '${flag}'`);
+		values[key] = argv[++index];
+	}
+	for (const field of ['configPath', 'runDirectory', 'rconPasswordFile']) if (typeof values[field] !== 'string' || values[field].trim() === '') throw new TypeError(`--${field} is required`);
+	values.rconPort = Number(values.rconPort);
+	return values;
+}
+
+function boundedPositiveInteger(value, field) {
+	if (!Number.isSafeInteger(value) || value < 1 || value > MAX_TIMEOUT_MS) throw new RangeError(`${field} must be between 1 and ${MAX_TIMEOUT_MS}`);
+	return value;
+}
+
 function generatedAgentName(scenario, timestamp) {
 	const id = String(scenario.id ?? 'scenario').replace(/[^A-Za-z0-9_]/g, '_').slice(0, 32) || 'scenario';
 	return `headless_${id}_${Math.abs(Number(timestamp) || 0).toString(36)}`.slice(0, 40);
@@ -376,3 +443,15 @@ function boundedText(value, limit) {
 }
 
 async function defaultPoll() { await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS)); }
+
+if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+	try {
+		const options = parseHeadlessCliArguments(process.argv.slice(2));
+		const result = await runHeadlessMatrix(options);
+		process.stdout.write(`${JSON.stringify(result.report)}\n`);
+		process.exitCode = result.exitCode;
+	} catch (error) {
+		process.stderr.write(`${boundedText(error?.message ?? error, MAX_DIAGNOSTICS)}\n`);
+		process.exitCode = 1;
+	}
+}

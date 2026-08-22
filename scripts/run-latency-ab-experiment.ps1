@@ -27,6 +27,8 @@ param(
     [int] $BaselinePlanningConcurrency = 16,
     [ValidateRange(1, 16)]
     [int] $OptimizedPlanningConcurrency = 4,
+    [ValidateRange(0, 16)]
+    [int] $FixedPlanningConcurrency = 0,
     [AllowNull()]
     [Alias('BaselineReplayPath')]
     [string] $BaselineReplayRecordingsPath,
@@ -1188,6 +1190,7 @@ function Invoke-LatencyAbExperiment {
         [AllowNull()] [AllowEmptyCollection()] [string[]] $OptimizedRunnerArguments,
         [ValidateRange(1, 16)] [int] $BaselinePlanningConcurrency = 16,
         [ValidateRange(1, 16)] [int] $OptimizedPlanningConcurrency = 4,
+        [ValidateRange(0, 16)] [int] $FixedPlanningConcurrency = 0,
         [AllowNull()] [string] $BaselineReplayRecordingsPath,
         [AllowNull()] [string] $OptimizedReplayRecordingsPath,
         [string] $OutputRoot,
@@ -1204,6 +1207,10 @@ function Invoke-LatencyAbExperiment {
     )
     $resolvedBaseline = Resolve-RequiredDirectory $BaselinePath
     $resolvedOptimized = Resolve-RequiredDirectory $OptimizedPath
+    if ($FixedPlanningConcurrency -gt 0) {
+        $BaselinePlanningConcurrency = $FixedPlanningConcurrency
+        $OptimizedPlanningConcurrency = $FixedPlanningConcurrency
+    }
     if (Test-PathEqual $resolvedBaseline $resolvedOptimized) { throw 'Baseline and optimized worktrees must be different directories.' }
     $resolvedOutputRoot = if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
         Resolve-DirectoryForCreate (Join-Path ([IO.Path]::GetTempPath()) 'latency-ab-runs')

@@ -8,6 +8,8 @@
 	"scripts": {
 		"start": "node src/dynamic-main.mjs",
 		"start:dynamic": "node src/dynamic-main.mjs",
+		"headless:matrix": "node src/headless-matrix.mjs",
+		"task9:simulator": "node src/benchmark/task9-harness-cli.mjs",
 		"test": "node --test"
 	},
 	"dependencies": {

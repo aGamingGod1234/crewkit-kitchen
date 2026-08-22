@@ -92,6 +92,27 @@ function Stop-ProcessTree([int] $ProcessId) {
 	Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
 }
 
+function Get-ProcessTreeIds([int] $RootProcessId) {
+	$ids = New-Object 'System.Collections.Generic.List[int]'
+	$pending = New-Object 'System.Collections.Generic.Queue[int]'
+	$pending.Enqueue($RootProcessId)
+	while ($pending.Count -gt 0) {
+		$id = $pending.Dequeue()
+		if ($ids.Contains($id)) { continue }
+		$ids.Add($id) | Out-Null
+		$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$id" -ErrorAction SilentlyContinue)
+		foreach ($child in $children) { $pending.Enqueue([int]$child.ProcessId) }
+	}
+	return @($ids.ToArray())
+}
+
+function Test-ProcessIdsGone([int[]] $ProcessIds) {
+	foreach ($id in @($ProcessIds)) {
+		if (Get-Process -Id $id -ErrorAction SilentlyContinue) { return $false }
+	}
+	return $true
+}
+
 function Start-RedirectedProcess(
 	[string] $FileName,
 	[string] $Arguments,
@@ -292,11 +313,13 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	$serverHandle = $null
 	$coordinatorHandle = $null
 	$runnerHandle = $null
+	$observedProcessIds = @()
 	$failure = $null
 	$runnerExit = $null
 	try {
 		$serverArgs = "-Darenaagents.bridgeSecretFile=$(Quote-Argument $secretPath) -Xms1G -Xmx4G -jar $(Quote-Argument (Join-Path $serverDirectory 'fabric-server-launch.jar')) nogui"
 		$serverHandle = Start-RedirectedProcess $Java $serverArgs $serverDirectory (Join-Path $logsDirectory 'fabric.stdout.log') (Join-Path $logsDirectory 'fabric.stderr.log') @{}
+		$observedProcessIds += Get-ProcessTreeIds $serverHandle.Process.Id
 		Wait-Condition { (Test-Port $serverPort) -and ((Read-Text $serverLog).Contains('Done (')) } $StartupTimeoutSeconds 'Fabric server did not become ready'
 		Wait-Condition { Test-Port $rconPort } $StartupTimeoutSeconds 'RCON did not become ready'
 		$coordinatorArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\dynamic-main.mjs')) --config $(Quote-Argument $coordinatorConfig)"
@@ -306,6 +329,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			ARENA_HEADLESS_BRIDGE_PORT = $bridgePort; ARENA_HEADLESS_RCON_PORT = $rconPort; ARENA_HEADLESS_MINECRAFT_PORT = $serverPort
 		}
 		$coordinatorHandle = Start-RedirectedProcess $Node $coordinatorArgs (Join-Path $Project 'coordinator') (Join-Path $traceDirectory 'dynamic.stdout.log') (Join-Path $traceDirectory 'dynamic.stderr.log') $coordinatorEnvironment
+		$observedProcessIds += Get-ProcessTreeIds $coordinatorHandle.Process.Id
 		Wait-Condition { Test-Port $bridgePort } $StartupTimeoutSeconds 'Coordinator bridge did not become ready'
 		$runnerArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\headless-matrix.mjs')) --config $(Quote-Argument $MatrixFile) --scenario $(Quote-Argument $scenarioId) --run-directory $(Quote-Argument $scenarioDirectory) --rcon-host 127.0.0.1 --rcon-port $rconPort --rcon-password-file $(Quote-Argument $secretPath) --protocol-audit $(Quote-Argument $protocolAudit) --provider-turns $(Quote-Argument $providerTurns)"
 		if ($RequireAll) { $runnerArgs += ' --require-all' }
@@ -314,6 +338,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 			ARENA_PROTOCOL_AUDIT_PATH = $protocolAudit; ARENA_PROVIDER_TURNS_PATH = $providerTurns
 		}
 		$runnerHandle = Start-RedirectedProcess $Node $runnerArgs (Join-Path $Project 'coordinator') (Join-Path $traceDirectory 'runner.stdout.log') (Join-Path $traceDirectory 'runner.stderr.log') $runnerEnvironment
+		$observedProcessIds += Get-ProcessTreeIds $runnerHandle.Process.Id
 		if (-not $runnerHandle.Process.WaitForExit(([int] $Scenario.timeoutMs + 30000))) { throw "Scenario '$scenarioId' timed out" }
 		$runnerExit = $runnerHandle.Process.ExitCode
 		Complete-RedirectedProcess $runnerHandle
@@ -321,6 +346,9 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 	} catch {
 		$failure = $_
 	} finally {
+		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) {
+			if ($null -ne $handle -and $null -ne $handle.Process) { try { $observedProcessIds += Get-ProcessTreeIds $handle.Process.Id } catch {} }
+		}
 		if ($null -ne $serverHandle -and $null -ne $serverHandle.Process) {
 			try {
 				if (-not $serverHandle.Process.HasExited) {
@@ -337,9 +365,10 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		}
 		try { Wait-Condition { -not (Test-Port $serverPort) -and -not (Test-Port $rconPort) -and -not (Test-Port $bridgePort) } $CleanupTimeoutSeconds 'Scenario cleanup left an allocated listener running' } catch { if ($null -eq $failure) { $failure = $_ } }
 		foreach ($handle in @($runnerHandle, $coordinatorHandle, $serverHandle)) { Complete-RedirectedProcess $handle }
+		try { Wait-Condition { Test-ProcessIdsGone @($observedProcessIds) } $CleanupTimeoutSeconds 'Scenario cleanup left a tracked process running' } catch { if ($null -eq $failure) { $failure = $_ } }
 	}
 	$status = if ($null -eq $failure) { 'PASSED' } else { 'FAILED' }
-	$report = [pscustomobject]@{ status = $status; scenarioId = $scenarioId; provider = [string] $Scenario.provider; model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; exitCode = $runnerExit; cleanup = [pscustomobject]@{ status = if ($null -eq $failure) { 'CLEAN' } else { 'FAILED' } }; artifacts = $manifest; diagnostics = if ($null -eq $failure) { $null } else { $failure.Exception.Message } }
+	$report = [pscustomobject]@{ status = $status; scenarioId = $scenarioId; provider = [string] $Scenario.provider; model = [string] $Scenario.model; reasoningEffort = [string] $Scenario.reasoningEffort; exitCode = $runnerExit; cleanup = [pscustomobject]@{ status = if ($null -eq $failure) { 'CLEAN' } else { 'FAILED' }; processTreeClean = [bool](Test-ProcessIdsGone @($observedProcessIds)); listenersClosed = -not (Test-Port $serverPort) -and -not (Test-Port $rconPort) -and -not (Test-Port $bridgePort); trackedProcessIds = @($observedProcessIds | Select-Object -Unique) }; artifacts = $manifest; diagnostics = if ($null -eq $failure) { $null } else { $failure.Exception.Message } }
 	[IO.File]::WriteAllText((Join-Path $scenarioDirectory 'report.json'), ($report | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
 	return $report
 }
