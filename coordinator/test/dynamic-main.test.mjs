@@ -8,6 +8,7 @@ import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { createDynamicCoordinator, normalizeDynamicConfig } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { completionContract, withCompletionContract } from './fixtures/completion-contract.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
 
@@ -16,7 +17,21 @@ class FakeBridge extends EventEmitter {
 	sent = [];
 	start() { this.ready = true; }
 	stop() { this.ready = false; }
-	async send(type, agentId, payload) { this.sent.push({ type, agentId, payload }); }
+	async send(type, agentId, payload) {
+		this.sent.push({ type, agentId, payload });
+		if (type === 'goal_completed') {
+			queueMicrotask(() => this.emit('goal_completion_result', {
+				agentId,
+				payload: {
+					goalRevision: payload.goalRevision,
+					traceId: payload.traceId,
+					contractHash: payload.contractHash,
+					verified: true,
+					reasonCode: 'COMPLETION_VERIFIED',
+				},
+			}));
+		}
+	}
 	emit(event, message) {
 		if (event === 'observation' && message?.payload?.observation !== undefined) {
 			const payload = message.payload;
@@ -39,7 +54,7 @@ class FakePlanner {
 		return { registry, complete: Promise.resolve({ registry, providers: { valid: registry.records, invalid: [], catalog: { models: [] } } }) };
 	}
 	async reconcile(records) { return this.beginReconcile(records).complete; }
-	async requestPlan(request) { this.requests.push(request); return { summary: 'Wait twice.', directive: 'replace', source: SOURCE }; }
+	async requestPlan(request) { this.requests.push(request); return withCompletionContract({ summary: 'Wait twice.', directive: 'replace', source: SOURCE }, request.goalRevision); }
 	async interrupt(agentId) { this.interruptions.push(agentId); }
 	async remove(agentId) { return this.registry.remove(agentId); }
 }
@@ -107,7 +122,7 @@ function realPlannerProvider(decide) {
 	provider.reconcile = async (records) => ({ valid: records, invalid: [], catalog: { models: [] } });
 	provider.createAgent = async (record) => ({
 		setGoalRevision: async () => {},
-		decide: (input, options) => decide(input, options, record),
+		decide: async (input, options) => withCompletionContract(await decide(input, options, record), options?.goalRevision ?? record.goalRevision),
 	});
 	provider.removeAgent = async () => {};
 	return provider;
@@ -277,7 +292,7 @@ test('keeps lifecycle intake responsive while an initial provider turn is pendin
 	run.planner.requestPlan = async (request) => {
 		run.planner.requests.push(request);
 		await gate;
-		return { summary: 'Wait.', directive: 'replace', source: SOURCE };
+		return withCompletionContract({ summary: 'Wait.', directive: 'replace', source: SOURCE }, request.goalRevision);
 	};
 	try {
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
@@ -301,7 +316,7 @@ test('reissues the newest lifecycle plan after an older provider turn settles', 
 	run.planner.requestPlan = async (request) => {
 		run.planner.requests.push(request);
 		if (request.goalRevision === 1) await gate;
-		return { summary: 'Wait.', directive: 'replace', source: SOURCE };
+		return withCompletionContract({ summary: 'Wait.', directive: 'replace', source: SOURCE }, request.goalRevision);
 	};
 	try {
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
@@ -334,7 +349,7 @@ test('retries a queued urgent trigger after a failed initial provider turn', asy
 			run.registry.setState('agent-a', DynamicAgentState.ERROR, { goalRevision: 1, error: { code: 'PROVIDER_DOWN', message: 'Provider unavailable' } });
 			throw Object.assign(new Error('Provider unavailable'), { code: 'PROVIDER_DOWN' });
 		}
-		return { summary: 'Recovered.', directive: 'replace', source: SOURCE };
+		return withCompletionContract({ summary: 'Recovered.', directive: 'replace', source: SOURCE }, request.goalRevision);
 	};
 	try {
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
@@ -370,7 +385,7 @@ test('flushes conversation attention that arrived during initial planning after 
 		attempts += 1;
 		if (attempts === 1) await gate;
 		return attempts === 1
-			? { summary: 'Installed.', directive: 'replace', source: SOURCE }
+			? withCompletionContract({ summary: 'Installed.', directive: 'replace', source: SOURCE }, request.goalRevision)
 			: { summary: 'Continue.', directive: 'continue' };
 	};
 	try {
@@ -486,11 +501,11 @@ test('publishes completed program state back to the server registry', async () =
 	const run = await start();
 	run.planner.requestPlan = async (request) => {
 		run.planner.requests.push(request);
-		return {
+		return withCompletionContract({
 			summary: 'Wait, then finish.',
 			directive: 'replace',
 			source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");',
-		};
+		}, request.goalRevision);
 	};
 	try {
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait, then finish.' } });
@@ -500,11 +515,16 @@ test('publishes completed program state back to the server registry', async () =
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' } });
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'goal_completed'));
 		const stateMessages = run.bridge.sent.filter((message) => message.type === 'goal_completed');
-		assert.deepEqual(stateMessages.at(-1), {
-			type: 'goal_completed',
-			agentId: 'agent-a',
-			payload: { goalRevision: 1 },
+		const completion = stateMessages.at(-1);
+		assert.equal(completion.type, 'goal_completed');
+		assert.equal(completion.agentId, 'agent-a');
+		assert.equal(completion.payload.goalRevision, 1);
+		assert.deepEqual(completion.payload.completionContract, completionContract(1));
+		assert.deepEqual(completion.payload.profile, {
+			provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
 		});
+		assert.equal(completion.payload.traceId, 'trace-agent-a-1-1-initial');
+		assert.match(completion.payload.contractHash, /^sha256:[0-9a-f]{64}$/);
 		run.bridge.emit('conversation_event', {
 			agentId: 'agent-a',
 			payload: {
@@ -701,7 +721,7 @@ test('injects coordinator latency telemetry into program reaction timing', async
 	try {
 		run.planner.requestPlan = async (request) => {
 			run.planner.requests.push(request);
-			return { summary: 'Watch health.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);' };
+			return withCompletionContract({ summary: 'Watch health.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);' }, request.goalRevision);
 		};
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, observedAtEpochMs: 10, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
@@ -759,7 +779,7 @@ test('reconciliation reissues one dead-state turn to the selected session and pr
 	const planner = new FakePlanner(registry);
 	planner.requestPlan = async (request) => {
 		planner.requests.push(request);
-		return { summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' };
+		return withCompletionContract({ summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }, request.goalRevision);
 	};
 	const coordinator = createDynamicCoordinator(
 		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
@@ -792,7 +812,7 @@ test('disconnect fences the old dead respawn result before reconnect installs a 
 	const planner = new FakePlanner(registry);
 	planner.requestPlan = async (request) => {
 		planner.requests.push(request);
-		return { summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' };
+		return withCompletionContract({ summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }, request.goalRevision);
 	};
 	const errors = [];
 	const coordinator = createDynamicCoordinator(
@@ -827,8 +847,8 @@ test('death suspends the active program and asks the same selected model for a c
 		run.planner.requestPlan = async (request) => {
 			run.planner.requests.push(request);
 			return request.input.includes('fell from a high place')
-				? { summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }
-				: { summary: 'Wait.', directive: 'replace', source: SOURCE };
+				? withCompletionContract({ summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }, request.goalRevision)
+				: withCompletionContract({ summary: 'Wait.', directive: 'replace', source: SOURCE }, request.goalRevision);
 		};
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
 			operation: 'start', goalRevision: 1, goal: 'Wait.', updatedAtEpochMs: 1,
@@ -869,8 +889,8 @@ test('respawn success is consumed before lifecycle control without a stale-resul
 		run.planner.requestPlan = async (request) => {
 			run.planner.requests.push(request);
 			return request.input.includes('player_death')
-				? { summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }
-				: { summary: 'Wait.', directive: 'replace', source: SOURCE };
+				? withCompletionContract({ summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }, request.goalRevision)
+				: withCompletionContract({ summary: 'Wait.', directive: 'replace', source: SOURCE }, request.goalRevision);
 		};
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.', updatedAtEpochMs: 1 } });
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 2, updatedAtEpochMs: 2, death: DEATH } });

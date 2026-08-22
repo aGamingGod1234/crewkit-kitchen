@@ -4,6 +4,7 @@ import { AgentRegistry, DynamicAgentState } from '../../src/agent-registry.mjs';
 import { parseDecision } from '../../src/decision-parser.mjs';
 import { createDynamicCoordinator } from '../../src/dynamic-main.mjs';
 import { validateProtocolV2Envelope } from '../../src/protocol-v2.mjs';
+import { withCompletionContract } from './completion-contract.mjs';
 
 const PROFILES = Object.freeze([
 	{ agentId: 'agent-55', provider: 'codex', model: 'gpt-5.5', reasoningEffort: 'xhigh', serviceTier: 'fast' },
@@ -82,6 +83,19 @@ class FakeBridge extends EventEmitter {
 	async send(type, agentId, payload) {
 		validateProtocolV2Envelope({ protocolVersion: 2, serverInstanceId: this.#serverInstanceId, agentId, type, messageId: `out-${this.sent.length + 1}`, payload }, { direction: 'coordinator_to_server' });
 		this.sent.push({ type, agentId, payload });
+		if (type === 'goal_completed') {
+			setImmediate(() => this.emit('goal_completion_result', {
+				agentId,
+				payload: {
+					goalRevision: payload.goalRevision,
+					traceId: payload.traceId,
+					contractHash: payload.contractHash,
+					verified: true,
+					reasonCode: 'COMPLETION_VERIFIED',
+				},
+			}));
+			return;
+		}
 		if (type === 'action_command') {
 			const sequence = (this.#eventSequence.get(agentId) ?? 1) + 1;
 			this.#eventSequence.set(agentId, sequence);
@@ -118,7 +132,7 @@ class FixtureProvider {
 					parseDecision('{"summary":"legacy","directive":"replace","source":"old","actions":[]}');
 				}
 				session.turns += 1;
-				return parseDecision(JSON.stringify({ summary: session.turns === 1 ? 'Corrected program.' : 'Continue.', directive: 'replace', source: SOURCE }));
+				return parseDecision(JSON.stringify(withCompletionContract({ summary: session.turns === 1 ? 'Corrected program.' : 'Continue.', directive: 'replace', source: SOURCE }, session.goalRevision)));
 			},
 			interrupt: async () => { this.interruptions.push(record.agentId); },
 		};

@@ -3,9 +3,16 @@ import test from 'node:test';
 
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
-import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
+import { ProgramRuntimeManager as ProductionProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { withCompletionContract } from './fixtures/completion-contract.mjs';
+
+class ProgramRuntimeManager extends ProductionProgramRuntimeManager {
+	installDecision(record, decision, context) {
+		return super.installDecision(record, withCompletionContract(decision, record.goalRevision), context);
+	}
+}
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
 const DEATH = Object.freeze({
@@ -27,15 +34,29 @@ function harness(options = {}) {
 	registry.register(record());
 	const sent = [];
 	const requests = [];
-	const manager = new ProgramRuntimeManager({
+	let manager;
+	const completionRequests = [];
+	manager = new ProgramRuntimeManager({
 		registry,
 		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
-		planner: { requestPlan: async (request) => { requests.push(request); return { summary: 'Continue.', directive: 'continue' }; } },
+		planner: { requestPlan: async (request) => { requests.push(request); return withCompletionContract({ summary: 'Continue.', directive: 'continue' }, request.goalRevision); } },
 		onCompleted: options.onCompleted,
+		onCompletionRequested: options.onCompletionRequested ?? ((request) => {
+			completionRequests.push(request);
+			queueMicrotask(() => manager.onCompletionResult(registry.get(request.record.agentId), {
+				goalRevision: request.record.goalRevision,
+				traceId: request.traceId,
+				contractHash: request.contractHash,
+				verified: true,
+				reasonCode: 'COMPLETION_VERIFIED',
+			}));
+		}),
 		benchmarkRecorder: options.benchmarkRecorder,
 		latencyRegistry: options.latencyRegistry,
 	});
-	return { manager, registry, sent, requests };
+	const installDecision = manager.installDecision.bind(manager);
+	manager.installDecision = (target, decision, context) => installDecision(target, withCompletionContract(decision, target.goalRevision), context);
+	return { manager, registry, sent, requests, completionRequests };
 }
 
 test('retains the planning trace through program dispatch and first world action without fabricating verification', async () => {
@@ -180,11 +201,11 @@ test('corrects an omitted mine argument through the selected model before bridge
 		planner: {
 			requestPlan: async (request) => {
 				requests.push(request);
-				return {
+				return withCompletionContract({
 					summary: 'Use a valid primitive argument.',
 					directive: 'replace',
 					source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
-				};
+				}, request.goalRevision);
 			},
 		},
 	});
@@ -266,11 +287,11 @@ test('replans from bounded failed-action context instead of pausing after a repe
 		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
 		planner: { requestPlan: async (request) => {
 			requests.push(request);
-			return {
+			return withCompletionContract({
 				summary: 'Use a different action.',
 				directive: 'replace',
 				source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
-			};
+			}, request.goalRevision);
 		} },
 	});
 	await manager.installDecision(registry.get('agent-a'), {
@@ -322,10 +343,10 @@ test('serializes coalesced reactive planner requests for one program', async () 
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3, attention: true });
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(requests.length, 1, 'coalesced attention must not start a second planner request before the first response is applied');
-	releaseFirst({
+	releaseFirst(withCompletionContract({
 		directive: 'replace', summary: 'replace stale context',
 		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(9);',
-	});
+	}, 1));
 	for (let attempt = 0; attempt < 5 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(requests.length, 2, 'the newest coalesced context is still serviced after the first response');
 	assert.equal(traces.some((entry) => entry.event === 'program_replaced' && entry.version === 2), false,
@@ -510,7 +531,7 @@ test('keeps versions and external action identities monotonic across remove and 
 test('caps recursive compiler correction and reports exhaustion without a fallback action', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const errors = []; let requests = 0;
-	const manager = new ProgramRuntimeManager({ registry, bridge: { send: async () => assert.fail('must not dispatch') }, planner: { requestPlan: async () => { requests += 1; return { summary: 'Still bad.', directive: 'replace', source: 'broken {' }; } }, reportError: (_agentId, error) => errors.push(error), compilerCorrectionLimit: 1 });
+	const manager = new ProgramRuntimeManager({ registry, bridge: { send: async () => assert.fail('must not dispatch') }, planner: { requestPlan: async (request) => { requests += 1; return withCompletionContract({ summary: 'Still bad.', directive: 'replace', source: 'broken {' }, request.goalRevision); } }, reportError: (_agentId, error) => errors.push(error), compilerCorrectionLimit: 1 });
 	await manager.installDecision(registry.get('agent-a'), { summary: 'Bad.', directive: 'replace', source: 'broken {' }, { observation: observation(), eventSequence: 1 });
 	assert.equal(requests, 1);
 	assert.equal(errors.at(-1).code, 'ARENA_SCRIPT_COMPILER_EXHAUSTED');
