@@ -94,6 +94,7 @@ try {
 	foreach ($requiredPattern in @('Stop-ProcessTree', 'Get-CimInstance Win32_Process', 'Wait-Condition', 'Test-Port', 'ARENA_AGENT_BRIDGE_SECRET', 'provider-workspaces')) {
 		if ($wrapperText -notmatch [regex]::Escape($requiredPattern)) { throw "Lifecycle wrapper missing cleanup/isolation hook '$requiredPattern'" }
 	}
+	if ($wrapperText -notmatch [regex]::Escape("Test-Port `$bridgePort 'Established'")) { throw 'Lifecycle wrapper can start the runner before the coordinator authenticates.' }
 	Write-Output 'PASS timeout cleanup, port verification, child-tree cleanup, and provider isolation hooks'
 } finally {
 	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS')) { Set-TestEnvironment $name $null }

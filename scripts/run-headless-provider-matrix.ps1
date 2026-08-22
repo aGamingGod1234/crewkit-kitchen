@@ -65,8 +65,8 @@ function Get-ProcessCommand([string] $Name) {
 	return $command.Source
 }
 
-function Test-Port([int] $Port) {
-	$connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+function Test-Port([int] $Port, [string] $State = 'Listen') {
+	$connections = Get-NetTCPConnection -LocalPort $Port -State $State -ErrorAction SilentlyContinue
 	return $null -ne ($connections | Select-Object -First 1)
 }
 
@@ -343,7 +343,7 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		}
 		$coordinatorHandle = Start-RedirectedProcess $Node $coordinatorArgs (Join-Path $Project 'coordinator') (Join-Path $traceDirectory 'dynamic.stdout.log') (Join-Path $traceDirectory 'dynamic.stderr.log') $coordinatorEnvironment
 		$observedProcessIds += Get-ProcessTreeIds $coordinatorHandle.Process.Id
-		Wait-Condition { Test-Port $bridgePort } $StartupTimeoutSeconds 'Coordinator bridge did not become ready'
+		Wait-Condition { Test-Port $bridgePort 'Established' } $StartupTimeoutSeconds 'Coordinator did not establish the authenticated bridge'
 		$runnerArgs = "$(Quote-Argument (Join-Path $Project 'coordinator\src\headless-matrix.mjs')) --config $(Quote-Argument $MatrixFile) --scenario $(Quote-Argument $scenarioId) --run-directory $(Quote-Argument $scenarioDirectory) --rcon-host 127.0.0.1 --rcon-port $rconPort --rcon-password-file $(Quote-Argument $secretPath) --protocol-audit $(Quote-Argument $protocolAudit) --provider-turns $(Quote-Argument $providerTurns)"
 		if ($RequireAll) { $runnerArgs += ' --require-all' }
 		$runnerEnvironment = @{
