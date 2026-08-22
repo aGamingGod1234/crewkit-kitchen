@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { runLatencyMatrix, normalizeLatencyMatrix } from '../src/benchmark/latency-runner.mjs';
+import { BenchmarkRecorder } from '../src/benchmark/benchmark-recorder.mjs';
 import { createReplayProvider, createReplayRecord } from '../src/benchmark/provider-replay.mjs';
 
 const PROFILE = Object.freeze({ provider: 'instant', model: 'deterministic-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
@@ -70,6 +71,27 @@ test('runs deterministic instant full-path trials at every declared load', async
 	assert.equal(result.cleanup.ok, true);
 });
 
+test('marks synthetic identity and returns scoped benchmark and system summaries', async () => {
+	const recorder = new BenchmarkRecorder({ clock: () => 1 });
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'summary-trial' }] }),
+		scenarioResolver: () => fixtureScenario(),
+		providerFactories: { instant: () => instantProvider() },
+		recorder,
+		artifactDirectory: null,
+	});
+	const trial = result.trials[0];
+	assert.deepEqual(trial.providerIdentity, { provider: 'instant', synthetic: true });
+	assert.ok(result.benchmarkSummary.eventCount > 0);
+	assert.ok(trial.benchmark.eventCount > 0);
+	assert.ok(trial.systemSummary.sampleCount >= 2);
+	assert.ok(trial.systemSummary.immediateSample);
+	assert.ok(trial.systemSummary.finalSample);
+	assert.ok(trial.systemSummary.scheduler.active.p50 !== null);
+	assert.ok(trial.systemSummary.scheduler.pending.p50 !== null);
+	assert.ok(recorder.snapshot().every((row) => row.trialId === 'summary-trial'));
+});
+
 test('shipped default matrix proves physical stone-tool success for every isolated load', async () => {
 	const result = await runLatencyMatrix({ artifactDirectory: null });
 	assert.equal(result.status, 'PASSED');
@@ -88,6 +110,26 @@ test('skips optional unavailable providers, fails required providers, and never 
 	await assert.rejects(() => runLatencyMatrix({ matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'required', mode: 'live', providerProfile: { provider: 'codex', model: 'fixture', reasoningEffort: 'high', serviceTier: 'fast' }, providerAvailabilityRequired: true }] }), scenarioResolver: () => fixtureScenario(), providerFactories: { codex: unavailable }, artifactDirectory: null }), (error) => error.code === 'PROVIDER_UNAVAILABLE');
 });
 
+test('requires an exact declared identity for live providers', async () => {
+	const liveProfile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	const liveTrial = { ...matrix().trials[0], id: 'live-identity', mode: 'live', providerProfile: liveProfile, providerAvailabilityRequired: true };
+	const session = { async setGoalRevision() {}, async decide() { return { summary: 'done', directive: 'replace', source: SOURCE }; } };
+	for (const provider of [
+		{ available: true, async createAgent() { return session; }, async stop() {} },
+		{ available: true, provider: 'gemini', async createAgent() { return session; }, async stop() {} },
+		{ available: true, provider: 'codex', model: 'different-model', async createAgent() { return session; }, async stop() {} },
+	]) {
+		const result = await runLatencyMatrix({
+			matrix: matrix({ trials: [liveTrial] }),
+			scenarioResolver: () => fixtureScenario(),
+			providerFactories: { codex: () => provider },
+			artifactDirectory: null,
+		});
+		assert.equal(result.trials[0].status, 'FAILED');
+		assert.equal(result.trials[0].error.code, 'PROVIDER_MISMATCH');
+	}
+});
+
 test('turn and trial timeouts produce typed bounded failures and clean provider lifecycle', async () => {
 	let stopped = 0;
 	const hanging = () => ({
@@ -102,6 +144,68 @@ test('turn and trial timeouts produce typed bounded failures and clean provider 
 	assert.equal(result.trials[0].error.code, 'TURN_TIMEOUT');
 	assert.equal(stopped, 1);
 	assert.equal(result.cleanup.ok, true);
+});
+
+test('createAgent is bounded by the trial deadline and stops the provider', async () => {
+	let stopped = 0;
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'create-agent-timeout', trialBudgetMs: 300 }] }),
+		scenarioResolver: () => fixtureScenario(),
+		providerFactories: {
+			instant: () => ({
+				available: true,
+				provider: 'instant',
+				synthetic: true,
+				async createAgent() { return new Promise(() => {}); },
+				async stop() { stopped += 1; },
+			}),
+		},
+		artifactDirectory: null,
+	});
+	assert.equal(result.trials[0].status, 'TIMED_OUT');
+	assert.equal(result.trials[0].error.code, 'TRIAL_TIMEOUT');
+	assert.equal(stopped, 1);
+	assert.equal(result.cleanup.ok, true);
+});
+
+test('provider stop after a timeout is bounded by cleanup policy', async () => {
+	const startedAt = performance.now();
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'bounded-stop-timeout', trialBudgetMs: 100 }] }),
+		scenarioResolver: () => fixtureScenario(),
+		providerFactories: {
+			instant: () => ({
+				available: true,
+				provider: 'instant',
+				synthetic: true,
+				async createAgent() { return new Promise(() => {}); },
+				async stop() { await new Promise((resolve) => setTimeout(resolve, 250)); },
+			}),
+		},
+		artifactDirectory: null,
+	});
+	assert.equal(result.trials[0].status, 'TIMED_OUT');
+	assert.ok(performance.now() - startedAt < 220, 'timeout cleanup must not wait for an unbounded provider stop');
+});
+
+test('malformed planner/runtime decisions remain typed failures instead of timeout results', async () => {
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'malformed-decision' }] }),
+		scenarioResolver: () => fixtureScenario(),
+		providerFactories: {
+			instant: () => ({
+				available: true,
+				provider: 'instant',
+				synthetic: true,
+				async createAgent() {
+					return { async setGoalRevision() {}, async decide() { throw Object.assign(new Error('malformed fixture decision'), { code: 'INVALID_DECISION' }); } };
+				},
+			}),
+		},
+		artifactDirectory: null,
+	});
+	assert.equal(result.trials[0].status, 'FAILED');
+	assert.equal(result.trials[0].error.code, 'INVALID_DECISION');
 });
 
 test('provider process exit is typed and leaves the coordinator path clean', async () => {
@@ -190,7 +294,7 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 	let prompt = null;
 	const scenario = fixtureScenario();
 	const liveMatrix = matrix({ trials: [{ ...matrix().trials[0], id: 'replay-path', mode: 'live', providerProfile: profile }] });
-	const providerFactory = () => ({ available: true, async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return { summary: 'done', directive: 'replace', source }; } }; }, async stop() {} });
+	const providerFactory = () => ({ available: true, provider: 'codex', async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return { summary: 'done', directive: 'replace', source }; } }; }, async stop() {} });
 	const first = await runLatencyMatrix({ matrix: liveMatrix, scenarioResolver: () => scenario, providerFactories: { codex: providerFactory }, artifactDirectory: null });
 	assert.equal(first.trials[0].status, 'PASSED');
 	const recording = createReplayRecord({ trialId: 'replay-path', prompt, providerProfile: profile, scenario, protocolVersion: 2, decision: { summary: 'done', directive: 'replace', source } });
@@ -200,6 +304,7 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 		providerFactories: { codex: () => createReplayProvider({ recording, trialId: 'replay-path', prompt, providerProfile: profile, scenario, protocolVersion: 2 }) }, artifactDirectory: null,
 	});
 	assert.equal(replay.trials[0].status, 'PASSED');
+	assert.deepEqual(replay.trials[0].providerIdentity, { provider: 'codex', synthetic: true });
 	const drift = await runLatencyMatrix({
 		matrix: replayMatrix, scenarioResolver: () => scenario,
 		providerFactories: { codex: () => createReplayProvider({ recording, trialId: 'replay-path', prompt: `${prompt}-drift`, providerProfile: profile, scenario, protocolVersion: 2 }) }, artifactDirectory: null,

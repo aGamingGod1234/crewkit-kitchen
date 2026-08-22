@@ -78,7 +78,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#serverInstanceId = null;
 	#traceWriter;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, traceWriter = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, traceWriter = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -106,6 +106,7 @@ export class DynamicCoordinator extends EventEmitter {
 				conversationContext: this.#conversationMemory(agentId).toPlannerContext(),
 			}),
 			clock: () => this.#controlNow(),
+			benchmarkRecorder,
 		});
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
@@ -587,6 +588,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		maxConcurrent: config.limits.planningConcurrency,
 		maxPending: Math.max(0, config.limits.agentCap - config.limits.planningConcurrency),
 		onPressure: (snapshot) => dependencies.onSchedulerPressure?.(snapshot),
+		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
 	const workspaceManager = dependencies.workspaceManager ?? new AgentWorkspaceManager(config.workspaceRoot);
 	const codexService = dependencies.providerService ?? dependencies.codexService ?? new ProviderService({
@@ -608,6 +610,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		invalidDecisionRetries: config.limits.invalidDecisionRetries,
 		healthRegistry,
 		telemetrySink: dependencies.telemetrySink,
+		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
 	const bridge = dependencies.bridge ?? new MultiplexedServerBridge(config.bridge, {
 		socketFactory: dependencies.socketFactory,
@@ -628,6 +631,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,
 		clearStatusInterval: dependencies.clearStatusInterval,
+		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
 }
 

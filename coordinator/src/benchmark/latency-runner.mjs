@@ -11,6 +11,8 @@ import { VirtualWorld } from '../simulator/virtual-world.mjs';
 import { getSimulatorScenario } from '../simulator/simulator-scenarios.mjs';
 import { createReplayProvider } from './provider-replay.mjs';
 import { BenchmarkRecorder } from './benchmark-recorder.mjs';
+import { summarizeBenchmark } from './benchmark-report.mjs';
+import { PlanningScheduler } from '../planning-scheduler.mjs';
 import { SystemSampler } from './system-sampler.mjs';
 import { createLiveProviderFactory } from './live-provider-factories.mjs';
 import { buildAuthoritativeScenarioOutcome, captureScenarioInitialSnapshot, compileScenarioDecision, runAuthoritativeScenarioSuccess } from './scenario-program.mjs';
@@ -90,6 +92,7 @@ export async function runLatencyMatrix(options = {}) {
 		trials: results,
 		cleanup: { ok: results.every((trial) => trial.cleanup?.ok !== false), activeActions: results.reduce((sum, trial) => sum + (trial.cleanup?.activeActions ?? 0), 0), listeners: results.reduce((sum, trial) => sum + (trial.cleanup?.listeners ?? 0), 0) },
 		summary: recorder.snapshot ? recorder.snapshot().length : 0,
+		benchmarkSummary: summarizeBenchmark(recorder.snapshot ? recorder.snapshot() : []),
 	};
 	if (requiredFailure) throw Object.assign(new Error(requiredFailure.message), requiredFailure, { result: output });
 	if (options.artifactDirectory) await writeArtifacts(options.artifactDirectory, output, recorder, options.artifactFs);
@@ -99,6 +102,7 @@ export async function runLatencyMatrix(options = {}) {
 
 async function runTrial({ matrix, trial, repetition, scenarioResolver, providerFactories, recorder, ...options }) {
 	const startedAt = performance.now();
+	const deadline = startedAt + trial.trialBudgetMs;
 	let provider = null;
 	let coordinator = null;
 	let bridge = null;
@@ -111,8 +115,13 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 	const cleanupErrors = [];
 	let turnCount = 0;
 	let providerStopped = false;
+	let providerCleanupRegistered = false;
+	let trialRecorder = null;
+	let scheduler = null;
+	let systemSummary = null;
+	const cleanupTimeoutMs = 1_000;
 	try {
-		const rawScenario = await scenarioResolver(trial.scenarioId, trial);
+		const rawScenario = await runWithDeadline(() => scenarioResolver(trial.scenarioId, trial), deadline);
 		if (!rawScenario) throw coded('SCENARIO_NOT_FOUND', `Unknown simulator scenario '${trial.scenarioId}'`);
 		const scenario = cloneScenarioForLoad(rawScenario, trial.agentLoad, trial.seed);
 		const defaultLiveFactory = trial.mode === 'live' && !providerFactories[trial.providerProfile.provider]
@@ -123,20 +132,35 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			?? (trial.mode === 'replay' ? defaultReplayFactory : null)
 			?? defaultLiveFactory;
 		if (factory === null && trial.mode !== 'live') throw coded('PROVIDER_UNAVAILABLE', `No factory is configured for ${trial.providerProfile.provider}`);
-		if (factory !== null) provider = await factory(trial.providerProfile, { trial, repetition, mode: trial.mode, options, matrix, scenario: rawScenario, loadScenario: scenario });
-		if (provider === null || provider === undefined || provider.available === false) {
-			const error = coded('PROVIDER_UNAVAILABLE', boundedError(provider?.reason ?? 'provider is unavailable'));
-			if (!trial.providerAvailabilityRequired) return trialResult(trial, repetition, 'SKIPPED', error, startedAt, null, null);
-			return trialResult(trial, repetition, 'FAILED', error, startedAt, null, null);
-		}
+		if (factory !== null) provider = await runWithDeadline(() => factory(trial.providerProfile, { trial, repetition, mode: trial.mode, options, matrix, scenario: rawScenario, loadScenario: scenario, deadline }), deadline);
 		const stopProvider = async () => {
 			if (providerStopped) return;
 			providerStopped = true;
-			await provider.stop?.();
+			await provider?.stop?.();
 		};
-		cleanup.push(stopProvider);
-		if (trial.mode === 'replay' && !provider.createAgent) provider = createReplayProvider({ ...options, ...trial.replay, recordings: options.replayRecordings, trialId: trial.id, providerProfile: trial.providerProfile, scenario: await scenarioResolver(trial.scenarioId), prompt: trial.prompt ?? options.replayPrompt ?? 'latency-replay-prompt', protocolVersion: matrix.protocolVersion });
-		if (typeof provider.start === 'function') await provider.start();
+		const stopProviderAfterTimeout = () => {
+			void withTimeout(Promise.resolve().then(stopProvider), cleanupTimeoutMs, 'CLEANUP_TIMEOUT').catch(() => {});
+			return Promise.resolve();
+		};
+		const registerProviderCleanup = () => {
+			if (!providerCleanupRegistered && provider && typeof provider.stop === 'function') {
+				providerCleanupRegistered = true;
+				cleanup.push(stopProvider);
+			}
+		};
+		registerProviderCleanup();
+		if (provider === null || provider === undefined || provider.available === false) {
+			const error = coded('PROVIDER_UNAVAILABLE', boundedError(provider?.reason ?? 'provider is unavailable'));
+			result = trialResult(trial, repetition, trial.providerAvailabilityRequired ? 'FAILED' : 'SKIPPED', error, startedAt, null, null);
+			return result;
+		}
+		if (trial.mode === 'replay' && !provider.createAgent) provider = createReplayProvider({ ...options, ...trial.replay, recordings: options.replayRecordings, trialId: trial.id, providerProfile: trial.providerProfile, scenario: rawScenario, prompt: trial.prompt ?? options.replayPrompt ?? 'latency-replay-prompt', protocolVersion: matrix.protocolVersion });
+		registerProviderCleanup();
+		validateProviderIdentity(provider, trial);
+		if (typeof provider.start === 'function') {
+			try { await runWithDeadline(() => provider.start(), deadline); }
+			catch (error) { await stopProviderAfterTimeout(); throw error; }
+		}
 
 		const records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, goalRevision: 0, queue: [] }));
 		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: scenario.goal ?? `Complete ${trial.scenarioId}`, goalRevision: 1 }));
@@ -145,10 +169,15 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const virtual = new VirtualMinecraftBridge({ world, agentRecords: virtualRecords, serverInstanceId: `latency-${trial.id}-${repetition}` });
 		bridge = new VirtualMinecraftBridgeAdapter(virtual, records);
 		cleanup.push(() => bridge?.stop());
-		const providerService = factory !== null ? createInjectedProviderService(provider, trial, turnBudget(trial), () => ++turnCount, () => turnCount > trial.turnCap, stopProvider) : null;
-		const config = benchmarkCoordinatorConfig(trial.agentLoad);
+		trialRecorder = createTrialRecorder(recorder, { trial, repetition });
+		scheduler = createTrialScheduler(trial, trialRecorder, options);
+		cleanup.push(() => scheduler?.close?.('latency trial cleanup'));
+		const providerService = factory !== null ? createInjectedProviderService(provider, trial, turnBudget(trial), deadline, () => ++turnCount, stopProvider, stopProviderAfterTimeout) : null;
+		const config = benchmarkCoordinatorConfig(trial.agentLoad, options.planningConcurrency ?? trial.agentLoad);
 		coordinator = createDynamicCoordinator(config, {
 			bridge,
+			scheduler,
+			benchmarkRecorder: trialRecorder,
 			...(providerService ? { providerService } : {}),
 			setStatusInterval: () => null,
 			clearStatusInterval: () => {},
@@ -161,45 +190,53 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		cleanup.push(() => coordinator?.stop());
 		const samplerOptions = options.systemSamplerOptions ?? {};
 		sampler = options.systemSampler
-			?? options.systemSamplerFactory?.({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => ({ active: 0, pending: 0 })), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader })
-			?? new SystemSampler({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => ({ active: 0, pending: 0 })), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader });
+			?? options.systemSamplerFactory?.({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => schedulerSnapshot(scheduler)), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader ?? (() => null) })
+			?? new SystemSampler({ ...samplerOptions, schedulerReader: options.schedulerReader ?? samplerOptions.schedulerReader ?? (() => schedulerSnapshot(scheduler)), processReader: options.processReader ?? samplerOptions.processReader, childProcessReader: options.childProcessReader ?? samplerOptions.childProcessReader ?? (() => null) });
 		sampler.start();
+		sampler.sample?.();
 		cleanup.push(() => sampler?.stop());
 		const reconciled = new Promise((resolve) => coordinator.once('reconciled', resolve));
-		await withTimeout(coordinator.start(), trial.trialBudgetMs, 'TRIAL_TIMEOUT');
-		await withTimeout(reconciled, trial.trialBudgetMs, 'TRIAL_TIMEOUT');
+		await runWithDeadline(() => coordinator.start(), deadline);
+		await runWithDeadline(() => reconciled, deadline);
 		for (const agentId of scenario.agentIds) bridge.startAgent(agentId, scenario.goal ?? `Complete ${trial.scenarioId}`);
 		await Promise.resolve();
-		for (const agentId of scenario.agentIds) await bridge.publish(agentId);
-		await withTimeout(runVirtualTicks({ world, bridge, coordinator, records, cap: trial.turnCap, deadline: startedAt + trial.trialBudgetMs }), trial.trialBudgetMs, 'TRIAL_TIMEOUT');
+		for (const agentId of scenario.agentIds) await runWithDeadline(() => bridge.publish(agentId), deadline);
+		await runWithDeadline(() => runVirtualTicks({ world, bridge, coordinator, records, cap: trial.turnCap, deadline }), deadline);
 		const statuses = records.map((record) => coordinator.registry.get(record.agentId)?.state);
-		const providerError = runtimeErrors.find((entry) => ['TURN_TIMEOUT', 'PROVIDER_EXIT', 'PROVIDER_UNAVAILABLE', 'TURN_CAP', 'REPLAY_IDENTITY_MISMATCH', 'REPLAY_DECISION_MISMATCH'].includes(entry.code));
-		const registryStatus = ['TURN_TIMEOUT', 'TURN_CAP'].includes(providerError?.code) ? 'TIMED_OUT' : statuses.every((value) => value === DynamicAgentState.COMPLETED) ? 'PASSED' : statuses.some((value) => value === DynamicAgentState.ERROR) ? 'FAILED' : 'TIMED_OUT';
+		const runtimeError = runtimeErrors.find((entry) => entry.code);
+		const runtimeTimedOut = isTimeoutErrorCode(runtimeError?.code);
+		const registryStatus = runtimeTimedOut ? 'TIMED_OUT' : statuses.every((value) => value === DynamicAgentState.COMPLETED) ? 'PASSED' : statuses.some((value) => value === DynamicAgentState.ERROR) ? 'FAILED' : 'TIMED_OUT';
 		const scenarioRequired = typeof rawScenario.success === 'function';
 		const scenarioOutcomes = scenarioRequired ? scenario.agentIds.map((agentId) => buildAuthoritativeScenarioOutcome({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, actionCommands: authoritativeCommands(virtual, agentId), actionResults: authoritativeResults(virtual, agentId), initialSnapshot: initialSnapshots.get(agentId) })) : [];
 		const scenarioPassed = !scenarioRequired || scenario.agentIds.every((agentId) => runAuthoritativeScenarioSuccess({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, bridge: virtual, actionCommands: authoritativeCommands(virtual, agentId), actionResults: authoritativeResults(virtual, agentId), initialSnapshot: initialSnapshots.get(agentId) }));
 		const scenarioDigest = scenarioOutcomes.length > 0 ? hash(scenarioOutcomes.map(normalizeScenarioOutcome)) : null;
-		const status = providerError ? (['TURN_TIMEOUT', 'TURN_CAP'].includes(providerError.code) ? 'TIMED_OUT' : 'FAILED') : registryStatus === 'PASSED' && scenarioPassed ? 'PASSED' : registryStatus === 'TIMED_OUT' ? 'TIMED_OUT' : 'FAILED';
-		const error = providerError ? coded(providerError.code, providerError.message) : status === 'TIMED_OUT' ? coded('TURN_CAP', `trial exceeded the ${trial.turnCap}-turn cap`) : !scenarioPassed ? coded('SCENARIO_ASSERTION_FAILED', 'authoritative scenario outcome did not satisfy its success predicate') : null;
+		const status = runtimeError ? (runtimeTimedOut ? 'TIMED_OUT' : 'FAILED') : registryStatus === 'PASSED' && scenarioPassed ? 'PASSED' : registryStatus === 'TIMED_OUT' ? 'TIMED_OUT' : 'FAILED';
+		const error = runtimeError ? coded(runtimeError.code, runtimeError.message) : status === 'TIMED_OUT' ? coded('TURN_CAP', `trial exceeded the ${trial.turnCap}-turn cap`) : !scenarioPassed ? coded('SCENARIO_ASSERTION_FAILED', 'authoritative scenario outcome did not satisfy its success predicate') : null;
 		const outcomeHash = hash({ trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, providerProfile: trial.providerProfile, statuses, turnCount, scenarioDigest });
 		result = trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanupSnapshot(bridge, sampler));
+		result.benchmark = { eventCount: trialRecorder?.count ?? 0 };
 		result.debug = { statuses, turnCount, runtimeErrors, scenarioPassed, scenarioDigest, scenarioEvidence: scenarioEvidence(virtual, scenario.agentIds) };
 	} catch (error) {
 		if (error?.code === 'TRIAL_TIMEOUT') await new Promise((resolve) => setImmediate(resolve));
 		let typed = normalizeTrialError(error);
 		if (typed.code === 'TRIAL_TIMEOUT' && runtimeErrors.length > 0) {
 			const providerError = runtimeErrors.find((entry) => ['TURN_TIMEOUT', 'PROVIDER_EXIT', 'PROVIDER_UNAVAILABLE', 'TURN_CAP', 'REPLAY_IDENTITY_MISMATCH', 'REPLAY_DECISION_MISMATCH'].includes(entry.code));
-			if (providerError) typed = coded(providerError.code, providerError.message);
+			const runtimeError = providerError ?? runtimeErrors.find((entry) => entry.code && !['TRIAL_TIMEOUT'].includes(entry.code));
+			if (runtimeError) typed = coded(runtimeError.code, runtimeError.message);
 		}
-		result = trialResult(trial, repetition, typed.code === 'TURN_TIMEOUT' || typed.code === 'TRIAL_TIMEOUT' ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler));
+		result = trialResult(trial, repetition, isTimeoutErrorCode(typed.code) ? 'TIMED_OUT' : 'FAILED', typed, startedAt, null, cleanupSnapshot(bridge, sampler));
+		result.benchmark = { eventCount: trialRecorder?.count ?? 0 };
 		result.debug = { runtimeErrors, turnCount };
 	} finally {
+		try { sampler?.sample?.(); } catch {}
 		for (const close of cleanup.reverse()) {
-			try { await withTimeout(Promise.resolve().then(() => close?.()), Math.min(1_000, Math.max(25, trial.trialBudgetMs)), 'CLEANUP_TIMEOUT'); }
+			try { await withTimeout(Promise.resolve().then(() => close?.()), cleanupTimeoutMs, 'CLEANUP_TIMEOUT'); }
 			catch (error) { cleanupErrors.push({ code: 'CLEANUP_FAILED', message: boundedError(error) }); }
 		}
 		if (result !== null) {
+			try { systemSummary = summarizeTrialSystem(sampler); } catch { systemSummary = null; }
 			result.cleanup = cleanupSnapshot(bridge, sampler, cleanupErrors);
+			result.systemSummary = systemSummary;
 			if (!result.cleanup.ok) {
 				result.status = 'FAILED';
 				result.error = { code: 'CLEANUP_FAILED', message: 'trial cleanup left resources or reported an error' };
@@ -259,7 +296,7 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 	get activeActionIds() { return this.#virtual.activeActionIds; }
 }
 
-function createInjectedProviderService(provider, trial, budget, incrementTurn, overCap, stopProvider = async () => provider.stop?.()) {
+function createInjectedProviderService(provider, trial, budget, deadline, incrementTurn, stopProvider = async () => provider.stop?.(), stopProviderAfterTimeout = stopProvider) {
 	const sessions = new Map();
 	const agentTurns = new Map();
 	return {
@@ -268,9 +305,24 @@ function createInjectedProviderService(provider, trial, budget, incrementTurn, o
 		async bootstrapCatalog() { return { models: [] }; },
 		async createAgent(record) {
 			const profile = { ...record, ...trial.providerProfile, provider: trial.providerProfile.provider };
-			const session = await provider.createAgent(profile);
+			let session;
+			try { session = await runWithDeadline(() => provider.createAgent(profile), deadline); }
+			catch (error) { if (error?.code === 'TRIAL_TIMEOUT') await stopProviderAfterTimeout(); throw error; }
 			if (!session || typeof session.decide !== 'function') throw coded('PROVIDER_EXIT', 'provider returned no decision session');
-			const wrapped = { ...session, async decide(input, options = {}) { const turns = agentTurns.get(record.agentId) ?? 0; if (turns >= trial.turnCap) throw coded('TURN_CAP', 'turn cap exceeded'); agentTurns.set(record.agentId, turns + 1); incrementTurn(); return withTimeout(Promise.resolve().then(() => session.decide(input, options)), budget, 'TURN_TIMEOUT'); } };
+			const wrapped = { ...session, async decide(input, options = {}) {
+				const turns = agentTurns.get(record.agentId) ?? 0;
+				if (turns >= trial.turnCap) throw coded('TURN_CAP', 'turn cap exceeded');
+				agentTurns.set(record.agentId, turns + 1);
+				incrementTurn();
+				const remaining = deadline - performance.now();
+				if (remaining <= 0) { await stopProviderAfterTimeout(); throw coded('TRIAL_TIMEOUT', 'trial deadline elapsed before provider turn'); }
+				try {
+					return await withTimeout(Promise.resolve().then(() => session.decide(input, options)), Math.min(budget, remaining), remaining <= budget ? 'TRIAL_TIMEOUT' : 'TURN_TIMEOUT');
+				} catch (error) {
+					if (error?.code === 'TRIAL_TIMEOUT' || error?.code === 'TURN_TIMEOUT') await stopProviderAfterTimeout();
+					throw error;
+				}
+			} };
 			sessions.set(record.agentId, wrapped); return wrapped;
 		},
 		getAgent(agentId) { return sessions.get(agentId) ?? null; },
@@ -287,7 +339,7 @@ function defaultInstantFactory(_profile, context = {}) {
 		: { summary: 'deterministic wait', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");' };
 	const decisions = new Map(Object.entries(manifests).map(([agentId, manifest]) => [agentId, manifest?.commands?.length ? compileScenarioDecision(manifest) : fallbackDecision]));
 	const initialized = new Set();
-	return { available: true, async createAgent(record) { const decision = decisions.get(record.agentId) ?? fallbackDecision; return { async setGoalRevision() {}, async decide() { if (!initialized.has(record.agentId)) { initialized.add(record.agentId); return decision; } return { directive: 'continue', summary: 'continue deterministic program' }; } }; } };
+	return { available: true, provider: 'instant', synthetic: true, async createAgent(record) { const decision = decisions.get(record.agentId) ?? fallbackDecision; return { async setGoalRevision() {}, async decide() { if (!initialized.has(record.agentId)) { initialized.add(record.agentId); return decision; } return { directive: 'continue', summary: 'continue deterministic program' }; } }; } };
 }
 
 async function defaultReplayFactory(profile, context = {}) {
@@ -303,8 +355,9 @@ async function defaultReplayFactory(profile, context = {}) {
 	});
 }
 
-function benchmarkCoordinatorConfig(agentCap) {
-	return { bridge: { secret: 'latency-fixture' }, codex: { cwd: process.cwd() }, limits: { agentCap, goalQueueCap: 8, planningConcurrency: Math.min(4, agentCap), invalidDecisionRetries: 0 }, workspaceRoot: path.join(os.tmpdir(), 'arena-latency-workspaces') };
+function benchmarkCoordinatorConfig(agentCap, planningConcurrency = agentCap) {
+	const effectiveConcurrency = Math.max(1, Math.min(agentCap, planningConcurrency));
+	return { bridge: { secret: 'latency-fixture' }, codex: { cwd: process.cwd() }, limits: { agentCap, goalQueueCap: 8, planningConcurrency: effectiveConcurrency, invalidDecisionRetries: 0 }, workspaceRoot: path.join(os.tmpdir(), 'arena-latency-workspaces') };
 }
 
 function cloneScenarioForLoad(source, load, seed) {
@@ -386,6 +439,59 @@ function normalizedSeeds(value) { if (!Array.isArray(value) || value.length === 
 function normalizedLoads(value) { if (!Array.isArray(value) || value.length === 0 || new Set(value).size !== value.length || value.some((load) => !LOADS.includes(load))) throw new TypeError('agentLoads must contain unique values from 1, 4, 8, 16'); return [...value]; }
 async function loadMatrix(value) { if (value === undefined) return JSON.parse(await readFile(new URL('../../config/latency-matrix.json', import.meta.url), 'utf8')); if (typeof value === 'string') return JSON.parse(await readFile(value, 'utf8')); return value; }
 function turnBudget(trial) { return trial.turnBudgetMs; }
+function runWithDeadline(task, deadline, code = 'TRIAL_TIMEOUT') {
+	const remaining = deadline - performance.now();
+	if (remaining <= 0) return Promise.reject(coded(code, 'trial deadline elapsed'));
+	return withTimeout(Promise.resolve().then(task), remaining, code);
+}
+function createTrialRecorder(recorder, { trial, repetition }) {
+	let count = 0;
+	return {
+		record(stage, context = {}, fields = {}) {
+			const row = recorder.record(stage, { trialId: trial.id, repetition, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, synthetic: trial.mode !== 'live', provider: trial.providerProfile.provider, model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, ...context }, fields);
+			if (row !== null) count += 1;
+			return row;
+		},
+		get count() { return count; },
+	};
+}
+function createTrialScheduler(trial, recorder, options) {
+	if (options.planningScheduler !== undefined) return options.planningScheduler;
+	if (typeof options.planningSchedulerFactory === 'function') return options.planningSchedulerFactory({ trial, recorder });
+	const configuredConcurrency = options.planningConcurrency ?? trial.agentLoad;
+	const maxConcurrent = Math.max(1, Math.min(trial.agentLoad, configuredConcurrency));
+	return new PlanningScheduler({ maxConcurrent, maxPending: Math.max(0, trial.agentLoad - maxConcurrent), benchmarkRecorder: recorder });
+}
+function schedulerSnapshot(scheduler) { return { active: scheduler?.activeCount ?? null, pending: scheduler?.pendingCount ?? null }; }
+function summarizeTrialSystem(sampler) {
+	const summary = sampler?.summary?.() ?? null;
+	if (summary === null || typeof summary !== 'object' || Array.isArray(summary)) return summary;
+	const samples = typeof sampler?.snapshot === 'function' ? sampler.snapshot() : [];
+	return { ...summary, immediateSample: samples[0] ?? null, finalSample: samples.at(-1) ?? null };
+}
+function validateProviderIdentity(provider, trial) {
+	const expected = trial.providerProfile;
+	if (trial.mode !== 'live') {
+		if (provider?.provider !== undefined && provider.provider !== expected.provider) throw coded('PROVIDER_MISMATCH', `Provider '${String(provider.provider)}' does not match selected '${expected.provider}'`);
+		if (provider?.synthetic === false) throw coded('PROVIDER_MISMATCH', `${trial.mode} provider must be synthetic`);
+		return { provider: provider?.provider ?? expected.provider, synthetic: true };
+	}
+	if (provider === null || typeof provider !== 'object' || Array.isArray(provider) || typeof provider.provider !== 'string' || provider.provider.trim().length === 0) {
+		throw coded('PROVIDER_MISMATCH', `Live provider identity is missing; expected '${expected.provider}'`);
+	}
+	if (provider.provider !== expected.provider) throw coded('PROVIDER_MISMATCH', `Provider '${String(provider.provider)}' does not match selected '${expected.provider}'`);
+	for (const field of ['model', 'reasoningEffort', 'serviceTier']) {
+		if (provider[field] !== undefined && provider[field] !== expected[field]) throw coded('PROVIDER_MISMATCH', `Live provider ${field} does not match selected profile`);
+	}
+	if (provider.providerProfile !== undefined) {
+		if (!isRecord(provider.providerProfile)) throw coded('PROVIDER_MISMATCH', 'Live provider profile identity is invalid');
+		for (const field of ['provider', 'model', 'reasoningEffort', 'serviceTier']) {
+			if (provider.providerProfile[field] !== expected[field]) throw coded('PROVIDER_MISMATCH', `Live provider profile ${field} does not match selected profile`);
+		}
+	}
+	return { provider: expected.provider, synthetic: false };
+}
+function isTimeoutErrorCode(code) { return typeof code === 'string' && (code === 'TURN_CAP' || code.includes('TIMEOUT')); }
 function internalProvider(provider) { return PROVIDERS.has(provider) && ['codex', 'gemini', 'kimi'].includes(provider) ? provider : 'codex'; }
 function manualScheduler() { const handles = new Set(); return { setInterval(callback) { const handle = { callback }; handles.add(handle); return handle; }, clearInterval(handle) { handles.delete(handle); } }; }
 function authoritativeCommands(virtual, agentId) { return (virtual?.sent ?? []).filter((event) => event?.type === 'action_command' && event.agentId === agentId).map((event) => ({ ...event.payload, agentId })); }
@@ -436,7 +542,7 @@ function cleanupSnapshot(bridge, sampler, cleanupErrors = []) {
 	const samplerErrors = sampler?.errors?.length ?? 0;
 	return { ok: activeActions === 0 && listeners === 0 && relays === 0 && pendingObservations === 0 && !samplerActive && cleanupErrors.length === 0, activeActions, listeners, relays, pendingObservations, samplerActive, samplerErrors, errors: cleanupErrors.slice(0, 16) };
 }
-function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup) { return { trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, providerProfile: trial.providerProfile, ...(outcomeHash ? { outcomeHash } : {}), ...(error ? { error: { code: error.code, message: boundedError(error.message) } } : {}), cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 }, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) }; }
+function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup) { return { trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' }, ...(outcomeHash ? { outcomeHash } : {}), ...(error ? { error: { code: error.code, message: boundedError(error.message) } } : {}), cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 }, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) }; }
 function cleanupError() { return null; }
 async function writeArtifacts(directory, output, recorder, artifactFs = {}) {
 	const fs = { mkdir, rename, rm, writeFile, ...artifactFs };
