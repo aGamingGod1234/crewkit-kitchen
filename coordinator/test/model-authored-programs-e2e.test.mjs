@@ -362,7 +362,7 @@ function createProviderHarness({ initialObservation = observation(), onAction = 
 	harness.bridge.attach(harness.manager);
 	harness.installFromProvider = async () => {
 		const decision = await planner.requestPlan({ agentId: SELECTED_PROFILE.agentId, input: 'Task 10 provider decision', goalRevision: 1 });
-		return harness.manager.installDecision(harness.record, decision, { observation: harness.bridge.currentObservation, eventSequence: 1 });
+		return harness.manager.installDecision(harness.record, withCompletionContract(decision, harness.record.goalRevision), { observation: harness.bridge.currentObservation, eventSequence: 1 });
 	};
 	return harness;
 }

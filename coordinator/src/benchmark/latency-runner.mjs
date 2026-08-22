@@ -178,7 +178,11 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		metrics.attachWorld(world, scenario, scenario.agentIds);
 		initialSnapshots = new Map(scenario.agentIds.map((agentId) => [agentId, captureScenarioInitialSnapshot({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, agentId })]));
 		const virtual = new VirtualMinecraftBridge({ world, agentRecords: virtualRecords, serverInstanceId: `latency-${trial.id}-${repetition}` });
-		bridge = new VirtualMinecraftBridgeAdapter(virtual, records);
+		bridge = new VirtualMinecraftBridgeAdapter(virtual, records, {
+			scenario,
+			initialSnapshots,
+			recordPhase: (stage, context, fields) => trialRecorder?.record(stage, context, fields),
+		});
 		metrics.attachVirtualBridge(virtual);
 		metrics.attachBridgeAdapter(bridge);
 		cleanup.push(() => metrics.close());
@@ -214,7 +218,10 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		const reconciled = new Promise((resolve) => coordinator.once('reconciled', resolve));
 		await runWithDeadline(() => coordinator.start(), deadline);
 		await runWithDeadline(() => reconciled, deadline);
-		for (const agentId of scenario.agentIds) bridge.startAgent(agentId, scenario.goal ?? `Complete ${trial.scenarioId}`);
+		for (const agentId of scenario.agentIds) {
+			trialRecorder.record('goal_received', { agentId, goalRevision: 1 });
+			bridge.startAgent(agentId, scenario.goal ?? `Complete ${trial.scenarioId}`);
+		}
 		await Promise.resolve();
 		for (const agentId of scenario.agentIds) await runWithDeadline(() => bridge.publish(agentId), deadline);
 		await runVirtualTicks({ world, bridge, coordinator, records, cap: trial.turnCap, deadline, mode: trial.mode, pacing: options.virtualTickPacing, metrics });
@@ -351,11 +358,14 @@ function waitWithPacingTimer(delay, timer, pending) {
 class VirtualMinecraftBridgeAdapter extends EventEmitter {
 	#virtual;
 	#records;
+	#scenario;
+	#initialSnapshots;
+	#recordPhase;
 	#relays = [];
 	#pendingObservations = new Map();
 	#started = false;
-	constructor(virtual, records) {
-		super(); this.#virtual = virtual; this.#records = records;
+	constructor(virtual, records, { scenario = null, initialSnapshots = new Map(), recordPhase = null } = {}) {
+		super(); this.#virtual = virtual; this.#records = records; this.#scenario = scenario; this.#initialSnapshots = initialSnapshots; this.#recordPhase = typeof recordPhase === 'function' ? recordPhase : () => {};
 		for (const [event, type] of [['observation', 'observation'], ['progress', 'action_progress'], ['result', 'action_result']]) {
 			const relay = (entry) => {
 				const message = { agentId: entry.envelope.agentId, payload: entry.envelope.payload };
@@ -380,7 +390,38 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 	get relayCount() { return this.#relays.length; }
 	get pendingObservationCount() { return this.#pendingObservations.size; }
 	get listenerResidue() { return this.eventNames().reduce((count, event) => count + this.listenerCount(event), 0); }
-	send(type, agentId, payload) { if (agentId === 'server') return Promise.resolve(); return this.#virtual.send(type, agentId, payload); }
+	async send(type, agentId, payload) {
+		if (agentId === 'server') return;
+		await this.#virtual.send(type, agentId, payload);
+		if (type === 'goal_completed') this.#publishCompletionResult(agentId, payload);
+	}
+	#publishCompletionResult(agentId, payload) {
+		const manifest = this.#scenario?.agentManifests?.[agentId] ?? this.#scenario;
+		const verified = typeof manifest?.success !== 'function' || runAuthoritativeScenarioSuccess({
+			manifest,
+			world: this.#virtual.world,
+			bridge: this.#virtual,
+			actionCommands: authoritativeCommands(this.#virtual, agentId),
+			actionResults: authoritativeResults(this.#virtual, agentId),
+			initialSnapshot: this.#initialSnapshots.get(agentId),
+		});
+		this.#recordPhase('verification_started', { agentId, goalRevision: payload.goalRevision }, { traceId: payload.traceId });
+		queueMicrotask(() => {
+			const reasonCode = verified ? 'COMPLETION_VERIFIED' : 'PREDICATE_FAILED';
+			this.#recordPhase('verification_completed', { agentId, goalRevision: payload.goalRevision }, { traceId: payload.traceId, reasonCode });
+			this.#recordPhase(verified ? 'goal_completed' : 'goal_failed', { agentId, goalRevision: payload.goalRevision }, { traceId: payload.traceId, reasonCode });
+			this.emit('goal_completion_result', {
+				agentId,
+				payload: {
+					goalRevision: payload.goalRevision,
+					traceId: payload.traceId,
+					contractHash: payload.contractHash,
+					verified,
+					reasonCode,
+				},
+			});
+		});
+	}
 	publish(agentId, options) { return this.#virtual.publish(agentId, options); }
 	flush() { return this.#virtual.flush(); }
 	startAgent(agentId, goal) { this.emit('goal_control', { agentId, payload: { operation: 'start', goalRevision: 1, goal, updatedAtEpochMs: 0 } }); }
@@ -884,12 +925,10 @@ function createInjectedProviderService(provider, trial, budget, deadline, increm
 function defaultInstantFactory(_profile, context = {}) {
 	const manifests = context.loadScenario?.agentManifests ?? {};
 	const defaultManifest = context.scenario;
-	const fallbackDecision = defaultManifest?.commands?.length
-		? compileScenarioDecision(defaultManifest)
-		: { summary: 'deterministic wait', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");' };
-	const decisions = new Map(Object.entries(manifests).map(([agentId, manifest]) => [agentId, manifest?.commands?.length ? compileScenarioDecision(manifest) : fallbackDecision]));
+	const fallbackDecision = defaultManifest ? compileScenarioDecision(defaultManifest) : null;
+	const decisions = new Map(Object.entries(manifests).map(([agentId, manifest]) => [agentId, manifest ? compileScenarioDecision(manifest) : fallbackDecision]));
 	const initialized = new Set();
-	return { available: true, provider: 'instant', synthetic: true, async createAgent(record) { const decision = decisions.get(record.agentId) ?? fallbackDecision; return { async setGoalRevision() {}, async decide() { if (!initialized.has(record.agentId)) { initialized.add(record.agentId); return decision; } return { directive: 'continue', summary: 'continue deterministic program' }; } }; } };
+	return { available: true, provider: 'instant', synthetic: true, async createAgent(record) { const decision = decisions.get(record.agentId) ?? fallbackDecision; if (!decision) throw coded('SCENARIO_NOT_FOUND', 'instant fixture requires a scenario manifest'); return { async setGoalRevision() {}, async decide() { if (!initialized.has(record.agentId)) { initialized.add(record.agentId); return decision; } return { directive: 'continue', summary: 'continue deterministic program' }; } }; } };
 }
 
 async function defaultReplayFactory(profile, context = {}) {

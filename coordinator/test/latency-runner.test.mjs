@@ -36,7 +36,7 @@ function instantProvider() {
 		async start() {},
 		async stop() {},
 		async createAgent() {
-			return { async setGoalRevision() {}, async decide() { return { summary: 'done', directive: 'replace', source: SOURCE }; } };
+			return { async setGoalRevision() {}, async decide() { return fixtureDecision(); } };
 		},
 	};
 }
@@ -57,13 +57,17 @@ function movementScenario() {
 	};
 }
 
+function fixtureDecision({ summary = 'done', source = SOURCE, scenario = fixtureScenario() } = {}) {
+	return { summary, directive: 'replace', source, completionContract: compileScenarioDecision(scenario).completionContract };
+}
+
 function movementProvider() {
 	return {
 		available: true,
 		async start() {},
 		async stop() {},
 		async createAgent() {
-			return { async setGoalRevision() {}, async decide() { return { summary: 'move', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false }); program.finish("done");' }; } };
+			return { async setGoalRevision() {}, async decide() { return fixtureDecision({ summary: 'move', source: 'program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false }); program.finish("done");', scenario: movementScenario() }); } };
 		},
 	};
 }
@@ -212,7 +216,7 @@ test('records only declared hazard and direct-message event timing', async () =>
 	const respawn = await runLatencyMatrix({
 		matrix: matrix({ trials: [{ ...base, id: 'respawn-metrics', scenarioId: respawnScenario.id }] }),
 		scenarioResolver: () => respawnScenario,
-		providerFactories: { instant: () => ({ available: true, async createAgent() { return { async setGoalRevision() {}, async decide() { return { summary: 'respawn', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn(); program.finish("done");' }; } }; } }) },
+		providerFactories: { instant: () => ({ available: true, async createAgent() { return { async setGoalRevision() {}, async decide() { return fixtureDecision({ summary: 'respawn', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn(); program.finish("done");' }); } }; } }) },
 		artifactDirectory: null,
 	});
 	assert.equal(respawn.status, 'PASSED');
@@ -283,6 +287,12 @@ test('shipped default matrix proves physical stone-tool success for every isolat
 	assert.ok(result.trials.every((trial) => trial.debug?.scenarioDigest?.startsWith('sha256:')));
 });
 
+test('publishes goal and factual verification phase events for deterministic harness reports', async () => {
+	const result = await runLatencyMatrix({ matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'phase-events' }] }), scenarioResolver: () => fixtureScenario(), includeRawEvents: true, artifactDirectory: null });
+	const stages = new Set(result.rawEvents.map((event) => event.stage ?? event.phase));
+	for (const stage of ['goal_received', 'verification_started', 'verification_completed', 'goal_completed']) assert.equal(stages.has(stage), true, `missing ${stage}`);
+});
+
 test('delayed stone-tool pacing completes in one planner turn without reactive completion requests', async () => {
 	const profile = { provider: 'codex', model: 'stone-fixture', reasoningEffort: 'fixed', serviceTier: 'local' };
 	const scenario = getSimulatorScenario('stone-tool-gathering');
@@ -351,7 +361,7 @@ test('writes artifacts before throwing for a required unavailable provider', asy
 test('requires an exact declared identity for live providers', async () => {
 	const liveProfile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const liveTrial = { ...matrix().trials[0], id: 'live-identity', mode: 'live', providerProfile: liveProfile, providerAvailabilityRequired: true };
-	const session = { async setGoalRevision() {}, async decide() { return { summary: 'done', directive: 'replace', source: SOURCE }; } };
+	const session = { async setGoalRevision() {}, async decide() { return fixtureDecision(); } };
 	for (const provider of [
 		{ available: true, async createAgent() { return session; }, async stop() {} },
 		{ available: true, provider: 'gemini', async createAgent() { return session; }, async stop() {} },
@@ -532,10 +542,10 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 	let prompt = null;
 	const scenario = fixtureScenario();
 	const liveMatrix = matrix({ trials: [{ ...matrix().trials[0], id: 'replay-path', mode: 'live', providerProfile: profile }] });
-	const providerFactory = () => ({ available: true, provider: 'codex', model: profile.model, reasoningEffort: profile.reasoningEffort, serviceTier: profile.serviceTier, providerProfile: profile, async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return { summary: 'done', directive: 'replace', source }; } }; }, async stop() {} });
+	const providerFactory = () => ({ available: true, provider: 'codex', model: profile.model, reasoningEffort: profile.reasoningEffort, serviceTier: profile.serviceTier, providerProfile: profile, async createAgent() { return { async setGoalRevision() {}, async decide(input) { prompt = input; return fixtureDecision(); } }; }, async stop() {} });
 	const first = await runLatencyMatrix({ matrix: liveMatrix, scenarioResolver: () => scenario, providerFactories: { codex: providerFactory }, artifactDirectory: null });
 	assert.equal(first.trials[0].status, 'PASSED');
-	const recording = createReplayRecord({ trialId: 'replay-path', prompt, providerProfile: profile, scenario, protocolVersion: 2, decision: { summary: 'done', directive: 'replace', source } });
+	const recording = createReplayRecord({ trialId: 'replay-path', prompt, providerProfile: profile, scenario, protocolVersion: 2, decision: fixtureDecision() });
 	const replayMatrix = matrix({ trials: [{ ...liveMatrix.trials[0], mode: 'replay' }] });
 	const replay = await runLatencyMatrix({
 		matrix: replayMatrix, scenarioResolver: () => scenario,
@@ -554,7 +564,7 @@ test('paces delayed replay ticks against wall time instead of racing virtual tim
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const scenario = fixtureScenario();
 	const trial = { ...matrix().trials[0], id: 'paced-replay', mode: 'replay', providerProfile: profile, trialBudgetMs: 1_000, turnBudgetMs: 500 };
-	const decision = { summary: 'done', directive: 'replace', source: SOURCE };
+	const decision = fixtureDecision();
 	let prompt = null;
 	const liveProvider = () => ({
 		available: true,

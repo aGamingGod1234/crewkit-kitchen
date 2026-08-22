@@ -188,7 +188,7 @@ export async function runTask9SimulatorMatrix({ matrix, runMatrix = runLatencyMa
 	if (typeof runMatrix !== 'function') throw new TypeError('runMatrix must be a function');
 	const liveTrial = normalized.trials.find((trial) => trial.mode === 'live');
 	if (liveTrial) throw new Error(`Task 9 deterministic harness rejects live trial '${liveTrial.id}'; use the isolated Desktop gate separately`);
-	const run = await runMatrix({ ...options, matrix: { version: 1, benchmarkVersion: normalized.benchmarkVersion, protocolVersion: normalized.protocolVersion, fixedSeeds: normalized.fixedSeeds, agentLoads: normalized.agentLoads, trials: normalized.trials }, includeRawEvents: true });
+	const run = await runMatrix({ ...options, matrix: { version: 1, benchmarkVersion: normalized.benchmarkVersion, protocolVersion: normalized.protocolVersion, fixedSeeds: normalized.fixedSeeds, agentLoads: normalized.agentLoads, trials: normalized.trials.map((trial) => ({ ...trial, providerAvailabilityRequired: true })) }, includeRawEvents: true });
 	const trials = (run?.trials ?? []).map((trial) => {
 		const raw = trial.metrics?.raw ?? {};
 		const samples = trial.systemSummary?.rawSamples ?? [];
@@ -200,7 +200,7 @@ export async function runTask9SimulatorMatrix({ matrix, runMatrix = runLatencyMa
 			cellId: `${trial.trialId}/rep-${trial.repetition}`, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad,
 			providerProfile: trial.providerProfile, sourceHash: options.sourceHash ?? null, configHash: options.configHash ?? null,
 		};
-		return buildTask9TrialReport({ identity, status: trial.status, events, cpuSamples: samples.map((sample) => sample.cpu?.totalMs).filter(Number.isFinite), rssSamples: samples.map((sample) => sample.memory?.rssBytes).filter(Number.isFinite), tickSamples: raw.ticks?.map((sample) => sample.wallDurationMs).filter(Number.isFinite) ?? [], factualSuccess: trial.debug?.scenarioPassed === true, fairness: trial.fairness, cleanup: trial.cleanup, correctness: { authoritative: trial.debug?.scenarioEvidence ?? null }, retries: trial.retries ?? {} });
+		return buildTask9TrialReport({ identity, status: trial.status, events, cpuSamples: samples.map((sample) => sample.cpu?.totalMs).filter(Number.isFinite), rssSamples: samples.map((sample) => sample.memory?.rssBytes).filter(Number.isFinite), tickSamples: raw.ticks?.map((sample) => sample.wallDurationMs).filter(Number.isFinite) ?? [], factualSuccess: trial.debug?.scenarioPassed === true, fairness: trial.fairness, cleanup: normalizeTask9Cleanup(trial.cleanup), correctness: { authoritative: trial.debug?.scenarioEvidence ?? null }, retries: trial.retries ?? {} });
 	});
 	const output = { schemaVersion: TASK9_SCHEMA_VERSION, status: trials.some((trial) => trial.status === 'FAILED' || trial.status === 'TIMED_OUT') ? 'FAILED' : run?.status ?? 'FAILED', runManifest: createTask9RunManifest({ runId: options.runId ?? 'task9-run', arm: options.arm ?? null, sourceCommit: options.sourceCommit ?? 'unknown', sourceHash: options.sourceHash ?? 'unknown', matrixHash: hashJson(normalized), configHash: options.configHash ?? hashJson(normalized), pairingKey: options.pairingKey ?? 'task9', providerProfile: normalized.trials[0]?.providerProfile ?? { provider: 'replay', model: 'unknown', reasoningEffort: 'fixed', serviceTier: 'synthetic-delayed' }, scheduler: options.scheduler ?? { mode: 'fixed', fixedConcurrency: options.planningConcurrency ?? 16 }, order: trials.map((trial) => `${trial.cellId}/${trial.arm ?? 'unknown'}`) }), trials };
 	for (const trial of trials) validateTask9TrialReport(trial);
@@ -252,4 +252,21 @@ function normalizeRawPhaseEvent(event) {
 		goal_completed: 'goal_completed_or_failed', goal_failed: 'goal_completed_or_failed',
 	}[stage] ?? stage;
 	return { ...event, phase };
+}
+
+function normalizeTask9Cleanup(value = {}) {
+	const activeActions = Number.isSafeInteger(value.activeActions) ? value.activeActions : 0;
+	const listeners = Number.isSafeInteger(value.listeners) ? value.listeners : 0;
+	const relays = Number.isSafeInteger(value.relays) ? value.relays : 0;
+	const ok = value.ok === true;
+	return {
+		...value,
+		processTreeClean: value.processTreeClean ?? (ok && activeActions === 0),
+		listenersClosed: value.listenersClosed ?? (ok && listeners === 0 && relays === 0),
+		activeActions,
+		inputLeases: Number.isSafeInteger(value.inputLeases) ? value.inputLeases : 0,
+		providerSessions: Number.isSafeInteger(value.providerSessions) ? value.providerSessions : 0,
+		workspaces: Number.isSafeInteger(value.workspaces) ? value.workspaces : 0,
+		ok,
+	};
 }

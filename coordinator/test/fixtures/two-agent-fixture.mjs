@@ -75,7 +75,7 @@ class FakeBridge extends EventEmitter {
 					skinVariant: 'default', state: entry.state, goalRevision: entry.goalRevision, queue: [], createdAtEpochMs: 1, updatedAtEpochMs: 1,
 				})),
 			} }, { direction: 'server_to_coordinator' });
-		} else if (event === 'goal_control' || event === 'observation' || event === 'action_result') {
+		} else if (event === 'goal_control' || event === 'observation' || event === 'action_result' || event === 'goal_completion_result') {
 			validateProtocolV2Envelope({ protocolVersion: 2, serverInstanceId: this.#serverInstanceId, agentId: value.agentId, type: event, messageId: `${event}-${value.agentId}-${value.payload.eventSequence ?? value.payload.goalRevision}`, payload: value.payload }, { direction: 'server_to_coordinator' });
 		}
 		return super.emit(event, value);

@@ -66,9 +66,10 @@ test('adapts deterministic runner output into raw evidence artifacts', async () 
 		matrix: matrix({ repetitions: 1 }), artifactDirectory: root, runId: 'run-1', arm: 'optimized', sourceHash: 'sha256:source', configHash: 'sha256:config',
 		runMatrix: async (options) => {
 			assert.equal(options.includeRawEvents, true);
+			assert.equal(options.matrix.trials[0].providerAvailabilityRequired, true);
 			return {
 				status: 'PASSED', rawEvents: phases.map((event) => ({ ...event, trialId: 'stone', repetition: 1 })),
-				trials: [{ trialId: 'stone', repetition: 1, status: 'PASSED', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, providerProfile: profile, metrics: { raw: { ticks: [{ wallDurationMs: 2 }] } }, systemSummary: { rawSamples: [{ cpu: { totalMs: 1 }, memory: { rssBytes: 2 } }] }, debug: { scenarioPassed: true }, cleanup: { ok: true, processTreeClean: true, listenersClosed: true, activeActions: 0, inputLeases: 0, providerSessions: 0, workspaces: 0 } }],
+				trials: [{ trialId: 'stone', repetition: 1, status: 'PASSED', scenarioId: 'stone-tool-gathering', seed: 20260821, agentLoad: 4, providerProfile: profile, metrics: { raw: { ticks: [{ wallDurationMs: 2 }] } }, systemSummary: { rawSamples: [{ cpu: { totalMs: 1 }, memory: { rssBytes: 2 } }] }, debug: { scenarioPassed: true }, cleanup: { ok: true, activeActions: 0, listeners: 0, relays: 0 } }],
 			};
 		},
 	});
