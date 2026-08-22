@@ -78,10 +78,25 @@ export class ProgramRuntimeManager {
 			};
 			this.#recordMinecraftPublication(receiptEpochMs, payload.observedAtEpochMs);
 		}
-		state.engine.ingestObservation({ observation, eventSequence, attention: payload.attention === true });
+		state.engine.ingestObservation({
+			observation,
+			eventSequence,
+			attention: payload.attention === true,
+			priority: payload.priority,
+			trigger: payload.trigger,
+		});
 		this.#flushDeferredProgramTrace(state);
 		this.#syncState(record, state);
 		return state.engine.snapshot();
+	}
+
+	/** Delivers a non-observation attention event, such as a direct message, to the active program. */
+	notifyAttention(record, { priority = 'urgent', trigger = 'conversation' } = {}) {
+		const state = this.#states.get(record.agentId);
+		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return null;
+		const snapshot = state.engine.notifyAttention({ priority, trigger });
+		this.#syncState(record, state);
+		return snapshot;
 	}
 
 	onActionProgress(record, payload = {}) {
@@ -287,7 +302,10 @@ export class ProgramRuntimeManager {
 					compilerError: { code: error.code, message: error.message, line: error.location?.line ?? 0, column: error.location?.column ?? 0 },
 					rejectedSourceHash: `sha256:${createHash('sha256').update(source).digest('hex')}`,
 					observation: observation ?? {},
+					...(context === null ? {} : { attentionPriority: context.priority, attentionTrigger: context.trigger }),
 				}),
+				planningPriority: context?.priority,
+				priority: context?.priority,
 			});
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return null;
 			if (decision?.directive !== 'replace') throw codedError('INVALID_COMPILER_CORRECTION', 'Compiler correction must replace with fresh ArenaScript source');
@@ -330,7 +348,7 @@ export class ProgramRuntimeManager {
 	}
 
 	async #requestReactiveDecision(state, context) {
-		state.reactiveRequest = context;
+		state.reactiveRequest = mergeReactiveRequest(state.reactiveRequest, context);
 		if (state.reactiveRequestActive) return;
 		state.reactiveRequestActive = true;
 		try {
@@ -365,9 +383,13 @@ export class ProgramRuntimeManager {
 					programId: context.programId,
 					programVersion: context.version,
 					eventSequence: context.eventSequence,
+					attentionPriority: context.priority,
+					attentionTrigger: context.trigger,
 					...(context.actionFailure === undefined ? {} : { actionFailure: context.actionFailure }),
 					observation: context.observation,
 				}, this.#plannerContext(record.agentId)),
+				planningPriority: context.priority,
+				priority: context.priority,
 			});
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return;
 			if (decision?.directive === 'replace') {
@@ -684,7 +706,29 @@ function actionArguments(type, value) {
 	throw codedError('INVALID_ARENA_SCRIPT_COMMAND', `ArenaScript primitive '${type}' requires an object argument`);
 }
 function requestKey(context) { return [context.programId, context.version, context.generation, context.lifecycleEpoch, context.continuationEpoch, context.activeActionId, context.eventSequence, context.factsSequence].join('\u0000'); }
-function sameEngineRequest(snapshot, context) { return snapshot.programId === context.programId && snapshot.version === context.version && snapshot.generation === context.generation && snapshot.lifecycleEpoch === context.lifecycleEpoch && snapshot.continuationEpoch === context.continuationEpoch && snapshot.activeActionId === context.activeActionId && snapshot.eventSequence === context.eventSequence && snapshot.factsSequence === context.factsSequence; }
+function sameEngineRequest(snapshot, context) {
+	return snapshot.programId === context.programId
+		&& snapshot.version === context.version
+		&& snapshot.generation === context.generation
+		&& snapshot.lifecycleEpoch === context.lifecycleEpoch
+		&& snapshot.continuationEpoch === context.continuationEpoch
+		&& snapshot.activeActionId === context.activeActionId
+		&& snapshot.eventSequence === context.eventSequence
+		&& snapshot.factsSequence === context.factsSequence
+		&& snapshot.pendingRequestPriority === context.priority
+		&& snapshot.pendingRequestTrigger === context.trigger;
+}
+function mergeReactiveRequest(previous, next) {
+	if (previous === null || previous === undefined) return next;
+	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
+	const winner = next.priority === priority ? next : previous;
+	const merged = { ...next, priority, trigger: winner.trigger };
+	if (winner.actionFailure !== undefined) {
+		merged.decisionContext = winner.decisionContext;
+		merged.actionFailure = winner.actionFailure;
+	}
+	return Object.freeze(merged);
+}
 
 function codedError(code, message) {
 	return Object.assign(new Error(message), { code });

@@ -55,6 +55,9 @@ export class DynamicCoordinator extends EventEmitter {
 	#bridge;
 	#listeners = [];
 	#agentOperations = new Map();
+	#providerWork = new Map();
+	#pendingAttention = new Map();
+	#attentionFlushes = new Map();
 	#lifecycleGenerations = new Map();
 	#providerRetryAfter = new Map();
 	#factLedgers = new Map();
@@ -145,6 +148,9 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#scheduler.close('Dynamic coordinator stopped');
 		await Promise.allSettled([this.#reconciliation, ...this.#agentOperations.values()]);
 		this.#agentOperations.clear();
+		this.#providerWork.clear();
+		this.#pendingAttention.clear();
+		this.#attentionFlushes.clear();
 		this.#lifecycleGenerations.clear();
 		this.#programRuntime.disposeAll();
 		this.#providerRetryAfter.clear();
@@ -215,6 +221,9 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listen('agent_removed', (message) => this.#run(async () => {
 			await this.#reconciliation;
 			this.#programRuntime.dispose(message.agentId);
+			this.#providerWork.delete(message.agentId);
+			this.#pendingAttention.delete(message.agentId);
+			this.#attentionFlushes.delete(message.agentId);
 			await this.#planner.remove(message.agentId);
 			this.#lifecycleGenerations.delete(message.agentId);
 			this.#providerRetryAfter.delete(message.agentId);
@@ -229,7 +238,7 @@ export class DynamicCoordinator extends EventEmitter {
 			if (!orderedRespawn) this.#invalidateLifecycleWork(message);
 			const previous = this.#registry.get(message.agentId);
 			if (!orderedRespawn && previous !== null && message.payload.operation !== 'queue') this.#programRuntime.onGoalControl(previous, message.payload.operation);
-			const interruption = this.#beginGoalControlInterruption(message);
+			this.#beginGoalControlInterruption(message);
 			this.#enqueueAgent(message.agentId, async () => {
 				if (orderedRespawn) {
 					this.#invalidateLifecycleWork(message);
@@ -240,10 +249,14 @@ export class DynamicCoordinator extends EventEmitter {
 				if (message.payload.operation !== 'queue') {
 					this.#providerRetryAfter.delete(message.agentId);
 				}
-				const interruptionResult = await interruption;
-				if (interruptionResult.error !== null) throw interruptionResult.error;
 				if (message.payload.operation === 'dead') {
-					await this.#installDeadStatePlan(record, message.payload.death);
+					void this.#installDeadStatePlan(record, message.payload.death).catch((error) => this.#reportAgentError(record.agentId, error));
+				}
+				if (message.payload.operation === 'start' || message.payload.operation === 'resume' || message.payload.operation === 'steer') {
+					this.#rememberPendingAttention(record.agentId, record.goalRevision, {
+						priority: message.payload.operation === 'steer' ? 'urgent' : 'ordinary',
+						trigger: message.payload.operation,
+					});
 				}
 				if (['start', 'resume', 'steer'].includes(message.payload.operation)) {
 					await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
@@ -254,6 +267,11 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listen('conversation_event', (message) => {
 			this.#enqueueAgent(message.agentId, async () => {
 				this.#conversationMemory(message.agentId).ingest(message.payload);
+				const record = this.#registry.get(message.agentId);
+				if (record !== null) {
+					this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation' });
+					this.#schedulePendingAttentionFlush(record);
+				}
 				this.emit('conversationEvent', message);
 			}, { waitForReconciliation: false });
 		});
@@ -267,6 +285,8 @@ export class DynamicCoordinator extends EventEmitter {
 					}
 					const record = this.#registry.applyConversationWake(message.agentId, message.payload.control);
 					this.#providerRetryAfter.delete(message.agentId);
+					this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation_wake' });
+					this.#schedulePendingAttentionFlush(record);
 					await this.#bridge.send('conversation_wake_ack', message.agentId, {
 						transactionId: message.payload.transactionId,
 						goalRevision: record.goalRevision,
@@ -287,6 +307,8 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 				if (previous !== null && record.goalRevision > previous.goalRevision) this.#programRuntime.onGoalControl(previous, 'start');
 				this.#providerRetryAfter.delete(message.agentId);
+				this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation_wake' });
+				this.#schedulePendingAttentionFlush(record);
 				this.#rememberConversationWake(message.payload.transactionId, message.agentId, fingerprint);
 				await this.#bridge.send('conversation_wake_ack', record.agentId, {
 					transactionId: message.payload.transactionId,
@@ -307,35 +329,50 @@ export class DynamicCoordinator extends EventEmitter {
 				if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
 				const wireObservation = message.payload.observation ?? message.payload;
 				const observation = adaptObservation(wireObservation);
+				const classified = classifyObservationTrigger(message.payload, wireObservation);
+				const pendingAttention = this.#pendingAttention.get(record.agentId);
+				const attention = pendingAttention?.goalRevision === record.goalRevision
+					? mergeAttentionTrigger(classified, pendingAttention)
+					: classified;
+				if (pendingAttention?.goalRevision === record.goalRevision) this.#pendingAttention.delete(record.agentId);
 				const ledger = this.#ledger(record.agentId);
 				ledger.ingest('observation', wireObservation);
 				const installed = await this.#programRuntime.onObservation(record, {
 					observation,
 					eventSequence: message.payload.eventSequence,
-					attention: message.payload.attention === true,
+					attention: attention.attention,
+					priority: attention.priority,
+					trigger: attention.trigger,
 					receiptMonotonicMs,
 					receiptEpochMs,
 					observedAtEpochMs: message.payload.observedAtEpochMs,
 				});
 				if (installed !== null) return;
-				if (this.#scheduler.hasScheduled(record.agentId)) return;
-				if (receiptMonotonicMs !== null && (this.#providerRetryAfter.get(record.agentId) ?? 0) > receiptMonotonicMs) return;
-				await this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING });
-				const decision = await this.#planner.requestPlan({
+				this.#scheduleInitialPlan(record, {
 					agentId: record.agentId,
 					goalRevision: record.goalRevision,
-					recoverySummary: record.lastSummary,
+					observation,
+					wireObservation,
+					eventSequence: message.payload.eventSequence,
+					receiptMonotonicMs,
+					attention: attention.attention,
+					priority: attention.priority,
+					trigger: attention.trigger,
+					preserveState: false,
+					kind: 'initial',
+					lifecycleGeneration,
 					input: buildPlannerInput({
 						agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
-						goal: record.currentGoal, goalRevision: record.goalRevision, observation,
+						goal: record.currentGoal,
+						goalRevision: record.goalRevision,
+						attentionPriority: attention.priority,
+						attentionTrigger: attention.trigger,
+						observation,
 					}, {
 						untrustedFacts: ledger.toPlannerFacts(),
 						conversationContext: this.#conversationMemory(record.agentId).toPlannerContext(),
 					}),
 				});
-				if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
-				const runtime = await this.#programRuntime.installDecision(record, decision, { observation, eventSequence: message.payload.eventSequence });
-				if (runtime !== null) this.#providerRetryAfter.delete(record.agentId);
 			});
 		});
 		this.#listen('action_progress', (message) => {
@@ -365,6 +402,9 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
 			this.#programRuntime.disposeAll();
+			this.#providerWork.clear();
+			this.#pendingAttention.clear();
+			this.#attentionFlushes.clear();
 			this.#providerRetryAfter.clear();
 			await Promise.allSettled(this.#registry.list().map(async (record) => {
 				if (![DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED].includes(record.state)) this.#registry.setState(record.agentId, DynamicAgentState.DISCONNECTED, { goalRevision: record.goalRevision });
@@ -387,20 +427,151 @@ export class DynamicCoordinator extends EventEmitter {
 		if (record.currentGoal === null) return;
 		if (this.#programRuntime.hasCurrent(record)) return;
 		const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
-		const decision = await this.#planner.requestPlan({
+		return this.#scheduleProviderPlan(record, {
 			agentId: record.agentId,
 			goalRevision: record.goalRevision,
+			observation: { death },
+			eventSequence: 0,
+			attention: true,
+			priority: 'urgent',
+			trigger: 'player_death',
 			preserveState: true,
+			kind: 'death',
+			lifecycleGeneration,
 			input: buildPlannerInput({
 				agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
 				goal: record.currentGoal,
 				goalRevision: record.goalRevision,
 				decisionContext: 'player_death',
+				attentionPriority: 'urgent',
+				attentionTrigger: 'player_death',
 				death,
 			}),
-		});
-		if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
-		await this.#programRuntime.installDecision(record, decision, { observation: { death }, eventSequence: 0 });
+		}, { preserveState: true, kind: 'death' });
+	}
+
+	#scheduleInitialPlan(record, request) {
+		if (!this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		const existing = this.#providerWork.get(record.agentId);
+		if (existing !== undefined) {
+			if (existing.goalRevision !== record.goalRevision || existing.lifecycleGeneration !== request.lifecycleGeneration) {
+				existing.pending = mergePlannerRequest(existing.pending, request);
+				return;
+			}
+			if (request.priority === 'urgent' && existing.request.priority !== 'urgent' && this.#scheduler.pendingAgentIds?.includes(record.agentId)) {
+				void Promise.resolve(this.#planner.interrupt(record.agentId, 'Urgent planning trigger')).catch(() => {});
+				return;
+			}
+			existing.pending = mergePlannerRequest(existing.pending, request);
+			return;
+		}
+		if (this.#scheduler.hasScheduled(record.agentId)) return;
+		if (request.priority !== 'urgent' && request.receiptMonotonicMs !== null && (this.#providerRetryAfter.get(record.agentId) ?? 0) > request.receiptMonotonicMs) return;
+		void this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING }).catch((error) => this.#reportAgentError(record.agentId, error));
+		void this.#scheduleProviderPlan(record, request, { preserveState: false, kind: 'initial' });
+	}
+
+	#scheduleProviderPlan(record, request, { preserveState = false, kind = 'initial' } = {}) {
+		const lifecycleGeneration = request.lifecycleGeneration ?? this.#lifecycleGeneration(record.agentId);
+		if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return Promise.resolve(null);
+		const existing = this.#providerWork.get(record.agentId);
+		if (existing !== undefined) {
+			if (existing.goalRevision !== record.goalRevision || existing.lifecycleGeneration !== lifecycleGeneration) {
+				existing.pending = mergePlannerRequest(existing.pending, request);
+				return existing.promise;
+			}
+			existing.pending = mergePlannerRequest(existing.pending, request);
+			return existing.promise;
+		}
+		const work = {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			lifecycleGeneration,
+			kind,
+			preserveState,
+			request,
+			pending: null,
+			promise: null,
+		};
+		this.#providerWork.set(record.agentId, work);
+		const providerRequest = {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			preserveState,
+			recoverySummary: record.lastSummary,
+			input: request.input,
+			planningPriority: request.priority,
+			priority: request.priority,
+		};
+		work.promise = Promise.resolve()
+			.then(() => this.#planner.requestPlan(providerRequest))
+			.then((decision) => this.#completeProviderPlan(work, decision), (error) => this.#failProviderPlan(work, record, error));
+		return work.promise;
+	}
+
+	async #completeProviderPlan(work, decision) {
+		if (this.#providerWork.get(work.agentId) !== work) return null;
+		const record = this.#registry.get(work.agentId);
+		if (record === null || record.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+			const pending = work.pending;
+			this.#providerWork.delete(work.agentId);
+			this.#reschedulePendingProviderPlan(pending);
+			return null;
+		}
+		let runtime = null;
+		try {
+			runtime = await this.#programRuntime.installDecision(record, decision, {
+				observation: work.request.observation,
+				eventSequence: work.request.eventSequence,
+			});
+		} catch (error) {
+			this.#providerWork.delete(work.agentId);
+			const current = this.#registry.get(work.agentId);
+			const stale = current?.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
+			if (!stale) await this.#reportAgentError(work.agentId, error);
+			if (stale || work.pending?.priority === 'urgent') this.#reschedulePendingProviderPlan(work.pending);
+			return null;
+		}
+		const pending = work.pending;
+		this.#providerWork.delete(work.agentId);
+		this.#providerRetryAfter.delete(work.agentId);
+		if (runtime === null || pending === null) return runtime;
+		const latest = this.#registry.get(work.agentId);
+		if (latest === null || latest.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) return runtime;
+		try {
+			if (pending.observation !== undefined) {
+				await this.#programRuntime.onObservation(latest, {
+					observation: pending.observation,
+					eventSequence: pending.eventSequence,
+					attention: pending.attention,
+					priority: pending.priority,
+					trigger: pending.trigger,
+				});
+			} else if (pending.attention) {
+				this.#programRuntime.notifyAttention(latest, { priority: pending.priority, trigger: pending.trigger });
+			}
+		} catch (error) {
+			await this.#reportAgentError(work.agentId, error);
+		}
+		return runtime;
+	}
+
+	async #failProviderPlan(work, record, error) {
+		if (this.#providerWork.get(work.agentId) !== work) return null;
+		const pending = work.pending;
+		this.#providerWork.delete(work.agentId);
+		const current = this.#registry.get(work.agentId);
+		const stale = current?.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
+		if (!stale) await this.#reportAgentError(record.agentId, error);
+		if (pending?.priority === 'urgent' || stale) this.#reschedulePendingProviderPlan(pending);
+		return null;
+	}
+
+	#reschedulePendingProviderPlan(request) {
+		if (request === null || request === undefined) return;
+		const record = this.#registry.get(request.agentId);
+		if (record === null || record.goalRevision !== request.goalRevision || !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		void this.#scheduleProviderPlan(record, request, { preserveState: request.preserveState === true, kind: request.kind ?? 'initial' });
 	}
 
 	#unbindBridge() {
@@ -412,14 +583,11 @@ export class DynamicCoordinator extends EventEmitter {
 		let reason = null;
 		if (['stop', 'disconnect', 'dead'].includes(message.payload.operation)) reason = `Goal ${message.payload.operation}`;
 		if (message.payload.operation === 'steer') reason = 'Goal steered';
-		if (reason === null) return Promise.resolve({ error: null });
+		if (reason === null) return;
 		try {
-			return Promise.resolve(this.#planner.interrupt(message.agentId, reason)).then(
-				() => ({ error: null }),
-				(error) => ({ error }),
-			);
+			Promise.resolve(this.#planner.interrupt(message.agentId, reason)).catch((error) => this.#reportAgentError(message.agentId, error));
 		} catch (error) {
-			return Promise.resolve({ error });
+			void this.#reportAgentError(message.agentId, error);
 		}
 	}
 
@@ -437,7 +605,42 @@ export class DynamicCoordinator extends EventEmitter {
 		if (message.payload.operation === 'queue') return;
 		const current = this.#registry.get(message.agentId);
 		if (current !== null && message.payload.goalRevision <= current.goalRevision) return;
+		this.#pendingAttention.delete(message.agentId);
+		this.#attentionFlushes.delete(message.agentId);
 		this.#advanceLifecycleGeneration(message.agentId);
+	}
+
+	#rememberPendingAttention(agentId, goalRevision, attention) {
+		const previous = this.#pendingAttention.get(agentId);
+		if (previous === undefined || previous.goalRevision !== goalRevision) {
+			this.#pendingAttention.set(agentId, { goalRevision, ...attention });
+			return;
+		}
+		const merged = mergeAttentionTrigger(previous, attention);
+		this.#pendingAttention.set(agentId, { goalRevision, ...merged });
+	}
+
+	#schedulePendingAttentionFlush(record) {
+		if (!this.#programRuntime.hasCurrent(record)) return;
+		const existing = this.#attentionFlushes.get(record.agentId);
+		if (existing?.goalRevision === record.goalRevision) return;
+		const token = { goalRevision: record.goalRevision };
+		this.#attentionFlushes.set(record.agentId, token);
+		setImmediate(() => {
+			if (this.#attentionFlushes.get(record.agentId) !== token) return;
+			this.#attentionFlushes.delete(record.agentId);
+			if (this.#stopping || this.#closed) return;
+			const current = this.#registry.get(record.agentId);
+			const pending = this.#pendingAttention.get(record.agentId);
+			if (current === null || pending?.goalRevision !== token.goalRevision || current.goalRevision !== token.goalRevision) return;
+			if (!this.#programRuntime.hasCurrent(current)) return;
+			try {
+				const notified = this.#programRuntime.notifyAttention(current, { priority: pending.priority, trigger: pending.trigger });
+				if (notified !== null) this.#pendingAttention.delete(record.agentId);
+			} catch (error) {
+				void this.#reportAgentError(record.agentId, error);
+			}
+		});
 	}
 
 	#isLifecycleGenerationCurrent(agentId, generation) {
@@ -839,6 +1042,40 @@ function safeClockRead(clock) {
 	} catch {
 		return null;
 	}
+}
+
+function classifyObservationTrigger(payload, observation) {
+	const explicitTrigger = typeof payload.trigger === 'string' && payload.trigger.trim().length > 0 ? payload.trigger.trim().slice(0, 128) : null;
+	const attention = payload.attention === true;
+	if (!attention && explicitTrigger === null) return { attention: false, priority: 'ordinary', trigger: 'observation' };
+	if (explicitTrigger !== null) return { attention: true, priority: payload.priority === 'urgent' ? 'urgent' : 'ordinary', trigger: explicitTrigger };
+	const changedFacts = Array.isArray(payload.changedFacts) ? payload.changedFacts : [];
+	const joinedFacts = changedFacts.filter((value) => typeof value === 'string').join('|').toLowerCase();
+	const player = observation?.player ?? {};
+	if (joinedFacts.includes('health') || joinedFacts.includes('attacker') || joinedFacts.includes('damage')) return { attention: true, priority: 'urgent', trigger: 'damage' };
+	if (joinedFacts.includes('lava')) return { attention: true, priority: 'urgent', trigger: 'lava' };
+	if (joinedFacts.includes('fire') || player.fire === true) return { attention: true, priority: 'urgent', trigger: 'fire' };
+	if (joinedFacts.includes('suffoc') || joinedFacts.includes('air')) return { attention: true, priority: 'urgent', trigger: 'suffocation' };
+	if (joinedFacts.includes('fall')) return { attention: true, priority: 'urgent', trigger: 'fall' };
+	if (Array.isArray(observation?.blocks) && observation.blocks.some((block) => typeof block?.blockId === 'string' && block.blockId.toLowerCase().includes('lava'))) return { attention: true, priority: 'urgent', trigger: 'lava' };
+	return { attention: true, priority: 'ordinary', trigger: 'attention' };
+}
+
+function mergeAttentionTrigger(previous, next) {
+	const priority = previous?.priority === 'urgent' || next?.priority === 'urgent' ? 'urgent' : 'ordinary';
+	const winner = next?.priority === priority ? next : previous;
+	return {
+		attention: previous?.attention === true || next?.attention !== false,
+		priority,
+		trigger: winner?.trigger ?? 'attention',
+	};
+}
+
+function mergePlannerRequest(previous, next) {
+	if (previous === null || previous === undefined) return next;
+	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
+	const winner = next.priority === priority ? next : previous;
+	return { ...next, priority, trigger: winner.trigger };
 }
 
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

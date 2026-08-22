@@ -116,6 +116,20 @@ test('coalesces unmatched continue policy notifications and ignores stale events
 	assert.deepEqual(dispatched.map((row) => row.action.type), ['wait']);
 });
 
+test('coalesced attention keeps the highest-priority trigger metadata', () => {
+	const { engine, modelRequests } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage' });
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: true, priority: 'ordinary', trigger: 'observation' });
+	assert.equal(modelRequests.length, 1);
+	assert.equal(modelRequests[0].priority, 'urgent');
+	assert.equal(modelRequests[0].trigger, 'damage');
+	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
+	assert.equal(modelRequests.length, 2);
+	assert.equal(modelRequests[1].priority, 'urgent');
+	assert.equal(modelRequests[1].trigger, 'damage');
+	assert.equal(modelRequests[1].eventSequence, 3);
+});
+
 test('requests one selected-model recovery after an identical deterministic action failure repeats', () => {
 	const { engine, dispatched, modelRequests } = engineFor(`
 		program.onUnhandledAttention("continue_and_notify");
@@ -134,6 +148,8 @@ test('requests one selected-model recovery after an identical deterministic acti
 	assert.equal(engine.snapshot().status, 'SUSPENDED');
 	assert.equal(modelRequests.length, 1);
 	assert.equal(modelRequests[0].decisionContext, 'program_action_failure');
+	assert.equal(modelRequests[0].priority, 'urgent');
+	assert.equal(modelRequests[0].trigger, 'action_failure');
 	assert.deepEqual({ ...modelRequests[0].actionFailure, arguments: { ...modelRequests[0].actionFailure.arguments } }, {
 		sourceStepId: second.provenance.stepId,
 		actionType: 'craft_inventory',

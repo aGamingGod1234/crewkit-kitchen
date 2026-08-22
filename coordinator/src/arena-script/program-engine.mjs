@@ -2,6 +2,10 @@ import { ArenaScriptInterpreter } from './interpreter.mjs';
 import { createInterpreterFacts } from './facts.mjs';
 import { SCRIPT_BINDINGS } from './minecraft-api.mjs';
 
+const ORDINARY_PRIORITY = 'ordinary';
+const URGENT_PRIORITY = 'urgent';
+const DEFAULT_ATTENTION_TRIGGER = 'attention';
+
 /** Runs one provenanced ArenaScript program without adding gameplay decisions. */
 export class ArenaScriptEngine {
 	#callbacks; #vm = null; #program = null; #facts = null; #eventSequence = -1; #factsSequence = -1; #generation = 0; #lifecycleEpoch = 0; #continuationEpoch = 0;
@@ -29,7 +33,7 @@ export class ArenaScriptEngine {
 		return this.#activate(target);
 	}
 
-	ingestObservation({ observation, eventSequence, attention = false } = {}) {
+	ingestObservation({ observation, eventSequence, attention = false, priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER } = {}) {
 		if (!this.#isLive() || !Number.isSafeInteger(eventSequence) || eventSequence < 0 || eventSequence < this.#eventSequence) return this.snapshot();
 		const mayResume = this.#pendingResult && eventSequence >= this.#pendingResult.eventSequence;
 		if (eventSequence === this.#eventSequence && !mayResume && this.#factsSequence >= eventSequence) return this.snapshot();
@@ -41,7 +45,14 @@ export class ArenaScriptEngine {
 		const edges = this.#updateWatchers();
 		if (this.#pendingResult && !this.#cancelling && eventSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
 		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
-		if (attention && edges === 0) this.#requestModel();
+		if (attention && edges === 0) this.#requestModel(null, { priority, trigger });
+		return this.snapshot();
+	}
+
+	/** Queues an external attention trigger against the current factual snapshot. */
+	notifyAttention({ priority = URGENT_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER } = {}) {
+		if (!this.#isLive() || this.#facts === null) return this.snapshot();
+		this.#requestModel(null, { priority, trigger });
 		return this.snapshot();
 	}
 
@@ -85,7 +96,7 @@ export class ArenaScriptEngine {
 	applyDirective(directive = {}) {
 		const request = this.#pendingRequest;
 		if (!request || !sameRequest(directive, request)) return this.snapshot();
-		if (this.#coalescedRequest && (this.#coalescedRequest.eventSequence > request.eventSequence || this.#coalescedRequest.factsSequence > request.factsSequence || this.#coalescedRequest.lifecycleEpoch !== request.lifecycleEpoch || this.#coalescedRequest.continuationEpoch !== request.continuationEpoch || this.#coalescedRequest.activeActionId !== request.activeActionId)) {
+		if (this.#coalescedRequest && !sameRequest(this.#coalescedRequest, request)) {
 			this.#pendingRequest = this.#coalescedRequest;
 			this.#callbacks.requestModel(this.#pendingRequest);
 			return this.snapshot();
@@ -146,7 +157,7 @@ export class ArenaScriptEngine {
 		this.#clear();
 	}
 
-	snapshot() { return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, generation: this.#generation, lifecycleEpoch: this.#lifecycleEpoch, continuationEpoch: this.#continuationEpoch, activeActionId: this.#active?.actionId ?? null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null }); }
+	snapshot() { const pending = this.#coalescedRequest ?? this.#pendingRequest; return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, generation: this.#generation, lifecycleEpoch: this.#lifecycleEpoch, continuationEpoch: this.#continuationEpoch, activeActionId: this.#active?.actionId ?? null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null, pendingRequestPriority: pending?.priority ?? null, pendingRequestTrigger: pending?.trigger ?? null }); }
 
 	#activate(target) {
 		const latestFacts = this.#facts && this.#factsSequence > target.factsSequence ? this.#facts : target.facts;
@@ -226,9 +237,12 @@ export class ArenaScriptEngine {
 		} else this.#handleYield(this.#vm.runWatcherHandler(latch.watcherId, latch.facts), watcherExecution(latch));
 	}
 
-	#requestModel(actionFailure = null) {
-		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts, actionFailure);
-		if (this.#pendingRequest) { this.#coalescedRequest = context; return; }
+	#requestModel(actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER } = {}) {
+		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts, actionFailure, { priority, trigger });
+		if (this.#pendingRequest) {
+			this.#coalescedRequest = mergeRequestContexts(this.#coalescedRequest ?? this.#pendingRequest, context);
+			return;
+		}
 		this.#pendingRequest = context;
 		this.#coalescedRequest = context;
 		if (actionFailure === null) this.#emitTrace('attention_unhandled', { eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, programId: this.#program.programId, version: this.#program.version });
@@ -242,7 +256,22 @@ export class ArenaScriptEngine {
 		this.#transition = { kind: 'terminal', status: 'SUSPENDED', reason: 'unhandled_attention' };
 		if (this.#active) this.#cancelActive('unhandled_attention'); else this.#completeTransition();
 	}
-	#fencePendingRequest() { if (this.#pendingRequest) this.#coalescedRequest = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts); }
+	#fencePendingRequest() {
+		if (!this.#pendingRequest) return;
+		const pending = this.#coalescedRequest ?? this.#pendingRequest;
+		this.#coalescedRequest = requestContext(
+			this.#program,
+			this.#generation,
+			this.#lifecycleEpoch,
+			this.#continuationEpoch,
+			this.#active?.actionId ?? null,
+			this.#eventSequence,
+			this.#factsSequence,
+			this.#facts,
+			pending.actionFailure ?? null,
+			{ priority: pending.priority, trigger: pending.trigger },
+		);
+	}
 	#refreshInstalledFacts(target) {
 		if (target.eventSequence < this.#eventSequence || target.factsSequence < this.#factsSequence) return this.snapshot();
 		this.#facts = target.facts; this.#factsSequence = target.factsSequence;
@@ -300,7 +329,7 @@ export class ArenaScriptEngine {
 				arguments: yielded.failure.arguments,
 				state: yielded.failure.state,
 				reasonCode: yielded.failure.reasonCode,
-			}));
+			}), { priority: URGENT_PRIORITY, trigger: 'action_failure' });
 			return;
 		}
 		if (yielded.kind === 'idle' && !this.#active && this.#boundary.length > 0) return this.#runBoundary();
@@ -340,7 +369,7 @@ function installationRelation(next, current) {
 	return next.eventSequence > current.eventSequence ? 0 : -1;
 }
 function sameImmutableProgram(next, current) { return next.agentId === current.agentId && next.modelIdentity === current.modelIdentity && next.programId === current.programId && next.compiled === current.compiled && next.compiled.source === current.compiled.source; }
-function requestContext(program, generation, lifecycleEpoch, continuationEpoch, activeActionId, eventSequence, factsSequence, observation, actionFailure = null) {
+function requestContext(program, generation, lifecycleEpoch, continuationEpoch, activeActionId, eventSequence, factsSequence, observation, actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER } = {}) {
 	return freezeRecord({
 		agentId: program.agentId,
 		goalRevision: program.goalRevision,
@@ -354,10 +383,32 @@ function requestContext(program, generation, lifecycleEpoch, continuationEpoch, 
 		eventSequence,
 		factsSequence,
 		observation,
+		priority: normalizePriority(priority),
+		trigger: normalizeTrigger(trigger),
 		...(actionFailure === null ? {} : { decisionContext: 'program_action_failure', actionFailure }),
 	});
 }
-function sameRequest(value, request) { return value && ['agentId', 'goalRevision', 'modelIdentity', 'programId', 'version', 'generation', 'lifecycleEpoch', 'continuationEpoch', 'activeActionId', 'eventSequence', 'factsSequence'].every((key) => value[key] === request[key]); }
+function mergeRequestContexts(previous, next) {
+	const priority = previous.priority === URGENT_PRIORITY || next.priority === URGENT_PRIORITY ? URGENT_PRIORITY : ORDINARY_PRIORITY;
+	const winner = next.priority === priority ? next : previous;
+	const merged = { ...next, priority, trigger: winner.trigger };
+	if (winner.actionFailure !== undefined) {
+		merged.decisionContext = winner.decisionContext;
+		merged.actionFailure = winner.actionFailure;
+	} else if (priority === ORDINARY_PRIORITY) {
+		delete merged.decisionContext;
+		delete merged.actionFailure;
+	}
+	return freezeRecord(merged);
+}
+function sameRequest(value, request) {
+	return value && [
+		'agentId', 'goalRevision', 'modelIdentity', 'programId', 'version', 'generation', 'lifecycleEpoch',
+		'continuationEpoch', 'activeActionId', 'eventSequence', 'factsSequence', 'priority', 'trigger',
+	].every((key) => value[key] === request[key]);
+}
 function watcherExecution(authority, executionFactsSequence = authority.eventSequence) { return freezeRecord({ authority, executionFactsSequence }); }
 function watcherMode(compiled, index) { const watches = []; for (const statement of compiled.ast.body) { const call = statement.type === 'ExpressionStatement' ? statement.expression : null; if (call?.type === 'CallExpression' && call.callee.type === 'MemberExpression' && call.callee.object.name === 'program' && call.callee.property.name === 'watch') watches.push(call); } return watches[index]?.arguments[1]?.properties?.find((property) => property.key.name === 'mode')?.value?.value ?? 'boundary'; }
 function freezeRecord(values) { return Object.freeze(Object.assign(Object.create(null), values)); }
+function normalizePriority(value) { return value === URGENT_PRIORITY ? URGENT_PRIORITY : ORDINARY_PRIORITY; }
+function normalizeTrigger(value) { return typeof value === 'string' && value.trim().length > 0 ? value.trim().slice(0, 128) : DEFAULT_ATTENTION_TRIGGER; }

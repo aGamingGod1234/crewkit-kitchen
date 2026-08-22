@@ -202,6 +202,55 @@ test('does not submit a duplicate initial plan while the agent already has a sch
 	}
 });
 
+test('keeps lifecycle intake responsive while an initial provider turn is pending', async () => {
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const run = await start();
+	run.planner.requestPlan = async (request) => {
+		run.planner.requests.push(request);
+		await gate;
+		return { summary: 'Wait.', directive: 'replace', source: SOURCE };
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.planner.requests.length === 1);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Stop waiting.' } });
+		await eventually(() => run.registry.get('agent-a')?.goalRevision === 2);
+		release();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'action_command'), false, 'the stale initial result cannot install after steering');
+	} finally {
+		release();
+		await run.coordinator.stop();
+	}
+});
+
+test('reissues the newest lifecycle plan after an older provider turn settles', async () => {
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const run = await start();
+	run.planner.requestPlan = async (request) => {
+		run.planner.requests.push(request);
+		if (request.goalRevision === 1) await gate;
+		return { summary: 'Wait.', directive: 'replace', source: SOURCE };
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.planner.requests.length === 1);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Stop waiting.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 2, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.registry.get('agent-a')?.goalRevision === 2);
+		release();
+		await eventually(() => run.planner.requests.length === 2);
+		assert.equal(run.planner.requests[1].goalRevision, 2);
+	} finally {
+		release();
+		await run.coordinator.stop();
+	}
+});
+
 test('installs a selected-model program and continues its next primitive without another provider turn', async () => {
 	const run = await start();
 	try {

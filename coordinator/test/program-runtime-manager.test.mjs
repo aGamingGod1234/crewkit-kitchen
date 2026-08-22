@@ -251,6 +251,28 @@ test('serializes coalesced reactive planner requests for one program', async () 
 	scheduler.close();
 });
 
+test('passes urgent trigger metadata through a coalesced reactive planner turn', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const requests = [];
+	let release;
+	const first = new Promise((resolve) => { release = resolve; });
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner: { requestPlan: async (request) => { requests.push(request); if (requests.length === 1) return first; return { directive: 'continue', summary: 'continue' }; } },
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: true, priority: 'ordinary', trigger: 'observation' });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3, attention: true, priority: 'urgent', trigger: 'damage' });
+	release({ directive: 'continue', summary: 'continue' });
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(requests[1].planningPriority, 'urgent');
+	assert.equal(requests[1].priority, 'urgent');
+	assert.match(requests[1].input, /"attentionPriority":"urgent"/);
+	assert.match(requests[1].input, /"attentionTrigger":"damage"/);
+});
+
 test('measures one thousand watcher branches with the real monotonic clock', async () => {
 	const registry = new AgentRegistry();
 	for (const agentId of ['agent-a', 'agent-b', 'agent-c', 'agent-d']) registry.register(record(agentId));
