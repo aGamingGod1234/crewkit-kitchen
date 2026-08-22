@@ -215,6 +215,37 @@ test('does not submit a duplicate initial plan while the agent already has a sch
 	}
 });
 
+test('retains an urgent observation while an ordinary provider turn is queued behind scheduler capacity', async () => {
+	let releaseBlocker;
+	const blocker = new Promise((resolve) => { releaseBlocker = resolve; });
+	let attempts = 0;
+	const provider = realPlannerProvider(async (input) => {
+		attempts += 1;
+		assert.match(input, /damage|health/i);
+		return { summary: 'Respond.', directive: 'replace', source: SOURCE };
+	});
+	const registry = new AgentRegistry();
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 4 });
+	const planner = new AgentPlanner({ registry, scheduler, codexService: provider });
+	const run = await start({ registry, scheduler, planner, codexService: provider });
+	try {
+		scheduler.schedule('blocking-agent', async () => blocker);
+		await eventually(() => scheduler.activeAgentIds.includes('blocking-agent'));
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
+		await eventually(() => scheduler.pendingAgentIds.includes('agent-a'));
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, attention: true, changedFacts: ['player.health'], observation: { player: { x: 0, y: 64, z: 0, health: 18 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
+		await new Promise((resolve) => setImmediate(resolve));
+		releaseBlocker();
+		await eventually(() => attempts === 1 && run.bridge.sent.some((message) => message.type === 'action_command'));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+		assert.equal(run.bridge.sent.find((message) => message.type === 'action_command').payload.goalRevision, 1);
+	} finally {
+		releaseBlocker();
+		await run.coordinator.stop();
+	}
+});
+
 test('keeps lifecycle intake responsive while an initial provider turn is pending', async () => {
 	let release;
 	const gate = new Promise((resolve) => { release = resolve; });

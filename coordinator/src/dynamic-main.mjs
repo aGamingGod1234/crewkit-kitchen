@@ -458,6 +458,10 @@ export class DynamicCoordinator extends EventEmitter {
 				return;
 			}
 			if (request.priority === 'urgent' && existing.request.priority !== 'urgent' && this.#scheduler.pendingAgentIds?.includes(record.agentId)) {
+				// Retain the urgent payload before cancellation settles. The scheduler
+				// may reject the queued turn immediately, so interruption alone cannot
+				// be the handoff mechanism for the replacement request.
+				existing.pending = mergePlannerRequest(existing.pending, request);
 				void Promise.resolve(this.#planner.interrupt(record.agentId, 'Urgent planning trigger')).catch(() => {});
 				return;
 			}
