@@ -14,7 +14,7 @@ param(
     [string] $OptimizedRunnerPath,
     [switch] $NeutralRunner,
     [Alias('RunnerArgs')]
-    [string[]] $RunnerArguments = @(),
+    [string[]] $RunnerArguments = @('__LATENCY_AB_NO_ARGS__'),
     [Alias('BaselineArguments')]
     [AllowNull()]
     [AllowEmptyCollection()]
@@ -240,20 +240,20 @@ function Get-ArmExecutionConfig {
     param(
         [Parameter(Mandatory = $true)] [ValidateSet('baseline', 'optimized')] [string] $ArmName,
         [Parameter(Mandatory = $true)] [ValidateRange(1, 16)] [int] $PlanningConcurrency,
-        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [string[]] $RunnerArguments,
+        [Parameter(Mandatory = $true)] [AllowNull()] [AllowEmptyCollection()] [string[]] $RunnerArguments,
         [AllowNull()] [string] $ReplayRecordingsPath
     )
     $raw = [ordered]@{
         arm = $ArmName
         planningConcurrency = $PlanningConcurrency
         replayRecordingsPath = $ReplayRecordingsPath
-        runnerArguments = @($RunnerArguments)
+        runnerArguments = if ($null -eq $RunnerArguments) { @() } else { @($RunnerArguments) }
     }
     $canonical = ConvertTo-CanonicalJsonValue $raw
     $json = $canonical | ConvertTo-Json -Depth 30 -Compress
     return [pscustomobject]@{
         Raw = $raw
-        Redacted = [ordered]@{ arm = $ArmName; planningConcurrency = $PlanningConcurrency; replayRecordingsPath = ConvertTo-RedactedValue $ReplayRecordingsPath 'replayRecordingsPath'; runnerArguments = ConvertTo-RedactedRunnerArguments $RunnerArguments }
+        Redacted = [ordered]@{ arm = $ArmName; planningConcurrency = $PlanningConcurrency; replayRecordingsPath = ConvertTo-RedactedValue $ReplayRecordingsPath 'replayRecordingsPath'; runnerArguments = ConvertTo-RedactedRunnerArguments @($RunnerArguments) }
         Sha256 = Get-Sha256Bytes ([Text.Encoding]::UTF8.GetBytes($json))
     }
 }
@@ -598,18 +598,18 @@ function Get-ArmRunnerArguments {
         [AllowNull()] [AllowEmptyCollection()] [string[]] $BaselineArguments,
         [AllowNull()] [AllowEmptyCollection()] [string[]] $OptimizedArguments
     )
-    if ($ArmName -eq 'baseline' -and $null -ne $BaselineArguments) { return @($BaselineArguments) }
-    if ($ArmName -eq 'optimized' -and $null -ne $OptimizedArguments) { return @($OptimizedArguments) }
-    return @($CommonArguments)
+    if ($ArmName -eq 'baseline' -and $null -ne $BaselineArguments) { return @($BaselineArguments | Where-Object { $_ -ne '__LATENCY_AB_NO_ARGS__' -and -not [string]::IsNullOrEmpty([string]$_) }) }
+    if ($ArmName -eq 'optimized' -and $null -ne $OptimizedArguments) { return @($OptimizedArguments | Where-Object { $_ -ne '__LATENCY_AB_NO_ARGS__' -and -not [string]::IsNullOrEmpty([string]$_) }) }
+    return @($CommonArguments | Where-Object { $_ -ne '__LATENCY_AB_NO_ARGS__' -and -not [string]::IsNullOrEmpty([string]$_) })
 }
 
 function Get-RunnerInvocationArguments {
     param(
         [Parameter(Mandatory = $true)] [object] $CommandPlan,
-        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [string[]] $UserRunnerArguments,
+        [Parameter(Mandatory = $true)] [AllowNull()] [AllowEmptyCollection()] [string[]] $UserRunnerArguments,
         [Parameter(Mandatory = $true)] [object] $Context
     )
-    $expanded = @($UserRunnerArguments | ForEach-Object { Expand-RunnerArgument -Argument ([string]$_) -Context $Context })
+    $expanded = @($UserRunnerArguments | Where-Object { $_ -ne '__LATENCY_AB_NO_ARGS__' -and -not [string]::IsNullOrEmpty([string]$_) } | ForEach-Object { Expand-RunnerArgument -Argument ([string]$_) -Context $Context })
     if ([string]$CommandPlan.Kind -eq 'node') {
         # The real latency-runner-cli emits one bounded JSON result on stdout
         # and owns its artifact directory. Keep its native flag contract here;
@@ -1033,7 +1033,7 @@ function Invoke-OneLatencyArm {
         [AllowNull()] [string] $ReplayRecordingsPath,
         [Parameter(Mandatory = $true)] [int] $TimeoutSeconds,
         [Parameter(Mandatory = $true)] [int] $Retries,
-        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [string[]] $UserRunnerArguments,
+        [Parameter(Mandatory = $true)] [AllowNull()] [AllowEmptyCollection()] [string[]] $UserRunnerArguments,
         [Parameter(Mandatory = $true)] [string] $MatrixPathValue,
         [Parameter(Mandatory = $true)] [string] $EffectiveMatrixPath,
         [Parameter(Mandatory = $true)] [string] $ArmRoot,
@@ -1183,7 +1183,7 @@ function Invoke-LatencyAbExperiment {
         [AllowNull()] [string] $OptimizedRunnerPath,
         [switch] $NeutralRunner,
         [string] $MatrixPath = 'coordinator\config\latency-matrix.json',
-        [string[]] $RunnerArguments = @(),
+        [AllowNull()] [object] $RunnerArguments = '__LATENCY_AB_NO_ARGS__',
         [AllowNull()] [AllowEmptyCollection()] [string[]] $BaselineRunnerArguments,
         [AllowNull()] [AllowEmptyCollection()] [string[]] $OptimizedRunnerArguments,
         [ValidateRange(1, 16)] [int] $BaselinePlanningConcurrency = 16,
@@ -1226,8 +1226,9 @@ function Invoke-LatencyAbExperiment {
     $baselineReplayPath = Resolve-OptionalReplayRecordingsPath -RequestedPath $BaselineReplayRecordingsPath -WorktreePath $resolvedBaseline
     $optimizedReplayPath = Resolve-OptionalReplayRecordingsPath -RequestedPath $OptimizedReplayRecordingsPath -WorktreePath $resolvedOptimized
     $selection = Normalize-Selection -Modes $Mode -ProviderValues $Providers
-    $baselineArguments = Get-ArmRunnerArguments -ArmName 'baseline' -CommonArguments $RunnerArguments -BaselineArguments $BaselineRunnerArguments -OptimizedArguments $OptimizedRunnerArguments
-    $optimizedArguments = Get-ArmRunnerArguments -ArmName 'optimized' -CommonArguments $RunnerArguments -BaselineArguments $BaselineRunnerArguments -OptimizedArguments $OptimizedRunnerArguments
+    $commonRunnerArguments = if ($null -eq $RunnerArguments) { @() } else { @($RunnerArguments) }
+    $baselineArguments = Get-ArmRunnerArguments -ArmName 'baseline' -CommonArguments $commonRunnerArguments -BaselineArguments $BaselineRunnerArguments -OptimizedArguments $OptimizedRunnerArguments
+    $optimizedArguments = Get-ArmRunnerArguments -ArmName 'optimized' -CommonArguments $commonRunnerArguments -BaselineArguments $BaselineRunnerArguments -OptimizedArguments $OptimizedRunnerArguments
     $baselineConfig = Get-ArmExecutionConfig -ArmName 'baseline' -PlanningConcurrency $BaselinePlanningConcurrency -RunnerArguments $baselineArguments -ReplayRecordingsPath $baselineReplayPath
     $optimizedConfig = Get-ArmExecutionConfig -ArmName 'optimized' -PlanningConcurrency $OptimizedPlanningConcurrency -RunnerArguments $optimizedArguments -ReplayRecordingsPath $optimizedReplayPath
     $runSeed = [Math]::Abs([int64]$Seed)
@@ -1369,5 +1370,12 @@ function Invoke-LatencyAbExperiment {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-    Invoke-LatencyAbExperiment -BaselinePath $BaselinePath -OptimizedPath $OptimizedPath -RunnerPath $RunnerPath -BaselineRunnerPath $BaselineRunnerPath -OptimizedRunnerPath $OptimizedRunnerPath -NeutralRunner:$NeutralRunner -MatrixPath $MatrixPath -RunnerArguments $RunnerArguments -BaselineRunnerArguments $BaselineRunnerArguments -OptimizedRunnerArguments $OptimizedRunnerArguments -BaselinePlanningConcurrency $BaselinePlanningConcurrency -OptimizedPlanningConcurrency $OptimizedPlanningConcurrency -BaselineReplayRecordingsPath $BaselineReplayRecordingsPath -OptimizedReplayRecordingsPath $OptimizedReplayRecordingsPath -OutputRoot $OutputRoot -OuterTimeoutSeconds $OuterTimeoutSeconds -MaxRetries $MaxRetries -Mode $Mode -Providers $Providers -RequireLive:$RequireLive -RequireProviders:$RequireProviders -Seed $Seed -MaxOutputBytes $MaxOutputBytes -MaxResultBytes $MaxResultBytes -KeepArtifacts:$KeepArtifacts
+    $invokeArgs = @{}
+    foreach ($key in $PSBoundParameters.Keys) {
+        if ($key -notin @('RunnerArguments','BaselineRunnerArguments','OptimizedRunnerArguments')) { $invokeArgs[$key] = $PSBoundParameters[$key] }
+    }
+    if ($null -ne $RunnerArguments -and @($RunnerArguments).Count -gt 0) { $invokeArgs.RunnerArguments = @($RunnerArguments) }
+    if ($null -ne $BaselineRunnerArguments) { $invokeArgs.BaselineRunnerArguments = @($BaselineRunnerArguments) }
+    if ($null -ne $OptimizedRunnerArguments) { $invokeArgs.OptimizedRunnerArguments = @($OptimizedRunnerArguments) }
+    Invoke-LatencyAbExperiment @invokeArgs
 }

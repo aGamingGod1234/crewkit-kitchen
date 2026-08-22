@@ -112,6 +112,19 @@ try {
     Assert-Fixture ((Get-Content -Raw -LiteralPath (Join-Path ([string]$firstManifest.runRoot) 'manifest.json')) -match '"status"\s*:\s*"passed"') 'Manifest artifact was not written.'
     Assert-Fixture ((Get-Content -Raw -LiteralPath "$statePath.max") -match 'maxActive=1') 'Fixture observed overlapping arm processes.'
 
+    $noArgsArtifactRoot = Join-Path $fixtureRoot 'artifacts-no-args'
+    New-Item -ItemType Directory -Force -Path $noArgsArtifactRoot | Out-Null
+    $noArgs = $common.Clone()
+    $noArgs.OutputRoot = $noArgsArtifactRoot
+    $noArgs.Remove('RunnerArguments')
+    $noArgs.Remove('BaselineRunnerArguments')
+    $noArgs.Remove('OptimizedRunnerArguments')
+    $noArgs.Remove('BaselineReplayRecordingsPath')
+    $noArgs.Remove('OptimizedReplayRecordingsPath')
+    $noArgsOutput = @( & $orchestratorPath @noArgs )
+    $noArgsManifest = Get-ManifestFromOutput $noArgsOutput
+    Assert-Fixture ([string]$noArgsManifest.Status -eq 'passed') 'Omitted runner argument arrays were not accepted by the real interface.'
+
     $secondArtifactRoot = Join-Path $fixtureRoot 'artifacts-second'
     New-Item -ItemType Directory -Force -Path $secondArtifactRoot | Out-Null
     $secondCommon = $common.Clone()
