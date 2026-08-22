@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { readFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,6 +26,7 @@ import { adaptObservation } from './observation-adapter.mjs';
 import { advanceContextCursor, buildPlannerInput, createContextCursor } from './prompts.mjs';
 import { profileFingerprint } from './provider-session.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
+import { NativeToolRuntime } from './native-tool-runtime.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { TraceWriter } from './trace-writer.mjs';
@@ -66,6 +68,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#contextCursors = new Map();
 	#conversationWakeTransactions = new Map();
 	#programRuntime;
+	#nativeRuntime;
+	#codexControlProtocol;
 	#reconciliation = Promise.resolve();
 	#started = false;
 	#stopping = false;
@@ -83,7 +87,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#serverInstanceId = null;
 	#traceWriter;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, traceWriter = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, codexControlProtocol = 'arena_script', traceWriter = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -94,6 +98,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#latencyRegistry = requireDependency(latencyRegistry, 'latencyRegistry');
 		if (traceWriter !== null && typeof traceWriter.write !== 'function') throw new TypeError('traceWriter.write must be a function');
 		this.#traceWriter = traceWriter;
+		if (!['arena_script', 'native_tools'].includes(codexControlProtocol)) throw new TypeError('codexControlProtocol must be arena_script or native_tools');
+		this.#codexControlProtocol = codexControlProtocol;
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
 		if (typeof epochNow !== 'function') throw new TypeError('epochNow must be a function');
 		this.#controlNow = controlNow;
@@ -109,6 +115,19 @@ export class DynamicCoordinator extends EventEmitter {
 			plannerContext: (agentId) => this.#plannerContext(agentId),
 			clock: () => this.#controlNow(),
 			benchmarkRecorder,
+		});
+		this.#nativeRuntime = new NativeToolRuntime({
+			bridge: this.#bridge,
+			trace: (event, fields) => this.#writeTrace(event, fields),
+			onFinish: async ({ record, result }) => {
+				const current = this.#registry.get(record.agentId);
+				if (current === null || current.goalRevision !== record.goalRevision) return;
+				if (result.state === 'COMPLETED') this.#registry.setState(record.agentId, DynamicAgentState.COMPLETED, { goalRevision: record.goalRevision });
+				if (result.state === 'IMPOSSIBLE') this.#registry.setState(record.agentId, DynamicAgentState.ERROR, {
+					goalRevision: record.goalRevision,
+					error: { code: 'GOAL_IMPOSSIBLE', message: 'The selected model reported this goal as impossible' },
+				});
+			},
 		});
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
@@ -152,6 +171,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#attentionFlushes.clear();
 		this.#lifecycleGenerations.clear();
 		this.#programRuntime.disposeAll();
+		await this.#nativeRuntime.disposeAll();
 		this.#providerRetryAfter.clear();
 		this.#factLedgers.clear();
 		this.#conversationMemories.clear();
@@ -185,6 +205,7 @@ export class DynamicCoordinator extends EventEmitter {
 				if (record === null) throw new ProtocolV2Error('UNKNOWN_AGENT', `Reconciled provider profile references unknown agent '${profile.agentId}'`);
 				await this.#bridge.send('agent_ready', profile.agentId, { goalRevision: record.goalRevision, reconciled: true });
 				this.#supportedAgentIds.add(profile.agentId);
+				this.#prewarmNativeAgent(record);
 				if (record.state === DynamicAgentState.DEAD) await this.#installDeadStatePlan(record, record.death);
 			}
 			for (const invalid of providers.invalid) {
@@ -214,11 +235,13 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#codexService.catalog.assertSupported(record.provider, record.model, record.reasoningEffort, record.serviceTier ?? DEFAULT_SERVICE_TIER);
 			await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision, reconciled: false });
 			this.#supportedAgentIds.add(record.agentId);
+			this.#prewarmNativeAgent(record);
 			await this.#publishStatus();
 		}));
 		this.#listen('agent_removed', (message) => this.#run(async () => {
 			await this.#reconciliation;
 			this.#programRuntime.dispose(message.agentId);
+			await this.#nativeRuntime.dispose(message.agentId, 'agent_removed');
 			this.#providerWork.delete(message.agentId);
 			this.#pendingAttention.delete(message.agentId);
 			this.#attentionFlushes.delete(message.agentId);
@@ -236,13 +259,19 @@ export class DynamicCoordinator extends EventEmitter {
 			const orderedRespawn = message.payload.operation === 'respawn';
 			if (!orderedRespawn) this.#invalidateLifecycleWork(message);
 			const previous = this.#registry.get(message.agentId);
-			if (!orderedRespawn && previous !== null && message.payload.operation !== 'queue') this.#programRuntime.onGoalControl(previous, message.payload.operation);
+			if (!orderedRespawn && previous !== null && message.payload.operation !== 'queue') {
+				this.#programRuntime.onGoalControl(previous, message.payload.operation);
+				void this.#nativeRuntime.dispose(previous.agentId, `goal_${message.payload.operation}`);
+			}
 			this.#beginGoalControlInterruption(message);
 			this.#enqueueAgent(message.agentId, async () => {
 				if (orderedRespawn) {
 					this.#invalidateLifecycleWork(message);
 					const orderedPrevious = this.#registry.get(message.agentId);
-					if (orderedPrevious !== null) this.#programRuntime.onGoalControl(orderedPrevious, message.payload.operation);
+					if (orderedPrevious !== null) {
+						this.#programRuntime.onGoalControl(orderedPrevious, message.payload.operation);
+						await this.#nativeRuntime.dispose(orderedPrevious.agentId, 'goal_respawn');
+					}
 				}
 				const record = this.#registry.applyGoalControl(message.agentId, message.payload);
 				if (message.payload.operation !== 'queue') {
@@ -269,7 +298,8 @@ export class DynamicCoordinator extends EventEmitter {
 				const record = this.#registry.get(message.agentId);
 				if (record !== null) {
 					this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation' });
-					this.#schedulePendingAttentionFlush(record);
+					if (this.#usesNativeTools(record)) this.#scheduleNativeConversation(record, message.payload, 'conversation');
+					else this.#schedulePendingAttentionFlush(record);
 				}
 				this.emit('conversationEvent', message);
 			}, { waitForReconciliation: false });
@@ -285,7 +315,8 @@ export class DynamicCoordinator extends EventEmitter {
 					const record = this.#registry.applyConversationWake(message.agentId, message.payload.control);
 					this.#providerRetryAfter.delete(message.agentId);
 					this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation_wake' });
-					this.#schedulePendingAttentionFlush(record);
+					if (this.#usesNativeTools(record)) this.#scheduleNativeConversation(record, message.payload.event, 'conversation_wake');
+					else this.#schedulePendingAttentionFlush(record);
 					await this.#bridge.send('conversation_wake_ack', message.agentId, {
 						transactionId: message.payload.transactionId,
 						goalRevision: record.goalRevision,
@@ -304,10 +335,14 @@ export class DynamicCoordinator extends EventEmitter {
 					if (error instanceof AgentRegistryError && ['STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION', 'INVALID_AGENT_STATE'].includes(error.code)) return;
 					throw error;
 				}
-				if (previous !== null && record.goalRevision > previous.goalRevision) this.#programRuntime.onGoalControl(previous, 'start');
+				if (previous !== null && record.goalRevision > previous.goalRevision) {
+					this.#programRuntime.onGoalControl(previous, 'start');
+					await this.#nativeRuntime.dispose(previous.agentId, 'conversation_wake');
+				}
 				this.#providerRetryAfter.delete(message.agentId);
 				this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation_wake' });
-				this.#schedulePendingAttentionFlush(record);
+				if (this.#usesNativeTools(record)) this.#scheduleNativeConversation(record, message.payload.event, 'conversation_wake');
+				else this.#schedulePendingAttentionFlush(record);
 				this.#rememberConversationWake(message.payload.transactionId, message.agentId, fingerprint);
 				await this.#bridge.send('conversation_wake_ack', record.agentId, {
 					transactionId: message.payload.transactionId,
@@ -336,6 +371,23 @@ export class DynamicCoordinator extends EventEmitter {
 				if (pendingAttention?.goalRevision === record.goalRevision) this.#pendingAttention.delete(record.agentId);
 				const ledger = this.#ledger(record.agentId);
 				ledger.ingest('observation', wireObservation);
+				if (this.#usesNativeTools(record)) {
+					const conversation = this.#conversationMemory(record.agentId).delta(null).entries.slice(-4);
+					this.#nativeRuntime.updateObservation(record, observation, { eventSequence: message.payload.eventSequence, conversation });
+					this.#scheduleNativeTurn(record, {
+						agentId: record.agentId,
+						goalRevision: record.goalRevision,
+						observation,
+						eventSequence: message.payload.eventSequence,
+						priority: attention.priority,
+						trigger: attention.trigger,
+						lifecycleGeneration,
+						input: buildNativeEventInput(record, {
+							event: 'observation', trigger: attention.trigger, observation, conversation,
+						}),
+					});
+					return;
+				}
 				const installed = await this.#programRuntime.onObservation(record, {
 					observation,
 					eventSequence: message.payload.eventSequence,
@@ -377,6 +429,10 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listen('action_progress', (message) => {
 			this.#enqueueAgent(message.agentId, async () => {
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
+			if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionProgress(record, message.payload)) {
+				this.emit('actionProgress', message);
+				return;
+			}
 			if (!this.#programRuntime.onActionProgress(record, message.payload)) throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
 			this.emit('actionProgress', message);
 			});
@@ -387,6 +443,10 @@ export class DynamicCoordinator extends EventEmitter {
 			if (current === null || message.payload.goalRevision !== current.goalRevision) return;
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 			this.#ledger(record.agentId).ingest('action_result', message.payload);
+			if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionResult(record, message.payload)) {
+				this.emit('actionResult', message);
+				return;
+			}
 			if (!await this.#programRuntime.onActionResult(record, message.payload)) {
 				if (this.#programRuntime.isActionResultStale(record, message.payload)) return;
 				throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
@@ -398,6 +458,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#enqueueAgent(message.agentId, async () => {
 				const current = this.#registry.get(message.agentId);
 				if (current === null || current.goalRevision !== message.payload.goalRevision) return;
+				if (this.#usesNativeTools(current) && this.#nativeRuntime.onCompletionResult(current, message.payload)) return;
 				const accepted = this.#programRuntime.onCompletionResult(current, message.payload);
 				if (!accepted) throw new ProtocolV2Error('UNEXPECTED_COMPLETION_RESULT', `Agent '${message.agentId}' has no matching completion request`);
 			});
@@ -409,6 +470,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
 			this.#programRuntime.disposeAll();
+			void this.#nativeRuntime.disposeAll('bridge_disconnected');
 			this.#pendingAttention.clear();
 			this.#attentionFlushes.clear();
 			this.#providerRetryAfter.clear();
@@ -455,6 +517,186 @@ export class DynamicCoordinator extends EventEmitter {
 				death,
 			}),
 		}, { preserveState: true, kind: 'death' });
+	}
+
+	#usesNativeTools(record) {
+		return this.#codexControlProtocol === 'native_tools' && record?.provider === 'codex';
+	}
+
+	#prewarmNativeAgent(record) {
+		if (!this.#usesNativeTools(record) || typeof this.#codexService.prewarmAgent !== 'function') return;
+		void Promise.resolve(this.#codexService.prewarmAgent(record, { goalRevision: record.goalRevision })).catch((error) => {
+			this.#writeTrace('native_prewarm_failed', {
+				agentId: record.agentId,
+				goalRevision: record.goalRevision,
+				errorCode: String(error?.code ?? 'PREWARM_FAILED').slice(0, 128),
+			});
+		});
+	}
+
+	#scheduleNativeConversation(record, event, trigger) {
+		if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
+		const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
+		const conversation = this.#conversationMemory(record.agentId).delta(null).entries.slice(-4);
+		this.#scheduleNativeTurn(record, {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			priority: 'urgent',
+			trigger,
+			lifecycleGeneration,
+			input: buildNativeEventInput(record, {
+				event: event?.kind ?? 'conversation',
+				trigger,
+				observation: {},
+				conversation,
+			}),
+		});
+	}
+
+	#scheduleNativeTurn(record, request) {
+		if (!this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		const existing = this.#providerWork.get(record.agentId);
+		if (existing !== undefined) {
+			if (
+				existing.kind === 'native'
+				&& existing.goalRevision === request.goalRevision
+				&& existing.lifecycleGeneration === request.lifecycleGeneration
+				&& request.priority === 'urgent'
+			) {
+				this.#queueNativeSteer(existing, request);
+				return existing.promise;
+			}
+			existing.pending = mergePlannerRequest(existing.pending, request);
+			return existing.promise;
+		}
+		const work = {
+			agentId: record.agentId,
+			goalRevision: record.goalRevision,
+			lifecycleGeneration: request.lifecycleGeneration,
+			kind: 'native',
+			request,
+			pending: null,
+			steerQueued: null,
+			steerPromise: null,
+			traceId: planningTraceId(record.agentId, record.goalRevision, request.lifecycleGeneration, 'native'),
+			promise: null,
+		};
+		this.#providerWork.set(record.agentId, work);
+		if (record.state === DynamicAgentState.STARTING) this.#registry.setState(record.agentId, DynamicAgentState.PLANNING, { goalRevision: record.goalRevision });
+		void this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING })
+			.catch((error) => this.#reportAgentError(record.agentId, error));
+		work.promise = Promise.resolve()
+			.then(() => this.#planner.requestNativeTurn({
+				agentId: record.agentId,
+				goalRevision: record.goalRevision,
+				input: request.input,
+				recoverySummary: record.lastSummary,
+				priority: request.priority,
+				traceId: work.traceId,
+				executeTool: (toolRequest) => this.#executeNativeTool(work, toolRequest),
+			}))
+			.then((result) => this.#completeNativeTurn(work, result), (error) => this.#failNativeTurn(work, error));
+		return work.promise;
+	}
+
+	#queueNativeSteer(work, request) {
+		work.steerQueued = mergePlannerRequest(work.steerQueued, request);
+		if (work.steerPromise !== null) return;
+		const steering = this.#drainNativeSteering(work);
+		const tracked = steering.finally(() => {
+			if (work.steerPromise === tracked) work.steerPromise = null;
+		});
+		work.steerPromise = tracked;
+	}
+
+	async #drainNativeSteering(work) {
+		while (work.steerQueued !== null) {
+			const request = work.steerQueued;
+			work.steerQueued = null;
+			try {
+				await this.#planner.steerNativeTurn({
+					agentId: work.agentId,
+					goalRevision: work.goalRevision,
+					input: request.input,
+				});
+				this.#writeTrace('native_turn_steered', {
+					agentId: work.agentId,
+					goalRevision: work.goalRevision,
+					traceId: work.traceId,
+					trigger: request.trigger,
+				});
+			} catch (error) {
+				work.pending = mergePlannerRequest(work.pending, request);
+				if (work.steerQueued !== null) work.pending = mergePlannerRequest(work.pending, work.steerQueued);
+				work.steerQueued = null;
+				this.#writeTrace('native_turn_steer_deferred', {
+					agentId: work.agentId,
+					goalRevision: work.goalRevision,
+					traceId: work.traceId,
+					errorCode: String(error?.code ?? 'TURN_STEER_FAILED').slice(0, 128),
+				});
+				return;
+			}
+		}
+	}
+
+	async #settleNativeSteering(work) {
+		while (work.steerPromise !== null) await work.steerPromise;
+	}
+
+	async #executeNativeTool(work, toolRequest) {
+		const record = this.#registry.get(work.agentId);
+		if (record === null || record.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+			throw Object.assign(new Error('Native tool belongs to an obsolete goal'), { code: 'STALE_PLAN' });
+		}
+		const executesBody = toolRequest.tool.kind === 'action' || toolRequest.tool.kind === 'sequence';
+		if (executesBody && record.state === DynamicAgentState.PLANNING) {
+			this.#registry.setState(record.agentId, DynamicAgentState.ACTING, { goalRevision: record.goalRevision });
+		}
+		try {
+			return await this.#nativeRuntime.execute(toolRequest, record);
+		} finally {
+			const latest = this.#registry.get(work.agentId);
+			if (executesBody && latest?.goalRevision === work.goalRevision && latest.state === DynamicAgentState.ACTING) {
+				this.#registry.setState(latest.agentId, DynamicAgentState.PLANNING, { goalRevision: latest.goalRevision });
+			}
+		}
+	}
+
+	async #completeNativeTurn(work, result) {
+		await this.#settleNativeSteering(work);
+		if (this.#providerWork.get(work.agentId) !== work) return null;
+		this.#providerWork.delete(work.agentId);
+		this.#providerRetryAfter.delete(work.agentId);
+		const pending = work.pending;
+		const record = this.#registry.get(work.agentId);
+		if (record !== null && record.goalRevision === work.goalRevision && this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+			this.#writeTrace('native_turn_completed', { agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId, toolCalls: result?.toolCalls ?? 0 });
+		}
+		this.#reschedulePendingNativeTurn(pending);
+		return result;
+	}
+
+	async #failNativeTurn(work, error) {
+		await this.#settleNativeSteering(work);
+		if (this.#providerWork.get(work.agentId) !== work) return null;
+		this.#providerWork.delete(work.agentId);
+		const record = this.#registry.get(work.agentId);
+		const stale = record?.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
+		if (!stale) {
+			await this.#nativeRuntime.dispose(work.agentId, 'native_turn_failed');
+			await this.#reportAgentError(work.agentId, error);
+		}
+		this.#reschedulePendingNativeTurn(work.pending);
+		return null;
+	}
+
+	#reschedulePendingNativeTurn(request) {
+		if (request === null || request === undefined) return;
+		const record = this.#registry.get(request.agentId);
+		if (record === null || record.goalRevision !== request.goalRevision || !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		if (!this.#usesNativeTools(record)) return;
+		this.#scheduleNativeTurn(record, request);
 	}
 
 	#scheduleInitialPlan(record, request) {
@@ -938,6 +1180,7 @@ export class DynamicCoordinator extends EventEmitter {
 		for (const record of this.#registry.list()) {
 			this.#advanceLifecycleGeneration(record.agentId);
 			this.#programRuntime.dispose(record.agentId);
+			void this.#nativeRuntime.dispose(record.agentId, 'server_replaced');
 			this.#pendingAttention.delete(record.agentId);
 			this.#attentionFlushes.delete(record.agentId);
 			this.#providerRetryAfter.delete(record.agentId);
@@ -1034,6 +1277,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		bridge,
 		healthRegistry,
 		latencyRegistry,
+		codexControlProtocol: config.codex.controlProtocol,
 		traceWriter: dependencies.traceWriter,
 		controlNow: dependencies.controlNow,
 		epochNow: dependencies.epochNow,
@@ -1063,7 +1307,9 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	if (value.voice !== undefined && (value.voice === null || typeof value.voice !== 'object' || Array.isArray(value.voice))) throw new TypeError('dynamic coordinator voice config must be an object');
 	const secret = value.bridge.secret ?? environment[value.bridge.secretEnvironmentVariable ?? 'ARENA_AGENT_BRIDGE_SECRET'];
 	const cwd = value.codex.cwd ?? PROJECT_DIRECTORY;
-	const workspaceRoot = path.resolve(PROJECT_DIRECTORY, value.workspaceRoot ?? path.join('runtime', 'agent-workspaces'));
+	const workspaceRoot = value.workspaceRoot === undefined
+		? path.join(os.tmpdir(), 'arena-agents-workspaces')
+		: path.resolve(PROJECT_DIRECTORY, value.workspaceRoot);
 	const agentCap = positiveInteger(value.limits?.agentCap ?? DEFAULT_AGENT_CAP, 'limits.agentCap');
 	const planningConcurrency = positiveInteger(value.limits?.planningConcurrency ?? DEFAULT_PLANNING_CONCURRENCY, 'limits.planningConcurrency');
 	const planningMode = value.limits?.planningMode ?? 'fixed';
@@ -1076,6 +1322,8 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	const urgentReserve = value.limits?.urgentReserve ?? (agentCap >= 4 ? 1 : 0);
 	if (!Number.isSafeInteger(urgentReserve) || urgentReserve < 0 || urgentReserve > agentCap) throw new TypeError('limits.urgentReserve must be a non-negative safe integer within limits.agentCap');
 	const voice = normalizeVoiceConfig(value.voice, environment);
+	const codexControlProtocol = value.codex.controlProtocol ?? 'arena_script';
+	if (!['arena_script', 'native_tools'].includes(codexControlProtocol)) throw new TypeError('codex.controlProtocol must be arena_script or native_tools');
 	return {
 		bridge: { ...value.bridge, secret },
 		workspaceRoot,
@@ -1083,6 +1331,7 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 		codex: {
 			...value.codex,
 			cwd,
+			controlProtocol: codexControlProtocol,
 			launchProfile: value.codex.launchProfile === undefined ? undefined : { ...value.codex.launchProfile, cwd },
 		},
 		gemini: {
@@ -1290,6 +1539,29 @@ function mergePlannerRequest(previous, next) {
 	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
 	const winner = next.priority === priority ? next : previous;
 	return { ...next, priority, trigger: winner.trigger };
+}
+
+export function buildNativeEventInput(record, { event, trigger, observation = {}, conversation = [] } = {}) {
+	const compactObservation = {
+		player: observation.player ?? {},
+		inventory: { items: (observation.inventory?.items ?? []).slice(0, 32), ...(observation.inventory?.tagCounts === undefined ? {} : { tagCounts: observation.inventory.tagCounts }) },
+		items: (observation.items ?? []).slice(0, 16),
+		entities: (observation.entities ?? []).filter((entity) => entity?.type !== 'minecraft:item').slice(0, 16),
+		blocks: (observation.blocks ?? []).slice(0, 32),
+	};
+	const payload = {
+		event: typeof event === 'string' && event.length > 0 ? event : 'observation',
+		trigger: typeof trigger === 'string' && trigger.length > 0 ? trigger : 'observation',
+		goal: record?.currentGoal ?? null,
+		goalRevision: record?.goalRevision ?? 0,
+		observation: compactObservation,
+		conversation: Array.isArray(conversation) ? conversation.slice(-4) : [],
+	};
+	let json = JSON.stringify(payload);
+	if (Buffer.byteLength(json, 'utf8') > 16_384) {
+		json = JSON.stringify({ ...payload, observation: { player: compactObservation.player, inventory: { items: compactObservation.inventory.items.slice(0, 16) }, items: [], entities: [], blocks: compactObservation.blocks.slice(0, 12) } });
+	}
+	return `Live Minecraft event. Choose and call the smallest useful tool now.\n${json}`;
 }
 
 function planningTraceId(agentId, goalRevision, lifecycleGeneration, kind) {

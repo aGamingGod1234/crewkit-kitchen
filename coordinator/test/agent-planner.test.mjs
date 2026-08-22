@@ -526,6 +526,87 @@ test('provider circuit rejects work before allocating a provider session', async
 	assert.equal(registry.states.at(-1).options.error.code, 'PROVIDER_CIRCUIT_OPEN');
 });
 
+test('native turn keeps scheduler and selected Codex profile while delegating body execution', async () => {
+	const nativeRecord = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' };
+	const states = [];
+	const registry = {
+		assertCurrentRevision(agentId, goalRevision) {
+			assert.equal(agentId, AGENT_ID);
+			assert.equal(goalRevision, GOAL_REVISION);
+			return nativeRecord;
+		},
+		setState(_agentId, state, options) { states.push({ state, options }); },
+	};
+	const calls = [];
+	const executeTool = async () => ({ state: 'SUCCEEDED' });
+	const agent = {
+		async setGoalRevision(revision) { calls.push(['revision', revision]); },
+		async act(input, options) {
+			calls.push(['act', input, options.goalRevision, options.executeTool]);
+			return { status: 'completed', toolCalls: 2 };
+		},
+	};
+	const planner = new AgentPlanner({
+		registry,
+		scheduler: {
+			schedule(_agentId, operation, options) { calls.push(['schedule', options]); return operation({ signal: new AbortController().signal }); },
+			cancel() { return false; },
+		},
+		codexService: {
+			async createAgent(profile, options) { calls.push(['create', profile, options]); return agent; },
+			getAgent() { return null; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	assert.deepEqual(await planner.requestNativeTurn({
+		agentId: AGENT_ID,
+		goalRevision: GOAL_REVISION,
+		input: 'event: goal started',
+		executeTool,
+		priority: 'urgent',
+	}), { status: 'completed', toolCalls: 2 });
+	assert.deepEqual(calls.find((call) => call[0] === 'create')[2], { recoverySummary: null, controlProtocol: 'native_tools' });
+	assert.equal(typeof calls.find((call) => call[0] === 'act')[3], 'function');
+	assert.equal(states[0].state, DynamicAgentState.PLANNING);
+});
+
+test('urgent native steering reuses the active selected-model turn without scheduler admission', async () => {
+	const nativeRecord = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' };
+	const calls = [];
+	const planner = new AgentPlanner({
+		registry: {
+			assertCurrentRevision(agentId, goalRevision) {
+				assert.equal(agentId, AGENT_ID);
+				assert.equal(goalRevision, GOAL_REVISION);
+				return nativeRecord;
+			},
+		},
+		scheduler: {
+			schedule() { throw new Error('steering must not consume another scheduler slot'); },
+			cancel() { return false; },
+		},
+		codexService: {
+			getAgent(agentId) {
+				assert.equal(agentId, AGENT_ID);
+				return { async steer(input, options) { calls.push({ input, options }); return { turnId: 'turn-active' }; } };
+			},
+			async createAgent() { throw new Error('steering must not create another agent session'); },
+			async removeAgent() { return false; },
+		},
+	});
+
+	assert.deepEqual(await planner.steerNativeTurn({
+		agentId: AGENT_ID,
+		goalRevision: GOAL_REVISION,
+		input: 'urgent event: direct message from Lucas',
+	}), { turnId: 'turn-active' });
+	assert.deepEqual(calls, [{
+		input: 'urgent event: direct message from Lucas',
+		options: { goalRevision: GOAL_REVISION },
+	}]);
+});
+
 function createPlanner(registry, agent, invalidDecisionRetries) {
 	return createPlannerForService(registry, {
 		async createAgent() { return agent; },

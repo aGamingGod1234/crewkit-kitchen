@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Arena Agents 16-agent performance</title>
+<style>
+:root{color-scheme:dark;--bg:#091017;--panel:#111b25;--line:#293746;--text:#edf5fa;--muted:#98a9b7;--green:#67dda7;--blue:#78b9ff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}.page{width:min(980px,100%);margin:auto;padding:26px 16px 56px}h1{margin:.2em 0;font-size:clamp(2rem,7vw,4rem);line-height:1.04;letter-spacing:-.04em}h2{margin:34px 0 12px;font-size:1.25rem}.eyebrow{color:var(--green);font-size:.76rem;font-weight:750;letter-spacing:.12em;text-transform:uppercase}.lead{max-width:790px;color:#cbd6de;font-size:1.08rem}.verdict{margin:22px 0;padding:16px;border:1px solid var(--green);background:var(--panel)}.scroll{overflow-x:auto;border:1px solid var(--line);background:var(--panel)}table{width:100%;min-width:580px;border-collapse:collapse;font-variant-numeric:tabular-nums}th,td{padding:10px 12px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}th:first-child,td:first-child{text-align:left}th{color:var(--muted);font-size:.75rem;text-transform:uppercase}tbody tr:last-child td{border-bottom:0}.good{color:var(--green)}.note{color:var(--muted);max-width:830px}.facts{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:18px 0}.fact{padding:14px;border:1px solid var(--line);background:var(--panel)}.fact b{display:block;font-size:1.45rem}.fact span{color:var(--muted)}code{color:var(--blue)}@media(max-width:650px){.facts{grid-template-columns:1fr}.page{padding-top:18px}}
+</style>
+</head>
+<body><main class="page">
+<div class="eyebrow">Arena Agents | 16 agents | 22 Aug 2026</div>
+<h1>Three repeated runs, every check passed.</h1>
+<p class="lead">Each run used 16 persistent Luna threads, the packaged production scheduler, Fast service tier, an observation-only startup warmup, and immediate deterministic Minecraft body results.</p>
+<div class="verdict">Low reached a 1.410 to 1.623 second median DM first action. XHigh reached 1.777 to 2.502 seconds. The model-authored sequence reduced median move plus mine completion by 1.353 to 2.172 seconds.</div>
+<div class="facts"><div class="fact"><b class="good">384 / 384</b><span>scenario checks</span></div><div class="fact"><b>16</b><span>concurrent agents</span></div><div class="fact"><b>16 / 0</b><span>concurrency / reserve</span></div></div>
+
+<h2>Luna Low Fast, seconds</h2>
+<div class="scroll"><table><thead><tr><th>Metric</th><th>Run 1</th><th>Run 2</th><th>Run 3</th></tr></thead><tbody>
+<tr><td>Passed / expected</td><td>64 / 64</td><td>64 / 64</td><td>64 / 64</td></tr>
+<tr><td>Parallel prewarm</td><td>13.616</td><td>11.003</td><td>11.998</td></tr>
+<tr><td>First DM, first p50</td><td>1.488</td><td>1.623</td><td>1.498</td></tr>
+<tr><td>First DM, first p95</td><td>8.019</td><td>3.144</td><td>5.416</td></tr>
+<tr><td>First DM, total p50</td><td>2.719</td><td>2.801</td><td>2.562</td></tr>
+<tr><td>First DM, total p95</td><td>12.827</td><td>6.883</td><td>10.284</td></tr>
+<tr><td>Warm DM, first p50</td><td>1.461</td><td class="good">1.410</td><td>1.463</td></tr>
+<tr><td>Warm DM, first p95</td><td>4.446</td><td>4.393</td><td>10.143</td></tr>
+<tr><td>Warm DM, total p50</td><td>2.725</td><td>2.514</td><td>2.524</td></tr>
+<tr><td>Atomic move+mine, total p50</td><td>5.216</td><td>4.796</td><td>5.177</td></tr>
+<tr><td>Atomic move+mine, total p95</td><td>17.212</td><td>11.805</td><td>14.121</td></tr>
+<tr><td>Sequence move+mine, first p50</td><td>2.059</td><td>2.111</td><td>2.165</td></tr>
+<tr><td>Sequence move+mine, total p50</td><td class="good">3.362</td><td class="good">3.262</td><td class="good">3.292</td></tr>
+<tr><td>Sequence move+mine, total p95</td><td>9.600</td><td>8.821</td><td>9.373</td></tr>
+<tr><td>Sequence saved, p50</td><td class="good">1.854</td><td class="good">1.534</td><td class="good">1.885</td></tr>
+</tbody></table></div>
+
+<h2>Luna XHigh Fast, seconds</h2>
+<div class="scroll"><table><thead><tr><th>Metric</th><th>Run 1</th><th>Run 2</th><th>Run 3</th></tr></thead><tbody>
+<tr><td>Passed / expected</td><td>64 / 64</td><td>64 / 64</td><td>64 / 64</td></tr>
+<tr><td>Parallel prewarm</td><td>10.505</td><td>13.878</td><td>12.617</td></tr>
+<tr><td>First DM, first p50</td><td>1.959</td><td>2.502</td><td>2.013</td></tr>
+<tr><td>First DM, first p95</td><td>5.103</td><td>5.440</td><td>4.103</td></tr>
+<tr><td>First DM, total p50</td><td>3.118</td><td>3.585</td><td>3.096</td></tr>
+<tr><td>First DM, total p95</td><td>8.571</td><td>9.633</td><td>6.668</td></tr>
+<tr><td>Warm DM, first p50</td><td>2.275</td><td class="good">1.777</td><td>1.835</td></tr>
+<tr><td>Warm DM, first p95</td><td>5.936</td><td>5.631</td><td>2.464</td></tr>
+<tr><td>Warm DM, total p50</td><td>3.387</td><td>3.034</td><td>3.189</td></tr>
+<tr><td>Atomic move+mine, total p50</td><td>5.469</td><td>5.943</td><td>6.092</td></tr>
+<tr><td>Atomic move+mine, total p95</td><td>14.931</td><td>15.247</td><td>9.321</td></tr>
+<tr><td>Sequence move+mine, first p50</td><td>2.730</td><td>2.755</td><td>2.800</td></tr>
+<tr><td>Sequence move+mine, total p50</td><td class="good">4.116</td><td class="good">4.048</td><td class="good">3.920</td></tr>
+<tr><td>Sequence move+mine, total p95</td><td>8.884</td><td>10.148</td><td>8.172</td></tr>
+<tr><td>Sequence saved, p50</td><td class="good">1.353</td><td class="good">1.895</td><td class="good">2.172</td></tr>
+</tbody></table></div>
+
+<h2>What shipped in this pass</h2>
+<p class="note">The packaged scheduler now admits all 16 ordinary agent turns in one wave. Each native thread receives a safe observation-only warmup before its first real event. The selected model can send a short exact action sequence in one call, while the unchanged body validates and executes each action in order and stops at the first failure.</p>
+
+<h2>Verification boundary</h2>
+<p class="note"><code>630</code> coordinator tests, <code>6,416</code> Java protocol assertions, and <code>77</code> voice assertions passed. The provider and coordinator were real. Minecraft action results were simulated, so these numbers exclude pathfinding, ticks, world load, rendering, and network time inside Minecraft.</p>
+</main></body>
+</html>

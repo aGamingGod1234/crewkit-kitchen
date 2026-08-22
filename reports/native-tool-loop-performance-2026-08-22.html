@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Arena Agents native tool loop report</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1016;--panel:#131b24;--line:#2a3745;--text:#eef4f8;--muted:#9eacb9;--green:#68dfa9;--amber:#ffc766;--blue:#79baff}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}.page{width:min(1000px,100%);margin:auto;padding:28px 18px 64px}h1{max-width:870px;margin:.22em 0;font-size:clamp(2.1rem,7vw,4.3rem);line-height:1.02;letter-spacing:-.045em}h2{margin:38px 0 13px;font-size:1.4rem}p{max-width:850px}.eyebrow{color:var(--green);font-size:.78rem;font-weight:750;letter-spacing:.12em;text-transform:uppercase}.lead{color:#ced8e0;font-size:1.14rem}.verdict,.section,.metric{border:1px solid var(--line);background:var(--panel)}.verdict{margin:26px 0;padding:18px;border-color:var(--green)}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:20px 0}.metric{padding:17px}.metric b{display:block;font-size:1.8rem;letter-spacing:-.035em}.metric span,.muted{color:var(--muted)}.good{color:var(--green)}.warn{color:var(--amber)}.section{padding:18px}table{width:100%;border-collapse:collapse;background:var(--panel);font-variant-numeric:tabular-nums}th,td{padding:11px 12px;text-align:left;border-bottom:1px solid var(--line)}th{color:var(--muted);font-size:.78rem;text-transform:uppercase}code{color:var(--blue)}ul{padding-left:1.3rem}li{margin:.5rem 0}.callout{padding:4px 16px;border-left:3px solid var(--amber);color:#ced8e0}.footer{margin-top:38px;color:var(--muted);font-size:.9rem}@media(max-width:720px){.grid{grid-template-columns:1fr}.scroll{overflow-x:auto}table{min-width:690px}.page{padding-top:19px}.metric b{font-size:1.55rem}}
+</style>
+</head>
+<body><main class="page">
+<div class="eyebrow">Arena Agents · native tool loop · 22 Aug 2026</div>
+<h1>The 30-second control floor is gone from the provider path.</h1>
+<p class="lead">A persistent Codex thread now receives compact live Minecraft events, calls a native player tool immediately, sees the factual body result in the same turn, and chooses the next action. The chosen model and reasoning level remain the only brain.</p>
+
+<div class="verdict"><strong>Verdict.</strong> This is the right control architecture for player-like responsiveness. In authenticated probes, warm first actions arrived in 1.7 to 2.4 seconds instead of tens of seconds. It is built and automated verification is green, but a post-change real Minecraft run is still required before calling end-to-end gameplay proven.</div>
+
+<div class="grid">
+  <div class="metric"><b class="good">1.7 s</b><span>Luna low warm first tool</span></div>
+  <div class="metric"><b class="good">1.9 s</b><span>Luna xhigh warm first tool</span></div>
+  <div class="metric"><b class="good">622 / 622</b><span>coordinator tests passed</span></div>
+</div>
+
+<h2>Authenticated provider results</h2>
+<p>The app-server was real and authenticated. The Minecraft body was deterministic and simulated, allowing exact measurement of provider and coordinator reaction time without tick or pathfinding variance.</p>
+<div class="scroll"><table><thead><tr><th>Scenario</th><th>Luna low fast</th><th>Luna xhigh fast</th><th>What it proves</th></tr></thead><tbody>
+  <tr><td>Cold DM, first tool</td><td>6.67 s</td><td>5.77 s</td><td>New thread startup no longer takes 30+ seconds</td></tr>
+  <tr><td>Warm DM, first tool</td><td class="good">1.71 s</td><td class="good">1.87 s</td><td>Persistent sessions respond quickly even at xhigh</td></tr>
+  <tr><td>Move, first tool</td><td>1.96 s</td><td>2.41 s</td><td>The body can start before the turn finishes</td></tr>
+  <tr><td>Mine after move result</td><td>3.33 s</td><td>5.21 s</td><td>A dependent second action stays in the same live turn</td></tr>
+  <tr><td>Advanced craft, first tool</td><td>1.85 s</td><td>1.94 s</td><td>The generic validated action path works through the real protocol</td></tr>
+</tbody></table></div>
+<p class="muted">Warm DM first-action time is about 94% below a 30-second floor. These are single samples, not stable percentiles.</p>
+
+<h2>Sixteen concurrent agents</h2>
+<div class="scroll"><table><thead><tr><th>Seconds</th><th>Original</th><th>Broken</th><th>Fixed</th><th>Native low</th><th>Native xhigh</th></tr></thead><tbody>
+  <tr><td>DM total p50</td><td>2.640</td><td>10.127</td><td>2.708</td><td>2.695</td><td>3.245</td></tr>
+  <tr><td>Stone / move→mine total p50</td><td>3.184</td><td>10.721</td><td>3.279</td><td>4.322</td><td>5.410</td></tr>
+  <tr><td>Warm DM first p50</td><td>—</td><td>—</td><td>—</td><td>1.410</td><td>1.998</td></tr>
+  <tr><td>Warm DM first p95</td><td>—</td><td>—</td><td>—</td><td>1.881</td><td>3.381</td></tr>
+  <tr><td>Move first p50</td><td>—</td><td>—</td><td>—</td><td>1.820</td><td>2.667</td></tr>
+  <tr><td>Mine p50</td><td>—</td><td>—</td><td>—</td><td>3.157</td><td>4.276</td></tr>
+  <tr><td>Move→mine total p95</td><td>—</td><td>—</td><td>—</td><td>8.191</td><td>9.486</td></tr>
+</tbody></table></div>
+<p class="muted">16 of 16 agents passed every phase for both native profiles. Original, broken, and fixed values are historical simulated completion times. Native values use real concurrent provider threads with simulated body results.</p>
+
+<h2>What changed</h2>
+<div class="section"><ul>
+  <li>One persistent thread per agent keeps the exact selected provider, model, reasoning effort, and service tier.</li>
+  <li>A short bootstrap replaces the long planner prompt and output schema.</li>
+  <li>Compact events include the current goal, player state, inventory, nearby blocks, entities, and recent conversation.</li>
+  <li>Tool requests stream out before the model turn ends. Each exact result returns into that same turn.</li>
+  <li>Skills, connectors, MCP servers, shell, browser, computer use, plugins, repository context, and model fallback are disabled for native agent threads.</li>
+  <li>The body performs pathfinding, action timing, correlation, cancellation, and factual completion checks without making strategic decisions.</li>
+</ul></div>
+
+<h2>Player control coverage</h2>
+<p>Common actions have small direct tools: <code>observe</code>, <code>moveTo</code>, <code>mine</code>, <code>say</code>, and <code>wait</code>. A strict <code>act</code> tool exposes every remaining production body action, including crafting, block placement, inventory transfer, combat, flee, follow, item pickup, interaction, equipment, menus, building sequences, elytra, and respawn. <code>finish</code> uses server-side factual verification rather than trusting a model claim.</p>
+
+<h2>Historical context</h2>
+<div class="scroll"><table><thead><tr><th>Run</th><th>First visible action</th><th>Scope</th></tr></thead><tbody>
+  <tr><td>Earlier Desktop</td><td>53 s</td><td>Real Minecraft, old orchestration</td></tr>
+  <tr><td>Final prior Desktop</td><td>141.8 s</td><td>Real Minecraft, old planner path</td></tr>
+  <tr><td>New native warm probe</td><td>1.7 to 2.4 s</td><td>Real provider, simulated body</td></tr>
+</tbody></table></div>
+<div class="callout"><p>This table is directional, not apples-to-apples. The old Desktop values include Minecraft execution and a different orchestration path. The new probe isolates the bottleneck we replaced. A real headless Minecraft rerun is the remaining proof.</p></div>
+
+<h2>Verification</h2>
+<div class="section"><ul>
+  <li>Coordinator: <strong>622 passed, 0 failed</strong>.</li>
+  <li>Java protocol and bridge: <strong>6,416 assertions passed</strong>.</li>
+  <li>Voice addon: <strong>77 assertions passed</strong>.</li>
+  <li>Native runtime: exact action correlation, cancellation, factual completion, DM wake, stale-goal reissue, and 16-agent isolation covered.</li>
+  <li>Real app-server: cold DM, warm DM, dependent move then mine, and advanced craft passed for Luna low and Luna xhigh on Fast.</li>
+</ul></div>
+
+<h2>Remaining proof</h2>
+<div class="section"><ul>
+  <li>Run the new JAR against a real headless Minecraft instance and repeat DM, movement, mining, crafting, combat, death, and respawn.</li>
+  <li>Measure 1, 8, and 16 live provider agents. The current 16-agent result proves coordinator isolation, not provider capacity.</li>
+  <li>Collect repeated samples before setting p50, p95, or capacity claims.</li>
+</ul></div>
+
+<h2>Build</h2>
+<div class="callout"><p>JAR: <code>build/libs/arena-agents-0.1.0.jar</code><br>Size: <code>1,895,232 bytes</code><br>SHA-256: <code>E205DC404016BD594302CBB1179131809EFF3ECB060EC9791050A46BED2FD2EC</code></p></div>
+
+<p class="footer">Evidence file: <code>reports/native-tool-loop-performance-2026-08-22.json</code>. Credentials and raw provider content are excluded.</p>
+</main></body>
+</html>

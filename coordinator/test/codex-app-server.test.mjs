@@ -55,6 +55,19 @@ test('builds an isolated app-server process command with exact model profile', (
 		'-c', 'model_reasoning_effort="xhigh"',
 		'-c', 'service_tier="fast"',
 		'-c', 'features.fast_mode=true',
+		'-c', 'mcp_servers={}',
+		'-c', 'features.apps=false',
+		'-c', 'features.browser_use=false',
+		'-c', 'features.computer_use=false',
+		'-c', 'features.goals=false',
+		'-c', 'features.hooks=false',
+		'-c', 'features.image_generation=false',
+		'-c', 'features.multi_agent=false',
+		'-c', 'features.plugins=false',
+		'-c', 'features.skill_search=false',
+		'-c', 'features.shell_tool=false',
+		'-c', 'features.unified_exec=false',
+		'-c', 'features.view_image=false',
 	]);
 });
 

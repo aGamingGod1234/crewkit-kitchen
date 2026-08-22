@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Native Minecraft Tool Loop</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b0f14;--panel:#121923;--line:#273241;--text:#eef4fa;--muted:#9aa9b8;--accent:#73e0ad;--warn:#f2c66d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}main{width:min(920px,calc(100% - 32px));margin:48px auto 80px}.eyebrow{color:var(--accent);font-size:.82rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase}h1{font-size:clamp(2rem,7vw,4.3rem);line-height:1.02;letter-spacing:-.05em;margin:.45rem 0 1rem;max-width:780px}h2{font-size:1.25rem;margin:0 0 .7rem}.lead{font-size:1.1rem;color:#c8d3de;max-width:760px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:28px 0}.card,.step{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px}.label{color:var(--muted);font-size:.78rem;letter-spacing:.09em;text-transform:uppercase}.value{font-size:1.05rem;margin-top:6px}.steps{display:grid;gap:10px;counter-reset:item}.step{display:grid;grid-template-columns:40px 1fr;gap:14px}.step:before{counter-increment:item;content:counter(item);width:34px;height:34px;display:grid;place-items:center;border-radius:50%;background:#1e2d2b;color:var(--accent);font-weight:800}.step p{margin:.3rem 0 0;color:#b7c4d0}.decision{border-left:3px solid var(--accent)}.risk{border-left:3px solid var(--warn)}code{font: .92em ui-monospace,SFMono-Regular,Consolas,monospace;color:#bff5d9}ul{padding-left:1.25rem;margin:.65rem 0 0}li+li{margin-top:.35rem}@media(max-width:650px){main{margin-top:28px}.grid{grid-template-columns:1fr}.step{grid-template-columns:34px 1fr;padding:16px}}
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Arena Agents · Implemented and verified</div>
+  <h1>Replace planning delay with a live Minecraft tool loop.</h1>
+  <p class="lead">The selected provider, model, reasoning level, and speed tier stay the agent's only brain. The coordinator becomes a small, deterministic body that executes actions and returns results immediately.</p>
+
+  <section class="grid" aria-label="Plan summary">
+    <div class="card"><div class="label">First rollout</div><div class="value">Codex agents only, behind an explicit protocol setting</div></div>
+    <div class="card"><div class="label">Native tools</div><div class="value"><code>observe</code>, <code>moveTo</code>, <code>mine</code>, <code>say</code>, <code>wait</code>, validated <code>act</code>, and <code>finish</code></div></div>
+    <div class="card"><div class="label">Target behavior</div><div class="value">First useful tool call streams before the model finishes its turn</div></div>
+    <div class="card"><div class="label">Compatibility</div><div class="value">Existing ArenaScript remains available for providers without native tool adapters</div></div>
+  </section>
+
+  <h2>Implementation sequence</h2>
+  <section class="steps">
+    <article class="step"><div><strong>Specify the boundary</strong><p>Add strict, provider-neutral tool schemas and bounded result payloads. Invalid names, arguments, revisions, and oversized outputs fail at the coordinator boundary.</p></div></article>
+    <article class="step"><div><strong>Prove the app-server handshake</strong><p>Add a failing transport test for server-initiated <code>item/tool/call</code>, then implement JSON-RPC request recognition and client responses.</p></div></article>
+    <article class="step"><div><strong>Create the lean Codex thread</strong><p>Replace the long planner prompt and output schema with a short real-time bootstrap and seven Minecraft tools. The validated <code>act</code> tool retains crafting, building, combat, inventory, interaction, equipment, movement composites, and respawning. Keep the chosen model, effort, and tier unchanged.</p></div></article>
+    <article class="step"><div><strong>Execute while the turn is live</strong><p>Route each tool request to an injected body executor immediately, return its factual result into the same turn, and allow the model to issue its next action without a new cold thread.</p></div></article>
+    <article class="step"><div><strong>Connect to the existing body</strong><p>Map tool calls to current bridge actions, correlate action results by ID and goal revision, and feed compact observations and DM events into the persistent agent session.</p></div></article>
+    <article class="step"><div><strong>Preserve lifecycle correctness</strong><p>Cancel stale calls on steer, death, disconnect, or replacement. Keep provider identity immutable and never switch to another model or hidden decision system.</p></div></article>
+    <article class="step"><div><strong>Measure the real latency</strong><p>Record provider request, first tool call, bridge dispatch, first progress, completion, and next tool call separately. Remove the existing fake first-byte timestamps.</p></div></article>
+    <article class="step"><div><strong>Verify and roll out</strong><p>Run focused unit and simulator tests, build the mod, then compare first-action and multi-action latency against the recorded baseline before enabling the new protocol by default.</p></div></article>
+  </section>
+
+  <section class="grid">
+    <div class="card decision"><h2>Decisions</h2><ul><li>No hybrid brain or automatic strategic fallback.</li><li>No repository, shell, browser, skills, or connector tools in agent threads.</li><li>Pathfinding and motor timing belong to the body. Goal choice and recovery belong to the selected brain.</li></ul></div>
+    <div class="card risk"><h2>Risks and controls</h2><ul><li>Experimental app-server API: isolate it behind one adapter.</li><li>Stale action results: require turn, action, agent, and goal correlation.</li><li>Provider variance: compare medians and tails across repeated identical scenarios.</li></ul></div>
+  </section>
+
+  <section class="card decision">
+    <h2>Verified result</h2>
+    <ul><li>Warm first tool: 1.7 seconds on Luna low and 1.9 seconds on Luna xhigh in the single-agent authenticated probe.</li><li>Sixteen concurrent agents reached warm first-tool p50 of 1.410 seconds on low and 1.998 seconds on xhigh.</li><li>Dependent move then mine calls ran inside one live provider turn.</li><li>Advanced craft calls passed through the real app-server tool protocol.</li><li>622 coordinator tests, 6,416 Java protocol and bridge assertions, and 77 voice-addon assertions passed.</li></ul>
+  </section>
+</main>
+</body>
+</html>

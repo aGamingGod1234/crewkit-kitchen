@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-22",
+  "environment": "authenticated Codex app-server, production scheduler, 16 persistent agents, immediate deterministic Minecraft body results",
+  "scheduler": { "planningConcurrency": 16, "urgentReserve": 0 },
+  "profiles": {
+    "lunaLowFast": [
+      { "passed": 64, "total": 64, "prewarmMs": 13616, "firstDm": { "firstP50Ms": 1488, "firstP95Ms": 8019, "totalP50Ms": 2719, "totalP95Ms": 12827 }, "warmDm": { "firstP50Ms": 1461, "firstP95Ms": 4446, "totalP50Ms": 2725, "totalP95Ms": 8479 }, "atomicMoveMine": { "firstP50Ms": 2730, "lastP50Ms": 4090, "totalP50Ms": 5216, "totalP95Ms": 17212 }, "sequenceMoveMine": { "firstP50Ms": 2059, "firstP95Ms": 4784, "totalP50Ms": 3362, "totalP95Ms": 9600 } },
+      { "passed": 64, "total": 64, "prewarmMs": 11003, "firstDm": { "firstP50Ms": 1623, "firstP95Ms": 3144, "totalP50Ms": 2801, "totalP95Ms": 6883 }, "warmDm": { "firstP50Ms": 1410, "firstP95Ms": 4393, "totalP50Ms": 2514, "totalP95Ms": 9211 }, "atomicMoveMine": { "firstP50Ms": 1798, "lastP50Ms": 3643, "totalP50Ms": 4796, "totalP95Ms": 11805 }, "sequenceMoveMine": { "firstP50Ms": 2111, "firstP95Ms": 4609, "totalP50Ms": 3262, "totalP95Ms": 8821 } },
+      { "passed": 64, "total": 64, "prewarmMs": 11998, "firstDm": { "firstP50Ms": 1498, "firstP95Ms": 5416, "totalP50Ms": 2562, "totalP95Ms": 10284 }, "warmDm": { "firstP50Ms": 1463, "firstP95Ms": 10143, "totalP50Ms": 2524, "totalP95Ms": 11630 }, "atomicMoveMine": { "firstP50Ms": 2244, "lastP50Ms": 3630, "totalP50Ms": 5177, "totalP95Ms": 14121 }, "sequenceMoveMine": { "firstP50Ms": 2165, "firstP95Ms": 5583, "totalP50Ms": 3292, "totalP95Ms": 9373 } }
+    ],
+    "lunaXhighFast": [
+      { "passed": 64, "total": 64, "prewarmMs": 10505, "firstDm": { "firstP50Ms": 1959, "firstP95Ms": 5103, "totalP50Ms": 3118, "totalP95Ms": 8571 }, "warmDm": { "firstP50Ms": 2275, "firstP95Ms": 5936, "totalP50Ms": 3387, "totalP95Ms": 9697 }, "atomicMoveMine": { "firstP50Ms": 2807, "lastP50Ms": 4214, "totalP50Ms": 5469, "totalP95Ms": 14931 }, "sequenceMoveMine": { "firstP50Ms": 2730, "firstP95Ms": 5267, "totalP50Ms": 4116, "totalP95Ms": 8884 } },
+      { "passed": 64, "total": 64, "prewarmMs": 13878, "firstDm": { "firstP50Ms": 2502, "firstP95Ms": 5440, "totalP50Ms": 3585, "totalP95Ms": 9633 }, "warmDm": { "firstP50Ms": 1777, "firstP95Ms": 5631, "totalP50Ms": 3034, "totalP95Ms": 9369 }, "atomicMoveMine": { "firstP50Ms": 2899, "lastP50Ms": 4675, "totalP50Ms": 5943, "totalP95Ms": 15247 }, "sequenceMoveMine": { "firstP50Ms": 2755, "firstP95Ms": 6099, "totalP50Ms": 4048, "totalP95Ms": 10148 } },
+      { "passed": 64, "total": 64, "prewarmMs": 12617, "firstDm": { "firstP50Ms": 2013, "firstP95Ms": 4103, "totalP50Ms": 3096, "totalP95Ms": 6668 }, "warmDm": { "firstP50Ms": 1835, "firstP95Ms": 2464, "totalP50Ms": 3189, "totalP95Ms": 4391 }, "atomicMoveMine": { "firstP50Ms": 2567, "lastP50Ms": 4907, "totalP50Ms": 6092, "totalP95Ms": 9321 }, "sequenceMoveMine": { "firstP50Ms": 2800, "firstP95Ms": 4362, "totalP50Ms": 3920, "totalP95Ms": 8172 } }
+    ]
+  },
+  "verification": { "coordinatorTests": 630, "javaAssertions": 6416, "voiceAssertions": 77 }
+}

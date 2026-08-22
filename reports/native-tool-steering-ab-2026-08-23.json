@@ -1,0 +1,1453 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-22T16:46:03.400Z",
+  "design": {
+    "repetitions": 10,
+    "ordering": "alternating paired baseline/current",
+    "model": "gpt-5.6-luna",
+    "reasoningEffort": "xhigh",
+    "serviceTier": "fast"
+  },
+  "passed": 20,
+  "failed": 0,
+  "summary": {
+    "baseline": {
+      "initializationMs": {
+        "count": 10,
+        "p50": 1376,
+        "p95": 1538,
+        "min": 1294,
+        "max": 1538
+      },
+      "coldDmFirstMs": {
+        "count": 10,
+        "p50": 4949,
+        "p95": 8178,
+        "min": 4620,
+        "max": 8178
+      },
+      "coldDmTotalMs": {
+        "count": 10,
+        "p50": 6340,
+        "p95": 9273,
+        "min": 5845,
+        "max": 9273
+      },
+      "warmDmFirstMs": {
+        "count": 10,
+        "p50": 1829,
+        "p95": 2455,
+        "min": 1488,
+        "max": 2455
+      },
+      "warmDmTotalMs": {
+        "count": 10,
+        "p50": 3429,
+        "p95": 4618,
+        "min": 2509,
+        "max": 4618
+      },
+      "moveFirstMs": {
+        "count": 10,
+        "p50": 2416,
+        "p95": 3150,
+        "min": 2078,
+        "max": 3150
+      },
+      "mineMs": {
+        "count": 10,
+        "p50": 4386,
+        "p95": 5188,
+        "min": 3499,
+        "max": 5188
+      },
+      "moveMineTotalMs": {
+        "count": 10,
+        "p50": 5829,
+        "p95": 6913,
+        "min": 4434,
+        "max": 6913
+      },
+      "craftFirstMs": {
+        "count": 10,
+        "p50": 1821,
+        "p95": 3197,
+        "min": 1735,
+        "max": 3197
+      },
+      "craftTotalMs": {
+        "count": 10,
+        "p50": 2969,
+        "p95": 6702,
+        "min": 2755,
+        "max": 6702
+      }
+    },
+    "current": {
+      "initializationMs": {
+        "count": 10,
+        "p50": 1447,
+        "p95": 1544,
+        "min": 1316,
+        "max": 1544
+      },
+      "coldDmFirstMs": {
+        "count": 10,
+        "p50": 5560,
+        "p95": 6651,
+        "min": 4522,
+        "max": 6651
+      },
+      "coldDmTotalMs": {
+        "count": 10,
+        "p50": 7133,
+        "p95": 8913,
+        "min": 5941,
+        "max": 8913
+      },
+      "warmDmFirstMs": {
+        "count": 10,
+        "p50": 1766,
+        "p95": 4725,
+        "min": 1478,
+        "max": 4725
+      },
+      "warmDmTotalMs": {
+        "count": 10,
+        "p50": 3209,
+        "p95": 8652,
+        "min": 2658,
+        "max": 8652
+      },
+      "moveFirstMs": {
+        "count": 10,
+        "p50": 2475,
+        "p95": 5627,
+        "min": 1700,
+        "max": 5627
+      },
+      "mineMs": {
+        "count": 10,
+        "p50": 4012,
+        "p95": 10212,
+        "min": 3257,
+        "max": 10212
+      },
+      "moveMineTotalMs": {
+        "count": 10,
+        "p50": 5672,
+        "p95": 11642,
+        "min": 4554,
+        "max": 11642
+      },
+      "craftFirstMs": {
+        "count": 10,
+        "p50": 1817,
+        "p95": 3938,
+        "min": 1705,
+        "max": 3938
+      },
+      "craftTotalMs": {
+        "count": 10,
+        "p50": 2921,
+        "p95": 5395,
+        "min": 2658,
+        "max": 5395
+      }
+    }
+  },
+  "pairedCurrentMinusBaseline": {
+    "initializationMs": {
+      "count": 10,
+      "p50": 22,
+      "p95": 149,
+      "min": -160,
+      "max": 149
+    },
+    "coldDmFirstMs": {
+      "count": 10,
+      "p50": 364,
+      "p95": 1416,
+      "min": -2142,
+      "max": 1416
+    },
+    "coldDmTotalMs": {
+      "count": 10,
+      "p50": 151,
+      "p95": 2951,
+      "min": -2067,
+      "max": 2951
+    },
+    "warmDmFirstMs": {
+      "count": 10,
+      "p50": -32,
+      "p95": 2814,
+      "min": -689,
+      "max": 2814
+    },
+    "warmDmTotalMs": {
+      "count": 10,
+      "p50": -393,
+      "p95": 5733,
+      "min": -1591,
+      "max": 5733
+    },
+    "moveFirstMs": {
+      "count": 10,
+      "p50": -375,
+      "p95": 3033,
+      "min": -723,
+      "max": 3033
+    },
+    "mineMs": {
+      "count": 10,
+      "p50": -137,
+      "p95": 5619,
+      "min": -1368,
+      "max": 5619
+    },
+    "moveMineTotalMs": {
+      "count": 10,
+      "p50": -165,
+      "p95": 5836,
+      "min": -2079,
+      "max": 5836
+    },
+    "craftFirstMs": {
+      "count": 10,
+      "p50": 36,
+      "p95": 2080,
+      "min": -1474,
+      "max": 2080
+    },
+    "craftTotalMs": {
+      "count": 10,
+      "p50": 79,
+      "p95": 2578,
+      "min": -4011,
+      "max": 2578
+    }
+  },
+  "rows": [
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 1,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1538,
+      "totalMs": 20530,
+      "coldDm": {
+        "firstToolMs": 4620,
+        "lastToolMs": 4620,
+        "totalMs": 5845,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1567,
+        "lastToolMs": 1567,
+        "totalMs": 3892,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2208,
+        "lastToolMs": 4397,
+        "totalMs": 6433,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1735,
+        "lastToolMs": 1735,
+        "totalMs": 2821,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 1,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1544,
+      "totalMs": 19177,
+      "coldDm": {
+        "firstToolMs": 4984,
+        "lastToolMs": 4984,
+        "totalMs": 5941,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 2261,
+        "lastToolMs": 2261,
+        "totalMs": 3358,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2615,
+        "lastToolMs": 4217,
+        "totalMs": 5433,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1771,
+        "lastToolMs": 1771,
+        "totalMs": 2900,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 2,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1507,
+      "totalMs": 21103,
+      "coldDm": {
+        "firstToolMs": 4522,
+        "lastToolMs": 4522,
+        "totalMs": 6491,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1478,
+        "lastToolMs": 1478,
+        "totalMs": 2658,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2365,
+        "lastToolMs": 4012,
+        "totalMs": 7526,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1869,
+        "lastToolMs": 1869,
+        "totalMs": 2921,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 2,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1358,
+      "totalMs": 19513,
+      "coldDm": {
+        "firstToolMs": 4641,
+        "lastToolMs": 4641,
+        "totalMs": 6707,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1510,
+        "lastToolMs": 1510,
+        "totalMs": 2509,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2740,
+        "lastToolMs": 4149,
+        "totalMs": 6094,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1750,
+        "lastToolMs": 1750,
+        "totalMs": 2845,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 3,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1338,
+      "totalMs": 19384,
+      "coldDm": {
+        "firstToolMs": 4905,
+        "lastToolMs": 4905,
+        "totalMs": 6567,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1911,
+        "lastToolMs": 1911,
+        "totalMs": 2919,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 3150,
+        "lastToolMs": 4593,
+        "totalMs": 5806,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1766,
+        "lastToolMs": 1766,
+        "totalMs": 2755,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 3,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1447,
+      "totalMs": 32537,
+      "coldDm": {
+        "firstToolMs": 5752,
+        "lastToolMs": 5752,
+        "totalMs": 7133,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 4725,
+        "lastToolMs": 4725,
+        "totalMs": 8652,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 5627,
+        "lastToolMs": 10212,
+        "totalMs": 11642,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 2461,
+        "lastToolMs": 2461,
+        "totalMs": 3661,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 4,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1510,
+      "totalMs": 22766,
+      "coldDm": {
+        "firstToolMs": 6365,
+        "lastToolMs": 6365,
+        "totalMs": 7697,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 2262,
+        "lastToolMs": 2262,
+        "totalMs": 3525,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 3502,
+        "lastToolMs": 5184,
+        "totalMs": 6378,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 2403,
+        "lastToolMs": 2403,
+        "totalMs": 3656,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 4,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1387,
+      "totalMs": 17787,
+      "coldDm": {
+        "firstToolMs": 4949,
+        "lastToolMs": 4949,
+        "totalMs": 6151,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1566,
+        "lastToolMs": 1566,
+        "totalMs": 2553,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2167,
+        "lastToolMs": 3689,
+        "totalMs": 4726,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1821,
+        "lastToolMs": 1821,
+        "totalMs": 2969,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 5,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1299,
+      "totalMs": 21575,
+      "coldDm": {
+        "firstToolMs": 4955,
+        "lastToolMs": 4955,
+        "totalMs": 6883,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 2302,
+        "lastToolMs": 2302,
+        "totalMs": 3442,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2416,
+        "lastToolMs": 4386,
+        "totalMs": 6633,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 2163,
+        "lastToolMs": 2163,
+        "totalMs": 3317,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 5,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1354,
+      "totalMs": 21134,
+      "coldDm": {
+        "firstToolMs": 5560,
+        "lastToolMs": 5560,
+        "totalMs": 8534,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1697,
+        "lastToolMs": 1697,
+        "totalMs": 3049,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 1700,
+        "lastToolMs": 3257,
+        "totalMs": 4554,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1817,
+        "lastToolMs": 1817,
+        "totalMs": 3644,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 6,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1316,
+      "totalMs": 28302,
+      "coldDm": {
+        "firstToolMs": 6143,
+        "lastToolMs": 6143,
+        "totalMs": 8913,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 2261,
+        "lastToolMs": 2261,
+        "totalMs": 4349,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 5111,
+        "lastToolMs": 6934,
+        "totalMs": 9076,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 2814,
+        "lastToolMs": 2814,
+        "totalMs": 4649,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 6,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1294,
+      "totalMs": 17446,
+      "coldDm": {
+        "firstToolMs": 5031,
+        "lastToolMs": 5031,
+        "totalMs": 5962,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1488,
+        "lastToolMs": 1488,
+        "totalMs": 2752,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2078,
+        "lastToolMs": 3499,
+        "totalMs": 4434,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1788,
+        "lastToolMs": 1788,
+        "totalMs": 3003,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 7,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1418,
+      "totalMs": 21417,
+      "coldDm": {
+        "firstToolMs": 5847,
+        "lastToolMs": 5847,
+        "totalMs": 7620,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1829,
+        "lastToolMs": 1829,
+        "totalMs": 3733,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 3110,
+        "lastToolMs": 4541,
+        "totalMs": 5829,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1858,
+        "lastToolMs": 1858,
+        "totalMs": 2817,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 7,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1478,
+      "totalMs": 25070,
+      "coldDm": {
+        "firstToolMs": 6651,
+        "lastToolMs": 6651,
+        "totalMs": 7771,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1731,
+        "lastToolMs": 1731,
+        "totalMs": 2821,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2734,
+        "lastToolMs": 6042,
+        "totalMs": 7605,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 3938,
+        "lastToolMs": 3938,
+        "totalMs": 5395,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 8,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1343,
+      "totalMs": 18966,
+      "coldDm": {
+        "firstToolMs": 4640,
+        "lastToolMs": 4640,
+        "totalMs": 6917,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1514,
+        "lastToolMs": 1514,
+        "totalMs": 3209,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2475,
+        "lastToolMs": 3853,
+        "totalMs": 4837,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1705,
+        "lastToolMs": 1705,
+        "totalMs": 2658,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 8,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1503,
+      "totalMs": 18909,
+      "coldDm": {
+        "firstToolMs": 4818,
+        "lastToolMs": 4818,
+        "totalMs": 5966,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 2106,
+        "lastToolMs": 2106,
+        "totalMs": 3429,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2206,
+        "lastToolMs": 3895,
+        "totalMs": 5002,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1829,
+        "lastToolMs": 1829,
+        "totalMs": 3010,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 9,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1533,
+      "totalMs": 25550,
+      "coldDm": {
+        "firstToolMs": 5298,
+        "lastToolMs": 5298,
+        "totalMs": 6340,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 2455,
+        "lastToolMs": 2455,
+        "totalMs": 4618,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2962,
+        "lastToolMs": 4508,
+        "totalMs": 6357,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 3197,
+        "lastToolMs": 3197,
+        "totalMs": 6702,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 9,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1489,
+      "totalMs": 19068,
+      "coldDm": {
+        "firstToolMs": 4684,
+        "lastToolMs": 4684,
+        "totalMs": 6188,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1766,
+        "lastToolMs": 1766,
+        "totalMs": 3027,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2239,
+        "lastToolMs": 3815,
+        "totalMs": 5672,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1723,
+        "lastToolMs": 1723,
+        "totalMs": 2691,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "current",
+      "trial": 10,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1364,
+      "totalMs": 19832,
+      "coldDm": {
+        "firstToolMs": 6036,
+        "lastToolMs": 6036,
+        "totalMs": 7206,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 2074,
+        "lastToolMs": 2074,
+        "totalMs": 3467,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 2402,
+        "lastToolMs": 3820,
+        "totalMs": 4912,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 1782,
+        "lastToolMs": 1782,
+        "totalMs": 2883,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    },
+    {
+      "status": "PASSED",
+      "variant": "baseline",
+      "trial": 10,
+      "profile": {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast"
+      },
+      "initializationMs": 1376,
+      "totalMs": 25549,
+      "coldDm": {
+        "firstToolMs": 8178,
+        "lastToolMs": 8178,
+        "totalMs": 9273,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "warmDm": {
+        "firstToolMs": 1853,
+        "lastToolMs": 1853,
+        "totalMs": 4358,
+        "calls": [
+          "chat"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      },
+      "moveMine": {
+        "firstToolMs": 3023,
+        "lastToolMs": 5188,
+        "totalMs": 6913,
+        "calls": [
+          "navigate_to",
+          "break_block"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 2
+        }
+      },
+      "craft": {
+        "firstToolMs": 2144,
+        "lastToolMs": 2144,
+        "totalMs": 3629,
+        "calls": [
+          "craft_inventory"
+        ],
+        "result": {
+          "status": "completed",
+          "toolCalls": 1
+        }
+      }
+    }
+  ]
+}

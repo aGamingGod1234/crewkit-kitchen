@@ -76,6 +76,69 @@ export class AgentPlanner {
 
 	get healthRegistry() { return this.#healthRegistry; }
 
+	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null }) {
+		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
+		if (record.provider !== 'codex') throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex agents only');
+		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native turn input must be nonblank');
+		if (typeof executeTool !== 'function') throw new TypeError('executeTool must be a function');
+		const traceId = requestedTraceId === null ? defaultTraceId(agentId, goalRevision) : validateTraceId(requestedTraceId);
+		const queuedAt = this.#now();
+		this.#record('planner_requested', record, { operation: 'native_turn', preserveState, retry: false, lane: record.provider, priority, traceId });
+		return this.#scheduler.schedule(agentId, async ({ signal }) => {
+			const admittedAt = this.#now();
+			const queueWaitMs = elapsed(queuedAt, admittedAt);
+			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
+			this.#registry.assertCurrentRevision(agentId, goalRevision);
+			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
+			try {
+				const agent = await this.#providerAttempt(record, {
+					operation: 'create_agent', attempt: 1, queueWaitMs, retry: false, traceId,
+				}, async () => {
+					const created = await this.#codexService.createAgent(record, { recoverySummary, controlProtocol: 'native_tools' });
+					await created.setGoalRevision(goalRevision);
+					return created;
+				});
+				let firstToolAt = null;
+				const result = await this.#providerAttempt(record, {
+					operation: 'native_turn', attempt: 1, queueWaitMs, retry: false, traceId,
+				}, () => agent.act(input, {
+					goalRevision,
+					signal,
+					executeTool: async (request) => {
+						if (firstToolAt === null) {
+							firstToolAt = this.#now();
+							this.#recordTracePhase(record, traceId, 'provider_first_byte', firstToolAt, firstToolAt, 'completed');
+						}
+						return executeTool(request);
+					},
+				}), agent);
+				const completedAt = this.#now();
+				if (firstToolAt === null) this.#recordTracePhase(record, traceId, 'provider_first_byte', completedAt, completedAt, 'failed', 'NO_TOOL_CALL');
+				this.#recordTracePhase(record, traceId, 'provider_final_byte', completedAt, completedAt, 'completed');
+				this.#record('planner_decision_completed', record, { operation: 'native_turn', attempt: 1, queueWaitMs, directive: 'native_tools', traceId });
+				return result;
+			} catch (error) {
+				this.#record('planner_failed', record, { operation: 'native_turn', errorCode: error?.code ?? 'NATIVE_TURN_FAILED', retry: false, traceId });
+				if (!preserveState && this.#isCurrent(agentId, goalRevision) && !['STALE_PLAN', 'PLAN_CANCELLED'].includes(error?.code)) {
+					this.#registry.setState(agentId, DynamicAgentState.ERROR, {
+						goalRevision,
+						error: { code: String(error?.code ?? 'NATIVE_TURN_FAILED').slice(0, 128), message: String(error?.message ?? error).slice(0, 2_048) },
+					});
+				}
+				throw error;
+			}
+		}, { lane: record.provider, priority });
+	}
+
+	async steerNativeTurn({ agentId, input, goalRevision }) {
+		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
+		if (record.provider !== 'codex') throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex agents only');
+		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native steer input must be nonblank');
+		const agent = this.#codexService.getAgent(agentId);
+		if (agent === null) throw codedError('TURN_NOT_ACTIVE', `Agent '${agentId}' has no active Codex turn`);
+		return agent.steer(input, { goalRevision });
+	}
+
 	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null, traceId: requestedTraceId = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
 		const traceIdProvided = requestedTraceId !== null;
@@ -342,6 +405,8 @@ function readSessionFields(agent) {
 function defaultTraceId(agentId, goalRevision) {
 	return `trace-${String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_')}-${goalRevision}`.slice(0, 128);
 }
+
+function codedError(code, message) { return Object.assign(new Error(message), { code }); }
 
 function elapsed(startedAt, finishedAt) {
 	if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) throw new TypeError('planner clock must return finite values');

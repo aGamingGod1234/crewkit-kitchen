@@ -14,6 +14,7 @@
 		"deepgramApiKeyEnvironmentVariable": "DEEPGRAM_API_KEY"
 	},
 	"codex": {
+		"controlProtocol": "native_tools",
 		"planningTimeoutMs": 120000,
 		"catalogTtlMs": 60000,
 		"serviceTier": "priority",
@@ -48,9 +49,9 @@
 	"limits": {
 		"agentCap": 16,
 		"goalQueueCap": 32,
-		"planningConcurrency": 4,
+		"planningConcurrency": 16,
 		"planningMode": "fixed",
-		"urgentReserve": 1,
+		"urgentReserve": 0,
 		"invalidDecisionRetries": 1
 	}
 }
