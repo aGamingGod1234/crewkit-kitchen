@@ -205,8 +205,7 @@ export class ReplayProvider {
 		if (record.agentLoad !== null && requestedLoad !== null && requestedLoad !== undefined && record.agentLoad !== requestedLoad) {
 			throw codedError('REPLAY_IDENTITY_MISMATCH', `replay load for '${this.#trialId}' does not match the recording`);
 		}
-		const trialRecords = this.#records.filter((entry) => entry.trialId === this.#trialId);
-		if (trialRecords.length === 1 && hashIdentity(this.#prompt) !== record.promptHashes[0]) {
+		if (record.agentId === null && hashIdentity(this.#prompt) !== record.promptHashes[0]) {
 			throw codedError('REPLAY_IDENTITY_MISMATCH', `replay configured prompt for '${this.#trialId}' does not match the recording`);
 		}
 	}

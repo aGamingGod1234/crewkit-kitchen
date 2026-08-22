@@ -178,6 +178,19 @@ test('replays bounded per-turn wall delays without exposing prompts', async () =
 	assert.deepEqual(sleeps, [125, 250]);
 });
 
+test('agent-specific replay validates the real turn prompt instead of a global placeholder', async () => {
+	const recording = createReplayRecord({
+		trialId: 'agent-specific', agentId: 'agent-a', agentLoad: 1, prompt: 'real generated prompt',
+		providerProfile: PROFILE, scenario: SCENARIO, decision: DECISION,
+	});
+	const provider = new ReplayProvider({
+		recording, trialId: 'agent-specific', prompt: 'private placeholder', providerProfile: PROFILE,
+		scenario: SCENARIO, agentLoad: 1,
+	});
+	const session = await provider.createAgent({ agentId: 'agent-a', agentLoad: 1, ...PROFILE });
+	assert.deepEqual(await session.decide('real generated prompt'), DECISION);
+});
+
 function SOURCE_FOR(label) {
 	return `program.onUnhandledAttention("continue_and_notify"); await player.wait(${label.length}); program.finish("done");`;
 }
