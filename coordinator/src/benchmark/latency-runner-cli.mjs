@@ -103,6 +103,7 @@ export async function runLatencyRunnerCli(argv = process.argv.slice(2), dependen
 	const read = fs.readFile ?? dependencies.readFile ?? readFile;
 	const inspect = fs.stat ?? dependencies.stat ?? stat;
 	let args = null;
+	let selectedMatrix = null;
 	try {
 		args = parseLatencyRunnerArgs(argv);
 		const matrix = await readJsonFile(args.matrixPath, MAX_MATRIX_BYTES, '--matrix', { read, inspect });
@@ -115,7 +116,7 @@ export async function runLatencyRunnerCli(argv = process.argv.slice(2), dependen
 		let replayPrompt = args.replayPrompt;
 		if (args.replayPromptFile !== null) replayPrompt = await readTextFile(args.replayPromptFile, MAX_PROMPT_BYTES, '--replay-prompt-file', { read, inspect });
 		else if (args.replayPrompt !== null && path.isAbsolute(args.replayPrompt)) replayPrompt = await readPromptArgument(args.replayPrompt, { read, inspect });
-		const selectedMatrix = selectTrial(matrix, args.trialId);
+		selectedMatrix = selectTrial(matrix, args.trialId);
 		const liveConfig = buildLiveProviderOptions(selectedMatrix, args, path.resolve(process.cwd()));
 		const runner = dependencies.runLatencyMatrix ?? defaultRunLatencyMatrix;
 		if (typeof runner !== 'function') throw cliInternal('runLatencyMatrix dependency must be a function');
@@ -135,23 +136,23 @@ export async function runLatencyRunnerCli(argv = process.argv.slice(2), dependen
 			...(args.pairingKey === null ? {} : { pairingKey: args.pairingKey }),
 		};
 		const result = await runner(runnerOptions);
-		const publicResult = publicResultFor(result, args);
+		const publicResult = publicResultFor(result, args, null, selectedMatrix);
 		writePublicResult(output, publicResult);
 		const status = publicResult.status;
 		if (status === 'FAILED') {
 			writeDiagnostic(diagnostics, firstFailureCode(result) ?? 'RUN_FAILED');
-			return EXIT_CODES.FAILED;
+			return isRequiredProviderError(null, result, selectedMatrix) ? EXIT_CODES.REQUIRED_PROVIDER : EXIT_CODES.FAILED;
 		}
 		return status === 'SKIPPED' ? EXIT_CODES.SKIPPED : EXIT_CODES.PASSED;
 	} catch (error) {
 		const code = classifyErrorCode(error);
 		const preserved = error?.result;
-		const publicResult = publicResultFor(preserved, args, code);
+		const publicResult = publicResultFor(preserved, args, code, selectedMatrix);
 		writePublicResult(output, publicResult);
 		writeDiagnostic(diagnostics, code);
 		if (code === 'CLI_USAGE') return EXIT_CODES.USAGE;
 		if (code === 'CLI_INTERNAL') return EXIT_CODES.INTERNAL;
-		return isRequiredProviderError(error, preserved) ? EXIT_CODES.REQUIRED_PROVIDER : EXIT_CODES.FAILED;
+		return isRequiredProviderError(error, preserved, selectedMatrix) ? EXIT_CODES.REQUIRED_PROVIDER : EXIT_CODES.FAILED;
 	}
 }
 
@@ -259,8 +260,9 @@ async function readBoundedFile(filePath, maximumBytes, field, { read, inspect })
 	return Buffer.isBuffer(value) ? value.toString('utf8') : String(value);
 }
 
-function publicResultFor(result, args, errorCode = null) {
+function publicResultFor(result, args, errorCode = null, matrix = null) {
 	const trials = Array.isArray(result?.trials) ? result.trials : [];
+	const matrixTrials = Array.isArray(matrix?.trials) ? matrix.trials : [];
 	const failed = errorCode !== null || result?.status === 'FAILED' || trials.some((trial) => ['FAILED', 'TIMED_OUT'].includes(trial?.status));
 	const skipped = !failed && (result?.status === 'SKIPPED' || (trials.length > 0 && trials.every((trial) => trial?.status === 'SKIPPED')));
 	const status = failed ? 'FAILED' : skipped ? 'SKIPPED' : 'PASSED';
@@ -269,7 +271,7 @@ function publicResultFor(result, args, errorCode = null) {
 		...(errorCode ? { error: { code: safeCode(errorCode) } } : {}),
 		...(result?.matrix && isPlainRecord(result.matrix) ? { matrix: pickMatrix(result.matrix) } : {}),
 		metadata: publicMetadata(args),
-		trials: trials.slice(0, MAX_PUBLIC_TRIALS).map(publicTrial),
+		trials: trials.slice(0, MAX_PUBLIC_TRIALS).map((trial) => publicTrial(trial, matrixTrials.find((candidate) => candidate?.id === trial?.trialId))),
 		trialsTruncated: trials.length > MAX_PUBLIC_TRIALS,
 		cleanup: publicCleanup(result?.cleanup),
 		summary: Number.isSafeInteger(result?.summary) && result.summary >= 0 ? result.summary : null,
@@ -277,7 +279,7 @@ function publicResultFor(result, args, errorCode = null) {
 	return boundPublicOutput(publicResult);
 }
 
-function publicTrial(trial) {
+function publicTrial(trial, matrixTrial = null) {
 	if (!isPlainRecord(trial)) return { status: 'FAILED', error: { code: 'INVALID_TRIAL' } };
 	const providerProfile = isPlainRecord(trial.providerProfile) ? {
 		provider: boundedPublicText(trial.providerProfile.provider, 128),
@@ -293,7 +295,7 @@ function publicTrial(trial) {
 		agentLoad: safeIntegerOrNull(trial.agentLoad),
 		mode: boundedPublicText(trial.mode, 32),
 		status: normalizeStatus(trial.status),
-		providerAvailabilityRequired: trial.providerAvailabilityRequired === true,
+		providerAvailabilityRequired: matrixTrial?.providerAvailabilityRequired === true || trial.providerAvailabilityRequired === true,
 		...(providerProfile ? { providerProfile } : {}),
 		...(isPlainRecord(trial.providerIdentity) ? { providerIdentity: { provider: boundedPublicText(trial.providerIdentity.provider, 128), synthetic: trial.providerIdentity.synthetic === true } } : {}),
 		...(typeof trial.outcomeHash === 'string' ? { outcomeHash: boundedPublicText(trial.outcomeHash, 128) } : {}),
@@ -344,6 +346,15 @@ function publicSystemSummary(summary) {
 			const values = numericFields(summary[key][seriesName], ['min', 'max', 'p50', 'p95', 'p99']);
 			if (Object.keys(values).length > 0) projected[seriesName] = values;
 		}
+		if (Object.keys(projected).length > 0) output[key] = projected;
+	}
+	for (const [key, fields] of Object.entries({
+		cpuDelta: ['userMs', 'systemMs', 'totalMs'],
+		memoryDelta: ['rssBytes', 'heapUsedBytes'],
+		memoryPeak: ['rssBytes', 'heapUsedBytes'],
+	})) {
+		if (!isPlainRecord(summary[key])) continue;
+		const projected = numericFields(summary[key], fields);
 		if (Object.keys(projected).length > 0) output[key] = projected;
 	}
 	if (isPlainRecord(summary.childProcessCount)) output.childProcessCount = numericFields(summary.childProcessCount, ['min', 'max', 'p50', 'p95', 'p99']);
@@ -429,9 +440,12 @@ function classifyErrorCode(error) {
 	return safeCode(error?.code) === 'UNKNOWN' ? 'RUN_FAILED' : safeCode(error.code);
 }
 
-function isRequiredProviderError(error, result) {
+function isRequiredProviderError(error, result, matrix = null) {
 	if (error?.code === 'PROVIDER_UNAVAILABLE' || /(?:required[._-]?provider|provider[._-]?required)/i.test(String(error?.code ?? ''))) return true;
-	return result?.trials?.some((trial) => trial?.providerAvailabilityRequired === true && trial?.error?.code === 'PROVIDER_UNAVAILABLE') === true;
+	return result?.trials?.some((trial) => {
+		const matrixTrial = matrix?.trials?.find?.((candidate) => candidate?.id === trial?.trialId);
+		return (trial?.providerAvailabilityRequired === true || matrixTrial?.providerAvailabilityRequired === true) && trial?.error?.code === 'PROVIDER_UNAVAILABLE';
+	}) === true;
 }
 
 function normalizeStatus(value) {

@@ -347,3 +347,40 @@ test('publishes bounded numeric metrics and CPU/memory summaries without raw pri
 		await rm(files.root, { recursive: true, force: true });
 	}
 });
+
+test('preserves required-provider classification and CPU/memory deltas from runner-shaped trials', async () => {
+	const files = await fixtureFiles();
+	const requiredMatrix = {
+		version: 1, fixedSeeds: [42], agentLoads: [1, 4, 8, 16],
+		trials: [{ id: 'required-cell', mode: 'live', scenarioId: 'fixture', seed: 42, agentLoad: 1,
+			providerProfile: { provider: 'codex', model: 'fixture', reasoningEffort: 'high', serviceTier: 'fast' },
+			repetitions: 1, turnBudgetMs: 100, trialBudgetMs: 500, turnCap: 2, providerAvailabilityRequired: true }],
+	};
+	await writeFile(files.matrix, JSON.stringify(requiredMatrix), 'utf8');
+	const io = capture();
+	try {
+		const exitCode = await runLatencyRunnerCli(['--matrix', files.matrix, '--artifact-directory', files.artifacts], {
+			runLatencyMatrix: async () => ({
+				status: 'FAILED',
+				trials: [{ trialId: 'required-cell', status: 'FAILED', error: { code: 'PROVIDER_UNAVAILABLE', message: 'unavailable' }, systemSummary: {
+					cpuDelta: { basis: 'process_resource_usage_delta_ms', userMs: 7, systemMs: 2, totalMs: 9, privateNumber: 99 },
+					memoryDelta: { basis: 'process_memory_sample_delta_bytes', rssBytes: 30, heapUsedBytes: 20 },
+					memoryPeak: { basis: 'process_memory_sample_bytes', rssBytes: 130, heapUsedBytes: 70 },
+					privateNumber: 999,
+				} }],
+				cleanup: { ok: true },
+			}),
+			stdout: io.out, stderr: io.err,
+		});
+		assert.equal(exitCode, EXIT_CODES.REQUIRED_PROVIDER);
+		const trial = JSON.parse(io.stdout[0]).trials[0];
+		assert.equal(trial.providerAvailabilityRequired, true);
+		assert.deepEqual(trial.systemSummary.cpuDelta, { userMs: 7, systemMs: 2, totalMs: 9 });
+		assert.deepEqual(trial.systemSummary.memoryDelta, { rssBytes: 30, heapUsedBytes: 20 });
+		assert.deepEqual(trial.systemSummary.memoryPeak, { rssBytes: 130, heapUsedBytes: 70 });
+		assert.equal(trial.systemSummary.cpuDelta.privateNumber, undefined);
+		assert.equal(trial.systemSummary.privateNumber, undefined);
+	} finally {
+		await rm(files.root, { recursive: true, force: true });
+	}
+});
