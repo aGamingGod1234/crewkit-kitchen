@@ -25,6 +25,7 @@ $PackageRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $ModsSource = Join-Path $PackageRoot 'mods'
 $RuntimeDirectory = Join-Path $PackageRoot 'runtime'
 $RuntimeDeploymentHelper = Join-Path $PSScriptRoot 'distribution-runtime.ps1'
+$StartupPackagingPreflight = Join-Path $PSScriptRoot 'verify-startup-packaging.ps1'
 $SecretPath = Join-Path $RuntimeDirectory 'bridge-secret.txt'
 $ResolvedGameDirectory = [IO.Path]::GetFullPath($GameDirectory)
 $InstalledPackageRoot = Join-Path $ResolvedGameDirectory 'arena-agents-runtime'
@@ -56,11 +57,12 @@ if ($LASTEXITCODE -ne 0) { throw "Java version check failed with code $LASTEXITC
 if ($javaVersion -notmatch 'version "25(\.|")') {
     throw "Arena Agents requires Java 25. Detected: $($javaVersion.Trim())"
 }
-foreach ($required in @($LauncherProfiles, $VersionMetadata, $ModsSource, $RuntimeDeploymentHelper)) {
+foreach ($required in @($LauncherProfiles, $VersionMetadata, $ModsSource, $RuntimeDeploymentHelper, $StartupPackagingPreflight)) {
 	if (-not (Test-Path -LiteralPath $required)) { throw "Missing installation prerequisite: $required" }
 }
 
 . $RuntimeDeploymentHelper
+& $StartupPackagingPreflight -PackageRoot $PackageRoot
 
 New-Item -ItemType Directory -Force -Path $RuntimeDirectory, (Join-Path $ResolvedGameDirectory 'mods'), $InstalledPackageRoot | Out-Null
 if (-not (Test-Path -LiteralPath $SecretPath -PathType Leaf)) {

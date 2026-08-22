@@ -19,6 +19,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private final Path gameDirectory;
 	private final BundledCoordinatorInstaller.RuntimePackage runtimePackage;
 	private final NodeRuntimeLocator.LocatedNode node;
+	private final Map<String, String> launchEnvironmentOverrides;
 	private final long createdAtEpochMs;
 	private final CoordinatorLaunchPolicy.RestartBudget restartBudget = new CoordinatorLaunchPolicy.RestartBudget();
 	private Process process;
@@ -32,7 +33,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	CoordinatorProcessSupervisor(Path gameDirectory) {
+		this(gameDirectory, Map.of());
+	}
+
+	/** Allows isolated startup fixtures to control inherited environment state without invoking a shell. */
+	CoordinatorProcessSupervisor(Path gameDirectory, Map<String, String> launchEnvironmentOverrides) {
 		this.gameDirectory = gameDirectory.toAbsolutePath().normalize();
+		this.launchEnvironmentOverrides = Map.copyOf(Objects.requireNonNull(launchEnvironmentOverrides, "launch environment overrides must not be null"));
 		this.createdAtEpochMs = System.currentTimeMillis();
 		BundledCoordinatorInstaller.RuntimePackage prepared = null;
 		NodeRuntimeLocator.LocatedNode located = null;
@@ -118,6 +125,12 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			Map<String, String> environment = builder.environment();
 			// ProcessBuilder inherits the caller's provider credentials and environment by default.
 			// Only the validated bridge secret is added for the coordinator child.
+			for (Map.Entry<String, String> override : launchEnvironmentOverrides.entrySet()) {
+				for (String existing : List.copyOf(environment.keySet())) {
+					if (existing.equalsIgnoreCase(override.getKey())) environment.remove(existing);
+				}
+				environment.put(override.getKey(), override.getValue());
+			}
 			environment.put("ARENA_AGENT_BRIDGE_SECRET", secret);
 			Path logDirectory = gameDirectory.resolve("logs");
 			builder.redirectOutput(ProcessBuilder.Redirect.appendTo(logDirectory.resolve("arena-agents-coordinator.log").toFile()));
@@ -146,14 +159,23 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	@Override
 	public synchronized void close() {
-		if (process == null || !process.isAlive()) return;
-		process.destroy();
+		Process owned = process;
+		if (owned == null) return;
+		ProcessHandle handle = owned.toHandle();
+		handle.descendants().forEach(ProcessHandle::destroy);
+		if (owned.isAlive()) owned.destroy();
 		try {
-			if (!process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly();
+			if (!owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+				handle.descendants().forEach(ProcessHandle::destroyForcibly);
+				owned.destroyForcibly();
+				owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+			}
 		} catch (InterruptedException exception) {
 			Thread.currentThread().interrupt();
-			process.destroyForcibly();
+			handle.descendants().forEach(ProcessHandle::destroyForcibly);
+			owned.destroyForcibly();
 		}
+		process = null;
 	}
 
 	private static void configureSharedBridgeSecretPath(Path secretPath) {
