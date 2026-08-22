@@ -53,11 +53,32 @@ test('context cursor binds exact profile/session/goal/server and advances only a
 	const binding = { agentId: 'agent-a', profileFingerprint: PROFILE_FINGERPRINT, sessionGeneration: 2, goalRevision: 4, serverInstanceId: 'server-1' };
 	const cursor = createContextCursor({ ...binding, factRevision: 8, conversationSequence: 12 });
 	assert.equal(contextCursorMatches(cursor, binding), true);
+	assert.equal(contextCursorMatches(cursor, { ...binding, serverInstanceId: 'server-2' }), false, 'a world replacement invalidates the cursor binding');
 	assert.equal(contextCursorMatches(cursor, { ...binding, serviceTier: 'other' }), true, 'binding ignores fields outside the canonical tuple');
 	const rejected = advanceContextCursor(cursor, { ...binding, factRevision: 9, conversationSequence: 13, providerAccepted: false });
 	assert.deepEqual(rejected, cursor);
 	const accepted = advanceContextCursor(cursor, { ...binding, factRevision: 9, conversationSequence: 13, providerAccepted: true });
 	assert.deepEqual(accepted, { ...binding, factRevision: 9, conversationSequence: 13 });
+});
+
+test('changed server bindings force full fact and conversation baselines from their current sources', () => {
+	const ledger = new FactLedger();
+	ledger.add({ key: 'new-world', fact: 'new world', source: 'observation', tick: 1, dimension: 'minecraft:overworld', expiresAtTick: 20, confidence: 1 });
+	const memory = new ConversationMemory();
+	memory.ingest({ sequence: 1, kind: 'player_message', sourceId: 'player', recipientId: 'agent-a', scope: 'direct', text: 'fresh world', goalRevision: 4, observedAtEpochMs: 1 });
+	const oldBinding = { agentId: 'agent-a', profileFingerprint: PROFILE_FINGERPRINT, sessionGeneration: 1, goalRevision: 4, serverInstanceId: 'server-1' };
+	const newBinding = { ...oldBinding, serverInstanceId: 'server-2' };
+	const input = buildPlannerInput(state, {
+		factLedger: ledger,
+		conversationMemory: memory,
+		contextCursor: createContextCursor({ ...oldBinding, factRevision: 0, conversationSequence: -1 }),
+		contextBinding: newBinding,
+		cursorBinding: oldBinding,
+	});
+	assert.match(input, /"fullBaseline":true/);
+	assert.match(input, /new world/);
+	assert.match(input, /fresh world/);
+	assert.doesNotMatch(input, /"mode":"delta"/);
 });
 
 test('planner input can project ledger and memory cursors without deltaing authoritative state', () => {

@@ -121,3 +121,17 @@ test('fact ledger emits expiry tombstones and falls back when a revision base is
 	assert.deepEqual(fallback.removals, []);
 	assert.equal(fallback.upserts.every((entry) => typeof entry.key === 'string'), true);
 });
+
+test('fact ledger reset invalidates prior revision cursors before accepting a fresh world baseline', () => {
+	const ledger = new FactLedger();
+	ledger.add({ key: 'old-world', fact: 'old world', source: 'observation', tick: 1, dimension: 'minecraft:overworld', expiresAtTick: 20, confidence: 1 });
+	const cursor = ledger.delta(null, 1).nextRevision;
+
+	ledger.reset();
+	ledger.add({ key: 'new-world', fact: 'new world', source: 'observation', tick: 1, dimension: 'minecraft:overworld', expiresAtTick: 20, confidence: 1 });
+
+	const delta = ledger.delta(cursor, 1);
+	assert.equal(delta.fullBaseline, true);
+	assert.deepEqual(delta.removals, []);
+	assert.deepEqual(delta.upserts.map(({ key }) => key), ['new-world']);
+});

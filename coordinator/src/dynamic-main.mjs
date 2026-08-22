@@ -22,7 +22,8 @@ import {
 import { PlanningScheduler } from './planning-scheduler.mjs';
 import { MultiplexedServerBridge, ProtocolV2Error } from './protocol-v2.mjs';
 import { adaptObservation } from './observation-adapter.mjs';
-import { buildPlannerInput } from './prompts.mjs';
+import { advanceContextCursor, buildPlannerInput, createContextCursor } from './prompts.mjs';
+import { profileFingerprint } from './provider-session.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
@@ -62,6 +63,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#providerRetryAfter = new Map();
 	#factLedgers = new Map();
 	#conversationMemories = new Map();
+	#contextCursors = new Map();
 	#conversationWakeTransactions = new Map();
 	#programRuntime;
 	#reconciliation = Promise.resolve();
@@ -104,10 +106,7 @@ export class DynamicCoordinator extends EventEmitter {
 			onCompletionRequested: (request) => this.#publishGoalCompleted(request),
 			latencyRegistry: this.#latencyRegistry,
 			trace: (event, fields) => this.#writeTrace(event, fields),
-			plannerContext: (agentId) => ({
-				untrustedFacts: this.#ledger(agentId).toPlannerFacts(),
-				conversationContext: this.#conversationMemory(agentId).toPlannerContext(),
-			}),
+			plannerContext: (agentId) => this.#plannerContext(agentId),
 			clock: () => this.#controlNow(),
 			benchmarkRecorder,
 		});
@@ -156,6 +155,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#providerRetryAfter.clear();
 		this.#factLedgers.clear();
 		this.#conversationMemories.clear();
+		this.#contextCursors.clear();
 		this.#conversationWakeTransactions.clear();
 		if (this.#traceWriter !== null && typeof this.#traceWriter.close === 'function') await this.#traceWriter.close();
 		await this.#codexService.stop();
@@ -167,9 +167,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#bindBridge() {
 		this.#listen('ready', ({ serverInstanceId, registry }) => {
 			if (this.#serverInstanceId !== null && serverInstanceId !== this.#serverInstanceId) {
-				this.#healthRegistry.reset();
-				this.#conversationMemories.clear();
-				this.#conversationWakeTransactions.clear();
+				this.#invalidateServerInstance();
 			}
 			this.#serverInstanceId = serverInstanceId;
 			this.#reconciledStatus = false;
@@ -229,6 +227,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#providerRetryAfter.delete(message.agentId);
 			this.#factLedgers.delete(message.agentId);
 			this.#conversationMemories.delete(message.agentId);
+			this.#contextCursors.delete(message.agentId);
 			this.#forgetConversationWakes(message.agentId);
 			this.#supportedAgentIds.delete(message.agentId);
 			await this.#publishStatus();
@@ -413,6 +412,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#pendingAttention.clear();
 			this.#attentionFlushes.clear();
 			this.#providerRetryAfter.clear();
+			this.#providerWork.clear();
 			await Promise.allSettled(this.#registry.list().map(async (record) => {
 				if (![DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED].includes(record.state)) this.#registry.setState(record.agentId, DynamicAgentState.DISCONNECTED, { goalRevision: record.goalRevision });
 				await this.#planner.interrupt(record.agentId, 'Minecraft bridge disconnected');
@@ -501,6 +501,7 @@ export class DynamicCoordinator extends EventEmitter {
 			kind,
 			preserveState,
 			request,
+			contextSnapshot: this.#contextSnapshot(record),
 			pending: null,
 			traceId: request.traceId ?? planningTraceId(record.agentId, record.goalRevision, lifecycleGeneration, kind),
 			promise: null,
@@ -552,6 +553,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (runtime === null) return runtime;
 		const latest = this.#registry.get(work.agentId);
 		if (latest === null || latest.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) return runtime;
+		this.#rememberAcceptedContextCursor(latest, work.contextSnapshot);
 		this.#flushPendingAttention(latest);
 		if (pending === null) return runtime;
 		try {
@@ -668,6 +670,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (current !== null && message.payload.goalRevision <= current.goalRevision) return;
 		this.#pendingAttention.delete(message.agentId);
 		this.#attentionFlushes.delete(message.agentId);
+		this.#contextCursors.delete(message.agentId);
 		this.#advanceLifecycleGeneration(message.agentId);
 	}
 
@@ -850,6 +853,101 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#factLedgers.set(agentId, ledger);
 		}
 		return ledger;
+	}
+
+	#plannerContext(agentId) {
+		const ledger = this.#ledger(agentId);
+		const memory = this.#conversationMemory(agentId);
+		const cursor = this.#contextCursors.get(agentId);
+		const record = this.#registry.get(agentId);
+		if (cursor === undefined || record === null || this.#serverInstanceId === null) {
+			return {
+				untrustedFacts: ledger.toPlannerFacts(),
+				conversationContext: memory.toPlannerContext(),
+			};
+		}
+		const binding = this.#contextBinding(record);
+		return {
+			factLedger: ledger,
+			conversationMemory: memory,
+			contextCursor: cursor,
+			contextBinding: binding,
+			cursorBinding: cursor,
+		};
+	}
+
+	#contextBinding(record) {
+		const session = typeof this.#codexService.getAgent === 'function'
+			? this.#codexService.getAgent(record.agentId)
+			: null;
+		let metadata = null;
+		try { metadata = session?.sessionMetadata?.() ?? null; } catch { metadata = null; }
+		const selectedProfile = {
+			provider: record.provider,
+			model: record.model,
+			reasoningEffort: record.reasoningEffort,
+			serviceTier: record.serviceTier ?? DEFAULT_SERVICE_TIER,
+		};
+		const sessionFingerprint = metadata?.profileFingerprint ?? session?.profileFingerprint;
+		const resolvedFingerprint = typeof sessionFingerprint === 'string' && /^sha256:[0-9a-f]{64}$/.test(sessionFingerprint)
+			? sessionFingerprint
+			: profileFingerprint(selectedProfile);
+		const sessionGeneration = metadata?.sessionGeneration ?? session?.sessionGeneration;
+		return {
+			agentId: record.agentId,
+			profileFingerprint: resolvedFingerprint,
+			sessionGeneration: Number.isSafeInteger(sessionGeneration) && sessionGeneration >= 1 ? sessionGeneration : 1,
+			goalRevision: record.goalRevision,
+			serverInstanceId: this.#serverInstanceId,
+		};
+	}
+
+	#contextSnapshot(record) {
+		return {
+			factRevision: this.#ledger(record.agentId).delta(null).nextRevision,
+			conversationSequence: this.#conversationMemory(record.agentId).delta(null).nextSequence,
+		};
+	}
+
+	#rememberAcceptedContextCursor(record, snapshot = null) {
+		if (this.#serverInstanceId === null) return;
+		const binding = this.#contextBinding(record);
+		const revisions = snapshot ?? this.#contextSnapshot(record);
+		const value = {
+			...binding,
+			factRevision: revisions.factRevision,
+			conversationSequence: revisions.conversationSequence,
+			providerAccepted: true,
+		};
+		const previous = this.#contextCursors.get(record.agentId);
+		try {
+			this.#contextCursors.set(record.agentId, previous === undefined ? createContextCursor(value) : advanceContextCursor(previous, value));
+		} catch {
+			// A replacement provider session starts from a full current baseline.
+			this.#contextCursors.set(record.agentId, createContextCursor(value));
+		}
+	}
+
+	#invalidateServerInstance() {
+		this.#healthRegistry.reset();
+		this.#factLedgers.clear();
+		this.#conversationMemories.clear();
+		this.#contextCursors.clear();
+		this.#conversationWakeTransactions.clear();
+		this.#providerWork.clear();
+		for (const record of this.#registry.list()) {
+			this.#advanceLifecycleGeneration(record.agentId);
+			this.#programRuntime.dispose(record.agentId);
+			this.#pendingAttention.delete(record.agentId);
+			this.#attentionFlushes.delete(record.agentId);
+			this.#providerRetryAfter.delete(record.agentId);
+			try {
+				Promise.resolve(this.#planner.interrupt(record.agentId, 'Minecraft server instance changed'))
+					.catch((error) => this.#reportAgentError(record.agentId, error));
+			} catch (error) {
+				void this.#reportAgentError(record.agentId, error);
+			}
+		}
 	}
 
 	#conversationMemory(agentId) {

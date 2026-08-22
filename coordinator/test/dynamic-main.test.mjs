@@ -990,6 +990,86 @@ test('adds only the target agent conversation memory to its next planner turn', 
 	}
 });
 
+test('new server instance fences old planning, clears facts, and waits for fresh observation', async () => {
+	const run = await start();
+	let releaseOldPlan;
+	const oldPlanGate = new Promise((resolve) => { releaseOldPlan = resolve; });
+	run.planner.requestPlan = async (request) => {
+		run.planner.requests.push(request);
+		if (request.goalRevision === 1) await oldPlanGate;
+		return {
+			summary: 'Wait.', directive: 'replace', source: SOURCE,
+			completionContract: { goalRevision: request.goalRevision, predicates: [{ type: 'position_within', x: 0, y: 64, z: 0, radius: 1 }] },
+		};
+	};
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1,
+			eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [{ itemId: 'minecraft:old-world-token', count: 1 }], tagCounts: {} } },
+		} });
+		await eventually(() => run.planner.requests.length === 1);
+		assert.match(run.planner.requests[0].input, /minecraft:old-world-token/);
+
+		run.bridge.emit('ready', {
+			serverInstanceId: 'replacement-server',
+			registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Wait.', goalRevision: 1 }],
+		});
+		await eventually(() => run.bridge.sent.filter((message) => message.type === 'agent_ready').some((message) => message.payload?.reconciled === true));
+		assert.equal(run.planner.requests.length, 1, 'reconciliation does not plan from stale world state');
+		releaseOldPlan();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'action_command'), false, 'the old server plan cannot install after replacement');
+
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 2, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 2,
+			eventSequence: 1,
+			observation: { player: { x: 5, y: 70, z: 2, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [{ itemId: 'minecraft:new-world-token', count: 1 }], tagCounts: {} } },
+		} });
+		await eventually(() => run.planner.requests.length === 2);
+		assert.doesNotMatch(run.planner.requests[1].input, /minecraft:old-world-token/);
+		assert.match(run.planner.requests[1].input, /minecraft:new-world-token/);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('same server reconnect preserves deduplicated facts and conversation memory', async () => {
+	const run = await start();
+	try {
+		const conversation = {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'remember this once', goalRevision: 1, observedAtEpochMs: 1_787_184_000_000,
+		};
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: conversation });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [{ itemId: 'minecraft:shared-token', count: 1 }], tagCounts: {} } },
+		} });
+		await eventually(() => run.planner.requests.length === 1);
+
+		run.bridge.emit('disconnected');
+		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DISCONNECTED);
+		run.bridge.emit('ready', {
+			serverInstanceId: 'test',
+			registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Wait.', goalRevision: 1 }],
+		});
+		await eventually(() => run.bridge.sent.filter((message) => message.type === 'agent_ready').some((message) => message.payload?.reconciled === true));
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 2, goal: 'Wait.' } });
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: { ...structuredClone(conversation), goalRevision: 2 } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 2, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [{ itemId: 'minecraft:shared-token', count: 1 }], tagCounts: {} } },
+		} });
+		await eventually(() => run.planner.requests.length === 2);
+		const input = run.planner.requests[1].input;
+		const facts = input.slice(input.indexOf('Untrusted world facts'));
+		assert.equal(facts.split('minecraft:shared-token').length - 1, 1);
+		assert.equal(input.split('remember this once').length - 1, 1);
+	} finally { await run.coordinator.stop(); }
+});
+
 test('includes a DM in the active agent reactive turn without changing its goal revision', async () => {
 	const run = await start();
 	try {

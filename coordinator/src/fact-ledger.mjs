@@ -152,7 +152,10 @@ export class FactLedger {
 	toPlannerDelta(baseRevision = null, nowTick = this.#lastTick) { return this.delta(baseRevision, nowTick); }
 
 	reset() {
-		for (const entry of this.#entries) this.#recordRemoval(entry.key);
+		// Keep revisions monotonic so cursors held by an old world cannot be
+		// mistaken for a cursor into the replacement baseline.
+		this.#revision += 1;
+		this.#history = [];
 		this.#entries = [];
 		this.#sequence = 0;
 		this.#lastTick = 0;
