@@ -78,7 +78,15 @@ export class ProgramRuntimeManager {
 		if (payload.goalRevision !== state.goalRevision || payload.traceId !== state.traceId || payload.contractHash !== state.completionHash) return false;
 		state.completionResult = { verified: payload.verified === true, reasonCode: payload.reasonCode };
 		const verifiedAt = this.#safeNow() ?? 0;
-		this.#recordTracePhase(state, record, 'completion_verification', verifiedAt, verifiedAt, payload.verified === true ? 'completed' : 'failed', payload.reasonCode);
+		this.#recordTracePhase(
+			state,
+			record,
+			'completion_verification',
+			verifiedAt,
+			verifiedAt,
+			payload.verified === true ? 'completed' : 'failed',
+			payload.verified === true ? null : payload.reasonCode,
+		);
 		if (payload.verified !== true) return true;
 		this.#setTerminalState(record, DynamicAgentState.COMPLETED);
 		return true;
@@ -170,7 +178,6 @@ export class ProgramRuntimeManager {
 		if ((timing?.firstProgressAt === null || timing === undefined) && (executionStarted || legacyExecutionResult)) {
 			this.#recordTracePhase(state, record, 'first_world_action', completedAt, completedAt, 'completed', null, actionTraceId);
 		}
-		this.#recordTracePhase(state, record, 'completion_verification', completedAt, completedAt, 'skipped', 'VERIFIER_NOT_INSTALLED', actionTraceId);
 		if (metadata !== undefined) {
 			this.#traceState(state, 'program_step', {
 				programId: metadata.command.provenance.programId,

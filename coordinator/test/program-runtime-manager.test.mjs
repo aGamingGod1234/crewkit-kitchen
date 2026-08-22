@@ -59,13 +59,13 @@ function harness(options = {}) {
 	return { manager, registry, sent, requests, completionRequests };
 }
 
-test('retains the planning trace through program dispatch and first world action without fabricating verification', async () => {
+test('retains the planning trace through factual completion verification', async () => {
 	const rows = [];
 	const run = harness({ benchmarkRecorder: { record(stage, context, fields) { rows.push({ stage, context, fields }); } } });
 	const traceId = 'trace-runtime-1';
 	const decision = {
 		summary: 'Wait once.', directive: 'replace', traceId,
-		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); program.finish("done");',
 	};
 	await run.manager.installDecision(run.registry.get('agent-a'), decision, { observation: observation(), eventSequence: 1 });
 	const command = run.sent.find((message) => message.type === 'action_command');
@@ -77,12 +77,15 @@ test('retains the planning trace through program dispatch and first world action
 	await run.manager.onActionResult(run.registry.get('agent-a'), {
 		traceId, actionId: command.payload.actionId, eventSequence: 3, state: 'SUCCEEDED', reasonCode: 'DONE',
 	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(run.completionRequests.length, 1, 'finished program must request factual completion verification');
 	assert.equal(rows.every((row) => row.context.traceId === traceId), true);
 	assert.equal(rows.some((row) => row.stage === 'first_command_dispatch'), true);
 	assert.equal(rows.some((row) => row.stage === 'first_world_action'), true);
 	const verification = rows.find((row) => row.stage === 'completion_verification');
-	assert.equal(verification?.fields.outcome, 'skipped');
-	assert.equal(verification?.fields.retryReason, 'VERIFIER_NOT_INSTALLED');
+	assert.equal(verification?.fields.outcome, 'completed');
+	assert.equal(Object.hasOwn(verification?.fields ?? {}, 'retryReason'), false);
+	assert.equal(rows.some((row) => row.stage === 'completion_verification' && row.fields.outcome === 'skipped'), false);
 });
 
 test('bridge pre-execution rejection does not count as first world action', async () => {
