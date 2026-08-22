@@ -8,6 +8,7 @@ import { runLatencyMatrix, normalizeLatencyMatrix } from '../src/benchmark/laten
 import { BenchmarkRecorder } from '../src/benchmark/benchmark-recorder.mjs';
 import { createReplayProvider, createReplayRecord } from '../src/benchmark/provider-replay.mjs';
 import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
+import { compileScenarioDecision } from '../src/benchmark/scenario-program.mjs';
 import { VIRTUAL_TICK_MS } from '../src/simulator/virtual-world.mjs';
 
 const PROFILE = Object.freeze({ provider: 'instant', model: 'deterministic-v1', reasoningEffort: 'fixed', serviceTier: 'local' });
@@ -270,6 +271,46 @@ test('shipped default matrix proves physical stone-tool success for every isolat
 	assert.ok(result.trials.every((trial) => trial.debug?.turnCount <= trial.agentLoad * 2));
 	assert.ok(result.trials.every((trial) => trial.debug?.scenarioEvidence?.every((agent) => agent.actionResults === 3 && agent.succeeded === 3 && agent.cancelled === 0 && agent.failed === 0)));
 	assert.ok(result.trials.every((trial) => trial.debug?.scenarioDigest?.startsWith('sha256:')));
+});
+
+test('delayed stone-tool pacing completes in one planner turn without reactive completion requests', async () => {
+	const profile = { provider: 'codex', model: 'stone-fixture', reasoningEffort: 'fixed', serviceTier: 'local' };
+	const scenario = getSimulatorScenario('stone-tool-gathering');
+	const decision = compileScenarioDecision(scenario);
+	let turns = 0;
+	const recorder = new BenchmarkRecorder();
+	const result = await runLatencyMatrix({
+		matrix: matrix({
+			trials: [{
+				...matrix().trials[0], id: 'stone-delayed-completion', mode: 'live', scenarioId: scenario.id,
+				providerProfile: profile, trialBudgetMs: 5_000, turnBudgetMs: 1_000, turnCap: 4,
+			}],
+		}),
+		scenarioResolver: () => scenario,
+		providerFactories: {
+			codex: () => ({
+				available: true, provider: profile.provider, model: profile.model,
+				reasoningEffort: profile.reasoningEffort, serviceTier: profile.serviceTier, providerProfile: profile,
+				async createAgent() {
+					return {
+						async setGoalRevision() {},
+						async decide() {
+							turns += 1;
+							return turns === 1 ? decision : { directive: 'continue', summary: 'continue' };
+						},
+					};
+				},
+				async stop() {},
+			}),
+		},
+		recorder,
+		artifactDirectory: null,
+	});
+
+	assert.equal(result.trials[0].status, 'PASSED');
+	assert.equal(result.trials[0].debug.turnCount, 1);
+	assert.equal(turns, 1);
+	assert.equal(recorder.snapshot().filter((event) => event.stage === 'planner_requested').length, 1);
 });
 
 test('skips optional unavailable providers, fails required providers, and never substitutes', async () => {

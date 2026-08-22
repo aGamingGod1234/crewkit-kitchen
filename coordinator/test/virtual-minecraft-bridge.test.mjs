@@ -57,6 +57,54 @@ test('accepted command produces RUNNING, changed observation, then one terminal 
 	assert.equal(bridge.validatedInbound, 3);
 });
 
+test('routine completion keeps its authoritative observation non-attentive before action_result', async () => {
+	const world = VirtualWorld.fromScenario(scenario());
+	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
+	const manager = managerEvents();
+	bridge.attach(manager);
+	await bridge.send('action_command', 'alice', command('routine-wait', 'wait', { durationMs: 50 }));
+	world.stepTicks(1);
+	await bridge.flush();
+
+	const observation = bridge.events.find((event) => event.type === 'observation');
+	const result = bridge.events.find((event) => event.type === 'result');
+	assert.equal(observation.envelope.payload.attention, false);
+	assert.deepEqual(observation.envelope.payload.changedFacts, []);
+	assert.equal(observation.envelope.payload.lastResult.present, true);
+	assert.equal(observation.envelope.payload.currentAction.active, false);
+	assert.ok(observation.eventSequence < result.eventSequence);
+	assert.deepEqual(manager.events.map((event) => event.type), ['progress', 'observation', 'result']);
+});
+
+test('completion retains attention for health, fire, and attacker hazard facts only', async () => {
+	const world = VirtualWorld.fromScenario({
+		agents: { alice: { position: { x: 0, y: 1, z: 1 }, onGround: true } },
+		blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }, { x: 0, y: 0, z: 1, blockId: 'minecraft:lava' }],
+	});
+	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
+	await bridge.send('action_command', 'alice', command('hazard-wait', 'wait', { durationMs: 100 }));
+	world.stepTicks(1);
+	world.damage('alice', 1, { uuid: 'mob-1', type: 'minecraft:zombie', distance: 2 });
+	world.stepTicks(1);
+	await bridge.flush();
+
+	const observation = bridge.events.find((event) => event.type === 'observation');
+	assert.equal(observation.envelope.payload.attention, true);
+	assert.deepEqual(observation.envelope.payload.changedFacts, ['player.health', 'player.lastAttacker', 'player.onFire']);
+	assert.equal(observation.envelope.payload.currentAction.active, false);
+});
+
+test('explicit publish preserves valid non-active attention facts', async () => {
+	const world = VirtualWorld.fromScenario(scenario());
+	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });
+	await bridge.publish('alice', { attention: true, changedFacts: ['blocks.1,1,0'] });
+	await bridge.flush();
+
+	const observation = bridge.events.find((event) => event.type === 'observation');
+	assert.equal(observation.envelope.payload.attention, true);
+	assert.deepEqual(observation.envelope.payload.changedFacts, ['blocks.1,1,0']);
+});
+
 test('cancellation emits one terminal cancellation and suppresses stale completion', async () => {
 	const world = VirtualWorld.fromScenario(scenario());
 	const bridge = new VirtualMinecraftBridge({ world, agentRecords: { alice: { agentId: 'alice', goalRevision: 1 } } });

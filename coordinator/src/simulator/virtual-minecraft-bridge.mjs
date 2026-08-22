@@ -5,6 +5,13 @@ import { createProtocolV2Envelope, validateProtocolV2Envelope } from '../protoco
 import { ActionRuntime } from './action-runtime.mjs';
 import { VIRTUAL_TICK_MS } from './virtual-world.mjs';
 
+const ACTIVE_ACTION_PLAYER_FACTS = Object.freeze(['health', 'maxHealth', 'gameMode', 'onFire', 'suffocating']);
+const ACTIVE_ACTION_ATTENTION_FACTS = new Set([
+	...ACTIVE_ACTION_PLAYER_FACTS.map((field) => `player.${field}`),
+	'player.lastAttacker',
+	'world',
+]);
+
 /**
  * Deterministic protocol-v2 bridge backed by VirtualWorld and the complete action runtime.
  */
@@ -79,6 +86,7 @@ export class VirtualMinecraftBridge extends EventEmitter {
 				agentId,
 				record,
 				command,
+				baselineObservation: this.#world.observation(agentId),
 				generation: Symbol('action'),
 				elapsedTicks: 0,
 				progressSent: false,
@@ -184,7 +192,6 @@ export class VirtualMinecraftBridge extends EventEmitter {
 	#complete(active, outcome) {
 		const state = outcome.state ?? 'SUCCEEDED';
 		const reasonCode = outcome.reasonCode ?? 'DONE';
-		const changedFacts = outcome.changedFacts ?? (outcome.changed ? ['position'] : ['currentAction']);
 		this.#world.setLastResult(active.agentId, {
 			present: true,
 			actionId: active.command.actionId,
@@ -193,7 +200,13 @@ export class VirtualMinecraftBridge extends EventEmitter {
 			reasonCode,
 			message: reasonCode,
 		});
-		this.#publishObservation(active.record, { attention: true, changedFacts });
+		const completionObservation = this.#world.observation(active.agentId);
+		const changedFacts = completionAttentionFacts(active.baselineObservation, completionObservation);
+		this.#publishObservation(active.record, {
+			attention: changedFacts.length > 0,
+			changedFacts,
+			observation: completionObservation,
+		});
 		const eventSequence = this.#nextEventSequence(active.agentId);
 		const payload = {
 			goalRevision: active.command.goalRevision,
@@ -211,10 +224,11 @@ export class VirtualMinecraftBridge extends EventEmitter {
 		this.#enqueue(async () => this.#manager?.onActionResult(active.record, { ...envelope.payload, eventSequence }));
 	}
 
-	#publishObservation(record, options) {
-		const worldObservation = this.#world.observation(record.agentId, options);
+	#publishObservation(record, { attention = false, changedFacts = [], observation = undefined } = {}) {
+		const worldObservation = observation ?? this.#world.observation(record.agentId);
+		const factualChanges = attention === true ? [...new Set(changedFacts)] : [];
 		const eventSequence = this.#nextEventSequence(record.agentId);
-		const payload = { ...worldObservation, eventSequence };
+		const payload = { ...worldObservation, eventSequence, attention: factualChanges.length > 0, changedFacts: factualChanges };
 		const envelope = this.#inbound(record.agentId, 'observation', payload);
 		this.#recordEvent('observation', envelope, eventSequence);
 		const adapted = adaptObservation(envelope.payload);
@@ -290,4 +304,33 @@ function normalizeRecord(agentId, value) {
 function requireIdentifier(value, field) {
 	if (typeof value !== 'string' || value.length === 0 || value.length > 256) throw new TypeError(`${field} must be a non-empty string`);
 	return value;
+}
+
+function completionAttentionFacts(previous, current) {
+	if (!previous || !current) return [];
+	const facts = new Set();
+	const previousPlayer = previous.player ?? {};
+	const currentPlayer = current.player ?? {};
+	for (const field of ACTIVE_ACTION_PLAYER_FACTS) {
+		if (previousPlayer[field] !== currentPlayer[field]) facts.add(`player.${field}`);
+	}
+	if (attackerAppearedOrChanged(previousPlayer.lastAttacker, currentPlayer.lastAttacker)) facts.add('player.lastAttacker');
+	if (materialWorldChanged(previous.world, current.world)) facts.add('world');
+	return normalizedAttentionFacts([...facts]);
+}
+
+function normalizedAttentionFacts(changedFacts) {
+	if (!Array.isArray(changedFacts)) return [];
+	return [...new Set(changedFacts.filter((fact) => ACTIVE_ACTION_ATTENTION_FACTS.has(fact)))].sort();
+}
+
+function attackerAppearedOrChanged(previous, current) {
+	if (!current || typeof current !== 'object' || Array.isArray(current)) return false;
+	if (!previous || typeof previous !== 'object' || Array.isArray(previous)) return true;
+	return previous.uuid !== current.uuid || previous.type !== current.type;
+}
+
+function materialWorldChanged(previous, current) {
+	for (const field of ['dimension', 'raining', 'thundering']) if (previous?.[field] !== current?.[field]) return true;
+	return false;
 }
