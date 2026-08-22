@@ -6,6 +6,7 @@ export const REPLAY_PROTOCOL_VERSION = 2;
 const MAX_ID_LENGTH = 128;
 const MAX_RECORDINGS = 65_536;
 const MAX_TURNS = 128;
+const MAX_REPLAY_DELAY_MS = 300_000;
 const MAX_DEPTH = 8;
 const MAX_NODES = 8_192;
 const MAX_KEYS = 128;
@@ -55,6 +56,8 @@ export function createReplayRecord({
 	protocolVersion = 2,
 	decision,
 	decisions,
+	delayMs,
+	delaysMs,
 	replayVersion = REPLAY_PROTOCOL_VERSION,
 } = {}) {
 	const id = requireIdentifier(trialId, 'trialId');
@@ -63,6 +66,7 @@ export function createReplayRecord({
 	const selectedPrompts = normalizePrompts(prompts ?? [prompt]);
 	const selectedDecisions = normalizeDecisions(decisions ?? [decision]);
 	if (selectedPrompts.length !== selectedDecisions.length) throw codedError('REPLAY_TURN_COUNT_MISMATCH', 'replay prompts and decisions must contain the same number of turns');
+	const selectedDelays = normalizeDelays(delaysMs ?? [delayMs ?? 0], selectedDecisions.length);
 	const selectedProtocolVersion = positiveInteger(protocolVersion, 'protocolVersion');
 	const selectedReplayVersion = positiveInteger(replayVersion, 'replayVersion');
 	const profile = normalizeProfile(providerProfile);
@@ -83,6 +87,9 @@ export function createReplayRecord({
 		decisionHashes,
 		decision: selectedDecisions[0],
 		decisions: selectedDecisions,
+		delayMs: selectedDelays[0],
+		delaysMs: selectedDelays,
+		timingHash: hashIdentity(selectedDelays),
 	});
 }
 
@@ -105,11 +112,12 @@ export class ReplayProvider {
 	#scenarioHash;
 	#protocolVersion;
 	#agentLoad;
+	#sleep;
 	#sessions = new Map();
 	#stopped = false;
 	calls = 0;
 
-	constructor({ recordings, recording, trialId, prompt, providerProfile, scenario, agentLoad, protocolVersion = 2 } = {}) {
+	constructor({ recordings, recording, trialId, prompt, providerProfile, scenario, agentLoad, protocolVersion = 2, sleep = delay } = {}) {
 		const values = recording === undefined ? recordings : [recording];
 		if (!Array.isArray(values) || values.length === 0 || values.length > MAX_RECORDINGS) throw new TypeError('replay recordings must be a non-empty bounded array');
 		this.#records = values.map(normalizeRecord);
@@ -121,6 +129,8 @@ export class ReplayProvider {
 		this.#scenarioHash = hashIdentity(projectScenarioIdentity(scenario));
 		this.#protocolVersion = positiveInteger(protocolVersion, 'protocolVersion');
 		this.#agentLoad = agentLoad === undefined ? null : positiveInteger(agentLoad, 'agentLoad');
+		if (typeof sleep !== 'function') throw new TypeError('replay sleep must be a function');
+		this.#sleep = sleep;
 		this.available = true;
 		this.synthetic = true;
 	}
@@ -161,6 +171,8 @@ export class ReplayProvider {
 				if (index >= record.decisions.length) throw codedError('REPLAY_EXHAUSTED', `Replay decision sequence for '${record.trialId}/${agentId}' is exhausted`);
 				const actualPromptHash = hashIdentity(requirePrompt(input ?? this.#prompt));
 				if (actualPromptHash !== record.promptHashes[index]) throw codedError('REPLAY_PROMPT_MISMATCH', `Replay prompt for '${record.trialId}/${agentId}' does not match recorded turn ${index + 1}`);
+				await this.#sleep(record.delaysMs[index], options.signal);
+				if (options.signal?.aborted) throw options.signal.reason ?? codedError('PLAN_CANCELLED', 'replay decision was cancelled');
 				if (!legacyRepeat) turn += 1;
 				this.calls += 1;
 				return structuredClone(record.decisions[index]);
@@ -212,6 +224,9 @@ function normalizeRecord(value) {
 	const promptHashes = normalizeHashes(source.promptHashes ?? [source.promptHash], 'recording.promptHashes');
 	const decisions = normalizeDecisions(source.decisions ?? [source.decision]);
 	const decisionHashes = normalizeHashes(source.decisionHashes ?? [source.decisionHash], 'recording.decisionHashes');
+	const delays = normalizeDelays(source.delaysMs ?? [source.delayMs ?? 0], decisions.length);
+	const timingHash = source.timingHash === undefined ? hashIdentity(delays) : requireHash(source.timingHash, 'recording.timingHash');
+	if (timingHash !== hashIdentity(delays)) throw codedError('REPLAY_RECORD_INVALID', 'recorded timing hash does not match the delay sequence');
 	if (promptHashes.length !== decisions.length || decisionHashes.length !== decisions.length) throw codedError('REPLAY_RECORD_INVALID', 'recorded prompt and decision sequences must have equal lengths');
 	for (let index = 0; index < decisions.length; index += 1) {
 		if (decisionHash(decisions[index]) !== decisionHashes[index]) throw codedError('REPLAY_RECORD_INVALID', `recorded decision hash does not match turn ${index + 1}`);
@@ -223,6 +238,8 @@ function normalizeRecord(value) {
 		profileHash: source.profileHash, scenarioHash: source.scenarioHash,
 		decisionHash: decisionHashes[0], decisionHashes,
 		decision: decisions[0], decisions,
+		delayMs: delays[0], delaysMs: delays,
+		timingHash,
 	});
 }
 
@@ -234,6 +251,17 @@ function normalizeDecisions(value) {
 function normalizePrompts(value) {
 	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_TURNS) throw new TypeError(`replay prompts must contain 1-${MAX_TURNS} turns`);
 	return value.map(requirePrompt);
+}
+
+function normalizeDelays(value, turnCount) {
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_TURNS) throw new TypeError(`replay delays must contain 1-${MAX_TURNS} turns`);
+	const normalized = value.map((entry, index) => {
+		if (!Number.isFinite(entry) || entry < 0 || entry > MAX_REPLAY_DELAY_MS) throw new TypeError(`replay delay ${index + 1} must be finite and in [0, ${MAX_REPLAY_DELAY_MS}]`);
+		return entry;
+	});
+	if (normalized.length === 1 && turnCount > 1 && normalized[0] === 0) return Array(turnCount).fill(0);
+	if (normalized.length !== turnCount) throw codedError('REPLAY_TURN_COUNT_MISMATCH', 'replay delays and decisions must contain the same number of turns');
+	return normalized;
 }
 
 function normalizeHashes(value, field) {
@@ -397,6 +425,17 @@ function countNode(context) {
 }
 
 function codedError(code, message) { return Object.assign(new Error(message), { code }); }
+
+function delay(milliseconds, signal) {
+	if (milliseconds === 0) return Promise.resolve();
+	if (signal?.aborted) return Promise.reject(signal.reason ?? codedError('PLAN_CANCELLED', 'replay decision was cancelled'));
+	return new Promise((resolve, reject) => {
+		const complete = () => { signal?.removeEventListener('abort', abort); resolve(); };
+		const handle = setTimeout(complete, milliseconds);
+		const abort = () => { clearTimeout(handle); signal?.removeEventListener('abort', abort); reject(signal.reason ?? codedError('PLAN_CANCELLED', 'replay decision was cancelled')); };
+		signal?.addEventListener('abort', abort, { once: true });
+	});
+}
 
 function deepFreeze(value, seen = new WeakSet()) {
 	if (value === null || typeof value !== 'object' || seen.has(value)) return value;

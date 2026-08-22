@@ -159,6 +159,25 @@ test('rejects prompt drift at the exact turn and does not consume the recorded d
 	assert.deepEqual(await session.decide('turn-2'), { summary: 'second', directive: 'continue' });
 });
 
+test('replays bounded per-turn wall delays without exposing prompts', async () => {
+	const sleeps = [];
+	const recording = createReplayRecord({
+		trialId: 'timed-replay', prompt: 'turn-1', prompts: ['turn-1', 'turn-2'], providerProfile: PROFILE,
+		scenario: SCENARIO, decisions: [DECISION, { summary: 'second', directive: 'continue' }], delaysMs: [125, 250],
+	});
+	assert.deepEqual(recording.delaysMs, [125, 250]);
+	assert.match(recording.timingHash, /^sha256:[a-f0-9]{64}$/);
+	assert.equal(JSON.stringify(recording).includes('turn-1'), false);
+	const provider = new ReplayProvider({
+		recording, trialId: 'timed-replay', prompt: 'turn-1', providerProfile: PROFILE, scenario: SCENARIO,
+		sleep: async (milliseconds) => { sleeps.push(milliseconds); },
+	});
+	const session = await provider.createAgent({ agentId: 'agent-a', ...PROFILE });
+	assert.deepEqual(await session.decide('turn-1'), DECISION);
+	assert.deepEqual(await session.decide('turn-2'), { summary: 'second', directive: 'continue' });
+	assert.deepEqual(sleeps, [125, 250]);
+});
+
 function SOURCE_FOR(label) {
 	return `program.onUnhandledAttention("continue_and_notify"); await player.wait(${label.length}); program.finish("done");`;
 }
