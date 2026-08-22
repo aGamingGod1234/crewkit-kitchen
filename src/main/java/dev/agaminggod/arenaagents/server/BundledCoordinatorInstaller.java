@@ -37,6 +37,16 @@ final class BundledCoordinatorInstaller {
 		});
 	}
 
+	/** Installs the embedded coordinator when present, then returns one validated runtime context. */
+	static RuntimePackage prepare(Path packageRoot) throws IOException {
+		installBundled(packageRoot);
+		return validate(packageRoot);
+	}
+
+	static RuntimePackage validate(Path packageRoot) throws IOException {
+		return validatedPackage(packageRoot);
+	}
+
 	static boolean install(Path packageRoot, ResourceSource resources) throws IOException {
 		Path normalizedRoot = packageRoot.toAbsolutePath().normalize();
 		recoverInterruptedSwap(normalizedRoot);
@@ -143,6 +153,21 @@ final class BundledCoordinatorInstaller {
 		}
 	}
 
+	private static RuntimePackage validatedPackage(Path packageRoot) throws IOException {
+		Path root = packageRoot.toAbsolutePath().normalize();
+		Path coordinator = root.resolve("coordinator").normalize();
+		Path main = coordinator.resolve("src/dynamic-main.mjs").normalize();
+		Path config = coordinator.resolve(USER_CONFIG_PATH).normalize();
+		Path secret = root.resolve(SECRET_PATH).normalize();
+		if (!Files.isRegularFile(main) || !Files.isRegularFile(config)) {
+			throw new IOException("Coordinator package is incomplete; install the bundled coordinator runtime");
+		}
+		if (!Files.isRegularFile(secret)) throw new IOException("Bridge secret file is missing");
+		String value = Files.readString(secret, StandardCharsets.UTF_8).trim();
+		if (value.length() < 32) throw new IOException("Bridge secret is invalid");
+		return new RuntimePackage(root, coordinator, main, config, secret);
+	}
+
 	private static void recoverInterruptedSwap(Path root) throws IOException {
 		Path coordinator = root.resolve("coordinator");
 		if (!Files.isDirectory(root)) return;
@@ -200,5 +225,15 @@ final class BundledCoordinatorInstaller {
 	}
 
 	private record Entry(Path path, String sha256) {
+	}
+
+	record RuntimePackage(Path root, Path coordinatorRoot, Path main, Path config, Path secret) {
+		RuntimePackage {
+			root = root.toAbsolutePath().normalize();
+			coordinatorRoot = coordinatorRoot.toAbsolutePath().normalize();
+			main = main.toAbsolutePath().normalize();
+			config = config.toAbsolutePath().normalize();
+			secret = secret.toAbsolutePath().normalize();
+		}
 	}
 }

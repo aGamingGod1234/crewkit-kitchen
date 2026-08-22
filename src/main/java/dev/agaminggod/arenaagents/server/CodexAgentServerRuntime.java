@@ -13,6 +13,7 @@ import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
+import java.nio.file.Path;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.UUID;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
@@ -58,19 +59,30 @@ public final class CodexAgentServerRuntime {
 		if (BRIDGES.containsKey(server)) {
 			return;
 		}
-		VoiceSubsystemRuntime.start(server);
+		CoordinatorProcessSupervisor supervisor = null;
 		try {
-			CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor();
-			if (supervisor.configured()) {
+			// Prepare the package, Node executable, and canonical secret before any optional
+			// voice or catalog-dependent bridge work is constructed.
+			supervisor = new CoordinatorProcessSupervisor();
+			if (supervisor.configured() || supervisor.failureCode() != null) {
 				COORDINATORS.put(server, supervisor);
 			}
-			MultiplexedServerBridge bridge = new MultiplexedServerBridge(CodexAgentManager.get(server));
+			VoiceSubsystemRuntime.start(server);
+			Path secretPath = supervisor.secretPath();
+			MultiplexedServerBridge bridge = secretPath == null
+					? new MultiplexedServerBridge(CodexAgentManager.get(server))
+					: new MultiplexedServerBridge(CodexAgentManager.get(server), secretPath);
 			bridge.start();
 			MultiplexedServerBridge previous = BRIDGES.putIfAbsent(server, bridge);
 			if (previous != null) {
 				bridge.close();
 			}
 		} catch (RuntimeException exception) {
+			if (supervisor != null) {
+				COORDINATORS.remove(server, supervisor);
+				supervisor.close();
+			}
+			VoiceSubsystemRuntime.close(server);
 			LOGGER.error(
 					"Codex agent bridge is unavailable; summoned agents will remain locally controllable but autonomous planning is disabled",
 					exception
@@ -119,11 +131,28 @@ public final class CodexAgentServerRuntime {
 	}
 
 	public static String automationStatus(MinecraftServer server) {
+		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
+		if (supervisor != null && supervisor.failureCode() != null) {
+			return startupFailureStatus(supervisor.failureCode());
+		}
 		MultiplexedServerBridge bridge = BRIDGES.get(server);
 		if (bridge == null) {
 			return "Automation is offline. Restart Minecraft after checking the bridge setup.";
 		}
 		return bridge.authenticated() ? "Automation ready" : "Waiting for the agent coordinator...";
+	}
+
+	private static String startupFailureStatus(String code) {
+		if (code.startsWith("NODE_RUNTIME")) {
+			return "Automation is offline. Node.js 22+ was not found; set -Darenaagents.nodePath to an absolute executable or install the bundled profile runtime.";
+		}
+		if ("BRIDGE_SECRET_PATH_CONFLICT".equals(code)) {
+			return "Automation is offline. Bridge and voice secret paths must point to the prepared runtime secret.";
+		}
+		if ("COORDINATOR_RESTART_EXHAUSTED".equals(code)) {
+			return "Automation is offline. The coordinator stopped repeatedly; check the coordinator error log and restart Minecraft.";
+		}
+		return "Automation is offline. Restart Minecraft after checking the coordinator setup.";
 	}
 
 	public static List<AgentControlModelOption> modelCatalog(MinecraftServer server) {

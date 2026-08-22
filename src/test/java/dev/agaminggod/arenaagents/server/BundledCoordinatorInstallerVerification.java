@@ -106,6 +106,17 @@ public final class BundledCoordinatorInstallerVerification {
 					"fresh JAR install extracts the bundled coordinator");
 			Path secret = packageRoot.resolve("runtime/bridge-secret.txt");
 			assertTrue(Files.isRegularFile(secret), "fresh JAR install creates the shared bridge secret");
+			BundledCoordinatorInstaller.RuntimePackage prepared = BundledCoordinatorInstaller.prepare(packageRoot);
+			assertEquals(packageRoot.toAbsolutePath().normalize(), prepared.root(), "preparation returns normalized package root");
+			assertEquals(packageRoot.resolve("coordinator").toAbsolutePath().normalize(), prepared.coordinatorRoot(),
+					"preparation returns coordinator root");
+			assertEquals(packageRoot.resolve("coordinator/src/dynamic-main.mjs").toAbsolutePath().normalize(), prepared.main(),
+					"preparation returns coordinator entrypoint");
+			assertEquals(packageRoot.resolve("coordinator/config/dynamic-agents.json").toAbsolutePath().normalize(), prepared.config(),
+					"preparation returns coordinator config");
+			assertEquals(secret.toAbsolutePath().normalize(), prepared.secret(), "preparation returns the canonical secret path");
+			assertFalse(Files.exists(packageRoot.resolve("coordinator/runtime/bridge-secret.txt")),
+					"preparation never copies the shared secret into the coordinator tree");
 			String secretFingerprint = sha256(Files.readAllBytes(secret));
 			assertTrue(Files.readString(secret, StandardCharsets.UTF_8).trim().length() >= 32,
 					"fresh shared bridge secret is bounded and usable");
@@ -127,7 +138,7 @@ public final class BundledCoordinatorInstallerVerification {
 					"coordinator upgrade keeps the one shared bridge secret");
 			assertFalse(BundledCoordinatorInstaller.install(packageRoot, resource(upgradedResources)),
 					"matching coordinator upgrade is idempotent after preserving custom config");
-			return 6;
+			return 13;
 		} finally {
 			deleteTree(packageRoot);
 		}

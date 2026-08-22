@@ -46,6 +46,8 @@ import dev.agaminggod.arenaagents.server.conversation.NativeAgentWhisperTargetsV
 import dev.agaminggod.arenaagents.server.group.AgentGroupRegistryVerification;
 import dev.agaminggod.arenaagents.server.AgentModelArgumentVerification;
 import dev.agaminggod.arenaagents.server.BundledCoordinatorInstallerVerification;
+import dev.agaminggod.arenaagents.server.NodeRuntimeLocatorVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorLaunchPolicyVerification;
 import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayersVerification;
 import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerification;
@@ -154,6 +156,8 @@ public final class VerificationMain {
 		passedAssertions += AgentGroupRegistryVerification.verify();
 		passedAssertions += AgentModelArgumentVerification.verify();
 		passedAssertions += BundledCoordinatorInstallerVerification.verify();
+		passedAssertions += NodeRuntimeLocatorVerification.verify();
+		passedAssertions += CoordinatorLaunchPolicyVerification.verify();
 		passedAssertions += AgentActivityPresentationVerification.verify();
 		passedAssertions += AgentDeathCaptureVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();

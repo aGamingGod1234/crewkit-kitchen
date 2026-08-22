@@ -117,6 +117,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		this(manager, DEFAULT_PORT, configuredSecretPath());
 	}
 
+	public MultiplexedServerBridge(CodexAgentManager manager, Path secretPath) {
+		this(manager, DEFAULT_PORT, secretPath);
+	}
+
 	public MultiplexedServerBridge(CodexAgentManager manager, int port, Path secretPath) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
