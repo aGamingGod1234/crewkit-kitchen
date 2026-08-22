@@ -2,41 +2,41 @@ import { createHash } from 'node:crypto';
 
 import { parseDecision } from '../decision-parser.mjs';
 
-export const REPLAY_PROTOCOL_VERSION = 1;
-const MAX_TRIAL_ID_LENGTH = 128;
-const MAX_HASH_LENGTH = 80;
+export const REPLAY_PROTOCOL_VERSION = 2;
+const MAX_ID_LENGTH = 128;
 const MAX_RECORDINGS = 65_536;
+const MAX_TURNS = 128;
+const MAX_DEPTH = 8;
+const MAX_NODES = 8_192;
+const MAX_KEYS = 128;
+const MAX_ARRAY_ITEMS = 4_096;
+const MAX_STRING_BYTES = 65_536;
+const MAX_CANONICAL_BYTES = 1_048_576;
+const FORBIDDEN_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
-/**
- * Canonical, stable identity hashing used by bounded decision recordings.
- * Prompts and provider responses are never stored in the returned recording.
- */
+/** Canonical, bounded identity hashing. Prompts are hashed and never retained. */
 export function hashIdentity(value) {
 	return `sha256:${createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex')}`;
 }
 
 export function canonicalJson(value) {
-	return JSON.stringify(canonicalize(value));
+	const json = JSON.stringify(canonicalize(value));
+	if (Buffer.byteLength(json, 'utf8') > MAX_CANONICAL_BYTES) throw codedError('REPLAY_VALUE_TOO_LARGE', 'replay identity exceeds the bounded byte limit');
+	return json;
 }
 
-export function canonicalize(value, depth = 0) {
-	if (depth > 8) throw codedError('REPLAY_VALUE_TOO_DEEP', 'replay identity exceeds the maximum depth');
-	if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-	if (typeof value === 'number') {
-		if (!Number.isFinite(value)) throw codedError('REPLAY_INVALID_VALUE', 'replay identity contains a non-finite number');
-		return value;
-	}
-	if (typeof value === 'undefined') return null;
-	if (Array.isArray(value)) return value.map((entry) => canonicalize(entry, depth + 1));
-	if (typeof value !== 'object') throw codedError('REPLAY_INVALID_VALUE', 'replay identity contains an unsupported value');
-	const output = {};
-	for (const key of Object.keys(value).sort()) output[key] = canonicalize(value[key], depth + 1);
-	return output;
+export function canonicalize(value) {
+	return canonicalValue(value, { nodes: 0, stack: new WeakSet() }, 0);
+}
+
+/** Remove executable scenario predicates while retaining the authoritative data identity. */
+export function projectScenarioIdentity(value) {
+	return projectScenarioValue(value, { nodes: 0, stack: new WeakSet() }, 0, 'scenario');
 }
 
 /** Normalize and validate the trusted planner decision envelope. */
 export function normalizeDecision(value) {
-	const parsed = typeof value === 'string' ? parseDecision(value) : parseDecision(JSON.stringify(value));
+	const parsed = typeof value === 'string' ? parseDecision(value) : parseDecision(canonicalJson(value));
 	return deepFreeze(structuredClone(parsed));
 }
 
@@ -46,70 +46,91 @@ export function decisionHash(decision) {
 
 export function createReplayRecord({
 	trialId,
+	agentId,
+	agentLoad,
 	prompt,
+	prompts,
 	providerProfile,
 	scenario,
 	protocolVersion = 2,
 	decision,
+	decisions,
 	replayVersion = REPLAY_PROTOCOL_VERSION,
 } = {}) {
 	const id = requireIdentifier(trialId, 'trialId');
-	if (!Number.isSafeInteger(protocolVersion) || protocolVersion < 1) throw new TypeError('protocolVersion must be a positive safe integer');
-	if (!Number.isSafeInteger(replayVersion) || replayVersion < 1) throw new TypeError('replayVersion must be a positive safe integer');
+	const selectedAgentId = agentId === undefined ? null : requireIdentifier(agentId, 'agentId');
+	const selectedAgentLoad = agentLoad === undefined ? null : positiveInteger(agentLoad, 'agentLoad');
+	const selectedPrompts = normalizePrompts(prompts ?? [prompt]);
+	const selectedDecisions = normalizeDecisions(decisions ?? [decision]);
+	if (selectedPrompts.length !== selectedDecisions.length) throw codedError('REPLAY_TURN_COUNT_MISMATCH', 'replay prompts and decisions must contain the same number of turns');
+	const selectedProtocolVersion = positiveInteger(protocolVersion, 'protocolVersion');
+	const selectedReplayVersion = positiveInteger(replayVersion, 'replayVersion');
 	const profile = normalizeProfile(providerProfile);
-	const scenarioHash = hashIdentity(scenario);
-	const normalizedDecision = normalizeDecision(decision);
+	const scenarioHash = hashIdentity(projectScenarioIdentity(scenario));
+	const promptHashes = selectedPrompts.map(hashIdentity);
+	const decisionHashes = selectedDecisions.map(decisionHash);
 	return deepFreeze({
-		replayVersion,
+		replayVersion: selectedReplayVersion,
 		trialId: id,
-		protocolVersion,
-		promptHash: hashIdentity(requirePrompt(prompt)),
+		...(selectedAgentId === null ? {} : { agentId: selectedAgentId }),
+		...(selectedAgentLoad === null ? {} : { agentLoad: selectedAgentLoad }),
+		protocolVersion: selectedProtocolVersion,
+		promptHash: promptHashes[0],
+		promptHashes,
 		profileHash: hashIdentity(profile),
 		scenarioHash,
-		decisionHash: decisionHash(normalizedDecision),
-		decision: normalizedDecision,
+		decisionHash: decisionHashes[0],
+		decisionHashes,
+		decision: selectedDecisions[0],
+		decisions: selectedDecisions,
 	});
 }
 
-export function verifyReplayDecision(recording, decision) {
+export function verifyReplayDecision(recording, decision, turnIndex = 0) {
 	const record = normalizeRecord(recording);
+	if (!Number.isSafeInteger(turnIndex) || turnIndex < 0 || turnIndex >= record.decisions.length) throw codedError('REPLAY_EXHAUSTED', `Replay decision sequence for '${record.trialId}' is exhausted`);
 	const normalized = normalizeDecision(decision);
-	if (decisionHash(normalized) !== record.decisionHash || canonicalJson(normalized) !== canonicalJson(record.decision)) {
-		throw codedError('REPLAY_DECISION_MISMATCH', `Replay decision for '${record.trialId}' does not match the recorded decision`);
+	if (decisionHash(normalized) !== record.decisionHashes[turnIndex] || canonicalJson(normalized) !== canonicalJson(record.decisions[turnIndex])) {
+		throw codedError('REPLAY_DECISION_MISMATCH', `Replay decision for '${record.trialId}' does not match recorded turn ${turnIndex + 1}`);
 	}
 	return true;
 }
 
-/** Bounded provider-service adapter that returns recorded decisions only. */
+/** Bounded provider adapter that returns only exact recorded decisions. */
 export class ReplayProvider {
-	#recordings;
+	#records;
 	#trialId;
 	#prompt;
 	#providerProfile;
-	#scenario;
+	#scenarioHash;
 	#protocolVersion;
+	#agentLoad;
 	#sessions = new Map();
 	#stopped = false;
 	calls = 0;
 
-	constructor({ recordings, recording, trialId, prompt, providerProfile, scenario, protocolVersion = 2 } = {}) {
+	constructor({ recordings, recording, trialId, prompt, providerProfile, scenario, agentLoad, protocolVersion = 2 } = {}) {
 		const values = recording === undefined ? recordings : [recording];
 		if (!Array.isArray(values) || values.length === 0 || values.length > MAX_RECORDINGS) throw new TypeError('replay recordings must be a non-empty bounded array');
-		const normalizedValues = values.map((entry) => normalizeRecord(entry));
-		if (new Set(normalizedValues.map((entry) => entry.trialId)).size !== normalizedValues.length) throw codedError('DUPLICATE_REPLAY_TRIAL', 'replay recordings contain duplicate trial IDs');
-		this.#recordings = new Map(normalizedValues.map((normalized) => {
-			return [normalized.trialId, normalized];
-		}));
+		this.#records = values.map(normalizeRecord);
+		const keys = this.#records.map((entry) => `${entry.trialId}\u0000${entry.agentId ?? '*'}`);
+		if (new Set(keys).size !== keys.length) throw codedError('DUPLICATE_REPLAY_RECORD', 'replay recordings contain duplicate trial and agent identities');
 		this.#trialId = requireIdentifier(trialId, 'trialId');
 		this.#prompt = requirePrompt(prompt);
 		this.#providerProfile = normalizeProfile(providerProfile);
-		this.#scenario = scenario;
-		this.#protocolVersion = protocolVersion;
+		this.#scenarioHash = hashIdentity(projectScenarioIdentity(scenario));
+		this.#protocolVersion = positiveInteger(protocolVersion, 'protocolVersion');
+		this.#agentLoad = agentLoad === undefined ? null : positiveInteger(agentLoad, 'agentLoad');
 		this.available = true;
+		this.synthetic = true;
 	}
 
 	get provider() { return this.#providerProfile.provider; }
-	get recording() { return this.#recordings.get(this.#trialId) ?? null; }
+	get model() { return this.#providerProfile.model; }
+	get recording() {
+		const candidates = this.#records.filter((entry) => entry.trialId === this.#trialId);
+		return candidates.length === 1 ? candidates[0] : null;
+	}
 
 	async start() {
 		if (this.#stopped) throw codedError('PROVIDER_STOPPED', 'replay provider is stopped');
@@ -120,15 +141,30 @@ export class ReplayProvider {
 		const profile = normalizeProfile(profileValue);
 		if (hashIdentity(profile) !== hashIdentity(this.#providerProfile)) throw codedError('REPLAY_IDENTITY_MISMATCH', 'replay provider profile does not match the recording');
 		const agentId = requireIdentifier(profileValue?.agentId, 'agentId');
+		const requestedLoad = profileValue?.agentLoad ?? this.#agentLoad;
+		if (requestedLoad !== null && requestedLoad !== undefined) positiveInteger(requestedLoad, 'agentLoad');
 		let session = this.#sessions.get(agentId);
 		if (session !== undefined) return session;
+		const record = this.#selectRecord(agentId);
+		this.#assertStaticIdentity(record, requestedLoad);
+		let turn = 0;
 		session = {
 			goalRevision: 0,
 			async setGoalRevision(revision) {
 				if (!Number.isSafeInteger(revision) || revision < 0) throw new TypeError('goalRevision must be a nonnegative safe integer');
 				this.goalRevision = revision;
 			},
-			decide: (prompt, options = {}) => this.#decide(prompt, options),
+			decide: async (input, options = {}) => {
+				if (options.signal?.aborted) throw options.signal.reason ?? codedError('PLAN_CANCELLED', 'replay decision was cancelled');
+				const legacyRepeat = record.decisions.length === 1 && record.promptHashes.length === 1 && record.agentId === null;
+				const index = legacyRepeat ? 0 : turn;
+				if (index >= record.decisions.length) throw codedError('REPLAY_EXHAUSTED', `Replay decision sequence for '${record.trialId}/${agentId}' is exhausted`);
+				const actualPromptHash = hashIdentity(requirePrompt(input ?? this.#prompt));
+				if (actualPromptHash !== record.promptHashes[index]) throw codedError('REPLAY_PROMPT_MISMATCH', `Replay prompt for '${record.trialId}/${agentId}' does not match recorded turn ${index + 1}`);
+				if (!legacyRepeat) turn += 1;
+				this.calls += 1;
+				return structuredClone(record.decisions[index]);
+			},
 			interrupt: async () => {},
 		};
 		this.#sessions.set(agentId, session);
@@ -136,83 +172,228 @@ export class ReplayProvider {
 	}
 
 	getAgent(agentId) { return this.#sessions.get(agentId) ?? null; }
-
 	async removeAgent(agentId) { return this.#sessions.delete(agentId); }
+	async stop() { this.#stopped = true; this.#sessions.clear(); }
 
-	async stop() {
-		this.#stopped = true;
-		this.#sessions.clear();
+	#selectRecord(agentId) {
+		const candidates = this.#records.filter((entry) => entry.trialId === this.#trialId);
+		if (candidates.length === 0) throw codedError('REPLAY_IDENTITY_MISMATCH', `replay trial '${this.#trialId}' does not match any recording`);
+		const exact = candidates.find((entry) => entry.agentId === agentId);
+		const fallback = candidates.find((entry) => entry.agentId === null);
+		const record = exact ?? fallback;
+		if (record === undefined) throw codedError('REPLAY_RECORD_NOT_FOUND', `no replay recording exists for '${this.#trialId}/${agentId}'`);
+		return record;
 	}
 
-	async #decide(prompt, { signal } = {}) {
-		if (signal?.aborted) throw signal.reason ?? codedError('PLAN_CANCELLED', 'replay decision was cancelled');
-		this.#assertIdentity(prompt);
-		const recording = this.recording;
-		if (recording === null) throw codedError('REPLAY_RECORD_NOT_FOUND', `no replay recording exists for '${this.#trialId}'`);
-		this.calls += 1;
-		return structuredClone(recording.decision);
-	}
-
-	#assertIdentity(prompt) {
-		const recording = this.recording ?? (this.#recordings.size === 1 ? this.#recordings.values().next().value : null);
-		if (recording === null) throw codedError('REPLAY_RECORD_NOT_FOUND', `no replay recording exists for '${this.#trialId}'`);
-		const configured = {
-			trialId: this.#trialId,
-			protocolVersion: this.#protocolVersion,
-			promptHash: hashIdentity(this.#prompt),
-			profileHash: hashIdentity(this.#providerProfile),
-			scenarioHash: hashIdentity(this.#scenario),
-		};
-		if (configured.trialId !== recording.trialId || configured.protocolVersion !== recording.protocolVersion
-			|| configured.promptHash !== recording.promptHash || configured.profileHash !== recording.profileHash
-			|| configured.scenarioHash !== recording.scenarioHash) {
+	#assertStaticIdentity(record, requestedLoad) {
+		if (record.trialId !== this.#trialId || record.protocolVersion !== this.#protocolVersion
+			|| record.profileHash !== hashIdentity(this.#providerProfile) || record.scenarioHash !== this.#scenarioHash) {
 			throw codedError('REPLAY_IDENTITY_MISMATCH', `replay identity for '${this.#trialId}' does not match the recording`);
 		}
-		if (hashIdentity(requirePrompt(prompt ?? this.#prompt)) !== recording.promptHash) throw codedError('REPLAY_IDENTITY_MISMATCH', `replay prompt for '${this.#trialId}' does not match the recording`);
+		if (record.agentLoad !== null && requestedLoad !== null && requestedLoad !== undefined && record.agentLoad !== requestedLoad) {
+			throw codedError('REPLAY_IDENTITY_MISMATCH', `replay load for '${this.#trialId}' does not match the recording`);
+		}
+		const trialRecords = this.#records.filter((entry) => entry.trialId === this.#trialId);
+		if (trialRecords.length === 1 && hashIdentity(this.#prompt) !== record.promptHashes[0]) {
+			throw codedError('REPLAY_IDENTITY_MISMATCH', `replay configured prompt for '${this.#trialId}' does not match the recording`);
+		}
 	}
 }
 
 export function createReplayProvider(options) { return new ReplayProvider(options); }
 
 function normalizeRecord(value) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('replay recording must be an object');
-	const trialId = requireIdentifier(value.trialId, 'recording.trialId');
-	const protocolVersion = value.protocolVersion;
-	if (!Number.isSafeInteger(protocolVersion) || protocolVersion < 1) throw new TypeError('recording.protocolVersion must be a positive safe integer');
-	const replayVersion = value.replayVersion ?? REPLAY_PROTOCOL_VERSION;
-	if (!Number.isSafeInteger(replayVersion) || replayVersion < 1) throw new TypeError('recording.replayVersion must be a positive safe integer');
-	for (const key of ['promptHash', 'profileHash', 'scenarioHash', 'decisionHash']) {
-		if (typeof value[key] !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value[key])) throw new TypeError(`recording.${key} must be a sha256 hash`);
+	const source = requirePlainDataRecord(value, 'replay recording');
+	const trialId = requireIdentifier(source.trialId, 'recording.trialId');
+	const agentId = source.agentId === undefined ? null : requireIdentifier(source.agentId, 'recording.agentId');
+	const agentLoad = source.agentLoad === undefined ? null : positiveInteger(source.agentLoad, 'recording.agentLoad');
+	const protocolVersion = positiveInteger(source.protocolVersion, 'recording.protocolVersion');
+	const replayVersion = positiveInteger(source.replayVersion ?? 1, 'recording.replayVersion');
+	const promptHashes = normalizeHashes(source.promptHashes ?? [source.promptHash], 'recording.promptHashes');
+	const decisions = normalizeDecisions(source.decisions ?? [source.decision]);
+	const decisionHashes = normalizeHashes(source.decisionHashes ?? [source.decisionHash], 'recording.decisionHashes');
+	if (promptHashes.length !== decisions.length || decisionHashes.length !== decisions.length) throw codedError('REPLAY_RECORD_INVALID', 'recorded prompt and decision sequences must have equal lengths');
+	for (let index = 0; index < decisions.length; index += 1) {
+		if (decisionHash(decisions[index]) !== decisionHashes[index]) throw codedError('REPLAY_RECORD_INVALID', `recorded decision hash does not match turn ${index + 1}`);
 	}
-	const decision = normalizeDecision(value.decision);
-	if (decisionHash(decision) !== value.decisionHash) throw codedError('REPLAY_RECORD_INVALID', 'recorded decision hash does not match the decision');
+	for (const key of ['profileHash', 'scenarioHash']) requireHash(source[key], `recording.${key}`);
 	return deepFreeze({
-		replayVersion,
-		trialId,
-		protocolVersion,
-		promptHash: value.promptHash,
-		profileHash: value.profileHash,
-		scenarioHash: value.scenarioHash,
-		decisionHash: value.decisionHash,
-		decision,
+		replayVersion, trialId, agentId, agentLoad, protocolVersion,
+		promptHash: promptHashes[0], promptHashes,
+		profileHash: source.profileHash, scenarioHash: source.scenarioHash,
+		decisionHash: decisionHashes[0], decisionHashes,
+		decision: decisions[0], decisions,
 	});
 }
 
+function normalizeDecisions(value) {
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_TURNS) throw new TypeError(`replay decisions must contain 1-${MAX_TURNS} turns`);
+	return value.map(normalizeDecision);
+}
+
+function normalizePrompts(value) {
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_TURNS) throw new TypeError(`replay prompts must contain 1-${MAX_TURNS} turns`);
+	return value.map(requirePrompt);
+}
+
+function normalizeHashes(value, field) {
+	if (!Array.isArray(value) || value.length === 0 || value.length > MAX_TURNS) throw new TypeError(`${field} must be a bounded non-empty array`);
+	return value.map((entry, index) => requireHash(entry, `${field}[${index}]`));
+}
+
 function normalizeProfile(value) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('providerProfile must be an object');
-	const profile = {};
-	for (const key of ['provider', 'model', 'reasoningEffort', 'serviceTier']) profile[key] = requireIdentifier(value[key], `providerProfile.${key}`);
+	const source = requirePlainDataRecord(value, 'providerProfile');
+	const profile = Object.create(null);
+	for (const key of ['provider', 'model', 'reasoningEffort', 'serviceTier']) profile[key] = requireIdentifier(source[key], `providerProfile.${key}`);
 	return profile;
+}
+
+function canonicalValue(value, context, depth) {
+	countNode(context);
+	if (depth > MAX_DEPTH) throw codedError('REPLAY_VALUE_TOO_DEEP', 'replay identity exceeds the maximum depth');
+	if (value === null || typeof value === 'boolean') return value;
+	if (typeof value === 'string') { requireBoundedString(value); return value; }
+	if (typeof value === 'number') {
+		if (!Number.isFinite(value)) throw codedError('REPLAY_INVALID_VALUE', 'replay identity contains a non-finite number');
+		return Object.is(value, -0) ? 0 : value;
+	}
+	if (typeof value !== 'object') throw codedError('REPLAY_INVALID_VALUE', 'replay identity contains an unsupported value');
+	if (context.stack.has(value)) throw codedError('REPLAY_CYCLE', 'replay identity contains a cycle');
+	context.stack.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (value.length > MAX_ARRAY_ITEMS) throw codedError('REPLAY_ARRAY_TOO_LARGE', 'replay identity array exceeds the bounded item limit');
+			const descriptors = safeDescriptors(value);
+			const symbolCount = safeSymbols(value).length;
+			if (symbolCount > 0) throw codedError('REPLAY_INVALID_VALUE', 'replay identity arrays cannot contain symbol properties');
+			const allowedKeys = new Set(['length', ...Array.from({ length: value.length }, (_, index) => String(index))]);
+			if (Object.keys(descriptors).some((key) => !allowedKeys.has(key))) throw codedError('REPLAY_INVALID_KEY', 'replay identity arrays cannot contain custom properties');
+			for (let index = 0; index < value.length; index += 1) {
+				const descriptor = descriptors[String(index)];
+				if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) throw codedError('REPLAY_ACCESSOR_REJECTED', 'replay identity arrays must contain own data elements');
+			}
+			return Array.from({ length: value.length }, (_, index) => canonicalValue(descriptors[String(index)].value, context, depth + 1));
+		}
+		const descriptors = plainDescriptors(value);
+		const keys = Object.keys(descriptors).filter((key) => descriptors[key].enumerable);
+		if (keys.length > MAX_KEYS) throw codedError('REPLAY_TOO_MANY_KEYS', 'replay identity object exceeds the bounded key limit');
+		const output = Object.create(null);
+		for (const key of keys.sort()) {
+			requireSafeKey(key);
+			const descriptor = descriptors[key];
+			if (!Object.hasOwn(descriptor, 'value')) throw codedError('REPLAY_ACCESSOR_REJECTED', 'replay identity cannot contain accessors');
+			output[key] = canonicalValue(descriptor.value, context, depth + 1);
+		}
+		return output;
+	} finally {
+		context.stack.delete(value);
+	}
+}
+
+function projectScenarioValue(value, context, depth, field) {
+	countNode(context);
+	if (depth > MAX_DEPTH) throw codedError('REPLAY_VALUE_TOO_DEEP', `${field} exceeds the maximum depth`);
+	if (value === null || typeof value === 'boolean' || typeof value === 'number' || typeof value === 'string') return canonicalValue(value, { nodes: context.nodes - 1, stack: context.stack }, depth);
+	if (typeof value === 'function' || typeof value === 'undefined') return undefined;
+	if (typeof value !== 'object') throw codedError('REPLAY_INVALID_VALUE', `${field} contains an unsupported value`);
+	if (context.stack.has(value)) throw codedError('REPLAY_CYCLE', `${field} contains a cycle`);
+	context.stack.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (value.length > MAX_ARRAY_ITEMS) throw codedError('REPLAY_ARRAY_TOO_LARGE', `${field} exceeds the bounded item limit`);
+			const descriptors = safeDescriptors(value);
+			const allowedKeys = new Set(['length', ...Array.from({ length: value.length }, (_, index) => String(index))]);
+			if (Object.keys(descriptors).some((key) => !allowedKeys.has(key)) || safeSymbols(value).length > 0) throw codedError('REPLAY_INVALID_KEY', `${field} arrays cannot contain custom properties`);
+			const output = [];
+			for (let index = 0; index < value.length; index += 1) {
+				const descriptor = descriptors[String(index)];
+				if (descriptor === undefined || !Object.hasOwn(descriptor, 'value')) throw codedError('REPLAY_ACCESSOR_REJECTED', `${field} cannot contain accessors or sparse items`);
+				const projected = projectScenarioValue(descriptor.value, context, depth + 1, `${field}[${index}]`);
+				if (projected === undefined) throw codedError('REPLAY_INVALID_VALUE', `${field} arrays cannot contain executable values`);
+				output.push(projected);
+			}
+			return output;
+		}
+		const descriptors = plainDescriptors(value);
+		const keys = Object.keys(descriptors).filter((key) => descriptors[key].enumerable);
+		if (keys.length > MAX_KEYS) throw codedError('REPLAY_TOO_MANY_KEYS', `${field} exceeds the bounded key limit`);
+		const output = Object.create(null);
+		for (const key of keys.sort()) {
+			requireSafeKey(key);
+			const descriptor = descriptors[key];
+			if (!Object.hasOwn(descriptor, 'value')) throw codedError('REPLAY_ACCESSOR_REJECTED', `${field} cannot contain accessors`);
+			const projected = projectScenarioValue(descriptor.value, context, depth + 1, `${field}.${key}`);
+			if (projected !== undefined) output[key] = projected;
+		}
+		return output;
+	} finally {
+		context.stack.delete(value);
+	}
+}
+
+function safeDescriptors(value) {
+	try { return Object.getOwnPropertyDescriptors(value); }
+	catch { throw codedError('REPLAY_UNSAFE_OBJECT', 'replay identity object could not be inspected safely'); }
+}
+
+function safeSymbols(value) {
+	try { return Object.getOwnPropertySymbols(value); }
+	catch { throw codedError('REPLAY_UNSAFE_OBJECT', 'replay identity object could not be inspected safely'); }
+}
+
+function plainDescriptors(value) {
+	let prototype;
+	try { prototype = Object.getPrototypeOf(value); }
+	catch { throw codedError('REPLAY_UNSAFE_OBJECT', 'replay identity object could not be inspected safely'); }
+	if (prototype !== Object.prototype && prototype !== null) throw codedError('REPLAY_UNSAFE_OBJECT', 'replay identity must contain only plain objects');
+	if (safeSymbols(value).length > 0) throw codedError('REPLAY_INVALID_VALUE', 'replay identity cannot contain symbol properties');
+	const descriptors = safeDescriptors(value);
+	for (const [key, descriptor] of Object.entries(descriptors)) {
+		requireSafeKey(key);
+		if (!descriptor.enumerable) throw codedError('REPLAY_INVALID_VALUE', 'replay identity objects cannot hide non-enumerable properties');
+	}
+	return descriptors;
+}
+
+function requirePlainDataRecord(value, field) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${field} must be an object`);
+	const descriptors = plainDescriptors(value);
+	for (const descriptor of Object.values(descriptors)) if (descriptor.enumerable && !Object.hasOwn(descriptor, 'value')) throw codedError('REPLAY_ACCESSOR_REJECTED', `${field} cannot contain accessors`);
+	return Object.fromEntries(Object.entries(descriptors).filter(([, descriptor]) => descriptor.enumerable).map(([key, descriptor]) => [key, descriptor.value]));
+}
+
+function requireSafeKey(key) {
+	if (Buffer.byteLength(key, 'utf8') > MAX_ID_LENGTH || FORBIDDEN_KEYS.has(key)) throw codedError('REPLAY_INVALID_KEY', 'replay identity contains a forbidden or oversized key');
+}
+
+function requireBoundedString(value) {
+	if (Buffer.byteLength(value, 'utf8') > MAX_STRING_BYTES) throw codedError('REPLAY_STRING_TOO_LARGE', 'replay identity string exceeds the bounded byte limit');
 }
 
 function requirePrompt(value) {
 	if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('prompt must be nonblank');
+	requireBoundedString(value);
 	return value;
 }
 
 function requireIdentifier(value, field) {
-	if (typeof value !== 'string' || value.trim().length === 0 || value.length > MAX_TRIAL_ID_LENGTH) throw new TypeError(`${field} must be nonblank and at most ${MAX_TRIAL_ID_LENGTH} characters`);
+	if (typeof value !== 'string' || value.trim().length === 0 || value.length > MAX_ID_LENGTH) throw new TypeError(`${field} must be nonblank and at most ${MAX_ID_LENGTH} characters`);
 	return value.trim();
+}
+
+function requireHash(value, field) {
+	if (typeof value !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value)) throw new TypeError(`${field} must be a sha256 hash`);
+	return value;
+}
+
+function positiveInteger(value, field) {
+	if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${field} must be a positive safe integer`);
+	return value;
+}
+
+function countNode(context) {
+	context.nodes += 1;
+	if (context.nodes > MAX_NODES) throw codedError('REPLAY_VALUE_TOO_LARGE', 'replay identity exceeds the bounded node limit');
 }
 
 function codedError(code, message) { return Object.assign(new Error(message), { code }); }

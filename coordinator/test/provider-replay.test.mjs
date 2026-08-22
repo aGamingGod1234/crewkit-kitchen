@@ -3,12 +3,16 @@ import test from 'node:test';
 
 import {
 	ReplayProvider,
+	canonicalJson,
+	canonicalize,
 	createReplayRecord,
 	decisionHash,
 	hashIdentity,
 	normalizeDecision,
+	projectScenarioIdentity,
 	verifyReplayDecision,
 } from '../src/benchmark/provider-replay.mjs';
+import { getSimulatorScenario } from '../src/simulator/simulator-scenarios.mjs';
 
 const PROFILE = Object.freeze({
 	provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast',
@@ -74,3 +78,87 @@ test('rejects a replay decision mismatch rather than accepting provider drift', 
 		(error) => error.code === 'REPLAY_DECISION_MISMATCH',
 	);
 });
+
+test('canonicalization is bounded, prototype-safe, and never invokes accessors', () => {
+	const nullPrototype = Object.create(null);
+	nullPrototype.z = 1;
+	nullPrototype.a = [true, 'ok'];
+	const normalized = canonicalize(nullPrototype);
+	assert.equal(Object.getPrototypeOf(normalized), null);
+	assert.equal(Array.isArray(normalized.a), true);
+	assert.equal(canonicalJson(nullPrototype), '{"a":[true,"ok"],"z":1}');
+
+	let invoked = false;
+	const accessor = {};
+	Object.defineProperty(accessor, 'secret', { enumerable: true, get() { invoked = true; return 'do-not-read'; } });
+	assert.throws(() => hashIdentity(accessor), (error) => error.code === 'REPLAY_ACCESSOR_REJECTED');
+	assert.equal(invoked, false);
+
+	let proxyTrapInvoked = false;
+	const hostileProxy = new Proxy({ value: 1 }, {
+		ownKeys() { proxyTrapInvoked = true; throw new Error('proxy trap'); },
+	});
+	assert.throws(() => hashIdentity(hostileProxy), (error) => error.code === 'REPLAY_UNSAFE_OBJECT');
+	assert.equal(proxyTrapInvoked, true);
+
+	const tooManyKeys = Object.fromEntries(Array.from({ length: 129 }, (_, index) => [`key-${index}`, index]));
+	assert.throws(() => hashIdentity(tooManyKeys), (error) => error.code === 'REPLAY_TOO_MANY_KEYS');
+	assert.throws(() => hashIdentity('x'.repeat(70_000)), (error) => error.code === 'REPLAY_STRING_TOO_LARGE');
+	assert.throws(() => hashIdentity('x'.repeat(70_000)), /bounded/i);
+});
+
+test('projects shipped function-bearing manifests without serializing executable values', () => {
+	const stone = getSimulatorScenario('stone-tool-gathering');
+	const recording = createReplayRecord({
+		trialId: 'stone-projection', prompt: 'stone prompt', providerProfile: PROFILE, scenario: stone,
+		decision: DECISION,
+	});
+	assert.equal(typeof stone.success, 'function');
+	assert.equal(recording.scenarioHash, hashIdentity(projectScenarioIdentity(stone)));
+	assert.equal(JSON.stringify(recording).includes('success'), false);
+	assert.equal(JSON.stringify(recording).includes('stone prompt'), false);
+});
+
+test('replays exact independent decision sequences for translated agents in one load', async () => {
+	const decisionA1 = { summary: 'a1', directive: 'replace', source: SOURCE_FOR('a1') };
+	const decisionA2 = { summary: 'a2', directive: 'continue' };
+	const decisionB1 = { summary: 'b1', directive: 'replace', source: SOURCE_FOR('b1') };
+	const decisionB2 = { summary: 'b2', directive: 'continue' };
+	const recordingA = createReplayRecord({
+		trialId: 'multi-turn-load-2', agentId: 'agent-a', agentLoad: 2, prompt: 'a-turn-1',
+		prompts: ['a-turn-1', 'a-turn-2'], providerProfile: PROFILE, scenario: SCENARIO,
+		decisions: [decisionA1, decisionA2],
+	});
+	const recordingB = createReplayRecord({
+		trialId: 'multi-turn-load-2', agentId: 'agent-b', agentLoad: 2, prompt: 'b-turn-1',
+		prompts: ['b-turn-1', 'b-turn-2'], providerProfile: PROFILE, scenario: SCENARIO,
+		decisions: [decisionB1, decisionB2],
+	});
+	const provider = new ReplayProvider({ recordings: [recordingA, recordingB], trialId: 'multi-turn-load-2', prompt: 'a-turn-1', providerProfile: PROFILE, scenario: SCENARIO, agentLoad: 2, protocolVersion: 2 });
+	const sessionA = await provider.createAgent({ agentId: 'agent-a', agentLoad: 2, ...PROFILE });
+	const sessionB = await provider.createAgent({ agentId: 'agent-b', agentLoad: 2, ...PROFILE });
+	assert.deepEqual(await sessionA.decide('a-turn-1'), decisionA1);
+	assert.deepEqual(await sessionA.decide('a-turn-2'), decisionA2);
+	await assert.rejects(() => sessionA.decide('a-turn-3'), (error) => error.code === 'REPLAY_EXHAUSTED');
+	assert.deepEqual(await sessionB.decide('b-turn-1'), decisionB1);
+	assert.deepEqual(await sessionB.decide('b-turn-2'), decisionB2);
+	await assert.rejects(() => sessionB.decide('b-turn-3'), (error) => error.code === 'REPLAY_EXHAUSTED');
+	assert.equal(provider.calls, 4);
+});
+
+test('rejects prompt drift at the exact turn and does not consume the recorded decision', async () => {
+	const recording = createReplayRecord({
+		trialId: 'prompt-drift', prompt: 'turn-1', prompts: ['turn-1', 'turn-2'], providerProfile: PROFILE,
+		scenario: SCENARIO, decisions: [DECISION, { summary: 'second', directive: 'continue' }],
+	});
+	const provider = new ReplayProvider({ recording, trialId: 'prompt-drift', prompt: 'turn-1', providerProfile: PROFILE, scenario: SCENARIO, protocolVersion: 2 });
+	const session = await provider.createAgent({ agentId: 'agent-a', ...PROFILE });
+	await assert.rejects(() => session.decide('wrong-turn-1'), (error) => error.code === 'REPLAY_PROMPT_MISMATCH');
+	assert.deepEqual(await session.decide('turn-1'), DECISION);
+	await assert.rejects(() => session.decide('wrong-turn-2'), (error) => error.code === 'REPLAY_PROMPT_MISMATCH');
+	assert.deepEqual(await session.decide('turn-2'), { summary: 'second', directive: 'continue' });
+});
+
+function SOURCE_FOR(label) {
+	return `program.onUnhandledAttention("continue_and_notify"); await player.wait(${label.length}); program.finish("done");`;
+}
