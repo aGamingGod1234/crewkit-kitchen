@@ -10,8 +10,7 @@ const MAX_DIAGNOSTICS = 4096;
 const MAX_TEXT = 4096;
 const MAX_ASSERTION_ARGS = 8192;
 const MAX_EVIDENCE_BYTES = 16_384;
-const MAX_POLL_ATTEMPTS = 256;
-const POLL_INTERVAL_MS = 50;
+const POLL_INTERVAL_MS = 250;
 const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'assert', 'assertions', 'repetitions', 'planningTimeoutMs', 'scenarioTimeoutMs', 'requireFactualSuccess']);
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
@@ -190,13 +189,22 @@ export async function runHeadlessScenario({
 		}
 		if (classification === null) {
 			if (!isAcceptedResponse(summon.text)) await poll({ phase: 'summon', attempt: 0, deadline: startedAt + timeoutMs, response: summon.text, now });
-			await command(`codex start ${generatedName} ${scenario.task}`);
+			const started = await command(`codex start ${generatedName} ${scenario.task}`);
+			if (isFailedResponse(started.text)) {
+				classification = 'ERROR';
+				diagnostics = started.text;
+			}
 			let attempts = 0;
-			while (terminalState === null && attempts < MAX_POLL_ATTEMPTS) {
+			while (classification === null && terminalState === null) {
 				const status = await command(`codex status ${generatedName}`);
 				const parsedState = parseLifecycle(status.text);
 				terminalState = LIFECYCLE_STATES.has(parsedState) ? parsedState : null;
 				if (terminalState !== null) break;
+				if (isFailedResponse(status.text)) {
+					classification = 'ERROR';
+					diagnostics = status.text;
+					break;
+				}
 				const elapsed = Math.max(Number(now()) - startedAt, attempts * POLL_INTERVAL_MS);
 				if (elapsed >= timeoutMs) { classification = 'TIMEOUT'; break; }
 				await poll({ phase: 'status', attempt: attempts, deadline: startedAt + timeoutMs, status: status.text, readStatus: () => command(`codex status ${generatedName}`), now });
@@ -418,8 +426,9 @@ function boundedPositiveInteger(value, field) {
 }
 
 function generatedAgentName(scenario, timestamp) {
-	const id = String(scenario.id ?? 'scenario').replace(/[^A-Za-z0-9_]/g, '_').slice(0, 32) || 'scenario';
-	return `headless_${id}_${Math.abs(Number(timestamp) || 0).toString(36)}`.slice(0, 40);
+	const id = String(scenario.id ?? 'scenario').replace(/[^A-Za-z0-9_]/g, '_').slice(0, 8) || 'scenario';
+	const suffix = Math.abs(Number(timestamp) || 0).toString(36).slice(-5).padStart(5, '0');
+	return `ha_${id}_${suffix}`.slice(0, 16);
 }
 
 function parseLifecycle(value) {

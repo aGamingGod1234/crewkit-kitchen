@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
 	normalizeHeadlessMatrix,
 	normalizeHeadlessScenario,
+	runHeadlessScenario,
 	selectHeadlessScenarios,
 	scenarioReport,
 } from '../src/headless-matrix.mjs';
@@ -11,6 +12,29 @@ const validScenario = (overrides = {}) => ({
 	id: 'codex-chat-completion', provider: 'codex', model: 'gpt-5.6-sol',
 	reasoningEffort: 'high', serviceTier: 'fast', task: 'Send HEADLESS_PASS',
 	timeoutMs: 180000, assert: [{ type: 'lifecycle', state: 'COMPLETED' }], ...overrides,
+});
+
+test('uses a valid Minecraft player name and honors the configured deadline beyond 256 polls', async () => {
+	const scenario = normalizeHeadlessScenario(validScenario({ timeoutMs: 300000 }), 0);
+	let clock = 0;
+	const commands = [];
+	const rcon = {
+		async command(value) {
+			commands.push(value);
+			if (value.startsWith('codex summon-configured')) return { text: 'Created agent' };
+			if (value.startsWith('codex start')) return { text: 'Starting task' };
+			return { text: 'PLANNING' };
+		},
+		async close() {},
+	};
+	const report = await runHeadlessScenario({
+		scenario, runDirectory: 'headless-timeout-fixture', rcon,
+		now: () => (clock += 1000), poll: async () => {}, readFile: async () => '', writeFile: async () => {},
+	});
+	const name = commands[0].split(' ').at(-1);
+	assert.ok(name.length <= 16);
+	assert.equal(report.classification, 'TIMEOUT');
+	assert.ok(commands.filter((command) => command.startsWith('codex status')).length > 256);
 });
 
 test('normalizes one bounded real-provider scenario', () => {

@@ -57,9 +57,10 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 
 	assert.equal(report.status, 'PASSED');
 	assert.equal(report.classification, 'PASSED');
-	assert.match(commands[0], /^codex summon-configured codex gpt-5\.6-sol high priority survival headless_runner_case_/);
-	assert.match(commands[1], /^codex start headless_runner_case_[^ ]+ Do the bounded task$/);
-	assert.match(commands[2], /^codex status headless_runner_case_[^ ]+$/);
+	const generatedName = commands[0].split(' ').at(-1);
+	assert.ok(generatedName.length <= 16);
+	assert.equal(commands[1], `codex start ${generatedName} Do the bounded task`);
+	assert.equal(commands[2], `codex status ${generatedName}`);
 	assert.equal(commands.at(-1), 'data get entity @s Pos');
 	assert.equal(commands.some((command) => command.includes('action_result')), false);
 	assert.equal(recorderClosed, 1);
@@ -138,5 +139,7 @@ test('expands the generated-agent placeholder and requires authoritative factual
 	const report = await runHeadlessScenario({ scenario: factualScenario, runDirectory: 'C:/runs/factual', rcon, now: () => clock++, readFile: async () => '', poll: async () => {} });
 	assert.equal(report.status, 'PASSED');
 	assert.equal(report.factualSuccess, true);
-	assert.match(inventoryCommand, /^data get entity headless_factual_case_/);
+	const generatedName = inventoryCommand.split(' ')[3];
+	assert.ok(generatedName.startsWith('ha_'));
+	assert.ok(generatedName.length <= 16);
 });
