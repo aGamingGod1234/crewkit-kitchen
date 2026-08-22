@@ -26,7 +26,18 @@ function Quote-Argument([string] $Value) {
 
 function Read-Text([string] $Path) {
 	if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
-	return [IO.File]::ReadAllText($Path)
+	$stream = [IO.FileStream]::new(
+		$Path,
+		[IO.FileMode]::Open,
+		[IO.FileAccess]::Read,
+		[IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+	)
+	try {
+		$reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8, $true, 4096, $true)
+		try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+	} finally {
+		$stream.Dispose()
+	}
 }
 
 function Write-PrivateText([string] $Path, [string] $Value) {
