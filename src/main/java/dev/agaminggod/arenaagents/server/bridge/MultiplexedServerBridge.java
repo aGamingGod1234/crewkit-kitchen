@@ -454,7 +454,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			));
 		}
 		JsonObject scheduler = requiredObject(payload, "scheduler");
-		requireKeys(scheduler, Set.of("active", "pending", "maxConcurrent", "maxPending", "warning"), "scheduler");
+		Set<String> schedulerRequiredKeys = Set.of("active", "pending", "maxConcurrent", "maxPending", "warning");
+		Set<String> schedulerAllowedKeys = Set.of(
+				"active", "pending", "maxConcurrent", "maxPending", "warning", "mode", "configuredTarget", "target",
+				"minConcurrency", "maxConcurrency", "urgentReserve", "ordinaryActiveLimit", "activeOrdinary", "activeUrgent",
+				"pendingOrdinary", "pendingUrgent", "growthCount", "backoffCount", "lastChangeReason", "healthyCompletions",
+				"ordinaryReservationRejections", "urgentReservationRejections"
+		);
+		if (!scheduler.keySet().containsAll(schedulerRequiredKeys) || !schedulerAllowedKeys.containsAll(scheduler.keySet())) {
+			throw new BridgeProtocolException("INVALID_FIELD", "scheduler");
+		}
 		CoordinatorStatusSnapshot.SchedulerStatus schedulerStatus = new CoordinatorStatusSnapshot.SchedulerStatus(
 				requiredInt(scheduler, "active"), requiredInt(scheduler, "pending"),
 				requiredInt(scheduler, "maxConcurrent"), requiredInt(scheduler, "maxPending"), requiredBoolean(scheduler, "warning")
