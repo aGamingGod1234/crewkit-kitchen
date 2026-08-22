@@ -5,7 +5,7 @@ import test from 'node:test';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
-import { createDynamicCoordinator } from '../src/dynamic-main.mjs';
+import { createDynamicCoordinator, normalizeDynamicConfig } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 
@@ -71,6 +71,14 @@ const DEATH = Object.freeze({
 	cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 0, y: 64, z: 0,
 	respawnDimensionId: 'minecraft:overworld', respawnX: 100.5, respawnY: 70, respawnZ: -20.5,
 	respawnYaw: 37.5, respawnPitch: -12.25, respawnForced: true, gameMode: 'spectator', diedAtEpochMs: 2,
+});
+
+test('normalizes fixed and adaptive planning modes with production bounds', () => {
+	const base = { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: {} };
+	assert.equal(normalizeDynamicConfig({ ...base, limits: { agentCap: 16, planningConcurrency: 8 } }).limits.planningMode, 'fixed');
+	assert.equal(normalizeDynamicConfig({ ...base, limits: { agentCap: 16, planningConcurrency: 4, planningMode: 'adaptive' } }).limits.planningMode, 'adaptive');
+	assert.throws(() => normalizeDynamicConfig({ ...base, limits: { agentCap: 16, planningConcurrency: 3, planningMode: 'adaptive' } }), /adaptive planningConcurrency/);
+	assert.throws(() => normalizeDynamicConfig({ ...base, limits: { agentCap: 16, planningConcurrency: 17, planningMode: 'adaptive' } }), /adaptive planningConcurrency/);
 });
 
 async function eventually(predicate) {

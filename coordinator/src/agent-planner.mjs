@@ -229,6 +229,11 @@ export class AgentPlanner {
 
 	#publishTelemetry(telemetry) {
 		this.#healthRegistry.record(telemetry);
+		try {
+			if (typeof this.#scheduler.observeProviderTelemetry === 'function') {
+				this.#scheduler.observeProviderTelemetry(telemetry, this.#scheduler.pressureSnapshot);
+			}
+		} catch { /* adaptive admission feedback cannot fail planning */ }
 		try { this.#telemetrySink(telemetry); } catch { /* telemetry consumers cannot fail planning */ }
 	}
 

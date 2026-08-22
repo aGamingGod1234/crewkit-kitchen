@@ -182,3 +182,108 @@ test('scheduler warns at 75 percent and rejects beyond its hard capacity', async
 	assert.equal(scheduler.activeCount, 0);
 	assert.equal(scheduler.pendingCount, 0);
 });
+
+test('adaptive target grows one slot per four demand-backed successful decisions', () => {
+	const events = [];
+	const scheduler = new PlanningScheduler({
+		planningMode: 'adaptive',
+		maxConcurrent: 4,
+		maxPending: 12,
+		urgentReserve: 1,
+		recorder: { record: (stage, context, fields) => events.push({ stage, context, fields }) },
+	});
+
+	assert.equal(scheduler.planningMode, 'adaptive');
+	assert.equal(scheduler.target, 4);
+	for (let index = 0; index < 3; index += 1) {
+		scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: null }, { pendingOrdinary: 1 });
+		assert.equal(scheduler.target, 4);
+	}
+	scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: null }, { pendingOrdinary: 1 });
+	assert.equal(scheduler.target, 5);
+	assert.equal(events.filter((event) => event.stage === 'scheduler_target_changed').length, 1);
+	assert.equal(events.at(-1).fields.reason, 'healthy_growth');
+	assert.deepEqual(Object.keys(events.at(-1).fields).sort(), [
+		'active', 'activeOrdinary', 'activeUrgent', 'maxConcurrency', 'minConcurrency', 'mode',
+		'ordinaryActiveLimit', 'pending', 'pendingOrdinary', 'pendingUrgent', 'previousTarget',
+		'reason', 'target', 'urgentReserve',
+	].sort());
+
+	for (let index = 0; index < 4; index += 1) {
+		scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: null }, { pendingOrdinary: 0 });
+	}
+	assert.equal(scheduler.target, 5, 'idle completions do not create a later burst growth');
+});
+
+test('fixed target ignores provider and tick feedback', () => {
+	const scheduler = new PlanningScheduler({
+		planningMode: 'fixed',
+		maxConcurrent: 8,
+		maxPending: 8,
+		urgentReserve: 1,
+	});
+
+	for (const errorCode of ['RATE_LIMITED', 'OVERLOADED', 'PLANNING_TIMEOUT', null]) {
+		scheduler.observeProviderTelemetry({ operation: 'decide', errorCode }, { pendingOrdinary: 1 });
+	}
+	for (let index = 0; index < 3; index += 1) scheduler.observeSystemHealth({ tickP95Ms: 60 });
+	assert.equal(scheduler.target, 8);
+	assert.equal(scheduler.backoffCount, 0);
+});
+
+test('ordinary work leaves one active reservation for urgent work', async () => {
+	const scheduler = new PlanningScheduler({ planningMode: 'adaptive', maxConcurrent: 4, maxPending: 12, urgentReserve: 1 });
+	const gates = Array.from({ length: 4 }, () => deferred());
+	const ordinaryRuns = [0, 1, 2].map((index) => scheduler.schedule(`ordinary-${index}`, () => gates[index].promise));
+	await Promise.resolve();
+	assert.equal(scheduler.activeCount, 3);
+	assert.equal(scheduler.activeOrdinaryCount, 3);
+	assert.equal(scheduler.pendingCount, 0);
+
+	const urgentGate = deferred();
+	const urgent = scheduler.schedule('urgent', () => urgentGate.promise, { priority: 'urgent', lane: 'urgent' });
+	await Promise.resolve();
+	assert.equal(scheduler.activeCount, 4);
+	assert.equal(scheduler.activeUrgentCount, 1);
+	assert.equal(scheduler.activeAgentIds.includes('urgent'), true);
+
+	for (const gate of gates) gate.resolve();
+	urgentGate.resolve();
+	await Promise.all([...ordinaryRuns, urgent]);
+});
+
+test('ordinary queue capacity preserves the reserved urgent entry at the global boundary', async () => {
+	const scheduler = new PlanningScheduler({ planningMode: 'adaptive', maxConcurrent: 4, maxPending: 12, urgentReserve: 1 });
+	const gates = Array.from({ length: 3 }, () => deferred());
+	const active = gates.map((gate, index) => scheduler.schedule(`active-${index}`, () => gate.promise));
+	await Promise.resolve();
+	const pending = Array.from({ length: 12 }, (_, index) => scheduler.schedule(`pending-${index}`, async () => null));
+	await assert.rejects(scheduler.schedule('ordinary-over-cap', async () => null), (error) => error.code === 'SCHEDULER_CAPACITY');
+	const urgentGate = deferred();
+	const urgent = scheduler.schedule('urgent-at-boundary', () => urgentGate.promise, { lane: 'urgent', priority: 'urgent' });
+	await Promise.resolve();
+	assert.equal(scheduler.activeUrgentCount, 1);
+	assert.equal(scheduler.ordinaryReservationRejections, 1);
+	for (const gate of gates) gate.resolve();
+	urgentGate.resolve();
+	await Promise.all([...active, ...pending, urgent]);
+});
+
+test('adaptive pressure backs off immediately and tick pressure needs three samples', () => {
+	const scheduler = new PlanningScheduler({ planningMode: 'adaptive', maxConcurrent: 8, maxPending: 8, urgentReserve: 1 });
+	scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: 'RATE_LIMITED' });
+	assert.equal(scheduler.target, 7);
+	scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: 'OVERLOADED' });
+	assert.equal(scheduler.target, 6);
+	for (const errorCode of ['AUTH_FAILED', 'MALFORMED_DECISION', 'PLAN_CANCELLED', 'STALE_PLAN', 'MISSING_FINAL_MESSAGE']) {
+		scheduler.observeProviderTelemetry({ operation: 'decide', errorCode });
+	}
+	assert.equal(scheduler.target, 6);
+
+	scheduler.observeSystemHealth({ tickP95Ms: 60 });
+	scheduler.observeSystemHealth({ tickP95Ms: 60 });
+	assert.equal(scheduler.target, 6);
+	scheduler.observeSystemHealth({ tickP95Ms: 60 });
+	assert.equal(scheduler.target, 5);
+	assert.equal(scheduler.lastChangeReason, 'tick_pressure');
+});

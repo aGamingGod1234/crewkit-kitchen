@@ -555,7 +555,13 @@ function normalizeCoordinatorStatus(value) {
 	}
 	if (new Set(profiles.map((profile) => profile.agentId)).size !== profiles.length) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status profile identities must be unique');
 	const schedulerField = 'coordinator_status.scheduler';
-	exactKeys(value.scheduler, ['active', 'pending', 'maxConcurrent', 'maxPending', 'warning'], ['active', 'pending', 'maxConcurrent', 'maxPending', 'warning'], schedulerField);
+	const schedulerOptionalKeys = [
+		'mode', 'configuredTarget', 'target', 'minConcurrency', 'maxConcurrency', 'urgentReserve',
+		'ordinaryActiveLimit', 'activeOrdinary', 'activeUrgent', 'pendingOrdinary', 'pendingUrgent',
+		'growthCount', 'backoffCount', 'lastChangeReason', 'healthyCompletions',
+		'ordinaryReservationRejections', 'urgentReservationRejections',
+	];
+	exactKeys(value.scheduler, ['active', 'pending', 'maxConcurrent', 'maxPending', 'warning', ...schedulerOptionalKeys], ['active', 'pending', 'maxConcurrent', 'maxPending', 'warning'], schedulerField);
 	const scheduler = {
 		active: nonnegativeInteger(value.scheduler.active, `${schedulerField}.active`),
 		pending: nonnegativeInteger(value.scheduler.pending, `${schedulerField}.pending`),
@@ -563,12 +569,31 @@ function normalizeCoordinatorStatus(value) {
 		maxPending: nonnegativeInteger(value.scheduler.maxPending, `${schedulerField}.maxPending`),
 		warning: boolean(value.scheduler.warning, `${schedulerField}.warning`),
 	};
-	if (scheduler.active > scheduler.maxConcurrent || scheduler.pending > scheduler.maxPending) {
+	const schedulerTarget = value.scheduler.target === undefined ? scheduler.maxConcurrent : nonnegativeInteger(value.scheduler.target, `${schedulerField}.target`);
+	if (scheduler.active > schedulerTarget || scheduler.pending > scheduler.maxPending) {
 		throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status scheduler counts exceed capacity');
 	}
 	if (scheduler.maxConcurrent < 1 || scheduler.maxConcurrent + scheduler.maxPending > 16) {
 		throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status scheduler capacity must be in [1, 16]');
 	}
+	if (value.scheduler.mode !== undefined && !['fixed', 'adaptive'].includes(value.scheduler.mode)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${schedulerField}.mode is invalid`);
+	if (value.scheduler.mode !== undefined) scheduler.mode = value.scheduler.mode;
+	for (const field of ['configuredTarget', 'minConcurrency', 'maxConcurrency', 'urgentReserve', 'ordinaryActiveLimit', 'activeOrdinary', 'activeUrgent', 'pendingOrdinary', 'pendingUrgent', 'growthCount', 'backoffCount', 'healthyCompletions', 'ordinaryReservationRejections', 'urgentReservationRejections']) {
+		if (value.scheduler[field] !== undefined) scheduler[field] = nonnegativeInteger(value.scheduler[field], `${schedulerField}.${field}`);
+	}
+	if (value.scheduler.target !== undefined) scheduler.target = schedulerTarget;
+	if (value.scheduler.lastChangeReason !== undefined) scheduler.lastChangeReason = boundedText(value.scheduler.lastChangeReason, `${schedulerField}.lastChangeReason`, MAX_REASON_CODE_LENGTH);
+	if (schedulerTarget < 1 || schedulerTarget > 16) throw new ProtocolV2Error('INVALID_PAYLOAD', `${schedulerField}.target must be in [1, 16]`);
+	if (scheduler.mode === 'adaptive') {
+		if (scheduler.minConcurrency !== undefined && scheduler.minConcurrency < 4) throw new ProtocolV2Error('INVALID_PAYLOAD', `${schedulerField}.minConcurrency must be at least 4 in adaptive mode`);
+		if (scheduler.maxConcurrency !== undefined && scheduler.maxConcurrency > 16) throw new ProtocolV2Error('INVALID_PAYLOAD', `${schedulerField}.maxConcurrency must not exceed 16`);
+		if (scheduler.minConcurrency !== undefined && schedulerTarget < scheduler.minConcurrency) throw new ProtocolV2Error('INVALID_PAYLOAD', `${schedulerField}.target is below its adaptive minimum`);
+		if (scheduler.maxConcurrency !== undefined && schedulerTarget > scheduler.maxConcurrency) throw new ProtocolV2Error('INVALID_PAYLOAD', `${schedulerField}.target exceeds its adaptive maximum`);
+	}
+	if (scheduler.urgentReserve !== undefined && scheduler.maxConcurrency !== undefined && scheduler.urgentReserve > scheduler.maxConcurrency) throw new ProtocolV2Error('INVALID_PAYLOAD', `${schedulerField}.urgentReserve exceeds maxConcurrency`);
+	if (scheduler.ordinaryActiveLimit !== undefined && scheduler.ordinaryActiveLimit > schedulerTarget) throw new ProtocolV2Error('INVALID_PAYLOAD', `${schedulerField}.ordinaryActiveLimit exceeds target`);
+	if (scheduler.activeOrdinary !== undefined && scheduler.activeUrgent !== undefined && scheduler.activeOrdinary + scheduler.activeUrgent !== scheduler.active) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status scheduler active priority counts are inconsistent');
+	if (scheduler.pendingOrdinary !== undefined && scheduler.pendingUrgent !== undefined && scheduler.pendingOrdinary + scheduler.pendingUrgent !== scheduler.pending) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status scheduler pending priority counts are inconsistent');
 	const circuits = boundedArray(value.circuits, 'coordinator_status.circuits', MAX_COORDINATOR_CIRCUITS).map((circuit, index) => {
 		const field = `coordinator_status.circuits[${index}]`;
 		exactKeys(circuit, ['provider', 'model', 'operation', 'count', 'p50Ms', 'p95Ms', 'failureRate', 'circuit'], ['provider', 'model', 'operation', 'count', 'p50Ms', 'p95Ms', 'failureRate', 'circuit'], field);

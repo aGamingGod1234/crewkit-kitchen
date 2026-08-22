@@ -794,7 +794,30 @@ export class DynamicCoordinator extends EventEmitter {
 			supportedProfileCount: profiles.length,
 			rosterReadyCount,
 			rosterCount: records.length,
-			scheduler: { active: pressure.active, pending: pressure.pending, maxConcurrent: pressure.maxConcurrent, maxPending: pressure.maxPending, warning: pressure.warning },
+			scheduler: {
+				active: pressure.active,
+				pending: pressure.pending,
+				maxConcurrent: pressure.maxConcurrent,
+				maxPending: pressure.maxPending,
+				warning: pressure.warning,
+				mode: pressure.mode,
+				configuredTarget: pressure.configuredTarget,
+				target: pressure.target,
+				minConcurrency: pressure.minConcurrency,
+				maxConcurrency: pressure.maxConcurrency,
+				urgentReserve: pressure.urgentReserve,
+				ordinaryActiveLimit: pressure.ordinaryActiveLimit,
+				activeOrdinary: pressure.activeOrdinary,
+				activeUrgent: pressure.activeUrgent,
+				pendingOrdinary: pressure.pendingOrdinary,
+				pendingUrgent: pressure.pendingUrgent,
+				growthCount: pressure.growthCount,
+				backoffCount: pressure.backoffCount,
+				lastChangeReason: pressure.lastChangeReason,
+				healthyCompletions: pressure.healthyCompletions,
+				ordinaryReservationRejections: pressure.ordinaryReservationRejections,
+				urgentReservationRejections: pressure.urgentReservationRejections,
+			},
 			circuits: healthIdentities.slice(0, 32).map((identity) => this.#healthRegistry.snapshot(identity)),
 			latencies: this.#latencyRegistry.snapshot(),
 		});
@@ -848,6 +871,10 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 	const scheduler = dependencies.scheduler ?? new PlanningScheduler({
 		maxConcurrent: config.limits.planningConcurrency,
 		maxPending: Math.max(0, config.limits.agentCap - config.limits.planningConcurrency),
+		planningMode: config.limits.planningMode,
+		minConcurrency: 4,
+		maxConcurrency: config.limits.agentCap,
+		urgentReserve: config.limits.urgentReserve,
 		onPressure: (snapshot) => dependencies.onSchedulerPressure?.(snapshot),
 		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
@@ -921,8 +948,15 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	const workspaceRoot = path.resolve(PROJECT_DIRECTORY, value.workspaceRoot ?? path.join('runtime', 'agent-workspaces'));
 	const agentCap = positiveInteger(value.limits?.agentCap ?? DEFAULT_AGENT_CAP, 'limits.agentCap');
 	const planningConcurrency = positiveInteger(value.limits?.planningConcurrency ?? DEFAULT_PLANNING_CONCURRENCY, 'limits.planningConcurrency');
+	const planningMode = value.limits?.planningMode ?? 'fixed';
+	if (planningMode !== 'fixed' && planningMode !== 'adaptive') throw new TypeError("limits.planningMode must be 'fixed' or 'adaptive'");
 	if (agentCap > 16) throw new TypeError('limits.agentCap must not exceed 16');
+	if (planningMode === 'adaptive' && (agentCap < 4 || planningConcurrency < 4 || planningConcurrency > 16 || planningConcurrency > agentCap)) {
+		throw new TypeError('adaptive planningConcurrency and agentCap must be in [4, 16]');
+	}
 	if (planningConcurrency > agentCap) throw new TypeError('limits.planningConcurrency must not exceed limits.agentCap');
+	const urgentReserve = value.limits?.urgentReserve ?? (agentCap >= 4 ? 1 : 0);
+	if (!Number.isSafeInteger(urgentReserve) || urgentReserve < 0 || urgentReserve > agentCap) throw new TypeError('limits.urgentReserve must be a non-negative safe integer within limits.agentCap');
 	const voice = normalizeVoiceConfig(value.voice, environment);
 	return {
 		bridge: { ...value.bridge, secret },
@@ -958,6 +992,8 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 			agentCap,
 			goalQueueCap: positiveInteger(value.limits?.goalQueueCap ?? DEFAULT_GOAL_QUEUE_CAP, 'limits.goalQueueCap'),
 			planningConcurrency,
+			planningMode,
+			urgentReserve,
 			invalidDecisionRetries: nonNegativeInteger(value.limits?.invalidDecisionRetries ?? DEFAULT_INVALID_DECISION_RETRIES, 'limits.invalidDecisionRetries'),
 		},
 	};

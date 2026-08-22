@@ -456,6 +456,43 @@ test('records strict provider-attempt telemetry without planner input or output'
 	assert.ok(telemetry.every((row) => row.durationMs >= 0 && row.queueWaitMs >= 0));
 });
 
+test('feeds redacted provider telemetry to the scheduler after health recording', async () => {
+	const registry = new FakeRegistry();
+	const order = [];
+	let observed = null;
+	const healthRegistry = {
+		canAttempt: () => true,
+		record: (row) => { order.push(`health:${row.operation}`); },
+	};
+	const scheduler = {
+		schedule(_agentId, operation) { return operation({ signal: new AbortController().signal }); },
+		cancel() { return false; },
+		pressureSnapshot: { pendingOrdinary: 1 },
+		observeProviderTelemetry(row, snapshot) {
+			order.push(`scheduler:${row.operation}`);
+			observed = { row, snapshot };
+		},
+	};
+	const telemetry = [];
+	const planner = new AgentPlanner({
+		registry,
+		healthRegistry,
+		scheduler,
+		telemetrySink: (row) => { order.push(`sink:${row.operation}`); telemetry.push(row); },
+		codexService: {
+			async createAgent() { return { async setGoalRevision() {}, async decide() { return VALID_DECISION; } }; },
+			getAgent() { return null; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	await planner.requestPlan({ agentId: AGENT_ID, input: 'state', goalRevision: GOAL_REVISION });
+	assert.deepEqual(order, ['health:create_agent', 'scheduler:create_agent', 'sink:create_agent', 'health:decide', 'scheduler:decide', 'sink:decide']);
+	assert.equal(observed.row.operation, 'decide');
+	assert.deepEqual(observed.snapshot, { pendingOrdinary: 1 });
+	assert.equal(telemetry.at(-1).errorCode, null);
+});
+
 test('provider circuit rejects work before allocating a provider session', async () => {
 	const registry = new FakeRegistry();
 	let creates = 0;
