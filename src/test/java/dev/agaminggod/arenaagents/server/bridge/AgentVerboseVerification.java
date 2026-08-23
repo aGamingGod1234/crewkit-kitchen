@@ -16,6 +16,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class AgentVerboseVerification {
 	private AgentVerboseVerification() {
@@ -33,7 +34,34 @@ public final class AgentVerboseVerification {
 		verifyToggleSurvivesReconnect();
 		verifyStrictVerboseEventIsAccepted();
 		verifyStrictSchemaAndRedaction();
-		return 35;
+		verifyRawAgentErrorChatPolicy();
+		return 38;
+	}
+
+	private static void verifyRawAgentErrorChatPolicy() {
+		AgentVerboseState state = new AgentVerboseState();
+		AtomicInteger rawReports = new AtomicInteger();
+		reportRawAgentError(state, rawReports::incrementAndGet);
+		assertEquals(1, rawReports.get(), "verbose off retains concise agent_error chat");
+
+		state.setEnabled(true);
+		reportRawAgentError(state, rawReports::incrementAndGet);
+		assertEquals(1, rawReports.get(), "verbose on suppresses the duplicate raw agent_error message");
+
+		state.setEnabled(false);
+		reportRawAgentError(state, rawReports::incrementAndGet);
+		assertEquals(2, rawReports.get(), "turning verbose off restores concise agent_error chat");
+	}
+
+	private static void reportRawAgentError(AgentVerboseState state, Runnable reporter) {
+		try {
+			var method = MultiplexedServerBridge.class.getDeclaredMethod(
+					"reportRawAgentError", AgentVerboseState.class, Runnable.class);
+			method.setAccessible(true);
+			method.invoke(null, state, reporter);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("missing raw agent_error reporting boundary", exception);
+		}
 	}
 
 	private static void verifyStrictSchemaAndRedaction() {
@@ -68,9 +96,9 @@ public final class AgentVerboseVerification {
 		assertEquals("World details redacted.",
 				AgentVerboseChat.sanitizeMessage("Raw observation {\"blocks\":[1,2,3]}"),
 				"raw world dumps are never sent to Minecraft chat");
-		assertEquals("{\"directive\":\"replace\",\"summary\":\"Gather wood\"}",
+		assertEquals("Technical details hidden.",
 				AgentVerboseChat.sanitizeMessage("{\"directive\":\"replace\",\"summary\":\"Gather wood\"}"),
-				"ordinary bounded planner output remains visible");
+				"raw planner JSON never reaches Minecraft chat");
 		CodexAgentManager manager = uninitializedManager();
 		var record = manager.registry().create("gpt-5.6-luna", "high", Optional.of("RedactionAgent"), 1_000L);
 		record = manager.registry().start(record.agentId(), "Find the hidden diamond cache", 1_001L).after();

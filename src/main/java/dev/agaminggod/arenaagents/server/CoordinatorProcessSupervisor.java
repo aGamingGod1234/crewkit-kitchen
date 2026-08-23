@@ -15,6 +15,7 @@ import java.util.Objects;
 /** Starts the bundled localhost coordinator with one prepared runtime context. */
 final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CoordinatorProcessSupervisor.class);
+	private static final String FISH_API_KEY_FILE = "runtime/fish-api-key.txt";
 
 	private final Path gameDirectory;
 	private final BundledCoordinatorInstaller.RuntimePackage runtimePackage;
@@ -134,13 +135,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			builder.directory(runtimePackage.coordinatorRoot().toFile());
 			Map<String, String> environment = builder.environment();
 			// ProcessBuilder inherits the caller's provider credentials and environment by default.
-			// Only the validated bridge secret is added for the coordinator child.
 			for (Map.Entry<String, String> override : launchEnvironmentOverrides.entrySet()) {
 				for (String existing : List.copyOf(environment.keySet())) {
 					if (existing.equalsIgnoreCase(override.getKey())) environment.remove(existing);
 				}
 				environment.put(override.getKey(), override.getValue());
 			}
+			configureVoiceProviderCredential(environment);
 			environment.put("ARENA_AGENT_BRIDGE_SECRET", secret);
 			Path logDirectory = gameDirectory.resolve("logs");
 			builder.redirectOutput(ProcessBuilder.Redirect.appendTo(logDirectory.resolve("arena-agents-coordinator.log").toFile()));
@@ -196,6 +197,43 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		while (handles.stream().anyMatch(ProcessHandle::isAlive) && System.nanoTime() < deadline) {
 			Thread.sleep(10L);
 		}
+	}
+
+	private void configureVoiceProviderCredential(Map<String, String> environment) {
+		configureVoiceProviderCredential(runtimePackage.root(), environment);
+	}
+
+	static void configureVoiceProviderCredential(Path runtimeRoot, Map<String, String> environment) {
+		if (nonBlankEnvironmentValue(environment, "FISH_AUDIO_API_KEY")
+				|| nonBlankEnvironmentValue(environment, "FISH_API_KEY")) return;
+		Path credentialFile = Objects.requireNonNull(runtimeRoot, "runtime root must not be null")
+				.resolve(FISH_API_KEY_FILE).normalize();
+		if (!Files.isRegularFile(credentialFile)) return;
+		String credential;
+		try {
+			credential = Files.readString(credentialFile, StandardCharsets.UTF_8).trim();
+		} catch (IOException exception) {
+			LOGGER.warn("Ignoring unreadable optional Fish TTS credential; proximity speech will use its fallback");
+			return;
+		}
+		if (credential.length() < 8 || credential.length() > 512) {
+			LOGGER.warn("Ignoring malformed optional Fish TTS credential; proximity speech will use its fallback");
+			return;
+		}
+		for (String existing : List.copyOf(environment.keySet())) {
+			if (existing.equalsIgnoreCase("FISH_AUDIO_API_KEY")) environment.remove(existing);
+		}
+		environment.put("FISH_AUDIO_API_KEY", credential);
+		LOGGER.info("Configured the Arena Agents TTS provider from the runtime credential file");
+	}
+
+	private static boolean nonBlankEnvironmentValue(Map<String, String> environment, String name) {
+		for (Map.Entry<String, String> entry : environment.entrySet()) {
+			if (entry.getKey().equalsIgnoreCase(name) && entry.getValue() != null && !entry.getValue().isBlank()) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	static void configureSharedBridgeSecretPath(Path secretPath) {

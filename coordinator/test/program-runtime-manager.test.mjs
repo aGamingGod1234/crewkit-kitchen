@@ -265,6 +265,122 @@ test('installs a model-authored program and dispatches its next primitive withou
 	assert.equal(run.requests.length, 0, 'pre-authored continuation must not call the provider');
 });
 
+test('keeps the agent acting while a successful exhausted program is replaced', async () => {
+	const registry = new AgentRegistry();
+	registry.register(record());
+	const sent = [];
+	const requests = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			return withCompletionContract({
+				summary: 'Continue with the next bounded action.',
+				directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(2);',
+			}, request.goalRevision);
+		} },
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onActionResult(registry.get('agent-a'), {
+		actionId: sent[0].payload.actionId,
+		state: 'SUCCEEDED',
+		reasonCode: 'DONE',
+		eventSequence: 2,
+	});
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	for (let attempt = 0; attempt < 10 && sent.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(requests.length, 1);
+	assert.match(requests[0].input, /"attentionTrigger":"program_exhausted"/);
+	assert.equal(sent.length, 2, 'the replacement program dispatches without operator intervention');
+	assert.deepEqual(sent[1].payload.arguments, { durationMs: 2 });
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
+test('retries an exhausted program after a provider failure on fresh facts', async () => {
+	const registry = new AgentRegistry();
+	registry.register(record());
+	const sent = [];
+	const requests = [];
+	const errors = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) throw Object.assign(new Error('provider unavailable'), { code: 'PROVIDER_OFFLINE' });
+			return withCompletionContract({
+				summary: 'Recovered with the next action.',
+				directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(2);',
+			}, request.goalRevision);
+		} },
+		reportError: (_agentId, error) => errors.push(error),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onActionResult(registry.get('agent-a'), {
+		actionId: sent[0].payload.actionId,
+		state: 'SUCCEEDED',
+		reasonCode: 'DONE',
+		eventSequence: 2,
+	});
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	for (let attempt = 0; attempt < 10 && errors.length < 1; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
+	for (let attempt = 0; attempt < 10 && sent.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(errors[0]?.code, 'PROVIDER_OFFLINE');
+	assert.equal(requests.length, 2, 'fresh facts retry the exhausted continuation after provider recovery');
+	assert.equal(sent.length, 2);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
+test('asks again when continue cannot resume an exhausted program', async () => {
+	const registry = new AgentRegistry();
+	registry.register(record());
+	const sent = [];
+	const requests = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) return withCompletionContract({ summary: 'Continue.', directive: 'continue' }, request.goalRevision);
+			return withCompletionContract({
+				summary: 'Install the missing continuation.',
+				directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(2);',
+			}, request.goalRevision);
+		} },
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onActionResult(registry.get('agent-a'), {
+		actionId: sent[0].payload.actionId,
+		state: 'SUCCEEDED',
+		reasonCode: 'DONE',
+		eventSequence: 2,
+	});
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	for (let attempt = 0; attempt < 10 && requests.length < 1; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
+	for (let attempt = 0; attempt < 10 && sent.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(requests.length, 2);
+	assert.equal(sent.length, 2, 'a later replacement resumes action without an operator click');
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
 test('reports a completed ArenaScript program after its final action result', async () => {
 	const changes = [];
 	const run = harness({ onCompleted: (changed) => changes.push(changed) });

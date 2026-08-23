@@ -230,14 +230,18 @@ public final class ServerActionExecutor {
 	}
 
 	private void submitVanillaRespawn(ServerActionRequest request) {
+		CodexAgentManager.VanillaRespawnAttempt attempt = null;
 		try {
 			if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
 				throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 			}
+			attempt = manager.beginVanillaRespawn(request.agentId());
+			AgentChatReporter.acting(manager, attempt.deadRecord(), request);
 			pendingRespawns.put(request.agentId(), new PendingRespawn(
-					request, manager.beginVanillaRespawn(request.agentId()), System.currentTimeMillis(), coordinatorGeneration
+					request, attempt, System.currentTimeMillis(), coordinatorGeneration
 			));
 		} catch (RuntimeException exception) {
+			if (attempt != null) manager.rollbackVanillaRespawn(attempt);
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
 			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L, false, false);
 		}
@@ -298,9 +302,30 @@ public final class ServerActionExecutor {
 	public synchronized void coordinatorDisconnected() {
 		coordinatorGeneration++;
 		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) {
-			pendingRespawns.remove(pending.request().agentId(), pending);
-			manager.rollbackVanillaRespawn(pending.attempt());
+			finishDisconnectedRespawn(
+					pendingRespawns,
+					pending.request().agentId(),
+					pending,
+					() -> manager.rollbackVanillaRespawn(pending.attempt()),
+					() -> AgentChatReporter.respawnDisconnected(manager, pending.attempt().deadRecord())
+			);
 		}
+	}
+
+	static boolean finishDisconnectedRespawn(
+			Map<AgentId, ?> pendingRespawns,
+			AgentId agentId,
+			Object pending,
+			Runnable rollback,
+			Runnable terminalReport
+	) {
+		if (!pendingRespawns.remove(agentId, pending)) return false;
+		try {
+			rollback.run();
+		} finally {
+			terminalReport.run();
+		}
+		return true;
 	}
 
 	private void tickRespawn(PendingRespawn pending, long now) {
@@ -1118,6 +1143,9 @@ public final class ServerActionExecutor {
 		String recipientId = nullableString(arguments, "recipientId");
 		String message = string(arguments, "message");
 		if (audience != ConversationAudience.PROXIMITY || !VoiceSubsystemRuntime.available(manager.server())) {
+			if (audience == ConversationAudience.PROXIMITY) {
+				VoiceSubsystemRuntime.reportAvailabilityFallback(manager.server(), request.agentId());
+			}
 			conversationRouter.deliverAgentMessage(request.agentId(), audience, recipientId, message);
 			return;
 		}

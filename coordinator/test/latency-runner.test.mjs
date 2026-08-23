@@ -53,7 +53,7 @@ function movementScenario() {
 	return {
 		id: 'fixture-movement', seed: 42, agentId: 'agent-a', goal: 'Move.',
 		world: { seed: 42, agents: { 'agent-a': { position: { x: 0, y: 1, z: 0 }, onGround: true } }, blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }] },
-		commands: [{ actionId: 'move-1', actionType: 'move_to', arguments: { x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false } }], events: [], expected: {},
+		commands: [{ actionId: 'move-1', actionType: 'navigate_to', arguments: { x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false, timeoutMs: 5_000 } }], events: [], expected: {},
 	};
 }
 
@@ -67,7 +67,7 @@ function movementProvider() {
 		async start() {},
 		async stop() {},
 		async createAgent() {
-			return { async setGoalRevision() {}, async decide() { return fixtureDecision({ summary: 'move', source: 'program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false }); program.finish("done");', scenario: movementScenario() }); } };
+			return { async setGoalRevision() {}, async decide() { return fixtureDecision({ summary: 'move', source: 'program.onUnhandledAttention("continue_and_notify"); await player.navigateTo({ x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false, timeoutMs: 5_000 }); program.finish("done");', scenario: movementScenario() }); } };
 		},
 	};
 }

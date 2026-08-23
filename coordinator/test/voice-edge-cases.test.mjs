@@ -95,6 +95,38 @@ test('voice worker enforces its shared TTS and STT concurrency limit', async () 
 	});
 });
 
+test('TTS route aborts synthesis when the client closes before the response', async () => {
+	let entered;
+	const providerEntered = new Promise((resolve) => { entered = resolve; });
+	let providerSignal;
+	await withWorker({
+		provider: { synthesize({ signal }) {
+			providerSignal = signal;
+			entered();
+			return new Promise((resolve, reject) => {
+				signal.addEventListener('abort', () => {
+					const error = new Error('synthesis cancelled');
+					error.name = 'AbortError';
+					reject(error);
+				}, { once: true });
+			});
+		} },
+	}, async ({ baseUrl }) => {
+		const controller = new AbortController();
+		const request = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST',
+			headers: ttsHeaders(),
+			body: JSON.stringify(ttsPayload()),
+			signal: controller.signal,
+		});
+		await providerEntered;
+		controller.abort();
+		await assert.rejects(request, (error) => error?.name === 'AbortError');
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(providerSignal.aborted, true);
+	});
+});
+
 test('voice worker start and close are bounded when called concurrently', async () => {
 	const worker = createVoiceHttpServer({
 		provider: { async synthesize() { return validSynthesis(); } },

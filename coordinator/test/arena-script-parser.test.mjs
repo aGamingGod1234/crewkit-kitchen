@@ -24,12 +24,12 @@ test('compiles a bounded program and records its model-owned policy', () => {
 test('admits the exact Task 2 direct action and terminal API calls', () => {
 	assert.doesNotThrow(() => parseArenaScript(`
 		program.onUnhandledAttention("continue_and_notify");
-		const moved = await tryResult(player.moveTo({ x: 4, y: 64, z: 2 }));
+		const moved = await tryResult(player.navigateTo({ x: 4, y: 64, z: 2, tolerance: 1, sprint: false, timeoutMs: 5_000 }));
 		if (!moved.succeeded) program.checkpoint(moved.reason);
 		program.finish("arrived");
 	`));
 	for (const source of [
-		'program.onUnhandledAttention("continue_and_notify"); const move = player.moveTo; await move({ x: 1, y: 2, z: 3 });',
+		'program.onUnhandledAttention("continue_and_notify"); const move = player.navigateTo; await move({ x: 1, y: 2, z: 3 });',
 		'program.onUnhandledAttention("continue_and_notify"); const finish = program.finish; finish("escaped");',
 		'program.onUnhandledAttention("continue_and_notify"); const checkpoint = program.checkpoint; checkpoint("escaped");',
 	]) {
@@ -52,6 +52,28 @@ test('requires exact observed target ids for attack and ranged use', () => {
 	}
 });
 
+test('rejects navigateTo coordinates derived from an observed floating item', () => {
+	assert.throws(() => parseArenaScript(`
+		program.onUnhandledAttention("continue_and_notify");
+		const drop = world.nearest(world.items({ tag: "#minecraft:logs" }));
+		if (drop !== null) await player.navigateTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false, timeoutMs: 5_000 });
+	`), (error) => error.code === 'UNSUPPORTED_SYNTAX' && /floating item coordinates/i.test(error.message));
+});
+
+test('preserves navigation to block, entity, and player-state coordinates', () => {
+	for (const source of [
+		'const target = world.nearest(world.blocks({ tag: "#minecraft:logs" }));',
+		'const target = world.nearest(world.entities());',
+		'const target = player.state();',
+	]) {
+		assert.doesNotThrow(() => parseArenaScript(`
+			program.onUnhandledAttention("continue_and_notify");
+			${source}
+			await player.navigateTo({ x: target.x, y: target.y, z: target.z, tolerance: 1, sprint: false, timeoutMs: 5_000 });
+		`));
+	}
+});
+
 test('admits only factual observed-candidate queries in watcher conditions', () => {
 	assert.doesNotThrow(() => parseArenaScript(`
 		program.onUnhandledAttention("continue_and_notify");
@@ -70,13 +92,13 @@ test('requires watchers to appear in the top-level registration prologue', () =>
 
 test('rejects side-effecting watcher and repeatUntil conditions', () => {
 	for (const source of [
-		'program.onUnhandledAttention("continue_and_notify"); program.watch(async () => { await player.moveTo({ x: 1 }); return false; }, { mode: "boundary" }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(async () => { await player.navigateTo({ x: 1 }); return false; }, { mode: "boundary" }, async () => {});',
 		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => { program.finish("escaped"); return false; }, { maxIterations: 1 }, async () => {});',
 		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => program.checkpoint("escaped"), { mode: "boundary" }, async () => {});',
 		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => program.watch(() => true, { mode: "boundary" }, async () => {}), { maxIterations: 1 }, async () => {});',
-		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.moveTo, { mode: "boundary" }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.navigateTo, { mode: "boundary" }, async () => {});',
 		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => player.wait, { maxIterations: 1 }, async () => {});',
-		'program.onUnhandledAttention("continue_and_notify"); const move = player.moveTo; program.watch(() => move, { mode: "boundary" }, async () => {});',
+		'program.onUnhandledAttention("continue_and_notify"); const move = player.navigateTo; program.watch(() => move, { mode: "boundary" }, async () => {});',
 		'program.onUnhandledAttention("continue_and_notify"); const p = player; program.watch(() => p.moveTo, { mode: "boundary" }, async () => {});',
 	]) assert.throws(() => parseArenaScript(source), (error) => error.code === 'UNSUPPORTED_SYNTAX');
 });

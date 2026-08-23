@@ -43,11 +43,17 @@ public final class CoordinatorStartupSmokeVerification {
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
 			stageCoordinator(sourceCoordinator, packageRoot);
+			int credentialAssertions = verifyOptionalVoiceCredential(packageRoot.resolve("credential-test"));
 			Path node = stageBundledNode(packageRoot);
 			Path fakeAppData = stageFakeCodex(packageRoot);
 			Path secret = packageRoot.resolve("runtime/bridge-secret.txt");
 			Files.createDirectories(secret.getParent());
 			Files.writeString(secret, "s".repeat(32), StandardCharsets.UTF_8);
+			Files.writeString(
+					packageRoot.resolve("runtime/fish-api-key.txt"),
+					"test-fish-api-key",
+					StandardCharsets.UTF_8
+			);
 			System.setProperty("arenaagents.packageRoot", packageRoot.toString());
 			System.clearProperty(NodeRuntimeLocator.PROPERTY);
 			System.clearProperty("arenaagents.bridgeSecretFile");
@@ -55,7 +61,8 @@ public final class CoordinatorStartupSmokeVerification {
 			System.clearProperty("arenaagents.voiceUrl");
 
 			try (ServerSocket bridge = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-				writeSmokeConfig(packageRoot, bridge.getLocalPort());
+				int voicePort = unusedLoopbackPort();
+				writeSmokeConfig(packageRoot, bridge.getLocalPort(), voicePort);
 				Map<String, String> emptyPath = new HashMap<>();
 				emptyPath.put("PATH", "");
 				emptyPath.put("APPDATA", fakeAppData.toString());
@@ -63,7 +70,7 @@ public final class CoordinatorStartupSmokeVerification {
 				emptyPath.put("FISH_API_KEY", "");
 				supervisor = new CoordinatorProcessSupervisor(packageRoot.resolve("game"), emptyPath);
 				assertTrue(supervisor.configured(), "staged package is configured");
-				assertEquals("http://127.0.0.1:9123/v1/tts", System.getProperty("arenaagents.voiceUrl"),
+				assertEquals("http://127.0.0.1:" + voicePort + "/v1/tts", System.getProperty("arenaagents.voiceUrl"),
 						"coordinator voice endpoint is shared with the addon before voice startup");
 				assertEquals(node.toAbsolutePath().normalize(), NodeRuntimeLocator.locate(packageRoot).executable(),
 						"bundled runtime is selected before the empty PATH");
@@ -74,7 +81,11 @@ public final class CoordinatorStartupSmokeVerification {
 					if (bridge.getSoTimeout() == 0) bridge.setSoTimeout(250);
 					try (Socket socket = bridge.accept()) {
 						socket.setSoTimeout(15_000);
-						if (completeHandshakeAndCatalog(socket)) return 7;
+						if (completeHandshakeAndCatalog(socket)) {
+							assertTrue(awaitLoopbackListener(voicePort, 5_000L),
+									"runtime Fish credential starts the loopback voice worker");
+							return 8 + credentialAssertions;
+						}
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
 					}
@@ -162,17 +173,50 @@ public final class CoordinatorStartupSmokeVerification {
 		return root.resolve("fake-appdata");
 	}
 
-	private static void writeSmokeConfig(Path root, int port) throws IOException {
+	private static void writeSmokeConfig(Path root, int port, int voicePort) throws IOException {
 		String config = """
 				{
 				  "bridge": { "host": "127.0.0.1", "port": %d, "secretEnvironmentVariable": "ARENA_AGENT_BRIDGE_SECRET", "reconnectDelayMs": 50, "maxReconnectDelayMs": 100 },
 				  "codex": { "cwd": "%s", "planningTimeoutMs": 1000, "catalogTtlMs": 60000, "serviceTier": "fast", "launchProfile": { "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "serviceTier": "fast" } },
-				  "voice": { "port": 9123, "maxConcurrent": 1 },
+				  "voice": { "port": %d, "maxConcurrent": 1 },
 				  "limits": { "agentCap": 1, "goalQueueCap": 1, "planningConcurrency": 1, "planningMode": "fixed", "urgentReserve": 0, "invalidDecisionRetries": 0 }
 				}
-				""".formatted(port, root.toString().replace("\\", "\\\\"));
+				""".formatted(port, root.toString().replace("\\", "\\\\"), voicePort);
 		Files.createDirectories(root.resolve("coordinator/config"));
 		Files.writeString(root.resolve("coordinator/config/dynamic-agents.json"), config, StandardCharsets.UTF_8);
+	}
+
+	private static int verifyOptionalVoiceCredential(Path runtimeRoot) throws IOException {
+		Path credential = runtimeRoot.resolve("runtime/fish-api-key.txt");
+		Files.createDirectories(credential.getParent());
+		Files.writeString(credential, "bad", StandardCharsets.UTF_8);
+		Map<String, String> environment = new HashMap<>();
+		CoordinatorProcessSupervisor.configureVoiceProviderCredential(runtimeRoot, environment);
+		assertTrue(!environment.containsKey("FISH_AUDIO_API_KEY"),
+				"malformed optional TTS credential is ignored");
+		Files.writeString(credential, "valid-test-fish-key", StandardCharsets.UTF_8);
+		CoordinatorProcessSupervisor.configureVoiceProviderCredential(runtimeRoot, environment);
+		assertEquals("valid-test-fish-key", environment.get("FISH_AUDIO_API_KEY"),
+				"valid optional TTS credential is injected");
+		return 2;
+	}
+
+	private static int unusedLoopbackPort() throws IOException {
+		try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+			return socket.getLocalPort();
+		}
+	}
+
+	private static boolean awaitLoopbackListener(int port, long timeoutMs) throws InterruptedException {
+		long deadline = System.currentTimeMillis() + timeoutMs;
+		while (System.currentTimeMillis() < deadline) {
+			try (Socket ignored = new Socket(InetAddress.getLoopbackAddress(), port)) {
+				return true;
+			} catch (IOException unavailable) {
+				Thread.sleep(25L);
+			}
+		}
+		return false;
 	}
 
 	private static Path findHostNode() throws IOException {
@@ -210,8 +254,19 @@ public final class CoordinatorStartupSmokeVerification {
 
 	private static void deleteTree(Path root) throws IOException {
 		if (!Files.exists(root)) return;
-		try (var paths = Files.walk(root)) {
-			for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+		for (int attempt = 0; attempt < 20; attempt += 1) {
+			try (var paths = Files.walk(root)) {
+				for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+				return;
+			} catch (java.nio.file.AccessDeniedException busyExecutable) {
+				if (attempt == 19) throw busyExecutable;
+				try {
+					Thread.sleep(50L);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					throw new IOException("Interrupted while cleaning the startup fixture", interrupted);
+				}
+			}
 		}
 	}
 

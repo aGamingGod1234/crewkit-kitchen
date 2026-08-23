@@ -91,8 +91,9 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /continue_and_notify.*expected or routine.*movement or action observations/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /pause_and_notify.*only.*unexpected attention event.*halt progress/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /observed facts only/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /player\.moveTo\(\{ x, y, z, tolerance, sprint \}\)/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /multi-tree and pickup example/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /player\.navigateTo\(\{ x, y, z, tolerance, sprint, timeoutMs \}\)/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /do not navigate to floating item coordinates/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /multi-tree collection example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /watcher example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /compiler diagnostics.*correct/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /do not use Math/i);

@@ -410,6 +410,9 @@ function validateCallExpression(node, state, context) {
 	if (pathEqual(path, ['player', 'attack']) || pathEqual(path, ['player', 'useRanged'])) {
 		validateExactTargetCall(node);
 	}
+	if (pathEqual(path, ['player', 'navigateTo'])) {
+		validateNavigateTarget(node, context.scope);
+	}
 	if (path?.[0] === 'player' && Object.hasOwn(PLAYER_MEMBER_PRIMITIVES, path[1])) {
 		validatePlayerPrimitiveArity(node, path[1]);
 	}
@@ -449,6 +452,32 @@ function validateExactTargetCall(node) {
 	if (target?.value?.type === 'Literal' && typeof target.value.value === 'string' && target.value.value.startsWith('nearest_')) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'nearest target selectors are not valid target ids', target.value);
 	}
+}
+
+function validateNavigateTarget(node, scope) {
+	const argument = node.arguments[0];
+	if (!argument) return;
+	const coordinates = argument.type === 'ObjectExpression'
+		? argument.properties
+			.filter((property) => ['x', 'y', 'z'].includes(propertyName(property.key)))
+			.map((property) => property.value)
+		: [argument];
+	const unsafeCoordinate = coordinates.find((coordinate) => isObservedItemCoordinate(coordinate, scope));
+	if (unsafeCoordinate) {
+		throw arenaError('UNSUPPORTED_SYNTAX', 'player.navigateTo cannot target floating item coordinates', unsafeCoordinate);
+	}
+}
+
+function isObservedItemCoordinate(node, scope) {
+	if (node?.type !== 'MemberExpression' || node.computed || node.optional) return false;
+	if (!['x', 'y', 'z'].includes(propertyName(node.property)) || node.object.type !== 'Identifier') return false;
+	return resolveBinding(scope, node.object.name)?.observedItemCandidate === true;
+}
+
+function isDirectObservedItemCandidate(node) {
+	if (node?.type !== 'CallExpression' || !pathEqual(staticMemberPath(node.callee), ['world', 'nearest'])) return false;
+	const candidates = node.arguments[0];
+	return candidates?.type === 'CallExpression' && pathEqual(staticMemberPath(candidates.callee), ['world', 'items']);
 }
 
 function validateMemberExpression(node, state, context) {
@@ -688,7 +717,11 @@ function createLexicalScope(parent, statements, state) {
 			if (statement.kind === 'const' && isFunctionNode(declaration.init)) {
 				registerFunctionBinding(scope, declaration.id.name, declaration.init, state);
 			} else {
-				scope.bindings.set(declaration.id.name, Object.freeze({ callable: false, name: declaration.id.name }));
+				scope.bindings.set(declaration.id.name, Object.freeze({
+					callable: false,
+					name: declaration.id.name,
+					observedItemCandidate: statement.kind === 'const' && isDirectObservedItemCandidate(declaration.init),
+				}));
 			}
 		}
 	}

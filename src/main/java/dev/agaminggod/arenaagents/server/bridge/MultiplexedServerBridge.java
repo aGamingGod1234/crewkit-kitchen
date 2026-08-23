@@ -408,6 +408,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	@Override
 	public synchronized void close() {
 		running.set(false);
+		verboseState.clearActivity();
 		CoordinatorStatusStore.clear(manager.server());
 		Session active = session;
 		if (active != null) {
@@ -517,6 +518,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during authentication");
 				}
 				resetObservationPublication();
+				verboseState.clearActivity();
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;
@@ -645,7 +647,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		String code = requiredString(envelope.payload(), "code");
 		String message = requiredString(envelope.payload(), "message");
 		AgentTransition transition = router.plannerFailed(agentId, goalRevision, message);
-		AgentChatReporter.failed(manager, transition.after(), code, message);
+		reportRawAgentError(verboseState,
+				() -> AgentChatReporter.failed(manager, transition.after(), code, message));
+	}
+
+	static void reportRawAgentError(AgentVerboseState verboseState, Runnable reporter) {
+		if (verboseState.standardActivityEnabled()) reporter.run();
 	}
 
 	private void acceptVerboseEvent(BridgeEnvelope envelope) {
@@ -700,12 +707,27 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier().verify(
 				record, manager.findAgentPlayer(agentId).orElse(null), contract, actionExecutor.actionSuccessLedger());
+		VerboseEvent feedback = completionVerboseEvent(goalRevision, verification);
+		if (!verification.verified()) {
+			AgentVerboseChat.report(manager, verboseState, record, feedback.stage(), feedback.message());
+		}
 		JsonObject result = completionResultPayload(goalRevision, traceId, contractHash, verification);
 		send("goal_completion_result", agentId.toString(), result);
 		if (verification.verified()) {
 			AgentRecord completed = router.coordinatorCompleted(agentId, goalRevision);
-			AgentVerboseChat.report(manager, verboseState, completed, "lifecycle", "Goal completion verified");
+			AgentVerboseChat.report(manager, verboseState, completed, feedback.stage(), feedback.message());
 		}
+	}
+
+	static VerboseEvent completionVerboseEvent(
+			long goalRevision,
+			GoalCompletionVerifier.VerificationResult verification
+	) {
+		Objects.requireNonNull(verification, "verification must not be null");
+		return verification.verified()
+				? new VerboseEvent(goalRevision, "result", "Task complete.")
+				: new VerboseEvent(
+						goalRevision, "retry", "Goal completion could not be verified. Continuing the task.");
 	}
 
 	static JsonObject completionResultPayload(long goalRevision, String traceId, String contractHash, GoalCompletionVerifier.VerificationResult verification) {
@@ -934,7 +956,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		result.addProperty("executionStarted", false);
 		result.addProperty("physicalAttempted", false);
 		send("action_result", identity.agentId(), result);
-		reportVerbose(AgentId.parse(identity.agentId()), "result",
+		reportVerbose(AgentId.parse(identity.agentId()), "error",
 				"Action rejected: " + boundedRejectionMessage(exception.getMessage()));
 		return true;
 	}
@@ -1034,7 +1056,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 						&& !"TARGET_ALREADY_SATISFIED".equals(result.reasonCode())
 		);
 		send("action_result", result.agentId().toString(), actionResultPayload(result));
-		reportVerbose(result.agentId(), "result", verboseResult(result));
+		reportVerbose(result.agentId(), AgentActivityPresentation.verboseResultStage(result), verboseResult(result));
+		verboseState.finishAction(result);
 		observationPublication.markAttention(result.agentId());
 		queueUrgentObservation(result.agentId());
 	}
@@ -1147,7 +1170,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		);
 		programActions.terminal(result);
 		observations.invalidate(result.agentId());
-		reportVerbose(result.agentId(), "result", verboseResult(result));
+		reportVerbose(result.agentId(), AgentActivityPresentation.verboseResultStage(result), verboseResult(result));
+		verboseState.finishAction(result);
 		observationPublication.markAttention(result.agentId());
 		queueUrgentObservation(result.agentId());
 	}
@@ -1184,8 +1208,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private static String verboseResult(ServerActionResult result) {
-		return AgentActivityPresentation.action(result.actionType()) + " " + result.state().name()
-				+ ": " + result.reasonCode() + " after " + result.elapsedMs() + " ms";
+		return AgentVerboseChat.sanitizeMessage(AgentActivityPresentation.verboseResult(result));
 	}
 
 	private static JsonObject goalControlPayload(AgentTransition transition, String operation) {
@@ -1258,9 +1281,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("elapsedMs", progress.elapsedMs());
 		payload.addProperty("observedAtEpochMs", progress.observedAtEpochMs());
 		send("action_progress", progress.agentId().toString(), payload);
-		long percent = Math.round(progress.progress() * 100.0D);
-		reportVerbose(progress.agentId(), "progress",
-				AgentActivityPresentation.action(progress.actionType()) + " " + percent + "%");
+		verboseState.progressMilestone(progress).ifPresent(milestone ->
+				reportVerbose(progress.agentId(), "progress",
+						AgentActivityPresentation.progress(progress.actionType(), milestone)));
 		queueObservation(progress.agentId());
 	}
 
@@ -2143,6 +2166,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			try { socket.close(); } catch (IOException ignored) { }
 			synchronized (publicationLock) {
 				if (session != this) return;
+				verboseState.clearActivity();
 				MultiplexedServerBridge.onSessionClosed(observationPublication, this);
 				protocolKnownAgentIds.clear();
 				catalogProfiles = Set.of();

@@ -100,7 +100,560 @@ test('normalizes fixed and adaptive planning modes with production bounds', () =
 	assert.throws(() => normalizeDynamicConfig({ ...base, limits: { agentCap: 16, planningConcurrency: 17, planningMode: 'adaptive' } }), /adaptive planningConcurrency/);
 });
 
-test('verbose mode defaults off, streams revision-bound coordinator events when enabled, and stops immediately when disabled', async () => {
+test('verbose feed never publishes raw provider chunks', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		request.onVerbose('output', 'Provider error: verbose mode is on');
+		request.onVerbose('provider', 'Provider response received.');
+		return withCompletionContract({ summary: 'Keep watch.', directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep watch.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+		const feed = run.bridge.sent.filter(({ type }) => type === 'verbose_event');
+		assert.equal(feed.some(({ payload }) => payload.message.includes('Provider error: verbose mode is on')), false);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('repeated inbound action progress never becomes verbose player chat', async () => {
+	const run = await start();
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+		const actionId = run.bridge.sent.find(({ type }) => type === 'action_command').payload.actionId;
+		const progress = { goalRevision: 1, actionId, state: 'RUNNING', eventSequence: 2 };
+		run.bridge.emit('action_progress', { agentId: 'agent-a', payload: progress });
+		run.bridge.emit('action_progress', { agentId: 'agent-a', payload: progress });
+		await new Promise((resolve) => setImmediate(resolve));
+		const feed = run.bridge.sent.filter(({ type }) => type === 'verbose_event');
+		assert.equal(feed.some(({ payload }) => ['action', 'progress', 'result'].includes(payload.stage)), false);
+		assert.equal(feed.some(({ payload }) => payload.message.includes(actionId)), false);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('verbose feed publishes the parsed plan summary once', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		request.onVerbose('decision', '{"directive":"replace","summary":"raw planner JSON"}');
+		return withCompletionContract({ summary: 'Move to the safe ledge.', directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Move safely.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+		const decisions = run.bridge.sent
+			.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision')
+			.map(({ payload }) => payload.message);
+		assert.deepEqual(decisions, ['Move to the safe ledge.']);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('curated verbose boundaries preserve natural summaries while removing untrusted identifiers and retry prose', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		request.onVerbose('agent_message', 'I will hold position. actionId=native-action-123e4567-e89b-12d3-a456-426614174000 traceId=trace-123e4567-e89b-12d3-a456-426614174000');
+		request.onVerbose('retry', 'Provider error: verbose mode is on. callId=call-123e4567-e89b-12d3-a456-426614174000');
+		return withCompletionContract({
+			summary: 'Hold position while watching the entrance. tool call dispatch actionId=native-action-123e4567-e89b-12d3-a456-426614174000 uuid=123e4567-e89b-12d3-a456-426614174000 password=hunter2 diagnostic trace.',
+			directive: 'replace', source: SOURCE,
+		}, request.goalRevision);
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Hold position.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+		const feed = run.bridge.sent.filter(({ type }) => type === 'verbose_event');
+		assert.deepEqual(feed.filter(({ payload }) => payload.stage === 'output').map(({ payload }) => payload.message), []);
+		assert.deepEqual(feed.filter(({ payload }) => payload.stage === 'decision').map(({ payload }) => payload.message), ['Hold position while watching the entrance.']);
+		assert.deepEqual(feed.filter(({ payload }) => payload.stage === 'retry'), []);
+		assert.equal(feed.every(({ payload }) => payload.message.length <= 256), true);
+		assert.doesNotMatch(JSON.stringify(feed), /123e4567-e89b-12d3-a456-426614174000|actionId|callId|tool call|diagnostic|hunter2|verbose mode is on/i);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('verbose decisions reject actual identifier and tool-execution formats', async () => {
+	for (const probe of [
+		'00000000-0000-0000-0000-000000000000',
+		'native:agent-a:1:7',
+		'action-progress-1',
+		'call_abc123',
+		'Calling move_to with x=1',
+		'agent-a:1:1:1:program-1-1:1:1:arena-state-1',
+		'program-1-1:1:1:arena-state-1',
+		'agent-a:1:1:1:program-1-1:1:1:step-1',
+		'program-1-1:1:1:step-1',
+		'trace-agent-a-1-1-initial',
+	]) {
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		planner.requestPlan = async (request) => {
+			planner.requests.push(request);
+			return withCompletionContract({ summary: `Proceed safely. ${probe}`, directive: 'replace', source: SOURCE }, request.goalRevision);
+		};
+		const run = await start({ registry, planner });
+		try {
+			run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Proceed safely.' } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+				goalRevision: 1, eventSequence: 1,
+				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+			} });
+			await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+			const decisions = run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').map(({ payload }) => payload.message);
+			assert.deepEqual(decisions, ['Proceed safely.']);
+			assert.doesNotMatch(JSON.stringify(decisions), new RegExp(probe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+		} finally {
+			await run.coordinator.stop();
+		}
+	}
+});
+
+test('verbose summaries preserve ordinary action and call prose while rejecting only structural tool syntax', async () => {
+	for (const summary of [
+		'Take an action-oriented approach and wait.',
+		'Make a call-back plan before nightfall.',
+		'Calling Lucas with a question is appropriate.',
+	]) {
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		planner.requestPlan = async (request) => {
+			planner.requests.push(request);
+			return withCompletionContract({ summary, directive: 'replace', source: SOURCE }, request.goalRevision);
+		};
+		const run = await start({ registry, planner });
+		try {
+			run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+			await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+			assert.deepEqual(run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').map(({ payload }) => payload.message), [summary]);
+		} finally {
+			await run.coordinator.stop();
+		}
+	}
+});
+
+test('verbose boundary caps huge raw summaries before sanitizing and blocks a crossing trace marker', async () => {
+	const prefix = `Safe route ${'x'.repeat(242)} `;
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		return withCompletionContract({ summary: `${prefix}trace-agent-a-1-1-initial${'z'.repeat(1_000_000)}`, directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+		const decision = run.bridge.sent.find(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').payload.message;
+		assert.equal(decision, 'Plan accepted.');
+		assert.equal(decision.length <= 256, true);
+		assert.doesNotMatch(decision, /trace-agent-a-1-1-initial/i);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('native completed agent messages reject ArenaScript program identities', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		request.onVerbose('agent_message', 'Proceed safely. agent-a:1:1:1:program-1-1:1:1:arena-state-1');
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+	});
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1);
+		assert.deepEqual(
+			run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && ['decision', 'output'].includes(payload.stage)).map(({ payload }) => ({ stage: payload.stage, message: payload.message })),
+			[{ stage: 'decision', message: 'Proceed safely.' }],
+		);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('verbose raw cap never publishes a partial identifier after whitespace normalization', async () => {
+	const probes = [
+		`Safe ${' '.repeat(995)}00000000-0000-0000-0000-000000000000`,
+		`Safe ${' '.repeat(1_014)}action-progress-12345`,
+		`Safe ${' '.repeat(1_014)}native:agent-a:1:7`,
+		`Safe ${' '.repeat(1_014)}call_abc123`,
+	];
+	for (const summary of probes) {
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		planner.requestPlan = async (request) => {
+			planner.requests.push(request);
+			return withCompletionContract({ summary, directive: 'replace', source: SOURCE }, request.goalRevision);
+		};
+		const run = await start({ registry, planner });
+		try {
+			run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Proceed safely.' } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+				goalRevision: 1, eventSequence: 1,
+				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+			} });
+			await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+			assert.deepEqual(
+				run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').map(({ payload }) => payload.message),
+				['Plan accepted.'],
+			);
+		} finally {
+			await run.coordinator.stop();
+		}
+	}
+});
+
+test('verbose raw cap never publishes a partial structural tool clause', async () => {
+	for (const padding of [998, 999, 1_000]) {
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		planner.requestPlan = async (request) => {
+			planner.requests.push(request);
+			return withCompletionContract({
+				summary: `Safe ${' '.repeat(padding)}Calling move_to with x=1`,
+				directive: 'replace', source: SOURCE,
+			}, request.goalRevision);
+		};
+		const run = await start({ registry, planner });
+		try {
+			run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Proceed safely.' } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+				goalRevision: 1, eventSequence: 1,
+				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+			} });
+			await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+			assert.deepEqual(
+				run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').map(({ payload }) => payload.message),
+				['Plan accepted.'],
+			);
+		} finally {
+			await run.coordinator.stop();
+		}
+	}
+});
+
+test('native verbose raw cap suppresses partial structural tool clauses', async () => {
+	for (const padding of [998, 999, 1_000]) {
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		planner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+		planner.requestNativeTurn = async (request) => {
+			planner.requests.push(request);
+			request.onVerbose('agent_message', `Safe ${' '.repeat(padding)}Calling move_to with x=1`);
+			return { status: 'completed', toolCalls: 0 };
+		};
+		const run = await start({
+			registry,
+			planner,
+			config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+		});
+		try {
+			run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Proceed safely.' } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+				goalRevision: 1, eventSequence: 1,
+				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+			} });
+			await eventually(() => planner.requests.length === 1);
+			assert.deepEqual(
+				run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && ['decision', 'output'].includes(payload.stage)).map(({ payload }) => payload.message),
+				[],
+			);
+		} finally {
+			await run.coordinator.stop();
+		}
+	}
+});
+
+test('verbose raw cap retains complete safe sentences before a truncated clause', async () => {
+	const safeSentence = 'I will gather wood before searching for iron.';
+	const summary = `${safeSentence} ${' '.repeat(1_000)}Calling move_to with x=1`;
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		return withCompletionContract({ summary, directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Find iron.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+		assert.deepEqual(
+			run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').map(({ payload }) => payload.message),
+			[safeSentence],
+		);
+	} finally {
+		await run.coordinator.stop();
+	}
+
+	const nativeRegistry = new AgentRegistry();
+	const nativePlanner = new FakePlanner(nativeRegistry);
+	nativePlanner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+	nativePlanner.requestNativeTurn = async (request) => {
+		nativePlanner.requests.push(request);
+		request.onVerbose('agent_message', summary);
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const nativeRun = await start({
+		registry: nativeRegistry,
+		planner: nativePlanner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+	});
+	try {
+		nativeRun.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		nativeRun.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Find iron.' } });
+		nativeRun.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => nativePlanner.requests.length === 1);
+		assert.deepEqual(
+			nativeRun.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').map(({ payload }) => payload.message),
+			[safeSentence],
+		);
+	} finally {
+		await nativeRun.coordinator.stop();
+	}
+});
+
+test('verbose boundaries scan identifiers that cross the 256-character public limit', async () => {
+	for (const probe of [
+		'00000000-0000-0000-0000-000000000000',
+		'actionId=native:agent-a:1:7',
+		'call_abc123',
+	]) {
+		const prefix = `Safe route ${'x'.repeat(242)} `;
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		planner.requestPlan = async (request) => {
+			planner.requests.push(request);
+			return withCompletionContract({ summary: `${prefix}${probe}`, directive: 'replace', source: SOURCE }, request.goalRevision);
+		};
+		const run = await start({ registry, planner });
+		try {
+			run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Proceed safely.' } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+				goalRevision: 1, eventSequence: 1,
+				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+			} });
+			await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+			const decision = run.bridge.sent.find(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').payload.message;
+			assert.equal(decision, prefix.trim());
+			assert.equal(decision.length <= 256, true);
+		} finally {
+			await run.coordinator.stop();
+		}
+	}
+});
+
+test('native turns alone may publish one safe agent message and decision summaries preserve brackets or fall back safely', async () => {
+	const nativeRegistry = new AgentRegistry();
+	const nativePlanner = new FakePlanner(nativeRegistry);
+	nativePlanner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+	nativePlanner.requestNativeTurn = async (request) => {
+		nativePlanner.requests.push(request);
+		request.onVerbose('agent_message', 'Use [the east entrance] and wait.');
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const nativeRun = await start({
+		registry: nativeRegistry,
+		planner: nativePlanner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+	});
+	try {
+		nativeRun.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		nativeRun.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		nativeRun.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => nativePlanner.requests.length === 1);
+		assert.deepEqual(
+			nativeRun.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && ['decision', 'output'].includes(payload.stage)).map(({ payload }) => ({ stage: payload.stage, message: payload.message })),
+			[{ stage: 'decision', message: 'Use [the east entrance] and wait.' }],
+		);
+	} finally {
+		await nativeRun.coordinator.stop();
+	}
+
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		return withCompletionContract({ summary: '{"tool":"move_to","arguments":{"x":1}}', directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+		assert.deepEqual(run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').map(({ payload }) => payload.message), ['Plan accepted.']);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('verbose errors classify authentication and planning timeout by trusted code', async () => {
+	for (const [code, expected] of [
+		['AUTHENTICATION_REQUIRED', 'Provider error (AUTHENTICATION_REQUIRED).'],
+		['PLANNING_TIMEOUT', 'Planning error (PLANNING_TIMEOUT).'],
+	]) {
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		planner.requestPlan = async (request) => {
+			planner.requests.push(request);
+			throw Object.assign(new Error(`private ${code} diagnostic`), { code });
+		};
+		const run = await start({ registry, planner });
+		try {
+			run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+				goalRevision: 1, eventSequence: 1,
+				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+			} });
+			await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'error'));
+			assert.deepEqual(
+				run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'error').map(({ payload }) => payload.message),
+				[expected],
+			);
+		} finally {
+			await run.coordinator.stop();
+		}
+	}
+});
+
+test('retryable provider failures publish one canonical Problem and no Error', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		throw Object.assign(new Error('private timeout diagnostics'), { code: 'REQUEST_TIMEOUT' });
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'retry'));
+		assert.deepEqual(
+			run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && ['retry', 'error'].includes(payload.stage)).map(({ payload }) => ({ stage: payload.stage, message: payload.message })),
+			[{ stage: 'retry', message: 'Provider output was incomplete; retrying from the next fresh observation.' }],
+		);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('quiet lifecycle failures publish neither Problem nor Error', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		throw Object.assign(new Error('private stale-plan diagnostics'), { code: 'STALE_PLAN' });
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => planner.requests.length === 1);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(
+			run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && ['retry', 'error'].includes(payload.stage)),
+			[],
+		);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('non-retryable failures publish one correctly scoped Error and no Problem', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		throw Object.assign(new Error('private provider diagnostics'), { code: 'PROVIDER_DOWN' });
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'error'));
+		assert.deepEqual(
+			run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && ['retry', 'error'].includes(payload.stage)).map(({ payload }) => ({ stage: payload.stage, message: payload.message })),
+			[{ stage: 'error', message: 'Provider error (PROVIDER_DOWN).' }],
+		);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('verbose mode defaults off, emits curated revision-bound events, and stops immediately when disabled', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
@@ -135,15 +688,12 @@ test('verbose mode defaults off, streams revision-bound coordinator events when 
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
 			goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 3,
 		} });
-		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'result'));
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision'));
 		const verbose = run.bridge.sent.filter(({ type }) => type === 'verbose_event');
 		assert.equal(verbose.every(({ agentId, payload }) => agentId === 'agent-a' && payload.goalRevision === 1 && payload.message.length <= 256), true);
-		assert.deepEqual(new Set(verbose.map(({ payload }) => payload.stage)), new Set(['conversation', 'lifecycle', 'planner', 'provider', 'output', 'error', 'decision', 'action', 'progress', 'result']));
-		const visibleOutput = verbose.find(({ payload }) => payload.stage === 'output').payload.message;
-		assert.match(visibleOutput, /Visible plan output/);
-		assert.doesNotMatch(visibleOutput, /hunter2|top-secret|Zm9vOmJhcg|key-value/);
-		const safeError = verbose.find(({ payload }) => payload.stage === 'error').payload.message;
-		assert.doesNotMatch(safeError, /private body|raw-error-secret|stderr/i);
+		assert.deepEqual(new Set(verbose.map(({ payload }) => payload.stage)), new Set(['conversation', 'lifecycle', 'decision']));
+		assert.deepEqual(verbose.filter(({ payload }) => payload.stage === 'decision').map(({ payload }) => payload.message), ['Wait.']);
+		assert.doesNotMatch(JSON.stringify(verbose), /hunter2|top-secret|Zm9vOmJhcg|key-value|private body|raw-error-secret|stderr/i);
 
 		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: false } });
 		const disabledAt = verbose.length;
@@ -180,7 +730,7 @@ test('verbose send failures never break planning or action delivery', async () =
 	}
 });
 
-test('verbose output preserves bounded tails and redacts credentials split across provider chunks', async () => {
+test('verbose feed drops provider chunks containing split credentials', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
@@ -203,18 +753,13 @@ test('verbose output preserves bounded tails and redacts credentials split acros
 		} });
 		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
 		const outputEvents = run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'output');
-		assert.equal(outputEvents.length > 1, true);
-		assert.equal(outputEvents.every(({ payload }) => payload.message.length <= 256), true);
-		const visible = outputEvents.map(({ payload }) => payload.message).join('');
-		assert.match(visible, /Visible head/);
-		assert.match(visible, /visible tail/);
-		assert.doesNotMatch(visible, /split-bearer|split-password/);
+		assert.deepEqual(outputEvents, []);
 	} finally {
 		await run.coordinator.stop();
 	}
 });
 
-test('verbose output redacts a quoted JSON credential split across provider chunks', async () => {
+test('verbose feed drops provider JSON chunks containing credentials', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
@@ -236,17 +781,13 @@ test('verbose output redacts a quoted JSON credential split across provider chun
 		} });
 		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
 		const outputEvents = run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'output');
-		const visible = outputEvents.map(({ payload }) => payload.message).join('');
-		assert.match(visible, /Visible JSON provider output/);
-		assert.match(visible, /visible tail/);
-		assert.doesNotMatch(visible, /split-json-secret|private-json-value|end-secret/);
-		assert.equal(outputEvents.every(({ payload }) => payload.message.length <= 256), true);
+		assert.deepEqual(outputEvents, []);
 	} finally {
 		await run.coordinator.stop();
 	}
 });
 
-test('verbose output applies one strict per-turn budget to huge delimiter-free provider output', async () => {
+test('verbose feed drops huge delimiter-free provider output', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
@@ -266,15 +807,13 @@ test('verbose output applies one strict per-turn budget to huge delimiter-free p
 		} });
 		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
 		const output = run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'output');
-		assert.equal(output.length <= 64, true);
-		assert.equal(output.reduce((total, { payload }) => total + payload.message.length, 0) <= 16_384, true);
-		assert.equal(output.every(({ payload }) => payload.message.length <= 256), true);
+		assert.deepEqual(output, []);
 	} finally {
 		await run.coordinator.stop();
 	}
 });
 
-test('verbose output emits a safe bounded prefix before the provider turn completes', async () => {
+test('verbose feed does not publish provider output before the plan completes', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
@@ -302,16 +841,14 @@ test('verbose output emits a safe bounded prefix before the provider turn comple
 		finishPlan = null;
 		completePlan();
 		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
-		assert.equal(emittedBeforeCompletion.length > 0, true);
-		assert.equal(emittedBeforeCompletion.every(({ payload }) => payload.message.length <= 256), true);
-		assert.match(emittedBeforeCompletion.map(({ payload }) => payload.message).join(''), /Visible realtime provider output/);
+		assert.deepEqual(emittedBeforeCompletion, []);
 	} finally {
 		if (finishPlan !== null) finishPlan();
 		await run.coordinator.stop();
 	}
 });
 
-test('verbose off immediately clears buffered output before the same turn is re-enabled', async () => {
+test('verbose re-enable does not replay raw provider output', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
@@ -341,8 +878,7 @@ test('verbose off immediately clears buffered output before the same turn is re-
 		const visible = run.bridge.sent
 			.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'output')
 			.map(({ payload }) => payload.message).join('');
-		assert.match(visible, /fresh visible output/);
-		assert.doesNotMatch(visible, /stale buffered fragment/);
+		assert.equal(visible, '');
 	} finally {
 		await run.coordinator.stop();
 	}

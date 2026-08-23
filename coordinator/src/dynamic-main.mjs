@@ -35,6 +35,7 @@ import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
 import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
 import { createVoiceHttpServer } from './voice/voice-http-server.mjs';
 import { loadPersistentVoiceProfileStore } from './voice/voice-profile-store.mjs';
+import { WindowsTtsProvider } from './voice/windows-tts-provider.mjs';
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const COORDINATOR_DIRECTORY = path.resolve(SOURCE_DIRECTORY, '..');
@@ -45,13 +46,20 @@ const EMPTY_TURN_RETRY_DELAY_MS = 1_000;
 const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set(['MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE', 'REQUEST_TIMEOUT']);
 const QUIET_LIFECYCLE_ERRORS = new Set(['PLAN_CANCELLED', 'STALE_PLAN', 'STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION']);
 const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
-const MAX_VERBOSE_OUTPUT_CHARS = 16_384;
-const VERBOSE_OUTPUT_LOOKBEHIND_CHARS = 64;
+const MAX_PUBLIC_NARRATIVE_RAW_CHARS = 1_024;
 const DEFAULT_VOICE_PORT = 8_766;
 const DEFAULT_VOICE_MAX_CONCURRENT = 5;
 const DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH = path.join('runtime', 'voice-profile-assignments.json');
 const DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE = 'FISH_AUDIO_API_KEY';
 const DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE = 'DEEPGRAM_API_KEY';
+const WINDOWS_TTS_FALLBACK_CODES = new Set([
+	'TTS_AUDIO_TOO_LONG',
+	'TTS_MALFORMED_AUDIO',
+	'TTS_PROVIDER_ERROR',
+	'TTS_RATE_LIMITED',
+	'TTS_TIMEOUT',
+	'TTS_UNAVAILABLE',
+]);
 
 export class DynamicCoordinator extends EventEmitter {
 	#registry;
@@ -455,7 +463,6 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listen('action_progress', (message) => {
 			this.#enqueueAgent(message.agentId, async () => {
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
-				this.#publishVerbose(record.agentId, record.goalRevision, 'progress', `Action '${message.payload.actionId}' reported progress.`);
 				if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionProgress(record, message.payload)) {
 					this.emit('actionProgress', message);
 					return;
@@ -469,7 +476,6 @@ export class DynamicCoordinator extends EventEmitter {
 			const current = this.#registry.get(message.agentId);
 			if (current === null || message.payload.goalRevision !== current.goalRevision) return;
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
-			this.#publishVerbose(record.agentId, record.goalRevision, 'result', `Action '${message.payload.actionId}' finished with state '${message.payload.state}'.`);
 			this.#ledger(record.agentId).ingest('action_result', message.payload);
 			if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionResult(record, message.payload)) {
 				this.emit('actionResult', message);
@@ -486,7 +492,6 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#enqueueAgent(message.agentId, async () => {
 				const current = this.#registry.get(message.agentId);
 				if (current === null || current.goalRevision !== message.payload.goalRevision) return;
-				this.#publishVerbose(current.agentId, current.goalRevision, 'result', `Goal verification returned '${message.payload.reasonCode}'.`);
 				if (this.#usesNativeTools(current) && this.#nativeRuntime.onCompletionResult(current, message.payload)) return;
 				const accepted = this.#programRuntime.onCompletionResult(current, message.payload);
 				if (!accepted) throw new ProtocolV2Error('UNEXPECTED_COMPLETION_RESULT', `Agent '${message.agentId}' has no matching completion request`);
@@ -613,10 +618,9 @@ export class DynamicCoordinator extends EventEmitter {
 		};
 		this.#providerWork.set(record.agentId, work);
 		if (record.state === DynamicAgentState.STARTING) this.#registry.setState(record.agentId, DynamicAgentState.PLANNING, { goalRevision: record.goalRevision });
-		this.#publishVerbose(record.agentId, record.goalRevision, 'planner', `Native planning started for '${request.trigger}'.`);
 		void this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING })
 			.catch((error) => this.#reportAgentError(record.agentId, error));
-		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision);
+		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision, { allowPublicAgentMessage: true });
 		work.promise = Promise.resolve()
 			.then(() => this.#planner.requestNativeTurn({
 				agentId: record.agentId,
@@ -754,7 +758,6 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		if (this.#scheduler.hasScheduled(record.agentId)) return;
 		if (request.priority !== 'urgent' && request.receiptMonotonicMs !== null && (this.#providerRetryAfter.get(record.agentId) ?? 0) > request.receiptMonotonicMs) return;
-		this.#publishVerbose(record.agentId, record.goalRevision, 'planner', `Planning started for '${request.trigger}'.`);
 		void this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING }).catch((error) => this.#reportAgentError(record.agentId, error));
 		void this.#scheduleProviderPlan(record, request, { preserveState: false, kind: 'initial' });
 	}
@@ -830,6 +833,7 @@ export class DynamicCoordinator extends EventEmitter {
 		const pending = work.pending;
 		this.#providerWork.delete(work.agentId);
 		this.#providerRetryAfter.delete(work.agentId);
+		this.#publishVerbose(record.agentId, record.goalRevision, 'decision', verboseDecisionSummary(decision));
 		if (runtime === null) return runtime;
 		const latest = this.#registry.get(work.agentId);
 		if (latest === null || latest.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) return runtime;
@@ -1015,7 +1019,6 @@ export class DynamicCoordinator extends EventEmitter {
 	async #reportAgentError(agentId, error) {
 		try {
 			const verboseRecord = this.#registry.get(agentId);
-			if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'error', verboseErrorMessage(error));
 			if (QUIET_LIFECYCLE_ERRORS.has(error?.code)) return;
 			if (QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)) {
 				// App-server transport silence is retried from the next fresh observation.
@@ -1026,6 +1029,7 @@ export class DynamicCoordinator extends EventEmitter {
 				else this.#providerRetryAfter.set(agentId, retryAt + EMPTY_TURN_RETRY_DELAY_MS);
 				return;
 			}
+			if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'error', verboseErrorMessage(error));
 			this.#emitRuntimeError(error);
 			if (!this.#bridge.ready || !this.#registry.has(agentId)) return;
 			const record = this.#registry.get(agentId);
@@ -1049,7 +1053,6 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#writeTrace(event, fields) {
-		this.#publishVerboseTrace(event, fields);
 		if (this.#traceWriter === null) return;
 		try {
 			Promise.resolve(this.#traceWriter.write(event, fields)).catch(() => {});
@@ -1057,25 +1060,23 @@ export class DynamicCoordinator extends EventEmitter {
 		} catch { /* diagnostics cannot interrupt agent control */ }
 	}
 
-	#verboseReporter(agentId, goalRevision) {
-		const output = createVerboseOutputStream((message) => this.#sendVerbose(agentId, goalRevision, 'output', message));
+	#verboseReporter(agentId, goalRevision, { allowPublicAgentMessage = false } = {}) {
+		let publishedAgentMessage = false;
 		const reporter = (stage, message) => {
 			try {
-				if (!this.#verboseEnabled) {
-					output.reset();
+				if (!this.#verboseEnabled) return;
+				if (allowPublicAgentMessage && stage === 'agent_message') {
+					if (publishedAgentMessage) return;
+					const publicMessage = sanitizePublicAgentMessage(message);
+					if (publicMessage.length === 0) return;
+					publishedAgentMessage = true;
+					this.#publishVerbose(agentId, goalRevision, 'decision', publicMessage);
 					return;
 				}
-				if (stage === 'output') {
-					output.push(message);
-					return;
-				}
-				output.flush();
-				this.#publishVerbose(agentId, goalRevision, stage, message);
 			} catch { /* verbose reporting is observational */ }
 		};
-		reporter.reset = () => output.reset();
+		reporter.reset = () => {};
 		reporter.dispose = () => {
-			output.reset();
 			this.#verboseReporters.delete(reporter);
 		};
 		this.#verboseReporters.add(reporter);
@@ -1101,15 +1102,6 @@ export class DynamicCoordinator extends EventEmitter {
 		const current = this.#registry.get(agentId);
 		if (current === null || current.goalRevision !== goalRevision || message.length === 0 || message.length > MAX_VERBOSE_MESSAGE_LENGTH) return;
 		Promise.resolve(this.#bridge.send('verbose_event', agentId, { goalRevision, stage, message })).catch(() => {});
-	}
-
-	#publishVerboseTrace(event, fields) {
-		const agentId = fields?.agentId;
-		const goalRevision = fields?.goalRevision;
-		if (typeof agentId !== 'string' || !Number.isSafeInteger(goalRevision) || goalRevision < 0) return;
-		const stage = verboseTraceStage(event);
-		if (stage === null) return;
-		this.#publishVerbose(agentId, goalRevision, stage, verboseTraceMessage(event, fields));
 	}
 
 	async #publishCatalog(snapshot) {
@@ -1572,16 +1564,19 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		environment[voice.fishApiKeyEnvironmentVariable ?? DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE],
 		environment.FISH_API_KEY,
 	);
-	if (fishApiKey === null) return null;
+	const platform = dependencies.platform ?? process.platform;
+	if (fishApiKey === null && platform !== 'win32') return null;
 	const profilePath = dependencies.profilePath
 		?? voice.profileAssignmentsPath
 		?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
 	const loadProfileStore = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
 	const createTtsProvider = dependencies.createTtsProvider ?? ((options) => new FishTtsProvider(options));
+	const createWindowsTtsProvider = dependencies.createWindowsTtsProvider ?? ((options) => new WindowsTtsProvider(options));
 	const createSttProvider = dependencies.createSttProvider ?? ((options) => new DeepgramSttProvider(options));
 	const createServer = dependencies.createVoiceServer ?? createVoiceHttpServer;
 	if (typeof loadProfileStore !== 'function') throw new TypeError('loadProfileStore must be a function');
 	if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
+	if (typeof createWindowsTtsProvider !== 'function') throw new TypeError('createWindowsTtsProvider must be a function');
 	if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
 	const profiles = await loadProfileStore(profilePath);
 	if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
@@ -1591,8 +1586,12 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
 	);
 	if (deepgramApiKey !== null && typeof createSttProvider !== 'function') throw new TypeError('createSttProvider must be a function when Deepgram is configured');
+	let provider = fishApiKey === null ? createWindowsTtsProvider({}) : createTtsProvider({ apiKey: fishApiKey });
+	if (fishApiKey !== null && platform === 'win32') {
+		provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}));
+	}
 	const worker = createServer({
-		provider: createTtsProvider({ apiKey: fishApiKey }),
+		provider,
 		sttProvider: deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey }),
 		profileStore: typeof profiles.flush === 'function' ? Object.assign(profiles.store, { flush: profiles.flush }) : profiles.store,
 		secret: config.bridge?.secret,
@@ -1609,6 +1608,24 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		await Promise.allSettled([worker.close()]);
 		throw error;
 	}
+}
+
+function ttsProviderWithFallback(primary, fallback) {
+	return Object.freeze({
+		async synthesize(request) {
+			try {
+				return await primary.synthesize(request);
+			} catch (error) {
+				if (!shouldUseWindowsTtsFallback(error)) throw error;
+				return fallback.synthesize(request);
+			}
+		},
+	});
+}
+
+function shouldUseWindowsTtsFallback(error) {
+	if (error?.name === 'AbortError') return false;
+	return error?.name === 'TimeoutError' || WINDOWS_TTS_FALLBACK_CODES.has(error?.code);
 }
 
 function normalizeVoiceConfig(value, environment) {
@@ -1680,7 +1697,7 @@ function isTransientCompletionSendError(error) {
 
 function verboseErrorMessage(error) {
 	const code = String(error?.code ?? 'COORDINATOR_ERROR').slice(0, 128);
-	return `Coordinator error (${code}).`;
+	return `${verboseErrorScope(code)} error (${code}).`;
 }
 
 function sanitizeVerboseMessage(stage, message) {
@@ -1690,10 +1707,59 @@ function sanitizeVerboseMessage(stage, message) {
 		.trim();
 	if (stage === 'error') {
 		const code = normalized.match(/\(([A-Z][A-Z0-9_]{1,127})\)/)?.[1]
-			?? normalized.match(/\b[A-Z][A-Z0-9_]{2,127}\b/)?.[0];
-		return (code === undefined ? 'Provider reported an error.' : `Provider error (${code}).`).slice(0, MAX_VERBOSE_MESSAGE_LENGTH);
+			?? normalized.match(/\b[A-Z][A-Z0-9_]{2,127}\b/)?.[0]
+			?? 'COORDINATOR_ERROR';
+		const scope = /^(Provider|Planning|Coordinator) error \(/i.exec(normalized)?.[1] ?? verboseErrorScope(code);
+		return `${scope[0].toUpperCase()}${scope.slice(1).toLowerCase()} error (${code}).`.slice(0, MAX_VERBOSE_MESSAGE_LENGTH);
 	}
 	return sanitizeVerboseOutput(normalized).slice(0, MAX_VERBOSE_MESSAGE_LENGTH);
+}
+
+function verboseDecisionSummary(decision) {
+	return sanitizePublicNarrative(decision?.summary) || 'Plan accepted.';
+}
+
+function sanitizePublicAgentMessage(message) {
+	return sanitizePublicNarrative(message);
+}
+
+function sanitizePublicNarrative(message) {
+	const source = typeof message === 'string' ? message : String(message ?? '');
+	let raw = source.slice(0, MAX_PUBLIC_NARRATIVE_RAW_CHARS);
+	if (source.length > MAX_PUBLIC_NARRATIVE_RAW_CHARS) raw = completePublicSentences(raw);
+	const visible = sanitizeVerboseOutput(raw);
+	if (visible.length === 0 || /^[{]/.test(visible)) return '';
+	const boundary = publicNarrativeBoundary(visible);
+	return visible.slice(0, boundary ?? visible.length).replace(/[\s,;:-]+$/, '').trim().slice(0, MAX_VERBOSE_MESSAGE_LENGTH);
+}
+
+function completePublicSentences(value) {
+	let boundary = 0;
+	for (const match of value.matchAll(/[.!?](?=\s|$)/g)) boundary = match.index + match[0].length;
+	return value.slice(0, boundary);
+}
+
+function publicNarrativeBoundary(value) {
+	const matches = [
+		value.search(/\{/),
+		value.search(/\[\s*\{/),
+		value.search(/\b(?:action[_ -]?id|native[_ -]?action|action[_ -]?call|call[_ -]?id|tool[_ -]?(?:call|record|result)|trace[_ -]?id|uuid|diagnostic|program[_ -]?(?:step|compiled|replaced))\b/i),
+		value.search(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i),
+		value.search(/\bnative:[a-z0-9._-]+:\d+:\d+\b/i),
+		value.search(/\baction-progress-\d+\b/i),
+		value.search(/\bcall_[a-z0-9]{3,}\b/i),
+		value.search(/\b[a-z0-9._-]+:\d+:\d+:\d+:program-\d+-\d+:\d+:\d+:(?:arena-state|step)-\d+\b/i),
+		value.search(/\bprogram-\d+-\d+:\d+:\d+:(?:arena-state|step)-\d+\b/i),
+		value.search(/\btrace-[a-z0-9._:-]+-\d+-\d+-[a-z][a-z0-9_-]*\b/i),
+		value.search(/\b(?:calling|executing|invoking)\s+[a-z][a-z0-9_]*\s+with\s+(?:[a-z][a-z0-9_]*\s*=|\{)/i),
+	].filter((index) => index >= 0);
+	return matches.length === 0 ? null : Math.min(...matches);
+}
+
+function verboseErrorScope(code) {
+	if (/^(?:AUTHENTICATION_REQUIRED|PROVIDER|TURN_|REQUEST_TIMEOUT|MISSING_(?:AGENT|FINAL)_MESSAGE|SPAWN_|APP_SERVER_)/.test(code)) return 'Provider';
+	if (/(?:DECISION|PLANNER|PLANNING_TIMEOUT|PLAN_|PARSE|DIRECTIVE|ARENA_SCRIPT)/.test(code)) return 'Planning';
+	return 'Coordinator';
 }
 
 function sanitizeVerboseOutput(message) {
@@ -1703,96 +1769,6 @@ function sanitizeVerboseOutput(message) {
 		.trim()
 		.replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '[REDACTED_AUTH]')
 		.replace(/(\b(?:secret|token|api[-_ ]?key|password|authorization)\b["']?\s*(?:[:=]\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1[REDACTED]');
-}
-
-function createVerboseOutputStream(publish) {
-	let pending = '';
-	let acceptedChars = 0;
-	let publishedChars = 0;
-	let scanOffset = 0;
-	const publishSanitized = (raw) => {
-		const remaining = MAX_VERBOSE_OUTPUT_CHARS - publishedChars;
-		if (remaining <= 0) return;
-		const preserveTrailingSpace = /\s$/.test(raw);
-		let visible = sanitizeVerboseOutput(raw);
-		if (preserveTrailingSpace && visible.length > 0) visible += ' ';
-		visible = visible.slice(0, remaining);
-		publishedChars += visible.length;
-		for (let offset = 0; offset < visible.length; offset += MAX_VERBOSE_MESSAGE_LENGTH) {
-			publish(visible.slice(offset, offset + MAX_VERBOSE_MESSAGE_LENGTH));
-		}
-	};
-	const drain = (final = false) => {
-		if (final) {
-			publishSanitized(pending);
-			pending = '';
-			scanOffset = 0;
-			return;
-		}
-		while (true) {
-			const scanLimit = pending.length - VERBOSE_OUTPUT_LOOKBEHIND_CHARS;
-			let safeBoundary = 0;
-			while (scanOffset <= scanLimit) {
-				const relativeSeparator = pending.slice(scanOffset, scanLimit + 1).search(/[\s,;]/);
-				if (relativeSeparator === -1) {
-					scanOffset = scanLimit + 1;
-					break;
-				}
-				const boundary = scanOffset + relativeSeparator + 1;
-				scanOffset = boundary;
-				if (!hasIncompleteVerboseCredential(pending.slice(0, boundary))) safeBoundary = boundary;
-			}
-			if (safeBoundary === 0) return;
-			publishSanitized(pending.slice(0, safeBoundary));
-			pending = pending.slice(safeBoundary);
-			scanOffset = Math.max(0, scanOffset - safeBoundary);
-		}
-	};
-	return {
-		push(value) {
-			const remaining = MAX_VERBOSE_OUTPUT_CHARS - acceptedChars;
-			if (remaining <= 0) return;
-			const accepted = String(value ?? '').slice(0, remaining);
-			pending += accepted;
-			acceptedChars += accepted.length;
-			drain(acceptedChars === MAX_VERBOSE_OUTPUT_CHARS);
-		},
-		flush() { drain(true); },
-		reset() {
-			pending = '';
-			acceptedChars = 0;
-			publishedChars = 0;
-			scanOffset = 0;
-		},
-	};
-}
-
-function hasIncompleteVerboseCredential(value) {
-	return /\b(?:Bearer|Basic)\s*$/i.test(value)
-		|| /\b(?:secret|token|api[-_ ]?key|password|authorization)\b["']?\s*(?::|=)?\s*$/i.test(value)
-		|| /\b(?:secret|token|api[-_ ]?key|password|authorization)\b["']?\s*(?::|=)?\s*(?:"[^"]*|'[^']*)$/i.test(value);
-}
-
-function verboseTraceStage(event) {
-	if (typeof event !== 'string') return null;
-	if (event.includes('error') || event.includes('failed') || event.includes('rejected')) return 'error';
-	if (event.includes('progress')) return 'progress';
-	if (event.includes('completed')) return 'result';
-	if (event === 'program_step' || event.includes('tool_dispatch') || event.includes('command_sent')) return 'action';
-	if (event.includes('compiled') || event.includes('replaced')) return 'decision';
-	return null;
-}
-
-function verboseTraceMessage(event, fields) {
-	const actionId = typeof fields?.actionId === 'string' ? ` '${fields.actionId.slice(0, 64)}'` : '';
-	if (event.includes('progress')) return `Action${actionId} reported progress.`;
-	if (event.includes('completed')) return `Operation '${event}' completed.`;
-	if (event.includes('error') || event.includes('failed') || event.includes('rejected')) {
-		const code = String(fields?.errorCode ?? fields?.reasonCode ?? 'ERROR').slice(0, 128);
-		return `Operation '${event}' reported '${code}'.`;
-	}
-	if (event === 'program_step' || event.includes('tool_dispatch') || event.includes('command_sent')) return `Action${actionId} dispatched by the active plan.`;
-	return `Planner decision event '${event}' accepted.`;
 }
 
 function classifyObservationTrigger(payload, observation) {

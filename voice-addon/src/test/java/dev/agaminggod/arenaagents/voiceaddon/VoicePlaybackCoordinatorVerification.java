@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.voiceaddon;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.voice.VoiceReceipt;
 import dev.agaminggod.arenaagents.server.voice.VoiceRequest;
+import java.net.ConnectException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -24,7 +25,9 @@ final class VoicePlaybackCoordinatorVerification {
 		assertions += verifyUnavailableSpeechDegradesWithoutSynthesis();
 		assertions += verifySuccessfulPlaybackUsesRegisteredEntityAndRadius();
 		assertions += verifyReplacementStopsThePreviousUtterance();
+		assertions += verifyStopReplacementAndCloseCancelPendingSynthesis();
 		assertions += verifyFailuresCompleteAndDoNotWedgeLaterSpeech();
+		assertions += verifyUnavailableWorkerReportsSafeDiagnostic();
 		assertions += verifyStartFailureWinsOverSynchronousStopCallback();
 		assertions += verifyUnregisterAndCloseStopPlayback();
 		return assertions;
@@ -87,6 +90,49 @@ final class VoicePlaybackCoordinatorVerification {
 		assertEquals(VoiceReceipt.Status.PLAYED, second.join().status(), "replacement playback completes");
 		coordinator.close();
 		return 3;
+	}
+
+	private static int verifyStopReplacementAndCloseCancelPendingSynthesis() {
+		RecordingSynthesizer synthesizer = new RecordingSynthesizer();
+		RecordingTransport transport = new RecordingTransport();
+		VoicePlaybackCoordinator coordinator = new VoicePlaybackCoordinator(synthesizer, Runnable::run, transport);
+		coordinator.registerAgent(AGENT, ENTITY);
+
+		CompletableFuture<VoiceReceipt> replacedReceipt = coordinator.speak(request(20L)).toCompletableFuture();
+		CompletableFuture<short[]> replacedSynthesis = synthesizer.pending.remove();
+		CompletableFuture<VoiceReceipt> replacementReceipt = coordinator.speak(request(21L)).toCompletableFuture();
+		assertEquals(true, replacedSynthesis.isCancelled(), "replacement cancels pending synthesis");
+		assertEquals(VoiceReceipt.Status.FAILED, replacedReceipt.join().status(), "replacement completes replaced receipt");
+
+		CompletableFuture<short[]> replacementSynthesis = synthesizer.pending.remove();
+		coordinator.stop(AGENT);
+		assertEquals(true, replacementSynthesis.isCancelled(), "stop cancels pending synthesis");
+		assertEquals(VoiceReceipt.Status.FAILED, replacementReceipt.join().status(), "stop completes pending receipt");
+
+		CompletableFuture<VoiceReceipt> closeReceipt = coordinator.speak(request(22L)).toCompletableFuture();
+		CompletableFuture<short[]> closeSynthesis = synthesizer.pending.remove();
+		coordinator.close();
+		assertEquals(true, closeSynthesis.isCancelled(), "close cancels pending synthesis");
+		assertEquals(VoiceReceipt.Status.FAILED, closeReceipt.join().status(), "close completes pending receipt");
+		return 6;
+	}
+
+	private static int verifyUnavailableWorkerReportsSafeDiagnostic() {
+		RecordingSynthesizer synthesizer = new RecordingSynthesizer();
+		RecordingTransport transport = new RecordingTransport();
+		VoicePlaybackCoordinator coordinator = new VoicePlaybackCoordinator(synthesizer, Runnable::run, transport);
+		coordinator.registerAgent(AGENT, ENTITY);
+		CompletableFuture<VoiceReceipt> receipt = coordinator.speak(request(9L)).toCompletableFuture();
+		synthesizer.failNext(new CompletionException(new ConnectException(
+				"Connection refused; Authorization=Bearer must-not-reach-logs"
+		)));
+		assertEquals(
+				"[VOICE_WORKER_UNAVAILABLE] Voice worker is not reachable",
+				receipt.join().message(),
+				"unavailable TTS worker reports a stable safe diagnostic"
+		);
+		coordinator.close();
+		return 1;
 	}
 
 	private static int verifyFailuresCompleteAndDoNotWedgeLaterSpeech() {

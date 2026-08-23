@@ -12,6 +12,7 @@ const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
 const THREAD_START_TIMEOUT_MS = 60_000;
 const MAX_BUFFERED_TURN_NOTIFICATIONS = 4_096;
+const MAX_PUBLIC_AGENT_MESSAGE_CANDIDATE_CHARS = 1_280;
 const PROFILE_CONFLICT_MESSAGE = 'Agent profile is immutable for the active Codex session';
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Codex Agents', version: '2.0.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
@@ -641,10 +642,7 @@ function isRateLimitError(error) {
 function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose }) {
 	let expectedTurnId = null;
 	let bufferedRequests = [];
-	const streamedAgentMessageIds = new Set();
-	const completedAgentMessageIds = new Set();
-	let streamedAnonymousMessage = false;
-	let lastAnonymousCompletedMessage = null;
+	let publishedAgentMessage = false;
 	let settled = false;
 	let toolCalls = 0;
 	let toolExecutor = executeTool;
@@ -690,26 +688,10 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 	const onNotification = ({ method, params }) => {
 		if (params?.threadId !== threadId || expectedTurnId === null || notificationTurnId(params) !== expectedTurnId) return;
-		if (method === 'item/agentMessage/delta' && typeof params?.delta === 'string') {
-			const itemId = agentMessageItemId(params);
-			if (params.delta.length > 0) {
-				if (itemId === null) streamedAnonymousMessage = true;
-				else rememberBoundedItemId(streamedAgentMessageIds, itemId);
-			}
-			safeVerbose(onVerbose, 'output', params.delta);
-		}
 		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') {
-			const itemId = agentMessageItemId(params);
-			const duplicate = itemId === null
-				? streamedAnonymousMessage || params.item.text === lastAnonymousCompletedMessage
-				: streamedAgentMessageIds.has(itemId) || completedAgentMessageIds.has(itemId);
-			if (!duplicate) safeVerbose(onVerbose, 'output', params.item.text);
-			if (itemId === null) {
-				streamedAnonymousMessage = false;
-				lastAnonymousCompletedMessage = params.item.text;
-			} else {
-				streamedAgentMessageIds.delete(itemId);
-				rememberBoundedItemId(completedAgentMessageIds, itemId);
+			if (!publishedAgentMessage) {
+				publishedAgentMessage = true;
+				safeVerbose(onVerbose, 'agent_message', params.item.text);
 			}
 		}
 		if (method !== 'turn/completed' || settled) return;
@@ -741,16 +723,6 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 }
 
-function agentMessageItemId(params) {
-	const value = params?.itemId ?? params?.item?.id;
-	return typeof value === 'string' && value.length > 0 ? value : null;
-}
-
-function rememberBoundedItemId(values, itemId) {
-	values.add(itemId);
-	if (values.size > MAX_BUFFERED_TURN_NOTIFICATIONS) values.delete(values.values().next().value);
-}
-
 function notificationTurnId(params) {
 	return params?.turnId ?? params?.turn?.id ?? null;
 }
@@ -766,7 +738,16 @@ function withTimeout(promise, timeoutMs, schedule, cancelSchedule) {
 }
 
 function safeVerbose(callback, stage, message) {
-	if (stage === 'output') reportVisibleOutput(callback, String(message ?? ''));
+	if (typeof callback !== 'function') return;
+	if (stage === 'output') {
+		reportVisibleOutput(callback, String(message ?? ''));
+		return;
+	}
+	if (stage !== 'agent_message') return;
+	const raw = typeof message === 'string' ? message : String(message ?? '');
+	const candidate = raw.slice(0, MAX_PUBLIC_AGENT_MESSAGE_CANDIDATE_CHARS);
+	try { Promise.resolve(callback(stage, candidate)).catch(() => {}); }
+	catch { /* public-agent-message reporting cannot affect provider work */ }
 }
 
 function validateServiceConfig(value, { requireLaunchProfile }) {

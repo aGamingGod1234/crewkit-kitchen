@@ -47,6 +47,50 @@ public final class AgentActivityPresentation {
 		};
 	}
 
+	public static String actionStart(ActionType type) {
+		return sentence(action(type));
+	}
+
+	public static String respawnDisconnected() {
+		return "Connection lost while respawning. Reconnect the coordinator and try again.";
+	}
+
+	public static String progress(ActionType type, int milestone) {
+		Objects.requireNonNull(type, "type must not be null");
+		if (milestone != 25 && milestone != 50 && milestone != 75) {
+			throw new IllegalArgumentException("progress milestone must be 25, 50, or 75");
+		}
+		return milestone + (type == ActionType.MOVE_TO || type == ActionType.NAVIGATE_TO ? "% there." : "% complete.");
+	}
+
+	public static String verboseResultStage(ServerActionResult result) {
+		Objects.requireNonNull(result, "result must not be null");
+		if (result.state() == ServerActionState.SUCCEEDED || result.state() == ServerActionState.CANCELLED) {
+			return "result";
+		}
+		if (timedOut(result)) return "error";
+		return result.state() == ServerActionState.FAILED && !shouldAnnounceFailure(result.reasonCode())
+				? "retry" : "error";
+	}
+
+	public static String verboseResult(ServerActionResult result) {
+		Objects.requireNonNull(result, "result must not be null");
+		if (timedOut(result)) {
+			return timeoutSubject(result.actionType()) + " timed out after " + readableDuration(result.elapsedMs()) + ".";
+		}
+		if (result.state() == ServerActionState.CANCELLED) {
+			return timeoutSubject(result.actionType()) + " was cancelled.";
+		}
+		if ("retry".equals(verboseResultStage(result))) return recoveryMessage(result.reasonCode());
+		String detail = compactResultMessage(result.message());
+		if (result.state() == ServerActionState.SUCCEEDED) {
+			return detail.isBlank() ? sentence(action(result.actionType()) + " completed") : sentence(detail);
+		}
+		return detail.isBlank()
+				? sentence(timeoutSubject(result.actionType()) + " failed")
+				: timeoutSubject(result.actionType()) + " failed: " + sentence(detail);
+	}
+
 	public static Optional<String> result(ServerActionResult result) {
 		Objects.requireNonNull(result, "result must not be null");
 		if (result.state() == ServerActionState.SUCCEEDED) return Optional.empty();
@@ -94,5 +138,57 @@ public final class AgentActivityPresentation {
 		}
 		if (reasonCode == null || reasonCode.isBlank()) return "";
 		return reasonCode.toLowerCase(Locale.ROOT).replace('_', ' ');
+	}
+
+	private static boolean timedOut(ServerActionResult result) {
+		if (result.state() == ServerActionState.TIMED_OUT) return true;
+		String reason = result.reasonCode();
+		if (reason == null) return false;
+		String normalized = reason.toUpperCase(Locale.ROOT);
+		return normalized.contains("TIMEOUT") || normalized.contains("TIMED_OUT");
+	}
+
+	private static String recoveryMessage(String reasonCode) {
+		if (reasonCode != null) {
+			String normalized = reasonCode.toUpperCase(Locale.ROOT);
+			if (normalized.equals("PATH_BLOCKED") || normalized.equals("NO_PATH")
+					|| normalized.equals("NO_STANDABLE_PATH") || normalized.equals("PATH_LIMIT_REACHED")) {
+				return "The path is blocked. Trying another route.";
+			}
+		}
+		return "That action did not work. Trying another approach.";
+	}
+
+	private static String timeoutSubject(ActionType type) {
+		return switch (type) {
+			case MOVE_TO, NAVIGATE_TO -> "Movement";
+			case BREAK_BLOCK -> "Mining";
+			case PLACE_BLOCK -> "Block placement";
+			case BUILD_SEQUENCE -> "Building";
+			case CRAFT_INVENTORY, CRAFT_TABLE -> "Crafting";
+			case RESPAWN -> "Respawning";
+			default -> action(type);
+		};
+	}
+
+	private static String readableDuration(long elapsedMs) {
+		if (elapsedMs < 1_000L) return elapsedMs + (elapsedMs == 1L ? " millisecond" : " milliseconds");
+		if (elapsedMs % 1_000L == 0L) {
+			long seconds = elapsedMs / 1_000L;
+			return seconds + (seconds == 1L ? " second" : " seconds");
+		}
+		String seconds = String.format(Locale.ROOT, "%.1f", elapsedMs / 1_000.0D);
+		return seconds + " seconds";
+	}
+
+	private static String compactResultMessage(String message) {
+		if (message == null || message.isBlank()) return "";
+		String compact = message.replace('\n', ' ').replace('\r', ' ').trim();
+		return compact.length() <= 180 ? compact : compact.substring(0, 177) + "...";
+	}
+
+	private static String sentence(String value) {
+		if (value.endsWith(".") || value.endsWith("!") || value.endsWith("?")) return value;
+		return value + ".";
 	}
 }

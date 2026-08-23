@@ -58,6 +58,18 @@ public final class VoiceSubsystemRuntime {
 		return holder != null && holder.subsystem().available();
 	}
 
+	public static synchronized void reportAvailabilityFallback(MinecraftServer server, AgentId agentId) {
+		Holder holder = INSTANCES.get(server);
+		String code = holder == null || holder.subsystem() == NoVoiceSubsystem.INSTANCE
+				? "VOICE_ADDON_UNAVAILABLE" : "VOICE_TRANSPORT_UNAVAILABLE";
+		String reason = holder == null || holder.subsystem() == NoVoiceSubsystem.INSTANCE
+				? "voice addon is not installed or initialized" : "Simple Voice Chat server API is unavailable";
+		LOGGER.warn(
+				"Proximity voice fallback [{}] at availability boundary for agent {}: {}",
+				code, agentId, reason
+		);
+	}
+
 	public static synchronized CompletionStage<VoiceReceipt> speak(MinecraftServer server, VoiceRequest request) {
 		Holder holder = INSTANCES.get(server);
 		return (holder == null ? NoVoiceSubsystem.INSTANCE : holder.subsystem()).speak(request);

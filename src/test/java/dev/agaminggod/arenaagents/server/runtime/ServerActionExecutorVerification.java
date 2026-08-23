@@ -13,7 +13,9 @@ import dev.agaminggod.arenaagents.protocol.ActionType;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -23,6 +25,11 @@ import net.minecraft.world.phys.Vec3;
 
 public final class ServerActionExecutorVerification {
 	private ServerActionExecutorVerification() {
+	}
+
+	public static void main(String[] args) {
+		net.minecraft.server.Bootstrap.bootStrap();
+		System.out.println("Server action executor verification passed: " + verify() + " assertions");
 	}
 
 	public static int verify() {
@@ -157,6 +164,7 @@ public final class ServerActionExecutorVerification {
 				"respawn completion remains valid only for its coordinator generation");
 		assertFalse(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 5L),
 				"respawn completion from a disconnected coordinator generation is ignored");
+		verifyDisconnectedRespawnFinishesOnce();
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 1.1D, 250L, 1_750_000_000_250L
 		), "progress rejects fractions above one");
@@ -221,7 +229,41 @@ public final class ServerActionExecutorVerification {
 			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
 			admitted[start] = true;
 		}
-		return 44;
+		return 48;
+	}
+
+	private static void verifyDisconnectedRespawnFinishesOnce() {
+		AgentId agentId = AgentId.random();
+		Object pending = new Object();
+		Map<AgentId, Object> pendingRespawns = new LinkedHashMap<>();
+		pendingRespawns.put(agentId, pending);
+		AtomicInteger rollbacks = new AtomicInteger();
+		AtomicInteger terminalReports = new AtomicInteger();
+		assertTrue(finishDisconnectedRespawn(
+				pendingRespawns, agentId, pending, rollbacks::incrementAndGet, terminalReports::incrementAndGet),
+				"the accepted pending respawn is finished at disconnect");
+		assertFalse(finishDisconnectedRespawn(
+				pendingRespawns, agentId, pending, rollbacks::incrementAndGet, terminalReports::incrementAndGet),
+				"a second disconnect cannot finish the same respawn twice");
+		assertEquals(1, rollbacks.get(), "pending respawn rollback runs exactly once");
+		assertEquals(1, terminalReports.get(), "pending respawn terminal reporting runs exactly once");
+	}
+
+	private static boolean finishDisconnectedRespawn(
+			Map<AgentId, ?> pendingRespawns,
+			AgentId agentId,
+			Object pending,
+			Runnable rollback,
+			Runnable terminalReport
+	) {
+		try {
+			var method = ServerActionExecutor.class.getDeclaredMethod(
+					"finishDisconnectedRespawn", Map.class, AgentId.class, Object.class, Runnable.class, Runnable.class);
+			method.setAccessible(true);
+			return (boolean) method.invoke(null, pendingRespawns, agentId, pending, rollback, terminalReport);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("missing pending-respawn disconnect boundary", exception);
+		}
 	}
 
 	private static void verifySetupFailureDoesNotClaimPhysicalExecution() {

@@ -5,6 +5,7 @@ import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentRegistryVerification;
 import dev.agaminggod.arenaagents.agent.AgentIdentityVerification;
 import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
+import dev.agaminggod.arenaagents.server.AgentVerbosePresentationVerification;
 import dev.agaminggod.arenaagents.server.AgentDeathCaptureVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
@@ -146,6 +147,7 @@ public final class VerificationMain {
 	public static void main(String[] args) throws Exception {
 		ProtocolCodec codec = new ProtocolCodec();
 
+		passedAssertions += AgentVerbosePresentationVerification.verify();
 		verifyProtocolConstants();
 		verifyActionWireNames();
 		verifyValidActionUnion(codec);

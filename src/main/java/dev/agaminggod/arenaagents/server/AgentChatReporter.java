@@ -13,17 +13,20 @@ public final class AgentChatReporter {
 	}
 
 	public static void planning(CodexAgentManager manager, AgentRecord record) {
-		AgentVerboseChat.report(manager, record, "planner", "Planning started");
-		// Planning state belongs in the field console; chat is reserved for meaningful activity.
+		// Public agent summaries describe intent. Generic planner state stays in the field console.
 	}
 
 	public static void stillPlanning(CodexAgentManager manager, AgentRecord record) {
-		AgentVerboseChat.report(manager, record, "planner", "Planning is still in progress");
-		// Deliberately quiet: periodic provider heartbeat text drowned out actual actions.
+		// Periodic planner heartbeats do not belong in player chat.
 	}
 
 	public static void acting(CodexAgentManager manager, AgentRecord record, ServerActionRequest request) {
-		AgentVerboseChat.report(manager, record, "action", AgentActivityPresentation.action(request.type()));
+		AgentVerboseState verbose = verboseState(manager);
+		if (verbose != null && verbose.beginAction(request)) {
+			AgentVerboseChat.report(
+					manager, verbose, record, "action", AgentActivityPresentation.actionStart(request.type()));
+		}
+		if (verbose != null && !verbose.standardActivityEnabled()) return;
 		if (AgentActivityPresentation.shouldAnnounceAction(request.type())) {
 			report(manager, record, AgentActivityPresentation.action(request.type()), ChatFormatting.WHITE);
 		}
@@ -35,13 +38,15 @@ public final class AgentChatReporter {
 	}
 
 	public static void result(CodexAgentManager manager, AgentRecord record, ServerActionResult result) {
+		AgentVerboseState verbose = verboseState(manager);
+		if (verbose != null && !verbose.standardActivityEnabled()) return;
 		AgentActivityPresentation.result(result).ifPresent(message ->
 				report(manager, record, message, ChatFormatting.RED));
 	}
 
 	public static void completed(CodexAgentManager manager, AgentRecord record, String summary) {
-		AgentVerboseChat.report(manager, record, "lifecycle",
-				summary == null || summary.isBlank() ? "Task complete" : summary);
+		AgentVerboseState verbose = verboseState(manager);
+		if (verbose != null && !verbose.standardActivityEnabled()) return;
 		report(manager, record, summary == null || summary.isBlank() ? "Task complete" : summary, ChatFormatting.GREEN);
 	}
 
@@ -50,15 +55,36 @@ public final class AgentChatReporter {
 	}
 
 	public static void failed(CodexAgentManager manager, AgentRecord record, String reasonCode, String error) {
-		AgentVerboseChat.report(manager, record, "error", readableError(error));
+		AgentVerboseState verbose = verboseState(manager);
+		if (verbose != null && !verbose.standardActivityEnabled()) {
+			AgentVerboseChat.report(manager, verbose, record, "error", readableError(error));
+			return;
+		}
 		if (reasonCode != null && !AgentActivityPresentation.shouldShowInChat(reasonCode, true)) return;
 		report(manager, record, "Needs attention: " + readableError(error), ChatFormatting.RED);
 	}
 
 	public static void disconnected(CodexAgentManager manager, AgentRecord record) {
-		AgentVerboseChat.report(manager, record, "lifecycle", "Coordinator disconnected");
+		AgentVerboseState verbose = verboseState(manager);
+		if (verbose != null && !verbose.standardActivityEnabled()) {
+			AgentVerboseChat.report(
+					manager, verbose, record, "error",
+					"Connection lost. Reconnect the coordinator, then resume or restart this task.");
+			return;
+		}
 		report(manager, record,
 				"Connection lost. Reconnect the coordinator, then resume or restart this task.", ChatFormatting.RED);
+	}
+
+	public static void respawnDisconnected(CodexAgentManager manager, AgentRecord record) {
+		AgentVerboseState verbose = verboseState(manager);
+		if (verbose == null || verbose.standardActivityEnabled()) return;
+		AgentVerboseChat.report(manager, verbose, record, "error", AgentActivityPresentation.respawnDisconnected());
+	}
+
+	private static AgentVerboseState verboseState(CodexAgentManager manager) {
+		var server = manager.server();
+		return server == null ? null : AgentVerboseState.forServer(server);
 	}
 
 	private static void report(

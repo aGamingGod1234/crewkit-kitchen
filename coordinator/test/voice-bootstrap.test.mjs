@@ -5,17 +5,43 @@ import { startVoiceWorker } from '../src/dynamic-main.mjs';
 
 const SECRET = 'voice-bootstrap-test-secret';
 
-test('voice bootstrap is disabled without an environment Fish key', async () => {
+test('voice bootstrap uses credential-free Windows speech when Fish is not configured', async () => {
 	let profileLoads = 0;
-	const worker = await startVoiceWorker({
+	let localProviders = 0;
+	let starts = 0;
+	const serverWorker = {
+		async start() { starts++; return { port: 8766 }; },
+		async close() {},
+	};
+	const created = await startVoiceWorker({
 		bridge: { secret: SECRET },
 		voice: { port: 0 },
 		fishApiKey: 'config-must-not-be-used',
 	}, {}, {
-		loadProfileStore: async () => {
-			profileLoads++;
-			throw new Error('profile store must not load when voice is disabled');
+		platform: 'win32',
+		loadProfileStore: async () => { profileLoads++; return { store: { resolve() {} } }; },
+		createWindowsTtsProvider: () => { localProviders++; return { synthesize: async () => ({}) }; },
+		createVoiceServer: ({ provider }) => {
+			assert.equal(typeof provider.synthesize, 'function');
+			return serverWorker;
 		},
+	});
+
+	assert.equal(created, serverWorker);
+	assert.equal(profileLoads, 1);
+	assert.equal(localProviders, 1);
+	assert.equal(starts, 1);
+	await created.close();
+});
+
+test('voice bootstrap remains disabled without a provider on non-Windows hosts', async () => {
+	let profileLoads = 0;
+	const worker = await startVoiceWorker({
+		bridge: { secret: SECRET },
+		voice: { port: 0 },
+	}, {}, {
+		platform: 'linux',
+		loadProfileStore: async () => { profileLoads++; return { store: { resolve() {} } }; },
 	});
 
 	assert.equal(worker, null);
@@ -69,6 +95,35 @@ test('voice bootstrap reads Fish and optional STT credentials from environment o
 
 	await created.close();
 	assert.equal(captured.closed, 1);
+});
+
+test('Windows voice bootstrap falls back to local speech when Fish rejects a stale credential', async () => {
+	const rejected = new Error('Fish rejected stale key must-not-reach-output');
+	rejected.code = 'TTS_PROVIDER_ERROR';
+	let provider;
+	let localCalls = 0;
+	const worker = await startVoiceWorker({
+		bridge: { secret: SECRET },
+		voice: { port: 8_766 },
+	}, { FISH_AUDIO_API_KEY: 'stale-fish-credential' }, {
+		platform: 'win32',
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => ({ async synthesize() { throw rejected; } }),
+		createWindowsTtsProvider: () => ({ async synthesize() {
+			localCalls++;
+			return { sampleRateHz: 16_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(2) };
+		} }),
+		createVoiceServer: (options) => {
+			provider = options.provider;
+			return { async start() {}, async close() {} };
+		},
+	});
+
+	const result = await provider.synthesize({ text: 'Hello.', voiceId: 'ignored', speed: 1 });
+	assert.equal(result.sampleRateHz, 16_000);
+	assert.equal(localCalls, 1);
+	assert.doesNotMatch(JSON.stringify(result), /stale-fish-credential|must-not-reach-output/);
+	await worker.close();
 });
 
 test('voice bootstrap closes a worker when binding fails', async () => {

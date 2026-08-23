@@ -9,7 +9,7 @@ export const SCRIPT_PRIMITIVES = Object.freeze(new Set([
 ]));
 
 export const PLAYER_MEMBER_PRIMITIVES = Object.freeze({
-	moveTo: 'move_to', navigateTo: 'navigate_to', lookAt: 'look_at', attack: 'attack',
+	navigateTo: 'navigate_to', lookAt: 'look_at', attack: 'attack',
 	selectItem: 'select_item', useItem: 'use_item', mine: 'break_block', place: 'place_block',
 	chat: 'chat', wait: 'wait', setDoor: 'set_door', dropItem: 'drop_item',
 	transferContainer: 'transfer_container', craftInventory: 'craft_inventory', craftTable: 'craft_table',

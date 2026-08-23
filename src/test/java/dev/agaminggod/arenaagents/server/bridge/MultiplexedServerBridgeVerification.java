@@ -120,7 +120,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
 		verifyCompletionResultFacts();
-		return 114;
+		return 121;
 	}
 
 	private static void verifyHandshakeWaitsForPendingMarker() {
@@ -249,8 +249,15 @@ public final class MultiplexedServerBridgeVerification {
 				ActionType.RESPAWN, ServerActionState.SUCCEEDED, "VANILLA_RESPAWNED",
 				"Respawned", 42L, 3_000L
 		);
-		assertEquals("Respawning SUCCEEDED: VANILLA_RESPAWNED after 42 ms", invokeVerboseResult(respawnResult),
-				"respawn verbose result retains terminal reason and elapsed time after paired publication");
+		assertEquals("Respawned.", invokeVerboseResult(respawnResult),
+				"respawn verbose result uses readable player-facing copy");
+		ServerActionResult technicalResult = new ServerActionResult(
+				respawnResult.agentId(), 3L, "respawn-result-technical", ActionType.RESPAWN,
+				ServerActionState.FAILED, "RESPAWN_REJECTED",
+				"Result payload {\"action\":\"respawn-result-technical\"}", 42L, 3_001L
+		);
+		assertEquals("Technical details hidden.", invokeVerboseResult(technicalResult),
+				"typed action result messages pass through the technical-output defense");
 		CodexAgentManager activeManager = uninitializedManager();
 		AgentRecord active = activeManager.registry().create("gpt-5.6-sol", "high", Optional.of("ActiveDeath"), 3_000L);
 		activeManager.registry().start(active.agentId(), "continue after respawn", 3_001L);
@@ -634,6 +641,18 @@ public final class MultiplexedServerBridgeVerification {
 		assertEquals(2, payload.getAsJsonArray("facts").size(), "completion result retains every verifier fact");
 		assertEquals(0, payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("predicateIndex").getAsInt(), "completion result retains failed predicate index");
 		assertEquals("0", payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("observedValue").getAsString(), "completion result retains observed value");
+		MultiplexedServerBridge.VerboseEvent rejected = invokeCompletionVerboseEvent(7L, verification);
+		assertEquals(7L, rejected.goalRevision(), "rejected completion feedback retains the guarded revision");
+		assertEquals("retry", rejected.stage(), "rejected completion feedback uses the Problem stage exactly once");
+		assertEquals("Goal completion could not be verified. Continuing the task.", rejected.message(),
+				"rejected completion feedback explains that work will continue");
+		GoalCompletionVerifier.VerificationResult verified = new GoalCompletionVerifier.VerificationResult(
+				true, 7L, "VERIFIED", List.of()
+		);
+		MultiplexedServerBridge.VerboseEvent completed = invokeCompletionVerboseEvent(7L, verified);
+		assertEquals(7L, completed.goalRevision(), "successful completion feedback retains the guarded revision");
+		assertEquals("result", completed.stage(), "successful completion feedback uses Result instead of Lifecycle");
+		assertEquals("Task complete.", completed.message(), "successful completion feedback is concise");
 	}
 
 	private static void verifyTraceWireValidation() {
@@ -957,6 +976,20 @@ public final class MultiplexedServerBridgeVerification {
 			return (String) method.invoke(null, result);
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not format verbose action result", exception);
+		}
+	}
+
+	private static MultiplexedServerBridge.VerboseEvent invokeCompletionVerboseEvent(
+			long goalRevision,
+			GoalCompletionVerifier.VerificationResult verification
+	) {
+		try {
+			var method = MultiplexedServerBridge.class.getDeclaredMethod(
+					"completionVerboseEvent", long.class, GoalCompletionVerifier.VerificationResult.class);
+			method.setAccessible(true);
+			return (MultiplexedServerBridge.VerboseEvent) method.invoke(null, goalRevision, verification);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not format goal completion verbose feedback", exception);
 		}
 	}
 

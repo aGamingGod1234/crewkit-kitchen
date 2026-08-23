@@ -546,13 +546,14 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	await service.stop();
 });
 
-test('native Codex output deduplicates each message item without hiding a later completed-only item', async () => {
+test('native Codex exposes one complete public agent-message candidate without streaming raw chunks', async () => {
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
 	const agent = await service.createAgent(profile('agent-native-output'), { controlProtocol: 'native_tools' });
 	await agent.setGoalRevision(1);
 	const events = [];
+	const publicMessage = `${'x'.repeat(250)} actionId=native:agent-a:1:7`;
 	const turn = agent.act('event: wait', {
 		goalRevision: 1,
 		executeTool: async () => ({ state: 'SUCCEEDED' }),
@@ -563,10 +564,10 @@ test('native Codex output deduplicates each message item without hiding a later 
 		threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1', delta: 'hidden reasoning',
 	} });
 	transport.emit('notification', { method: 'item/agentMessage/delta', params: {
-		threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'First streamed item.',
+		threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: publicMessage,
 	} });
 	transport.emit('notification', { method: 'item/completed', params: {
-		threadId: 'thread-1', turnId: 'turn-1', item: { id: 'message-1', type: 'agentMessage', text: 'First streamed item.' },
+		threadId: 'thread-1', turnId: 'turn-1', item: { id: 'message-1', type: 'agentMessage', text: publicMessage },
 	} });
 	transport.emit('notification', { method: 'item/completed', params: {
 		threadId: 'thread-1', turnId: 'turn-1', item: { id: 'message-2', type: 'agentMessage', text: 'Second completed-only item.' },
@@ -578,9 +579,33 @@ test('native Codex output deduplicates each message item without hiding a later 
 		threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' },
 	} });
 	assert.deepEqual(await turn, { status: 'completed', toolCalls: 0 });
-	assert.equal(events.map(({ message }) => message).join(''), 'First streamed item.Second completed-only item.');
-	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.deepEqual(events, [{ stage: 'agent_message', message: publicMessage }]);
 	assert.doesNotMatch(JSON.stringify(events), /hidden reasoning/);
+	await service.stop();
+});
+
+test('native Codex bounds the raw completed agent message before public preprocessing', async () => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-native-bounded-output'), { controlProtocol: 'native_tools' });
+	await agent.setGoalRevision(1);
+	const events = [];
+	const publicMessage = `Safe ${' '.repeat(100_000)}00000000-0000-0000-0000-000000000000`;
+	const turn = agent.act('event: wait', {
+		goalRevision: 1,
+		executeTool: async () => ({ state: 'SUCCEEDED' }),
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('notification', { method: 'item/completed', params: {
+		threadId: 'thread-1', turnId: 'turn-1', item: { id: 'message-1', type: 'agentMessage', text: publicMessage },
+	} });
+	transport.emit('notification', { method: 'turn/completed', params: {
+		threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' },
+	} });
+	assert.deepEqual(await turn, { status: 'completed', toolCalls: 0 });
+	assert.deepEqual(events, [{ stage: 'agent_message', message: publicMessage.slice(0, 1_280) }]);
 	await service.stop();
 });
 

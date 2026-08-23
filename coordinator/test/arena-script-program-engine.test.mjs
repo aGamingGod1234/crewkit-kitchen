@@ -53,6 +53,36 @@ test('a failed factual completion reopens a finished program for an urgent corre
 	assert.equal(run.engine.snapshot().pendingRequestTrigger, null);
 });
 
+test('requests a continuation when the traced one-action mining program falls off its end', () => {
+	const { engine, dispatched, modelRequests } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		const mined = await tryResult(player.mine({ x: 47, y: 93, z: -23, timeoutMs: 30_000 }));
+		if (!mined.succeeded) program.checkpoint("mining failed");
+		if (!mined.succeeded) program.checkpoint("mining still failed");
+	`);
+	assert.equal(dispatched.length, 1);
+	assert.equal(dispatched[0].action.type, 'break_block');
+	acknowledge(engine, dispatched, observation(), 2);
+	assert.equal(dispatched.length, 1, 'the successful action must not be replayed after program exhaustion');
+	assert.equal(engine.snapshot().status, 'ACTIVE');
+	assert.equal(engine.snapshot().pendingRequestTrigger, 'program_exhausted');
+	assert.equal(modelRequests.length, 1);
+	assert.equal(modelRequests[0].trigger, 'program_exhausted');
+	assert.equal(modelRequests[0].priority, 'urgent');
+});
+
+test('requests a continuation when a fresh program falls through before its first action', () => {
+	const { engine, dispatched, modelRequests } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		if (inventory.countTag("#minecraft:logs") > 0) program.finish("already has logs");
+	`);
+	assert.equal(dispatched.length, 0);
+	assert.equal(engine.snapshot().status, 'ACTIVE');
+	assert.equal(engine.snapshot().pendingRequestTrigger, 'program_exhausted');
+	assert.equal(modelRequests.length, 1);
+	assert.equal(modelRequests[0].trigger, 'program_exhausted');
+});
+
 test('measures a multi-tree pickup loop instead of assuming a tree yield or pickup range', () => {
 	const source = `
 		program.onUnhandledAttention("continue_and_notify");
@@ -60,8 +90,6 @@ test('measures a multi-tree pickup loop instead of assuming a tree yield or pick
 			() => inventory.countTag("#minecraft:logs") >= 8,
 			{ maxIterations: 8 },
 			async () => {
-				const drop = world.nearest(world.items({ tag: "#minecraft:logs" }));
-				if (drop !== null) { await player.moveTo(drop.position); return; }
 				const tree = world.nearest(world.blocks({ tag: "#minecraft:logs" }));
 				if (tree !== null) await player.mine(tree.position);
 			}
@@ -73,23 +101,14 @@ test('measures a multi-tree pickup loop instead of assuming a tree yield or pick
 	}) });
 	assert.equal(dispatched.at(-1).action.type, 'break_block');
 	acknowledge(engine, dispatched, observation({
-		items: [{ stableId: 'drop-five', itemId: 'minecraft:oak_log', count: 5, x: 8, y: 64, z: 0, tags: ['#minecraft:logs'] }],
-	}), 2);
-	assert.equal(dispatched.at(-1).action.type, 'move_to');
-	acknowledge(engine, dispatched, observation({
 		blocks: [{ stableId: 'tree-two', blockId: 'minecraft:oak_log', x: 10, y: 64, z: 0, tags: ['#minecraft:logs'] }],
 		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } },
-	}), 3);
+	}), 2);
 	assert.equal(dispatched.at(-1).action.type, 'break_block');
 	acknowledge(engine, dispatched, observation({
-		items: [{ stableId: 'drop-three', itemId: 'minecraft:oak_log', count: 3, x: 8, y: 64, z: 0, tags: ['#minecraft:logs'] }],
-		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } },
-	}), 4);
-	assert.equal(dispatched.at(-1).action.type, 'move_to');
-	acknowledge(engine, dispatched, observation({
 		inventory: { items: [{ itemId: 'minecraft:oak_log', count: 8 }], tagCounts: { '#minecraft:logs': 8 } },
-	}), 5);
-	assert.deepEqual(dispatched.map((row) => row.action.type), ['break_block', 'move_to', 'break_block', 'move_to']);
+	}), 3);
+	assert.deepEqual(dispatched.map((row) => row.action.type), ['break_block', 'break_block']);
 	assert.equal(engine.snapshot().status, 'FINISHED');
 });
 
@@ -97,13 +116,13 @@ test('watchers fire on false-to-true edges and boundary handlers wait for the ac
 	const { engine, dispatched } = engineFor(`
 		program.onUnhandledAttention("continue_and_notify");
 		program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(1); });
-		await player.moveTo({ x: 4, y: 64, z: 0 });
+		await player.navigateTo({ x: 4, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 5_000 });
 	`);
 	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 2, attention: true });
 	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 3, attention: true });
-	assert.deepEqual(dispatched.map((row) => row.action.type), ['move_to']);
+	assert.deepEqual(dispatched.map((row) => row.action.type), ['navigate_to']);
 	acknowledge(engine, dispatched, observation({ player: { x: 4, y: 64, z: 0, health: 19 } }), 4);
-	assert.deepEqual(dispatched.map((row) => row.action.type), ['move_to', 'wait']);
+	assert.deepEqual(dispatched.map((row) => row.action.type), ['navigate_to', 'wait']);
 });
 
 test('coalesces one pending latch per watcher and preserves the newest facts sequence', () => {
@@ -171,14 +190,14 @@ test('interrupt watchers wait for cancellation acknowledgement and unmatched att
 	const { engine, dispatched, cancelled, modelRequests } = engineFor(`
 		program.onUnhandledAttention("pause_and_notify");
 		program.watch(() => player.state().health < 20, { mode: "interrupt" }, async () => { await player.wait(1); });
-		await player.moveTo({ x: 4, y: 64, z: 0 });
+		await player.navigateTo({ x: 4, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 5_000 });
 	`);
 	const active = dispatched.at(-1);
 	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 19 } }), eventSequence: 2, attention: true });
 	assert.deepEqual(cancelled, [active.actionId]);
-	assert.deepEqual(dispatched.map((row) => row.action.type), ['move_to']);
+	assert.deepEqual(dispatched.map((row) => row.action.type), ['navigate_to']);
 	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'DAMAGE', eventSequence: 2 });
-	assert.deepEqual(dispatched.map((row) => row.action.type), ['move_to', 'wait']);
+	assert.deepEqual(dispatched.map((row) => row.action.type), ['navigate_to', 'wait']);
 	engine.ingestObservation({ observation: observation({ player: { x: 0, y: 64, z: 0, health: 20 } }), eventSequence: 3, attention: true });
 	assert.equal(modelRequests.length, 1);
 	assert.equal(engine.snapshot().status, 'SUSPENDING');

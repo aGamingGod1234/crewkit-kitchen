@@ -1,10 +1,14 @@
 package dev.agaminggod.arenaagents.server;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Pattern;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
@@ -18,7 +22,21 @@ public final class AgentVerboseChat {
 	private static final Logger LOGGER = LoggerFactory.getLogger(AgentVerboseChat.class);
 	private static final Set<String> STAGES = Set.of(
 			"conversation", "lifecycle", "planner", "provider", "output", "decision",
-			"action", "progress", "result", "retry", "error"
+			"agent_message", "action", "progress", "result", "retry", "error"
+	);
+	private static final Set<String> CURATED_STAGES = Set.of(
+			"planner", "output", "agent_message", "decision", "action", "progress", "result", "retry", "error"
+	);
+	private static final Pattern UUID_PATTERN = Pattern.compile(
+			"(?i)\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b"
+	);
+	private static final List<Pattern> TECHNICAL_ID_PATTERNS = List.of(
+			Pattern.compile("(?i)\\b(?:action|call|trace)[ _-]?id\\b\\s*[:=]"),
+			Pattern.compile("(?i)\\baction-progress-\\d+\\b"),
+			Pattern.compile("(?i)\\bcall_[a-z0-9]{3,}\\b"),
+			Pattern.compile("(?i)\\b[a-z0-9._-]+:\\d+:\\d+:\\d+:program-\\d+-\\d+:\\d+:\\d+:(?:arena-state|step)-\\d+\\b"),
+			Pattern.compile("(?i)\\bprogram-\\d+-\\d+:\\d+:\\d+:(?:arena-state|step)-\\d+\\b"),
+			Pattern.compile("(?i)\\btrace-[a-z0-9._:-]+-\\d+-\\d+-[a-z][a-z0-9_-]*\\b")
 	);
 	private static final List<String> CREDENTIAL_MARKERS = List.of(
 			"api key", "api_key", "apikey", "authorization", "bearer ", "credential",
@@ -28,12 +46,20 @@ public final class AgentVerboseChat {
 			"world dump", "observation dump", "block dump", "entity dump", "chunk dump",
 			"inventory dump", "raw observation"
 	);
+	private static final List<String> TECHNICAL_MARKERS = List.of(
+			"actionid", "action_id", "callid", "call_id", "tool call", "tool_call",
+			"traceid", "trace_id", "program step", "diagnostic"
+	);
 
 	private AgentVerboseChat() {
 	}
 
 	public static boolean allowedStage(String stage) {
 		return stage != null && STAGES.contains(stage);
+	}
+
+	public static boolean curatedStage(String stage) {
+		return stage != null && CURATED_STAGES.contains(stage);
 	}
 
 	public static String sanitizeMessage(String message) {
@@ -45,6 +71,11 @@ public final class AgentVerboseChat {
 		}
 		if (WORLD_DUMP_MARKERS.stream().anyMatch(lower::contains)) {
 			return "World details redacted.";
+		}
+		if (lower.contains("native:") || containsJsonContainer(compact)
+				|| TECHNICAL_MARKERS.stream().anyMatch(lower::contains) || UUID_PATTERN.matcher(compact).find()
+				|| TECHNICAL_ID_PATTERNS.stream().anyMatch(pattern -> pattern.matcher(compact).find())) {
+			return "Technical details hidden.";
 		}
 		if (compact.isBlank()) return "No details.";
 		return bound(compact);
@@ -78,6 +109,7 @@ public final class AgentVerboseChat {
 			LOGGER.warn("Skipped unsupported verbose stage {}", stage);
 			return;
 		}
+		if (!curatedStage(stage)) return;
 		try {
 			MinecraftServer server = manager.server();
 			if (server == null) return;
@@ -116,16 +148,12 @@ public final class AgentVerboseChat {
 
 	private static String stageLabel(String stage) {
 		return switch (stage) {
-			case "conversation" -> "Conversation";
-			case "lifecycle" -> "Lifecycle";
-			case "planner" -> "Planner";
-			case "provider" -> "Provider";
-			case "output" -> "Output";
-			case "decision" -> "Decision";
+			case "planner", "output", "agent_message" -> "Thinking";
+			case "decision" -> "Plan";
 			case "action" -> "Action";
 			case "progress" -> "Progress";
 			case "result" -> "Result";
-			case "retry" -> "Retry";
+			case "retry" -> "Problem";
 			case "error" -> "Error";
 			default -> throw new IllegalArgumentException("Unsupported verbose stage: " + stage);
 		};
@@ -155,6 +183,53 @@ public final class AgentVerboseChat {
 			result.appendCodePoint(codePoint);
 		}
 		return result.toString();
+	}
+
+	private static boolean containsJsonContainer(String value) {
+		for (int start = 0; start < value.length(); start++) {
+			char opening = value.charAt(start);
+			if (opening != '[' && opening != '{') continue;
+			int end = matchingJsonContainerEnd(value, start);
+			if (end < 0) continue;
+			try {
+				JsonElement parsed = JsonParser.parseString(value.substring(start, end + 1));
+				if (parsed.isJsonArray() || parsed.isJsonObject()) return true;
+			} catch (RuntimeException ignored) {
+				// Bracketed natural-language prose is not a technical JSON record.
+			}
+		}
+		return false;
+	}
+
+	private static int matchingJsonContainerEnd(String value, int start) {
+		ArrayDeque<Character> closings = new ArrayDeque<>();
+		closings.push(value.charAt(start) == '[' ? ']' : '}');
+		boolean quoted = false;
+		boolean escaped = false;
+		for (int index = start + 1; index < value.length(); index++) {
+			char current = value.charAt(index);
+			if (quoted) {
+				if (escaped) {
+					escaped = false;
+				} else if (current == '\\') {
+					escaped = true;
+				} else if (current == '"') {
+					quoted = false;
+				}
+				continue;
+			}
+			if (current == '"') {
+				quoted = true;
+			} else if (current == '[') {
+				closings.push(']');
+			} else if (current == '{') {
+				closings.push('}');
+			} else if (current == ']' || current == '}') {
+				if (closings.isEmpty() || closings.pop() != current) return -1;
+				if (closings.isEmpty()) return index;
+			}
+		}
+		return -1;
 	}
 
 	private static String bound(String value) {
