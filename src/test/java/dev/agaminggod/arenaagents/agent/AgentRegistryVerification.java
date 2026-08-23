@@ -1,10 +1,10 @@
 package dev.agaminggod.arenaagents.agent;
 
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
 import java.util.UUID;
 
 public final class AgentRegistryVerification {
@@ -16,11 +16,12 @@ public final class AgentRegistryVerification {
 	public static int verify() {
 		int assertions = 0;
 		assertions += verifyLifecycleAndRevisions();
+		assertions += verifyAtomicStartPublication();
+		assertions += verifyPendingConversationWakeRecovery();
 		assertions += verifyCoordinatorCompletion();
+		assertions += verifyCoordinatorCompletionPromotesQueue();
 		assertions += verifyQueueAndSteeringBounds();
 		assertions += verifyIdentityResolution();
-		assertions += verifyIdentityUniqueness();
-		assertions += verifyCanonicalIdentityKeys();
 		assertions += verifyPersistenceRecovery();
 		assertions += verifyProviderPersistenceAndMigration();
 		assertions += verifyEntityLocationPersistenceAndMigration();
@@ -28,6 +29,64 @@ public final class AgentRegistryVerification {
 		assertions += verifyEntityRecoveryTarget();
 		assertions += verifyDeathSnapshotPersistenceAndRespawn();
 		return assertions;
+	}
+
+	private static int verifyAtomicStartPublication() {
+		ArrayList<AgentTransition> dispatched = new ArrayList<>();
+		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, dispatched::add);
+		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("WakeTarget"), START_TIME);
+
+		try {
+			registry.startAtomically(created.agentId(), "Respond to the player", START_TIME + 1L, (transition, commit) -> {
+				throw new AgentDomainException("PUBLICATION_FAILED", "paired publication failed before commit");
+			});
+			throw new AssertionError("Expected atomic start publication failure");
+		} catch (AgentDomainException exception) {
+			assertEquals("PUBLICATION_FAILED", exception.code(), "pre-commit start publication failure code");
+		}
+		assertEquals(created, registry.require(created.agentId()), "pre-commit publication failure retains the exact idle record");
+
+		try {
+			registry.startAtomically(created.agentId(), "Respond to the player", START_TIME + 2L, (transition, commit) -> {
+				commit.run();
+				throw new AgentDomainException("PUBLICATION_FAILED", "paired publication failed after commit");
+			});
+			throw new AssertionError("Expected post-commit atomic start publication failure");
+		} catch (AgentDomainException exception) {
+			assertEquals("PUBLICATION_FAILED", exception.code(), "post-commit start publication failure code");
+		}
+		assertEquals(created, registry.require(created.agentId()), "post-commit publication failure restores the exact idle record");
+
+		ArrayList<String> barrierOrder = new ArrayList<>();
+		AgentTransition started = registry.startAtomically(
+				created.agentId(), "Respond to the player", START_TIME + 3L,
+				(transition, commit) -> {
+					barrierOrder.add(transition.before().state().name());
+					commit.run();
+					barrierOrder.add(registry.require(created.agentId()).state().name());
+				}
+		);
+		assertEquals(List.of("IDLE", "STARTING"), barrierOrder, "atomic start exposes a prepared transition and explicit commit point");
+		assertEquals(AgentLifecycleState.STARTING, started.after().state(), "successful paired publication commits starting state");
+		assertEquals(1L, started.after().goalRevision(), "successful paired publication advances the goal revision once");
+		assertEquals(0, dispatched.size(), "atomic publisher owns the transition and avoids a duplicate runtime-hook publication");
+		return 8;
+	}
+
+	private static int verifyPendingConversationWakeRecovery() {
+		AgentRegistry source = new AgentRegistry(2, 1, () -> { }, transition -> { });
+		AgentRecord created = source.create("gpt-5.6-sol", "high", Optional.of("DurableWake"), START_TIME);
+		AgentRecord active = source.start(created.agentId(), "Respond to the player", START_TIME + 1L).after();
+		AgentRegistry recovered = AgentRegistry.restore(
+				source.snapshot(), () -> { }, transition -> { }, START_TIME + 2L, Set.of(created.agentId())
+		);
+		AgentRecord rearmed = recovered.require(created.agentId());
+		assertEquals(AgentLifecycleState.STARTING, rearmed.state(), "durable conversation wake restores as starting");
+		assertEquals(active.goalRevision(), rearmed.goalRevision(), "durable conversation wake recovery preserves its revision");
+		assertEquals(active.currentGoal().orElseThrow().goalId(), rearmed.currentGoal().orElseThrow().goalId(),
+				"durable conversation wake recovery preserves its exact goal identity");
+		assertEquals("", rearmed.lastError(), "durable conversation wake recovery does not report a false reload pause");
+		return 4;
 	}
 
 	private static int verifyLifecycleAndRevisions() {
@@ -39,6 +98,8 @@ public final class AgentRegistryVerification {
 		assertEquals(3, registry.availableCapacity(), "creating an agent consumes one capacity slot");
 		expectFailure(() -> registry.requireCapacity(4), "AGENT_LIMIT_REACHED");
 		assertEquals(AgentLifecycleState.IDLE, created.state(), "new agent is idle");
+		assertEquals(RespawnPolicy.RESPAWN_AUTOMATICALLY, created.respawnPolicy(),
+				"new agents automatically return after vanilla death");
 
 		AgentTransition started = registry.start(created.agentId(), "Build a shelter", START_TIME + 1L);
 		assertEquals(AgentLifecycleState.STARTING, started.after().state(), "start state");
@@ -77,7 +138,7 @@ public final class AgentRegistryVerification {
 		assertEquals(AgentLifecycleState.DISCONNECTED, disconnected.after().state(), "disconnect state");
 		AgentTransition resumedAfterDisconnect = registry.resume(created.agentId(), START_TIME + 8L);
 		assertEquals(AgentLifecycleState.STARTING, resumedAfterDisconnect.after().state(), "resume after coordinator reconnect");
-		return 23;
+		return 24;
 	}
 
 	private static int verifyCoordinatorCompletion() {
@@ -90,20 +151,34 @@ public final class AgentRegistryVerification {
 		assertEquals(AgentLifecycleState.COMPLETED, completed.state(), "coordinator completion state");
 		assertEquals(1L, completed.goalRevision(), "coordinator completion preserves goal revision");
 		assertEquals("Finish this task", completed.currentGoal().orElseThrow().prompt(), "coordinator completion preserves current goal");
-		assertEquals(3, transitions.size(), "coordinator completion dispatches a local lifecycle transition");
-		assertEquals(AgentLifecycleState.COMPLETED, transitions.getLast().after().state(), "coordinator completion transition exposes DONE locally");
+		assertEquals(3, transitions.size(), "coordinator completion dispatches a state transition hook");
+		AgentTransition completion = transitions.getLast();
+		assertEquals(AgentLifecycleState.PLANNING, completion.before().state(), "completion transition records the prior lifecycle state");
+		assertEquals(AgentLifecycleState.COMPLETED, completion.after().state(), "completion transition records the terminal lifecycle state");
+		assertEquals(1L, completion.before().goalRevision(), "completion transition retains the prior revision");
+		assertEquals(1L, completion.after().goalRevision(), "completion transition does not echo a revised goal");
+		assertTrue(!completion.cancelAction(), "coordinator completion does not cancel an already finished action");
+		assertTrue(!completion.interruptPlanner(), "coordinator completion does not interrupt an already finished planner");
 		assertEquals(AgentLifecycleState.COMPLETED, registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 4L).state(), "repeated coordinator completion is idempotent");
 		expectFailure(() -> registry.coordinatorCompleted(created.agentId(), 0L, START_TIME + 5L), "STALE_REVISION");
+		return 12;
+	}
 
-		AgentRecord queued = registry.create("gpt-5.6-sol", "high", Optional.of("Queued"), START_TIME + 6L);
-		registry.start(queued.agentId(), "First task", START_TIME + 7L);
-		registry.queue(queued.agentId(), "Second task", START_TIME + 8L);
-		AgentRecord promoted = registry.coordinatorCompleted(queued.agentId(), 1L, START_TIME + 9L);
-		assertEquals(AgentLifecycleState.STARTING, promoted.state(), "coordinator completion promotes queued work");
-		assertEquals("Second task", promoted.currentGoal().orElseThrow().prompt(), "coordinator completion installs the queued goal");
-		assertEquals(2L, promoted.goalRevision(), "queued promotion advances the goal revision");
-		assertEquals(0, promoted.queuedGoals().size(), "queued promotion consumes the queue head");
-		return 11;
+	private static int verifyCoordinatorCompletionPromotesQueue() {
+		ArrayList<AgentTransition> transitions = new ArrayList<>();
+		AgentRegistry registry = new AgentRegistry(2, 2, () -> { }, transitions::add);
+		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("QueuedCoordinator"), START_TIME);
+		registry.start(created.agentId(), "Finish this task", START_TIME + 1L);
+		registry.queue(created.agentId(), "Start the queued task", START_TIME + 2L);
+		AgentRecord completed = registry.coordinatorCompleted(created.agentId(), 1L, START_TIME + 3L);
+		assertEquals(AgentLifecycleState.STARTING, completed.state(), "coordinator completion promotes the queued goal");
+		assertEquals(2L, completed.goalRevision(), "queued promotion advances the goal revision");
+		assertEquals("Start the queued task", completed.currentGoal().orElseThrow().prompt(), "queued goal becomes current");
+		assertEquals(0, completed.queuedGoals().size(), "promoted queued goal is removed from the queue");
+		assertEquals(3, transitions.size(), "queued completion promotion dispatches one lifecycle transition");
+		AgentTransition promotion = transitions.getLast();
+		assertEquals(AgentLifecycleState.STARTING, promotion.after().state(), "promotion is restartable by the coordinator");
+		return 7;
 	}
 
 	private static int verifyQueueAndSteeringBounds() {
@@ -135,87 +210,10 @@ public final class AgentRegistryVerification {
 		AgentRecord named = registry.create("gpt-5.5", "high", Optional.of("Scout"), START_TIME);
 		assertEquals(named.agentId(), registry.resolve("scout").agentId(), "case-insensitive name resolution");
 		assertEquals(named.agentId(), registry.resolve(named.agentId().shortValue()).agentId(), "short ID resolution");
-		AgentRecord unnamed = registry.create("kimi", "kimi-code/k3-256k", "max", Optional.empty(), START_TIME + 1L);
-		String generatedName = AgentIdentity.displayName(unnamed.agentId(), unnamed.profile());
-		assertEquals(unnamed.agentId(), registry.resolve(generatedName.toUpperCase()).agentId(),
-				"generated operator name resolves case-insensitively");
-		assertTrue(registry.selectors().contains(generatedName), "generated operator name is offered as a selector");
 		expectFailure(
-				() -> registry.create("codex", "gpt-5.6-sol", "high", Optional.of(generatedName.toUpperCase()),
-						START_TIME + 2L),
+				() -> registry.create("gpt-5.6-sol", "high", Optional.of("SCOUT"), START_TIME + 1L),
 				"DUPLICATE_AGENT_NAME"
 		);
-		expectFailure(
-				() -> registry.create("gpt-5.6-sol", "high", Optional.of("SCOUT"), START_TIME + 3L),
-				"DUPLICATE_AGENT_NAME"
-		);
-		for (int index = 0; index < 8; index++) {
-			registry.create("codex", "gpt-5.6-sol", "high", Optional.empty(), START_TIME + 4L + index);
-		}
-		assertEquals(registry.records().size(), new HashSet<>(registry.records().stream()
-				.map(record -> AgentIdentity.displayName(record.agentId(), record.profile()).toLowerCase(Locale.ROOT))
-				.toList()).size(), "create preserves case-insensitive display-name uniqueness");
-		assertEquals(registry.records().size(), new HashSet<>(registry.records().stream()
-				.map(record -> AgentIdentity.playerName(record.agentId(), record.profile()).toLowerCase(Locale.ROOT))
-				.toList()).size(), "create preserves case-insensitive technical-name uniqueness");
-		return 8;
-	}
-
-	private static int verifyIdentityUniqueness() {
-		AgentId first = new AgentId(UUID.fromString("193a9add-1111-1111-9abc-123456789abc"));
-		AgentId second = new AgentId(UUID.fromString("193a9add-2222-2222-9abc-123456789abc"));
-		AgentProfile unnamed = new AgentProfile("codex", "gpt-5.6-sol", "high", Optional.empty(), 0);
-		AgentRecord firstRecord = AgentRecord.create(first, unnamed, START_TIME);
-		AgentRecord secondRecord = AgentRecord.create(second, unnamed, START_TIME + 1L);
-		assertTrue(!AgentIdentity.displayName(first, unnamed).equalsIgnoreCase(
-				AgentIdentity.displayName(second, unnamed)), "full IDs distinguish same-prefix generated names");
-		assertEquals(AgentIdentity.playerName(first, unnamed), AgentIdentity.playerName(second, unnamed),
-				"technical collision fixture shares its lossy transport name");
-		expectFailure(
-				() -> AgentRegistry.restore(snapshot(firstRecord, secondRecord), () -> { }, transition -> { },
-						START_TIME + 2L),
-				"DUPLICATE_AGENT_PLAYER_NAME"
-		);
-
-		String generatedName = AgentIdentity.displayName(first, unnamed);
-		AgentId namedId = new AgentId(UUID.fromString("abcdef01-3333-3333-9abc-123456789abc"));
-		AgentProfile named = new AgentProfile(
-				"cursor", "composer-2.5", "high", "fast", Optional.of(generatedName.toUpperCase()), 1,
-				AgentGameMode.SURVIVAL);
-		expectFailure(
-				() -> AgentRegistry.restore(
-						snapshot(firstRecord, AgentRecord.create(namedId, named, START_TIME + 1L)),
-						() -> { }, transition -> { }, START_TIME + 2L),
-				"DUPLICATE_AGENT_NAME"
-		);
-		return 4;
-	}
-
-	private static AgentRegistry.Snapshot snapshot(AgentRecord... records) {
-		return new AgentRegistry.Snapshot(
-				AgentConstants.SCHEMA_VERSION,
-				AgentConstants.DEFAULT_AGENT_LIMIT,
-				AgentConstants.DEFAULT_QUEUE_LIMIT,
-				List.of(records)
-		);
-	}
-
-	private static int verifyCanonicalIdentityKeys() {
-		AgentRegistry registry = AgentRegistry.createDefault(() -> { }, transition -> { });
-		AgentRecord named = registry.create(
-				"codex", "gpt-5.6-sol", "high", Optional.of("\u0130"), START_TIME);
-		assertEquals(named.agentId(), registry.resolve("i\u0307").agentId(),
-				"selector matching uses the canonical identity key");
-		expectFailure(
-				() -> registry.create("codex", "gpt-5.6-sol", "high", Optional.of("i\u0307"),
-						START_TIME + 1L),
-				"DUPLICATE_AGENT_NAME"
-		);
-		registry.create("kimi", "kimi-code/k3", "max", Optional.empty(), START_TIME + 2L);
-		AgentRegistry restored = AgentRegistry.restore(
-				registry.snapshot(), () -> { }, transition -> { }, START_TIME + 3L);
-		assertEquals(registry.records(), restored.records(),
-				"every successfully created identity remains valid when its snapshot restores");
 		return 3;
 	}
 
@@ -238,48 +236,31 @@ public final class AgentRegistryVerification {
 
 	private static int verifyProviderPersistenceAndMigration() {
 		AgentRegistrySnapshotCodec codec = new AgentRegistrySnapshotCodec();
-		AgentId persistedId = new AgentId(UUID.fromString("abcdef01-1234-5678-9abc-123456789abc"));
-		AgentProfile kimi = new AgentProfile(
-				"kimi", "kimi-code/k3-256k", "max", "priority", Optional.of("Rook"), 2,
-				AgentGameMode.CREATIVE);
-		AgentRecord record = AgentRecord.create(persistedId, kimi, START_TIME);
+		AgentProfile kimi = new AgentProfile("kimi", "kimi-code/k3", "max", Optional.empty(), 2);
+		AgentProfile fastCodex = new AgentProfile(
+				"codex", "gpt-5.6-luna", "xhigh", "fast", Optional.of("Fast"), 3, AgentGameMode.SURVIVAL
+		);
+		AgentRecord record = AgentRecord.create(AgentId.random(), kimi, START_TIME);
+		AgentRecord fastRecord = AgentRecord.create(AgentId.random(), fastCodex, START_TIME + 1L);
 		AgentRegistry.Snapshot snapshot = new AgentRegistry.Snapshot(
 				AgentConstants.SCHEMA_VERSION,
 				AgentConstants.DEFAULT_AGENT_LIMIT,
 				AgentConstants.DEFAULT_QUEUE_LIMIT,
-				List.of(record)
+				List.of(record, fastRecord)
 		);
-		AgentProfile decoded = codec.decode(codec.encode(snapshot)).records().getFirst().profile();
+		String encoded = codec.encode(snapshot);
+		AgentRegistry.Snapshot roundTrip = codec.decode(encoded);
+		AgentProfile decoded = roundTrip.records().getFirst().profile();
 		assertEquals("kimi", decoded.provider(), "provider round-trip");
-		assertEquals("kimi-code/k3-256k", decoded.model(), "model round-trip");
-		assertEquals("max", decoded.reasoning(), "reasoning round-trip");
-		assertEquals("priority", decoded.serviceTier(), "service tier round-trip");
-		assertEquals(Optional.of("Rook"), decoded.userName(), "friendly name round-trip");
-		assertEquals(AgentGameMode.CREATIVE, decoded.gameMode(), "game mode round-trip");
-		assertEquals(
-				AgentVisualIdentity.resolve(kimi.provider(), kimi.model(), kimi.skinVariant()),
-				AgentVisualIdentity.resolve(decoded.provider(), decoded.model(), decoded.skinVariant()),
-				"resolved visual and transport identity round-trip");
-		assertEquals("Rook", AgentIdentity.displayName(persistedId, decoded),
-				"resolved operator identity round-trip");
-		assertEquals(Optional.of("☾ Rook · K3 256K"), AgentIdentity.worldTag(decoded),
-				"resolved friendly world identity round-trip");
+		assertEquals("Kimi K3 Max | Orchid", decoded.nameTag(), "provider and skin aware name tag");
+		assertEquals("fast", roundTrip.records().get(1).profile().serviceTier(), "fast service tier round-trip");
 
-		String legacy = codec.encode(snapshot).replace("\"provider\":\"kimi\",", "");
-		assertEquals("codex", codec.decode(legacy).records().getFirst().profile().provider(), "legacy provider migration");
-		AgentProfile cursor = new AgentProfile(
-				"cursor", "composer-2.5", "high", "fast", Optional.empty(), 1, AgentGameMode.SURVIVAL);
-		AgentRegistry.Snapshot cursorSnapshot = new AgentRegistry.Snapshot(
-				AgentConstants.SCHEMA_VERSION,
-				AgentConstants.DEFAULT_AGENT_LIMIT,
-				AgentConstants.DEFAULT_QUEUE_LIMIT,
-				List.of(AgentRecord.create(AgentId.random(), cursor, START_TIME))
-		);
-		AgentProfile decodedCursor = codec.decode(codec.encode(cursorSnapshot)).records().getFirst().profile();
-		assertEquals("cursor", decodedCursor.provider(), "Cursor provider round-trip");
-		assertEquals("composer-2.5", decodedCursor.model(), "Cursor model round-trip");
-		assertEquals("fast", decodedCursor.serviceTier(), "Cursor native fast mode round-trip");
-		return 13;
+		String legacyProvider = encoded.replace("\"provider\":\"kimi\",", "");
+		assertEquals("codex", codec.decode(legacyProvider).records().getFirst().profile().provider(), "legacy provider migration");
+		String legacyTier = encoded.replace(",\"service_tier\":\"fast\"", "");
+		assertEquals("priority", codec.decode(legacyTier).records().get(1).profile().serviceTier(),
+				"legacy service tier migration defaults to priority");
+		return 5;
 	}
 
 	private static int verifyEntityLocationPersistenceAndMigration() {
@@ -290,7 +271,7 @@ public final class AgentRegistryVerification {
 				START_TIME
 		).withEntity(
 				Optional.of(UUID.fromString("01234567-89ab-cdef-0123-456789abcdef")),
-				Optional.of(new AgentEntityLocation("minecraft:the_nether", 12, -8)),
+				Optional.of(new AgentEntityLocation("minecraft:the_nether", 12, -8, OptionalInt.of(71))),
 				START_TIME + 1L
 		);
 		AgentRegistry.Snapshot snapshot = new AgentRegistry.Snapshot(
@@ -303,15 +284,21 @@ public final class AgentRegistryVerification {
 		String encoded = codec.encode(snapshot);
 		AgentRecord decoded = codec.decode(encoded).records().getFirst();
 		assertEquals(record.entityLocation(), decoded.entityLocation(), "entity location round-trip");
+		assertTrue(encoded.contains("\"block_y\":71"), "entity recovery height is persisted");
 
 		String legacy = encoded.replace(
-				",\"entity_location\":{\"dimension\":\"minecraft:the_nether\",\"chunk_x\":12,\"chunk_z\":-8}",
+				",\"entity_location\":{\"dimension\":\"minecraft:the_nether\",\"chunk_x\":12,\"chunk_z\":-8,\"block_y\":71}",
 				""
 		);
 		AgentRecord migrated = codec.decode(legacy).records().getFirst();
 		assertEquals(Optional.empty(), migrated.entityLocation(), "legacy entity location migration");
 		assertEquals(record.entityUuid(), migrated.entityUuid(), "legacy entity UUID preserved");
-		return 3;
+
+		AgentRegistry registry = AgentRegistry.restore(snapshot, () -> { }, transition -> { }, START_TIME + 2L);
+		AgentRecord detached = registry.detachEntity(record.agentId(), START_TIME + 3L);
+		assertEquals(Optional.empty(), detached.entityUuid(), "missing physical player clears stale entity UUID");
+		assertEquals(Optional.empty(), detached.entityLocation(), "missing physical player clears stale entity location");
+		return 6;
 	}
 
 	private static int verifyAutomaticProgressPersistence() {

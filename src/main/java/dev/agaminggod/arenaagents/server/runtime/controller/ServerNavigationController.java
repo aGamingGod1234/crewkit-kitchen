@@ -8,7 +8,13 @@ import dev.agaminggod.arenaagents.client.navigation.PathPlan;
 import dev.agaminggod.arenaagents.client.navigation.TraversalType;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates;
+import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
+import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
+import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
@@ -29,6 +35,8 @@ public final class ServerNavigationController implements ServerController {
 	private int waypointIndex;
 	private WaypointProgress progress;
 	private double lastProgressValue;
+	private InputLease inputLease;
+	private AgentInputStates.MotorState motorState;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -93,13 +101,24 @@ public final class ServerNavigationController implements ServerController {
 			waypoint = plan.nodes().get(waypointIndex);
 			target = center(waypoint.position());
 		}
-		drive(player, waypoint, target);
+		drive(player, waypoint, target, nowEpochMs);
 		return TickResult.running(update.progress());
 	}
 
 	@Override
 	public void cancel(ServerPlayer player) {
-		OfflineAgentPlayers.stop(player);
+		if (inputLease == null) {
+			OfflineAgentPlayers.stop(player);
+			motorState = null;
+			return;
+		}
+		try {
+			AgentInputRuntime.controller(player).release(inputLease);
+		} catch (IllegalStateException ignored) {
+			// A lifecycle clear may already have invalidated every lease.
+		}
+		inputLease = null;
+		motorState = null;
 	}
 
 	private TickResult replanOrResult(ServerPlayer player, long nowEpochMs, double remaining) {
@@ -126,7 +145,13 @@ public final class ServerNavigationController implements ServerController {
 		if (start == null || goal == null) {
 			return fail(player, "NO_STANDABLE_PATH", "Start or destination has no safe standing position", currentProgress());
 		}
-		PathPlan candidate = planner.findPath(world, start, goal);
+		ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
+		if (planning.deferred()) {
+			// Shared server-tick exhaustion is transient. Keep the action alive so the
+			// fair executor rotation can admit it on a later tick.
+			return TickResult.running(currentProgress());
+		}
+		PathPlan candidate = planning.plan();
 		if (candidate.outcome() != PathOutcome.FOUND || candidate.nodes().size() > DEFAULT_MAX_PATH_LENGTH) {
 			String reason = candidate.outcome() == PathOutcome.NODE_LIMIT
 					|| candidate.outcome() == PathOutcome.TIME_LIMIT
@@ -143,24 +168,46 @@ public final class ServerNavigationController implements ServerController {
 		return null;
 	}
 
-	private void drive(ServerPlayer player, PathNode waypoint, Vec3 target) {
-		EntityPlayerActionPack actions = OfflineAgentPlayers.actions(player);
+	private void drive(ServerPlayer player, PathNode waypoint, Vec3 target, long nowEpochMs) {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
-		actions.lookAt(target.add(0.0D, 0.85D, 0.0D))
-				.setSprinting((sprint || gapJump) && player.getFoodData().getFoodLevel() > 6)
-				.setForward(1.0F);
-		if (waypoint.traversal() == TraversalType.JUMP_UP || gapJump) {
-			actions.start(EntityPlayerActionPack.ActionType.JUMP, EntityPlayerActionPack.Action.once());
+		LeasedServerInputController controller = AgentInputRuntime.controller(player);
+		if (inputLease == null) {
+			inputLease = controller.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
 		}
+		Vec3 lookTarget = target.add(0.0D, 0.85D, 0.0D);
+		Vec3 delta = lookTarget.subtract(player.getEyePosition());
+		double horizontal = Math.sqrt(delta.x * delta.x + delta.z * delta.z);
+		float targetYaw = net.minecraft.util.Mth.wrapDegrees(
+				(float) Math.toDegrees(Math.atan2(-delta.x, delta.z)));
+		float targetPitch = net.minecraft.util.Mth.clamp(
+				(float) -Math.toDegrees(Math.atan2(delta.y, horizontal)), -90.0F, 90.0F);
+		if (motorState == null) motorState = AgentInputStates.MotorState.initial(player.getYRot(), player.getXRot());
+		AgentInputStates.MotorStep step = AgentInputStates.stepMotor(
+				motorState,
+				new AgentInputStates.MotorTarget(
+						targetYaw,
+						targetPitch,
+						true,
+						waypoint.traversal() == TraversalType.JUMP_UP || gapJump,
+						(sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
+				),
+				nowEpochMs
+		);
+		motorState = step.state();
+		controller.apply(inputLease, new dev.agaminggod.arenaagents.server.runtime.input.AgentInputState(
+				step.forward(), step.strafe(), step.jump(), false, step.sprint(),
+				false, false, step.state().yaw(), step.state().pitch(),
+				player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
+		));
 	}
 
 	private TickResult succeed(ServerPlayer player, String reasonCode, String message) {
-		OfflineAgentPlayers.stop(player);
+		cancel(player);
 		return TickResult.succeeded(reasonCode, message);
 	}
 
 	private TickResult fail(ServerPlayer player, String reasonCode, String message, double progressValue) {
-		OfflineAgentPlayers.stop(player);
+		cancel(player);
 		return TickResult.failed(reasonCode, message, progressValue);
 	}
 

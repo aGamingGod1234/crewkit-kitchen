@@ -3,10 +3,13 @@ import { parseDecision } from './decision-parser.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { discoverKimiCatalog } from './provider-catalog-discovery.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
+const DEFAULT_SERVICE_TIER = 'priority';
+const PROFILE_KEYS = Object.freeze(['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier']);
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft AI Agents', version: '2.1.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ fs: { readTextFile: false, writeTextFile: false }, terminal: false });
 
@@ -18,6 +21,7 @@ export class AcpProviderService {
 	#workspaceManager;
 	#agents = new Map();
 	#creating = new Map();
+	#sessionGenerations = new Map();
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -38,17 +42,18 @@ export class AcpProviderService {
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
 		await this.catalog.refresh();
-		const profile = validateProfile(profileValue, this.#config);
-		const existing = this.#agents.get(profile.agentId);
+		const requested = profileIdentity(profileValue, this.#config);
+		const existing = this.#agents.get(requested.agentId);
 		if (existing !== undefined) {
-			if (!existing.matchesProfile(profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `${profile.provider} agent '${profile.agentId}' already has a different profile`);
+			if (!existing.matchesProfile(requested)) throw profileConflict();
 			return existing;
 		}
-		const creating = this.#creating.get(profile.agentId);
+		const creating = this.#creating.get(requested.agentId);
 		if (creating !== undefined) {
-			if (!profilesMatch(creating.profile, profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `${profile.provider} agent '${profile.agentId}' is being created with a different profile`);
+			if (!profilesMatch(creating.profile, requested)) throw profileConflict();
 			return creating.promise;
 		}
+		const profile = validateProfile(profileValue, this.#config);
 		const promise = this.#createAgentOnce(profile, recoverySummary);
 		this.#creating.set(profile.agentId, { profile, promise });
 		try { return await promise; } finally { this.#creating.delete(profile.agentId); }
@@ -59,10 +64,14 @@ export class AcpProviderService {
 			? this.#config.cwd
 			: await this.#workspaceManager.prepare(profile.provider, profile.agentId);
 		const transport = this.#transportFactory({ ...profile, cwd });
+		const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
+		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
 		const agent = new AcpAgent(profile, transport, {
 			planningTimeoutMs: this.#config.planningTimeoutMs,
 			maxDecisionBytes: this.#config.maxDecisionBytes,
 			recoverySummary: normalizeRecoverySummary(recoverySummary),
+			sessionGeneration,
+			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 		});
 		try { await agent.start(cwd); } catch (error) {
 			await transport.stop();
@@ -110,22 +119,33 @@ class AcpAgent {
 	#planningTimeoutMs;
 	#maxDecisionBytes;
 	#recoverySummary;
+	#sessionGeneration;
+	#sessionState = 'cold';
+	#resetReason;
 	#sessionId = null;
 	#goalRevision = 0;
 	#active = false;
 	#disposed = false;
 
-	constructor(profile, transport, { planningTimeoutMs, maxDecisionBytes, recoverySummary }) {
+	constructor(profile, transport, { planningTimeoutMs, maxDecisionBytes, recoverySummary, sessionGeneration = 1, resetReason = null }) {
 		this.#profile = structuredClone(profile);
 		this.#transport = transport;
 		this.#planningTimeoutMs = planningTimeoutMs;
 		this.#maxDecisionBytes = maxDecisionBytes;
 		this.#recoverySummary = recoverySummary;
+		this.#sessionGeneration = sessionGeneration;
+		this.#resetReason = resetReason ?? null;
 	}
 
 	get agentId() { return this.#profile.agentId; }
 	get provider() { return this.#profile.provider; }
-	matchesProfile(profile) { return ['agentId', 'provider', 'model', 'reasoningEffort'].every((key) => this.#profile[key] === profile[key]); }
+	get serviceTier() { return this.#profile.serviceTier; }
+	get sessionGeneration() { return this.#sessionGeneration; }
+	get profileFingerprint() { return profileFingerprint(this.#profile); }
+	sessionMetadata() {
+		return createSessionMetadata(this.#profile, { sessionGeneration: this.#sessionGeneration, sessionState: this.#sessionState, continuation: 'durable', durability: 'proven', resetReason: this.#resetReason });
+	}
+	matchesProfile(profile) { return profilesMatch(this.#profile, profile); }
 
 	async start(cwd) {
 		await this.#transport.start();
@@ -141,9 +161,10 @@ class AcpAgent {
 		let currentOptions = configOptions;
 		if (this.#profile.model !== 'auto') {
 			const model = findOption(currentOptions, 'model');
-			assertOptionValue(model, this.#profile.model, 'UNSUPPORTED_MODEL', `${this.provider} model`);
-			if (model.currentValue !== this.#profile.model) {
-				currentOptions = await this.#setConfig(model.id, this.#profile.model, currentOptions);
+			const requestedModel = resolveKimiApiKeyModel(this.provider, this.#profile.model, model);
+			assertOptionValue(model, requestedModel, 'UNSUPPORTED_MODEL', `${this.provider} model`);
+			if (model.currentValue !== requestedModel) {
+				currentOptions = await this.#setConfig(model.id, requestedModel, currentOptions);
 			}
 		}
 		const thinking = findOption(currentOptions, 'thought_level', { optional: this.provider === 'kimi' });
@@ -213,12 +234,21 @@ class AcpAgent {
 			if (response?.stopReason !== 'end_turn') throw new AcpProtocolError('INCOMPLETE_TURN', `${this.provider} ACP stopped with '${String(response?.stopReason)}'`);
 			const decisionText = chunks.join('');
 			rawOutput = decisionText;
+			if (this.provider === 'kimi' && decisionText.trim().length === 0) {
+				throw new AcpProtocolError(
+					'PROVIDER_UNAVAILABLE',
+					'Kimi ended the turn without a response. Verify the Kimi CLI login and membership entitlement.',
+				);
+			}
 			let decision;
 			let parseError = null;
-			try {
-				decision = parseDecision(decisionText);
-			} catch (error) {
-				parseError = new AcpProtocolError(error?.code ?? 'INVALID_DECISION', `${this.provider} returned an invalid planner decision`, { cause: error });
+			try { decision = parseDecision(decisionText); }
+			catch (error) {
+				parseError = new AcpProtocolError(
+					error?.code ?? 'INVALID_DECISION',
+					`${this.provider} returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
+					{ cause: error },
+				);
 				parseError.category = 'decision_parse';
 			}
 			outputHandled = true;
@@ -231,6 +261,7 @@ class AcpAgent {
 				...(tokens === null ? {} : { tokens }),
 			});
 			if (parseError !== null) throw parseError;
+			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
@@ -250,6 +281,24 @@ class AcpAgent {
 
 	interrupt() { if (this.#sessionId !== null) this.#transport.notify('session/cancel', { sessionId: this.#sessionId }); }
 	async dispose() { if (this.#disposed) return; this.#disposed = true; if (this.#active) this.interrupt(); await this.#transport.stop(); }
+}
+
+function resolveKimiApiKeyModel(provider, requestedModel, modelOption) {
+	if (provider !== 'kimi') return requestedModel;
+	const apiKeyModel = {
+		'kimi-code/k3': 'moonshot-ai/kimi-k3',
+		'kimi-code/kimi-for-coding': 'moonshot-ai/kimi-k2.7-code',
+		'kimi-code/kimi-for-coding-highspeed': 'moonshot-ai/kimi-k2.7-code-highspeed',
+	}[requestedModel];
+	if (apiKeyModel === undefined) return requestedModel;
+	return Array.isArray(modelOption?.options)
+		&& modelOption.options.some((option) => option?.value === apiKeyModel)
+		? apiKeyModel
+		: requestedModel;
+}
+
+function decisionExcerpt(value) {
+	return JSON.stringify(String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 512));
 }
 
 function acpTokenUsage(value) {
@@ -365,6 +414,7 @@ function validateProfile(value, config) {
 		provider: value.provider ?? 'codex',
 		model: requireText(value.model, 'model'),
 		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
 	};
 	if (profile.provider !== config.provider) throw new AcpProtocolError('PROVIDER_MISMATCH', `Expected ${config.provider} profile, received ${profile.provider}`);
 	if (!config.models.includes(profile.model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `${config.provider} model '${profile.model}' is not configured`);
@@ -375,7 +425,22 @@ function validateProfile(value, config) {
 }
 
 function profilesMatch(left, right) {
-	return ['agentId', 'provider', 'model', 'reasoningEffort'].every((key) => left[key] === right[key]);
+	return PROFILE_KEYS.every((key) => left[key] === right[key]);
+}
+
+function profileIdentity(value, config) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('agent profile must be an object');
+	return {
+		agentId: requireText(value.agentId, 'agentId'),
+		provider: value.provider ?? 'codex',
+		model: requireText(value.model, 'model'),
+		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
+	};
+}
+
+function profileConflict() {
+	return new AcpProtocolError('AGENT_PROFILE_CONFLICT', 'Agent profile is immutable for the active ACP session');
 }
 
 function findOption(options, category, { optional = false } = {}) {

@@ -3,12 +3,13 @@ package dev.agaminggod.arenaagents.agent;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
@@ -47,7 +48,7 @@ public final class AgentRegistry {
 		}
 		this.onChange = Objects.requireNonNull(onChange, "onChange must not be null");
 		this.transitionSink = Objects.requireNonNull(transitionSink, "transitionSink must not be null");
-		validateUniqueIdentities(records.values());
+		validateUniqueNames(records.values());
 	}
 
 	public static AgentRegistry createDefault(Runnable onChange, Consumer<AgentTransition> transitionSink) {
@@ -65,15 +66,39 @@ public final class AgentRegistry {
 			Consumer<AgentTransition> transitionSink,
 			long nowEpochMs
 	) {
+		return restore(snapshot, onChange, transitionSink, nowEpochMs, Set.of());
+	}
+
+	public static AgentRegistry restore(
+			Snapshot snapshot,
+			Runnable onChange,
+			Consumer<AgentTransition> transitionSink,
+			long nowEpochMs,
+			Set<AgentId> pendingConversationWakeAgents
+	) {
 		Objects.requireNonNull(snapshot, "snapshot must not be null");
+		Set<AgentId> wakeAgents = Set.copyOf(Objects.requireNonNull(
+				pendingConversationWakeAgents, "pendingConversationWakeAgents must not be null"
+		));
 		LinkedHashMap<AgentId, AgentRecord> recovered = new LinkedHashMap<>();
 		for (AgentRecord record : snapshot.records()) {
-			AgentRecord revised = AgentLifecycleReducer.recoverAfterReload(record, nowEpochMs);
+			AgentRecord revised = wakeAgents.contains(record.agentId())
+					? recoverConversationWake(record, nowEpochMs)
+					: AgentLifecycleReducer.recoverAfterReload(record, nowEpochMs);
 			if (recovered.put(revised.agentId(), revised) != null) {
 				throw new AgentDomainException("DUPLICATE_AGENT_ID", "Duplicate agent ID in snapshot: " + revised.agentId());
 			}
 		}
 		return new AgentRegistry(snapshot.maxAgents(), snapshot.queueLimit(), recovered, onChange, transitionSink);
+	}
+
+	private static AgentRecord recoverConversationWake(AgentRecord record, long nowEpochMs) {
+		if (!record.state().isReloadUncertain() || record.currentGoal().isEmpty()) {
+			throw new AgentDomainException("INVALID_CONVERSATION_WAKE", "Pending conversation wake does not own recoverable active work");
+		}
+		return record.withLifecycle(
+				AgentLifecycleState.STARTING, record.currentGoal(), record.goalRevision(), record.queuedGoals(), nowEpochMs, ""
+		);
 	}
 
 	public synchronized int availableCapacity() {
@@ -135,14 +160,13 @@ public final class AgentRegistry {
 		}
 		Optional<String> checkedName = Objects.requireNonNull(userName, "userName must not be null")
 				.map(AgentValidators::requireUserName);
-		checkedName.ifPresent(this::requireUniqueDisplayName);
+		checkedName.ifPresent(this::requireUniqueName);
 		AgentId id;
-		AgentProfile profile;
 		do {
 			id = AgentId.random();
-			int skinVariant = Math.floorMod(id.value().hashCode(), AgentVisualIdentity.INDIVIDUAL_VARIANT_COUNT);
-			profile = new AgentProfile(provider, model, reasoning, serviceTier, checkedName, skinVariant, gameMode);
-		} while (!identityAvailable(id, profile));
+		} while (records.containsKey(id));
+		int skinVariant = Math.floorMod(id.value().hashCode(), AgentConstants.DEFAULT_SKIN_VARIANT_COUNT);
+		AgentProfile profile = new AgentProfile(provider, model, reasoning, serviceTier, checkedName, skinVariant, gameMode);
 		AgentRecord created = AgentRecord.create(id, profile, nowEpochMs);
 		records.put(id, created);
 		onChange.run();
@@ -171,6 +195,15 @@ public final class AgentRegistry {
 				Optional.of(Objects.requireNonNull(entityLocation, "entityLocation must not be null")),
 				nowEpochMs
 		);
+		records.put(id, revised);
+		onChange.run();
+		return revised;
+	}
+
+	public synchronized AgentRecord detachEntity(AgentId id, long nowEpochMs) {
+		AgentRecord current = require(id);
+		if (current.entityUuid().isEmpty()) return current;
+		AgentRecord revised = current.withEntityUuid(Optional.empty(), nowEpochMs);
 		records.put(id, revised);
 		onChange.run();
 		return revised;
@@ -207,6 +240,18 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.start(require(id), prompt, nowEpochMs));
 	}
 
+	/** Commits a prepared start only after its publication barrier succeeds. */
+	public synchronized AgentTransition startAtomically(
+			AgentId id,
+			String prompt,
+			long nowEpochMs,
+			BiConsumer<AgentTransition, Runnable> barrier
+	) {
+		Objects.requireNonNull(barrier, "barrier must not be null");
+		AgentTransition transition = AgentLifecycleReducer.start(require(id), prompt, nowEpochMs);
+		return applyAtomically(transition, barrier, "start");
+	}
+
 	public synchronized AgentTransition queue(AgentId id, String prompt, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.queue(require(id), prompt, queueLimit, nowEpochMs));
 	}
@@ -239,7 +284,7 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.completeGoal(require(id), revision, nowEpochMs));
 	}
 
-	/** Applies a coordinator-owned completion while preserving terminal revisions and promoting queued work. */
+	/** Applies a coordinator-owned terminal state, promoting queued work when present. */
 	public synchronized AgentRecord coordinatorCompleted(AgentId id, long revision, long nowEpochMs) {
 		AgentRecord current = require(id);
 		if (current.goalRevision() != revision) {
@@ -260,7 +305,7 @@ public final class AgentRegistry {
 				nowEpochMs,
 				""
 		);
-		return apply(new AgentTransition(current, completed, true, true)).after();
+		return apply(new AgentTransition(current, completed, false, false)).after();
 	}
 
 	public synchronized AgentTransition fail(AgentId id, String message, long nowEpochMs) {
@@ -269,6 +314,33 @@ public final class AgentRegistry {
 
 	public synchronized AgentTransition disconnect(AgentId id, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.disconnect(require(id), nowEpochMs));
+	}
+
+	/** Re-arms a durable wake after transport loss without manufacturing a new goal revision. */
+	public synchronized AgentTransition rearmConversationWake(
+			AgentId id,
+			long goalRevision,
+			UUID goalId,
+			long nowEpochMs
+	) {
+		AgentRecord current = require(id);
+		if (current.goalRevision() != goalRevision
+				|| current.currentGoal().map(goal -> !goal.goalId().equals(goalId)).orElse(true)) {
+			throw new AgentDomainException("STALE_REVISION", "Pending conversation wake no longer owns the current goal");
+		}
+		if (current.state() == AgentLifecycleState.STARTING) {
+			return new AgentTransition(current, current, false, false);
+		}
+		if (!current.state().isActive() && current.state() != AgentLifecycleState.PAUSED
+				&& current.state() != AgentLifecycleState.DISCONNECTED) {
+			throw new AgentDomainException("INVALID_AGENT_STATE", "Pending conversation wake cannot re-arm " + current.state());
+		}
+		AgentRecord rearmed = current.withLifecycle(
+				AgentLifecycleState.STARTING, current.currentGoal(), current.goalRevision(), current.queuedGoals(), nowEpochMs, ""
+		);
+		records.put(id, rearmed);
+		onChange.run();
+		return new AgentTransition(current, rearmed, current.state() != AgentLifecycleState.STARTING, true);
 	}
 
 	public synchronized AgentTransition die(AgentId id, AgentDeathSnapshot deathSnapshot, long nowEpochMs) {
@@ -288,7 +360,7 @@ public final class AgentRegistry {
 	) {
 		Objects.requireNonNull(barrier, "barrier must not be null");
 		AgentTransition transition = AgentLifecycleReducer.respawn(require(id), entityUuid, nowEpochMs);
-		return respawnAtomically(transition, barrier);
+		return applyAtomically(transition, barrier, "respawn");
 	}
 
 	public synchronized AgentTransition respawnAtomically(
@@ -305,17 +377,18 @@ public final class AgentRegistry {
 				lifecycle.before(), lifecycle.after().withEntityLocation(entityLocation, nowEpochMs),
 				lifecycle.cancelAction(), lifecycle.interruptPlanner()
 		);
-		return respawnAtomically(located, barrier);
+		return applyAtomically(located, barrier, "respawn");
 	}
 
-	private AgentTransition respawnAtomically(
+	private AgentTransition applyAtomically(
 			AgentTransition transition,
-			BiConsumer<AgentTransition, Runnable> barrier
+			BiConsumer<AgentTransition, Runnable> barrier,
+			String operation
 	) {
 		AgentId id = transition.after().agentId();
 		boolean[] committed = { false };
 		Runnable commit = () -> {
-			if (committed[0]) throw new IllegalStateException("respawn transition was already committed");
+			if (committed[0]) throw new IllegalStateException(operation + " transition was already committed");
 			records.put(id, transition.after());
 			try {
 				onChange.run();
@@ -327,7 +400,7 @@ public final class AgentRegistry {
 		};
 		try {
 			barrier.accept(transition, commit);
-			if (!committed[0]) throw new IllegalStateException("respawn barrier did not commit the transition");
+			if (!committed[0]) throw new IllegalStateException(operation + " barrier did not commit the transition");
 			return transition;
 		} catch (RuntimeException exception) {
 			if (committed[0]) {
@@ -388,11 +461,10 @@ public final class AgentRegistry {
 			// A command selector may be a short ID or user name instead of a full UUID.
 		}
 
-		String folded = AgentIdentity.canonicalIdentityKey(checked);
+		String folded = checked.toLowerCase(Locale.ROOT);
 		List<AgentRecord> matches = records.values().stream()
 				.filter(record -> record.agentId().startsWith(checked)
-						|| AgentIdentity.canonicalIdentityKey(
-								AgentIdentity.displayName(record.agentId(), record.profile())).equals(folded))
+						|| record.profile().userName().map(name -> name.toLowerCase(Locale.ROOT).equals(folded)).orElse(false))
 				.toList();
 		if (matches.isEmpty()) {
 			throw new AgentDomainException("AGENT_NOT_FOUND", "Unknown agent: " + checked);
@@ -413,7 +485,7 @@ public final class AgentRegistry {
 		ArrayList<String> selectors = new ArrayList<>();
 		for (AgentRecord record : records()) {
 			selectors.add(record.agentId().shortValue());
-			selectors.add(AgentIdentity.displayName(record.agentId(), record.profile()));
+			record.profile().userName().ifPresent(selectors::add);
 		}
 		return List.copyOf(selectors);
 	}
@@ -440,42 +512,26 @@ public final class AgentRegistry {
 		return transition;
 	}
 
-	private void requireUniqueDisplayName(String proposedName) {
-		String proposedKey = AgentIdentity.canonicalIdentityKey(proposedName);
+	private void requireUniqueName(String proposedName) {
+		String folded = proposedName.toLowerCase(Locale.ROOT);
 		boolean duplicate = records.values().stream()
-				.map(record -> AgentIdentity.displayName(record.agentId(), record.profile()))
-				.map(AgentIdentity::canonicalIdentityKey)
-				.anyMatch(proposedKey::equals);
+				.flatMap(record -> record.profile().userName().stream())
+				.anyMatch(existing -> existing.toLowerCase(Locale.ROOT).equals(folded));
 		if (duplicate) {
 			throw new AgentDomainException("DUPLICATE_AGENT_NAME", "Agent name is already in use: " + proposedName);
 		}
 	}
 
-	private boolean identityAvailable(AgentId id, AgentProfile profile) {
-		if (records.containsKey(id)) return false;
-		String displayKey = AgentIdentity.canonicalIdentityKey(AgentIdentity.displayName(id, profile));
-		String playerKey = AgentIdentity.canonicalIdentityKey(AgentIdentity.playerName(id, profile));
-		return records.values().stream().noneMatch(record ->
-				AgentIdentity.canonicalIdentityKey(
-						AgentIdentity.displayName(record.agentId(), record.profile())).equals(displayKey)
-						|| AgentIdentity.canonicalIdentityKey(
-								AgentIdentity.playerName(record.agentId(), record.profile())).equals(playerKey));
-	}
-
-	private static void validateUniqueIdentities(Collection<AgentRecord> records) {
-		HashSet<String> displayNames = new HashSet<>();
-		HashSet<String> playerNames = new HashSet<>();
+	private static void validateUniqueNames(Collection<AgentRecord> records) {
+		ArrayList<String> names = new ArrayList<>();
 		for (AgentRecord record : records) {
-			String displayName = AgentIdentity.displayName(record.agentId(), record.profile());
-			if (!displayNames.add(AgentIdentity.canonicalIdentityKey(displayName))) {
-				throw new AgentDomainException(
-						"DUPLICATE_AGENT_NAME", "Duplicate agent name in snapshot: " + displayName);
-			}
-			String playerName = AgentIdentity.playerName(record.agentId(), record.profile());
-			if (!playerNames.add(AgentIdentity.canonicalIdentityKey(playerName))) {
-				throw new AgentDomainException(
-						"DUPLICATE_AGENT_PLAYER_NAME", "Duplicate technical player name in snapshot: " + playerName);
-			}
+			record.profile().userName().ifPresent(name -> {
+				String folded = name.toLowerCase(Locale.ROOT);
+				if (names.contains(folded)) {
+					throw new AgentDomainException("DUPLICATE_AGENT_NAME", "Duplicate agent name in snapshot: " + name);
+				}
+				names.add(folded);
+			});
 		}
 	}
 

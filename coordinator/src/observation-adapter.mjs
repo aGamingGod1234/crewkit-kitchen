@@ -20,12 +20,14 @@ export function adaptObservation(value) {
 		z: position.z,
 		yaw: view.yaw,
 		pitch: view.pitch,
+		dead: false,
 	};
 	copyNumber(playerSource, player, 'health');
 	copyNumber(playerSource, player, 'foodLevel', 'hunger');
 	copyNumber(playerSource, player, 'air');
 	copyBoolean(playerSource, player, 'onFire', 'fire');
 	copyNumber(playerSource, player, 'fallDistance');
+	if (Object.hasOwn(playerSource, 'lastAttacker')) player.lastAttacker = attackerFacts(playerSource.lastAttacker);
 
 	const entities = boundedDataArray(source.entities, 'entities', MAX_ENTITIES)
 		.map((value, index) => entityFacts(value, index));
@@ -64,7 +66,7 @@ export function adaptObservation(value) {
 export const adaptWireObservation = adaptObservation;
 
 function emptyFacts(dead = false) {
-	return { player: dead ? { dead: true } : {}, items: [], entities: [], blocks: [], inventory: { items: [] } };
+	return { player: { dead }, items: [], entities: [], blocks: [], inventory: { items: [] } };
 }
 
 function entityFacts(value, index) {
@@ -152,6 +154,18 @@ function copyBoolean(source, target, sourceField, targetField = sourceField) {
 		if (typeof source[sourceField] !== 'boolean') throw new TypeError(`player.${sourceField} must be boolean`);
 		target[targetField] = source[sourceField];
 	}
+}
+
+function attackerFacts(value) {
+	const source = ownDataRecord(value, 'wire observation.player.lastAttacker');
+	if (Reflect.ownKeys(source).some((key) => !['uuid', 'type', 'distance'].includes(key))) {
+		throw new TypeError('wire observation.player.lastAttacker has an invalid schema');
+	}
+	return {
+		uuid: identifier(source.uuid, 'player.lastAttacker.uuid'),
+		type: identifier(source.type, 'player.lastAttacker.type'),
+		distance: finiteNumber(source.distance, 'player.lastAttacker.distance'),
+	};
 }
 
 function identifier(value, label) {

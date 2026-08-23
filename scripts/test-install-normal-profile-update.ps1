@@ -1,7 +1,8 @@
 [CmdletBinding()]
-param([string] $ProjectRoot = (Split-Path -Parent $PSScriptRoot))
+param([string] $ProjectRoot)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 $root = [IO.Path]::GetFullPath($ProjectRoot)
 & (Join-Path $root 'scripts\install-normal-profile-update.ps1') -ProjectRoot $root -GameDirectory $env:TEMP -TestProcessClassification
 $target = Join-Path $env:TEMP ('arena-normal-profile-test-' + [guid]::NewGuid().ToString('N'))

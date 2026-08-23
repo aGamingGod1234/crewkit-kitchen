@@ -42,14 +42,16 @@ test('accepts Cursor Composer and Grok scenarios through the same matrix schema'
 
 test('checked-in live matrix covers every provider with real model and setting combinations', () => {
 	const matrix = normalizeHeadlessMatrix(JSON.parse(readFileSync(new URL('../config/headless-provider-matrix.json', import.meta.url), 'utf8')));
-	assert.equal(matrix.scenarios.length, 18);
+	assert.equal(matrix.scenarios.length, 19);
 	for (const provider of ['codex', 'gemini', 'kimi', 'cursor']) {
 		const scenarios = matrix.scenarios.filter((scenario) => scenario.provider === provider);
 		assert.ok(new Set(scenarios.map((scenario) => scenario.model)).size >= 2, `${provider} needs at least two models`);
 		for (const model of new Set(scenarios.map((scenario) => scenario.model))) {
 			assert.ok(new Set(scenarios.filter((scenario) => scenario.model === model).map((scenario) => `${scenario.reasoningEffort}/${scenario.serviceTier}`)).size >= 2, `${provider}/${model} needs two settings`);
 		}
-		assert.ok(scenarios.every((scenario) => ['chat', 'action', 'program'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
+		assert.ok(scenarios.every((scenario) => scenario.id === 'codex-luna-xhigh-fast-wooden-pickaxe'
+			? scenario.requireFactualSuccess && scenario.assertions.some((assertion) => assertion.type === 'rcon')
+			: ['chat', 'action', 'program'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
 	}
 	assert.deepEqual([...new Set(matrix.scenarios.filter((scenario) => scenario.provider === 'cursor').map((scenario) => scenario.model))], ['composer-2.5', 'grok-4.5', 'grok-4.6']);
 	assert.deepEqual([...new Set(matrix.scenarios.map((scenario) => scenario.rosterSize))].sort((left, right) => left - right), [1, 8, 16]);

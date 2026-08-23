@@ -9,9 +9,15 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAd
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostcondition;
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionSnapshot;
 import dev.agaminggod.arenaagents.server.runtime.transaction.UseConfirmation;
+import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistry;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
@@ -28,9 +34,11 @@ import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.AbstractCraftingMenu;
 import net.minecraft.world.inventory.AbstractFurnaceMenu;
+import net.minecraft.world.inventory.AnvilMenu;
 import net.minecraft.world.inventory.ChestMenu;
 import net.minecraft.world.inventory.CraftingMenu;
 import net.minecraft.world.inventory.InventoryMenu;
+import net.minecraft.world.inventory.MerchantMenu;
 import net.minecraft.world.inventory.RecipeBookMenu;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
@@ -39,6 +47,7 @@ import net.minecraft.world.item.crafting.CraftingInput;
 import net.minecraft.world.item.crafting.CraftingRecipe;
 import net.minecraft.world.item.crafting.Recipe;
 import net.minecraft.world.item.crafting.RecipeHolder;
+import net.minecraft.world.item.crafting.RecipeManager;
 import net.minecraft.world.item.crafting.RecipeType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
@@ -49,10 +58,21 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	private static final long EQUIPMENT_TIMEOUT_MS = 5_000L;
 	private final ServerProtectionPolicy protection;
 	private final ResourceLeaseManager leases;
+	private final CraftCommitter craftCommitter;
 
 	public AdvancedInteractionService(ServerProtectionPolicy protection, ResourceLeaseManager leases) {
+		this(protection, leases, (menu, player, resultSlot) -> menu.quickMoveStack(player, resultSlot));
+	}
+
+	AdvancedInteractionService(ServerProtectionPolicy protection, ResourceLeaseManager leases, CraftCommitter craftCommitter) {
 		this.protection = Objects.requireNonNull(protection);
 		this.leases = Objects.requireNonNull(leases);
+		this.craftCommitter = Objects.requireNonNull(craftCommitter);
+	}
+
+	@FunctionalInterface
+	interface CraftCommitter {
+		ItemStack quickMove(AbstractContainerMenu menu, ServerPlayer player, int resultSlot);
 	}
 
 	static String canonicalRecipeId(String recipeId) {
@@ -63,12 +83,112 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		};
 	}
 
+	static String resolveGenericPlankRecipeId(
+			String requestedRecipeId,
+			Map<String, ? extends Collection<String>> loadedRecipeIngredients,
+			Collection<String> observedIngredientIds
+	) {
+		Objects.requireNonNull(requestedRecipeId, "requestedRecipeId must not be null");
+		Objects.requireNonNull(loadedRecipeIngredients, "loadedRecipeIngredients must not be null");
+		Objects.requireNonNull(observedIngredientIds, "observedIngredientIds must not be null");
+		String canonical = canonicalRecipeId(requestedRecipeId);
+		if (!canonical.equals("minecraft:planks")) return canonical;
+
+		Set<String> observed = new TreeSet<>();
+		for (String observedIngredientId : observedIngredientIds) {
+			if (observedIngredientId != null && !observedIngredientId.isBlank()) observed.add(observedIngredientId);
+		}
+		Set<String> matches = new TreeSet<>();
+		for (Map.Entry<String, ? extends Collection<String>> entry : loadedRecipeIngredients.entrySet()) {
+			String recipeId = entry.getKey();
+			if (!isConcreteVanillaPlankRecipeId(recipeId)) continue;
+			Collection<String> ingredientIds = entry.getValue();
+			if (ingredientIds == null) continue;
+			for (String ingredientId : ingredientIds) {
+				if (ingredientId != null && observed.contains(ingredientId)) {
+					matches.add(recipeId);
+					break;
+				}
+			}
+		}
+		if (matches.isEmpty()) {
+			throw new AgentDomainException(
+					"RECIPE_NOT_FOUND",
+					"No loaded vanilla plank recipe matches the agent's current inventory ingredients"
+			);
+		}
+		if (matches.size() > 1) {
+			throw new AgentDomainException(
+					"RECIPE_AMBIGUOUS",
+					"Generic plank request matches multiple loaded recipes: " + String.join(", ", matches)
+			);
+		}
+		return matches.iterator().next();
+	}
+
+	private static String resolveGenericPlankRecipeId(ServerLevel level, Inventory inventory) {
+		Objects.requireNonNull(level, "level must not be null");
+		Objects.requireNonNull(inventory, "inventory must not be null");
+		Map<String, Set<String>> loadedRecipeIngredients = new HashMap<>();
+		Set<String> observedIngredientIds = new TreeSet<>();
+		for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+			ItemStack stack = inventory.getItem(slot);
+			if (!stack.isEmpty()) observedIngredientIds.add(itemId(stack));
+		}
+
+		RecipeManager recipeManager = level.recipeAccess();
+		for (RecipeHolder<?> holder : recipeManager.getRecipes()) {
+			Identifier recipeId = holder.id().identifier();
+			if (!isConcreteVanillaPlankRecipeId(recipeId.toString())) continue;
+			if (!(holder.value() instanceof CraftingRecipe craftingRecipe)) continue;
+			for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+				ItemStack ingredient = inventory.getItem(slot);
+				if (ingredient.isEmpty()) continue;
+				try {
+					ItemStack singleIngredient = ingredient.copyWithCount(1);
+					CraftingInput input = CraftingInput.of(1, 1, List.of(singleIngredient));
+					if (!craftingRecipe.matches(input, level)) continue;
+					ItemStack assembled = craftingRecipe.assemble(input);
+					if (assembled.isEmpty() || !itemId(assembled).equals(recipeId.toString())) continue;
+					loadedRecipeIngredients
+							.computeIfAbsent(recipeId.toString(), ignored -> new TreeSet<>())
+							.add(itemId(ingredient));
+				} catch (RuntimeException invalidRecipe) {
+					// An invalid loaded recipe cannot be authoritative evidence for a generic request.
+				}
+			}
+		}
+		return resolveGenericPlankRecipeId("minecraft:planks", loadedRecipeIngredients, observedIngredientIds);
+	}
+
+	private static boolean isConcreteVanillaPlankRecipeId(String recipeId) {
+		if (recipeId == null) return false;
+		try {
+			Identifier identifier = Identifier.parse(recipeId);
+			return identifier.getNamespace().equals("minecraft")
+					&& identifier.getPath().endsWith("_planks")
+					&& !identifier.getPath().equals("planks");
+		} catch (RuntimeException invalidRecipeId) {
+			return false;
+		}
+	}
+
 	static boolean ensureRecipeUnlocked(ServerRecipeBook recipeBook, ResourceKey<Recipe<?>> recipeKey) {
 		Objects.requireNonNull(recipeBook, "recipeBook must not be null");
 		Objects.requireNonNull(recipeKey, "recipeKey must not be null");
 		if (recipeBook.contains(recipeKey)) return false;
 		recipeBook.add(recipeKey);
 		return true;
+	}
+
+	static boolean craftOutputSatisfiesRequest(int outputCount, int requestedCount) {
+		return requestedCount > 0 && outputCount >= requestedCount;
+	}
+
+	static String craftPlacementFailureReason(RecipeBookMenu.PostPlaceAction placement) {
+		return placement == RecipeBookMenu.PostPlaceAction.PLACE_GHOST_RECIPE
+				? "RECIPE_INPUTS_UNAVAILABLE"
+				: "RECIPE_PLACEMENT_REJECTED";
 	}
 
 	@Override
@@ -85,6 +205,9 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			case SELECT_TOOL -> new ToolSelectionTransaction(player, request, arguments);
 			case BLOCK_WITH_SHIELD -> new ShieldTransaction(player, request, arguments);
 			case USE_RANGED -> new ServerRangedUseController(player, arguments, protection);
+			case MENU_TRANSFER -> new MenuTransferTransaction(player, request, arguments);
+			case MENU_BUTTON -> new MenuButtonTransaction(player, request, arguments);
+			case ANVIL_RENAME -> new AnvilRenameTransaction(player, request, arguments);
 			default -> throw new AgentDomainException("UNSUPPORTED_TRANSACTION", "Action is not a transaction adapter action");
 		};
 	}
@@ -282,6 +405,73 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		}
 	}
 
+	private final class MenuTransferTransaction extends Transaction {
+		MenuTransferTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
+			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
+		}
+
+		@Override
+		TickResult execute(long nowEpochMs) {
+			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Menu transfer executed more than once");
+			executed = true;
+			AbstractContainerMenu menu = requireCurrentSupportedMenu(player, text(arguments, "menuId"));
+			return transfer(
+					this,
+					player,
+					menu,
+					integer(arguments, "sourceSlot"),
+					integer(arguments, "destinationSlot"),
+					text(arguments, "expectedItemId"),
+					integer(arguments, "count"),
+					true
+			);
+		}
+	}
+
+	private final class MenuButtonTransaction extends Transaction {
+		MenuButtonTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
+			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
+		}
+
+		@Override
+		TickResult execute(long nowEpochMs) {
+			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Menu button executed more than once");
+			executed = true;
+			AbstractContainerMenu menu = requireCurrentSupportedMenu(player, text(arguments, "menuId"));
+			int buttonId = integer(arguments, "buttonId");
+			boolean accepted;
+			if (menu instanceof MerchantMenu merchant) {
+				merchant.setSelectionHint(buttonId);
+				merchant.tryMoveItems(buttonId);
+				accepted = true;
+			} else {
+				accepted = menu.clickMenuButton(player, buttonId);
+			}
+			if (!accepted) return TickResult.failed("MENU_BUTTON_REJECTED", "Vanilla menu rejected the requested button");
+			menu.broadcastChanges();
+			return TickResult.succeeded("MENU_BUTTON_ACCEPTED", "Vanilla menu accepted the requested option");
+		}
+	}
+
+	private final class AnvilRenameTransaction extends Transaction {
+		AnvilRenameTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
+			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
+		}
+
+		@Override
+		TickResult execute(long nowEpochMs) {
+			if (executed) return TickResult.failed("TRANSACTION_CONFLICT", "Anvil rename executed more than once");
+			executed = true;
+			AbstractContainerMenu current = requireCurrentSupportedMenu(player, text(arguments, "menuId"));
+			if (!(current instanceof AnvilMenu anvil)) return unsupportedMenu(current);
+			if (!anvil.setItemName(text(arguments, "name"))) {
+				return TickResult.failed("ANVIL_NAME_REJECTED", "Vanilla anvil rejected the requested name");
+			}
+			anvil.broadcastChanges();
+			return TickResult.succeeded("ANVIL_NAME_SET", "Vanilla anvil accepted the requested name");
+		}
+	}
+
 	private final class FurnaceTransaction extends Transaction {
 		FurnaceTransaction(ServerPlayer player, ServerActionRequest request, JsonObject arguments) {
 			super(player, request, arguments, arguments.get("timeoutMs").getAsLong());
@@ -390,10 +580,15 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				menu = player.inventoryMenu;
 				if (menu.getClass() != InventoryMenu.class) return unsupportedMenu(menu);
 			}
+			String requestedRecipeId = canonicalRecipeId(text(arguments, "recipeId"));
+			if (requestedRecipeId.equals("minecraft:planks")) {
+				requestedRecipeId = resolveGenericPlankRecipeId(player.level(), player.getInventory());
+			}
+			String lookupRecipeId = requestedRecipeId;
 			ResourceKey<Recipe<?>> recipeKey = ResourceKey.create(
-					Registries.RECIPE, Identifier.parse(canonicalRecipeId(text(arguments, "recipeId"))));
+					Registries.RECIPE, Identifier.parse(lookupRecipeId));
 			RecipeHolder<?> holder = player.level().recipeAccess().byKey(recipeKey).orElseThrow(() ->
-					new AgentDomainException("RECIPE_NOT_FOUND", "Recipe is not loaded"));
+					new AgentDomainException("RECIPE_NOT_FOUND", "Recipe " + lookupRecipeId + " is not registered"));
 			if (!(holder.value() instanceof CraftingRecipe craftingRecipe)) {
 				return TickResult.failed("RECIPE_TYPE_MISMATCH", "Requested recipe is not a crafting recipe");
 			}
@@ -404,6 +599,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			if (!menu.getCarried().isEmpty()) {
 				return TickResult.failed("TRANSACTION_CONFLICT", "Safe crafting requires an empty carried stack");
 			}
+			CraftMenuSnapshot beforeCraft = CraftMenuSnapshot.capture(menu);
 			TransactionSnapshot.CraftPlacementGuard placementGuard =
 					new TransactionSnapshot.CraftPlacementGuard(ownedStacks(player.getInventory(), gridSlots));
 			placementAttempted = true;
@@ -425,7 +621,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				}
 				if (placement != RecipeBookMenu.PostPlaceAction.NOTHING) {
 					return failureAfterPlacement(
-							"RECIPE_PLACEMENT_REJECTED",
+							craftPlacementFailureReason(placement),
 							"Vanilla recipe placement did not place one craft",
 							placementGuard,
 							gridSlots
@@ -477,17 +673,17 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 				Slot resultSlot = menu.getSlot(0);
 				ItemStack output = resultSlot.getItem().copy();
 				int requestedCount = integer(arguments, "count");
-				if (output.isEmpty() || output.getCount() != requestedCount) {
+				if (output.isEmpty() || !craftOutputSatisfiesRequest(output.getCount(), requestedCount)) {
 					return failureAfterPlacement(
 							"CRAFT_COUNT_UNSUPPORTED",
-							"One vanilla craft must produce exactly the requested count",
+							"One vanilla craft must produce at least the requested count",
 							placementGuard,
 							gridSlots
 					);
 				}
 				int playerStart = table ? 10 : 9;
 				int playerEnd = table ? 45 : 44;
-				if (menuCapacity(menu, playerStart, playerEnd, output) < requestedCount) {
+				if (menuCapacity(menu, playerStart, playerEnd, output) < output.getCount()) {
 					return failureAfterPlacement(
 							"DESTINATION_FULL",
 							"Player inventory cannot accept the complete crafting result",
@@ -519,20 +715,26 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 					);
 				}
 				try {
-					ItemStack moved = menu.quickMoveStack(player, 0);
+					ItemStack moved = craftCommitter.quickMove(menu, player, 0);
 					menu.broadcastChanges();
 					TransactionPostcondition.Verdict craftVerdict = accounting.verify(
 							ownedStacks(player.getInventory(), gridSlots));
-					if (!moved.isEmpty() && moved.getCount() == requestedCount
+					if (!moved.isEmpty() && moved.getCount() == output.getCount()
 							&& craftVerdict instanceof TransactionPostcondition.Verdict.Succeeded) {
 						return TickResult.succeeded("CRAFT_CONFIRMED",
 								"One vanilla recipe transaction completed with remainder handling");
 					}
-					return TickResult.failed("ROLLBACK_FAILED",
-							"Irreversible craft completed without exact ingredient, remainder, and output accounting");
+					return rollbackCommittedCraft(
+							menu, beforeCraft, placementGuard, gridSlots,
+							"CRAFT_POSTCONDITION_FAILED",
+							"Craft result did not satisfy exact ingredient, remainder, and output accounting"
+					);
 				} catch (RuntimeException mutationFailure) {
-					return TickResult.failed("ROLLBACK_FAILED",
-							"Irreversible craft mutation raised an exception: " + safeMessage(mutationFailure));
+					return rollbackCommittedCraft(
+							menu, beforeCraft, placementGuard, gridSlots,
+							"CRAFT_POSTCOMMIT_EXCEPTION",
+							"Craft mutation raised an exception: " + safeMessage(mutationFailure)
+					);
 				}
 			} catch (RuntimeException placementFailure) {
 				return failureAfterPlacement(
@@ -572,9 +774,47 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 					message + "; exact pre-placement ownership restoration was not proved" + suffix);
 		}
 
+		private TickResult rollbackCommittedCraft(
+			AbstractContainerMenu menu,
+			CraftMenuSnapshot beforeCraft,
+			TransactionSnapshot.CraftPlacementGuard placementGuard,
+			List<Slot> gridSlots,
+			String reasonCode,
+			String message
+		) {
+			RuntimeException restoreFailure = null;
+			try {
+				beforeCraft.restore(menu);
+				menu.broadcastChanges();
+			} catch (RuntimeException exception) {
+				restoreFailure = exception;
+			}
+			if (restoreFailure != null) {
+				try { cleanup(); } catch (RuntimeException cleanupFailure) { restoreFailure.addSuppressed(cleanupFailure); }
+				return TickResult.failed("ROLLBACK_FAILED", message + "; exact pre-action inventory restoration failed");
+			}
+			TickResult restored = failureAfterPlacement(reasonCode, message + "; exact pre-action inventory restored", placementGuard, gridSlots);
+			if (restored.reasonCode().equals("ROLLBACK_FAILED")) return restored;
+			return restored;
+		}
+
 		@Override
 		void beforeCleanup() {
 			if (!table && placementAttempted) player.inventoryMenu.removed(player);
+		}
+	}
+
+	static record CraftMenuSnapshot(List<ItemStack> slots, ItemStack carried) {
+		static CraftMenuSnapshot capture(AbstractContainerMenu menu) {
+			List<ItemStack> slots = new ArrayList<>(menu.slots.size());
+			for (int index = 0; index < menu.slots.size(); index++) slots.add(menu.getSlot(index).getItem().copy());
+			return new CraftMenuSnapshot(List.copyOf(slots), menu.getCarried().copy());
+		}
+
+		void restore(AbstractContainerMenu menu) {
+			if (menu.slots.size() != slots.size()) throw new IllegalStateException("Craft menu shape changed during transaction");
+			for (int index = 0; index < slots.size(); index++) menu.getSlot(index).set(slots.get(index).copy());
+			menu.setCarried(carried.copy());
 		}
 	}
 
@@ -888,6 +1128,24 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		if (player.containerMenu.getClass() != InventoryMenu.class) {
 			throw new AgentDomainException("UNSUPPORTED_MENU", "Player inventory menu is unavailable");
 		}
+	}
+
+	private static AbstractContainerMenu requireCurrentSupportedMenu(ServerPlayer player, String expectedMenuId) {
+		AbstractContainerMenu menu = player.containerMenu;
+		String actualMenuId;
+		try {
+			actualMenuId = BuiltInRegistries.MENU.getKey(menu.getType()).toString();
+		} catch (RuntimeException exception) {
+			throw new AgentDomainException("UNSUPPORTED_MENU", "Open menu has no registered vanilla type");
+		}
+		if (!actualMenuId.equals(expectedMenuId)) {
+			throw new AgentDomainException(
+					"MENU_MISMATCH",
+					"Expected open menu " + expectedMenuId + " but observed " + actualMenuId
+			);
+		}
+		MenuCapabilityRegistry.requireSupported(actualMenuId);
+		return menu;
 	}
 
 	private static void requireBlockPreflight(ServerPlayer player, BlockPos position) {

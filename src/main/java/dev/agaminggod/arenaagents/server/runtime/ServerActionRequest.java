@@ -9,9 +9,10 @@ public record ServerActionRequest(
 		AgentId agentId,
 		long goalRevision,
 		String actionId,
-		ActionType type,
-		JsonObject arguments,
-		ActionProvenance provenance
+	ActionType type,
+	JsonObject arguments,
+	ActionProvenance provenance,
+	String traceId
 ) {
 	public ServerActionRequest {
 		Objects.requireNonNull(agentId, "agentId must not be null");
@@ -24,10 +25,29 @@ public record ServerActionRequest(
 		Objects.requireNonNull(type, "type must not be null");
 		arguments = Objects.requireNonNull(arguments, "arguments must not be null").deepCopy();
 		provenance = Objects.requireNonNull(provenance, "provenance must not be null");
+		if (traceId != null) traceId = boundedTraceId(traceId);
+		if (!Objects.equals(traceId, provenance.traceId())) {
+			throw new IllegalArgumentException("request.traceId must match provenance.traceId");
+		}
+	}
+
+	public ServerActionRequest(
+			AgentId agentId, long goalRevision, String actionId, ActionType type,
+			JsonObject arguments, ActionProvenance provenance
+	) {
+		this(agentId, goalRevision, actionId, type, arguments, provenance, null);
 	}
 
 	@Override
 	public JsonObject arguments() {
 		return arguments.deepCopy();
+	}
+
+	private static String boundedTraceId(String value) {
+		if (value.isBlank() || value.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 128
+				|| value.codePoints().anyMatch(codePoint -> codePoint < 0x20 || codePoint == 0x7f)) {
+			throw new IllegalArgumentException("traceId must be nonblank and at most 128 UTF-8 bytes");
+		}
+		return value;
 	}
 }

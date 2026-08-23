@@ -1,6 +1,5 @@
 package dev.agaminggod.arenaagents.control;
 
-import dev.agaminggod.arenaagents.agent.AgentModelNames;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -26,12 +25,21 @@ public final class AgentControlCatalog {
 	}
 
 	public static String defaultModel(String provider) {
-		return models(provider).getFirst();
+		String checked = requireProvider(provider);
+		String preferred = checked.equals(CODEX) ? "gpt-5.6-luna" : null;
+		List<String> available = models(checked);
+		return preferred != null && available.contains(preferred) ? preferred : available.getFirst();
 	}
 
 	public static String defaultReasoning(String provider, String model) {
 		List<String> efforts = reasoningEfforts(provider, model);
+		if (CODEX.equals(provider) && "gpt-5.6-luna".equals(model) && efforts.contains("xhigh")) return "xhigh";
 		return efforts.contains("high") ? "high" : efforts.getFirst();
+	}
+
+	public static String defaultServiceTier(String provider, String model) {
+		List<String> tiers = serviceTiers(provider, model);
+		return CODEX.equals(provider) && tiers.contains("fast") ? "fast" : "priority";
 	}
 
 	public static String displayName(String provider, String model) {
@@ -92,39 +100,51 @@ public final class AgentControlCatalog {
 
 	private static List<AgentControlModelOption> buildFallbackOptions() {
 		ArrayList<AgentControlModelOption> values = new ArrayList<>();
-		add(values, CODEX, "gpt-5.6-sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		add(values, CODEX, "gpt-5.6-sol-wm", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		add(values, CODEX, "gpt-5.6-terra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		add(values, CODEX, "gpt-5.6-luna", List.of("low", "medium", "high", "xhigh", "max"), true);
+		add(values, CODEX, "gpt-5.6-luna", "GPT 5.6 Luna", List.of("low", "medium", "high", "xhigh", "max"), true);
+		add(values, CODEX, "gpt-5.6-sol", "GPT 5.6 Sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
+		add(values, CODEX, "gpt-5.6-sol-wm", "GPT 5.6 Sol WM", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
+		add(values, CODEX, "gpt-5.6-terra", "GPT 5.6 Terra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		for (String model : List.of("gpt-5.5", "gpt-5.4")) {
-			add(values, CODEX, model, List.of("low", "medium", "high", "xhigh"), true);
+			add(values, CODEX, model, readable(model), List.of("low", "medium", "high", "xhigh"), true);
 		}
 		for (String model : List.of("gpt-5.4-mini", "gpt-5.3-codex-spark")) {
-			add(values, CODEX, model, List.of("low", "medium", "high", "xhigh"), false);
+			add(values, CODEX, model, readable(model), List.of("low", "medium", "high", "xhigh"), false);
 		}
-		add(values, CODEX, "codex-auto-review", List.of("low", "medium", "high", "xhigh", "max"), true);
-		add(values, "gemini", "gemini-3.1-pro", List.of("high", "low"), false);
+		add(values, CODEX, "codex-auto-review", "Codex Auto Review", List.of("low", "medium", "high", "xhigh", "max"), true);
+		add(values, "gemini", "gemini-3.1-pro", "Gemini 3.1 Pro", List.of("high", "low"), false);
 		for (String model : List.of("gemini-3.6-flash", "gemini-3.5-flash")) {
-			add(values, "gemini", model, List.of("high", "medium", "low"), false);
+			add(values, "gemini", model, readable(model), List.of("high", "medium", "low"), false);
 		}
 		for (String model : List.of("claude-sonnet-4-6", "claude-opus-4-6")) {
-			add(values, "gemini", model, List.of("thinking"), false);
+			add(values, "gemini", model, readable(model), List.of("thinking"), false);
 		}
-		add(values, "gemini", "gpt-oss-120b", List.of("medium"), false);
+		add(values, "gemini", "gpt-oss-120b", "GPT OSS 120B", List.of("medium"), false);
 		for (String model : List.of("kimi-code/k3", "kimi-code/k3-256k")) {
-			add(values, "kimi", model, List.of("low", "high", "max"), false);
+			add(values, "kimi", model, readable(model), List.of("low", "high", "max"), false);
 		}
-		add(values, "kimi", "kimi-code/kimi-for-coding", List.of("high"), false);
-		add(values, "kimi", "kimi-code/kimi-for-coding-highspeed", List.of("high"), false);
-		add(values, "cursor", "composer-2.5", List.of("high"), true);
-		add(values, "cursor", "grok-4.5", List.of("low", "medium", "high"), true);
-		add(values, "cursor", "grok-4.6", List.of("low", "medium", "high", "xhigh"), true);
+		add(values, "kimi", "kimi-code/kimi-for-coding", "K2.7 Coding", List.of("high"), false);
+		add(values, "kimi", "kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed", List.of("high"), false);
+		add(values, "cursor", "composer-2.5", "Composer 2.5", List.of("high"), true);
+		add(values, "cursor", "grok-4.5", "Grok 4.5", List.of("low", "medium", "high"), true);
+		add(values, "cursor", "grok-4.6", "Grok 4.6", List.of("low", "medium", "high", "xhigh"), true);
 		return List.copyOf(values);
 	}
 
 	private static void add(List<AgentControlModelOption> values, String provider, String model,
-	                        List<String> efforts, boolean fast) {
-		values.add(new AgentControlModelOption(provider, model, AgentModelNames.displayName(provider, model), efforts,
+	                        String displayName, List<String> efforts, boolean fast) {
+		values.add(new AgentControlModelOption(provider, model, displayName, efforts,
 				fast ? List.of("priority", "fast") : List.of()));
+	}
+
+	private static String readable(String model) {
+		String value = model.startsWith("kimi-code/") ? model.substring("kimi-code/".length()) : model;
+		StringBuilder result = new StringBuilder();
+		for (String part : value.replace('_', '-').split("-")) {
+			if (part.isBlank()) continue;
+			if (!result.isEmpty()) result.append(' ');
+			result.append(part.equalsIgnoreCase("gpt") ? "GPT"
+					: Character.toUpperCase(part.charAt(0)) + part.substring(1));
+		}
+		return result.toString();
 	}
 }

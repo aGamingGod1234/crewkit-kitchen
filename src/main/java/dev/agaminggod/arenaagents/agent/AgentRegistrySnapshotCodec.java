@@ -10,6 +10,7 @@ import com.google.gson.JsonParser;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.UUID;
 
 public final class AgentRegistrySnapshotCodec {
@@ -154,6 +155,8 @@ public final class AgentRegistrySnapshotCodec {
 		json.addProperty("dimension", location.dimension());
 		json.addProperty("chunk_x", location.chunkX());
 		json.addProperty("chunk_z", location.chunkZ());
+		if (location.blockY().isPresent()) json.addProperty("block_y", location.blockY().getAsInt());
+		else json.add("block_y", null);
 		return json;
 	}
 
@@ -165,8 +168,14 @@ public final class AgentRegistrySnapshotCodec {
 		return Optional.of(new AgentEntityLocation(
 				requireString(json, "dimension"),
 				requireInt(json, "chunk_x"),
-				requireInt(json, "chunk_z")
+				requireInt(json, "chunk_z"),
+				optionalInt(json, "block_y")
 		));
+	}
+
+	private static OptionalInt optionalInt(JsonObject object, String field) {
+		if (!object.has(field) || object.get(field).isJsonNull()) return OptionalInt.empty();
+		return OptionalInt.of(requireInt(object, field));
 	}
 
 	private static JsonObject encodeProfile(AgentProfile profile) {

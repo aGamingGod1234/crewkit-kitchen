@@ -1,3 +1,5 @@
+import java.security.MessageDigest
+
 plugins {
 	id 'net.fabricmc.fabric-loom' version "${loom_version}"
 	id 'maven-publish'
@@ -83,7 +85,11 @@ tasks.register('generateCoordinatorManifest') {
 		}.files
 		def prefixLength = coordinatorDirectory.absolutePath.length() + 1
 		def entries = files
-			.collect { it.absolutePath.substring(prefixLength).replaceAll('\\\\', '/') }
+			.collect {
+				def path = it.absolutePath.substring(prefixLength).replaceAll('\\\\', '/')
+				def hash = MessageDigest.getInstance('SHA-256').digest(it.bytes).encodeHex().toString()
+				"${hash} ${path}"
+			}
 			.sort()
 		def output = coordinatorManifest.get().asFile
 		output.parentFile.mkdirs()
@@ -226,7 +232,7 @@ tasks.register('upgradeMapStructure', JavaExec) {
 }
 
 tasks.named('check') {
-	dependsOn tasks.named('verifyCore'), tasks.named('verifyEntrypoints')
+	dependsOn tasks.named('verifyCore'), tasks.named('verifyEntrypoints'), ':voice-addon:check'
 }
 
 publishing {

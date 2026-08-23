@@ -38,6 +38,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.storage.LevelData;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.Container;
 import net.minecraft.world.item.ItemStack;
@@ -839,6 +840,16 @@ public final class ScenarioRuntimeService {
 					player.getY() - run.origin.getY(),
 					player.getZ() - run.origin.getZ()
 			);
+			ScenarioParkourRecovery.Target target = decision.target();
+			BlockPos respawn = BlockPos.containing(
+					run.origin.getX() + target.x(),
+					run.origin.getY() + target.y(),
+					run.origin.getZ() + target.z()
+			);
+			player.setRespawnPosition(new ServerPlayer.RespawnConfig(
+					LevelData.RespawnData.of(run.level.dimension(), respawn, player.getYRot(), player.getXRot()),
+					true
+			), false);
 		}
 	}
 

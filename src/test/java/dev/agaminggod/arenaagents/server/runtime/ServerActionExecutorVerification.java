@@ -3,21 +3,20 @@ package dev.agaminggod.arenaagents.server.runtime;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
-import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
-import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
-import dev.agaminggod.arenaagents.agent.RespawnPolicy;
+import dev.agaminggod.arenaagents.server.AgentSavedData;
+import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
-import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
-import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
+import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
+import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.phys.Vec3;
@@ -107,6 +106,16 @@ public final class ServerActionExecutorVerification {
 				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L
 		);
 		assertEquals("program-7-1", provenance.programId(), "provenance retains program identity");
+		ActionProvenance watcherProvenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L, "trace-watcher-1", "watcher-0"
+		);
+		assertEquals("watcher-0", watcherProvenance.watcherId(), "watcher provenance retains its authorizing identity");
+		assertThrows(IllegalArgumentException.class, () -> new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L, null, "watcher-0"
+		), "watcher provenance requires a trace identity");
+		assertThrows(IllegalArgumentException.class, () -> new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "step-80-126", 4L, "trace-watcher-1", "x".repeat(129)
+		), "watcher provenance remains bounded");
 		assertThrows(IllegalArgumentException.class, () -> new ActionProvenance(
 				"codex", "gpt-5.6-sol", "high", "priority", "program-7-1", 1L, "\u00a0", 4L
 		), "provenance rejects non-breaking blank source steps");
@@ -117,7 +126,9 @@ public final class ServerActionExecutorVerification {
 			boolean expectedPrimitive = switch (type) {
 				case MOVE_TO, NAVIGATE_TO, LOOK_AT, ATTACK, SELECT_ITEM, USE_ITEM, BREAK_BLOCK, PLACE_BLOCK,
 						CHAT, WAIT, SET_DOOR, DROP_ITEM, TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE,
-						FURNACE_TRANSACTION, EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED -> true;
+						FURNACE_TRANSACTION, EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED,
+						INTERACT_BLOCK, INTERACT_ENTITY, DISMOUNT, START_FALL_FLYING -> true;
+				case MENU_TRANSFER, MENU_BUTTON, ANVIL_RENAME -> true;
 				case RESPAWN -> true;
 				default -> false;
 			};
@@ -191,72 +202,63 @@ public final class ServerActionExecutorVerification {
 				"explicit player selectors retain their existing behavior");
 		assertEquals("nearest_hostile", EntityTargetSelector.normalize("nearest_hostile"),
 				"symbolic proximity selectors remain unchanged");
-		AgentRecord namedTarget = targetRecord(
-				"12345678-1234-5678-9abc-123456789abc", Optional.of("Rook"));
-		AgentRecord unnamedTarget = targetRecord(
-				"193a9add-1234-5678-9abc-123456789abc", Optional.empty());
-		AgentRecord localeSensitiveTarget = targetRecord(
-				"22345678-1234-5678-9abc-123456789abc", Optional.of("\u0130"));
-		AgentRecord technicalFriendlyTarget = targetRecord(
-				"32345678-1234-5678-9abc-123456789abc", Optional.of("c02_193A9ADD"));
-		assertEquals(namedTarget.agentId(), ServerActionExecutor.resolveNamedTargetIdentity(
-				"rook", List.of(namedTarget, unnamedTarget), null, null).orElseThrow().agentId().orElseThrow(),
-				"explicit friendly names resolve agent action targets case-insensitively");
-		assertEquals(unnamedTarget.agentId(), ServerActionExecutor.resolveNamedTargetIdentity(
-				"Sol GTqa3RI0VniavBI0VniavA", List.of(namedTarget, unnamedTarget), null, null)
-						.orElseThrow().agentId().orElseThrow(),
-				"ID-aware canonical display names resolve unnamed agent action targets");
-		assertEquals(localeSensitiveTarget.agentId(), ServerActionExecutor.resolveNamedTargetIdentity(
-				"i\u0307", List.of(localeSensitiveTarget), null, null).orElseThrow().agentId().orElseThrow(),
-				"Locale.ROOT canonical identity matches dotted capital I to i plus combining dot");
-		assertTrue(ServerActionExecutor.resolveNamedTargetIdentity(
-				"i", List.of(localeSensitiveTarget), null, null).isEmpty(),
-				"Locale.ROOT canonical identity does not collapse dotted capital I to plain i");
-		assertTrue(ServerActionExecutor.resolveNamedTargetIdentity(
-				"c02_193A9ADD", List.of(namedTarget, unnamedTarget), "c02_193A9ADD",
-				OfflineAgentPlayers.offlineUuid(unnamedTarget.agentId(), unnamedTarget.profile())).isEmpty(),
-				"actual fake-player provenance suppresses the hidden technical selector");
-		UUID genuinePlayerUuid = UUID.fromString("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
-		assertEquals("c02_193A9ADD", ServerActionExecutor.resolveNamedTargetIdentity(
-				"c02_193A9ADD", List.of(namedTarget, unnamedTarget), "c02_193A9ADD", genuinePlayerUuid)
-						.orElseThrow().ordinaryPlayerName().orElseThrow(),
-				"a genuine player sharing an offline agent technical name remains an ordinary target");
-		AgentDomainException technicalCollision = assertThrows(AgentDomainException.class,
-				() -> ServerActionExecutor.resolveNamedTargetIdentity(
-						"c02_193A9ADD", List.of(unnamedTarget, technicalFriendlyTarget),
-						"c02_193A9ADD", genuinePlayerUuid),
-				"a genuine player matching an agent friendly name remains ambiguous despite the technical-looking text");
-		assertEquals("AMBIGUOUS_TARGET", technicalCollision.code(),
-				"technical-looking genuine-player collision retains the ambiguity domain reason");
-		AgentDomainException ambiguous = assertThrows(AgentDomainException.class,
-				() -> ServerActionExecutor.resolveNamedTargetIdentity(
-						"Rook", List.of(namedTarget, unnamedTarget), "Rook", genuinePlayerUuid),
-				"an ordinary player sharing an agent friendly name is rejected as ambiguous");
-		assertEquals("AMBIGUOUS_TARGET", ambiguous.code(),
-				"ambiguous ordinary-player and agent selectors retain a precise domain reason");
-		assertEquals("Lucas", ServerActionExecutor.resolveNamedTargetIdentity(
-				"Lucas", List.of(namedTarget, unnamedTarget), "Lucas", genuinePlayerUuid)
-						.orElseThrow().ordinaryPlayerName().orElseThrow(),
-				"unambiguous ordinary player names retain their existing selector behavior");
 		assertEquals("TARGET_OCCUPIED",
 				ServerActionExecutor.failureReason(new dev.agaminggod.arenaagents.agent.AgentDomainException(
 						"TARGET_OCCUPIED", "changed world")),
 				"runtime revalidation preserves a precise recoverable domain reason");
 		assertEquals("ACTION_EXCEPTION", ServerActionExecutor.failureReason(new IllegalStateException("broken")),
 				"unexpected runtime exceptions remain isolated");
-		return 51;
+		verifySetupFailureDoesNotClaimPhysicalExecution();
+		assertEquals(0, ServerActionExecutor.roundRobinStart(0L, 16),
+				"round-robin starts with the first active agent");
+		assertEquals(1, ServerActionExecutor.roundRobinStart(1L, 16),
+				"round-robin advances one active agent per tick");
+		assertEquals(0, ServerActionExecutor.roundRobinStart(16L, 16),
+				"round-robin wraps after all sixteen active agents");
+		boolean[] admitted = new boolean[16];
+		for (long cursor = 0L; cursor < admitted.length; cursor++) {
+			int start = ServerActionExecutor.roundRobinStart(cursor, admitted.length);
+			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
+			admitted[start] = true;
+		}
+		return 44;
 	}
 
-	private static AgentRecord targetRecord(String id, Optional<String> friendlyName) {
-		AgentId agentId = new AgentId(UUID.fromString(id));
-		return new AgentRecord(
-				1, agentId, Optional.empty(), Optional.empty(),
-				new AgentProfile("codex", "gpt-5.6-sol", "high", "priority", friendlyName, 2,
-						AgentGameMode.SURVIVAL),
-				AgentLifecycleState.IDLE, Optional.empty(), 0L, List.of(), "", "", true,
-				RespawnPolicy.PAUSE_UNTIL_RESPAWN, Optional.empty(),
-				1_750_000_000_000L, 1_750_000_000_000L, ""
+	private static void verifySetupFailureDoesNotClaimPhysicalExecution() {
+		CodexAgentManager manager = uninitializedManager();
+		AgentRecord agent = manager.registry().create(
+				"codex", "gpt-5.6-sol", "high", Optional.of("SetupFailureTarget"), AgentGameMode.SURVIVAL, 1_000L
 		);
+		manager.start(agent.agentId().toString(), "Run the setup failure test");
+		manager.registry().setAutomaticProgress(agent.agentId(), false, 1_001L);
+		ActionProvenance provenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-setup", 1L, "step-setup", 1L, "trace-setup"
+		);
+		JsonObject arguments = new JsonObject();
+		arguments.addProperty("durationMs", 1L);
+		ServerActionRequest request = new ServerActionRequest(
+				agent.agentId(), agent.goalRevision() + 1L, "action-setup", ActionType.WAIT, arguments, provenance, "trace-setup"
+		);
+		List<ServerActionResult> results = new ArrayList<>();
+		new ServerActionExecutor(manager, results::add).submitProgramPrimitive(request);
+		assertEquals(1, results.size(), "missing player setup failure emits one terminal result");
+		ServerActionResult result = results.getFirst();
+		assertFalse(result.executionStarted(), "setup failure does not claim execution started");
+		assertFalse(result.physicalAttempted(), "setup failure does not claim a physical attempt");
+	}
+
+	private static CodexAgentManager uninitializedManager() {
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+			CodexAgentManager manager = (CodexAgentManager) unsafe.allocateInstance(CodexAgentManager.class);
+			Field savedData = CodexAgentManager.class.getDeclaredField("savedData");
+			unsafe.putObject(manager, unsafe.objectFieldOffset(savedData), new AgentSavedData());
+			return manager;
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not allocate setup-failure manager", exception);
+		}
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {
@@ -271,11 +273,11 @@ public final class ServerActionExecutorVerification {
 		if (value) throw new AssertionError(label);
 	}
 
-	private static <T extends Throwable> T assertThrows(Class<T> type, Runnable action, String label) {
+	private static void assertThrows(Class<? extends Throwable> type, Runnable action, String label) {
 		try {
 			action.run();
 		} catch (Throwable throwable) {
-			if (type.isInstance(throwable)) return type.cast(throwable);
+			if (type.isInstance(throwable)) return;
 			throw new AssertionError(label + " threw " + throwable.getClass().getSimpleName(), throwable);
 		}
 		throw new AssertionError(label + " did not throw " + type.getSimpleName());

@@ -710,7 +710,8 @@ function Invoke-Scenario($Scenario, [string] $Project, [string] $RunDirectory, [
 		Add-ProcessTreeSnapshot $processIds $serverHandle.Identity
 		Add-ProcessTreeSnapshot $processIds $coordinatorHandle.Identity
 		Add-ProcessTreeSnapshot $processIds $runnerHandle.Identity
-		$runnerDeadline = [DateTime]::UtcNow.AddMilliseconds([int] $Scenario.timeoutMs + ($RunnerGraceSeconds * 1000))
+		$repetitions = if ($null -ne $Scenario.PSObject.Properties['repetitions']) { [Math]::Max(1, [int] $Scenario.repetitions) } else { 1 }
+		$runnerDeadline = [DateTime]::UtcNow.AddMilliseconds(([int64] $Scenario.timeoutMs * $repetitions) + ($RunnerGraceSeconds * 1000))
 		try {
 			$resourcePeak = Measure-RunnerResourcesUntilExit $runnerHandle @($serverHandle, $coordinatorHandle, $runnerHandle) $processIds $runnerDeadline
 		} catch {

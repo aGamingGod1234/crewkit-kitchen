@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-22",
+  "architecture": "persistent-native-minecraft-tool-loop",
+  "probe": {
+    "environment": "authenticated Codex app-server with simulated deterministic Minecraft body results",
+    "profiles": [
+      {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "low",
+        "serviceTier": "fast",
+        "initializationMs": 1874,
+        "coldDm": { "firstToolMs": 6667, "totalMs": 8734 },
+        "warmDm": { "firstToolMs": 1706, "totalMs": 3937 },
+        "moveThenMine": { "firstToolMs": 1955, "secondToolMs": 3329, "totalMs": 4835 },
+        "advancedCraft": { "firstToolMs": 1846, "totalMs": 4323 }
+      },
+      {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast",
+        "initializationMs": 1874,
+        "coldDm": { "firstToolMs": 5773, "totalMs": 6934 },
+        "warmDm": { "firstToolMs": 1866, "totalMs": 3118 },
+        "moveThenMine": { "firstToolMs": 2405, "secondToolMs": 5214, "totalMs": 6954 },
+        "advancedCraft": { "firstToolMs": 1940, "totalMs": 5363 }
+      }
+    ]
+  },
+  "load16Probe": {
+    "environment": "sixteen concurrent authenticated Codex threads with immediate deterministic Minecraft body results",
+    "profiles": [
+      {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "low",
+        "serviceTier": "fast",
+        "passedAgents": 16,
+        "coldDm": { "firstToolP50Ms": 4932, "firstToolP95Ms": 8792, "totalP50Ms": 6138, "totalP95Ms": 9760 },
+        "warmDm": { "firstToolP50Ms": 1410, "firstToolP95Ms": 1881, "totalP50Ms": 2695, "totalP95Ms": 4545 },
+        "moveThenMine": { "moveP50Ms": 1820, "moveP95Ms": 2895, "mineP50Ms": 3157, "mineP95Ms": 4576, "totalP50Ms": 4322, "totalP95Ms": 8191 }
+      },
+      {
+        "model": "gpt-5.6-luna",
+        "reasoningEffort": "xhigh",
+        "serviceTier": "fast",
+        "passedAgents": 16,
+        "coldDm": { "firstToolP50Ms": 5093, "firstToolP95Ms": 6426, "totalP50Ms": 6695, "totalP95Ms": 9162 },
+        "warmDm": { "firstToolP50Ms": 1998, "firstToolP95Ms": 3381, "totalP50Ms": 3245, "totalP95Ms": 6600 },
+        "moveThenMine": { "moveP50Ms": 2667, "moveP95Ms": 6087, "mineP50Ms": 4276, "mineP95Ms": 6088, "totalP50Ms": 5410, "totalP95Ms": 9486 }
+      }
+    ]
+  },
+  "historicalReferences": {
+    "desktopEarlierFirstVisibleActionMs": 53000,
+    "desktopFinalFirstVisibleActionMs": 141800,
+    "commonObservedFloorMs": 30000,
+    "comparisonWarning": "Historical Desktop values include Minecraft and an older orchestration path. The new probe isolates provider and coordinator latency with simulated body results, so it is directional rather than an end-to-end Desktop benchmark."
+  },
+  "verification": {
+    "coordinatorTestsPassed": 622,
+    "coordinatorTestsFailed": 0,
+    "javaProtocolAndBridgeAssertionsPassed": 6416,
+    "voiceAddonAssertionsPassed": 77,
+    "nativeConcurrentAgentsCovered": 16,
+    "authenticatedProviderProbePassed": true
+  },
+  "build": {
+    "jar": "build/libs/arena-agents-0.1.0.jar",
+    "sizeBytes": 1895232,
+    "sha256": "E205DC404016BD594302CBB1179131809EFF3ECB060EC9791050A46BED2FD2EC"
+  },
+  "limitations": [
+    "No post-change real Minecraft headless gameplay run was performed in this pass.",
+    "Live provider concurrency at 8 and 16 agents was not measured.",
+    "Provider latency varies, so these single samples are not percentiles."
+  ]
+}

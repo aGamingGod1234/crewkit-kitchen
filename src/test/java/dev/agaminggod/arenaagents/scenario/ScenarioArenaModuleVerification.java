@@ -229,7 +229,8 @@ public final class ScenarioArenaModuleVerification {
 		try (InputStream stream = ScenarioArenaModuleVerification.class.getClassLoader()
 				.getResourceAsStream(RESOURCE_PREFIX + RESOURCE_PATH)) {
 			assertTrue(stream != null, "fixture resource exists");
-			assertEquals(FIXTURE + "\n", new String(stream.readAllBytes(), StandardCharsets.UTF_8),
+			assertEquals(FIXTURE + "\n",
+					new String(stream.readAllBytes(), StandardCharsets.UTF_8).replace("\r\n", "\n"),
 					"resource bytes exactly match Task 2 output");
 		}
 	}

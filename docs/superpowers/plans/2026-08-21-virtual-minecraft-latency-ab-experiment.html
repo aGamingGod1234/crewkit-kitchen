@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Virtual Minecraft latency A/B experiment</title>
+	<style>
+		:root { color-scheme: dark; --bg:#0b1116; --panel:#111a22; --line:#263543; --text:#e8eef3; --muted:#98a8b7; --accent:#69d3a7; --warn:#efc46b; --code:#091016; }
+		* { box-sizing:border-box; }
+		body { margin:0; background:var(--bg); color:var(--text); font:15px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+		main { width:min(1080px,calc(100% - 32px)); margin:0 auto; padding:48px 0 80px; }
+		h1 { max-width:760px; margin:0 0 12px; font-size:clamp(32px,7vw,58px); line-height:1.02; letter-spacing:-.045em; }
+		h2 { margin:48px 0 16px; font-size:24px; letter-spacing:-.025em; }
+		h3 { margin:0 0 10px; font-size:19px; }
+		p { max-width:820px; }
+		.lede { color:var(--muted); font-size:18px; max-width:760px; }
+		.meta { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px; margin:32px 0; border:1px solid var(--line); background:var(--line); }
+		.meta div { background:var(--panel); padding:16px; }
+		.meta small { display:block; color:var(--muted); margin-bottom:4px; }
+		.callout { border-left:3px solid var(--accent); padding:12px 16px; background:var(--panel); }
+		.task { margin:14px 0; padding:20px; border:1px solid var(--line); background:var(--panel); }
+		.task > p { color:var(--muted); }
+		.files { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+		ol,ul { padding-left:22px; }
+		li + li { margin-top:8px; }
+		code { color:#bcebd8; font-family:"Cascadia Code",Consolas,monospace; }
+		pre { overflow:auto; padding:14px; border:1px solid var(--line); background:var(--code); font:13px/1.5 "Cascadia Code",Consolas,monospace; }
+		table { width:100%; border-collapse:collapse; font-size:14px; }
+		th,td { padding:11px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+		th { color:var(--muted); font-weight:600; }
+		.status { color:var(--accent); }
+		.risk { color:var(--warn); }
+		@media (max-width:760px) { main { width:min(100% - 22px,1080px); padding-top:28px; } .meta { grid-template-columns:1fr 1fr; } .task { padding:16px; } table { display:block; overflow-x:auto; } }
+	</style>
+</head>
+<body>
+<main>
+	<p class="status">Approved design · ready for subagent-driven execution</p>
+	<h1>Virtual Minecraft latency A/B experiment</h1>
+	<p class="lede">Build a deterministic 20 Hz Minecraft substitute, run the real agent stack against it, apply the hybrid-control optimizations to one isolated copy, and report the measured difference without confusing simulated results with live Minecraft evidence.</p>
+
+	<div class="meta">
+		<div><small>Goal</small>Measure baseline vs optimized</div>
+		<div><small>Execution</small>Luna xhigh/max subagents</div>
+		<div><small>Provider modes</small>Instant, replay, live</div>
+		<div><small>Loads</small>1, 4, 8, 16 agents</div>
+	</div>
+
+	<div class="callout">
+		<strong>For agentic workers.</strong> Use <code>superpowers:subagent-driven-development</code>. Read the approved spec first. Each task follows test-driven development, stays inside its assigned worktree and files, and receives specification review followed by code-quality review before integration.
+	</div>
+
+	<h2>Architecture and constraints</h2>
+	<ul>
+		<li>Spec: <code>docs/superpowers/specs/2026-08-21-virtual-minecraft-latency-ab-experiment-design.md</code>.</li>
+		<li>Freeze the current dirty working tree through a temporary Git index. Do not alter the user's index or working files.</li>
+		<li>Create <code>.worktrees/latency-baseline</code> and <code>.worktrees/latency-optimized</code> from the same snapshot.</li>
+		<li>Apply identical behavior-neutral instrumentation and simulator code to both copies. Apply runtime optimizations only to the optimized copy.</li>
+		<li>Use Java 25, Node 22 or newer, existing dependencies, protocol-v2, existing provider adapters, and the production ArenaScript path.</li>
+		<li>Never copy OAuth files, API keys, environment files, bridge secrets, runtime directories, or provider login stores.</li>
+		<li>Real-provider calls are bounded, opt-in, sequential across arms, redacted, and cleaned up after every result.</li>
+		<li>Report virtual tick performance as simulator evidence, never as Minecraft TPS.</li>
+	</ul>
+
+	<h2>File map</h2>
+	<table>
+		<thead><tr><th>Unit</th><th>Responsibility</th><th>Primary files</th></tr></thead>
+		<tbody>
+			<tr><td>Snapshot</td><td>Create and verify two exact source copies</td><td><code>scripts/new-latency-experiment-copies.ps1</code></td></tr>
+			<tr><td>Telemetry</td><td>Raw monotonic events, process samples, summaries</td><td><code>coordinator/src/benchmark/benchmark-recorder.mjs</code>, <code>benchmark-report.mjs</code></td></tr>
+			<tr><td>Simulator</td><td>Seeded world, 20 Hz ticks, physical state</td><td><code>coordinator/src/simulator/virtual-world.mjs</code>, <code>virtual-minecraft-bridge.mjs</code></td></tr>
+			<tr><td>Actions</td><td>Multi-tick movement, mining, craft, build, combat, respawn</td><td><code>coordinator/src/simulator/action-runtime.mjs</code></td></tr>
+			<tr><td>Runner</td><td>Scenario matrix, instant/replay/live providers, cleanup</td><td><code>coordinator/src/benchmark/latency-runner.mjs</code>, <code>latency-matrix.json</code></td></tr>
+			<tr><td>Coordinator</td><td>Fair planning, non-blocking observations, continuation</td><td><code>planning-scheduler.mjs</code>, <code>dynamic-main.mjs</code>, <code>program-runtime-manager.mjs</code></td></tr>
+			<tr><td>Java runtime</td><td>Observation budget, cache, navigation and motor behavior</td><td><code>MultiplexedServerBridge.java</code>, <code>ServerObservationCollector.java</code>, controller classes</td></tr>
+			<tr><td>Analysis</td><td>Paired trials and final HTML report</td><td><code>scripts/run-latency-ab-experiment.ps1</code>, <code>coordinator/src/benchmark/paired-analysis.mjs</code></td></tr>
+		</tbody>
+	</table>
+
+	<h2>Implementation tasks</h2>
+
+	<section class="task">
+		<h3>Task 1. Freeze and verify the two copies</h3>
+		<p class="files">Create: scripts/new-latency-experiment-copies.ps1 · Test: scripts/test-new-latency-experiment-copies.ps1</p>
+		<p><strong>Produces:</strong> <code>New-LatencyExperimentCopies -ProjectRoot &lt;path&gt; -DestinationRoot &lt;path&gt;</code> returning snapshot ID, worktree paths, and matching source hashes.</p>
+		<ol>
+			<li>[ ] Write a test repository fixture with tracked edits, an untracked source file, an ignored runtime secret, and a pre-staged file. Assert both copies contain the edits and untracked source but exclude the secret, while the original index remains byte-identical.</li>
+			<li>[ ] Run <code>powershell -NoProfile -File scripts/test-new-latency-experiment-copies.ps1</code>. Expect failure because the creation script does not exist.</li>
+			<li>[ ] Implement a temporary-index snapshot using <code>git read-tree</code>, <code>git add -A</code>, <code>git write-tree</code>, and <code>git commit-tree</code>. Add detached worktrees and calculate a normalized SHA-256 source manifest in each.</li>
+			<li>[ ] Re-run the focused test. Expect both manifests to match and the user's index hash to remain unchanged.</li>
+			<li>[ ] Commit only the two scripts with <code>git commit -m "test: isolate latency experiment copies"</code>.</li>
+		</ol>
+	</section>
+
+	<section class="task">
+		<h3>Task 2. Add raw benchmark telemetry</h3>
+		<p class="files">Create: coordinator/src/benchmark/benchmark-recorder.mjs, benchmark-report.mjs · Test: coordinator/test/benchmark-recorder.test.mjs</p>
+		<p><strong>Produces:</strong> <code>BenchmarkRecorder.record(stage, context, fields)</code>, <code>snapshot()</code>, <code>writeArtifacts(directory)</code>, and <code>summarizeBenchmark(events)</code>.</p>
+		<ol>
+			<li>[ ] Test immutable rows, monotonic timestamps, bounded identities, raw percentile samples, error categories, credential redaction, JSONL output, and p50/p95/p99 calculation.</li>
+			<li>[ ] Run <code>node --test test/benchmark-recorder.test.mjs</code> from <code>coordinator</code>. Expect module-not-found failure.</li>
+			<li>[ ] Implement the recorder with a bounded event count, injected clock, append-only rows, atomic artifact rename, and recursive redaction for token, key, secret, authorization, cookie, and OAuth-shaped fields.</li>
+			<li>[ ] Wire optional recorder callbacks into <code>AgentPlanner</code>, <code>PlanningScheduler</code>, <code>ProgramRuntimeManager</code>, and the benchmark bridge. With no recorder, behavior and command order must remain unchanged.</li>
+			<li>[ ] Test the disabled and enabled paths against identical fixture decisions and assert byte-equivalent action-command sequences.</li>
+			<li>[ ] Commit with <code>git commit -m "test: record full agent latency path"</code>.</li>
+		</ol>
+	</section>
+
+	<section class="task">
+		<h3>Task 3. Build the deterministic 20 Hz virtual world</h3>
+		<p class="files">Create: coordinator/src/simulator/seeded-random.mjs, virtual-world.mjs, virtual-minecraft-bridge.mjs · Test: coordinator/test/virtual-world.test.mjs, virtual-minecraft-bridge.test.mjs</p>
+		<p><strong>Produces:</strong> <code>VirtualWorld.fromScenario(scenario)</code>, <code>world.tick()</code>, <code>world.observation(agentId)</code>, and a bridge implementing <code>send(type, agentId, payload)</code>.</p>
+		<ol>
+			<li>[ ] Test that equal seeds produce equal observations and different seeds affect only declared random events.</li>
+			<li>[ ] Test 20 ticks advance exactly one simulated second, collision blocks penetration, lava damages, drops enter inventory only inside pickup radius, and checkpoint respawn restores the recorded checkpoint.</li>
+			<li>[ ] Test protocol ordering: command acceptance, running progress, changed observation, terminal result. Cancellation must end once and stale completion must be ignored.</li>
+			<li>[ ] Run both focused test files and confirm they fail on missing modules.</li>
+			<li>[ ] Implement immutable scenario input, continuous player state, sparse voxel map, entity and item maps, virtual/real clock separation, and explicit <code>stepTicks(count)</code> plus real-time <code>start()</code>/<code>stop()</code>.</li>
+			<li>[ ] Re-run focused tests and commit with <code>git commit -m "test: add virtual Minecraft tick runtime"</code>.</li>
+		</ol>
+	</section>
+
+	<section class="task">
+		<h3>Task 4. Execute complete agent actions in simulation</h3>
+		<p class="files">Create: coordinator/src/simulator/action-runtime.mjs, simulator-scenarios.mjs · Test: coordinator/test/simulator-actions.test.mjs, simulator-scenarios.test.mjs</p>
+		<p><strong>Produces:</strong> <code>ActionRuntime.accept(command)</code>, <code>tick(world)</code>, <code>cancel(actionId)</code>, and fixed scenario manifests for gather, craft, build, combat, hazards, respawn, DM wake, stall, and correction.</p>
+		<ol>
+			<li>[ ] Add failing tests for movement displacement and yaw rate, mining duration and drops, exact-count crafting, block placement postconditions, cooldown-limited combat, shield use, death, respawn, and action timeout.</li>
+			<li>[ ] Assert every supported production action either has simulator semantics or returns typed <code>SIMULATOR_UNSUPPORTED_ACTION</code>. Silent success is forbidden.</li>
+			<li>[ ] Implement multi-tick action state machines and authoritative postconditions. Use exact protocol action names from <code>ACTION_FIELDS</code>.</li>
+			<li>[ ] Add scenario success functions that inspect world state, not provider prose.</li>
+			<li>[ ] Run <code>node --test test/simulator-actions.test.mjs test/simulator-scenarios.test.mjs test/model-authored-programs-e2e.test.mjs</code>.</li>
+			<li>[ ] Commit with <code>git commit -m "test: simulate full agent action loops"</code>.</li>
+		</ol>
+	</section>
+
+	<section class="task">
+		<h3>Task 5. Add instant, replay, and live-provider benchmark modes</h3>
+		<p class="files">Create: coordinator/src/benchmark/latency-runner.mjs, provider-replay.mjs, system-sampler.mjs, coordinator/config/latency-matrix.json · Test: coordinator/test/latency-runner.test.mjs, provider-replay.test.mjs, system-sampler.test.mjs</p>
+		<p><strong>Produces:</strong> <code>runLatencyMatrix(options)</code> with <code>mode: "instant" | "replay" | "live"</code>, strict turn/time budgets, provider preflight, artifacts, and cleanup status.</p>
+		<ol>
+			<li>[ ] Test matrix normalization, unique IDs, 1/4/8/16 loads, fixed seeds, time budgets, provider turn caps, unavailable-provider skip, required-provider failure, and no silent provider substitution.</li>
+			<li>[ ] Test replay hashes and exact decision equality. Reject a replay recorded for a different prompt, profile, scenario, or protocol version.</li>
+			<li>[ ] Test system sampling through an injected process reader and verify CPU, RSS, event-loop delay, scheduler depth, and child count remain observational.</li>
+			<li>[ ] Implement live mode through existing Codex, Kimi, and Gemini services. Record only bounded redacted outputs. In <code>finally</code>, stop the coordinator, sessions, providers, sampler, simulator, and listeners.</li>
+			<li>[ ] Add failure tests for timeout and provider-process exit, asserting no listener or child remains.</li>
+			<li>[ ] Run the focused tests and full <code>npm test</code>, then commit with <code>git commit -m "test: run provider-backed latency matrix"</code>.</li>
+		</ol>
+	</section>
+
+	<section class="task">
+		<h3>Task 6. Implement coordinator responsiveness optimizations</h3>
+		<p class="files">Modify in optimized copy only: coordinator/src/planning-scheduler.mjs, coordinator/src/agent-planner.mjs, coordinator/src/dynamic-main.mjs, coordinator/src/program-runtime-manager.mjs, coordinator/src/constants.mjs, coordinator/config/dynamic-agents.json · Test: coordinator/test/planning-scheduler.test.mjs, coordinator/test/agent-planner.test.mjs, coordinator/test/dynamic-main.test.mjs, coordinator/test/program-runtime-manager.test.mjs</p>
+		<p><strong>Produces:</strong> four active turns by default, provider-aware fair admission, latest-observation coalescing, urgent-event priority, and local action continuation during non-urgent planning.</p>
+		<ol>
+			<li>[ ] Add failing scheduler tests with mixed Codex/Kimi/Gemini queues. Assert FIFO within one provider, round-robin provider fairness, one active turn per agent, total active count at most four, and cancellation releases capacity.</li>
+			<li>[ ] Add a red regression showing an active provider turn delays observation handling in the current per-agent queue.</li>
+			<li>[ ] Add tests that 200 movement-only updates cause zero new provider turns, newest ordinary observation replaces older pending state, and damage, lava, death, action failure, DM, and operator steer bypass coalescing.</li>
+			<li>[ ] Add a test where a local action advances for at least 20 simulated ticks while a provider promise remains unresolved.</li>
+			<li>[ ] Implement separate lightweight observation ingestion from serialized lifecycle/provider mutation, then implement provider-aware planning lanes and the four-turn default.</li>
+			<li>[ ] Prove stale provider output cannot replace a newer program/action and provider failure affects only its agent and lane.</li>
+			<li>[ ] Run focused tests, <code>npm test</code>, and commit with <code>git commit -m "perf: keep agents active while providers think"</code>.</li>
+		</ol>
+	</section>
+
+	<section class="task">
+		<h3>Task 7. Reduce Minecraft-side tick work and improve local control</h3>
+		<p class="files">Modify in optimized copy only: src/main/java/dev/agaminggod/arenaagents/server/bridge/MultiplexedServerBridge.java, src/main/java/dev/agaminggod/arenaagents/server/perception/ServerObservationCollector.java, src/main/java/dev/agaminggod/arenaagents/client/navigation/LocalPathfinder.java, src/main/java/dev/agaminggod/arenaagents/server/runtime/controller/ServerPathPlanner.java, src/main/java/dev/agaminggod/arenaagents/server/runtime/controller/ServerNavigationController.java, src/main/java/dev/agaminggod/arenaagents/server/runtime/controller/ServerCombatController.java, src/main/java/dev/agaminggod/arenaagents/server/runtime/input/AgentInputStates.java · Test: src/test/java/dev/agaminggod/arenaagents/server/perception/ObservationBudgetVerification.java, src/test/java/dev/agaminggod/arenaagents/client/navigation/LocalPathfinderVerification.java, src/test/java/dev/agaminggod/arenaagents/server/runtime/controller/ServerPathPlannerVerification.java, src/test/java/dev/agaminggod/arenaagents/server/runtime/controller/NavigationProgressVerification.java, src/test/java/dev/agaminggod/arenaagents/server/runtime/controller/CombatPolicyVerification.java</p>
+		<p><strong>Produces:</strong> change-triggered observation scheduling with heartbeats, effective spatial caching, shared replan budget, smooth movement, and better combat micro-control.</p>
+		<ol>
+			<li>[ ] Add a red observation-budget test proving unchanged agents currently request a full observation every tick. Add assertions for immediate urgent change and bounded heartbeat publication.</li>
+			<li>[ ] Add cache tests that unchanged spatial state is reused for ten ticks, movement invalidates only position-sensitive sections, and damage/inventory facts never wait for the spatial cache.</li>
+			<li>[ ] Add a 16-agent pathfinding-budget test that rejects more than the declared aggregate expansions or elapsed budget in one simulated server tick and eventually services every agent.</li>
+			<li>[ ] Add navigation tests for bounded yaw/pitch delta, acceleration, deceleration, strafing, jump timing, and exact final alignment. Add combat tests for line of sight, pursuit, aim error, cooldown, shield timing, and no idle response to recent damage.</li>
+			<li>[ ] Implement the minimum policy changes that satisfy those tests, reusing the existing client <code>MovementController</code> behavior where its pure calculations apply.</li>
+			<li>[ ] Run <code>gradlew verifyCore --no-daemon --console=plain</code> and commit with <code>git commit -m "perf: bound agent tick work and smooth controls"</code>.</li>
+		</ol>
+	</section>
+
+	<section class="task">
+		<h3>Task 8. Run the paired A/B experiment and publish the report</h3>
+		<p class="files">Create: scripts/run-latency-ab-experiment.ps1, coordinator/src/benchmark/paired-analysis.mjs, docs/live-qa/2026-08-21-virtual-minecraft-latency-ab-report.html · Test: coordinator/test/paired-analysis.test.mjs, scripts/test-run-latency-ab-experiment.ps1</p>
+		<p><strong>Produces:</strong> sequential randomized paired trials, bootstrap confidence intervals, raw artifacts, and a human-readable report.</p>
+		<ol>
+			<li>[ ] Test paired-delta calculations, p50/p95/p99, bootstrap interval determinism under a fixed analysis seed, success-rate differences, timeout inclusion, and provisional labels for small samples.</li>
+			<li>[ ] Test the PowerShell orchestrator with fixture runners. Assert randomized arm order, no concurrent arms, source/config hash checks, bounded retries, and cleanup verification.</li>
+			<li>[ ] Run instant-provider controls at 1, 4, 8, and 16 agents in both copies. Require identical scenario inputs and authoritative success assertions.</li>
+			<li>[ ] Run recorded-decision replay in both copies. Reject any decision-hash mismatch.</li>
+			<li>[ ] Preflight live providers. Run bounded Codex and Kimi cells sequentially. Record Gemini as skipped if authentication remains unavailable.</li>
+			<li>[ ] Run existing coordinator, Java, voice, packaging, and performance verification in the optimized copy. Run focused unchanged-behavior gates in the baseline copy.</li>
+			<li>[ ] Generate the final report with baseline, optimized, paired difference, percentage, sample count, confidence interval, error taxonomy, source hashes, exact commands, and evidence limits.</li>
+			<li>[ ] Inspect raw artifacts and process/listener cleanup directly. Commit report and reusable benchmark tools with <code>git commit -m "test: report agent latency optimization results"</code>.</li>
+		</ol>
+	</section>
+
+	<h2>Verification matrix</h2>
+	<table>
+		<thead><tr><th>Gate</th><th>Command</th><th>Required result</th></tr></thead>
+		<tbody>
+			<tr><td>Coordinator</td><td><code>cd coordinator; npm test</code></td><td>Zero failures in both copies</td></tr>
+			<tr><td>Java and voice</td><td><code>gradlew verifyCore :voice-addon:verifyVoiceAddon --no-daemon</code></td><td>Zero assertion failures</td></tr>
+			<tr><td>Full automated</td><td><code>scripts/run-automated-verification.ps1</code></td><td>Build, tests, bridge contracts pass</td></tr>
+			<tr><td>Performance soak</td><td><code>scripts/run-performance-reliability-verification.ps1</code></td><td>All configured soak repetitions pass</td></tr>
+			<tr><td>A/B deterministic</td><td><code>scripts/run-latency-ab-experiment.ps1 -Mode instant,replay</code></td><td>Complete paired matrix, no cleanup leaks</td></tr>
+			<tr><td>A/B live</td><td><code>scripts/run-latency-ab-experiment.ps1 -Mode live -Providers codex,kimi</code></td><td>Bounded results or typed failures, never substitution</td></tr>
+		</tbody>
+	</table>
+
+	<h2>Decisions and risks</h2>
+	<ul>
+		<li><strong>Decision.</strong> Instrumentation is identical in both arms. Optimized-only instrumentation would invalidate the comparison.</li>
+		<li><strong>Decision.</strong> Real-provider and replay results remain separate. Reduced provider-call count is reported as its own mechanism.</li>
+		<li class="risk"><strong>Risk.</strong> Live model nondeterminism can overwhelm local differences. Paired randomized trials and decision replay control this.</li>
+		<li class="risk"><strong>Risk.</strong> The simulator may reward behavior that does not transfer to Minecraft. Held-out seeds, production protocol use, Java controller tests, and explicit evidence limits reduce this risk.</li>
+		<li class="risk"><strong>Risk.</strong> Sixteen live provider sessions may exhaust provider or host limits. Strict concurrency, turn budgets, sequential arms, and cleanup checks contain the run.</li>
+		<li class="risk"><strong>Risk.</strong> The dirty source tree may be captured incorrectly. The temporary-index fixture and matching source manifests are the first blocking gate.</li>
+	</ul>
+</main>
+</body>
+</html>

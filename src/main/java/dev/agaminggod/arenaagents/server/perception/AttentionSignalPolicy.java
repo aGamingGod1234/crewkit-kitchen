@@ -13,6 +13,7 @@ import java.util.TreeSet;
 public final class AttentionSignalPolicy {
 	private static final int CRITICAL_AIR = 60;
 	private static final int CRITICAL_FOOD = 6;
+	private static final double HAZARDOUS_FALL_DISTANCE = 6.0D;
 
 	private AttentionSignalPolicy() {
 	}
@@ -22,28 +23,44 @@ public final class AttentionSignalPolicy {
 		if (previous == null) return List.of();
 		TreeSet<String> facts = new TreeSet<>();
 		addChanged(facts, "ready", previous.get("ready"), current.get("ready"));
-		addChanged(facts, "status", previous.get("status"), current.get("status"));
+		if (statusRequiresAttention(previous.get("status"), current.get("status"))) facts.add("status");
 
 		JsonObject beforePlayer = object(previous, "player");
 		JsonObject afterPlayer = object(current, "player");
+		boolean activeActionWindow = activeAction(previous) || activeAction(current);
 		if (decreased(beforePlayer, afterPlayer, "health")) facts.add("player.health");
 		if (started(beforePlayer, afterPlayer, "onFire")) facts.add("player.onFire");
 		if (started(beforePlayer, afterPlayer, "suffocating")) facts.add("player.suffocating");
 		if (crossedAtOrBelow(beforePlayer, afterPlayer, "air", CRITICAL_AIR)) facts.add("player.air");
 		if (crossedAtOrBelow(beforePlayer, afterPlayer, "foodLevel", CRITICAL_FOOD)) facts.add("player.foodLevel");
+		if (crossedAtOrAbove(beforePlayer, afterPlayer, "fallDistance", HAZARDOUS_FALL_DISTANCE)) {
+			facts.add("player.fallDistance");
+		}
+		if (activeActionWindow && attackerAppearedOrChanged(beforePlayer, afterPlayer)) {
+			facts.add("player.lastAttacker");
+		}
 
-		if (!inventory(previous).equals(inventory(current))) facts.add("inventory");
+		if (!activeActionWindow && !inventory(previous).equals(inventory(current))) facts.add("inventory");
 		if (newFailure(previous, current)) facts.add("lastResult");
 		if (!Objects.equals(dimension(previous), dimension(current))) facts.add("world.dimension");
+		addLavaChanges(facts, previous, current);
 
 		boolean viewpointChanged = !Objects.equals(previous.get("position"), current.get("position"))
 				|| !Objects.equals(previous.get("view"), current.get("view"));
-		if (!viewpointChanged) addEntityMembershipChanges(facts, entityIds(previous), entityIds(current));
+		if (!activeActionWindow && !viewpointChanged) {
+			addEntityMembershipChanges(facts, entityIds(previous), entityIds(current));
+		}
 		return facts.stream().limit(AttentionFactDelta.MAX_CHANGED_FACTS).toList();
 	}
 
 	private static void addChanged(Set<String> facts, String path, JsonElement before, JsonElement after) {
 		if (!Objects.equals(before, after)) facts.add(path);
+	}
+
+	private static boolean statusRequiresAttention(JsonElement before, JsonElement after) {
+		if (Objects.equals(before, after)) return false;
+		String status = primitiveString(after);
+		return status != null && Set.of("PLAYER_DEAD", "DEAD", "ERROR", "DISCONNECTED").contains(status);
 	}
 
 	private static boolean decreased(JsonObject before, JsonObject after, String field) {
@@ -56,6 +73,49 @@ public final class AttentionSignalPolicy {
 		Double left = number(before, field);
 		Double right = number(after, field);
 		return left != null && right != null && left > threshold && right <= threshold;
+	}
+
+	private static boolean crossedAtOrAbove(JsonObject before, JsonObject after, String field, double threshold) {
+		Double left = number(before, field);
+		Double right = number(after, field);
+		return left != null && right != null && left < threshold && right >= threshold;
+	}
+
+	private static boolean activeAction(JsonObject observation) {
+		return booleanValue(object(observation, "currentAction"), "active");
+	}
+
+	private static boolean attackerAppearedOrChanged(JsonObject before, JsonObject after) {
+		JsonObject previous = object(before, "lastAttacker");
+		JsonObject current = object(after, "lastAttacker");
+		if (current == null) return false;
+		return previous == null
+				|| !Objects.equals(previous.get("uuid"), current.get("uuid"))
+				|| !Objects.equals(previous.get("type"), current.get("type"));
+	}
+
+	private static void addLavaChanges(Set<String> facts, JsonObject previous, JsonObject current) {
+		java.util.Map<String, String> before = lavaByPosition(array(previous, "blocks"));
+		java.util.Map<String, String> after = lavaByPosition(array(current, "blocks"));
+		TreeSet<String> positions = new TreeSet<>(before.keySet());
+		positions.addAll(after.keySet());
+		for (String position : positions) {
+			if (!Objects.equals(before.get(position), after.get(position))) facts.add("blocks." + position);
+		}
+	}
+
+	private static java.util.Map<String, String> lavaByPosition(JsonArray blocks) {
+		java.util.Map<String, String> lava = new java.util.HashMap<>();
+		if (blocks == null) return lava;
+		for (JsonElement value : blocks) {
+			if (!value.isJsonObject()) continue;
+			JsonObject block = value.getAsJsonObject();
+			String blockId = primitiveString(block.get("blockId"));
+			if (!"minecraft:lava".equals(blockId)
+					|| !block.has("x") || !block.has("y") || !block.has("z")) continue;
+			lava.put(block.get("x").getAsInt() + "," + block.get("y").getAsInt() + "," + block.get("z").getAsInt(), blockId);
+		}
+		return lava;
 	}
 
 	private static boolean started(JsonObject before, JsonObject after, String field) {

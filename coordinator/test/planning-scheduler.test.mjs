@@ -10,18 +10,21 @@ function deferred() {
 	return { promise, resolve, reject };
 }
 
-test('default scheduler starts all sixteen independent agent turns together', async () => {
+test('default scheduler admits four turns and retains twelve pending turns', async () => {
 	const scheduler = new PlanningScheduler();
 	const gates = Array.from({ length: 16 }, () => deferred());
 	const started = gates.map(() => deferred());
 	const runs = gates.map((gate, index) => scheduler.schedule(`agent-${index}`, async () => {
 		started[index].resolve();
-		await gate.promise;
+		if (index < 4) await gate.promise;
 	}));
+	await Promise.all(started.slice(0, 4).map((entry) => entry.promise));
+	assert.equal(scheduler.maxConcurrent, 4);
+	assert.equal(scheduler.maxPending, 12);
+	assert.equal(scheduler.activeCount, 4);
+	assert.equal(scheduler.pendingCount, 12);
+	for (const gate of gates.slice(0, 4)) gate.resolve();
 	await Promise.all(started.map((entry) => entry.promise));
-	assert.equal(scheduler.activeCount, 16);
-	assert.equal(scheduler.pendingCount, 0);
-	for (const gate of gates) gate.resolve();
 	await Promise.all(runs);
 });
 
@@ -55,6 +58,45 @@ test('scheduler caps concurrency and starts queued agents in FIFO order', async 
 	assert.deepEqual(await Promise.all(runs), [0, 1, 2, 3]);
 });
 
+test('scheduler round-robins provider lanes while preserving lane FIFO', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 5 });
+	const gate = deferred();
+	const started = [];
+	const first = scheduler.schedule('gemini-1', async () => {
+		started.push('gemini-1');
+		await gate.promise;
+	}, { lane: 'gemini', priority: 'ordinary' });
+	const runs = [
+		first,
+		scheduler.schedule('gemini-2', async () => started.push('gemini-2'), { lane: 'gemini', priority: 'ordinary' }),
+		scheduler.schedule('kimi-1', async () => started.push('kimi-1'), { lane: 'kimi', priority: 'ordinary' }),
+		scheduler.schedule('kimi-2', async () => started.push('kimi-2'), { lane: 'kimi', priority: 'ordinary' }),
+	];
+	await Promise.resolve();
+	assert.deepEqual(started, ['gemini-1']);
+	gate.resolve();
+	await Promise.all(runs);
+	assert.deepEqual(started, ['gemini-1', 'kimi-1', 'gemini-2', 'kimi-2']);
+});
+
+test('urgent turns lead ordinary turns but ordinary work is admitted after a bounded burst', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 6, maxUrgentBurst: 3 });
+	const bootstrapGate = deferred();
+	const started = [];
+	const bootstrap = scheduler.schedule('bootstrap', async () => {
+		started.push('bootstrap');
+		await bootstrapGate.promise;
+	}, { lane: 'codex', priority: 'ordinary' });
+	const ordinary = scheduler.schedule('ordinary', async () => started.push('ordinary'), { lane: 'ordinary-lane', priority: 'ordinary' });
+	const urgentRuns = Array.from({ length: 4 }, (_, index) => scheduler.schedule(`urgent-${index}`, async () => started.push(`urgent-${index}`), {
+		lane: `urgent-lane-${index}`,
+		priority: 'urgent',
+	}));
+	bootstrapGate.resolve();
+	await Promise.all([bootstrap, ordinary, ...urgentRuns]);
+	assert.deepEqual(started.slice(0, 5), ['bootstrap', 'urgent-0', 'urgent-1', 'urgent-2', 'ordinary']);
+});
+
 test('scheduler permits at most one active or pending turn per agent', async () => {
 	const scheduler = new PlanningScheduler({ maxConcurrent: 1 });
 	const gate = deferred();
@@ -85,6 +127,37 @@ test('cancelling an active turn aborts its dependency-injected signal', async ()
 	assert.equal(signal.aborted, true);
 });
 
+test('cancelling a pending turn releases capacity for another agent', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1 });
+	const gate = deferred();
+	const active = scheduler.schedule('agent-a', () => gate.promise);
+	await Promise.resolve();
+	const cancelled = scheduler.schedule('agent-b', async () => 'cancelled');
+	assert.equal(scheduler.cancel('agent-b', 'stopped'), true);
+	await assert.rejects(cancelled, (error) => error.code === 'PLAN_CANCELLED');
+	const replacement = scheduler.schedule('agent-c', async () => 'replacement');
+	gate.resolve('active');
+	assert.equal(await active, 'active');
+	assert.equal(await replacement, 'replacement');
+});
+
+test('a failed provider turn releases its slot without affecting another lane', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 2 });
+	const failure = Object.assign(new Error('gemini unavailable'), { code: 'PROVIDER_UNAVAILABLE' });
+	const started = [];
+	const failed = scheduler.schedule('gemini-1', async () => {
+		started.push('gemini-1');
+		throw failure;
+	}, { lane: 'gemini', priority: 'ordinary' });
+	const healthy = scheduler.schedule('kimi-1', async () => {
+		started.push('kimi-1');
+		return 'healthy';
+	}, { lane: 'kimi', priority: 'ordinary' });
+	await assert.rejects(failed, (error) => error === failure);
+	assert.equal(await healthy, 'healthy');
+	assert.deepEqual(started, ['gemini-1', 'kimi-1']);
+});
+
 test('scheduler warns at 75 percent and rejects beyond its hard capacity', async () => {
 	const pressure = [];
 	const scheduler = new PlanningScheduler({
@@ -108,4 +181,109 @@ test('scheduler warns at 75 percent and rejects beyond its hard capacity', async
 	await Promise.all(runs);
 	assert.equal(scheduler.activeCount, 0);
 	assert.equal(scheduler.pendingCount, 0);
+});
+
+test('adaptive target grows one slot per four demand-backed successful decisions', () => {
+	const events = [];
+	const scheduler = new PlanningScheduler({
+		planningMode: 'adaptive',
+		maxConcurrent: 4,
+		maxPending: 12,
+		urgentReserve: 1,
+		recorder: { record: (stage, context, fields) => events.push({ stage, context, fields }) },
+	});
+
+	assert.equal(scheduler.planningMode, 'adaptive');
+	assert.equal(scheduler.target, 4);
+	for (let index = 0; index < 3; index += 1) {
+		scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: null }, { pendingOrdinary: 1 });
+		assert.equal(scheduler.target, 4);
+	}
+	scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: null }, { pendingOrdinary: 1 });
+	assert.equal(scheduler.target, 5);
+	assert.equal(events.filter((event) => event.stage === 'scheduler_target_changed').length, 1);
+	assert.equal(events.at(-1).fields.reason, 'healthy_growth');
+	assert.deepEqual(Object.keys(events.at(-1).fields).sort(), [
+		'active', 'activeOrdinary', 'activeUrgent', 'maxConcurrency', 'minConcurrency', 'mode',
+		'ordinaryActiveLimit', 'pending', 'pendingOrdinary', 'pendingUrgent', 'previousTarget',
+		'reason', 'target', 'urgentReserve',
+	].sort());
+
+	for (let index = 0; index < 4; index += 1) {
+		scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: null }, { pendingOrdinary: 0 });
+	}
+	assert.equal(scheduler.target, 5, 'idle completions do not create a later burst growth');
+});
+
+test('fixed target ignores provider and tick feedback', () => {
+	const scheduler = new PlanningScheduler({
+		planningMode: 'fixed',
+		maxConcurrent: 8,
+		maxPending: 8,
+		urgentReserve: 1,
+	});
+
+	for (const errorCode of ['RATE_LIMITED', 'OVERLOADED', 'PLANNING_TIMEOUT', null]) {
+		scheduler.observeProviderTelemetry({ operation: 'decide', errorCode }, { pendingOrdinary: 1 });
+	}
+	for (let index = 0; index < 3; index += 1) scheduler.observeSystemHealth({ tickP95Ms: 60 });
+	assert.equal(scheduler.target, 8);
+	assert.equal(scheduler.backoffCount, 0);
+});
+
+test('ordinary work leaves one active reservation for urgent work', async () => {
+	const scheduler = new PlanningScheduler({ planningMode: 'adaptive', maxConcurrent: 4, maxPending: 12, urgentReserve: 1 });
+	const gates = Array.from({ length: 4 }, () => deferred());
+	const ordinaryRuns = [0, 1, 2].map((index) => scheduler.schedule(`ordinary-${index}`, () => gates[index].promise));
+	await Promise.resolve();
+	assert.equal(scheduler.activeCount, 3);
+	assert.equal(scheduler.activeOrdinaryCount, 3);
+	assert.equal(scheduler.pendingCount, 0);
+
+	const urgentGate = deferred();
+	const urgent = scheduler.schedule('urgent', () => urgentGate.promise, { priority: 'urgent', lane: 'urgent' });
+	await Promise.resolve();
+	assert.equal(scheduler.activeCount, 4);
+	assert.equal(scheduler.activeUrgentCount, 1);
+	assert.equal(scheduler.activeAgentIds.includes('urgent'), true);
+
+	for (const gate of gates) gate.resolve();
+	urgentGate.resolve();
+	await Promise.all([...ordinaryRuns, urgent]);
+});
+
+test('ordinary queue capacity preserves the reserved urgent entry at the global boundary', async () => {
+	const scheduler = new PlanningScheduler({ planningMode: 'adaptive', maxConcurrent: 4, maxPending: 12, urgentReserve: 1 });
+	const gates = Array.from({ length: 3 }, () => deferred());
+	const active = gates.map((gate, index) => scheduler.schedule(`active-${index}`, () => gate.promise));
+	await Promise.resolve();
+	const pending = Array.from({ length: 12 }, (_, index) => scheduler.schedule(`pending-${index}`, async () => null));
+	await assert.rejects(scheduler.schedule('ordinary-over-cap', async () => null), (error) => error.code === 'SCHEDULER_CAPACITY');
+	const urgentGate = deferred();
+	const urgent = scheduler.schedule('urgent-at-boundary', () => urgentGate.promise, { lane: 'urgent', priority: 'urgent' });
+	await Promise.resolve();
+	assert.equal(scheduler.activeUrgentCount, 1);
+	assert.equal(scheduler.ordinaryReservationRejections, 1);
+	for (const gate of gates) gate.resolve();
+	urgentGate.resolve();
+	await Promise.all([...active, ...pending, urgent]);
+});
+
+test('adaptive pressure backs off immediately and tick pressure needs three samples', () => {
+	const scheduler = new PlanningScheduler({ planningMode: 'adaptive', maxConcurrent: 8, maxPending: 8, urgentReserve: 1 });
+	scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: 'RATE_LIMITED' });
+	assert.equal(scheduler.target, 7);
+	scheduler.observeProviderTelemetry({ operation: 'decide', errorCode: 'OVERLOADED' });
+	assert.equal(scheduler.target, 6);
+	for (const errorCode of ['AUTH_FAILED', 'MALFORMED_DECISION', 'PLAN_CANCELLED', 'STALE_PLAN', 'MISSING_FINAL_MESSAGE']) {
+		scheduler.observeProviderTelemetry({ operation: 'decide', errorCode });
+	}
+	assert.equal(scheduler.target, 6);
+
+	scheduler.observeSystemHealth({ tickP95Ms: 60 });
+	scheduler.observeSystemHealth({ tickP95Ms: 60 });
+	assert.equal(scheduler.target, 6);
+	scheduler.observeSystemHealth({ tickP95Ms: 60 });
+	assert.equal(scheduler.target, 5);
+	assert.equal(scheduler.lastChangeReason, 'tick_pressure');
 });

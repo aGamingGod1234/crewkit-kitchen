@@ -52,7 +52,9 @@ public final class ActionFactory {
 					BUILD_SEQUENCE ->
 					deferred(command.type(), "server-side NPC execution");
 			case TRANSFER_CONTAINER, CRAFT_INVENTORY, CRAFT_TABLE, FURNACE_TRANSACTION,
-					EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED, RESPAWN ->
+					EQUIP_ITEM, SELECT_TOOL, BLOCK_WITH_SHIELD, USE_RANGED, INTERACT_BLOCK,
+					INTERACT_ENTITY, DISMOUNT, START_FALL_FLYING, MENU_TRANSFER, MENU_BUTTON,
+					ANVIL_RENAME, RESPAWN ->
 					deferred(command.type(), "server-side transaction adapter");
 			case COMPLETE_GOAL -> deferred(command.type(), "coordinator goal completion");
 		};

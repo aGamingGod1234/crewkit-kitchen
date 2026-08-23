@@ -9,6 +9,7 @@ import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { FakeMinecraftBridge, SELECTED_PROFILE, assertCommandProvenance, commandPayloads, observation } from './fixtures/fake-minecraft-bridge.mjs';
+import { withCompletionContract } from './fixtures/completion-contract.mjs';
 
 const latency = new ControlLatencyRegistry({ windowSize: 20_000 });
 const providerLatencyMs = [];
@@ -271,12 +272,12 @@ test('corrects invalid source through the same selected model', async () => {
 test('rejects a physical command without model-program provenance before bridge acceptance', async () => {
 	const harness = createHarness();
 	await assert.rejects(
-		() => harness.bridge.send('action_command', SELECTED_PROFILE.agentId, { goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
+		() => harness.bridge.send('action_command', SELECTED_PROFILE.agentId, { traceId: 'trace-unauthorised', goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
 		(error) => /provenance|MISSING_FIELD/i.test(error.message),
 	);
 	assert.equal(commandPayloads(harness.bridge).length, 0);
 	assert.throws(
-		() => validateProtocolV2Payload('action_command', { goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
+		() => validateProtocolV2Payload('action_command', { traceId: 'trace-unauthorised', goalRevision: 1, actionId: 'unauthorised', actionType: 'wait', arguments: { durationMs: 1 } }),
 		/provenance|MISSING_FIELD/i,
 	);
 	scenarioResults.push({ name: 'provenance_rejection', passed: true });
@@ -304,12 +305,25 @@ function createHarness({ initialObservation = observation(), onAction = async ()
 		harness.totalCommands += 1;
 		return onAction(command, fakeBridge);
 	} });
-	const manager = new ProgramRuntimeManager({ registry, bridge, planner, latencyRegistry: latency, clock: () => ++harness.clock });
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge,
+		planner,
+		latencyRegistry: latency,
+		clock: () => ++harness.clock,
+		onCompletionRequested: (request) => queueMicrotask(() => harness.manager.onCompletionResult(record, {
+			goalRevision: request.record.goalRevision,
+			traceId: request.traceId,
+			contractHash: request.contractHash,
+			verified: true,
+			reasonCode: 'COMPLETION_VERIFIED',
+		})),
+	});
 	harness.clock = 0;
 	bridge.attach(manager);
 	harness.manager = manager;
 	harness.bridge = bridge;
-	harness.install = (source) => harness.manager.installDecision(record, { summary: 'Task 10 source', directive: 'replace', source }, { observation: bridge.currentObservation, eventSequence: 1 });
+	harness.install = (source) => harness.manager.installDecision(record, withCompletionContract({ summary: 'Task 10 source', directive: 'replace', source }, record.goalRevision), { observation: bridge.currentObservation, eventSequence: 1 });
 	return harness;
 }
 
@@ -320,13 +334,13 @@ function createProviderHarness({ initialObservation = observation(), onAction = 
 		goalRevision: 0,
 		inputs: [],
 		async setGoalRevision(goalRevision) { this.goalRevision = goalRevision; },
-		async decide(input) {
+		async decide(input, options) {
 			harness.providerCalls += 1;
 			this.inputs.push(input);
 			const next = decisions.shift();
 			if (next?.invalid === true) throw Object.assign(new Error('invalid source'), { code: 'INVALID_DECISION' });
 			if (!next) throw new Error('provider decision queue exhausted');
-			return next;
+			return withCompletionContract(next, options?.goalRevision ?? this.goalRevision);
 		},
 	};
 	const providerService = {
@@ -341,11 +355,24 @@ function createProviderHarness({ initialObservation = observation(), onAction = 
 	harness.sessionIdentity = session;
 	harness.providerService = providerService;
 	harness.planner = planner;
-	harness.manager = new ProgramRuntimeManager({ registry: harness.registry, bridge: harness.bridge, planner, latencyRegistry: latency, clock: () => ++harness.clock });
+	harness.manager = new ProgramRuntimeManager({
+		registry: harness.registry,
+		bridge: harness.bridge,
+		planner,
+		latencyRegistry: latency,
+		clock: () => ++harness.clock,
+		onCompletionRequested: (request) => queueMicrotask(() => harness.manager.onCompletionResult(harness.record, {
+			goalRevision: request.record.goalRevision,
+			traceId: request.traceId,
+			contractHash: request.contractHash,
+			verified: true,
+			reasonCode: 'COMPLETION_VERIFIED',
+		})),
+	});
 	harness.bridge.attach(harness.manager);
 	harness.installFromProvider = async () => {
 		const decision = await planner.requestPlan({ agentId: SELECTED_PROFILE.agentId, input: 'Task 10 provider decision', goalRevision: 1 });
-		return harness.manager.installDecision(harness.record, decision, { observation: harness.bridge.currentObservation, eventSequence: 1 });
+		return harness.manager.installDecision(harness.record, withCompletionContract(decision, harness.record.goalRevision), { observation: harness.bridge.currentObservation, eventSequence: 1 });
 	};
 	return harness;
 }

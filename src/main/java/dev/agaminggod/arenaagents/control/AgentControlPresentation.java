@@ -17,7 +17,7 @@ public final class AgentControlPresentation {
 			case "PAUSED" -> "Paused";
 			case "COMPLETED" -> "Task complete";
 			case "ERROR" -> "Needs attention";
-			case "DEAD" -> "Dead - awaiting model";
+			case "DEAD" -> "Dead - ready to respawn";
 			case "DISCONNECTED" -> "Disconnected";
 			default -> "Unknown";
 		};

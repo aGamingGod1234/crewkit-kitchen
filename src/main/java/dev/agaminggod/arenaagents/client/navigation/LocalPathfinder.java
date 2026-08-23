@@ -67,6 +67,28 @@ public final class LocalPathfinder implements PathPlanner {
 				|| maximumExpandedNodes <= 0 || timeBudgetNanos <= 0L) {
 			return PathPlan.failed(PathOutcome.INVALID, 0);
 		}
+		return findPath(
+				view,
+				start,
+				destination,
+				new SearchBudget(maximumExpandedNodes, timeBudgetNanos, monotonicClock)
+		);
+	}
+
+	/**
+	 * Plans against a caller-owned budget. Reusing the budget across requests makes
+	 * its expansion and deadline limits aggregate instead of multiplying per path.
+	 */
+	public PathPlan findPath(
+			WalkabilityView view,
+			GridPosition start,
+			GridPosition destination,
+			SearchBudget budget
+	) {
+		if (view == null || start == null || destination == null || budget == null) {
+			return PathPlan.failed(PathOutcome.INVALID, 0);
+		}
+		int expandedAtStart = budget.expandedNodes();
 		if (!isStandable(view, start) || !isStandable(view, destination)) {
 			return PathPlan.failed(PathOutcome.INVALID, 0);
 		}
@@ -74,7 +96,6 @@ public final class LocalPathfinder implements PathPlanner {
 			return new PathPlan(List.of(new PathNode(start, TraversalType.START)), PathOutcome.FOUND, 0);
 		}
 
-		long startedAtNanos = monotonicClock.getAsLong();
 		PriorityQueue<SearchNode> open = new PriorityQueue<>(OPEN_ORDER);
 		Map<GridPosition, Long> bestCosts = new HashMap<>();
 		Map<GridPosition, ParentEdge> parents = new HashMap<>();
@@ -83,11 +104,10 @@ public final class LocalPathfinder implements PathPlanner {
 		long startHeuristic = heuristic(start, destination);
 		open.add(new SearchNode(start, 0L, startHeuristic, nextSequence++));
 		bestCosts.put(start, 0L);
-		int expandedNodes = 0;
 
 		while (!open.isEmpty()) {
-			if (deadlineReached(startedAtNanos, monotonicClock.getAsLong(), timeBudgetNanos)) {
-				return PathPlan.failed(PathOutcome.TIME_LIMIT, expandedNodes);
+			if (budget.timeExceeded()) {
+				return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
 			}
 			SearchNode current = open.remove();
 			Long currentBestCost = bestCosts.get(current.position());
@@ -95,13 +115,12 @@ public final class LocalPathfinder implements PathPlanner {
 				continue;
 			}
 			if (current.position().equals(destination)) {
-				return reconstruct(start, destination, parents, expandedNodes);
+				return reconstruct(start, destination, parents, budget.expandedNodes() - expandedAtStart);
 			}
-			if (expandedNodes >= maximumExpandedNodes) {
-				return PathPlan.failed(PathOutcome.NODE_LIMIT, expandedNodes);
+			if (!budget.tryExpand()) {
+				return PathPlan.failed(budget.exhaustionOutcome(), budget.expandedNodes() - expandedAtStart);
 			}
 			closed.add(current.position());
-			expandedNodes++;
 
 			for (Neighbor neighbor : neighbors(view, current.position())) {
 				if (closed.contains(neighbor.position())) {
@@ -126,7 +145,7 @@ public final class LocalPathfinder implements PathPlanner {
 			}
 		}
 
-		return PathPlan.failed(PathOutcome.NO_PATH, expandedNodes);
+		return PathPlan.failed(PathOutcome.NO_PATH, budget.expandedNodes() - expandedAtStart);
 	}
 
 	private static List<Neighbor> neighbors(WalkabilityView view, GridPosition current) {
@@ -260,10 +279,6 @@ public final class LocalPathfinder implements PathPlanner {
 		return new PathPlan(nodes, PathOutcome.FOUND, expandedNodes);
 	}
 
-	private static boolean deadlineReached(long start, long now, long budget) {
-		return now - start >= budget;
-	}
-
 	private static long absoluteDifference(int first, int second) {
 		return Math.abs((long) first - second);
 	}
@@ -303,5 +318,68 @@ public final class LocalPathfinder implements PathPlanner {
 	}
 
 	private record Neighbor(GridPosition position, TraversalType traversal, int cost) {
+	}
+
+	/** Mutable limits shared by all path requests admitted during one server tick. */
+	public static final class SearchBudget {
+		private final int maximumExpandedNodes;
+		private final long timeBudgetNanos;
+		private final LongSupplier monotonicClock;
+		private final long startedAtNanos;
+		private int expandedNodes;
+		private boolean exhausted;
+		private PathOutcome exhaustionOutcome;
+
+		public SearchBudget(int maximumExpandedNodes, long timeBudgetNanos, LongSupplier monotonicClock) {
+			if (maximumExpandedNodes <= 0 || timeBudgetNanos <= 0L || monotonicClock == null) {
+				throw new IllegalArgumentException("path search budget must be positive");
+			}
+			this.maximumExpandedNodes = maximumExpandedNodes;
+			this.timeBudgetNanos = timeBudgetNanos;
+			this.monotonicClock = monotonicClock;
+			this.startedAtNanos = monotonicClock.getAsLong();
+		}
+
+		public int maximumExpandedNodes() {
+			return maximumExpandedNodes;
+		}
+
+		public long timeBudgetNanos() {
+			return timeBudgetNanos;
+		}
+
+		public int expandedNodes() {
+			return expandedNodes;
+		}
+
+		public boolean exhausted() {
+			return exhausted;
+		}
+
+		public PathOutcome exhaustionOutcome() {
+			if (!exhausted || exhaustionOutcome == null) {
+				throw new IllegalStateException("path search budget is not exhausted");
+			}
+			return exhaustionOutcome;
+		}
+
+		private boolean timeExceeded() {
+			if (exhausted) return exhaustionOutcome == PathOutcome.TIME_LIMIT;
+			if (monotonicClock.getAsLong() - startedAtNanos < timeBudgetNanos) return false;
+			exhausted = true;
+			exhaustionOutcome = PathOutcome.TIME_LIMIT;
+			return true;
+		}
+
+		private boolean tryExpand() {
+			if (timeExceeded()) return false;
+			if (expandedNodes >= maximumExpandedNodes) {
+				exhausted = true;
+				exhaustionOutcome = PathOutcome.NODE_LIMIT;
+				return false;
+			}
+			expandedNodes++;
+			return true;
+		}
 	}
 }

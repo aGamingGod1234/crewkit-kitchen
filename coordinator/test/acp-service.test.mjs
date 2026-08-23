@@ -3,12 +3,10 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { AcpProviderService, buildAcpLaunch } from '../src/acp-service.mjs';
+import { profileFingerprint } from '../src/provider-session.mjs';
+import { replaceDecisionJson } from './provider-decision-fixtures.mjs';
 
-const DECISION = JSON.stringify({
-	summary: 'Wait safely.',
-	directive: 'replace',
-	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);',
-});
+const DECISION = replaceDecisionJson();
 
 class FakeAcpTransport extends EventEmitter {
 	constructor(configOptions, { configOptionsAfterModel = null } = {}) {
@@ -74,66 +72,47 @@ test('Gemini ACP sessions apply the exact model and thinking level and parse pla
 	await service.stop();
 });
 
-test('ACP malformed output records one final error row for the attempt', async () => {
+test('ACP keeps the exact service profile for recovery and rejects profile mutation', async () => {
 	const transport = new FakeAcpTransport(options());
-	transport.message = 'not-json ARBITRARY_ACP_MODEL_SECRET';
-	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
-	const agent = await service.createAgent({ agentId: 'gemini-malformed-record', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
-	await agent.setGoalRevision(2);
-	const rows = [];
-	const turnRecorder = { async record(row) { rows.push(row); } };
-	await assert.rejects(agent.decide('authoritative state', { goalRevision: 2, turnRecorder, attempt: 4, retry: true }), (error) => error?.code === 'MALFORMED_DECISION');
-	assert.equal(rows.length, 1);
-	assert.equal(rows[0].error?.code, 'MALFORMED_DECISION');
-	assert.equal(rows[0].error?.category, 'decision_parse');
-	assert.doesNotMatch(JSON.stringify(rows[0]), /ARBITRARY_ACP_MODEL_SECRET/);
-	assert.equal(rows[0].attempt, 4);
-	assert.equal(rows[0].retry, true);
-	assert.ok(rows[0].timing.durationMs >= 0);
-	assert.equal(rows[0].timing.apiDurationMs, null);
+	const service = new AcpProviderService(
+		{ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] },
+		{ transportFactory: () => transport },
+	);
+	const selected = { agentId: 'gemini-profile', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'fast' };
+	const agent = await service.createAgent(selected, { recoverySummary: 'recover through the same session' });
+	assert.equal(agent.sessionGeneration, 1);
+	assert.equal(agent.profileFingerprint, profileFingerprint(selected));
+	assert.equal(await service.createAgent(selected, { recoverySummary: 'same profile retry' }), agent);
+	for (const mutation of [
+		{ model: 'auto' },
+		{ reasoningEffort: 'low' },
+		{ serviceTier: 'priority' },
+	]) {
+		await assert.rejects(
+			service.createAgent({ ...selected, ...mutation }),
+			(error) => error?.code === 'AGENT_PROFILE_CONFLICT'
+				&& error?.message.length <= 256
+				&& !error?.message.includes('secret'),
+		);
+	}
+	assert.equal(transport.calls.filter((call) => call.method === 'session/new').length, 1);
 	await service.stop();
 });
 
-test('ACP records authoritative identity, scheduler wait, and native per-turn usage categories', async () => {
+test('ACP session metadata stays warm and durable across sequential prompts', async () => {
 	const transport = new FakeAcpTransport(options());
-	transport.promptResponse = { stopReason: 'end_turn', usage: {
-		inputTokens: 80, outputTokens: 12, cachedReadTokens: 30, cachedWriteTokens: 4, thoughtTokens: 6, totalTokens: 98,
-	} };
 	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
-	const agent = await service.createAgent({ agentId: 'gemini-native-metrics', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	const selected = { agentId: 'gemini-session', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'priority' };
+	const agent = await service.createAgent(selected);
 	await agent.setGoalRevision(2);
-	const rows = [];
-	await agent.decide('authoritative state', { goalRevision: 2, queueWaitMs: 29, turnRecorder: { async record(row) { rows.push(row); } } });
-	assert.equal(rows[0].agentId, 'gemini-native-metrics');
-	assert.equal(rows[0].timing.queueWaitMs, 29);
-	assert.deepEqual(rows[0].tokens, { input: 80, output: 12, reasoning: 6, cached: 30, cacheWrite: 4 });
-	await service.stop();
-});
-
-test('Gemini ACP uses exact native quota counts only when standard ACP usage is absent', async () => {
-	const transport = new FakeAcpTransport(options());
-	transport.promptResponse = { stopReason: 'end_turn', _meta: { quota: { token_count: { input_tokens: 44, output_tokens: 9 } } } };
-	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
-	const agent = await service.createAgent({ agentId: 'gemini-quota', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
-	await agent.setGoalRevision(2);
-	const rows = [];
-	await agent.decide('state', { goalRevision: 2, turnRecorder: { async record(row) { rows.push(row); } } });
-	assert.deepEqual(rows[0].tokens, { input: 44, output: 9, reasoning: null, cached: null, cacheWrite: null });
-	await service.stop();
-});
-
-test('ACP does not label prose as a rate limit without a structured 429', async () => {
-	const transport = new FakeAcpTransport(options());
-	transport.request = async function (method, params) {
-		if (method !== 'session/prompt') return FakeAcpTransport.prototype.request.call(this, method, params);
-		throw Object.assign(new Error('incidental prose: too many blocks near rate limit HTTP 429'), { code: 'PROVIDER_UNAVAILABLE' });
-	};
-	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
-	const agent = await service.createAgent({ agentId: 'gemini-prose', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
-	await agent.setGoalRevision(2);
-	const rows = [];
-	await assert.rejects(agent.decide('state', { goalRevision: 2, turnRecorder: { async record(row) { rows.push(row); } } }));
-	assert.equal(Object.hasOwn(rows[0], 'rateLimited'), false);
+	await agent.decide('first authoritative state', { goalRevision: 2 });
+	const first = agent.sessionMetadata();
+	await agent.decide('second authoritative state', { goalRevision: 2 });
+	const second = agent.sessionMetadata();
+	assert.equal(first.sessionGeneration, 1);
+	assert.equal(first.sessionState, 'warm');
+	assert.equal(first.continuation, 'durable');
+	assert.deepEqual(second, first);
 	await service.stop();
 });
 
@@ -166,16 +145,14 @@ test('ACP processes and sessions use the same per-agent workspace', async () => 
 
 test('Kimi launches one effort-isolated process and applies the exact ACP thinking level', async () => {
 	const launch = buildAcpLaunch('kimi', { reasoningEffort: 'max' }, {
-		platform: 'win32', execPath: 'C:\\node.exe', existsSync: (value) => value === 'C:\\appdata\\npm\\node_modules\\@moonshot-ai\\kimi-code\\dist\\main.mjs',
 		env: {
 			PATH: 'test',
-			APPDATA: 'C:\\appdata',
 			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
 			ARENA_AGENT_BRIDGE_SECRET_FILE: 'C:\\runtime\\bridge.secret',
 		},
 	});
-	assert.equal(launch.command, 'C:\\node.exe');
-	assert.deepEqual(launch.args, ['C:\\appdata\\npm\\node_modules\\@moonshot-ai\\kimi-code\\dist\\main.mjs', 'acp']);
+	assert.equal(launch.command, 'kimi');
+	assert.deepEqual(launch.args, ['acp']);
 	assert.equal(launch.options.env.KIMI_MODEL_THINKING_EFFORT, 'max');
 	assert.equal(launch.options.env.PATH, 'test');
 	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET, undefined, 'provider child cannot inherit the bridge secret');
@@ -246,6 +223,56 @@ test('Kimi ACP accepts sessions that expose no thinking control because effort i
 	await service.stop();
 });
 
+test('Kimi K3 uses the API-key-backed Moonshot alias when it is available', async () => {
+	const transport = new FakeAcpTransport([
+		{
+			id: 'model', category: 'model', type: 'select', currentValue: 'moonshot-ai/kimi-k3',
+			options: [
+				{ value: 'kimi-code/k3', name: 'K3 OAuth' },
+				{ value: 'moonshot-ai/kimi-k3', name: 'K3 API' },
+			],
+		},
+	]);
+	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
+	await service.createAgent({ agentId: 'kimi-api-k3', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'high' });
+	assert.equal(transport.calls.some((call) => call.params?.configId === 'model'), false);
+	await service.stop();
+});
+
+test('Kimi K2.7 coding aliases use their API-key-backed Moonshot equivalents', async () => {
+	for (const [requested, routed] of [
+		['kimi-code/kimi-for-coding', 'moonshot-ai/kimi-k2.7-code'],
+		['kimi-code/kimi-for-coding-highspeed', 'moonshot-ai/kimi-k2.7-code-highspeed'],
+	]) {
+		const transport = new FakeAcpTransport([{
+			id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3',
+			options: [{ value: requested, name: 'OAuth' }, { value: routed, name: 'API' }],
+		}]);
+		const service = new AcpProviderService({
+			provider: 'kimi', cwd: 'C:\\workspace', models: [requested], reasoningEfforts: ['high'],
+			modelReasoningEfforts: { [requested]: ['high'] },
+		}, { transportFactory: () => transport });
+		await service.createAgent({ agentId: `route-${requested}`, provider: 'kimi', model: requested, reasoningEffort: 'high' });
+		assert.equal(transport.calls.find((call) => call.params?.configId === 'model')?.params.value, routed);
+		await service.stop();
+	}
+});
+
+test('Kimi empty turns surface provider availability instead of a misleading planner parse error', async () => {
+	const transport = new FakeAcpTransport([
+		{ id: 'model', category: 'model', type: 'select', currentValue: 'kimi-code/k3', options: [{ value: 'kimi-code/k3', name: 'K3' }] },
+	]);
+	transport.message = '';
+	const service = new AcpProviderService({ provider: 'kimi', cwd: 'C:\\workspace', reasoningEfforts: ['low', 'high', 'max'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'kimi-empty', provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'high' });
+	await agent.setGoalRevision(1);
+	await assert.rejects(
+		agent.decide('authoritative state', { goalRevision: 1 }),
+		(error) => error?.code === 'PROVIDER_UNAVAILABLE' && /login and membership entitlement/i.test(error.message),
+	);
+	await service.stop();
+});
+
 test('ACP refreshes dependent capabilities after changing the model', async () => {
 	const transport = new FakeAcpTransport([
 		{ id: 'model', category: 'model', type: 'select', currentValue: 'auto', options: [{ value: 'auto', name: 'Auto' }, { value: 'kimi-code/k3', name: 'K3' }] },
@@ -279,4 +306,67 @@ test('Kimi catalog retains the last discovered display names when a later CLI re
 	assert.deepEqual(retained, first);
 	assert.equal(retained.models[0].displayName, 'K2.7 Coding');
 	assert.equal(service.catalog.stale, true);
+});
+
+test('ACP malformed output records one final error row for the attempt', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.message = 'not-json ARBITRARY_ACP_MODEL_SECRET';
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-malformed-record', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	const turnRecorder = { async record(row) { rows.push(row); } };
+	await assert.rejects(agent.decide('authoritative state', { goalRevision: 2, turnRecorder, attempt: 4, retry: true }), (error) => error?.code === 'MALFORMED_DECISION');
+	assert.equal(rows.length, 1);
+	assert.equal(rows[0].error?.code, 'MALFORMED_DECISION');
+	assert.equal(rows[0].error?.category, 'decision_parse');
+	assert.doesNotMatch(JSON.stringify(rows[0]), /ARBITRARY_ACP_MODEL_SECRET/);
+	assert.equal(rows[0].attempt, 4);
+	assert.equal(rows[0].retry, true);
+	assert.ok(rows[0].timing.durationMs >= 0);
+	assert.equal(rows[0].timing.apiDurationMs, null);
+	await service.stop();
+});
+
+test('ACP records authoritative identity, scheduler wait, and native per-turn usage categories', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.promptResponse = { stopReason: 'end_turn', usage: {
+		inputTokens: 80, outputTokens: 12, cachedReadTokens: 30, cachedWriteTokens: 4, thoughtTokens: 6, totalTokens: 98,
+	} };
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-native-metrics', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	await agent.decide('authoritative state', { goalRevision: 2, queueWaitMs: 29, turnRecorder: { async record(row) { rows.push(row); } } });
+	assert.equal(rows[0].agentId, 'gemini-native-metrics');
+	assert.equal(rows[0].timing.queueWaitMs, 29);
+	assert.deepEqual(rows[0].tokens, { input: 80, output: 12, reasoning: 6, cached: 30, cacheWrite: 4 });
+	await service.stop();
+});
+
+test('Gemini ACP uses exact native quota counts only when standard ACP usage is absent', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.promptResponse = { stopReason: 'end_turn', _meta: { quota: { token_count: { input_tokens: 44, output_tokens: 9 } } } };
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-quota', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	await agent.decide('state', { goalRevision: 2, turnRecorder: { async record(row) { rows.push(row); } } });
+	assert.deepEqual(rows[0].tokens, { input: 44, output: 9, reasoning: null, cached: null, cacheWrite: null });
+	await service.stop();
+});
+
+test('ACP does not label prose as a rate limit without a structured 429', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.request = async function (method, params) {
+		if (method !== 'session/prompt') return FakeAcpTransport.prototype.request.call(this, method, params);
+		throw Object.assign(new Error('incidental prose: too many blocks near rate limit HTTP 429'), { code: 'PROVIDER_UNAVAILABLE' });
+	};
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-prose', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(2);
+	const rows = [];
+	await assert.rejects(agent.decide('state', { goalRevision: 2, turnRecorder: { async record(row) { rows.push(row); } } }));
+	assert.equal(Object.hasOwn(rows[0], 'rateLimited'), false);
+	await service.stop();
 });

@@ -13,6 +13,13 @@ import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntities;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntity;
+import dev.agaminggod.arenaagents.server.group.AgentGroup;
+import dev.agaminggod.arenaagents.server.group.AgentGroupRegistry;
+import dev.agaminggod.arenaagents.server.group.AgentGroupSavedData;
+import dev.agaminggod.arenaagents.server.group.AgentGroupSpawnCoordinator;
+import dev.agaminggod.arenaagents.server.conversation.ConversationEvent;
+import dev.agaminggod.arenaagents.server.conversation.PendingConversationWake;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -24,6 +31,7 @@ import java.util.WeakHashMap;
 import java.util.Set;
 import java.util.function.BiConsumer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -31,6 +39,8 @@ import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.FallingBlock;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.scores.PlayerTeam;
@@ -43,6 +53,7 @@ public final class CodexAgentManager {
 	private static final Map<MinecraftServer, CodexAgentManager> INSTANCES = new WeakHashMap<>();
 	private static final int AGENT_TICKET_RADIUS = 2;
 	private static final long PLAYER_SPAWN_TIMEOUT_MS = 10_000L;
+	private static final long RECOVERY_RETRY_DELAY_MS = 30_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
 	private static final String HIDDEN_AGENT_TEAM = "arenaagents_hidden";
 	private static final TicketType AGENT_TICKET_TYPE = new TicketType(
@@ -52,9 +63,13 @@ public final class CodexAgentManager {
 
 	private final MinecraftServer server;
 	private final AgentSavedData savedData;
+	private final AgentGroupSavedData groupSavedData;
 	private final Map<AgentId, AgentChunkTicket> chunkTickets = new LinkedHashMap<>();
 	private final Map<AgentChunkTicket, Integer> chunkTicketReferences = new LinkedHashMap<>();
 	private final Map<AgentId, Long> pendingPlayerSpawns = new LinkedHashMap<>();
+	private final Map<AgentId, VanillaRespawnAttempt> pendingVerifiedRespawns = new LinkedHashMap<>();
+	private final Set<AgentId> pendingAgentRegistrations = new LinkedHashSet<>();
+	private final Set<AgentId> pendingEntityRecoveries = new LinkedHashSet<>();
 	private final PendingSpawnCancellationLedger cancelledPlayerSpawns =
 			new PendingSpawnCancellationLedger(CANCELLED_SPAWN_RETENTION_MS);
 	private final Set<AgentId> seenPlayers = new LinkedHashSet<>();
@@ -63,6 +78,7 @@ public final class CodexAgentManager {
 	private CodexAgentManager(MinecraftServer server) {
 		this.server = Objects.requireNonNull(server, "server must not be null");
 		this.savedData = AgentSavedData.get(server);
+		this.groupSavedData = AgentGroupSavedData.get(server);
 		this.savedData.setRuntimeHooks(new ForwardingRuntimeHooks());
 	}
 
@@ -77,8 +93,10 @@ public final class CodexAgentManager {
 		CodexAgentManager manager = INSTANCES.remove(server);
 		if (manager != null) {
 			manager.runtimeHooks.onServerStopping();
+			manager.releasePendingVerifiedRespawns();
 			manager.releaseChunkTickets();
 			manager.savedData.setRuntimeHooks(AgentRuntimeHooks.NO_OP);
+			AgentInputRuntime.release(server);
 		}
 	}
 
@@ -147,20 +165,12 @@ public final class CodexAgentManager {
 					gameMode
 			);
 			pendingPlayerSpawns.put(created.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
-			AgentRecord attached = registry.attachEntity(
-					created.agentId(),
-					OfflineAgentPlayers.offlineUuid(created.agentId(), created.profile()),
-					entityLocation(level, new ChunkPos(
-							((int) Math.floor(position.x)) >> 4,
-							((int) Math.floor(position.z)) >> 4
-					)),
-					now
-			);
-			restoreChunkTicket(attached);
-			runtimeHooks.onCreated(attached);
-			return attached;
+			pendingAgentRegistrations.add(created.agentId());
+			return created;
 		} catch (RuntimeException exception) {
 			releaseChunkTicket(created.agentId());
+			pendingAgentRegistrations.remove(created.agentId());
+			pendingEntityRecoveries.remove(created.agentId());
 			OfflineAgentPlayers.find(server, created.agentId(), created.profile()).ifPresent(OfflineAgentPlayers::remove);
 			if (pendingPlayerSpawns.remove(created.agentId()) != null) {
 				cancelledPlayerSpawns.record(created.agentId(), System.currentTimeMillis());
@@ -177,6 +187,62 @@ public final class CodexAgentManager {
 	public AgentTransition start(String selector, String prompt) {
 		AgentRecord record = resolve(selector);
 		return savedData.registry().start(record.agentId(), prompt, System.currentTimeMillis());
+	}
+
+	public AgentTransition startAtomically(
+			AgentId agentId,
+			String prompt,
+			BiConsumer<AgentTransition, Runnable> publicationBarrier
+	) {
+		return savedData.registry().startAtomically(
+				Objects.requireNonNull(agentId, "agentId must not be null"),
+				prompt,
+				System.currentTimeMillis(),
+				Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null")
+		);
+	}
+
+	public AgentTransition startConversationWakeAtomically(
+			ConversationEvent event,
+			String prompt,
+			BiConsumer<PendingConversationWake, Runnable> publicationBarrier
+	) {
+		Objects.requireNonNull(event, "event must not be null");
+		Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null");
+		PendingConversationWake[] staged = { null };
+		try {
+			return savedData.registry().startAtomically(
+					event.agentId(), prompt, System.currentTimeMillis(),
+					(transition, commit) -> {
+						PendingConversationWake wake = PendingConversationWake.create(event, transition);
+						savedData.stageConversationWake(wake);
+						staged[0] = wake;
+						publicationBarrier.accept(wake, commit);
+					}
+			);
+		} catch (RuntimeException exception) {
+			if (staged[0] != null) savedData.rollbackConversationWake(staged[0].transactionId());
+			throw exception;
+		}
+	}
+
+	public List<PendingConversationWake> pendingConversationWakes() {
+		return savedData.conversationWakes();
+	}
+
+	public boolean acknowledgeConversationWake(UUID transactionId, AgentId agentId, long goalRevision) {
+		return savedData.acknowledgeConversationWake(transactionId, agentId, goalRevision);
+	}
+
+	public Optional<PendingConversationWake> pendingConversationWake(AgentId agentId) {
+		return savedData.conversationWake(agentId);
+	}
+
+	public AgentTransition rearmConversationWake(PendingConversationWake wake) {
+		Objects.requireNonNull(wake, "wake must not be null");
+		return savedData.registry().rearmConversationWake(
+				wake.event().agentId(), wake.goalRevision(), wake.goal().goalId(), System.currentTimeMillis()
+		);
 	}
 
 	public AgentTransition stop(String selector) {
@@ -210,19 +276,21 @@ public final class CodexAgentManager {
 					() -> new AgentDomainException("DEATH_SNAPSHOT_MISSING", "Dead agent has no persisted vanilla respawn facts")
 			);
 			OfflineAgentPlayers.VanillaRespawnTarget target = OfflineAgentPlayers.resolveVanillaRespawn(server, death);
-			findAgentPlayer(record.agentId()).ifPresent(OfflineAgentPlayers::remove);
-			OfflineAgentPlayers.spawn(
-					server,
-					record.agentId(),
-					record.profile(),
-					target.position(),
-					target.yaw(),
-					target.pitch(),
-					target.level().dimension(), target.gameMode()
-			);
 			long now = System.currentTimeMillis();
-			pendingPlayerSpawns.put(record.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
-			return new VanillaRespawnAttempt(record, target, now + PLAYER_SPAWN_TIMEOUT_MS);
+			VanillaRespawnAttempt attempt = new VanillaRespawnAttempt(record, target, now + PLAYER_SPAWN_TIMEOUT_MS);
+			Optional<ServerPlayer> existing = findAgentPlayer(record.agentId());
+			if (existing.isPresent()) {
+				AgentInputRuntime.clear(server, record.agentId());
+				ServerPlayer existingPlayer = existing.orElseThrow();
+				if (AgentRespawnSpawnPolicy.existingPlayerAction(existingPlayer.isAlive())
+						== AgentRespawnSpawnPolicy.ExistingPlayerAction.REMOVE_STALE_PLAYER) {
+					OfflineAgentPlayers.remove(existingPlayer);
+				}
+				pendingPlayerSpawns.put(record.agentId(), attempt.deadlineEpochMs());
+			} else {
+				requestVanillaRespawnPlayer(attempt, now);
+			}
+			return attempt;
 		} catch (RuntimeException exception) {
 			rollbackVanillaRespawn(record);
 			throw exception;
@@ -235,9 +303,22 @@ public final class CodexAgentManager {
 			throw new AgentDomainException("STALE_RESPAWN_ATTEMPT", "Dead lifecycle changed during respawn");
 		}
 		Optional<ServerPlayer> found = findAgentPlayer(attempt.deadRecord().agentId());
-		if (found.isEmpty()) {
-			if (nowEpochMs >= attempt.deadlineEpochMs()) throw new AgentDomainException("PLAYER_SPAWN_TIMEOUT", "Respawned player did not appear before the deadline");
-			return false;
+		AgentRespawnSpawnPolicy.Decision decision = AgentRespawnSpawnPolicy.decide(
+				attempt.spawnRequested, found.isPresent(), nowEpochMs, attempt.deadlineEpochMs()
+		);
+		switch (decision) {
+			case WAIT_FOR_REMOVAL, WAIT_FOR_SPAWN -> { return false; }
+			case REQUEST_SPAWN -> {
+				requestVanillaRespawnPlayer(attempt, nowEpochMs);
+				return false;
+			}
+			case TIMED_OUT -> throw new AgentDomainException(
+					attempt.spawnRequested ? "PLAYER_SPAWN_TIMEOUT" : "PLAYER_REMOVAL_TIMEOUT",
+					attempt.spawnRequested
+							? "Respawned player did not appear before the deadline"
+							: "Dead player did not leave before the respawn deadline"
+			);
+			case VERIFY_PLAYER -> { }
 		}
 		ServerPlayer player = found.orElseThrow();
 		if (!player.isAlive()) throw new AgentDomainException("PLAYER_SPAWN_FAILED", "Respawned player is not alive");
@@ -258,6 +339,23 @@ public final class CodexAgentManager {
 		return true;
 	}
 
+	private void requestVanillaRespawnPlayer(VanillaRespawnAttempt attempt, long nowEpochMs) {
+		AgentRecord record = attempt.deadRecord();
+		OfflineAgentPlayers.spawn(
+				server,
+				record.agentId(),
+				record.profile(),
+				attempt.target().position(),
+				attempt.target().yaw(),
+				attempt.target().pitch(),
+				attempt.target().level().dimension(),
+				attempt.target().gameMode()
+		);
+		attempt.spawnRequested = true;
+		attempt.deadlineEpochMs = nowEpochMs + PLAYER_SPAWN_TIMEOUT_MS;
+		pendingPlayerSpawns.put(record.agentId(), attempt.deadlineEpochMs);
+	}
+
 	public AgentTransition commitVanillaRespawn(
 			VanillaRespawnAttempt attempt,
 			BiConsumer<AgentTransition, Runnable> publicationBarrier
@@ -267,7 +365,7 @@ public final class CodexAgentManager {
 		Runnable rollbackWorld = () -> { };
 		try {
 			rollbackWorld = attempt.target().commitWorldEffects();
-			AgentEntityLocation location = entityLocation(player.level(), player.chunkPosition());
+			AgentEntityLocation location = entityLocation(player);
 			AgentTransition transition = savedData.registry().respawnAtomically(
 					attempt.deadRecord().agentId(), player.getUUID(), location, System.currentTimeMillis(),
 					(prepared, commit) -> {
@@ -281,6 +379,7 @@ public final class CodexAgentManager {
 					}
 			);
 			pendingPlayerSpawns.remove(attempt.deadRecord().agentId());
+			pendingEntityRecoveries.remove(attempt.deadRecord().agentId());
 			return transition;
 		} catch (RuntimeException exception) {
 			rollbackWorld.run();
@@ -296,13 +395,15 @@ public final class CodexAgentManager {
 	private void rollbackVanillaRespawn(AgentRecord deadRecord) {
 		releaseChunkTicket(deadRecord.agentId());
 		pendingPlayerSpawns.remove(deadRecord.agentId());
+		AgentInputRuntime.clear(server, deadRecord.agentId());
 		OfflineAgentPlayers.find(server, deadRecord.agentId(), deadRecord.profile()).ifPresent(OfflineAgentPlayers::remove);
 	}
 
 	public static final class VanillaRespawnAttempt {
 		private final AgentRecord deadRecord;
 		private final OfflineAgentPlayers.VanillaRespawnTarget target;
-		private final long deadlineEpochMs;
+		private long deadlineEpochMs;
+		private boolean spawnRequested;
 		private ServerPlayer verifiedPlayer;
 
 		private VanillaRespawnAttempt(AgentRecord deadRecord, OfflineAgentPlayers.VanillaRespawnTarget target, long deadlineEpochMs) {
@@ -318,6 +419,8 @@ public final class CodexAgentManager {
 
 	public void reconcileDeaths() {
 		long now = System.currentTimeMillis();
+		boolean recoveryAttempted = false;
+		tickVerifiedRespawns(now);
 		for (AgentId cancelled : cancelledPlayerSpawns.active(now)) {
 			try {
 				AgentRecord cancelledRecord = savedData.registry().require(cancelled);
@@ -327,18 +430,32 @@ public final class CodexAgentManager {
 			}
 		}
 		for (AgentRecord record : records()) {
+			if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
+				pendingEntityRecoveries.remove(record.agentId());
+				if (record.respawnPolicy() == dev.agaminggod.arenaagents.agent.RespawnPolicy.RESPAWN_AUTOMATICALLY
+						&& !pendingVerifiedRespawns.containsKey(record.agentId())
+						&& pendingPlayerSpawns.getOrDefault(record.agentId(), 0L) <= now) {
+					try {
+						pendingVerifiedRespawns.put(record.agentId(), beginVanillaRespawn(record.agentId()));
+					} catch (RuntimeException exception) {
+						scheduleRecoveryRetry(record.agentId(), now);
+						LOGGER.warn("Could not begin automatic respawn for agent {}", record.agentId(), exception);
+					}
+				}
+				continue;
+			}
 			Optional<ServerPlayer> player = findAgentPlayer(record.agentId());
 			if (player.isPresent() && player.get().isAlive()) {
 				pendingPlayerSpawns.remove(record.agentId());
 				seenPlayers.add(record.agentId());
-				if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
-					continue;
-				}
-				if (record.entityUuid().isEmpty() || !record.entityUuid().get().equals(player.get().getUUID())) {
-					savedData.registry().attachEntity(
+				AgentEntityLocation location = entityLocation(player.get());
+				AgentRecord attached = record;
+				if (record.entityUuid().filter(player.get().getUUID()::equals).isEmpty()
+						|| record.entityLocation().filter(location::equals).isEmpty()) {
+					attached = savedData.registry().attachEntity(
 							record.agentId(),
 							player.get().getUUID(),
-							entityLocation(player.get().level(), player.get().chunkPosition()),
+							location,
 							now
 					);
 				}
@@ -347,19 +464,121 @@ public final class CodexAgentManager {
 				player.get().setCustomNameVisible(false);
 				hideWorldName(player.get());
 				trackChunkTicket(record.agentId(), player.get());
-			} else if (player.isPresent() && record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
+				if (pendingAgentRegistrations.contains(record.agentId())) {
+					try {
+						runtimeHooks.onCreated(attached);
+						pendingAgentRegistrations.remove(record.agentId());
+					} catch (RuntimeException exception) {
+						LOGGER.warn("Could not publish verified agent registration for {}", record.agentId(), exception);
+					}
+				}
+				if (pendingEntityRecoveries.remove(record.agentId())
+						&& attached.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DISCONNECTED) {
+					savedData.registry().resume(record.agentId(), now);
+				}
+			} else if (player.isPresent()) {
+				AgentInputRuntime.clear(server, record.agentId());
 				savedData.registry().die(record.agentId(), deathSnapshot(player.get(), now), now);
-			} else if (record.state() != dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
+			} else {
 				long deadline = pendingPlayerSpawns.getOrDefault(record.agentId(), 0L);
 				if (deadline > now) continue;
-				if (seenPlayers.contains(record.agentId())) {
-					// A missing fake is not evidence of vanilla death. Preserve its lifecycle for recovery.
-					savedData.registry().disconnect(record.agentId(), now);
-					continue;
+				AgentRecord recoveryTarget = record;
+				AgentRecord recoveryRecord = record;
+				if (record.entityUuid().isPresent()) {
+					releaseChunkTicket(record.agentId());
+					AgentInputRuntime.clear(server, record.agentId());
+					recoveryRecord = savedData.registry().detachEntity(record.agentId(), now);
 				}
-				recoverOfflinePlayer(record, now);
+				if (seenPlayers.contains(record.agentId()) && recoveryRecord.state().isActive()) {
+					AgentTransition disconnected = savedData.registry().disconnect(record.agentId(), now);
+					pendingEntityRecoveries.add(record.agentId());
+					recoveryRecord = disconnected.after();
+				}
+				if (recoveryAttempted) continue;
+				recoveryAttempted = recoverOfflinePlayer(recoveryTarget, now);
 			}
 		}
+	}
+
+	public AgentGroup saveGroup(String name, List<AgentId> memberIds) {
+		List<AgentId> checkedIds = List.copyOf(Objects.requireNonNull(memberIds, "memberIds must not be null"));
+		for (AgentId memberId : checkedIds) savedData.registry().require(memberId);
+		return groupSavedData.registry().save(name, checkedIds);
+	}
+
+	public AgentGroup deleteGroup(String name) {
+		return groupSavedData.registry().delete(name);
+	}
+
+	public List<AgentGroup> groups() {
+		return groupSavedData.registry().groups();
+	}
+
+	public AgentGroupSpawnCoordinator.Result spawnGroup(String name) {
+		AgentGroup group = groupSavedData.registry().require(name);
+		return AgentGroupSpawnCoordinator.spawn(group, this::ensureGroupMemberPresent);
+	}
+
+	public AgentRecord requestRespawn(String selector) {
+		AgentRecord record = resolve(selector);
+		requestVerifiedRespawn(record.agentId());
+		return record;
+	}
+
+	private void requestVerifiedRespawn(AgentId agentId) {
+		if (pendingVerifiedRespawns.containsKey(agentId)) return;
+		long now = System.currentTimeMillis();
+		if (pendingPlayerSpawns.getOrDefault(agentId, 0L) > now) {
+			throw new AgentDomainException("RESPAWN_ALREADY_PENDING", "The agent player is already respawning");
+		}
+		pendingVerifiedRespawns.put(agentId, beginVanillaRespawn(agentId));
+	}
+
+	private AgentGroupSpawnCoordinator.MemberStatus ensureGroupMemberPresent(AgentId agentId) {
+		AgentRecord record;
+		try {
+			record = savedData.registry().require(agentId);
+		} catch (AgentDomainException exception) {
+			if ("AGENT_NOT_FOUND".equals(exception.code())) return AgentGroupSpawnCoordinator.MemberStatus.MISSING;
+			throw exception;
+		}
+		Optional<ServerPlayer> player = OfflineAgentPlayers.find(server, agentId, record.profile());
+		if (player.filter(ServerPlayer::isAlive).isPresent()) {
+			return AgentGroupSpawnCoordinator.MemberStatus.PRESENT;
+		}
+		if (record.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DEAD) {
+			requestVerifiedRespawn(agentId);
+			return AgentGroupSpawnCoordinator.MemberStatus.RESTORING;
+		}
+		recoverOfflinePlayer(record, System.currentTimeMillis());
+		return AgentGroupSpawnCoordinator.MemberStatus.RESTORING;
+	}
+
+	private void tickVerifiedRespawns(long nowEpochMs) {
+		for (Map.Entry<AgentId, VanillaRespawnAttempt> entry : List.copyOf(pendingVerifiedRespawns.entrySet())) {
+			AgentId agentId = entry.getKey();
+			VanillaRespawnAttempt attempt = entry.getValue();
+			try {
+				if (!verifyVanillaRespawn(attempt, nowEpochMs)) continue;
+				commitVanillaRespawn(attempt, (transition, commit) -> {
+					commit.run();
+					runtimeHooks.onTransition(transition);
+				});
+				pendingVerifiedRespawns.remove(agentId, attempt);
+			} catch (RuntimeException exception) {
+				pendingVerifiedRespawns.remove(agentId, attempt);
+				rollbackVanillaRespawn(attempt);
+				scheduleRecoveryRetry(agentId, nowEpochMs);
+				LOGGER.warn("Could not complete verified respawn for agent {}", agentId, exception);
+			}
+		}
+	}
+
+	private void releasePendingVerifiedRespawns() {
+		for (VanillaRespawnAttempt attempt : List.copyOf(pendingVerifiedRespawns.values())) {
+			rollbackVanillaRespawn(attempt);
+		}
+		pendingVerifiedRespawns.clear();
 	}
 
 	public boolean captureDeath(ServerPlayer player, DamageSource source) {
@@ -372,6 +591,10 @@ public final class CodexAgentManager {
 		} catch (RuntimeException ignored) {
 			cause = "Agent died";
 		}
+		records().stream()
+				.filter(record -> OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile()).equals(player.getUUID()))
+				.findFirst()
+				.ifPresent(record -> AgentInputRuntime.clear(server, record.agentId()));
 		return AgentDeathCapture.record(
 				savedData.registry(), player.getUUID(), deathSnapshot(player, cause, now), now
 		);
@@ -423,32 +646,42 @@ public final class CodexAgentManager {
 		server.getScoreboard().addPlayerToTeam(player.getScoreboardName(), team);
 	}
 
-	private void recoverOfflinePlayer(AgentRecord record, long now) {
-		ServerLevel level;
-		Vec3 position;
-		Optional<CodexAgentEntity> legacy = findAgentEntity(record.agentId());
-		if (legacy.isPresent() && legacy.get().level() instanceof ServerLevel legacyLevel) {
-			level = legacyLevel;
-			position = legacy.get().position();
-			legacy.get().discard();
-		} else if (record.entityLocation().isPresent()) {
-			AgentEntityLocation location = record.entityLocation().get();
-			level = findLevel(location.dimension()).orElse(server.overworld());
-			int x = (location.chunkX() << 4) + 8;
-			int z = (location.chunkZ() << 4) + 8;
-			BlockPos ground = level.getHeightmapPos(
-					Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
-					new BlockPos(x, 0, z)
-			);
-			position = Vec3.atBottomCenterOf(ground.above());
-		} else {
-			level = server.overworld();
-			BlockPos ground = level.getHeightmapPos(
-					Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
-					new BlockPos(0, 0, 0)
-			);
-			position = Vec3.atBottomCenterOf(ground.above());
+	private boolean recoverOfflinePlayer(AgentRecord record, long now) {
+		Optional<RecoverySpawn> recovery;
+		try {
+			Optional<CodexAgentEntity> legacy = findAgentEntity(record.agentId());
+			if (legacy.isPresent() && legacy.get().level() instanceof ServerLevel legacyLevel) {
+				Vec3 legacyPosition = legacy.get().position();
+				legacy.get().discard();
+				AgentRecoverySpawnPolicy.ChunkPosition chunk =
+						AgentRecoverySpawnPolicy.chunkContaining(legacyPosition.x, legacyPosition.z);
+				recovery = findRecoverySpawn(
+						legacyLevel,
+						chunk.x(),
+						chunk.z(),
+						java.util.OptionalInt.of((int) Math.floor(legacyPosition.y))
+				);
+			} else if (record.entityLocation().isPresent()) {
+				AgentEntityLocation location = record.entityLocation().orElseThrow();
+				recovery = findLevel(location.dimension())
+						.flatMap(level -> findRecoverySpawn(
+								level, location.chunkX(), location.chunkZ(), location.blockY()));
+			} else {
+				recovery = Optional.empty();
+			}
+			if (recovery.isEmpty()) recovery = findOverworldSpawnRecovery();
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not search for a safe recovery position for agent {}", record.agentId().value(), exception);
+			scheduleRecoveryRetry(record.agentId(), now);
+			return false;
 		}
+		if (recovery.isEmpty()) {
+			LOGGER.warn("No dry supported recovery position is available for agent {}", record.agentId().value());
+			scheduleRecoveryRetry(record.agentId(), now);
+			return false;
+		}
+		ServerLevel level = recovery.orElseThrow().level();
+		Vec3 position = recovery.orElseThrow().position();
 		try {
 			OfflineAgentPlayers.spawn(
 					server,
@@ -461,18 +694,132 @@ public final class CodexAgentManager {
 					record.profile().gameMode()
 			);
 			pendingPlayerSpawns.put(record.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
-			savedData.registry().attachEntity(
-					record.agentId(),
-					OfflineAgentPlayers.offlineUuid(record.agentId(), record.profile()),
-					entityLocation(level, new ChunkPos(
-							((int) Math.floor(position.x)) >> 4,
-							((int) Math.floor(position.z)) >> 4
-					)),
-					now
-			);
-		} catch (AgentDomainException exception) {
-			pendingPlayerSpawns.put(record.agentId(), now + 5_000L);
+			return true;
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not request a recovery player spawn for agent {}", record.agentId().value(), exception);
+			scheduleRecoveryRetry(record.agentId(), now);
+			return false;
 		}
+	}
+
+	private void scheduleRecoveryRetry(AgentId agentId, long now) {
+		pendingPlayerSpawns.put(agentId, now + RECOVERY_RETRY_DELAY_MS);
+	}
+
+	private Optional<RecoverySpawn> findOverworldSpawnRecovery() {
+		ServerLevel overworld = server.overworld();
+		BlockPos spawn = overworld.getRespawnData().pos();
+		return findRecoverySpawn(
+				overworld,
+				spawn.getX() >> 4,
+				spawn.getZ() >> 4,
+				java.util.OptionalInt.of(spawn.getY())
+		);
+	}
+
+	private Optional<RecoverySpawn> findRecoverySpawn(
+			ServerLevel level,
+			int chunkX,
+			int chunkZ,
+			java.util.OptionalInt preferredY
+	) {
+		level.getChunk(chunkX, chunkZ);
+		int centerX = (chunkX << 4) + 8;
+		int centerZ = (chunkZ << 4) + 8;
+		Optional<RecoverySpawn> local = findRecoverySpawnInBounds(
+				level,
+				centerX,
+				centerZ,
+				chunkX << 4,
+				((chunkX + 1) << 4) - 1,
+				chunkZ << 4,
+				((chunkZ + 1) << 4) - 1,
+				preferredY
+		);
+		if (local.isPresent()) return local;
+
+		int chunkRadius = 1;
+		for (int x = chunkX - chunkRadius; x <= chunkX + chunkRadius; x++) {
+			for (int z = chunkZ - chunkRadius; z <= chunkZ + chunkRadius; z++) {
+				if (x != chunkX || z != chunkZ) level.getChunk(x, z);
+			}
+		}
+		int minX = (chunkX - chunkRadius) << 4;
+		int maxX = ((chunkX + chunkRadius + 1) << 4) - 1;
+		int minZ = (chunkZ - chunkRadius) << 4;
+		int maxZ = ((chunkZ + chunkRadius + 1) << 4) - 1;
+		return findRecoverySpawnInBounds(level, centerX, centerZ, minX, maxX, minZ, maxZ, preferredY);
+	}
+
+	private Optional<RecoverySpawn> findRecoverySpawnInBounds(
+			ServerLevel level,
+			int centerX,
+			int centerZ,
+			int minX,
+			int maxX,
+			int minZ,
+			int maxZ,
+			java.util.OptionalInt preferredY
+	) {
+		return AgentRecoverySpawnPolicy.selectNearestDryPosition(
+				centerX, centerZ, minX, maxX, minZ, maxZ,
+				(x, z) -> recoveryColumn(level, x, z, preferredY)
+		).map(selected -> new RecoverySpawn(
+				level,
+				Vec3.atBottomCenterOf(new BlockPos(selected.x(), selected.y(), selected.z()))
+		));
+	}
+
+	private AgentRecoverySpawnPolicy.Column recoveryColumn(
+			ServerLevel level,
+			int x,
+			int z,
+			java.util.OptionalInt preferredY
+	) {
+		if (preferredY.isEmpty()) {
+			BlockPos surface = level.getHeightmapPos(Heightmap.Types.WORLD_SURFACE, new BlockPos(x, 0, z));
+			return recoveryColumnAt(level, x, surface.getY(), z);
+		}
+		java.util.OptionalInt selected = AgentRecoverySpawnPolicy.selectNearestSafeY(
+				preferredY.getAsInt(),
+				level.getMinY() + 1,
+				level.getMaxY() - 2,
+				y -> recoveryColumnAt(level, x, y, z).safe()
+		);
+		if (selected.isEmpty()) {
+			return new AgentRecoverySpawnPolicy.Column(
+					preferredY.getAsInt(), false, false, false, false, false, false, false);
+		}
+		return recoveryColumnAt(level, x, selected.getAsInt(), z);
+	}
+
+	private AgentRecoverySpawnPolicy.Column recoveryColumnAt(ServerLevel level, int x, int y, int z) {
+		BlockPos feet = new BlockPos(x, y, z);
+		BlockPos floor = feet.below();
+		BlockPos head = feet.above();
+		var floorState = level.getBlockState(floor);
+		BlockPos floorSupport = floor.below();
+		boolean safeFloor = floorState.isFaceSturdy(level, floor, Direction.UP)
+				&& !floorState.is(Blocks.CACTUS)
+				&& !floorState.is(Blocks.MAGMA_BLOCK)
+				&& !floorState.is(Blocks.CAMPFIRE)
+				&& !floorState.is(Blocks.SOUL_CAMPFIRE)
+				&& !floorState.is(Blocks.POWDER_SNOW);
+		boolean stableFloor = !(floorState.getBlock() instanceof FallingBlock)
+				|| level.getBlockState(floorSupport).isFaceSturdy(level, floorSupport, Direction.UP);
+		return new AgentRecoverySpawnPolicy.Column(
+				feet.getY(),
+				safeFloor,
+				stableFloor,
+				level.getFluidState(floor).isEmpty(),
+				level.getBlockState(feet).getCollisionShape(level, feet).isEmpty(),
+				level.getFluidState(feet).isEmpty(),
+				level.getBlockState(head).getCollisionShape(level, head).isEmpty(),
+				level.getFluidState(head).isEmpty()
+		);
+	}
+
+	private record RecoverySpawn(ServerLevel level, Vec3 position) {
 	}
 
 	public void maintainChunkTickets() {
@@ -482,30 +829,39 @@ public final class CodexAgentManager {
 				continue;
 			}
 			restoreChunkTicket(record);
-			findAgentPlayer(record.agentId()).ifPresent(entity -> trackChunkTicket(record.agentId(), entity));
+			if (record.entityUuid().isPresent()) {
+				findAgentPlayer(record.agentId()).ifPresent(entity -> trackChunkTicket(record.agentId(), entity));
+			}
 		}
 	}
 
 	public AgentRecord remove(String selector) {
 		AgentRecord record = resolve(selector);
 		Optional<ServerPlayer> player = findAgentPlayer(record.agentId());
+		AgentInputRuntime.clear(server, record.agentId());
 		long terminalRevision = record.goalRevision() == Long.MAX_VALUE
 				? Long.MAX_VALUE
 				: record.goalRevision() + 1L;
-		return AgentRemovalCoordinator.removeRegistryFirst(
+		AgentRecord removed = AgentRemovalCoordinator.removeRegistryFirst(
 				savedData.registry(),
 				record.agentId(),
 				() -> {
+					VanillaRespawnAttempt pendingRespawn = pendingVerifiedRespawns.remove(record.agentId());
+					if (pendingRespawn != null) rollbackVanillaRespawn(pendingRespawn);
 					releaseChunkTicket(record.agentId());
 					player.ifPresent(OfflineAgentPlayers::remove);
 					if (pendingPlayerSpawns.remove(record.agentId()) != null) {
 						cancelledPlayerSpawns.record(record.agentId(), System.currentTimeMillis());
 					}
+					pendingAgentRegistrations.remove(record.agentId());
+					pendingEntityRecoveries.remove(record.agentId());
 					seenPlayers.remove(record.agentId());
 				},
 				() -> runtimeHooks.onRemoved(record.agentId(), terminalRevision),
 				failure -> LOGGER.warn("Post-delete cleanup failed for agent {}", record.agentId(), failure)
 		);
+		savedData.clearConversationWake(record.agentId());
+		return removed;
 	}
 
 	public boolean toggleAutomaticProgress(String selector) {
@@ -622,11 +978,16 @@ public final class CodexAgentManager {
 		return Optional.empty();
 	}
 
-	private static AgentEntityLocation entityLocation(ServerLevel level, ChunkPos position) {
+	private static AgentEntityLocation entityLocation(Entity entity) {
+		if (!(entity.level() instanceof ServerLevel level)) {
+			throw new AgentDomainException("AGENT_LEVEL_INVALID", "Codex agent is not in a server level");
+		}
+		ChunkPos position = entity.chunkPosition();
 		return new AgentEntityLocation(
 				level.dimension().identifier().toString(),
 				position.x(),
-				position.z()
+				position.z(),
+				java.util.OptionalInt.of((int) Math.floor(entity.getY()))
 		);
 	}
 
@@ -637,7 +998,7 @@ public final class CodexAgentManager {
 		ChunkPos position = entity.chunkPosition();
 		AgentChunkTicket current = chunkTickets.get(agentId);
 		if (current != null && current.level() == level && current.position().equals(position)) {
-			savedData.registry().updateEntityLocation(agentId, entityLocation(level, position), System.currentTimeMillis());
+			savedData.registry().updateEntityLocation(agentId, entityLocation(entity), System.currentTimeMillis());
 			return;
 		}
 		AgentChunkTicket next = new AgentChunkTicket(level, position);
@@ -646,7 +1007,7 @@ public final class CodexAgentManager {
 			releaseChunkTicket(current);
 		}
 		chunkTickets.put(agentId, next);
-		savedData.registry().updateEntityLocation(agentId, entityLocation(level, position), System.currentTimeMillis());
+		savedData.registry().updateEntityLocation(agentId, entityLocation(entity), System.currentTimeMillis());
 	}
 
 	private void releaseChunkTicket(AgentId agentId) {

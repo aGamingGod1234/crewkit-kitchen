@@ -36,6 +36,19 @@ export function buildCodexArgs(config) {
 		'-c', `model_reasoning_effort="${effort}"`,
 		'-c', `service_tier="${serviceTier}"`,
 		'-c', 'features.fast_mode=true',
+		'-c', 'mcp_servers={}',
+		'-c', 'features.apps=false',
+		'-c', 'features.browser_use=false',
+		'-c', 'features.computer_use=false',
+		'-c', 'features.goals=false',
+		'-c', 'features.hooks=false',
+		'-c', 'features.image_generation=false',
+		'-c', 'features.multi_agent=false',
+		'-c', 'features.plugins=false',
+		'-c', 'features.skill_search=false',
+		'-c', 'features.shell_tool=false',
+		'-c', 'features.unified_exec=false',
+		'-c', 'features.view_image=false',
 	];
 }
 
@@ -125,6 +138,14 @@ export class CodexStdioTransport extends EventEmitter {
 		this.#write({ method, params });
 	}
 
+	respond(id, result) {
+		this.#requireRunning();
+		if ((typeof id !== 'string' || id.length === 0) && !Number.isSafeInteger(id)) {
+			throw new TypeError('Codex server request id must be a nonblank string or safe integer');
+		}
+		this.#write({ id, result });
+	}
+
 	async stop() {
 		const child = this.#child;
 		if (child === null) return;
@@ -144,6 +165,10 @@ export class CodexStdioTransport extends EventEmitter {
 	}
 
 	#acceptMessage(message) {
+		if (Object.hasOwn(message, 'id') && typeof message.method === 'string') {
+			this.emit('serverRequest', { id: message.id, method: message.method, params: message.params ?? {} });
+			return;
+		}
 		if (Object.hasOwn(message, 'id')) {
 			const pending = this.#pending.get(message.id);
 			if (pending === undefined) {
@@ -231,6 +256,9 @@ export class CodexAgent {
 				model: this.#config.model,
 				serviceTier: this.#config.serviceTier,
 				cwd: this.#config.cwd,
+				allowProviderModelFallback: false,
+				runtimeWorkspaceRoots: [this.#config.cwd],
+				selectedCapabilityRoots: [],
 				approvalPolicy: 'never',
 				sandbox: 'read-only',
 				dynamicTools: [],

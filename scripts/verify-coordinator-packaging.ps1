@@ -26,11 +26,16 @@ try {
     try { $manifest = @($reader.ReadToEnd() -split "\r?\n" | Where-Object { $_ -ne '' }) }
     finally { $reader.Dispose() }
 
+	$manifestRecords = @($manifest | ForEach-Object {
+		if ($_ -notmatch '^(?<Hash>[0-9a-f]{64}) (?<Path>.+)$') { throw "Invalid coordinator manifest entry: $_" }
+		[pscustomobject]@{ Hash = $Matches.Hash; Path = $Matches.Path }
+	})
+
     $actual = @($entries |
         Where-Object { $_.StartsWith($prefix) -and $_ -ne $manifestPath -and -not $_.EndsWith('/') } |
         ForEach-Object { $_.Substring($prefix.Length) } |
         Sort-Object)
-    $expected = @($manifest | Sort-Object)
+    $expected = @($manifestRecords.Path | Sort-Object)
     if (@(Compare-Object -ReferenceObject $expected -DifferenceObject $actual).Count -ne 0) {
         throw 'Coordinator manifest does not match the embedded runtime file set.'
     }
@@ -54,6 +59,16 @@ try {
     if ($forbidden.Count -ne 0) {
         throw "Forbidden coordinator entries are embedded: $($forbidden -join ', ')"
     }
+
+	foreach ($record in $manifestRecords) {
+		$entry = $archive.GetEntry($prefix + $record.Path)
+		if ($null -eq $entry) { throw "Manifest resource is missing: $($record.Path)" }
+		$sha = [Security.Cryptography.SHA256]::Create()
+		$stream = $entry.Open()
+		try { $actualHash = (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '') }
+		finally { $stream.Dispose(); $sha.Dispose() }
+		if ($actualHash -cne $record.Hash) { throw "Manifest hash differs from embedded resource: $($record.Path)" }
+	}
 
     if (-not [string]::IsNullOrWhiteSpace($StagingPath)) {
         $resolvedStaging = (Resolve-Path -LiteralPath $StagingPath).Path

@@ -5,9 +5,11 @@ import { parseDecision } from '../src/decision-parser.mjs';
 import { SCRIPT_PRIMITIVES } from '../src/arena-script/minecraft-api.mjs';
 import { buildPlannerInput, PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from '../src/prompts.mjs';
 
+const COMPLETION_CONTRACT = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
+
 test('parses a replace envelope containing ArenaScript source', () => {
 	const source = 'program.onUnhandledAttention("continue_and_notify");';
-	const wire = { summary: 'Gather logs', directive: 'replace', source };
+	const wire = { summary: 'Gather logs', directive: 'replace', source, completionContract: COMPLETION_CONTRACT };
 	assert.deepEqual(parseDecision(JSON.stringify(wire)), wire);
 	assert.deepEqual(parseDecision(`\`\`\`json\n${JSON.stringify(wire)}\n\`\`\``), wire);
 });
@@ -19,11 +21,11 @@ test('parses non-replacement envelopes without unused fields', () => {
 	assert.deepEqual(parseDecision('{"summary":"Awaiting a selected-model turn","directive":"pause"}'), {
 		summary: 'Awaiting a selected-model turn', directive: 'pause',
 	});
-	assert.deepEqual(parseDecision('{"summary":"Goal complete","directive":"finish","status":"completed"}'), {
-		summary: 'Goal complete', directive: 'finish', status: 'completed',
+	assert.deepEqual(parseDecision(JSON.stringify({ summary: 'Goal complete', directive: 'finish', status: 'completed', completionContract: COMPLETION_CONTRACT })), {
+		summary: 'Goal complete', directive: 'finish', status: 'completed', completionContract: COMPLETION_CONTRACT,
 	});
-	assert.deepEqual(parseDecision('{"summary":"No observed route","directive":"finish","status":"impossible"}'), {
-		summary: 'No observed route', directive: 'finish', status: 'impossible',
+	assert.deepEqual(parseDecision(JSON.stringify({ summary: 'No observed route', directive: 'finish', status: 'impossible', completionContract: COMPLETION_CONTRACT })), {
+		summary: 'No observed route', directive: 'finish', status: 'impossible', completionContract: COMPLETION_CONTRACT,
 	});
 });
 
@@ -37,6 +39,19 @@ test('enforces discriminated envelope fields and summary bounds', () => {
 	assert.throws(() => parseDecision('{"summary":"x","directive":"cancel"}'), /directive/);
 	assert.throws(() => parseDecision('{"summary":"","directive":"continue"}'), /summary/);
 	assert.throws(() => parseDecision(JSON.stringify({ summary: 'x'.repeat(2_049), directive: 'continue' })), /summary/);
+});
+
+test('requires a revision-bound factual contract for every completion-capable decision', () => {
+	const contract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
+	assert.deepEqual(parseDecision(JSON.stringify({ summary: 'Crafted', directive: 'replace', source: 'program.finish("done");', completionContract: contract })), {
+		summary: 'Crafted', directive: 'replace', source: 'program.finish("done");', completionContract: contract,
+	});
+	assert.deepEqual(parseDecision(JSON.stringify({ summary: 'Done', directive: 'finish', status: 'completed', completionContract: contract })), {
+		summary: 'Done', directive: 'finish', status: 'completed', completionContract: contract,
+	});
+	assert.throws(() => parseDecision('{"summary":"Done","directive":"finish","status":"completed"}'), /completionContract/i);
+	assert.throws(() => parseDecision(JSON.stringify({ summary: 'Wait', directive: 'replace', source: 'program.wait(1);', completionContract: null })), /completionContract/i);
+	assert.throws(() => parseDecision(JSON.stringify({ summary: 'Wait', directive: 'continue', completionContract: contract })), /completionContract/i);
 });
 
 test('rejects prose, multiple objects, unknown keys, and old action-list fields', () => {
@@ -61,7 +76,7 @@ test('rejects duplicate JSON envelope keys before a later value can override the
 });
 
 test('bounds replace source by UTF-8 bytes rather than JavaScript character count', () => {
-	const envelope = (source) => JSON.stringify({ summary: 'x', directive: 'replace', source });
+	const envelope = (source) => JSON.stringify({ summary: 'x', directive: 'replace', source, completionContract: COMPLETION_CONTRACT });
 	assert.doesNotThrow(() => parseDecision(envelope('a'.repeat(65_532) + '🙂')));
 	assert.throws(
 		() => parseDecision(envelope('a'.repeat(65_533) + '🙂')),
@@ -80,17 +95,28 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /multi-tree and pickup example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /watcher example/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /compiler diagnostics.*correct/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /do not use Math/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /no bracket.*computed.*optional member access/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /do not iterate factual candidate arrays/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /world\.nearest.*\.length/i);
+	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /for \(const candidate of candidates\)/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /string concatenation.*both operands.*strings/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /do not concatenate numeric candidate fields/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /coordinate-free player\.respawn\(\)/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /valid only while the authoritative player facts report dead/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /respawnDimensionId.*respawnX.*respawnY.*respawnZ.*respawnYaw.*respawnPitch.*respawnForced.*gameMode/s);
 	assert.match(PLANNER_SYSTEM_PROMPT, /never invent.*respawn/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*exact registered recipe id/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /craft.*count.*minimum output.*one recipe execution/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /never retry the same action signature after a deterministic failure/i);
 	assert.deepEqual([...SCRIPT_PRIMITIVES].sort(), [
-		'attack', 'block_with_shield', 'break_block', 'chat', 'craft_inventory', 'craft_table', 'drop_item',
-		'equip_item', 'furnace_transaction', 'look_at', 'move_to', 'navigate_to', 'place_block', 'respawn',
-		'select_item', 'select_tool', 'set_door', 'transfer_container', 'use_item', 'use_ranged', 'wait',
+		'anvil_rename', 'attack', 'block_with_shield', 'break_block', 'chat', 'craft_inventory', 'craft_table', 'dismount',
+		'drop_item', 'equip_item', 'furnace_transaction', 'interact_block', 'interact_entity', 'look_at',
+		'menu_button', 'menu_transfer', 'move_to', 'navigate_to', 'place_block', 'respawn', 'select_item', 'select_tool', 'set_door',
+		'start_fall_flying', 'transfer_container', 'use_item', 'use_ranged', 'wait',
 	]);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /default priority framework|preserve life before|prefer cooked food/i);
-	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.required, ['summary', 'directive', 'source', 'status']);
+	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.required, ['summary', 'directive', 'source', 'status', 'completionContract']);
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.directive, {
 		type: 'string', enum: ['replace', 'continue', 'pause', 'finish'],
 	});
@@ -100,12 +126,12 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 
 test('parses the canonical nullable decision envelope required by the Codex structured-output API', () => {
 	assert.deepEqual(
-		parseDecision('{"summary":"Wait","directive":"replace","source":"program.onUnhandledAttention(\\"continue_and_notify\\"); await player.wait(1);","status":null}'),
-		{ summary: 'Wait', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);' },
+		parseDecision(JSON.stringify({ summary: 'Wait', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);', status: null, completionContract: COMPLETION_CONTRACT })),
+		{ summary: 'Wait', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);', completionContract: COMPLETION_CONTRACT },
 	);
 	assert.deepEqual(
-		parseDecision('{"summary":"Done","directive":"finish","source":null,"status":"completed"}'),
-		{ summary: 'Done', directive: 'finish', status: 'completed' },
+		parseDecision(JSON.stringify({ summary: 'Done', directive: 'finish', source: null, status: 'completed', completionContract: COMPLETION_CONTRACT })),
+		{ summary: 'Done', directive: 'finish', status: 'completed', completionContract: COMPLETION_CONTRACT },
 	);
 });
 

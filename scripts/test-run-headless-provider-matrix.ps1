@@ -250,6 +250,8 @@ function Test-PortClosed([int] $Port) {
 }
 
 $project = Join-Path ([IO.Path]::GetTempPath()) "arena-headless-wrapper-test-$([Guid]::NewGuid().ToString('N'))"
+$originalAppData = [Environment]::GetEnvironmentVariable('APPDATA')
+$originalLocalAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA')
 New-Item -ItemType Directory -Path $project -Force | Out-Null
 try {
 	Set-TestEnvironment 'ARENA_HEADLESS_JAVA' (Join-Path $project 'not-java.exe')
@@ -262,6 +264,8 @@ try {
 
 	$fixture = Join-Path $project 'fixture'
 	New-Fixture $fixture
+	Set-TestEnvironment 'APPDATA' (Join-Path $fixture 'fake-appdata')
+	Set-TestEnvironment 'LOCALAPPDATA' (Join-Path $fixture 'fake-localappdata')
 	Set-TestEnvironment 'ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT' '1'
 	Set-TestEnvironment 'ARENA_HEADLESS_MINECRAFT_PORT' '39165'
 	Set-TestEnvironment 'ARENA_HEADLESS_RCON_PORT' '39166'
@@ -435,6 +439,8 @@ try {
 	Write-Output 'PASS timeout cleanup, port verification, child-tree cleanup, and provider isolation hooks'
 } finally {
 	foreach ($name in @('ARENA_HEADLESS_JAVA','ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT','ARENA_HEADLESS_MINECRAFT_PORT','ARENA_HEADLESS_RCON_PORT','ARENA_HEADLESS_BRIDGE_PORT','ARENA_HEADLESS_FAKE_NO_HELLO_ACK','ARENA_HEADLESS_FAKE_SUMMON_RESPONSE','ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS','ARENA_HEADLESS_CLEANUP_TIMEOUT_SECONDS','ARENA_HEADLESS_RUNNER_GRACE_SECONDS','ARENA_HEADLESS_GRACEFUL_STOP_TIMEOUT_SECONDS','ARENA_HEADLESS_OUTPUT_DRAIN_TIMEOUT_MILLISECONDS')) { Set-TestEnvironment $name $null }
+	Set-TestEnvironment 'APPDATA' $originalAppData
+	Set-TestEnvironment 'LOCALAPPDATA' $originalLocalAppData
 	if (Test-Path -LiteralPath $project) {
 		$extendedProject = if ($project.StartsWith('\\')) { '\\?\UNC\' + $project.Substring(2) } else { '\\?\' + [IO.Path]::GetFullPath($project) }
 		[IO.Directory]::Delete($extendedProject, $true)

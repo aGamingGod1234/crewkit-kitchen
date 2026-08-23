@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server;
 
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
+import dev.agaminggod.arenaagents.control.AgentControlGroup;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotPayload;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchPayload;
@@ -189,12 +190,19 @@ public final class AgentControlSync {
 	public static void sendSnapshot(ServerPlayer player) {
 		try {
 			boolean canControl = GoalControl.mayControl(player.createCommandSourceStack());
+			CodexAgentManager manager = CodexAgentManager.get(player.level().getServer());
 			AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(
 					canControl,
 					CodexAgentServerRuntime.automationAvailable(player.level().getServer()),
 					CodexAgentServerRuntime.automationStatus(player.level().getServer()),
 					System.currentTimeMillis(),
-					CodexAgentManager.get(player.level().getServer()).records(),
+					manager.records(),
+					manager.groups().stream()
+							.map(group -> new AgentControlGroup(
+									group.name(),
+									group.memberIds().stream().map(Object::toString).toList()
+							))
+							.toList(),
 					CodexAgentServerRuntime.modelCatalog(player.level().getServer())
 			);
 			if (ServerPlayNetworking.canSend(player, AgentControlSnapshotPayload.TYPE)) {

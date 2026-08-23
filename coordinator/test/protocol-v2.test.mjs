@@ -3,8 +3,10 @@ import { EventEmitter, once } from 'node:events';
 import test from 'node:test';
 
 import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { completionContractFingerprint } from '../src/goal-contract.mjs';
 
 const SECRET = 's'.repeat(32);
+const TRACE_ID = 'trace-wire-1';
 const DESIRED_OAK_STAIRS_STATE = 'minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]';
 const PROVENANCE = Object.freeze({
 	provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
@@ -45,6 +47,26 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 		circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 100, p95Ms: 200, failureRate: 0, circuit: 'closed' }],
 	};
 	assert.deepEqual(validateProtocolV2Payload('coordinator_status', payload), { ...payload, latencies: [] });
+	assert.deepEqual(validateProtocolV2Payload('coordinator_status', {
+		...payload,
+		scheduler: { ...payload.scheduler, active: 3, target: 2 },
+	}).scheduler, { ...payload.scheduler, active: 3, target: 2 });
+	assert.deepEqual(validateProtocolV2Payload('coordinator_status', {
+		...payload,
+		scheduler: {
+			...payload.scheduler,
+			active: 5,
+			mode: 'adaptive',
+			configuredTarget: 4,
+			target: 5,
+			minConcurrency: 4,
+			maxConcurrency: 16,
+		},
+	}).scheduler.active, 5);
+	assert.throws(() => validateProtocolV2Payload('coordinator_status', {
+		...payload,
+		scheduler: { ...payload.scheduler, active: 5 },
+	}), /counts exceed capacity/i);
 	const latency = { operation: 'observation_to_plan', count: 8, p50Ms: 25.25, p95Ms: 80.75 };
 	assert.deepEqual(
 		validateProtocolV2Payload('coordinator_status', { ...payload, latencies: [latency] }).latencies,
@@ -59,22 +81,76 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 	}), /field/i);
 });
 
-test('protocol v2 carries a coordinator goal completion update', () => {
-	const payload = { goalRevision: 4 };
+test('protocol v2 carries a revision/profile/trace-bound factual goal completion request', () => {
+	const completionContract = { goalRevision: 4, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
+	const payload = {
+		goalRevision: 4,
+		completionContract,
+		traceId: TRACE_ID,
+		profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
+		contractHash: completionContractFingerprint(completionContract),
+	};
 	assert.deepEqual(validateProtocolV2Payload('goal_completed', payload), payload);
-	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, unexpected: true }), /field/i);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_completed', { goalRevision: 4 }),
+		error => error.code === 'CONTRACT_REQUIRED',
+		'goal completion cannot fall back to a revision-only proof',
+	);
+	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, contractHash: 'sha256:wrong' }), /contractHash/i);
+	const completionResult = {
+		goalRevision: 4, traceId: TRACE_ID, contractHash: payload.contractHash, verified: false, reasonCode: 'PREDICATE_FAILED',
+		facts: [
+			{ predicateIndex: 0, type: 'inventory_min', satisfied: false, observedValue: '0' },
+			{ predicateIndex: 1, type: 'position_within', satisfied: true, observedValue: '1.25' },
+		],
+	};
+	assert.deepEqual(validateProtocolV2Payload('goal_completion_result', completionResult), completionResult);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_completion_result', { ...completionResult, facts: Array.from({ length: 17 }, () => completionResult.facts[0]) }),
+		/facts/i,
+	);
+});
+
+test('protocol v2 carries one acknowledged conversation wake transaction', () => {
+	const event = {
+		sequence: 7, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+		text: 'Can you respond?', goalRevision: 3, observedAtEpochMs: 20,
+	};
+	const control = { operation: 'start', goalRevision: 4, updatedAtEpochMs: 21, goal: 'Respond to the player.' };
+	const payload = { transactionId: 'wake-00000001', event, control };
+	assert.deepEqual(validateProtocolV2Payload('conversation_wake', payload), payload);
+	assert.deepEqual(
+		validateProtocolV2Payload('conversation_wake_ack', { transactionId: payload.transactionId, goalRevision: 4 }),
+		{ transactionId: payload.transactionId, goalRevision: 4 },
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('conversation_wake', { ...payload, control: { ...control, goalRevision: 5 } }),
+		/revision/i,
+		'composite wake revisions must be consecutive',
+	);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('conversation_wake', 'agent-b', 'wake-1', payload), { direction: 'server_to_coordinator' }),
+		/recipientId|scope/i,
+		'the nested conversation recipient must match the envelope agent',
+	);
 });
 
 test('protocol v2 requires immutable provenance on every action command form', () => {
 	const payload = {
-		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
 	};
 	const normalized = validateProtocolV2Payload('action_command', payload);
 	assert.deepEqual(normalized.provenance, PROVENANCE);
 	assert.throws(() => { normalized.provenance.programId = 'forged'; }, TypeError);
 	assert.equal(PROVENANCE.programId, 'program-1-1');
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, provenance: { ...PROVENANCE, traceId: 'trace-other' } }),
+		(error) => error.code === 'INVALID_PAYLOAD' && /traceId/.test(error.message),
+		'provenance trace IDs cannot diverge from the command trace',
+	);
 	assert.throws(() => validateProtocolV2Payload('action_command', { ...payload, provenance: undefined }), /provenance/);
 	assert.throws(() => validateProtocolV2Payload('action_command', {
+		traceId: TRACE_ID,
 		goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 },
 	}), /provenance/);
 	for (const alias of ['commandId', 'command', 'type', 'action']) {
@@ -103,9 +179,52 @@ test('protocol v2 requires immutable provenance on every action command form', (
 	);
 });
 
+test('protocol v2 carries a bounded watcher identity with the selected trace', () => {
+	const payload = {
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-watcher', actionType: 'wait', arguments: { durationMs: 25 },
+		provenance: { ...PROVENANCE, traceId: TRACE_ID, watcherId: 'watcher-0' },
+	};
+	assert.equal(validateProtocolV2Payload('action_command', payload).provenance.watcherId, 'watcher-0');
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, provenance: { ...payload.provenance, traceId: undefined } }),
+		/traceId/i,
+		'watcher provenance must select a trace',
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('action_command', { ...payload, provenance: { ...payload.provenance, watcherId: 'x'.repeat(129) } }),
+		/watcherId/i,
+	);
+});
+
+test('traced action commands, progress, and results round-trip one bounded trace ID', () => {
+	const traceId = 'trace-wire-1';
+	const command = validateProtocolV2Payload('action_command', {
+		traceId, goalRevision: 1, actionId: 'action-trace-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
+	});
+	const progress = validateProtocolV2Payload('action_progress', {
+		traceId, goalRevision: 1, actionId: 'action-trace-1', commandId: 'action-trace-1', actionType: 'wait', state: 'RUNNING', progress: 0.5,
+	});
+	const result = validateProtocolV2Payload('action_result', {
+		traceId, goalRevision: 1, actionId: 'action-trace-1', commandId: 'action-trace-1', actionType: 'wait', state: 'SUCCEEDED', reasonCode: 'DONE', message: '', elapsedMs: 10, observedAtEpochMs: 20,
+	});
+	assert.equal(command.traceId, traceId);
+	assert.equal(progress.traceId, traceId);
+	assert.equal(result.traceId, traceId);
+	for (const type of ['action_command', 'action_progress', 'action_result']) {
+		const payload = type === 'action_command' ? { traceId, goalRevision: 1, actionId: 'action-trace-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }
+			: type === 'action_progress' ? { traceId, goalRevision: 1, actionId: 'action-trace-1', state: 'RUNNING' }
+			: { traceId, goalRevision: 1, actionId: 'action-trace-1', commandId: 'action-trace-1', actionType: 'wait', state: 'SUCCEEDED', reasonCode: 'DONE', message: '', elapsedMs: 10, observedAtEpochMs: 20 };
+		assert.throws(() => validateProtocolV2Payload(type, { ...payload, traceId: '' }), /traceId/i, `${type} rejects blank trace IDs`);
+		assert.throws(() => validateProtocolV2Payload(type, { ...payload, traceId: '🙂'.repeat(40) }), /traceId/i, `${type} rejects overlong UTF-8 trace IDs`);
+	}
+	assert.throws(() => validateProtocolV2Payload('action_command', {
+		traceId: undefined, goalRevision: 1, actionId: 'action-trace-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
+	}), /traceId/i);
+});
+
 test('protocol v2 accepts only coordinate-free respawn arguments', () => {
 	const payload = {
-		goalRevision: 7, actionId: 'respawn-1', actionType: 'respawn', arguments: {}, provenance: PROVENANCE,
+		traceId: TRACE_ID, goalRevision: 7, actionId: 'respawn-1', actionType: 'respawn', arguments: {}, provenance: PROVENANCE,
 	};
 	assert.deepEqual(validateProtocolV2Payload('action_command', payload).arguments, {});
 	assert.throws(
@@ -200,6 +319,7 @@ function registeredRecord(agentId = 'agent-a') {
 
 function actionResult(actionId, goalRevision = 4) {
 	return {
+		traceId: `trace-${actionId}`,
 		goalRevision,
 		actionId,
 		commandId: actionId,
@@ -244,6 +364,25 @@ function readyServerObservation(goalRevision = 4) {
 				distance: 3.25,
 			},
 			effects: [{ effectId: 'minecraft:speed', amplifier: 1, duration: 120 }],
+		},
+		interaction: {
+			mainHandItemId: 'minecraft:bread',
+			offHandItemId: 'minecraft:shield',
+			usingItem: false,
+			activeHand: 'none',
+			useRemainingTicks: 0,
+			attackCooldown: 1,
+			input: {
+				active: true, forward: 1, strafe: 0, jump: false, sneak: false, sprint: true,
+				attack: false, use: false, yaw: 90, pitch: 0, selectedSlot: 2, hand: 'main_hand',
+			},
+			menu: {
+				type: 'minecraft:inventory',
+				cursor: { itemId: 'minecraft:air', count: 0 },
+				slots: [{ slot: 0, itemId: 'minecraft:air', count: 0 }],
+				capabilities: [],
+			},
+			rayTarget: { type: 'block', x: 11, y: 64, z: -3, face: 'north', blockId: 'minecraft:oak_log' },
 		},
 		inventory: {
 			items: [
@@ -343,6 +482,13 @@ test('multiplexed bridge authenticates once and learns the complete registry sna
 	bridge.stop();
 });
 
+test('unused coordinator wake requests are not part of protocol v2', () => {
+	assert.throws(
+		() => validateProtocolV2Payload('conversation_wake_request', { goalRevision: 1, kind: 'player_message' }),
+		/unsupported protocol v2 payload type/i,
+	);
+});
+
 test('multiplexed bridge audits validated detached inbound and outbound envelopes', async () => {
 	const socket = new FakeSocket();
 	const audit = [];
@@ -363,6 +509,7 @@ test('multiplexed bridge audits validated detached inbound and outbound envelope
 	socket.emit('data', `${JSON.stringify(serverEnvelope('observation', 'agent-a', 'server-2', readyServerObservation(4)))}\n`);
 	await bridge.send('agent_ready', 'agent-a', { goalRevision: 4 });
 	await bridge.send('action_command', 'agent-a', {
+		traceId: TRACE_ID,
 		goalRevision: 4, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE,
 	});
 	assert.deepEqual(audit.map(({ direction, envelope }) => [direction, envelope.messageId, envelope.type, envelope.agentId]), [
@@ -390,7 +537,9 @@ test('audit callback failures never interrupt bridge delivery', async () => {
 	socket.emit('connect');
 	const hello = JSON.parse(socket.writes[0]);
 	const ready = once(bridge, 'ready');
-	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
 	await ready;
 	await bridge.send('agent_ready', 'agent-a', { goalRevision: 4 });
 	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'agent_ready');
@@ -412,6 +561,7 @@ test('multiplexed bridge rejects stale revisions before writing', async () => {
 	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
 	await ready;
 	await assert.rejects(bridge.send('action_command', 'agent-a', {
+		traceId: TRACE_ID,
 		goalRevision: 8,
 		actionId: 'action-1',
 		actionType: 'wait',
@@ -498,6 +648,7 @@ test('a newer lifecycle revision removes queued stale action commands under back
 	socket.writable = false;
 	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
 	const staleCommand = bridge.send('action_command', 'agent-a', {
+		traceId: TRACE_ID,
 		goalRevision: 1,
 		actionId: 'action-stale',
 		actionType: 'wait',
@@ -550,6 +701,7 @@ test('a newer lifecycle revision removes queued stale agent readiness under back
 
 test('strict payload validators accept every current wire shape and reject unknown fields', () => {
 	const catalog = { refreshedAtEpochMs: 1, models: [{ id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT 5.6 Sol', reasoningEfforts: ['high'], serviceTiers: ['fast'] }] };
+	const completionContract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
 	const messages = [
 		['hello', { secret: SECRET }],
 		['hello_ack', { replyTo: 'coordinator-1', authenticated: true, registry: [registeredRecord()] }],
@@ -559,12 +711,13 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['agent_removed', { goalRevision: 1 }],
 		['goal_control', { operation: 'start', goalRevision: 1, updatedAtEpochMs: 2, goal: 'Build shelter.' }],
 		['observation', { goalRevision: 1, observedAtEpochMs: 2, ready: false, status: 'ENTITY_UNAVAILABLE' }],
-		['action_progress', { goalRevision: 1, actionId: 'action-1', state: 'RUNNING', progress: 0.5 }],
+		['action_progress', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', state: 'RUNNING', progress: 0.5 }],
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
-		['goal_completed', { goalRevision: 1 }],
-		['action_command', { goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
+		['goal_completed', { goalRevision: 1, completionContract, traceId: TRACE_ID, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' }, contractHash: completionContractFingerprint(completionContract) }],
+		['goal_completion_result', { goalRevision: 1, traceId: TRACE_ID, contractHash: completionContractFingerprint(completionContract), verified: false, reasonCode: 'PREDICATE_FAILED', facts: [] }],
+		['action_command', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],
 		['heartbeat', {}],
@@ -574,17 +727,6 @@ test('strict payload validators accept every current wire shape and reject unkno
 	assert.deepEqual(validateProtocolV2Payload('agent_ready', { goalRevision: 2 }), { goalRevision: 2 });
 	for (const [type, payload] of messages) assert.throws(() => validateProtocolV2Payload(type, { ...payload, unexpected: true }), (error) => error.code === 'INVALID_PAYLOAD_FIELD', type);
 	assert.throws(() => validateProtocolV2Payload('hello_ack', { replyTo: 'x', authenticated: true, registry: Array(1_025).fill(registeredRecord()) }), /at most 1024/);
-});
-
-test('catalog snapshots carry Cursor Composer and Grok profiles', () => {
-	const model = {
-		provider: 'cursor', id: 'cursor:composer-2.5', model: 'composer-2.5', displayName: 'Composer 2.5',
-		reasoningEfforts: ['low', 'high'], serviceTiers: ['priority', 'fast'],
-	};
-	assert.deepEqual(
-		validateProtocolV2Payload('catalog_snapshot', { refreshedAtEpochMs: 1, models: [model] }).models,
-		[model],
-	);
 });
 
 test('action cancellation requires an exact goal revision and action identity', () => {
@@ -609,6 +751,7 @@ test('protocol v2 validates raw transaction arguments before normalizing action 
 		count: 3, expectedItemId: 'minecraft:oak_log', timeoutMs: 5_000,
 	};
 	const normalized = validateProtocolV2Payload('action_command', {
+		traceId: TRACE_ID,
 		goalRevision: 4,
 		actionId: 'action-transaction-1',
 		actionType: 'transfer_container',
@@ -618,6 +761,7 @@ test('protocol v2 validates raw transaction arguments before normalizing action 
 	assert.deepEqual(normalized.arguments, validTransfer);
 	assert.throws(
 		() => validateProtocolV2Payload('action_command', {
+			traceId: TRACE_ID,
 			goalRevision: 4,
 			actionId: 'action-transaction-2',
 			actionType: 'transfer_container',
@@ -633,6 +777,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 		x: 1, y: 64, z: -2, face: 'up', itemId: 'minecraft:oak_stairs', desiredState: DESIRED_OAK_STAIRS_STATE,
 	};
 	const normalized = validateProtocolV2Payload('action_command', {
+		traceId: TRACE_ID,
 		goalRevision: 4,
 		actionId: 'action-place-1',
 		actionType: 'place_block',
@@ -642,6 +787,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 	assert.deepEqual(normalized.arguments, placeArguments);
 	assert.equal(
 		validateProtocolV2Payload('action_command', {
+			traceId: TRACE_ID,
 			goalRevision: 4, actionId: 'action-place-2', actionType: 'place_block',
 			arguments: { ...placeArguments, desiredState: null },
 			provenance: PROVENANCE,
@@ -650,6 +796,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 	);
 	assert.equal(
 		validateProtocolV2Payload('action_command', {
+			traceId: TRACE_ID,
 			goalRevision: 4, actionId: 'action-place-3', actionType: 'place_block',
 			arguments: { ...placeArguments, desiredState: 'minecraft:stone[facing=north]' },
 			provenance: PROVENANCE,
@@ -658,6 +805,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 	);
 	assert.throws(
 		() => validateProtocolV2Payload('action_command', {
+			traceId: TRACE_ID,
 			goalRevision: 4, actionId: 'action-place-4', actionType: 'place_block',
 			arguments: { ...placeArguments, desiredState: 'x'.repeat(513) },
 			provenance: PROVENANCE,
@@ -670,6 +818,7 @@ test('protocol v2 rejects retired high-level controller action types', () => {
 	for (const actionType of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
 		assert.throws(
 			() => validateProtocolV2Payload('action_command', {
+				traceId: TRACE_ID,
 				goalRevision: 4, actionId: `retired-${actionType}`, actionType, arguments: {}, provenance: PROVENANCE,
 			}),
 			(error) => error.code === 'INVALID_ACTION' && /Unsupported action/.test(error.message),
@@ -687,6 +836,8 @@ test('accepts the exact rich ready observation emitted by ServerObservationColle
 	assert.equal(normalized.player.foodLevel, 14);
 	assert.equal(normalized.player.lastAttacker.type, 'minecraft:zombie');
 	assert.equal(normalized.player.effects[0].duration, 120);
+	assert.equal(normalized.interaction.input.sprint, true);
+	assert.equal(normalized.interaction.rayTarget.blockId, 'minecraft:oak_log');
 	assert.equal(normalized.inventory.items[0].slot, 'chest');
 	assert.equal(normalized.inventory.items[1].slot, 2);
 	assert.equal(normalized.inventory.selectedItem, 'minecraft:bread');
@@ -789,4 +940,92 @@ test('malformed action results fail before terminal-result tracking or delivery'
 	const [error] = await failed;
 	assert.equal(error.code, 'INVALID_PAYLOAD_FIELD');
 	assert.equal(delivered, false);
+});
+
+test('validates strict targeted conversation events with Unicode code-point limits', () => {
+	const payload = {
+		sequence: 18,
+		kind: 'agent_message',
+		sourceId: 'agent-source',
+		recipientId: 'agent-a',
+		scope: 'direct',
+		text: '\ud83d\ude80'.repeat(512),
+		goalRevision: 4,
+		observedAtEpochMs: 1_787_184_000_000,
+	};
+	assert.deepEqual(validateProtocolV2Payload('conversation_event', payload), payload);
+	assert.throws(() => validateProtocolV2Payload('conversation_event', { ...payload, text: '\ud83d\ude80'.repeat(513) }), /512 code points/);
+	assert.throws(() => validateProtocolV2Payload('conversation_event', { ...payload, extra: true }), /Unknown/);
+	assert.throws(() => validateProtocolV2Payload('conversation_event', { ...payload, sequence: -1 }), /sequence/);
+	assert.throws(() => validateProtocolV2Envelope(serverEnvelope('conversation_event', 'agent-a', 'server-2', { ...payload, recipientId: 'agent-b' }), { direction: 'server_to_coordinator' }), /recipientId/);
+});
+
+test('delivers a conversation event once through an authenticated bridge', async () => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge(
+		{ port: 25570, secret: SECRET },
+		{ socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4 },
+	);
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
+	await ready;
+	const payload = {
+		sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+		text: 'Meet at spawn.', goalRevision: 4, observedAtEpochMs: 1_787_184_000_000,
+	};
+	const delivered = once(bridge, 'conversation_event');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('conversation_event', 'agent-a', 'server-2', payload))}\n`);
+	const [message] = await delivered;
+	assert.deepEqual(message.payload, payload);
+	bridge.stop();
+});
+
+test('authenticated bridge accepts same-revision conversation wake replay and its acknowledgement', async () => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 1,
+	});
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId,
+		authenticated: true,
+		registry: [{ ...registeredRecord(), state: 'STARTING', currentGoal: 'Respond.', goalRevision: 1 }],
+	}))}\n`);
+	await ready;
+	const payload = {
+		transactionId: 'wake-replay-1',
+		event: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Hello?', goalRevision: 0, observedAtEpochMs: 10,
+		},
+		control: { operation: 'start', goalRevision: 1, updatedAtEpochMs: 11, goal: 'Respond.' },
+	};
+	const delivered = once(bridge, 'conversation_wake');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('conversation_wake', 'agent-a', 'server-2', payload))}\n`);
+	assert.deepEqual((await delivered)[0].payload, payload);
+	await bridge.send('conversation_wake_ack', 'agent-a', { transactionId: payload.transactionId, goalRevision: 1 });
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'conversation_wake_ack');
+	assert.equal(socket.destroyed, false);
+	bridge.stop();
+});
+
+
+test('catalog snapshots carry Cursor Composer and Grok profiles', () => {
+	const model = {
+		provider: 'cursor', id: 'cursor:composer-2.5', model: 'composer-2.5', displayName: 'Composer 2.5',
+		reasoningEfforts: ['low', 'high'], serviceTiers: ['priority', 'fast'],
+	};
+	assert.deepEqual(
+		validateProtocolV2Payload('catalog_snapshot', { refreshedAtEpochMs: 1, models: [model] }).models,
+		[model],
+	);
 });

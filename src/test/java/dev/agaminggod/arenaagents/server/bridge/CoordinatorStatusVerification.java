@@ -24,6 +24,32 @@ public final class CoordinatorStatusVerification {
 		legacy.remove("latencies");
 		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(legacy, 1_000L).latencies().isEmpty(),
 				"legacy status without latencies remains compatible");
+		JsonObject extendedScheduler = payload();
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("mode", "adaptive");
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("configuredTarget", 4);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("target", 4);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("minConcurrency", 4);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("maxConcurrency", 16);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("urgentReserve", 1);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("ordinaryActiveLimit", 3);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("activeOrdinary", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("activeUrgent", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("pendingOrdinary", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("pendingUrgent", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("growthCount", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("backoffCount", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("lastChangeReason", "initial");
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("healthyCompletions", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("ordinaryReservationRejections", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("urgentReservationRejections", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("active", 5);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("target", 5);
+		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(extendedScheduler, 1_000L).scheduler().maxConcurrent() == 4,
+				"extended scheduler telemetry remains wire-compatible");
+		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(extendedScheduler, 1_000L).scheduler().hardConcurrentLimit() == 16,
+				"adaptive growth validates against the hard concurrency limit");
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("privateSchedulerField", "must not cross");
+		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(extendedScheduler, 1_000L), "unknown scheduler field rejected");
 		JsonObject numericIdentity = payload();
 		numericIdentity.getAsJsonArray("profiles").get(0).getAsJsonObject().addProperty("provider", 7);
 		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(numericIdentity, 1_000L), "numeric status identity rejected");
@@ -42,7 +68,7 @@ public final class CoordinatorStatusVerification {
 				"catalog speed tiers preserved");
 		catalog.addProperty("privatePrompt", "must never cross this seam");
 		assertThrows(() -> MultiplexedServerBridge.decodeCatalog(catalog), "unknown catalog field rejected");
-		return 14;
+		return 16;
 	}
 
 	private static JsonObject catalogPayload() {

@@ -10,6 +10,7 @@ const ACTION_BINDINGS = Object.freeze(Object.assign(Object.create(null), {
 		wait: Object.freeze(Object.assign(Object.create(null), { primitive: 'wait' })),
 		attack: Object.freeze(Object.assign(Object.create(null), { primitive: 'attack' })),
 		useRanged: Object.freeze(Object.assign(Object.create(null), { primitive: 'use_ranged' })),
+		craftInventory: Object.freeze(Object.assign(Object.create(null), { primitive: 'craft_inventory' })),
 	})),
 }));
 
@@ -100,14 +101,14 @@ test('runs a registered watcher only when its condition is true', () => {
 		program.watch(
 			() => player.state().health < 10,
 			{ mode: "boundary" },
-			async () => { program.finish("heal"); }
+			async () => { await player.wait(1); }
 		);
 	`);
 	assert.equal(vm.start(facts()).kind, 'idle');
 	assert.equal(vm.runWatcher('watcher-0', facts()).kind, 'idle');
 	const fired = vm.runWatcher('watcher-0', facts({ player: { health: 8 } }));
-	assert.equal(fired.kind, 'finish');
-	assert.equal(fired.summary, 'heal');
+	assert.equal(fired.kind, 'command');
+	assert.equal(fired.call.primitive, 'wait');
 });
 
 test('executes local functions, safe local records, bounded iteration, and repeatUntil', () => {
@@ -243,7 +244,7 @@ test('keeps finished and checkpointed programs inactive for watcher execution', 
 	for (const terminal of ['program.finish("done")', 'program.checkpoint("paused")']) {
 		const vm = interpreter(`
 			program.onUnhandledAttention("continue_and_notify");
-			program.watch(() => true, { mode: "boundary" }, async () => { program.finish("watch"); });
+			program.watch(() => true, { mode: "boundary" }, async () => { await player.wait(1); });
 			${terminal};
 		`);
 		vm.start(facts());
@@ -262,6 +263,76 @@ test('resets per-slice loop budget after each valid command result while retaini
 	const exhausted = vm.resume(actionResult(third), facts());
 	assert.equal(exhausted.kind, 'checkpoint');
 	assert.equal(exhausted.reason, 'repeat_until_exhausted');
+});
+
+test('requests model recovery after the same deterministic failure twice', () => {
+	const vm = interpreter(`
+		program.onUnhandledAttention("continue_and_notify");
+		await program.repeatUntil(() => false, { maxIterations: 8 }, async () => {
+			await player.craftInventory({ recipeId: "minecraft:planks", count: 1, timeoutMs: 5000 });
+		});
+	`);
+	const first = vm.start(facts());
+	const second = vm.resume(actionResult(first, 'FAILED', 'RECIPE_NOT_FOUND'), facts());
+	assert.equal(second.kind, 'command', 'one failure remains available to authored fallback logic');
+	const stopped = vm.resume(actionResult(second, 'FAILED', 'RECIPE_NOT_FOUND'), facts());
+	assert.equal(stopped.kind, 'replan');
+	assert.equal(stopped.reason, 'repeated_action_failure:RECIPE_NOT_FOUND');
+	assert.deepEqual({ ...stopped.failure, arguments: { ...stopped.failure.arguments } }, {
+		actionType: 'craft_inventory',
+		arguments: { recipeId: 'minecraft:planks', count: 1, timeoutMs: 5000 },
+		state: 'FAILED',
+		reasonCode: 'RECIPE_NOT_FOUND',
+	});
+});
+
+test('requests model recovery for repeated malformed actions and timeouts', () => {
+	for (const [state, reasonCode] of [['FAILED', 'INVALID_ACTION'], ['TIMED_OUT', 'ACTION_TIMED_OUT']]) {
+		const vm = interpreter(`
+			program.onUnhandledAttention("continue_and_notify");
+			await program.repeatUntil(() => false, { maxIterations: 4 }, async () => {
+				await player.wait({ durationMs: 50 });
+			});
+		`);
+		const first = vm.start(facts());
+		const second = vm.resume(actionResult(first, state, reasonCode), facts());
+		const stopped = vm.resume(actionResult(second, state, reasonCode), facts());
+		assert.equal(stopped.kind, 'replan', `${reasonCode} stops an unchanged retry loop`);
+		assert.equal(stopped.failure.state, state);
+		assert.equal(stopped.failure.reasonCode, reasonCode);
+	}
+});
+
+test('does not conflate changed action arguments at one source step', () => {
+	const vm = interpreter(`
+		program.onUnhandledAttention("continue_and_notify");
+		await program.repeatUntil(() => false, { maxIterations: 4 }, async () => {
+			const recipeId = inventory.countTag("#minecraft:sticks") === 0 ? "minecraft:jungle_planks" : "minecraft:planks";
+			await player.craftInventory({ recipeId, count: 1, timeoutMs: 5000 });
+		});
+	`);
+	const first = vm.start(facts());
+	const changedFacts = facts({ inventory: { tagCounts: { '#minecraft:sticks': 1 } } });
+	const changed = vm.resume(actionResult(first, 'FAILED', 'RECIPE_NOT_FOUND'), changedFacts);
+	assert.equal(changed.kind, 'command');
+	assert.equal(changed.call.arguments.recipeId, 'minecraft:planks');
+	const stopped = vm.resume(actionResult(changed, 'FAILED', 'RECIPE_NOT_FOUND'), changedFacts);
+	assert.equal(stopped.kind, 'command', 'a changed command signature starts a fresh failure streak');
+});
+
+test('a different intervening command resets the deterministic failure streak', () => {
+	const vm = interpreter(`
+		program.onUnhandledAttention("continue_and_notify");
+		await player.craftInventory({ recipeId: "minecraft:planks", count: 1, timeoutMs: 5000 });
+		await player.wait({ durationMs: 50 });
+		await player.craftInventory({ recipeId: "minecraft:planks", count: 1, timeoutMs: 5000 });
+		program.finish("done");
+	`);
+	const first = vm.start(facts());
+	const wait = vm.resume(actionResult(first, 'FAILED', 'RECIPE_NOT_FOUND'), facts());
+	const secondCraft = vm.resume(actionResult(wait, 'SUCCEEDED', 'WAIT_COMPLETE'), facts());
+	const finished = vm.resume(actionResult(secondCraft, 'FAILED', 'RECIPE_NOT_FOUND'), facts());
+	assert.equal(finished.kind, 'finish', 'non-consecutive identical failures remain available to authored recovery');
 });
 
 test('does not poison lifecycle when start rejects invalid facts', () => {
@@ -291,10 +362,26 @@ test('bounds canonical facts, results, and command output without native stack o
 	assert.throws(() => outputVm.start(facts({ player: { blob: 'x'.repeat(8_193) } })), (error) => error.code === 'OUTPUT_LIMIT');
 });
 
+test('accepts a full bounded Minecraft block observation above the old 16 KiB fact ceiling', () => {
+	const blocks = Array.from({ length: 128 }, (_, index) => ({
+		stableId: `${index},64,0`,
+		blockId: 'minecraft:chiseled_copper',
+		tags: [
+			`#minecraft:mineable/pickaxe_${'long_path_'.repeat(8)}${index}`,
+			`#minecraft:needs_stone_tool_${'bounded_tag_'.repeat(8)}${index}`,
+		],
+		x: index,
+		y: 64,
+		z: 0,
+	}));
+	const vm = interpreter('program.onUnhandledAttention("continue_and_notify"); program.finish("observed");');
+	assert.equal(vm.start(facts({ world: { blocks } })).kind, 'finish');
+});
+
 test('pauses execution errors and blocks watcher activation afterward', () => {
 	const vm = interpreter(`
 		program.onUnhandledAttention("continue_and_notify");
-		program.watch(() => true, { mode: "boundary" }, async () => { program.finish("watch"); });
+		program.watch(() => true, { mode: "boundary" }, async () => { await player.wait(1); });
 		for (let index = 0; index < 2; index += 1) { }
 	`, { loopIterationsPerYield: 1 });
 	assert.throws(() => vm.start(facts()), (error) => error.code === 'LOOP_LIMIT');

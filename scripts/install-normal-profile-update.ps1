@@ -88,8 +88,13 @@ function Assert-ArchiveParity([string] $JarPath, [string] $CoordinatorRoot, [str
         $manifestEntry = $zip.GetEntry($prefix + 'coordinator-manifest.txt')
         if ($null -eq $manifestEntry) { throw 'Embedded coordinator manifest is missing.' }
         $manifestReader = [IO.StreamReader]::new($manifestEntry.Open())
-        try { $manifest = @($manifestReader.ReadToEnd() -split "\r?\n" | Where-Object { $_ -ne '' } | Sort-Object) }
+        try { $manifestLines = @($manifestReader.ReadToEnd() -split "\r?\n" | Where-Object { $_ -ne '' }) }
         finally { $manifestReader.Dispose() }
+		$manifestRecords = @($manifestLines | ForEach-Object {
+			if ($_ -notmatch '^(?<Hash>[0-9a-f]{64}) (?<Path>.+)$') { throw "Invalid embedded coordinator manifest entry: $_" }
+			[pscustomobject]@{ Hash = $Matches.Hash.ToUpperInvariant(); Path = $Matches.Path }
+		})
+		$manifest = @($manifestRecords.Path | Sort-Object)
         if (@(Compare-Object -ReferenceObject $Expected -DifferenceObject $manifest).Count -ne 0) { throw 'Embedded coordinator manifest differs from the independently derived source set.' }
         foreach ($relative in $Expected) {
             $source = Join-Path $CoordinatorRoot ($relative.Replace('/', '\'))
@@ -102,6 +107,8 @@ function Assert-ArchiveParity([string] $JarPath, [string] $CoordinatorRoot, [str
             } finally { $stream.Dispose() }
             $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToUpperInvariant()
             if ($sourceHash -ne $archiveHash) { throw "Coordinator hash mismatch: $relative" }
+			$manifestHash = ($manifestRecords | Where-Object { $_.Path -ceq $relative }).Hash
+			if ($manifestHash -cne $archiveHash) { throw "Coordinator manifest hash mismatch: $relative" }
         }
     } finally { $zip.Dispose() }
 }

@@ -33,14 +33,17 @@ export function createFactView(observation) {
 /** Serializable frozen facts used by the interpreter. */
 export function createInterpreterFacts(observation = {}) {
 	const source = ownDataRecord(observation, 'observation');
-	const player = freezeRecord(copyRecord(ownDataRecord(source.player ?? Object.create(null), 'observation.player'), PLAYER_FIELDS, 'observation.player'));
+	const playerSource = ownDataRecord(source.player ?? Object.create(null), 'observation.player');
+	const player = copyRecord(playerSource, PLAYER_FIELDS, 'observation.player');
+	if (Object.hasOwn(playerSource, 'lastAttacker')) player.lastAttacker = copyAttacker(playerSource.lastAttacker);
+	const frozenPlayer = freezeRecord(player);
 	const inventorySource = ownDataRecord(source.inventory ?? Object.create(null), 'observation.inventory');
 	const tagCounts = Object.create(null);
 	for (const [tag, count] of Object.entries(ownDataRecord(inventorySource.tagCounts ?? Object.create(null), 'observation.inventory.tagCounts'))) {
 		if (validKey(tag) && nonNegativeInteger(count)) tagCounts[tag] = count;
 	}
 	return freezeRecord({
-		player,
+		player: frozenPlayer,
 		world: freezeRecord({ items: copyCandidates(source.items, 'item'), entities: copyCandidates(source.entities, 'entity'), blocks: copyCandidates(source.blocks, 'block') }),
 		inventory: freezeRecord({ items: copyInventory(inventorySource.items), tagCounts: freezeRecord(tagCounts) }),
 	});
@@ -100,9 +103,24 @@ function copyInventory(values) {
 	if (values === undefined) return Object.freeze([]);
 	return Object.freeze(denseDataArray(values, 'observation inventory items').map((value) => {
 		const source = ownDataRecord(value, 'observation inventory item');
-		if (Reflect.ownKeys(source).some((key) => !['itemId', 'count', 'slot'].includes(key)) || typeof source.itemId !== 'string' || !nonNegativeInteger(source.count)) throw new TypeError('observation inventory item has an invalid schema');
-		return freezeRecord(copyRecord(source, ['itemId', 'count', 'slot'], 'observation inventory item'));
+		if (Reflect.ownKeys(source).some((key) => !['itemId', 'count', 'slot', 'tags'].includes(key)) || typeof source.itemId !== 'string' || !nonNegativeInteger(source.count)) throw new TypeError('observation inventory item has an invalid schema');
+		const copied = copyRecord(source, ['itemId', 'count', 'slot'], 'observation inventory item');
+		if (Object.hasOwn(source, 'tags')) {
+			const tags = denseDataArray(source.tags, 'observation inventory item tags');
+			if (tags.some((tag) => typeof tag !== 'string')) throw new TypeError('observation inventory item has invalid tags');
+			copied.tags = Object.freeze([...tags]);
+		}
+		return freezeRecord(copied);
 	}));
+}
+
+function copyAttacker(value) {
+	const source = ownDataRecord(value, 'observation.player.lastAttacker');
+	if (Reflect.ownKeys(source).some((key) => !['uuid', 'type', 'distance'].includes(key))
+		|| typeof source.uuid !== 'string' || typeof source.type !== 'string' || !Number.isFinite(source.distance)) {
+		throw new TypeError('observation.player.lastAttacker has an invalid schema');
+	}
+	return freezeRecord({ uuid: source.uuid, type: source.type, distance: source.distance });
 }
 
 function denseDataArray(value, label) {

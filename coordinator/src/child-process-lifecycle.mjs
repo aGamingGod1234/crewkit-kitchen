@@ -25,7 +25,8 @@ async function terminateWindowsProcessTree(child, timeoutMs, execute) {
 	await runTaskkill(execute, child.pid, false);
 	if (hasExited(child) || await waitForExit(child, timeoutMs)) return;
 	const forced = await runTaskkill(execute, child.pid, true);
-	if (!forced && !hasExited(child)) throw new Error(`Could not terminate provider process tree ${child.pid}`);
+	if (forced || hasExited(child) || await waitForExit(child, timeoutMs)) return;
+	throw new Error(`Could not terminate provider process tree ${child.pid}`);
 }
 
 function runTaskkill(execute, pid, force) {

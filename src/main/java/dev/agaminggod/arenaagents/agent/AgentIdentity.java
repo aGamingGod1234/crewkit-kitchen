@@ -66,7 +66,17 @@ public final class AgentIdentity {
 
 	public static String defaultDisplayName(AgentProfile profile) {
 		Objects.requireNonNull(profile, "profile must not be null");
-		return AgentModelNames.shortLabel(profile.provider(), profile.model()) + " " + title(profile.reasoning());
+		return AgentModelNames.displayName(profile.provider(), profile.model()) + " " + title(profile.reasoning())
+				+ " | " + skinName(profile.provider(), profile.skinVariant());
+	}
+
+	public static String skinName(String provider, int variant) {
+		String[] names = switch (normalizedProvider(provider)) {
+			case "gemini" -> new String[]{"Azure", "Crimson", "Solar", "Verdant"};
+			case "kimi" -> new String[]{"Moon", "Ice", "Orchid", "Sunrise"};
+			default -> new String[]{"Cyan", "Violet", "Emerald", "Amber"};
+		};
+		return names[Math.floorMod(variant, names.length)];
 	}
 
 	public static String playerName(AgentId id, AgentProfile profile) {

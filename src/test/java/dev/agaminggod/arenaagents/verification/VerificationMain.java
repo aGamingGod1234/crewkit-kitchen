@@ -8,9 +8,9 @@ import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
 import dev.agaminggod.arenaagents.server.AgentDeathCaptureVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
+import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGridLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentRosterGridVerification;
-import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.ConsoleThemeVerification;
 import dev.agaminggod.arenaagents.client.gui.LiveArenaLayoutVerification;
 import dev.agaminggod.arenaagents.client.gui.LocalizationVerification;
@@ -50,8 +50,15 @@ import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.GoalControlVerification;
-import dev.agaminggod.arenaagents.server.CoordinatorLaunchPolicyVerification;
+import dev.agaminggod.arenaagents.server.conversation.AgentConversationRouterVerification;
+import dev.agaminggod.arenaagents.server.conversation.NativeAgentWhisperTargetsVerification;
+import dev.agaminggod.arenaagents.server.group.AgentGroupRegistryVerification;
 import dev.agaminggod.arenaagents.server.AgentModelArgumentVerification;
+import dev.agaminggod.arenaagents.server.BundledCoordinatorInstallerVerification;
+import dev.agaminggod.arenaagents.server.NodeRuntimeLocatorVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorLaunchPolicyVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorStartupSmokeVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorVoiceEndpointVerification;
 import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayersVerification;
 import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerification;
@@ -60,9 +67,13 @@ import dev.agaminggod.arenaagents.server.bridge.BoundedServerTaskQueueVerificati
 import dev.agaminggod.arenaagents.server.bridge.ProgramActionLedgerVerification;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusVerification;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridgeVerification;
+import dev.agaminggod.arenaagents.server.bridge.SingleBrainBoundaryVerification;
+import dev.agaminggod.arenaagents.server.AgentRecoverySpawnPolicyVerification;
+import dev.agaminggod.arenaagents.server.AgentRespawnSpawnPolicyVerification;
 import dev.agaminggod.arenaagents.server.perception.BlockObservationOrderingVerification;
 import dev.agaminggod.arenaagents.server.perception.InventoryObservationSlotsVerification;
 import dev.agaminggod.arenaagents.server.perception.ObservationBudgetVerification;
+import dev.agaminggod.arenaagents.server.perception.ServerObservationRayTargetVerification;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudgetVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
@@ -71,6 +82,12 @@ import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
 import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerification;
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
+import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContractVerification;
+import dev.agaminggod.arenaagents.server.runtime.ActionSuccessLedgerVerification;
+import dev.agaminggod.arenaagents.server.runtime.input.InputStateVerification;
+import dev.agaminggod.arenaagents.server.perception.AttentionHazardVerification;
+import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistryVerification;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostconditionVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionProtocolVerification;
@@ -149,7 +166,15 @@ public final class VerificationMain {
 		passedAssertions += NavigationMovementVerification.verify();
 		passedAssertions += MinecraftWalkabilityViewVerification.verify();
 		passedAssertions += GoalControlVerification.verify();
+		passedAssertions += AgentConversationRouterVerification.verify();
+		passedAssertions += NativeAgentWhisperTargetsVerification.verify();
+		passedAssertions += AgentGroupRegistryVerification.verify();
 		passedAssertions += AgentModelArgumentVerification.verify();
+		passedAssertions += BundledCoordinatorInstallerVerification.verify();
+		passedAssertions += NodeRuntimeLocatorVerification.verify();
+		passedAssertions += CoordinatorLaunchPolicyVerification.verify();
+		passedAssertions += CoordinatorStartupSmokeVerification.verify();
+		passedAssertions += CoordinatorVoiceEndpointVerification.verify();
 		passedAssertions += AgentActivityPresentationVerification.verify();
 		passedAssertions += AgentDeathCaptureVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();
@@ -163,6 +188,7 @@ public final class VerificationMain {
 		passedAssertions += BlockObservationOrderingVerification.verify();
 		passedAssertions += InventoryObservationSlotsVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
+		passedAssertions += ServerObservationRayTargetVerification.verify();
 		passedAssertions += ServerObservationWireBudgetVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();
 		passedAssertions += BlockPlacementPostconditionVerification.verify();
@@ -174,6 +200,12 @@ public final class VerificationMain {
 		passedAssertions += TransactionPostconditionVerification.verify();
 		passedAssertions += EquipmentAndUseVerification.verify();
 		passedAssertions += ServerActionExecutorVerification.verify();
+		passedAssertions += GoalCompletionContractVerification.verify();
+		passedAssertions += ActionSuccessLedgerVerification.verify();
+		passedAssertions += InputStateVerification.verify();
+		passedAssertions += AttentionHazardVerification.verify();
+		passedAssertions += MenuCapabilityRegistryVerification.verify();
+		passedAssertions += VoiceSubsystemVerification.verify();
 		passedAssertions += ServerPathPlannerVerification.verify();
 		passedAssertions += NavigationProgressVerification.verify();
 		passedAssertions += CombatPolicyVerification.verify();
@@ -190,20 +222,22 @@ public final class VerificationMain {
 		passedAssertions += ArenaSpectatorSnapshotVerification.verify();
 		passedAssertions += ArenaSpectatorStateVerification.verify();
 		passedAssertions += ArenaAgentsClientBootstrapVerification.verify();
+		passedAssertions += ScenarioSetupStateVerification.verify();
 		passedAssertions += AgentRosterGridLayoutVerification.verify();
 		passedAssertions += AgentRosterGridVerification.verify();
 		passedAssertions += ConsoleThemeVerification.verify();
 		passedAssertions += LiveArenaLayoutVerification.verify();
 		passedAssertions += LocalizationVerification.verify();
 		passedAssertions += ScenarioResultsLayoutVerification.verify();
-		passedAssertions += ScenarioSetupStateVerification.verify();
 		passedAssertions += ScenarioSetupLayoutVerification.verify();
 		passedAssertions += BridgeEnvelopeCodecVerification.verify();
 		passedAssertions += BoundedServerTaskQueueVerification.verify();
 		passedAssertions += ProgramActionLedgerVerification.verify();
 		passedAssertions += CoordinatorStatusVerification.verify();
-		passedAssertions += CoordinatorLaunchPolicyVerification.verify();
+		passedAssertions += AgentRecoverySpawnPolicyVerification.verify();
+		passedAssertions += AgentRespawnSpawnPolicyVerification.verify();
 		passedAssertions += MultiplexedServerBridgeVerification.verify();
+		passedAssertions += SingleBrainBoundaryVerification.verify();
 		passedAssertions += GoalReceiverVerification.verify();
 		verifyObservationContracts(codec);
 		ObservationCollectorVerification.verifyLoadedChunkBoundary();
@@ -266,6 +300,13 @@ public final class VerificationMain {
 				"select_tool",
 				"block_with_shield",
 				"use_ranged",
+				"interact_block",
+				"interact_entity",
+				"dismount",
+				"start_fall_flying",
+				"menu_transfer",
+				"menu_button",
+				"anvil_rename",
 				"respawn",
 				"complete_goal"
 		);
@@ -289,6 +330,17 @@ public final class VerificationMain {
 		assertDecodedType(codec, "place_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:stone\",\"desiredState\":null", ActionType.PLACE_BLOCK);
 		assertDecodedType(codec, "build_sequence", "\"placements\":[{\"x\":1,\"y\":64,\"z\":-2,\"face\":\"up\",\"itemId\":\"minecraft:stone\",\"desiredState\":null}],\"timeoutMs\":60000", ActionType.BUILD_SEQUENCE);
 		assertDecodedType(codec, "chat", "\"message\":\"Ready.\"", ActionType.CHAT);
+		ActionCommand directChat = codec.decodeCommand(commandJson(
+				"chat",
+				"\"message\":\"Meet behind the tower.\",\"audience\":\"direct\","
+						+ "\"recipientId\":\"00000000-0000-0000-0000-000000000001\""
+		));
+		assertEquals("direct", directChat.arguments().get("audience").getAsString(), "direct chat audience");
+		assertEquals(
+				"00000000-0000-0000-0000-000000000001",
+				directChat.arguments().get("recipientId").getAsString(),
+				"direct chat recipient"
+		);
 		assertDecodedType(codec, "wait", "\"durationMs\":250", ActionType.WAIT);
 		assertDecodedType(codec, "set_door", "\"x\":1,\"y\":64,\"z\":-2,\"open\":true", ActionType.SET_DOOR);
 		assertDecodedType(codec, "pick_up_item", "\"targetSelector\":\"minecraft:item\"", ActionType.PICK_UP_ITEM);
@@ -297,6 +349,13 @@ public final class VerificationMain {
 		assertDecodedType(codec, "fight_target", "\"targetSelector\":\"nearest_hostile\",\"desiredRange\":2.5,\"timeoutMs\":15000", ActionType.FIGHT_TARGET);
 		assertDecodedType(codec, "flee_from", "\"targetSelector\":\"last_attacker\",\"distance\":16,\"timeoutMs\":10000", ActionType.FLEE_FROM);
 		assertDecodedType(codec, "follow_entity", "\"targetSelector\":\"player:Lucas\",\"distance\":3,\"timeoutMs\":30000", ActionType.FOLLOW_ENTITY);
+		assertDecodedType(codec, "interact_block", "\"x\":1,\"y\":64,\"z\":-2,\"face\":\"north\",\"hand\":\"main\",\"expectedItemId\":\"minecraft:air\"", ActionType.INTERACT_BLOCK);
+		assertDecodedType(codec, "interact_entity", "\"targetId\":\"00000000-0000-0000-0000-000000000001\",\"hand\":\"off\",\"expectedItemId\":\"minecraft:lead\"", ActionType.INTERACT_ENTITY);
+		assertDecodedType(codec, "dismount", "", ActionType.DISMOUNT);
+		assertDecodedType(codec, "start_fall_flying", "", ActionType.START_FALL_FLYING);
+		assertDecodedType(codec, "menu_transfer", "\"menuId\":\"minecraft:smithing\",\"sourceSlot\":3,\"destinationSlot\":4,\"count\":1,\"expectedItemId\":\"minecraft:netherite_sword\",\"timeoutMs\":5000", ActionType.MENU_TRANSFER);
+		assertDecodedType(codec, "menu_button", "\"menuId\":\"minecraft:enchantment\",\"buttonId\":1,\"timeoutMs\":5000", ActionType.MENU_BUTTON);
+		assertDecodedType(codec, "anvil_rename", "\"menuId\":\"minecraft:anvil\",\"name\":\"Explorer\",\"timeoutMs\":5000", ActionType.ANVIL_RENAME);
 		assertDecodedType(codec, "respawn", "", ActionType.RESPAWN);
 		assertDecodedType(codec, "complete_goal", "\"summary\":\"Reached the arena.\"", ActionType.COMPLETE_GOAL);
 	}
@@ -419,6 +478,22 @@ public final class VerificationMain {
 				"OUT_OF_RANGE",
 				"message",
 				"chat text limit"
+		);
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson("chat", "\"message\":\"Missing target.\",\"audience\":\"direct\"")),
+				"MISSING_FIELD",
+				"recipientId",
+				"direct chat recipient"
+		);
+		expectProtocolException(
+				() -> codec.decodeCommand(commandJson(
+						"chat",
+						"\"message\":\"Wrong target.\",\"audience\":\"public\","
+								+ "\"recipientId\":\"00000000-0000-0000-0000-000000000001\""
+				)),
+				"INVALID_FIELD",
+				"recipientId",
+				"public chat recipient"
 		);
 	}
 

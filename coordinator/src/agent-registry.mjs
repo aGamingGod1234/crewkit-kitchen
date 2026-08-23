@@ -34,8 +34,8 @@ const PROMOTION_SOURCE_STATES = new Set([
 const GOAL_OPERATIONS = new Set(['start', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn']);
 const ALLOWED_STATE_TRANSITIONS = Object.freeze({
 	[DynamicAgentState.IDLE]: new Set([DynamicAgentState.STARTING, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
-	[DynamicAgentState.STARTING]: new Set([DynamicAgentState.PLANNING, DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
-	[DynamicAgentState.PLANNING]: new Set([DynamicAgentState.ACTING, DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
+	[DynamicAgentState.STARTING]: new Set([DynamicAgentState.PLANNING, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
+	[DynamicAgentState.PLANNING]: new Set([DynamicAgentState.ACTING, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
 	[DynamicAgentState.ACTING]: new Set([DynamicAgentState.PLANNING, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
 	[DynamicAgentState.PAUSED]: new Set([DynamicAgentState.STARTING, DynamicAgentState.IDLE, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
 	[DynamicAgentState.COMPLETED]: new Set([DynamicAgentState.STARTING, DynamicAgentState.IDLE, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
@@ -110,6 +110,42 @@ export class AgentRegistry {
 		const updated = reduceGoalControl(current, value, { queueCap: this.#queueCap });
 		this.#agents.set(id, updated);
 		return clone(updated);
+	}
+
+	applyConversationWake(agentId, value) {
+		const id = requireIdentifier(agentId, 'agentId');
+		const current = this.#agents.get(id);
+		if (current === undefined) throw new AgentRegistryError('UNKNOWN_AGENT', `Unknown agent '${id}'`);
+		if (!isPlainObject(value) || value.operation !== 'start') {
+			throw new AgentRegistryError('INVALID_GOAL_OPERATION', 'Conversation wake requires a start control');
+		}
+		const revision = nonnegativeInteger(value.goalRevision, 'goalRevision');
+		if (revision > current.goalRevision) {
+			const updated = reduceGoalControl(current, value, { queueCap: this.#queueCap });
+			this.#agents.set(id, updated);
+			return clone(updated);
+		}
+		if (revision < current.goalRevision) {
+			throw new AgentRegistryError('STALE_GOAL_REVISION', `Conversation wake revision ${revision} is older than ${current.goalRevision}`);
+		}
+		const goal = requireGoal(value.goal);
+		if (current.currentGoal !== goal) {
+			throw new AgentRegistryError('GOAL_REVISION_COLLISION', 'Conversation wake revision belongs to a different goal');
+		}
+		if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING, DynamicAgentState.PAUSED, DynamicAgentState.DISCONNECTED].includes(current.state)) {
+			throw new AgentRegistryError('INVALID_AGENT_STATE', `Conversation wake cannot re-arm ${current.state}`);
+		}
+		if ([DynamicAgentState.PAUSED, DynamicAgentState.DISCONNECTED].includes(current.state)) {
+			const updated = {
+				...current,
+				state: DynamicAgentState.STARTING,
+				updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs ?? this.#now(), 'updatedAtEpochMs'),
+				lastError: null,
+			};
+			this.#agents.set(id, updated);
+			return clone(updated);
+		}
+		return clone(current);
 	}
 
 	setState(agentId, state, { goalRevision, error = null } = {}) {
@@ -217,7 +253,9 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	const next = { ...record, goalRevision: revision, updatedAtEpochMs: now, lastError: null };
 	if (operation === 'start' || operation === 'steer') {
 		const nextGoal = requireGoal(controlValue.goal);
-		if (operation === 'start' && PROMOTION_SOURCE_STATES.has(record.state)) {
+		const promotesQueuedGoal = PROMOTION_SOURCE_STATES.has(record.state)
+			|| (record.state === DynamicAgentState.COMPLETED && record.queue.length > 0);
+		if (operation === 'start' && promotesQueuedGoal) {
 			const promoted = record.queue[0];
 			if (promoted === undefined || promoted.goal !== nextGoal) {
 				throw new AgentRegistryError(

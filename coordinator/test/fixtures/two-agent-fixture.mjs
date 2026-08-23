@@ -4,6 +4,7 @@ import { AgentRegistry, DynamicAgentState } from '../../src/agent-registry.mjs';
 import { parseDecision } from '../../src/decision-parser.mjs';
 import { createDynamicCoordinator } from '../../src/dynamic-main.mjs';
 import { validateProtocolV2Envelope } from '../../src/protocol-v2.mjs';
+import { withCompletionContract } from './completion-contract.mjs';
 
 const PROFILES = Object.freeze([
 	{ agentId: 'agent-55', provider: 'codex', model: 'gpt-5.5', reasoningEffort: 'xhigh', serviceTier: 'fast' },
@@ -33,7 +34,15 @@ export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) 
 			}
 		},
 		async untilBothComplete() {
-			await eventually(() => PROFILES.every((profile) => registry.get(profile.agentId)?.state === DynamicAgentState.COMPLETED), 'both dynamic agents did not complete');
+			await eventually(
+				() => PROFILES.every((profile) => registry.get(profile.agentId)?.state === DynamicAgentState.COMPLETED),
+				() => `both dynamic agents did not complete: ${JSON.stringify(PROFILES.map((profile) => ({
+					agentId: profile.agentId,
+					state: registry.get(profile.agentId)?.state,
+					actions: bridge.sent.filter((message) => message.type === 'action_command' && message.agentId === profile.agentId).length,
+					plannerAttempts: provider.attempts.get(profile.agentId) ?? 0,
+				})))}`,
+			);
 		},
 		crossAgentMessages: () => bridge.sent.filter((message) => message.agentId !== 'server' && !PROFILES.some((profile) => profile.agentId === message.agentId)).length,
 		models: () => PROFILES.map((profile) => profile.model),
@@ -74,7 +83,7 @@ class FakeBridge extends EventEmitter {
 					skinVariant: 'default', state: entry.state, goalRevision: entry.goalRevision, queue: [], createdAtEpochMs: 1, updatedAtEpochMs: 1,
 				})),
 			} }, { direction: 'server_to_coordinator' });
-		} else if (event === 'goal_control' || event === 'observation' || event === 'action_result') {
+		} else if (event === 'goal_control' || event === 'observation' || event === 'action_result' || event === 'goal_completion_result') {
 			validateProtocolV2Envelope({ protocolVersion: 2, serverInstanceId: this.#serverInstanceId, agentId: value.agentId, type: event, messageId: `${event}-${value.agentId}-${value.payload.eventSequence ?? value.payload.goalRevision}`, payload: value.payload }, { direction: 'server_to_coordinator' });
 		}
 		return super.emit(event, value);
@@ -82,11 +91,25 @@ class FakeBridge extends EventEmitter {
 	async send(type, agentId, payload) {
 		validateProtocolV2Envelope({ protocolVersion: 2, serverInstanceId: this.#serverInstanceId, agentId, type, messageId: `out-${this.sent.length + 1}`, payload }, { direction: 'coordinator_to_server' });
 		this.sent.push({ type, agentId, payload });
+		if (type === 'goal_completed') {
+			setImmediate(() => this.emit('goal_completion_result', {
+				agentId,
+				payload: {
+					goalRevision: payload.goalRevision,
+					traceId: payload.traceId,
+					contractHash: payload.contractHash,
+					verified: true,
+					reasonCode: 'COMPLETION_VERIFIED',
+					facts: [],
+				},
+			}));
+			return;
+		}
 		if (type === 'action_command') {
 			const sequence = (this.#eventSequence.get(agentId) ?? 1) + 1;
 			this.#eventSequence.set(agentId, sequence);
 			setImmediate(() => {
-				this.emit('action_result', { agentId, payload: { goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } });
+				this.emit('action_result', { agentId, payload: { traceId: payload.traceId, goalRevision: payload.goalRevision, actionId: payload.actionId, commandId: payload.actionId, actionType: payload.actionType, state: 'SUCCEEDED', reasonCode: 'DONE', message: 'done', elapsedMs: 1, observedAtEpochMs: sequence } });
 				this.emit('observation', observation(agentId, payload.goalRevision, sequence, false));
 			});
 		}
@@ -121,7 +144,7 @@ class FixtureProvider {
 					parseDecision('{"summary":"legacy","directive":"replace","source":"old","actions":[]}');
 				}
 				session.turns += 1;
-				return parseDecision(JSON.stringify({ summary: session.turns === 1 ? 'Corrected program.' : 'Continue.', directive: 'replace', source: SOURCE }));
+				return parseDecision(JSON.stringify(withCompletionContract({ summary: session.turns === 1 ? 'Corrected program.' : 'Continue.', directive: 'replace', source: SOURCE }, session.goalRevision)));
 			},
 			interrupt: async () => { this.interruptions.push(record.agentId); },
 		};
@@ -138,5 +161,5 @@ async function eventually(predicate, message) {
 		if (predicate()) return;
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
-	throw new Error(message);
+	throw new Error(typeof message === 'function' ? message() : message);
 }

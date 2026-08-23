@@ -15,6 +15,8 @@ import dev.agaminggod.arenaagents.control.AgentControlActions;
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlCommandBuilder;
+import dev.agaminggod.arenaagents.control.AgentControlGroup;
+import dev.agaminggod.arenaagents.control.AgentControlGroupSelection;
 import dev.agaminggod.arenaagents.control.AgentControlPresentation;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.control.AgentRosterEntry;
@@ -30,6 +32,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -74,6 +77,8 @@ public final class AgentControlScreen extends Screen {
 	private AgentGameMode gameMode = AgentGameMode.SURVIVAL;
 	private String name = "";
 	private String prompt = "";
+	private String savedGroupName = "";
+	private String selectedSavedGroupName = "";
 	private String feedback = "";
 	private boolean feedbackError;
 	private boolean selectNewlySummonedAgent;
@@ -81,6 +86,7 @@ public final class AgentControlScreen extends Screen {
 	private boolean compactGroupComposer;
 	private Page page = Page.OVERVIEW;
 	private ConsoleEditBox nameInput;
+	private ConsoleEditBox groupNameInput;
 	private MultiLineEditBox promptInput;
 
 	public AgentControlScreen() {
@@ -129,6 +135,8 @@ public final class AgentControlScreen extends Screen {
 		snapshot = checkedSnapshot;
 		rosterEntries = candidateEntries;
 		rosterVisuals = candidateVisuals;
+		String resolvedGroup = AgentControlGroupSelection.resolve(selectedSavedGroupName, snapshot.groups());
+		if (!resolvedGroup.equals(selectedSavedGroupName)) selectSavedGroup(resolvedGroup);
 		if (previous != null && snapshot.generatedAtEpochMs() > previous.generatedAtEpochMs() && !feedbackError) {
 			feedback = "";
 		}
@@ -165,11 +173,13 @@ public final class AgentControlScreen extends Screen {
 		snapshot = nextSnapshot;
 		rosterEntries = candidateEntries;
 		rosterVisuals = candidateVisuals;
+		selectSavedGroup(AgentControlGroupSelection.resolve("", snapshot.groups()));
 	}
 
 	@Override
 	protected void init() {
 		nameInput = null;
+		groupNameInput = null;
 		promptInput = null;
 		rosterGrid = null;
 		visibleRosterPage = null;
@@ -346,7 +356,7 @@ public final class AgentControlScreen extends Screen {
 
 	private void addNavigation() {
 		AgentControlLayout layout = layout();
-		boolean groupAvailable = snapshot == null || snapshot.agents().size() > 1;
+		boolean groupAvailable = snapshot == null || snapshot.agents().size() > 1 || !snapshot.groups().isEmpty();
 		boolean agentWorkflow = page == Page.OVERVIEW || page == Page.CREATE || page == Page.TASK
 				|| page == Page.MANAGE || page == Page.REMOVE_CONFIRM;
 		if (layout.sideNavigation()) {
@@ -420,13 +430,14 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private void initGroup() {
-		if (snapshot != null && snapshot.agents().size() < 2) {
+		if (snapshot != null && snapshot.agents().size() < 2 && snapshot.groups().isEmpty()) {
 			page = Page.OVERVIEW;
 			initOverview();
 			return;
 		}
 		AgentControlLayout layout = layout();
-		boolean columns = layout.splitWorkspace() || layout.contentWidth() >= 500;
+		int bodyTop = addSavedGroupToolbar(layout.contentLeft(), layout.contentTop(), layout.contentWidth()) + GAP;
+		boolean columns = layout.groupColumns();
 		if (columns) {
 			int listX = layout.canvasLeft();
 			int listWidth = layout.splitWorkspace()
@@ -436,29 +447,123 @@ public final class AgentControlScreen extends Screen {
 					? layout.contextLeft()
 					: listX + listWidth + 12;
 			int controlWidth = layout.contentRight() - controlX;
-			addRosterFilters(listX, layout.contentTop(), listWidth);
-			int gridTop = layout.contentTop() + (filtersVisible() ? 30 : 0);
+			addRosterFilters(listX, bodyTop, listWidth);
+			int gridTop = bodyTop + (filtersVisible() ? 30 : 0);
 			addRosterGrid(new AgentControlLayout.Bounds(
 					listX, gridTop, listX + listWidth, layout.contentBottom()),
 					AgentRosterGrid.Mode.MULTI_SELECT);
-			promptInput = multiLineInput(controlX, layout.contentTop(), controlWidth, 66,
+			promptInput = multiLineInput(controlX, bodyTop, controlWidth, 66,
 					"Group task", "Describe one shared outcome for the selected agents");
 			addRenderableWidget(promptInput);
-			addVerticalGroupActions(controlX, layout.contentTop() + 74, controlWidth);
+			addVerticalGroupActions(controlX, bodyTop + 74, controlWidth);
 		} else {
 			if (compactGroupComposer) {
-				AgentControlLayout.Bounds composer = layout.composerBounds();
+				AgentControlLayout.Bounds composer = new AgentControlLayout.Bounds(
+						layout.contentLeft(), bodyTop, layout.contentRight(), layout.workspaceActionBounds().top());
 				promptInput = multiLineInput(composer.left(), composer.top(), composer.width(), composer.height(),
 						"Group task", "Tell the selected group what to do");
 				addRenderableWidget(promptInput);
 				addCompactComposerActions(layout.workspaceActionBounds());
 			} else {
-				addRosterFilters(layout.contentLeft(), layout.contentTop(), layout.contentWidth());
-				addRosterGrid(layout.rosterBounds(filtersVisible(), true), AgentRosterGrid.Mode.MULTI_SELECT);
+				addRosterFilters(layout.contentLeft(), bodyTop, layout.contentWidth());
+				int gridTop = bodyTop + (filtersVisible() ? 30 : 0);
+				addRosterGrid(new AgentControlLayout.Bounds(
+						layout.contentLeft(), gridTop, layout.contentRight(), layout.workspaceActionBounds().top() - GAP),
+						AgentRosterGrid.Mode.MULTI_SELECT);
 				addCompactSelectionActions(layout.workspaceActionBounds());
 			}
 		}
 		addOverviewFooter();
+	}
+
+	private int addSavedGroupToolbar(int x, int y, int width) {
+		List<AgentControlGroup> groups = snapshot == null ? List.of() : snapshot.groups();
+		int gapCount = groups.isEmpty() ? 3 : 4;
+		int selectorWidth = groups.isEmpty() ? 0 : Math.max(56, width * 20 / 100);
+		int nameWidth = Math.max(68, width * 24 / 100);
+		int remaining = Math.max(90, width - selectorWidth - nameWidth - GAP * gapCount);
+		int buttonWidth = remaining / 3;
+		int cursor = x;
+		if (!groups.isEmpty()) {
+			AgentControlGroup selected = selectedSavedGroup().orElse(groups.getFirst());
+			addRenderableWidget(new ConsoleCycleButton<>(
+					font, cursor, y, selectorWidth, ROW_HEIGHT, Component.literal("Saved"),
+					groups, selected, group -> Component.literal(group.name()), group -> {
+						selectSavedGroup(group.name());
+						rebuildWidgets();
+					}));
+			cursor += selectorWidth + GAP;
+		}
+		groupNameInput = consoleEditBox(
+				cursor, y, nameWidth, ROW_HEIGHT, "saved-group-name", Component.literal("Group name"));
+		groupNameInput.setMaxLength(AgentControlGroup.MAX_NAME_CODE_POINTS);
+		groupNameInput.setValue(savedGroupName);
+		groupNameInput.setResponder(value -> savedGroupName = value);
+		addRenderableWidget(groupNameInput);
+		cursor += nameWidth + GAP;
+
+		ConsoleButton save = primaryButton("Save", cursor, y, buttonWidth, ROW_HEIGHT, this::saveSelectedGroup);
+		save.active = canControl() && !rosterState.selectedIds().isEmpty();
+		addRenderableWidget(save);
+		cursor += buttonWidth + GAP;
+		ConsoleButton spawn = consoleButton("Spawn", cursor, y, buttonWidth, ROW_HEIGHT, false,
+				this::spawnSelectedGroup);
+		spawn.active = canControl() && selectedSavedGroup().isPresent();
+		addRenderableWidget(spawn);
+		cursor += buttonWidth + GAP;
+		ConsoleButton delete = dangerButton("Delete", cursor, y, x + width - cursor, ROW_HEIGHT,
+				this::deleteSelectedGroup);
+		delete.active = canControl() && selectedSavedGroup().isPresent();
+		addRenderableWidget(delete);
+		return y + ROW_HEIGHT;
+	}
+
+	private void selectSavedGroup(String name) {
+		selectedSavedGroupName = Objects.requireNonNullElse(name, "");
+		savedGroupName = selectedSavedGroupName;
+		if (snapshot == null || selectedSavedGroupName.isBlank()) return;
+		Set<String> presentIds = snapshot.agents().stream()
+				.map(AgentControlAgent::agentId)
+				.collect(java.util.stream.Collectors.toSet());
+		rosterState.clearSelection();
+		for (String agentId : AgentControlGroupSelection.members(selectedSavedGroupName, snapshot.groups())) {
+			if (presentIds.contains(agentId)) rosterState.toggle(agentId);
+		}
+	}
+
+	private Optional<AgentControlGroup> selectedSavedGroup() {
+		if (snapshot == null || selectedSavedGroupName.isBlank()) return Optional.empty();
+		return snapshot.groups().stream()
+				.filter(group -> group.name().equalsIgnoreCase(selectedSavedGroupName))
+				.findFirst();
+	}
+
+	private void saveSelectedGroup() {
+		try {
+			String normalizedName = AgentControlGroup.normalizeName(savedGroupName);
+			if (rosterState.selectedIds().isEmpty()) throw new IllegalArgumentException("Select at least one agent");
+			selectedSavedGroupName = normalizedName;
+			savedGroupName = normalizedName;
+			send(AgentControlCommandBuilder.saveGroup(normalizedName, List.copyOf(rosterState.selectedIds())),
+					"Saving group " + normalizedName + "...");
+		} catch (IllegalArgumentException exception) {
+			setFeedback(exception.getMessage(), true);
+		}
+	}
+
+	private void spawnSelectedGroup() {
+		selectedSavedGroup().ifPresentOrElse(
+				group -> send(AgentControlCommandBuilder.spawnGroup(group.name()),
+						"Restoring group " + group.name() + "..."),
+				() -> setFeedback("Choose a saved group first", true));
+	}
+
+	private void deleteSelectedGroup() {
+		selectedSavedGroup().ifPresentOrElse(group -> {
+			send(AgentControlCommandBuilder.deleteGroup(group.name()), "Deleting saved group " + group.name() + "...");
+			selectedSavedGroupName = "";
+			savedGroupName = "";
+		}, () -> setFeedback("Choose a saved group first", true));
 	}
 
 	private void addVerticalGroupActions(int x, int y, int width) {
@@ -794,10 +899,10 @@ public final class AgentControlScreen extends Screen {
 		int x = layout.contentLeft();
 		int width = layout.contentWidth();
 		int top = layout.contentTop() + (layout.sideNavigation() ? 28 : 0);
-		int buttonWidth = (width - GAP) / 2;
-		for (int index = 0; index < 2; index++) {
-			String operation = List.of("stop", "resume").get(index);
-			String label = List.of("Pause work", "Resume work").get(index);
+		int buttonWidth = (width - GAP * 2) / 3;
+		for (int index = 0; index < 3; index++) {
+			String operation = List.of("stop", "resume", "respawn").get(index);
+			String label = List.of("Pause work", "Resume work", "Respawn").get(index);
 			ConsoleButton action = consoleButton(label,
 					x + index * (buttonWidth + GAP), top, buttonWidth, ROW_HEIGHT, false,
 					() -> submitAgentOperation(operation));
@@ -1261,7 +1366,8 @@ public final class AgentControlScreen extends Screen {
 
 	private void show(Page next) {
 		Page destination = next;
-		if (next == Page.GROUP && snapshot != null && snapshot.agents().size() < 2) {
+		if (next == Page.GROUP && snapshot != null && snapshot.agents().size() < 2
+				&& snapshot.groups().isEmpty()) {
 			destination = Page.OVERVIEW;
 		}
 		page = destination;

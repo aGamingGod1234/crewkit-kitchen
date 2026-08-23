@@ -1,3 +1,5 @@
+import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
+
 const MAX_IDENTITY_LENGTH = 128;
 
 export function createProviderTurnTelemetry(value) {
@@ -15,6 +17,16 @@ export function createProviderTurnTelemetry(value) {
 		timeout: Boolean(input.timeout),
 		retry: Boolean(input.retry),
 		restart: Boolean(input.restart),
+		...(input.profileFingerprint === undefined ? {} : { profileFingerprint: requireFingerprint(input.profileFingerprint) }),
+		...(input.sessionGeneration === undefined ? {} : { sessionGeneration: requirePositiveInteger(input.sessionGeneration, 'sessionGeneration') }),
+		...(input.sessionReuse === undefined ? {} : { sessionReuse: Boolean(input.sessionReuse) }),
+		...(input.sessionState === undefined ? {} : { sessionState: requireIdentity(input.sessionState, 'sessionState') }),
+		...(input.continuation === undefined ? {} : { continuation: requireIdentity(input.continuation, 'continuation') }),
+		...(input.resetReason === undefined ? {} : { resetReason: input.resetReason === null ? null : requireIdentity(input.resetReason, 'resetReason') }),
+		...(input.traceId === undefined ? {} : { traceId: validateTraceId(input.traceId) }),
+		...(input.retryReason === undefined || input.retryReason === null
+			? {}
+			: { retryReason: normalizeRetryReason(input.retryReason) }),
 		...(tokens === null ? {} : { tokens }),
 		...(input.rateLimited === undefined ? {} : { rateLimited: Boolean(input.rateLimited) }),
 		...(input.compaction === undefined ? {} : { compaction: Boolean(input.compaction) }),
@@ -49,6 +61,11 @@ function requireIdentity(value, field) {
 	const normalized = value.trim();
 	if (normalized.length === 0 || normalized.length > MAX_IDENTITY_LENGTH) throw new TypeError(`${field} must be nonblank and at most ${MAX_IDENTITY_LENGTH} characters`);
 	return normalized;
+}
+
+function requireFingerprint(value) {
+	if (typeof value !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(value)) throw new TypeError('profileFingerprint must be a sha256 fingerprint');
+	return value;
 }
 
 function requirePositiveInteger(value, field) {

@@ -23,6 +23,7 @@ const scenario = (overrides = {}) => normalizeHeadlessScenario({
 });
 
 const jsonl = (rows) => rows.map((row) => JSON.stringify(row)).join('\n') + '\n';
+const GENERATED_NAME_AT_100 = 'ha_runner__0002s';
 
 test('PowerShell wrapper samples a fast-exit tracked runner before completion', () => {
 	const wrapper = path.resolve('../scripts/run-headless-provider-matrix.ps1').replaceAll("'", "''");
@@ -158,10 +159,11 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 	assert.equal(commands[0], 'execute in minecraft:overworld run forceload add 0 0');
 	assert.equal(commands[1], 'execute in minecraft:overworld run fill -8 200 -8 8 200 8 minecraft:stone');
 	assert.equal(commands[2], 'execute in minecraft:overworld run fill -8 201 -8 8 204 8 minecraft:air');
-	assert.match(commands[3], /^execute in minecraft:overworld positioned 0.5 201 0.5 run codex summon-configured codex gpt-5\.6-sol high priority survival headless_runner_case_/);
+	const generatedName = commands[3].split(' ').at(-1);
+	assert.ok(generatedName.length <= 16);
 	assert.equal(commands[4], 'execute in minecraft:overworld run forceload remove 0 0');
-	assert.match(commands[5], /^codex start headless_runner_case_[^ ]+ Do the bounded task$/);
-	assert.match(commands[6], /^codex status headless_runner_case_[^ ]+$/);
+	assert.equal(commands[5], `codex start ${generatedName} Do the bounded task`);
+	assert.equal(commands[6], `codex status ${generatedName}`);
 	assert.equal(commands.at(-1), 'data get entity @s Pos');
 	assert.equal(commands.some((command) => command.includes('action_result')), false);
 	assert.equal(recorderClosed, 1);
@@ -320,7 +322,7 @@ test('keeps a sixteen-agent report bounded with one isolated lifecycle per autho
 });
 
 test('reports bounded p50 p95 p99 metrics and null provider-native token categories', async () => {
-	const agentId = 'headless_runner_case_2s';
+	const agentId = GENERATED_NAME_AT_100;
 	const providerRows = [
 		{ agentId, provider: 'codex', model: 'gpt-5.6-sol', retry: false, outcome: 'success', timing: { queueWaitMs: 1, durationMs: 10, apiDurationMs: 8 }, tokens: { input: 10, output: 2, reasoning: 1, cached: 3, cacheWrite: null } },
 		{ agentId, provider: 'codex', model: 'gpt-5.6-sol', retry: true, outcome: 'error', error: { code: 'RATE_LIMITED', message: 'bounded' }, rateLimited: true, compaction: true, timing: { queueWaitMs: 9, durationMs: 90, apiDurationMs: 80 }, tokens: { input: 20, output: 4, reasoning: 2, cached: 6, cacheWrite: null } },
@@ -355,7 +357,7 @@ test('reports bounded p50 p95 p99 metrics and null provider-native token categor
 });
 
 test('binds single-agent metrics to the authoritative snapshot ID instead of the generated selector', async () => {
-	const generatedName = 'headless_runner_case_2s';
+	const generatedName = GENERATED_NAME_AT_100;
 	const files = new Map([
 		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'authoritative-single', payload: {
 			agentId: 'authoritative-single', name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
@@ -375,7 +377,7 @@ test('binds single-agent metrics to the authoritative snapshot ID instead of the
 });
 
 test('evaluates single-agent assertions only after exact authoritative identity isolation', async () => {
-	const generatedName = 'headless_runner_case_2s';
+	const generatedName = GENERATED_NAME_AT_100;
 	const files = new Map([
 		['protocol.jsonl', jsonl([
 			{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'authoritative', payload: { agentId: 'authoritative', name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } } },
@@ -424,7 +426,7 @@ test('aggregates concurrent metrics from exact member IDs and preserves per-agen
 });
 
 test('provider turn summaries expose only allowlisted structured errors', async () => {
-	const generatedName = 'headless_runner_case_2s';
+	const generatedName = GENERATED_NAME_AT_100;
 	const secret = 'ARBITRARY_MODEL_SECRET_TEXT';
 	const files = new Map([
 		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'summary-agent', payload: { agentId: 'summary-agent', name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } } }])],
@@ -440,7 +442,7 @@ test('provider turn summaries expose only allowlisted structured errors', async 
 });
 
 test('fails closed when single-agent authoritative snapshot identity is missing', async () => {
-	const generatedName = 'headless_runner_case_2s';
+	const generatedName = GENERATED_NAME_AT_100;
 	const files = new Map([
 		['protocol.jsonl', jsonl([{ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId: 'unrelated', payload: {
 			agentId: 'unrelated', name: 'someone-else', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
@@ -459,7 +461,7 @@ test('fails closed when single-agent authoritative snapshot identity is missing'
 });
 
 test('fails closed when single-agent authoritative snapshot identity is ambiguous', async () => {
-	const generatedName = 'headless_runner_case_2s';
+	const generatedName = GENERATED_NAME_AT_100;
 	const snapshots = ['first-id', 'second-id'].map((agentId) => ({ direction: 'server_to_coordinator', envelope: { type: 'agent_snapshot', agentId, payload: {
 		agentId, name: generatedName, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
 	} } }));

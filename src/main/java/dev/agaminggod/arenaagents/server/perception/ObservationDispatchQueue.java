@@ -41,20 +41,28 @@ public final class ObservationDispatchQueue<T> {
 		return pending.remove(Objects.requireNonNull(identity, "identity must not be null"));
 	}
 
+	public synchronized boolean contains(T identity) {
+		return pending.contains(Objects.requireNonNull(identity, "identity must not be null"));
+	}
+
 	public synchronized void clear() {
 		pending.clear();
+	}
+
+	/** Removes and returns the oldest pending identity, or {@code null} when empty. */
+	public synchronized T poll() {
+		Iterator<T> iterator = pending.iterator();
+		if (!iterator.hasNext()) return null;
+		T identity = iterator.next();
+		iterator.remove();
+		return identity;
 	}
 
 	public void drain(Consumer<T> consumer) {
 		Objects.requireNonNull(consumer, "consumer must not be null");
 		for (int emitted = 0; emitted < maximumPerDrain; emitted++) {
-			T identity;
-			synchronized (this) {
-				Iterator<T> iterator = pending.iterator();
-				if (!iterator.hasNext()) return;
-				identity = iterator.next();
-				iterator.remove();
-			}
+			T identity = poll();
+			if (identity == null) return;
 			consumer.accept(identity);
 		}
 	}

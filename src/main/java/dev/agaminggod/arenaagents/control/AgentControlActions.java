@@ -31,13 +31,14 @@ public final class AgentControlActions {
 			return false;
 		}
 		return switch (checkedOperation) {
-			case "start" -> STARTABLE.contains(state);
+			case "start" -> agent.entityPresent() && STARTABLE.contains(state);
 			case "queue" -> state != AgentLifecycleState.DEAD
 					&& agent.queuedGoalCount() < AgentConstants.DEFAULT_QUEUE_LIMIT;
 			case "steer" -> state.isActive() && !agent.currentGoal().isBlank();
 			case "stop" -> state.isActive() && !agent.currentGoal().isBlank();
 			case "resume" -> (state == AgentLifecycleState.PAUSED || state == AgentLifecycleState.DISCONNECTED)
-					&& !agent.currentGoal().isBlank();
+					&& agent.entityPresent() && !agent.currentGoal().isBlank();
+			case "respawn" -> state == AgentLifecycleState.DEAD;
 			case "remove" -> true;
 			default -> false;
 		};

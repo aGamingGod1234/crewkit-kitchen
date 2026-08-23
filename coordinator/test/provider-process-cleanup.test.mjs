@@ -168,6 +168,83 @@ test('Codex request timeout preserves the shared transport and unrelated request
 	await transport.stop();
 });
 
+test('Codex transport surfaces server tool requests and sends their JSON-RPC result', async () => {
+	const child = new UncooperativeChild();
+	const written = [];
+	child.stdin.write = (line) => written.push(JSON.parse(String(line).trim()));
+	const transport = new CodexStdioTransport(
+		{ model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
+		{ spawn: spawnUncooperativeChild(child), stopTimeoutMs: FAST_STOP_TIMEOUT_MS },
+	);
+	await transport.start();
+
+	const request = new Promise((resolve) => transport.once('serverRequest', resolve));
+	child.stdout.emit('data', `${JSON.stringify({
+		id: 91,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'call-1', tool: 'observe', arguments: {} },
+	})}\n`);
+	assert.deepEqual(await within(request), {
+		id: 91,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'call-1', tool: 'observe', arguments: {} },
+	});
+
+	transport.respond(91, { success: true, contentItems: [{ type: 'inputText', text: '{"ok":true}' }] });
+	assert.deepEqual(written.at(-1), {
+		id: 91,
+		result: { success: true, contentItems: [{ type: 'inputText', text: '{"ok":true}' }] },
+	});
+	await transport.stop();
+});
+
+test('Windows cleanup terminates the complete provider process tree', async () => {
+	const child = new UncooperativeChild();
+	child.pid = 4_242;
+	const calls = [];
+	const execute = (file, args, options, callback) => {
+		calls.push({ file, args, options });
+		callback(null, '', '');
+	};
+
+	await terminateChildProcess(child, {
+		timeoutMs: FAST_STOP_TIMEOUT_MS,
+		platform: 'win32',
+		execFile: execute,
+	});
+
+	assert.deepEqual(calls.map((call) => call.args), [
+		['/PID', '4242', '/T'],
+		['/PID', '4242', '/T', '/F'],
+	]);
+});
+
+test('Windows cleanup accepts a late exit when forced taskkill reports an already-gone process', async () => {
+	const child = new UncooperativeChild();
+	child.pid = 4_243;
+	let calls = 0;
+	const execute = (_file, _args, _options, callback) => {
+		calls += 1;
+		if (calls === 1) {
+			callback(null, '', '');
+			return;
+		}
+		callback(new Error('process not found'), '', '');
+		setImmediate(() => {
+			child.exitCode = 0;
+			child.emit('exit', 0, null);
+		});
+	};
+
+	await terminateChildProcess(child, {
+		timeoutMs: FAST_STOP_TIMEOUT_MS,
+		platform: 'win32',
+		execFile: execute,
+	});
+	assert.equal(calls, 2);
+});
+
+
 test('Gemini ACP preserves bounded structured 429 metadata without retaining provider data', async () => {
 	const child = new UncooperativeChild();
 	const requests = [];
@@ -217,25 +294,4 @@ test('ACP RPC fallback never stringifies provider error data', async () => {
 		return true;
 	});
 	await transport.stop();
-});
-
-test('Windows cleanup terminates the complete provider process tree', async () => {
-	const child = new UncooperativeChild();
-	child.pid = 4_242;
-	const calls = [];
-	const execute = (file, args, options, callback) => {
-		calls.push({ file, args, options });
-		callback(null, '', '');
-	};
-
-	await terminateChildProcess(child, {
-		timeoutMs: FAST_STOP_TIMEOUT_MS,
-		platform: 'win32',
-		execFile: execute,
-	});
-
-	assert.deepEqual(calls.map((call) => call.args), [
-		['/PID', '4242', '/T'],
-		['/PID', '4242', '/T', '/F'],
-	]);
 });

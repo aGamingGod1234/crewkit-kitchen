@@ -7,6 +7,8 @@ import {
 	buildAntigravityLaunch,
 } from '../src/antigravity-service.mjs';
 import { buildPlannerInput } from '../src/prompts.mjs';
+import { profileFingerprint } from '../src/provider-session.mjs';
+import { replaceDecisionJson } from './provider-decision-fixtures.mjs';
 
 test('Antigravity catalog retains the last discovered aliases when a later CLI refresh fails', async () => {
 	let fail = false;
@@ -38,11 +40,7 @@ test('Antigravity fallback configuration accepts the installed Gemini 3.7 Flash 
 	await service.stop();
 });
 
-const DECISION = JSON.stringify({
-	summary: 'Wait safely.',
-	directive: 'replace',
-	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);',
-});
+const DECISION = replaceDecisionJson();
 
 class FakeChild extends EventEmitter {
 	constructor() {
@@ -206,6 +204,69 @@ test('Antigravity rejects unsupported model-thinking combinations and profile co
 		service.createAgent(profile({ reasoningEffort: 'low' })),
 		(error) => error?.code === 'AGENT_PROFILE_CONFLICT',
 	);
+	await service.stop();
+});
+
+test('Antigravity retains service tier in the exact session profile', async () => {
+	const service = new AntigravityProviderService(config(), { spawn: successfulSpawner([]) });
+	const selected = profile({ serviceTier: 'fast' });
+	const agent = await service.createAgent(selected);
+	assert.equal(agent.sessionGeneration, 1);
+	assert.equal(agent.profileFingerprint, profileFingerprint(selected));
+	assert.equal(await service.createAgent(selected), agent, 'same profile reuses the existing Gemini session');
+	await assert.rejects(
+		service.createAgent({ ...selected, serviceTier: 'priority' }),
+		(error) => error?.code === 'AGENT_PROFILE_CONFLICT',
+	);
+	await service.stop();
+});
+
+test('Antigravity exposes explicit best-effort continuation status without claiming a durable session', async () => {
+	const spawnCalls = [];
+	const service = new AntigravityProviderService(config(), { spawn: successfulSpawner(spawnCalls) });
+	const selected = profile({ serviceTier: 'priority' });
+	const agent = await service.createAgent(selected);
+	await agent.setGoalRevision(1);
+	await agent.decide('first authoritative state', { goalRevision: 1 });
+	const first = agent.sessionMetadata();
+	await agent.decide('second authoritative state', { goalRevision: 1 });
+	const second = agent.sessionMetadata();
+	assert.equal(first.sessionGeneration, 1);
+	assert.equal(first.sessionState, 'warm');
+	assert.equal(first.continuation, 'best_effort');
+	assert.equal(first.durability, 'unverified');
+	assert.equal(first.profileFingerprint, profileFingerprint(selected));
+	assert.deepEqual(second, first);
+	assert.equal(spawnCalls[1].args.includes('--continue'), true);
+	await service.stop();
+});
+
+test('Antigravity does not warm a session when decision parsing fails', async () => {
+	const spawnCalls = [];
+	let attempt = 0;
+	const service = new AntigravityProviderService(config(), {
+		spawn: (command, args, options) => {
+			spawnCalls.push({ command, args, options });
+			const child = new FakeChild();
+			attempt += 1;
+			queueMicrotask(() => {
+				const output = attempt === 1
+					? '{"summary":"Wait safely.","directive":"replace","source":"program.onUnhandledAttention(\\"continue_and_notify\\"); await player.wait(25);"}'
+					: DECISION;
+				child.stdout.emit('data', Buffer.from(output));
+				child.exitCode = 0;
+				child.emit('close', 0, null);
+			});
+			return child;
+		},
+	});
+	const agent = await service.createAgent(profile());
+	await agent.setGoalRevision(1);
+	await assert.rejects(agent.decide('state', { goalRevision: 1 }), (error) => error?.code === 'DECISION_FIELD_MISMATCH');
+	assert.equal(agent.sessionMetadata().sessionState, 'cold');
+	await agent.decide('state', { goalRevision: 1 });
+	assert.equal(spawnCalls[1].args.includes('--continue'), false);
+	assert.equal(agent.sessionMetadata().sessionState, 'warm');
 	await service.stop();
 });
 

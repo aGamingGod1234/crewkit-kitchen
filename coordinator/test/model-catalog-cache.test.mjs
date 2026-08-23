@@ -45,3 +45,20 @@ test('catalog preserves Codex speed tiers and raw catalog naming variants', asyn
 	});
 	assert.equal(cache.assertSupported('gpt-5.6-sol', 'ultra', 'fast').id, 'gpt-5.6-sol');
 });
+
+test('catalog cache does not retain decision-like provider output fields', async () => {
+	const cache = new ModelCatalogCache(async () => [{
+		...MODEL,
+		source: 'program.onUnhandledAttention("continue_and_notify");',
+		decision: { directive: 'finish', status: 'completed' },
+		completion: { claim: 'done' },
+	}]);
+	await cache.refresh();
+	assert.deepEqual(cache.find(MODEL.id), {
+		id: MODEL.id,
+		model: MODEL.model,
+		displayName: MODEL.id,
+		reasoningEfforts: ['high', 'xhigh'],
+		serviceTiers: ['priority'],
+	});
+});

@@ -7,9 +7,12 @@ import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.exceptions.DynamicCommandExceptionType;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
-import dev.agaminggod.arenaagents.agent.AgentIdentity;
+import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.server.group.AgentGroup;
+import dev.agaminggod.arenaagents.server.group.AgentGroupSpawnCoordinator;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -17,21 +20,28 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
+import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class CodexAgentCommands {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CodexAgentCommands.class);
-	private static final String DEFAULT_MODEL = "gpt-5.6-sol";
-	private static final String DEFAULT_REASONING = "high";
+	private static final String DEFAULT_MODEL = "gpt-5.6-luna";
+	private static final String DEFAULT_REASONING = "xhigh";
+	private static final String DEFAULT_CODEX_SERVICE_TIER = "fast";
 	private static final String PROVIDER_CODEX = "codex";
 	private static final String PROVIDER_GEMINI = "gemini";
 	private static final String PROVIDER_KIMI = "kimi";
+	private static final String PROVIDER_CURSOR = "cursor";
 	private static final String ARGUMENT_AGENT = "agent";
 	private static final String ARGUMENT_GAME_MODE = "game_mode";
+	private static final String ARGUMENT_GROUP = "group";
+	private static final String ARGUMENT_GROUP_MEMBERS = "members";
 	private static final String ARGUMENT_MODEL = "model";
 	private static final String ARGUMENT_NAME = "name";
+	private static final String ARGUMENT_MESSAGE = "message";
 	private static final String ARGUMENT_PROVIDER = "provider";
 	private static final String ARGUMENT_PROMPT = "prompt";
 	private static final String ARGUMENT_REASONING = "reasoning";
@@ -50,11 +60,12 @@ public final class CodexAgentCommands {
 	static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
 		dispatcher.register(
 				Commands.literal("codex")
-						.requires(GoalControl::mayControl)
 						.then(Commands.literal("summon")
+								.requires(GoalControl::mayControl)
 								.executes(context -> summon(context, PROVIDER_CODEX, DEFAULT_MODEL, DEFAULT_REASONING, Optional.empty()))
 								.then(providerSummon(PROVIDER_GEMINI))
 								.then(providerSummon(PROVIDER_KIMI))
+								.then(providerSummon(PROVIDER_CURSOR))
 								.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model())
 										.then(Commands.argument(ARGUMENT_REASONING, StringArgumentType.word())
 												.executes(context -> summon(
@@ -73,27 +84,52 @@ public final class CodexAgentCommands {
 																Optional.of(StringArgumentType.getString(context, ARGUMENT_NAME))
 														))))))
 						.then(configuredSummon())
+						.then(Commands.literal("dm")
+								.then(agentArgument().then(
+										Commands.argument(ARGUMENT_MESSAGE, StringArgumentType.greedyString())
+												.executes(CodexAgentCommands::directMessage)
+								)))
+						.then(Commands.literal("group")
+								.requires(GoalControl::mayControl)
+								.then(Commands.literal("save")
+										.then(Commands.argument(ARGUMENT_GROUP, StringArgumentType.string())
+												.then(Commands.argument(ARGUMENT_GROUP_MEMBERS, StringArgumentType.greedyString())
+														.executes(CodexAgentCommands::saveGroup))))
+								.then(Commands.literal("spawn")
+										.then(groupArgument().executes(CodexAgentCommands::spawnGroup)))
+								.then(Commands.literal("delete")
+										.then(groupArgument().executes(CodexAgentCommands::deleteGroup))))
+						.then(Commands.literal("voice-consent")
+								.then(Commands.literal("on").executes(context -> voiceConsent(context, true)))
+								.then(Commands.literal("off").executes(context -> voiceConsent(context, false)))
+								.then(Commands.literal("status").executes(CodexAgentCommands::voiceConsentStatus)))
 						.then(promptCommand("start", CodexAgentManager::start))
 						.then(agentCommand("stop", CodexAgentManager::stop))
 						.then(agentCommand("resume", CodexAgentManager::resume))
+						.then(Commands.literal("respawn")
+								.requires(GoalControl::mayControl)
+								.then(agentArgument().executes(CodexAgentCommands::respawn)))
 						.then(promptCommand("queue", CodexAgentManager::queue))
 						.then(promptCommand("steer", CodexAgentManager::steer))
 						.then(Commands.literal("status")
+								.requires(GoalControl::mayControl)
 								.executes(CodexAgentCommands::statusAll)
 								.then(agentArgument().executes(CodexAgentCommands::statusOne)))
-						.then(Commands.literal("list").executes(CodexAgentCommands::statusAll))
+						.then(Commands.literal("list").requires(GoalControl::mayControl).executes(CodexAgentCommands::statusAll))
 						.then(Commands.literal("remove")
+								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::remove)))
 						.then(Commands.literal("auto")
+								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::toggleAutomatic)))
 		);
 	}
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> configuredSummon() {
-		return Commands.literal("summon-configured").then(
+		return Commands.literal("summon-configured").requires(GoalControl::mayControl).then(
 				Commands.argument(ARGUMENT_PROVIDER, StringArgumentType.word())
 						.suggests((context, builder) -> SharedSuggestionProvider.suggest(
-								List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_KIMI), builder))
+								List.of(PROVIDER_CODEX, PROVIDER_GEMINI, PROVIDER_KIMI, PROVIDER_CURSOR), builder))
 						.then(Commands.argument(ARGUMENT_MODEL, AgentModelArgumentType.model()).then(
 								Commands.argument(ARGUMENT_REASONING, StringArgumentType.word()).then(
 										Commands.argument(ARGUMENT_SERVICE_TIER, StringArgumentType.word())
@@ -141,7 +177,7 @@ public final class CodexAgentCommands {
 			String literal,
 			PromptOperation operation
 	) {
-		return Commands.literal(literal).then(
+		return Commands.literal(literal).requires(GoalControl::mayControl).then(
 				agentArgument().then(
 						Commands.argument(ARGUMENT_PROMPT, StringArgumentType.greedyString())
 								.executes(context -> runPromptOperation(context, literal, operation))
@@ -153,13 +189,13 @@ public final class CodexAgentCommands {
 			String literal,
 			AgentOperation operation
 	) {
-		return Commands.literal(literal).then(
+		return Commands.literal(literal).requires(GoalControl::mayControl).then(
 				agentArgument().executes(context -> runAgentOperation(context, literal, operation))
 		);
 	}
 
 	private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, String> agentArgument() {
-		return Commands.argument(ARGUMENT_AGENT, StringArgumentType.string())
+		return Commands.argument(ARGUMENT_AGENT, StringArgumentType.word())
 				.suggests((context, builder) -> SharedSuggestionProvider.suggest(
 						manager(context).selectors(),
 						builder
@@ -186,7 +222,8 @@ public final class CodexAgentCommands {
 			AgentGameMode gameMode
 	)
 			throws CommandSyntaxException {
-		return summon(context, provider, model, reasoning, "priority", userName, gameMode);
+		return summon(context, provider, model, reasoning,
+				PROVIDER_CODEX.equals(provider) ? DEFAULT_CODEX_SERVICE_TIER : "priority", userName, gameMode);
 	}
 
 	private static int summon(
@@ -220,7 +257,7 @@ public final class CodexAgentCommands {
 					gameMode
 			);
 			context.getSource().sendSuccess(
-					() -> Component.literal("Created " + manager.displayName(record) + ". It is ready for a task."),
+					() -> Component.literal("Creating " + manager.displayName(record) + ". It will be ready when its player joins."),
 					false
 			);
 			return 1;
@@ -248,6 +285,118 @@ public final class CodexAgentCommands {
 		} catch (RuntimeException exception) {
 			throw unexpectedFailure(operationName, exception);
 		}
+	}
+
+	private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, String> groupArgument() {
+		return Commands.argument(ARGUMENT_GROUP, StringArgumentType.string())
+				.suggests((context, builder) -> SharedSuggestionProvider.suggest(
+						manager(context).groups().stream()
+								.map(AgentGroup::name)
+								.map(StringArgumentType::escapeIfRequired)
+								.toList(),
+						builder
+				));
+	}
+
+	private static int directMessage(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			if (!(context.getSource().getEntity() instanceof ServerPlayer player)) {
+				throw new AgentDomainException("PLAYER_REQUIRED", "Only an in-game player can send an agent DM");
+			}
+			CodexAgentManager manager = manager(context);
+			AgentRecord target = manager.resolve(StringArgumentType.getString(context, ARGUMENT_AGENT));
+			CodexAgentServerRuntime.sendDirectMessage(
+					context.getSource().getServer(),
+					player,
+					target.agentId(),
+					StringArgumentType.getString(context, ARGUMENT_MESSAGE)
+			);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("dm", exception);
+		}
+	}
+
+	private static int saveGroup(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			List<AgentId> members = Arrays.stream(StringArgumentType.getString(context, ARGUMENT_GROUP_MEMBERS).strip().split("\\s+"))
+					.filter(value -> !value.isBlank())
+					.map(AgentId::parse)
+					.toList();
+			AgentGroup group = manager(context).saveGroup(
+					StringArgumentType.getString(context, ARGUMENT_GROUP),
+					members
+			);
+			context.getSource().sendSuccess(
+					() -> Component.literal("Saved " + group.name() + " with " + group.memberIds().size()
+							+ (group.memberIds().size() == 1 ? " agent." : " agents.")),
+					false
+			);
+			return group.memberIds().size();
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("group save", exception);
+		}
+	}
+
+	private static int spawnGroup(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			String name = StringArgumentType.getString(context, ARGUMENT_GROUP);
+			AgentGroupSpawnCoordinator.Result result = manager(context).spawnGroup(name);
+			String missing = result.missingIds().isEmpty() ? ""
+					: " Missing: " + String.join(", ", result.missingIds().stream().map(AgentId::shortValue).toList()) + ".";
+			context.getSource().sendSuccess(
+					() -> Component.literal("Group " + name + ": " + result.present() + " already present, "
+							+ result.restoring() + " restoring." + missing),
+					false
+			);
+			return result.present() + result.restoring();
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("group spawn", exception);
+		}
+	}
+
+	private static int deleteGroup(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			AgentGroup group = manager(context).deleteGroup(StringArgumentType.getString(context, ARGUMENT_GROUP));
+			context.getSource().sendSuccess(() -> Component.literal("Deleted saved group " + group.name() + "."), false);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("group delete", exception);
+		}
+	}
+
+	private static int voiceConsent(CommandContext<CommandSourceStack> context, boolean enabled) throws CommandSyntaxException {
+		ServerPlayer player = requirePlayer(context);
+		if (enabled) VoiceConsentRegistry.grant(context.getSource().getServer(), player.getUUID());
+		else VoiceConsentRegistry.revoke(context.getSource().getServer(), player.getUUID());
+		context.getSource().sendSuccess(
+				() -> Component.literal("Agent voice transcription " + (enabled ? "enabled for this session." : "disabled.")),
+				false
+		);
+		return enabled ? 1 : 0;
+	}
+
+	private static int voiceConsentStatus(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		ServerPlayer player = requirePlayer(context);
+		boolean enabled = VoiceConsentRegistry.granted(context.getSource().getServer(), player.getUUID());
+		context.getSource().sendSuccess(
+				() -> Component.literal("Agent voice transcription is " + (enabled ? "enabled" : "disabled") + " for this session."),
+				false
+		);
+		return enabled ? 1 : 0;
+	}
+
+	private static ServerPlayer requirePlayer(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		if (context.getSource().getEntity() instanceof ServerPlayer player) return player;
+		throw COMMAND_FAILURE.create("PLAYER_REQUIRED: Only an in-game player can change voice consent");
 	}
 
 	private static int runAgentOperation(
@@ -310,6 +459,22 @@ public final class CodexAgentCommands {
 		}
 	}
 
+	private static int respawn(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			CodexAgentManager manager = manager(context);
+			AgentRecord record = manager.requestRespawn(StringArgumentType.getString(context, ARGUMENT_AGENT));
+			context.getSource().sendSuccess(
+					() -> Component.literal("Respawning " + manager.displayName(record) + "..."),
+					false
+			);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("respawn", exception);
+		}
+	}
+
 	private static int toggleAutomatic(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
 		try {
 			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
@@ -348,7 +513,7 @@ public final class CodexAgentCommands {
 
 	private static String formatStatus(AgentRecord record) {
 		String currentGoal = record.currentGoal().map(goal -> goal.prompt()).orElse("none");
-		return AgentIdentity.displayName(record.agentId(), record.profile())
+		return dev.agaminggod.arenaagents.agent.AgentIdentity.displayName(record.agentId(), record.profile())
 				+ " | " + dev.agaminggod.arenaagents.control.AgentControlPresentation.stateLabel(record.state().name())
 				+ ". Current task: " + currentGoal
 				+ ". Queued tasks: " + record.queuedGoals().size() + ".";

@@ -62,69 +62,33 @@ The coordinator checks the local provider CLIs, publishes a provider-aware model
 /codex summon kimi <model> <thinking> [name]
 /codex summon cursor <model> <thinking> [name]
 /codex summon-configured <provider> <model> <thinking> <speed_mode> <game_mode> [name]
+/msg <online-agent-name> <message>
 /codex start <agent> <prompt>
 /codex stop <agent>
 /codex resume <agent>
 /codex queue <agent> <prompt>
 /codex steer <agent> <prompt>
+/codex group save <group-name> <agent-uuid> [agent-uuid...]
+/codex group spawn <group-name>
+/codex group delete <group-name>
 /codex status [agent]
 /codex list
 /codex remove <agent>
 ```
 
-`/codex summon` and the legacy two-argument form remain Codex-compatible and default to `gpt-5.6-sol` with `high` reasoning. The command center consumes the live Codex app-server catalog, Antigravity's installed `agy models` list, Kimi's installed provider aliases, and Cursor's native `agent models` catalog; a bounded offline catalog is used only when discovery is unavailable. Cursor is intentionally restricted to Composer 2.5, Grok 4.5, and Grok 4.6. Kimi's `kimi-for-coding` aliases are shown by their current CLI names, `K2.7 Coding` and `K2.7 Coding Highspeed`. Player-facing speed choices are `Normal` and `Fast mode`; provider-native wire values such as Codex `priority` stay internal. A newly summoned NPC remains idle until `/codex start`; `stop` freezes its active work, `queue` preserves later goals, and `steer` interrupts the current plan and applies the new instruction at a higher revision.
+`/codex summon` and the legacy two-argument form remain Codex-compatible and default to `gpt-5.6-luna` with `xhigh` reasoning in Fast mode. The command center consumes the live Codex app-server catalog, Antigravity's installed `agy models` list, Kimi's installed provider aliases, and Cursor's native `agent models` catalog; a bounded offline catalog is used only when discovery is unavailable. Cursor is intentionally restricted to Composer 2.5, Grok 4.5, and Grok 4.6. Kimi's `kimi-for-coding` aliases are shown by their current CLI names, `K2.7 Coding` and `K2.7 Coding Highspeed`. Player-facing speed choices are `Normal` and `Fast mode`; provider-native wire values such as Codex `priority` stay internal. A newly summoned NPC remains idle until `/codex start`; `stop` freezes its active work, `queue` preserves later goals, and `steer` interrupts the current plan and applies the new instruction at a higher revision.
 
 Every NPC receives a stable directory beneath `runtime/agent-workspaces/<provider>/<agent-id>`. Codex keeps the efficient shared app-server but starts each isolated thread with that NPC's directory. Each Gemini decision runs one cancellable, sandboxed Antigravity print process in that NPC's directory; its visible model and thinking map to one exact CLI model ID such as `gemini-3.1-pro-low`. Kimi retains one isolated ACP process and session per NPC. Kimi effort is process-scoped and works with ACP sessions that expose exact levels, only an on/off thinking switch, or no thinking switch. Cursor runs its native `agent.ps1` launcher in read-only ask mode, supplies the prompt over standard input, and resumes the isolated agent session on later turns. Windows launches omit Cursor's unsupported sandbox flag; supported non-Windows launches enable it. Player-facing Composer and Grok settings map to exact native IDs such as `composer-2.5-fast` and `cursor-grok-4.6-high-fast`. No OAuth state or bridge secret is copied into an agent directory.
 
 Invalid ArenaScript source receives bounded compiler diagnostics and a corrective turn from the same selected provider/model/session. Repeated physical-action failures remain bounded factual evidence for the next model decision; they never make the runtime choose to abandon the goal. Kimi reads the existing `~/.kimi-code` OAuth state and receives its effort through an isolated process environment. Gemini reuses the existing Antigravity login through `agy`; missing authentication, unavailable models, oversized Windows command-line prompts, timeouts, and output overflow fail closed for only that NPC.
 
-Press the configured Agent Controls key (`G` by default) in a world to open the custom Field Console. Agent creation, one-at-a-time configuration, individual tasks, group selection, lifecycle controls, arena construction, and live match telemetry use separate workspaces behind persistent `Agents`, `Group`, `Live`, and `Build` navigation. The console renders its own flat controls, text fields, confirmation surface, selection rows, no-shadow labels, and mod-local Roboto typography instead of exposing Minecraft's default button grid or pixel type. Full-row selection, explicit `SELECTED` / `IN GROUP` labels, keyboard focus outlines, scroll-safe 320x240 layouts, and plain status copy keep the current target unmistakable.
+Press the configured Agent Controls key (`G` by default) in a world to open the custom Field Console. Agent creation, one-at-a-time configuration, individual tasks, saved groups, lifecycle controls, arena construction, and live match telemetry use separate workspaces behind persistent `Agents`, `Group`, `Live`, and `Build` navigation. The Group workspace saves an ordered roster of stable agent identities, so spawning it restores the same characters without duplicating agents that are already present. Direct messages stay in Minecraft's native `/msg`, `/tell`, and `/w` flow; the mod routes messages addressed to online agents into their private conversation memory and mirrors them to operators. The console renders its own flat controls, text fields, confirmation surface, selection rows, no-shadow labels, and mod-local Roboto typography instead of exposing Minecraft's default button grid or pixel type. Full-row selection, explicit `SELECTED` / `IN GROUP` labels, keyboard focus outlines, scroll-safe 320x240 layouts, and plain status copy keep the current target unmistakable.
 
 Arena setup defaults to building 80 blocks in front of the operator so construction remains visible; exact server coordinates are published before the reset job starts. `At my position` and deterministic fixed lanes remain available. World mutation is deliberately paced while bookkeeping and verification retain their higher bounded throughput, so the arena visibly grows instead of appearing all at once. The build dashboard reports the current phase, processed work, successful world changes, exact origin, actionable failures, and retry state. Each preset authors only the contestant stations, building plots, or parkour lanes required by the configured roster and adds a connected operator observation deck. Parkour lanes progress through easy, medium, hard, and expert sections; decorated checkpoints save progress, and lava deaths respawn Adventure-mode participants at their latest checkpoint. The compact in-world HUD shows four readable health/score cards, while the Live Arena workspace exposes the full scrollable roster and meaningful activity feed. Authored-map research and attribution are recorded in [MAP-SOURCES.md](MAP-SOURCES.md).
 
 ## Visual release validation
 
-The current offline-player release is covered by the headless Java/Fabric and coordinator verification suites. The opt-in real-provider matrix below adds live Fabric-server, provider-turn, action-result, and program-completion verification without opening a Minecraft client.
-
-## Real-provider headless matrix checks
-
-The real-provider runner is opt-in. First materialize the ignored runnable server from the tracked `server-template/` skeleton. The materializer verifies pinned Fabric downloads, builds the mod, and requires explicit Minecraft EULA acceptance:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\prepare-headless-server-template.ps1 -AcceptMinecraftEula
-```
-
-Then log in to the provider CLI that owns the selected profile. Codex requires an authenticated local `codex` session; Gemini requires a usable `agy` account and installed model; Kimi requires a usable `kimi` ACP account and installed model. Cursor requires the official native Windows CLI and OAuth:
-
-```powershell
-irm 'https://cursor.com/install?win32=true' | iex
-agent login
-agent status
-```
-
-The runner uses those existing local logins and reads only the generated Minecraft RCON password file. It never reads provider credentials. Minecraft/Fabric binaries, generated EULA state, worlds, logs, and credentials remain ignored under `runtime/`; only the source skeleton and pinned materializer belong in Git.
-
-These checks start Minecraft and a coordinator, consume provider turns, and can take several minutes or incur provider usage costs. Run them only when that cost and latency are acceptable. They are separate from the fast, provider-free offline test suite and do not replace `npm test`.
-
-Run one Codex scenario from the repository root:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-headless-provider-matrix.ps1 -ProjectRoot (Get-Location) -MatrixPath .\coordinator\config\headless-provider-matrix.json -ScenarioId codex-sol-high-fast
-```
-
-Run every configured scenario sequentially:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\run-headless-provider-matrix.ps1 -ProjectRoot (Get-Location) -MatrixPath .\coordinator\config\headless-provider-matrix.json -RequireAll
-```
-
-The lower-level coordinator command is also available through `npm run headless:matrix` when a prepared server and RCON password file already exist. All paths must be absolute:
-
-```powershell
-npm --prefix .\coordinator run headless:matrix -- --config <absolute-matrix.json> --scenario cursor-composer-high-fast --run-directory <absolute-run-directory> --rcon-host 127.0.0.1 --rcon-port <rcon-port> --rcon-password-file <absolute-rcon-password-file> --protocol-audit <absolute-protocol.jsonl> --provider-turns <absolute-provider-turns.jsonl>
-```
-
-Each scenario builds a small temporary stone platform in its isolated world, asks the selected real model to author the task program, and evaluates Minecraft-produced evidence. The checked-in matrix contains 18 live profiles: two models at two settings for Codex, Gemini, and Kimi, plus all three supported Cursor models at two native settings. Action assertions require a successful movement result, so dispatching an action that later fails cannot produce a false pass. The command prints the matrix report path and one summary line per scenario. Reports are written under `runtime/headless-runs/<run-id>/`, with `matrix-report.json` at the run root and bounded reports under each scenario directory. Each scenario report includes total elapsed time, matching provider p50/p95 health metrics, control-path latency, sanitized per-turn errors, and Cursor's API time when its JSON result supplies it. Generated servers, credentials, private provider turns, and detailed traces are removed after every run unless `-KeepArtifacts` is explicitly supplied. The direct runner accepts at most 24 selected scenarios and rejects matrix reports larger than 262,144 bytes. When supplied, `--provider-turns` points at the private provider-turn recorder artifact; the runner reads only bounded timing and outcome metadata and reports the artifact path, never raw provider text. A provider that is unavailable is reported as `SKIPPED` and returns exit code 0 when optional; `--require-all` classifies that same skip as `FAILED` and returns exit code 1. Provider, bridge, assertion, timeout, and cleanup failures always return a nonzero exit code. Do not paste RCON passwords or provider output into issue reports.
+The current offline-player release is covered by the headless Java/Fabric and coordinator verification suites. Live Minecraft gameplay and provider-latency acceptance remain pending; headless checks do not establish live success.
 
 ## Current action surface
 

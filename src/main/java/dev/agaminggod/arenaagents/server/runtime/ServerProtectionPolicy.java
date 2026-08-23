@@ -13,6 +13,8 @@ public interface ServerProtectionPolicy {
 		@Override public boolean mayDropItem(ServerPlayer agent) { return true; }
 		@Override public boolean mayUseContainer(ServerPlayer agent, ServerLevel level, BlockPos position) { return true; }
 		@Override public boolean mayUseRangedWeapon(ServerPlayer agent, Entity target) { return true; }
+		@Override public boolean mayInteractWithBlock(ServerPlayer agent, ServerLevel level, BlockPos position) { return true; }
+		@Override public boolean mayInteractWithEntity(ServerPlayer agent, Entity entity) { return true; }
 	};
 
 	default boolean mayModifyBlock(ServerPlayer agent, ServerLevel level, BlockPos position) { return false; }
@@ -20,4 +22,6 @@ public interface ServerProtectionPolicy {
 	default boolean mayDropItem(ServerPlayer agent) { return false; }
 	default boolean mayUseContainer(ServerPlayer agent, ServerLevel level, BlockPos position) { return false; }
 	default boolean mayUseRangedWeapon(ServerPlayer agent, Entity target) { return false; }
+	default boolean mayInteractWithBlock(ServerPlayer agent, ServerLevel level, BlockPos position) { return false; }
+	default boolean mayInteractWithEntity(ServerPlayer agent, Entity entity) { return false; }
 }

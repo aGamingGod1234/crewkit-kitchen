@@ -45,6 +45,8 @@ public final class ProtocolCodec {
 	private static final int MAX_DESIRED_STATE_LENGTH = 512;
 	private static final int MAX_BUILD_SEQUENCE_PLACEMENTS = 32;
 	private static final String FIELD_MESSAGE = "message";
+	private static final String FIELD_AUDIENCE = "audience";
+	private static final String FIELD_RECIPIENT_ID = "recipientId";
 	private static final String FIELD_SUMMARY = "summary";
 	private static final String FIELD_OPEN = "open";
 	private static final String FIELD_SLOT = "slot";
@@ -63,6 +65,10 @@ public final class ProtocolCodec {
 	private static final String FIELD_HOTBAR_SLOT = "hotbarSlot";
 	private static final String FIELD_MIN_REMAINING_DURABILITY = "minRemainingDurability";
 	private static final String FIELD_DRAW_DURATION_MS = "drawDurationMs";
+	private static final String FIELD_HAND = "hand";
+	private static final String FIELD_MENU_ID = "menuId";
+	private static final String FIELD_BUTTON_ID = "buttonId";
+	private static final String FIELD_NAME = "name";
 
 	private static final List<String> ENVELOPE_FIELDS = List.of(
 			FIELD_PROTOCOL_VERSION,
@@ -294,7 +300,7 @@ public final class ProtocolCodec {
 			case BREAK_BLOCK -> validateBreakBlock(arguments);
 			case PLACE_BLOCK -> validatePlaceBlock(arguments);
 			case BUILD_SEQUENCE -> validateBuildSequence(arguments);
-			case CHAT -> requireBoundedText(arguments, FIELD_MESSAGE, ProtocolConstants.MAX_CHAT_LENGTH, false);
+			case CHAT -> validateChat(arguments);
 			case SET_DOOR -> {
 				validateCoordinates(arguments, true);
 				requireBoolean(arguments, FIELD_OPEN);
@@ -314,6 +320,12 @@ public final class ProtocolCodec {
 			case SELECT_TOOL -> validateSelectTool(arguments);
 			case BLOCK_WITH_SHIELD -> requireDuration(arguments, FIELD_DURATION_MS);
 			case USE_RANGED -> validateUseRanged(arguments);
+			case INTERACT_BLOCK -> validateInteractBlock(arguments);
+			case INTERACT_ENTITY -> validateInteractEntity(arguments);
+			case DISMOUNT, START_FALL_FLYING -> { }
+			case MENU_TRANSFER -> validateMenuTransfer(arguments);
+			case MENU_BUTTON -> validateMenuButton(arguments);
+			case ANVIL_RENAME -> validateAnvilRename(arguments);
 			case RESPAWN -> { }
 			case COMPLETE_GOAL -> requireBoundedText(
 					arguments,
@@ -354,6 +366,26 @@ public final class ProtocolCodec {
 			);
 		}
 		requireBoolean(command, FIELD_SPRINT);
+	}
+
+	private static void validateChat(JsonObject arguments) throws ProtocolException {
+		requireBoundedCodePointText(arguments, FIELD_MESSAGE, ProtocolConstants.MAX_CHAT_LENGTH);
+		String audience = arguments.has(FIELD_AUDIENCE) && !arguments.get(FIELD_AUDIENCE).isJsonNull()
+				? requireBoundedText(arguments, FIELD_AUDIENCE, 32, false)
+				: "public";
+		if (!Set.of("public", "direct", "proximity").contains(audience)) {
+			throw invalidField("Field 'audience' must be public, direct, or proximity");
+		}
+		if ("proximity".equals(audience)) {
+			requireBoundedCodePointText(arguments, FIELD_MESSAGE, ProtocolConstants.MAX_VOICE_TEXT_LENGTH);
+		}
+		boolean hasRecipient = arguments.has(FIELD_RECIPIENT_ID) && !arguments.get(FIELD_RECIPIENT_ID).isJsonNull();
+		if ("direct".equals(audience)) {
+			if (!hasRecipient) throw new ProtocolException(ProtocolConstants.ERROR_MISSING_FIELD, "Required field 'recipientId' is missing");
+			requireUuid(arguments, FIELD_RECIPIENT_ID);
+		} else if (hasRecipient) {
+			throw invalidField("Field 'recipientId' is only valid for direct chat");
+		}
 	}
 
 	private static void validateAttack(JsonObject command) throws ProtocolException {
@@ -638,6 +670,50 @@ public final class ProtocolCodec {
 		return value;
 	}
 
+	private static void validateInteractBlock(JsonObject arguments) throws ProtocolException {
+		validateCoordinates(arguments, true);
+		requireOneOf(arguments, FIELD_FACE, BLOCK_FACES);
+		requireOneOf(arguments, FIELD_HAND, List.of("main", "off"));
+		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+	}
+
+	private static void validateInteractEntity(JsonObject arguments) throws ProtocolException {
+		requireUuid(arguments, FIELD_TARGET_ID);
+		requireOneOf(arguments, FIELD_HAND, List.of("main", "off"));
+		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+	}
+
+	private static void validateMenuTransfer(JsonObject arguments) throws ProtocolException {
+		requireIdentifier(arguments, FIELD_MENU_ID);
+		requireIntegralRange(arguments, FIELD_SOURCE_SLOT, 0, 255);
+		requireIntegralRange(arguments, FIELD_DESTINATION_SLOT, 0, 255);
+		requireIntegralRange(arguments, FIELD_COUNT, 1, 64);
+		requireIdentifier(arguments, FIELD_EXPECTED_ITEM_ID);
+		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateMenuButton(JsonObject arguments) throws ProtocolException {
+		requireIdentifier(arguments, FIELD_MENU_ID);
+		requireIntegralRange(arguments, FIELD_BUTTON_ID, 0, 255);
+		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static void validateAnvilRename(JsonObject arguments) throws ProtocolException {
+		requireIdentifier(arguments, FIELD_MENU_ID);
+		requireBoundedText(arguments, FIELD_NAME, 50, false);
+		requireDuration(arguments, FIELD_TIMEOUT_MS);
+	}
+
+	private static String requireBoundedCodePointText(JsonObject object, String field, int maximumLength)
+			throws ProtocolException {
+		String value = requireString(object, field);
+		if (isProtocolBlank(value)) throw invalidField("Field '" + field + "' must not be blank");
+		if (value.codePointCount(0, value.length()) > maximumLength) {
+			throw outOfRange(field, "at most " + maximumLength + " code points");
+		}
+		return value;
+	}
+
 	private static boolean isProtocolBlank(String value) {
 		return value.codePoints().allMatch(ProtocolCodec::isProtocolWhitespace);
 	}
@@ -726,7 +802,7 @@ public final class ProtocolCodec {
 		fields.put(ActionType.BREAK_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.PLACE_BLOCK, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_ITEM_ID, FIELD_DESIRED_STATE));
 		fields.put(ActionType.BUILD_SEQUENCE, List.of(FIELD_PLACEMENTS, FIELD_TIMEOUT_MS));
-		fields.put(ActionType.CHAT, List.of(FIELD_MESSAGE));
+		fields.put(ActionType.CHAT, List.of(FIELD_MESSAGE, FIELD_AUDIENCE, FIELD_RECIPIENT_ID));
 		fields.put(ActionType.WAIT, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.SET_DOOR, List.of(FIELD_X, FIELD_Y, FIELD_Z, FIELD_OPEN));
 		fields.put(ActionType.PICK_UP_ITEM, List.of(FIELD_TARGET_SELECTOR));
@@ -757,6 +833,18 @@ public final class ProtocolCodec {
 		));
 		fields.put(ActionType.BLOCK_WITH_SHIELD, List.of(FIELD_DURATION_MS));
 		fields.put(ActionType.USE_RANGED, List.of(FIELD_TARGET_ID, FIELD_DRAW_DURATION_MS, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.INTERACT_BLOCK, List.of(
+				FIELD_X, FIELD_Y, FIELD_Z, FIELD_FACE, FIELD_HAND, FIELD_EXPECTED_ITEM_ID
+		));
+		fields.put(ActionType.INTERACT_ENTITY, List.of(FIELD_TARGET_ID, FIELD_HAND, FIELD_EXPECTED_ITEM_ID));
+		fields.put(ActionType.DISMOUNT, List.of());
+		fields.put(ActionType.START_FALL_FLYING, List.of());
+		fields.put(ActionType.MENU_TRANSFER, List.of(
+				FIELD_MENU_ID, FIELD_SOURCE_SLOT, FIELD_DESTINATION_SLOT,
+				FIELD_COUNT, FIELD_EXPECTED_ITEM_ID, FIELD_TIMEOUT_MS
+		));
+		fields.put(ActionType.MENU_BUTTON, List.of(FIELD_MENU_ID, FIELD_BUTTON_ID, FIELD_TIMEOUT_MS));
+		fields.put(ActionType.ANVIL_RENAME, List.of(FIELD_MENU_ID, FIELD_NAME, FIELD_TIMEOUT_MS));
 		fields.put(ActionType.RESPAWN, List.of());
 		fields.put(ActionType.COMPLETE_GOAL, List.of(FIELD_SUMMARY));
 		return Map.copyOf(fields);

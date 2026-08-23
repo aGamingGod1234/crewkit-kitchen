@@ -501,6 +501,60 @@ function validateWatcher(node, state, context) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'watcher mode must be the boundary or interrupt literal', node.arguments[1]);
 	}
 	validatePureCondition(node.arguments[0]);
+	validateWatcherHandler(node.arguments[2], state, context.scope);
+}
+
+const WATCHER_FORBIDDEN_PATHS = new Set([
+	'player.chat',
+	'program.checkpoint',
+	'program.finish',
+	'program.onUnhandledAttention',
+	'program.repeatUntil',
+	'program.watch',
+]);
+
+/** Reject watcher handlers that can speak or mutate program/brain lifecycle. */
+function validateWatcherHandler(node, state, parentScope) {
+	const visitedFunctions = new Set();
+	const visitFunction = (functionNode, definingScope) => {
+		if (visitedFunctions.has(functionNode)) return;
+		visitedFunctions.add(functionNode);
+		const functionBinding = state.functionBindingsByNode.get(functionNode) ?? null;
+		const functionScope = createParameterScope(definingScope, functionNode, functionBinding);
+		if (functionNode.body.type === 'BlockStatement') visitNode(functionNode.body, createLexicalScope(functionScope, functionNode.body.body, state));
+		else visitNode(functionNode.body, functionScope);
+	};
+	const visitNode = (current, scope) => {
+		if (!current || typeof current !== 'object') return;
+		if (Array.isArray(current)) {
+			for (const child of current) visitNode(child, scope);
+			return;
+		}
+		if (current.type === 'FunctionDeclaration' || current.type === 'FunctionExpression' || current.type === 'ArrowFunctionExpression') {
+			visitFunction(current, scope);
+			return;
+		}
+		if (current.type === 'CallExpression') {
+			const path = staticMemberPath(current.callee)?.join('.') ?? null;
+			if (path && WATCHER_FORBIDDEN_PATHS.has(path)) {
+				throw arenaError('UNSUPPORTED_SYNTAX', `watcher handlers cannot call ${path}`, current);
+			}
+			if (current.callee.type === 'Identifier') {
+				const binding = resolveBinding(scope, current.callee.name);
+				if (binding?.callable) visitFunction(binding.functionNode, binding.scope ?? scope);
+			}
+		}
+		if (current.type === 'BlockStatement') {
+			const blockScope = createLexicalScope(scope, current.body, state);
+			for (const child of current.body) visitNode(child, blockScope);
+			return;
+		}
+		for (const [key, value] of Object.entries(current)) {
+			if (key === 'loc' || key === 'start' || key === 'end' || key === 'type') continue;
+			visitNode(value, scope);
+		}
+	};
+	visitFunction(node, parentScope);
 }
 
 function validatePureCondition(node) {
@@ -657,7 +711,7 @@ function createParameterScope(parent, node, functionBinding) {
 }
 
 function registerFunctionBinding(scope, name, functionNode, state) {
-	const binding = Object.freeze({ callable: true, name, functionNode });
+	const binding = Object.freeze({ callable: true, name, functionNode, scope });
 	scope.bindings.set(name, binding);
 	state.functionBindingsByNode.set(functionNode, binding);
 	state.functionBindings.add(binding);

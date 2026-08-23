@@ -36,6 +36,23 @@ function acknowledge(engine, dispatched, observationValue, eventSequence) {
 	engine.ingestObservation({ observation: observationValue, eventSequence, attention: false });
 }
 
+test('a failed factual completion reopens a finished program for an urgent correction', () => {
+	const run = engineFor('program.onUnhandledAttention("continue_and_notify"); program.finish("done");');
+	assert.equal(run.engine.snapshot().status, 'FINISHED');
+	run.engine.requestCorrection({
+		trigger: 'completion_verification_failed',
+		actionFailure: { actionType: 'complete_goal', state: 'FAILED', reasonCode: 'INVENTORY_MISSING' },
+	});
+	assert.equal(run.engine.snapshot().status, 'SUSPENDED');
+	assert.equal(run.modelRequests.length, 1);
+	assert.equal(run.modelRequests[0].priority, 'urgent');
+	assert.equal(run.modelRequests[0].trigger, 'completion_verification_failed');
+	assert.equal(run.modelRequests[0].actionFailure.reasonCode, 'INVENTORY_MISSING');
+	run.engine.applyDirective({ ...run.modelRequests[0], directive: 'continue' });
+	assert.equal(run.engine.snapshot().status, 'FINISHED', 'continuing a terminal correction re-arms factual verification');
+	assert.equal(run.engine.snapshot().pendingRequestTrigger, null);
+});
+
 test('measures a multi-tree pickup loop instead of assuming a tree yield or pickup range', () => {
 	const source = `
 		program.onUnhandledAttention("continue_and_notify");
@@ -89,6 +106,67 @@ test('watchers fire on false-to-true edges and boundary handlers wait for the ac
 	assert.deepEqual(dispatched.map((row) => row.action.type), ['move_to', 'wait']);
 });
 
+test('coalesces one pending latch per watcher and preserves the newest facts sequence', () => {
+	const traces = [];
+	const { engine, dispatched } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); });
+		await player.wait(1);
+	`, { trace: (event, fields) => traces.push({ event, ...fields }) });
+	const base = dispatched.at(-1);
+	engine.ingestObservation({ observation: observation({ player: { health: 19 } }), eventSequence: 2, attention: true });
+	engine.ingestObservation({ observation: observation({ player: { health: 20 } }), eventSequence: 3, attention: false });
+	engine.ingestObservation({ observation: observation({ player: { health: 19 } }), eventSequence: 4, attention: true });
+	engine.ingestActionResult({ actionId: base.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 5 });
+	engine.ingestObservation({ observation: observation({ player: { health: 19 } }), eventSequence: 5, attention: false });
+	assert.deepEqual(dispatched.map((row) => row.action.arguments), [1, 9]);
+	assert.equal(dispatched.at(-1).provenance.authorizingEventSequence, 4);
+	assert.equal(traces.some((entry) => entry.event === 'watcher_coalesced' && entry.watcherId === 'watcher-0'), true);
+});
+
+test('cancellation transport failure converges to a paused fence and ignores late results', () => {
+	const dispatched = [];
+	const cancelled = [];
+	const engine = new ArenaScriptEngine({
+		dispatch: (command) => dispatched.push(command),
+		cancel: (actionId) => cancelled.push(actionId),
+		requestModel() {},
+	});
+	engine.install({
+		agentId: 'agent-a', goalRevision: 1, modelIdentity: 'model-a', programId: 'program-a', version: 1,
+		compiled: parseArenaScript('program.onUnhandledAttention("pause_and_notify"); await player.wait(1);'), observation: observation(), eventSequence: 1,
+	});
+	const active = dispatched[0];
+	engine.suspend('operator');
+	assert.deepEqual(cancelled, [active.actionId]);
+	engine.failCancellation({ actionId: active.actionId, eventSequence: 2, reasonCode: 'CANCEL_SEND_FAILED' });
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	assert.equal(engine.snapshot().activeActionId, null);
+	engine.ingestActionResult({ actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3 });
+	assert.equal(dispatched.length, 1);
+});
+
+test('carries the exact profile, trace, and watcher identity into watcher commands', () => {
+	const dispatched = [];
+	const engine = new ArenaScriptEngine({ dispatch: (command) => dispatched.push(command), cancel() {}, requestModel() {} });
+	engine.install({
+		agentId: 'agent-a', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast',
+		goalRevision: 1, modelIdentity: 'gpt-5.6-sol', traceId: 'trace-watch-1', programId: 'program-a', version: 1,
+		compiled: parseArenaScript('program.onUnhandledAttention("continue_and_notify"); program.watch(() => player.state().health < 20, { mode: "boundary" }, async () => { await player.wait(9); }); await player.wait(1);'),
+		observation: observation(), eventSequence: 1,
+	});
+	const base = dispatched[0];
+	engine.ingestObservation({ observation: observation({ player: { health: 19 } }), eventSequence: 2, attention: true });
+	engine.ingestActionResult({ actionId: base.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 2 });
+	const watcher = dispatched.at(-1);
+	assert.equal(watcher.provenance.provider, 'codex');
+	assert.equal(watcher.provenance.model, 'gpt-5.6-sol');
+	assert.equal(watcher.provenance.reasoningEffort, 'high');
+	assert.equal(watcher.provenance.serviceTier, 'fast');
+	assert.equal(watcher.provenance.traceId, 'trace-watch-1');
+	assert.equal(watcher.provenance.watcherId, 'watcher-0');
+});
+
 test('interrupt watchers wait for cancellation acknowledgement and unmatched attention follows the authored policy', () => {
 	const { engine, dispatched, cancelled, modelRequests } = engineFor(`
 		program.onUnhandledAttention("pause_and_notify");
@@ -114,6 +192,49 @@ test('coalesces unmatched continue policy notifications and ignores stale events
 	assert.equal(modelRequests.length, 1);
 	assert.equal(modelRequests[0].eventSequence, 2);
 	assert.deepEqual(dispatched.map((row) => row.action.type), ['wait']);
+});
+
+test('coalesced attention keeps the highest-priority trigger metadata', () => {
+	const { engine, modelRequests } = engineFor('program.onUnhandledAttention("continue_and_notify"); await player.wait(1);');
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage' });
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: true, priority: 'ordinary', trigger: 'observation' });
+	assert.equal(modelRequests.length, 1);
+	assert.equal(modelRequests[0].priority, 'urgent');
+	assert.equal(modelRequests[0].trigger, 'damage');
+	engine.applyDirective({ directive: 'continue', ...modelRequests[0] });
+	assert.equal(modelRequests.length, 2);
+	assert.equal(modelRequests[1].priority, 'urgent');
+	assert.equal(modelRequests[1].trigger, 'damage');
+	assert.equal(modelRequests[1].eventSequence, 3);
+});
+
+test('requests one selected-model recovery after an identical deterministic action failure repeats', () => {
+	const { engine, dispatched, modelRequests } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		await program.repeatUntil(() => false, { maxIterations: 8 }, async () => {
+			await player.craftInventory({ recipeId: "minecraft:planks", count: 1, timeoutMs: 5000 });
+		});
+	`);
+	const first = dispatched.at(-1);
+	engine.ingestActionResult({ actionId: first.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND', eventSequence: 2 });
+	engine.ingestObservation({ observation: observation(), eventSequence: 2, attention: false });
+	const second = dispatched.at(-1);
+	assert.notEqual(second.actionId, first.actionId);
+	engine.ingestActionResult({ actionId: second.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND', eventSequence: 3 });
+	engine.ingestObservation({ observation: observation(), eventSequence: 3, attention: false });
+	assert.equal(dispatched.length, 2, 'the failed command is not dispatched a third time');
+	assert.equal(engine.snapshot().status, 'SUSPENDED');
+	assert.equal(modelRequests.length, 1);
+	assert.equal(modelRequests[0].decisionContext, 'program_action_failure');
+	assert.equal(modelRequests[0].priority, 'urgent');
+	assert.equal(modelRequests[0].trigger, 'action_failure');
+	assert.deepEqual({ ...modelRequests[0].actionFailure, arguments: { ...modelRequests[0].actionFailure.arguments } }, {
+		sourceStepId: second.provenance.stepId,
+		actionType: 'craft_inventory',
+		arguments: { recipeId: 'minecraft:planks', count: 1, timeoutMs: 5000 },
+		state: 'FAILED',
+		reasonCode: 'RECIPE_NOT_FOUND',
+	});
 });
 
 test('fences a replacement behind cancellation and rejects an old action result by generation', () => {

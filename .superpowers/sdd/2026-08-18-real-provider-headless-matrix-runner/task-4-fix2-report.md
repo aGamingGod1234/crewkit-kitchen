@@ -19,4 +19,3 @@ Implementation commit: `99db0d7` (`Harden quoted provider JSON secret redaction`
 - Full coordinator suite: `npm test` - 348 passed, 0 failed.
 - `git diff --check` - passed.
 - No real provider calls were made; all provider coverage uses injected/fake transports and processes.
-

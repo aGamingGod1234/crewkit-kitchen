@@ -6,13 +6,21 @@
 		"reconnectDelayMs": 500,
 		"maxReconnectDelayMs": 5000
 	},
+	"voice": {
+		"port": 8766,
+		"maxConcurrent": 5,
+		"profileAssignmentsPath": "runtime/voice-profile-assignments.json",
+		"fishApiKeyEnvironmentVariable": "FISH_AUDIO_API_KEY",
+		"deepgramApiKeyEnvironmentVariable": "DEEPGRAM_API_KEY"
+	},
 	"codex": {
+		"controlProtocol": "native_tools",
 		"planningTimeoutMs": 120000,
 		"catalogTtlMs": 60000,
 		"serviceTier": "priority",
 		"launchProfile": {
-			"model": "gpt-5.6-sol",
-			"reasoningEffort": "high",
+			"model": "gpt-5.6-luna",
+			"reasoningEffort": "xhigh",
 			"serviceTier": "fast"
 		}
 	},
@@ -53,6 +61,8 @@
 		"agentCap": 16,
 		"goalQueueCap": 32,
 		"planningConcurrency": 16,
+		"planningMode": "fixed",
+		"urgentReserve": 0,
 		"invalidDecisionRetries": 1
 	}
 }

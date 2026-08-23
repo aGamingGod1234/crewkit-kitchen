@@ -1,4 +1,5 @@
 import { AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
+import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
 
@@ -33,8 +34,10 @@ export class AgentPlanner {
 	#codexService;
 	#invalidDecisionRetries;
 	#healthRegistry;
+	#latencyRegistry;
 	#telemetrySink;
 	#now;
+	#recorder;
 	#turnRecorder;
 
 	constructor({
@@ -43,8 +46,11 @@ export class AgentPlanner {
 		codexService,
 		invalidDecisionRetries = DEFAULT_INVALID_DECISION_RETRIES,
 		healthRegistry = new ProviderHealthRegistry(),
+		latencyRegistry = null,
 		telemetrySink = () => {},
 		now = () => performance.now(),
+		recorder = null,
+		benchmarkRecorder = null,
 		turnRecorder = null,
 	}) {
 		if (registry === null || registry === undefined) throw new TypeError('registry is required');
@@ -54,26 +60,102 @@ export class AgentPlanner {
 			throw new TypeError('invalidDecisionRetries must be a non-negative safe integer');
 		}
 		if (typeof healthRegistry?.canAttempt !== 'function' || typeof healthRegistry?.record !== 'function') throw new TypeError('healthRegistry must provide canAttempt and record');
+		if (latencyRegistry !== null && typeof latencyRegistry.recordTracePhase !== 'function') throw new TypeError('latencyRegistry.recordTracePhase must be a function');
 		if (typeof telemetrySink !== 'function') throw new TypeError('telemetrySink must be a function');
 		if (typeof now !== 'function') throw new TypeError('now must be a function');
+		const selectedRecorder = recorder ?? benchmarkRecorder;
+		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
 		this.#registry = registry;
 		this.#scheduler = scheduler;
 		this.#codexService = codexService;
 		this.#invalidDecisionRetries = invalidDecisionRetries;
 		this.#healthRegistry = healthRegistry;
+		this.#latencyRegistry = latencyRegistry;
 		this.#telemetrySink = telemetrySink;
 		this.#now = now;
+		this.#recorder = selectedRecorder;
 		this.#turnRecorder = turnRecorder;
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
 
-	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false }) {
+	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
+		if (record.provider !== 'codex') throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex agents only');
+		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native turn input must be nonblank');
+		if (typeof executeTool !== 'function') throw new TypeError('executeTool must be a function');
+		const traceId = requestedTraceId === null ? defaultTraceId(agentId, goalRevision) : validateTraceId(requestedTraceId);
 		const queuedAt = this.#now();
+		this.#record('planner_requested', record, { operation: 'native_turn', preserveState, retry: false, lane: record.provider, priority, traceId });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
-			const queueWaitMs = elapsed(queuedAt, this.#now());
+			const admittedAt = this.#now();
+			const queueWaitMs = elapsed(queuedAt, admittedAt);
+			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
+			this.#registry.assertCurrentRevision(agentId, goalRevision);
+			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
+			try {
+				const agent = await this.#providerAttempt(record, {
+					operation: 'create_agent', attempt: 1, queueWaitMs, retry: false, traceId,
+				}, async () => {
+					const created = await this.#codexService.createAgent(record, { recoverySummary, controlProtocol: 'native_tools' });
+					await created.setGoalRevision(goalRevision);
+					return created;
+				});
+				let firstToolAt = null;
+				const result = await this.#providerAttempt(record, {
+					operation: 'native_turn', attempt: 1, queueWaitMs, retry: false, traceId,
+				}, () => agent.act(input, {
+					goalRevision,
+					signal,
+					executeTool: async (request) => {
+						if (firstToolAt === null) {
+							firstToolAt = this.#now();
+							this.#recordTracePhase(record, traceId, 'provider_first_byte', firstToolAt, firstToolAt, 'completed');
+						}
+						return executeTool(request);
+					},
+				}), agent);
+				const completedAt = this.#now();
+				if (firstToolAt === null) this.#recordTracePhase(record, traceId, 'provider_first_byte', completedAt, completedAt, 'failed', 'NO_TOOL_CALL');
+				this.#recordTracePhase(record, traceId, 'provider_final_byte', completedAt, completedAt, 'completed');
+				this.#record('planner_decision_completed', record, { operation: 'native_turn', attempt: 1, queueWaitMs, directive: 'native_tools', traceId });
+				return result;
+			} catch (error) {
+				this.#record('planner_failed', record, { operation: 'native_turn', errorCode: error?.code ?? 'NATIVE_TURN_FAILED', retry: false, traceId });
+				if (!preserveState && this.#isCurrent(agentId, goalRevision) && !['STALE_PLAN', 'PLAN_CANCELLED'].includes(error?.code)) {
+					this.#registry.setState(agentId, DynamicAgentState.ERROR, {
+						goalRevision,
+						error: { code: String(error?.code ?? 'NATIVE_TURN_FAILED').slice(0, 128), message: String(error?.message ?? error).slice(0, 2_048) },
+					});
+				}
+				throw error;
+			}
+		}, { lane: record.provider, priority });
+	}
+
+	async steerNativeTurn({ agentId, input, goalRevision }) {
+		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
+		if (record.provider !== 'codex') throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex agents only');
+		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native steer input must be nonblank');
+		const agent = this.#codexService.getAgent(agentId);
+		if (agent === null) throw codedError('TURN_NOT_ACTIVE', `Agent '${agentId}' has no active Codex turn`);
+		return agent.steer(input, { goalRevision });
+	}
+
+	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null, traceId: requestedTraceId = null }) {
+		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
+		const traceIdProvided = requestedTraceId !== null;
+		const traceId = traceIdProvided ? validateTraceId(requestedTraceId) : defaultTraceId(agentId, goalRevision);
+		const selectedPriority = planningPriority ?? priority ?? record.planningPriority ?? record.priority ?? 'ordinary';
+		const queuedAt = this.#now();
+		const trace = { retryReason: null, phasesRecorded: false };
+		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false, lane: record.provider, priority: selectedPriority, traceId });
+		return this.#scheduler.schedule(agentId, async ({ signal }) => {
+			const admittedAt = this.#now();
+			const queueWaitMs = elapsed(queuedAt, admittedAt);
+			this.#record('planner_admitted', record, { operation: 'plan', queueWaitMs, preserveState, lane: record.provider, priority: selectedPriority, traceId });
+			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
 			try {
@@ -86,6 +168,7 @@ export class AgentPlanner {
 							attempt: initializationRetryCount + 1,
 							queueWaitMs,
 							retry: initializationRetryCount > 0,
+							traceId,
 						}, async () => {
 							const created = await this.#codexService.createAgent(record, { recoverySummary });
 							await created.setGoalRevision(goalRevision);
@@ -113,12 +196,22 @@ export class AgentPlanner {
 					try {
 						const attempt = retryCount + providerRetryCount + 1;
 						const decision = await this.#providerAttempt(record, {
-							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1,
-						}, () => this.#turnRecorder === null
-							? agent.decide(plannerInput, { goalRevision, signal })
-							: agent.decide(plannerInput, { goalRevision, signal, turnRecorder: this.#turnRecorder, attempt, retry: attempt > 1, queueWaitMs }));
+							operation: 'decide', attempt, queueWaitMs, retry: attempt > 1, traceId,
+						}, () => agent.decide(plannerInput, {
+							goalRevision,
+							signal,
+							...(this.#turnRecorder === null ? {} : { turnRecorder: this.#turnRecorder, attempt, retry: attempt > 1, queueWaitMs }),
+						}), agent);
 						this.#registry.assertCurrentRevision(agentId, goalRevision);
-						return { ...decision, goalRevision };
+						const parseBoundary = this.#now();
+						if (!trace.phasesRecorded) {
+							this.#recordTracePhase(record, traceId, 'provider_first_byte', parseBoundary, parseBoundary, 'completed');
+							this.#recordTracePhase(record, traceId, 'provider_final_byte', parseBoundary, parseBoundary, 'completed');
+							this.#recordTracePhase(record, traceId, 'parse', parseBoundary, parseBoundary, 'completed', trace.retryReason);
+							trace.phasesRecorded = true;
+						}
+						this.#record('planner_decision_completed', record, { operation: 'decide', attempt, queueWaitMs, directive: decision?.directive ?? null, traceId });
+						return { ...decision, goalRevision, ...(traceIdProvided ? { traceId } : {}) };
 					} catch (error) {
 						if (
 							RETRYABLE_DECISION_ERRORS.has(error?.code)
@@ -127,6 +220,7 @@ export class AgentPlanner {
 							&& !signal.aborted
 						) {
 							retryCount += 1;
+							trace.retryReason = normalizeRetryReason(error?.code ?? 'INVALID_DECISION');
 							plannerInput = buildCorrectiveRetryInput(input, error, retryCount);
 							continue;
 						}
@@ -144,6 +238,7 @@ export class AgentPlanner {
 					}
 				}
 			} catch (error) {
+				this.#record('planner_failed', record, { operation: 'plan', errorCode: error?.code ?? 'PLANNING_FAILED', retry: true, traceId });
 				if (
 					error?.code !== 'STALE_PLAN'
 					&& error?.code !== 'PLAN_CANCELLED'
@@ -158,36 +253,48 @@ export class AgentPlanner {
 				}
 				throw error;
 			}
-		});
+		}, { lane: record.provider, priority: selectedPriority });
 	}
 
-	async #providerAttempt(record, fields, operation) {
+	async #providerAttempt(record, fields, operation, sessionAgent = null) {
 		const healthIdentity = { provider: record.provider, model: record.model, operation: fields.operation };
 		if (!this.#healthRegistry.canAttempt(healthIdentity)) {
 			const error = new Error(`Provider circuit is open for '${record.provider}/${record.model}/${fields.operation}'`);
 			error.code = 'PROVIDER_CIRCUIT_OPEN';
+			this.#record('provider_attempt_rejected', record, { ...fields, operation: fields.operation, errorCode: error.code });
 			throw error;
 		}
 		const startedAt = this.#now();
+		this.#record('provider_request_started', record, { ...fields, operation: fields.operation });
 		try {
 			const result = await operation();
+			const sessionFields = readSessionFields(sessionAgent ?? result);
+			const durationMs = elapsed(startedAt, this.#now());
+			this.#record('provider_response_completed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: null });
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
 				...fields,
-				durationMs: elapsed(startedAt, this.#now()),
+				...sessionFields,
+				durationMs,
 				errorCode: null,
+				retryReason: fields.retryReason,
 				timeout: false,
 				restart: false,
 			}));
 			return result;
 		} catch (error) {
+			const sessionFields = readSessionFields(sessionAgent);
+			const durationMs = elapsed(startedAt, this.#now());
+			this.#record('provider_response_failed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
 				...fields,
-				durationMs: elapsed(startedAt, this.#now()),
+				...sessionFields,
+				durationMs,
 				error,
+				retryReason: error?.code ?? 'ERROR',
 				timeout: error?.code === 'PLANNING_TIMEOUT',
 				restart: false,
 			}));
@@ -197,7 +304,59 @@ export class AgentPlanner {
 
 	#publishTelemetry(telemetry) {
 		this.#healthRegistry.record(telemetry);
+		try {
+			if (typeof this.#scheduler.observeProviderTelemetry === 'function') {
+				this.#scheduler.observeProviderTelemetry(telemetry, this.#scheduler.pressureSnapshot);
+			}
+		} catch { /* adaptive admission feedback cannot fail planning */ }
 		try { this.#telemetrySink(telemetry); } catch { /* telemetry consumers cannot fail planning */ }
+	}
+
+	#recordTracePhase(record, traceId, phase, startMs, endMs, outcome, retryReason = null) {
+		if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+			this.#invalidateTrace(traceId);
+			return;
+		}
+		let normalizedRetryReason = null;
+		if (retryReason !== null) {
+			try { normalizedRetryReason = normalizeRetryReason(retryReason); }
+			catch { this.#invalidateTrace(traceId); return; }
+		}
+		const fields = {
+			traceId,
+			phase,
+			startMonotonicMs: startMs,
+			endMonotonicMs: endMs,
+			durationMs: Math.max(0, endMs - startMs),
+			outcome,
+			...(normalizedRetryReason === null ? {} : { retryReason: normalizedRetryReason }),
+		};
+		if (this.#latencyRegistry !== null) {
+			try {
+				this.#latencyRegistry.recordTracePhase(traceId, phase, { startMs, endMs, outcome, ...(normalizedRetryReason === null ? {} : { retryReason: normalizedRetryReason }) });
+			} catch { return; }
+		}
+		this.#record(phase, record, fields);
+	}
+
+	#invalidateTrace(traceId) {
+		try { this.#latencyRegistry?.invalidateTrace?.(traceId); } catch { /* telemetry cannot interrupt planning */ }
+	}
+
+	#record(stage, record, fields = {}) {
+		if (this.#recorder === null) return;
+		try {
+			const context = {
+				agentId: record.agentId,
+				provider: record.provider,
+				model: record.model,
+				reasoningEffort: record.reasoningEffort,
+				serviceTier: record.serviceTier ?? 'priority',
+				goalRevision: record.goalRevision,
+				...(fields.traceId === undefined ? {} : { traceId: fields.traceId }),
+			};
+			this.#recorder.record(stage, context, fields);
+		} catch { /* benchmark telemetry cannot affect planning */ }
 	}
 
 	async interrupt(agentId, reason = 'Agent planning interrupted') {
@@ -214,10 +373,15 @@ export class AgentPlanner {
 	}
 
 	async reconcile(snapshot) {
+		return (await this.beginReconcile(snapshot).complete);
+	}
+
+	beginReconcile(snapshot) {
 		const result = this.#registry.reconcile(snapshot);
 		for (const agentId of result.removed) this.#scheduler.cancel(agentId, 'Agent absent from reconciled server snapshot');
-		const providers = await this.#codexService.reconcile(result.records);
-		return { registry: result, providers, codex: providers };
+		const complete = Promise.resolve(this.#codexService.reconcile(result.records)).then((providers) =>
+			({ registry: result, providers, codex: providers }));
+		return { registry: result, complete };
 	}
 
 	#isCurrent(agentId, goalRevision) {
@@ -230,6 +394,27 @@ export class AgentPlanner {
 		}
 	}
 }
+
+function readSessionFields(agent) {
+	if (agent === null || agent === undefined || typeof agent.sessionMetadata !== 'function') return {};
+	try {
+		const metadata = agent.sessionMetadata();
+		return {
+			...(metadata?.profileFingerprint === undefined ? {} : { profileFingerprint: metadata.profileFingerprint }),
+			...(metadata?.sessionGeneration === undefined ? {} : { sessionGeneration: metadata.sessionGeneration }),
+			...(metadata?.sessionReuse === undefined ? {} : { sessionReuse: metadata.sessionReuse }),
+			...(metadata?.sessionState === undefined ? {} : { sessionState: metadata.sessionState }),
+			...(metadata?.continuation === undefined ? {} : { continuation: metadata.continuation }),
+			...(metadata?.resetReason === undefined ? {} : { resetReason: metadata.resetReason }),
+		};
+	} catch { return {}; }
+}
+
+function defaultTraceId(agentId, goalRevision) {
+	return `trace-${String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_')}-${goalRevision}`.slice(0, 128);
+}
+
+function codedError(code, message) { return Object.assign(new Error(message), { code }); }
 
 function elapsed(startedAt, finishedAt) {
 	if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) throw new TypeError('planner clock must return finite values');

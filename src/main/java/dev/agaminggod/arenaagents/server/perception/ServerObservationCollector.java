@@ -9,12 +9,17 @@ import dev.agaminggod.arenaagents.server.runtime.BlockPlacementAttemptPolicy;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
+import dev.agaminggod.arenaagents.server.runtime.menu.MenuCapabilityRegistry;
 import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Function;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -28,6 +33,8 @@ import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.HitResult;
 
 public final class ServerObservationCollector {
 	public static final int MAX_ENTITIES = 64;
@@ -38,6 +45,7 @@ public final class ServerObservationCollector {
 	public static final int MAX_OBSERVATION_TAGS = 32;
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
+	/** Spatial block/container scans are expensive; movement and view changes still invalidate the key immediately. */
 	private static final long SPATIAL_CACHE_TICKS = 10L;
 
 	private final CodexAgentManager manager;
@@ -99,6 +107,7 @@ public final class ServerObservationCollector {
 		}
 		player.add("effects", effects(agent));
 		observation.add("player", player);
+		observation.add("interaction", interaction(agentId, agent));
 
 		observation.add("inventory", inventory(agent));
 		observation.add("entities", entities(level, agent));
@@ -126,22 +135,34 @@ public final class ServerObservationCollector {
 		}
 	}
 
-	/** Returns registered agents whose compact factual player state changed since the last sample. */
+	/** Returns loaded agents whose compact factual player or inventory state changed since the last sample. */
 	public List<AgentId> changedActiveAgents() {
 		List<AgentId> changed = new ArrayList<>();
-		Map<AgentId, Boolean> registered = new HashMap<>();
+		if (manager.server() == null) {
+			synchronized (lastRawStates) {
+				lastRawStates.clear();
+			}
+			return List.of();
+		}
+		HashSet<AgentId> tracked = new HashSet<>();
 		for (AgentRecord record : manager.records()) {
 			AgentId agentId = record.agentId();
-			registered.put(agentId, true);
+			tracked.add(agentId);
 			ServerPlayer agent = manager.findAgentPlayer(agentId).orElse(null);
-			if (agent == null || !agent.isAlive()) continue;
+			if (agent == null || !agent.isAlive()) {
+				synchronized (lastRawStates) {
+					lastRawStates.remove(agentId);
+				}
+				continue;
+			}
 			RawPlayerState current = rawPlayerState(agent);
 			synchronized (lastRawStates) {
-				if (!current.equals(lastRawStates.put(agentId, current))) changed.add(agentId);
+				RawPlayerState previous = lastRawStates.put(agentId, current);
+				if (previous != null && !current.equals(previous)) changed.add(agentId);
 			}
 		}
 		synchronized (lastRawStates) {
-			lastRawStates.keySet().removeIf(agentId -> !registered.containsKey(agentId));
+			lastRawStates.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
 		return List.copyOf(changed);
 	}
@@ -191,6 +212,92 @@ public final class ServerObservationCollector {
 			json.addProperty("message", result.message());
 		}
 		return json;
+	}
+
+	private JsonObject interaction(AgentId agentId, ServerPlayer agent) {
+		JsonObject interaction = new JsonObject();
+		interaction.addProperty("mainHandItemId", itemId(agent.getMainHandItem()));
+		interaction.addProperty("offHandItemId", itemId(agent.getOffhandItem()));
+		interaction.addProperty("usingItem", agent.isUsingItem());
+		interaction.addProperty(
+				"activeHand",
+				agent.isUsingItem() ? agent.getUsedItemHand().name().toLowerCase(java.util.Locale.ROOT) : "none"
+		);
+		interaction.addProperty("useRemainingTicks", Math.max(0, agent.getUseItemRemainingTicks()));
+		interaction.addProperty("attackCooldown", finite(agent.getAttackStrengthScale(0.0F)));
+
+		AgentInputState input = AgentInputRuntime.controller(agent).currentState(agentId)
+				.orElseGet(() -> AgentInputState.idle(
+						agent.getYRot(),
+						agent.getXRot(),
+						agent.getInventory().getSelectedSlot()
+				));
+		JsonObject inputJson = new JsonObject();
+		inputJson.addProperty("active", AgentInputRuntime.controller(agent).currentState(agentId).isPresent());
+		inputJson.addProperty("forward", finite(input.forward()));
+		inputJson.addProperty("strafe", finite(input.strafe()));
+		inputJson.addProperty("jump", input.jump());
+		inputJson.addProperty("sneak", input.sneak());
+		inputJson.addProperty("sprint", input.sprint());
+		inputJson.addProperty("attack", input.attack());
+		inputJson.addProperty("use", input.use());
+		inputJson.addProperty("yaw", finite(input.yaw()));
+		inputJson.addProperty("pitch", finite(input.pitch()));
+		inputJson.addProperty("selectedSlot", input.selectedSlot());
+		inputJson.addProperty("hand", input.hand().name().toLowerCase(java.util.Locale.ROOT));
+		interaction.add("input", inputJson);
+
+		JsonObject menu = new JsonObject();
+		String menuType;
+		try {
+			menuType = BuiltInRegistries.MENU.getKey(agent.containerMenu.getType()).toString();
+		} catch (RuntimeException exception) {
+			menuType = agent.containerMenu == agent.inventoryMenu ? "minecraft:inventory" : "minecraft:unknown";
+		}
+		menu.addProperty("type", menuType);
+		menu.add("cursor", compactItem(agent.containerMenu.getCarried()));
+		JsonArray menuSlots = new JsonArray();
+		for (int index = 0; index < agent.containerMenu.slots.size() && index < 64; index++) {
+			JsonObject slot = compactItem(agent.containerMenu.getSlot(index).getItem());
+			slot.addProperty("slot", index);
+			menuSlots.add(slot);
+		}
+		menu.add("slots", menuSlots);
+		JsonArray menuCapabilities = new JsonArray();
+		MenuCapabilityRegistry.capabilities(menuType).orElse(List.of()).forEach(menuCapabilities::add);
+		menu.add("capabilities", menuCapabilities);
+		interaction.add("menu", menu);
+
+		HitResult hit = agent.pick(agent.blockInteractionRange(), 0.0F, false);
+		interaction.add("rayTarget", rayTarget(hit, position ->
+				BuiltInRegistries.BLOCK.getKey(agent.level().getBlockState(position).getBlock()).toString()
+		));
+		return interaction;
+	}
+
+	static JsonObject rayTarget(HitResult hit, Function<BlockPos, String> blockIdAt) {
+		JsonObject rayTarget = new JsonObject();
+		rayTarget.addProperty("type", hit.getType().name().toLowerCase(java.util.Locale.ROOT));
+		if (hit.getType() == HitResult.Type.BLOCK && hit instanceof BlockHitResult blockHit) {
+			BlockPos position = blockHit.getBlockPos();
+			rayTarget.addProperty("x", position.getX());
+			rayTarget.addProperty("y", position.getY());
+			rayTarget.addProperty("z", position.getZ());
+			rayTarget.addProperty("face", blockHit.getDirection().getName());
+			rayTarget.addProperty("blockId", blockIdAt.apply(position));
+		}
+		return rayTarget;
+	}
+
+	private static JsonObject compactItem(ItemStack stack) {
+		JsonObject item = new JsonObject();
+		item.addProperty("itemId", itemId(stack));
+		item.addProperty("count", stack.isEmpty() ? 0 : stack.getCount());
+		return item;
+	}
+
+	private static String itemId(ItemStack stack) {
+		return stack.isEmpty() ? "minecraft:air" : BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
 	}
 
 	private static JsonArray effects(ServerPlayer agent) {
@@ -396,6 +503,12 @@ public final class ServerObservationCollector {
 			case "minecraft:crafting_table" -> List.of("craft_table");
 			case "minecraft:furnace", "minecraft:smoker", "minecraft:blast_furnace" ->
 					List.of("furnace_transaction");
+			case "minecraft:brewing_stand" -> List.of("menu_transfer", "brewing");
+			case "minecraft:anvil" -> List.of("menu_transfer", "anvil");
+			case "minecraft:smithing_table" -> List.of("menu_transfer", "smithing");
+			case "minecraft:loom" -> List.of("menu_transfer", "loom");
+			case "minecraft:stonecutter" -> List.of("menu_transfer", "stonecutter");
+			case "minecraft:enchanting_table" -> List.of("menu_transfer", "enchanting");
 			default -> List.of();
 		};
 	}
@@ -424,8 +537,32 @@ public final class ServerObservationCollector {
 				agent.isInWall(),
 				agent.onGround(),
 				finite(agent.fallDistance),
-				attacker != null && attacker.isAlive() ? attacker.getUUID() : null
+				attacker != null && attacker.isAlive() ? attacker.getUUID() : null,
+				inventorySignature(agent)
 			);
+	}
+
+	private static String inventorySignature(ServerPlayer agent) {
+		StringBuilder signature = new StringBuilder(512);
+		Inventory inventory = agent.getInventory();
+		signature.append("selected=").append(inventory.getSelectedSlot()).append(';');
+		for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+			appendItemSignature(signature, inventory.getItem(slot));
+		}
+		for (EquipmentSlot slot : EquipmentSlot.values()) appendItemSignature(signature, agent.getItemBySlot(slot));
+		if (agent.containerMenu != null) {
+			appendItemSignature(signature, agent.containerMenu.getCarried());
+			for (int slot = 0; slot < agent.containerMenu.slots.size() && slot < 64; slot++) {
+				appendItemSignature(signature, agent.containerMenu.getSlot(slot).getItem());
+			}
+		}
+		return signature.toString();
+	}
+
+	private static void appendItemSignature(StringBuilder signature, ItemStack stack) {
+		signature.append(itemId(stack)).append(':')
+				.append(stack.isEmpty() ? 0 : stack.getCount()).append(':')
+				.append(stack.isEmpty() ? 0 : stack.getDamageValue()).append(';');
 	}
 
 	private record RawPlayerState(
@@ -438,7 +575,8 @@ public final class ServerObservationCollector {
 		boolean suffocating,
 		boolean onGround,
 		double fallDistance,
-		java.util.UUID lastAttacker
+		java.util.UUID lastAttacker,
+		String inventorySignature
 	) {
 	}
 }

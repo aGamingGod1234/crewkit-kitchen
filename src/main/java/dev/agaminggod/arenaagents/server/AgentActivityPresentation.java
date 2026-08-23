@@ -35,6 +35,13 @@ public final class AgentActivityPresentation {
 			case EQUIP_ITEM -> "Equipping an item";
 			case BLOCK_WITH_SHIELD -> "Blocking with a shield";
 			case USE_RANGED -> "Using a ranged weapon";
+			case INTERACT_BLOCK -> "Interacting with a block";
+			case INTERACT_ENTITY -> "Interacting with an entity";
+			case DISMOUNT -> "Dismounting";
+			case START_FALL_FLYING -> "Starting elytra flight";
+			case MENU_TRANSFER -> "Moving items in a menu";
+			case MENU_BUTTON -> "Selecting a menu option";
+			case ANVIL_RENAME -> "Naming an item";
 			case RESPAWN -> "Respawning";
 			case COMPLETE_GOAL -> "Finishing the task";
 		};

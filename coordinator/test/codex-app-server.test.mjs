@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, resolveCodexLaunch } from '../src/codex-app-server.mjs';
+import { finishDecisionJson } from './provider-decision-fixtures.mjs';
 
 const model = {
 	id: 'gpt-5.5',
@@ -28,7 +29,7 @@ class FakeCodexTransport extends EventEmitter {
 		if (method === 'thread/start') return { thread: { id: 'thread-1' } };
 		if (method === 'turn/start') {
 			if (this.autoComplete) queueMicrotask(() => {
-				this.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 1, item: { id: 'item-1', type: 'agentMessage', text: '{"summary":"Done","directive":"finish","status":"completed"}' } } });
+				this.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', completedAtMs: 1, item: { id: 'item-1', type: 'agentMessage', text: finishDecisionJson() } } });
 				this.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
 			});
 			return { turn: { id: 'turn-1', status: 'inProgress', items: [], error: null } };
@@ -54,6 +55,19 @@ test('builds an isolated app-server process command with exact model profile', (
 		'-c', 'model_reasoning_effort="xhigh"',
 		'-c', 'service_tier="fast"',
 		'-c', 'features.fast_mode=true',
+		'-c', 'mcp_servers={}',
+		'-c', 'features.apps=false',
+		'-c', 'features.browser_use=false',
+		'-c', 'features.computer_use=false',
+		'-c', 'features.goals=false',
+		'-c', 'features.hooks=false',
+		'-c', 'features.image_generation=false',
+		'-c', 'features.multi_agent=false',
+		'-c', 'features.plugins=false',
+		'-c', 'features.skill_search=false',
+		'-c', 'features.shell_tool=false',
+		'-c', 'features.unified_exec=false',
+		'-c', 'features.view_image=false',
 	]);
 });
 
@@ -117,7 +131,7 @@ test('uses streamed agent-message deltas when a completed message item is absent
 	await agent.start();
 	const decisionPromise = agent.decide('compact state');
 	await Promise.resolve();
-	const text = '{"summary":"Done","directive":"finish","status":"completed"}';
+	const text = finishDecisionJson();
 	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: text } });
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
 	assert.equal((await decisionPromise).status, 'completed');

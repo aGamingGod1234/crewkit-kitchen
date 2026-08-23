@@ -3,10 +3,11 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { AcpProtocolError } from './acp-transport.mjs';
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
 import { parseDecision } from './decision-parser.mjs';
-import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { discoverAntigravityCatalog } from './provider-catalog-discovery.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
+import { recordProviderTurn } from './provider-turn-recorder.mjs';
 
 const DEFAULT_EXECUTABLE = 'agy';
 const DEFAULT_PLANNING_TIMEOUT_MS = 120_000;
@@ -14,6 +15,9 @@ const DEFAULT_STDOUT_LIMIT_BYTES = 1_024 * 1_024;
 const DEFAULT_STDERR_LIMIT_BYTES = 64 * 1_024;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
 const MAX_WINDOWS_PROMPT_CHARS = 24_000;
+const DEFAULT_SERVICE_TIER = 'priority';
+const PROFILE_KEYS = Object.freeze(['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier']);
+const PROFILE_CONFLICT_MESSAGE = 'Agent profile is immutable for the active Gemini session';
 const GEMINI_MODEL_REASONING = Object.freeze({
 	'gemini-3.7-flash': Object.freeze(['high', 'medium', 'low']),
 	'gemini-3.1-pro': Object.freeze(['high', 'low']),
@@ -27,6 +31,7 @@ export class AntigravityProviderService {
 	#workspaceManager;
 	#agents = new Map();
 	#creating = new Map();
+	#sessionGenerations = new Map();
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -54,14 +59,14 @@ export class AntigravityProviderService {
 		const existing = this.#agents.get(profile.agentId);
 		if (existing !== undefined) {
 			if (!existing.matchesProfile(profile)) {
-				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `gemini agent '${profile.agentId}' already has a different profile`);
+				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			}
 			return existing;
 		}
 		const creating = this.#creating.get(profile.agentId);
 		if (creating !== undefined) {
 			if (!profilesMatch(creating.profile, profile)) {
-				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `gemini agent '${profile.agentId}' is being created with a different profile`);
+				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			}
 			return creating.promise;
 		}
@@ -87,10 +92,14 @@ export class AntigravityProviderService {
 				{ cause: error },
 			);
 		}
+		const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
+		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
 		const agent = new AntigravityAgent(profile, cwd, {
 			...this.#dependencies,
 			config: this.#config,
 			recoverySummary: normalizeRecoverySummary(recoverySummary),
+			sessionGeneration,
+			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 		});
 		this.#agents.set(profile.agentId, agent);
 		return agent;
@@ -147,9 +156,12 @@ class AntigravityAgent {
 	#goalRevision = 0;
 	#activeOperation = null;
 	#hasConversation = false;
+	#sessionGeneration;
+	#sessionState = 'cold';
+	#resetReason;
 	#disposed = false;
 
-	constructor(profile, cwd, { config, spawn, terminate, platform, recoverySummary }) {
+	constructor(profile, cwd, { config, spawn, terminate, platform, recoverySummary, sessionGeneration = 1, resetReason = null }) {
 		this.#profile = structuredClone(profile);
 		this.#cwd = cwd;
 		this.#config = config;
@@ -157,10 +169,18 @@ class AntigravityAgent {
 		this.#terminate = terminate;
 		this.#platform = platform;
 		this.#recoverySummary = recoverySummary;
+		this.#sessionGeneration = sessionGeneration;
+		this.#resetReason = resetReason;
 	}
 
 	get agentId() { return this.#profile.agentId; }
 	get provider() { return this.#profile.provider; }
+	get serviceTier() { return this.#profile.serviceTier; }
+	get sessionGeneration() { return this.#sessionGeneration; }
+	get profileFingerprint() { return profileFingerprint(this.#profile); }
+	sessionMetadata() {
+		return createSessionMetadata(this.#profile, { sessionGeneration: this.#sessionGeneration, sessionState: this.#sessionState, continuation: 'best_effort', durability: 'unverified', resetReason: this.#resetReason });
+	}
 	matchesProfile(profile) { return profilesMatch(this.#profile, profile); }
 
 	async setGoalRevision(revision) {
@@ -204,12 +224,10 @@ class AntigravityAgent {
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
-			this.#hasConversation = true;
 			let decision;
 			let parseError = null;
-			try {
-				decision = parseDecision(decisionText.trim());
-			} catch (error) {
+			try { decision = parseDecision(decisionText.trim()); }
+			catch (error) {
 				parseError = new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
 					`gemini returned an invalid planner decision: ${error?.message ?? String(error)} [output=${decisionExcerpt(decisionText)}]`,
@@ -218,17 +236,17 @@ class AntigravityAgent {
 			}
 			outputHandled = true;
 			await recordProviderTurn(turnRecorder, {
-				agentId: this.agentId,
-				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				agentId: this.agentId, provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
 			});
 			if (parseError !== null) throw parseError;
+			this.#hasConversation = true;
+			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
 			if (!outputHandled) await recordProviderTurn(turnRecorder, {
-				agentId: this.agentId,
-				provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
+				agentId: this.agentId, provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
 			});
@@ -255,7 +273,9 @@ class AntigravityAgent {
 	}
 }
 
-function providerTiming(durationMs, apiDurationMs, queueWaitMs) { return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) }; }
+function providerTiming(durationMs, apiDurationMs, queueWaitMs) {
+	return { durationMs, apiDurationMs, ...(Number.isFinite(queueWaitMs) && queueWaitMs >= 0 ? { queueWaitMs } : {}) };
+}
 
 export function buildAntigravityLaunch(profile, configValue = {}, dependencies = {}) {
 	const config = validateServiceConfig({
@@ -489,6 +509,7 @@ function validateProfile(value, config) {
 		provider: value.provider ?? 'codex',
 		model: requireText(value.model, 'model'),
 		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
 	};
 	if (profile.provider !== 'gemini') throw new AcpProtocolError('PROVIDER_MISMATCH', `Expected gemini profile, received ${profile.provider}`);
 	if (!config.models.includes(profile.model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `gemini model '${profile.model}' is not configured`);
@@ -499,7 +520,7 @@ function validateProfile(value, config) {
 }
 
 function profilesMatch(left, right) {
-	return ['agentId', 'provider', 'model', 'reasoningEffort'].every((key) => left[key] === right[key]);
+	return PROFILE_KEYS.every((key) => left[key] === right[key]);
 }
 
 function decisionExcerpt(value) {

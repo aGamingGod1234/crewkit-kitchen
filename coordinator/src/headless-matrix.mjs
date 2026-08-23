@@ -18,7 +18,7 @@ const SENSITIVE_REPORT_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refr
 const REPORT_SECRET_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 const REPORT_BEARER_TEXT = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const REPORT_QUOTED_SECRET_KEY = /(["'])(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\1\s*:\s*(["'])/gi;
-const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'rosterSize', 'assert', 'assertions']);
+const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'rosterSize', 'assert', 'assertions', 'repetitions', 'planningTimeoutMs', 'scenarioTimeoutMs', 'requireFactualSuccess']);
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
 	chat: new Set(['type', 'message']),
@@ -96,8 +96,13 @@ export function normalizeHeadlessScenario(value, index = 0) {
 		id: text(value.id, `scenarios[${index}].id`), provider: text(value.provider, `scenarios[${index}].provider`),
 		model: text(value.model, `scenarios[${index}].model`), reasoningEffort: text(value.reasoningEffort, `scenarios[${index}].reasoningEffort`),
 		serviceTier: text(value.serviceTier ?? 'priority', `scenarios[${index}].serviceTier`), task: text(value.task, `scenarios[${index}].task`), timeoutMs, rosterSize,
+		repetitions: value.repetitions === undefined ? 1 : boundedPositiveInteger(value.repetitions, `scenarios[${index}].repetitions`),
+		planningTimeoutMs: value.planningTimeoutMs === undefined ? null : boundedPositiveInteger(value.planningTimeoutMs, `scenarios[${index}].planningTimeoutMs`),
+		scenarioTimeoutMs: value.scenarioTimeoutMs === undefined ? timeoutMs : boundedPositiveInteger(value.scenarioTimeoutMs, `scenarios[${index}].scenarioTimeoutMs`),
+		requireFactualSuccess: value.requireFactualSuccess === true,
 		assertions: assertions.map(normalizeAssertion),
 	};
+	if (scenario.repetitions > 32) throw new RangeError(`scenarios[${index}].repetitions must not exceed 32`);
 	if (!PROVIDERS.has(scenario.provider)) throw new TypeError(`unsupported provider '${scenario.provider}'`);
 	return freeze(scenario);
 }
@@ -292,18 +297,22 @@ export async function runHeadlessScenario({
 			deadline, now, startedAt, poll, scenario, generatedName,
 		});
 		const { scopedEvidence, scopedAudit, identity, assertionResult } = evidenceResult;
+		const factualAssertions = assertions.filter((assertion) => assertion.type === 'rcon');
+		const factualSuccess = factualAssertions.length > 0
+			&& assertionResult.results.filter((result) => result.type === 'rcon').every((result) => result.passed);
 		const resolvedAgentId = identity.agentId;
 		if (identity.error !== null) {
 			classification = 'ERROR';
 			diagnostics = identity.error;
 		}
 		if (classification === null && !assertionResult.passed) classification = 'ASSERTION_MISMATCH';
+		if (classification === null && scenario.requireFactualSuccess && !factualSuccess) classification = 'FAILED_USER_OBJECTIVE';
 		if (classification === null) classification = 'PASSED';
 		const status = classification === 'PASSED' ? 'PASSED' : classification === 'SKIPPED_PROFILE' ? 'SKIPPED' : 'FAILED';
 		const elapsedMs = Math.max(0, Number(now()) - startedAt);
 		const report = scenarioReport(status, scenario, {
 			classification, generatedName, lifecycle: terminalState, elapsedMs,
-			commands, assertions: assertionResult.results, evidence: evidenceSummary(directory, scopedEvidence, scopedAudit),
+			commands, assertions: assertionResult.results, factualSuccess, evidence: evidenceSummary(directory, scopedEvidence, scopedAudit),
 			timings: timingSummary(profile, scopedEvidence, scopedAudit, elapsedMs),
 			metrics: performanceMetrics(profile, scopedEvidence, scopedAudit, resolvedAgentId, { minecraftMspt }),
 			diagnostics,
@@ -577,7 +586,9 @@ export async function runHeadlessMatrix({
 	const runId = path.basename(path.resolve(runDirectory));
 	const scenarioReports = [];
 	for (const scenario of scenarios) {
-		const scenarioDirectory = scenarioId === null ? path.join(path.resolve(runDirectory), scenario.id) : path.resolve(runDirectory);
+		for (let repetition = 1; repetition <= scenario.repetitions; repetition += 1) {
+		const scenarioRoot = scenarioId === null ? path.join(path.resolve(runDirectory), scenario.id) : path.resolve(runDirectory);
+		const scenarioDirectory = scenario.repetitions === 1 ? scenarioRoot : path.join(scenarioRoot, `repetition-${repetition}`);
 		let rcon = null;
 		try {
 			rcon = rconFactory({ host: rconHost, port: rconPort, password });
@@ -594,11 +605,13 @@ export async function runHeadlessMatrix({
 				protocolAudit: protocolAuditPath,
 				providerTurnsPath,
 			});
-			scenarioReports.push(report);
+			scenarioReports.push(scenario.repetitions === 1 ? report : { ...report, repetition });
 		} catch (error) {
 			let cleanupStatus = 'CLEAN';
 			try { await rcon?.close?.(); } catch { cleanupStatus = 'FAILED'; }
-			scenarioReports.push(scenarioReport('FAILED', scenario, { classification: 'ERROR', diagnostics: error?.message ?? String(error), cleanup: { status: cleanupStatus } }));
+			const failure = scenarioReport('FAILED', scenario, { classification: 'ERROR', diagnostics: error?.message ?? String(error), cleanup: { status: cleanupStatus } });
+			scenarioReports.push(scenario.repetitions === 1 ? failure : { ...failure, repetition });
+		}
 		}
 	}
 	const classifiedReports = scenarioReports.map((report) => {
@@ -696,7 +709,8 @@ function makeEvidence({ terminalState, protocolAudit, protocolRows = [], traceRo
 }
 
 async function collectHeadlessEvidence({ directory, readFile, tailReader, protocolAudit, providerTurnsPath, evidenceOffsets, protocolAuditOffset, assertions, terminalState, rconEvidence, readOnlyCommand, deadline, now, startedAt, poll, scenario, generatedName }) {
-	for (const assertion of assertions) {
+	const resolvedAssertions = resolveAgentAssertions(assertions, generatedName);
+	for (const assertion of resolvedAssertions) {
 		if (assertion.type !== 'rcon' || logicalNow(now, startedAt, 0) >= deadline) continue;
 		try { await withDeadline(() => readOnlyCommand(assertion.command), deadline, () => logicalNow(now, startedAt, 0), 'HEADLESS_TIMEOUT'); }
 		catch (error) { if (error?.code !== 'HEADLESS_TIMEOUT') throw error; }
@@ -723,7 +737,7 @@ async function collectHeadlessEvidence({ directory, readFile, tailReader, protoc
 			scopedAudit = [];
 		}
 		evidence = makeEvidence({ terminalState, protocolAudit: scopedAudit, ...scopedEvidence, rcon: rconEvidence });
-		assertionResult = evaluateHeadlessAssertions(assertions, evidence);
+		assertionResult = evaluateHeadlessAssertions(resolvedAssertions, evidence);
 	};
 	await evaluate();
 	const waitsForFiles = assertions.some((assertion) => assertion.type !== 'lifecycle' && assertion.type !== 'rcon');
@@ -1137,10 +1151,17 @@ function normalizeRunDirectory(value) {
 }
 
 function generatedAgentName(scenario, timestamp, rosterIndex = null) {
-	const id = String(scenario.id ?? 'scenario').replace(/[^A-Za-z0-9_]/g, '_').slice(0, 32) || 'scenario';
-	const suffix = rosterIndex === null ? '' : `_${String(rosterIndex + 1).padStart(2, '0')}`;
-	const base = `headless_${id}_${Math.abs(Number(timestamp) || 0).toString(36)}`;
-	return `${base.slice(0, 32 - suffix.length)}${suffix}`;
+	const rosterSuffix = rosterIndex === null ? '' : `_${String(rosterIndex + 1).padStart(2, '0')}`;
+	const clockSuffix = Math.abs(Number(timestamp) || 0).toString(36).slice(-5).padStart(5, '0');
+	const idBudget = Math.max(1, 16 - 3 - 1 - clockSuffix.length - rosterSuffix.length);
+	const id = String(scenario.id ?? 'scenario').replace(/[^A-Za-z0-9_]/g, '_').slice(0, idBudget) || 's';
+	return `ha_${id}_${clockSuffix}${rosterSuffix}`;
+}
+
+function resolveAgentAssertions(assertions, generatedName) {
+	return assertions.map((assertion) => assertion.type === 'rcon'
+		? { ...assertion, command: assertion.command.replaceAll('{agent}', generatedName) }
+		: assertion);
 }
 
 function rosterPosition(index) {
@@ -1176,6 +1197,10 @@ function validateRunnerScenario(scenario, assertions) {
 	if (!Number.isSafeInteger(scenario.timeoutMs) || scenario.timeoutMs <= 0 || scenario.timeoutMs > MAX_TIMEOUT_MS) throw new RangeError('scenario.timeoutMs is out of bounds');
 	if (![1, 8, 16].includes(scenario.rosterSize ?? 1)) throw new RangeError('scenario.rosterSize is out of bounds');
 	if (!Array.isArray(assertions) || assertions.length === 0) throw new TypeError('scenario requires assertions');
+}
+function boundedPositiveInteger(value, field) {
+	if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${field} must be a positive safe integer`);
+	return value;
 }
 function boundedScalar(value) { return value === null || value === undefined ? null : String(value).slice(0, MAX_TEXT); }
 function boundedText(value, limit) {

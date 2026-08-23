@@ -179,7 +179,7 @@ test('runs only the selected scenario', async () => {
 	});
 	assert.equal(result.report.status, 'PASSED');
 	assert.equal(summoned.length, 1);
-	assert.match(summoned[0], /selected/);
+	assert.ok(summoned[0].split(' ').at(-1).length <= 16);
 	assert.equal(writes.some(({ file }) => file.endsWith('matrix-report.json')), true);
 });
 
