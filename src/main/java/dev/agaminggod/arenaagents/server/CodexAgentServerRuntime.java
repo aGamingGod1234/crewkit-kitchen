@@ -69,9 +69,10 @@ public final class CodexAgentServerRuntime {
 			}
 			VoiceSubsystemRuntime.start(server);
 			Path secretPath = supervisor.secretPath();
+			AgentVerboseState verboseState = AgentVerboseState.forServer(server);
 			MultiplexedServerBridge bridge = secretPath == null
-					? new MultiplexedServerBridge(CodexAgentManager.get(server))
-					: new MultiplexedServerBridge(CodexAgentManager.get(server), secretPath);
+					? new MultiplexedServerBridge(CodexAgentManager.get(server), verboseState)
+					: new MultiplexedServerBridge(CodexAgentManager.get(server), secretPath, verboseState);
 			bridge.start();
 			MultiplexedServerBridge previous = BRIDGES.putIfAbsent(server, bridge);
 			if (previous != null) {
@@ -128,6 +129,13 @@ public final class CodexAgentServerRuntime {
 	public static boolean automationAvailable(MinecraftServer server) {
 		MultiplexedServerBridge bridge = BRIDGES.get(server);
 		return bridge != null && bridge.authenticated();
+	}
+
+	public static void setVerbose(MinecraftServer server, boolean enabled) {
+		AgentVerboseState state = AgentVerboseState.forServer(server);
+		state.setEnabled(enabled);
+		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		if (bridge != null) bridge.setVerbose(enabled);
 	}
 
 	public static String automationStatus(MinecraftServer server) {
@@ -226,6 +234,7 @@ public final class CodexAgentServerRuntime {
 				bridge.close();
 			}
 			if (supervisor != null) supervisor.close();
+			AgentVerboseState.release(server);
 		}
 	}
 }

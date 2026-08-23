@@ -236,6 +236,7 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	if (!isPlainObject(controlValue)) throw new TypeError('goal control must be an object');
 	const operation = controlValue.operation;
 	if (!GOAL_OPERATIONS.has(operation)) throw new AgentRegistryError('INVALID_GOAL_OPERATION', `Unsupported goal operation '${String(operation)}'`);
+	if (operation !== 'respawn' && controlValue.resumeGoal !== undefined) throw new AgentRegistryError('INVALID_GOAL_CONTROL', `Goal operation '${operation}' must not include resumeGoal`);
 	const revision = nonnegativeInteger(controlValue.goalRevision, 'goalRevision');
 	if (operation === 'queue') {
 		if (revision !== record.goalRevision) throw new AgentRegistryError('STALE_GOAL_REVISION', `Queued goal revision ${revision} does not match current revision ${record.goalRevision}`);
@@ -248,6 +249,9 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	}
 	if ((operation === 'stop' && record.state === DynamicAgentState.PAUSED && revision === record.goalRevision)
 		|| (operation === 'disconnect' && record.state === DynamicAgentState.DISCONNECTED && revision === record.goalRevision)) return record;
+	if (operation === 'respawn' && record.state !== DynamicAgentState.DEAD) {
+		throw new AgentRegistryError('INVALID_GOAL_CONTROL', `Cannot respawn an agent from state '${record.state}'`);
+	}
 	if (revision <= record.goalRevision) throw new AgentRegistryError('STALE_GOAL_REVISION', `Goal revision ${revision} is not newer than ${record.goalRevision}`);
 	const now = nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs');
 	const next = { ...record, goalRevision: revision, updatedAtEpochMs: now, lastError: null };
@@ -288,7 +292,10 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 		return next;
 	}
 	if (operation === 'respawn') {
-		next.state = next.currentGoal === null ? DynamicAgentState.IDLE : DynamicAgentState.PAUSED;
+		if (controlValue.resumeGoal !== undefined && typeof controlValue.resumeGoal !== 'boolean') throw new TypeError('resumeGoal must be a boolean');
+		next.state = next.currentGoal === null
+			? DynamicAgentState.IDLE
+			: controlValue.resumeGoal === true ? DynamicAgentState.STARTING : DynamicAgentState.PAUSED;
 		next.death = null;
 		return next;
 	}

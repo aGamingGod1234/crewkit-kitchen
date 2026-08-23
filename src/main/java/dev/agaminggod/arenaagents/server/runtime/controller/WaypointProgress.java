@@ -40,6 +40,9 @@ public final class WaypointProgress {
 			bestRemainingDistance = remainingDistance;
 			lastProgressAt = nowEpochMs;
 		}
+		if (waypointReached) {
+			lastProgressAt = nowEpochMs;
+		}
 		long idleMs = Math.max(0L, nowEpochMs - lastProgressAt);
 		Decision decision = idleMs < stallTimeoutMs
 				? Decision.CONTINUE

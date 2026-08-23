@@ -49,6 +49,50 @@ test('retries one malformed planner decision with bounded corrective feedback', 
 	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
 });
 
+test('streams safe planner, provider, output, retry, and decision events without letting callback failures affect planning', async () => {
+	const registry = new FakeRegistry();
+	const events = [];
+	let calls = 0;
+	const invalid = Object.assign(new Error('planner output was not JSON'), { code: 'MALFORMED_DECISION' });
+	const agent = {
+		async setGoalRevision() {},
+		async decide(_input, options) {
+			options.onVerbose('output', 'Visible provider response');
+			calls += 1;
+			if (calls === 1) throw invalid;
+			return VALID_DECISION;
+		},
+	};
+	const planner = createPlanner(registry, agent, 1);
+
+	const result = await planner.requestPlan({
+		agentId: AGENT_ID,
+		input: 'authoritative state',
+		goalRevision: GOAL_REVISION,
+		onVerbose(stage, message) {
+			events.push({ stage, message });
+			throw new Error('verbose consumer unavailable');
+		},
+	});
+
+	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
+	assert.deepEqual(new Set(events.map(({ stage }) => stage)), new Set(['planner', 'provider', 'output', 'retry', 'decision']));
+	assert.equal(events.every(({ message }) => message.length <= 256), true);
+
+	agent.decide = async () => { throw Object.assign(new Error('authorization: Bearer provider-secret; stderr contained a private response body'), { code: 'FATAL_PROVIDER_ERROR' }); };
+	const failureEvents = [];
+	await assert.rejects(planner.requestPlan({
+		agentId: AGENT_ID,
+		input: 'authoritative state',
+		goalRevision: GOAL_REVISION,
+		onVerbose(stage, message) { failureEvents.push({ stage, message }); },
+	}), (error) => error?.code === 'FATAL_PROVIDER_ERROR');
+	assert.equal(failureEvents.some(({ stage }) => stage === 'error'), true, 'terminal planning errors are observable');
+	const errorMessages = failureEvents.filter(({ stage }) => stage === 'error').map(({ message }) => message).join(' ');
+	assert.match(errorMessages, /FATAL_PROVIDER_ERROR/);
+	assert.doesNotMatch(errorMessages, /provider-secret|private response body|authorization|stderr/i);
+});
+
 test('keeps one trace across a malformed decision retry and records queue/provider/parse boundaries once', async () => {
 	const registry = new FakeRegistry();
 	const rows = [];

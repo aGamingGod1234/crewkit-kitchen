@@ -2,9 +2,11 @@ import { AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
+import { reportVisibleOutput } from './verbose-output.mjs';
 
 const DEFAULT_INVALID_DECISION_RETRIES = 1;
 const MAX_RETRY_ERROR_LENGTH = 512;
+const MAX_VERBOSE_MESSAGE_LENGTH = 256;
 const RETRYABLE_DECISION_ERRORS = new Set([
 	'EMPTY_DECISION',
 	'MALFORMED_DECISION',
@@ -80,17 +82,19 @@ export class AgentPlanner {
 
 	get healthRegistry() { return this.#healthRegistry; }
 
-	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null }) {
+	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null, onVerbose = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
 		if (record.provider !== 'codex') throw codedError('NATIVE_TOOLS_UNAVAILABLE', 'Native Minecraft tools are currently available for Codex agents only');
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native turn input must be nonblank');
 		if (typeof executeTool !== 'function') throw new TypeError('executeTool must be a function');
 		const traceId = requestedTraceId === null ? defaultTraceId(agentId, goalRevision) : validateTraceId(requestedTraceId);
 		const queuedAt = this.#now();
+		safeVerbose(onVerbose, 'planner', `Native turn queued with ${priority} priority.`);
 		this.#record('planner_requested', record, { operation: 'native_turn', preserveState, retry: false, lane: record.provider, priority, traceId });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
 			const admittedAt = this.#now();
 			const queueWaitMs = elapsed(queuedAt, admittedAt);
+			safeVerbose(onVerbose, 'planner', 'Native turn admitted by the planning scheduler.');
 			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
@@ -101,13 +105,14 @@ export class AgentPlanner {
 					const created = await this.#codexService.createAgent(record, { recoverySummary, controlProtocol: 'native_tools' });
 					await created.setGoalRevision(goalRevision);
 					return created;
-				});
+				}, null, onVerbose);
 				let firstToolAt = null;
 				const result = await this.#providerAttempt(record, {
 					operation: 'native_turn', attempt: 1, queueWaitMs, retry: false, traceId,
 				}, () => agent.act(input, {
 					goalRevision,
 					signal,
+					onVerbose: (stage, message) => safeVerbose(onVerbose, stage, message),
 					executeTool: async (request) => {
 						if (firstToolAt === null) {
 							firstToolAt = this.#now();
@@ -115,14 +120,16 @@ export class AgentPlanner {
 						}
 						return executeTool(request);
 					},
-				}), agent);
+				}), agent, onVerbose);
 				const completedAt = this.#now();
 				if (firstToolAt === null) this.#recordTracePhase(record, traceId, 'provider_first_byte', completedAt, completedAt, 'failed', 'NO_TOOL_CALL');
 				this.#recordTracePhase(record, traceId, 'provider_final_byte', completedAt, completedAt, 'completed');
 				this.#record('planner_decision_completed', record, { operation: 'native_turn', attempt: 1, queueWaitMs, directive: 'native_tools', traceId });
+				safeVerbose(onVerbose, 'decision', 'Native provider turn completed.');
 				return result;
 			} catch (error) {
 				this.#record('planner_failed', record, { operation: 'native_turn', errorCode: error?.code ?? 'NATIVE_TURN_FAILED', retry: false, traceId });
+				safeVerbose(onVerbose, 'error', verboseErrorMessage('Native turn failed', error));
 				if (!preserveState && this.#isCurrent(agentId, goalRevision) && !['STALE_PLAN', 'PLAN_CANCELLED'].includes(error?.code)) {
 					this.#registry.setState(agentId, DynamicAgentState.ERROR, {
 						goalRevision,
@@ -143,17 +150,19 @@ export class AgentPlanner {
 		return agent.steer(input, { goalRevision });
 	}
 
-	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null, traceId: requestedTraceId = null }) {
+	requestPlan({ agentId, input, goalRevision, recoverySummary = null, preserveState = false, priority = null, planningPriority = null, traceId: requestedTraceId = null, onVerbose = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
 		const traceIdProvided = requestedTraceId !== null;
 		const traceId = traceIdProvided ? validateTraceId(requestedTraceId) : defaultTraceId(agentId, goalRevision);
 		const selectedPriority = planningPriority ?? priority ?? record.planningPriority ?? record.priority ?? 'ordinary';
 		const queuedAt = this.#now();
 		const trace = { retryReason: null, phasesRecorded: false };
+		safeVerbose(onVerbose, 'planner', `Planning request queued with ${selectedPriority} priority.`);
 		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false, lane: record.provider, priority: selectedPriority, traceId });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
 			const admittedAt = this.#now();
 			const queueWaitMs = elapsed(queuedAt, admittedAt);
+			safeVerbose(onVerbose, 'planner', 'Planning request admitted by the scheduler.');
 			this.#record('planner_admitted', record, { operation: 'plan', queueWaitMs, preserveState, lane: record.provider, priority: selectedPriority, traceId });
 			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
@@ -173,7 +182,7 @@ export class AgentPlanner {
 							const created = await this.#codexService.createAgent(record, { recoverySummary });
 							await created.setGoalRevision(goalRevision);
 							return created;
-						});
+						}, null, onVerbose);
 						break;
 					} catch (error) {
 						if (
@@ -183,6 +192,7 @@ export class AgentPlanner {
 							&& !signal.aborted
 						) {
 							initializationRetryCount += 1;
+							safeVerbose(onVerbose, 'retry', verboseErrorMessage('Retrying provider initialization', error));
 							continue;
 						}
 						throw error;
@@ -200,8 +210,10 @@ export class AgentPlanner {
 						}, () => agent.decide(plannerInput, {
 							goalRevision,
 							signal,
+							onVerbose: (stage, message) => safeVerbose(onVerbose, stage, message),
 							...(this.#turnRecorder === null ? {} : { turnRecorder: this.#turnRecorder, attempt, retry: attempt > 1, queueWaitMs }),
-						}), agent);
+						}), agent, onVerbose);
+						safeVerbose(onVerbose, 'output', 'Provider returned a planner response.');
 						this.#registry.assertCurrentRevision(agentId, goalRevision);
 						const parseBoundary = this.#now();
 						if (!trace.phasesRecorded) {
@@ -211,6 +223,7 @@ export class AgentPlanner {
 							trace.phasesRecorded = true;
 						}
 						this.#record('planner_decision_completed', record, { operation: 'decide', attempt, queueWaitMs, directive: decision?.directive ?? null, traceId });
+						safeVerbose(onVerbose, 'decision', `Planner decision accepted with directive '${decision?.directive ?? 'unknown'}'.`);
 						return { ...decision, goalRevision, ...(traceIdProvided ? { traceId } : {}) };
 					} catch (error) {
 						if (
@@ -221,6 +234,7 @@ export class AgentPlanner {
 						) {
 							retryCount += 1;
 							trace.retryReason = normalizeRetryReason(error?.code ?? 'INVALID_DECISION');
+							safeVerbose(onVerbose, 'retry', verboseErrorMessage(`Corrective decision retry ${retryCount}`, error));
 							plannerInput = buildCorrectiveRetryInput(input, error, retryCount);
 							continue;
 						}
@@ -231,6 +245,7 @@ export class AgentPlanner {
 							&& !signal.aborted
 						) {
 							providerRetryCount += 1;
+							safeVerbose(onVerbose, 'retry', verboseErrorMessage(`Provider retry ${providerRetryCount}`, error));
 							plannerInput = input;
 							continue;
 						}
@@ -239,6 +254,7 @@ export class AgentPlanner {
 				}
 			} catch (error) {
 				this.#record('planner_failed', record, { operation: 'plan', errorCode: error?.code ?? 'PLANNING_FAILED', retry: true, traceId });
+				safeVerbose(onVerbose, 'error', verboseErrorMessage('Planning failed', error));
 				if (
 					error?.code !== 'STALE_PLAN'
 					&& error?.code !== 'PLAN_CANCELLED'
@@ -256,21 +272,24 @@ export class AgentPlanner {
 		}, { lane: record.provider, priority: selectedPriority });
 	}
 
-	async #providerAttempt(record, fields, operation, sessionAgent = null) {
+	async #providerAttempt(record, fields, operation, sessionAgent = null, onVerbose = null) {
 		const healthIdentity = { provider: record.provider, model: record.model, operation: fields.operation };
 		if (!this.#healthRegistry.canAttempt(healthIdentity)) {
 			const error = new Error(`Provider circuit is open for '${record.provider}/${record.model}/${fields.operation}'`);
 			error.code = 'PROVIDER_CIRCUIT_OPEN';
 			this.#record('provider_attempt_rejected', record, { ...fields, operation: fields.operation, errorCode: error.code });
+			safeVerbose(onVerbose, 'error', `Provider circuit rejected ${fields.operation}.`);
 			throw error;
 		}
 		const startedAt = this.#now();
 		this.#record('provider_request_started', record, { ...fields, operation: fields.operation });
+		safeVerbose(onVerbose, 'provider', `Provider ${fields.operation} request started (attempt ${fields.attempt}).`);
 		try {
 			const result = await operation();
 			const sessionFields = readSessionFields(sessionAgent ?? result);
 			const durationMs = elapsed(startedAt, this.#now());
 			this.#record('provider_response_completed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: null });
+			safeVerbose(onVerbose, 'provider', `Provider ${fields.operation} request completed.`);
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
@@ -287,6 +306,7 @@ export class AgentPlanner {
 			const sessionFields = readSessionFields(sessionAgent);
 			const durationMs = elapsed(startedAt, this.#now());
 			this.#record('provider_response_failed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
+			safeVerbose(onVerbose, 'provider', verboseErrorMessage(`Provider ${fields.operation} request failed`, error));
 			this.#publishTelemetry(createProviderTurnTelemetry({
 				provider: record.provider,
 				model: record.model,
@@ -427,4 +447,23 @@ function buildCorrectiveRetryInput(input, error, retryCount) {
 	return `${input}\n\nThe previous planner response was rejected by the trusted runtime validator `
 		+ `(corrective retry ${retryCount}). Error code: ${code}. Validation message: ${message}. `
 		+ 'Return a fresh decision that exactly matches the required JSON schema. Do not repeat or discuss the invalid response.';
+}
+
+function safeVerbose(callback, stage, message) {
+	if (typeof callback !== 'function') return;
+	if (stage === 'output') {
+		reportVisibleOutput(callback, String(message ?? ''));
+		return;
+	}
+	try {
+		const normalized = String(message ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_VERBOSE_MESSAGE_LENGTH);
+		if (normalized.length === 0) return;
+		Promise.resolve(callback(stage, normalized)).catch(() => {});
+	}
+	catch { /* verbose reporting is observational and cannot affect planning */ }
+}
+
+function verboseErrorMessage(prefix, error) {
+	const code = String(error?.code ?? 'ERROR').slice(0, 128);
+	return `${prefix} (${code}).`;
 }

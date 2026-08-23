@@ -41,6 +41,7 @@ import dev.agaminggod.arenaagents.client.navigation.NavigationMovementVerificati
 import dev.agaminggod.arenaagents.client.navigation.MinecraftWalkabilityViewVerification;
 import dev.agaminggod.arenaagents.client.network.GoalReceiverVerification;
 import dev.agaminggod.arenaagents.control.AgentControlVerification;
+import dev.agaminggod.arenaagents.control.AgentControlSelectionStateVerification;
 import dev.agaminggod.arenaagents.control.AgentRosterViewStateVerification;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
@@ -67,6 +68,7 @@ import dev.agaminggod.arenaagents.server.bridge.BoundedServerTaskQueueVerificati
 import dev.agaminggod.arenaagents.server.bridge.ProgramActionLedgerVerification;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusVerification;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridgeVerification;
+import dev.agaminggod.arenaagents.server.bridge.AgentVerboseVerification;
 import dev.agaminggod.arenaagents.server.bridge.SingleBrainBoundaryVerification;
 import dev.agaminggod.arenaagents.server.AgentRecoverySpawnPolicyVerification;
 import dev.agaminggod.arenaagents.server.AgentRespawnSpawnPolicyVerification;
@@ -183,6 +185,7 @@ public final class VerificationMain {
 		passedAssertions += AgentRegistryVerification.verify();
 		passedAssertions += AgentIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
+		passedAssertions += AgentControlSelectionStateVerification.verify();
 		passedAssertions += AgentRosterViewStateVerification.verify();
 		passedAssertions += AgentControlLayoutVerification.verify();
 		passedAssertions += BlockObservationOrderingVerification.verify();
@@ -237,6 +240,7 @@ public final class VerificationMain {
 		passedAssertions += AgentRecoverySpawnPolicyVerification.verify();
 		passedAssertions += AgentRespawnSpawnPolicyVerification.verify();
 		passedAssertions += MultiplexedServerBridgeVerification.verify();
+		passedAssertions += AgentVerboseVerification.verify();
 		passedAssertions += SingleBrainBoundaryVerification.verify();
 		passedAssertions += GoalReceiverVerification.verify();
 		verifyObservationContracts(codec);

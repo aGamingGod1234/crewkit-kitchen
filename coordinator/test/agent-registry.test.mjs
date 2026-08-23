@@ -168,6 +168,49 @@ test('dead record normalization preserves every authoritative vanilla respawn fa
 	);
 });
 
+test('respawn clears death and resumes only an explicitly requested live goal', () => {
+	const death = {
+		cause: 'fell from a high place', dimensionId: 'minecraft:overworld', x: 0, y: 64, z: 0,
+		respawnDimensionId: 'minecraft:overworld', respawnX: 10, respawnY: 70, respawnZ: 10,
+		respawnYaw: 0, respawnPitch: 0, respawnForced: false, gameMode: 'spectator', diedAtEpochMs: 2,
+	};
+	const paused = new AgentRegistry();
+	paused.register(record('paused', { state: DynamicAgentState.DEAD, currentGoal: 'Keep building.', goalRevision: 2, death }));
+	const pausedRespawn = paused.applyGoalControl('paused', { operation: 'respawn', goalRevision: 3 });
+	assert.equal(pausedRespawn.state, DynamicAgentState.PAUSED);
+	assert.equal(pausedRespawn.death, null);
+
+	const resumed = new AgentRegistry();
+	resumed.register(record('resumed', { state: DynamicAgentState.DEAD, currentGoal: 'Keep building.', goalRevision: 2, death }));
+	const resumedRespawn = resumed.applyGoalControl('resumed', { operation: 'respawn', goalRevision: 3, resumeGoal: true });
+	assert.equal(resumedRespawn.state, DynamicAgentState.STARTING);
+	assert.equal(resumedRespawn.currentGoal, 'Keep building.');
+	assert.equal(resumedRespawn.death, null);
+
+	const idle = new AgentRegistry();
+	idle.register(record('idle', { state: DynamicAgentState.DEAD, currentGoal: null, goalRevision: 2, death }));
+	assert.equal(idle.applyGoalControl('idle', { operation: 'respawn', goalRevision: 3, resumeGoal: true }).state, DynamicAgentState.IDLE);
+});
+
+test('respawn rejects every current state except DEAD', () => {
+	for (const state of [DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.STARTING]) {
+		const registry = new AgentRegistry();
+		registry.register(record(state.toLowerCase(), {
+			state,
+			currentGoal: 'Keep building.',
+			goalRevision: 2,
+			...(state === DynamicAgentState.ERROR ? { lastError: { code: 'FAILED', message: 'failed' } } : {}),
+		}));
+		assert.throws(
+			() => registry.applyGoalControl(state.toLowerCase(), { operation: 'respawn', goalRevision: 3, resumeGoal: true }),
+			(error) => error instanceof AgentRegistryError && error.code === 'INVALID_GOAL_CONTROL',
+			`${state} must reject respawn`,
+		);
+		assert.equal(registry.get(state.toLowerCase()).state, state);
+		assert.equal(registry.get(state.toLowerCase()).goalRevision, 2);
+	}
+});
+
 test('registry persistence codec is deterministic and pauses active work on reload', () => {
 	const encoded = encodeAgentRegistrySnapshot([
 		record('agent-b'),

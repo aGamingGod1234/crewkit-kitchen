@@ -13,6 +13,11 @@ const PROVENANCE = Object.freeze({
 	programId: 'program-1-1', programVersion: 1, sourceStepId: 'step-80-126', eventSequence: 4,
 });
 
+const VERBOSE_STAGES = Object.freeze([
+	'conversation', 'lifecycle', 'planner', 'provider', 'output', 'decision',
+	'action', 'progress', 'result', 'retry', 'error',
+]);
+
 class FakeSocket extends EventEmitter {
 	writes = [];
 	destroyed = false;
@@ -35,6 +40,33 @@ class FakeSocket extends EventEmitter {
 function serverEnvelope(type, agentId, messageId, payload = {}) {
 	return { protocolVersion: 2, serverInstanceId: 'server-instance', agentId, type, messageId, payload };
 }
+
+test('verbose control and events use strict authenticated scopes, stages, revisions, and message bounds', () => {
+	assert.deepEqual(validateProtocolV2Payload('verbose_control', { enabled: true }), { enabled: true });
+	assert.throws(() => validateProtocolV2Payload('verbose_control', { enabled: true, agentId: 'agent-a' }), /field/i);
+	assert.throws(() => validateProtocolV2Payload('verbose_control', { enabled: 'true' }), /boolean/i);
+	assert.deepEqual(
+		validateProtocolV2Envelope(serverEnvelope('verbose_control', 'server', 'verbose-on', { enabled: true }), { direction: 'server_to_coordinator' }).payload,
+		{ enabled: true },
+	);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('verbose_control', 'agent-a', 'verbose-agent', { enabled: true }), { direction: 'server_to_coordinator' }),
+		/agentId 'server'/i,
+	);
+
+	for (const stage of VERBOSE_STAGES) {
+		assert.deepEqual(validateProtocolV2Payload('verbose_event', { goalRevision: 4, stage, message: 'Visible progress.' }), {
+			goalRevision: 4, stage, message: 'Visible progress.',
+		});
+	}
+	assert.throws(() => validateProtocolV2Payload('verbose_event', { goalRevision: 4, stage: 'reasoning', message: 'hidden' }), /stage/i);
+	assert.throws(() => validateProtocolV2Payload('verbose_event', { goalRevision: 4, stage: 'planner', message: 'x'.repeat(257) }), /message/i);
+	assert.throws(() => validateProtocolV2Payload('verbose_event', { goalRevision: 4, stage: 'planner', message: 'ok', detail: 'private' }), /field/i);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('verbose_event', 'server', 'verbose-server', { goalRevision: 4, stage: 'planner', message: 'ok' }), { direction: 'coordinator_to_server' }),
+		/agent id|agent scope/i,
+	);
+});
 
 test('coordinator status is strict, bounded, and excludes private planner data', () => {
 	const payload = {
@@ -277,6 +309,21 @@ test('protocol v2 accepts exact death facts only on dead lifecycle control', () 
 	assert.throws(
 		() => validateProtocolV2Payload('goal_control', { operation: 'start', goalRevision: 8, updatedAtEpochMs: 18, goal: 'run', death }),
 		/must not include death/,
+	);
+});
+
+test('goal respawn control accepts only an optional strict resumeGoal flag and defaults it off', () => {
+	const control = { operation: 'respawn', goalRevision: 9, updatedAtEpochMs: 20 };
+	assert.deepEqual(validateProtocolV2Payload('goal_control', control), { ...control, resumeGoal: false });
+	assert.deepEqual(validateProtocolV2Payload('goal_control', { ...control, resumeGoal: true }), { ...control, resumeGoal: true });
+	assert.deepEqual(validateProtocolV2Payload('goal_control', { ...control, resumeGoal: false }), { ...control, resumeGoal: false });
+	assert.throws(
+		() => validateProtocolV2Payload('goal_control', { ...control, resumeGoal: 'true' }),
+		/boolean/i,
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_control', { operation: 'resume', goalRevision: 9, updatedAtEpochMs: 20, resumeGoal: true }),
+		/resumeGoal|respawn/i,
 	);
 });
 
@@ -568,6 +615,10 @@ test('multiplexed bridge rejects stale revisions before writing', async () => {
 		arguments: { durationMs: 25 },
 		provenance: PROVENANCE,
 	}), (error) => error.code === 'STALE_GOAL_REVISION');
+	await assert.rejects(
+		bridge.send('verbose_event', 'agent-a', { goalRevision: 8, stage: 'planner', message: 'Stale planner event.' }),
+		(error) => error.code === 'STALE_GOAL_REVISION',
+	);
 	assert.equal(socket.writes.length, 1);
 	bridge.stop();
 });
@@ -627,6 +678,47 @@ test('multiplexed bridge bounds queued messages per agent while socket is backpr
 	socket.emit('drain');
 	await queued;
 	bridge.stop();
+});
+
+test('lossy verbose traffic cannot consume control capacity while the socket is backpressured', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, connectionQueueCap: 1, agentQueueCap: 1 }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 1,
+	});
+	bridge.start();
+	t.after(() => bridge.stop());
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+
+	socket.writable = false;
+	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	const verboseResults = Array.from({ length: 8 }, (_, index) => bridge.send('verbose_event', 'agent-a', {
+		goalRevision: 1, stage: 'output', message: `visible-${index}`,
+	}).catch((error) => error));
+	const actionResult = bridge.send('action_command', 'agent-a', {
+		traceId: TRACE_ID,
+		goalRevision: 1,
+		actionId: 'action-after-verbose',
+		actionType: 'wait',
+		arguments: { durationMs: 25 },
+		provenance: PROVENANCE,
+	}).catch((error) => error);
+
+	socket.writable = true;
+	socket.emit('drain');
+	assert.equal((await Promise.all(verboseResults)).some((value) => value instanceof Error), false);
+	assert.equal(await actionResult instanceof Error, false);
+	const wires = socket.writes.map((wire) => JSON.parse(wire));
+	assert.equal(wires.some(({ type }) => type === 'verbose_event'), false, 'blocked verbose events are dropped');
+	assert.equal(wires.some(({ type }) => type === 'action_command'), true, 'control traffic keeps the reserved queue slot');
 });
 
 test('a newer lifecycle revision removes queued stale action commands under backpressure', async (t) => {

@@ -172,20 +172,30 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		Process owned = process;
 		if (owned == null) return;
 		ProcessHandle handle = owned.toHandle();
-		handle.descendants().forEach(ProcessHandle::destroy);
+		List<ProcessHandle> descendants = handle.descendants().toList();
+		descendants.forEach(ProcessHandle::destroy);
 		if (owned.isAlive()) owned.destroy();
 		try {
 			if (!owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
-				handle.descendants().forEach(ProcessHandle::destroyForcibly);
+				descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
 				owned.destroyForcibly();
 				owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
 			}
+			descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
+			awaitExit(descendants, 2_000L);
 		} catch (InterruptedException exception) {
 			Thread.currentThread().interrupt();
-			handle.descendants().forEach(ProcessHandle::destroyForcibly);
+			descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
 			owned.destroyForcibly();
 		}
 		process = null;
+	}
+
+	private static void awaitExit(List<ProcessHandle> handles, long timeoutMs) throws InterruptedException {
+		long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+		while (handles.stream().anyMatch(ProcessHandle::isAlive) && System.nanoTime() < deadline) {
+			Thread.sleep(10L);
+		}
 	}
 
 	static void configureSharedBridgeSecretPath(Path secretPath) {

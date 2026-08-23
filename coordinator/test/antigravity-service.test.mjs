@@ -146,6 +146,23 @@ test('Antigravity parses planner output and uses the stable per-agent workspace'
 	await service.stop();
 });
 
+test('Antigravity reports its bounded visible result through the verbose adapter contract', async () => {
+	const service = new AntigravityProviderService(config(), {
+		platform: 'win32',
+		spawn: successfulSpawner([]),
+	});
+	const agent = await service.createAgent(profile({ agentId: 'gemini-verbose' }));
+	await agent.setGoalRevision(1);
+	const events = [];
+	await agent.decide('authoritative state', {
+		goalRevision: 1,
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
+	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.equal(events.map(({ message }) => message).join(''), DECISION);
+	await service.stop();
+});
+
 test('Antigravity malformed output records one final error row for the attempt', async () => {
 	const spawnCalls = [];
 	const service = new AntigravityProviderService(config(), { platform: 'win32', spawn: successfulSpawner(spawnCalls, 'not-json') });

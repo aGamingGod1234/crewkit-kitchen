@@ -149,6 +149,34 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	await service.stop();
 });
 
+test('Cursor reports only its bounded visible result through the verbose adapter contract', async () => {
+	const spawn = () => {
+		const child = new FakeChild();
+		queueMicrotask(() => {
+			child.stdout.emit('data', Buffer.from(JSON.stringify({
+				type: 'result', subtype: 'success', is_error: false, result: DECISION,
+				session_id: 'cursor-session-visible', duration_ms: 12, duration_api_ms: 9,
+			})));
+			child.exitCode = 0;
+			child.emit('close', 0, null);
+		});
+		return child;
+	};
+	const service = new CursorProviderService(config(), {
+		spawn, discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+	});
+	const agent = await service.createAgent(profile({ agentId: 'cursor-verbose' }));
+	await agent.setGoalRevision(1);
+	const events = [];
+	await agent.decide('authoritative state', {
+		goalRevision: 1,
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
+	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.equal(events.map(({ message }) => message).join(''), DECISION);
+	await service.stop();
+});
+
 test('Cursor parse failures record only a generic structured error', async () => {
 	const secret = 'ARBITRARY_CURSOR_MODEL_SECRET';
 	const spawn = () => {

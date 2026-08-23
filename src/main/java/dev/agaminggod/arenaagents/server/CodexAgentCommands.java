@@ -59,6 +59,12 @@ public final class CodexAgentCommands {
 
 	static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
 		dispatcher.register(
+				Commands.literal("verbose")
+						.requires(GoalControl::mayControl)
+						.then(Commands.literal("on").executes(context -> verbose(context, true)))
+						.then(Commands.literal("off").executes(context -> verbose(context, false)))
+		);
+		dispatcher.register(
 				Commands.literal("codex")
 						.then(Commands.literal("summon")
 								.requires(GoalControl::mayControl)
@@ -123,6 +129,16 @@ public final class CodexAgentCommands {
 								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::toggleAutomatic)))
 		);
+	}
+
+	private static int verbose(CommandContext<CommandSourceStack> context, boolean enabled) {
+		CodexAgentServerRuntime.setVerbose(context.getSource().getServer(), enabled);
+		context.getSource().sendSuccess(
+				() -> Component.literal("Verbose agent activity " + (enabled ? "enabled" : "disabled")
+						+ " for operators for this server session."),
+				false
+		);
+		return 1;
 	}
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> configuredSummon() {

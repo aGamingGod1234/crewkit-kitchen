@@ -16,6 +16,7 @@ class FakeAcpTransport extends EventEmitter {
 		this.calls = [];
 		this.started = false;
 		this.message = DECISION;
+		this.hiddenMessage = null;
 		this.promptResponse = { stopReason: 'end_turn' };
 	}
 
@@ -33,6 +34,10 @@ class FakeAcpTransport extends EventEmitter {
 			return { configOptions: this.configOptions };
 		}
 		if (method === 'session/prompt') {
+			if (this.hiddenMessage !== null) queueMicrotask(() => this.emit('notification', {
+				method: 'session/update',
+				params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: this.hiddenMessage } } },
+			}));
 			queueMicrotask(() => this.emit('notification', {
 				method: 'session/update',
 				params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: this.message } } },
@@ -69,6 +74,23 @@ test('Gemini ACP sessions apply the exact model and thinking level and parse pla
 	assert.match(prompt, /strategic author for one Minecraft player/i);
 	assert.match(prompt, /authoritative state/);
 	assert.match(prompt, /Previous movement timed out/);
+	await service.stop();
+});
+
+test('ACP reports only bounded visible agent-message chunks through the verbose adapter contract', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.hiddenMessage = 'hidden ACP thought';
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-verbose', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(1);
+	const events = [];
+	await agent.decide('authoritative state', {
+		goalRevision: 1,
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
+	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.equal(events.map(({ message }) => message).join(''), DECISION);
+	assert.doesNotMatch(JSON.stringify(events), /hidden ACP thought/);
 	await service.stop();
 });
 

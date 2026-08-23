@@ -68,7 +68,7 @@ public final class ServerNavigationController implements ServerController {
 			return fail(player, "ACTION_TIMEOUT", "Navigation timed out", currentProgress());
 		}
 		double remaining = player.position().distanceTo(destination);
-		if (remaining <= tolerance) {
+		if (satisfiesDestinationTolerance(remaining, tolerance)) {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
 		if (plan == null) {
@@ -80,8 +80,9 @@ public final class ServerNavigationController implements ServerController {
 			return replanOrResult(player, nowEpochMs, remaining);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
-		Vec3 target = center(waypoint.position());
-		boolean reached = reachedWaypoint(player.position(), target);
+		boolean finalWaypoint = waypointIndex == nodes.size() - 1;
+		Vec3 target = targetFor(waypoint, finalWaypoint);
+		boolean reached = reachedTarget(player.position(), waypoint, finalWaypoint);
 		WaypointProgress.Update update = progress.observe(remaining, reached, nowEpochMs);
 		lastProgressValue = update.progress();
 		if (reached) {
@@ -90,7 +91,7 @@ public final class ServerNavigationController implements ServerController {
 				return replanOrResult(player, nowEpochMs, remaining);
 			}
 			waypoint = nodes.get(waypointIndex);
-			target = center(waypoint.position());
+			target = targetFor(waypoint, waypointIndex == nodes.size() - 1);
 		}
 		if (update.decision() == WaypointProgress.Decision.FAIL) {
 			return fail(player, "PATH_BLOCKED", "Navigation could not recover from repeated stalls", update.progress());
@@ -99,7 +100,7 @@ public final class ServerNavigationController implements ServerController {
 			TickResult replanned = replan(player, nowEpochMs, remaining, true);
 			if (replanned != null) return replanned;
 			waypoint = plan.nodes().get(waypointIndex);
-			target = center(waypoint.position());
+			target = targetFor(waypoint, waypointIndex == plan.nodes().size() - 1);
 		}
 		drive(player, waypoint, target, nowEpochMs);
 		return TickResult.running(update.progress());
@@ -122,11 +123,31 @@ public final class ServerNavigationController implements ServerController {
 	}
 
 	private TickResult replanOrResult(ServerPlayer player, long nowEpochMs, double remaining) {
-		if (remaining <= tolerance + 0.5D) {
+		if (satisfiesDestinationTolerance(remaining, tolerance)) {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
 		TickResult replanned = replan(player, nowEpochMs, remaining, true);
 		return replanned == null ? TickResult.running(currentProgress()) : replanned;
+	}
+
+	static boolean satisfiesDestinationTolerance(double remaining, double tolerance) {
+		return remaining <= tolerance;
+	}
+
+	Vec3 targetFor(PathNode waypoint, boolean finalWaypoint) {
+		Objects.requireNonNull(waypoint, "waypoint must not be null");
+		return targetsExactDestination(waypoint, finalWaypoint) ? destination : center(waypoint.position());
+	}
+
+	boolean reachedTarget(Vec3 playerPosition, PathNode waypoint, boolean finalWaypoint) {
+		Objects.requireNonNull(playerPosition, "playerPosition must not be null");
+		return targetsExactDestination(waypoint, finalWaypoint)
+				? satisfiesDestinationTolerance(playerPosition.distanceTo(destination), tolerance)
+				: reachedWaypoint(playerPosition, center(waypoint.position()));
+	}
+
+	private boolean targetsExactDestination(PathNode waypoint, boolean finalWaypoint) {
+		return finalWaypoint && waypoint.position().equals(grid(destination));
 	}
 
 	private TickResult replan(

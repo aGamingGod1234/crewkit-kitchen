@@ -164,6 +164,35 @@ test('Codex service accepts the streamed agent-message contract when no complete
 	await service.stop();
 });
 
+test('Codex streams only visible agent output in real time and isolates verbose callback failures', async () => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-verbose-output'));
+	await agent.setGoalRevision(1);
+	const events = [];
+	const decisionPromise = agent.decide('Observation.', {
+		goalRevision: 1,
+		onVerbose(stage, message) {
+			events.push({ stage, message });
+			throw new Error('verbose callback failed');
+		},
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('notification', { method: 'item/reasoning/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'hidden chain of thought' } });
+	const text = finishDecisionJson();
+	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: text } });
+	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.equal(events.map(({ message }) => message).join(''), text, 'bounded chunks preserve the full visible output before completion');
+	const streamedEventCount = events.length;
+	transport.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'agentMessage', text } } });
+	transport.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'agentMessage', text } } });
+	assert.equal(events.length, streamedEventCount, 'completed items do not repeat output that was already streamed');
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+	assert.equal((await decisionPromise).status, 'completed');
+	await service.stop();
+});
+
 test('Codex malformed output records one final error row for the attempt', async () => {
 	const transport = new FakeSharedTransport();
 	transport.complete = function (threadId, turnId) {
@@ -244,10 +273,15 @@ test('Codex service cancels an over-budget streamed planner decision before pars
 	const service = new CodexService({ cwd: 'C:\\workspace', maxDecisionBytes: 32 }, { transport });
 	const agent = await service.createAgent(profile('agent-bounded'));
 	await agent.setGoalRevision(1);
-	const decisionPromise = agent.decide('Observation.', { goalRevision: 1 });
+	const events = [];
+	const decisionPromise = agent.decide('Observation.', {
+		goalRevision: 1,
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
 	await Promise.resolve();
 	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'x'.repeat(33) } });
 	await assert.rejects(decisionPromise, (error) => error?.code === 'TURN_OUTPUT_LIMIT');
+	assert.deepEqual(events, [], 'an over-budget provider body is rejected before it becomes visible output');
 	assert.ok(transport.calls.some((call) => call.method === 'turn/interrupt' && call.params.turnId === 'turn-1'));
 	await service.stop();
 });
@@ -509,6 +543,44 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
 	const turnStart = transport.calls.find((call) => call.method === 'turn/start').params;
 	assert.equal(Object.hasOwn(turnStart, 'outputSchema'), false);
+	await service.stop();
+});
+
+test('native Codex output deduplicates each message item without hiding a later completed-only item', async () => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-native-output'), { controlProtocol: 'native_tools' });
+	await agent.setGoalRevision(1);
+	const events = [];
+	const turn = agent.act('event: wait', {
+		goalRevision: 1,
+		executeTool: async () => ({ state: 'SUCCEEDED' }),
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('notification', { method: 'item/reasoning/delta', params: {
+		threadId: 'thread-1', turnId: 'turn-1', itemId: 'reasoning-1', delta: 'hidden reasoning',
+	} });
+	transport.emit('notification', { method: 'item/agentMessage/delta', params: {
+		threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'First streamed item.',
+	} });
+	transport.emit('notification', { method: 'item/completed', params: {
+		threadId: 'thread-1', turnId: 'turn-1', item: { id: 'message-1', type: 'agentMessage', text: 'First streamed item.' },
+	} });
+	transport.emit('notification', { method: 'item/completed', params: {
+		threadId: 'thread-1', turnId: 'turn-1', item: { id: 'message-2', type: 'agentMessage', text: 'Second completed-only item.' },
+	} });
+	transport.emit('notification', { method: 'item/completed', params: {
+		threadId: 'thread-1', turnId: 'turn-1', item: { id: 'message-2', type: 'agentMessage', text: 'Second completed-only item.' },
+	} });
+	transport.emit('notification', { method: 'turn/completed', params: {
+		threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' },
+	} });
+	assert.deepEqual(await turn, { status: 'completed', toolCalls: 0 });
+	assert.equal(events.map(({ message }) => message).join(''), 'First streamed item.Second completed-only item.');
+	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.doesNotMatch(JSON.stringify(events), /hidden reasoning/);
 	await service.stop();
 });
 

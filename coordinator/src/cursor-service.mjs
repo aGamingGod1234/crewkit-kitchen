@@ -7,6 +7,7 @@ import { parseDecision } from './decision-parser.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { reportVisibleOutput } from './verbose-output.mjs';
 
 const DEFAULT_MODELS = Object.freeze(['composer-2.5', 'grok-4.5', 'grok-4.6']);
 const DEFAULT_REASONING = Object.freeze({
@@ -151,7 +152,7 @@ class CursorAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs, onVerbose = null } = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `cursor agent '${this.agentId}' is disposed`);
 		if (this.#activeOperation !== null) throw new AcpProtocolError('TURN_IN_PROGRESS', `cursor agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
@@ -182,6 +183,7 @@ class CursorAgent {
 			rawOutput = result.result;
 			timing = providerTiming(result.durationMs, result.apiDurationMs, queueWaitMs);
 			if (signal?.aborted || goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_PLAN', 'cursor result belongs to an obsolete goal');
+			reportVisibleOutput(onVerbose, result.result);
 			let decision;
 			let parseError = null;
 			try { decision = parseDecision(result.result.trim()); }

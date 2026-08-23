@@ -43,6 +43,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'action_command',
 	'action_cancel',
 	'agent_error',
+	'verbose_event',
 	'heartbeat',
 ]);
 
@@ -58,6 +59,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'action_progress',
 	'action_result',
 	'goal_completion_result',
+	'verbose_control',
 	'heartbeat',
 	'shutdown',
 ]);
@@ -65,7 +67,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
 const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'conversation_event', 'action_progress', 'action_result', 'goal_completion_result']);
-const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'action_command', 'action_cancel', 'agent_error']);
+const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'action_command', 'action_cancel', 'agent_error', 'verbose_event']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
@@ -76,6 +78,12 @@ const MAX_REGISTRY_SNAPSHOT_AGENTS = 1_024;
 const MAX_NEARBY_TRANSACTION_TARGETS = 16;
 const MAX_COMPLETION_FACTS = 16;
 const MAX_CHANGED_FACTS = 256;
+export const MAX_VERBOSE_MESSAGE_LENGTH = 256;
+export const VERBOSE_STAGES = Object.freeze([
+	'conversation', 'lifecycle', 'planner', 'provider', 'output', 'decision',
+	'action', 'progress', 'result', 'retry', 'error',
+]);
+const VERBOSE_STAGE_SET = new Set(VERBOSE_STAGES);
 const FACTUAL_PLAYER_FIELDS = new Set([
 	'health', 'maxHealth', 'armor', 'foodLevel', 'saturation', 'gameMode', 'onGround', 'inWater',
 	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
@@ -117,9 +125,10 @@ export function validateProtocolV2Envelope(value, { direction } = {}) {
 	if (!isPlainObject(value.payload)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Protocol v2 payload must be an object');
 	if (direction === 'coordinator_to_server' && !COORDINATOR_TYPES.has(type)) throw new ProtocolV2Error('INVALID_MESSAGE_TYPE', `Message type '${type}' is not coordinator-to-server`);
 	if (direction === 'server_to_coordinator' && !SERVER_TYPES.has(type)) throw new ProtocolV2Error('INVALID_MESSAGE_TYPE', `Message type '${type}' is not server-to-coordinator`);
-	if ((type === 'hello' || type === 'hello_ack' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
+	if ((type === 'hello' || type === 'hello_ack' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'verbose_control' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use agentId 'server'`);
 	}
+	if (type === 'verbose_event' && agentId === 'server') throw new ProtocolV2Error('INVALID_AGENT_SCOPE', "Message type 'verbose_event' must use an agent ID");
 	const payload = validateProtocolV2Payload(type, value.payload);
 	if (type === 'conversation_event' && payload.recipientId !== agentId) {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', 'conversation_event recipientId must match the envelope agentId');
@@ -209,6 +218,19 @@ export function validateProtocolV2Payload(type, value) {
 				code: boundedText(value.code, 'code', MAX_REASON_CODE_LENGTH),
 				message: boundedText(value.message, 'message', MAX_RESULT_MESSAGE_LENGTH),
 			};
+		case 'verbose_control':
+			exactKeys(value, ['enabled'], ['enabled'], type);
+			return { enabled: boolean(value.enabled, 'enabled') };
+		case 'verbose_event': {
+			exactKeys(value, ['goalRevision', 'stage', 'message'], ['goalRevision', 'stage', 'message'], type);
+			const stage = requireIdentifier(value.stage, 'stage');
+			if (!VERBOSE_STAGE_SET.has(stage)) throw new ProtocolV2Error('INVALID_PAYLOAD', `verbose_event stage '${stage}' is not allowed`);
+			return {
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
+				stage,
+				message: boundedText(value.message, 'message', MAX_VERBOSE_MESSAGE_LENGTH),
+			};
+		}
 		case 'heartbeat':
 			exactKeys(value, [], [], type);
 			return {};
@@ -324,6 +346,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		});
 		validateProtocolV2Envelope(envelope, { direction: 'coordinator_to_server' });
 		this.#assertRevision(envelope, REVISION_GUARDED_OUTBOUND_TYPES);
+		if (type === 'verbose_event') return this.#sendLossy(envelope);
 		return this.#enqueue(envelope);
 	}
 
@@ -495,6 +518,19 @@ export class MultiplexedServerBridge extends EventEmitter {
 			this.#queuedByAgent.set(envelope.agentId, agentCount + 1);
 			this.#flush();
 		});
+	}
+
+	#sendLossy(envelope) {
+		const socket = this.#socket;
+		if (this.#writeBlocked || this.#outboundQueue.length > 0 || socket === null || socket.destroyed) return Promise.resolve(null);
+		try {
+			this.#invokeAudit('coordinator_to_server', envelope);
+			if (!socket.write(encodeJsonLine(envelope))) this.#writeBlocked = true;
+			return Promise.resolve(envelope.messageId);
+		} catch (error) {
+			this.#fail(error);
+			return Promise.reject(error);
+		}
 	}
 
 	#flush() {
@@ -740,7 +776,7 @@ function normalizeProvider(value, field) {
 }
 
 function normalizeGoalControl(value) {
-	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal', 'death'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
+	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal', 'death', 'resumeGoal'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
 	const operation = boundedText(value.operation, 'operation', MAX_REASON_CODE_LENGTH);
 	if (!['start', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
 	const normalized = { operation, goalRevision: revision(value.goalRevision, 'goalRevision'), updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, 'updatedAtEpochMs') };
@@ -750,6 +786,8 @@ function normalizeGoalControl(value) {
 	if (!['start', 'steer', 'queue'].includes(operation) && normalized.goal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goal`);
 	if (operation === 'dead' && normalized.death === undefined) throw new ProtocolV2Error('MISSING_FIELD', 'goal_control dead requires death facts');
 	if (operation !== 'dead' && normalized.death !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include death facts`);
+	if (operation === 'respawn') normalized.resumeGoal = value.resumeGoal === undefined ? false : boolean(value.resumeGoal, 'resumeGoal');
+	else if (value.resumeGoal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include resumeGoal`);
 	return normalized;
 }
 

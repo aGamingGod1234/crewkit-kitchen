@@ -6,6 +6,7 @@ import { MINECRAFT_DYNAMIC_TOOLS, NATIVE_AGENT_INSTRUCTIONS, normalizeMinecraftT
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
+import { reportVisibleOutput } from './verbose-output.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
@@ -243,7 +244,7 @@ export class SharedCodexAgent {
 		if (this.#active !== null && this.#active.goalRevision !== revision) await this.interrupt();
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
+	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs, onVerbose = null } = {}) {
 		if (this.#controlProtocol !== 'arena_script') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'Native tool agents must use act()');
 		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
@@ -252,7 +253,7 @@ export class SharedCodexAgent {
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new CodexProtocolError('TURN_INTERRUPTED', 'Planning turn was interrupted');
 		const turnStartedAt = performance.now();
-		const collector = createTurnCollector(this.#transport, this.#threadId, this.#maxDecisionBytes);
+		const collector = createTurnCollector(this.#transport, this.#threadId, this.#maxDecisionBytes, onVerbose);
 		void collector.promise.catch(() => { /* observed immediately; the decision awaits the original promise after turn/start */ });
 		let lifecycleSettled = false;
 		let rejectLifecycle;
@@ -372,7 +373,7 @@ export class SharedCodexAgent {
 		return this.#prewarmPromise;
 	}
 
-	async act(input, { goalRevision, signal, executeTool, prewarm = false } = {}) {
+	async act(input, { goalRevision, signal, executeTool, prewarm = false, onVerbose = null } = {}) {
 		if (this.#controlProtocol !== 'native_tools') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'ArenaScript agents must use decide()');
 		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native event input must be nonblank');
@@ -395,6 +396,7 @@ export class SharedCodexAgent {
 			agentId: this.agentId,
 			goalRevision,
 			executeTool,
+			onVerbose,
 		});
 		void collector.promise.catch(() => {});
 		let lifecycleSettled = false;
@@ -533,11 +535,12 @@ export class SharedCodexAgent {
 	}
 }
 
-function createTurnCollector(transport, threadId, maxDecisionBytes) {
+function createTurnCollector(transport, threadId, maxDecisionBytes, onVerbose) {
 	let expectedTurnId = null;
 	let lastMessage = null;
 	let streamedMessage = '';
 	let streamedMessageBytes = 0;
+	let lastCompletedMessage = null;
 	let outputLimitError = null;
 	let bufferedNotifications = [];
 	let tokens = null;
@@ -556,6 +559,7 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 				rejectPromise(outputLimitError);
 				return;
 			}
+			safeVerbose(onVerbose, 'output', params.delta);
 			streamedMessageBytes += deltaBytes;
 			streamedMessage += params.delta;
 		}
@@ -565,7 +569,9 @@ function createTurnCollector(transport, threadId, maxDecisionBytes) {
 				rejectPromise(outputLimitError);
 				return;
 			}
+			if (streamedMessageBytes === 0 && params.item.text !== lastCompletedMessage) safeVerbose(onVerbose, 'output', params.item.text);
 			lastMessage = params.item.text;
+			lastCompletedMessage = params.item.text;
 			streamedMessage = '';
 			streamedMessageBytes = 0;
 		}
@@ -632,9 +638,13 @@ function isRateLimitError(error) {
 		.some((key) => info[key]?.httpStatusCode === 429);
 }
 
-function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool }) {
+function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose }) {
 	let expectedTurnId = null;
 	let bufferedRequests = [];
+	const streamedAgentMessageIds = new Set();
+	const completedAgentMessageIds = new Set();
+	let streamedAnonymousMessage = false;
+	let lastAnonymousCompletedMessage = null;
 	let settled = false;
 	let toolCalls = 0;
 	let toolExecutor = executeTool;
@@ -680,6 +690,28 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 	const onNotification = ({ method, params }) => {
 		if (params?.threadId !== threadId || expectedTurnId === null || notificationTurnId(params) !== expectedTurnId) return;
+		if (method === 'item/agentMessage/delta' && typeof params?.delta === 'string') {
+			const itemId = agentMessageItemId(params);
+			if (params.delta.length > 0) {
+				if (itemId === null) streamedAnonymousMessage = true;
+				else rememberBoundedItemId(streamedAgentMessageIds, itemId);
+			}
+			safeVerbose(onVerbose, 'output', params.delta);
+		}
+		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') {
+			const itemId = agentMessageItemId(params);
+			const duplicate = itemId === null
+				? streamedAnonymousMessage || params.item.text === lastAnonymousCompletedMessage
+				: streamedAgentMessageIds.has(itemId) || completedAgentMessageIds.has(itemId);
+			if (!duplicate) safeVerbose(onVerbose, 'output', params.item.text);
+			if (itemId === null) {
+				streamedAnonymousMessage = false;
+				lastAnonymousCompletedMessage = params.item.text;
+			} else {
+				streamedAgentMessageIds.delete(itemId);
+				rememberBoundedItemId(completedAgentMessageIds, itemId);
+			}
+		}
 		if (method !== 'turn/completed' || settled) return;
 		settled = true;
 		if (params?.turn?.status === 'failed') rejectPromise(new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex native turn failed'));
@@ -709,6 +741,16 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 }
 
+function agentMessageItemId(params) {
+	const value = params?.itemId ?? params?.item?.id;
+	return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function rememberBoundedItemId(values, itemId) {
+	values.add(itemId);
+	if (values.size > MAX_BUFFERED_TURN_NOTIFICATIONS) values.delete(values.values().next().value);
+}
+
 function notificationTurnId(params) {
 	return params?.turnId ?? params?.turn?.id ?? null;
 }
@@ -721,6 +763,10 @@ function withTimeout(promise, timeoutMs, schedule, cancelSchedule) {
 			(error) => { cancelSchedule(handle); reject(error); },
 		);
 	});
+}
+
+function safeVerbose(callback, stage, message) {
+	if (stage === 'output') reportVisibleOutput(callback, String(message ?? ''));
 }
 
 function validateServiceConfig(value, { requireLaunchProfile }) {

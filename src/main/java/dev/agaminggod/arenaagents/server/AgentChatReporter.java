@@ -13,20 +13,24 @@ public final class AgentChatReporter {
 	}
 
 	public static void planning(CodexAgentManager manager, AgentRecord record) {
+		AgentVerboseChat.report(manager, record, "planner", "Planning started");
 		// Planning state belongs in the field console; chat is reserved for meaningful activity.
 	}
 
 	public static void stillPlanning(CodexAgentManager manager, AgentRecord record) {
+		AgentVerboseChat.report(manager, record, "planner", "Planning is still in progress");
 		// Deliberately quiet: periodic provider heartbeat text drowned out actual actions.
 	}
 
 	public static void acting(CodexAgentManager manager, AgentRecord record, ServerActionRequest request) {
+		AgentVerboseChat.report(manager, record, "action", AgentActivityPresentation.action(request.type()));
 		if (AgentActivityPresentation.shouldAnnounceAction(request.type())) {
 			report(manager, record, AgentActivityPresentation.action(request.type()), ChatFormatting.WHITE);
 		}
 	}
 
 	public static void decision(CodexAgentManager manager, AgentRecord record, String summary) {
+		AgentVerboseChat.report(manager, record, "decision", summary);
 		// The concrete action that follows is clearer than repeating the planner's internal summary.
 	}
 
@@ -36,6 +40,8 @@ public final class AgentChatReporter {
 	}
 
 	public static void completed(CodexAgentManager manager, AgentRecord record, String summary) {
+		AgentVerboseChat.report(manager, record, "lifecycle",
+				summary == null || summary.isBlank() ? "Task complete" : summary);
 		report(manager, record, summary == null || summary.isBlank() ? "Task complete" : summary, ChatFormatting.GREEN);
 	}
 
@@ -44,11 +50,13 @@ public final class AgentChatReporter {
 	}
 
 	public static void failed(CodexAgentManager manager, AgentRecord record, String reasonCode, String error) {
+		AgentVerboseChat.report(manager, record, "error", readableError(error));
 		if (reasonCode != null && !AgentActivityPresentation.shouldShowInChat(reasonCode, true)) return;
 		report(manager, record, "Needs attention: " + readableError(error), ChatFormatting.RED);
 	}
 
 	public static void disconnected(CodexAgentManager manager, AgentRecord record) {
+		AgentVerboseChat.report(manager, record, "lifecycle", "Coordinator disconnected");
 		report(manager, record,
 				"Connection lost. Reconnect the coordinator, then resume or restart this task.", ChatFormatting.RED);
 	}

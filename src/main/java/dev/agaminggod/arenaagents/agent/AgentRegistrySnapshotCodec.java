@@ -66,6 +66,7 @@ public final class AgentRegistrySnapshotCodec {
 		);
 		json.add("profile", encodeProfile(record.profile()));
 		json.addProperty("state", record.state().name());
+		json.addProperty("resume_after_respawn", record.resumeAfterRespawn());
 		record.currentGoal().ifPresentOrElse(
 				goal -> json.add("current_goal", encodeGoal(goal)),
 				() -> json.add("current_goal", null)
@@ -104,6 +105,7 @@ public final class AgentRegistrySnapshotCodec {
 				optionalEntityLocation(json, "entity_location"),
 				profile,
 				parseEnum(AgentLifecycleState.class, requireString(json, "state"), "state"),
+				optionalBoolean(json, "resume_after_respawn", false),
 				optionalGoal(json, "current_goal"),
 				requireLong(json, "goal_revision"),
 				queue,

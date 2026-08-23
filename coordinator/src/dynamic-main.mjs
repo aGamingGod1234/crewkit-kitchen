@@ -22,7 +22,7 @@ import {
 	DEFAULT_SERVICE_TIER,
 } from './constants.mjs';
 import { PlanningScheduler } from './planning-scheduler.mjs';
-import { MultiplexedServerBridge, ProtocolV2Error } from './protocol-v2.mjs';
+import { MAX_VERBOSE_MESSAGE_LENGTH, MultiplexedServerBridge, ProtocolV2Error, VERBOSE_STAGES } from './protocol-v2.mjs';
 import { adaptObservation } from './observation-adapter.mjs';
 import { advanceContextCursor, buildPlannerInput, createContextCursor } from './prompts.mjs';
 import { profileFingerprint } from './provider-session.mjs';
@@ -45,6 +45,8 @@ const EMPTY_TURN_RETRY_DELAY_MS = 1_000;
 const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set(['MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE', 'REQUEST_TIMEOUT']);
 const QUIET_LIFECYCLE_ERRORS = new Set(['PLAN_CANCELLED', 'STALE_PLAN', 'STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION']);
 const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
+const MAX_VERBOSE_OUTPUT_CHARS = 16_384;
+const VERBOSE_OUTPUT_LOOKBEHIND_CHARS = 64;
 const DEFAULT_VOICE_PORT = 8_766;
 const DEFAULT_VOICE_MAX_CONCURRENT = 5;
 const DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH = path.join('runtime', 'voice-profile-assignments.json');
@@ -64,6 +66,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#attentionFlushes = new Map();
 	#lifecycleGenerations = new Map();
 	#providerRetryAfter = new Map();
+	#verboseReporters = new Set();
 	#factLedgers = new Map();
 	#conversationMemories = new Map();
 	#contextCursors = new Map();
@@ -88,6 +91,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#serverInstanceId = null;
 	#traceWriter;
 	#providerTurnRecorder;
+	#verboseEnabled = false;
 
 	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, codexControlProtocol = 'arena_script', traceWriter = null, providerTurnRecorder = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
 		super();
@@ -163,6 +167,7 @@ export class DynamicCoordinator extends EventEmitter {
 	async stop() {
 		if (this.#stopping || this.#closed) return;
 		this.#stopping = true;
+		this.#setVerboseEnabled(false);
 		if (this.#statusHandle !== null) this.#clearStatusInterval(this.#statusHandle);
 		this.#statusHandle = null;
 		this.#bridge.stop();
@@ -191,6 +196,7 @@ export class DynamicCoordinator extends EventEmitter {
 
 	#bindBridge() {
 		this.#listen('ready', ({ serverInstanceId, registry }) => {
+			this.#setVerboseEnabled(false);
 			if (this.#serverInstanceId !== null && serverInstanceId !== this.#serverInstanceId) {
 				this.#invalidateServerInstance();
 			}
@@ -210,6 +216,7 @@ export class DynamicCoordinator extends EventEmitter {
 				if (record === null) throw new ProtocolV2Error('UNKNOWN_AGENT', `Reconciled provider profile references unknown agent '${profile.agentId}'`);
 				await this.#bridge.send('agent_ready', profile.agentId, { goalRevision: record.goalRevision, reconciled: true });
 				this.#supportedAgentIds.add(profile.agentId);
+				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent reconciled and ready.');
 				this.#prewarmNativeAgent(record);
 				if (record.state === DynamicAgentState.DEAD) await this.#installDeadStatePlan(record, record.death);
 			}
@@ -227,6 +234,9 @@ export class DynamicCoordinator extends EventEmitter {
 				return null;
 			});
 		});
+		this.#listen('verbose_control', (message) => {
+			this.#setVerboseEnabled(message.payload.enabled);
+		});
 		this.#listen('catalog_request', () => this.#run(async () => {
 			await this.#reconciliation;
 			const catalog = await this.#codexService.catalog.refresh({ force: true });
@@ -240,11 +250,13 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#codexService.catalog.assertSupported(record.provider, record.model, record.reasoningEffort, record.serviceTier ?? DEFAULT_SERVICE_TIER);
 			await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision, reconciled: false });
 			this.#supportedAgentIds.add(record.agentId);
+			this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent registered and ready.');
 			this.#prewarmNativeAgent(record);
 			await this.#publishStatus();
 		}));
 		this.#listen('agent_removed', (message) => this.#run(async () => {
 			await this.#reconciliation;
+			this.#publishVerbose(message.agentId, message.payload.goalRevision, 'lifecycle', 'Agent removed from the coordinator roster.');
 			this.#programRuntime.dispose(message.agentId);
 			await this.#nativeRuntime.dispose(message.agentId, 'agent_removed');
 			this.#providerWork.delete(message.agentId);
@@ -268,30 +280,37 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#programRuntime.onGoalControl(previous, message.payload.operation);
 				void this.#nativeRuntime.dispose(previous.agentId, `goal_${message.payload.operation}`);
 			}
-			this.#beginGoalControlInterruption(message);
+			if (!orderedRespawn) this.#beginGoalControlInterruption(message);
 			this.#enqueueAgent(message.agentId, async () => {
 				if (orderedRespawn) {
-					this.#invalidateLifecycleWork(message);
 					const orderedPrevious = this.#registry.get(message.agentId);
+					if (orderedPrevious === null || orderedPrevious.state !== DynamicAgentState.DEAD) {
+						this.#registry.applyGoalControl(message.agentId, message.payload);
+					}
+					this.#beginGoalControlInterruption(message);
+					this.#invalidateLifecycleWork(message);
 					if (orderedPrevious !== null) {
 						this.#programRuntime.onGoalControl(orderedPrevious, message.payload.operation);
 						await this.#nativeRuntime.dispose(orderedPrevious.agentId, 'goal_respawn');
 					}
 				}
 				const record = this.#registry.applyGoalControl(message.agentId, message.payload);
+				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', `Goal lifecycle operation '${message.payload.operation}' accepted.`);
 				if (message.payload.operation !== 'queue') {
 					this.#providerRetryAfter.delete(message.agentId);
 				}
 				if (message.payload.operation === 'dead') {
 					void this.#installDeadStatePlan(record, message.payload.death).catch((error) => this.#reportAgentError(record.agentId, error));
 				}
-				if (message.payload.operation === 'start' || message.payload.operation === 'resume' || message.payload.operation === 'steer') {
+				const resumesGoal = ['start', 'resume', 'steer'].includes(message.payload.operation)
+					|| message.payload.operation === 'respawn' && record.state === DynamicAgentState.STARTING;
+				if (resumesGoal) {
 					this.#rememberPendingAttention(record.agentId, record.goalRevision, {
 						priority: message.payload.operation === 'steer' ? 'urgent' : 'ordinary',
 						trigger: message.payload.operation,
 					});
 				}
-				if (['start', 'resume', 'steer'].includes(message.payload.operation)) {
+				if (resumesGoal) {
 					await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
 				}
 				this.emit('goalControl', record);
@@ -299,6 +318,7 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 		this.#listen('conversation_event', (message) => {
 			this.#enqueueAgent(message.agentId, async () => {
+				this.#publishVerbose(message.agentId, message.payload.goalRevision, 'conversation', `Conversation event '${message.payload.kind}' received from '${message.payload.sourceId}'.`);
 				this.#conversationMemory(message.agentId).ingest(message.payload);
 				const record = this.#registry.get(message.agentId);
 				if (record !== null) {
@@ -311,6 +331,7 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 		this.#listen('conversation_wake', (message) => {
 			this.#enqueueAgent(message.agentId, async () => {
+				this.#publishVerbose(message.agentId, message.payload.event.goalRevision, 'conversation', `Conversation wake '${message.payload.event.kind}' received.`);
 				const fingerprint = JSON.stringify({ agentId: message.agentId, event: message.payload.event, control: message.payload.control });
 				const existing = this.#conversationWakeTransactions.get(message.payload.transactionId);
 				if (existing !== undefined) {
@@ -433,13 +454,14 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 		this.#listen('action_progress', (message) => {
 			this.#enqueueAgent(message.agentId, async () => {
-			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
-			if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionProgress(record, message.payload)) {
+				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
+				this.#publishVerbose(record.agentId, record.goalRevision, 'progress', `Action '${message.payload.actionId}' reported progress.`);
+				if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionProgress(record, message.payload)) {
+					this.emit('actionProgress', message);
+					return;
+				}
+				if (!this.#programRuntime.onActionProgress(record, message.payload)) throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
 				this.emit('actionProgress', message);
-				return;
-			}
-			if (!this.#programRuntime.onActionProgress(record, message.payload)) throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
-			this.emit('actionProgress', message);
 			});
 		});
 		this.#listen('action_result', (message) => {
@@ -447,6 +469,7 @@ export class DynamicCoordinator extends EventEmitter {
 			const current = this.#registry.get(message.agentId);
 			if (current === null || message.payload.goalRevision !== current.goalRevision) return;
 			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
+			this.#publishVerbose(record.agentId, record.goalRevision, 'result', `Action '${message.payload.actionId}' finished with state '${message.payload.state}'.`);
 			this.#ledger(record.agentId).ingest('action_result', message.payload);
 			if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionResult(record, message.payload)) {
 				this.emit('actionResult', message);
@@ -463,12 +486,14 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#enqueueAgent(message.agentId, async () => {
 				const current = this.#registry.get(message.agentId);
 				if (current === null || current.goalRevision !== message.payload.goalRevision) return;
+				this.#publishVerbose(current.agentId, current.goalRevision, 'result', `Goal verification returned '${message.payload.reasonCode}'.`);
 				if (this.#usesNativeTools(current) && this.#nativeRuntime.onCompletionResult(current, message.payload)) return;
 				const accepted = this.#programRuntime.onCompletionResult(current, message.payload);
 				if (!accepted) throw new ProtocolV2Error('UNEXPECTED_COMPLETION_RESULT', `Agent '${message.agentId}' has no matching completion request`);
 			});
 		});
 		this.#listen('disconnected', () => {
+			this.#setVerboseEnabled(false);
 			for (const record of this.#registry.list()) this.#advanceLifecycleGeneration(record.agentId);
 			this.#run(async () => {
 			this.#disconnectedAt ??= safeClockRead(this.#controlNow);
@@ -588,8 +613,10 @@ export class DynamicCoordinator extends EventEmitter {
 		};
 		this.#providerWork.set(record.agentId, work);
 		if (record.state === DynamicAgentState.STARTING) this.#registry.setState(record.agentId, DynamicAgentState.PLANNING, { goalRevision: record.goalRevision });
+		this.#publishVerbose(record.agentId, record.goalRevision, 'planner', `Native planning started for '${request.trigger}'.`);
 		void this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING })
 			.catch((error) => this.#reportAgentError(record.agentId, error));
+		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision);
 		work.promise = Promise.resolve()
 			.then(() => this.#planner.requestNativeTurn({
 				agentId: record.agentId,
@@ -598,9 +625,11 @@ export class DynamicCoordinator extends EventEmitter {
 				recoverySummary: record.lastSummary,
 				priority: request.priority,
 				traceId: work.traceId,
+				onVerbose: verboseReporter,
 				executeTool: (toolRequest) => this.#executeNativeTool(work, toolRequest),
 			}))
-			.then((result) => this.#completeNativeTurn(work, result), (error) => this.#failNativeTurn(work, error));
+			.then((result) => this.#completeNativeTurn(work, result), (error) => this.#failNativeTurn(work, error))
+			.finally(() => verboseReporter.dispose());
 		return work.promise;
 	}
 
@@ -725,6 +754,7 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		if (this.#scheduler.hasScheduled(record.agentId)) return;
 		if (request.priority !== 'urgent' && request.receiptMonotonicMs !== null && (this.#providerRetryAfter.get(record.agentId) ?? 0) > request.receiptMonotonicMs) return;
+		this.#publishVerbose(record.agentId, record.goalRevision, 'planner', `Planning started for '${request.trigger}'.`);
 		void this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING }).catch((error) => this.#reportAgentError(record.agentId, error));
 		void this.#scheduleProviderPlan(record, request, { preserveState: false, kind: 'initial' });
 	}
@@ -754,6 +784,7 @@ export class DynamicCoordinator extends EventEmitter {
 			promise: null,
 		};
 		this.#providerWork.set(record.agentId, work);
+		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision);
 		const providerRequest = {
 			agentId: record.agentId,
 			goalRevision: record.goalRevision,
@@ -762,11 +793,13 @@ export class DynamicCoordinator extends EventEmitter {
 			input: request.input,
 			traceId: work.traceId,
 			planningPriority: request.priority,
-					priority: request.priority,
-				};
+			priority: request.priority,
+			onVerbose: verboseReporter,
+		};
 		work.promise = Promise.resolve()
 			.then(() => this.#planner.requestPlan(providerRequest))
-			.then((decision) => this.#completeProviderPlan(work, decision), (error) => this.#failProviderPlan(work, record, error));
+			.then((decision) => this.#completeProviderPlan(work, decision), (error) => this.#failProviderPlan(work, record, error))
+			.finally(() => verboseReporter.dispose());
 		return work.promise;
 	}
 
@@ -981,10 +1014,13 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #reportAgentError(agentId, error) {
 		try {
+			const verboseRecord = this.#registry.get(agentId);
+			if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'error', verboseErrorMessage(error));
 			if (QUIET_LIFECYCLE_ERRORS.has(error?.code)) return;
 			if (QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)) {
 				// App-server transport silence is retried from the next fresh observation.
 				// It is not a world-action failure that the player or agent must repair.
+				if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'retry', 'Provider output was incomplete; retrying from the next fresh observation.');
 				const retryAt = safeClockRead(this.#controlNow);
 				if (retryAt === null) this.#providerRetryAfter.delete(agentId);
 				else this.#providerRetryAfter.set(agentId, retryAt + EMPTY_TURN_RETRY_DELAY_MS);
@@ -1013,11 +1049,67 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#writeTrace(event, fields) {
+		this.#publishVerboseTrace(event, fields);
 		if (this.#traceWriter === null) return;
 		try {
 			Promise.resolve(this.#traceWriter.write(event, fields)).catch(() => {});
 			if (typeof this.#traceWriter.writeDiagnostic === 'function') Promise.resolve(this.#traceWriter.writeDiagnostic(event, fields)).catch(() => {});
 		} catch { /* diagnostics cannot interrupt agent control */ }
+	}
+
+	#verboseReporter(agentId, goalRevision) {
+		const output = createVerboseOutputStream((message) => this.#sendVerbose(agentId, goalRevision, 'output', message));
+		const reporter = (stage, message) => {
+			try {
+				if (!this.#verboseEnabled) {
+					output.reset();
+					return;
+				}
+				if (stage === 'output') {
+					output.push(message);
+					return;
+				}
+				output.flush();
+				this.#publishVerbose(agentId, goalRevision, stage, message);
+			} catch { /* verbose reporting is observational */ }
+		};
+		reporter.reset = () => output.reset();
+		reporter.dispose = () => {
+			output.reset();
+			this.#verboseReporters.delete(reporter);
+		};
+		this.#verboseReporters.add(reporter);
+		return reporter;
+	}
+
+	#setVerboseEnabled(enabled) {
+		this.#verboseEnabled = enabled;
+		if (enabled) return;
+		for (const reporter of this.#verboseReporters) reporter.reset();
+	}
+
+	#publishVerbose(agentId, goalRevision, stage, message) {
+		try {
+			const bounded = sanitizeVerboseMessage(stage, message);
+			if (bounded.length === 0) return;
+			this.#sendVerbose(agentId, goalRevision, stage, bounded);
+		} catch { /* verbose delivery is best effort */ }
+	}
+
+	#sendVerbose(agentId, goalRevision, stage, message) {
+		if (!this.#verboseEnabled || !this.#bridge.ready || !VERBOSE_STAGES.includes(stage)) return;
+		const current = this.#registry.get(agentId);
+		if (current === null || current.goalRevision !== goalRevision || message.length === 0 || message.length > MAX_VERBOSE_MESSAGE_LENGTH) return;
+		Promise.resolve(this.#bridge.send('verbose_event', agentId, { goalRevision, stage, message })).catch(() => {});
+	}
+
+	#publishVerboseTrace(event, fields) {
+		const agentId = fields?.agentId;
+		const goalRevision = fields?.goalRevision;
+		if (typeof agentId !== 'string' || !Number.isSafeInteger(goalRevision) || goalRevision < 0) return;
+		const stage = verboseTraceStage(event);
+		if (stage === null) return;
+		this.#publishVerbose(agentId, goalRevision, stage, verboseTraceMessage(event, fields));
 	}
 
 	async #publishCatalog(snapshot) {
@@ -1584,6 +1676,123 @@ function codedRuntimeError(code, message, cause = undefined) {
 
 function isTransientCompletionSendError(error) {
 	return ['BRIDGE_NOT_READY', 'BRIDGE_DISCONNECTED', 'CONNECTION_BACKPRESSURE', 'AGENT_BACKPRESSURE'].includes(error?.code);
+}
+
+function verboseErrorMessage(error) {
+	const code = String(error?.code ?? 'COORDINATOR_ERROR').slice(0, 128);
+	return `Coordinator error (${code}).`;
+}
+
+function sanitizeVerboseMessage(stage, message) {
+	const normalized = String(message ?? '')
+		.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim();
+	if (stage === 'error') {
+		const code = normalized.match(/\(([A-Z][A-Z0-9_]{1,127})\)/)?.[1]
+			?? normalized.match(/\b[A-Z][A-Z0-9_]{2,127}\b/)?.[0];
+		return (code === undefined ? 'Provider reported an error.' : `Provider error (${code}).`).slice(0, MAX_VERBOSE_MESSAGE_LENGTH);
+	}
+	return sanitizeVerboseOutput(normalized).slice(0, MAX_VERBOSE_MESSAGE_LENGTH);
+}
+
+function sanitizeVerboseOutput(message) {
+	return String(message ?? '')
+		.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+		.replace(/\s+/g, ' ')
+		.trim()
+		.replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '[REDACTED_AUTH]')
+		.replace(/(\b(?:secret|token|api[-_ ]?key|password|authorization)\b["']?\s*(?:[:=]\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1[REDACTED]');
+}
+
+function createVerboseOutputStream(publish) {
+	let pending = '';
+	let acceptedChars = 0;
+	let publishedChars = 0;
+	let scanOffset = 0;
+	const publishSanitized = (raw) => {
+		const remaining = MAX_VERBOSE_OUTPUT_CHARS - publishedChars;
+		if (remaining <= 0) return;
+		const preserveTrailingSpace = /\s$/.test(raw);
+		let visible = sanitizeVerboseOutput(raw);
+		if (preserveTrailingSpace && visible.length > 0) visible += ' ';
+		visible = visible.slice(0, remaining);
+		publishedChars += visible.length;
+		for (let offset = 0; offset < visible.length; offset += MAX_VERBOSE_MESSAGE_LENGTH) {
+			publish(visible.slice(offset, offset + MAX_VERBOSE_MESSAGE_LENGTH));
+		}
+	};
+	const drain = (final = false) => {
+		if (final) {
+			publishSanitized(pending);
+			pending = '';
+			scanOffset = 0;
+			return;
+		}
+		while (true) {
+			const scanLimit = pending.length - VERBOSE_OUTPUT_LOOKBEHIND_CHARS;
+			let safeBoundary = 0;
+			while (scanOffset <= scanLimit) {
+				const relativeSeparator = pending.slice(scanOffset, scanLimit + 1).search(/[\s,;]/);
+				if (relativeSeparator === -1) {
+					scanOffset = scanLimit + 1;
+					break;
+				}
+				const boundary = scanOffset + relativeSeparator + 1;
+				scanOffset = boundary;
+				if (!hasIncompleteVerboseCredential(pending.slice(0, boundary))) safeBoundary = boundary;
+			}
+			if (safeBoundary === 0) return;
+			publishSanitized(pending.slice(0, safeBoundary));
+			pending = pending.slice(safeBoundary);
+			scanOffset = Math.max(0, scanOffset - safeBoundary);
+		}
+	};
+	return {
+		push(value) {
+			const remaining = MAX_VERBOSE_OUTPUT_CHARS - acceptedChars;
+			if (remaining <= 0) return;
+			const accepted = String(value ?? '').slice(0, remaining);
+			pending += accepted;
+			acceptedChars += accepted.length;
+			drain(acceptedChars === MAX_VERBOSE_OUTPUT_CHARS);
+		},
+		flush() { drain(true); },
+		reset() {
+			pending = '';
+			acceptedChars = 0;
+			publishedChars = 0;
+			scanOffset = 0;
+		},
+	};
+}
+
+function hasIncompleteVerboseCredential(value) {
+	return /\b(?:Bearer|Basic)\s*$/i.test(value)
+		|| /\b(?:secret|token|api[-_ ]?key|password|authorization)\b["']?\s*(?::|=)?\s*$/i.test(value)
+		|| /\b(?:secret|token|api[-_ ]?key|password|authorization)\b["']?\s*(?::|=)?\s*(?:"[^"]*|'[^']*)$/i.test(value);
+}
+
+function verboseTraceStage(event) {
+	if (typeof event !== 'string') return null;
+	if (event.includes('error') || event.includes('failed') || event.includes('rejected')) return 'error';
+	if (event.includes('progress')) return 'progress';
+	if (event.includes('completed')) return 'result';
+	if (event === 'program_step' || event.includes('tool_dispatch') || event.includes('command_sent')) return 'action';
+	if (event.includes('compiled') || event.includes('replaced')) return 'decision';
+	return null;
+}
+
+function verboseTraceMessage(event, fields) {
+	const actionId = typeof fields?.actionId === 'string' ? ` '${fields.actionId.slice(0, 64)}'` : '';
+	if (event.includes('progress')) return `Action${actionId} reported progress.`;
+	if (event.includes('completed')) return `Operation '${event}' completed.`;
+	if (event.includes('error') || event.includes('failed') || event.includes('rejected')) {
+		const code = String(fields?.errorCode ?? fields?.reasonCode ?? 'ERROR').slice(0, 128);
+		return `Operation '${event}' reported '${code}'.`;
+	}
+	if (event === 'program_step' || event.includes('tool_dispatch') || event.includes('command_sent')) return `Action${actionId} dispatched by the active plan.`;
+	return `Planner decision event '${event}' accepted.`;
 }
 
 function classifyObservationTrigger(payload, observation) {
