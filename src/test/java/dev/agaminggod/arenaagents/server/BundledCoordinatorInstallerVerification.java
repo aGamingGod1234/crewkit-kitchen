@@ -16,11 +16,32 @@ public final class BundledCoordinatorInstallerVerification {
 
 	public static int verify() throws Exception {
 		int assertions = 0;
+		assertions += verifyConfiguredSecretPathUsesPreparedRuntime();
 		assertions += verifyStaleCoordinatorIsReplacedWithoutTouchingRuntimeState();
 		assertions += verifyIncompleteBundleLeavesExistingCoordinatorIntact();
 		assertions += verifyFreshInstallCreatesSecretAndPreservesProviderConfig();
 		assertions += verifyInterruptedSwapRecoversPreviousCoordinator();
 		return assertions;
+	}
+
+	private static int verifyConfiguredSecretPathUsesPreparedRuntime() {
+		Path preparedSecret = Path.of("prepared-runtime", "runtime", "bridge-secret.txt")
+				.toAbsolutePath().normalize();
+		String oldBridgeSecret = System.getProperty("arenaagents.bridgeSecretFile");
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
+		try {
+			System.setProperty("arenaagents.bridgeSecretFile", "development-runtime/runtime/bridge-secret.txt");
+			System.setProperty("arenaagents.voiceSecretFile", "development-runtime/runtime/bridge-secret.txt");
+			CoordinatorProcessSupervisor.configureSharedBridgeSecretPath(preparedSecret);
+			assertEquals(preparedSecret.toString(), System.getProperty("arenaagents.bridgeSecretFile"),
+					"prepared runtime overrides a stale development bridge secret path");
+			assertEquals(preparedSecret.toString(), System.getProperty("arenaagents.voiceSecretFile"),
+					"prepared runtime overrides a stale development voice secret path");
+			return 2;
+		} finally {
+			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+		}
 	}
 
 	private static int verifyStaleCoordinatorIsReplacedWithoutTouchingRuntimeState() throws Exception {
@@ -234,5 +255,10 @@ public final class BundledCoordinatorInstallerVerification {
 
 	private static void assertFalse(boolean condition, String label) {
 		assertTrue(!condition, label);
+	}
+
+	private static void restoreProperty(String name, String value) {
+		if (value == null) System.clearProperty(name);
+		else System.setProperty(name, value);
 	}
 }

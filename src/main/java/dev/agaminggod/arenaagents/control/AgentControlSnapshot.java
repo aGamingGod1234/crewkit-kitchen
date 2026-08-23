@@ -74,6 +74,11 @@ public record AgentControlSnapshot(
 		}
 	}
 
+	/** Group controls are useful only when a roster or saved group can contain more than one agent. */
+	public boolean groupAvailable() {
+		return agents.size() > 1 || !groups.isEmpty();
+	}
+
 	public static AgentControlSnapshot fromRecords(
 			boolean canControl,
 			long generatedAtEpochMs,

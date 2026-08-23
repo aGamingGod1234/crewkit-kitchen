@@ -356,7 +356,7 @@ public final class AgentControlScreen extends Screen {
 
 	private void addNavigation() {
 		AgentControlLayout layout = layout();
-		boolean groupAvailable = snapshot == null || snapshot.agents().size() > 1 || !snapshot.groups().isEmpty();
+		boolean groupAvailable = snapshot == null || snapshot.groupAvailable();
 		boolean agentWorkflow = page == Page.OVERVIEW || page == Page.CREATE || page == Page.TASK
 				|| page == Page.MANAGE || page == Page.REMOVE_CONFIRM;
 		if (layout.sideNavigation()) {

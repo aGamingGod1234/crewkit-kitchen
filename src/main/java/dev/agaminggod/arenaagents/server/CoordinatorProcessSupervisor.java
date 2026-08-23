@@ -188,17 +188,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		process = null;
 	}
 
-	private static void configureSharedBridgeSecretPath(Path secretPath) {
+	static void configureSharedBridgeSecretPath(Path secretPath) {
 		Path canonical = secretPath.toAbsolutePath().normalize();
-		String configuredBridge = firstNonblank(System.getProperty("arenaagents.bridgeSecretFile"),
-				System.getenv("ARENA_AGENT_BRIDGE_SECRET_FILE"));
-		String configuredVoice = System.getProperty("arenaagents.voiceSecretFile");
-		if (configuredBridge != null && !samePath(configuredBridge, canonical)) {
-			throw new StartupFailure("BRIDGE_SECRET_PATH_CONFLICT", "Configured bridge secret path does not match the prepared runtime");
-		}
-		if (configuredVoice != null && !configuredVoice.isBlank() && !samePath(configuredVoice, canonical)) {
-			throw new StartupFailure("BRIDGE_SECRET_PATH_CONFLICT", "Configured voice secret path does not match the prepared runtime");
-		}
 		System.setProperty("arenaagents.bridgeSecretFile", canonical.toString());
 		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
 	}
@@ -208,19 +199,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		if (configured != null && !configured.isBlank()) return;
 		CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
 				.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
-	}
-
-	private static String firstNonblank(String first, String second) {
-		if (first != null && !first.isBlank()) return first;
-		return second == null || second.isBlank() ? null : second;
-	}
-
-	private static boolean samePath(String configured, Path canonical) {
-		try {
-			return Path.of(configured).toAbsolutePath().normalize().equals(canonical);
-		} catch (RuntimeException exception) {
-			return false;
-		}
 	}
 
 	private static Path findPackageRoot(Path gameDirectory) {

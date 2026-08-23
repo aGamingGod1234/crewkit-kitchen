@@ -18,6 +18,7 @@ import dev.agaminggod.arenaagents.client.gui.widget.ConsoleEditBox;
 import dev.agaminggod.arenaagents.client.gui.widget.ConsoleScenarioTile;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlPresentation;
+import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.control.AgentRosterEntry;
 import dev.agaminggod.arenaagents.control.AgentRosterFilter;
 import dev.agaminggod.arenaagents.control.AgentRosterPage;
@@ -66,6 +67,7 @@ public final class ScenarioSetupScreen extends Screen {
 	private boolean feedbackError;
 	private boolean launchPending;
 	private boolean firstInitialization = true;
+	private Boolean navigationGroupAvailable;
 	private ConsoleEditBox nameInput;
 
 	public ScenarioSetupScreen() {
@@ -113,6 +115,7 @@ public final class ScenarioSetupScreen extends Screen {
 			}
 		}
 		ScenarioSetupLayout layout = layout();
+		navigationGroupAvailable = groupAvailable();
 		addTabs(layout);
 		switch (state.step()) {
 			case ARENA -> initArena(layout);
@@ -263,37 +266,54 @@ public final class ScenarioSetupScreen extends Screen {
 	@Override
 	public void tick() {
 		super.tick();
+		boolean currentGroupAvailable = groupAvailable();
+		if (navigationGroupAvailable != null && currentGroupAvailable != navigationGroupAvailable) {
+			navigationGroupAvailable = currentGroupAvailable;
+			rebuildWidgets();
+			return;
+		}
 		if (!queuedInspectorRebuild) return;
 		queuedInspectorRebuild = false;
 		rebuildWidgets();
 	}
 
 	private void addTabs(ScenarioSetupLayout layout) {
+		boolean showGroup = groupAvailable();
 		if (layout.sideNavigation()) {
 			int x = layout.panelLeft() + 10;
 			int width = layout.contentLeft() - layout.panelLeft() - 24;
 			int y = layout.navigationTop();
 			addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.agents"),
 					x, y, width, ROW_HEIGHT, false, this::openAgents));
-			addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.group"),
-					x, y + 31, width, ROW_HEIGHT, false, this::openGroup));
+			if (showGroup) {
+				addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.group"),
+						x, y + 31, width, ROW_HEIGHT, false, this::openGroup));
+			}
 			addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.live"),
-					x, y + 62, width, ROW_HEIGHT, false, this::openLiveArena));
+					x, y + (showGroup ? 62 : 31), width, ROW_HEIGHT, false, this::openLiveArena));
 			addRenderableWidget(consoleButton(Component.translatable("screen.arenaagents.navigation.build"),
-					x, y + 93, width, ROW_HEIGHT, true, () -> { }));
+					x, y + (showGroup ? 93 : 62), width, ROW_HEIGHT, true, () -> { }));
 			return;
 		}
 		int x = layout.contentLeft();
-		String[] labels = {"Agents", "Group", "Live", "Build"};
-		Runnable[] actions = {this::openAgents, this::openGroup, this::openLiveArena, () -> { }};
-		int available = layout.contentWidth() - GAP * 3;
-		int buttonWidth = available / 4;
-		for (int index = 0; index < labels.length; index++) {
+		List<String> labels = showGroup
+				? List.of("Agents", "Group", "Live", "Build")
+				: List.of("Agents", "Live", "Build");
+		List<Runnable> actions = showGroup
+				? List.of(this::openAgents, this::openGroup, this::openLiveArena, () -> { })
+				: List.of(this::openAgents, this::openLiveArena, () -> { });
+		int available = layout.contentWidth() - GAP * (labels.size() - 1);
+		int buttonWidth = available / labels.size();
+		for (int index = 0; index < labels.size(); index++) {
 			int buttonX = x + index * (buttonWidth + GAP);
-			int actualWidth = index == labels.length - 1 ? layout.contentRight() - buttonX : buttonWidth;
-			addRenderableWidget(consoleButton(labels[index], buttonX, layout.navigationTop(), actualWidth,
-					ROW_HEIGHT, index == labels.length - 1, actions[index]));
+			int actualWidth = index == labels.size() - 1 ? layout.contentRight() - buttonX : buttonWidth;
+			addRenderableWidget(consoleButton(labels.get(index), buttonX, layout.navigationTop(), actualWidth,
+					ROW_HEIGHT, index == labels.size() - 1, actions.get(index)));
 		}
+	}
+
+	private boolean groupAvailable() {
+		return AgentControlClient.snapshot().map(AgentControlSnapshot::groupAvailable).orElse(true);
 	}
 
 	private void initArena(ScenarioSetupLayout layout) {

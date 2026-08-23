@@ -63,6 +63,7 @@ public final class AgentControlVerification {
 		assertTrue(agent.entityPresent(), "snapshot carries entity presence");
 		assertTrue(decoded.automationAvailable(), "legacy ready snapshot reports available automation");
 		assertEquals("Automation ready", decoded.automationStatus(), "snapshot carries a human-readable readiness message");
+		assertTrue(!snapshot.groupAvailable(), "a single-agent snapshot without saved groups hides group controls");
 		AgentControlGroup group = new AgentControlGroup("Builders", List.of(AGENT_UUID));
 		AgentControlGroup canonicalGroup = new AgentControlGroup(
 				"Canonical", List.of(AGENT_UUID.toUpperCase(java.util.Locale.ROOT))
@@ -84,6 +85,7 @@ public final class AgentControlVerification {
 		);
 		assertEquals(List.of(group), AgentControlSnapshotCodec.decode(
 				AgentControlSnapshotCodec.encode(grouped)).groups(), "snapshot carries saved identity groups");
+		assertTrue(grouped.groupAvailable(), "a saved group enables group controls for one agent");
 		expectFailure(() -> AgentControlSnapshotCodec.decode("{\"schemaVersion\":999}"), "unsupported snapshot schema");
 		expectFailure(
 				() -> new AgentControlSnapshot(true, NOW_EPOCH_MS, java.util.Collections.nCopies(17, agent)),
