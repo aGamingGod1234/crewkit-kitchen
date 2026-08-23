@@ -124,6 +124,19 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.status, { type: ['string', 'null'], enum: ['completed', 'impossible', null] });
 });
 
+test('planner completion contracts use strict object schemas accepted by Codex', () => {
+	const completionContract = PLANNER_OUTPUT_SCHEMA.properties.completionContract;
+	assert.deepEqual(completionContract.anyOf?.map((branch) => branch.type), ['object', 'null']);
+
+	const contractObject = completionContract.anyOf?.find((branch) => branch.type === 'object');
+	assert.equal(contractObject?.additionalProperties, false);
+	assert.deepEqual(contractObject?.required, ['goalRevision', 'predicates']);
+	assert.equal(contractObject?.properties?.predicates?.items?.anyOf?.length, 5);
+	for (const predicate of contractObject?.properties?.predicates?.items?.anyOf ?? []) {
+		assert.equal(predicate.additionalProperties, false);
+	}
+});
+
 test('parses the canonical nullable decision envelope required by the Codex structured-output API', () => {
 	assert.deepEqual(
 		parseDecision(JSON.stringify({ summary: 'Wait', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);', status: null, completionContract: COMPLETION_CONTRACT })),
