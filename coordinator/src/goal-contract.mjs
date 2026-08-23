@@ -47,8 +47,37 @@ export function bindCompletionContract(contract, { goalRevision, traceId, profil
 }
 
 export function completionContractFingerprint(contract) {
+	return `sha256:${createHash('sha256').update(completionContractCanonicalText(contract), 'utf8').digest('hex')}`;
+}
+
+export function completionContractCanonicalText(contract) {
 	const normalized = parseCompletionContract(contract);
-	return `sha256:${createHash('sha256').update(JSON.stringify(normalized), 'utf8').digest('hex')}`;
+	return [
+		'arena-completion-v1',
+		String(normalized.goalRevision),
+		...normalized.predicates.map(canonicalPredicate),
+	].join('\n');
+}
+
+function canonicalPredicate(predicate) {
+	switch (predicate.type) {
+		case 'inventory_min': return `inventory_min|${base64Url(predicate.itemId)}|${predicate.count}`;
+		case 'position_within': return `position_within|${doubleHex(predicate.x)}|${doubleHex(predicate.y)}|${doubleHex(predicate.z)}|${doubleHex(predicate.radius)}`;
+		case 'block_matches': return `block_matches|${predicate.x}|${predicate.y}|${predicate.z}|${base64Url(predicate.blockId)}`;
+		case 'entity_state': return `entity_state|${base64Url(predicate.entityId)}|${base64Url(predicate.state)}`;
+		case 'action_success_count': return `action_success_count|${base64Url(predicate.actionType)}|${predicate.count}`;
+		default: throw new GoalContractError('INVALID_PREDICATE', 'Unsupported completion predicate');
+	}
+}
+
+function base64Url(value) {
+	return Buffer.from(value, 'utf8').toString('base64url');
+}
+
+function doubleHex(value) {
+	const bytes = Buffer.allocUnsafe(8);
+	bytes.writeDoubleBE(value === 0 ? 0 : value);
+	return bytes.toString('hex');
 }
 
 function normalizePredicate(value, index) {
@@ -95,7 +124,7 @@ function positiveCount(value, index) {
 }
 
 function coordinate(value, label) {
-	if (!Number.isSafeInteger(value)) fail('INVALID_PREDICATE', `${label} must be an integer coordinate`);
+	if (!Number.isSafeInteger(value) || value < -2_147_483_648 || value > 2_147_483_647) fail('INVALID_PREDICATE', `${label} must be a 32-bit integer coordinate`);
 	return value;
 }
 
@@ -116,7 +145,7 @@ function namespacedId(value, label) {
 }
 
 function boundedText(value, label, max) {
-	if (typeof value !== 'string' || value.length === 0 || value.length > max || [...value].some((character) => {
+	if (typeof value !== 'string' || value.trim().length === 0 || value.length > max || [...value].some((character) => {
 		const codePoint = character.codePointAt(0);
 		return codePoint < 0x20 || codePoint === 0x7f;
 	})) fail('INVALID_CONTRACT_BINDING', `${label} must be bounded, nonblank text`);

@@ -26,8 +26,11 @@ export class ProgramRuntimeManager {
 	#onCompletionRequested;
 	#plannerContext;
 	#recorder;
+	#completionRetryDelayMs;
+	#setTimeout;
+	#clearTimeout;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
@@ -52,6 +55,11 @@ export class ProgramRuntimeManager {
 		this.#latencyRegistry = latencyRegistry;
 		this.#clock = clock;
 		this.#recorder = selectedRecorder;
+		if (!Number.isSafeInteger(completionRetryDelayMs) || completionRetryDelayMs < 0) throw new TypeError('completionRetryDelayMs must be a non-negative safe integer');
+		if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') throw new TypeError('completion retry timer functions are required');
+		this.#completionRetryDelayMs = completionRetryDelayMs;
+		this.#setTimeout = setTimeoutFn;
+		this.#clearTimeout = clearTimeoutFn;
 	}
 
 	async installDecision(record, decision, { observation, eventSequence, traceId = undefined } = {}) {
@@ -76,7 +84,8 @@ export class ProgramRuntimeManager {
 		const state = this.#states.get(record.agentId);
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision || !state.completionRequested) return false;
 		if (payload.goalRevision !== state.goalRevision || payload.traceId !== state.traceId || payload.contractHash !== state.completionHash) return false;
-		state.completionResult = { verified: payload.verified === true, reasonCode: payload.reasonCode };
+		this.#clearCompletionRetry(state);
+		state.completionResult = { verified: payload.verified === true, reasonCode: payload.reasonCode, facts: payload.facts };
 		const verifiedAt = this.#safeNow() ?? 0;
 		this.#recordTracePhase(
 			state,
@@ -87,7 +96,21 @@ export class ProgramRuntimeManager {
 			payload.verified === true ? 'completed' : 'failed',
 			payload.verified === true ? null : payload.reasonCode,
 		);
-		if (payload.verified !== true) return true;
+		if (payload.verified !== true) {
+			state.completionRequested = false;
+			state.terminalStatus = null;
+			state.engine.requestCorrection({
+				trigger: 'completion_verification_failed',
+				actionFailure: {
+					actionType: 'complete_goal',
+					arguments: { completionContract: state.completionContract },
+					state: 'FAILED',
+					reasonCode: payload.reasonCode,
+					facts: payload.facts,
+				},
+			});
+			return true;
+		}
 		this.#setTerminalState(record, DynamicAgentState.COMPLETED);
 		return true;
 	}
@@ -233,6 +256,7 @@ export class ProgramRuntimeManager {
 		const state = this.#states.get(record.agentId);
 		if (!state) return;
 		state.disposed = true;
+		this.#clearCompletionRetry(state);
 		state.engine.dispose();
 		this.#states.delete(record.agentId);
 	}
@@ -241,6 +265,7 @@ export class ProgramRuntimeManager {
 		const state = this.#states.get(agentId);
 		if (!state) return;
 		state.disposed = true;
+		this.#clearCompletionRetry(state);
 		state.engine.dispose();
 		this.#states.delete(agentId);
 	}
@@ -289,6 +314,7 @@ export class ProgramRuntimeManager {
 			completionHash: null,
 			completionRequested: false,
 			completionResult: null,
+			completionRetryTimer: null,
 			branchReceipt: null,
 			lastReceiptMonotonicMs: null,
 			lastReceiptEpochMs: null,
@@ -448,7 +474,7 @@ export class ProgramRuntimeManager {
 					agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort, serviceTier: record.serviceTier ?? state.serviceTier },
 					goal: record.currentGoal,
 					goalRevision: record.goalRevision,
-					decisionContext: context.decisionContext ?? 'program_attention',
+					decisionContext: context.decisionContext ?? (context.trigger === 'completion_verification_failed' ? 'completion_verification_failed' : 'program_attention'),
 					programId: context.programId,
 					programVersion: context.version,
 					eventSequence: context.eventSequence,
@@ -508,7 +534,12 @@ export class ProgramRuntimeManager {
 			this.#syncState(record, state);
 		} catch (error) {
 			state.engine.failDirectiveRequest(context);
-			this.#reportError(record.agentId, error);
+			if (context.decisionContext === 'completion_verification_failed') {
+				this.#setTerminalState(record, DynamicAgentState.ERROR);
+				const correctionError = codedError('COMPLETION_CORRECTION_FAILED', 'The selected model could not correct a rejected completion claim');
+				correctionError.cause = error;
+				this.#reportError(record.agentId, correctionError);
+			} else this.#reportError(record.agentId, error);
 		}
 	}
 
@@ -842,6 +873,7 @@ export class ProgramRuntimeManager {
 
 	#requestCompletion(record, state) {
 		if (state.completionRequested || state.completionContract === null) return;
+		this.#clearCompletionRetry(state);
 		state.completionRequested = true;
 		const request = {
 			record,
@@ -852,12 +884,31 @@ export class ProgramRuntimeManager {
 		try {
 			Promise.resolve(this.#onCompletionRequested(request)).catch((error) => {
 				state.completionRequested = false;
-				this.#reportError(record.agentId, error);
+				if (isRetryableCompletionError(error)) this.#scheduleCompletionRetry(record, state);
+				else this.#reportError(record.agentId, error);
 			});
 		} catch (error) {
 			state.completionRequested = false;
-			this.#reportError(record.agentId, error);
+			if (isRetryableCompletionError(error)) this.#scheduleCompletionRetry(record, state);
+			else this.#reportError(record.agentId, error);
 		}
+	}
+
+	#scheduleCompletionRetry(record, state) {
+		if (state.disposed || state.completionRetryTimer !== null) return;
+		state.completionRetryTimer = this.#setTimeout(() => {
+			state.completionRetryTimer = null;
+			const current = this.#registry.get(record.agentId);
+			if (state.disposed || current === null || current.goalRevision !== state.goalRevision) return;
+			this.#requestCompletion(current, state);
+		}, this.#completionRetryDelayMs);
+		state.completionRetryTimer?.unref?.();
+	}
+
+	#clearCompletionRetry(state) {
+		if (state.completionRetryTimer === null) return;
+		this.#clearTimeout(state.completionRetryTimer);
+		state.completionRetryTimer = null;
 	}
 }
 
@@ -942,6 +993,10 @@ function stableFailureCode(error) {
 	return typeof error?.code === 'string' && /^[A-Z0-9_]{1,128}$/.test(error.code)
 		? error.code
 		: 'BRIDGE_SEND_REJECTED';
+}
+
+function isRetryableCompletionError(error) {
+	return ['BRIDGE_NOT_READY', 'BRIDGE_DISCONNECTED', 'CONNECTION_BACKPRESSURE', 'AGENT_BACKPRESSURE', 'AGENT_NOT_SUPPORTED'].includes(error?.code);
 }
 
 function monotonicTimestamp(value) {

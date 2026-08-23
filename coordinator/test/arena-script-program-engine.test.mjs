@@ -36,6 +36,23 @@ function acknowledge(engine, dispatched, observationValue, eventSequence) {
 	engine.ingestObservation({ observation: observationValue, eventSequence, attention: false });
 }
 
+test('a failed factual completion reopens a finished program for an urgent correction', () => {
+	const run = engineFor('program.onUnhandledAttention("continue_and_notify"); program.finish("done");');
+	assert.equal(run.engine.snapshot().status, 'FINISHED');
+	run.engine.requestCorrection({
+		trigger: 'completion_verification_failed',
+		actionFailure: { actionType: 'complete_goal', state: 'FAILED', reasonCode: 'INVENTORY_MISSING' },
+	});
+	assert.equal(run.engine.snapshot().status, 'SUSPENDED');
+	assert.equal(run.modelRequests.length, 1);
+	assert.equal(run.modelRequests[0].priority, 'urgent');
+	assert.equal(run.modelRequests[0].trigger, 'completion_verification_failed');
+	assert.equal(run.modelRequests[0].actionFailure.reasonCode, 'INVENTORY_MISSING');
+	run.engine.applyDirective({ ...run.modelRequests[0], directive: 'continue' });
+	assert.equal(run.engine.snapshot().status, 'FINISHED', 'continuing a terminal correction re-arms factual verification');
+	assert.equal(run.engine.snapshot().pendingRequestTrigger, null);
+});
+
 test('measures a multi-tree pickup loop instead of assuming a tree yield or pickup range', () => {
 	const source = `
 		program.onUnhandledAttention("continue_and_notify");

@@ -56,6 +56,14 @@ export class ArenaScriptEngine {
 		return this.snapshot();
 	}
 
+	/** Reopens a factually rejected terminal decision so the selected brain can correct it. */
+	requestCorrection({ trigger = 'completion_verification_failed', actionFailure } = {}) {
+		if (this.#status !== 'FINISHED' || this.#program === null || this.#facts === null) return this.snapshot();
+		this.#status = 'SUSPENDED';
+		this.#requestModel(freezeRecord(actionFailure), { priority: URGENT_PRIORITY, trigger, decisionContext: 'completion_verification_failed' });
+		return this.snapshot();
+	}
+
 	ingestActionResult({ actionId, state, reasonCode, eventSequence } = {}) {
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0 || typeof actionId !== 'string' || typeof state !== 'string' || typeof reasonCode !== 'string') return this.snapshot();
 		const signature = `${state}\u0000${reasonCode}\u0000${eventSequence}`;
@@ -124,7 +132,8 @@ export class ArenaScriptEngine {
 		this.#coalescedRequest = null;
 		this.#requestUpdate = null;
 		if (directive.directive === 'continue') {
-			if (this.#transition?.kind === 'terminal' && this.#transition.reason === 'unhandled_attention') this.#transition = { kind: 'resume' };
+			if (request.decisionContext === 'completion_verification_failed') this.#status = 'FINISHED';
+			else if (this.#transition?.kind === 'terminal' && this.#transition.reason === 'unhandled_attention') this.#transition = { kind: 'resume' };
 			else if (this.#status === 'SUSPENDED' && (this.#suspendedResult || this.#resumableUnhandled)) {
 				this.#pendingResult = this.#suspendedResult; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#status = 'ACTIVE';
 				if (this.#pendingResult && this.#factsSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
@@ -280,8 +289,8 @@ export class ArenaScriptEngine {
 		} else this.#handleYield(this.#vm.runWatcherHandler(latch.watcherId, latch.facts), watcherExecution(latch));
 	}
 
-	#requestModel(actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER } = {}) {
-		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts, actionFailure, { priority, trigger });
+	#requestModel(actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER, decisionContext = null } = {}) {
+		const context = requestContext(this.#program, this.#generation, this.#lifecycleEpoch, this.#continuationEpoch, this.#active?.actionId ?? null, this.#eventSequence, this.#factsSequence, this.#facts, actionFailure, { priority, trigger, decisionContext });
 		if (this.#pendingRequest) {
 			this.#coalescedRequest = mergeRequestContexts(this.#coalescedRequest ?? this.#pendingRequest, context);
 			return;
@@ -418,7 +427,7 @@ function normalizeTraceId(value) {
 	if (typeof value !== 'string' || value.trim().length === 0 || Buffer.byteLength(value, 'utf8') > 128 || [...value].some((character) => /[\u0000-\u001f\u007f]/u.test(character))) throw new TypeError('ArenaScriptEngine traceId must be a bounded string');
 	return value.trim();
 }
-function requestContext(program, generation, lifecycleEpoch, continuationEpoch, activeActionId, eventSequence, factsSequence, observation, actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER } = {}) {
+function requestContext(program, generation, lifecycleEpoch, continuationEpoch, activeActionId, eventSequence, factsSequence, observation, actionFailure = null, { priority = ORDINARY_PRIORITY, trigger = DEFAULT_ATTENTION_TRIGGER, decisionContext = null } = {}) {
 	return freezeRecord({
 		agentId: program.agentId,
 		provider: program.provider,
@@ -438,7 +447,7 @@ function requestContext(program, generation, lifecycleEpoch, continuationEpoch, 
 		observation,
 		priority: normalizePriority(priority),
 		trigger: normalizeTrigger(trigger),
-		...(actionFailure === null ? {} : { decisionContext: 'program_action_failure', actionFailure }),
+		...(actionFailure === null ? {} : { decisionContext: decisionContext ?? 'program_action_failure', actionFailure }),
 	});
 }
 function mergeRequestContexts(previous, next) {

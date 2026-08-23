@@ -424,6 +424,7 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 					contractHash: payload.contractHash,
 					verified,
 					reasonCode,
+					facts: [],
 				},
 			});
 		});

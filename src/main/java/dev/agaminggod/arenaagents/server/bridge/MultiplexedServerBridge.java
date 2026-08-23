@@ -92,7 +92,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "conversation_wake_request", "action_command", "action_cancel", "agent_error", "heartbeat"
+			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "action_command", "action_cancel", "agent_error", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -431,7 +431,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "agent_ready", "planning_state" -> plannerReady(envelope);
 			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "conversation_wake_ack" -> acceptConversationWakeAck(envelope);
-			case "conversation_wake_request" -> acceptConversationWakeRequest(envelope);
 			case "action_command" -> acceptAction(envelope);
 			case "action_cancel" -> acceptActionCancel(envelope);
 			case "agent_error" -> acceptAgentError(envelope);
@@ -475,7 +474,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		CoordinatorStatusSnapshot.SchedulerStatus schedulerStatus = new CoordinatorStatusSnapshot.SchedulerStatus(
 				requiredInt(scheduler, "active"), requiredInt(scheduler, "pending"),
-				requiredInt(scheduler, "maxConcurrent"), requiredInt(scheduler, "maxPending"), requiredBoolean(scheduler, "warning")
+				requiredInt(scheduler, "maxConcurrent"), requiredInt(scheduler, "maxPending"), requiredBoolean(scheduler, "warning"),
+				scheduler.has("mode") && "adaptive".equals(requiredString(scheduler, "mode")) && scheduler.has("maxConcurrency")
+						? requiredInt(scheduler, "maxConcurrency")
+						: requiredInt(scheduler, "maxConcurrent")
 		);
 		JsonArray circuitValues = requiredArray(payload, "circuits", CoordinatorStatusSnapshot.MAX_CIRCUITS);
 		ArrayList<CoordinatorStatusSnapshot.CircuitHealth> circuits = new ArrayList<>();
@@ -551,25 +553,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier().verify(
 				record, manager.findAgentPlayer(agentId).orElse(null), contract, actionExecutor.actionSuccessLedger());
-		JsonObject result = new JsonObject();
-		result.addProperty("goalRevision", goalRevision);
-		result.addProperty("traceId", traceId);
-		result.addProperty("contractHash", contractHash);
-		result.addProperty("verified", verification.verified());
-		result.addProperty("reasonCode", verification.reasonCode());
+		JsonObject result = completionResultPayload(goalRevision, traceId, contractHash, verification);
 		send("goal_completion_result", agentId.toString(), result);
 		if (verification.verified()) router.coordinatorCompleted(agentId, goalRevision);
 	}
 
+	static JsonObject completionResultPayload(long goalRevision, String traceId, String contractHash, GoalCompletionVerifier.VerificationResult verification) {
+		JsonObject result = verification.toJson();
+		result.addProperty("goalRevision", goalRevision);
+		result.addProperty("traceId", traceId);
+		result.addProperty("contractHash", contractHash);
+		return result;
+	}
+
 	private static String hashContract(GoalCompletionContract contract) {
-		try {
-			byte[] digest = MessageDigest.getInstance("SHA-256").digest(contract.toJson().toString().getBytes(StandardCharsets.UTF_8));
-			StringBuilder hex = new StringBuilder("sha256:");
-			for (byte value : digest) hex.append(String.format("%02x", value));
-			return hex.toString();
-		} catch (java.security.NoSuchAlgorithmException exception) {
-			throw new IllegalStateException("SHA-256 unavailable", exception);
-		}
+		return contract.fingerprint();
 	}
 
 	private void acceptConversationWakeAck(BridgeEnvelope envelope) {
@@ -583,22 +581,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new BridgeProtocolException("INVALID_FIELD", "conversation_wake_ack.transactionId", exception);
 		}
 		manager.acknowledgeConversationWake(transactionId, agentId, requiredLong(payload, "goalRevision"));
-	}
-
-	private void acceptConversationWakeRequest(BridgeEnvelope envelope) {
-		AgentId agentId = AgentId.parse(envelope.agentId());
-		JsonObject payload = envelope.payload();
-		requireKeys(payload, Set.of("goalRevision", "kind"), "conversation_wake_request");
-		long goalRevision = requiredLong(payload, "goalRevision");
-		AgentRecord record = manager.registry().require(agentId);
-		if (record.goalRevision() != goalRevision) return;
-		try {
-			ConversationKind.valueOf(requiredString(payload, "kind").toUpperCase(java.util.Locale.ROOT));
-		} catch (IllegalArgumentException exception) {
-			throw new BridgeProtocolException("INVALID_FIELD", "conversation_wake_request.kind", exception);
-		}
-		// Lifecycle starts are server-owned by the composite conversation_wake transaction.
-		// No coordinator sender currently has a contract to authorize a second start here.
 	}
 
 	private void requestActiveDisconnect() {

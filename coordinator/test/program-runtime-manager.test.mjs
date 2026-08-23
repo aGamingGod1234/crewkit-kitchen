@@ -34,12 +34,14 @@ function harness(options = {}) {
 	registry.register(record());
 	const sent = [];
 	const requests = [];
+	const errors = [];
 	let manager;
 	const completionRequests = [];
 	manager = new ProgramRuntimeManager({
 		registry,
 		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
 		planner: { requestPlan: async (request) => { requests.push(request); return withCompletionContract({ summary: 'Continue.', directive: 'continue' }, request.goalRevision); } },
+		reportError: (agentId, error) => errors.push({ agentId, error }),
 		onCompleted: options.onCompleted,
 		onCompletionRequested: options.onCompletionRequested ?? ((request) => {
 			completionRequests.push(request);
@@ -53,11 +55,149 @@ function harness(options = {}) {
 		}),
 		benchmarkRecorder: options.benchmarkRecorder,
 		latencyRegistry: options.latencyRegistry,
+		completionRetryDelayMs: options.completionRetryDelayMs,
+		setTimeoutFn: options.setTimeoutFn,
+		clearTimeoutFn: options.clearTimeoutFn,
 	});
 	const installDecision = manager.installDecision.bind(manager);
 	manager.installDecision = (target, decision, context) => installDecision(target, withCompletionContract(decision, target.goalRevision), context);
-	return { manager, registry, sent, requests, completionRequests };
+	return { manager, registry, sent, requests, completionRequests, errors };
 }
+
+test('retries a completion publication that was temporarily unavailable', async () => {
+	let attempts = 0;
+	const run = harness({
+		completionRetryDelayMs: 1,
+		onCompletionRequested: (request) => {
+			attempts += 1;
+			if (attempts === 1) throw Object.assign(new Error('bridge unavailable'), { code: 'BRIDGE_NOT_READY' });
+			queueMicrotask(() => run.manager.onCompletionResult(run.registry.get(request.record.agentId), {
+				goalRevision: request.record.goalRevision,
+				traceId: request.traceId,
+				contractHash: request.contractHash,
+				verified: true,
+				reasonCode: 'COMPLETION_VERIFIED',
+			}));
+		},
+	});
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Done.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("done");',
+	}, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(attempts, 2);
+	assert.equal(run.errors.length, 0, 'a retryable bridge outage must not publish an agent failure');
+	assert.equal(run.registry.get('agent-a').state, DynamicAgentState.COMPLETED);
+});
+
+test('routes failed factual completion back through the selected brain', async () => {
+	let completionRequest;
+	const run = harness({ onCompletionRequested: (request) => { completionRequest = request; } });
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Done.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("done");',
+	}, { observation: observation(), eventSequence: 1 });
+	assert.equal(run.manager.onCompletionResult(run.registry.get('agent-a'), {
+		goalRevision: 1,
+		traceId: completionRequest.traceId,
+		contractHash: completionRequest.contractHash,
+		verified: false,
+		reasonCode: 'INVENTORY_MISSING',
+		facts: [
+			{ predicateIndex: 0, type: 'inventory_min', satisfied: false, observedValue: '0' },
+			{ predicateIndex: 1, type: 'position_within', satisfied: true, observedValue: '1.25' },
+		],
+	}), true);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(run.requests.length, 1);
+	assert.match(run.requests[0].input, /"decisionContext":"completion_verification_failed"/);
+	assert.match(run.requests[0].input, /"reasonCode":"INVENTORY_MISSING"/);
+	assert.match(run.requests[0].input, /"predicateIndex":0/);
+	assert.match(run.requests[0].input, /"observedValue":"0"/);
+});
+
+test('turns an exhausted silent completion correction into an explicit agent error', async () => {
+	let completionRequest;
+	const registry = new AgentRegistry();
+	registry.register(record());
+	const errors = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner: { requestPlan: async () => { throw Object.assign(new Error('provider timed out'), { code: 'REQUEST_TIMEOUT' }); } },
+		reportError: (_agentId, error) => errors.push(error),
+		onCompletionRequested: (request) => { completionRequest = request; },
+	});
+	await manager.installDecision(registry.get('agent-a'), withCompletionContract({
+		summary: 'Done.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("done");',
+	}, 1), { observation: observation(), eventSequence: 1 });
+	manager.onCompletionResult(registry.get('agent-a'), {
+		goalRevision: 1,
+		traceId: completionRequest.traceId,
+		contractHash: completionRequest.contractHash,
+		verified: false,
+		reasonCode: 'PREDICATE_FAILED',
+		facts: [{ predicateIndex: 0, type: 'inventory_min', satisfied: false, observedValue: '0' }],
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ERROR);
+	assert.equal(errors[0].code, 'COMPLETION_CORRECTION_FAILED');
+});
+
+test('clears a scheduled completion retry before a newer publication and correction', async () => {
+	const timers = [];
+	let attempts = 0;
+	let latestRequest;
+	const run = harness({
+		completionRetryDelayMs: 1_000,
+		setTimeoutFn: (callback) => {
+			const timer = { callback, cleared: false, unref() {} };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeoutFn: (timer) => { timer.cleared = true; },
+		onCompletionRequested: (request) => {
+			attempts += 1;
+			if (attempts === 1) throw Object.assign(new Error('bridge unavailable'), { code: 'BRIDGE_NOT_READY' });
+			latestRequest = request;
+		},
+	});
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Done.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("done");',
+	}, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(timers.length, 1);
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	assert.equal(attempts, 2);
+	assert.equal(timers[0].cleared, true, 'a fresh publication cancels its obsolete retry');
+	assert.equal(run.manager.onCompletionResult(run.registry.get('agent-a'), {
+		goalRevision: 1,
+		traceId: latestRequest.traceId,
+		contractHash: latestRequest.contractHash,
+		verified: false,
+		reasonCode: 'PREDICATE_FAILED',
+	}), true);
+	assert.equal(attempts, 2, 'correction does not republish the rejected contract');
+});
+
+test('reports a permanent completion protocol rejection without retrying forever', async () => {
+	const timers = [];
+	const run = harness({
+		setTimeoutFn: (callback) => { timers.push(callback); return { unref() {} }; },
+		clearTimeoutFn() {},
+		onCompletionRequested: () => {
+			throw Object.assign(new Error('invalid completion payload'), {
+				code: 'COMPLETION_SEND_FAILED',
+				cause: Object.assign(new Error('invalid payload'), { code: 'INVALID_PAYLOAD' }),
+			});
+		},
+	});
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Done.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("done");',
+	}, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(timers.length, 0);
+	assert.equal(run.errors.length, 1);
+	assert.equal(run.errors[0].error.code, 'COMPLETION_SEND_FAILED');
+});
 
 test('retains the planning trace through factual completion verification', async () => {
 	const rows = [];

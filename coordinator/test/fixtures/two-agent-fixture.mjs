@@ -100,6 +100,7 @@ class FakeBridge extends EventEmitter {
 					contractHash: payload.contractHash,
 					verified: true,
 					reasonCode: 'COMPLETION_VERIFIED',
+					facts: [],
 				},
 			}));
 			return;

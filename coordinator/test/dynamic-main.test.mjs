@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
@@ -29,6 +31,7 @@ class FakeBridge extends EventEmitter {
 					contractHash: payload.contractHash,
 					verified: true,
 					reasonCode: 'COMPLETION_VERIFIED',
+					facts: [],
 				},
 			}));
 		}
@@ -817,11 +820,6 @@ test('publishes completed program state back to the server registry', async () =
 		});
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 2, goal: 'Respond to the player.' } });
 		await eventually(() => run.registry.get('agent-a').goalRevision === 2);
-		assert.equal(
-			run.bridge.sent.filter((message) => message.type === 'conversation_wake_request').length,
-			0,
-			'ordered conversation/start publication does not emit a stale duplicate wake request',
-		);
 	} finally { await run.coordinator.stop(); }
 });
 
@@ -1376,6 +1374,12 @@ test('includes a DM in the active agent reactive turn without changing its goal 
 	} finally {
 		await run.coordinator.stop();
 	}
+});
+
+test('defaults agent workspaces to the persistent project runtime directory', () => {
+	const base = { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: {} };
+	const projectDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+	assert.equal(normalizeDynamicConfig(base).workspaceRoot, path.join(projectDirectory, 'runtime', 'agent-workspaces'));
 });
 
 

@@ -69,10 +69,17 @@ public record CoordinatorStatusSnapshot(
 		}
 	}
 
-	public record SchedulerStatus(int active, int pending, int maxConcurrent, int maxPending, boolean warning) {
+	public record SchedulerStatus(int active, int pending, int maxConcurrent, int maxPending, boolean warning, int hardConcurrentLimit) {
+		public SchedulerStatus(int active, int pending, int maxConcurrent, int maxPending, boolean warning) {
+			this(active, pending, maxConcurrent, maxPending, warning, maxConcurrent);
+		}
+
 		public SchedulerStatus {
-			if (active < 0 || pending < 0 || maxConcurrent < 1 || maxPending < 0 || active > maxConcurrent || pending > maxPending
-					|| (long) maxConcurrent + maxPending > MAX_PROFILES) {
+			long totalCapacity = (long) maxConcurrent + maxPending;
+			if (active < 0 || pending < 0 || maxConcurrent < 1 || maxPending < 0
+					|| hardConcurrentLimit < maxConcurrent || hardConcurrentLimit > MAX_PROFILES
+					|| active > hardConcurrentLimit || pending > maxPending || (long) active + pending > totalCapacity
+					|| totalCapacity > MAX_PROFILES) {
 				throw new IllegalArgumentException("invalid scheduler status");
 			}
 		}

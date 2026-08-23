@@ -42,8 +42,8 @@ test('completion is a factual request and cannot enter COMPLETED before server v
 	assert.notEqual(registry.get('agent-a').state, DynamicAgentState.COMPLETED);
 	assert.equal(manager.onCompletionResult(registry.get('agent-a'), {
 		goalRevision: 1, traceId: request.traceId, contractHash: request.contractHash, verified: true, reasonCode: 'COMPLETION_VERIFIED',
-	}), true);
-	assert.equal(registry.get('agent-a').state, DynamicAgentState.COMPLETED);
+	}), false, 'the rejected request is no longer authoritative after correction begins');
+	assert.notEqual(registry.get('agent-a').state, DynamicAgentState.COMPLETED);
 });
 
 test('completion contract cannot mutate within one goal revision', async () => {

@@ -5,7 +5,11 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -54,6 +58,22 @@ public final class GoalCompletionContract {
 		for (Predicate predicate : predicates) values.add(predicate.toJson());
 		object.add("predicates", values);
 		return object;
+	}
+
+	/** Stable language-neutral bytes used by both Java and JavaScript completion handshakes. */
+	public String canonicalText() {
+		StringBuilder value = new StringBuilder("arena-completion-v1\n").append(goalRevision);
+		for (Predicate predicate : predicates) value.append('\n').append(predicate.canonicalText());
+		return value.toString();
+	}
+
+	public String fingerprint() {
+		try {
+			byte[] digest = MessageDigest.getInstance("SHA-256").digest(canonicalText().getBytes(StandardCharsets.UTF_8));
+			return "sha256:" + HexFormat.of().formatHex(digest);
+		} catch (NoSuchAlgorithmException exception) {
+			throw new IllegalStateException("SHA-256 unavailable", exception);
+		}
 	}
 
 	private static Predicate parsePredicate(JsonObject object, int index) {
@@ -115,11 +135,31 @@ public final class GoalCompletionContract {
 			return object;
 		}
 
+		private String canonicalText() {
+			return switch (type) {
+				case "inventory_min" -> "inventory_min|" + base64Url(itemId) + "|" + count;
+				case "position_within" -> "position_within|" + doubleHex(x) + "|" + doubleHex(y) + "|" + doubleHex(z) + "|" + doubleHex(radius);
+				case "block_matches" -> "block_matches|" + x.intValue() + "|" + y.intValue() + "|" + z.intValue() + "|" + base64Url(blockId);
+				case "entity_state" -> "entity_state|" + base64Url(entityId.toString()) + "|" + base64Url(entityState);
+				case "action_success_count" -> "action_success_count|" + base64Url(actionType) + "|" + count;
+				default -> throw invalid("Unsupported completion predicate type");
+			};
+		}
+
+		private static String doubleHex(Double value) {
+			if (value == null) throw invalid("Missing numeric predicate value");
+			return String.format(java.util.Locale.ROOT, "%016x", Double.doubleToLongBits(value == 0.0D ? 0.0D : value));
+		}
+
 		private static void addCanonicalNumber(JsonObject object, String field, Double value) {
 			if (value == null) throw invalid("Missing numeric predicate value");
 			if (value == Math.rint(value) && Math.abs(value) <= 9_007_199_254_740_991D) object.addProperty(field, value.longValue());
 			else object.addProperty(field, value);
 		}
+	}
+
+	private static String base64Url(String value) {
+		return Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8));
 	}
 
 	private static void requireKeys(JsonObject object, Set<String> expected, String label) {

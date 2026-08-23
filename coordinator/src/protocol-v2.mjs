@@ -40,7 +40,6 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'planning_state',
 	'goal_completed',
 	'conversation_wake_ack',
-	'conversation_wake_request',
 	'action_command',
 	'action_cancel',
 	'agent_error',
@@ -66,7 +65,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
 const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'conversation_event', 'action_progress', 'action_result', 'goal_completion_result']);
-const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'conversation_wake_request', 'action_command', 'action_cancel', 'agent_error']);
+const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'action_command', 'action_cancel', 'agent_error']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
@@ -75,6 +74,7 @@ const MAX_CATALOG_MODELS = 512;
 const MAX_MODEL_CAPABILITIES = 32;
 const MAX_REGISTRY_SNAPSHOT_AGENTS = 1_024;
 const MAX_NEARBY_TRANSACTION_TARGETS = 16;
+const MAX_COMPLETION_FACTS = 16;
 const MAX_CHANGED_FACTS = 256;
 const FACTUAL_PLAYER_FIELDS = new Set([
 	'health', 'maxHealth', 'armor', 'foodLevel', 'saturation', 'gameMode', 'onGround', 'inWater',
@@ -179,13 +179,14 @@ export function validateProtocolV2Payload(type, value) {
 		case 'goal_completed':
 			return normalizeGoalCompletionRequest(value);
 		case 'goal_completion_result':
-			exactKeys(value, ['goalRevision', 'traceId', 'contractHash', 'verified', 'reasonCode'], ['goalRevision', 'traceId', 'contractHash', 'verified', 'reasonCode'], type);
+			exactKeys(value, ['goalRevision', 'traceId', 'contractHash', 'verified', 'reasonCode', 'facts'], ['goalRevision', 'traceId', 'contractHash', 'verified', 'reasonCode', 'facts'], type);
 			return {
 				goalRevision: revision(value.goalRevision, 'goalRevision'),
 				traceId: requireTraceId(value.traceId),
 				contractHash: boundedText(value.contractHash, 'contractHash', 80),
 				verified: boolean(value.verified, 'verified'),
 				reasonCode: boundedText(value.reasonCode, 'reasonCode', MAX_REASON_CODE_LENGTH),
+				facts: boundedArray(value.facts, 'facts', MAX_COMPLETION_FACTS).map((fact, index) => normalizeCompletionFact(fact, index)),
 			};
 		case 'conversation_wake_ack':
 			exactKeys(value, ['transactionId', 'goalRevision'], ['transactionId', 'goalRevision'], type);
@@ -193,14 +194,6 @@ export function validateProtocolV2Payload(type, value) {
 				transactionId: requireIdentifier(value.transactionId, 'transactionId'),
 				goalRevision: revision(value.goalRevision, 'goalRevision'),
 			};
-		case 'conversation_wake_request': {
-			exactKeys(value, ['goalRevision', 'kind'], ['goalRevision', 'kind'], type);
-			const kind = requireIdentifier(value.kind, 'kind');
-			if (!['player_message', 'proximity_speech'].includes(kind)) {
-				throw new ProtocolV2Error('INVALID_PAYLOAD', 'conversation_wake_request kind is invalid');
-			}
-			return { goalRevision: revision(value.goalRevision, 'goalRevision'), kind };
-		}
 		case 'action_command':
 			return normalizeActionCommand(value);
 		case 'action_cancel':
@@ -225,6 +218,20 @@ export function validateProtocolV2Payload(type, value) {
 		default:
 			throw new ProtocolV2Error('INVALID_MESSAGE_TYPE', `Unsupported protocol v2 payload type '${String(type)}'`);
 	}
+}
+
+function normalizeCompletionFact(value, index) {
+	const field = `facts[${index}]`;
+	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
+	exactKeys(value, ['predicateIndex', 'type', 'satisfied', 'observedValue'], ['predicateIndex', 'type', 'satisfied', 'observedValue'], field);
+	const predicateIndex = nonnegativeInteger(value.predicateIndex, `${field}.predicateIndex`);
+	if (predicateIndex >= MAX_COMPLETION_FACTS) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.predicateIndex must be less than ${MAX_COMPLETION_FACTS}`);
+	return {
+		predicateIndex,
+		type: boundedText(value.type, `${field}.type`, MAX_REASON_CODE_LENGTH),
+		satisfied: boolean(value.satisfied, `${field}.satisfied`),
+		observedValue: boundedText(value.observedValue, `${field}.observedValue`, 128, 0),
+	};
 }
 
 export class MultiplexedServerBridge extends EventEmitter {
@@ -603,7 +610,11 @@ function normalizeCoordinatorStatus(value) {
 		warning: boolean(value.scheduler.warning, `${schedulerField}.warning`),
 	};
 	const schedulerTarget = value.scheduler.target === undefined ? scheduler.maxConcurrent : nonnegativeInteger(value.scheduler.target, `${schedulerField}.target`);
-	if (scheduler.active > schedulerTarget || scheduler.pending > scheduler.maxPending) {
+	const schedulerHardConcurrentLimit = value.scheduler.mode === 'adaptive' && value.scheduler.maxConcurrency !== undefined
+		? nonnegativeInteger(value.scheduler.maxConcurrency, `${schedulerField}.maxConcurrency`)
+		: scheduler.maxConcurrent;
+	if (scheduler.active > schedulerHardConcurrentLimit || scheduler.pending > scheduler.maxPending
+		|| scheduler.active + scheduler.pending > scheduler.maxConcurrent + scheduler.maxPending) {
 		throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status scheduler counts exceed capacity');
 	}
 	if (scheduler.maxConcurrent < 1 || scheduler.maxConcurrent + scheduler.maxPending > 16) {

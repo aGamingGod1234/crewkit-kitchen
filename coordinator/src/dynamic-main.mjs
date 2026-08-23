@@ -1,6 +1,5 @@
 import { EventEmitter } from 'node:events';
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1026,20 +1025,26 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #publishGoalCompleted({ record, completionContract, traceId, contractHash }) {
-		if (!this.#bridge.ready || !this.#supportedAgentIds.has(record.agentId)) return;
+		if (!this.#bridge.ready) throw codedRuntimeError('BRIDGE_NOT_READY', 'Minecraft bridge is not ready for completion verification');
+		if (!this.#supportedAgentIds.has(record.agentId)) throw codedRuntimeError('AGENT_NOT_SUPPORTED', `Agent '${record.agentId}' is not in the reconciled bridge roster`);
 		const profile = {
 			provider: record.provider,
 			model: record.model,
 			reasoningEffort: record.reasoningEffort,
 			serviceTier: record.serviceTier ?? DEFAULT_SERVICE_TIER,
 		};
-		await this.#bridge.send('goal_completed', record.agentId, {
-			goalRevision: record.goalRevision,
-			completionContract,
-			traceId,
-			profile,
-			contractHash,
-		});
+		try {
+			await this.#bridge.send('goal_completed', record.agentId, {
+				goalRevision: record.goalRevision,
+				completionContract,
+				traceId,
+				profile,
+				contractHash,
+			});
+		} catch (error) {
+			if (isTransientCompletionSendError(error)) throw error;
+			throw codedRuntimeError('COMPLETION_SEND_FAILED', 'Minecraft bridge rejected completion verification', error);
+		}
 	}
 
 	async #publishStatus() {
@@ -1339,7 +1344,7 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	const secret = value.bridge.secret ?? environment[value.bridge.secretEnvironmentVariable ?? 'ARENA_AGENT_BRIDGE_SECRET'];
 	const cwd = value.codex.cwd ?? PROJECT_DIRECTORY;
 	const workspaceRoot = value.workspaceRoot === undefined
-		? path.join(os.tmpdir(), 'arena-agents-workspaces')
+		? path.join(PROJECT_DIRECTORY, 'runtime', 'agent-workspaces')
 		: path.resolve(PROJECT_DIRECTORY, value.workspaceRoot);
 	const agentCap = positiveInteger(value.limits?.agentCap ?? DEFAULT_AGENT_CAP, 'limits.agentCap');
 	const planningConcurrency = positiveInteger(value.limits?.planningConcurrency ?? DEFAULT_PLANNING_CONCURRENCY, 'limits.planningConcurrency');
@@ -1571,6 +1576,14 @@ function safeClockRead(clock) {
 	} catch {
 		return null;
 	}
+}
+
+function codedRuntimeError(code, message, cause = undefined) {
+	return Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { code });
+}
+
+function isTransientCompletionSendError(error) {
+	return ['BRIDGE_NOT_READY', 'BRIDGE_DISCONNECTED', 'CONNECTION_BACKPRESSURE', 'AGENT_BACKPRESSURE'].includes(error?.code);
 }
 
 function classifyObservationTrigger(payload, observation) {

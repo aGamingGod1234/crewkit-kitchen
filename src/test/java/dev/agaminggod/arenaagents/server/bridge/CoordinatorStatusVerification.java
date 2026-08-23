@@ -42,8 +42,12 @@ public final class CoordinatorStatusVerification {
 		extendedScheduler.getAsJsonObject("scheduler").addProperty("healthyCompletions", 0);
 		extendedScheduler.getAsJsonObject("scheduler").addProperty("ordinaryReservationRejections", 0);
 		extendedScheduler.getAsJsonObject("scheduler").addProperty("urgentReservationRejections", 0);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("active", 5);
+		extendedScheduler.getAsJsonObject("scheduler").addProperty("target", 5);
 		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(extendedScheduler, 1_000L).scheduler().maxConcurrent() == 4,
 				"extended scheduler telemetry remains wire-compatible");
+		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(extendedScheduler, 1_000L).scheduler().hardConcurrentLimit() == 16,
+				"adaptive growth validates against the hard concurrency limit");
 		extendedScheduler.getAsJsonObject("scheduler").addProperty("privateSchedulerField", "must not cross");
 		assertThrows(() -> MultiplexedServerBridge.decodeCoordinatorStatus(extendedScheduler, 1_000L), "unknown scheduler field rejected");
 		JsonObject numericIdentity = payload();

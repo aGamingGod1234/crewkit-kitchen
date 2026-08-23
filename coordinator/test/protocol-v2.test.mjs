@@ -47,6 +47,26 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 		circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 100, p95Ms: 200, failureRate: 0, circuit: 'closed' }],
 	};
 	assert.deepEqual(validateProtocolV2Payload('coordinator_status', payload), { ...payload, latencies: [] });
+	assert.deepEqual(validateProtocolV2Payload('coordinator_status', {
+		...payload,
+		scheduler: { ...payload.scheduler, active: 3, target: 2 },
+	}).scheduler, { ...payload.scheduler, active: 3, target: 2 });
+	assert.deepEqual(validateProtocolV2Payload('coordinator_status', {
+		...payload,
+		scheduler: {
+			...payload.scheduler,
+			active: 5,
+			mode: 'adaptive',
+			configuredTarget: 4,
+			target: 5,
+			minConcurrency: 4,
+			maxConcurrency: 16,
+		},
+	}).scheduler.active, 5);
+	assert.throws(() => validateProtocolV2Payload('coordinator_status', {
+		...payload,
+		scheduler: { ...payload.scheduler, active: 5 },
+	}), /counts exceed capacity/i);
 	const latency = { operation: 'observation_to_plan', count: 8, p50Ms: 25.25, p95Ms: 80.75 };
 	assert.deepEqual(
 		validateProtocolV2Payload('coordinator_status', { ...payload, latencies: [latency] }).latencies,
@@ -77,9 +97,18 @@ test('protocol v2 carries a revision/profile/trace-bound factual goal completion
 		'goal completion cannot fall back to a revision-only proof',
 	);
 	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, contractHash: 'sha256:wrong' }), /contractHash/i);
-	assert.deepEqual(validateProtocolV2Payload('goal_completion_result', {
+	const completionResult = {
 		goalRevision: 4, traceId: TRACE_ID, contractHash: payload.contractHash, verified: false, reasonCode: 'PREDICATE_FAILED',
-	}).verified, false);
+		facts: [
+			{ predicateIndex: 0, type: 'inventory_min', satisfied: false, observedValue: '0' },
+			{ predicateIndex: 1, type: 'position_within', satisfied: true, observedValue: '1.25' },
+		],
+	};
+	assert.deepEqual(validateProtocolV2Payload('goal_completion_result', completionResult), completionResult);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_completion_result', { ...completionResult, facts: Array.from({ length: 17 }, () => completionResult.facts[0]) }),
+		/facts/i,
+	);
 });
 
 test('protocol v2 carries one acknowledged conversation wake transaction', () => {
@@ -453,6 +482,13 @@ test('multiplexed bridge authenticates once and learns the complete registry sna
 	bridge.stop();
 });
 
+test('unused coordinator wake requests are not part of protocol v2', () => {
+	assert.throws(
+		() => validateProtocolV2Payload('conversation_wake_request', { goalRevision: 1, kind: 'player_message' }),
+		/unsupported protocol v2 payload type/i,
+	);
+});
+
 test('multiplexed bridge audits validated detached inbound and outbound envelopes', async () => {
 	const socket = new FakeSocket();
 	const audit = [];
@@ -680,7 +716,7 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
 		['goal_completed', { goalRevision: 1, completionContract, traceId: TRACE_ID, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' }, contractHash: completionContractFingerprint(completionContract) }],
-		['goal_completion_result', { goalRevision: 1, traceId: TRACE_ID, contractHash: completionContractFingerprint(completionContract), verified: false, reasonCode: 'PREDICATE_FAILED' }],
+		['goal_completion_result', { goalRevision: 1, traceId: TRACE_ID, contractHash: completionContractFingerprint(completionContract), verified: false, reasonCode: 'PREDICATE_FAILED', facts: [] }],
 		['action_command', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],

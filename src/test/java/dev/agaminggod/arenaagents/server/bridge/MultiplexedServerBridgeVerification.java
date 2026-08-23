@@ -17,6 +17,7 @@ import dev.agaminggod.arenaagents.server.conversation.ConversationKind;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWakeCodec;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
+import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
@@ -96,8 +97,24 @@ public final class MultiplexedServerBridgeVerification {
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
-		verifyConversationWakeRequestCannotStartGoal();
-		return 56;
+		verifyCompletionResultFacts();
+		return 54;
+	}
+
+	private static void verifyCompletionResultFacts() {
+		GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier.VerificationResult(
+				false,
+				7L,
+				"PREDICATE_FAILED",
+				List.of(
+						new GoalCompletionVerifier.Fact(0, "inventory_min", false, "0"),
+						new GoalCompletionVerifier.Fact(1, "position_within", true, "1.25")
+				)
+		);
+		JsonObject payload = MultiplexedServerBridge.completionResultPayload(7L, "trace-java-1", "sha256:contract", verification);
+		assertEquals(2, payload.getAsJsonArray("facts").size(), "completion result retains every verifier fact");
+		assertEquals(0, payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("predicateIndex").getAsInt(), "completion result retains failed predicate index");
+		assertEquals("0", payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("observedValue").getAsString(), "completion result retains observed value");
 	}
 
 	private static void verifyTraceWireValidation() {
@@ -149,62 +166,6 @@ public final class MultiplexedServerBridgeVerification {
 				"mismatched wire trace IDs fail closed");
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionRequest(agent, 1L, "action-1", ActionType.WAIT, arguments, provenance, ""), "blank trace ID is typed validation");
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionRequest(agent, 1L, "action-1", ActionType.WAIT, arguments, provenance, "🙂".repeat(40)), "overlong UTF-8 trace ID is typed validation");
-	}
-
-	private static void verifyConversationWakeRequestCannotStartGoal() {
-		MultiplexedServerBridge bridge = null;
-		Path secretFile = null;
-		try {
-			String secret = "0123456789abcdef0123456789abcdef";
-			secretFile = Files.createTempFile("arena-agents-wake-request-secret-", ".txt");
-			Files.writeString(secretFile, secret);
-			CodexAgentManager manager = uninitializedManager();
-			AgentRecord idle = manager.registry().create("gpt-5.6-sol", "high", Optional.of("WakeTarget"), 1_000L);
-			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
-			bridge.start();
-			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
-			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
-				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
-				socket.setSoTimeout(2_000);
-				JsonObject helloPayload = new JsonObject();
-				helloPayload.addProperty("secret", secret);
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-wake-request", helloPayload
-				)).getBytes(StandardCharsets.UTF_8));
-				socket.getOutputStream().flush();
-				BridgeEnvelope helloAck = codec.decode(reader.readLine());
-
-				JsonObject request = new JsonObject();
-				request.addProperty("goalRevision", 0L);
-				request.addProperty("kind", "player_message");
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, helloAck.serverInstanceId(), idle.agentId().toString(), "conversation_wake_request",
-						"wake-request", request
-				)).getBytes(StandardCharsets.UTF_8));
-				JsonObject heartbeat = new JsonObject();
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, helloAck.serverInstanceId(), "server", "heartbeat", "wake-request-heartbeat", heartbeat
-				)).getBytes(StandardCharsets.UTF_8));
-				socket.getOutputStream().flush();
-
-				BridgeEnvelope response = pollBridgeResponse(bridge, socket, reader, codec);
-				assertEquals("heartbeat", response.type(),
-						"an unsolicited coordinator wake request cannot publish a second goal control");
-				assertEquals(idle, manager.registry().require(idle.agentId()),
-						"an unsolicited coordinator wake request leaves the idle record unchanged");
-			}
-		} catch (Exception exception) {
-			throw new AssertionError("conversation wake request guard failed", exception);
-		} finally {
-			if (bridge != null) bridge.close();
-			if (secretFile != null) {
-				try {
-					Files.deleteIfExists(secretFile);
-				} catch (java.io.IOException exception) {
-					throw new AssertionError("could not remove temporary wake request secret", exception);
-				}
-			}
-		}
 	}
 
 	private static void verifyAtomicConversationWakePublication() {
@@ -315,25 +276,6 @@ public final class MultiplexedServerBridgeVerification {
 				manager.registry().coordinatorCompleted(idle.agentId(), 1L, System.currentTimeMillis());
 				assertTrue(manager.pendingConversationWakes().isEmpty(),
 						"terminal wake goal clears its durable replay context");
-				JsonObject staleRequest = new JsonObject();
-				staleRequest.addProperty("goalRevision", 1L);
-				staleRequest.addProperty("kind", "player_message");
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, helloAck.serverInstanceId(), idle.agentId().toString(), "conversation_wake_request",
-						"stale-replayed-wake-request", staleRequest
-				)).getBytes(StandardCharsets.UTF_8));
-				JsonObject heartbeat = new JsonObject();
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, helloAck.serverInstanceId(), "server", "heartbeat", "stale-wake-heartbeat", heartbeat
-				)).getBytes(StandardCharsets.UTF_8));
-				socket.getOutputStream().flush();
-				BridgeEnvelope response = pollBridgeResponse(bridge, socket, reader, codec);
-				assertEquals("heartbeat", response.type(),
-						"a replayed wake request cannot restart a completed composite wake at its matching revision");
-				assertEquals(AgentLifecycleState.COMPLETED, manager.registry().require(idle.agentId()).state(),
-						"a replayed wake request leaves the completed composite wake terminal");
-				assertEquals(1L, manager.registry().require(idle.agentId()).goalRevision(),
-						"a replayed wake request cannot advance the completed wake revision");
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("atomic conversation wake publication failed", exception);
