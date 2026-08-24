@@ -140,3 +140,33 @@ test('voice bootstrap closes a worker when binding fails', async () => {
 	);
 	assert.equal(closes, 1);
 });
+
+test('voice bootstrap prefers one local speech runtime for both expressive TTS and STT', async () => {
+	const captured = {};
+	let localCloses = 0;
+	let serverCloses = 0;
+	const local = {
+		async synthesize() { return {}; },
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() { localCloses++; },
+	};
+	const created = await startVoiceWorker({
+		bridge: { secret: SECRET },
+		voice: { port: 8_766 },
+	}, {}, {
+		platform: 'win32',
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createLocalSpeechProvider: async () => local,
+		createWindowsTtsProvider: () => { throw new Error('Windows fallback must not replace an available local provider'); },
+		createVoiceServer: (options) => {
+			captured.options = options;
+			return { async start() {}, async close() { serverCloses++; } };
+		},
+	});
+
+	assert.equal(captured.options.provider, local);
+	assert.equal(captured.options.sttProvider, local);
+	await created.close();
+	assert.equal(serverCloses, 1);
+	assert.equal(localCloses, 1);
+});

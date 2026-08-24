@@ -836,6 +836,17 @@ test('action cancellation requires an exact goal revision and action identity', 
 	);
 });
 
+test('post-action observation requests carry only the active goal revision', () => {
+	assert.deepEqual(
+		validateProtocolV2Payload('request_observation', { goalRevision: 4 }),
+		{ goalRevision: 4 },
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('request_observation', { goalRevision: 4, actionId: 'action-9' }),
+		(error) => error.code === 'INVALID_PAYLOAD_FIELD',
+	);
+});
+
 test('protocol v2 validates raw transaction arguments before normalizing action commands', () => {
 	const validTransfer = {
 		x: 1, y: 64, z: -2,

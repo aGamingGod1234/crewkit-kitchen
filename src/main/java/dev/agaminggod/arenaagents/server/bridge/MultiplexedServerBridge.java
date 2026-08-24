@@ -95,7 +95,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "action_command", "action_cancel", "agent_error", "verbose_event", "heartbeat"
+			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "request_observation", "action_command", "action_cancel", "agent_error", "verbose_event", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -552,6 +552,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "agent_ready", "planning_state" -> plannerReady(envelope);
 			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "conversation_wake_ack" -> acceptConversationWakeAck(envelope);
+			case "request_observation" -> acceptObservationRequest(envelope);
 			case "action_command" -> acceptAction(envelope);
 			case "action_cancel" -> acceptActionCancel(envelope);
 			case "agent_error" -> acceptAgentError(envelope);
@@ -559,6 +560,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "heartbeat" -> send("heartbeat", "server", new JsonObject());
 			default -> throw new BridgeProtocolException("UNKNOWN_MESSAGE_TYPE", envelope.type());
 		}
+	}
+
+	private void acceptObservationRequest(BridgeEnvelope envelope) {
+		AgentId id = AgentId.parse(envelope.agentId());
+		AgentRecord record = manager.registry().require(id);
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("goalRevision"), "request_observation");
+		if (requiredLong(payload, "goalRevision") != record.goalRevision()) {
+			throw new AgentDomainException("STALE_REVISION", "Coordinator observation request revision is stale");
+		}
+		observations.invalidate(id);
+		observationPublication.markAttention(id);
+		queueUrgentObservation(id);
 	}
 
 	private void acceptCoordinatorStatus(JsonObject payload) {

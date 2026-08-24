@@ -40,6 +40,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'planning_state',
 	'goal_completed',
 	'conversation_wake_ack',
+	'request_observation',
 	'action_command',
 	'action_cancel',
 	'agent_error',
@@ -67,7 +68,7 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 const COORDINATOR_TYPES = new Set(COORDINATOR_TO_SERVER_TYPES);
 const SERVER_TYPES = new Set(SERVER_TO_COORDINATOR_TYPES);
 const REVISION_GUARDED_INBOUND_TYPES = new Set(['observation', 'conversation_event', 'action_progress', 'action_result', 'goal_completion_result']);
-const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'action_command', 'action_cancel', 'agent_error', 'verbose_event']);
+const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state', 'goal_completed', 'conversation_wake_ack', 'request_observation', 'action_command', 'action_cancel', 'agent_error', 'verbose_event']);
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
@@ -203,6 +204,9 @@ export function validateProtocolV2Payload(type, value) {
 				transactionId: requireIdentifier(value.transactionId, 'transactionId'),
 				goalRevision: revision(value.goalRevision, 'goalRevision'),
 			};
+		case 'request_observation':
+			exactKeys(value, ['goalRevision'], ['goalRevision'], type);
+			return { goalRevision: revision(value.goalRevision, 'goalRevision') };
 		case 'action_command':
 			return normalizeActionCommand(value);
 		case 'action_cancel':

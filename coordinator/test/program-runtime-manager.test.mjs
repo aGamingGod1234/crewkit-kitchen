@@ -29,6 +29,10 @@ function observation(overrides = {}) {
 	return { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} }, ...overrides };
 }
 
+function actionCommands(messages) {
+	return messages.filter((message) => message.type === 'action_command');
+}
+
 function harness(options = {}) {
 	const registry = new AgentRegistry();
 	registry.register(record());
@@ -252,16 +256,17 @@ test('bridge pre-execution rejection does not count as first world action', asyn
 test('installs a model-authored program and dispatches its next primitive without a provider turn', async () => {
 	const run = harness();
 	await run.manager.installDecision(run.registry.get('agent-a'), { summary: 'Wait twice.', directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
-	assert.equal(run.sent.length, 1);
-	assert.equal(run.sent[0].payload.actionType, 'wait');
-	assert.deepEqual(run.sent[0].payload.arguments, { durationMs: 1 });
-	assert.equal(run.sent[0].payload.provenance.programId, 'program-1-1');
-	const wire = validateProtocolV2Payload('action_command', run.sent[0].payload);
-	assert.deepEqual(wire.provenance, { ...run.sent[0].payload.provenance });
+	const first = actionCommands(run.sent)[0];
+	assert.equal(actionCommands(run.sent).length, 1);
+	assert.equal(first.payload.actionType, 'wait');
+	assert.deepEqual(first.payload.arguments, { durationMs: 1 });
+	assert.equal(first.payload.provenance.programId, 'program-1-1');
+	const wire = validateProtocolV2Payload('action_command', first.payload);
+	assert.deepEqual(wire.provenance, { ...first.payload.provenance });
 	assert.match(wire.provenance.sourceStepId, /^step-\d+-\d+$/);
-	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: run.sent[0].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
+	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' });
 	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
-	assert.equal(run.sent.length, 2);
+	assert.equal(actionCommands(run.sent).length, 2);
 	assert.equal(run.requests.length, 0, 'pre-authored continuation must not call the provider');
 });
 
@@ -293,12 +298,12 @@ test('keeps the agent acting while a successful exhausted program is replaced', 
 		eventSequence: 2,
 	});
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
-	for (let attempt = 0; attempt < 10 && sent.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 
 	assert.equal(requests.length, 1);
 	assert.match(requests[0].input, /"attentionTrigger":"program_exhausted"/);
-	assert.equal(sent.length, 2, 'the replacement program dispatches without operator intervention');
-	assert.deepEqual(sent[1].payload.arguments, { durationMs: 2 });
+	assert.equal(actionCommands(sent).length, 2, 'the replacement program dispatches without operator intervention');
+	assert.deepEqual(actionCommands(sent)[1].payload.arguments, { durationMs: 2 });
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });
 
@@ -335,11 +340,11 @@ test('retries an exhausted program after a provider failure on fresh facts', asy
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
 	for (let attempt = 0; attempt < 10 && errors.length < 1; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
-	for (let attempt = 0; attempt < 10 && sent.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 
 	assert.equal(errors[0]?.code, 'PROVIDER_OFFLINE');
 	assert.equal(requests.length, 2, 'fresh facts retry the exhausted continuation after provider recovery');
-	assert.equal(sent.length, 2);
+	assert.equal(actionCommands(sent).length, 2);
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });
 
@@ -374,10 +379,10 @@ test('asks again when continue cannot resume an exhausted program', async () => 
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
 	for (let attempt = 0; attempt < 10 && requests.length < 1; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
-	for (let attempt = 0; attempt < 10 && sent.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 
 	assert.equal(requests.length, 2);
-	assert.equal(sent.length, 2, 'a later replacement resumes action without an operator click');
+	assert.equal(actionCommands(sent).length, 2, 'a later replacement resumes action without an operator click');
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });
 
@@ -394,6 +399,27 @@ test('reports a completed ArenaScript program after its final action result', as
 	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
 	assert.equal(run.registry.get('agent-a').state, DynamicAgentState.COMPLETED);
 	assert.equal(changes.at(-1)?.state, DynamicAgentState.COMPLETED, 'terminal state is reported to the bridge owner');
+});
+
+test('requests an authoritative post-action observation instead of leaving a completed action pending forever', async () => {
+	const run = harness();
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		summary: 'Wait twice.', directive: 'replace', source: SOURCE,
+	}, { observation: observation(), eventSequence: 1 });
+	const first = run.sent.find((message) => message.type === 'action_command');
+
+	assert.equal(await run.manager.onActionResult(run.registry.get('agent-a'), {
+		actionId: first.payload.actionId,
+		state: 'SUCCEEDED',
+		reasonCode: 'DONE',
+	}), true);
+	await new Promise((resolve) => setImmediate(resolve));
+
+	assert.deepEqual(
+		run.sent.filter((message) => message.type === 'request_observation').map((message) => message.payload),
+		[{ goalRevision: 1 }],
+		'a terminal action explicitly requests the fresh facts needed to resume its continuation',
+	);
 });
 
 test('reports a completed ArenaScript program that needs no physical action', async () => {
@@ -569,16 +595,16 @@ test('replans from bounded failed-action context instead of pausing after a repe
 			});
 		`,
 	}, { observation: observation(), eventSequence: 1 });
-	await manager.onActionResult(registry.get('agent-a'), { actionId: sent[0].payload.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND' });
+	await manager.onActionResult(registry.get('agent-a'), { actionId: actionCommands(sent)[0].payload.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND' });
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
-	await manager.onActionResult(registry.get('agent-a'), { actionId: sent[1].payload.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND' });
+	await manager.onActionResult(registry.get('agent-a'), { actionId: actionCommands(sent)[1].payload.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND' });
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
-	for (let attempt = 0; attempt < 10 && sent.length < 3; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).length < 3; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(requests.length, 1);
 	assert.match(requests[0].input, /"decisionContext":"program_action_failure"/);
 	assert.match(requests[0].input, /"recipeId":"minecraft:planks"/);
-	assert.equal(sent.length, 3);
-	assert.equal(sent[2].payload.actionType, 'wait');
+	assert.equal(actionCommands(sent).length, 3);
+	assert.equal(actionCommands(sent)[2].payload.actionType, 'wait');
 });
 
 test('serializes coalesced reactive planner requests for one program', async () => {
@@ -682,7 +708,7 @@ test('measures one thousand watcher branches with the real monotonic clock', asy
 		assert.equal(metric.count, 1_000, `${operation} has exactly one sample per watcher branch`);
 		assert.ok(Number.isFinite(metric.p95Ms) && metric.p95Ms > 0 && metric.p95Ms < 5, `${operation} p95 is positive and stays below 5ms`);
 	}
-	assert.equal(sent.filter((message) => message.payload.provenance.eventSequence > 1).length, 1_000, 'each watcher event produces exactly one command');
+	assert.equal(actionCommands(sent).filter((message) => message.payload.provenance.eventSequence > 1).length, 1_000, 'each watcher event produces exactly one command');
 	assert.equal(snapshot.find((entry) => entry.operation === 'branch_to_bridge_send').count, 1_000, 'each watcher command contributes one branch-to-send sample');
 });
 
@@ -743,7 +769,7 @@ test('telemetry clock faults omit samples without interrupting program control',
 	const samples = [Number.NaN, -1, 10, 9, new Error('clock unavailable')];
 	const manager = new ProgramRuntimeManager({
 		registry,
-		bridge: { send: async (_type, _agentId, payload) => sent.push(payload) },
+		bridge: { send: async (type, _agentId, payload) => sent.push({ type, payload }) },
 		planner: { requestPlan: async () => ({ directive: 'continue' }) },
 		latencyRegistry: new ControlLatencyRegistry(),
 		clock: () => {
@@ -754,13 +780,13 @@ test('telemetry clock faults omit samples without interrupting program control',
 	});
 	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(1); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: sent[0].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: actionCommands(sent)[0].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: sent[1].actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: actionCommands(sent)[1].payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE' }), true);
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(sent.length, 3, 'NaN, negative, regressing, and throwing clock reads cannot stop commands');
+	assert.equal(actionCommands(sent).length, 3, 'NaN, negative, regressing, and throwing clock reads cannot stop commands');
 	assert.ok(await manager.onObservation(registry.get('agent-a'), {
 		observation: observation(), eventSequence: 4, attention: true,
 		receiptMonotonicMs: -1, receiptEpochMs: Number.NaN, observedAtEpochMs: 1,
@@ -874,12 +900,12 @@ test('retains one terminal result across duplicates and releases it on a jumped 
 	assert.equal(await run.manager.onActionResult(run.registry.get('agent-a'), {
 		actionId: first.payload.actionId, state: 'FAILED', reasonCode: 'DUPLICATE', eventSequence: 100,
 	}), false, 'a duplicate cannot replace the retained result');
-	assert.equal(run.sent.length, 1);
+	assert.equal(actionCommands(run.sent).length, 1);
 	await run.manager.onObservation(run.registry.get('agent-a'), {
 		observation: observation({ player: { x: 9, y: 64, z: 0, health: 20 } }), eventSequence: 9, attention: false,
 	});
-	assert.equal(run.sent.length, 2, 'a jumped authoritative sequence releases the retained result once');
-	assert.equal(run.sent[1].payload.provenance.eventSequence, 9);
+	assert.equal(actionCommands(run.sent).length, 2, 'a jumped authoritative sequence releases the retained result once');
+	assert.equal(actionCommands(run.sent)[1].payload.provenance.eventSequence, 9);
 });
 
 test('goal replacement clears a retained terminal result', async () => {
@@ -919,7 +945,7 @@ test('refreshes authored watcher facts across two hundred quiet movement observa
 	await run.manager.onActionResult(run.registry.get('agent-a'), {
 		actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 202,
 	});
-	assert.equal(run.sent.length, 1, 'the result still waits after two hundred prior fact updates');
+	assert.equal(actionCommands(run.sent).length, 1, 'the result still waits after two hundred prior fact updates');
 	await run.manager.onObservation(run.registry.get('agent-a'), {
 		observation: observation({ player: { x: 200, y: 64, z: 100, health: 20 } }),
 		eventSequence: 202,

@@ -240,6 +240,7 @@ export class ProgramRuntimeManager {
 		state.actionTiming.delete(payload.actionId);
 		state.actionMetadata.delete(payload.actionId);
 		this.#syncState(record, state);
+		await this.#bridge.send('request_observation', state.agentId, { goalRevision: state.goalRevision });
 		return true;
 	}
 
