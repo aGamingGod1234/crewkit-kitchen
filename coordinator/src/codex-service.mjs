@@ -23,6 +23,7 @@ export class CodexService {
 	#transport;
 	#catalog;
 	#workspaceManager;
+	#minecraftWorkspace;
 	#agents = new Map();
 	#sessionGenerations = new Map();
 	#creating = new Map();
@@ -38,6 +39,10 @@ export class CodexService {
 		this.#workspaceManager = dependencies.workspaceManager ?? null;
 		if (this.#workspaceManager !== null && typeof this.#workspaceManager.prepare !== 'function') {
 			throw new TypeError('workspaceManager must expose prepare(provider, agentId)');
+		}
+		this.#minecraftWorkspace = dependencies.minecraftWorkspace ?? null;
+		if (this.#minecraftWorkspace !== null && typeof this.#minecraftWorkspace.prepare !== 'function') {
+			throw new TypeError('minecraftWorkspace must expose prepare()');
 		}
 		this.#catalog = dependencies.catalog ?? new ModelCatalogCache(() => this.#listModels(), {
 			ttlMs: this.#config.catalogTtlMs,
@@ -85,16 +90,27 @@ export class CodexService {
 	async #createAgentOnce(profile, recoverySummary, controlProtocol) {
 		if (this.#catalog.stale) await this.#catalog.refresh();
 		this.#catalog.assertSupported(profile.model, profile.reasoningEffort, profile.serviceTier);
-		const cwd = this.#workspaceManager === null
-			? this.#config.cwd
-			: await this.#workspaceManager.prepare(profile.provider, profile.agentId);
+		let cwd;
+		let selectedCapabilityRoots = [];
+		if (controlProtocol === 'native_tools' && this.#minecraftWorkspace !== null) {
+			const prepared = await this.#minecraftWorkspace.prepare();
+			if (prepared === null || typeof prepared !== 'object' || typeof prepared.cwd !== 'string' || !Array.isArray(prepared.selectedCapabilityRoots)) {
+				throw new TypeError('minecraftWorkspace.prepare() must return cwd and selectedCapabilityRoots');
+			}
+			cwd = prepared.cwd;
+			selectedCapabilityRoots = [...prepared.selectedCapabilityRoots];
+		} else {
+			cwd = this.#workspaceManager === null
+				? this.#config.cwd
+				: await this.#workspaceManager.prepare(profile.provider, profile.agentId);
+		}
 		const response = await this.#transport.request('thread/start', {
 			model: profile.model,
 			serviceTier: profile.serviceTier,
 			cwd,
 			allowProviderModelFallback: false,
 			runtimeWorkspaceRoots: [cwd],
-			selectedCapabilityRoots: [],
+			selectedCapabilityRoots,
 			approvalPolicy: 'never',
 			sandbox: 'read-only',
 			dynamicTools: controlProtocol === 'native_tools' ? MINECRAFT_DYNAMIC_TOOLS : [],

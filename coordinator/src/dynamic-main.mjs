@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { AgentPlanner } from './agent-planner.mjs';
 import { AgentRegistry, AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
 import { AgentWorkspaceManager } from './agent-workspace.mjs';
+import { MinecraftAgentWorkspace } from './minecraft-agent-workspace.mjs';
 import { AcpProviderService } from './acp-service.mjs';
 import { AntigravityProviderService } from './antigravity-service.mjs';
 import { CodexService } from './codex-service.mjs';
@@ -1338,8 +1339,12 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
 	const workspaceManager = dependencies.workspaceManager ?? new AgentWorkspaceManager(config.workspaceRoot);
+	const minecraftWorkspace = dependencies.minecraftWorkspace ?? new MinecraftAgentWorkspace({
+		root: config.minecraftAgentRoot,
+		templateRoot: config.minecraftAgentTemplateRoot,
+	});
 	const codexService = dependencies.providerService ?? dependencies.codexService ?? new ProviderService({
-		codex: new CodexService({ ...config.codex, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transport: dependencies.codexTransport, now: dependencies.now ?? Date.now, workspaceManager }),
+		codex: new CodexService({ ...config.codex, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, { transport: dependencies.codexTransport, now: dependencies.now ?? Date.now, workspaceManager, minecraftWorkspace }),
 		gemini: new AntigravityProviderService({ ...config.gemini, environment: providerEnvironment, bridgeSecretEnvironmentVariable: config.bridge.secretEnvironmentVariable }, {
 			spawn: dependencies.antigravitySpawn,
 			terminate: dependencies.terminateProviderProcess,
@@ -1432,6 +1437,9 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	const workspaceRoot = value.workspaceRoot === undefined
 		? path.join(PROJECT_DIRECTORY, 'runtime', 'agent-workspaces')
 		: path.resolve(PROJECT_DIRECTORY, value.workspaceRoot);
+	const minecraftAgentRoot = value.minecraftAgentRoot === undefined
+		? path.join(PROJECT_DIRECTORY, 'runtime', 'minecraft-agent')
+		: path.resolve(PROJECT_DIRECTORY, value.minecraftAgentRoot);
 	const agentCap = positiveInteger(value.limits?.agentCap ?? DEFAULT_AGENT_CAP, 'limits.agentCap');
 	const planningConcurrency = positiveInteger(value.limits?.planningConcurrency ?? DEFAULT_PLANNING_CONCURRENCY, 'limits.planningConcurrency');
 	const planningMode = value.limits?.planningMode ?? 'fixed';
@@ -1444,11 +1452,13 @@ export function normalizeDynamicConfig(value, environment = process.env) {
 	const urgentReserve = value.limits?.urgentReserve ?? (agentCap >= 4 ? 1 : 0);
 	if (!Number.isSafeInteger(urgentReserve) || urgentReserve < 0 || urgentReserve > agentCap) throw new TypeError('limits.urgentReserve must be a non-negative safe integer within limits.agentCap');
 	const voice = normalizeVoiceConfig(value.voice, environment);
-	const codexControlProtocol = value.codex.controlProtocol ?? 'arena_script';
+	const codexControlProtocol = value.codex.controlProtocol ?? 'native_tools';
 	if (!['arena_script', 'native_tools'].includes(codexControlProtocol)) throw new TypeError('codex.controlProtocol must be arena_script or native_tools');
 	return {
 		bridge: { ...value.bridge, secret },
 		workspaceRoot,
+		minecraftAgentRoot,
+		minecraftAgentTemplateRoot: path.join(COORDINATOR_DIRECTORY, 'config', 'minecraft-agent'),
 		voice,
 		codex: {
 			...value.codex,

@@ -2203,6 +2203,14 @@ test('defaults agent workspaces to the persistent project runtime directory', ()
 	assert.equal(normalizeDynamicConfig(base).workspaceRoot, path.join(projectDirectory, 'runtime', 'agent-workspaces'));
 });
 
+test('legacy preserved Codex config defaults to native tools and the shared Minecraft workspace', () => {
+	const base = { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: {} };
+	const projectDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+	const config = normalizeDynamicConfig(base);
+	assert.equal(config.codex.controlProtocol, 'native_tools');
+	assert.equal(config.minecraftAgentRoot, path.join(projectDirectory, 'runtime', 'minecraft-agent'));
+});
+
 
 test('dynamic config exposes the native Cursor model families and genuine settings', () => {
 	const config = normalizeDynamicConfig({

@@ -310,6 +310,37 @@ test('Codex threads use provider-scoped per-agent workspaces', async () => {
 	await service.stop();
 });
 
+test('native Codex threads share the Minecraft workspace and selected skill root', async () => {
+	const transport = new FakeSharedTransport();
+	const prepared = [];
+	const workspaceManager = {
+		async prepare(provider, agentId) {
+			return `C:\\agents\\${provider}\\${agentId}`;
+		},
+	};
+	const minecraftWorkspace = {
+		async prepare() {
+			prepared.push('prepared');
+			return {
+				cwd: 'C:\\shared\\minecraft-agent',
+				selectedCapabilityRoots: ['C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control'],
+			};
+		},
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport, workspaceManager, minecraftWorkspace });
+	await service.createAgent(profile('native-a'), { controlProtocol: 'native_tools' });
+	await service.createAgent(profile('native-b'), { controlProtocol: 'native_tools' });
+
+	assert.deepEqual(prepared, ['prepared', 'prepared']);
+	for (const call of transport.calls.filter((entry) => entry.method === 'thread/start')) {
+		assert.equal(call.params.cwd, 'C:\\shared\\minecraft-agent');
+		assert.deepEqual(call.params.runtimeWorkspaceRoots, ['C:\\shared\\minecraft-agent']);
+		assert.deepEqual(call.params.selectedCapabilityRoots, ['C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control']);
+		assert.equal(call.params.sandbox, 'read-only');
+	}
+	await service.stop();
+});
+
 test('concurrent stop paths interrupt a Codex turn exactly once and reject its late result', async () => {
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;
