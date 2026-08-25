@@ -16,6 +16,8 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,6 +26,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 	private final Synthesizer synthesizer;
 	private final Executor playbackExecutor;
 	private final Transport transport;
+	private final Consumer<OutputLatency> latencyObserver;
 	private final Map<AgentId, UUID> entities = new LinkedHashMap<>();
 	private final Map<AgentId, Playback> players = new LinkedHashMap<>();
 	private final Map<AgentId, CompletableFuture<VoiceReceipt>> pending = new LinkedHashMap<>();
@@ -31,9 +34,19 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 	private boolean closed;
 
 	VoicePlaybackCoordinator(Synthesizer synthesizer, Executor playbackExecutor, Transport transport) {
+		this(synthesizer, playbackExecutor, transport, ignored -> { });
+	}
+
+	VoicePlaybackCoordinator(
+			Synthesizer synthesizer,
+			Executor playbackExecutor,
+			Transport transport,
+			Consumer<OutputLatency> latencyObserver
+	) {
 		this.synthesizer = Objects.requireNonNull(synthesizer, "synthesizer must not be null");
 		this.playbackExecutor = Objects.requireNonNull(playbackExecutor, "playbackExecutor must not be null");
 		this.transport = Objects.requireNonNull(transport, "transport must not be null");
+		this.latencyObserver = Objects.requireNonNull(latencyObserver, "latencyObserver must not be null");
 	}
 
 	synchronized boolean available() {
@@ -62,6 +75,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 
 	CompletionStage<VoiceReceipt> speak(VoiceRequest request) {
 		Objects.requireNonNull(request, "request must not be null");
+		long requestedNanos = System.nanoTime();
 		synchronized (this) {
 			VoiceReceipt unavailable = availabilityFailure(request);
 			if (unavailable != null) return CompletableFuture.completedFuture(unavailable);
@@ -92,6 +106,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 			syntheses.put(request.agentId(), synthesis);
 		}
 		synthesis.whenComplete((samples, failure) -> {
+			long synthesisCompletedNanos = System.nanoTime();
 			synchronized (this) {
 				syntheses.remove(request.agentId(), synthesis);
 			}
@@ -100,7 +115,9 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 				return;
 			}
 			try {
-				playbackExecutor.execute(() -> startPlayback(request, samples, result));
+				playbackExecutor.execute(() -> startPlayback(
+						request, samples, result, requestedNanos, synthesisCompletedNanos
+				));
 			} catch (RuntimeException exception) {
 				completeFallback(request, result, Boundary.PLAYBACK, failureDiagnostic(Boundary.PLAYBACK, exception));
 			}
@@ -111,7 +128,9 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 	private void startPlayback(
 			VoiceRequest request,
 			short[] samples,
-			CompletableFuture<VoiceReceipt> result
+			CompletableFuture<VoiceReceipt> result,
+			long requestedNanos,
+			long synthesisCompletedNanos
 	) {
 		UUID entityId;
 		synchronized (this) {
@@ -162,6 +181,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		}
 		try {
 			playback.start();
+			reportLatency(request, requestedNanos, synthesisCompletedNanos, System.nanoTime());
 		} catch (RuntimeException exception) {
 			completeFallback(request, result, Boundary.PLAYBACK, failureDiagnostic(Boundary.PLAYBACK, exception));
 			try {
@@ -314,6 +334,24 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		}
 	}
 
+	private void reportLatency(
+			VoiceRequest request,
+			long requestedNanos,
+			long synthesisCompletedNanos,
+			long playbackStartedNanos
+	) {
+		try {
+			latencyObserver.accept(new OutputLatency(
+					request.agentId(),
+					request.conversationSequence(),
+					TimeUnit.NANOSECONDS.toMillis(Math.max(0L, synthesisCompletedNanos - requestedNanos)),
+					TimeUnit.NANOSECONDS.toMillis(Math.max(0L, playbackStartedNanos - requestedNanos))
+			));
+		} catch (RuntimeException ignored) {
+			// Timing diagnostics must never interrupt voice playback.
+		}
+	}
+
 	private record Diagnostic(String code, String reason) {
 		private Diagnostic {
 			Objects.requireNonNull(code, "code must not be null");
@@ -340,6 +378,14 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		void start();
 
 		void stop();
+	}
+
+	record OutputLatency(
+			AgentId agentId,
+			long conversationSequence,
+			long synthesisMilliseconds,
+			long firstPlaybackMilliseconds
+	) {
 	}
 
 	static final class UnavailableException extends RuntimeException {

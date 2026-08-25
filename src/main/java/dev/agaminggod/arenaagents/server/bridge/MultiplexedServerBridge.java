@@ -93,6 +93,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_CONVERSATION_SOURCES_PER_AGENT = 16;
 	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
+	private static final String COORDINATOR_OFFLINE_MESSAGE =
+			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
 			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "request_observation", "action_command", "action_cancel", "agent_error", "verbose_event", "heartbeat"
@@ -126,6 +128,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private final Object publicationLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
+	private final Set<AgentId> coordinatorReadyAgentIds = new HashSet<>();
 	private boolean disconnectInProgress;
 	private volatile Session session;
 	private volatile ServerSocket serverSocket;
@@ -239,6 +242,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return observationPublication;
 	}
 
+	boolean coordinatorReadyForVerification(AgentId agentId) {
+		return coordinatorReadyAgentIds.contains(agentId);
+	}
+
 	/** Server ticks serialize input leases with observation publication at this boundary. */
 	static ObservationPublication.Result publishObservationWithInputGuard(
 			ObservationPublication publication,
@@ -273,21 +280,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	public DeliveryReceipt sendPlayerDirectMessage(ServerPlayer source, AgentId recipientAgentId, String text) {
 		if (!authenticated()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		return conversationRouter.deliverPlayerMessage(source, recipientAgentId, text);
 	}
 
 	public DeliveryReceipt sendNativePlayerDirectMessage(ServerPlayer source, AgentId recipientAgentId, String text) {
 		if (!authenticated()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		return conversationRouter.deliverPlayerMessageFromNativeWhisper(source, recipientAgentId, text);
 	}
 
 	public DeliveryReceipt sendPlayerProximitySpeech(ServerPlayer source, String text, boolean whispering) {
 		if (!authenticated()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		return conversationRouter.deliverPlayerProximitySpeech(source, text, whispering ? 16.0D : 48.0D);
 	}
@@ -295,7 +302,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	@Override
 	public void validateProfile(AgentProfile profile) {
 		if (!authenticated()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		if (!catalogLoaded) {
 			throw new AgentDomainException("MODEL_CATALOG_UNAVAILABLE", "AI provider model catalog has not loaded yet");
@@ -364,6 +371,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		programActions.remove(agentId);
 		observationPublication.remove(agentId);
 		synchronized (publicationLock) {
+			coordinatorReadyAgentIds.remove(agentId);
 			if (!protocolKnownAgentIds.contains(agentId)) return;
 			Session active = session;
 			if (active == null || !active.open.get() || !active.authenticated.get()) {
@@ -524,11 +532,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogLoaded = false;
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
+				coordinatorReadyAgentIds.clear();
 				try {
 					source.completeHandshake(handshake);
 					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
 					protocolKnownAgentIds.clear();
+					coordinatorReadyAgentIds.clear();
 					throw exception;
 				}
 				return;
@@ -875,11 +885,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void plannerReady(BridgeEnvelope envelope) {
 		AgentId id = AgentId.parse(envelope.agentId());
-		AgentRecord record = manager.registry().require(id);
 		long revision = requiredLong(envelope.payload(), "goalRevision");
+		AgentRecord record;
+		try {
+			record = manager.registry().require(id);
+		} catch (AgentDomainException exception) {
+			if ("AGENT_NOT_FOUND".equals(exception.code())) return;
+			throw exception;
+		}
 		if (revision != record.goalRevision()) {
+			if (revision < record.goalRevision()) return;
 			throw new AgentDomainException("STALE_REVISION", "Coordinator planning revision is stale");
 		}
+		if ("agent_ready".equals(envelope.type())) coordinatorReadyAgentIds.add(id);
 		boolean reconciledReconnect = "agent_ready".equals(envelope.type())
 				&& envelope.payload().has("reconciled")
 				&& requiredBoolean(envelope.payload(), "reconciled")
@@ -1109,11 +1127,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private Session requireConversationSession(AgentId agentId) {
 		Session active = session;
 		if (active == null || !active.open.get() || !active.authenticated.get()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		if (!protocolKnownAgentIds.contains(agentId)) {
 			throw new AgentDomainException(
 					"AGENT_NOT_READY", "AI agent is still registering with the coordinator; retry shortly"
+			);
+		}
+		if (!coordinatorReadyAgentIds.contains(agentId)) {
+			throw new AgentDomainException(
+					"AGENT_NOT_READY", "AI agent is waiting for coordinator readiness; retry shortly"
 			);
 		}
 		return active;
@@ -2183,6 +2206,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				verboseState.clearActivity();
 				MultiplexedServerBridge.onSessionClosed(observationPublication, this);
 				protocolKnownAgentIds.clear();
+				coordinatorReadyAgentIds.clear();
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;

@@ -131,6 +131,7 @@ function validateProgram(ast, limits) {
 		policyCount: 0,
 		unhandledPolicy: null,
 		watcherCount: 0,
+		primitiveCalls: new Set(),
 		userDeclarations: new Set(),
 		functionBindingsByNode: new WeakMap(),
 		functionBindings: new Set(),
@@ -152,6 +153,7 @@ function validateProgram(ast, limits) {
 		stepLocations: createFrozenMap(state.stepLocations),
 		unhandledPolicy: state.unhandledPolicy,
 		watcherCount: state.watcherCount,
+		primitiveCalls: Object.freeze([...state.primitiveCalls].sort()),
 	};
 }
 
@@ -415,6 +417,7 @@ function validateCallExpression(node, state, context) {
 	}
 	if (path?.[0] === 'player' && Object.hasOwn(PLAYER_MEMBER_PRIMITIVES, path[1])) {
 		validatePlayerPrimitiveArity(node, path[1]);
+		state.primitiveCalls.add(PLAYER_MEMBER_PRIMITIVES[path[1]]);
 	}
 	if (functionBinding && context.functionBinding) {
 		let edges = state.functionEdges.get(context.functionBinding);

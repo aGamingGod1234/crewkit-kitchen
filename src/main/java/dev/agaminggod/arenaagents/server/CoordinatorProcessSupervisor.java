@@ -51,17 +51,30 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		NodeRuntimeLocator.LocatedNode located = null;
 		try {
 			Path installedRoot = this.gameDirectory.resolve("arena-agents-runtime");
-			if (BundledCoordinatorInstaller.installBundled(installedRoot)) {
-				LOGGER.info("Installed the bundled Arena Agents coordinator runtime");
+			int reaped = CoordinatorProcessOwnership.reapOrphaned(installedRoot);
+			if (reaped > 0) LOGGER.warn("Stopped {} orphaned Arena Agents coordinator process(es) before updating the runtime", reaped);
+			IOException installFailure = null;
+			try {
+				if (BundledCoordinatorInstaller.installBundled(installedRoot)) {
+					LOGGER.info("Installed the bundled Arena Agents coordinator runtime");
+				}
+			} catch (IOException failure) {
+				installFailure = failure;
+				LOGGER.warn("Could not refresh the bundled Arena Agents runtime; attempting the last complete installed version", failure);
 			}
 			Path discoveredRoot = findPackageRoot(this.gameDirectory);
 			if (discoveredRoot != null) {
-				prepared = discoveredRoot.equals(installedRoot)
-						? BundledCoordinatorInstaller.prepare(discoveredRoot)
-						: BundledCoordinatorInstaller.validate(discoveredRoot);
+				try {
+					prepared = BundledCoordinatorInstaller.validate(discoveredRoot);
+				} catch (IOException invalidRuntime) {
+					if (installFailure != null) invalidRuntime.addSuppressed(installFailure);
+					throw invalidRuntime;
+				}
 				configureSharedBridgeSecretPath(prepared.secret());
 				configureSharedVoiceEndpoint(prepared.config());
 				located = NodeRuntimeLocator.locate(prepared.root());
+			} else if (installFailure != null) {
+				throw installFailure;
 			}
 		} catch (NodeRuntimeLocator.NodeRuntimeFailure exception) {
 			failureCode = exception.code();
@@ -90,6 +103,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	synchronized String failureCode() {
 		return failureCode;
+	}
+
+	synchronized String failureMessage() {
+		return failureMessage;
 	}
 
 	synchronized void tick(boolean bridgeAuthenticated) {
@@ -144,9 +161,17 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			configureVoiceProviderCredential(environment);
 			environment.put("ARENA_AGENT_BRIDGE_SECRET", secret);
 			Path logDirectory = gameDirectory.resolve("logs");
+			CoordinatorLogRotation.rotate(logDirectory);
 			builder.redirectOutput(ProcessBuilder.Redirect.appendTo(logDirectory.resolve("arena-agents-coordinator.log").toFile()));
 			builder.redirectError(ProcessBuilder.Redirect.appendTo(logDirectory.resolve("arena-agents-coordinator-error.log").toFile()));
-			process = builder.start();
+			Process started = builder.start();
+			try {
+				CoordinatorProcessOwnership.record(runtimePackage.root(), started, runtimePackage.main());
+			} catch (IOException ownershipFailure) {
+				terminateFailedStart(started);
+				throw ownershipFailure;
+			}
+			process = started;
 			observedExit = null;
 			nextStartEpochMs = now;
 			LOGGER.info("Started the Arena Agents coordinator (pid {})", process.pid());
@@ -155,6 +180,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		} catch (IOException | RuntimeException exception) {
 			latchFailure("COORDINATOR_START_FAILED", "Could not start the Arena Agents coordinator");
 		}
+	}
+
+	static void terminateFailedStart(Process started) {
+		CoordinatorProcessOwnership.terminateTree(started.toHandle());
 	}
 
 	private void latchFailure(String code, String message) {
@@ -172,31 +201,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	public synchronized void close() {
 		Process owned = process;
 		if (owned == null) return;
-		ProcessHandle handle = owned.toHandle();
-		List<ProcessHandle> descendants = handle.descendants().toList();
-		descendants.forEach(ProcessHandle::destroy);
-		if (owned.isAlive()) owned.destroy();
+		CoordinatorProcessOwnership.terminateTree(owned.toHandle());
 		try {
-			if (!owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
-				descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
-				owned.destroyForcibly();
-				owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
-			}
-			descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
-			awaitExit(descendants, 2_000L);
-		} catch (InterruptedException exception) {
-			Thread.currentThread().interrupt();
-			descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
-			owned.destroyForcibly();
+			CoordinatorProcessOwnership.clear(runtimePackage.root(), owned);
+		} catch (IOException exception) {
+			LOGGER.warn("Could not clear the Arena Agents coordinator ownership record", exception);
 		}
 		process = null;
-	}
-
-	private static void awaitExit(List<ProcessHandle> handles, long timeoutMs) throws InterruptedException {
-		long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-		while (handles.stream().anyMatch(ProcessHandle::isAlive) && System.nanoTime() < deadline) {
-			Thread.sleep(10L);
-		}
 	}
 
 	private void configureVoiceProviderCredential(Map<String, String> environment) {

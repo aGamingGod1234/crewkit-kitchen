@@ -593,6 +593,50 @@ test('audit callback failures never interrupt bridge delivery', async () => {
 	bridge.stop();
 });
 
+test('bridge preserves ready and disconnected events while exposing authenticated recovery', async (t) => {
+	const sockets = [];
+	let scheduledReconnect = null;
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, reconnectDelayMs: 1 }, {
+		socketFactory: () => {
+			const socket = new FakeSocket();
+			sockets.push(socket);
+			return socket;
+		},
+		schedule: (callback) => { scheduledReconnect = callback; return 1; },
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	const readyEvents = [];
+	const disconnected = once(bridge, 'disconnected');
+	bridge.on('ready', (event) => readyEvents.push(event));
+	const recovered = once(bridge, 'recovered');
+
+	bridge.start();
+	sockets[0].emit('connect');
+	const firstHello = JSON.parse(sockets[0].writes[0]);
+	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: firstHello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	sockets[0].destroy();
+	await disconnected;
+	assert.equal(typeof scheduledReconnect, 'function');
+
+	scheduledReconnect();
+	sockets[1].emit('connect');
+	const secondHello = JSON.parse(sockets[1].writes[0]);
+	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-2', {
+		replyTo: secondHello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	const [recovery] = await recovered;
+
+	assert.equal(readyEvents.length, 2);
+	assert.equal(recovery.serverInstanceId, 'server-instance');
+	assert.equal(recovery.registry.length, 1);
+	assert.equal(recovery.registry[0].agentId, 'agent-a');
+});
+
 test('multiplexed bridge rejects stale revisions before writing', async () => {
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
@@ -918,7 +962,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 });
 
 test('protocol v2 rejects retired high-level controller action types', () => {
-	for (const actionType of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+	for (const actionType of ['build_sequence', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
 		assert.throws(
 			() => validateProtocolV2Payload('action_command', {
 				traceId: TRACE_ID,
@@ -927,6 +971,25 @@ test('protocol v2 rejects retired high-level controller action types', () => {
 			(error) => error.code === 'INVALID_ACTION' && /Unsupported action/.test(error.message),
 		);
 	}
+});
+
+test('protocol v2 carries an exact observed dropped-item identity to Minecraft', () => {
+	const targetSelector = '550e8400-e29b-41d4-a716-446655440000';
+	assert.deepEqual(validateProtocolV2Payload('action_command', {
+		traceId: TRACE_ID,
+		goalRevision: 1,
+		actionId: 'pickup-1',
+		actionType: 'pick_up_item',
+		arguments: { targetSelector },
+		provenance: PROVENANCE,
+	}), {
+		traceId: TRACE_ID,
+		goalRevision: 1,
+		actionId: 'pickup-1',
+		actionType: 'pick_up_item',
+		arguments: { targetSelector },
+		provenance: PROVENANCE,
+	});
 });
 
 test('accepts the exact rich ready observation emitted by ServerObservationCollector', () => {

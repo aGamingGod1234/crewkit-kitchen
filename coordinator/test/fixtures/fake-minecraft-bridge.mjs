@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { createProtocolV2Envelope, validateProtocolV2Envelope, validateProtocolV2Payload } from '../../src/protocol-v2.mjs';
 import { adaptObservation } from '../../src/observation-adapter.mjs';
 
@@ -239,4 +240,371 @@ export function assertCommandProvenance(commands, profile = SELECTED_PROFILE, ex
 		if (!/^step-/.test(provenance.sourceStepId)) throw new Error(`invalid source step ${provenance.sourceStepId}`);
 		if (!Number.isSafeInteger(provenance.eventSequence)) throw new Error('command event sequence is not a safe integer');
 	}
+}
+
+/**
+ * Event-emitting bridge for coordinator-level native-turn tests. It is the
+ * external socket/world boundary: tests inject failures here, never into
+ * coordinator private state or supervisor timers.
+ */
+export class FaultInjectingMinecraftBridge extends EventEmitter {
+	#scenario;
+	#record;
+	#serverInstanceId = 'native-fault-fixture-1';
+	#eventSequence = 1;
+	#actionNumber = 0;
+	#completionNumber = 0;
+	#connected = false;
+	#stopped = false;
+	#world;
+	#reconnectTimer = null;
+	#actionResults = [];
+
+	sent = [];
+	states = [];
+	recoveries = [];
+	maxRecoveryHandles = 0;
+	validatedOutbound = 0;
+	validatedInbound = 0;
+	recoveryHandles = 0;
+	recoveryDispatches = 0;
+
+	constructor(scenario = {}) {
+		super();
+		this.#scenario = scenario;
+		this.#record = {
+			agentId: 'native-fault-agent',
+			provider: 'codex',
+			model: 'gpt-5.6-luna',
+			reasoningEffort: 'xhigh',
+			serviceTier: 'fast',
+			goalRevision: 0,
+		};
+		this.#world = {
+			position: { x: 0, y: 64, z: 0 },
+			dead: false,
+			health: 20,
+			inventory: new Map(),
+			blocks: new Map([['0,64,0', 'minecraft:oak_log']]),
+			entities: new Map(),
+			drop: { stableId: '00000000-0000-4000-8000-000000000001', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 },
+		};
+	}
+
+	get record() { return { ...this.#record }; }
+	get connected() { return this.#connected; }
+	get actionCount() { return this.#actionNumber; }
+	get completionCount() { return this.#completionNumber; }
+	get inventory() { return new Map(this.#world.inventory); }
+	get world() { return structuredClone({ ...this.#world, inventory: Object.fromEntries(this.#world.inventory) }); }
+
+	start() {
+		this.#stopped = false;
+		this.#connected = true;
+	}
+
+	stop() {
+		this.#stopped = true;
+		this.#connected = false;
+		if (this.#reconnectTimer !== null) this.#reconnectTimer.cancelled = true;
+		this.#reconnectTimer = null;
+	}
+
+	ready({ revision = this.#record.goalRevision, state = 'IDLE' } = {}) {
+		this.#connected = true;
+		this.#record.goalRevision = revision;
+		const profile = {
+			schemaVersion: 1,
+			agentId: this.#record.agentId,
+			provider: this.#record.provider,
+			model: this.#record.model,
+			reasoningEffort: this.#record.reasoningEffort,
+			serviceTier: this.#record.serviceTier,
+			skinVariant: 'default',
+			state,
+			goalRevision: revision,
+			currentGoal: this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe',
+			queue: [],
+			createdAtEpochMs: 1,
+			updatedAtEpochMs: 1,
+		};
+		this.emit('ready', { serverInstanceId: this.#serverInstanceId, registry: [profile] });
+	}
+
+	startGoal(goal = this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe', revision = 1) {
+		this.#record.goalRevision = revision;
+		this.#record.goal = goal;
+		this.emit('goal_control', {
+			agentId: this.#record.agentId,
+			payload: { operation: 'start', goalRevision: revision, goal, updatedAtEpochMs: revision },
+		});
+		return this.publishObservation({ attention: true });
+	}
+
+	async send(type, agentId, payload) {
+		const envelope = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId,
+			type,
+			messageId: `native-fault-out-${this.sent.length + 1}`,
+			payload,
+		});
+		validateProtocolV2Envelope(envelope, { direction: 'coordinator_to_server' });
+		this.validatedOutbound += 1;
+		this.sent.push({ type, agentId, payload: envelope.payload });
+		if (type === 'planning_state') this.states.push(envelope.payload.state);
+		if (type === 'agent_error') this.recoveries.push(envelope.payload.code);
+		if (type === 'agent_error' && this.#scenario.unsupportedProfile) {
+			queueMicrotask(() => this.#emitGoalControl('fail', this.#record.goalRevision + 1));
+		}
+		if (type === 'request_observation') {
+			this.recoveries.push('REQUEST_OBSERVATION');
+			this.recoveryHandles += 1;
+			this.maxRecoveryHandles = Math.max(this.maxRecoveryHandles, this.recoveryHandles);
+			this.recoveryDispatches += 1;
+			queueMicrotask(() => {
+				try { this.publishObservation({ attention: true }); }
+				finally { this.recoveryHandles = Math.max(0, this.recoveryHandles - 1); }
+			});
+		}
+		if (type === 'action_command') queueMicrotask(() => { void this.#executeAction(envelope.payload); });
+		if (type === 'goal_completed') queueMicrotask(() => { void this.#completeGoal(envelope.payload); });
+		if (type === 'action_cancel') this.recoveries.push('ACTION_CANCELLED');
+	}
+
+	publishObservation({ attention = true, revision = this.#record.goalRevision, stale = false } = {}) {
+		const observedRevision = stale ? Math.max(0, revision - 1) : revision;
+		const payload = wireObservation(this.#world, observedRevision, ++this.#eventSequence, attention);
+		const envelope = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId: this.#record.agentId,
+			type: 'observation',
+			messageId: `native-fault-in-${this.#eventSequence}`,
+			payload,
+		});
+		validateProtocolV2Envelope(envelope, { direction: 'server_to_coordinator' });
+		this.validatedInbound += 1;
+		if (this.#connected && !this.#stopped) this.emit('observation', { agentId: this.#record.agentId, payload: envelope.payload });
+		return envelope.payload;
+	}
+
+	pause() {
+		const revision = this.#record.goalRevision + 1;
+		this.#record.goalRevision = revision;
+		this.emit('goal_control', {
+			agentId: this.#record.agentId,
+			payload: { operation: 'stop', goalRevision: revision, updatedAtEpochMs: revision },
+		});
+	}
+
+	#emitGoalControl(operation, revision, extra = {}) {
+		this.#record.goalRevision = revision;
+		this.emit('goal_control', {
+			agentId: this.#record.agentId,
+			payload: { operation, goalRevision: revision, updatedAtEpochMs: revision, ...extra },
+		});
+	}
+
+	async #executeAction(command) {
+		if (!this.#connected || this.#stopped) return;
+		this.#actionNumber += 1;
+		const actionFault = this.#scenario.actionResults?.[this.#actionNumber - 1] ?? 'SUCCEEDED';
+		const actionType = command.actionType;
+		const succeeded = actionFault === 'SUCCEEDED';
+		if (succeeded) this.#applySuccessfulAction(command);
+		const respawned = succeeded && actionType === 'respawn';
+		const died = this.#scenario.dieAtAction === this.#actionNumber;
+		if (died) {
+			this.#world.dead = true;
+			this.#world.health = 0;
+		}
+		const state = succeeded ? 'SUCCEEDED' : 'FAILED';
+		const result = {
+			traceId: command.traceId,
+			goalRevision: command.goalRevision,
+			actionId: command.actionId,
+			commandId: command.actionId,
+			actionType,
+			state,
+			reasonCode: actionFault,
+			message: actionFault,
+			elapsedMs: 1,
+			observedAtEpochMs: this.#eventSequence,
+			executionStarted: true,
+			physicalAttempted: true,
+		};
+		this.#actionResults.push(result);
+		this.recoveries.push(actionFault);
+		this.#emitInbound('action_progress', {
+			traceId: command.traceId,
+			goalRevision: command.goalRevision,
+			actionId: command.actionId,
+			commandId: command.actionId,
+			actionType,
+			state: 'RUNNING',
+			message: 'fixture progress',
+			progress: 0.5,
+			elapsedMs: 1,
+			observedAtEpochMs: this.#eventSequence,
+		});
+		this.#emitInbound('action_result', result);
+		if (respawned) this.#emitGoalControl('respawn', this.#record.goalRevision + 1, { resumeGoal: true });
+		if (died) this.#emitGoalControl('dead', this.#record.goalRevision + 1, { death: {
+			cause: 'fixture',
+			dimensionId: 'minecraft:overworld',
+			x: this.#world.position.x,
+			y: this.#world.position.y,
+			z: this.#world.position.z,
+			respawnDimensionId: 'minecraft:overworld',
+			respawnX: this.#world.position.x,
+			respawnY: this.#world.position.y,
+			respawnZ: this.#world.position.z,
+			respawnYaw: 0,
+			respawnPitch: 0,
+			respawnForced: false,
+			gameMode: 'survival',
+			diedAtEpochMs: this.#eventSequence,
+		} });
+		if (this.#scenario.disconnectAtAction === this.#actionNumber) this.#disconnectAndResume();
+		if (this.#scenario.staleCallbackAfterRevision && this.#actionNumber === 1) {
+			queueMicrotask(() => { this.publishObservation({ revision: command.goalRevision, stale: true }); });
+		}
+		if (!this.#world.dead && this.#connected) this.publishObservation({ attention: actionFault !== 'SUCCEEDED' });
+	}
+
+	async #completeGoal(request) {
+		this.#completionNumber += 1;
+		const scriptedResult = this.#scenario.completionResults?.[this.#completionNumber - 1];
+		const verified = this.#evaluateCompletionContract(request.completionContract)
+			&& (scriptedResult === undefined || scriptedResult === true);
+		if (!verified) this.recoveries.push('COMPLETION_REJECTED');
+		this.#emitInbound('goal_completion_result', {
+			goalRevision: request.goalRevision,
+			traceId: request.traceId,
+			contractHash: request.contractHash,
+			verified,
+			reasonCode: verified ? 'COMPLETION_VERIFIED' : 'COMPLETION_REJECTED',
+			facts: [],
+		});
+	}
+
+	#applySuccessfulAction(command) {
+		const actionType = command.actionType;
+		const args = command.arguments ?? {};
+		if (actionType === 'break_block' || actionType === 'mine') {
+			this.#world.blocks.delete(`${args.x},${args.y},${args.z}`);
+			if (this.#world.drop !== null) {
+				this.#world.drop = {
+					...this.#world.drop,
+					x: this.#scenario.moveDropBeforePickup ? 3 : this.#world.drop.x,
+				};
+			}
+		}
+		if (actionType === 'navigate_to') {
+			this.#world.position = { x: args.x, y: args.y, z: args.z };
+		}
+		if (actionType === 'pick_up_item') {
+			const drop = this.#world.drop;
+			if (drop !== null && args.targetSelector === drop.stableId) {
+				this.#world.inventory.set(drop.itemId, (this.#world.inventory.get(drop.itemId) ?? 0) + drop.count);
+				this.#world.drop = null;
+			}
+		}
+		if (actionType === 'craft_inventory') this.#world.inventory.set('minecraft:wooden_pickaxe', 1);
+		if (actionType === 'respawn') {
+			this.#world.dead = false;
+			this.#world.health = 20;
+		}
+	}
+
+	#evaluateCompletionContract(contract) {
+		if (contract === null || typeof contract !== 'object' || !Array.isArray(contract.predicates)) return false;
+		return contract.predicates.every((predicate) => {
+			switch (predicate.type) {
+				case 'inventory_min':
+					return (this.#world.inventory.get(predicate.itemId) ?? 0) >= predicate.count;
+				case 'position_within':
+					return Math.hypot(this.#world.position.x - predicate.x, this.#world.position.y - predicate.y, this.#world.position.z - predicate.z) <= predicate.radius;
+				case 'block_matches':
+					return this.#world.blocks.get(`${predicate.x},${predicate.y},${predicate.z}`) === predicate.blockId;
+				case 'entity_state':
+					return this.#entityState(predicate.entityId) === predicate.state;
+				case 'action_success_count':
+					return this.#actionResults.filter((result) => result.actionType === predicate.actionType && result.state === 'SUCCEEDED').length >= predicate.count;
+				default:
+					return false;
+			}
+		});
+	}
+
+	#entityState(entityId) {
+		if (this.#world.drop?.stableId?.toLowerCase() === entityId.toLowerCase()) return 'alive';
+		return this.#world.entities.get(entityId.toLowerCase()) ?? null;
+	}
+
+	#disconnectAndResume() {
+		this.#connected = false;
+		this.recoveries.push('BRIDGE_DISCONNECTED');
+		this.emit('disconnected');
+		if (this.#stopped) return;
+		const reconnect = { cancelled: false };
+		this.#reconnectTimer = reconnect;
+		queueMicrotask(() => {
+			if (reconnect.cancelled || this.#reconnectTimer !== reconnect) return;
+			this.#reconnectTimer = null;
+			if (this.#stopped) return;
+			const nextRevision = this.#record.goalRevision + 1;
+			this.#serverInstanceId = `native-fault-fixture-${nextRevision}`;
+			this.ready({ revision: nextRevision, state: 'DISCONNECTED' });
+			this.#emitGoalControl('resume', nextRevision + 1, { goal: this.#record.goal ?? this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe' });
+			this.publishObservation({ attention: true, revision: this.#record.goalRevision });
+		});
+	}
+
+	#emitInbound(type, payload) {
+		const envelope = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId: this.#record.agentId,
+			type,
+			messageId: `native-fault-in-${++this.#eventSequence}`,
+			payload,
+		});
+		validateProtocolV2Envelope(envelope, { direction: 'server_to_coordinator' });
+		this.validatedInbound += 1;
+		if (this.#connected && !this.#stopped) this.emit(type, { agentId: this.#record.agentId, payload: envelope.payload });
+	}
+}
+
+function wireObservation(world, goalRevision, eventSequence, attention) {
+	const item = world.drop;
+	return {
+		goalRevision,
+		observedAtEpochMs: eventSequence,
+		ready: true,
+		status: 'ready',
+		eventSequence,
+		attention,
+		changedFacts: attention ? ['inventory', 'entities'] : [],
+		position: { ...world.position },
+		velocity: { x: 0, y: 0, z: 0 },
+		view: { yaw: 0, pitch: 0 },
+		player: {
+			health: world.health, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5,
+			gameMode: 'survival', onGround: true, inWater: false, onFire: false,
+			air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [],
+		},
+		inventory: {
+			items: [...world.inventory].map(([itemId, count], slot) => ({ itemId, count, damage: 0, maxDamage: 0, slot })),
+			selectedItem: 'minecraft:air',
+		},
+		entities: item === null ? [] : [{ uuid: item.stableId, type: 'minecraft:item', name: 'drop', distance: 1, position: { x: item.x, y: item.y, z: item.z }, itemId: item.itemId, count: item.count }],
+		blocks: [...world.blocks].map(([key, blockId]) => {
+			const [x, y, z] = key.split(',').map(Number);
+			return { x, y, z, blockId, placeableFaces: ['up', 'down', 'north', 'south', 'east', 'west'] };
+		}),
+		nearbyContainers: [],
+		world: { dimension: 'minecraft:overworld', gameTime: eventSequence, dayTime: eventSequence, raining: false, thundering: false },
+		currentAction: { active: false },
+		lastResult: { present: false },
+	};
 }

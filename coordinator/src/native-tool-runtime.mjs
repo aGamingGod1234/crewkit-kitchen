@@ -8,6 +8,7 @@ export class NativeToolRuntime {
 	#observations = new Map();
 	#actions = new Map();
 	#completions = new Map();
+	#staleActions = new Map();
 	#sequence = 0;
 
 	constructor({ bridge, onFinish = async () => ({ state: 'FINISH_REQUESTED' }), trace = () => {} } = {}) {
@@ -22,6 +23,8 @@ export class NativeToolRuntime {
 	updateObservation(record, observation, { eventSequence = 0, conversation = undefined } = {}) {
 		validateRecord(record);
 		if (!Number.isSafeInteger(eventSequence) || eventSequence < 0) throw new TypeError('eventSequence must be a nonnegative safe integer');
+		const latest = this.#observations.get(record.agentId);
+		if (latest?.goalRevision === record.goalRevision && eventSequence <= latest.eventSequence) return false;
 		this.#observations.set(record.agentId, {
 			goalRevision: record.goalRevision,
 			eventSequence,
@@ -29,6 +32,7 @@ export class NativeToolRuntime {
 			observation: structuredClone(observation ?? {}),
 			...(conversation === undefined ? {} : { conversation: structuredClone(conversation) }),
 		});
+		return true;
 	}
 
 	hasCurrent(record) {
@@ -36,16 +40,17 @@ export class NativeToolRuntime {
 		return latest?.goalRevision === record.goalRevision;
 	}
 
-	async execute(request, record) {
+	async execute(request, record, { lifecycleGeneration = null } = {}) {
 		validateRecord(record);
 		validateRequest(request, record);
+		if (lifecycleGeneration !== null && (!Number.isSafeInteger(lifecycleGeneration) || lifecycleGeneration < 0)) throw new TypeError('lifecycleGeneration must be a nonnegative safe integer or null');
 		if (request.tool.kind === 'observe') {
 			const latest = this.#observations.get(record.agentId);
 			if (latest?.goalRevision !== record.goalRevision) return { eventSequence: 0, goal: record.currentGoal ?? null, observation: {} };
 			const { goalRevision: _goalRevision, ...facts } = latest;
 			return structuredClone(facts);
 		}
-		if (request.tool.kind === 'finish') return this.#finish(request, record);
+		if (request.tool.kind === 'finish') return this.#finish(request, record, lifecycleGeneration);
 		if (request.tool.kind === 'sequence') return this.#executeSequence(request, record);
 		if (request.tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
 		return this.#executeAction(request, record, request.tool);
@@ -64,6 +69,7 @@ export class NativeToolRuntime {
 
 	async #executeAction(request, record, tool, sequenceIndex = null) {
 		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'The Minecraft body is already executing an action');
+		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
 
 		const ordinal = ++this.#sequence;
 		const traceId = validateTraceId(`native-${safeSegment(record.agentId)}-${record.goalRevision}-${ordinal}`.slice(0, 128));
@@ -123,6 +129,11 @@ export class NativeToolRuntime {
 		return true;
 	}
 
+	isActionResultStale(record, payload = {}) {
+		const stale = this.#staleActions.get(record.agentId);
+		return stale?.has(actionResultKey(payload.goalRevision, payload.actionId)) === true;
+	}
+
 	onCompletionResult(record, payload = {}) {
 		const active = this.#completions.get(record.agentId);
 		if (active === undefined || active.goalRevision !== record.goalRevision) return false;
@@ -146,6 +157,7 @@ export class NativeToolRuntime {
 		}
 		if (active !== undefined) {
 			this.#actions.delete(agentId);
+			this.#rememberStaleAction(agentId, active);
 			active.reject(codedError('NATIVE_ACTION_CANCELLED', `Native action cancelled: ${String(reason).slice(0, 128)}`));
 			try {
 				await this.#bridge.send('action_cancel', agentId, { goalRevision: active.goalRevision, actionId: active.actionId });
@@ -154,15 +166,24 @@ export class NativeToolRuntime {
 		return active !== undefined || completion !== undefined;
 	}
 
+	#rememberStaleAction(agentId, active) {
+		let stale = this.#staleActions.get(agentId);
+		if (stale === undefined) {
+			stale = new Set();
+			this.#staleActions.set(agentId, stale);
+		}
+		stale.add(actionResultKey(active.goalRevision, active.actionId));
+		while (stale.size > 32) stale.delete(stale.values().next().value);
+	}
+
 	async disposeAll(reason = 'coordinator_stopped') {
 		await Promise.allSettled([...new Set([...this.#observations.keys(), ...this.#actions.keys(), ...this.#completions.keys()])].map((agentId) => this.dispose(agentId, reason)));
 	}
 
-	async #finish(request, record) {
+	async #finish(request, record, lifecycleGeneration) {
+		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'The Minecraft body is already executing an action');
 		if (request.tool.status === 'impossible') {
-			const result = { state: 'IMPOSSIBLE', verified: false, reasonCode: 'MODEL_REPORTED_IMPOSSIBLE' };
-			await this.#onFinish({ record, request, result });
-			return result;
+			return { state: 'FAILED', verified: false, reasonCode: 'IMPOSSIBLE_NOT_VERIFIED' };
 		}
 		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
 		const ordinal = ++this.#sequence;
@@ -198,7 +219,7 @@ export class NativeToolRuntime {
 			rejectCompletion(error);
 		}
 		const result = await completion;
-		await this.#onFinish({ record, request, result });
+		await this.#onFinish({ record, request, result, lifecycleGeneration });
 		return result;
 	}
 }
@@ -220,4 +241,5 @@ function validateRequest(request, record) {
 }
 
 function safeSegment(value) { return String(value).replace(/[^A-Za-z0-9._:-]/g, '_') || 'item'; }
+function actionResultKey(goalRevision, actionId) { return `${goalRevision}:${String(actionId ?? '')}`; }
 function codedError(code, message) { return Object.assign(new Error(message), { code }); }

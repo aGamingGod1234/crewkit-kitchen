@@ -38,6 +38,7 @@ test('accepts every exact action shape and returns a detached value', () => {
 		{ type: 'select_item', itemId: 'minecraft:diamond_sword' },
 		{ type: 'use_item', durationMs: 250 },
 		{ type: 'break_block', x: 1, y: 64, z: 2, timeoutMs: 5_000 },
+		{ type: 'pick_up_item', targetSelector: '00000000-0000-0000-0000-000000000002' },
 		{ type: 'place_block', x: 1, y: 64, z: 2, face: 'up', itemId: 'minecraft:stone' },
 		{ type: 'chat', message: 'Ready.' },
 		{ type: 'chat', message: 'Meet behind the tower.', audience: 'direct', recipientId: '00000000-0000-0000-0000-000000000001' },
@@ -93,7 +94,8 @@ test('rejects unknown fields, unsupported actions, and unsafe numeric/text value
 	assert.throws(() => validateAction({ type: 'interact_entity', targetId: 'nearest_player', hand: 'main', expectedItemId: 'minecraft:air' }), /UUID/);
 	assert.throws(() => validateAction({ type: 'interact_block', x: 1, y: 64, z: 2, face: 'north', hand: 'third', expectedItemId: 'minecraft:air' }), /hand/);
 	assert.throws(() => validateAction({ type: 'menu_button', menuId: 'minecraft:enchantment', buttonId: 256, timeoutMs: 5_000 }), /buttonId/);
-	for (const type of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+	assert.throws(() => validateAction({ type: 'pick_up_item', targetSelector: 'nearest_item' }), /UUID/);
+	for (const type of ['build_sequence', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
 		assert.throws(() => validateAction({ type }), /Unsupported action/);
 	}
 });

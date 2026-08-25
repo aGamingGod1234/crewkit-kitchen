@@ -130,12 +130,6 @@ export class AgentPlanner {
 			} catch (error) {
 				this.#record('planner_failed', record, { operation: 'native_turn', errorCode: error?.code ?? 'NATIVE_TURN_FAILED', retry: false, traceId });
 				safeVerbose(onVerbose, 'error', verboseErrorMessage('Native turn failed', error));
-				if (!preserveState && this.#isCurrent(agentId, goalRevision) && !['STALE_PLAN', 'PLAN_CANCELLED'].includes(error?.code)) {
-					this.#registry.setState(agentId, DynamicAgentState.ERROR, {
-						goalRevision,
-						error: { code: String(error?.code ?? 'NATIVE_TURN_FAILED').slice(0, 128), message: String(error?.message ?? error).slice(0, 2_048) },
-					});
-				}
 				throw error;
 			}
 		}, { lane: record.provider, priority });
@@ -179,7 +173,7 @@ export class AgentPlanner {
 							retry: initializationRetryCount > 0,
 							traceId,
 						}, async () => {
-							const created = await this.#codexService.createAgent(record, { recoverySummary });
+							const created = await this.#codexService.createAgent(record, { recoverySummary, controlProtocol: 'arena_script' });
 							await created.setGoalRevision(goalRevision);
 							return created;
 						}, null, onVerbose);

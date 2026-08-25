@@ -68,7 +68,7 @@ export class ProgramRuntimeManager {
 		}
 		const state = this.#state(record, observation, eventSequence, traceId ?? decision?.traceId);
 		if (decision?.directive === 'finish') {
-			this.#setCompletionContract(state, record, decision.completionContract);
+			this.#initializeCompletionContract(state, record, decision.completionContract);
 			if (decision.status === 'completed') this.#requestCompletion(record, state);
 			else this.#setTerminalState(record, DynamicAgentState.ERROR);
 			return state.engine?.snapshot() ?? null;
@@ -76,7 +76,7 @@ export class ProgramRuntimeManager {
 		if (decision?.directive !== 'replace' || typeof decision.source !== 'string') {
 			throw codedError('INVALID_PLANNER_DIRECTIVE', 'Initial model decision must replace with ArenaScript source');
 		}
-		this.#setCompletionContract(state, record, decision.completionContract);
+		this.#initializeCompletionContract(state, record, decision.completionContract);
 		return this.#installSource(state, record, decision.source, observation, eventSequence);
 	}
 
@@ -343,7 +343,7 @@ export class ProgramRuntimeManager {
 		let compiled;
 		try {
 			this.#record('program_compile_started', record, { eventSequence });
-			compiled = parseArenaScript(source);
+			compiled = compileGoalProgram(source, state.completionContract);
 		} catch (error) {
 			this.#traceState(state, 'program_sandbox_error', {
 				result: { code: error?.code ?? 'ARENA_SCRIPT_COMPILE_ERROR', message: String(error?.message ?? error).slice(0, 512) },
@@ -404,7 +404,6 @@ export class ProgramRuntimeManager {
 			});
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return null;
 			if (decision?.directive !== 'replace') throw codedError('INVALID_COMPILER_CORRECTION', 'Compiler correction must replace with fresh ArenaScript source');
-			this.#setCompletionContract(state, record, decision.completionContract);
 			if (context === null) return this.#installSource(state, record, decision.source, observation, eventSequence);
 			if (!sameEngineRequest(state.engine.snapshot(), context)) {
 				state.engine.failDirectiveRequest(context);
@@ -417,7 +416,7 @@ export class ProgramRuntimeManager {
 				return null;
 			}
 			let compiled;
-			try { compiled = parseArenaScript(decision.source); }
+			try { compiled = compileGoalProgram(decision.source, state.completionContract); }
 			catch (nextError) {
 				if (nextError instanceof ArenaScriptError) {
 					this.#traceState(state, 'program_sandbox_error', {
@@ -482,6 +481,7 @@ export class ProgramRuntimeManager {
 					attentionPriority: context.priority,
 					attentionTrigger: context.trigger,
 					...(context.actionFailure === undefined ? {} : { actionFailure: context.actionFailure }),
+					completionContract: state.completionContract,
 					observation: context.observation,
 				}, this.#plannerContext(record.agentId)),
 				traceId: nextTraceId(state),
@@ -491,7 +491,6 @@ export class ProgramRuntimeManager {
 			if (state.disposed || this.#registry.get(record.agentId)?.goalRevision !== record.goalRevision) return;
 			if (decision?.traceId !== undefined) this.#setTrace(state, decision.traceId);
 			if (decision?.directive === 'replace') {
-				this.#setCompletionContract(state, record, decision.completionContract);
 				if (!sameEngineRequest(state.engine.snapshot(), context)) {
 					state.engine.failDirectiveRequest(context);
 					this.#traceState(state, 'program_replacement_rejected', {
@@ -503,7 +502,7 @@ export class ProgramRuntimeManager {
 					return;
 				}
 				let compiled;
-				try { compiled = parseArenaScript(decision.source); }
+				try { compiled = compileGoalProgram(decision.source, state.completionContract); }
 				catch (error) {
 					if (error instanceof ArenaScriptError) {
 						this.#traceState(state, 'program_sandbox_error', {
@@ -527,7 +526,6 @@ export class ProgramRuntimeManager {
 				const accepted = sameEngineRequest(state.engine.snapshot(), context);
 				state.engine.applyDirective({ ...context, directive: decision?.directive, status: decision?.status });
 				if (accepted && decision?.directive === 'finish') {
-					this.#setCompletionContract(state, record, decision.completionContract);
 					state.terminalStatus = decision.status;
 				}
 				else if (accepted && ['continue', 'replace'].includes(decision?.directive)) state.terminalStatus = null;
@@ -848,7 +846,7 @@ export class ProgramRuntimeManager {
 		}
 	}
 
-	#setCompletionContract(state, record, value) {
+	#initializeCompletionContract(state, record, value) {
 		if (value === null || value === undefined) throw codedError('CONTRACT_REQUIRED', 'A factual completionContract is required before a program can finish');
 		let normalized;
 		try { normalized = parseCompletionContract(value, { goalRevision: record.goalRevision }); }
@@ -911,6 +909,27 @@ export class ProgramRuntimeManager {
 		this.#clearTimeout(state.completionRetryTimer);
 		state.completionRetryTimer = null;
 	}
+}
+
+const ACKNOWLEDGEMENT_PRIMITIVES = new Set(['chat', 'wait', 'look_at']);
+
+function compileGoalProgram(source, completionContract) {
+	const compiled = parseArenaScript(source);
+	const requiresWorldProgress = completionContract?.predicates?.some((predicate) => (
+		predicate.type !== 'action_success_count' || predicate.actionType !== 'chat'
+	)) === true;
+	const fulfillsExactActionContract = completionContract?.predicates?.every((predicate) => (
+		predicate.type === 'action_success_count' && compiled.primitiveCalls.includes(predicate.actionType)
+	)) === true;
+	const acknowledges = compiled.primitiveCalls.includes('chat');
+	const progresses = compiled.primitiveCalls.some((primitive) => !ACKNOWLEDGEMENT_PRIMITIVES.has(primitive));
+	if (requiresWorldProgress && !fulfillsExactActionContract && acknowledges && !progresses) {
+		throw new ArenaScriptError(
+			'ACKNOWLEDGEMENT_ONLY_PROGRAM',
+			'ArenaScript ACKNOWLEDGEMENT_ONLY_PROGRAM: a physical goal cannot replace its program with only chat, waiting, or looking; acknowledge briefly and include the first concrete world action in the same program',
+		);
+	}
+	return compiled;
 }
 
 function versionKey(record) { return `${record.agentId}\u0000${record.goalRevision}`; }

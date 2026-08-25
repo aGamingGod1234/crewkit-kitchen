@@ -48,7 +48,7 @@ export class ActiveGoalSupervisor {
 		return token;
 	}
 
-	end(token, { progress = false } = {}) {
+	end(token, { progress = false, scheduleRecovery = true } = {}) {
 		if (this.#closed || token === null || typeof token !== 'object') return false;
 		const entry = this.#current(token);
 		if (entry === null || !entry.tokens.delete(token.operationId)) return false;
@@ -56,7 +56,7 @@ export class ActiveGoalSupervisor {
 			entry.failures = 0;
 			entry.progressVersion += 1;
 		}
-		this.#ensureEntry(entry, progress ? 'progress_settled' : 'work_settled');
+		if (scheduleRecovery) this.#ensureEntry(entry, progress ? 'progress_settled' : 'work_settled');
 		return true;
 	}
 

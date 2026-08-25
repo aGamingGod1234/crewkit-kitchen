@@ -48,6 +48,7 @@ export const ACTION_FIELDS = Object.freeze({
 	select_item: Object.freeze(['itemId']),
 	use_item: Object.freeze(['durationMs']),
 	break_block: Object.freeze(['x', 'y', 'z', 'timeoutMs']),
+	pick_up_item: Object.freeze(['targetSelector']),
 	place_block: Object.freeze(['x', 'y', 'z', 'face', 'itemId', 'desiredState']),
 	chat: Object.freeze(['message', 'audience', 'recipientId']),
 	wait: Object.freeze(['durationMs']),

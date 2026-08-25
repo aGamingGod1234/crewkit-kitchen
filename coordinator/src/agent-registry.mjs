@@ -20,7 +20,7 @@ export const DynamicAgentState = Object.freeze({
 });
 
 const DYNAMIC_AGENT_STATES = new Set(Object.values(DynamicAgentState));
-const ACTIVE_ON_RELOAD = new Set([
+const DISCONNECT_ON_RELOAD = new Set([
 	DynamicAgentState.STARTING,
 	DynamicAgentState.PLANNING,
 	DynamicAgentState.ACTING,
@@ -197,7 +197,7 @@ export class AgentRegistry {
 export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP, reload = false } = {}) {
 	if (!isPlainObject(value)) throw new TypeError('agent record must be an object');
 	const state = requireState(value.state ?? DynamicAgentState.IDLE);
-	const normalizedState = reload && ACTIVE_ON_RELOAD.has(state) ? DynamicAgentState.PAUSED : state;
+	const normalizedState = reload && DISCONNECT_ON_RELOAD.has(state) ? DynamicAgentState.DISCONNECTED : state;
 	const goalRevision = nonnegativeInteger(value.goalRevision ?? 0, 'goalRevision');
 	const queue = value.queue ?? [];
 	if (!Array.isArray(queue)) throw new TypeError('agent queue must be an array');

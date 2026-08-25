@@ -83,6 +83,22 @@ test('requests a continuation when a fresh program falls through before its firs
 	assert.equal(modelRequests[0].trigger, 'program_exhausted');
 });
 
+test('picks up an observed dropped item by its stable identity', () => {
+	const droppedItemId = '00000000-0000-0000-0000-000000000099';
+	const { dispatched } = engineFor(`
+		program.onUnhandledAttention("continue_and_notify");
+		const droppedLog = world.nearest(world.items({ tag: "#minecraft:logs" }));
+		if (droppedLog !== null) {
+			await player.pickUpItem({ targetSelector: droppedLog.stableId });
+		}
+	`, { initialObservation: observation({
+		items: [{ stableId: droppedItemId, itemId: 'minecraft:spruce_log', count: 1, x: 2, y: 64, z: 0, tags: ['#minecraft:logs'] }],
+	}) });
+	assert.equal(dispatched.length, 1);
+	assert.equal(dispatched[0].action.type, 'pick_up_item');
+	assert.deepEqual(Object.fromEntries(Object.entries(dispatched[0].action.arguments)), { targetSelector: droppedItemId });
+});
+
 test('measures a multi-tree pickup loop instead of assuming a tree yield or pickup range', () => {
 	const source = `
 		program.onUnhandledAttention("continue_and_notify");

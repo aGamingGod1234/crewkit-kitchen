@@ -13,12 +13,14 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 final class SpeechCaptureEngine implements AutoCloseable {
 	private final Transcriber transcriber;
 	private final ScheduledExecutorService scheduler;
 	private final long silenceMilliseconds;
 	private final int maxSamples;
+	private final Consumer<InputLatency> latencyObserver;
 	private final Map<UUID, Utterance> utterances = new LinkedHashMap<>();
 	private final Map<UUID, Long> sequences = new LinkedHashMap<>();
 	private final Map<UUID, TranscriptQueue> transcriptQueues = new LinkedHashMap<>();
@@ -31,12 +33,23 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			long silenceMilliseconds,
 			int maxSamples
 	) {
+		this(transcriber, scheduler, silenceMilliseconds, maxSamples, ignored -> { });
+	}
+
+	SpeechCaptureEngine(
+			Transcriber transcriber,
+			ScheduledExecutorService scheduler,
+			long silenceMilliseconds,
+			int maxSamples,
+			Consumer<InputLatency> latencyObserver
+	) {
 		this.transcriber = Objects.requireNonNull(transcriber, "transcriber must not be null");
 		this.scheduler = Objects.requireNonNull(scheduler, "scheduler must not be null");
 		if (silenceMilliseconds < 1L) throw new IllegalArgumentException("silenceMilliseconds must be positive");
 		if (maxSamples < 1) throw new IllegalArgumentException("maxSamples must be positive");
 		this.silenceMilliseconds = silenceMilliseconds;
 		this.maxSamples = maxSamples;
+		this.latencyObserver = Objects.requireNonNull(latencyObserver, "latencyObserver must not be null");
 	}
 
 	void accept(
@@ -80,6 +93,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			}
 			if (decoded != null) {
 				utterance.append(decoded);
+				utterance.lastPacketNanos = System.nanoTime();
 				if (utterance.timeout != null) utterance.timeout.cancel(false);
 				Utterance current = utterance;
 				utterance.timeout = scheduler.schedule(
@@ -110,7 +124,9 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				utterance.whispering,
 				Arrays.copyOf(utterance.samples, utterance.length),
 				utterance.deliveryExecutor,
-				utterance.delivery
+				utterance.delivery,
+				utterance.lastPacketNanos,
+				System.nanoTime()
 		);
 	}
 
@@ -127,7 +143,9 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				utterance.whispering,
 				new short[0],
 				utterance.deliveryExecutor,
-				utterance.delivery
+				utterance.delivery,
+				utterance.lastPacketNanos,
+				System.nanoTime()
 		);
 	}
 
@@ -136,6 +154,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			completeTranscription(utterance, null, null);
 			return;
 		}
+		long transcriptionStartedNanos = System.nanoTime();
 		CompletionStage<SpeechWorkerClient.Transcript> stage;
 		try {
 			stage = Objects.requireNonNull(transcriber.transcribe(
@@ -145,10 +164,31 @@ final class SpeechCaptureEngine implements AutoCloseable {
 					utterance.samples
 			), "transcriber returned null");
 		} catch (RuntimeException failure) {
+			reportLatency(utterance, transcriptionStartedNanos, System.nanoTime());
 			completeTranscription(utterance, null, failure);
 			return;
 		}
-		stage.whenComplete((transcript, failure) -> completeTranscription(utterance, transcript, failure));
+		stage.whenComplete((transcript, failure) -> {
+			reportLatency(utterance, transcriptionStartedNanos, System.nanoTime());
+			completeTranscription(utterance, transcript, failure);
+		});
+	}
+
+	private void reportLatency(CompletedUtterance utterance, long transcriptionStartedNanos, long completedNanos) {
+		long endpointNanos = Math.max(0L, utterance.endpointCompletedNanos - utterance.lastPacketNanos);
+		long transcriptionNanos = Math.max(0L, completedNanos - transcriptionStartedNanos);
+		long totalNanos = Math.max(0L, completedNanos - utterance.lastPacketNanos);
+		try {
+			latencyObserver.accept(new InputLatency(
+					utterance.playerId,
+					utterance.sequence,
+					TimeUnit.NANOSECONDS.toMillis(endpointNanos),
+					TimeUnit.NANOSECONDS.toMillis(transcriptionNanos),
+					TimeUnit.NANOSECONDS.toMillis(totalNanos)
+			));
+		} catch (RuntimeException ignored) {
+			// Timing diagnostics must never interrupt speech delivery.
+		}
 	}
 
 	private void completeTranscription(
@@ -252,6 +292,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		private final int maxSamples;
 		private short[] samples;
 		private int length;
+		private long lastPacketNanos;
 		private ScheduledFuture<?> timeout;
 
 		private Utterance(
@@ -289,7 +330,18 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			boolean whispering,
 			short[] samples,
 			Executor deliveryExecutor,
-			TranscriptDelivery delivery
+			TranscriptDelivery delivery,
+			long lastPacketNanos,
+			long endpointCompletedNanos
+	) {
+	}
+
+	record InputLatency(
+			UUID playerId,
+			long utteranceSequence,
+			long endpointMilliseconds,
+			long transcriptionMilliseconds,
+			long totalMilliseconds
 	) {
 	}
 

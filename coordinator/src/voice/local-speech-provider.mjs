@@ -35,6 +35,10 @@ export class LocalSpeechProvider {
 		return new LocalSpeechProvider(options);
 	}
 
+	async warmup({ signal } = {}) {
+		await this.#request({ op: 'warmup' }, signal);
+	}
+
 	async synthesize({ text, speed = 1, signal } = {}) {
 		if (typeof text !== 'string' || text.trim() === '') throw new TypeError('text must not be blank');
 		if ([...text].length > MAX_TTS_TEXT_CODE_POINTS) throw new TypeError('text must be at most 280 Unicode code points');

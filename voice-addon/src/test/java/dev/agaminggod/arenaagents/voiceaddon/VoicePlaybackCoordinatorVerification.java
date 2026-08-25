@@ -23,6 +23,7 @@ final class VoicePlaybackCoordinatorVerification {
 	static int verify() {
 		int assertions = 0;
 		assertions += verifyUnavailableSpeechDegradesWithoutSynthesis();
+		assertions += verifyOutputLatencyReportsFirstPlayback();
 		assertions += verifySuccessfulPlaybackUsesRegisteredEntityAndRadius();
 		assertions += verifyReplacementStopsThePreviousUtterance();
 		assertions += verifyStopReplacementAndCloseCancelPendingSynthesis();
@@ -31,6 +32,28 @@ final class VoicePlaybackCoordinatorVerification {
 		assertions += verifyStartFailureWinsOverSynchronousStopCallback();
 		assertions += verifyUnregisterAndCloseStopPlayback();
 		return assertions;
+	}
+
+	private static int verifyOutputLatencyReportsFirstPlayback() {
+		RecordingSynthesizer synthesizer = new RecordingSynthesizer();
+		RecordingTransport transport = new RecordingTransport();
+		List<VoicePlaybackCoordinator.OutputLatency> latencies = new ArrayList<>();
+		VoicePlaybackCoordinator coordinator = new VoicePlaybackCoordinator(
+				synthesizer, Runnable::run, transport, latencies::add
+		);
+		coordinator.registerAgent(AGENT, ENTITY);
+		coordinator.speak(request(30L));
+		synthesizer.completeNext(new short[] { 1, 2 });
+		assertEquals(1, latencies.size(), "one output latency sample");
+		VoicePlaybackCoordinator.OutputLatency latency = latencies.getFirst();
+		assertEquals(AGENT, latency.agentId(), "output latency agent identity");
+		assertEquals(30L, latency.conversationSequence(), "output latency conversation sequence");
+		assertEquals(true, latency.synthesisMilliseconds() >= 0L,
+				"output synthesis latency is non-negative");
+		assertEquals(true, latency.firstPlaybackMilliseconds() >= latency.synthesisMilliseconds(),
+				"first playback latency includes synthesis");
+		coordinator.close();
+		return 5;
 	}
 
 	private static int verifyUnavailableSpeechDegradesWithoutSynthesis() {

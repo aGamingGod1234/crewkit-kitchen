@@ -51,7 +51,9 @@ test('checked-in live matrix covers every provider with real model and setting c
 		}
 		assert.ok(scenarios.every((scenario) => scenario.id === 'codex-luna-xhigh-fast-wooden-pickaxe'
 			? scenario.requireFactualSuccess && scenario.assertions.some((assertion) => assertion.type === 'rcon')
-			: ['chat', 'action', 'program'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
+			: scenario.provider === 'codex'
+				? ['chat', 'action'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))
+				: ['chat', 'action', 'program'].every((type) => scenario.assertions.some((assertion) => assertion.type === type))));
 	}
 	assert.deepEqual([...new Set(matrix.scenarios.filter((scenario) => scenario.provider === 'cursor').map((scenario) => scenario.model))], ['composer-2.5', 'grok-4.5', 'grok-4.6']);
 	assert.deepEqual([...new Set(matrix.scenarios.map((scenario) => scenario.rosterSize))].sort((left, right) => left - right), [1, 8, 16]);

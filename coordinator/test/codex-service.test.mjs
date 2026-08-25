@@ -67,11 +67,44 @@ test('Codex service defaults dynamic profiles to the priority app-server tier', 
 	await service.stop();
 });
 
+test('Codex service forwards app-server diagnostics to the coordinator error log', (t) => {
+	const diagnostics = [];
+	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));
+	const transport = new FakeSharedTransport();
+	new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	transport.emit('diagnostic', 'failed to spawn required runtime sidecar');
+	assert.deepEqual(diagnostics, ['[codex-app-server] failed to spawn required runtime sidecar']);
+});
+
+test('direct Codex callers default to native Minecraft tools when protocol is omitted', async () => {
+	const transport = new FakeSharedTransport();
+	let prepareCalls = 0;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, {
+		transport,
+		minecraftWorkspace: {
+			async prepare() {
+				prepareCalls += 1;
+				return {
+					cwd: 'C:\\shared\\minecraft-agent',
+					selectedCapabilityRoots: [{ id: 'minecraft-control', location: { type: 'environment', environmentId: 'local', path: 'C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control' } }],
+				};
+			},
+		},
+	});
+	await service.createAgent(profile('agent-direct-default'));
+	const threadStart = transport.calls.find((call) => call.method === 'thread/start');
+	assert.equal(prepareCalls, 1);
+	assert.equal(threadStart.params.cwd, 'C:\\shared\\minecraft-agent');
+	assert.equal(threadStart.params.dynamicTools.some((tool) => tool.name === 'observe'), true);
+	assert.deepEqual(threadStart.params.selectedCapabilityRoots, [{ id: 'minecraft-control', location: { type: 'environment', environmentId: 'local', path: 'C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control' } }]);
+	await service.stop();
+});
+
 test('Codex service shares one initialized transport across isolated agent threads', async () => {
 	const transport = new FakeSharedTransport();
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const first = await service.createAgent(profile('agent-a'));
-	const second = await service.createAgent(profile('agent-b'));
+	const first = await service.createAgent(profile('agent-a'), { controlProtocol: 'arena_script' });
+	const second = await service.createAgent(profile('agent-b'), { controlProtocol: 'arena_script' });
 	assert.equal(transport.calls.filter((call) => call.method === 'initialize').length, 1);
 	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 2);
 	await first.setGoalRevision(1);
@@ -113,7 +146,7 @@ test('Codex session metadata stays warm on the same exact profile across sequent
 	const transport = new FakeSharedTransport();
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
 	const selected = profile('agent-session');
-	const agent = await service.createAgent(selected);
+	const agent = await service.createAgent(selected, { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	await agent.decide('first authoritative state', { goalRevision: 1 });
 	const first = agent.sessionMetadata();
@@ -153,7 +186,7 @@ test('Codex service accepts the streamed agent-message contract when no complete
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-streamed'));
+	const agent = await service.createAgent(profile('agent-streamed'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decisionPromise = agent.decide('Observation.', { goalRevision: 1 });
 	await Promise.resolve();
@@ -168,7 +201,7 @@ test('Codex streams only visible agent output in real time and isolates verbose 
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-verbose-output'));
+	const agent = await service.createAgent(profile('agent-verbose-output'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const events = [];
 	const decisionPromise = agent.decide('Observation.', {
@@ -200,7 +233,7 @@ test('Codex malformed output records one final error row for the attempt', async
 		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'completed' } } });
 	};
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-malformed-record'));
+	const agent = await service.createAgent(profile('agent-malformed-record'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const rows = [];
 	const turnRecorder = { async record(row) { rows.push(row); } };
@@ -226,7 +259,7 @@ test('Codex records authoritative identity, scheduler wait, native token usage, 
 		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'completed' } } });
 	};
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-native-metrics'));
+	const agent = await service.createAgent(profile('agent-native-metrics'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const rows = [];
 	await agent.decide('Observation.', { goalRevision: 1, queueWaitMs: 37, turnRecorder: { async record(row) { rows.push(row); } } });
@@ -243,7 +276,7 @@ test('Codex marks an explicit provider 429 as rate limited without inventing tok
 		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'failed', error: { codexErrorInfo: 'usageLimitExceeded', message: 'quota unavailable' } } } });
 	};
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-rate-limited'));
+	const agent = await service.createAgent(profile('agent-rate-limited'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const rows = [];
 	await assert.rejects(agent.decide('Observation.', { goalRevision: 1, attempt: 2, retry: true, turnRecorder: { async record(row) { rows.push(row); } } }));
@@ -259,7 +292,7 @@ test('Codex does not label overloaded or prose-only failures as rate limited', a
 		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'failed', error: { codexErrorInfo: 'serverOverloaded', message: 'prose mentions HTTP 429 and too many requests' } } } });
 	};
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-not-rate-limited'));
+	const agent = await service.createAgent(profile('agent-not-rate-limited'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const rows = [];
 	await assert.rejects(agent.decide('Observation.', { goalRevision: 1, turnRecorder: { async record(row) { rows.push(row); } } }));
@@ -271,7 +304,7 @@ test('Codex service cancels an over-budget streamed planner decision before pars
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace', maxDecisionBytes: 32 }, { transport });
-	const agent = await service.createAgent(profile('agent-bounded'));
+	const agent = await service.createAgent(profile('agent-bounded'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const events = [];
 	const decisionPromise = agent.decide('Observation.', {
@@ -296,8 +329,8 @@ test('Codex threads use provider-scoped per-agent workspaces', async () => {
 		},
 	};
 	const service = new CodexService({ cwd: 'C:\\\\workspace' }, { transport, workspaceManager });
-	await service.createAgent(profile('agent-a'));
-	await service.createAgent(profile('agent-b'));
+	await service.createAgent(profile('agent-a'), { controlProtocol: 'arena_script' });
+	await service.createAgent(profile('agent-b'), { controlProtocol: 'arena_script' });
 
 	assert.deepEqual(prepared, [
 		{ provider: 'codex', agentId: 'agent-a' },
@@ -323,7 +356,7 @@ test('native Codex threads share the Minecraft workspace and selected skill root
 			prepared.push('prepared');
 			return {
 				cwd: 'C:\\shared\\minecraft-agent',
-				selectedCapabilityRoots: ['C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control'],
+				selectedCapabilityRoots: [{ id: 'minecraft-control', location: { type: 'environment', environmentId: 'local', path: 'C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control' } }],
 			};
 		},
 	};
@@ -335,7 +368,7 @@ test('native Codex threads share the Minecraft workspace and selected skill root
 	for (const call of transport.calls.filter((entry) => entry.method === 'thread/start')) {
 		assert.equal(call.params.cwd, 'C:\\shared\\minecraft-agent');
 		assert.deepEqual(call.params.runtimeWorkspaceRoots, ['C:\\shared\\minecraft-agent']);
-		assert.deepEqual(call.params.selectedCapabilityRoots, ['C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control']);
+		assert.deepEqual(call.params.selectedCapabilityRoots, [{ id: 'minecraft-control', location: { type: 'environment', environmentId: 'local', path: 'C:\\shared\\minecraft-agent\\.codex\\skills\\minecraft-control' } }]);
 		assert.equal(call.params.sandbox, 'read-only');
 	}
 	await service.stop();
@@ -345,7 +378,7 @@ test('concurrent stop paths interrupt a Codex turn exactly once and reject its l
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-a'));
+	const agent = await service.createAgent(profile('agent-a'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await Promise.resolve();
@@ -361,7 +394,7 @@ test('an abort-time stale interrupt rejection cannot escape as an unhandled proc
 	transport.autoComplete = false;
 	transport.rejectInterrupt = true;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-abort-race'));
+	const agent = await service.createAgent(profile('agent-abort-race'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const controller = new AbortController();
 	const decision = agent.decide('Observation.', { goalRevision: 1, signal: controller.signal });
@@ -387,7 +420,7 @@ test('Codex turn start is bounded by the planning timeout', async () => {
 		},
 		cancelSchedule() {},
 	}, { transport });
-	const agent = await service.createAgent(profile('agent-turn-start-timeout'));
+	const agent = await service.createAgent(profile('agent-turn-start-timeout'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
@@ -403,7 +436,7 @@ test('aborting before turn start settles the decision promptly', async () => {
 	const transport = new FakeSharedTransport();
 	transport.holdTurnStart = true;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-abort-before-turn-id'));
+	const agent = await service.createAgent(profile('agent-abort-before-turn-id'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const controller = new AbortController();
 	const decision = agent.decide('Observation.', { goalRevision: 1, signal: controller.signal });
@@ -422,7 +455,7 @@ test('disposing before turn start settles the decision promptly', async () => {
 	const transport = new FakeSharedTransport();
 	transport.holdTurnStart = true;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-dispose-before-turn-id'));
+	const agent = await service.createAgent(profile('agent-dispose-before-turn-id'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
@@ -441,7 +474,7 @@ test('a completed notification cannot be mistaken for a delayed turn-start respo
 	transport.holdTurnStart = true;
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-notification-before-start-response'));
+	const agent = await service.createAgent(profile('agent-notification-before-start-response'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
@@ -456,7 +489,7 @@ test('a late prior-turn completion cannot satisfy a new turn before its ID is kn
 	transport.holdTurnStart = true;
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
-	const agent = await service.createAgent(profile('agent-stale-notification'));
+	const agent = await service.createAgent(profile('agent-stale-notification'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
@@ -478,7 +511,7 @@ test('an empty completion before the turn-start response rejects without an unha
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
 	t.after(() => service.stop());
-	const agent = await service.createAgent(profile('agent-empty-before-start-response'));
+	const agent = await service.createAgent(profile('agent-empty-before-start-response'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
@@ -496,7 +529,7 @@ test('interrupting before turn start settles the decision promptly', async (t) =
 	transport.holdTurnStart = true;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
 	t.after(() => service.stop());
-	const agent = await service.createAgent(profile('agent-interrupt-before-turn-id'));
+	const agent = await service.createAgent(profile('agent-interrupt-before-turn-id'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
@@ -516,7 +549,7 @@ test('interrupting as turn-start resolves still cleans up the late provider turn
 	transport.autoComplete = false;
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
 	t.after(() => service.stop());
-	const agent = await service.createAgent(profile('agent-interrupt-at-turn-start'));
+	const agent = await service.createAgent(profile('agent-interrupt-at-turn-start'), { controlProtocol: 'arena_script' });
 	await agent.setGoalRevision(1);
 	const decision = agent.decide('Observation.', { goalRevision: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
@@ -574,6 +607,136 @@ test('native Codex turn executes a Minecraft tool and returns its result before 
 	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
 	const turnStart = transport.calls.find((call) => call.method === 'turn/start').params;
 	assert.equal(Object.hasOwn(turnStart, 'outputSchema'), false);
+	await service.stop();
+});
+
+test('native Codex drains an in-flight tool before completing its turn', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-native-drain'), { controlProtocol: 'native_tools' });
+	t.after(async () => { release?.(); await service.stop(); });
+	await agent.setGoalRevision(1);
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	let started = 0;
+	const turn = agent.act('event: wait for the action', {
+		goalRevision: 1,
+		executeTool: async () => {
+			started += 1;
+			await gate;
+			return { state: 'SUCCEEDED' };
+		},
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('serverRequest', {
+		id: 101,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'drain-call', tool: 'wait', arguments: { durationMs: 1 } },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+	assert.equal(await Promise.race([
+		turn.then(() => 'resolved'),
+		new Promise((resolve) => setImmediate(() => resolve('pending'))),
+	]), 'pending');
+	assert.equal(started, 1);
+	release();
+	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+	assert.equal(transport.calls.some((call) => call.method === '$respond' && call.id === 101), true);
+	await service.stop();
+});
+
+test('native Codex serializes two tool calls within one turn', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-native-serial'), { controlProtocol: 'native_tools' });
+	t.after(async () => { releaseFirst?.(); await service.stop(); });
+	await agent.setGoalRevision(1);
+	let releaseFirst;
+	const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+	let active = 0;
+	let maxActive = 0;
+	const started = [];
+	const turn = agent.act('event: perform two actions', {
+		goalRevision: 1,
+		executeTool: async ({ callId }) => {
+			started.push(callId);
+			active += 1;
+			maxActive = Math.max(maxActive, active);
+			try {
+				if (callId === 'serial-first') await firstGate;
+				return { state: 'SUCCEEDED', callId };
+			} finally {
+				active -= 1;
+			}
+		},
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	for (const [id, callId] of [[102, 'serial-first'], [103, 'serial-second']]) {
+		transport.emit('serverRequest', {
+			id,
+			method: 'item/tool/call',
+			params: { threadId: 'thread-1', turnId: 'turn-1', callId, tool: 'wait', arguments: { durationMs: 1 } },
+		});
+	}
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(started, ['serial-first']);
+	assert.equal(maxActive, 1);
+	releaseFirst();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(started, ['serial-first', 'serial-second']);
+	assert.equal(maxActive, 1);
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+	assert.deepEqual(await turn, { status: 'completed', toolCalls: 2 });
+	const responses = transport.calls
+		.filter((call) => call.method === '$respond')
+		.map((call) => ({ id: call.id, callId: JSON.parse(call.result.contentItems[0].text).callId }));
+	assert.deepEqual(responses, [{ id: 102, callId: 'serial-first' }, { id: 103, callId: 'serial-second' }]);
+	await service.stop();
+});
+
+test('native Codex ignores a late tool call after turn completion while draining', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('agent-native-late-tool'), { controlProtocol: 'native_tools' });
+	t.after(async () => { release?.(); await service.stop(); });
+	await agent.setGoalRevision(1);
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const started = [];
+	const turn = agent.act('event: wait for the current action', {
+		goalRevision: 1,
+		executeTool: async ({ callId }) => {
+			started.push(callId);
+			await gate;
+			return { state: 'SUCCEEDED', callId };
+		},
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('serverRequest', {
+		id: 104,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'current-call', tool: 'wait', arguments: { durationMs: 1 } },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+	transport.emit('serverRequest', {
+		id: 105,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'late-call', tool: 'wait', arguments: { durationMs: 1 } },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(started, ['current-call']);
+	assert.equal(await Promise.race([
+		turn.then(() => 'resolved'),
+		new Promise((resolve) => setImmediate(() => resolve('pending'))),
+	]), 'pending');
+	release();
+	await turn;
+	assert.equal(transport.calls.some((call) => call.method === '$respond' && call.id === 105), false);
 	await service.stop();
 });
 
@@ -769,4 +932,35 @@ test('a real native event takes over in-flight prewarm without waiting or starti
 	assert.deepEqual(executed, [{ kind: 'action', actionType: 'chat', arguments: { message: 'Hi Lucas!', audience: 'public' } }]);
 	assert.equal(transport.calls.filter((call) => call.method === 'turn/start').length, 1);
 	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 1);
+});
+
+test('a real native event starts cleanly after a conversation wake supersedes prewarm revision', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	t.after(() => service.stop());
+	const warming = service.prewarmAgent(profile('agent-prewarm-revision-race'), { goalRevision: 0 });
+	void warming.catch(() => {});
+	await new Promise((resolve) => setImmediate(resolve));
+	const agent = await service.createAgent(profile('agent-prewarm-revision-race'), { controlProtocol: 'native_tools' });
+	await agent.setGoalRevision(1);
+	const executed = [];
+	const realTurn = agent.act('event: conversation wake from Lucas', {
+		goalRevision: 1,
+		executeTool: async (request) => { executed.push(request.tool); return { state: 'SUCCEEDED', delivered: true }; },
+	});
+	void realTurn.catch(() => {});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(transport.calls.filter((call) => call.method === 'turn/steer').length, 0);
+	assert.equal(transport.calls.filter((call) => call.method === 'turn/start').length, 2);
+	assert.equal(transport.calls.filter((call) => call.method === 'turn/interrupt' && call.params.turnId === 'turn-1').length, 1);
+	transport.emit('serverRequest', {
+		id: 141,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-2', callId: 'real-say-after-wake', tool: 'say', arguments: { message: 'Hi Lucas!' } },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-2', status: 'completed' } } });
+	assert.deepEqual(await realTurn, { status: 'completed', toolCalls: 1 });
+	assert.deepEqual(executed, [{ kind: 'action', actionType: 'chat', arguments: { message: 'Hi Lucas!', audience: 'public' } }]);
 });

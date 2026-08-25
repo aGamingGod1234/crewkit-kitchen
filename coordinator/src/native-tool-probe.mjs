@@ -2,8 +2,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdir } from 'node:fs/promises';
 
-import { AgentWorkspaceManager } from './agent-workspace.mjs';
 import { CodexService } from './codex-service.mjs';
+import { MinecraftAgentWorkspace } from './minecraft-agent-workspace.mjs';
 
 const [model = 'gpt-5.6-luna', reasoningEffort = 'low', serviceTier = 'fast'] = process.argv.slice(2);
 const startedAt = performance.now();
@@ -15,7 +15,10 @@ const service = new CodexService({
 	serviceTier,
 	launchProfile: { model, reasoningEffort, serviceTier, cwd: probeRoot },
 }, {
-	workspaceManager: new AgentWorkspaceManager(path.join(os.tmpdir(), 'arena-native-probe-workspaces')),
+	minecraftWorkspace: new MinecraftAgentWorkspace({
+		root: path.join(probeRoot, 'minecraft-agent'),
+		templateRoot: path.resolve('config', 'minecraft-agent'),
+	}),
 });
 
 try {

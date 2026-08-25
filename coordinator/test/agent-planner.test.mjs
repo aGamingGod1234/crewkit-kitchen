@@ -21,6 +21,21 @@ const VALID_DECISION = Object.freeze({
 	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(100);',
 });
 
+test('ArenaScript planning explicitly creates an ArenaScript provider session', async () => {
+	const registry = new FakeRegistry();
+	const optionsSeen = [];
+	const planner = createPlannerForService(registry, {
+		async createAgent(_record, options) {
+			optionsSeen.push(options);
+			return { async setGoalRevision() {}, async decide() { return VALID_DECISION; } };
+		},
+		getAgent() { return null; },
+		async removeAgent() { return false; },
+	});
+	await planner.requestPlan({ agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION });
+	assert.deepEqual(optionsSeen, [{ recoverySummary: null, controlProtocol: 'arena_script' }]);
+});
+
 test('retries one malformed planner decision with bounded corrective feedback', async () => {
 	const registry = new FakeRegistry();
 	const inputs = [];
@@ -613,6 +628,40 @@ test('native turn keeps scheduler and selected Codex profile while delegating bo
 	assert.deepEqual(calls.find((call) => call[0] === 'create')[2], { recoverySummary: null, controlProtocol: 'native_tools' });
 	assert.equal(typeof calls.find((call) => call[0] === 'act')[3], 'function');
 	assert.equal(states[0].state, DynamicAgentState.PLANNING);
+});
+
+test('native turn leaves lifecycle error decisions to the coordinator', async () => {
+	const nativeRecord = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' };
+	const states = [];
+	const failure = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
+	const planner = new AgentPlanner({
+		registry: {
+			assertCurrentRevision() { return nativeRecord; },
+			setState(_agentId, state, options) { states.push({ state, options }); },
+		},
+		scheduler: {
+			schedule(_agentId, operation) { return operation({ signal: new AbortController().signal }); },
+			cancel() { return false; },
+		},
+		codexService: {
+			async createAgent() {
+				return {
+					async setGoalRevision() {},
+					async act() { throw failure; },
+				};
+			},
+			getAgent() { return null; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	await assert.rejects(planner.requestNativeTurn({
+		agentId: AGENT_ID,
+		goalRevision: GOAL_REVISION,
+		input: 'event: goal started',
+		executeTool: async () => ({ state: 'SUCCEEDED' }),
+	}), (error) => error === failure);
+	assert.deepEqual(states.map(({ state }) => state), [DynamicAgentState.PLANNING]);
 });
 
 test('urgent native steering reuses the active selected-model turn without scheduler admission', async () => {

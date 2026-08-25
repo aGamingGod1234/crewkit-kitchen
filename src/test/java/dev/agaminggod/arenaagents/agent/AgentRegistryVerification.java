@@ -222,16 +222,24 @@ public final class AgentRegistryVerification {
 		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("Miner"), START_TIME);
 		registry.start(created.agentId(), "Mine iron", START_TIME + 1L);
 		registry.beginPlanning(created.agentId(), START_TIME + 2L);
+		AgentRecord paused = registry.create("gpt-5.6-sol", "high", Optional.of("Paused Miner"), START_TIME + 2L);
+		registry.start(paused.agentId(), "Wait for the operator", START_TIME + 3L);
+		paused = registry.stop(paused.agentId(), START_TIME + 4L).after();
 
 		AgentRegistrySnapshotCodec codec = new AgentRegistrySnapshotCodec();
 		String encoded = codec.encode(registry.snapshot());
 		AgentRegistry.Snapshot decoded = codec.decode(encoded);
-		AgentRegistry recovered = AgentRegistry.restore(decoded, () -> { }, transition -> { }, START_TIME + 3L);
+		AgentRegistry recovered = AgentRegistry.restore(decoded, () -> { }, transition -> { }, START_TIME + 5L);
 		AgentRecord restored = recovered.require(created.agentId());
-		assertEquals(AgentLifecycleState.PAUSED, restored.state(), "active reload state");
+		assertEquals(AgentLifecycleState.DISCONNECTED, restored.state(), "active reload state");
 		assertEquals(2L, restored.goalRevision(), "reload revision");
 		assertEquals("Mine iron", restored.currentGoal().orElseThrow().prompt(), "reload goal");
-		return 3;
+		AgentRecord restoredPaused = recovered.require(paused.agentId());
+		assertEquals(AgentLifecycleState.PAUSED, restoredPaused.state(), "explicit pause survives reload");
+		assertEquals(paused.goalRevision(), restoredPaused.goalRevision(), "explicit pause revision survives reload");
+		assertEquals(paused.currentGoal().orElseThrow().prompt(), restoredPaused.currentGoal().orElseThrow().prompt(),
+				"explicit pause goal survives reload");
+		return 6;
 	}
 
 	private static int verifyProviderPersistenceAndMigration() {

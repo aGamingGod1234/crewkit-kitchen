@@ -125,6 +125,9 @@ export function validateAction(value) {
 			requireCoordinates(action, true, 'action');
 			requireDuration(action.timeoutMs, 'action.timeoutMs');
 			break;
+		case 'pick_up_item':
+			requireTargetId(action.targetSelector, 'action.targetSelector');
+			break;
 		case 'place_block':
 			requireCoordinates(action, true, 'action');
 			if (!FACES.has(action.face)) throw invalid('INVALID_FIELD', `action.face must be one of ${BLOCK_FACES.join(', ')}`);

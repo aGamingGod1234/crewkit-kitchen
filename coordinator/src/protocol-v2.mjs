@@ -281,6 +281,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#decoder = null;
 	#running = false;
 	#ready = false;
+	#recovering = false;
 	#helloMessageId = null;
 	#reconnectHandle = null;
 	#outboundQueue = [];
@@ -329,6 +330,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (!this.#running) return;
 		this.#running = false;
 		this.#ready = false;
+		this.#recovering = false;
 		if (this.#reconnectHandle !== null) {
 			this.#cancelSchedule(this.#reconnectHandle);
 			this.#reconnectHandle = null;
@@ -443,9 +445,13 @@ export class MultiplexedServerBridge extends EventEmitter {
 			revision(entry?.goalRevision, 'registry goalRevision'),
 		]));
 		if (this.#knownAgentIds.size !== registry.length) throw new ProtocolV2Error('DUPLICATE_AGENT', 'hello_ack registry contains duplicate agents');
+		const recovered = this.#recovering;
+		this.#recovering = false;
 		this.#ready = true;
 		this.#reconnectDelayMs = this.#initialReconnectDelayMs;
-		this.emit('ready', { serverInstanceId: this.#serverInstanceId, registry: structuredClone(registry) });
+		const connection = { serverInstanceId: this.#serverInstanceId, registry: structuredClone(registry) };
+		this.emit('ready', connection);
+		if (recovered) this.emit('recovered', { serverInstanceId: this.#serverInstanceId, registry: structuredClone(registry) });
 	}
 
 	#assertRevision(envelope, guardedTypes) {
@@ -588,6 +594,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 
 	#onClose(socket) {
 		if (socket !== this.#socket) return;
+		if (this.#running) this.#recovering = true;
 		const wasReady = this.#ready;
 		this.#socket = null;
 		this.#ready = false;

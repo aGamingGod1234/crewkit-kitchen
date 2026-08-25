@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, resolveCodexLaunch } from '../src/codex-app-server.mjs';
@@ -48,6 +51,18 @@ const config = {
 	cwd: 'C:\\arena-runtime',
 };
 
+const desktopRuntimeFiles = [
+	'codex.exe',
+	'codex-code-mode-host.exe',
+	'codex-command-runner.exe',
+	'codex-windows-sandbox-setup.exe',
+];
+
+function writeDesktopRuntime(resources, prefix) {
+	mkdirSync(resources, { recursive: true });
+	for (const name of desktopRuntimeFiles) writeFileSync(path.join(resources, name), `${prefix}-${name}`);
+}
+
 test('builds an isolated app-server process command with exact model profile', () => {
 	assert.deepEqual(buildCodexArgs(config), [
 		'app-server', '--stdio',
@@ -76,6 +91,112 @@ test('launches the npm Codex JavaScript entrypoint directly on Windows', () => {
 	assert.equal(launch.command, 'C:\\node.exe');
 	assert.match(launch.args[0], /@openai[\\/]codex[\\/]bin[\\/]codex\.js$/);
 	assert.deepEqual(launch.args.slice(1), buildCodexArgs(config));
+});
+
+test('copies the complete installed Codex desktop runtime to a runnable private cache on Windows', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-desktop-'));
+	try {
+		const programFiles = path.join(root, 'Program Files');
+		const packageName = 'OpenAI.Codex_26.818.8289.0_x64__2p2nqsd0c76g0';
+		const resources = path.join(programFiles, 'WindowsApps', packageName, 'app', 'resources');
+		const localAppData = path.join(root, 'Local');
+		writeDesktopRuntime(resources, 'desktop-codex-fixture');
+
+		const launch = resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: {
+				appdata: path.join(root, 'Roaming'),
+				systemdrive: root,
+			},
+			windowsPackageLocations: [],
+			execPath: 'C:\\node.exe',
+		});
+
+		const cachedCli = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0', 'codex.exe');
+		assert.equal(launch.command, cachedCli);
+		assert.deepEqual(launch.args, buildCodexArgs(config));
+		for (const name of desktopRuntimeFiles) {
+			assert.equal(readFileSync(path.join(path.dirname(cachedCli), name), 'utf8'), `desktop-codex-fixture-${name}`);
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('uses the registered Codex Appx location when WindowsApps cannot be enumerated', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-appx-'));
+	try {
+		const packageRoot = path.join(root, 'OpenAI.Codex_26.818.8289.0_x64__2p2nqsd0c76g0');
+		const resources = path.join(packageRoot, 'app', 'resources');
+		const localAppData = path.join(root, 'Local');
+		writeDesktopRuntime(resources, 'registered-appx-codex-fixture');
+
+		const launch = resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { LOCALAPPDATA: localAppData },
+			windowsPackageLocations: [packageRoot],
+		});
+
+		const cachedCli = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0', 'codex.exe');
+		assert.equal(launch.command, cachedCli);
+		for (const name of desktopRuntimeFiles) {
+			assert.equal(readFileSync(path.join(path.dirname(cachedCli), name), 'utf8'), `registered-appx-codex-fixture-${name}`);
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('reuses a complete private desktop runtime before any Windows package discovery', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-cache-'));
+	try {
+		const localAppData = path.join(root, 'Local');
+		const cachedRuntime = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0');
+		writeDesktopRuntime(cachedRuntime, 'cached-desktop-runtime');
+		let discoveryCalls = 0;
+
+		const launch = resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { LOCALAPPDATA: localAppData },
+			spawnSync: () => {
+				discoveryCalls += 1;
+				throw new Error('package discovery must not run when the complete cache is ready');
+			},
+		});
+
+		assert.equal(launch.command, path.join(cachedRuntime, 'codex.exe'));
+		assert.equal(discoveryCalls, 0);
+		assert.deepEqual(launch.args, buildCodexArgs(config));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('reuses the user profile cache when a packaged launcher redirects LOCALAPPDATA', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-packaged-env-'));
+	try {
+		const userProfile = path.join(root, 'Users', 'lucas');
+		const localAppData = path.join(userProfile, 'AppData', 'Local');
+		const redirectedLocalAppData = path.join(localAppData, 'Packages', 'Minecraft', 'LocalCache', 'Local');
+		const cachedRuntime = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0');
+		writeDesktopRuntime(cachedRuntime, 'user-profile-desktop-runtime');
+		let discoveryCalls = 0;
+
+		const launch = resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { LOCALAPPDATA: redirectedLocalAppData, USERPROFILE: userProfile },
+			spawnSync: () => {
+				discoveryCalls += 1;
+				throw new Error('package discovery must not run when the user profile cache is ready');
+			},
+		});
+
+		assert.equal(launch.command, path.join(cachedRuntime, 'codex.exe'));
+		assert.equal(discoveryCalls, 0);
+		assert.deepEqual(launch.args, buildCodexArgs(config));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test('Codex launch retains provider configuration but strips bridge credentials', () => {

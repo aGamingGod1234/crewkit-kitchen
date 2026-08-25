@@ -144,8 +144,10 @@ test('voice bootstrap closes a worker when binding fails', async () => {
 test('voice bootstrap prefers one local speech runtime for both expressive TTS and STT', async () => {
 	const captured = {};
 	let localCloses = 0;
+	let warmups = 0;
 	let serverCloses = 0;
 	const local = {
+		async warmup() { warmups++; },
 		async synthesize() { return {}; },
 		async transcribe() { return { transcript: '', confidence: 0 }; },
 		async close() { localCloses++; },
@@ -166,6 +168,7 @@ test('voice bootstrap prefers one local speech runtime for both expressive TTS a
 
 	assert.equal(captured.options.provider, local);
 	assert.equal(captured.options.sttProvider, local);
+	assert.equal(warmups, 1);
 	await created.close();
 	assert.equal(serverCloses, 1);
 	assert.equal(localCloses, 1);

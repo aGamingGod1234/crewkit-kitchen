@@ -4,6 +4,7 @@ import json
 import math
 import os
 import sys
+import threading
 
 
 MAX_TTS_CODE_POINTS = 280
@@ -12,19 +13,26 @@ MAX_STT_PCM_BYTES = 48_000 * 2 * 20
 
 _tts_model = None
 _stt_model = None
+_tts_lock = threading.Lock()
+_stt_lock = threading.Lock()
+_warmup_lock = threading.Lock()
+_warmup_started = False
 
 
 def _load_tts():
     global _tts_model
     if _tts_model is not None:
         return _tts_model
-    with contextlib.redirect_stdout(sys.stderr):
-        import torch
-        from chatterbox.tts import ChatterboxTTS
+    with _tts_lock:
+        if _tts_model is not None:
+            return _tts_model
+        with contextlib.redirect_stdout(sys.stderr):
+            import torch
+            from chatterbox.tts import ChatterboxTTS
 
-        requested_device = os.environ.get("ARENA_LOCAL_TTS_DEVICE", "").strip().lower()
-        device = requested_device or ("cuda" if torch.cuda.is_available() else "cpu")
-        _tts_model = ChatterboxTTS.from_pretrained(device=device)
+            requested_device = os.environ.get("ARENA_LOCAL_TTS_DEVICE", "").strip().lower()
+            device = requested_device or ("cuda" if torch.cuda.is_available() else "cpu")
+            _tts_model = ChatterboxTTS.from_pretrained(device=device)
     return _tts_model
 
 
@@ -32,12 +40,52 @@ def _load_stt():
     global _stt_model
     if _stt_model is not None:
         return _stt_model
-    with contextlib.redirect_stdout(sys.stderr):
-        from faster_whisper import WhisperModel
+    with _stt_lock:
+        if _stt_model is not None:
+            return _stt_model
+        with contextlib.redirect_stdout(sys.stderr):
+            import torch
+            from faster_whisper import WhisperModel
 
-        model_name = os.environ.get("ARENA_LOCAL_STT_MODEL", "small.en").strip() or "small.en"
-        _stt_model = WhisperModel(model_name, device="cpu", compute_type="int8")
+            model_name = os.environ.get("ARENA_LOCAL_STT_MODEL", "small.en").strip() or "small.en"
+            requested_device = os.environ.get("ARENA_LOCAL_STT_DEVICE", "auto").strip().lower() or "auto"
+            if requested_device not in {"auto", "cpu", "cuda"}:
+                raise ValueError("ARENA_LOCAL_STT_DEVICE must be auto, cpu, or cuda")
+            devices = ["cuda", "cpu"] if requested_device == "auto" and torch.cuda.is_available() else [
+                "cpu" if requested_device == "auto" else requested_device
+            ]
+            configured_compute = os.environ.get("ARENA_LOCAL_STT_COMPUTE_TYPE", "").strip().lower()
+            last_error = None
+            for device in devices:
+                compute_type = configured_compute or ("float16" if device == "cuda" else "int8")
+                try:
+                    _stt_model = WhisperModel(model_name, device=device, compute_type=compute_type)
+                    break
+                except Exception as error:
+                    last_error = error
+                    if requested_device != "auto" or device == devices[-1]:
+                        raise
+            if _stt_model is None and last_error is not None:
+                raise last_error
     return _stt_model
+
+
+def _warmup_model(name, loader):
+    try:
+        loader()
+    except Exception as error:
+        sys.stderr.write(f"Arena local speech {name} warmup failed: {type(error).__name__}: {error}\n")
+        sys.stderr.flush()
+
+
+def _warmup():
+    global _warmup_started
+    with _warmup_lock:
+        if _warmup_started:
+            return
+        _warmup_started = True
+        threading.Thread(target=_warmup_model, args=("STT", _load_stt), daemon=True).start()
+        threading.Thread(target=_warmup_model, args=("TTS", _load_tts), daemon=True).start()
 
 
 def _tts(request):
@@ -124,6 +172,9 @@ def main():
                 result = _tts(request)
             elif operation == "stt":
                 result = _stt(request)
+            elif operation == "warmup":
+                _warmup()
+                result = {"warming": True}
             else:
                 raise ValueError("Speech operation is invalid")
             _respond({"id": request_id, "ok": True, **result})

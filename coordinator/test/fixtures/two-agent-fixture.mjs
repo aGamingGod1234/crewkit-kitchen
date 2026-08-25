@@ -18,7 +18,7 @@ export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) 
 	const provider = new FixtureProvider({ malformedFirstAgent });
 	const trace = { rows: [], privateRows: [], async write(event, fields) { this.rows.push({ event, ...fields }); }, async writeDiagnostic(event, fields) { this.privateRows.push({ event, ...fields }); } };
 	const coordinator = createDynamicCoordinator(
-		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' }, serviceTier: 'fast' }, limits: { agentCap: 2, planningConcurrency: 2 } },
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' }, serviceTier: 'fast' }, limits: { agentCap: 2, planningConcurrency: 2 } },
 		{ bridge, registry, codexService: provider, traceWriter: trace },
 	);
 	await coordinator.start();

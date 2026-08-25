@@ -94,13 +94,26 @@ public final class CoordinatorStartupSmokeVerification {
 				throw new AssertionError("staged coordinator did not reach the catalog-ready boundary: " + supervisor.failureCode());
 			}
 		} finally {
-			if (supervisor != null) supervisor.close();
-			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
-			restoreProperty(NodeRuntimeLocator.PROPERTY, oldNodePath);
-			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
-			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
-			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
-			deleteTree(packageRoot);
+			AssertionError ownershipFailure = null;
+			try {
+				if (supervisor != null) {
+					supervisor.close();
+					try {
+						assertTrue(!Files.exists(CoordinatorProcessOwnership.ownershipFile(packageRoot)),
+								"coordinator close clears the ownership record");
+					} catch (AssertionError failure) {
+						ownershipFailure = failure;
+					}
+				}
+			} finally {
+				restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+				restoreProperty(NodeRuntimeLocator.PROPERTY, oldNodePath);
+				restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+				restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+				restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
+				deleteTree(packageRoot);
+			}
+			if (ownershipFailure != null) throw ownershipFailure;
 		}
 	}
 

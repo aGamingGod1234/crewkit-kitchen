@@ -44,7 +44,7 @@ public final class CodexAgentServerRuntime {
 		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::tick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
-				VoiceConsentRegistry.revoke(server, handler.getPlayer().getUUID()));
+				VoiceConsentRegistry.clearPlayer(server, handler.getPlayer().getUUID()));
 		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) -> {
 			if (!(entity instanceof net.minecraft.server.level.ServerPlayer player)) return true;
 			return AgentDeathCapture.allowVanillaDeath(
@@ -66,6 +66,11 @@ public final class CodexAgentServerRuntime {
 			supervisor = new CoordinatorProcessSupervisor();
 			if (supervisor.configured() || supervisor.failureCode() != null) {
 				COORDINATORS.put(server, supervisor);
+			}
+			if (supervisor.failureCode() != null) {
+				LOGGER.error("Arena Agents automation startup stopped cleanly [{}]: {}",
+						supervisor.failureCode(), supervisor.failureMessage());
+				return;
 			}
 			VoiceSubsystemRuntime.start(server);
 			Path secretPath = supervisor.secretPath();

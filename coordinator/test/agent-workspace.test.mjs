@@ -51,7 +51,14 @@ test('refreshes one shared native Minecraft workspace from bundled templates', a
 	const first = await workspace.prepare();
 	assert.deepEqual(first, {
 		cwd: path.join(root, 'runtime', 'minecraft-agent'),
-		selectedCapabilityRoots: [path.join(root, 'runtime', 'minecraft-agent', '.codex', 'skills', 'minecraft-control')],
+		selectedCapabilityRoots: [{
+			id: 'minecraft-control',
+			location: {
+				type: 'environment',
+				environmentId: 'local',
+				path: path.join(root, 'runtime', 'minecraft-agent', '.codex', 'skills', 'minecraft-control'),
+			},
+		}],
 	});
 	assert.equal(await readFile(path.join(first.cwd, 'AGENTS.md'), 'utf8'), '# verified completion\n');
 	assert.equal(

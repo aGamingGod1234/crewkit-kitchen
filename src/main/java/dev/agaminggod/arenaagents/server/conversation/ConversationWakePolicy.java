@@ -14,7 +14,9 @@ public final class ConversationWakePolicy {
 	public static Optional<String> goalFor(AgentLifecycleState state, ConversationKind kind) {
 		Objects.requireNonNull(state, "state must not be null");
 		Objects.requireNonNull(kind, "kind must not be null");
-		if (state != AgentLifecycleState.IDLE && state != AgentLifecycleState.COMPLETED) {
+		if (state != AgentLifecycleState.IDLE
+				&& state != AgentLifecycleState.COMPLETED
+				&& state != AgentLifecycleState.PAUSED) {
 			return Optional.empty();
 		}
 		return switch (kind) {

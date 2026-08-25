@@ -53,6 +53,12 @@ public final class AgentConversationRouterVerification {
 		assertEquals(true, ConversationWakePolicy.goalFor(
 				AgentLifecycleState.COMPLETED, ConversationKind.PROXIMITY_SPEECH
 		).isPresent(), "completed agent wakes for nearby player speech");
+		assertEquals(true, ConversationWakePolicy.goalFor(
+				AgentLifecycleState.PAUSED, ConversationKind.PLAYER_MESSAGE
+		).isPresent(), "paused agent wakes for direct player message");
+		assertEquals(true, ConversationWakePolicy.goalFor(
+				AgentLifecycleState.PAUSED, ConversationKind.PROXIMITY_SPEECH
+		).isPresent(), "paused agent wakes for nearby player speech");
 		assertEquals(false, ConversationWakePolicy.goalFor(
 				AgentLifecycleState.IDLE, ConversationKind.AGENT_MESSAGE
 		).isPresent(), "agent chatter does not wake idle agent");
@@ -60,7 +66,6 @@ public final class AgentConversationRouterVerification {
 				AgentLifecycleState.STARTING,
 				AgentLifecycleState.PLANNING,
 				AgentLifecycleState.ACTING,
-				AgentLifecycleState.PAUSED,
 				AgentLifecycleState.ERROR,
 				AgentLifecycleState.DEAD,
 				AgentLifecycleState.DISCONNECTED
@@ -69,7 +74,7 @@ public final class AgentConversationRouterVerification {
 					state, ConversationKind.PLAYER_MESSAGE
 			).isPresent(), state + " agent is not auto-started by conversation");
 		}
-		return 10;
+		return 11;
 	}
 
 	private static int verifyDirectDeliveryAndOperatorMirror() {

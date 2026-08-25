@@ -53,6 +53,8 @@ test('native lifecycle disposal cancels an outstanding body action and rejects t
 	await runtime.dispose('agent-a', 'goal_steered');
 	await assert.rejects(pending, (error) => error?.code === 'NATIVE_ACTION_CANCELLED');
 	assert.equal(sent.at(-1)[0], 'action_cancel');
+	assert.equal(runtime.isActionResultStale(record(), { goalRevision: 3, actionId: sent[0][2].actionId }), true);
+	assert.equal(runtime.isActionResultStale(record(), { goalRevision: 3, actionId: 'unknown' }), false);
 });
 
 test('native finish uses the existing factual completion verifier before reporting success', async () => {
@@ -68,7 +70,7 @@ test('native finish uses the existing factual completion verifier before reporti
 			kind: 'finish', status: 'completed', summary: 'Stone acquired.',
 			completionContract: { goalRevision: 3, predicates: [{ type: 'inventory_min', itemId: 'minecraft:stone', count: 1 }] },
 		},
-	}, record());
+	}, record(), { lifecycleGeneration: 7 });
 	await Promise.resolve();
 	assert.equal(sent[0][0], 'goal_completed');
 	assert.equal(sent[0][2].completionContract.predicates[0].itemId, 'minecraft:stone');
@@ -82,6 +84,72 @@ test('native finish uses the existing factual completion verifier before reporti
 	}), true);
 	assert.deepEqual(await pending, { state: 'COMPLETED', verified: true, reasonCode: 'COMPLETION_VERIFIED' });
 	assert.equal(finished.length, 1);
+	assert.equal(finished[0].lifecycleGeneration, 7);
+});
+
+test('native observe ignores a stale observation event sequence', async () => {
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} } });
+	const current = record();
+	runtime.updateObservation(current, { player: { health: 20 } }, { eventSequence: 8 });
+	runtime.updateObservation(current, { player: { health: 10 } }, { eventSequence: 7 });
+	const result = await runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'observe-stale', tool: { kind: 'observe' },
+	}, current);
+	assert.deepEqual(result, {
+		eventSequence: 8,
+		goal: 'get one stone',
+		observation: { player: { health: 20 } },
+	});
+});
+
+test('a model-reported impossible goal remains active until a supported authority verifies it', async () => {
+	const finished = [];
+	const runtime = new NativeToolRuntime({
+		bridge: { send: async () => assert.fail('impossible does not publish a completion request') },
+		onFinish: async (request) => finished.push(request),
+	});
+	const result = await runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'finish-impossible',
+		tool: { kind: 'finish', status: 'impossible', summary: 'I cannot find a route.' },
+	}, record());
+	assert.deepEqual(result, { state: 'FAILED', verified: false, reasonCode: 'IMPOSSIBLE_NOT_VERIFIED' });
+	assert.deepEqual(finished, []);
+});
+
+test('native completion cannot overlap an active physical action', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const action = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'action-1',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1_000 } },
+	}, record());
+	await Promise.resolve();
+	await assert.rejects(runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'finish-1',
+		tool: { kind: 'finish', status: 'completed', summary: 'Done.', completionContract: { goalRevision: 3, predicates: [{ type: 'inventory_min', itemId: 'minecraft:stone', count: 1 }] } },
+	}, record()), (error) => error?.code === 'NATIVE_ACTION_IN_PROGRESS');
+	assert.deepEqual(sent.map(([type]) => type), ['action_command']);
+	runtime.onActionResult(record(), { goalRevision: 3, actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: '' });
+	await action;
+});
+
+test('a physical action cannot overlap native completion verification', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const completion = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'finish-1',
+		tool: { kind: 'finish', status: 'completed', summary: 'Done.', completionContract: { goalRevision: 3, predicates: [{ type: 'inventory_min', itemId: 'minecraft:stone', count: 1 }] } },
+	}, record());
+	await Promise.resolve();
+	await assert.rejects(runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'action-1',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1_000 } },
+	}, record()), (error) => error?.code === 'NATIVE_COMPLETION_IN_PROGRESS');
+	assert.deepEqual(sent.map(([type]) => type), ['goal_completed']);
+	runtime.onCompletionResult(record(), {
+		goalRevision: 3, traceId: sent[0][2].traceId, contractHash: sent[0][2].contractHash, verified: true, reasonCode: 'COMPLETION_VERIFIED',
+	});
+	await completion;
 });
 
 test('native body isolates sixteen concurrent agents and their action results', async () => {

@@ -21,7 +21,30 @@ public final class BundledCoordinatorInstallerVerification {
 		assertions += verifyIncompleteBundleLeavesExistingCoordinatorIntact();
 		assertions += verifyFreshInstallCreatesSecretAndPreservesProviderConfig();
 		assertions += verifyInterruptedSwapRecoversPreviousCoordinator();
+		assertions += verifyTransientDirectoryLockIsRetried();
 		return assertions;
+	}
+
+	private static int verifyTransientDirectoryLockIsRetried() throws Exception {
+		Path root = Files.createTempDirectory("arena-coordinator-retry");
+		try {
+			Path source = root.resolve("source");
+			Path target = root.resolve("target");
+			Files.createDirectories(source);
+			int[] attempts = {0};
+			BundledCoordinatorInstaller.moveDirectoryWithRetry(source, target, (from, to) -> {
+				attempts[0] += 1;
+				if (attempts[0] < 3) {
+					throw new java.nio.file.FileSystemException(from.toString(), to.toString(), "temporarily busy");
+				}
+				Files.move(from, to);
+			});
+			assertEquals(3, attempts[0], "runtime swap retries a transient Windows directory lock");
+			assertTrue(Files.isDirectory(target), "runtime swap completes after the lock is released");
+			return 2;
+		} finally {
+			deleteTree(root);
+		}
 	}
 
 	private static int verifyConfiguredSecretPathUsesPreparedRuntime() {

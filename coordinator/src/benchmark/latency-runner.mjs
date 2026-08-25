@@ -901,10 +901,10 @@ function createInjectedProviderService(provider, trial, budget, deadline, increm
 		catalog: { stale: false, async refresh() { return { models: [] }; }, assertSupported() {} },
 		async start() {}, async stop() { await stopProvider(); sessions.clear(); },
 		async bootstrapCatalog() { return { models: [] }; },
-		async createAgent(record) {
+		async createAgent(record, options) {
 			const profile = { ...record, ...trial.providerProfile, provider: trial.providerProfile.provider };
 			let session;
-			try { session = await runWithDeadline(() => provider.createAgent(profile), deadline); }
+			try { session = await runWithDeadline(() => provider.createAgent(profile, options), deadline); }
 			catch (error) { if (error?.code === 'TRIAL_TIMEOUT') await stopProviderAfterTimeout(); throw error; }
 			if (!session || typeof session.decide !== 'function') throw coded('PROVIDER_EXIT', 'provider returned no decision session');
 			const wrapped = { ...session, async decide(input, options = {}) {
@@ -953,7 +953,7 @@ async function defaultReplayFactory(profile, context = {}) {
 
 function benchmarkCoordinatorConfig(agentCap, planningConcurrency = agentCap) {
 	const effectiveConcurrency = Math.max(1, Math.min(agentCap, planningConcurrency));
-	return { bridge: { secret: 'latency-fixture' }, codex: { cwd: process.cwd() }, limits: { agentCap, goalQueueCap: 8, planningConcurrency: effectiveConcurrency, invalidDecisionRetries: 0 }, workspaceRoot: path.join(os.tmpdir(), 'arena-latency-workspaces') };
+	return { bridge: { secret: 'latency-fixture' }, codex: { cwd: process.cwd(), controlProtocol: 'arena_script' }, limits: { agentCap, goalQueueCap: 8, planningConcurrency: effectiveConcurrency, invalidDecisionRetries: 0 }, workspaceRoot: path.join(os.tmpdir(), 'arena-latency-workspaces') };
 }
 
 function cloneScenarioForLoad(source, load, seed) {

@@ -41,7 +41,13 @@ export class MinecraftAgentWorkspace {
 		await this.fs.mkdir(skillRoot, { recursive: true });
 		await this.#replace(AGENTS_TEMPLATE, path.join(this.root, AGENTS_TEMPLATE));
 		await this.#replace(SKILL_TEMPLATE, path.join(skillRoot, 'SKILL.md'));
-		return { cwd: this.root, selectedCapabilityRoots: [skillRoot] };
+		return {
+			cwd: this.root,
+			selectedCapabilityRoots: [{
+				id: 'minecraft-control',
+				location: { type: 'environment', environmentId: 'local', path: skillRoot },
+			}],
+		};
 	}
 
 	async #replace(template, destination) {

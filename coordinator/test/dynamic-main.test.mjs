@@ -45,6 +45,34 @@ class FakeBridge extends EventEmitter {
 	}
 }
 
+class DeferredCompletionBridge extends FakeBridge {
+	async send(type, agentId, payload) {
+		this.sent.push({ type, agentId, payload });
+	}
+}
+
+class GatedAgentReadyBridge extends FakeBridge {
+	blocked = false;
+	#release;
+	#gate = new Promise((resolve) => { this.#release = resolve; });
+	async send(type, agentId, payload) {
+		await super.send(type, agentId, payload);
+		if (type === 'agent_ready' && payload.goalRevision === 1) {
+			this.blocked = true;
+			await this.#gate;
+		}
+	}
+	release() { this.#release(); }
+}
+
+class ThrowingPlanningRegistry extends AgentRegistry {
+	rejectPlanning = false;
+	setState(agentId, state, options) {
+		if (this.rejectPlanning && state === DynamicAgentState.PLANNING) throw Object.assign(new Error('planning transition rejected'), { code: 'TEST_PLANNING_REJECTED' });
+		return super.setState(agentId, state, options);
+	}
+}
+
 class FakeProvider {
 	catalog = { stale: false, refresh: async () => ({ models: [] }), assertSupported() {} };
 	async start() {}
@@ -927,6 +955,44 @@ test('native reconciliation starts an observation-only provider prewarm without 
 	}
 });
 
+test('native reconciliation does not prewarm an explicitly paused agent', async () => {
+	const provider = new FakeProvider();
+	const prewarms = [];
+	provider.prewarmAgent = async (profileValue, options) => prewarms.push({ profileValue, options });
+	const run = await start({
+		codexService: provider,
+		initialRegistry: [{ ...record(), state: DynamicAgentState.PAUSED, currentGoal: 'Wait for Lucas.', goalRevision: 1 }],
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.deepEqual(prewarms, []);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('native reconciliation re-arms an unfinished persisted goal', async () => {
+	const timers = new ManualTimerQueue();
+	const run = await start({
+		initialRegistry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Keep working.', goalRevision: 1 }],
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.STARTING && timers.pendingCount === 1);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('a newly registered native agent starts observation-only provider prewarm after becoming ready', async () => {
 	const provider = new FakeProvider();
 	const prewarms = [];
@@ -949,7 +1015,35 @@ test('a newly registered native agent starts observation-only provider prewarm a
 	}
 });
 
+test('new agent readiness does not wait for a stale catalog refresh', async () => {
+	let releaseRefresh;
+	const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
+	const provider = new FakeProvider();
+	provider.catalog = {
+		stale: true,
+		refresh: async () => {
+			await refreshGate;
+			return { models: [] };
+		},
+		assertSupported() {},
+	};
+	const run = await start({ codexService: provider });
+	try {
+		run.bridge.emit('agent_registered', { agentId: 'agent-b', payload: record('agent-b') });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(
+			run.bridge.sent.some((message) => message.type === 'agent_ready' && message.agentId === 'agent-b'),
+			true,
+			'registration acknowledgement must not share the optional catalog-refresh critical path',
+		);
+	} finally {
+		releaseRefresh();
+		await run.coordinator.stop();
+	}
+});
+
 test('native Codex control dispatches and returns a real body result inside one provider turn', async () => {
+	const timers = new ManualTimerQueue();
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
 	planner.requestPlan = async () => assert.fail('native Codex control must not request ArenaScript');
@@ -968,6 +1062,8 @@ test('native Codex control dispatches and returns a real body result inside one 
 	const run = await start({
 		registry,
 		planner,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
 		config: {
 			bridge: { port: 25570, secret: 's'.repeat(32) },
 			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
@@ -989,6 +1085,215 @@ test('native Codex control dispatches and returns a real body result inside one 
 		assert.deepEqual(runtimeErrors, [], runtimeErrors[0]?.stack ?? runtimeErrors[0]?.message);
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.PLANNING);
 		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+		await eventually(() => timers.pendingCount === 1);
+		await timers.runNext();
+		assert.equal(run.bridge.sent.filter(({ type }) => type === 'request_observation').length, 1);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('an unfinished native turn with no tools requests a fresh observation instead of stopping', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+		await timers.runNext();
+		assert.equal(run.bridge.sent.filter(({ type }) => type === 'request_observation').length, 1);
+		assert.equal(run.bridge.sent.some(({ type }) => type === 'agent_error'), false);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.PLANNING);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('a rejected native planning transition releases its supervisor token', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new ThrowingPlanningRegistry();
+	const run = await start({
+		registry,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		await eventually(() => timers.pendingCount === 1);
+		registry.rejectPlanning = true;
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'agent_error'));
+		assert.equal(timers.pendingCount, 1);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('a recoverable native provider failure stays active and schedules observation recovery', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		throw Object.assign(new Error('provider planning timed out'), { code: 'PLANNING_TIMEOUT' });
+	};
+	const run = await start({
+		registry,
+		planner,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+		await timers.runNext();
+		assert.equal(run.bridge.sent.filter(({ type }) => type === 'request_observation').length, 1);
+		assert.equal(run.bridge.sent.some(({ type }) => type === 'agent_error'), false);
+		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.ERROR);
+		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.PAUSED);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('a replaced native goal fences an already queued recovery callback', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Old goal.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+		const staleRecovery = timers.history.at(-1).callback;
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'New goal.' } });
+		await eventually(() => run.registry.get('agent-a').goalRevision === 2);
+		await staleRecovery();
+		assert.equal(run.bridge.sent.some(({ type, payload }) => type === 'request_observation' && payload.goalRevision === 1), false);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('an invalid higher-revision control cannot retire the live native goal', async () => {
+	const timers = new ManualTimerQueue();
+	const run = await start({
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Old goal.' } });
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.STARTING && timers.pendingCount === 1);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 2, goal: 'Invalid replacement.' } });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'agent_error'));
+		assert.equal(run.registry.get('agent-a').goalRevision, 1);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING);
+		assert.equal(timers.pendingCount, 1);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('back-to-back accepted controls do not publish stale lifecycle side effects', async () => {
+	const run = await start();
+	try {
+		run.bridge.sent.length = 0;
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Old goal.' } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'New goal.' } });
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'agent_ready' && payload.goalRevision === 2));
+		assert.deepEqual(
+			run.bridge.sent.filter(({ type }) => type === 'agent_ready').map(({ payload }) => payload.goalRevision),
+			[2],
+		);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('a superseded control cannot emit stale lifecycle events after an awaited acknowledgement', async () => {
+	const bridge = new GatedAgentReadyBridge();
+	const run = await start({ bridge });
+	const revisions = [];
+	run.coordinator.on('goalControl', (record) => revisions.push(record.goalRevision));
+	try {
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Old goal.' } });
+		await eventually(() => bridge.blocked);
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'New goal.' } });
+		bridge.release();
+		await eventually(() => revisions.includes(2));
+		assert.deepEqual(revisions, [2]);
+	} finally {
+		bridge.release();
+		await run.coordinator.stop();
+	}
+});
+
+test('an invalid higher-revision conversation wake cannot retire the live native goal', async () => {
+	const timers = new ManualTimerQueue();
+	const run = await start({
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Old goal.' } });
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.STARTING && timers.pendingCount === 1);
+		run.bridge.emit('conversation_wake', {
+			agentId: 'agent-a',
+			payload: {
+				transactionId: 'invalid-higher-revision-wake',
+				event: { sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: 'Replace this goal.', goalRevision: 1, observedAtEpochMs: 1 },
+				control: { operation: 'start', goalRevision: 2, updatedAtEpochMs: 2, goal: 'Invalid replacement.' },
+			},
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.registry.get('agent-a').goalRevision, 1);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING);
+		assert.equal(timers.pendingCount, 1);
 	} finally {
 		await run.coordinator.stop();
 	}
@@ -1034,6 +1339,52 @@ test('native model-authored sequence keeps lifecycle acting until its final body
 		const second = run.bridge.sent.filter((message) => message.type === 'action_command')[1];
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: { goalRevision: 1, actionId: second.payload.actionId, state: 'SUCCEEDED', reasonCode: '', executionStarted: true, eventSequence: 3 } });
 		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.PLANNING);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('a pre-disconnect native completion cannot complete the replacement lifecycle', async () => {
+	const bridge = new DeferredCompletionBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		await request.executeTool({
+			agentId: request.agentId,
+			goalRevision: request.goalRevision,
+			turnId: 'turn-stale-completion',
+			callId: 'finish-stale-completion',
+			tool: { kind: 'finish', status: 'completed', summary: 'Done.', completionContract: completionContract(request.goalRevision) },
+		});
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		bridge,
+		registry,
+		planner,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Finish safely.' } });
+		bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => bridge.sent.some(({ type }) => type === 'goal_completed'));
+		const completion = bridge.sent.find(({ type }) => type === 'goal_completed');
+		bridge.emit('goal_completion_result', { agentId: 'agent-a', payload: {
+			goalRevision: 1,
+			traceId: completion.payload.traceId,
+			contractHash: completion.payload.contractHash,
+			verified: true,
+			reasonCode: 'COMPLETION_VERIFIED',
+			facts: [],
+		} });
+		bridge.emit('disconnected');
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.DISCONNECTED);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.DISCONNECTED);
 	} finally {
 		await run.coordinator.stop();
 	}
@@ -1163,6 +1514,44 @@ test('native Codex control reissues the newest goal after an obsolete turn settl
 	}
 });
 
+test('native Codex control reissues a resumed goal after the interrupted turn fails', async () => {
+	let rejectFirst;
+	const firstGate = new Promise((_, reject) => { rejectFirst = reject; });
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) await firstGate;
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Old goal.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 2 } });
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.PAUSED);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'resume', goalRevision: 3 } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 3, eventSequence: 2, observation: { player: { x: 1, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => run.registry.get('agent-a').goalRevision === 3);
+		for (let index = 0; index < 10; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		rejectFirst(Object.assign(new Error('obsolete provider turn interrupted'), { code: 'STALE_PLAN' }));
+		await eventually(() => planner.requests.length === 2);
+		assert.equal(planner.requests[1].goalRevision, 3);
+		assert.match(planner.requests[1].input, /Old goal/);
+	} finally {
+		rejectFirst(Object.assign(new Error('test cleanup'), { code: 'STALE_PLAN' }));
+		await run.coordinator.stop();
+	}
+});
+
 async function eventually(predicate) {
 	for (let index = 0; index < 100; index += 1) {
 		if (predicate()) return;
@@ -1171,13 +1560,39 @@ async function eventually(predicate) {
 	throw new Error('condition was not reached');
 }
 
+class ManualTimerQueue {
+	#nextId = 0;
+	#timers = new Map();
+	history = [];
+
+	schedule = (callback, delay) => {
+		const handle = { id: ++this.#nextId };
+		this.#timers.set(handle.id, { handle, callback, delay });
+		this.history.push({ handle, callback, delay });
+		return handle;
+	};
+
+	cancel = (handle) => this.#timers.delete(handle?.id);
+
+	get pendingCount() {
+		return this.#timers.size;
+	}
+
+	async runNext() {
+		const timer = this.#timers.values().next().value;
+		if (timer === undefined) throw new Error('no recovery timer is pending');
+		this.#timers.delete(timer.handle.id);
+		await timer.callback();
+	}
+}
+
 async function start(dependencies = {}) {
 	const bridge = dependencies.bridge ?? new FakeBridge();
 	const registry = dependencies.registry ?? new AgentRegistry();
 	const planner = dependencies.planner ?? new FakePlanner(registry);
 	const scheduler = dependencies.scheduler ?? new PlanningScheduler();
 	const codexService = dependencies.codexService ?? new FakeProvider();
-	const config = dependencies.config ?? { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } };
+	const config = dependencies.config ?? { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } };
 	const coordinator = createDynamicCoordinator(config, { bridge, registry, planner, scheduler, codexService, ...dependencies });
 	await coordinator.start();
 	bridge.emit('ready', { serverInstanceId: 'test', registry: dependencies.initialRegistry ?? [record()] });
@@ -1219,7 +1634,7 @@ test('publishes a bootstrap catalog before slower full reconciliation completes'
 		models: [{ provider: 'codex', id: 'gpt-5.6-luna' }],
 	});
 	const coordinator = createDynamicCoordinator(
-		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-luna', reasoningEffort: 'xhigh', serviceTier: 'fast' } } },
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-luna', reasoningEffort: 'xhigh', serviceTier: 'fast' } } },
 		{ bridge, registry, planner, codexService: provider },
 	);
 	await coordinator.start();
@@ -1282,7 +1697,7 @@ test('a transient reconciliation timeout cannot poison later agent lifecycle tra
 		});
 		await eventually(() => registry.get('agent-a')?.goalRevision === 1);
 		assert.equal(registry.get('agent-a').state, DynamicAgentState.STARTING);
-		assert.equal(bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 1), true);
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 1));
 		assert.deepEqual(runtimeErrors, [timeout], 'one provider outage is reported once instead of once per queued agent event');
 	} finally {
 		await coordinator.stop();
@@ -1635,7 +2050,7 @@ test('acknowledges and idempotently replays one composite conversation wake', as
 			serverInstanceId: 'test',
 			registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: payload.control.goal, goalRevision: 1 }],
 		});
-		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.PAUSED);
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.DISCONNECTED);
 		run.bridge.emit('conversation_wake', { agentId: 'agent-a', payload: structuredClone(payload) });
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'conversation_wake_ack').length === 3);
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING,
@@ -1669,8 +2084,8 @@ test('replayed conversation wake restores memory and the same revision after coo
 		control: { operation: 'start', goalRevision: 1, updatedAtEpochMs: 1_787_184_000_001, goal: wakeGoal },
 	};
 	try {
-		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.PAUSED,
-			'ordinary reconciliation conservatively pauses active snapshot state');
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.DISCONNECTED,
+			'ordinary reconciliation keeps active snapshot state recoverable after reconnect');
 		run.bridge.emit('conversation_wake', { agentId: 'agent-a', payload });
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'conversation_wake_ack'));
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING);
@@ -1824,7 +2239,7 @@ test('reconciliation skips death planning when the dead agent has no current goa
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
 	const coordinator = createDynamicCoordinator(
-		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
 		{ bridge, registry, planner, codexService: new FakeProvider() },
 	);
 	await coordinator.start();
@@ -1848,7 +2263,7 @@ test('reconciliation reissues one dead-state turn to the selected session and pr
 		return withCompletionContract({ summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }, request.goalRevision);
 	};
 	const coordinator = createDynamicCoordinator(
-		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
 		{ bridge, registry, planner, codexService: new FakeProvider() },
 	);
 	await coordinator.start();
@@ -1882,7 +2297,7 @@ test('disconnect fences the old dead respawn result before reconnect installs a 
 	};
 	const errors = [];
 	const coordinator = createDynamicCoordinator(
-		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
 		{ bridge, registry, planner, codexService: new FakeProvider() },
 	);
 	coordinator.on('runtimeError', (error) => errors.push(error));

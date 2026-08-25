@@ -222,16 +222,16 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentRecord recoverAfterReload(AgentRecord current, long nowEpochMs) {
-		if (!current.state().isReloadUncertain()) {
+		if (!current.state().isActive()) {
 			return current;
 		}
 		return current.withLifecycle(
-				AgentLifecycleState.PAUSED,
+				AgentLifecycleState.DISCONNECTED,
 				current.currentGoal(),
 				nextRevision(current),
 				current.queuedGoals(),
 				nowEpochMs,
-				"Recovered paused after reload"
+				"Recovered disconnected after reload"
 		);
 	}
 

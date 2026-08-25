@@ -23,6 +23,8 @@ final class BundledCoordinatorInstaller {
 	private static final String INSTALLED_MANIFEST_NAME = ".arena-agents-bundle-manifest";
 	private static final String USER_CONFIG_PATH = "config/dynamic-agents.json";
 	private static final String SECRET_PATH = "runtime/bridge-secret.txt";
+	private static final int SWAP_ATTEMPTS = 21;
+	private static final long SWAP_RETRY_DELAY_MS = 50L;
 
 	private BundledCoordinatorInstaller() {
 	}
@@ -74,12 +76,12 @@ final class BundledCoordinatorInstaller {
 			preserveUserConfig(coordinator, staging);
 			Files.writeString(staging.resolve(INSTALLED_MANIFEST_NAME), manifest, StandardCharsets.UTF_8);
 			boolean hadExisting = Files.exists(coordinator);
-			if (hadExisting) Files.move(coordinator, previous);
+			if (hadExisting) moveDirectoryWithRetry(coordinator, previous);
 			try {
-				Files.move(staging, coordinator);
+				moveDirectoryWithRetry(staging, coordinator);
 			} catch (IOException exception) {
 				if (hadExisting && Files.exists(previous) && !Files.exists(coordinator)) {
-					Files.move(previous, coordinator);
+					moveDirectoryWithRetry(previous, coordinator);
 				}
 				throw exception;
 			}
@@ -175,9 +177,38 @@ final class BundledCoordinatorInstaller {
 			try (var paths = Files.list(root)) {
 				Path previous = paths.filter(path -> path.getFileName().toString().startsWith("coordinator.previous-"))
 						.findFirst().orElse(null);
-				if (previous != null) Files.move(previous, coordinator);
+				if (previous != null) moveDirectoryWithRetry(previous, coordinator);
 			}
 		}
+	}
+
+	private static void moveDirectoryWithRetry(Path source, Path target) throws IOException {
+		moveDirectoryWithRetry(source, target, Files::move);
+	}
+
+	static void moveDirectoryWithRetry(Path source, Path target, MoveOperation operation) throws IOException {
+		IOException lastFailure = null;
+		for (int attempt = 1; attempt <= SWAP_ATTEMPTS; attempt += 1) {
+			try {
+				operation.move(source, target);
+				return;
+			} catch (IOException busy) {
+				lastFailure = busy;
+				if (attempt == SWAP_ATTEMPTS) break;
+				try {
+					Thread.sleep(SWAP_RETRY_DELAY_MS);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					throw new IOException("Interrupted while waiting to replace the coordinator runtime", interrupted);
+				}
+			}
+		}
+		throw lastFailure;
+	}
+
+	@FunctionalInterface
+	interface MoveOperation {
+		void move(Path source, Path target) throws IOException;
 	}
 
 	private static void extract(Path staging, List<Entry> entries, ResourceSource resources) throws IOException {

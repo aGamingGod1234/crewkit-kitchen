@@ -14,7 +14,6 @@ const COORDINATE_LIMIT = 30_000_000;
 const MAX_SEQUENCE_ACTIONS = 8;
 const COMPOSITE_ACTION_FIELDS = Object.freeze({
 	build_sequence: Object.freeze(['placements', 'timeoutMs']),
-	pick_up_item: Object.freeze(['targetSelector']),
 	fight_target: Object.freeze(['targetSelector', 'desiredRange', 'timeoutMs']),
 	flee_from: Object.freeze(['targetSelector', 'distance', 'timeoutMs']),
 	follow_entity: Object.freeze(['targetSelector', 'distance', 'timeoutMs']),
@@ -25,7 +24,7 @@ export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player.
 
 Act as soon as it is safe. Do not wait to solve the whole goal and do not narrate a plan. Call the smallest useful Minecraft tool now, inspect its factual result, then choose the next tool. Keep each decision local and brief even when your configured reasoning effort is high.
 
-Use observe only when the latest event and tool results lack needed facts. Use moveTo, mine, say, and wait for common operations. Use act for another supported player action. Use sequence for a short exact chain you can choose now; it stops on the first failed action. Call finish only when the goal is factually complete or impossible. A completed finish requires a factual completionContract for the active goalRevision. Common predicates include inventory_min, position_within, block_matches, entity_state, and action_success_count. Never claim an action happened unless its tool result confirms it. Plain assistant text is not visible in Minecraft, so communicate through say.`;
+Use observe only when the latest event and tool results lack needed facts. Use moveTo, mine, say, and wait for common operations. Use act for another supported player action. Use sequence for a short exact chain you can choose now; it stops on the first failed action. Call finish only when the goal is factually complete or impossible. A completed finish requires a factual completionContract for the active goalRevision. Common predicates include inventory_min, position_within, block_matches, entity_state, and action_success_count. Never claim an action happened unless its tool result confirms it. Plain assistant text is not visible in Minecraft, so communicate through say. For nearby voice, say at most 12 words with audience proximity, then immediately call the first physical tool because speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('observe', 'Return the latest compact player, inventory, nearby block, entity, goal, and conversation facts.', objectSchema({})),
@@ -43,8 +42,9 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 		z: integerSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		timeoutMs: integerSchema(1, 120_000),
 	}, ['x', 'y', 'z'])),
-	tool('say', 'Send public Minecraft chat or a private message. Use recipientId for a DM.', objectSchema({
+	tool('say', 'Send public chat, a private message, or nearby proximity speech.', objectSchema({
 		message: { type: 'string', minLength: 1, maxLength: MAX_CHAT_LENGTH },
+		audience: { type: 'string', enum: ['public', 'direct', 'proximity'] },
 		recipientId: { type: 'string', minLength: 1, maxLength: MAX_IDENTIFIER_LENGTH },
 	}, ['message'])),
 	tool('wait', 'Pause briefly and wait for the body result.', objectSchema({
@@ -108,12 +108,18 @@ export function normalizeMinecraftToolCall(name, value) {
 				},
 			};
 		case 'say': {
-			requireExactKeys(args, ['message', 'recipientId']);
+			requireExactKeys(args, ['message', 'audience', 'recipientId']);
 			const message = boundedText(args.message, 'message', MAX_CHAT_LENGTH);
 			const recipientId = args.recipientId === undefined ? undefined : boundedText(args.recipientId, 'recipientId', MAX_IDENTIFIER_LENGTH);
-			return { kind: 'action', actionType: 'chat', arguments: recipientId === undefined
-				? { message, audience: 'public' }
-				: { message, audience: 'direct', recipientId } };
+			const audience = args.audience === undefined
+				? recipientId === undefined ? 'public' : 'direct'
+				: args.audience;
+			if (!['public', 'direct', 'proximity'].includes(audience)) invalid('audience is not supported');
+			if (audience === 'direct' && recipientId === undefined) invalid('direct speech requires recipientId');
+			if (audience !== 'direct' && recipientId !== undefined) invalid(`${audience} speech cannot use recipientId`);
+			return { kind: 'action', actionType: 'chat', arguments: audience === 'direct'
+				? { message, audience, recipientId }
+				: { message, audience } };
 		}
 		case 'wait':
 			requireExactKeys(args, ['durationMs']);
@@ -242,8 +248,6 @@ function validateCompositeAction(type, value) {
 			const placements = value.placements.map((placement) => stripActionType(validateAction({ type: 'place_block', ...requireObject(placement) })));
 			return { placements, timeoutMs: integer(value.timeoutMs, 'timeoutMs', MIN_DURATION_MS, MAX_DURATION_MS) };
 		}
-		case 'pick_up_item':
-			return { targetSelector: boundedText(value.targetSelector, 'targetSelector', MAX_TARGET_SELECTOR_LENGTH) };
 		case 'fight_target':
 			return {
 				targetSelector: boundedText(value.targetSelector, 'targetSelector', MAX_TARGET_SELECTOR_LENGTH),

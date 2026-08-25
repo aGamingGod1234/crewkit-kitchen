@@ -270,6 +270,44 @@ test('installs a model-authored program and dispatches its next primitive withou
 	assert.equal(run.requests.length, 0, 'pre-authored continuation must not call the provider');
 });
 
+test('corrects an acknowledgement-only program before dispatching it for a physical goal', async () => {
+	const registry = new AgentRegistry();
+	registry.register({ ...record(), currentGoal: 'Get an iron pickaxe' });
+	const sent = [];
+	const requests = [];
+	const errors = [];
+	const completionContract = {
+		goalRevision: 1,
+		predicates: [{ type: 'inventory_min', itemId: 'minecraft:iron_pickaxe', count: 1 }],
+	};
+	const manager = new ProductionProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			return {
+				summary: 'Begin gathering materials.',
+				directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); await player.mine({ x: 1, y: 64, z: 1, timeoutMs: 30000 });',
+				completionContract,
+			};
+		} },
+		reportError: (_agentId, error) => errors.push(error),
+	});
+
+	await manager.installDecision(registry.get('agent-a'), {
+		summary: "I'm on it.",
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.chat({ message: "I am on it.", audience: "proximity" });',
+		completionContract,
+	}, { observation: observation(), eventSequence: 1 });
+
+	assert.equal(requests.length, 1, 'the selected model receives one correction request');
+	assert.match(requests[0].input, /ACKNOWLEDGEMENT_ONLY_PROGRAM/);
+	assert.deepEqual(actionCommands(sent).map((message) => message.payload.actionType), ['break_block']);
+	assert.equal(errors.length, 0);
+});
+
 test('keeps the agent acting while a successful exhausted program is replaced', async () => {
 	const registry = new AgentRegistry();
 	registry.register(record());
@@ -303,6 +341,47 @@ test('keeps the agent acting while a successful exhausted program is replaced', 
 	assert.equal(requests.length, 1);
 	assert.match(requests[0].input, /"attentionTrigger":"program_exhausted"/);
 	assert.equal(actionCommands(sent).length, 2, 'the replacement program dispatches without operator intervention');
+	assert.deepEqual(actionCommands(sent)[1].payload.arguments, { durationMs: 2 });
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
+test('keeps the original goal contract when an exhausted-program replacement returns a different one', async () => {
+	const registry = new AgentRegistry();
+	registry.register(record());
+	const sent = [];
+	const errors = [];
+	const initialContract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:iron_pickaxe', count: 1 }] };
+	const replacementContract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:oak_log', count: 1 }] };
+	const manager = new ProductionProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async () => ({
+			summary: 'Continue after mining.',
+			directive: 'replace',
+			source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(2);',
+			completionContract: replacementContract,
+		}) },
+		reportError: (_agentId, error) => errors.push(error),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		summary: 'Mine one block.',
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+		completionContract: initialContract,
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onActionResult(registry.get('agent-a'), {
+		actionId: actionCommands(sent)[0].payload.actionId,
+		state: 'SUCCEEDED',
+		reasonCode: 'DONE',
+		eventSequence: 2,
+	});
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).length < 2 && errors.length === 0; attempt += 1) {
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+
+	assert.equal(errors.length, 0, 'a continuation cannot mutate or invalidate the goal-scoped contract');
+	assert.equal(actionCommands(sent).length, 2, 'the replacement continues automatically');
 	assert.deepEqual(actionCommands(sent)[1].payload.arguments, { durationMs: 2 });
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });

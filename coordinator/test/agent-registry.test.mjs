@@ -114,13 +114,26 @@ test('server start promotions reject a goal that is not the queued head', () => 
 	);
 });
 
-test('reconciliation pauses active persisted agents and rejects duplicate identities', () => {
+test('reconciliation disconnects in-flight persisted agents, preserves explicit pauses, and rejects duplicate identities', () => {
 	const registry = new AgentRegistry();
 	const result = registry.reconcile([
-		record('agent-a', { state: DynamicAgentState.ACTING, currentGoal: 'Explore.', goalRevision: 7 }),
+		record('agent-a', { state: DynamicAgentState.STARTING, currentGoal: 'Start.', goalRevision: 5 }),
+		record('agent-b', { state: DynamicAgentState.PLANNING, currentGoal: 'Plan.', goalRevision: 6 }),
+		record('agent-c', { state: DynamicAgentState.ACTING, currentGoal: 'Act.', goalRevision: 7 }),
+		record('agent-d', { state: DynamicAgentState.DISCONNECTED, currentGoal: 'Reconnect.', goalRevision: 8 }),
+		record('agent-e', { state: DynamicAgentState.PAUSED, currentGoal: 'Pause.', goalRevision: 9 }),
 	]);
-	assert.deepEqual(result.added, ['agent-a']);
-	assert.equal(registry.get('agent-a').state, DynamicAgentState.PAUSED);
+	assert.deepEqual(result.added, ['agent-a', 'agent-b', 'agent-c', 'agent-d', 'agent-e']);
+	assert.deepEqual(
+		registry.list().map((agent) => agent.state),
+		[
+			DynamicAgentState.DISCONNECTED,
+			DynamicAgentState.DISCONNECTED,
+			DynamicAgentState.DISCONNECTED,
+			DynamicAgentState.DISCONNECTED,
+			DynamicAgentState.PAUSED,
+		],
+	);
 	assert.throws(() => registry.reconcile([record('agent-a'), record('agent-a')]), (error) => error.code === 'DUPLICATE_AGENT');
 });
 
@@ -211,14 +224,14 @@ test('respawn rejects every current state except DEAD', () => {
 	}
 });
 
-test('registry persistence codec is deterministic and pauses active work on reload', () => {
+test('registry persistence codec is deterministic and disconnects active work on reload', () => {
 	const encoded = encodeAgentRegistrySnapshot([
 		record('agent-b'),
 		record('agent-a', { state: DynamicAgentState.PLANNING, currentGoal: 'Build.', goalRevision: 2 }),
 	]);
 	const decoded = decodeAgentRegistrySnapshot(encoded);
 	assert.deepEqual(decoded.map((entry) => entry.agentId), ['agent-a', 'agent-b']);
-	assert.equal(decoded[0].state, DynamicAgentState.PAUSED);
+	assert.equal(decoded[0].state, DynamicAgentState.DISCONNECTED);
 	assert.equal(decoded[0].provider, 'codex');
 });
 

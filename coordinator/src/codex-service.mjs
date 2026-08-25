@@ -33,6 +33,11 @@ export class CodexService {
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config, { requireLaunchProfile: dependencies.transport === undefined });
 		this.#transport = dependencies.transport ?? new CodexStdioTransport(this.#config.launchProfile);
+		if (typeof this.#transport.on === 'function') {
+			this.#transport.on('diagnostic', (message) => {
+				console.error(`[codex-app-server] ${String(message).slice(0, 4_096)}`);
+			});
+		}
 		if (typeof this.#transport.getMaxListeners === 'function' && typeof this.#transport.setMaxListeners === 'function') {
 			this.#transport.setMaxListeners(Math.max(this.#transport.getMaxListeners(), DEFAULT_AGENT_CAP + 4));
 		}
@@ -61,7 +66,7 @@ export class CodexService {
 		try { await this.#starting; } finally { this.#starting = null; }
 	}
 
-	async createAgent(profileValue, { recoverySummary = null, controlProtocol = 'arena_script' } = {}) {
+	async createAgent(profileValue, { recoverySummary = null, controlProtocol = 'native_tools' } = {}) {
 		await this.start();
 		const profile = validateProfile(profileValue, this.#config);
 		const protocol = validateControlProtocol(controlProtocol);
@@ -662,32 +667,52 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	let settled = false;
 	let toolCalls = 0;
 	let toolExecutor = executeTool;
+	let completionStatus = null;
+	let executionTail = Promise.resolve();
+	const pendingTools = new Set();
 	let resolvePromise;
 	let rejectPromise;
 	const promise = new Promise((resolve, reject) => { resolvePromise = resolve; rejectPromise = reject; });
-	const respondToTool = async (request) => {
-		if (settled) return;
+	const settleCompletedTurn = () => {
+		if (settled || completionStatus === null || pendingTools.size > 0) return;
+		settled = true;
+		if (completionStatus.status === 'failed') rejectPromise(completionStatus.error);
+		else resolvePromise({ status: 'completed', toolCalls });
+	};
+	const respondToTool = (request) => {
+		if (settled || completionStatus !== null) return;
 		const { id, params } = request;
 		if (params?.threadId !== threadId || params?.turnId !== expectedTurnId) return;
 		toolCalls += 1;
-		try {
-			const tool = normalizeMinecraftToolCall(params.tool, params.arguments);
-			const result = await toolExecutor({
-				agentId,
-				goalRevision,
-				threadId,
-				turnId: expectedTurnId,
-				callId: params.callId,
-				tool,
-			});
-			transport.respond(id, toolResultContent(result));
-		} catch (error) {
-			transport.respond(id, toolResultContent({
-				state: 'FAILED',
-				reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
-				message: String(error?.message ?? error).slice(0, 512),
-			}, false));
-		}
+		const executor = toolExecutor;
+		const execute = async () => {
+			if (settled || completionStatus?.status === 'failed') return;
+			try {
+				const tool = normalizeMinecraftToolCall(params.tool, params.arguments);
+				const result = await executor({
+					agentId,
+					goalRevision,
+					threadId,
+					turnId: expectedTurnId,
+					callId: params.callId,
+					tool,
+				});
+				transport.respond(id, toolResultContent(result));
+			} catch (error) {
+				transport.respond(id, toolResultContent({
+					state: 'FAILED',
+					reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
+					message: String(error?.message ?? error).slice(0, 512),
+				}, false));
+			}
+		};
+		const task = executionTail.then(execute, execute);
+		pendingTools.add(task);
+		executionTail = task.catch(() => {});
+		void task.finally(() => {
+			pendingTools.delete(task);
+			settleCompletedTurn();
+		}).catch(() => {});
 	};
 	const onServerRequest = (request) => {
 		if (request?.method !== 'item/tool/call' || request.params?.threadId !== threadId) return;
@@ -710,10 +735,15 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 				safeVerbose(onVerbose, 'agent_message', params.item.text);
 			}
 		}
-		if (method !== 'turn/completed' || settled) return;
-		settled = true;
-		if (params?.turn?.status === 'failed') rejectPromise(new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex native turn failed'));
-		else resolvePromise({ status: 'completed', toolCalls });
+		if (method !== 'turn/completed' || settled || completionStatus !== null) return;
+		if (params?.turn?.status === 'failed') {
+			completionStatus = { status: 'failed', error: new CodexProtocolError('TURN_FAILED', params.turn.error?.message ?? 'Codex native turn failed') };
+			settled = true;
+			rejectPromise(completionStatus.error);
+			return;
+		}
+		completionStatus = { status: 'completed' };
+		settleCompletedTurn();
 	};
 	transport.on('serverRequest', onServerRequest);
 	transport.on('notification', onNotification);
@@ -732,6 +762,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 			return previous;
 		},
 		dispose() {
+			settled = true;
 			bufferedRequests = [];
 			transport.off('serverRequest', onServerRequest);
 			transport.off('notification', onNotification);

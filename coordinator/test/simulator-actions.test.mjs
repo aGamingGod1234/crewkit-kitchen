@@ -261,6 +261,7 @@ test('every production action type is implemented or terminates with an explicit
 		select_item: { itemId: 'minecraft:stick' },
 		use_item: { durationMs: 1 },
 		break_block: { x: 1, y: 1, z: 0, timeoutMs: 1_000 },
+		pick_up_item: { targetSelector: uuid },
 		place_block: { x: 1, y: 1, z: 0, face: 'up', itemId: 'minecraft:cobblestone' },
 		chat: { message: 'hi', audience: 'direct', recipientId: uuid },
 		wait: { durationMs: 1 },

@@ -12,18 +12,21 @@ const PROFILE = Object.freeze({
 
 function fakeService({ provider = 'kimi', catalogStale = false, startError = null, createError = null } = {}) {
 	const calls = [];
+	const createOptions = [];
 	const agents = new Map();
 	return {
 		provider,
 		calls,
+		createOptions,
 		catalog: {
 			stale: catalogStale,
 			async refresh() { calls.push('catalog.refresh'); return { provider, models: [] }; },
 		},
 		async start() { calls.push('start'); if (startError) throw startError; },
 		async stop() { calls.push('stop'); },
-		async createAgent(profile) {
+		async createAgent(profile, options) {
 			calls.push(['createAgent', profile]);
+			createOptions.push(options);
 			if (createError) throw createError;
 			const agent = { provider, agentId: profile.agentId, async setGoalRevision() {}, async dispose() { calls.push(['agent.dispose', profile.agentId]); } };
 			agents.set(profile.agentId, agent);
@@ -33,6 +36,29 @@ function fakeService({ provider = 'kimi', catalogStale = false, startError = nul
 		getAgent(agentId) { return agents.get(agentId) ?? null; },
 	};
 }
+
+test('creates a Codex preflight session with the ArenaScript control protocol', async () => {
+	const service = fakeService({ provider: 'codex' });
+	const factory = createLiveProviderFactory('codex', { service });
+
+	const provider = await factory({ provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' });
+
+	assert.equal(provider.available, true);
+	assert.equal(service.createOptions[0].controlProtocol, 'arena_script');
+	await provider.stop();
+});
+
+test('creates a Codex benchmark session with the ArenaScript control protocol', async () => {
+	const service = fakeService({ provider: 'codex' });
+	const factory = createLiveProviderFactory('codex', { service });
+	const profile = { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' };
+	const provider = await factory(profile);
+
+	await provider.createAgent({ ...profile, agentId: 'benchmark-agent' });
+
+	assert.equal(service.createOptions.at(-1)?.controlProtocol, 'arena_script');
+	await provider.stop();
+});
 
 test('routes an exact provider to only the selected injected service', async () => {
 	let selected;

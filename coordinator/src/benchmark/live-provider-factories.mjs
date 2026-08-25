@@ -70,7 +70,7 @@ export function createLiveProviderFactory(providerValue, options = {}) {
 			}
 
 			phase = 'session';
-			agent = await runBounded((signal) => service.createAgent({ ...profile, agentId, provider }, { signal }), context.signal, timeoutMs);
+			agent = await runBounded((signal) => service.createAgent({ ...profile, agentId, provider }, { signal, controlProtocol: 'arena_script' }), context.signal, timeoutMs);
 			if (agent === null || typeof agent !== 'object') throw coded('INVALID_SESSION', 'provider returned no live agent session');
 
 			phase = provider === 'gemini' || typeof options.probe === 'function' ? 'first_turn' : 'session';
@@ -119,7 +119,10 @@ function createAvailableProvider({ provider, profile, service, catalogFallback, 
 		async stop() { return service.stop(); },
 		async createAgent(profile, options) {
 			const exact = exactProfile(profile, provider);
-			return service.createAgent({ ...exact, provider }, options);
+			const serviceOptions = provider === 'codex'
+				? { ...options, controlProtocol: options?.controlProtocol ?? 'arena_script' }
+				: options;
+			return service.createAgent({ ...exact, provider }, serviceOptions);
 		},
 		getAgent(agentId) { return service.getAgent?.(agentId) ?? null; },
 		async removeAgent(agentId) { return service.removeAgent?.(agentId) ?? false; },

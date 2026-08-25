@@ -560,6 +560,36 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 	assert.equal(drift.trials[0].error.code, 'REPLAY_IDENTITY_MISMATCH');
 });
 
+test('Codex benchmark sessions receive the explicit ArenaScript protocol', async () => {
+	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	const optionsSeen = [];
+	const scenario = fixtureScenario();
+	const trial = { ...matrix().trials[0], id: 'codex-arena-script', mode: 'live', providerProfile: profile, scenarioId: scenario.id };
+	const providerFactory = () => ({
+		available: true,
+		provider: 'codex',
+		model: profile.model,
+		reasoningEffort: profile.reasoningEffort,
+		serviceTier: profile.serviceTier,
+		providerProfile: profile,
+		async createAgent(_record, options) {
+			optionsSeen.push(options);
+			return { async setGoalRevision() {}, async decide() { return fixtureDecision({ scenario }); } };
+		},
+		async stop() {},
+	});
+
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [trial] }),
+		scenarioResolver: () => scenario,
+		providerFactories: { codex: providerFactory },
+		artifactDirectory: null,
+	});
+
+	assert.equal(result.trials[0].status, 'PASSED');
+	assert.equal(optionsSeen[0].controlProtocol, 'arena_script');
+});
+
 test('paces delayed replay ticks against wall time instead of racing virtual time ahead', async () => {
 	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
 	const scenario = fixtureScenario();

@@ -8,27 +8,31 @@ import java.util.WeakHashMap;
 import net.minecraft.server.MinecraftServer;
 
 public final class VoiceConsentRegistry {
-	private static final Map<MinecraftServer, Set<UUID>> CONSENT = new WeakHashMap<>();
+	private static final Map<MinecraftServer, Set<UUID>> DISABLED = new WeakHashMap<>();
 
 	private VoiceConsentRegistry() {
 	}
 
 	public static synchronized void grant(MinecraftServer server, UUID playerId) {
-		CONSENT.computeIfAbsent(server, ignored -> new LinkedHashSet<>()).add(playerId);
+		Set<UUID> players = DISABLED.get(server);
+		if (players == null) return;
+		players.remove(playerId);
+		if (players.isEmpty()) DISABLED.remove(server);
 	}
 
 	public static synchronized void revoke(MinecraftServer server, UUID playerId) {
-		Set<UUID> players = CONSENT.get(server);
-		if (players == null) return;
-		players.remove(playerId);
-		if (players.isEmpty()) CONSENT.remove(server);
+		DISABLED.computeIfAbsent(server, ignored -> new LinkedHashSet<>()).add(playerId);
 	}
 
 	public static synchronized boolean granted(MinecraftServer server, UUID playerId) {
-		return CONSENT.getOrDefault(server, Set.of()).contains(playerId);
+		return !DISABLED.getOrDefault(server, Set.of()).contains(playerId);
+	}
+
+	public static synchronized void clearPlayer(MinecraftServer server, UUID playerId) {
+		grant(server, playerId);
 	}
 
 	public static synchronized void clear(MinecraftServer server) {
-		CONSENT.remove(server);
+		DISABLED.remove(server);
 	}
 }

@@ -178,6 +178,15 @@ test('ending a token twice is harmless and close cancels every owned timer', () 
 	assert.equal(clock.pendingCount, 0);
 });
 
+test('a stale work token can be released without scheduling recovery', () => {
+	const clock = new FakeTimerQueue();
+	const supervisor = createSupervisor(clock);
+	supervisor.activate(key);
+	const token = supervisor.begin(key, 'provider');
+	assert.equal(supervisor.end(token, { scheduleRecovery: false }), true);
+	assert.equal(clock.pendingCount, 0);
+});
+
 test('stale tokens cannot settle work belonging to a newer fenced goal', () => {
 	const clock = new FakeTimerQueue();
 	const supervisor = createSupervisor(clock);

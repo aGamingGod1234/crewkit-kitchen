@@ -3,6 +3,10 @@ import { createInterface } from 'node:readline';
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of lines) {
 	const request = JSON.parse(line);
+	if (request.op === 'warmup') {
+		process.stdout.write(`${JSON.stringify({ id: request.id, ok: true })}\n`);
+		continue;
+	}
 	if (request.op === 'tts') {
 		const pcmBase64 = request.text === 'malformed'
 			? Buffer.from([1]).toString('base64')
