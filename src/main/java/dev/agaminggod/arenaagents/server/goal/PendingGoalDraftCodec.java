@@ -11,13 +11,15 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpecCodec;
 import java.util.Optional;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
 public final class PendingGoalDraftCodec {
 	private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
 	private static final Set<String> FIELDS = Set.of(
-			"draft_id", "agent_id", "requesting_player_id", "original_request", "proposed_predicate", "intent", "created_at_tick",
+			"draft_id", "agent_id", "requesting_player_id", "original_request", "candidate_ids", "proposed_predicate", "intent", "created_at_tick",
 			"expected_goal_revision", "expected_goal_id"
 	);
 	private final GoalSpecCodec goalCodec = new GoalSpecCodec();
@@ -28,6 +30,7 @@ public final class PendingGoalDraftCodec {
 		json.addProperty("agent_id", draft.agentId().toString());
 		json.addProperty("requesting_player_id", draft.requestingPlayerId().toString());
 		json.addProperty("original_request", draft.originalRequest());
+		json.add("candidate_ids", GSON.toJsonTree(draft.candidateIds()));
 		draft.proposedPredicate().ifPresentOrElse(
 				predicate -> json.add("proposed_predicate", goalCodec.encodePredicateObject(predicate)),
 				() -> json.add("proposed_predicate", null)
@@ -56,6 +59,7 @@ public final class PendingGoalDraftCodec {
 					AgentId.parse(string(json, "agent_id")),
 					uuid(string(json, "requesting_player_id"), "requesting_player_id"),
 					string(json, "original_request"),
+					strings(json, "candidate_ids"),
 					predicate,
 					enumeration(DraftIntent.class, string(json, "intent"), "intent"),
 					exactLong(json, "created_at_tick"),
@@ -69,6 +73,19 @@ public final class PendingGoalDraftCodec {
 		} catch (JsonParseException | IllegalStateException | NumberFormatException exception) {
 			throw failure("INVALID_GOAL_DRAFT", "Invalid persisted goal draft: " + exception.getMessage());
 		}
+	}
+
+	private static List<String> strings(JsonObject object, String field) {
+		JsonElement value = field(object, field);
+		if (!value.isJsonArray()) throw failure("INVALID_GOAL_DRAFT", field + " must be an array");
+		ArrayList<String> result = new ArrayList<>();
+		for (JsonElement element : value.getAsJsonArray()) {
+			if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
+				throw failure("INVALID_GOAL_DRAFT", field + " must contain strings");
+			}
+			result.add(element.getAsString());
+		}
+		return List.copyOf(result);
 	}
 
 	private static JsonElement field(JsonObject object, String field) {

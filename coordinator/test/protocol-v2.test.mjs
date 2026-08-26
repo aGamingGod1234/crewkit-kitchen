@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { completionContractFingerprint } from '../src/goal-contract.mjs';
+import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 
 const SECRET = 's'.repeat(32);
 const TRACE_ID = 'trace-wire-1';
@@ -166,6 +167,71 @@ test('protocol v2 carries one acknowledged conversation wake transaction', () =>
 		'the nested conversation recipient must match the envelope agent',
 	);
 });
+
+test('protocol v2 carries bounded goal translation requests, proposals, and results', () => {
+	const request = {
+		requestId: '00000000-0000-0000-0000-000000000201',
+		originalRequest: 'Get a good pickaxe',
+		candidateIds: ['minecraft:iron_pickaxe', 'minecraft:diamond_pickaxe'],
+	};
+	const proposal = {
+		requestId: request.requestId,
+		summary: 'Obtain an iron or diamond pickaxe',
+		predicate: {
+			type: 'any_of',
+			predicates: request.candidateIds.map(itemId => ({ type: 'inventory_contains', itemId, count: 1 })),
+		},
+	};
+	assert.deepEqual(validateProtocolV2Payload('goal_spec_request', request), request);
+	assert.deepEqual(validateProtocolV2Payload('goal_spec_proposal', proposal), proposal);
+	assert.deepEqual(validateProtocolV2Payload('goal_spec_result', {
+		requestId: request.requestId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED',
+	}), { requestId: request.requestId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' });
+	assert.throws(() => validateProtocolV2Payload('goal_spec_request', { ...request, extra: true }), /field/i);
+	assert.throws(() => validateProtocolV2Payload('goal_spec_proposal', {
+		...proposal, predicate: { type: 'action_success_count', count: 1 },
+	}), error => error?.code === 'UNKNOWN_GOAL_PREDICATE');
+	assert.throws(() => validateProtocolV2Payload('goal_spec_result', {
+		requestId: request.requestId, status: 'maybe', reasonCode: 'UNKNOWN',
+	}), /status/i);
+	assert.equal(validateProtocolV2Envelope(serverEnvelope(
+		'goal_spec_request', 'agent-a', 'goal-spec-request-1', request,
+	), { direction: 'server_to_coordinator' }).type, 'goal_spec_request');
+	assert.throws(() => validateProtocolV2Envelope(serverEnvelope(
+		'goal_spec_proposal', 'agent-a', 'goal-spec-proposal-wrong-way', proposal,
+	), { direction: 'server_to_coordinator' }), /message type/i);
+});
+
+test('goal lifecycle messages retain the full immutable server-authored goal specification', () => {
+	const goalSpec = goalSpecFixture({
+		originalRequest: 'Get an iron pickaxe',
+		predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 },
+		createdAtTick: 1200,
+	});
+	const queuedSpec = goalSpecFixture({
+		originalRequest: 'Get a diamond pickaxe',
+		predicate: { type: 'inventory_contains', itemId: 'minecraft:diamond_pickaxe', count: 1 },
+		createdAtTick: 1200,
+	});
+	const control = validateProtocolV2Payload('goal_control', {
+		operation: 'start', goalRevision: 1, updatedAtEpochMs: 2, goal: goalSpec.originalRequest, goalSpec,
+	});
+	assert.deepEqual(control.goalSpec, goalSpec);
+	assert.throws(() => { control.goalSpec.predicate.count = 2; }, TypeError);
+	const registered = validateProtocolV2Payload('hello_ack', {
+		replyTo: 'coordinator-1', authenticated: true,
+		registry: [{
+			...registeredRecord(), state: 'PAUSED', currentGoal: goalSpec.originalRequest, currentGoalSpec: goalSpec,
+			queue: ['Get a diamond pickaxe'], queueGoalSpecs: [queuedSpec],
+		}],
+	}).registry[0];
+	assert.deepEqual(registered.currentGoalSpec, goalSpec);
+	assert.equal(registered.queue[0].goalSpec.predicate.itemId, 'minecraft:diamond_pickaxe');
+});
+
+function goalSpecFixture(fields) {
+	return { ...fields, fingerprint: goalSpecFingerprint(fields) };
+}
 
 test('protocol v2 requires immutable provenance on every action command form', () => {
 	const payload = {

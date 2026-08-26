@@ -7,6 +7,7 @@ import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import java.util.Optional;
+import java.util.List;
 import java.util.UUID;
 import net.minecraft.core.RegistryAccess;
 
@@ -40,9 +41,22 @@ public final class GoalCompilerVerification {
 				compiler.compile("Get a good pickaxe", RegistryAccess.EMPTY, 1_200L).kind(),
 				"subjective item request requires translation"
 		);
+		assertEquals(
+				List.of(
+						"minecraft:copper_pickaxe", "minecraft:diamond_pickaxe", "minecraft:golden_pickaxe", "minecraft:iron_pickaxe",
+						"minecraft:netherite_pickaxe", "minecraft:stone_pickaxe", "minecraft:wooden_pickaxe"
+				),
+				compiler.candidateIdsFor("Get a good pickaxe", RegistryAccess.EMPTY),
+				"subjective item request keeps only bounded registered pickaxe candidates"
+		);
 		assertEquals(false, GoalCompiler.looksLikeGoalRequest("Hi, can you hear me?"), "casual speech remains conversation");
 		assertEquals(true, GoalCompiler.looksLikeGoalRequest("Can you get an iron pickaxe?"), "actionable speech is a goal request");
-		return 5;
+		assertEquals(
+				List.of("minecraft:iron_axe", "minecraft:iron_hoe", "minecraft:iron_pickaxe", "minecraft:iron_shovel", "minecraft:iron_sword"),
+				compiler.candidateIdsFor("Get iron tools", RegistryAccess.EMPTY),
+				"tool-set clarification keeps the registered material tool family"
+		);
+		return 7;
 	}
 
 	private static int verifyExactPositionEntityAndAdvancement() {
@@ -57,6 +71,11 @@ public final class GoalCompilerVerification {
 				"exact entity kill"
 		);
 		assertEquals(
+				new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true),
+				compiler.compile("Beat the game", RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion(),
+				"beating the game freezes an agent-attributed dragon kill"
+		);
+		assertEquals(
 				new GoalPredicate.AdvancementGranted("minecraft:story/mine_stone"),
 				compiler.compile("Complete advancement minecraft:story/mine_stone", RegistryAccess.EMPTY, 1_200L,
 						id -> id.equals("minecraft:story/mine_stone"))
@@ -68,7 +87,7 @@ public final class GoalCompilerVerification {
 				compiler.compile("Complete advancement minecraft:story/not_real", RegistryAccess.EMPTY, 1_200L, id -> false).kind(),
 				"nonexistent advancement ID requires clarification"
 		);
-		return 4;
+		return 5;
 	}
 
 	private static int verifyDraftRoundTrip() {
@@ -77,6 +96,7 @@ public final class GoalCompilerVerification {
 				new AgentId(UUID.fromString("00000000-0000-0000-0000-000000000102")),
 				UUID.fromString("00000000-0000-0000-0000-000000000103"),
 				"Get a good pickaxe",
+				List.of("minecraft:diamond_pickaxe", "minecraft:iron_pickaxe"),
 				Optional.of(new GoalPredicate.AnyOf(java.util.List.of(
 						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1),
 						new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 1)
@@ -88,7 +108,12 @@ public final class GoalCompilerVerification {
 		);
 		PendingGoalDraftCodec codec = new PendingGoalDraftCodec();
 		assertEquals(draft, codec.decode(codec.encode(draft)), "pending goal draft round-trip");
-		return 1;
+		assertEquals(
+				draft.withProposedPredicate(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)),
+				codec.decode(codec.encode(draft.withProposedPredicate(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)))),
+				"atomic proposal replacement retains draft identity and candidate IDs"
+		);
+		return 2;
 	}
 
 	private static int verifySpecAwareLifecycleStart() {

@@ -29,6 +29,7 @@ import { encodeJsonLine, JsonlDecoder } from './jsonl.mjs';
 import { MessageIdGenerator } from './message-id.mjs';
 import { ValidationError, validateAction, validateActionCommandPayload } from './schema.mjs';
 import { bindCompletionContract, parseCompletionContract } from './goal-contract.mjs';
+import { parseGoalSpec, parseGoalSpecProposal, parseGoalSpecRequest } from './goal-spec.mjs';
 
 const MAX_COORDINATOR_CIRCUITS = 32;
 
@@ -39,6 +40,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'agent_ready',
 	'planning_state',
 	'goal_completed',
+	'goal_spec_proposal',
 	'conversation_wake_ack',
 	'request_observation',
 	'action_command',
@@ -60,6 +62,8 @@ export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
 	'action_progress',
 	'action_result',
 	'goal_completion_result',
+	'goal_spec_request',
+	'goal_spec_result',
 	'verbose_control',
 	'heartbeat',
 	'shutdown',
@@ -198,6 +202,20 @@ export function validateProtocolV2Payload(type, value) {
 				reasonCode: boundedText(value.reasonCode, 'reasonCode', MAX_REASON_CODE_LENGTH),
 				facts: boundedArray(value.facts, 'facts', MAX_COMPLETION_FACTS).map((fact, index) => normalizeCompletionFact(fact, index)),
 			};
+		case 'goal_spec_request':
+			return parseGoalSpecRequest(value);
+		case 'goal_spec_proposal':
+			return parseGoalSpecProposal(value);
+		case 'goal_spec_result': {
+			exactKeys(value, ['requestId', 'status', 'reasonCode'], ['requestId', 'status', 'reasonCode'], type);
+			const status = requireIdentifier(value.status, 'status');
+			if (!['accepted', 'rejected'].includes(status)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'goal_spec_result status must be accepted or rejected');
+			return {
+				requestId: requireIdentifier(value.requestId, 'requestId'),
+				status,
+				reasonCode: requireIdentifier(value.reasonCode, 'reasonCode'),
+			};
+		}
 		case 'conversation_wake_ack':
 			exactKeys(value, ['transactionId', 'goalRevision'], ['transactionId', 'goalRevision'], type);
 			return {
@@ -722,10 +740,12 @@ function normalizeCoordinatorStatus(value) {
 
 function normalizeRegisteredAgent(value, field) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
-	const keys = ['schemaVersion', 'agentId', 'entityUuid', 'name', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'gameMode', 'skinVariant', 'state', 'currentGoal', 'goalRevision', 'queue', 'lastSummary', 'death', 'createdAtEpochMs', 'updatedAtEpochMs', 'lastError'];
+	const keys = ['schemaVersion', 'agentId', 'entityUuid', 'name', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'gameMode', 'skinVariant', 'state', 'currentGoal', 'currentGoalSpec', 'goalRevision', 'queue', 'queueGoalSpecs', 'lastSummary', 'death', 'createdAtEpochMs', 'updatedAtEpochMs', 'lastError'];
 	const required = ['schemaVersion', 'agentId', 'model', 'reasoningEffort', 'skinVariant', 'state', 'goalRevision', 'queue', 'createdAtEpochMs', 'updatedAtEpochMs'];
 	exactKeys(value, keys, required, field);
 	const queue = boundedArray(value.queue, `${field}.queue`, 256).map((goal, index) => boundedText(goal, `${field}.queue[${index}]`, MAX_GOAL_LENGTH));
+	const queueGoalSpecs = value.queueGoalSpecs === undefined ? [] : boundedArray(value.queueGoalSpecs, `${field}.queueGoalSpecs`, 256).map(parseGoalSpec);
+	if (queueGoalSpecs.length !== 0 && queueGoalSpecs.length !== queue.length) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.queueGoalSpecs must align with queue`);
 	let lastError = null;
 	if (value.lastError !== undefined) {
 		exactKeys(value.lastError, ['code', 'message'], ['code', 'message'], `${field}.lastError`);
@@ -748,8 +768,9 @@ function normalizeRegisteredAgent(value, field) {
 		skinVariant: requireIdentifier(value.skinVariant, `${field}.skinVariant`),
 		state,
 		currentGoal: value.currentGoal === undefined ? null : boundedText(value.currentGoal, `${field}.currentGoal`, MAX_GOAL_LENGTH),
+		currentGoalSpec: value.currentGoalSpec === undefined ? null : parseGoalSpec(value.currentGoalSpec),
 		goalRevision: revision(value.goalRevision, `${field}.goalRevision`),
-		queue,
+		queue: queue.map((goal, index) => ({ goal, goalRevision: index + 1, goalSpec: queueGoalSpecs[index] ?? null })),
 		lastSummary: value.lastSummary === undefined ? null : boundedText(value.lastSummary, `${field}.lastSummary`, MAX_SUMMARY_LENGTH),
 		death,
 		respawnPolicy: {},
@@ -787,14 +808,16 @@ function normalizeProvider(value, field) {
 }
 
 function normalizeGoalControl(value) {
-	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal', 'death', 'resumeGoal'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
+	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal', 'goalSpec', 'death', 'resumeGoal'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
 	const operation = boundedText(value.operation, 'operation', MAX_REASON_CODE_LENGTH);
 	if (!['start', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
 	const normalized = { operation, goalRevision: revision(value.goalRevision, 'goalRevision'), updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, 'updatedAtEpochMs') };
 	if (value.goal !== undefined) normalized.goal = boundedText(value.goal, 'goal', MAX_GOAL_LENGTH);
+	if (value.goalSpec !== undefined) normalized.goalSpec = parseGoalSpec(value.goalSpec);
 	if (value.death !== undefined) normalized.death = normalizeDeath(value.death);
 	if (['start', 'steer', 'queue'].includes(operation) && normalized.goal === undefined) throw new ProtocolV2Error('MISSING_FIELD', `goal_control ${operation} requires goal`);
 	if (!['start', 'steer', 'queue'].includes(operation) && normalized.goal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goal`);
+	if (!['start', 'steer', 'queue'].includes(operation) && normalized.goalSpec !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goalSpec`);
 	if (operation === 'dead' && normalized.death === undefined) throw new ProtocolV2Error('MISSING_FIELD', 'goal_control dead requires death facts');
 	if (operation !== 'dead' && normalized.death !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include death facts`);
 	if (operation === 'respawn') normalized.resumeGoal = value.resumeGoal === undefined ? false : boolean(value.resumeGoal, 'resumeGoal');

@@ -191,10 +191,15 @@ class AcpAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs, onVerbose = null } = {}) {
+	async decide(input, {
+		goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs, onVerbose = null,
+		parseOutput = parseDecision, systemPrompt,
+	} = {}) {
 		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `${this.provider} agent '${this.agentId}' is disposed`);
 		if (this.#active) throw new AcpProtocolError('TURN_IN_PROGRESS', `${this.provider} agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
+		if (typeof parseOutput !== 'function') throw new TypeError('parseOutput must be a function');
+		if (systemPrompt !== undefined && typeof systemPrompt !== 'string') throw new TypeError('systemPrompt must be a string');
 		if (goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled');
 		const turnStartedAt = performance.now();
@@ -226,7 +231,9 @@ class AcpAgent {
 		signal?.addEventListener('abort', abort, { once: true });
 		let rawOutput = '';
 		let outputHandled = false;
-		const prompt = `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`;
+		const prompt = systemPrompt === undefined
+			? `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`
+			: `${systemPrompt}${systemPrompt.length === 0 ? '' : '\n\n'}${input}`;
 		try {
 			const response = await withTimeout(Promise.race([this.#transport.request('session/prompt', {
 				sessionId: this.#sessionId,
@@ -244,7 +251,7 @@ class AcpAgent {
 			}
 			let decision;
 			let parseError = null;
-			try { decision = parseDecision(decisionText); }
+			try { decision = parseOutput(decisionText); }
 			catch (error) {
 				parseError = new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',

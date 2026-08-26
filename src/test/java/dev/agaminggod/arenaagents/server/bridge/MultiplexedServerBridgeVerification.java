@@ -125,8 +125,105 @@ public final class MultiplexedServerBridgeVerification {
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
+		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 123;
+		return 132;
+	}
+
+	private static void verifyGoalSpecProposalLifecycle() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-goal-spec-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord idle = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Translator"), 1_000L);
+			UUID requestId = UUID.fromString("00000000-0000-0000-0000-000000000301");
+			PendingGoalDraft draft = new PendingGoalDraft(
+					requestId, idle.agentId(), UUID.fromString("00000000-0000-0000-0000-000000000302"),
+					"Get a good pickaxe", List.of("minecraft:diamond_pickaxe", "minecraft:iron_pickaxe"),
+					Optional.empty(), DraftIntent.CONFIRM_TRANSLATION, 1_001L, idle.goalRevision(), Optional.empty()
+			);
+			manager.stageGoalDraft(draft);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				BridgeEnvelope hello = authenticate(socket, reader, codec, secret, "hello-goal-spec");
+				BridgeEnvelope replay = codec.decode(reader.readLine());
+				assertEquals("goal_spec_request", replay.type(), "pending goal translation is replayed during authentication");
+				assertEquals(requestId.toString(), replay.payload().get("requestId").getAsString(), "goal translation replay retains draft identity");
+				assertEquals(2, replay.payload().getAsJsonArray("candidateIds").size(), "goal translation replay retains bounded candidate IDs");
+
+				JsonObject malformedId = goalSpecProposal(requestId, "minecraft:iron_pickaxe");
+				malformedId.addProperty("requestId", "not-a-uuid");
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-invalid-id", malformedId));
+				BridgeEnvelope malformedRejected = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("rejected", malformedRejected.payload().get("status").getAsString(),
+						"malformed proposal identity receives an explicit rejection");
+				assertEquals("INVALID_GOAL_SPEC_REQUEST_ID", malformedRejected.payload().get("reasonCode").getAsString(),
+						"malformed proposal identity reports its stable reason code");
+
+				JsonObject proposal = goalSpecProposal(requestId, "minecraft:iron_pickaxe");
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-1", proposal));
+				BridgeEnvelope accepted = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("goal_spec_result", accepted.type(), "valid proposal receives an explicit acknowledgement");
+				assertEquals("accepted", accepted.payload().get("status").getAsString(), "valid proposal is staged");
+				assertEquals(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1),
+						manager.goalDraft(requestId).orElseThrow().proposedPredicate().orElseThrow(),
+						"proposal atomically updates only the matching draft");
+				assertEquals(AgentLifecycleState.IDLE, manager.registry().require(idle.agentId()).state(),
+						"proposal cannot start or replace the agent goal");
+
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-2", proposal));
+				assertEquals("accepted", pollBridgeResponse(bridge, socket, reader, codec).payload().get("status").getAsString(),
+						"identical proposal replay is idempotent");
+
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-3", goalSpecProposal(requestId, "minecraft:diamond_pickaxe")));
+				BridgeEnvelope rejected = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("rejected", rejected.payload().get("status").getAsString(), "changed proposal replay is rejected");
+				assertEquals("GOAL_DRAFT_PROPOSAL_CONFLICT", rejected.payload().get("reasonCode").getAsString(),
+						"changed proposal replay reports the stable conflict code");
+
+				UUID nonTranslationId = UUID.fromString("00000000-0000-0000-0000-000000000303");
+				manager.stageGoalDraft(new PendingGoalDraft(
+						nonTranslationId, idle.agentId(), UUID.fromString("00000000-0000-0000-0000-000000000304"),
+						"Get an iron pickaxe", List.of("minecraft:iron_pickaxe"), Optional.empty(),
+						DraftIntent.START, 1_002L, idle.goalRevision(), Optional.empty()
+				));
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-wrong-intent", goalSpecProposal(nonTranslationId, "minecraft:iron_pickaxe")));
+				BridgeEnvelope intentRejected = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("GOAL_DRAFT_INTENT_MISMATCH", intentRejected.payload().get("reasonCode").getAsString(),
+						"coordinator proposals cannot populate non-translation drafts");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("goal specification proposal lifecycle failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (secretFile != null) try { Files.deleteIfExists(secretFile); } catch (java.io.IOException exception) {
+				throw new AssertionError("could not remove goal spec bridge secret", exception);
+			}
+		}
+	}
+
+	private static JsonObject goalSpecProposal(UUID requestId, String itemId) {
+		JsonObject payload = new JsonObject();
+		payload.addProperty("requestId", requestId.toString());
+		payload.addProperty("summary", "Obtain the selected pickaxe.");
+		JsonObject predicate = new JsonObject();
+		predicate.addProperty("type", "inventory_contains");
+		predicate.addProperty("itemId", itemId);
+		predicate.addProperty("count", 1);
+		payload.add("predicate", predicate);
+		return payload;
 	}
 
 	private static void verifyObsoletePlannerReadinessIsIgnored() {

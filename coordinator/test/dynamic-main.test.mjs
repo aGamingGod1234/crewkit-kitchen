@@ -80,16 +80,119 @@ class FakeProvider {
 }
 
 class FakePlanner {
-	constructor(registry) { this.registry = registry; this.requests = []; this.interruptions = []; }
+	constructor(registry) { this.registry = registry; this.requests = []; this.goalSpecRequests = []; this.goalSpecCancellations = []; this.interruptions = []; }
 	beginReconcile(records) {
 		const registry = this.registry.reconcile(records);
 		return { registry, complete: Promise.resolve({ registry, providers: { valid: registry.records, invalid: [], catalog: { models: [] } } }) };
 	}
 	async reconcile(records) { return this.beginReconcile(records).complete; }
 	async requestPlan(request) { this.requests.push(request); return withCompletionContract({ summary: 'Wait twice.', directive: 'replace', source: SOURCE }, request.goalRevision); }
+	async requestGoalSpec(request) {
+		this.goalSpecRequests.push(request);
+		return { requestId: request.request.requestId, summary: 'Obtain an iron pickaxe.', predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 } };
+	}
+	cancelGoalSpec(agentId, requestId) { this.goalSpecCancellations.push({ agentId, requestId }); return true; }
 	async interrupt(agentId) { this.interruptions.push(agentId); }
 	async remove(agentId) { return this.registry.remove(agentId); }
 }
+
+test('goal translation is isolated, coalesced, acknowledged, and does not change lifecycle state', async () => {
+	const run = await start();
+	const request = {
+		agentId: 'agent-a',
+		payload: { requestId: '00000000-0000-0000-0000-000000000101', originalRequest: 'Get a good pickaxe', candidateIds: ['minecraft:iron_pickaxe', 'minecraft:diamond_pickaxe'] },
+	};
+	try {
+		run.bridge.emit('goal_spec_request', request);
+		run.bridge.emit('goal_spec_request', structuredClone(request));
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'goal_spec_proposal'));
+		assert.equal(run.planner.goalSpecRequests.length, 1);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.IDLE);
+		assert.deepEqual(run.bridge.sent.find((message) => message.type === 'goal_spec_proposal').payload, {
+			requestId: request.payload.requestId,
+			summary: 'Obtain an iron pickaxe.',
+			predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 },
+		});
+		run.bridge.emit('goal_spec_result', { agentId: 'agent-a', payload: { requestId: request.payload.requestId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' } });
+		await new Promise((resolve) => setImmediate(resolve));
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('goal translation retries provider failure and retransmits until Minecraft acknowledges it', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let attempts = 0;
+	planner.requestGoalSpec = async (request) => {
+		planner.goalSpecRequests.push(request);
+		attempts += 1;
+		if (attempts === 1) throw Object.assign(new Error('temporary provider outage'), { code: 'PROVIDER_UNAVAILABLE' });
+		return {
+			requestId: request.request.requestId,
+			summary: 'Obtain an iron pickaxe.',
+			predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 },
+		};
+	};
+	const run = await start({
+		registry, planner,
+		setGoalSpecTimeout: timers.schedule,
+		clearGoalSpecTimeout: timers.cancel,
+	});
+	const requestId = '00000000-0000-4000-8000-000000000102';
+	try {
+		run.bridge.emit('goal_spec_request', {
+			agentId: 'agent-a',
+			payload: { requestId, originalRequest: 'Get a good pickaxe', candidateIds: ['minecraft:iron_pickaxe'] },
+		});
+		await eventually(() => attempts === 1 && timers.pendingCount === 1);
+		await timers.runNext();
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'goal_spec_proposal'));
+		assert.equal(attempts, 2);
+		assert.equal(timers.pendingCount, 1, 'accepted proposal is retransmitted until its result arrives');
+		run.bridge.emit('goal_spec_result', {
+			agentId: 'agent-a', payload: { requestId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' },
+		});
+		await eventually(() => timers.pendingCount === 0);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('replacing a goal cancels stale goal translation and suppresses its late proposal', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let release;
+	planner.requestGoalSpec = async (request) => {
+		planner.goalSpecRequests.push(request);
+		await new Promise((resolve) => { release = resolve; });
+		return {
+			requestId: request.request.requestId,
+			summary: 'Obtain an iron pickaxe.',
+			predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 },
+		};
+	};
+	const run = await start({ registry, planner });
+	const requestId = '00000000-0000-4000-8000-000000000103';
+	try {
+		run.bridge.emit('goal_spec_request', {
+			agentId: 'agent-a',
+			payload: { requestId, originalRequest: 'Get a good pickaxe', candidateIds: ['minecraft:iron_pickaxe'] },
+		});
+		await eventually(() => planner.goalSpecRequests.length === 1);
+		run.bridge.emit('goal_control', {
+			agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Get stone' },
+		});
+		await eventually(() => planner.goalSpecCancellations.some((entry) => entry.requestId === requestId));
+		release();
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'goal_spec_proposal' && message.payload.requestId === requestId), false);
+	} finally {
+		release?.();
+		await run.coordinator.stop();
+	}
+});
 
 function record(agentId = 'agent-a') {
 	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] };

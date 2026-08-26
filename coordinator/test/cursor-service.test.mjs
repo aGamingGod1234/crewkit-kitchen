@@ -149,6 +149,32 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	await service.stop();
 });
 
+test('Cursor structured turns use an isolated prompt and caller-supplied parser', async () => {
+	const children = [];
+	const spawn = () => {
+		const child = new FakeChild();
+		children.push(child);
+		queueMicrotask(() => {
+			child.stdout.emit('data', Buffer.from(JSON.stringify({
+				type: 'result', subtype: 'success', is_error: false, result: '{"requestId":"draft-1"}',
+				session_id: 'cursor-structured', duration_ms: 1, duration_api_ms: 1,
+			})));
+			child.exitCode = 0;
+			child.emit('close', 0, null);
+		});
+		return child;
+	};
+	const service = new CursorProviderService(config(), {
+		spawn,
+		discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+	});
+	const agent = await service.createAgent(profile({ agentId: 'cursor-structured' }));
+	const result = await agent.decide('translate exactly', { goalRevision: 0, systemPrompt: '', parseOutput: JSON.parse });
+	assert.deepEqual(result, { requestId: 'draft-1' });
+	assert.equal(children[0].stdin.chunks.join(''), 'translate exactly');
+	await service.stop();
+});
+
 test('Cursor reports only its bounded visible result through the verbose adapter contract', async () => {
 	const spawn = () => {
 		const child = new FakeChild();

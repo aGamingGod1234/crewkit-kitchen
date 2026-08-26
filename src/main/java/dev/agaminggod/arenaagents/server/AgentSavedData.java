@@ -184,6 +184,34 @@ public final class AgentSavedData extends SavedData {
 		return Optional.ofNullable(goalDrafts.get(Objects.requireNonNull(draftId, "draftId must not be null")));
 	}
 
+	public synchronized PendingGoalDraft updateGoalDraftProposal(
+			UUID draftId,
+			AgentId agentId,
+			dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate
+	) {
+		Objects.requireNonNull(draftId, "draftId must not be null");
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		PendingGoalDraft draft = goalDrafts.get(draftId);
+		if (draft == null) throw new AgentDomainException("UNKNOWN_GOAL_DRAFT", "Goal draft does not exist");
+		if (!draft.agentId().equals(agentId)) throw new AgentDomainException("GOAL_DRAFT_AGENT_MISMATCH", "Goal draft belongs to another agent");
+		if (draft.intent() != dev.agaminggod.arenaagents.server.goal.DraftIntent.CONFIRM_TRANSLATION) {
+			throw new AgentDomainException("GOAL_DRAFT_INTENT_MISMATCH", "Only translation drafts accept coordinator proposals");
+		}
+		AgentRecord record = registry.records().stream()
+				.filter(candidate -> candidate.agentId().equals(agentId)).findFirst()
+				.orElseThrow(() -> new AgentDomainException("UNKNOWN_AGENT", "Goal draft target does not exist"));
+		if (!draft.matches(record)) throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
+		if (draft.proposedPredicate().isPresent()) {
+			if (draft.proposedPredicate().orElseThrow().equals(predicate)) return draft;
+			throw new AgentDomainException("GOAL_DRAFT_PROPOSAL_CONFLICT", "Goal draft already has a different proposal");
+		}
+		PendingGoalDraft updated = draft.withProposedPredicate(predicate);
+		goalDrafts.put(draftId, updated);
+		setDirty();
+		return updated;
+	}
+
 	public synchronized boolean removeGoalDraft(UUID draftId) {
 		boolean removed = goalDrafts.remove(Objects.requireNonNull(draftId, "draftId must not be null")) != null;
 		if (removed) setDirty();

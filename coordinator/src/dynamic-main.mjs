@@ -49,6 +49,9 @@ const PROJECT_DIRECTORY = path.resolve(COORDINATOR_DIRECTORY, '..');
 const DEFAULT_DYNAMIC_CONFIG_PATH = path.join(COORDINATOR_DIRECTORY, 'config', 'dynamic-agents.json');
 const DEFAULT_INVALID_DECISION_RETRIES = 1;
 const EMPTY_TURN_RETRY_DELAY_MS = 1_000;
+const GOAL_SPEC_RETRY_BASE_MS = 1_000;
+const GOAL_SPEC_RETRY_MAX_MS = 30_000;
+const GOAL_SPEC_PROPOSAL_RETRY_MS = 5_000;
 const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set(['MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE', 'REQUEST_TIMEOUT']);
 const QUIET_LIFECYCLE_ERRORS = new Set(['PLAN_CANCELLED', 'STALE_PLAN', 'STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION']);
 const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
@@ -86,6 +89,9 @@ export class DynamicCoordinator extends EventEmitter {
 	#conversationMemories = new Map();
 	#contextCursors = new Map();
 	#conversationWakeTransactions = new Map();
+	#goalSpecRequests = new Map();
+	#setGoalSpecTimeout;
+	#clearGoalSpecTimeout;
 	#programRuntime;
 	#nativeRuntime;
 	#goalSupervisor;
@@ -109,7 +115,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#providerTurnRecorder;
 	#verboseEnabled = false;
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -157,6 +163,8 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 		this.#setStatusInterval = requireDependency(setStatusInterval, 'setStatusInterval');
 		this.#clearStatusInterval = requireDependency(clearStatusInterval, 'clearStatusInterval');
+		this.#setGoalSpecTimeout = requireDependency(setGoalSpecTimeout, 'setGoalSpecTimeout');
+		this.#clearGoalSpecTimeout = requireDependency(clearGoalSpecTimeout, 'clearGoalSpecTimeout');
 	}
 
 	get registry() { return this.#registry; }
@@ -205,6 +213,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#conversationMemories.clear();
 		this.#contextCursors.clear();
 		this.#conversationWakeTransactions.clear();
+		this.#cancelGoalSpecRequests();
 		if (this.#traceWriter !== null && typeof this.#traceWriter.close === 'function') await this.#traceWriter.close();
 		if (this.#providerTurnRecorder !== null) await Promise.resolve(this.#providerTurnRecorder.close()).catch(() => {});
 		await this.#codexService.stop();
@@ -293,9 +302,39 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#conversationMemories.delete(message.agentId);
 			this.#contextCursors.delete(message.agentId);
 			this.#forgetConversationWakes(message.agentId);
+			this.#cancelGoalSpecRequests(message.agentId);
 			this.#supportedAgentIds.delete(message.agentId);
 			await this.#publishStatus();
 		}));
+		this.#listen('goal_spec_request', (message) => {
+			const key = this.#goalSpecRequestKey(message.agentId, message.payload.requestId);
+			const fingerprint = JSON.stringify(message.payload);
+			const existing = this.#goalSpecRequests.get(key);
+			if (existing !== undefined) {
+				if (existing.fingerprint !== fingerprint) {
+					this.#emitRuntimeError(new ProtocolV2Error('TRANSACTION_COLLISION', `Goal translation request '${message.payload.requestId}' changed during replay`));
+					return;
+				}
+				if (existing.proposal !== null) {
+					void this.#bridge.send('goal_spec_proposal', message.agentId, existing.proposal).catch((error) => this.#emitRuntimeError(error));
+				}
+				return;
+			}
+			const entry = {
+				agentId: message.agentId, requestId: message.payload.requestId, request: message.payload,
+				fingerprint, proposal: null, attempts: 0, translating: false, retryHandle: null,
+			};
+			this.#goalSpecRequests.set(key, entry);
+			this.#run(() => this.#processGoalSpecRequest(key, entry));
+		});
+		this.#listen('goal_spec_result', (message) => {
+			const key = this.#goalSpecRequestKey(message.agentId, message.payload.requestId);
+			const existing = this.#goalSpecRequests.get(key);
+			if (existing === undefined) return;
+			this.#goalSpecRequests.delete(key);
+			if (existing.retryHandle !== null) this.#clearGoalSpecTimeout(existing.retryHandle);
+			this.#planner.cancelGoalSpec?.(message.agentId, message.payload.requestId);
+		});
 		this.#listen('goal_control', (message) => {
 			const previous = this.#registry.get(message.agentId);
 			let record;
@@ -308,6 +347,7 @@ export class DynamicCoordinator extends EventEmitter {
 			const replaced = previous !== null && message.payload.operation !== 'queue' && record.goalRevision > previous.goalRevision;
 			let nativeDisposal = Promise.resolve();
 			if (replaced) {
+				this.#cancelGoalSpecRequests(message.agentId);
 				this.#retireGoalSupervision(previous, message.payload.operation);
 				this.#invalidateAcceptedLifecycle(message.agentId);
 				this.#beginGoalControlInterruption(message);
@@ -529,6 +569,7 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 		this.#listen('disconnected', () => {
 			this.#setVerboseEnabled(false);
+			this.#cancelGoalSpecRequests();
 			for (const record of this.#registry.list()) {
 				if (this.#usesNativeTools(record)) this.#goalSupervisor.suspend(this.#supervisionKey(record));
 				this.#advanceLifecycleGeneration(record.agentId);
@@ -1392,6 +1433,7 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#invalidateServerInstance() {
+		this.#cancelGoalSpecRequests();
 		this.#healthRegistry.reset();
 		this.#factLedgers.clear();
 		this.#conversationMemories.clear();
@@ -1412,6 +1454,61 @@ export class DynamicCoordinator extends EventEmitter {
 			} catch (error) {
 				void this.#reportAgentError(record.agentId, error);
 			}
+		}
+	}
+
+	#goalSpecRequestKey(agentId, requestId) {
+		return `${this.#serverInstanceId ?? 'disconnected'}\u0000${agentId}\u0000${requestId}`;
+	}
+
+	async #processGoalSpecRequest(key, entry) {
+		if (this.#goalSpecRequests.get(key) !== entry || this.#serverInstanceId === null || entry.translating) return;
+		if (entry.retryHandle !== null) {
+			this.#clearGoalSpecTimeout(entry.retryHandle);
+			entry.retryHandle = null;
+		}
+		if (entry.proposal !== null) {
+			try {
+				await this.#bridge.send('goal_spec_proposal', entry.agentId, entry.proposal);
+			} catch (error) {
+				if (this.#goalSpecRequests.get(key) === entry) this.#emitRuntimeError(error);
+			}
+			if (this.#goalSpecRequests.get(key) === entry) this.#scheduleGoalSpecRequest(key, entry, GOAL_SPEC_PROPOSAL_RETRY_MS);
+			return;
+		}
+		entry.translating = true;
+		try {
+			await this.#reconciliation;
+			if (this.#goalSpecRequests.get(key) !== entry || this.#serverInstanceId === null) return;
+			entry.proposal = await this.#planner.requestGoalSpec({ agentId: entry.agentId, request: entry.request });
+			entry.attempts = 0;
+		} catch (error) {
+			if (this.#goalSpecRequests.get(key) !== entry) return;
+			entry.attempts += 1;
+			this.#emitRuntimeError(error);
+			const delay = Math.min(GOAL_SPEC_RETRY_MAX_MS, GOAL_SPEC_RETRY_BASE_MS * (2 ** Math.min(entry.attempts - 1, 5)));
+			this.#scheduleGoalSpecRequest(key, entry, delay);
+			return;
+		} finally {
+			entry.translating = false;
+		}
+		if (this.#goalSpecRequests.get(key) === entry) await this.#processGoalSpecRequest(key, entry);
+	}
+
+	#scheduleGoalSpecRequest(key, entry, delayMs) {
+		if (entry.retryHandle !== null) this.#clearGoalSpecTimeout(entry.retryHandle);
+		entry.retryHandle = this.#setGoalSpecTimeout(() => {
+			entry.retryHandle = null;
+			this.#run(() => this.#processGoalSpecRequest(key, entry));
+		}, delayMs);
+	}
+
+	#cancelGoalSpecRequests(agentId = null) {
+		for (const [key, request] of this.#goalSpecRequests) {
+			if (agentId !== null && request.agentId !== agentId) continue;
+			this.#goalSpecRequests.delete(key);
+			if (request.retryHandle !== null) this.#clearGoalSpecTimeout(request.retryHandle);
+			try { this.#planner.cancelGoalSpec?.(request.agentId, request.requestId); } catch { /* cancellation is best effort */ }
 		}
 	}
 
@@ -1525,8 +1622,16 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,
 		clearStatusInterval: dependencies.clearStatusInterval,
+		setGoalSpecTimeout: dependencies.setGoalSpecTimeout,
+		clearGoalSpecTimeout: dependencies.clearGoalSpecTimeout,
 		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
+}
+
+function defaultGoalSpecTimeout(callback, delayMs) {
+	const handle = setTimeout(callback, delayMs);
+	handle.unref?.();
+	return handle;
 }
 
 export function parseDynamicCliArguments(args) {

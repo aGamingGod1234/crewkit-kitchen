@@ -10,6 +10,7 @@ import dev.agaminggod.arenaagents.server.goal.DraftIntent;
 import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
 import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
+import dev.agaminggod.arenaagents.server.goal.GoalSpecRequestSink;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,12 +27,18 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 
 	private final CodexAgentManager manager;
 	private final ConversationEventSink eventSink;
+	private final GoalSpecRequestSink goalSpecRequestSink;
 	private final GoalCompiler goalCompiler = new GoalCompiler();
 	private final Map<AgentId, Long> sequences = new LinkedHashMap<>();
 
 	public ServerAgentConversationRouter(CodexAgentManager manager, ConversationEventSink eventSink) {
+		this(manager, eventSink, draft -> { });
+	}
+
+	public ServerAgentConversationRouter(CodexAgentManager manager, ConversationEventSink eventSink, GoalSpecRequestSink goalSpecRequestSink) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.eventSink = Objects.requireNonNull(eventSink, "eventSink must not be null");
+		this.goalSpecRequestSink = Objects.requireNonNull(goalSpecRequestSink, "goalSpecRequestSink must not be null");
 	}
 
 	public DeliveryReceipt deliverAgentMessage(
@@ -271,6 +278,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 					? DraftIntent.REPLACE_OR_QUEUE
 					: DraftIntent.CONFIRM_TRANSLATION);
 			manager.stageGoalDraft(draft);
+			if (proposed.isEmpty()) goalSpecRequestSink.publish(draft);
 			notifyRequester(draft, proposed.isPresent()
 					? "That agent already has a goal. Choose Replace, Queue, or Cancel for draft " + draft.draftId() + "."
 					: compilation.playerMessage() + " Draft " + draft.draftId() + " is waiting for clarification.");
@@ -283,6 +291,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		}
 		PendingGoalDraft draft = draft(target, event, Optional.empty(), DraftIntent.CONFIRM_TRANSLATION);
 		manager.stageGoalDraft(draft);
+		goalSpecRequestSink.publish(draft);
 		notifyRequester(draft, compilation.playerMessage() + " Draft " + draft.draftId() + " is waiting for clarification.");
 		return GoalRoute.CONSUMED;
 	}
@@ -300,7 +309,8 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 			throw new AgentDomainException("INVALID_GOAL_REQUESTER", "Goal clarification requires a player identity");
 		}
 		return new PendingGoalDraft(
-				UUID.randomUUID(), target.agentId(), playerId, event.text(), proposed, intent,
+				UUID.randomUUID(), target.agentId(), playerId, event.text(),
+				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess()), proposed, intent,
 				manager.server().getTickCount(), target.goalRevision(), target.currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId)
 		);
 	}

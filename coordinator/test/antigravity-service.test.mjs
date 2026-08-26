@@ -146,6 +146,19 @@ test('Antigravity parses planner output and uses the stable per-agent workspace'
 	await service.stop();
 });
 
+test('Antigravity structured turns use an isolated prompt and caller-supplied parser', async () => {
+	const spawnCalls = [];
+	const service = new AntigravityProviderService(config(), {
+		platform: 'win32',
+		spawn: successfulSpawner(spawnCalls, '{"requestId":"draft-1"}'),
+	});
+	const agent = await service.createAgent(profile({ agentId: 'gemini-structured' }));
+	const result = await agent.decide('translate exactly', { goalRevision: 0, systemPrompt: '', parseOutput: JSON.parse });
+	assert.deepEqual(result, { requestId: 'draft-1' });
+	assert.equal(spawnCalls[0].args[1], 'translate exactly');
+	await service.stop();
+});
+
 test('Antigravity reports its bounded visible result through the verbose adapter contract', async () => {
 	const service = new AntigravityProviderService(config(), {
 		platform: 'win32',

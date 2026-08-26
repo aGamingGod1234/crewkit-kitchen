@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.regex.Matcher;
@@ -22,6 +23,7 @@ public final class GoalCompiler {
 	private static final Pattern POSITION = Pattern.compile("^(?:go|move|travel|get) to (-?\\d+)[, ]+(-?\\d+)[, ]+(-?\\d+)$");
 	private static final Pattern ADVANCEMENT = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:the )?(.+)$");
+	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
 	private static final Pattern ITEM = Pattern.compile("^(?:get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
 	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
@@ -67,6 +69,10 @@ public final class GoalCompiler {
 		}
 
 		Matcher kill = KILL.matcher(command);
+		if (BEAT_GAME.matcher(command).matches()) {
+			return accepted(original, new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true), createdAtTick,
+					"Goal set: defeat minecraft:ender_dragon.");
+		}
 		if (kill.matches()) {
 			List<String> matches = matchEntities(kill.group(1), registries);
 			if (matches.size() == 1) {
@@ -107,6 +113,24 @@ public final class GoalCompiler {
 		return GOAL_LEAD.matcher(normalized).find();
 	}
 
+	public List<String> candidateIdsFor(String request, RegistryAccess registries) {
+		Objects.requireNonNull(registries, "registries must not be null");
+		String command = stripTrailingPunctuation(stripPoliteness(
+				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		Matcher item = ITEM.matcher(command);
+		if (item.matches()) {
+			String target = SUBJECTIVE.matcher(item.group(2)).replaceAll(" ").replaceAll("\\s+", " ").strip();
+			return relatedItems(target, registries).stream().limit(64).toList();
+		}
+		Matcher kill = KILL.matcher(command);
+		if (BEAT_GAME.matcher(command).matches()) return List.of("minecraft:ender_dragon");
+		if (kill.matches()) {
+			String target = SUBJECTIVE.matcher(kill.group(1)).replaceAll(" ").replaceAll("\\s+", " ").strip();
+			return relatedEntities(target, registries).stream().limit(64).toList();
+		}
+		return List.of();
+	}
+
 	private static GoalCompilation accepted(String original, GoalPredicate predicate, long createdAtTick, String message) {
 		return GoalCompilation.accepted(GoalSpec.create(original, predicate, createdAtTick), message);
 	}
@@ -126,6 +150,25 @@ public final class GoalCompiler {
 		return matches.stream().distinct().sorted().toList();
 	}
 
+	private static List<String> relatedItems(String target, RegistryAccess registries) {
+		String wanted = normalizedTarget(target);
+		if (wanted.isEmpty()) return List.of();
+		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		boolean tools = wanted.endsWith(" tool") || wanted.endsWith(" tools");
+		String material = tools ? wanted.replaceFirst("\\s+tools?$", "") : "";
+		Set<String> toolKinds = Set.of("axe", "hoe", "pickaxe", "shovel", "sword");
+		return itemRegistry.keySet().stream()
+				.filter(id -> {
+					Item item = itemRegistry.getValue(id);
+					String description = item == null ? "" : descriptionName(item.getDescriptionId());
+					String path = pathName(id);
+					return id.toString().equals(wanted) || path.equals(wanted) || description.equals(wanted)
+							|| path.endsWith(" " + wanted) || description.endsWith(" " + wanted)
+							|| tools && path.startsWith(material + " ") && toolKinds.contains(path.substring(material.length() + 1));
+				})
+				.map(Identifier::toString).distinct().sorted().toList();
+	}
+
 	private static List<String> matchEntities(String target, RegistryAccess registries) {
 		String wanted = normalizedTarget(target);
 		Registry<EntityType<?>> entityRegistry = registries.lookup(Registries.ENTITY_TYPE).orElse(BuiltInRegistries.ENTITY_TYPE);
@@ -139,6 +182,15 @@ public final class GoalCompiler {
 				.distinct()
 				.sorted()
 				.toList();
+	}
+
+	private static List<String> relatedEntities(String target, RegistryAccess registries) {
+		String wanted = normalizedTarget(target);
+		if (wanted.isEmpty()) return List.of();
+		Registry<EntityType<?>> registry = registries.lookup(Registries.ENTITY_TYPE).orElse(BuiltInRegistries.ENTITY_TYPE);
+		return registry.keySet().stream()
+				.filter(id -> pathName(id).equals(wanted) || pathName(id).endsWith(" " + wanted))
+				.map(Identifier::toString).distinct().sorted().toList();
 	}
 
 	private static String pathName(Identifier id) {

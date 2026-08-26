@@ -16,7 +16,7 @@ const MAX_PUBLIC_AGENT_MESSAGE_CANDIDATE_CHARS = 1_280;
 const PROFILE_CONFLICT_MESSAGE = 'Agent profile is immutable for the active Codex session';
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Codex Agents', version: '2.0.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
-const CONTROL_PROTOCOLS = new Set(['arena_script', 'native_tools']);
+const CONTROL_PROTOCOLS = new Set(['arena_script', 'native_tools', 'goal_spec']);
 
 export class CodexService {
 	#config;
@@ -121,10 +121,12 @@ export class CodexService {
 			dynamicTools: controlProtocol === 'native_tools' ? MINECRAFT_DYNAMIC_TOOLS : [],
 			environments: [],
 			ephemeral: true,
-			baseInstructions: controlProtocol === 'native_tools' ? NATIVE_AGENT_INSTRUCTIONS : PLANNER_SYSTEM_PROMPT,
+			baseInstructions: controlProtocol === 'native_tools'
+				? NATIVE_AGENT_INSTRUCTIONS
+				: controlProtocol === 'goal_spec' ? goalSpecInstructions() : PLANNER_SYSTEM_PROMPT,
 			developerInstructions: controlProtocol === 'native_tools'
 				? nativeRecoveryInstructions(recoverySummary)
-				: recoveryInstructions(recoverySummary),
+				: controlProtocol === 'goal_spec' ? 'Return only one JSON value matching the supplied output schema. Never call tools.' : recoveryInstructions(recoverySummary),
 		}, { timeoutMs: THREAD_START_TIMEOUT_MS });
 		const threadId = requireNestedId(response, 'thread', 'thread/start');
 	const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
@@ -266,11 +268,18 @@ export class SharedCodexAgent {
 		if (this.#active !== null && this.#active.goalRevision !== revision) await this.interrupt();
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs, onVerbose = null } = {}) {
-		if (this.#controlProtocol !== 'arena_script') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'Native tool agents must use act()');
+	async decide(input, {
+		goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs, onVerbose = null,
+		outputSchema = PLANNER_OUTPUT_SCHEMA, parseOutput = parseDecision, systemPrompt,
+	} = {}) {
+		if (this.#controlProtocol === 'native_tools') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'Native tool agents must use act()');
 		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
+		if (typeof parseOutput !== 'function') throw new TypeError('parseOutput must be a function');
+		if (systemPrompt !== undefined && typeof systemPrompt !== 'string') throw new TypeError('systemPrompt must be a string');
+		if (outputSchema === null || typeof outputSchema !== 'object' || Array.isArray(outputSchema)) throw new TypeError('outputSchema must be an object');
+		const effectiveInput = systemPrompt === undefined || systemPrompt.length === 0 ? input : `${systemPrompt}\n\n${input}`;
 		requireRevision(goalRevision);
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new CodexProtocolError('TURN_INTERRUPTED', 'Planning turn was interrupted');
@@ -302,13 +311,13 @@ export class SharedCodexAgent {
 		try {
 			const turnStartPromise = this.#transport.request('turn/start', {
 				threadId: this.#threadId,
-				input: [{ type: 'text', text: input }],
+				input: [{ type: 'text', text: effectiveInput }],
 				model: this.#profile.model,
 				effort: this.#profile.reasoningEffort,
 				serviceTier: this.#profile.serviceTier,
 				approvalPolicy: 'never',
 				environments: [],
-				outputSchema: PLANNER_OUTPUT_SCHEMA,
+				outputSchema,
 			}, { timeoutMs: this.#planningTimeoutMs });
 			void turnStartPromise.then((response) => {
 				const turnId = response?.turn?.id;
@@ -334,7 +343,7 @@ export class SharedCodexAgent {
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex result belongs to an obsolete goal revision');
 			let decision;
 			let parseError = null;
-			try { decision = parseDecision(text); }
+			try { decision = parseOutput(text); }
 			catch (error) { parseError = error; }
 			outputHandled = true;
 			await recordProviderTurn(turnRecorder, {
@@ -844,8 +853,12 @@ function nativeRecoveryInstructions(summary) {
 	return `Use only the Minecraft tools. Act immediately. Prior factual summary: ${JSON.stringify(summary)}`;
 }
 
+function goalSpecInstructions() {
+	return 'Translate one player request into one bounded Minecraft goal predicate. Use only identifiers supplied by the caller and return only schema-valid JSON.';
+}
+
 function validateControlProtocol(value) {
-	if (!CONTROL_PROTOCOLS.has(value)) throw new TypeError("controlProtocol must be 'arena_script' or 'native_tools'");
+	if (!CONTROL_PROTOCOLS.has(value)) throw new TypeError("controlProtocol must be 'arena_script', 'native_tools', or 'goal_spec'");
 	return value;
 }
 

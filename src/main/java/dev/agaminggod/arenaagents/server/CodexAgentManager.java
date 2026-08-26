@@ -265,6 +265,14 @@ public final class CodexAgentManager {
 		return savedData.goalDraft(draftId);
 	}
 
+	public PendingGoalDraft updateGoalDraftProposal(
+			UUID draftId,
+			AgentId agentId,
+			dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate
+	) {
+		return savedData.updateGoalDraftProposal(draftId, agentId, predicate);
+	}
+
 	public boolean removeGoalDraft(UUID draftId) {
 		return savedData.removeGoalDraft(draftId);
 	}

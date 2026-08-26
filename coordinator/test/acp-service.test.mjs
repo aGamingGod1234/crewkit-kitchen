@@ -77,6 +77,19 @@ test('Gemini ACP sessions apply the exact model and thinking level and parse pla
 	await service.stop();
 });
 
+test('ACP structured turns use an isolated prompt and caller-supplied parser', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.message = '{"requestId":"draft-1"}';
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-structured', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	const result = await agent.decide('translate exactly', { goalRevision: 0, systemPrompt: '', parseOutput: JSON.parse });
+	assert.deepEqual(result, { requestId: 'draft-1' });
+	const prompt = transport.calls.find((call) => call.method === 'session/prompt').params.prompt[0].text;
+	assert.equal(prompt, 'translate exactly');
+	assert.doesNotMatch(prompt, /strategic author/i);
+	await service.stop();
+});
+
 test('ACP reports only bounded visible agent-message chunks through the verbose adapter contract', async () => {
 	const transport = new FakeAcpTransport(options());
 	transport.hiddenMessage = 'hidden ACP thought';

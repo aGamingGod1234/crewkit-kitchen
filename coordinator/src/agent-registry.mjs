@@ -214,6 +214,7 @@ export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP,
 		skinVariant: requireIdentifier(value.skinVariant ?? 'default', 'skinVariant'),
 		state: normalizedState,
 		currentGoal: optionalGoal(value.currentGoal),
+		currentGoalSpec: value.currentGoalSpec === null || value.currentGoalSpec === undefined ? null : parseGoalSpec(value.currentGoalSpec),
 		goalRevision,
 		queue: queue.map((entry, index) => normalizeQueuedGoal(entry, index)),
 		lastSummary: optionalText(value.lastSummary, 'lastSummary', MAX_RESULT_MESSAGE_LENGTH),
@@ -243,7 +244,7 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 		if (record.queue.length >= queueCap) throw new AgentRegistryError('GOAL_QUEUE_FULL', `Agent goal queue is limited to ${queueCap} entries`);
 		return {
 			...record,
-			queue: [...record.queue, normalizeQueuedGoal({ goal: controlValue.goal, goalRevision: revision }, record.queue.length)],
+			queue: [...record.queue, normalizeQueuedGoal({ goal: controlValue.goal, goalRevision: revision, goalSpec: controlValue.goalSpec }, record.queue.length)],
 			updatedAtEpochMs: nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs'),
 		};
 	}
@@ -270,6 +271,7 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 			next.queue = record.queue.slice(1);
 		}
 		next.currentGoal = nextGoal;
+		next.currentGoalSpec = controlValue.goalSpec === undefined ? promotedGoalSpec(record, operation) : parseGoalSpec(controlValue.goalSpec);
 		next.state = DynamicAgentState.STARTING;
 		return next;
 	}
@@ -307,10 +309,12 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	if (next.queue.length > 0) {
 		const [promoted, ...remaining] = next.queue;
 		next.currentGoal = promoted.goal;
+		next.currentGoalSpec = promoted.goalSpec;
 		next.queue = remaining;
 		next.state = DynamicAgentState.STARTING;
 	} else {
 		next.currentGoal = null;
+		next.currentGoalSpec = null;
 		next.state = DynamicAgentState.IDLE;
 	}
 	return next;
@@ -343,12 +347,18 @@ function assertCurrentGoalRevision(record, revisionValue) {
 }
 
 function normalizeQueuedGoal(value, index) {
-	if (typeof value === 'string') return { goal: requireGoal(value), goalRevision: index + 1 };
+	if (typeof value === 'string') return { goal: requireGoal(value), goalRevision: index + 1, goalSpec: null };
 	if (!isPlainObject(value)) throw new TypeError('queued goal must be an object');
 	return {
 		goal: requireGoal(value.goal),
 		goalRevision: nonnegativeInteger(value.goalRevision ?? index + 1, 'queued goalRevision'),
+		goalSpec: value.goalSpec === null || value.goalSpec === undefined ? null : parseGoalSpec(value.goalSpec),
 	};
+}
+
+function promotedGoalSpec(record, operation) {
+	if (operation === 'steer') return record.currentGoalSpec;
+	return record.queue[0]?.goalSpec ?? null;
 }
 
 function normalizeError(value) {
@@ -457,3 +467,4 @@ function isPlainObject(value) {
 function clone(value) {
 	return structuredClone(value);
 }
+import { parseGoalSpec } from './goal-spec.mjs';

@@ -21,6 +21,7 @@ class FakeSharedTransport extends EventEmitter {
 	rejectInterrupt = false;
 	holdTurnStart = false;
 	turnStartResolvers = [];
+	message = finishDecisionJson();
 
 	async start() { this.calls.push({ method: '$start' }); }
 	async stop() { this.calls.push({ method: '$stop' }); }
@@ -49,10 +50,30 @@ class FakeSharedTransport extends EventEmitter {
 	}
 
 	complete(threadId, turnId) {
-		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: finishDecisionJson() } } });
+		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: this.message } } });
 		this.emit('notification', { method: 'turn/completed', params: { threadId, turnId, turn: { id: turnId, status: 'completed' } } });
 	}
 }
+
+test('Codex goal-spec turns use the supplied closed schema and parser without Minecraft tools', async () => {
+	const transport = new FakeSharedTransport();
+	transport.message = '{"requestId":"draft-1","summary":"Obtain iron.","predicate":{"type":"inventory_contains","itemId":"minecraft:iron_ingot","count":1}}';
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const agent = await service.createAgent(profile('goal-spec-agent'), { controlProtocol: 'goal_spec' });
+	const outputSchema = { type: 'object', additionalProperties: false };
+	const result = await agent.decide('translate exactly', {
+		goalRevision: 0,
+		outputSchema,
+		parseOutput: JSON.parse,
+		systemPrompt: '',
+	});
+	assert.equal(result.requestId, 'draft-1');
+	const threadStart = transport.calls.find((call) => call.method === 'thread/start');
+	assert.deepEqual(threadStart.params.dynamicTools, []);
+	const turnStart = transport.calls.find((call) => call.method === 'turn/start');
+	assert.equal(turnStart.params.outputSchema, outputSchema);
+	await service.stop();
+});
 
 function profile(agentId) {
 	return { agentId, model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' };

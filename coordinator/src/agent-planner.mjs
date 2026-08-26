@@ -1,8 +1,12 @@
+import { createHash } from 'node:crypto';
+
 import { AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
+import { parseGoalSpecRequest } from './goal-spec.mjs';
+import { GoalSpecTranslator } from './goal-spec-translator.mjs';
 
 const DEFAULT_INVALID_DECISION_RETRIES = 1;
 const MAX_RETRY_ERROR_LENGTH = 512;
@@ -81,6 +85,42 @@ export class AgentPlanner {
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
+
+	requestGoalSpec({ agentId, request }) {
+		const record = this.#registry.get(agentId);
+		if (record === null || record === undefined) throw codedError('UNKNOWN_AGENT', `Agent '${agentId}' is not registered`);
+		const checkedRequest = parseGoalSpecRequest(request);
+		const translatorId = goalSpecTranslatorId(agentId, checkedRequest.requestId);
+		const translator = new GoalSpecTranslator({
+			generate: ({ prompt, schema }) => this.#scheduler.schedule(translatorId, async ({ signal }) => {
+				const queuedAt = this.#now();
+				const profile = { ...record, agentId: translatorId };
+				let agent = null;
+				try {
+					agent = await this.#providerAttempt(record, {
+						operation: 'goal_spec_create', attempt: 1, queueWaitMs: 0, retry: false, traceId: checkedRequest.requestId,
+					}, () => this.#codexService.createAgent(profile, { recoverySummary: null, controlProtocol: 'goal_spec' }));
+					await agent.setGoalRevision(0);
+					return await this.#providerAttempt(record, {
+						operation: 'goal_spec', attempt: 1, queueWaitMs: elapsed(queuedAt, this.#now()), retry: false, traceId: checkedRequest.requestId,
+					}, () => agent.decide(prompt, {
+						goalRevision: 0,
+						signal,
+						outputSchema: schema,
+						parseOutput: parseGoalSpecJson,
+						systemPrompt: '',
+					}));
+				} finally {
+					try { await this.#codexService.removeAgent(translatorId); } catch { /* transient cleanup is best effort */ }
+				}
+			}, { lane: record.provider, priority: 'ordinary' }),
+		});
+		return translator.translate(checkedRequest);
+	}
+
+	cancelGoalSpec(agentId, requestId) {
+		return this.#scheduler.cancel(goalSpecTranslatorId(agentId, requestId), 'Goal translation was cancelled');
+	}
 
 	requestNativeTurn({ agentId, input, goalRevision, executeTool, recoverySummary = null, preserveState = false, priority = 'ordinary', traceId: requestedTraceId = null, onVerbose = null }) {
 		const record = this.#registry.assertCurrentRevision(agentId, goalRevision);
@@ -426,6 +466,19 @@ function readSessionFields(agent) {
 
 function defaultTraceId(agentId, goalRevision) {
 	return `trace-${String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_')}-${goalRevision}`.slice(0, 128);
+}
+
+function goalSpecTranslatorId(agentId, requestId) {
+	if (typeof agentId !== 'string' || agentId.trim().length === 0) throw new TypeError('agentId must be nonblank');
+	if (typeof requestId !== 'string' || requestId.trim().length === 0) throw new TypeError('requestId must be nonblank');
+	const digest = createHash('sha256').update(`${agentId}\0${requestId}`).digest('hex').slice(0, 32);
+	return `goal-spec-${digest}`;
+}
+
+function parseGoalSpecJson(value) {
+	if (typeof value !== 'string') return value;
+	try { return JSON.parse(value); }
+	catch (error) { throw Object.assign(new Error('Goal translator output was not one JSON object', { cause: error }), { code: 'MALFORMED_GOAL_SPEC_PROPOSAL' }); }
 }
 
 function codedError(code, message) { return Object.assign(new Error(message), { code }); }

@@ -21,6 +21,42 @@ const VALID_DECISION = Object.freeze({
 	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(100);',
 });
 
+test('goal spec translation uses an isolated structured provider session without changing lifecycle state', async () => {
+	const registry = new FakeRegistry();
+	const calls = [];
+	const service = {
+		async createAgent(profile, options) {
+			calls.push({ type: 'create', profile, options });
+			return {
+				async setGoalRevision(revision) { calls.push({ type: 'revision', revision }); },
+				async decide(input, decisionOptions) {
+					calls.push({ type: 'decide', input, decisionOptions });
+					return {
+						requestId: '00000000-0000-4000-8000-000000000001', summary: 'Obtain an iron pickaxe',
+						predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 },
+					};
+				},
+			};
+		},
+		getAgent() { return null; },
+		async removeAgent(agentId) { calls.push({ type: 'remove', agentId }); return true; },
+	};
+	const planner = createPlannerForService(registry, service);
+	const proposal = await planner.requestGoalSpec({
+		agentId: AGENT_ID,
+		request: {
+			requestId: '00000000-0000-4000-8000-000000000001', originalRequest: 'Get a good pickaxe',
+			candidateIds: ['minecraft:iron_pickaxe', 'minecraft:diamond_pickaxe'],
+		},
+	});
+	assert.equal(proposal.requestId, '00000000-0000-4000-8000-000000000001');
+	assert.equal(calls.find(call => call.type === 'create').options.controlProtocol, 'goal_spec');
+	assert.notEqual(calls.find(call => call.type === 'create').profile.agentId, AGENT_ID);
+	assert.equal(typeof calls.find(call => call.type === 'decide').decisionOptions.parseOutput, 'function');
+	assert.equal(calls.at(-1).type, 'remove');
+	assert.deepEqual(registry.states, []);
+});
+
 test('ArenaScript planning explicitly creates an ArenaScript provider session', async () => {
 	const registry = new FakeRegistry();
 	const optionsSeen = [];
@@ -729,6 +765,10 @@ class FakeRegistry {
 		assert.equal(agentId, AGENT_ID);
 		assert.equal(goalRevision, GOAL_REVISION);
 		return RECORD;
+	}
+
+	get(agentId) {
+		return agentId === AGENT_ID ? RECORD : null;
 	}
 
 	setState(_agentId, state, options) {
