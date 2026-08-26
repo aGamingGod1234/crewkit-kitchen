@@ -15,12 +15,15 @@ class DeterministicGoalScheduler {
 	fired = 0;
 	maxPending = 0;
 	usesRealTimers = false;
+	scheduledDelays = [];
+	firedDelays = [];
 
 	schedule(callback, delayMs) {
 		if (typeof callback !== 'function') throw new TypeError('goal schedule callback must be a function');
 		const handle = { id: ++this.#nextHandle, cancelled: false };
 		this.#pending.set(handle.id, { handle, callback, delayMs });
 		this.scheduled += 1;
+		this.scheduledDelays.push(delayMs);
 		this.maxPending = Math.max(this.maxPending, this.#pending.size);
 		return handle;
 	}
@@ -36,6 +39,7 @@ class DeterministicGoalScheduler {
 		if (ready !== undefined) {
 			if (ready.handle.cancelled) return false;
 			this.fired += 1;
+			this.firedDelays.push(ready.delayMs);
 			ready.callback();
 			return true;
 		}
@@ -54,6 +58,8 @@ class DeterministicGoalScheduler {
 			maxPending: this.maxPending,
 			pending: this.#pending.size + this.#ready.filter(({ handle }) => !handle.cancelled).length,
 			usesRealTimers: this.usesRealTimers,
+			scheduledDelays: [...this.scheduledDelays],
+			firedDelays: [...this.firedDelays],
 		};
 	}
 }
@@ -176,6 +182,9 @@ export class NativeGoalHarness {
 			staleDispatches: this.#bridge.sent.filter((entry) => entry.type === 'action_command' && entry.payload.goalRevision < this.#bridge.record.goalRevision).length,
 			recoveryCycles: this.#provider.recoveryCycles,
 			inventory: this.#bridge.inventory,
+			completionEvaluations: this.#bridge.completionEvaluations,
+			goalControls: this.#bridge.goalControls,
+			goalSpec: this.#bridge.goalSpec,
 		};
 	}
 }

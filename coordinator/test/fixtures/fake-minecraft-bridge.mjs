@@ -269,6 +269,8 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	validatedInbound = 0;
 	recoveryHandles = 0;
 	recoveryDispatches = 0;
+	completionEvaluations = [];
+	goalControls = [];
 
 	constructor(scenario = {}) {
 		super();
@@ -285,7 +287,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			position: { x: 0, y: 64, z: 0 },
 			dead: false,
 			health: 20,
-			inventory: new Map(),
+			inventory: new Map(Object.entries(scenario.initialInventory ?? {})),
 			blocks: new Map([['0,64,0', 'minecraft:oak_log']]),
 			entities: new Map(),
 			drop: { stableId: '00000000-0000-4000-8000-000000000001', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 },
@@ -298,6 +300,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	get completionCount() { return this.#completionNumber; }
 	get inventory() { return new Map(this.#world.inventory); }
 	get world() { return structuredClone({ ...this.#world, inventory: Object.fromEntries(this.#world.inventory) }); }
+	get goalSpec() { return this.#record.goalSpec === undefined ? null : structuredClone(this.#record.goalSpec); }
 
 	start() {
 		this.#stopped = false;
@@ -342,10 +345,12 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			createdAtTick: revision,
 		};
 		this.#record.goalSpec = { ...fields, fingerprint: goalSpecFingerprint(fields) };
-		this.emit('goal_control', {
+		const control = {
 			agentId: this.#record.agentId,
 			payload: { operation: 'start', goalRevision: revision, goal, goalSpec: this.#record.goalSpec, updatedAtEpochMs: revision },
-		});
+		};
+		this.goalControls.push(structuredClone(control));
+		this.emit('goal_control', control);
 		return this.publishObservation({ attention: true });
 	}
 
@@ -407,10 +412,12 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 
 	#emitGoalControl(operation, revision, extra = {}) {
 		this.#record.goalRevision = revision;
-		this.emit('goal_control', {
+		const control = {
 			agentId: this.#record.agentId,
 			payload: { operation, goalRevision: revision, updatedAtEpochMs: revision, ...extra },
-		});
+		};
+		this.goalControls.push(structuredClone(control));
+		this.emit('goal_control', control);
 	}
 
 	async #executeAction(command) {
@@ -486,6 +493,12 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		const evaluation = this.#evaluateGoalPredicate(this.#record.goalSpec?.predicate);
 		const verified = request.goalFingerprint === this.#record.goalSpec?.fingerprint && evaluation.satisfied
 			&& (scriptedResult === undefined || scriptedResult === true);
+		this.completionEvaluations.push({
+			goalRevision: request.goalRevision,
+			goalFingerprint: request.goalFingerprint,
+			verified,
+			facts: structuredClone(evaluation.facts),
+		});
 		if (!verified) this.recoveries.push('COMPLETION_REJECTED');
 		this.#emitInbound('goal_completion_result', {
 			goalRevision: request.goalRevision,
@@ -519,7 +532,10 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 				this.#world.drop = null;
 			}
 		}
-		if (actionType === 'craft_inventory') this.#world.inventory.set('minecraft:wooden_pickaxe', 1);
+		if (actionType === 'craft_inventory') {
+			const itemId = args.recipeId ?? 'minecraft:wooden_pickaxe';
+			this.#world.inventory.set(itemId, (this.#world.inventory.get(itemId) ?? 0) + (args.count ?? 1));
+		}
 		if (actionType === 'respawn') {
 			this.#world.dead = false;
 			this.#world.health = 20;
