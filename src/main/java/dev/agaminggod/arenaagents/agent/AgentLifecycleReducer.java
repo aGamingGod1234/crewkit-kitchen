@@ -264,7 +264,7 @@ public final class AgentLifecycleReducer {
 		AgentRecord dead = current.withLifecycle(
 				AgentLifecycleState.DEAD,
 				current.currentGoal(),
-				nextRevision(current),
+				current.goalRevision(),
 				current.queuedGoals(),
 				nowEpochMs,
 				current.lastError()
@@ -282,7 +282,7 @@ public final class AgentLifecycleReducer {
 		AgentRecord respawned = current.withLifecycle(
 				nextState,
 				current.currentGoal(),
-				nextRevision(current),
+				current.goalRevision(),
 				current.queuedGoals(),
 				nowEpochMs,
 				""

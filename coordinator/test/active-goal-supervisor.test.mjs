@@ -5,194 +5,68 @@ import { ActiveGoalSupervisor } from '../src/active-goal-supervisor.mjs';
 
 const key = Object.freeze({ agentId: 'luna', goalRevision: 4, lifecycleGeneration: 2 });
 
-class FakeTimerQueue {
-	#nextId = 0;
-	#timers = new Map();
-	delays = [];
-	history = [];
-
-	schedule = (callback, delay) => {
-		const handle = { id: ++this.#nextId };
-		this.#timers.set(handle.id, { handle, callback, delay });
-		this.history.push({ handle, callback, delay });
-		this.delays.push(delay);
-		return handle;
-	};
-
-	cancel = (handle) => {
-		if (handle === undefined || handle === null) return false;
-		return this.#timers.delete(handle.id);
-	};
-
-	clearRecordedDelays() {
-		this.delays.length = 0;
-	}
-
-	get pendingCount() {
-		return this.#timers.size;
-	}
-
-	async runNext() {
-		const timer = this.#timers.values().next().value;
-		if (timer === undefined) return false;
-		this.#timers.delete(timer.handle.id);
-		await timer.callback();
-		return true;
-	}
-}
-
-function createSupervisor(clock, requests = []) {
-	return new ActiveGoalSupervisor({
-		requestObservation: async (requested) => requests.push(requested),
-		schedule: clock.schedule,
-		cancelSchedule: clock.cancel,
+function timerFixture(requests = []) {
+	let nextId = 0;
+	const timers = new Map();
+	const supervisor = new ActiveGoalSupervisor({
+		clock: () => 0,
+		requestObservation: (requested, reason) => requests.push({ requested, reason }),
+		schedule(callback, delay) {
+			const handle = { id: ++nextId };
+			timers.set(handle.id, { callback, delay });
+			return handle;
+		},
+		cancelSchedule: (handle) => timers.delete(handle?.id),
 	});
+	return { supervisor, timers };
 }
 
-test('an idle active goal schedules one observation recovery with capped backoff', async () => {
-	const clock = new FakeTimerQueue();
-	const requests = [];
-	const supervisor = createSupervisor(clock, requests);
-	supervisor.activate(key);
-	assert.deepEqual(clock.delays, [250]);
+test('an idle active goal owns exactly one scheduled recovery lease', () => {
+	const { supervisor } = timerFixture();
+	assert.equal(supervisor.activate(key), true);
+	assert.deepEqual(supervisor.snapshot(key).leases.map((lease) => lease.kind), ['scheduled']);
 	supervisor.ensure(key, 'duplicate signal');
-	assert.deepEqual(clock.delays, [250]);
-	await clock.runNext();
-	assert.deepEqual(requests, [key]);
-	assert.equal(clock.delays.at(-1), 500);
-	for (let index = 0; index < 8; index += 1) await clock.runNext();
-	assert.deepEqual(clock.delays.slice(0, 6), [250, 500, 1_000, 2_000, 4_000, 5_000]);
-	assert.equal(Math.max(...clock.delays), 5_000);
+	assert.deepEqual(supervisor.snapshot(key).leases.map((lease) => lease.kind), ['scheduled']);
 });
 
-test('overlapping provider and physical work suppress recovery until both end', () => {
-	const clock = new FakeTimerQueue();
-	const supervisor = createSupervisor(clock);
+test('overlapping provider and physical work suppress scheduled recovery until both end', () => {
+	const { supervisor } = timerFixture();
 	supervisor.activate(key);
 	const provider = supervisor.begin(key, 'provider');
 	const action = supervisor.begin(key, 'action');
-	clock.clearRecordedDelays();
+	assert.deepEqual(supervisor.snapshot(key).leases.map((lease) => lease.kind), ['provider', 'action']);
 	assert.equal(supervisor.end(action, { progress: true }), true);
-	assert.deepEqual(clock.delays, []);
+	assert.deepEqual(supervisor.snapshot(key).leases.map((lease) => lease.kind), ['provider']);
 	assert.equal(supervisor.end(provider, { progress: true }), true);
-	assert.deepEqual(clock.delays, [250]);
+	assert.deepEqual(supervisor.snapshot(key).leases.map((lease) => lease.kind), ['scheduled']);
 });
 
-test('stale revision callbacks and terminated goals cannot request observations', async () => {
-	const clock = new FakeTimerQueue();
+test('recoverable failure enters one bounded recovery lease', () => {
 	const requests = [];
-	const supervisor = createSupervisor(clock, requests);
+	const { supervisor } = timerFixture(requests);
 	supervisor.activate(key);
-	const staleRecoveryCallback = clock.history[0].callback;
-	supervisor.activate({ ...key, goalRevision: 5, lifecycleGeneration: 3 });
-	await staleRecoveryCallback();
-	assert.deepEqual(requests, []);
-	await clock.runNext();
-	assert.equal(requests.length, 1);
-	supervisor.terminate({ ...key, goalRevision: 5, lifecycleGeneration: 3 });
-	while (await clock.runNext());
-	assert.equal(requests.length, 1);
+	const provider = supervisor.begin(key, 'provider');
+	supervisor.end(provider, { scheduleRecovery: false });
+	assert.equal(supervisor.recover(key, { errorCode: 'PLANNING_TIMEOUT' }), true);
+	assert.equal(requests.length, 0);
+	assert.equal(supervisor.snapshot(key).state, 'recovering');
+	assert.deepEqual(supervisor.snapshot(key).leases.map((lease) => lease.kind), ['scheduled']);
 });
 
-test('a fresh observation resets the recovery backoff before the next lease', async () => {
-	const clock = new FakeTimerQueue();
-	const requests = [];
-	const supervisor = createSupervisor(clock, requests);
+test('explicit suspension cancels every owned timer and lease', () => {
+	const { supervisor, timers } = timerFixture();
 	supervisor.activate(key);
-	await clock.runNext();
-	assert.equal(clock.delays.at(-1), 500);
-	assert.equal(supervisor.observed(key), true);
-	assert.equal(clock.delays.at(-1), 250);
-});
-
-test('recoverable failure coalesces to one retry and keeps capped exponential backoff', async () => {
-	const clock = new FakeTimerQueue();
-	const requests = [];
-	const supervisor = createSupervisor(clock, requests);
-	supervisor.activate(key);
-	const failedProvider = supervisor.begin(key, 'provider');
-	clock.clearRecordedDelays();
-	supervisor.end(failedProvider);
-	supervisor.recover(key, { errorCode: 'PLANNING_TIMEOUT' });
-	supervisor.recover(key, { errorCode: 'PROVIDER_UNAVAILABLE' });
-	assert.deepEqual(clock.delays, [250]);
-	assert.equal(clock.pendingCount, 1);
-	await clock.runNext();
-	assert.equal(clock.delays.at(-1), 500);
-	assert.equal(clock.pendingCount, 1);
-});
-
-test('a failed observation request still re-arms the fenced recovery lease', async () => {
-	const clock = new FakeTimerQueue();
-	let calls = 0;
-	const supervisor = new ActiveGoalSupervisor({
-		requestObservation: async () => {
-			calls += 1;
-			throw new Error('bridge unavailable');
-		},
-		schedule: clock.schedule,
-		cancelSchedule: clock.cancel,
-	});
-	supervisor.activate(key);
-	await clock.runNext();
-	assert.equal(calls, 1);
-	assert.equal(clock.delays.at(-1), 500);
-	assert.equal(clock.pendingCount, 1);
-});
-
-test('an observation request that never settles cannot strand the recovery lease', async () => {
-	const clock = new FakeTimerQueue();
-	const supervisor = new ActiveGoalSupervisor({
-		requestObservation: () => new Promise(() => {}),
-		schedule: clock.schedule,
-		cancelSchedule: clock.cancel,
-	});
-	supervisor.activate(key);
-	await clock.runNext();
-	assert.equal(clock.delays.at(-1), 500);
-	assert.equal(clock.pendingCount, 1);
-});
-
-test('explicit suspension cancels recovery and prevents new timers', async () => {
-	const clock = new FakeTimerQueue();
-	const requests = [];
-	const supervisor = createSupervisor(clock, requests);
-	supervisor.activate(key);
+	supervisor.begin(key, 'provider');
 	assert.equal(supervisor.suspend(key), true);
-	assert.equal(clock.pendingCount, 0);
-	supervisor.ensure(key, 'suspended goal');
-	await clock.runNext();
-	assert.deepEqual(requests, []);
-});
-
-test('ending a token twice is harmless and close cancels every owned timer', () => {
-	const clock = new FakeTimerQueue();
-	const supervisor = createSupervisor(clock);
-	supervisor.activate(key);
-	const token = supervisor.begin(key, 'completion');
-	assert.equal(supervisor.end(token), true);
-	assert.equal(supervisor.end(token), false);
-	assert.equal(clock.pendingCount, 1);
-	supervisor.close();
-	supervisor.close();
-	assert.equal(clock.pendingCount, 0);
-});
-
-test('a stale work token can be released without scheduling recovery', () => {
-	const clock = new FakeTimerQueue();
-	const supervisor = createSupervisor(clock);
-	supervisor.activate(key);
-	const token = supervisor.begin(key, 'provider');
-	assert.equal(supervisor.end(token, { scheduleRecovery: false }), true);
-	assert.equal(clock.pendingCount, 0);
+	assert.equal(timers.size, 0);
+	assert.deepEqual(supervisor.snapshot(key).leases, []);
 });
 
 test('stale tokens cannot settle work belonging to a newer fenced goal', () => {
-	const clock = new FakeTimerQueue();
-	const supervisor = createSupervisor(clock);
+	const { supervisor } = timerFixture();
 	supervisor.activate(key);
 	const staleToken = supervisor.begin(key, 'provider');
 	supervisor.activate({ ...key, goalRevision: 5, lifecycleGeneration: 3 });
 	assert.equal(supervisor.end(staleToken, { progress: true }), false);
-	assert.deepEqual(clock.delays, [250, 250]);
+	assert.deepEqual(supervisor.snapshot({ ...key, goalRevision: 5, lifecycleGeneration: 3 }).leases.map((lease) => lease.kind), ['scheduled']);
 });

@@ -360,6 +360,7 @@ public final class AgentRegistryVerification {
 		AgentTransition died = AgentLifecycleReducer.die(active, death, START_TIME + 3L);
 		assertEquals(AgentLifecycleState.DEAD, died.after().state(), "death enters persistent dead state");
 		assertEquals(active.currentGoal(), died.after().currentGoal(), "death retains current goal");
+		assertEquals(active.goalRevision(), died.after().goalRevision(), "death preserves the unfinished goal revision");
 		assertEquals(active.queuedGoals(), died.after().queuedGoals(), "death retains queued goals");
 		assertEquals(active.profile(), died.after().profile(), "death retains selected model profile");
 		assertEquals(Optional.of(death), died.after().deathSnapshot(), "death retains exact factual snapshot");
@@ -405,9 +406,8 @@ public final class AgentRegistryVerification {
 		assertEquals(exactDead, registry.require(active.agentId()), "post-commit barrier failure restores the exact DEAD record");
 		AgentTransition respawned = registry.respawnAtomically(active.agentId(), UUID.randomUUID(), START_TIME + 6L, (transition, commit) -> commit.run());
 		assertEquals(AgentLifecycleState.STARTING, respawned.after().state(), "respawn restarts a goal that death interrupted");
-		assertEquals(exactDead.goalRevision() + 1L, respawned.after().goalRevision(), "respawn advances the interrupted goal revision");
-		assertTrue(registry.isCurrentActiveRevision(active.agentId(), respawned.after().goalRevision()), "respawned goal accepts only its new active revision");
-		assertTrue(!registry.isCurrentActiveRevision(active.agentId(), exactDead.goalRevision()), "respawn rejects the stale death revision");
+		assertEquals(exactDead.goalRevision(), respawned.after().goalRevision(), "respawn preserves the interrupted goal revision");
+		assertTrue(registry.isCurrentActiveRevision(active.agentId(), exactDead.goalRevision()), "respawn accepts the same unfinished goal revision");
 		assertEquals(Optional.empty(), respawned.after().deathSnapshot(), "only successful respawn clears death snapshot");
 
 		AgentRecord explicitlyPaused = AgentLifecycleReducer.stop(active, START_TIME + 4L).after();

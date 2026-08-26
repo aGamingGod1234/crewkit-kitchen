@@ -1496,6 +1496,41 @@ test('a pre-disconnect native completion cannot complete the replacement lifecyc
 	}
 });
 
+test('an expired native provider turn is evicted so a fresh observation can start replacement work', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) return new Promise(() => {});
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		goalClock: () => 0,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+		await timers.runNext();
+		await eventually(() => planner.interruptions.includes('agent-a') && run.bridge.sent.some((message) => message.type === 'request_observation'));
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 2);
+		assert.equal(run.registry.get('agent-a').goalRevision, 1);
+		assert.notEqual(planner.requests[0], planner.requests[1]);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 function immutableGoalSpec(originalRequest, predicate = { type: 'operator_confirmed' }, createdAtTick = 1) {
 	const fields = { originalRequest, predicate, createdAtTick };
 	return { ...fields, fingerprint: goalSpecFingerprint(fields) };
@@ -2341,7 +2376,7 @@ test('steering and death dispose programs so stale action results are rejected',
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Stop waiting.' } });
 		await eventually(() => run.registry.get('agent-a')?.goalRevision === 2);
 		assert.equal(run.bridge.sent.some((message) => message.type === 'action_cancel' && message.payload.actionId === command.payload.actionId), true);
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 3, updatedAtEpochMs: 3, death: DEATH } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 2, updatedAtEpochMs: 3, death: DEATH } });
 		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DEAD);
 		assert.equal(run.planner.interruptions.includes('agent-a'), true);
 	} finally { await run.coordinator.stop(); }
@@ -2453,7 +2488,7 @@ test('death suspends the active program and asks the same selected model for a c
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
 		const stale = run.bridge.sent.find((message) => message.type === 'action_command');
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
-			operation: 'dead', goalRevision: 2, updatedAtEpochMs: 2,
+			operation: 'dead', goalRevision: 1, updatedAtEpochMs: 2,
 			death: DEATH,
 		} });
 		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DEAD);
@@ -2487,16 +2522,16 @@ test('respawn success is consumed before lifecycle control without a stale-resul
 				: withCompletionContract({ summary: 'Wait.', directive: 'replace', source: SOURCE }, request.goalRevision);
 		};
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.', updatedAtEpochMs: 1 } });
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 2, updatedAtEpochMs: 2, death: DEATH } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 1, updatedAtEpochMs: 2, death: DEATH } });
 		await eventually(() => run.bridge.sent.some((message) => message.payload?.actionType === 'respawn'));
 		const command = run.bridge.sent.find((message) => message.payload?.actionType === 'respawn');
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
-			goalRevision: 2, actionId: command.payload.actionId, commandId: command.payload.actionId,
+			goalRevision: 1, actionId: command.payload.actionId, commandId: command.payload.actionId,
 			actionType: 'respawn', state: 'SUCCEEDED', reasonCode: 'VANILLA_RESPAWNED', message: '', elapsedMs: 1, observedAtEpochMs: 3,
 		} });
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'respawn', goalRevision: 3, updatedAtEpochMs: 3 } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'respawn', goalRevision: 1, updatedAtEpochMs: 3 } });
 		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.PAUSED);
-		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 3), false);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 1), false);
 		assert.deepEqual(errors, []);
 	} finally { await run.coordinator.stop(); }
 });
@@ -2513,26 +2548,26 @@ test('resumeGoal respawn re-arms the fenced goal and plans from the next fresh o
 				: withCompletionContract({ summary: 'Continue.', directive: 'replace', source: SOURCE }, request.goalRevision);
 		};
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.', updatedAtEpochMs: 1 } });
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 2, updatedAtEpochMs: 2, death: DEATH } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'dead', goalRevision: 1, updatedAtEpochMs: 2, death: DEATH } });
 		await eventually(() => run.bridge.sent.some((message) => message.payload?.actionType === 'respawn'));
 		const command = run.bridge.sent.find((message) => message.payload?.actionType === 'respawn');
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
-			goalRevision: 2, actionId: command.payload.actionId, commandId: command.payload.actionId,
+			goalRevision: 1, actionId: command.payload.actionId, commandId: command.payload.actionId,
 			actionType: 'respawn', state: 'SUCCEEDED', reasonCode: 'VANILLA_RESPAWNED', message: '', elapsedMs: 1, observedAtEpochMs: 3,
 		} });
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
-			operation: 'respawn', goalRevision: 3, updatedAtEpochMs: 3, resumeGoal: true,
+			operation: 'respawn', goalRevision: 1, updatedAtEpochMs: 3, resumeGoal: true,
 		} });
 		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.STARTING);
 		assert.equal(run.registry.get('agent-a').death, null);
-		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 3));
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 1));
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
-			goalRevision: 3, eventSequence: 1,
+			goalRevision: 1, eventSequence: 1,
 			observation: { player: { x: 0, y: 70, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
 		} });
-		await eventually(() => run.planner.requests.some((request) => request.goalRevision === 3));
-		assert.match(run.planner.requests.find((request) => request.goalRevision === 3).input, /respawn/);
-		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command' && message.payload.goalRevision === 3));
+		await eventually(() => run.planner.requests.filter((request) => request.goalRevision === 1).length >= 2);
+		assert.match(run.planner.requests.filter((request) => request.goalRevision === 1).at(-1).input, /respawn/);
+		await eventually(() => run.bridge.sent.filter((message) => message.type === 'action_command' && message.payload.goalRevision === 1).length >= 2);
 		assert.deepEqual(errors, []);
 	} finally { await run.coordinator.stop(); }
 });

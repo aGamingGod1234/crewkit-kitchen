@@ -1614,16 +1614,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private static String operation(AgentTransition transition) {
 		if (transition.after().queuedGoals().size() > transition.before().queuedGoals().size()) return "queue";
-		if (transition.after().goalRevision() <= transition.before().goalRevision()) return null;
 		if (transition.before().state() == AgentLifecycleState.DEAD
 				&& transition.after().state() != AgentLifecycleState.DEAD) return "respawn";
+		if (transition.after().state() == AgentLifecycleState.DEAD
+				&& transition.before().state() != AgentLifecycleState.DEAD) return "dead";
+		if (transition.after().goalRevision() <= transition.before().goalRevision()) return null;
 		if (transition.before().currentGoal().isPresent()
 				&& transition.after().state() == AgentLifecycleState.IDLE
 				&& transition.after().currentGoal().isEmpty()) return "complete";
 		if (transition.after().state() == AgentLifecycleState.PAUSED) return "stop";
 		if (transition.after().state() == AgentLifecycleState.COMPLETED) return "complete";
 		if (transition.after().state() == AgentLifecycleState.ERROR) return "fail";
-		if (transition.after().state() == AgentLifecycleState.DEAD) return "dead";
 		if (transition.after().state() == AgentLifecycleState.DISCONNECTED) return "disconnect";
 		if ((transition.before().state() == AgentLifecycleState.PAUSED
 				|| transition.before().state() == AgentLifecycleState.DISCONNECTED)

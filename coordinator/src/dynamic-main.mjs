@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { appendFile, mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -169,6 +170,42 @@ export class DynamicCoordinator extends EventEmitter {
 
 	get registry() { return this.#registry; }
 	get bridge() { return this.#bridge; }
+
+	handleLeaseExpired({ key, lease }) {
+		if (this.#stopping || this.#closed || !this.#isLifecycleGenerationCurrent(key.agentId, key.lifecycleGeneration)) return;
+		const record = this.#registry.get(key.agentId);
+		if (record === null || record.goalRevision !== key.goalRevision) return;
+		this.#writeTrace('work_lease_expired', { ...key, kind: lease.kind, operationId: lease.operationId });
+		this.#publishVerbose(key.agentId, key.goalRevision, 'retry', `${lease.kind} work timed out; recovering automatically.`);
+		if (lease.kind === 'provider') {
+			const work = this.#providerWork.get(key.agentId);
+			if (work?.kind === 'native' && work.goalRevision === key.goalRevision
+				&& work.lifecycleGeneration === key.lifecycleGeneration
+				&& work.supervisionToken?.operationId === lease.operationId) {
+				work.expired = true;
+				this.#providerWork.delete(key.agentId);
+			}
+			try {
+				void Promise.resolve(this.#planner.interrupt(key.agentId, 'Provider work lease expired'))
+					.catch((error) => this.#reportAgentError(key.agentId, error));
+			} catch (error) {
+				void this.#reportAgentError(key.agentId, error);
+			}
+		}
+		if (['provider', 'action', 'completion'].includes(lease.kind)) {
+			void this.#nativeRuntime.dispose(key.agentId, `${lease.kind}_lease_expired`)
+				.catch((error) => this.#reportAgentError(key.agentId, error));
+		}
+	}
+
+	handleGoalStuck({ key, inactiveMs, history }) {
+		if (this.#stopping || this.#closed || !this.#isLifecycleGenerationCurrent(key.agentId, key.lifecycleGeneration)) return;
+		const record = this.#registry.get(key.agentId);
+		if (record === null || record.goalRevision !== key.goalRevision) return;
+		this.#rememberPendingAttention(key.agentId, key.goalRevision, { priority: 'urgent', trigger: 'stuck' });
+		this.#writeTrace('goal_factual_progress_stuck', { ...key, inactiveMs, positionSamples: history.length });
+		this.#publishVerbose(key.agentId, key.goalRevision, 'retry', 'No factual world progress for 30 seconds; reassessing without pausing the goal.');
+	}
 
 	async start() {
 		if (this.#started) return;
@@ -344,9 +381,11 @@ export class DynamicCoordinator extends EventEmitter {
 				void this.#reportAgentError(message.agentId, error);
 				return;
 			}
-			const replaced = previous !== null && message.payload.operation !== 'queue' && record.goalRevision > previous.goalRevision;
+			const lifecycleChanged = previous !== null && message.payload.operation !== 'queue'
+				&& (record.goalRevision > previous.goalRevision
+					|| (record.goalRevision === previous.goalRevision && ['dead', 'respawn'].includes(message.payload.operation)));
 			let nativeDisposal = Promise.resolve();
-			if (replaced) {
+			if (lifecycleChanged) {
 				this.#cancelGoalSpecRequests(message.agentId);
 				this.#retireGoalSupervision(previous, message.payload.operation);
 				this.#invalidateAcceptedLifecycle(message.agentId);
@@ -462,8 +501,12 @@ export class DynamicCoordinator extends EventEmitter {
 				if (!this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration)) return;
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 				if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
-				if (this.#usesNativeTools(record)) this.#goalSupervisor.observed(this.#supervisionKey(record, lifecycleGeneration));
 				const wireObservation = message.payload.observation ?? message.payload;
+				if (this.#usesNativeTools(record)) {
+					const supervisionKey = this.#supervisionKey(record, lifecycleGeneration);
+					this.#goalSupervisor.observed(supervisionKey);
+					this.#goalSupervisor.factualProgress(supervisionKey, factualProgressSignature(wireObservation), factualProgressDetails(wireObservation));
+				}
 				const observation = adaptObservation(wireObservation);
 				const classified = classifyObservationTrigger(message.payload, wireObservation);
 				const pendingAttention = this.#pendingAttention.get(record.agentId);
@@ -531,6 +574,11 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listen('action_progress', (message) => {
 			this.#enqueueAgent(message.agentId, async () => {
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
+				const nativeWork = this.#providerWork.get(message.agentId);
+				if (this.#usesNativeTools(record) && nativeWork?.goalRevision === record.goalRevision) {
+					this.#goalSupervisor.progress(nativeWork.supervisionToken);
+					if (nativeWork.toolSupervisionToken !== null) this.#goalSupervisor.progress(nativeWork.toolSupervisionToken);
+				}
 				if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionProgress(record, message.payload)) {
 					this.emit('actionProgress', message);
 					return;
@@ -709,6 +757,8 @@ export class DynamicCoordinator extends EventEmitter {
 			promise: null,
 			supervisionKey,
 			supervisionToken: this.#goalSupervisor.begin(supervisionKey, 'provider'),
+			toolSupervisionToken: null,
+			expired: false,
 		};
 		this.#providerWork.set(record.agentId, work);
 		try {
@@ -787,7 +837,7 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #executeNativeTool(work, toolRequest) {
 		const record = this.#registry.get(work.agentId);
-		if (record === null || record.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+		if (work.expired === true || record === null || record.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 			throw Object.assign(new Error('Native tool belongs to an obsolete goal'), { code: 'STALE_PLAN' });
 		}
 		const executesBody = toolRequest.tool.kind === 'action' || toolRequest.tool.kind === 'sequence';
@@ -799,12 +849,16 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#registry.setState(record.agentId, DynamicAgentState.ACTING, { goalRevision: record.goalRevision });
 			}
 			supervisionToken = supervisionKind === null ? null : this.#goalSupervisor.begin(work.supervisionKey, supervisionKind);
+			work.toolSupervisionToken = supervisionToken;
+			this.#goalSupervisor.progress(work.supervisionToken);
 			result = await this.#nativeRuntime.execute(toolRequest, record, { lifecycleGeneration: work.lifecycleGeneration });
 			return result;
 		} finally {
 			if (supervisionToken !== null) {
 				this.#goalSupervisor.end(supervisionToken, { progress: ['SUCCEEDED', 'COMPLETED'].includes(result?.state) });
 			}
+			if (work.toolSupervisionToken === supervisionToken) work.toolSupervisionToken = null;
+			this.#goalSupervisor.progress(work.supervisionToken);
 			const latest = this.#registry.get(work.agentId);
 			if (!this.#stopping && !this.#closed && executesBody && latest?.goalRevision === work.goalRevision && latest.state === DynamicAgentState.ACTING
 				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
@@ -1600,12 +1654,18 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		cancelSchedule: dependencies.cancelSchedule,
 		currentRevision: (agentId) => registry.get(agentId)?.goalRevision ?? null,
 	});
+	let coordinator = null;
 	const goalSupervisor = dependencies.goalSupervisor ?? new ActiveGoalSupervisor({
 		requestObservation: ({ agentId, goalRevision }) => bridge.send('request_observation', agentId, { goalRevision }),
+		clock: dependencies.goalClock ?? dependencies.controlNow ?? Date.now,
 		schedule: dependencies.goalSchedule,
 		cancelSchedule: dependencies.cancelGoalSchedule,
+		stuckSchedule: dependencies.goalStuckSchedule,
+		cancelStuckSchedule: dependencies.cancelGoalStuckSchedule,
+		onExpire: (event) => coordinator?.handleLeaseExpired(event),
+		onStuck: (event) => coordinator?.handleGoalStuck(event),
 	});
-	return new DynamicCoordinator({
+	coordinator = new DynamicCoordinator({
 		registry,
 		scheduler,
 		codexService,
@@ -1625,6 +1685,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		clearGoalSpecTimeout: dependencies.clearGoalSpecTimeout,
 		benchmarkRecorder: dependencies.benchmarkRecorder,
 	});
+	return coordinator;
 }
 
 function defaultGoalSpecTimeout(callback, delayMs) {
@@ -2037,6 +2098,54 @@ function sanitizeVerboseOutput(message) {
 		.trim()
 		.replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '[REDACTED_AUTH]')
 		.replace(/(\b(?:secret|token|api[-_ ]?key|password|authorization)\b["']?\s*(?:[:=]\s*|\s+))(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi, '$1[REDACTED]');
+}
+
+function factualProgressSignature(observation) {
+	const projection = factualProgressProjection(observation);
+	return createHash('sha256').update(JSON.stringify(sortFactualValue(projection))).digest('hex');
+}
+
+function factualProgressDetails(observation) {
+	const player = observation?.player ?? {};
+	const position = player.position ?? player;
+	return {
+		position: {
+			x: finiteOrNull(position?.x),
+			y: finiteOrNull(position?.y),
+			z: finiteOrNull(position?.z),
+		},
+		lastResult: observation?.lastResult?.present === true ? {
+			actionType: observation.lastResult.actionType,
+			state: observation.lastResult.state,
+			reasonCode: observation.lastResult.reasonCode,
+		} : null,
+	};
+}
+
+function factualProgressProjection(observation) {
+	const player = observation?.player ?? {};
+	const position = player.position ?? player;
+	return {
+		position: [finiteOrNull(position?.x), finiteOrNull(position?.y), finiteOrNull(position?.z)],
+		alive: player.dead === true ? false : player.alive ?? null,
+		health: finiteOrNull(player.health),
+		inventory: (observation?.inventory?.items ?? []).map((item) => ({ itemId: item?.itemId ?? item?.id ?? null, count: item?.count ?? null })),
+		blocks: (observation?.blocks ?? []).map((block) => ({ x: block?.x ?? null, y: block?.y ?? null, z: block?.z ?? null, blockId: block?.blockId ?? block?.id ?? null, state: block?.state ?? block?.properties ?? null })),
+		advancements: observation?.advancements ?? null,
+		killEvidence: observation?.killEvidence ?? null,
+	};
+}
+
+function sortFactualValue(value) {
+	if (Array.isArray(value)) return value.map(sortFactualValue);
+	if (value !== null && typeof value === 'object') {
+		return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortFactualValue(value[key])]));
+	}
+	return value;
+}
+
+function finiteOrNull(value) {
+	return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function classifyObservationTrigger(payload, observation) {

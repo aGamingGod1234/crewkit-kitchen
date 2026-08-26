@@ -19,7 +19,6 @@ test('classifies local, profile, and configuration native errors as terminal', (
 		'REASONING_EFFORT_UNAVAILABLE',
 		'SERVICE_TIER_UNAVAILABLE',
 		'NATIVE_TOOLS_UNAVAILABLE',
-		'RPC_ERROR',
 	]) {
 		assert.equal(classifyNativeGoalError(Object.assign(new Error(code), { code })), 'terminal');
 	}
@@ -31,6 +30,7 @@ test('classifies provider and runtime failures as recoverable by default', () =>
 		Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' }),
 		Object.assign(new Error('provider unavailable'), { code: 'PROVIDER_UNAVAILABLE' }),
 		Object.assign(new Error('action failed'), { code: 'ACTION_TIMEOUT' }),
+		Object.assign(new Error('provider transport reset'), { code: 'RPC_ERROR' }),
 		new Error('uncoded runtime failure'),
 	]) {
 		assert.equal(classifyNativeGoalError(error), 'recoverable');

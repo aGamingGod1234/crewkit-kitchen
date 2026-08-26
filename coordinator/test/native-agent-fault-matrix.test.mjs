@@ -124,7 +124,7 @@ test('recovery scheduling is deterministic and remains bounded', async () => {
 	assert.equal(result.goalScheduler.usesRealTimers, false);
 	assert.ok(result.goalScheduler.scheduled > 0);
 	assert.ok(result.goalScheduler.fired > 0);
-	assert.ok(result.goalScheduler.maxPending <= 1);
+	assert.ok(result.goalScheduler.maxPending <= 2, 'provider and body leases may overlap, but no third recovery handle may leak');
 	assert.equal(result.goalScheduler.pending, 0);
 });
 

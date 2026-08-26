@@ -192,20 +192,20 @@ test('respawn clears death and resumes only an explicitly requested live goal', 
 	};
 	const paused = new AgentRegistry();
 	paused.register(record('paused', { state: DynamicAgentState.DEAD, currentGoal: 'Keep building.', goalRevision: 2, death }));
-	const pausedRespawn = paused.applyGoalControl('paused', { operation: 'respawn', goalRevision: 3 });
+	const pausedRespawn = paused.applyGoalControl('paused', { operation: 'respawn', goalRevision: 2 });
 	assert.equal(pausedRespawn.state, DynamicAgentState.PAUSED);
 	assert.equal(pausedRespawn.death, null);
 
 	const resumed = new AgentRegistry();
 	resumed.register(record('resumed', { state: DynamicAgentState.DEAD, currentGoal: 'Keep building.', goalRevision: 2, death }));
-	const resumedRespawn = resumed.applyGoalControl('resumed', { operation: 'respawn', goalRevision: 3, resumeGoal: true });
+	const resumedRespawn = resumed.applyGoalControl('resumed', { operation: 'respawn', goalRevision: 2, resumeGoal: true });
 	assert.equal(resumedRespawn.state, DynamicAgentState.STARTING);
 	assert.equal(resumedRespawn.currentGoal, 'Keep building.');
 	assert.equal(resumedRespawn.death, null);
 
 	const idle = new AgentRegistry();
 	idle.register(record('idle', { state: DynamicAgentState.DEAD, currentGoal: null, goalRevision: 2, death }));
-	assert.equal(idle.applyGoalControl('idle', { operation: 'respawn', goalRevision: 3, resumeGoal: true }).state, DynamicAgentState.IDLE);
+	assert.equal(idle.applyGoalControl('idle', { operation: 'respawn', goalRevision: 2, resumeGoal: true }).state, DynamicAgentState.IDLE);
 });
 
 test('respawn rejects every current state except DEAD', () => {

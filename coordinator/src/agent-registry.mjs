@@ -253,7 +253,12 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	if (operation === 'respawn' && record.state !== DynamicAgentState.DEAD) {
 		throw new AgentRegistryError('INVALID_GOAL_CONTROL', `Cannot respawn an agent from state '${record.state}'`);
 	}
-	if (revision <= record.goalRevision) throw new AgentRegistryError('STALE_GOAL_REVISION', `Goal revision ${revision} is not newer than ${record.goalRevision}`);
+	const preservesGoalRevision = operation === 'dead' || operation === 'respawn';
+	if (preservesGoalRevision ? revision !== record.goalRevision : revision <= record.goalRevision) {
+		throw new AgentRegistryError('STALE_GOAL_REVISION', preservesGoalRevision
+			? `Goal revision ${revision} does not match current revision ${record.goalRevision}`
+			: `Goal revision ${revision} is not newer than ${record.goalRevision}`);
+	}
 	const now = nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs');
 	const next = { ...record, goalRevision: revision, updatedAtEpochMs: now, lastError: null };
 	if (operation === 'start' || operation === 'steer') {

@@ -456,8 +456,8 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			observedAtEpochMs: this.#eventSequence,
 		});
 		this.#emitInbound('action_result', result);
-		if (respawned) this.#emitGoalControl('respawn', this.#record.goalRevision + 1, { resumeGoal: true });
-		if (died) this.#emitGoalControl('dead', this.#record.goalRevision + 1, { death: {
+		if (respawned) this.#emitGoalControl('respawn', this.#record.goalRevision, { resumeGoal: true });
+		if (died) this.#emitGoalControl('dead', this.#record.goalRevision, { death: {
 			cause: 'fixture',
 			dimensionId: 'minecraft:overworld',
 			x: this.#world.position.x,
