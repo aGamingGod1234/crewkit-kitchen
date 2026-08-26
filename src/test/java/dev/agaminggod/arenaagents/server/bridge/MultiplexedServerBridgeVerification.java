@@ -10,6 +10,8 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.AgentVerboseState;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
@@ -17,6 +19,8 @@ import dev.agaminggod.arenaagents.server.conversation.ConversationAudience;
 import dev.agaminggod.arenaagents.server.conversation.ConversationEvent;
 import dev.agaminggod.arenaagents.server.conversation.ConversationKind;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWakeCodec;
+import dev.agaminggod.arenaagents.server.goal.DraftIntent;
+import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
@@ -389,7 +393,7 @@ public final class MultiplexedServerBridgeVerification {
 						0L, 1_002L, 1L, "minecraft:overworld"
 				);
 				assertThrowsCode(
-						() -> activeBridge.publishConversationEvent(pendingMessage, Optional.of("Respond after registration.")),
+						() -> activeBridge.publishConversationEvent(pendingMessage, Optional.of(testGoal("Respond after registration."))),
 						"AGENT_NOT_READY"
 				);
 				assertEquals(beforeConversation, manager.registry().require(pending.agentId()),
@@ -883,7 +887,7 @@ public final class MultiplexedServerBridgeVerification {
 			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
 			MultiplexedServerBridge activeBridge = bridge;
 			dev.agaminggod.arenaagents.agent.AgentDomainException disconnected = assertThrowsDomain(
-					() -> activeBridge.publishConversationEvent(event, Optional.of("Respond to the player message.")),
+					() -> activeBridge.publishConversationEvent(event, Optional.of(testGoal("Respond to the player message."))),
 					"COORDINATOR_DISCONNECTED"
 			);
 			assertEquals(
@@ -920,7 +924,7 @@ public final class MultiplexedServerBridgeVerification {
 					return activeBridge.coordinatorReadyForVerification(idle.agentId());
 				}, "conversation fixture acknowledges coordinator readiness before publishing a wake");
 
-				bridge.publishConversationEvent(event, Optional.of("Respond to the player message."));
+				bridge.publishConversationEvent(event, Optional.of(testGoal("Respond to the player message.")));
 				BridgeEnvelope wake = codec.decode(reader.readLine());
 				assertEquals("conversation_wake", wake.type(), "conversation and lifecycle start cross the wire as one transaction");
 				transactionId = wake.payload().get("transactionId").getAsString();
@@ -931,9 +935,27 @@ public final class MultiplexedServerBridgeVerification {
 						),
 						"durable conversation wake round-trips without losing transaction identity or message context"
 				);
+				PendingGoalDraft draft = new PendingGoalDraft(
+						UUID.fromString("00000000-0000-0000-0000-000000000201"),
+						idle.agentId(),
+						UUID.fromString("00000000-0000-0000-0000-000000000099"),
+						"Get a good pickaxe",
+						Optional.of(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)),
+						DraftIntent.REPLACE_OR_QUEUE,
+						1_002L,
+						1L,
+						manager.registry().require(idle.agentId()).currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId)
+				);
+				manager.stageGoalDraft(draft);
+				assertThrowsCode(() -> manager.stageGoalDraft(draft), "DUPLICATE_GOAL_DRAFT");
 				AgentSavedData restored = roundTripSavedData(savedData(manager));
 				assertEquals(manager.pendingConversationWakes(), restored.conversationWakes(),
 						"Minecraft SavedData round-trip retains the durable wake outbox");
+				assertEquals(List.of(draft), restored.goalDrafts(),
+						"Minecraft SavedData round-trip retains the clarification draft");
+				assertEquals(manager.registry().require(idle.agentId()).currentGoal(),
+						restored.registry().require(idle.agentId()).currentGoal(),
+						"clarification draft persistence leaves the active goal unchanged");
 				assertEquals(AgentLifecycleState.STARTING, restored.registry().require(idle.agentId()).state(),
 						"Minecraft SavedData restore re-arms the pending wake at the same lifecycle boundary");
 				assertEquals(1L, restored.registry().require(idle.agentId()).goalRevision(),
@@ -1394,6 +1416,10 @@ public final class MultiplexedServerBridgeVerification {
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not read manager SavedData", exception);
 		}
+	}
+
+	private static GoalSpec testGoal(String request) {
+		return GoalSpec.create(request, new GoalPredicate.OperatorConfirmed(), 0L);
 	}
 
 	@SuppressWarnings("unchecked")

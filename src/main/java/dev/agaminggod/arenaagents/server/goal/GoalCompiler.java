@@ -1,0 +1,171 @@
+package dev.agaminggod.arenaagents.server.goal;
+
+import dev.agaminggod.arenaagents.agent.AgentValidators;
+import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.function.Predicate;
+import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.item.Item;
+
+public final class GoalCompiler {
+	private static final Pattern POSITION = Pattern.compile("^(?:go|move|travel|get) to (-?\\d+)[, ]+(-?\\d+)[, ]+(-?\\d+)$");
+	private static final Pattern ADVANCEMENT = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
+	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:the )?(.+)$");
+	private static final Pattern ITEM = Pattern.compile("^(?:get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
+	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
+	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
+
+	public GoalCompilation compile(String request, RegistryAccess registries, long createdAtTick) {
+		return compile(request, registries, createdAtTick, ignored -> true);
+	}
+
+	public GoalCompilation compile(
+			String request,
+			RegistryAccess registries,
+			long createdAtTick,
+			Predicate<String> advancementExists
+	) {
+		Objects.requireNonNull(registries, "registries must not be null");
+		Objects.requireNonNull(advancementExists, "advancementExists must not be null");
+		String original = AgentValidators.normalizePrompt(request);
+		String command = stripTrailingPunctuation(stripPoliteness(original.toLowerCase(Locale.ROOT)));
+		if (SUBJECTIVE.matcher(command).find()) {
+			return GoalCompilation.needsTranslation("I need you to clarify the exact Minecraft result you want.");
+		}
+
+		Matcher position = POSITION.matcher(command);
+		if (position.matches()) {
+			try {
+				GoalPredicate predicate = new GoalPredicate.PositionWithin(
+						Integer.parseInt(position.group(1)), Integer.parseInt(position.group(2)), Integer.parseInt(position.group(3)),
+						1.0D, 20
+				);
+				return accepted(original, predicate, createdAtTick, "Goal set: reach the requested coordinates.");
+			} catch (NumberFormatException exception) {
+				return GoalCompilation.rejected("Those coordinates are outside Minecraft's supported range.");
+			}
+		}
+
+		Matcher advancement = ADVANCEMENT.matcher(command);
+		if (advancement.matches()) {
+			if (!advancementExists.test(advancement.group(1))) {
+				return GoalCompilation.needsTranslation("That advancement ID does not exist on this server.");
+			}
+			return accepted(original, new GoalPredicate.AdvancementGranted(advancement.group(1)), createdAtTick,
+					"Goal set: earn " + advancement.group(1) + ".");
+		}
+
+		Matcher kill = KILL.matcher(command);
+		if (kill.matches()) {
+			List<String> matches = matchEntities(kill.group(1), registries);
+			if (matches.size() == 1) {
+				String entityId = matches.getFirst();
+				return accepted(original, new GoalPredicate.EntityKilledByAgent(entityId, true), createdAtTick,
+						"Goal set: defeat " + entityId + ".");
+			}
+			return GoalCompilation.needsTranslation(matches.isEmpty()
+					? "I could not identify the exact Minecraft entity to defeat."
+					: "More than one Minecraft entity matches that request.");
+		}
+
+		Matcher item = ITEM.matcher(command);
+		if (item.matches()) {
+			int count;
+			try {
+				count = item.group(1) == null ? 1 : Integer.parseInt(item.group(1));
+			} catch (NumberFormatException exception) {
+				return GoalCompilation.rejected("The requested item count is outside the supported range.");
+			}
+			if (count <= 0) return GoalCompilation.rejected("The requested item count must be positive.");
+			List<String> matches = matchItems(item.group(2), registries);
+			if (matches.size() == 1) {
+				String itemId = matches.getFirst();
+				return accepted(original, new GoalPredicate.InventoryContains(itemId, count), createdAtTick,
+						"Goal set: obtain " + itemId + " x" + count + ".");
+			}
+			return GoalCompilation.needsTranslation(matches.isEmpty()
+					? "I could not identify the exact Minecraft item you want."
+					: "More than one Minecraft item matches that request.");
+		}
+
+		return GoalCompilation.needsTranslation("I need an exact result before I can start this goal.");
+	}
+
+	public static boolean looksLikeGoalRequest(String request) {
+		String normalized = stripTrailingPunctuation(stripPoliteness(AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		return GOAL_LEAD.matcher(normalized).find();
+	}
+
+	private static GoalCompilation accepted(String original, GoalPredicate predicate, long createdAtTick, String message) {
+		return GoalCompilation.accepted(GoalSpec.create(original, predicate, createdAtTick), message);
+	}
+
+	private static List<String> matchItems(String target, RegistryAccess registries) {
+		String wanted = normalizedTarget(target);
+		ArrayList<String> matches = new ArrayList<>();
+		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		for (Identifier id : itemRegistry.keySet()) {
+			Item item = itemRegistry.getValue(id);
+			if (item == null) continue;
+			String descriptionName = descriptionName(item.getDescriptionId());
+			if (wanted.equals(id.toString()) || wanted.equals(pathName(id)) || wanted.equals(descriptionName)) {
+				matches.add(id.toString());
+			}
+		}
+		return matches.stream().distinct().sorted().toList();
+	}
+
+	private static List<String> matchEntities(String target, RegistryAccess registries) {
+		String wanted = normalizedTarget(target);
+		Registry<EntityType<?>> entityRegistry = registries.lookup(Registries.ENTITY_TYPE).orElse(BuiltInRegistries.ENTITY_TYPE);
+		return entityRegistry.keySet().stream()
+				.filter(id -> {
+					EntityType<?> entityType = entityRegistry.getValue(id);
+					String displayName = entityType == null ? "" : entityType.getDescription().getString().toLowerCase(Locale.ROOT);
+					return wanted.equals(id.toString()) || wanted.equals(pathName(id)) || wanted.equals(displayName);
+				})
+				.map(Identifier::toString)
+				.distinct()
+				.sorted()
+				.toList();
+	}
+
+	private static String pathName(Identifier id) {
+		return id.getPath().replace('_', ' ');
+	}
+
+	private static String descriptionName(String descriptionId) {
+		int separator = descriptionId.lastIndexOf('.');
+		return (separator < 0 ? descriptionId : descriptionId.substring(separator + 1)).replace('_', ' ').toLowerCase(Locale.ROOT);
+	}
+
+	private static String normalizedTarget(String value) {
+		return value.strip().replaceAll("\\s+", " ");
+	}
+
+	private static String stripPoliteness(String request) {
+		String result = request;
+		for (String prefix : List.of("hey, ", "hey ", "please ", "can you ", "could you ", "would you ", "go and ")) {
+			if (result.startsWith(prefix)) {
+				result = result.substring(prefix.length()).strip();
+				return stripPoliteness(result);
+			}
+		}
+		return result;
+	}
+
+	private static String stripTrailingPunctuation(String request) {
+		return request.replaceFirst("[.!?]+$", "").strip();
+	}
+}

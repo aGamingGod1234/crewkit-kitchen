@@ -5,15 +5,24 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 
 public final class AgentLifecycleReducer {
 	private AgentLifecycleReducer() {
 	}
 
 	public static AgentTransition start(AgentRecord current, String prompt, long nowEpochMs) {
+		return start(current, AgentGoal.create(prompt, nowEpochMs), nowEpochMs);
+	}
+
+	public static AgentTransition start(AgentRecord current, GoalSpec spec, long nowEpochMs) {
+		Objects.requireNonNull(spec, "spec must not be null");
+		return start(current, AgentGoal.create(spec.originalRequest(), spec, nowEpochMs), nowEpochMs);
+	}
+
+	private static AgentTransition start(AgentRecord current, AgentGoal goal, long nowEpochMs) {
 		requireState(current, "start", AgentLifecycleState.IDLE, AgentLifecycleState.PAUSED,
 				AgentLifecycleState.COMPLETED, AgentLifecycleState.ERROR, AgentLifecycleState.DISCONNECTED);
-		AgentGoal goal = AgentGoal.create(prompt, nowEpochMs);
 		AgentRecord revised = current.withLifecycle(
 				AgentLifecycleState.STARTING,
 				Optional.of(goal),
@@ -26,6 +35,15 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition queue(AgentRecord current, String prompt, int queueLimit, long nowEpochMs) {
+		return queue(current, AgentGoal.create(prompt, nowEpochMs), queueLimit, nowEpochMs);
+	}
+
+	public static AgentTransition queue(AgentRecord current, GoalSpec spec, int queueLimit, long nowEpochMs) {
+		Objects.requireNonNull(spec, "spec must not be null");
+		return queue(current, AgentGoal.create(spec.originalRequest(), spec, nowEpochMs), queueLimit, nowEpochMs);
+	}
+
+	private static AgentTransition queue(AgentRecord current, AgentGoal goal, int queueLimit, long nowEpochMs) {
 		if (queueLimit <= 0) {
 			throw new IllegalArgumentException("queueLimit must be positive");
 		}
@@ -33,7 +51,7 @@ public final class AgentLifecycleReducer {
 			throw new AgentDomainException("QUEUE_FULL", "Agent queue limit reached: " + queueLimit);
 		}
 		ArrayList<AgentGoal> queue = new ArrayList<>(current.queuedGoals());
-		queue.add(AgentGoal.create(prompt, nowEpochMs));
+		queue.add(goal);
 		AgentRecord revised = current.withLifecycle(
 				current.state(),
 				current.currentGoal(),

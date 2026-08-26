@@ -5,6 +5,11 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.GoalControl;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
+import dev.agaminggod.arenaagents.server.goal.DraftIntent;
+import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
+import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
+import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -21,6 +26,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 
 	private final CodexAgentManager manager;
 	private final ConversationEventSink eventSink;
+	private final GoalCompiler goalCompiler = new GoalCompiler();
 	private final Map<AgentId, Long> sequences = new LinkedHashMap<>();
 
 	public ServerAgentConversationRouter(CodexAgentManager manager, ConversationEventSink eventSink) {
@@ -243,7 +249,84 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				sequence,
 				source.dimensionId()
 		);
-		eventSink.publish(delivered, ConversationWakePolicy.goalFor(target.state(), delivered.kind()));
+		GoalRoute route = routePlayerGoal(target, delivered);
+		if (route.publish()) eventSink.publish(delivered, route.wakeSpec());
+	}
+
+	private GoalRoute routePlayerGoal(AgentRecord target, ConversationEvent event) {
+		if (event.kind() != ConversationKind.PLAYER_MESSAGE && event.kind() != ConversationKind.PROXIMITY_SPEECH) {
+			return GoalRoute.EVENT_ONLY;
+		}
+		if (isSteeringPhrase(event.text())) return GoalRoute.EVENT_ONLY;
+		if (!GoalCompiler.looksLikeGoalRequest(event.text())) return GoalRoute.EVENT_ONLY;
+
+		GoalCompilation compilation = goalCompiler.compile(
+				event.text(), manager.server().registryAccess(), manager.server().getTickCount(),
+				id -> manager.server().getAdvancements().get(net.minecraft.resources.Identifier.parse(id)) != null
+		);
+		if (target.currentGoal().isPresent()) {
+			Optional<dev.agaminggod.arenaagents.agent.goal.GoalPredicate> proposed = compilation.acceptedSpec()
+					.map(GoalSpec::completion);
+			PendingGoalDraft draft = draft(target, event, proposed, proposed.isPresent()
+					? DraftIntent.REPLACE_OR_QUEUE
+					: DraftIntent.CONFIRM_TRANSLATION);
+			manager.stageGoalDraft(draft);
+			notifyRequester(draft, proposed.isPresent()
+					? "That agent already has a goal. Choose Replace, Queue, or Cancel for draft " + draft.draftId() + "."
+					: compilation.playerMessage() + " Draft " + draft.draftId() + " is waiting for clarification.");
+			return GoalRoute.CONSUMED;
+		}
+
+		if (!ConversationWakePolicy.shouldStartGoal(target.state(), event.kind())) return GoalRoute.EVENT_ONLY;
+		if (compilation.kind() == GoalCompilation.Kind.ACCEPTED) {
+			return new GoalRoute(true, compilation.acceptedSpec());
+		}
+		PendingGoalDraft draft = draft(target, event, Optional.empty(), DraftIntent.CONFIRM_TRANSLATION);
+		manager.stageGoalDraft(draft);
+		notifyRequester(draft, compilation.playerMessage() + " Draft " + draft.draftId() + " is waiting for clarification.");
+		return GoalRoute.CONSUMED;
+	}
+
+	private PendingGoalDraft draft(
+			AgentRecord target,
+			ConversationEvent event,
+			Optional<dev.agaminggod.arenaagents.agent.goal.GoalPredicate> proposed,
+			DraftIntent intent
+	) {
+		UUID playerId;
+		try {
+			playerId = UUID.fromString(event.sourceId());
+		} catch (IllegalArgumentException exception) {
+			throw new AgentDomainException("INVALID_GOAL_REQUESTER", "Goal clarification requires a player identity");
+		}
+		return new PendingGoalDraft(
+				UUID.randomUUID(), target.agentId(), playerId, event.text(), proposed, intent,
+				manager.server().getTickCount(), target.goalRevision(), target.currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId)
+		);
+	}
+
+	private void notifyRequester(PendingGoalDraft draft, String message) {
+		ServerPlayer player = manager.server().getPlayerList().getPlayer(draft.requestingPlayerId());
+		if (player != null) player.sendSystemMessage(Component.literal(message));
+	}
+
+	private static boolean isSteeringPhrase(String text) {
+		String normalized = text.strip().toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", " ");
+		return normalized.equals("continue")
+				|| normalized.equals("keep going")
+				|| normalized.equals("watch out")
+				|| normalized.equals("try another route")
+				|| normalized.equals("retry")
+				|| normalized.equals("resume");
+	}
+
+	private record GoalRoute(boolean publish, Optional<GoalSpec> wakeSpec) {
+		private static final GoalRoute EVENT_ONLY = new GoalRoute(true, Optional.empty());
+		private static final GoalRoute CONSUMED = new GoalRoute(false, Optional.empty());
+
+		private GoalRoute {
+			Objects.requireNonNull(wakeSpec, "wakeSpec must not be null");
+		}
 	}
 
 	private OnlineParticipant resolveRecipient(String recipientId) {

@@ -13,6 +13,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 
 public final class AgentRegistry {
 	private final int maxAgents;
@@ -240,6 +241,10 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.start(require(id), prompt, nowEpochMs));
 	}
 
+	public synchronized AgentTransition start(AgentId id, GoalSpec spec, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.start(require(id), spec, nowEpochMs));
+	}
+
 	/** Commits a prepared start only after its publication barrier succeeds. */
 	public synchronized AgentTransition startAtomically(
 			AgentId id,
@@ -252,8 +257,23 @@ public final class AgentRegistry {
 		return applyAtomically(transition, barrier, "start");
 	}
 
+	public synchronized AgentTransition startAtomically(
+			AgentId id,
+			GoalSpec spec,
+			long nowEpochMs,
+			BiConsumer<AgentTransition, Runnable> barrier
+	) {
+		Objects.requireNonNull(barrier, "barrier must not be null");
+		AgentTransition transition = AgentLifecycleReducer.start(require(id), spec, nowEpochMs);
+		return applyAtomically(transition, barrier, "start");
+	}
+
 	public synchronized AgentTransition queue(AgentId id, String prompt, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.queue(require(id), prompt, queueLimit, nowEpochMs));
+	}
+
+	public synchronized AgentTransition queue(AgentId id, GoalSpec spec, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.queue(require(id), spec, queueLimit, nowEpochMs));
 	}
 
 	public synchronized AgentTransition stop(AgentId id, long nowEpochMs) {

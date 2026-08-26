@@ -1094,9 +1094,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		queueUrgentObservation(result.agentId());
 	}
 
-	void publishConversationEvent(ConversationEvent event, Optional<String> wakeGoal) {
+	void publishConversationEvent(ConversationEvent event, Optional<dev.agaminggod.arenaagents.agent.goal.GoalSpec> wakeGoal) {
 		Objects.requireNonNull(event, "event must not be null");
-		Optional<String> checkedWakeGoal = Objects.requireNonNull(wakeGoal, "wakeGoal must not be null");
+		Optional<dev.agaminggod.arenaagents.agent.goal.GoalSpec> checkedWakeGoal = Objects.requireNonNull(wakeGoal, "wakeGoal must not be null");
 		try {
 			if (checkedWakeGoal.isEmpty()) {
 				synchronized (publicationLock) {

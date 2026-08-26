@@ -54,6 +54,17 @@ public final class GoalSpecCodec {
 		);
 	}
 
+	public JsonObject encodePredicateObject(GoalPredicate predicate) {
+		validatePredicate(predicate);
+		return encodePredicate(predicate);
+	}
+
+	public GoalPredicate decodePredicateObject(JsonObject predicate) {
+		GoalPredicate decoded = decodePredicate(predicate, 0);
+		validatePredicate(decoded);
+		return decoded;
+	}
+
 	public static String fingerprint(GoalSpec spec) {
 		return fingerprint(spec.originalRequest(), spec.completion(), spec.createdAtTick());
 	}

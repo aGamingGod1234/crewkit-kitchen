@@ -53,6 +53,7 @@ import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.GoalControlVerification;
+import dev.agaminggod.arenaagents.server.goal.GoalCompilerVerification;
 import dev.agaminggod.arenaagents.server.conversation.AgentConversationRouterVerification;
 import dev.agaminggod.arenaagents.server.conversation.NativeAgentWhisperTargetsVerification;
 import dev.agaminggod.arenaagents.server.group.AgentGroupRegistryVerification;
@@ -173,6 +174,7 @@ public final class VerificationMain {
 		passedAssertions += NavigationMovementVerification.verify();
 		passedAssertions += MinecraftWalkabilityViewVerification.verify();
 		passedAssertions += GoalControlVerification.verify();
+		passedAssertions += GoalCompilerVerification.verify();
 		passedAssertions += AgentConversationRouterVerification.verify();
 		passedAssertions += NativeAgentWhisperTargetsVerification.verify();
 		passedAssertions += AgentGroupRegistryVerification.verify();

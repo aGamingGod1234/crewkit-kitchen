@@ -47,21 +47,21 @@ public final class AgentConversationRouterVerification {
 	}
 
 	private static int verifyPlayerConversationWakePolicy() {
-		assertEquals(true, ConversationWakePolicy.goalFor(
+		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.IDLE, ConversationKind.PLAYER_MESSAGE
-		).isPresent(), "idle agent wakes for direct player message");
-		assertEquals(true, ConversationWakePolicy.goalFor(
+		), "idle agent wakes for direct player message");
+		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.COMPLETED, ConversationKind.PROXIMITY_SPEECH
-		).isPresent(), "completed agent wakes for nearby player speech");
-		assertEquals(true, ConversationWakePolicy.goalFor(
+		), "completed agent wakes for nearby player speech");
+		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.PAUSED, ConversationKind.PLAYER_MESSAGE
-		).isPresent(), "paused agent wakes for direct player message");
-		assertEquals(true, ConversationWakePolicy.goalFor(
+		), "paused agent wakes for direct player message");
+		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.PAUSED, ConversationKind.PROXIMITY_SPEECH
-		).isPresent(), "paused agent wakes for nearby player speech");
-		assertEquals(false, ConversationWakePolicy.goalFor(
+		), "paused agent wakes for nearby player speech");
+		assertEquals(false, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.IDLE, ConversationKind.AGENT_MESSAGE
-		).isPresent(), "agent chatter does not wake idle agent");
+		), "agent chatter does not wake idle agent");
 		for (AgentLifecycleState state : List.of(
 				AgentLifecycleState.STARTING,
 				AgentLifecycleState.PLANNING,
@@ -70,9 +70,9 @@ public final class AgentConversationRouterVerification {
 				AgentLifecycleState.DEAD,
 				AgentLifecycleState.DISCONNECTED
 		)) {
-			assertEquals(false, ConversationWakePolicy.goalFor(
+			assertEquals(false, ConversationWakePolicy.shouldStartGoal(
 					state, ConversationKind.PLAYER_MESSAGE
-			).isPresent(), state + " agent is not auto-started by conversation");
+			), state + " agent is not auto-started by conversation");
 		}
 		return 11;
 	}

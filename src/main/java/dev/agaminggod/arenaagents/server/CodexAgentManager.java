@@ -11,6 +11,8 @@ import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
+import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntities;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntity;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
@@ -217,7 +219,7 @@ public final class CodexAgentManager {
 
 	public AgentTransition startConversationWakeAtomically(
 			ConversationEvent event,
-			String prompt,
+			GoalSpec spec,
 			BiConsumer<PendingConversationWake, Runnable> publicationBarrier
 	) {
 		Objects.requireNonNull(event, "event must not be null");
@@ -225,7 +227,7 @@ public final class CodexAgentManager {
 		PendingConversationWake[] staged = { null };
 		try {
 			return savedData.registry().startAtomically(
-					event.agentId(), prompt, System.currentTimeMillis(),
+					event.agentId(), spec, System.currentTimeMillis(),
 					(transition, commit) -> {
 						PendingConversationWake wake = PendingConversationWake.create(event, transition);
 						savedData.stageConversationWake(wake);
@@ -249,6 +251,22 @@ public final class CodexAgentManager {
 
 	public Optional<PendingConversationWake> pendingConversationWake(AgentId agentId) {
 		return savedData.conversationWake(agentId);
+	}
+
+	public void stageGoalDraft(PendingGoalDraft draft) {
+		savedData.stageGoalDraft(draft);
+	}
+
+	public List<PendingGoalDraft> goalDrafts() {
+		return savedData.goalDrafts();
+	}
+
+	public Optional<PendingGoalDraft> goalDraft(UUID draftId) {
+		return savedData.goalDraft(draftId);
+	}
+
+	public boolean removeGoalDraft(UUID draftId) {
+		return savedData.removeGoalDraft(draftId);
 	}
 
 	public AgentTransition rearmConversationWake(PendingConversationWake wake) {
@@ -867,6 +885,7 @@ public final class CodexAgentManager {
 				failure -> LOGGER.warn("Post-delete cleanup failed for agent {}", record.agentId(), failure)
 		);
 		savedData.clearConversationWake(record.agentId());
+		savedData.clearGoalDrafts(record.agentId());
 		return removed;
 	}
 
