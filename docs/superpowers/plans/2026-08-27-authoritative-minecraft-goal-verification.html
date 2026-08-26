@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authoritative Minecraft Goals · Implementation Plan</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#0a0d0b; --panel:#121713; --panel2:#171e18; --line:#2a352c;
+      --text:#edf5ef; --muted:#9eaca1; --green:#67db8e; --amber:#efbd62; --red:#f07b72;
+      --sans:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+      --mono:ui-monospace,SFMono-Regular,Consolas,monospace;
+    }
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.55}
+    main{width:min(980px,calc(100% - 32px));margin:auto;padding:52px 0 76px}
+    header{padding-bottom:32px;border-bottom:1px solid var(--line)}
+    .eyebrow{color:var(--green);font:700 12px/1 var(--mono);letter-spacing:.12em;text-transform:uppercase}
+    h1{max-width:820px;margin:14px 0 12px;font-size:clamp(34px,7vw,62px);line-height:1.03;letter-spacing:-.045em}
+    .lead{max-width:760px;color:var(--muted);font-size:clamp(17px,2vw,21px)}
+    .meta{display:flex;flex-wrap:wrap;gap:10px 20px;margin-top:22px;color:var(--muted);font:13px/1.4 var(--mono)}
+    section{padding:32px 0;border-bottom:1px solid var(--line)} h2{margin:0 0 14px;font-size:22px;letter-spacing:-.02em}
+    p{max-width:790px;margin:10px 0} ul,ol{max-width:820px;margin:12px 0;padding-left:22px} li+li{margin-top:8px}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:18px}
+    .card{padding:19px;border:1px solid var(--line);background:var(--panel);border-radius:8px}
+    .card h3{margin:0 0 8px;font-size:16px}.card p{margin:0;color:var(--muted);font-size:14px}
+    .task{display:grid;grid-template-columns:44px 1fr;gap:14px;padding:18px 0;border-top:1px solid var(--line)}
+    .task:first-of-type{border-top:0}.num{display:grid;place-items:center;width:36px;height:36px;border:1px solid #3c5542;border-radius:7px;color:var(--green);font:700 14px var(--mono)}
+    .task h3{margin:1px 0 5px;font-size:17px}.task p{margin:0;color:var(--muted);font-size:14px}
+    code{font-family:var(--mono);color:#baf4cb} .good{color:var(--green)} .warn{color:var(--amber)} .bad{color:var(--red)}
+    .gate{padding:20px;border:1px solid #5b4926;background:#19160f;border-radius:8px}
+    footer{padding-top:28px;color:var(--muted);font-size:13px}
+    @media(max-width:680px){main{width:min(100% - 24px,980px);padding-top:30px}.grid{grid-template-columns:1fr}.task{grid-template-columns:36px 1fr;gap:11px}.card{padding:16px}section{padding:27px 0}}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Arena Agents · implementation plan</div>
+    <h1>Minecraft decides when an agent is done</h1>
+    <p class="lead">Build immutable goal rules inside the mod, reject weak model claims, keep unfinished agents moving, and recover automatically after idle turns, danger, and death.</p>
+    <div class="meta"><span>Status: <span class="warn">ready for execution choice</span></span><span>8 testable tasks</span><span>Date: 27 August 2026</span></div>
+  </header>
+
+  <section>
+    <h2>Outcome</h2>
+    <div class="grid">
+      <article class="card"><h3 class="good">Authoritative completion</h3><p>Only live Minecraft state can satisfy a frozen goal rule.</p></article>
+      <article class="card"><h3 class="good">Persistent work</h3><p>An unfinished goal always owns active work or a deadline-bound next decision.</p></article>
+      <article class="card"><h3 class="good">Honest feedback</h3><p>A stone pickaxe cannot satisfy an iron-pickaxe request. The agent receives the exact mismatch.</p></article>
+      <article class="card"><h3 class="good">Automatic recovery</h3><p>Death, respawn, provider failure, and turn completion preserve and resume the same objective.</p></article>
+    </div>
+  </section>
+
+  <section>
+    <h2>Execution baseline</h2>
+    <p>Implementation must use a clean worktree based on <code>origin/codex/fix-coordinator-auth-and-console-navigation</code>. The stale dirty root checkout and the existing dirty deployment worktree remain untouched.</p>
+    <p class="warn">Deployment and device updates are a separate gate after reconciliation and full testing.</p>
+  </section>
+
+  <section>
+    <h2>Task sequence</h2>
+    <div class="task"><div class="num">1</div><div><h3>Persist immutable GoalSpec</h3><p>Add the closed predicate hierarchy, goal status, evidence, fingerprinting, strict codec, and backward-safe snapshot migration.</p></div></div>
+    <div class="task"><div class="num">2</div><div><h3>Compile exact requests</h3><p>Recognize exact items, coordinates, entities, and advancements. Persist ambiguous drafts without interrupting current work.</p></div></div>
+    <div class="task"><div class="num">3</div><div><h3>Constrained proposals</h3><p>Add bounded coordinator translation for complex requests. Every model proposal returns to Minecraft and requires player confirmation.</p></div></div>
+    <div class="task"><div class="num">4</div><div><h3>Verify live Minecraft state</h3><p>Evaluate inventory, stable position, blocks, advancements, survival time, operator confirmation, and agent-specific kills every server tick.</p></div></div>
+    <div class="task"><div class="num">5</div><div><h3>Remove model completion authority</h3><p>Simplify <code>finish</code> to a verification request. Reject false claims and continue the same turn or schedule another.</p></div></div>
+    <div class="task"><div class="num">6</div><div><h3>Enforce work leases</h3><p>Give provider, action, wait, recovery, and scheduled work deadlines. Recover within 2 seconds when no valid work remains.</p></div></div>
+    <div class="task"><div class="num">7</div><div><h3>Safety and clarification UX</h3><p>Add bounded survival reflexes, requester-authorized confirmation commands, concise normal chat, and deduplicated verbose reporting.</p></div></div>
+    <div class="task"><div class="num">8</div><div><h3>Headless proof</h3><p>Replay Sol's false finish and 232-second inactivity pattern, test dragon attribution and death recovery, then run one live iron-pickaxe acceptance task.</p></div></div>
+  </section>
+
+  <section>
+    <h2>Key interfaces</h2>
+    <div class="grid">
+      <article class="card"><h3><code>GoalSpec</code></h3><p>Original request, closed predicate, creation tick, and immutable fingerprint.</p></article>
+      <article class="card"><h3><code>GoalVerificationRuntime</code></h3><p>Evaluates the assigned player's live state and records the first accepted evidence.</p></article>
+      <article class="card"><h3><code>finish({summary})</code></h3><p>Requests verification. It cannot send predicates or a terminal status.</p></article>
+      <article class="card"><h3><code>WorkLeaseSupervisor</code></h3><p>Tracks deadline-bound work and forces recovery when an unfinished goal loses all valid leases.</p></article>
+    </div>
+  </section>
+
+  <section>
+    <h2>Acceptance checks</h2>
+    <ol>
+      <li>Stone does not satisfy iron. Iron completes immediately from inventory state.</li>
+      <li>A false finish leaves the goal active and starts another decision automatically.</li>
+      <li>Another player killing the dragon does not complete Sol's goal.</li>
+      <li>Death and respawn keep the exact goal revision and resume without speech.</li>
+      <li>Ambiguous requests ask <code>Replace / Queue / Cancel</code> while current work continues.</li>
+      <li>Save and reload preserve active, queued, recovering, and clarification-pending goals.</li>
+      <li>The captured Sol replay has no unexplained idle gap beyond the 2-second lease.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Verification commands</h2>
+    <ul>
+      <li><code>cd coordinator; npm test</code></li>
+      <li><code>./gradlew.bat verifyCore</code></li>
+      <li><code>./gradlew.bat check build</code></li>
+      <li><code>scripts/verify-coordinator-packaging.ps1</code></li>
+      <li><code>scripts/test-install-normal-profile-update.ps1</code></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Final gate</h2>
+    <div class="gate">Compare the finished feature branch with the dirty deployed worktree, reconcile overlapping runtime changes, rerun every test, and ask before updating devices or opening a PR.</div>
+  </section>
+
+  <footer>Implements the approved authoritative Minecraft goal verification design.</footer>
+</main>
+</body>
+</html>
