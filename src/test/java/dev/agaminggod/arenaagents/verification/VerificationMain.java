@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.verification;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentRegistryVerification;
+import dev.agaminggod.arenaagents.agent.GoalSpecVerification;
 import dev.agaminggod.arenaagents.agent.AgentIdentityVerification;
 import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
 import dev.agaminggod.arenaagents.server.AgentVerbosePresentationVerification;
@@ -189,6 +190,7 @@ public final class VerificationMain {
 		passedAssertions += OfflineAgentPlayersVerification.verify();
 		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();
 		passedAssertions += AgentRegistryVerification.verify();
+		passedAssertions += GoalSpecVerification.verify();
 		passedAssertions += AgentIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
 		passedAssertions += AgentControlSelectionStateVerification.verify();

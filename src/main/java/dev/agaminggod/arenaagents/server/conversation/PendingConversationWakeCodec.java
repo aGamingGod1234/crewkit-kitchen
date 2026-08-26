@@ -9,12 +9,15 @@ import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentGoal;
+import dev.agaminggod.arenaagents.agent.AgentGoalCodec;
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import java.util.ArrayList;
 import java.util.UUID;
 
 public final class PendingConversationWakeCodec {
-	private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
+	private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
+	private static final AgentGoalCodec GOAL_CODEC = new AgentGoalCodec();
 
 	public String encode(PendingConversationWake wake) {
 		JsonObject root = new JsonObject();
@@ -71,31 +74,11 @@ public final class PendingConversationWakeCodec {
 	}
 
 	private static JsonObject encodeGoal(AgentGoal goal) {
-		JsonObject json = new JsonObject();
-		json.addProperty("goal_id", goal.goalId().toString());
-		json.addProperty("prompt", goal.prompt());
-		JsonArray steering = new JsonArray();
-		goal.steeringInstructions().forEach(steering::add);
-		json.add("steering", steering);
-		json.addProperty("created_at_epoch_ms", goal.createdAtEpochMs());
-		json.addProperty("updated_at_epoch_ms", goal.updatedAtEpochMs());
-		return json;
+		return GOAL_CODEC.encode(goal);
 	}
 
 	private static AgentGoal decodeGoal(JsonObject json) {
-		JsonElement steeringElement = element(json, "steering");
-		if (!steeringElement.isJsonArray()) throw failure("steering must be an array");
-		ArrayList<String> steering = new ArrayList<>();
-		for (JsonElement entry : steeringElement.getAsJsonArray()) {
-			if (!entry.isJsonPrimitive() || !entry.getAsJsonPrimitive().isString()) {
-				throw failure("steering entries must be strings");
-			}
-			steering.add(entry.getAsString());
-		}
-		return new AgentGoal(
-				uuid(string(json, "goal_id"), "goal_id"), string(json, "prompt"), steering,
-				integer(json, "created_at_epoch_ms"), integer(json, "updated_at_epoch_ms")
-		);
+		return GOAL_CODEC.decode(json, GoalStatus.AWAITING_CLARIFICATION);
 	}
 
 	private static JsonElement element(JsonObject object, String field) {

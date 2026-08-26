@@ -15,6 +15,7 @@ import java.util.UUID;
 
 public final class AgentRegistrySnapshotCodec {
 	private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
+	private static final AgentGoalCodec GOAL_CODEC = new AgentGoalCodec();
 
 	public String encode(AgentRegistry.Snapshot snapshot) {
 		JsonObject root = new JsonObject();
@@ -94,19 +95,20 @@ public final class AgentRegistrySnapshotCodec {
 	private static AgentRecord decodeRecord(JsonObject json) {
 		JsonArray queueJson = requireArray(json, "queue");
 		ArrayList<AgentGoal> queue = new ArrayList<>(queueJson.size());
-		for (JsonElement element : queueJson) {
-			queue.add(decodeGoal(requireObject(element, "queued goal")));
-		}
 		AgentProfile profile = decodeProfile(requireObject(requireElement(json, "profile"), "profile"));
+		AgentLifecycleState state = parseEnum(AgentLifecycleState.class, requireString(json, "state"), "state");
+		for (JsonElement element : queueJson) {
+			queue.add(GOAL_CODEC.decode(requireObject(element, "queued goal"), dev.agaminggod.arenaagents.agent.goal.GoalStatus.AWAITING_CLARIFICATION));
+		}
 		return new AgentRecord(
 				requireInt(json, "schema_version"),
 				AgentId.parse(requireString(json, "agent_id")),
 				optionalUuid(json, "entity_uuid"),
 				optionalEntityLocation(json, "entity_location"),
 				profile,
-				parseEnum(AgentLifecycleState.class, requireString(json, "state"), "state"),
+				state,
 				optionalBoolean(json, "resume_after_respawn", false),
-				optionalGoal(json, "current_goal"),
+				optionalGoal(json, "current_goal", state),
 				requireLong(json, "goal_revision"),
 				queue,
 				requireString(json, "last_summary"),
@@ -210,47 +212,22 @@ public final class AgentRegistrySnapshotCodec {
 	}
 
 	private static JsonObject encodeGoal(AgentGoal goal) {
-		JsonObject json = new JsonObject();
-		json.addProperty("goal_id", goal.goalId().toString());
-		json.addProperty("prompt", goal.prompt());
-		JsonArray steering = new JsonArray();
-		for (String instruction : goal.steeringInstructions()) {
-			steering.add(instruction);
-		}
-		json.add("steering", steering);
-		json.addProperty("created_at_epoch_ms", goal.createdAtEpochMs());
-		json.addProperty("updated_at_epoch_ms", goal.updatedAtEpochMs());
-		return json;
-	}
-
-	private static AgentGoal decodeGoal(JsonObject json) {
-		JsonArray steeringJson = requireArray(json, "steering");
-		ArrayList<String> steering = new ArrayList<>(steeringJson.size());
-		for (JsonElement element : steeringJson) {
-			if (!element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
-				throw failure("INVALID_PERSISTED_FIELD", "steering entries must be strings");
-			}
-			steering.add(element.getAsString());
-		}
-		return new AgentGoal(
-				parseUuid(requireString(json, "goal_id"), "goal_id"),
-				requireString(json, "prompt"),
-				steering,
-				requireLong(json, "created_at_epoch_ms"),
-				requireLong(json, "updated_at_epoch_ms")
-		);
+		return GOAL_CODEC.encode(goal);
 	}
 
 	private static Optional<UUID> optionalUuid(JsonObject object, String field) {
 		return optionalString(object, field).map(value -> parseUuid(value, field));
 	}
 
-	private static Optional<AgentGoal> optionalGoal(JsonObject object, String field) {
+	private static Optional<AgentGoal> optionalGoal(JsonObject object, String field, AgentLifecycleState state) {
 		JsonElement element = requireElement(object, field);
 		if (element.isJsonNull()) {
 			return Optional.empty();
 		}
-		return Optional.of(decodeGoal(requireObject(element, field)));
+		dev.agaminggod.arenaagents.agent.goal.GoalStatus legacyStatus = state == AgentLifecycleState.COMPLETED
+				? dev.agaminggod.arenaagents.agent.goal.GoalStatus.SATISFIED
+				: dev.agaminggod.arenaagents.agent.goal.GoalStatus.AWAITING_CLARIFICATION;
+		return Optional.of(GOAL_CODEC.decode(requireObject(element, field), legacyStatus));
 	}
 
 	private static Optional<String> optionalString(JsonObject object, String field) {
