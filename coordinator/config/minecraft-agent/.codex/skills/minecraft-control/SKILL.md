@@ -160,24 +160,24 @@ Bad:
 {"tool":"sequence","arguments":{"actions":[{"actionType":"wait","arguments":{"durationMs":500}}]}}
 ```
 
-## finish - End only when the whole goal is factually completed or impossible. A completed result requires current-goal evidence.
+## finish - Request Minecraft to verify whether the whole goal is complete
 
 Formatting:
 
 ```text executor-format
-{"tool":"finish","arguments":{"status":<required "completed"|"impossible">,"summary":<required nonblank string 1..512 characters>,"completionContract":<required for completed; optional for impossible; {"goalRevision":<required nonnegative integer>,"predicates":<required array of 1..16 factual predicate objects>}>}}
+{"tool":"finish","arguments":{"summary":<required nonblank string 1..512 characters>}}
 ```
 
 Good:
 
 ```json executor-call
-{"tool":"finish","arguments":{"status":"completed","summary":"Crafted and collected the iron pickaxe.","completionContract":{"goalRevision":7,"predicates":[{"type":"inventory_min","itemId":"minecraft:iron_pickaxe","count":1}]}}}
+{"tool":"finish","arguments":{"summary":"Crafted and collected the iron pickaxe."}}
 ```
 
 Bad:
 
 ```json executor-bad-call
-{"tool":"finish","arguments":{"status":"completed","summary":"Done."}}
+{"tool":"finish","arguments":{"summary":"Done.","completionContract":{"predicates":[{"type":"inventory_min","itemId":"minecraft:iron_pickaxe","count":1}]}}}
 ```
 
 ## Combined speech and action - Acknowledge a physical task and start it in the same turn

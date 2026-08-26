@@ -134,8 +134,8 @@ test('Codex service shares one initialized transport across isolated agent threa
 		first.decide('First observation.', { goalRevision: 1 }),
 		second.decide('Second observation.', { goalRevision: 3 }),
 	]);
-	assert.equal(firstDecision.status, 'completed');
-	assert.equal(secondDecision.status, 'completed');
+	assert.equal(firstDecision.directive, 'finish');
+	assert.equal(secondDecision.directive, 'finish');
 	await service.stop();
 });
 
@@ -214,7 +214,7 @@ test('Codex service accepts the streamed agent-message contract when no complete
 	const text = finishDecisionJson();
 	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: text } });
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
-	assert.equal((await decisionPromise).status, 'completed');
+	assert.equal((await decisionPromise).directive, 'finish');
 	await service.stop();
 });
 
@@ -243,7 +243,7 @@ test('Codex streams only visible agent output in real time and isolates verbose 
 	transport.emit('notification', { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'agentMessage', text } } });
 	assert.equal(events.length, streamedEventCount, 'completed items do not repeat output that was already streamed');
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
-	assert.equal((await decisionPromise).status, 'completed');
+	assert.equal((await decisionPromise).directive, 'finish');
 	await service.stop();
 });
 
@@ -272,7 +272,7 @@ test('Codex malformed output records one final error row for the attempt', async
 test('Codex records authoritative identity, scheduler wait, native token usage, and compaction', async () => {
 	const transport = new FakeSharedTransport();
 	transport.complete = function (threadId, turnId) {
-		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: '{"summary":"Done","directive":"finish","status":"completed","completionContract":{"goalRevision":1,"predicates":[{"type":"position_within","x":0,"y":64,"z":0,"radius":16}]}}' } } });
+		this.emit('notification', { method: 'item/completed', params: { threadId, turnId, item: { type: 'agentMessage', text: '{"summary":"Done","directive":"finish","source":null}' } } });
 		this.emit('notification', { method: 'thread/tokenUsage/updated', params: { threadId, turnId, tokenUsage: { last: {
 			inputTokens: 101, outputTokens: 23, reasoningOutputTokens: 7, cachedInputTokens: 41, cacheWriteInputTokens: 5, totalTokens: 131,
 		} } } });
@@ -501,7 +501,7 @@ test('a completed notification cannot be mistaken for a delayed turn-start respo
 	await new Promise((resolve) => setImmediate(resolve));
 	transport.complete('thread-1', 'turn-delayed');
 	transport.turnStartResolvers[0]({ turn: { id: 'turn-delayed' } });
-	assert.equal((await decision).status, 'completed');
+	assert.equal((await decision).directive, 'finish');
 	await service.stop();
 });
 

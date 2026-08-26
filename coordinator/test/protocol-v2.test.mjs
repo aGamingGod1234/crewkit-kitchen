@@ -114,27 +114,26 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 	}), /field/i);
 });
 
-test('protocol v2 carries a revision/profile/trace-bound factual goal completion request', () => {
-	const completionContract = { goalRevision: 4, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
+test('protocol v2 carries a revision/profile/trace-bound server goal verification request', () => {
+	const goalFingerprint = 'a'.repeat(64);
 	const payload = {
 		goalRevision: 4,
-		completionContract,
+		goalFingerprint,
 		traceId: TRACE_ID,
 		profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
-		contractHash: completionContractFingerprint(completionContract),
 	};
 	assert.deepEqual(validateProtocolV2Payload('goal_completed', payload), payload);
 	assert.throws(
 		() => validateProtocolV2Payload('goal_completed', { goalRevision: 4 }),
-		error => error.code === 'CONTRACT_REQUIRED',
-		'goal completion cannot fall back to a revision-only proof',
+		/required/i,
+		'goal verification requires the immutable server fingerprint and provenance',
 	);
-	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, contractHash: 'sha256:wrong' }), /contractHash/i);
+	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, goalFingerprint: 'wrong' }), /goalFingerprint/i);
 	const completionResult = {
-		goalRevision: 4, traceId: TRACE_ID, contractHash: payload.contractHash, verified: false, reasonCode: 'PREDICATE_FAILED',
+		goalRevision: 4, traceId: TRACE_ID, goalFingerprint, verified: false, reasonCode: 'PREDICATE_FAILED',
 		facts: [
-			{ predicateIndex: 0, type: 'inventory_min', satisfied: false, observedValue: '0' },
-			{ predicateIndex: 1, type: 'position_within', satisfied: true, observedValue: '1.25' },
+			{ type: 'inventory_contains', satisfied: false, expectedValue: 'minecraft:wooden_pickaxe x1', observedValue: 'minecraft:wooden_pickaxe x0' },
+			{ type: 'position_within', satisfied: true, expectedValue: '0.0,64.0,0.0 radius=2.0', observedValue: '0.0,64.0,1.25 stableTicks=2' },
 		],
 	};
 	assert.deepEqual(validateProtocolV2Payload('goal_completion_result', completionResult), completionResult);
@@ -903,7 +902,7 @@ test('a newer lifecycle revision removes queued stale agent readiness under back
 
 test('strict payload validators accept every current wire shape and reject unknown fields', () => {
 	const catalog = { refreshedAtEpochMs: 1, models: [{ id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT 5.6 Sol', reasoningEfforts: ['high'], serviceTiers: ['fast'] }] };
-	const completionContract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
+	const goalFingerprint = 'a'.repeat(64);
 	const messages = [
 		['hello', { secret: SECRET }],
 		['hello_ack', { replyTo: 'coordinator-1', authenticated: true, registry: [registeredRecord()] }],
@@ -917,8 +916,8 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
-		['goal_completed', { goalRevision: 1, completionContract, traceId: TRACE_ID, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' }, contractHash: completionContractFingerprint(completionContract) }],
-		['goal_completion_result', { goalRevision: 1, traceId: TRACE_ID, contractHash: completionContractFingerprint(completionContract), verified: false, reasonCode: 'PREDICATE_FAILED', facts: [] }],
+		['goal_completed', { goalRevision: 1, goalFingerprint, traceId: TRACE_ID, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } }],
+		['goal_completion_result', { goalRevision: 1, traceId: TRACE_ID, goalFingerprint, verified: false, reasonCode: 'PREDICATE_FAILED', facts: [] }],
 		['action_command', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],

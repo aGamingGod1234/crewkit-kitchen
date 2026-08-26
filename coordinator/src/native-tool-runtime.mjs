@@ -1,5 +1,4 @@
 import { validateTraceId } from './control-latency-registry.mjs';
-import { bindCompletionContract } from './goal-contract.mjs';
 
 export class NativeToolRuntime {
 	#bridge;
@@ -137,12 +136,13 @@ export class NativeToolRuntime {
 	onCompletionResult(record, payload = {}) {
 		const active = this.#completions.get(record.agentId);
 		if (active === undefined || active.goalRevision !== record.goalRevision) return false;
-		if (payload.traceId !== active.traceId || payload.contractHash !== active.contractHash) return false;
+		if (payload.traceId !== active.traceId || payload.goalFingerprint !== active.goalFingerprint) return false;
 		this.#completions.delete(record.agentId);
 		active.resolve({
-			state: payload.verified === true ? 'COMPLETED' : 'FAILED',
+			state: payload.verified === true ? 'COMPLETED' : 'ACTIVE',
 			verified: payload.verified === true,
 			reasonCode: String(payload.reasonCode ?? '').slice(0, 128),
+			facts: structuredClone(Array.isArray(payload.facts) ? payload.facts : []),
 		});
 		return true;
 	}
@@ -182,10 +182,11 @@ export class NativeToolRuntime {
 
 	async #finish(request, record, lifecycleGeneration) {
 		if (this.#actions.has(record.agentId)) throw codedError('NATIVE_ACTION_IN_PROGRESS', 'The Minecraft body is already executing an action');
-		if (request.tool.status === 'impossible') {
-			return { state: 'FAILED', verified: false, reasonCode: 'IMPOSSIBLE_NOT_VERIFIED' };
-		}
 		if (this.#completions.has(record.agentId)) throw codedError('NATIVE_COMPLETION_IN_PROGRESS', 'Goal completion verification is already running');
+		const goalFingerprint = record.currentGoalSpec?.fingerprint;
+		if (typeof goalFingerprint !== 'string' || !/^[0-9a-f]{64}$/.test(goalFingerprint)) {
+			throw codedError('GOAL_SPEC_REQUIRED', 'Minecraft has not supplied an immutable goal specification');
+		}
 		const ordinal = ++this.#sequence;
 		const traceId = validateTraceId(`native-complete-${safeSegment(record.agentId)}-${record.goalRevision}-${ordinal}`.slice(0, 128));
 		const profile = {
@@ -194,32 +195,29 @@ export class NativeToolRuntime {
 			reasoningEffort: record.reasoningEffort,
 			serviceTier: record.serviceTier ?? 'priority',
 		};
-		const bound = bindCompletionContract(request.tool.completionContract, { goalRevision: record.goalRevision, traceId, profile });
-		const completionContract = { goalRevision: bound.goalRevision, predicates: bound.predicates };
 		let resolveCompletion;
 		let rejectCompletion;
 		const completion = new Promise((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; });
 		this.#completions.set(record.agentId, {
 			goalRevision: record.goalRevision,
 			traceId,
-			contractHash: bound.contractHash,
+			goalFingerprint,
 			resolve: resolveCompletion,
 			reject: rejectCompletion,
 		});
 		try {
 			await this.#bridge.send('goal_completed', record.agentId, {
 				goalRevision: record.goalRevision,
-				completionContract,
+				goalFingerprint,
 				traceId,
 				profile,
-				contractHash: bound.contractHash,
 			});
 		} catch (error) {
 			this.#completions.delete(record.agentId);
 			rejectCompletion(error);
 		}
 		const result = await completion;
-		await this.#onFinish({ record, request, result, lifecycleGeneration });
+		if (result.verified) await this.#onFinish({ record, request, result, lifecycleGeneration });
 		return result;
 	}
 }

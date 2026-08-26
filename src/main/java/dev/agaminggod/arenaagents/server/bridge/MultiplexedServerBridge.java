@@ -36,6 +36,7 @@ import dev.agaminggod.arenaagents.server.conversation.PendingConversationWake;
 import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
+import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
@@ -45,7 +46,6 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
-import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContract;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
@@ -110,6 +110,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ServerActionExecutor actionExecutor;
 	private final ServerAgentConversationRouter conversationRouter;
 	private final ServerObservationCollector observations;
+	private final GoalVerificationRuntime goalVerificationRuntime;
 	private final BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 	private static final GoalSpecWireCodec GOAL_SPEC_WIRE_CODEC = new GoalSpecWireCodec();
 	private final String serverInstanceId = UUID.randomUUID().toString();
@@ -168,11 +169,31 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			Path secretPath,
 			AgentVerboseState verboseState
 	) {
+		this(manager, port, secretPath, verboseState, defaultGoalVerificationRuntime(manager));
+	}
+
+	public MultiplexedServerBridge(
+			CodexAgentManager manager,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime
+	) {
+		this(manager, DEFAULT_PORT, secretPath, verboseState, goalVerificationRuntime);
+	}
+
+	public MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		this.port = port;
 		this.secret = readSecret(secretPath);
 		this.verboseState = Objects.requireNonNull(verboseState, "verboseState must not be null");
+		this.goalVerificationRuntime = Objects.requireNonNull(goalVerificationRuntime, "goalVerificationRuntime must not be null");
 		this.conversationRouter = new ServerAgentConversationRouter(
 				manager, this::publishConversationEvent, this::publishGoalSpecRequest);
 		this.actionExecutor = new ServerActionExecutor(
@@ -801,12 +822,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private void acceptGoalCompleted(BridgeEnvelope envelope) {
 		AgentId agentId = AgentId.parse(envelope.agentId());
 		JsonObject payload = envelope.payload();
-		if (!payload.has("completionContract")) throw new BridgeProtocolException("CONTRACT_REQUIRED", "goal_completed requires a factual completionContract");
-		requireKeys(payload, Set.of("goalRevision", "completionContract", "traceId", "profile", "contractHash"), "goal_completed");
+		requireKeys(payload, Set.of("goalRevision", "goalFingerprint", "traceId", "profile"), "goal_completed");
 		long goalRevision = requiredLong(payload, "goalRevision");
 		AgentRecord record = manager.registry().require(agentId);
 		String traceId = requiredTraceId(payload, "traceId");
-		String contractHash = requiredString(payload, "contractHash");
+		String goalFingerprint = requiredString(payload, "goalFingerprint");
+		if (!goalFingerprint.matches("[0-9a-f]{64}")) {
+			throw new BridgeProtocolException("INVALID_GOAL_FINGERPRINT", "goalFingerprint must be lowercase SHA-256");
+		}
 		JsonObject profile = requiredObject(payload, "profile");
 		requireKeys(profile, Set.of("provider", "model", "reasoningEffort", "serviceTier"), "goal_completed.profile");
 		if (!record.profile().provider().equals(requiredString(profile, "provider"))
@@ -815,22 +838,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				|| !record.profile().serviceTier().equals(requiredString(profile, "serviceTier"))) {
 			throw new AgentDomainException("STALE_PROVENANCE", "Completion profile does not match the selected model profile");
 		}
-		JsonElement contractElement = payload.get("completionContract");
-		if (!contractElement.isJsonObject()) throw new BridgeProtocolException("MALFORMED_CONTRACT", "completionContract must be an object");
-		GoalCompletionContract contract = GoalCompletionContract.parse(contractElement.getAsJsonObject());
-		if (contract.goalRevision() != goalRevision || !contractHash.equals(hashContract(contract))) {
-			throw new BridgeProtocolException("STALE_CONTRACT", "Completion contract revision or hash does not match");
-		}
-		GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier().verify(
-				record, manager.findAgentPlayer(agentId).orElse(null), contract, actionExecutor.actionSuccessLedger());
+		GoalCompletionVerifier.VerificationResult verification = goalVerificationRuntime.evaluateRequest(
+				agentId, goalRevision, goalFingerprint);
 		VerboseEvent feedback = completionVerboseEvent(goalRevision, verification);
 		if (!verification.verified()) {
 			AgentVerboseChat.report(manager, verboseState, record, feedback.stage(), feedback.message());
 		}
-		JsonObject result = completionResultPayload(goalRevision, traceId, contractHash, verification);
+		JsonObject result = completionResultPayload(goalRevision, traceId, goalFingerprint, verification);
 		send("goal_completion_result", agentId.toString(), result);
 		if (verification.verified()) {
-			AgentRecord completed = router.coordinatorCompleted(agentId, goalRevision);
+			goalVerificationRuntime.acceptVerified(agentId, goalRevision, goalFingerprint, verification);
+			AgentRecord completed = manager.registry().require(agentId);
 			AgentVerboseChat.report(manager, verboseState, completed, feedback.stage(), feedback.message());
 		}
 	}
@@ -846,16 +864,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 						goalRevision, "retry", "Goal completion could not be verified. Continuing the task.");
 	}
 
-	static JsonObject completionResultPayload(long goalRevision, String traceId, String contractHash, GoalCompletionVerifier.VerificationResult verification) {
+	static JsonObject completionResultPayload(long goalRevision, String traceId, String goalFingerprint, GoalCompletionVerifier.VerificationResult verification) {
 		JsonObject result = verification.toJson();
 		result.addProperty("goalRevision", goalRevision);
 		result.addProperty("traceId", traceId);
-		result.addProperty("contractHash", contractHash);
+		result.addProperty("goalFingerprint", goalFingerprint);
 		return result;
-	}
-
-	private static String hashContract(GoalCompletionContract contract) {
-		return contract.fingerprint();
 	}
 
 	private void acceptConversationWakeAck(BridgeEnvelope envelope) {
@@ -1634,6 +1648,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		int promptLimit = AgentConstants.MAX_PROMPT_LENGTH - steering.length();
 		String prompt = goal.prompt().length() <= promptLimit ? goal.prompt() : goal.prompt().substring(0, promptLimit);
 		return prompt + steering;
+	}
+
+	private static GoalVerificationRuntime defaultGoalVerificationRuntime(CodexAgentManager manager) {
+		Objects.requireNonNull(manager, "manager must not be null");
+		return new GoalVerificationRuntime(
+				manager.registry(),
+				agentId -> manager.findAgentPlayer(agentId).map(GoalCompletionVerifier::minecraftFacts),
+				() -> manager.server() == null ? 0L : manager.server().getTickCount(),
+				System::currentTimeMillis
+		);
 	}
 
 	private static Path configuredSecretPath() {

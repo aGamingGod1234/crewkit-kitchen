@@ -1275,7 +1275,7 @@ export class DynamicCoordinator extends EventEmitter {
 		await this.#bridge.send('catalog_snapshot', 'server', snapshot);
 	}
 
-	async #publishGoalCompleted({ record, completionContract, traceId, contractHash }) {
+	async #publishGoalCompleted({ record, goalFingerprint, traceId }) {
 		if (!this.#bridge.ready) throw codedRuntimeError('BRIDGE_NOT_READY', 'Minecraft bridge is not ready for completion verification');
 		if (!this.#supportedAgentIds.has(record.agentId)) throw codedRuntimeError('AGENT_NOT_SUPPORTED', `Agent '${record.agentId}' is not in the reconciled bridge roster`);
 		const profile = {
@@ -1287,10 +1287,9 @@ export class DynamicCoordinator extends EventEmitter {
 		try {
 			await this.#bridge.send('goal_completed', record.agentId, {
 				goalRevision: record.goalRevision,
-				completionContract,
+				goalFingerprint,
 				traceId,
 				profile,
-				contractHash,
 			});
 		} catch (error) {
 			if (isTransientCompletionSendError(error)) throw error;

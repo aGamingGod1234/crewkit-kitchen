@@ -3,7 +3,6 @@ import { parseArenaScript } from '../arena-script/parser.mjs';
 import { PLAYER_MEMBER_PRIMITIVES } from '../arena-script/minecraft-api.mjs';
 import { validateAction } from '../schema.mjs';
 import { runScenarioSuccess } from '../simulator/simulator-scenarios.mjs';
-import { parseCompletionContract } from '../goal-contract.mjs';
 
 const PRIMITIVE_MEMBERS = Object.freeze(Object.fromEntries(
 	Object.entries(PLAYER_MEMBER_PRIMITIVES).map(([member, primitive]) => [primitive, member]),
@@ -32,44 +31,8 @@ export function compileScenarioProgram(manifest, { limits = DEFAULT_ARENA_SCRIPT
 		summary: typeof summary === 'string' && summary.trim() ? summary : `Execute ${manifest.id ?? 'scenario'}`,
 		directive: 'replace',
 		source,
-		completionContract: buildScenarioCompletionContract(manifest),
 	});
 	return deepFreeze({ source, decision, compiled, commands });
-}
-
-/**
- * Translate deterministic fixture facts into the explicit contract required by
- * the coordinator. This is harness metadata, not a model-authored decision.
- */
-export function buildScenarioCompletionContract(manifest, { goalRevision = 1 } = {}) {
-	if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) throw new TypeError('manifest must be an object');
-	const expected = manifest.expected && typeof manifest.expected === 'object' ? manifest.expected : {};
-	const predicates = [];
-	const addInventory = (itemId, count = 1) => {
-		if (typeof itemId === 'string' && itemId.includes(':') && Number.isSafeInteger(count) && count > 0) predicates.push({ type: 'inventory_min', itemId, count });
-	};
-	const addPosition = (position, radius = expected.tolerance ?? 0.2) => {
-		if (isCoordinatePosition(position) && Number.isFinite(radius) && radius >= 0) predicates.push({ type: 'position_within', x: position.x, y: position.y, z: position.z, radius });
-	};
-	if (expected.terminalState) {
-		addPosition(initialAgentPosition(manifest), 0);
-	} else {
-		addInventory(expected.toolItemId, 1);
-		addInventory(expected.outputItemId, expected.finalPlanks ?? expected.outputCount ?? 1);
-		addInventory(expected.stickItemId, expected.stickCount ?? 1);
-		const block = expected.tableBlock ?? (isCoordinatePosition(expected.position) && typeof expected.blockId === 'string' ? { ...expected.position, blockId: expected.blockId } : null);
-		if (block && isCoordinatePosition(block) && typeof block.blockId === 'string' && block.blockId.includes(':')) predicates.push({ type: 'block_matches', x: block.x, y: block.y, z: block.z, blockId: block.blockId });
-		if (expected.checkpoint) addPosition(expected.checkpoint);
-		else if (Array.isArray(expected.waypoints) && expected.waypoints.length > 0) addPosition(expected.waypoints.at(-1));
-		else if (isCoordinatePosition(expected.position) && !expected.blockId) addPosition(expected.position);
-		if (typeof expected.targetId === 'string' && isCanonicalUuid(expected.targetId)) predicates.push({ type: 'entity_state', entityId: expected.targetId, state: expected.targetDefeated === true ? 'dead' : 'alive' });
-	}
-	if (!expected.terminalState) {
-		for (const [actionType, count] of actionTypeCounts(manifest.commands ?? [])) predicates.push({ type: 'action_success_count', actionType, count });
-	}
-	if (predicates.length === 0) addPosition(initialAgentPosition(manifest), 0);
-	if (predicates.length === 0) throw new TypeError('scenario manifest must provide a factual completion predicate');
-	return parseCompletionContract({ goalRevision, predicates }, { goalRevision });
 }
 
 /** Return only the provider-compatible decision envelope. */
@@ -209,26 +172,8 @@ function normalizeManifestCommands(manifest, limits) {
 	});
 }
 
-function actionTypeCounts(commands) {
-	const counts = new Map();
-	for (const command of commands) {
-		const actionType = command?.actionType ?? command?.type;
-		if (typeof actionType === 'string' && actionType.length > 0) counts.set(actionType, (counts.get(actionType) ?? 0) + 1);
-	}
-	return counts;
-}
-
-function initialAgentPosition(manifest) {
-	const agentId = manifest.agentId ?? Object.keys(manifest.world?.agents ?? manifest.world?.players ?? {})[0];
-	return manifest.world?.agents?.[agentId]?.position ?? manifest.world?.players?.[agentId]?.position ?? null;
-}
-
 function isCoordinatePosition(value) {
 	return value !== null && typeof value === 'object' && Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z);
-}
-
-function isCanonicalUuid(value) {
-	return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function stableJson(value) {

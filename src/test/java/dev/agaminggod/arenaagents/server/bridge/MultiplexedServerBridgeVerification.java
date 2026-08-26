@@ -899,9 +899,11 @@ public final class MultiplexedServerBridgeVerification {
 						new GoalEvidence.Fact("position_within", true, "12.0,64.0,12.0 radius=2.0", "12.0,64.0,13.25 stableTicks=1")
 				)
 		);
-		JsonObject payload = MultiplexedServerBridge.completionResultPayload(7L, "trace-java-1", "sha256:contract", verification);
+		String goalFingerprint = "a".repeat(64);
+		JsonObject payload = MultiplexedServerBridge.completionResultPayload(7L, "trace-java-1", goalFingerprint, verification);
 		assertEquals(2, payload.getAsJsonArray("facts").size(), "completion result retains every verifier fact");
-		assertEquals(0, payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("predicateIndex").getAsInt(), "completion result retains failed predicate index");
+		assertEquals(goalFingerprint, payload.get("goalFingerprint").getAsString(), "completion result retains the immutable goal fingerprint");
+		assertEquals("minecraft:iron_pickaxe x1", payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("expectedValue").getAsString(), "completion result retains expected value");
 		assertEquals("minecraft:iron_pickaxe x0", payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("observedValue").getAsString(), "completion result retains observed value");
 		MultiplexedServerBridge.VerboseEvent rejected = invokeCompletionVerboseEvent(7L, verification);
 		assertEquals(7L, rejected.goalRevision(), "rejected completion feedback retains the guarded revision");

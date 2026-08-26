@@ -1,11 +1,9 @@
 package dev.agaminggod.arenaagents.server.runtime;
 
 import carpet.helpers.EntityPlayerActionPack;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
-import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
@@ -185,25 +183,8 @@ public final class ServerActionExecutor {
 			throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 		}
 		if (request.type() == ActionType.COMPLETE_GOAL) {
-			var record = manager.registry().require(request.agentId());
-			try {
-				JsonElement contractElement = request.arguments().get("completionContract");
-				if (contractElement == null || contractElement.isJsonNull()) throw new AgentDomainException("CONTRACT_REQUIRED", "complete_goal requires a factual completionContract");
-				GoalCompletionContract contract = GoalCompletionContract.parse(contractElement.getAsJsonObject());
-				GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier().verify(
-						record, manager.findAgentPlayer(request.agentId()).orElse(null), contract, actionSuccessLedger);
-				if (!verification.verified()) {
-					emit(request, ServerActionState.FAILED, verification.reasonCode(), "Factual completion verification failed", 0L, false, false);
-					return;
-				}
-				AgentLifecycleReducer.completeGoal(record, request.goalRevision(), System.currentTimeMillis());
-				AgentChatReporter.completed(manager, record, string(request.arguments(), "summary"));
-				emit(request, ServerActionState.SUCCEEDED, "GOAL_COMPLETED", string(request.arguments(), "summary"), 0L, false, false);
-				router.goalCompleted(request.agentId(), request.goalRevision());
-			} catch (RuntimeException exception) {
-				String reason = exception instanceof AgentDomainException domain ? domain.code() : "MALFORMED_CONTRACT";
-				emit(request, ServerActionState.FAILED, reason, "Factual completion contract was rejected", 0L, false, false);
-			}
+			emit(request, ServerActionState.FAILED, "SERVER_VERIFICATION_REQUIRED",
+					"Goal completion must use the server-owned verification request", 0L, false, false);
 			return;
 		}
 

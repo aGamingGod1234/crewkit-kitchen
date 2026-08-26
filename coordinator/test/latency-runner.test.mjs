@@ -58,7 +58,8 @@ function movementScenario() {
 }
 
 function fixtureDecision({ summary = 'done', source = SOURCE, scenario = fixtureScenario() } = {}) {
-	return { summary, directive: 'replace', source, completionContract: compileScenarioDecision(scenario).completionContract };
+	void scenario;
+	return { summary, directive: 'replace', source };
 }
 
 function movementProvider() {

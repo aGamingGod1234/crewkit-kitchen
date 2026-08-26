@@ -6,6 +6,7 @@ import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { ProgramRuntimeManager as ProductionProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { withCompletionContract } from './fixtures/completion-contract.mjs';
 
 class ProgramRuntimeManager extends ProductionProgramRuntimeManager {
@@ -22,7 +23,8 @@ const DEATH = Object.freeze({
 });
 
 function record(agentId = 'agent-a') {
-	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast', state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'wait', queue: [] };
+	const fields = { originalRequest: 'wait', predicate: { type: 'operator_confirmed' }, createdAtTick: 1 };
+	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast', state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'wait', currentGoalSpec: { ...fields, fingerprint: goalSpecFingerprint(fields) }, queue: [] };
 }
 
 function observation(overrides = {}) {
@@ -52,7 +54,8 @@ function harness(options = {}) {
 			queueMicrotask(() => manager.onCompletionResult(registry.get(request.record.agentId), {
 				goalRevision: request.record.goalRevision,
 				traceId: request.traceId,
-				contractHash: request.contractHash,
+				goalFingerprint: request.goalFingerprint,
+				facts: [],
 				verified: true,
 				reasonCode: 'COMPLETION_VERIFIED',
 			}));
@@ -78,7 +81,8 @@ test('retries a completion publication that was temporarily unavailable', async 
 			queueMicrotask(() => run.manager.onCompletionResult(run.registry.get(request.record.agentId), {
 				goalRevision: request.record.goalRevision,
 				traceId: request.traceId,
-				contractHash: request.contractHash,
+				goalFingerprint: request.goalFingerprint,
+				facts: [],
 				verified: true,
 				reasonCode: 'COMPLETION_VERIFIED',
 			}));
@@ -102,20 +106,20 @@ test('routes failed factual completion back through the selected brain', async (
 	assert.equal(run.manager.onCompletionResult(run.registry.get('agent-a'), {
 		goalRevision: 1,
 		traceId: completionRequest.traceId,
-		contractHash: completionRequest.contractHash,
+		goalFingerprint: completionRequest.goalFingerprint,
 		verified: false,
 		reasonCode: 'INVENTORY_MISSING',
 		facts: [
-			{ predicateIndex: 0, type: 'inventory_min', satisfied: false, observedValue: '0' },
-			{ predicateIndex: 1, type: 'position_within', satisfied: true, observedValue: '1.25' },
+			{ type: 'inventory_contains', satisfied: false, expectedValue: 'minecraft:iron_pickaxe x1', observedValue: 'minecraft:iron_pickaxe x0' },
+			{ type: 'position_within', satisfied: true, expectedValue: '0,64,0 radius=2', observedValue: '0,64,1.25 stableTicks=2' },
 		],
 	}), true);
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(run.requests.length, 1);
 	assert.match(run.requests[0].input, /"decisionContext":"completion_verification_failed"/);
 	assert.match(run.requests[0].input, /"reasonCode":"INVENTORY_MISSING"/);
-	assert.match(run.requests[0].input, /"predicateIndex":0/);
-	assert.match(run.requests[0].input, /"observedValue":"0"/);
+	assert.match(run.requests[0].input, /"expectedValue":"minecraft:iron_pickaxe x1"/);
+	assert.match(run.requests[0].input, /"observedValue":"minecraft:iron_pickaxe x0"/);
 });
 
 test('turns an exhausted silent completion correction into an explicit agent error', async () => {
@@ -136,10 +140,10 @@ test('turns an exhausted silent completion correction into an explicit agent err
 	manager.onCompletionResult(registry.get('agent-a'), {
 		goalRevision: 1,
 		traceId: completionRequest.traceId,
-		contractHash: completionRequest.contractHash,
+		goalFingerprint: completionRequest.goalFingerprint,
 		verified: false,
 		reasonCode: 'PREDICATE_FAILED',
-		facts: [{ predicateIndex: 0, type: 'inventory_min', satisfied: false, observedValue: '0' }],
+		facts: [{ type: 'inventory_contains', satisfied: false, expectedValue: 'minecraft:iron_pickaxe x1', observedValue: 'minecraft:iron_pickaxe x0' }],
 	});
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ERROR);
@@ -175,7 +179,7 @@ test('clears a scheduled completion retry before a newer publication and correct
 	assert.equal(run.manager.onCompletionResult(run.registry.get('agent-a'), {
 		goalRevision: 1,
 		traceId: latestRequest.traceId,
-		contractHash: latestRequest.contractHash,
+		goalFingerprint: latestRequest.goalFingerprint,
 		verified: false,
 		reasonCode: 'PREDICATE_FAILED',
 	}), true);
@@ -272,14 +276,11 @@ test('installs a model-authored program and dispatches its next primitive withou
 
 test('corrects an acknowledgement-only program before dispatching it for a physical goal', async () => {
 	const registry = new AgentRegistry();
-	registry.register({ ...record(), currentGoal: 'Get an iron pickaxe' });
+	const goalFields = { originalRequest: 'Get an iron pickaxe', predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 }, createdAtTick: 1 };
+	registry.register({ ...record(), currentGoal: goalFields.originalRequest, currentGoalSpec: { ...goalFields, fingerprint: goalSpecFingerprint(goalFields) } });
 	const sent = [];
 	const requests = [];
 	const errors = [];
-	const completionContract = {
-		goalRevision: 1,
-		predicates: [{ type: 'inventory_min', itemId: 'minecraft:iron_pickaxe', count: 1 }],
-	};
 	const manager = new ProductionProgramRuntimeManager({
 		registry,
 		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
@@ -289,7 +290,6 @@ test('corrects an acknowledgement-only program before dispatching it for a physi
 				summary: 'Begin gathering materials.',
 				directive: 'replace',
 				source: 'program.onUnhandledAttention("continue_and_notify"); await player.mine({ x: 1, y: 64, z: 1, timeoutMs: 30000 });',
-				completionContract,
 			};
 		} },
 		reportError: (_agentId, error) => errors.push(error),
@@ -299,7 +299,6 @@ test('corrects an acknowledgement-only program before dispatching it for a physi
 		summary: "I'm on it.",
 		directive: 'replace',
 		source: 'program.onUnhandledAttention("continue_and_notify"); await player.chat({ message: "I am on it.", audience: "proximity" });',
-		completionContract,
 	}, { observation: observation(), eventSequence: 1 });
 
 	assert.equal(requests.length, 1, 'the selected model receives one correction request');
@@ -345,13 +344,11 @@ test('keeps the agent acting while a successful exhausted program is replaced', 
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });
 
-test('keeps the original goal contract when an exhausted-program replacement returns a different one', async () => {
+test('keeps the immutable server goal when an exhausted program is replaced', async () => {
 	const registry = new AgentRegistry();
 	registry.register(record());
 	const sent = [];
 	const errors = [];
-	const initialContract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:iron_pickaxe', count: 1 }] };
-	const replacementContract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:oak_log', count: 1 }] };
 	const manager = new ProductionProgramRuntimeManager({
 		registry,
 		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
@@ -359,7 +356,6 @@ test('keeps the original goal contract when an exhausted-program replacement ret
 			summary: 'Continue after mining.',
 			directive: 'replace',
 			source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(2);',
-			completionContract: replacementContract,
 		}) },
 		reportError: (_agentId, error) => errors.push(error),
 	});
@@ -367,7 +363,6 @@ test('keeps the original goal contract when an exhausted-program replacement ret
 		summary: 'Mine one block.',
 		directive: 'replace',
 		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
-		completionContract: initialContract,
 	}, { observation: observation(), eventSequence: 1 });
 	await manager.onActionResult(registry.get('agent-a'), {
 		actionId: actionCommands(sent)[0].payload.actionId,
@@ -380,7 +375,7 @@ test('keeps the original goal contract when an exhausted-program replacement ret
 		await new Promise((resolve) => setImmediate(resolve));
 	}
 
-	assert.equal(errors.length, 0, 'a continuation cannot mutate or invalidate the goal-scoped contract');
+	assert.equal(errors.length, 0, 'a continuation cannot mutate or invalidate the server-owned goal');
 	assert.equal(actionCommands(sent).length, 2, 'the replacement continues automatically');
 	assert.deepEqual(actionCommands(sent)[1].payload.arguments, { durationMs: 2 });
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);

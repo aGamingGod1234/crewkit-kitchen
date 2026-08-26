@@ -24,7 +24,7 @@ export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player.
 
 Act as soon as it is safe. Do not wait to solve the whole goal and do not narrate a plan. Call the smallest useful Minecraft tool now, inspect its factual result, then choose the next tool. Keep each decision local and brief even when your configured reasoning effort is high.
 
-Use observe only when the latest event and tool results lack needed facts. Use moveTo, mine, say, and wait for common operations. Use act for another supported player action. Use sequence for a short exact chain you can choose now; it stops on the first failed action. Call finish only when the goal is factually complete or impossible. A completed finish requires a factual completionContract for the active goalRevision. Common predicates include inventory_min, position_within, block_matches, entity_state, and action_success_count. Never claim an action happened unless its tool result confirms it. Plain assistant text is not visible in Minecraft, so communicate through say. For nearby voice, say at most 12 words with audience proximity, then immediately call the first physical tool because speech playback is asynchronous.`;
+Use observe only when the latest event and tool results lack needed facts. Use moveTo, mine, say, and wait for common operations. Use act for another supported player action. Use sequence for a short exact chain you can choose now; it stops on the first failed action. Call finish only to ask Minecraft to verify the immutable active goal. Minecraft decides whether the goal is complete and returns expected and observed facts. If verification fails, use those facts and continue working. Never claim an action happened unless its tool result confirms it. Plain assistant text is not visible in Minecraft, so communicate through say. For nearby voice, say at most 12 words with audience proximity, then immediately call the first physical tool because speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('observe', 'Return the latest compact player, inventory, nearby block, entity, goal, and conversation facts.', objectSchema({})),
@@ -60,19 +60,9 @@ export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 			items: objectSchema({ actionType: { type: 'string', enum: NATIVE_ACTION_TYPES }, arguments: { type: 'object' } }, ['actionType', 'arguments']),
 		},
 	}, ['actions'])),
-	tool('finish', 'Stop only when the goal is factually complete or impossible.', objectSchema({
-		status: { type: 'string', enum: ['completed', 'impossible'] },
+	tool('finish', 'Ask Minecraft to verify the immutable active goal. A failed check keeps the goal active.', objectSchema({
 		summary: { type: 'string', minLength: 1, maxLength: 512 },
-		completionContract: {
-			type: 'object',
-			properties: {
-				goalRevision: { type: 'integer', minimum: 0 },
-				predicates: { type: 'array', minItems: 1, maxItems: 16, items: { type: 'object' } },
-			},
-			required: ['goalRevision', 'predicates'],
-			additionalProperties: false,
-		},
-	}, ['status', 'summary'])),
+	}, ['summary'])),
 ]);
 
 export function normalizeMinecraftToolCall(name, value) {
@@ -149,16 +139,10 @@ export function normalizeMinecraftToolCall(name, value) {
 			};
 		}
 		case 'finish':
-			requireExactKeys(args, ['status', 'summary', 'completionContract']);
-			if (!['completed', 'impossible'].includes(args.status)) invalid('status must be completed or impossible');
-			if (args.status === 'completed' && (args.completionContract === null || typeof args.completionContract !== 'object' || Array.isArray(args.completionContract))) {
-				invalid('completed finish requires completionContract');
-			}
+			requireExactKeys(args, ['summary']);
 			return {
 				kind: 'finish',
-				status: args.status,
 				summary: boundedText(args.summary, 'summary', 512),
-				...(args.completionContract === undefined ? {} : { completionContract: structuredClone(args.completionContract) }),
 			};
 		default:
 			throw codedError('UNKNOWN_MINECRAFT_TOOL', `Unknown Minecraft tool '${String(name)}'`);

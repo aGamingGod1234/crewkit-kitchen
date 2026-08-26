@@ -11,6 +11,7 @@ import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { createDynamicCoordinator, normalizeDynamicConfig } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { completionContract, withCompletionContract } from './fixtures/completion-contract.mjs';
 
 const SOURCE = 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1); await player.wait(2);';
@@ -28,7 +29,7 @@ class FakeBridge extends EventEmitter {
 				payload: {
 					goalRevision: payload.goalRevision,
 					traceId: payload.traceId,
-					contractHash: payload.contractHash,
+					goalFingerprint: payload.goalFingerprint,
 					verified: true,
 					reasonCode: 'COMPLETION_VERIFIED',
 					facts: [],
@@ -1458,7 +1459,7 @@ test('a pre-disconnect native completion cannot complete the replacement lifecyc
 			goalRevision: request.goalRevision,
 			turnId: 'turn-stale-completion',
 			callId: 'finish-stale-completion',
-			tool: { kind: 'finish', status: 'completed', summary: 'Done.', completionContract: completionContract(request.goalRevision) },
+			tool: { kind: 'finish', summary: 'Done.' },
 		});
 		return { status: 'completed', toolCalls: 1 };
 	};
@@ -1472,14 +1473,16 @@ test('a pre-disconnect native completion cannot complete the replacement lifecyc
 		},
 	});
 	try {
-		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Finish safely.' } });
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'start', goalRevision: 1, goal: 'Finish safely.', goalSpec: immutableGoalSpec('Finish safely.'),
+		} });
 		bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => bridge.sent.some(({ type }) => type === 'goal_completed'));
 		const completion = bridge.sent.find(({ type }) => type === 'goal_completed');
 		bridge.emit('goal_completion_result', { agentId: 'agent-a', payload: {
 			goalRevision: 1,
 			traceId: completion.payload.traceId,
-			contractHash: completion.payload.contractHash,
+			goalFingerprint: completion.payload.goalFingerprint,
 			verified: true,
 			reasonCode: 'COMPLETION_VERIFIED',
 			facts: [],
@@ -1492,6 +1495,11 @@ test('a pre-disconnect native completion cannot complete the replacement lifecyc
 		await run.coordinator.stop();
 	}
 });
+
+function immutableGoalSpec(originalRequest, predicate = { type: 'operator_confirmed' }, createdAtTick = 1) {
+	const fields = { originalRequest, predicate, createdAtTick };
+	return { ...fields, fingerprint: goalSpecFingerprint(fields) };
+}
 
 test('urgent native conversation steers the active model turn while its body action continues', async () => {
 	const registry = new AgentRegistry();
@@ -2095,7 +2103,9 @@ test('publishes completed program state back to the server registry', async () =
 		}, request.goalRevision);
 	};
 	try {
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait, then finish.' } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'start', goalRevision: 1, goal: 'Wait, then finish.', goalSpec: immutableGoalSpec('Wait, then finish.'),
+		} });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
 		const command = run.bridge.sent.find((message) => message.type === 'action_command');
@@ -2107,12 +2117,12 @@ test('publishes completed program state back to the server registry', async () =
 		assert.equal(completion.type, 'goal_completed');
 		assert.equal(completion.agentId, 'agent-a');
 		assert.equal(completion.payload.goalRevision, 1);
-		assert.deepEqual(completion.payload.completionContract, completionContract(1));
+		assert.equal(completion.payload.goalFingerprint, immutableGoalSpec('Wait, then finish.').fingerprint);
 		assert.deepEqual(completion.payload.profile, {
 			provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
 		});
 		assert.equal(completion.payload.traceId, 'trace-agent-a-1-1-initial');
-		assert.match(completion.payload.contractHash, /^sha256:[0-9a-f]{64}$/);
+		assert.match(completion.payload.goalFingerprint, /^[0-9a-f]{64}$/);
 		run.bridge.emit('conversation_event', {
 			agentId: 'agent-a',
 			payload: {

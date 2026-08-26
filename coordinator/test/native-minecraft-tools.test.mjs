@@ -79,11 +79,9 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 		kind: 'action', actionType: 'chat', arguments: { message: 'On it.', audience: 'proximity' },
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('finish', {
-		status: 'completed', summary: 'Stone acquired.',
-		completionContract: { goalRevision: 3, predicates: [{ type: 'inventory_min', itemId: 'minecraft:stone', count: 1 }] },
+		summary: 'Stone acquired.',
 	}), {
-		kind: 'finish', status: 'completed', summary: 'Stone acquired.',
-		completionContract: { goalRevision: 3, predicates: [{ type: 'inventory_min', itemId: 'minecraft:stone', count: 1 }] },
+		kind: 'finish', summary: 'Stone acquired.',
 	});
 	assert.deepEqual(normalizeMinecraftToolCall('act', {
 		actionType: 'craft_inventory',
@@ -133,7 +131,7 @@ test('native Minecraft boundary rejects unknown, oversized, and malformed calls'
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'x'.repeat(257) }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'hi', audience: 'direct' }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'hi', audience: 'proximity', recipientId: 'agent-b' }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
-	assert.throws(() => normalizeMinecraftToolCall('finish', { status: 'completed', summary: 'done' }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
+	assert.throws(() => normalizeMinecraftToolCall('finish', { summary: 'done', completionContract: {} }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:oak_planks' } }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'pick_up_item', arguments: { targetSelector: 'nearest_item' } }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'fight_target', arguments: { targetSelector: 'zombie', desiredRange: 20, timeoutMs: 1_000 } }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');

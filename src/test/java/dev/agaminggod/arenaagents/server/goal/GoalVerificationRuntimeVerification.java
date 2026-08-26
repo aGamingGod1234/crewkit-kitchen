@@ -27,6 +27,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyAgentSpecificKillAttribution();
 		assertions += verifySurvivalAndOperatorConfirmation();
 		assertions += verifyQueuedPromotionAfterEvidence();
+		assertions += verifyRequestedCompletionLifecycle();
 		return assertions;
 	}
 
@@ -125,6 +126,40 @@ public final class GoalVerificationRuntimeVerification {
 		assertEquals("Get a diamond pickaxe", fixture.record().currentGoal().orElseThrow().prompt(), "queued head is promoted exactly");
 		assertEquals(AgentLifecycleState.STARTING, fixture.record().state(), "promoted goal resumes autonomous work");
 		return 5;
+	}
+
+	private static int verifyRequestedCompletionLifecycle() {
+		Fixture fixture = fixture(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1), 800L);
+		long requestedRevision = fixture.record().goalRevision();
+		String fingerprint = fixture.record().currentGoal().orElseThrow().spec().fingerprint();
+		GoalCompletionVerifier.VerificationResult failed = fixture.runtime.evaluateRequest(
+				fixture.agentId, requestedRevision, fingerprint);
+		assertEquals(false, failed.verified(), "server rejects a finish request while the immutable predicate is false");
+		assertEquals(GoalStatus.ACTIVE, fixture.goalStatus(), "failed finish verification leaves the goal active");
+		assertEquals(1, failed.facts().size(), "failed finish verification returns exact observed evidence");
+
+		fixture.facts.items.put("minecraft:iron_pickaxe", 1);
+		GoalCompletionVerifier.VerificationResult verified = fixture.runtime.evaluateRequest(
+				fixture.agentId, requestedRevision, fingerprint);
+		assertEquals(true, verified.verified(), "server accepts a finish request only after live facts satisfy the goal");
+		assertEquals(true, fixture.runtime.acceptVerified(
+				fixture.agentId, requestedRevision, fingerprint, verified).isPresent(),
+				"accepted server evidence performs one lifecycle transition");
+		assertEquals(GoalStatus.SATISFIED, fixture.goalStatus(), "accepted finish evidence persists satisfied status");
+		assertEquals(false, fixture.runtime.acceptVerified(
+				fixture.agentId, requestedRevision, fingerprint, verified).isPresent(),
+				"replayed verified finish is idempotent");
+		assertEquals(true, fixture.runtime.evaluateRequest(
+				fixture.agentId, requestedRevision, fingerprint).verified(),
+				"a delayed completion-result replay returns stored accepted evidence");
+
+		try {
+			fixture.runtime.evaluateRequest(fixture.agentId, requestedRevision, "stale-fingerprint");
+			throw new AssertionError("stale finish fingerprint must fail closed");
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+			assertEquals("STALE_GOAL_FINGERPRINT", expected.code(), "stale finish fingerprint is rejected explicitly");
+		}
+		return 9;
 	}
 
 	private static Fixture fixture(GoalPredicate predicate, long createdAtTick) {

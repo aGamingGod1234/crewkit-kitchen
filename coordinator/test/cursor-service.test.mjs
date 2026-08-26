@@ -12,7 +12,6 @@ const DECISION = JSON.stringify({
 	summary: 'Wait safely.',
 	directive: 'replace',
 	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);',
-	completionContract: { goalRevision: 1, predicates: [{ type: 'position_within', x: 0, y: 64, z: 0, radius: 16 }] },
 });
 
 const MODELS_OUTPUT = `Available models

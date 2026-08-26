@@ -52,19 +52,6 @@ public final class GoalCompletionVerifier {
 		);
 	}
 
-	/** Temporary legacy bridge adapter; the supplied model contract is never completion authority. */
-	public VerificationResult verify(
-			AgentRecord record,
-			ServerPlayer player,
-			GoalCompletionContract contract,
-			ActionSuccessLedger ignoredActionLedger
-	) {
-		if (contract == null) return failure(record.goalRevision(), "MALFORMED_CONTRACT");
-		if (contract.goalRevision() != record.goalRevision()) return failure(record.goalRevision(), "STALE_REVISION");
-		long tick = player == null ? 0L : player.level().getServer().getTickCount();
-		return verify(record, player == null ? null : minecraftFacts(player), new AgentKillLedger(), tick, false);
-	}
-
 	public void retainGoals(Set<UUID> goalIds) {
 		Set<UUID> retained = Set.copyOf(Objects.requireNonNull(goalIds, "goalIds must not be null"));
 		stablePositionTicks.keySet().removeIf(key -> !retained.contains(key.goalId()));
@@ -241,12 +228,11 @@ public final class GoalCompletionVerifier {
 			result.addProperty("goalRevision", goalRevision);
 			result.addProperty("reasonCode", reasonCode);
 			JsonArray jsonFacts = new JsonArray();
-			for (int index = 0; index < facts.size(); index++) {
-				GoalEvidence.Fact fact = facts.get(index);
+			for (GoalEvidence.Fact fact : facts) {
 				JsonObject entry = new JsonObject();
-				entry.addProperty("predicateIndex", index);
 				entry.addProperty("type", fact.type());
 				entry.addProperty("satisfied", fact.satisfied());
+				entry.addProperty("expectedValue", fact.expectedValue());
 				entry.addProperty("observedValue", fact.observedValue());
 				jsonFacts.add(entry);
 			}

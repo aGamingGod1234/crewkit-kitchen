@@ -25,41 +25,27 @@ test('compiles the stone-tool manifest into bounded deterministic ArenaScript', 
 	assert.match(compiled.source, /program\.finish\("scenario-complete"\);/);
 	assert.doesNotThrow(() => parseArenaScript(compiled.source));
 	assert.deepEqual(compileScenarioDecision(manifest), compiled.decision);
-	assert.deepEqual(compiled.decision.completionContract, {
-		goalRevision: 1,
-		predicates: [
-			{ type: 'inventory_min', itemId: 'minecraft:stone_pickaxe', count: 1 },
-			{ type: 'action_success_count', actionType: 'navigate_to', count: 1 },
-			{ type: 'action_success_count', actionType: 'break_block', count: 1 },
-			{ type: 'action_success_count', actionType: 'craft_inventory', count: 1 },
-		],
-	});
+	assert.equal(Object.hasOwn(compiled.decision, 'completionContract'), false);
 
 	const unsafe = { ...manifest, commands: [{ actionId: 'bad', actionType: 'chat', arguments: { message: '</script>', audience: 'public' } }] };
 	const unsafeCompiled = compileScenarioProgram(unsafe);
 	assert.equal(JSON.parse(unsafeCompiled.source.match(/player\.chat\((\{.*\})\);/)[1]).message, '</script>');
 });
 
-test('translates commandless and terminal manifests into explicit factual contracts', () => {
+test('never gives benchmark provider decisions completion authority', () => {
 	const commandless = {
 		id: 'wait-fixture', agentId: 'fixture-agent',
 		world: { agents: { 'fixture-agent': { position: { x: 2, y: 3, z: 4 } } } },
 		commands: [], events: [], expected: {},
 	};
-	assert.deepEqual(compileScenarioDecision(commandless).completionContract, {
-		goalRevision: 1,
-		predicates: [{ type: 'position_within', x: 2, y: 3, z: 4, radius: 0 }],
-	});
+	assert.equal(Object.hasOwn(compileScenarioDecision(commandless), 'completionContract'), false);
 	const terminal = {
 		...commandless,
 		id: 'terminal-fixture',
 		commands: [{ actionId: 'stall', actionType: 'navigate_to', arguments: { x: 50, y: 3, z: 4, tolerance: 0.1, sprint: false, timeoutMs: 1 } }],
 		expected: { terminalState: 'TIMED_OUT' },
 	};
-	assert.deepEqual(compileScenarioDecision(terminal).completionContract, {
-		goalRevision: 1,
-		predicates: [{ type: 'position_within', x: 2, y: 3, z: 4, radius: 0 }],
-	});
+	assert.equal(Object.hasOwn(compileScenarioDecision(terminal), 'completionContract'), false);
 });
 
 test('rejects unsupported or over-limit manifest commands before compiling', () => {

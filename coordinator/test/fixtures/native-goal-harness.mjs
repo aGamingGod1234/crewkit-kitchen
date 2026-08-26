@@ -1,5 +1,6 @@
 import { createDynamicCoordinator } from '../../src/dynamic-main.mjs';
 import { AgentRegistry, DynamicAgentState } from '../../src/agent-registry.mjs';
+import { goalSpecFingerprint } from '../../src/goal-spec.mjs';
 import { FaultInjectingMinecraftBridge } from './fake-minecraft-bridge.mjs';
 
 const AGENT_ID = 'native-fault-agent';
@@ -255,9 +256,14 @@ function actionTool(action, goalRevision = 1) {
 		case 'pick_up_item': return { kind: 'action', actionType: 'pick_up_item', arguments: { targetSelector: '00000000-0000-4000-8000-000000000001' } };
 		case 'craft_inventory': return { kind: 'action', actionType: 'craft_inventory', arguments: { recipeId: 'minecraft:wooden_pickaxe', count: 1, timeoutMs: 1_000 } };
 		case 'respawn': return { kind: 'action', actionType: 'respawn', arguments: {} };
-		case 'finish': return { kind: 'finish', status: 'completed', summary: 'Factual inventory evidence is present.', completionContract: { goalRevision, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] } };
+		case 'finish': return { kind: 'finish', summary: 'Factual inventory evidence is present.' };
 		default: return { kind: 'observe' };
 	}
+}
+
+export function immutableGoalSpec(originalRequest, predicate, createdAtTick = 1) {
+	const fields = { originalRequest, predicate, createdAtTick };
+	return { ...fields, fingerprint: goalSpecFingerprint(fields) };
 }
 
 function normalizeScenario(value) {

@@ -281,7 +281,7 @@ test('Antigravity does not warm a session when decision parsing fails', async ()
 			attempt += 1;
 			queueMicrotask(() => {
 				const output = attempt === 1
-					? '{"summary":"Wait safely.","directive":"replace","source":"program.onUnhandledAttention(\\"continue_and_notify\\"); await player.wait(25);"}'
+					? '{"summary":"Wait safely.","directive":"replace","source":null}'
 					: DECISION;
 				child.stdout.emit('data', Buffer.from(output));
 				child.exitCode = 0;

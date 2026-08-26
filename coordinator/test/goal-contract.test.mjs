@@ -20,7 +20,6 @@ const CROSS_LANGUAGE_CONTRACT = {
 		{ type: 'position_within', x: 0.5, y: 64, z: -2.5, radius: 2 },
 		{ type: 'block_matches', x: 0, y: 64, z: -2, blockId: 'minecraft:crafting_table' },
 		{ type: 'entity_state', entityId: '00000000-0000-4000-8000-000000000001', state: 'alive' },
-		{ type: 'action_success_count', actionType: 'craft_inventory', count: 1 },
 	],
 };
 
@@ -46,9 +45,8 @@ test('uses an explicit language-neutral completion contract fingerprint', () => 
 		'position_within|3fe0000000000000|4050000000000000|c004000000000000|4000000000000000',
 		'block_matches|0|64|-2|bWluZWNyYWZ0OmNyYWZ0aW5nX3RhYmxl',
 		'entity_state|MDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAx|YWxpdmU',
-		'action_success_count|Y3JhZnRfaW52ZW50b3J5|1',
 	].join('\n'));
-	assert.equal(completionContractFingerprint(CROSS_LANGUAGE_CONTRACT), 'sha256:5e370d8ef1836990f01b2cc8b1122e48443e9e2e1995ece12335b319418427d0');
+	assert.equal(completionContractFingerprint(CROSS_LANGUAGE_CONTRACT), 'sha256:b2ba25ecc8d315903a11a7fe14063839480492056211d8617437125e24db7182');
 });
 
 test('rejects stale, empty, unknown, and malformed factual predicates', () => {
@@ -58,7 +56,7 @@ test('rejects stale, empty, unknown, and malformed factual predicates', () => {
 	assert.throws(() => parseCompletionContract({ goalRevision: 7, predicates: [{ type: 'unknown', itemId: 'minecraft:stone', count: 1 }] }), /type/i);
 	assert.throws(() => parseCompletionContract({ goalRevision: 7, predicates: [{ type: 'position_within', x: 0, y: 0, z: 0, radius: -1 }] }), /radius/i);
 	assert.throws(() => parseCompletionContract({ goalRevision: 7, predicates: [{ type: 'block_matches', x: 2_147_483_648, y: 0, z: 0, blockId: 'minecraft:stone' }] }), /coordinate/i);
-	assert.throws(() => parseCompletionContract({ goalRevision: 7, predicates: [{ type: 'action_success_count', actionType: '   ', count: 1 }] }), /nonblank/i);
+	assert.throws(() => parseCompletionContract({ goalRevision: 7, predicates: [{ type: 'action_success_count', actionType: 'craft_inventory', count: 1 }] }), /type/i);
 });
 
 test('requires an exact binding and rejects profile or trace mutation', () => {

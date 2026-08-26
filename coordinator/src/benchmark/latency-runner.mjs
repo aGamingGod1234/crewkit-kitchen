@@ -17,6 +17,7 @@ import { ControlLatencyRegistry } from '../control-latency-registry.mjs';
 import { SystemSampler } from './system-sampler.mjs';
 import { createLiveProviderFactory } from './live-provider-factories.mjs';
 import { buildAuthoritativeScenarioOutcome, captureScenarioInitialSnapshot, compileScenarioDecision, runAuthoritativeScenarioSuccess } from './scenario-program.mjs';
+import { goalSpecFingerprint } from '../goal-spec.mjs';
 
 const LOADS = Object.freeze([1, 4, 8, 16]);
 const MODES = new Set(['instant', 'replay', 'live']);
@@ -173,8 +174,10 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			catch (error) { await stopProviderAfterTimeout(); throw error; }
 		}
 
-		records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, goalRevision: 0, queue: [] }));
-		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: scenario.goal ?? `Complete ${trial.scenarioId}`, goalRevision: 1 }));
+		const goal = scenario.goal ?? `Complete ${trial.scenarioId}`;
+		const goalSpec = benchmarkGoalSpec(goal);
+		records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, currentGoalSpec: null, goalRevision: 0, queue: [] }));
+		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: goal, currentGoalSpec: goalSpec, goalRevision: 1 }));
 		world = new VirtualWorld(scenario.world, { scheduler: manualScheduler() });
 		metrics.attachWorld(world, scenario, scenario.agentIds);
 		initialSnapshots = new Map(scenario.agentIds.map((agentId) => [agentId, captureScenarioInitialSnapshot({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, agentId })]));
@@ -221,7 +224,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		await runWithDeadline(() => reconciled, deadline);
 		for (const agentId of scenario.agentIds) {
 			trialRecorder.record('goal_received', { agentId, goalRevision: 1 });
-			bridge.startAgent(agentId, scenario.goal ?? `Complete ${trial.scenarioId}`);
+			bridge.startAgent(agentId, goal, goalSpec);
 		}
 		await Promise.resolve();
 		for (const agentId of scenario.agentIds) await runWithDeadline(() => bridge.publish(agentId), deadline);
@@ -421,7 +424,7 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 				payload: {
 					goalRevision: payload.goalRevision,
 					traceId: payload.traceId,
-					contractHash: payload.contractHash,
+					goalFingerprint: payload.goalFingerprint,
 					verified,
 					reasonCode,
 					facts: [],
@@ -431,8 +434,13 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 	}
 	publish(agentId, options) { return this.#virtual.publish(agentId, options); }
 	flush() { return this.#virtual.flush(); }
-	startAgent(agentId, goal) { this.emit('goal_control', { agentId, payload: { operation: 'start', goalRevision: 1, goal, updatedAtEpochMs: 0 } }); }
+	startAgent(agentId, goal, goalSpec) { this.emit('goal_control', { agentId, payload: { operation: 'start', goalRevision: 1, goal, goalSpec, updatedAtEpochMs: 0 } }); }
 	get activeActionIds() { return this.#virtual.activeActionIds; }
+}
+
+function benchmarkGoalSpec(originalRequest) {
+	const fields = { originalRequest, predicate: { type: 'operator_confirmed' }, createdAtTick: 1 };
+	return Object.freeze({ ...fields, fingerprint: goalSpecFingerprint(fields) });
 }
 
 /**

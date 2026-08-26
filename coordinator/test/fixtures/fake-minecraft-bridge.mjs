@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { createProtocolV2Envelope, validateProtocolV2Envelope, validateProtocolV2Payload } from '../../src/protocol-v2.mjs';
 import { adaptObservation } from '../../src/observation-adapter.mjs';
+import { goalSpecFingerprint } from '../../src/goal-spec.mjs';
 
 export const SELECTED_PROFILE = Object.freeze({
 	agentId: 'task10-agent',
@@ -324,6 +325,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			state,
 			goalRevision: revision,
 			currentGoal: this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe',
+			currentGoalSpec: this.#record.goalSpec ?? null,
 			queue: [],
 			createdAtEpochMs: 1,
 			updatedAtEpochMs: 1,
@@ -334,9 +336,15 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	startGoal(goal = this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe', revision = 1) {
 		this.#record.goalRevision = revision;
 		this.#record.goal = goal;
+		const fields = {
+			originalRequest: goal,
+			predicate: this.#scenario.goalPredicate ?? { type: 'inventory_contains', itemId: 'minecraft:wooden_pickaxe', count: 1 },
+			createdAtTick: revision,
+		};
+		this.#record.goalSpec = { ...fields, fingerprint: goalSpecFingerprint(fields) };
 		this.emit('goal_control', {
 			agentId: this.#record.agentId,
-			payload: { operation: 'start', goalRevision: revision, goal, updatedAtEpochMs: revision },
+			payload: { operation: 'start', goalRevision: revision, goal, goalSpec: this.#record.goalSpec, updatedAtEpochMs: revision },
 		});
 		return this.publishObservation({ attention: true });
 	}
@@ -475,16 +483,17 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	async #completeGoal(request) {
 		this.#completionNumber += 1;
 		const scriptedResult = this.#scenario.completionResults?.[this.#completionNumber - 1];
-		const verified = this.#evaluateCompletionContract(request.completionContract)
+		const evaluation = this.#evaluateGoalPredicate(this.#record.goalSpec?.predicate);
+		const verified = request.goalFingerprint === this.#record.goalSpec?.fingerprint && evaluation.satisfied
 			&& (scriptedResult === undefined || scriptedResult === true);
 		if (!verified) this.recoveries.push('COMPLETION_REJECTED');
 		this.#emitInbound('goal_completion_result', {
 			goalRevision: request.goalRevision,
 			traceId: request.traceId,
-			contractHash: request.contractHash,
+			goalFingerprint: request.goalFingerprint,
 			verified,
 			reasonCode: verified ? 'COMPLETION_VERIFIED' : 'COMPLETION_REJECTED',
-			facts: [],
+			facts: evaluation.facts,
 		});
 	}
 
@@ -517,24 +526,49 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		}
 	}
 
-	#evaluateCompletionContract(contract) {
-		if (contract === null || typeof contract !== 'object' || !Array.isArray(contract.predicates)) return false;
-		return contract.predicates.every((predicate) => {
-			switch (predicate.type) {
-				case 'inventory_min':
-					return (this.#world.inventory.get(predicate.itemId) ?? 0) >= predicate.count;
-				case 'position_within':
-					return Math.hypot(this.#world.position.x - predicate.x, this.#world.position.y - predicate.y, this.#world.position.z - predicate.z) <= predicate.radius;
-				case 'block_matches':
-					return this.#world.blocks.get(`${predicate.x},${predicate.y},${predicate.z}`) === predicate.blockId;
-				case 'entity_state':
-					return this.#entityState(predicate.entityId) === predicate.state;
-				case 'action_success_count':
-					return this.#actionResults.filter((result) => result.actionType === predicate.actionType && result.state === 'SUCCEEDED').length >= predicate.count;
-				default:
-					return false;
+	#evaluateGoalPredicate(predicate) {
+		if (predicate === null || typeof predicate !== 'object') return { satisfied: false, facts: [] };
+		if (predicate.type === 'all_of' || predicate.type === 'any_of') {
+			const children = predicate.predicates.map((child) => this.#evaluateGoalPredicate(child));
+			return {
+				satisfied: predicate.type === 'all_of' ? children.every((child) => child.satisfied) : children.some((child) => child.satisfied),
+				facts: children.flatMap((child) => child.facts),
+			};
+		}
+		let satisfied = false;
+		let expectedValue = predicate.type;
+		let observedValue = 'unsupported';
+		switch (predicate.type) {
+			case 'inventory_contains': {
+				const count = this.#world.inventory.get(predicate.itemId) ?? 0;
+				satisfied = count >= predicate.count;
+				expectedValue = `${predicate.itemId} x${predicate.count}`;
+				observedValue = `${predicate.itemId} x${count}`;
+				break;
 			}
-		});
+			case 'position_within': {
+				const distance = Math.hypot(this.#world.position.x - predicate.x, this.#world.position.y - predicate.y, this.#world.position.z - predicate.z);
+				satisfied = distance <= predicate.radius;
+				expectedValue = `${predicate.x},${predicate.y},${predicate.z} radius=${predicate.radius}`;
+				observedValue = `${this.#world.position.x},${this.#world.position.y},${this.#world.position.z}`;
+				break;
+			}
+			case 'block_matches': {
+				const observed = this.#world.blocks.get(`${predicate.x},${predicate.y},${predicate.z}`) ?? 'minecraft:air';
+				satisfied = observed === predicate.blockId;
+				expectedValue = predicate.blockId;
+				observedValue = observed;
+				break;
+			}
+			case 'operator_confirmed':
+				expectedValue = 'operator confirmation';
+				observedValue = this.#scenario.operatorConfirmed === true ? 'confirmed' : 'not confirmed';
+				satisfied = this.#scenario.operatorConfirmed === true;
+				break;
+			default:
+				break;
+		}
+		return { satisfied, facts: [{ type: predicate.type, satisfied, expectedValue, observedValue }] };
 	}
 
 	#entityState(entityId) {

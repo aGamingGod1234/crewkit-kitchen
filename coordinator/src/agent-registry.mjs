@@ -306,6 +306,10 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 		next.lastError = normalizeError(controlValue.error ?? { code: 'AGENT_ERROR', message: 'Agent goal failed' });
 		return next;
 	}
+	if (operation === 'complete') {
+		next.state = DynamicAgentState.COMPLETED;
+		return next;
+	}
 	if (next.queue.length > 0) {
 		const [promoted, ...remaining] = next.queue;
 		next.currentGoal = promoted.goal;

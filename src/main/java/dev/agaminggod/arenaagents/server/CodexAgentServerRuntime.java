@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.UUID;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
@@ -64,7 +65,7 @@ public final class CodexAgentServerRuntime {
 			return;
 		}
 		CodexAgentManager manager = CodexAgentManager.get(server);
-		GOAL_VERIFIERS.computeIfAbsent(server, ignored -> new GoalVerificationRuntime(
+		GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.computeIfAbsent(server, ignored -> new GoalVerificationRuntime(
 				manager.registry(),
 				agentId -> manager.findAgentPlayer(agentId).map(dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier::minecraftFacts),
 				server::getTickCount,
@@ -86,9 +87,12 @@ public final class CodexAgentServerRuntime {
 			VoiceSubsystemRuntime.start(server);
 			Path secretPath = supervisor.secretPath();
 			AgentVerboseState verboseState = AgentVerboseState.forServer(server);
-			MultiplexedServerBridge bridge = secretPath == null
-					? new MultiplexedServerBridge(CodexAgentManager.get(server), verboseState)
-					: new MultiplexedServerBridge(CodexAgentManager.get(server), secretPath, verboseState);
+			MultiplexedServerBridge bridge = new MultiplexedServerBridge(
+					CodexAgentManager.get(server),
+					secretPath == null ? Paths.get("runtime", "bridge-secret.txt") : secretPath,
+					verboseState,
+					goalVerifier
+			);
 			bridge.start();
 			MultiplexedServerBridge previous = BRIDGES.putIfAbsent(server, bridge);
 			if (previous != null) {

@@ -7,6 +7,7 @@ import { AgentPlanner } from '../src/agent-planner.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
+import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { FakeMinecraftBridge, SELECTED_PROFILE, assertCommandProvenance, commandPayloads, observation } from './fixtures/fake-minecraft-bridge.mjs';
 import { withCompletionContract } from './fixtures/completion-contract.mjs';
@@ -272,7 +273,8 @@ test('rejects a physical command without model-program provenance before bridge 
 function createHarness({ initialObservation = observation(), onAction = async () => ({ observation: initialObservation }), plannerDecision = () => null } = {}) {
 	const registry = new AgentRegistry({ agentCap: 1 });
 	const profile = { ...SELECTED_PROFILE };
-	registry.register({ ...profile, state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'Task 10 E2E', queue: [] });
+	const currentGoalSpec = fixtureGoalSpec('Task 10 E2E');
+	registry.register({ ...profile, state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'Task 10 E2E', currentGoalSpec, queue: [] });
 	const record = registry.get(profile.agentId);
 	const plannerCalls = [];
 	let plannerTime = 0;
@@ -300,7 +302,7 @@ function createHarness({ initialObservation = observation(), onAction = async ()
 		onCompletionRequested: (request) => queueMicrotask(() => harness.manager.onCompletionResult(record, {
 			goalRevision: request.record.goalRevision,
 			traceId: request.traceId,
-			contractHash: request.contractHash,
+			goalFingerprint: request.goalFingerprint,
 			verified: true,
 			reasonCode: 'COMPLETION_VERIFIED',
 		})),
@@ -350,7 +352,7 @@ function createProviderHarness({ initialObservation = observation(), onAction = 
 		onCompletionRequested: (request) => queueMicrotask(() => harness.manager.onCompletionResult(harness.record, {
 			goalRevision: request.record.goalRevision,
 			traceId: request.traceId,
-			contractHash: request.contractHash,
+			goalFingerprint: request.goalFingerprint,
 			verified: true,
 			reasonCode: 'COMPLETION_VERIFIED',
 		})),
@@ -361,6 +363,11 @@ function createProviderHarness({ initialObservation = observation(), onAction = 
 		return harness.manager.installDecision(harness.record, withCompletionContract(decision, harness.record.goalRevision), { observation: harness.bridge.currentObservation, eventSequence: 1 });
 	};
 	return harness;
+}
+
+function fixtureGoalSpec(originalRequest) {
+	const fields = { originalRequest, predicate: { type: 'operator_confirmed' }, createdAtTick: 1 };
+	return Object.freeze({ ...fields, fingerprint: goalSpecFingerprint(fields) });
 }
 
 function harnessCount(command, harness) {

@@ -6,7 +6,6 @@ import { parseArenaScript } from './arena-script/parser.mjs';
 import { ArenaScriptEngine } from './arena-script/program-engine.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { buildPlannerInput } from './prompts.mjs';
-import { GoalContractError, bindCompletionContract, completionContractFingerprint, parseCompletionContract } from './goal-contract.mjs';
 
 /** Coordinates model-authored ArenaScript programs for independent agents. */
 export class ProgramRuntimeManager {
@@ -68,22 +67,19 @@ export class ProgramRuntimeManager {
 		}
 		const state = this.#state(record, observation, eventSequence, traceId ?? decision?.traceId);
 		if (decision?.directive === 'finish') {
-			this.#initializeCompletionContract(state, record, decision.completionContract);
-			if (decision.status === 'completed') this.#requestCompletion(record, state);
-			else this.#setTerminalState(record, DynamicAgentState.ERROR);
+			this.#requestCompletion(record, state);
 			return state.engine?.snapshot() ?? null;
 		}
 		if (decision?.directive !== 'replace' || typeof decision.source !== 'string') {
 			throw codedError('INVALID_PLANNER_DIRECTIVE', 'Initial model decision must replace with ArenaScript source');
 		}
-		this.#initializeCompletionContract(state, record, decision.completionContract);
 		return this.#installSource(state, record, decision.source, observation, eventSequence);
 	}
 
 	onCompletionResult(record, payload = {}) {
 		const state = this.#states.get(record.agentId);
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision || !state.completionRequested) return false;
-		if (payload.goalRevision !== state.goalRevision || payload.traceId !== state.traceId || payload.contractHash !== state.completionHash) return false;
+		if (payload.goalRevision !== state.goalRevision || payload.traceId !== state.traceId || payload.goalFingerprint !== state.goalFingerprint) return false;
 		this.#clearCompletionRetry(state);
 		state.completionResult = { verified: payload.verified === true, reasonCode: payload.reasonCode, facts: payload.facts };
 		const verifiedAt = this.#safeNow() ?? 0;
@@ -102,8 +98,8 @@ export class ProgramRuntimeManager {
 			state.engine.requestCorrection({
 				trigger: 'completion_verification_failed',
 				actionFailure: {
-					actionType: 'complete_goal',
-					arguments: { completionContract: state.completionContract },
+					actionType: 'verify_goal',
+					arguments: { goalFingerprint: state.goalFingerprint },
 					state: 'FAILED',
 					reasonCode: payload.reasonCode,
 					facts: payload.facts,
@@ -311,8 +307,8 @@ export class ProgramRuntimeManager {
 			commands: 0,
 			corrections: new Map(),
 			terminalStatus: null,
-			completionContract: null,
-			completionHash: null,
+			goalSpec: record.currentGoalSpec ?? null,
+			goalFingerprint: record.currentGoalSpec?.fingerprint ?? null,
 			completionRequested: false,
 			completionResult: null,
 			completionRetryTimer: null,
@@ -343,7 +339,7 @@ export class ProgramRuntimeManager {
 		let compiled;
 		try {
 			this.#record('program_compile_started', record, { eventSequence });
-			compiled = compileGoalProgram(source, state.completionContract);
+			compiled = compileGoalProgram(source, state.goalSpec);
 		} catch (error) {
 			this.#traceState(state, 'program_sandbox_error', {
 				result: { code: error?.code ?? 'ARENA_SCRIPT_COMPILE_ERROR', message: String(error?.message ?? error).slice(0, 512) },
@@ -416,7 +412,7 @@ export class ProgramRuntimeManager {
 				return null;
 			}
 			let compiled;
-			try { compiled = compileGoalProgram(decision.source, state.completionContract); }
+			try { compiled = compileGoalProgram(decision.source, state.goalSpec); }
 			catch (nextError) {
 				if (nextError instanceof ArenaScriptError) {
 					this.#traceState(state, 'program_sandbox_error', {
@@ -481,7 +477,7 @@ export class ProgramRuntimeManager {
 					attentionPriority: context.priority,
 					attentionTrigger: context.trigger,
 					...(context.actionFailure === undefined ? {} : { actionFailure: context.actionFailure }),
-					completionContract: state.completionContract,
+					goalSpec: state.goalSpec,
 					observation: context.observation,
 				}, this.#plannerContext(record.agentId)),
 				traceId: nextTraceId(state),
@@ -502,7 +498,7 @@ export class ProgramRuntimeManager {
 					return;
 				}
 				let compiled;
-				try { compiled = compileGoalProgram(decision.source, state.completionContract); }
+				try { compiled = compileGoalProgram(decision.source, state.goalSpec); }
 				catch (error) {
 					if (error instanceof ArenaScriptError) {
 						this.#traceState(state, 'program_sandbox_error', {
@@ -846,39 +842,18 @@ export class ProgramRuntimeManager {
 		}
 	}
 
-	#initializeCompletionContract(state, record, value) {
-		if (value === null || value === undefined) throw codedError('CONTRACT_REQUIRED', 'A factual completionContract is required before a program can finish');
-		let normalized;
-		try { normalized = parseCompletionContract(value, { goalRevision: record.goalRevision }); }
-		catch (error) {
-			if (error instanceof GoalContractError) throw codedError(error.code, error.message);
-			throw error;
-		}
-		const hash = completionContractFingerprint(normalized);
-		if (state.completionHash !== null && state.completionHash !== hash) throw codedError('CONTRACT_MUTATION', 'Completion contract cannot change within a goal revision');
-		bindCompletionContract(normalized, {
-			goalRevision: record.goalRevision,
-			traceId: state.traceId,
-			profile: {
-				provider: record.provider,
-				model: record.model,
-				reasoningEffort: record.reasoningEffort,
-				serviceTier: record.serviceTier ?? 'priority',
-			},
-		});
-		state.completionContract = normalized;
-		state.completionHash = hash;
-	}
-
 	#requestCompletion(record, state) {
-		if (state.completionRequested || state.completionContract === null) return;
+		if (state.completionRequested) return;
+		if (state.goalFingerprint === null) {
+			this.#reportError(record.agentId, codedError('GOAL_SPEC_REQUIRED', 'Minecraft has not supplied an immutable goal specification'));
+			return;
+		}
 		this.#clearCompletionRetry(state);
 		state.completionRequested = true;
 		const request = {
 			record,
-			completionContract: state.completionContract,
+			goalFingerprint: state.goalFingerprint,
 			traceId: state.traceId,
-			contractHash: state.completionHash,
 		};
 		try {
 			Promise.resolve(this.#onCompletionRequested(request)).catch((error) => {
@@ -913,17 +888,12 @@ export class ProgramRuntimeManager {
 
 const ACKNOWLEDGEMENT_PRIMITIVES = new Set(['chat', 'wait', 'look_at']);
 
-function compileGoalProgram(source, completionContract) {
+function compileGoalProgram(source, goalSpec) {
 	const compiled = parseArenaScript(source);
-	const requiresWorldProgress = completionContract?.predicates?.some((predicate) => (
-		predicate.type !== 'action_success_count' || predicate.actionType !== 'chat'
-	)) === true;
-	const fulfillsExactActionContract = completionContract?.predicates?.every((predicate) => (
-		predicate.type === 'action_success_count' && compiled.primitiveCalls.includes(predicate.actionType)
-	)) === true;
+	const requiresWorldProgress = goalSpec?.predicate?.type !== 'operator_confirmed';
 	const acknowledges = compiled.primitiveCalls.includes('chat');
 	const progresses = compiled.primitiveCalls.some((primitive) => !ACKNOWLEDGEMENT_PRIMITIVES.has(primitive));
-	if (requiresWorldProgress && !fulfillsExactActionContract && acknowledges && !progresses) {
+	if (requiresWorldProgress && acknowledges && !progresses) {
 		throw new ArenaScriptError(
 			'ACKNOWLEDGEMENT_ONLY_PROGRAM',
 			'ArenaScript ACKNOWLEDGEMENT_ONLY_PROGRAM: a physical goal cannot replace its program with only chat, waiting, or looking; acknowledge briefly and include the first concrete world action in the same program',

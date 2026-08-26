@@ -16,11 +16,11 @@ import java.util.Set;
 import java.util.UUID;
 import net.minecraft.resources.Identifier;
 
-/** Immutable, allowlisted factual predicates authored by the selected brain. */
+/** Legacy contract parser retained for stored compatibility; never completion authority. */
 public final class GoalCompletionContract {
 	public static final int MAX_PREDICATES = 16;
 	public static final int MAX_BYTES = 4_096;
-	private static final Set<String> TYPES = Set.of("inventory_min", "position_within", "block_matches", "entity_state", "action_success_count");
+	private static final Set<String> TYPES = Set.of("inventory_min", "position_within", "block_matches", "entity_state");
 	private final long goalRevision;
 	private final List<Predicate> predicates;
 
@@ -105,10 +105,6 @@ public final class GoalCompletionContract {
 				if (!state.equals("alive") && !state.equals("dead")) throw invalid("entity state must be alive or dead");
 				yield new Predicate(type, null, 0, null, null, null, null, null, entityId, state, null);
 			}
-			case "action_success_count" -> {
-				requireKeys(object, Set.of("type", "actionType", "count"), "predicates[" + index + "]");
-				yield new Predicate(type, null, positiveInt(object, "count"), null, null, null, null, null, null, null, requiredText(object, "actionType", "predicate"));
-			}
 			default -> throw invalid("Unsupported completion predicate type");
 		};
 	}
@@ -129,7 +125,6 @@ public final class GoalCompletionContract {
 				case "position_within" -> { addCanonicalNumber(object, "x", x); addCanonicalNumber(object, "y", y); addCanonicalNumber(object, "z", z); addCanonicalNumber(object, "radius", radius); }
 				case "block_matches" -> { object.addProperty("x", x.intValue()); object.addProperty("y", y.intValue()); object.addProperty("z", z.intValue()); object.addProperty("blockId", blockId); }
 				case "entity_state" -> { object.addProperty("entityId", entityId.toString()); object.addProperty("state", entityState); }
-				case "action_success_count" -> { object.addProperty("actionType", actionType); object.addProperty("count", count); }
 				default -> throw invalid("Unsupported completion predicate type");
 			}
 			return object;
@@ -141,7 +136,6 @@ public final class GoalCompletionContract {
 				case "position_within" -> "position_within|" + doubleHex(x) + "|" + doubleHex(y) + "|" + doubleHex(z) + "|" + doubleHex(radius);
 				case "block_matches" -> "block_matches|" + x.intValue() + "|" + y.intValue() + "|" + z.intValue() + "|" + base64Url(blockId);
 				case "entity_state" -> "entity_state|" + base64Url(entityId.toString()) + "|" + base64Url(entityState);
-				case "action_success_count" -> "action_success_count|" + base64Url(actionType) + "|" + count;
 				default -> throw invalid("Unsupported completion predicate type");
 			};
 		}

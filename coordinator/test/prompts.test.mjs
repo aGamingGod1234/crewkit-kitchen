@@ -31,7 +31,7 @@ test('planner input always carries complete authoritative state with explicitly 
 test('planner tells agents to collect observed drops and never pause for routine reassessment', () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /player\.pickUpItem/);
 	assert.match(PLANNER_SYSTEM_PROMPT, /Do not use program\.checkpoint for routine reassessment/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /first accepted contract is immutable and authoritative for the whole goal/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /Minecraft owns the immutable goal rule/i);
 	assert.doesNotMatch(PLANNER_SYSTEM_PROMPT, /checkpoint for a new plan/);
 });
 

@@ -37,12 +37,15 @@ test('goal controls enforce monotonic revisions, queue bounds, and FIFO promotio
 		() => registry.applyGoalControl('agent-a', { operation: 'queue', goalRevision: 1, goal: 'Mine iron.' }),
 		(error) => error.code === 'GOAL_QUEUE_FULL',
 	);
-	const promoted = registry.applyGoalControl('agent-a', { operation: 'complete', goalRevision: 2 });
+	const satisfied = registry.applyGoalControl('agent-a', { operation: 'complete', goalRevision: 2 });
+	assert.equal(satisfied.currentGoal, 'Build shelter.');
+	assert.equal(satisfied.state, DynamicAgentState.COMPLETED);
+	const promoted = registry.applyGoalControl('agent-a', { operation: 'start', goalRevision: 3, goal: 'Find food.' });
 	assert.equal(promoted.currentGoal, 'Find food.');
 	assert.equal(promoted.queue[0].goal, 'Plant wheat.');
 	assert.equal(promoted.state, DynamicAgentState.STARTING);
 	assert.throws(
-		() => registry.applyGoalControl('agent-a', { operation: 'stop', goalRevision: 2 }),
+		() => registry.applyGoalControl('agent-a', { operation: 'stop', goalRevision: 3 }),
 		(error) => error.code === 'STALE_GOAL_REVISION',
 	);
 });
@@ -69,9 +72,9 @@ test('server start promotions consume exactly the queued head through exhaustion
 	registry.setState('agent-a', DynamicAgentState.PLANNING, { goalRevision: 3 });
 	registry.setState('agent-a', DynamicAgentState.ACTING, { goalRevision: 3 });
 	const exhausted = registry.applyGoalControl('agent-a', { operation: 'complete', goalRevision: 4 });
-	assert.equal(exhausted.currentGoal, null);
+	assert.equal(exhausted.currentGoal, 'C');
 	assert.deepEqual(exhausted.queue, []);
-	assert.equal(exhausted.state, DynamicAgentState.IDLE);
+	assert.equal(exhausted.state, DynamicAgentState.COMPLETED);
 });
 
 test('server promotion after coordinator completion consumes the queued head', () => {

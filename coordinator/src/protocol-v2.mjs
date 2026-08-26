@@ -28,7 +28,6 @@ import {
 import { encodeJsonLine, JsonlDecoder } from './jsonl.mjs';
 import { MessageIdGenerator } from './message-id.mjs';
 import { ValidationError, validateAction, validateActionCommandPayload } from './schema.mjs';
-import { bindCompletionContract, parseCompletionContract } from './goal-contract.mjs';
 import { parseGoalSpec, parseGoalSpecProposal, parseGoalSpecRequest } from './goal-spec.mjs';
 
 const MAX_COORDINATOR_CIRCUITS = 32;
@@ -193,11 +192,11 @@ export function validateProtocolV2Payload(type, value) {
 		case 'goal_completed':
 			return normalizeGoalCompletionRequest(value);
 		case 'goal_completion_result':
-			exactKeys(value, ['goalRevision', 'traceId', 'contractHash', 'verified', 'reasonCode', 'facts'], ['goalRevision', 'traceId', 'contractHash', 'verified', 'reasonCode', 'facts'], type);
+			exactKeys(value, ['goalRevision', 'traceId', 'goalFingerprint', 'verified', 'reasonCode', 'facts'], ['goalRevision', 'traceId', 'goalFingerprint', 'verified', 'reasonCode', 'facts'], type);
 			return {
 				goalRevision: revision(value.goalRevision, 'goalRevision'),
 				traceId: requireTraceId(value.traceId),
-				contractHash: boundedText(value.contractHash, 'contractHash', 80),
+				goalFingerprint: goalFingerprint(value.goalFingerprint),
 				verified: boolean(value.verified, 'verified'),
 				reasonCode: boundedText(value.reasonCode, 'reasonCode', MAX_REASON_CODE_LENGTH),
 				facts: boundedArray(value.facts, 'facts', MAX_COMPLETION_FACTS).map((fact, index) => normalizeCompletionFact(fact, index)),
@@ -267,14 +266,12 @@ export function validateProtocolV2Payload(type, value) {
 function normalizeCompletionFact(value, index) {
 	const field = `facts[${index}]`;
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be an object`);
-	exactKeys(value, ['predicateIndex', 'type', 'satisfied', 'observedValue'], ['predicateIndex', 'type', 'satisfied', 'observedValue'], field);
-	const predicateIndex = nonnegativeInteger(value.predicateIndex, `${field}.predicateIndex`);
-	if (predicateIndex >= MAX_COMPLETION_FACTS) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.predicateIndex must be less than ${MAX_COMPLETION_FACTS}`);
+	exactKeys(value, ['type', 'satisfied', 'expectedValue', 'observedValue'], ['type', 'satisfied', 'expectedValue', 'observedValue'], field);
 	return {
-		predicateIndex,
 		type: boundedText(value.type, `${field}.type`, MAX_REASON_CODE_LENGTH),
 		satisfied: boolean(value.satisfied, `${field}.satisfied`),
-		observedValue: boundedText(value.observedValue, `${field}.observedValue`, 128, 0),
+		expectedValue: boundedText(value.expectedValue, `${field}.expectedValue`, 512),
+		observedValue: boundedText(value.observedValue, `${field}.observedValue`, 512, 0),
 	};
 }
 
@@ -1086,22 +1083,21 @@ function normalizeActionResult(value) {
 }
 
 function normalizeGoalCompletionRequest(value) {
-	const allowed = ['goalRevision', 'completionContract', 'traceId', 'profile', 'contractHash'];
-	if (!Object.hasOwn(value, 'completionContract')) throw new ProtocolV2Error('CONTRACT_REQUIRED', 'goal_completed requires a factual completionContract');
+	const allowed = ['goalRevision', 'goalFingerprint', 'traceId', 'profile'];
 	exactKeys(value, allowed, allowed, 'goal_completed');
-	if (value.completionContract === null) throw new ProtocolV2Error('CONTRACT_REQUIRED', 'goal_completed requires a factual completionContract');
 	const goalRevision = revision(value.goalRevision, 'goalRevision');
 	const traceId = requireTraceId(value.traceId);
-	const contractHash = boundedText(value.contractHash, 'contractHash', 80);
-	let completionContract;
-	try {
-		completionContract = parseCompletionContract(value.completionContract, { goalRevision });
-		const bound = bindCompletionContract(completionContract, { goalRevision, traceId, profile: value.profile });
-		if (bound.contractHash !== contractHash) throw new Error('contractHash does not match completionContract');
-		return { goalRevision, completionContract, traceId, profile: bound.profile, contractHash };
-	} catch (error) {
-		throw new ProtocolV2Error('INVALID_COMPLETION_CONTRACT', error?.message ?? 'completionContract is invalid', { cause: error });
-	}
+	if (!isPlainObject(value.profile)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'goal_completed.profile must be an object');
+	const profileFields = ['provider', 'model', 'reasoningEffort', 'serviceTier'];
+	exactKeys(value.profile, profileFields, profileFields, 'goal_completed.profile');
+	const profile = Object.fromEntries(profileFields.map((field) => [field, boundedText(value.profile[field], `profile.${field}`, MAX_IDENTIFIER_LENGTH)]));
+	return { goalRevision, goalFingerprint: goalFingerprint(value.goalFingerprint), traceId, profile };
+}
+
+function goalFingerprint(value) {
+	const fingerprint = boundedText(value, 'goalFingerprint', 64);
+	if (!/^[0-9a-f]{64}$/.test(fingerprint)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'goalFingerprint must be 64 lowercase hexadecimal characters');
+	return fingerprint;
 }
 
 function normalizeActionCommand(value) {

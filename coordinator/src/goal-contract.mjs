@@ -2,9 +2,8 @@ import { createHash } from 'node:crypto';
 
 const MAX_PREDICATES = 16;
 const MAX_CONTRACT_BYTES = 4_096;
-const MAX_ACTION_TYPE_LENGTH = 64;
 const PREDICATE_TYPES = new Set([
-	'inventory_min', 'position_within', 'block_matches', 'entity_state', 'action_success_count',
+	'inventory_min', 'position_within', 'block_matches', 'entity_state',
 ]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NAMESPACED_ID = /^[a-z0-9_.-]+:[a-z0-9_./-]+$/;
@@ -65,7 +64,6 @@ function canonicalPredicate(predicate) {
 		case 'position_within': return `position_within|${doubleHex(predicate.x)}|${doubleHex(predicate.y)}|${doubleHex(predicate.z)}|${doubleHex(predicate.radius)}`;
 		case 'block_matches': return `block_matches|${predicate.x}|${predicate.y}|${predicate.z}|${base64Url(predicate.blockId)}`;
 		case 'entity_state': return `entity_state|${base64Url(predicate.entityId)}|${base64Url(predicate.state)}`;
-		case 'action_success_count': return `action_success_count|${base64Url(predicate.actionType)}|${predicate.count}`;
 		default: throw new GoalContractError('INVALID_PREDICATE', 'Unsupported completion predicate');
 	}
 }
@@ -99,9 +97,6 @@ function normalizePredicate(value, index) {
 			if (typeof value.entityId !== 'string' || !UUID.test(value.entityId)) fail('INVALID_PREDICATE', `predicates[${index}].entityId must be a canonical UUID`);
 			if (value.state !== 'alive' && value.state !== 'dead') fail('INVALID_PREDICATE', `predicates[${index}].state must be alive or dead`);
 			return { type, entityId: value.entityId.toLowerCase(), state: value.state };
-		case 'action_success_count':
-			exactKeys(value, ['type', 'actionType', 'count']);
-			return { type, actionType: boundedText(value.actionType, `predicates[${index}].actionType`, MAX_ACTION_TYPE_LENGTH), count: positiveCount(value.count, index) };
 		default:
 			throw new GoalContractError('INVALID_PREDICATE', 'Unsupported completion predicate');
 	}

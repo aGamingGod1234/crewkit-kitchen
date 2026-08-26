@@ -92,6 +92,48 @@ public final class GoalVerificationRuntime {
 				record.currentGoal().map(AgentGoal::goalId).filter(operatorConfirmed::contains).isPresent());
 	}
 
+	public GoalCompletionVerifier.VerificationResult evaluateRequest(
+			AgentId agentId, long requestedRevision, String goalFingerprint
+	) {
+		AgentRecord record = registry.require(agentId);
+		AgentGoal goal = record.currentGoal().orElseThrow(
+				() -> new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to verify"));
+		if (!goal.spec().fingerprint().equals(Objects.requireNonNull(goalFingerprint, "goalFingerprint must not be null"))) {
+			throw new AgentDomainException("STALE_GOAL_FINGERPRINT", "Completion request does not match the immutable current goal");
+		}
+		if (record.goalRevision() == requestedRevision) return evaluate(agentId);
+		if (record.goalRevision() > 0L && record.goalRevision() - 1L == requestedRevision && goal.status() == GoalStatus.SATISFIED) {
+			var evidence = goal.evidence().orElseThrow();
+			return new GoalCompletionVerifier.VerificationResult(
+					true, requestedRevision, evidence.reasonCode(), evidence.facts());
+		}
+		throw new AgentDomainException("STALE_REVISION", "Completion request revision is stale");
+	}
+
+	public Optional<AgentTransition> acceptVerified(
+			AgentId agentId,
+			long requestedRevision,
+			String goalFingerprint,
+			GoalCompletionVerifier.VerificationResult result
+	) {
+		Objects.requireNonNull(result, "result must not be null");
+		if (!result.verified()) throw new IllegalArgumentException("Only verified evidence may be accepted");
+		AgentRecord record = registry.require(agentId);
+		AgentGoal goal = record.currentGoal().orElseThrow(
+				() -> new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to satisfy"));
+		if (!goal.spec().fingerprint().equals(goalFingerprint)) {
+			throw new AgentDomainException("STALE_GOAL_FINGERPRINT", "Verified evidence targets a stale goal");
+		}
+		if (record.goalRevision() > 0L && record.goalRevision() - 1L == requestedRevision && goal.status() == GoalStatus.SATISFIED) {
+			return Optional.empty();
+		}
+		if (record.goalRevision() != requestedRevision) {
+			throw new AgentDomainException("STALE_REVISION", "Verified evidence targets a stale goal revision");
+		}
+		return Optional.of(registry.satisfyGoal(
+				agentId, requestedRevision, result.evidence(serverTick.getAsLong()), epochMillis.getAsLong()));
+	}
+
 	public void recordKill(AgentId agentId, String entityType) {
 		killLedger.record(agentId, entityType, serverTick.getAsLong());
 	}

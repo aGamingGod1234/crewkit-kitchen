@@ -139,24 +139,18 @@ test('completion results cannot override unsatisfied factual predicates', async 
 	assert.ok(result.recoveries.includes('COMPLETION_REJECTED'));
 });
 
-test('completion verifies position, block, entity, and successful-action predicates', async () => {
+test('completion verifies the immutable compound position and block predicates', async () => {
 	const result = await createNativeGoalHarness({
+		goalPredicate: {
+			type: 'all_of',
+			predicates: [
+				{ type: 'position_within', x: 1, y: 64, z: 0, radius: 0, stableTicks: 1 },
+				{ type: 'block_matches', x: 0, y: 64, z: 0, blockId: 'minecraft:oak_log', properties: {} },
+			],
+		},
 		turns: [
 			['move_to'],
-			[{
-				kind: 'finish',
-				status: 'completed',
-				summary: 'Factual world predicates are present.',
-				completionContract: {
-					goalRevision: 1,
-					predicates: [
-						{ type: 'position_within', x: 1, y: 64, z: 0, radius: 0 },
-						{ type: 'block_matches', x: 0, y: 64, z: 0, blockId: 'minecraft:oak_log' },
-						{ type: 'entity_state', entityId: '00000000-0000-4000-8000-000000000001', state: 'alive' },
-						{ type: 'action_success_count', actionType: 'navigate_to', count: 1 },
-					],
-				},
-			}],
+			[{ kind: 'finish', summary: 'Factual world predicates are present.' }],
 		],
 		timeoutMs: 100,
 	}).run();

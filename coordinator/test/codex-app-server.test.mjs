@@ -255,7 +255,7 @@ test('uses streamed agent-message deltas when a completed message item is absent
 	const text = finishDecisionJson();
 	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: text } });
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
-	assert.equal((await decisionPromise).status, 'completed');
+	assert.equal((await decisionPromise).directive, 'finish');
 	await agent.stop();
 });
 
