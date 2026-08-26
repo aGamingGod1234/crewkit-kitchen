@@ -9,6 +9,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
+import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
@@ -22,6 +23,7 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.core.registries.BuiltInRegistries;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,6 +32,7 @@ public final class CodexAgentServerRuntime {
 	private static final Map<MinecraftServer, MultiplexedServerBridge> BRIDGES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, CoordinatorProcessSupervisor> COORDINATORS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
+	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static boolean registered;
 
@@ -52,6 +55,7 @@ public final class CodexAgentServerRuntime {
 					() -> CodexAgentManager.get(player.level().getServer()).captureDeath(player, source)
 			);
 		});
+		ServerLivingEntityEvents.AFTER_DEATH.register(CodexAgentServerRuntime::recordAttributedKill);
 		registered = true;
 	}
 
@@ -59,6 +63,13 @@ public final class CodexAgentServerRuntime {
 		if (BRIDGES.containsKey(server)) {
 			return;
 		}
+		CodexAgentManager manager = CodexAgentManager.get(server);
+		GOAL_VERIFIERS.computeIfAbsent(server, ignored -> new GoalVerificationRuntime(
+				manager.registry(),
+				agentId -> manager.findAgentPlayer(agentId).map(dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier::minecraftFacts),
+				server::getTickCount,
+				System::currentTimeMillis
+		));
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
 			// Prepare the package, Node executable, and canonical secret before any optional
@@ -106,6 +117,8 @@ public final class CodexAgentServerRuntime {
 		if (supervisor != null) supervisor.tick(bridge != null && bridge.authenticated());
 		manager.reconcileDeaths();
 		manager.maintainChunkTickets();
+		GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.get(server);
+		if (goalVerifier != null) goalVerifier.tick();
 		VoiceSubsystemRuntime.tick(server);
 		maintainPlanningProgress(manager);
 		if (bridge != null) {
@@ -225,8 +238,21 @@ public final class CodexAgentServerRuntime {
 		return VoiceConsentRegistry.granted(server, playerId);
 	}
 
+	private static void recordAttributedKill(net.minecraft.world.entity.LivingEntity entity, net.minecraft.world.damagesource.DamageSource source) {
+		if (!(source.getEntity() instanceof ServerPlayer responsible)) return;
+		MinecraftServer server = responsible.level().getServer();
+		GoalVerificationRuntime runtime = GOAL_VERIFIERS.get(server);
+		if (runtime == null) return;
+		for (var record : CodexAgentManager.get(server).records()) {
+			if (record.entityUuid().filter(responsible.getUUID()::equals).isEmpty()) continue;
+			runtime.recordKill(record.agentId(), BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
+			return;
+		}
+	}
+
 	private static void stop(MinecraftServer server) {
 		PLANNING_UPDATES.remove(server);
+		GOAL_VERIFIERS.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		MultiplexedServerBridge bridge = BRIDGES.remove(server);
 		try {

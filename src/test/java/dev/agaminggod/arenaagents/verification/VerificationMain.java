@@ -90,6 +90,7 @@ import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerificatio
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContractVerification;
+import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntimeVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionSuccessLedgerVerification;
 import dev.agaminggod.arenaagents.server.runtime.input.InputStateVerification;
 import dev.agaminggod.arenaagents.server.perception.AttentionHazardVerification;
@@ -214,6 +215,7 @@ public final class VerificationMain {
 		passedAssertions += EquipmentAndUseVerification.verify();
 		passedAssertions += ServerActionExecutorVerification.verify();
 		passedAssertions += GoalCompletionContractVerification.verify();
+		passedAssertions += GoalVerificationRuntimeVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();
 		passedAssertions += AttentionHazardVerification.verify();

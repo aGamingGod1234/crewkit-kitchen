@@ -10,6 +10,7 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
@@ -894,14 +895,14 @@ public final class MultiplexedServerBridgeVerification {
 				7L,
 				"PREDICATE_FAILED",
 				List.of(
-						new GoalCompletionVerifier.Fact(0, "inventory_min", false, "0"),
-						new GoalCompletionVerifier.Fact(1, "position_within", true, "1.25")
+						new GoalEvidence.Fact("inventory_contains", false, "minecraft:iron_pickaxe x1", "minecraft:iron_pickaxe x0"),
+						new GoalEvidence.Fact("position_within", true, "12.0,64.0,12.0 radius=2.0", "12.0,64.0,13.25 stableTicks=1")
 				)
 		);
 		JsonObject payload = MultiplexedServerBridge.completionResultPayload(7L, "trace-java-1", "sha256:contract", verification);
 		assertEquals(2, payload.getAsJsonArray("facts").size(), "completion result retains every verifier fact");
 		assertEquals(0, payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("predicateIndex").getAsInt(), "completion result retains failed predicate index");
-		assertEquals("0", payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("observedValue").getAsString(), "completion result retains observed value");
+		assertEquals("minecraft:iron_pickaxe x0", payload.getAsJsonArray("facts").get(0).getAsJsonObject().get("observedValue").getAsString(), "completion result retains observed value");
 		MultiplexedServerBridge.VerboseEvent rejected = invokeCompletionVerboseEvent(7L, verification);
 		assertEquals(7L, rejected.goalRevision(), "rejected completion feedback retains the guarded revision");
 		assertEquals("retry", rejected.stage(), "rejected completion feedback uses the Problem stage exactly once");

@@ -14,6 +14,7 @@ import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 
 public final class AgentRegistry {
 	private final int maxAgents;
@@ -302,6 +303,14 @@ public final class AgentRegistry {
 
 	public synchronized AgentTransition completeGoal(AgentId id, long revision, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.completeGoal(require(id), revision, nowEpochMs));
+	}
+
+	public synchronized AgentTransition satisfyGoal(AgentId id, long revision, GoalEvidence evidence, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.satisfyGoal(require(id), revision, evidence, nowEpochMs));
+	}
+
+	public synchronized AgentTransition promoteSatisfied(AgentId id, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.promoteSatisfied(require(id), nowEpochMs));
 	}
 
 	/** Applies a coordinator-owned terminal state, promoting queued work when present. */

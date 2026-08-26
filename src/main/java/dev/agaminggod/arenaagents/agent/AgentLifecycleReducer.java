@@ -6,6 +6,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
+import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 
 public final class AgentLifecycleReducer {
 	private AgentLifecycleReducer() {
@@ -179,6 +181,55 @@ public final class AgentLifecycleReducer {
 				""
 		);
 		return transition(current, promotedRecord, true, true);
+	}
+
+	public static AgentTransition satisfyGoal(
+			AgentRecord current,
+			long revision,
+			GoalEvidence evidence,
+			long nowEpochMs
+	) {
+		requireState(current, "satisfy goal", AgentLifecycleState.STARTING, AgentLifecycleState.PLANNING, AgentLifecycleState.ACTING);
+		requireRevision(current, revision);
+		AgentGoal goal = current.currentGoal().orElseThrow(
+				() -> new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to satisfy")
+		);
+		if (goal.status() != GoalStatus.ACTIVE && goal.status() != GoalStatus.RECOVERING) {
+			throw new AgentDomainException("GOAL_NOT_ACTIVE", "Only active or recovering goals may become satisfied");
+		}
+		AgentGoal satisfied = goal.withStatus(GoalStatus.SATISFIED, Optional.of(
+				Objects.requireNonNull(evidence, "evidence must not be null")), nowEpochMs);
+		AgentRecord completed = current.withLifecycle(
+				AgentLifecycleState.COMPLETED,
+				Optional.of(satisfied),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		);
+		return transition(current, completed, true, true);
+	}
+
+	public static AgentTransition promoteSatisfied(AgentRecord current, long nowEpochMs) {
+		requireState(current, "promote satisfied goal", AgentLifecycleState.COMPLETED);
+		AgentGoal completed = current.currentGoal().orElseThrow(
+				() -> new AgentDomainException("NO_CURRENT_GOAL", "Completed agent has no satisfied goal")
+		);
+		if (completed.status() != GoalStatus.SATISFIED) {
+			throw new AgentDomainException("GOAL_NOT_SATISFIED", "Queued work can be promoted only after factual satisfaction");
+		}
+		if (current.queuedGoals().isEmpty()) {
+			throw new AgentDomainException("NO_QUEUED_GOAL", "Agent has no queued goal to promote");
+		}
+		AgentRecord promoted = current.withLifecycle(
+				AgentLifecycleState.STARTING,
+				Optional.of(current.queuedGoals().getFirst()),
+				nextRevision(current),
+				current.queuedGoals().subList(1, current.queuedGoals().size()),
+				nowEpochMs,
+				""
+		);
+		return transition(current, promoted, false, false);
 	}
 
 	public static AgentTransition fail(AgentRecord current, String message, long nowEpochMs) {
