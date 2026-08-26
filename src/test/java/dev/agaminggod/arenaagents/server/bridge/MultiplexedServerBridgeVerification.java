@@ -908,7 +908,7 @@ public final class MultiplexedServerBridgeVerification {
 		MultiplexedServerBridge.VerboseEvent rejected = invokeCompletionVerboseEvent(7L, verification);
 		assertEquals(7L, rejected.goalRevision(), "rejected completion feedback retains the guarded revision");
 		assertEquals("retry", rejected.stage(), "rejected completion feedback uses the Problem stage exactly once");
-		assertEquals("Goal completion could not be verified. Continuing the task.", rejected.message(),
+		assertEquals("Goal not complete: expected minecraft:iron_pickaxe x1, observed minecraft:iron_pickaxe x0. Continuing.", rejected.message(),
 				"rejected completion feedback explains that work will continue");
 		GoalCompletionVerifier.VerificationResult verified = new GoalCompletionVerifier.VerificationResult(
 				true, 7L, "VERIFIED", List.of()
@@ -916,7 +916,7 @@ public final class MultiplexedServerBridgeVerification {
 		MultiplexedServerBridge.VerboseEvent completed = invokeCompletionVerboseEvent(7L, verified);
 		assertEquals(7L, completed.goalRevision(), "successful completion feedback retains the guarded revision");
 		assertEquals("result", completed.stage(), "successful completion feedback uses Result instead of Lifecycle");
-		assertEquals("Task complete.", completed.message(), "successful completion feedback is concise");
+		assertEquals("Goal verified.", completed.message(), "successful completion feedback is concise");
 	}
 
 	private static void verifyTraceWireValidation() {

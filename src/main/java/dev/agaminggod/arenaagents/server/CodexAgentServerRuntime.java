@@ -10,6 +10,7 @@ import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
+import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
@@ -34,6 +35,7 @@ public final class CodexAgentServerRuntime {
 	private static final Map<MinecraftServer, CoordinatorProcessSupervisor> COORDINATORS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
+	private static final Map<MinecraftServer, GoalSafetyController> GOAL_SAFETY = new ConcurrentHashMap<>();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static boolean registered;
 
@@ -65,6 +67,7 @@ public final class CodexAgentServerRuntime {
 			return;
 		}
 		CodexAgentManager manager = CodexAgentManager.get(server);
+		GOAL_SAFETY.computeIfAbsent(server, ignored -> new GoalSafetyController(manager));
 		GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.computeIfAbsent(server, ignored -> new GoalVerificationRuntime(
 				manager.registry(),
 				agentId -> manager.findAgentPlayer(agentId).map(dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier::minecraftFacts),
@@ -121,8 +124,15 @@ public final class CodexAgentServerRuntime {
 		if (supervisor != null) supervisor.tick(bridge != null && bridge.authenticated());
 		manager.reconcileDeaths();
 		manager.maintainChunkTickets();
+		GoalSafetyController safety = GOAL_SAFETY.get(server);
+		if (safety != null) safety.tick();
 		GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.get(server);
-		if (goalVerifier != null) goalVerifier.tick();
+		if (goalVerifier != null) {
+			for (var transition : goalVerifier.tick()) {
+				transition.after().currentGoal().flatMap(dev.agaminggod.arenaagents.agent.AgentGoal::evidence)
+						.ifPresent(evidence -> reportProactiveGoalVerification(manager, transition.after(), evidence));
+			}
+		}
 		VoiceSubsystemRuntime.tick(server);
 		maintainPlanningProgress(manager);
 		if (bridge != null) {
@@ -242,6 +252,20 @@ public final class CodexAgentServerRuntime {
 		return VoiceConsentRegistry.granted(server, playerId);
 	}
 
+	private static void reportProactiveGoalVerification(
+			CodexAgentManager manager,
+			dev.agaminggod.arenaagents.agent.AgentRecord record,
+			dev.agaminggod.arenaagents.agent.goal.GoalEvidence evidence
+	) {
+		AgentVerboseState verbose = AgentVerboseState.forServer(manager.server());
+		if (!verbose.goalVerificationChanged(record.agentId(), record.goalRevision(), true, evidence.facts())) return;
+		AgentChatReporter.goalVerified(manager, record, evidence.facts());
+		String detail = evidence.facts().isEmpty()
+				? "Goal verified."
+				: "Goal verified: " + evidence.facts().getFirst().expectedValue() + ".";
+		AgentVerboseChat.report(manager, verbose, record, "result", detail);
+	}
+
 	private static void recordAttributedKill(net.minecraft.world.entity.LivingEntity entity, net.minecraft.world.damagesource.DamageSource source) {
 		if (!(source.getEntity() instanceof ServerPlayer responsible)) return;
 		MinecraftServer server = responsible.level().getServer();
@@ -257,9 +281,11 @@ public final class CodexAgentServerRuntime {
 	private static void stop(MinecraftServer server) {
 		PLANNING_UPDATES.remove(server);
 		GOAL_VERIFIERS.remove(server);
+		GoalSafetyController safety = GOAL_SAFETY.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		MultiplexedServerBridge bridge = BRIDGES.remove(server);
 		try {
+			if (safety != null) safety.close();
 			VoiceSubsystemRuntime.close(server);
 			VoiceConsentRegistry.clear(server);
 			CodexAgentManager.release(server);

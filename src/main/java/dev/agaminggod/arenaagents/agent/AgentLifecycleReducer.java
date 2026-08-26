@@ -40,6 +40,25 @@ public final class AgentLifecycleReducer {
 		return queue(current, AgentGoal.create(prompt, nowEpochMs), queueLimit, nowEpochMs);
 	}
 
+	public static AgentTransition replace(AgentRecord current, GoalSpec spec, long nowEpochMs) {
+		Objects.requireNonNull(spec, "spec must not be null");
+		if (current.currentGoal().isEmpty()) {
+			throw new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to replace");
+		}
+		requireState(current, "replace", AgentLifecycleState.STARTING, AgentLifecycleState.PLANNING,
+				AgentLifecycleState.ACTING, AgentLifecycleState.PAUSED, AgentLifecycleState.COMPLETED,
+				AgentLifecycleState.ERROR, AgentLifecycleState.DISCONNECTED);
+		AgentRecord revised = current.withLifecycle(
+				AgentLifecycleState.STARTING,
+				Optional.of(AgentGoal.create(spec.originalRequest(), spec, nowEpochMs)),
+				nextRevision(current),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		);
+		return transition(current, revised, true, true);
+	}
+
 	public static AgentTransition queue(AgentRecord current, GoalSpec spec, int queueLimit, long nowEpochMs) {
 		Objects.requireNonNull(spec, "spec must not be null");
 		return queue(current, AgentGoal.create(spec.originalRequest(), spec, nowEpochMs), queueLimit, nowEpochMs);

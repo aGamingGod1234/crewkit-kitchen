@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import java.util.Locale;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
@@ -48,6 +49,26 @@ public final class AgentChatReporter {
 		AgentVerboseState verbose = verboseState(manager);
 		if (verbose != null && !verbose.standardActivityEnabled()) return;
 		report(manager, record, summary == null || summary.isBlank() ? "Task complete" : summary, ChatFormatting.GREEN);
+	}
+
+	public static void goalVerified(CodexAgentManager manager, AgentRecord record, java.util.List<GoalEvidence.Fact> facts) {
+		GoalEvidence.Fact fact = firstFact(facts, true);
+		String detail = fact == null ? "server-observed requirements satisfied" : fact.expectedValue();
+		report(manager, record, "Goal verified: " + detail + ".", ChatFormatting.GREEN);
+	}
+
+	public static void goalNotComplete(CodexAgentManager manager, AgentRecord record, java.util.List<GoalEvidence.Fact> facts) {
+		GoalEvidence.Fact fact = firstFact(facts, false);
+		String detail = fact == null
+				? "requirements are not yet satisfied"
+				: "expected " + fact.expectedValue() + ", observed " + fact.observedValue();
+		report(manager, record, "Goal not complete: " + detail + ". Continuing.", ChatFormatting.YELLOW);
+	}
+
+	private static GoalEvidence.Fact firstFact(java.util.List<GoalEvidence.Fact> facts, boolean fallbackToFirst) {
+		if (facts == null || facts.isEmpty()) return null;
+		return facts.stream().filter(fact -> !fact.satisfied()).findFirst()
+				.orElse(fallbackToFirst ? facts.getFirst() : null);
 	}
 
 	public static void failed(CodexAgentManager manager, AgentRecord record, String error) {

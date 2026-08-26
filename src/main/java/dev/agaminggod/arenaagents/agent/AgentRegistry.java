@@ -246,6 +246,10 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.start(require(id), spec, nowEpochMs));
 	}
 
+	public synchronized AgentTransition replace(AgentId id, GoalSpec spec, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.replace(require(id), spec, nowEpochMs));
+	}
+
 	/** Commits a prepared start only after its publication barrier succeeds. */
 	public synchronized AgentTransition startAtomically(
 			AgentId id,

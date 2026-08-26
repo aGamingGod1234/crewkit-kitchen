@@ -43,6 +43,22 @@ public final class AgentInputStates {
 		);
 	}
 
+	public static AgentInputState safetyReflex(
+			ServerPlayer player,
+			Vec3 target,
+			float forward,
+			boolean jump,
+			boolean sprint,
+			boolean use,
+			InteractionHand hand
+	) {
+		AgentInputState movement = lookingAt(
+				player, target, forward, 0.0F, jump, false, sprint, false, use, hand);
+		return new AgentInputState(
+				movement.forward(), movement.strafe(), movement.jump(), movement.sneak(), movement.sprint(),
+				false, movement.use(), movement.yaw(), movement.pitch(), movement.selectedSlot(), movement.hand());
+	}
+
 	/**
 	 * Advances a small player-like movement motor toward a target view and movement direction.
 	 * The target's jump flag is treated as a held request and the returned jump flag is an edge

@@ -23,6 +23,7 @@ public final class GoalCompilerVerification {
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyDraftRoundTrip();
 		assertions += verifyDraftRevisionBinding();
+		assertions += verifyDraftAuthorizationAndChoices();
 		assertions += verifySpecAwareLifecycleStart();
 		return assertions;
 	}
@@ -129,7 +130,64 @@ public final class GoalCompilerVerification {
 		assertEquals(spec, started.currentGoal().orElseThrow().spec(), "lifecycle starts the frozen compiled specification");
 		assertEquals(dev.agaminggod.arenaagents.agent.goal.GoalStatus.ACTIVE,
 				started.currentGoal().orElseThrow().status(), "compiled goal starts active");
-		return 2;
+
+		GoalSpec queuedSpec = new GoalCompiler().compile(
+				"Get a diamond pickaxe", RegistryAccess.EMPTY, 1_201L
+		).acceptedSpec().orElseThrow();
+		AgentRecord queued = AgentLifecycleReducer.queue(started, queuedSpec, 8, 10_002L).after();
+		UUID replacedGoalId = queued.currentGoal().orElseThrow().goalId();
+		long replacedRevision = queued.goalRevision();
+		GoalSpec replacement = new GoalCompiler().compile(
+				"Get an iron axe", RegistryAccess.EMPTY, 1_202L
+		).acceptedSpec().orElseThrow();
+		var replaced = AgentLifecycleReducer.replace(queued, replacement, 10_003L);
+		assertEquals(replacement, replaced.after().currentGoal().orElseThrow().spec(),
+				"replace installs the confirmed frozen specification");
+		assertEquals(false, replacedGoalId.equals(replaced.after().currentGoal().orElseThrow().goalId()),
+				"replace creates a distinct goal identity");
+		assertEquals(replacedRevision + 1L, replaced.after().goalRevision(),
+				"replace advances the lifecycle revision exactly once");
+		assertEquals(queued.queuedGoals(), replaced.after().queuedGoals(),
+				"replace preserves already queued work");
+		assertEquals(true, replaced.cancelAction(), "replace cancels physical work owned by the prior goal");
+		return 7;
+	}
+
+	private static int verifyDraftAuthorizationAndChoices() {
+		UUID requester = UUID.randomUUID();
+		PendingGoalDraft idleDraft = new PendingGoalDraft(
+				UUID.randomUUID(), AgentId.random(), requester, "Get an iron pickaxe",
+				Optional.of(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)),
+				DraftIntent.CONFIRM_TRANSLATION, 100L, 0L, Optional.empty()
+		);
+		assertEquals(GoalDraftResolution.Operation.START,
+				GoalDraftResolution.authorize(idleDraft, requester, false, GoalDraftChoice.CONFIRM),
+				"requester can confirm a validated idle draft");
+		expectCode("GOAL_DRAFT_FORBIDDEN",
+				() -> GoalDraftResolution.authorize(idleDraft, UUID.randomUUID(), false, GoalDraftChoice.CONFIRM),
+				"another player cannot resolve the draft");
+		assertEquals(GoalDraftResolution.Operation.START,
+				GoalDraftResolution.authorize(idleDraft, UUID.randomUUID(), true, GoalDraftChoice.CONFIRM),
+				"operator can confirm another player's draft");
+
+		PendingGoalDraft activeDraft = new PendingGoalDraft(
+				UUID.randomUUID(), idleDraft.agentId(), requester, "Get a diamond pickaxe",
+				Optional.of(new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 1)),
+				DraftIntent.REPLACE_OR_QUEUE, 101L, 4L, Optional.of(UUID.randomUUID())
+		);
+		assertEquals(GoalDraftResolution.Operation.REPLACE,
+				GoalDraftResolution.authorize(activeDraft, requester, false, GoalDraftChoice.REPLACE),
+				"active draft explicitly replaces only after the player's choice");
+		assertEquals(GoalDraftResolution.Operation.QUEUE,
+				GoalDraftResolution.authorize(activeDraft, requester, false, GoalDraftChoice.QUEUE),
+				"active draft can queue without changing current work");
+		assertEquals(GoalDraftResolution.Operation.CANCEL,
+				GoalDraftResolution.authorize(activeDraft, requester, false, GoalDraftChoice.CANCEL),
+				"cancel removes only the draft");
+		expectCode("GOAL_DRAFT_CHOICE_REQUIRED",
+				() -> GoalDraftResolution.authorize(activeDraft, requester, false, GoalDraftChoice.CONFIRM),
+				"active draft requires an explicit replace or queue choice");
+		return 7;
 	}
 
 	private static int verifyDraftRevisionBinding() {
@@ -156,5 +214,14 @@ public final class GoalCompilerVerification {
 			throw new AssertionError(label + ": expected=" + expected + ", actual=" + actual);
 		}
 		System.out.println("PASS: " + label);
+	}
+
+	private static void expectCode(String code, Runnable operation, String label) {
+		try {
+			operation.run();
+			throw new AssertionError(label + ": expected " + code);
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException exception) {
+			assertEquals(code, exception.code(), label);
+		}
 	}
 }

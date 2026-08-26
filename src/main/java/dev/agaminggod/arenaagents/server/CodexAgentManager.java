@@ -13,6 +13,8 @@ import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
+import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
+import dev.agaminggod.arenaagents.server.goal.GoalDraftResolution;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntities;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntity;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
@@ -275,6 +277,47 @@ public final class CodexAgentManager {
 
 	public boolean removeGoalDraft(UUID draftId) {
 		return savedData.removeGoalDraft(draftId);
+	}
+
+	public Optional<GoalDraftResult> resolveGoalDraft(
+			UUID draftId,
+			UUID actorId,
+			boolean operator,
+			GoalDraftChoice choice
+	) {
+		Objects.requireNonNull(draftId, "draftId must not be null");
+		PendingGoalDraft draft = savedData.goalDraft(draftId).orElse(null);
+		if (draft == null) return Optional.empty();
+		GoalDraftResolution.Operation operation = GoalDraftResolution.authorize(draft, actorId, operator, choice);
+		if (operation == GoalDraftResolution.Operation.CANCEL) {
+			savedData.removeGoalDraft(draftId);
+			return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.empty()));
+		}
+		AgentRecord record = savedData.registry().require(draft.agentId());
+		if (!draft.matches(record)) throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
+		GoalSpec spec = GoalSpec.create(
+				draft.originalRequest(), draft.proposedPredicate().orElseThrow(), draft.createdAtTick());
+		long now = System.currentTimeMillis();
+		AgentTransition transition = switch (operation) {
+			case START -> savedData.registry().start(draft.agentId(), spec, now);
+			case REPLACE -> savedData.registry().replace(draft.agentId(), spec, now);
+			case QUEUE -> savedData.registry().queue(draft.agentId(), spec, now);
+			case CANCEL -> throw new AssertionError("cancel handled above");
+		};
+		savedData.removeGoalDraft(draftId);
+		return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.of(transition)));
+	}
+
+	public record GoalDraftResult(
+			GoalDraftResolution.Operation operation,
+			AgentId agentId,
+			Optional<AgentTransition> transition
+	) {
+		public GoalDraftResult {
+			Objects.requireNonNull(operation, "operation must not be null");
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			transition = Objects.requireNonNull(transition, "transition must not be null");
+		}
 	}
 
 	public AgentTransition rearmConversationWake(PendingConversationWake wake) {

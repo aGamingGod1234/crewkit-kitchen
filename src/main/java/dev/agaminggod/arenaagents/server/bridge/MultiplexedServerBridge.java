@@ -13,6 +13,7 @@ import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.protocol.ActionType;
@@ -841,7 +842,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		GoalCompletionVerifier.VerificationResult verification = goalVerificationRuntime.evaluateRequest(
 				agentId, goalRevision, goalFingerprint);
 		VerboseEvent feedback = completionVerboseEvent(goalRevision, verification);
-		if (!verification.verified()) {
+		boolean changed = verboseState.goalVerificationChanged(
+				agentId, goalRevision, verification.verified(), verification.facts());
+		if (!verification.verified() && changed) {
+			AgentChatReporter.goalNotComplete(manager, record, verification.facts());
 			AgentVerboseChat.report(manager, verboseState, record, feedback.stage(), feedback.message());
 		}
 		JsonObject result = completionResultPayload(goalRevision, traceId, goalFingerprint, verification);
@@ -849,7 +853,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (verification.verified()) {
 			goalVerificationRuntime.acceptVerified(agentId, goalRevision, goalFingerprint, verification);
 			AgentRecord completed = manager.registry().require(agentId);
-			AgentVerboseChat.report(manager, verboseState, completed, feedback.stage(), feedback.message());
+			if (changed) {
+				AgentChatReporter.goalVerified(manager, completed, verification.facts());
+				AgentVerboseChat.report(manager, verboseState, completed, feedback.stage(), feedback.message());
+			}
 		}
 	}
 
@@ -858,10 +865,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			GoalCompletionVerifier.VerificationResult verification
 	) {
 		Objects.requireNonNull(verification, "verification must not be null");
-		return verification.verified()
-				? new VerboseEvent(goalRevision, "result", "Task complete.")
-				: new VerboseEvent(
-						goalRevision, "retry", "Goal completion could not be verified. Continuing the task.");
+		GoalEvidence.Fact fact = verification.facts().stream().filter(item -> !item.satisfied()).findFirst()
+				.orElse(verification.facts().isEmpty() ? null : verification.facts().getFirst());
+		if (verification.verified()) {
+			return new VerboseEvent(goalRevision, "result",
+					fact == null ? "Goal verified." : "Goal verified: " + fact.expectedValue() + ".");
+		}
+		return new VerboseEvent(goalRevision, "retry", fact == null
+				? "Goal not complete. Continuing."
+				: "Goal not complete: expected " + fact.expectedValue() + ", observed " + fact.observedValue() + ". Continuing.");
 	}
 
 	static JsonObject completionResultPayload(long goalRevision, String traceId, String goalFingerprint, GoalCompletionVerifier.VerificationResult verification) {

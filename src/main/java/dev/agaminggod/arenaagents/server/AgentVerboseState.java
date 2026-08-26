@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalInt;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.server.MinecraftServer;
@@ -17,6 +18,7 @@ public final class AgentVerboseState {
 
 	private final AtomicBoolean enabled = new AtomicBoolean();
 	private final Map<AgentId, ActionActivity> actions = new HashMap<>();
+	private final Map<AgentId, GoalVerificationActivity> goalVerifications = new HashMap<>();
 
 	static AgentVerboseState forServer(MinecraftServer server) {
 		return SERVER_STATES.computeIfAbsent(
@@ -79,9 +81,24 @@ public final class AgentVerboseState {
 		actions.clear();
 	}
 
+	public synchronized boolean goalVerificationChanged(
+			AgentId agentId,
+			long goalRevision,
+			boolean verified,
+			java.util.List<GoalEvidence.Fact> facts
+	) {
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		String fingerprint = Boolean.toString(verified) + Objects.requireNonNull(facts, "facts must not be null").toString();
+		GoalVerificationActivity next = new GoalVerificationActivity(goalRevision, fingerprint);
+		if (next.equals(goalVerifications.get(agentId))) return false;
+		goalVerifications.put(agentId, next);
+		return true;
+	}
+
 	public boolean standardActivityEnabled() {
 		return !enabled();
 	}
 
 	private record ActionActivity(String actionId, int lastMilestone) { }
+	private record GoalVerificationActivity(long goalRevision, String fingerprint) { }
 }
