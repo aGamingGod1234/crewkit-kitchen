@@ -268,7 +268,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#serverInstanceId = serverInstanceId;
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
-			const startedReconciliation = this.#planner.beginReconcile(registry);
+			const startedReconciliation = this.#planner.beginReconcile(registry, { recovery: true });
 			const reconciliation = Promise.resolve().then(async () => {
 			if (typeof this.#codexService.bootstrapCatalog === 'function') {
 				await this.#publishCatalog(await this.#codexService.bootstrapCatalog());
@@ -279,8 +279,7 @@ export class DynamicCoordinator extends EventEmitter {
 			for (const profile of providers.valid) {
 				let record = this.#registry.get(profile.agentId);
 				if (record === null) throw new ProtocolV2Error('UNKNOWN_AGENT', `Reconciled provider profile references unknown agent '${profile.agentId}'`);
-				if (this.#usesNativeTools(record) && record.state === DynamicAgentState.DISCONNECTED && record.currentGoal !== null) {
-					record = this.#registry.setState(record.agentId, DynamicAgentState.STARTING, { goalRevision: record.goalRevision });
+				if (this.#usesNativeTools(record) && record.state === DynamicAgentState.STARTING && record.currentGoal !== null) {
 					this.#goalSupervisor.activate(this.#supervisionKey(record));
 				}
 				await this.#bridge.send('agent_ready', profile.agentId, { goalRevision: record.goalRevision, reconciled: true });
@@ -633,7 +632,9 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#providerRetryAfter.clear();
 			this.#providerWork.clear();
 			await Promise.allSettled(this.#registry.list().map(async (record) => {
-				if (![DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED].includes(record.state)) this.#registry.setState(record.agentId, DynamicAgentState.DISCONNECTED, { goalRevision: record.goalRevision });
+				if ([DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) {
+					this.#registry.setState(record.agentId, DynamicAgentState.DISCONNECTED, { goalRevision: record.goalRevision });
+				}
 				await this.#planner.interrupt(record.agentId, 'Minecraft bridge disconnected');
 			}));
 			});

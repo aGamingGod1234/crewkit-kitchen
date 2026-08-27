@@ -140,6 +140,44 @@ test('reconciliation disconnects in-flight persisted agents, preserves explicit 
 	assert.throws(() => registry.reconcile([record('agent-a'), record('agent-a')]), (error) => error.code === 'DUPLICATE_AGENT');
 });
 
+test('recovery reconciliation re-arms active goals without changing revisions or exact profiles', () => {
+	const registry = new AgentRegistry({ now: () => 99 });
+	const snapshot = [
+		record('agent-a', { state: DynamicAgentState.STARTING, currentGoal: 'Start.', goalRevision: 5, provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'fast' }),
+		record('agent-b', { state: DynamicAgentState.PLANNING, currentGoal: 'Plan.', goalRevision: 6 }),
+		record('agent-c', { state: DynamicAgentState.ACTING, currentGoal: 'Act.', goalRevision: 7 }),
+		record('agent-d', { state: DynamicAgentState.DISCONNECTED, currentGoal: 'Reconnect.', goalRevision: 8 }),
+		record('agent-e', { state: DynamicAgentState.PAUSED, currentGoal: 'Pause.', goalRevision: 9 }),
+	];
+
+	registry.reconcile(snapshot, { recovery: true });
+	assert.deepEqual(registry.list().map(({ state }) => state), [
+		DynamicAgentState.STARTING,
+		DynamicAgentState.STARTING,
+		DynamicAgentState.STARTING,
+		DynamicAgentState.STARTING,
+		DynamicAgentState.PAUSED,
+	]);
+	assert.deepEqual(
+		pickRecoveryIdentity(registry.get('agent-a')),
+		{ currentGoal: 'Start.', goalRevision: 5, provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'fast' },
+	);
+	const first = registry.snapshot();
+	registry.reconcile(first, { recovery: true });
+	assert.deepEqual(registry.snapshot(), first, 'duplicate recovery observations converge on the same records');
+});
+
+function pickRecoveryIdentity(value) {
+	return {
+		currentGoal: value.currentGoal,
+		goalRevision: value.goalRevision,
+		provider: value.provider,
+		model: value.model,
+		reasoningEffort: value.reasoningEffort,
+		serviceTier: value.serviceTier,
+	};
+}
+
 test('stop cleanup is idempotent while new commands still require newer revisions', () => {
 	const registry = new AgentRegistry();
 	registry.register(record('agent-a', { state: DynamicAgentState.ACTING, currentGoal: 'Explore.', goalRevision: 1 }));

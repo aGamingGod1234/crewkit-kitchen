@@ -1052,15 +1052,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new AgentDomainException("STALE_REVISION", "Coordinator planning revision is stale");
 		}
 		if ("agent_ready".equals(envelope.type())) coordinatorReadyAgentIds.add(id);
-		boolean reconciledReconnect = "agent_ready".equals(envelope.type())
+		boolean recoveryReady = "agent_ready".equals(envelope.type())
 				&& envelope.payload().has("reconciled")
-				&& requiredBoolean(envelope.payload(), "reconciled")
-				&& record.state() == AgentLifecycleState.DISCONNECTED
-				&& record.currentGoal().isPresent();
-		if (reconciledReconnect) {
-			manager.registry().resume(id, System.currentTimeMillis());
+				&& requiredBoolean(envelope.payload(), "reconciled");
+		if (recoveryReady && record.state() == AgentLifecycleState.DISCONNECTED
+				&& record.currentGoal().isPresent()) {
+			manager.registry().rearmAfterCoordinatorRecovery(id.value(), revision, System.currentTimeMillis());
 		}
-		if (record.state() == AgentLifecycleState.STARTING) {
+		if (!recoveryReady && record.state() == AgentLifecycleState.STARTING) {
 			router.plannerStarted(id);
 		}
 		if ("agent_ready".equals(envelope.type())) {

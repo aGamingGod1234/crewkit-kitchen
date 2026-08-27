@@ -129,7 +129,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 134;
+		return 140;
 	}
 
 	private static void verifyGoalSpecProposalLifecycle() {
@@ -245,6 +245,27 @@ public final class MultiplexedServerBridgeVerification {
 			));
 			assertEquals(AgentLifecycleState.STARTING, manager.registry().require(started.agentId()).state(),
 					"an obsolete readiness frame cannot mutate the current lifecycle");
+
+			AgentRecord disconnected = manager.registry().disconnect(started.agentId(), 1_702L).after();
+			JsonObject recoveredPayload = new JsonObject();
+			recoveredPayload.addProperty("goalRevision", disconnected.goalRevision());
+			recoveredPayload.addProperty("reconciled", true);
+			BridgeEnvelope recoveredReady = new BridgeEnvelope(
+					2, "coordinator", disconnected.agentId().toString(), "agent_ready", "ready-recovered", recoveredPayload
+			);
+			invokePlannerReady(bridge, recoveredReady);
+			AgentRecord recovered = manager.registry().require(disconnected.agentId());
+			assertEquals(disconnected.goalRevision(), recovered.goalRevision(),
+					"coordinator readiness preserves the authoritative goal revision");
+			assertEquals(disconnected.profile(), recovered.profile(),
+					"coordinator readiness preserves the exact selected profile");
+			assertEquals(1, bridge.observationPublicationForVerification().pendingCount(),
+					"coordinator readiness requests one fresh Minecraft observation");
+			invokePlannerReady(bridge, recoveredReady);
+			assertEquals(1, bridge.observationPublicationForVerification().pendingCount(),
+					"duplicate readiness coalesces to one fresh observation request");
+			assertEquals(AgentLifecycleState.STARTING, manager.registry().require(disconnected.agentId()).state(),
+					"duplicate recovery readiness leaves the same re-armed lifecycle state");
 
 			manager.registry().remove(started.agentId());
 			JsonObject removedPayload = new JsonObject();
@@ -785,22 +806,24 @@ public final class MultiplexedServerBridgeVerification {
 						2, helloAck.serverInstanceId(), disconnected.agentId().toString(), "agent_ready",
 						"ready-reconnected", reconnectReady
 				));
-				BridgeEnvelope resume = pollBridgeResponse(bridge, socket, reader, codec);
-				assertEquals("goal_control", resume.type(), "reconciliation publishes a lifecycle recovery control");
-				assertEquals(disconnected.agentId().toString(), resume.agentId(),
-						"recovery control retains the disconnected agent identity");
-				assertEquals("resume", resume.payload().get("operation").getAsString(),
-						"authenticated reconciliation resumes rather than steering the unfinished goal");
-				assertEquals(disconnectedRevision + 1L, resume.payload().get("goalRevision").getAsLong(),
-						"automatic reconnect recovery advances the authoritative goal revision once");
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, helloAck.serverInstanceId(), "server", "heartbeat", "heartbeat-after-recovery", new JsonObject()
+				));
+				BridgeEnvelope heartbeat = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("heartbeat", heartbeat.type(),
+						"infrastructure recovery emits no player resume command");
 				assertEquals(AgentLifecycleState.STARTING, manager.registry().require(disconnected.agentId()).state(),
 						"disconnected goal re-enters STARTING after authenticated reconciliation");
+				assertEquals(disconnectedRevision, manager.registry().require(disconnected.agentId()).goalRevision(),
+						"authenticated recovery preserves the authoritative goal revision");
+				assertEquals(disconnected.profile(), manager.registry().require(disconnected.agentId()).profile(),
+						"authenticated recovery preserves the exact selected profile");
 				assertEquals("finish the interrupted task",
 						manager.registry().require(disconnected.agentId()).currentGoal().orElseThrow().prompt(),
 						"automatic reconnect recovery preserves the unfinished goal");
 
 				JsonObject resumedReady = new JsonObject();
-				resumedReady.addProperty("goalRevision", disconnectedRevision + 1L);
+				resumedReady.addProperty("goalRevision", disconnectedRevision);
 				writeEnvelope(socket, codec, new BridgeEnvelope(
 						2, helloAck.serverInstanceId(), disconnected.agentId().toString(), "agent_ready",
 						"ready-resumed", resumedReady

@@ -82,8 +82,8 @@ class FakeProvider {
 
 class FakePlanner {
 	constructor(registry) { this.registry = registry; this.requests = []; this.goalSpecRequests = []; this.goalSpecCancellations = []; this.interruptions = []; }
-	beginReconcile(records) {
-		const registry = this.registry.reconcile(records);
+	beginReconcile(records, options = undefined) {
+		const registry = this.registry.reconcile(records, options);
 		return { registry, complete: Promise.resolve({ registry, providers: { valid: registry.records, invalid: [], catalog: { models: [] } } }) };
 	}
 	async reconcile(records) { return this.beginReconcile(records).complete; }
@@ -1525,6 +1525,58 @@ test('a pre-disconnect native completion cannot complete the replacement lifecyc
 	}
 });
 
+test('coordinator reconnect preserves player pause and schedules one plan for duplicate recovery facts', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let releasePlan;
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		await new Promise((resolve) => { releasePlan = resolve; });
+		return withCompletionContract({ summary: 'Wait.', directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const active = {
+		...record('agent-a'), state: DynamicAgentState.ACTING, currentGoal: 'Keep working.', goalRevision: 4,
+		provider: 'kimi', model: 'kimi-code/k3', reasoningEffort: 'max', serviceTier: 'fast',
+	};
+	const paused = { ...record('agent-b'), state: DynamicAgentState.PAUSED, currentGoal: 'Wait for Lucas.', goalRevision: 2 };
+	const run = await start({ registry, planner, initialRegistry: [active, paused] });
+	try {
+		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.STARTING);
+		assert.deepEqual(pickProfile(run.registry.get('agent-a')), pickProfile(active));
+		assert.equal(run.registry.get('agent-a').goalRevision, 4);
+		assert.equal(run.registry.get('agent-b').state, DynamicAgentState.PAUSED);
+
+		run.bridge.emit('disconnected');
+		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.DISCONNECTED);
+		assert.equal(run.registry.get('agent-b').state, DynamicAgentState.PAUSED, 'transport loss cannot overwrite player pause');
+
+		run.bridge.emit('ready', { serverInstanceId: 'test', registry: [active, paused] });
+		run.bridge.emit('ready', { serverInstanceId: 'test', registry: [active, paused] });
+		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.STARTING);
+		assert.deepEqual(pickProfile(run.registry.get('agent-a')), pickProfile(active));
+		assert.equal(run.registry.get('agent-b').state, DynamicAgentState.PAUSED);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'goal_control' && message.payload?.operation === 'resume'), false);
+
+		const facts = { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } };
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 4, eventSequence: 1, observation: facts } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 4, eventSequence: 1, observation: facts } });
+		await eventually(() => planner.requests.length === 1);
+		assert.equal(planner.requests.length, 1, 'duplicate recovery facts schedule one plan');
+	} finally {
+		releasePlan?.();
+		await run.coordinator.stop();
+	}
+});
+
+function pickProfile(value) {
+	return {
+		provider: value.provider,
+		model: value.model,
+		reasoningEffort: value.reasoningEffort,
+		serviceTier: value.serviceTier,
+	};
+}
+
 test('idle native agents answer direct conversation without creating a physical goal', async () => {
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
@@ -2268,7 +2320,7 @@ test('acknowledges and idempotently replays one composite conversation wake', as
 			serverInstanceId: 'test',
 			registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: payload.control.goal, goalRevision: 1 }],
 		});
-		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.DISCONNECTED);
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.STARTING);
 		run.bridge.emit('conversation_wake', { agentId: 'agent-a', payload: structuredClone(payload) });
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'conversation_wake_ack').length === 3);
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING,
@@ -2302,8 +2354,8 @@ test('replayed conversation wake restores memory and the same revision after coo
 		control: { operation: 'start', goalRevision: 1, updatedAtEpochMs: 1_787_184_000_001, goal: wakeGoal },
 	};
 	try {
-		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.DISCONNECTED,
-			'ordinary reconciliation keeps active snapshot state recoverable after reconnect');
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING,
+			'recovery reconciliation re-arms the active snapshot at the same revision');
 		run.bridge.emit('conversation_wake', { agentId: 'agent-a', payload });
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'conversation_wake_ack'));
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING);
@@ -2759,7 +2811,7 @@ test('new server instance fences old planning, clears facts, and waits for fresh
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(run.bridge.sent.some((message) => message.type === 'action_command'), false, 'the old server plan cannot install after replacement');
 
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 2, goal: 'Wait.' } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Wait.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
 			goalRevision: 2,
 			eventSequence: 1,
@@ -2793,7 +2845,7 @@ test('same server reconnect preserves deduplicated facts and conversation memory
 			registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Wait.', goalRevision: 1 }],
 		});
 		await eventually(() => run.bridge.sent.filter((message) => message.type === 'agent_ready').some((message) => message.payload?.reconciled === true));
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 2, goal: 'Wait.' } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Wait.' } });
 		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: { ...structuredClone(conversation), goalRevision: 2 } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
 			goalRevision: 2, eventSequence: 1,

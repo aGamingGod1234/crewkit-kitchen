@@ -173,12 +173,13 @@ export class AgentRegistry {
 		return clone(current);
 	}
 
-	reconcile(snapshot) {
+	reconcile(snapshot, { recovery = false } = {}) {
 		if (!Array.isArray(snapshot)) throw new TypeError('registry snapshot must be an array');
+		if (typeof recovery !== 'boolean') throw new TypeError('registry recovery option must be a boolean');
 		if (snapshot.length > this.#agentCap) throw new AgentRegistryError('AGENT_CAP_REACHED', `Registry snapshot exceeds agent cap of ${this.#agentCap}`);
 		const next = new Map();
 		for (const value of snapshot) {
-			const record = normalizeAgentRecord(value, { queueCap: this.#queueCap, reload: true });
+			const record = normalizeAgentRecord(value, { queueCap: this.#queueCap, reload: true, recovery });
 			if (next.has(record.agentId)) throw new AgentRegistryError('DUPLICATE_AGENT', `Duplicate agent '${record.agentId}' in registry snapshot`);
 			next.set(record.agentId, record);
 		}
@@ -194,10 +195,12 @@ export class AgentRegistry {
 	}
 }
 
-export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP, reload = false } = {}) {
+export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP, reload = false, recovery = false } = {}) {
 	if (!isPlainObject(value)) throw new TypeError('agent record must be an object');
 	const state = requireState(value.state ?? DynamicAgentState.IDLE);
-	const normalizedState = reload && DISCONNECT_ON_RELOAD.has(state) ? DynamicAgentState.DISCONNECTED : state;
+	const normalizedState = reload && DISCONNECT_ON_RELOAD.has(state)
+		? (recovery ? DynamicAgentState.STARTING : DynamicAgentState.DISCONNECTED)
+		: state;
 	const goalRevision = nonnegativeInteger(value.goalRevision ?? 0, 'goalRevision');
 	const queue = value.queue ?? [];
 	if (!Array.isArray(queue)) throw new TypeError('agent queue must be an array');

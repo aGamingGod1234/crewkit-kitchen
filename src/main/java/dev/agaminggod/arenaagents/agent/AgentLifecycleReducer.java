@@ -278,6 +278,31 @@ public final class AgentLifecycleReducer {
 		return transition(current, disconnected, true, true);
 	}
 
+	public static AgentTransition rearmAfterCoordinatorRecovery(
+			AgentRecord current,
+			long expectedGoalRevision,
+			long nowEpochMs
+	) {
+		requireRevision(current, expectedGoalRevision);
+		if (current.currentGoal().isEmpty()) {
+			throw new AgentDomainException("NO_CURRENT_GOAL", "Coordinator recovery requires an unfinished goal");
+		}
+		if (current.state() == AgentLifecycleState.STARTING) {
+			return transition(current, current, false, false);
+		}
+		requireState(current, "re-arm after coordinator recovery", AgentLifecycleState.PLANNING,
+				AgentLifecycleState.ACTING, AgentLifecycleState.DISCONNECTED);
+		AgentRecord rearmed = current.withLifecycle(
+				AgentLifecycleState.STARTING,
+				current.currentGoal(),
+				current.goalRevision(),
+				current.queuedGoals(),
+				nowEpochMs,
+				""
+		);
+		return transition(current, rearmed, false, false);
+	}
+
 	public static AgentTransition die(AgentRecord current, AgentDeathSnapshot deathSnapshot, long nowEpochMs) {
 		Objects.requireNonNull(deathSnapshot, "deathSnapshot must not be null");
 		AgentRecord dead = current.withLifecycle(
@@ -310,17 +335,10 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentRecord recoverAfterReload(AgentRecord current, long nowEpochMs) {
-		if (!current.state().isActive()) {
+		if (!current.state().isReloadUncertain()) {
 			return current;
 		}
-		return current.withLifecycle(
-				AgentLifecycleState.DISCONNECTED,
-				current.currentGoal(),
-				nextRevision(current),
-				current.queuedGoals(),
-				nowEpochMs,
-				"Recovered disconnected after reload"
-		);
+		return rearmAfterCoordinatorRecovery(current, current.goalRevision(), nowEpochMs).after();
 	}
 
 	private static void requireRevision(AgentRecord current, long revision) {
