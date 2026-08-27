@@ -138,7 +138,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final Object verboseControlLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
 	private final Set<AgentId> coordinatorReadyAgentIds = new HashSet<>();
+	private final Map<AgentId, RecoveryObservationIdentity> recoveryObservationIdentities = new HashMap<>();
 	private boolean disconnectInProgress;
+	private long coordinatorLifecycleGeneration;
 	private long verboseControlRevision;
 	private long publishedVerboseControlRevision;
 	private volatile Session session;
@@ -435,6 +437,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		observationPublication.remove(agentId);
 		synchronized (publicationLock) {
 			coordinatorReadyAgentIds.remove(agentId);
+			recoveryObservationIdentities.remove(agentId);
 			if (!protocolKnownAgentIds.contains(agentId)) return;
 			Session active = session;
 			if (active == null || !active.open.get() || !active.authenticated.get()) {
@@ -604,6 +607,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 				try {
 					source.completeHandshake(handshake);
+					coordinatorLifecycleGeneration++;
 					markVerboseControlPublished(verboseControl);
 					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
@@ -1051,8 +1055,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (revision < record.goalRevision()) return;
 			throw new AgentDomainException("STALE_REVISION", "Coordinator planning revision is stale");
 		}
-		if ("agent_ready".equals(envelope.type())) coordinatorReadyAgentIds.add(id);
-		boolean recoveryReady = "agent_ready".equals(envelope.type())
+		boolean agentReady = "agent_ready".equals(envelope.type());
+		if (agentReady) coordinatorReadyAgentIds.add(id);
+		boolean recoveryReady = agentReady
 				&& envelope.payload().has("reconciled")
 				&& requiredBoolean(envelope.payload(), "reconciled");
 		if (recoveryReady && record.state() == AgentLifecycleState.DISCONNECTED
@@ -1062,10 +1067,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!recoveryReady && record.state() == AgentLifecycleState.STARTING) {
 			router.plannerStarted(id);
 		}
-		if ("agent_ready".equals(envelope.type())) {
+		if (agentReady && shouldRequestReadyObservation(id, revision, recoveryReady)) {
 			observationPublication.markAttention(id);
 			queueUrgentObservation(id);
 		}
+	}
+
+	private boolean shouldRequestReadyObservation(AgentId agentId, long goalRevision, boolean recoveryReady) {
+		if (!recoveryReady) return true;
+		RecoveryObservationIdentity identity = new RecoveryObservationIdentity(
+				coordinatorLifecycleGeneration, goalRevision
+		);
+		return !identity.equals(recoveryObservationIdentities.put(agentId, identity));
 	}
 
 	private void acceptAction(BridgeEnvelope envelope) {
@@ -1157,6 +1170,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private record RejectionIdentity(String agentId, long goalRevision, String actionId, String actionType, String traceId) { }
+	private record RecoveryObservationIdentity(long coordinatorLifecycleGeneration, long goalRevision) { }
 
 	static String boundedRejectionMessage(String message) {
 		String fallback = "Action rejected";

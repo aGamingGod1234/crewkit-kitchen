@@ -129,7 +129,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 140;
+		return 145;
 	}
 
 	private static void verifyGoalSpecProposalLifecycle() {
@@ -266,6 +266,24 @@ public final class MultiplexedServerBridgeVerification {
 					"duplicate readiness coalesces to one fresh observation request");
 			assertEquals(AgentLifecycleState.STARTING, manager.registry().require(disconnected.agentId()).state(),
 					"duplicate recovery readiness leaves the same re-armed lifecycle state");
+			List<AgentId> recoveryObservations = new ArrayList<>();
+			bridge.observationPublicationForVerification().drain(recoveryObservations::add);
+			assertEquals(List.of(disconnected.agentId()), recoveryObservations,
+					"the first recovery readiness drains one observation request");
+			assertEquals(0, bridge.observationPublicationForVerification().pendingCount(),
+					"the first recovery observation is fully drained");
+			JsonObject planningPayload = new JsonObject();
+			planningPayload.addProperty("goalRevision", disconnected.goalRevision());
+			invokePlannerReady(bridge, new BridgeEnvelope(
+					2, "coordinator", disconnected.agentId().toString(), "planning_state", "planning-recovered", planningPayload
+			));
+			assertEquals(AgentLifecycleState.PLANNING, manager.registry().require(disconnected.agentId()).state(),
+					"the first recovery observation progresses into planning");
+			invokePlannerReady(bridge, recoveredReady);
+			assertEquals(0, bridge.observationPublicationForVerification().pendingCount(),
+					"late duplicate readiness cannot queue a second recovery observation");
+			assertEquals(AgentLifecycleState.PLANNING, manager.registry().require(disconnected.agentId()).state(),
+					"late duplicate readiness cannot restart the progressed recovery lifecycle");
 
 			manager.registry().remove(started.agentId());
 			JsonObject removedPayload = new JsonObject();

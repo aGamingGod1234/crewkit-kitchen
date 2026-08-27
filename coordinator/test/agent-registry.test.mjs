@@ -9,6 +9,7 @@ function record(agentId, overrides = {}) {
 		provider: 'codex',
 		model: 'gpt-5.6-sol',
 		reasoningEffort: 'high',
+		serviceTier: 'priority',
 		state: DynamicAgentState.IDLE,
 		goalRevision: 0,
 		queue: [],
@@ -165,6 +166,22 @@ test('recovery reconciliation re-arms active goals without changing revisions or
 	const first = registry.snapshot();
 	registry.reconcile(first, { recovery: true });
 	assert.deepEqual(registry.snapshot(), first, 'duplicate recovery observations converge on the same records');
+});
+
+test('recovery reconciliation rejects a profile with no provider', () => {
+	const registry = new AgentRegistry();
+	const missingProvider = record('agent-a', { state: DynamicAgentState.STARTING, currentGoal: 'Recover.', goalRevision: 1 });
+	delete missingProvider.provider;
+
+	assert.throws(() => registry.reconcile([missingProvider], { recovery: true }), /provider/i);
+});
+
+test('recovery reconciliation rejects a profile with no service tier', () => {
+	const registry = new AgentRegistry();
+	const missingServiceTier = record('agent-a', { state: DynamicAgentState.STARTING, currentGoal: 'Recover.', goalRevision: 1 });
+	delete missingServiceTier.serviceTier;
+
+	assert.throws(() => registry.reconcile([missingServiceTier], { recovery: true }), /serviceTier/i);
 });
 
 function pickRecoveryIdentity(value) {

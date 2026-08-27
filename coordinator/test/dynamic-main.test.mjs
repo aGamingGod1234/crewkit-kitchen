@@ -196,7 +196,7 @@ test('replacing a goal cancels stale goal translation and suppresses its late pr
 });
 
 function record(agentId = 'agent-a') {
-	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] };
+	return { agentId, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority', state: DynamicAgentState.IDLE, goalRevision: 0, queue: [] };
 }
 
 function factToWireObservation(value, goalRevision, eventSequence, attention, observedAtEpochMs) {
