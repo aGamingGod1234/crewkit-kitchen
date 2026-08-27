@@ -375,6 +375,35 @@ test('verbose decisions reject actual identifier and tool-execution formats', as
 	}
 });
 
+test('verbose decisions redact standalone provider credentials', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		return withCompletionContract({
+			summary: 'Credentials sk-proj-abcdefghijklmnopqrstuvwxyz0123456789 and AIzaabcdefghijklmnopqrstuvwxyz0123456789 must stay hidden.',
+			directive: 'replace',
+			source: SOURCE,
+		}, request.goalRevision);
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('verbose_control', { agentId: 'server', payload: { enabled: true } });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'action_command'));
+		assert.deepEqual(
+			run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'decision').map(({ payload }) => payload.message),
+			['Credentials [REDACTED_KEY] and [REDACTED_KEY] must stay hidden.'],
+		);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('verbose summaries preserve ordinary action and call prose while rejecting only structural tool syntax', async () => {
 	for (const summary of [
 		'Take an action-oriented approach and wait.',

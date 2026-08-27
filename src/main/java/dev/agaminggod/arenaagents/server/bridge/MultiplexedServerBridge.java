@@ -135,9 +135,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final AtomicLong registryPublicationRevision = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
 	private final Object publicationLock = new Object();
+	private final Object verboseControlLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
 	private final Set<AgentId> coordinatorReadyAgentIds = new HashSet<>();
 	private boolean disconnectInProgress;
+	private long verboseControlRevision;
+	private long publishedVerboseControlRevision;
 	private volatile Session session;
 	private volatile ServerSocket serverSocket;
 	private volatile Set<String> catalogProfiles = Set.of();
@@ -224,6 +227,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	public void tick() {
 		publishPendingDisconnects();
+		publishPendingVerboseControl();
 		serverTasks.drain(SERVER_TASKS_PER_TICK, task -> {
 			try {
 				task.run();
@@ -257,13 +261,43 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	public void setVerbose(boolean enabled) {
-		verboseState.setEnabled(enabled);
+		synchronized (verboseControlLock) {
+			verboseState.setEnabled(enabled);
+			verboseControlRevision += 1L;
+		}
+		publishPendingVerboseControl();
+	}
+
+	private void publishPendingVerboseControl() {
+		VerboseControlSnapshot control = verboseControlSnapshot();
+		if (control.revision() <= publishedVerboseControlRevision()) return;
 		Session active = session;
 		if (active == null || !active.authenticated.get()) return;
 		try {
-			active.enqueue(verboseControlEnvelope());
+			active.enqueue(verboseControlEnvelope(control.enabled()));
+			markVerboseControlPublished(control);
 		} catch (BridgeProtocolException exception) {
-			LOGGER.debug("Verbose control will be restored by the next authenticated session: {}", exception.getMessage());
+			LOGGER.debug("Verbose control will retry on the next server tick: {}", exception.getMessage());
+		}
+	}
+
+	private VerboseControlSnapshot verboseControlSnapshot() {
+		synchronized (verboseControlLock) {
+			return new VerboseControlSnapshot(verboseControlRevision, verboseState.enabled());
+		}
+	}
+
+	private long publishedVerboseControlRevision() {
+		synchronized (verboseControlLock) {
+			return publishedVerboseControlRevision;
+		}
+	}
+
+	private void markVerboseControlPublished(VerboseControlSnapshot control) {
+		synchronized (verboseControlLock) {
+			if (verboseControlRevision == control.revision() && verboseState.enabled() == control.enabled()) {
+				publishedVerboseControlRevision = Math.max(publishedVerboseControlRevision, control.revision());
+			}
 		}
 	}
 
@@ -545,7 +579,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			handshake.add(new BridgeEnvelope(
 					2, serverInstanceId, "server", "hello_ack", "server-" + messageIds.incrementAndGet(), payload
 			));
-			handshake.add(verboseControlEnvelope());
+			VerboseControlSnapshot verboseControl = verboseControlSnapshot();
+			handshake.add(verboseControlEnvelope(verboseControl.enabled()));
 			for (PendingConversationWake wake : pendingWakes) {
 				handshake.add(conversationWakeEnvelope(wake));
 			}
@@ -569,6 +604,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 				try {
 					source.completeHandshake(handshake);
+					markVerboseControlPublished(verboseControl);
 					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
 					protocolKnownAgentIds.clear();
@@ -580,9 +616,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
-	private BridgeEnvelope verboseControlEnvelope() {
+	private BridgeEnvelope verboseControlEnvelope(boolean enabled) {
 		JsonObject payload = new JsonObject();
-		payload.addProperty("enabled", verboseState.enabled());
+		payload.addProperty("enabled", enabled);
 		return new BridgeEnvelope(
 				2, serverInstanceId, "server", "verbose_control",
 				"server-" + messageIds.incrementAndGet(), payload
@@ -1263,6 +1299,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				2, serverInstanceId, draft.agentId().toString(), "goal_spec_request",
 				"server-" + messageIds.incrementAndGet(), payload
 		);
+	}
+
+	private record VerboseControlSnapshot(long revision, boolean enabled) {
 	}
 
 	private Session requireConversationSession(AgentId agentId) {

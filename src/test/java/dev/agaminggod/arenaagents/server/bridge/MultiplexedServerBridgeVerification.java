@@ -71,6 +71,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyObsoletePlannerReadinessIsIgnored();
 		verifyAgentErrorRevisionGate();
 		verifyRespawnContinuationPayload();
+		verifyVerboseControlRetriesAfterBackpressure();
 		verifyVerboseTelemetryCannotSuppressProgress();
 		List<AgentRecord> registered = new ArrayList<>();
 		for (int index = 0; index <= AgentConstants.DEFAULT_AGENT_LIMIT; index++) {
@@ -128,7 +129,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 132;
+		return 134;
 	}
 
 	private static void verifyGoalSpecProposalLifecycle() {
@@ -335,6 +336,45 @@ public final class MultiplexedServerBridgeVerification {
 					Files.deleteIfExists(secretFile);
 				} catch (java.io.IOException exception) {
 					throw new AssertionError("could not remove atomic-pending secret", exception);
+				}
+			}
+		}
+	}
+
+	private static void verifyVerboseControlRetriesAfterBackpressure() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-verbose-retry-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			AgentVerboseState verboseState = new AgentVerboseState();
+			verboseState.setEnabled(true);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile, verboseState);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				authenticate(socket, reader, codec, secret, "hello-verbose-retry");
+				setQueuedCount(bridge, "server", MultiplexedServerBridge.AGENT_QUEUE_CAP);
+				bridge.setVerbose(false);
+				setQueuedCount(bridge, "server", 0);
+				bridge.tick();
+				BridgeEnvelope retried = codec.decode(reader.readLine());
+				assertEquals("verbose_control", retried.type(), "a backpressured verbose change is retried");
+				assertEquals(false, retried.payload().get("enabled").getAsBoolean(),
+						"the retry publishes the latest server verbose setting");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("verbose control retry verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (secretFile != null) {
+				try {
+					Files.deleteIfExists(secretFile);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove verbose retry secret", exception);
 				}
 			}
 		}
@@ -1312,8 +1352,12 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
-	@SuppressWarnings("unchecked")
 	private static void saturateAgentQueue(MultiplexedServerBridge bridge, AgentId agentId) {
+		setQueuedCount(bridge, agentId.toString(), MultiplexedServerBridge.AGENT_QUEUE_CAP);
+	}
+
+	@SuppressWarnings("unchecked")
+	private static void setQueuedCount(MultiplexedServerBridge bridge, String agentId, int count) {
 		try {
 			Field sessionField = MultiplexedServerBridge.class.getDeclaredField("session");
 			sessionField.setAccessible(true);
@@ -1322,10 +1366,11 @@ public final class MultiplexedServerBridgeVerification {
 			queuedField.setAccessible(true);
 			synchronized (session) {
 				Map<String, Integer> queued = (Map<String, Integer>) queuedField.get(session);
-				queued.put(agentId.toString(), MultiplexedServerBridge.AGENT_QUEUE_CAP);
+				if (count == 0) queued.remove(agentId);
+				else queued.put(agentId, count);
 			}
 		} catch (ReflectiveOperationException exception) {
-			throw new AssertionError("could not saturate the agent publication queue", exception);
+			throw new AssertionError("could not set the agent publication queue count", exception);
 		}
 	}
 

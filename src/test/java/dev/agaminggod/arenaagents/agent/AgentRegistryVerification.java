@@ -416,13 +416,22 @@ public final class AgentRegistryVerification {
 		assertEquals(AgentLifecycleState.PAUSED, pausedRespawn.after().state(), "respawn preserves an explicit user pause");
 		assertTrue(!pausedRespawn.after().acceptsRevision(pausedRespawn.after().goalRevision()), "paused respawn does not accept coordinator work");
 
+		AgentRecord disconnected = AgentLifecycleReducer.disconnect(active, START_TIME + 4L).after();
+		AgentRecord disconnectedDead = AgentLifecycleReducer.die(disconnected, death, START_TIME + 5L).after();
+		assertTrue(disconnectedDead.resumeAfterRespawn(), "death while disconnected retains automatic continuation intent");
+		AgentTransition disconnectedRespawn = AgentLifecycleReducer.respawn(disconnectedDead, UUID.randomUUID(), START_TIME + 6L);
+		assertEquals(AgentLifecycleState.STARTING, disconnectedRespawn.after().state(),
+				"respawn restarts a goal interrupted while the coordinator was disconnected");
+		assertEquals(disconnected.goalRevision(), disconnectedRespawn.after().goalRevision(),
+				"disconnected respawn preserves the unfinished goal revision");
+
 		String legacyWithoutContinuationIntent = encoded.replaceFirst(",\\\"resume_after_respawn\\\":true", "");
 		AgentRecord legacyDead = codec.decode(legacyWithoutContinuationIntent).records().getFirst();
 		assertTrue(!legacyDead.resumeAfterRespawn(), "legacy dead records fail safe without continuation intent");
 		assertEquals(AgentLifecycleState.PAUSED,
 				AgentLifecycleReducer.respawn(legacyDead, UUID.randomUUID(), START_TIME + 7L).after().state(),
 				"legacy dead records remain paused after respawn");
-		return 25;
+		return 28;
 	}
 
 	private static void expectFailure(Runnable operation, String expectedCode) {

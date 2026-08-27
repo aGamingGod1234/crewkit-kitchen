@@ -69,7 +69,9 @@ public record AgentRecord(
 	public AgentRecord withLifecycle(AgentLifecycleState revisedState, Optional<AgentGoal> revisedGoal, long revisedRevision, List<AgentGoal> revisedQueue, long nowEpochMs, String revisedError) {
 		Optional<AgentDeathSnapshot> snapshot = revisedState == AgentLifecycleState.DEAD ? deathSnapshot : Optional.empty();
 		boolean continueAfterRespawn = revisedState == AgentLifecycleState.DEAD
-				&& (state == AgentLifecycleState.DEAD ? resumeAfterRespawn : state.isActive());
+				&& (state == AgentLifecycleState.DEAD
+						? resumeAfterRespawn
+						: state.isActive() || state == AgentLifecycleState.DISCONNECTED);
 		return copy(revisedState, continueAfterRespawn, revisedGoal, revisedRevision, revisedQueue, entityUuid, entityLocation, lastSummary, inventorySnapshot, automaticProgress, respawnPolicy, snapshot, nowEpochMs, revisedError);
 	}
 
