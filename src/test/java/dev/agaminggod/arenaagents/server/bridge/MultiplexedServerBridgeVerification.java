@@ -129,7 +129,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 145;
+		return 147;
 	}
 
 	private static void verifyGoalSpecProposalLifecycle() {
@@ -801,6 +801,14 @@ public final class MultiplexedServerBridgeVerification {
 			long pausedRevision = paused.goalRevision();
 
 			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			ProgramActionLedger programActions = programActions(bridge);
+			JsonObject replayArguments = new JsonObject();
+			replayArguments.addProperty("durationMs", 25L);
+			ServerActionRequest replayProtected = new ServerActionRequest(
+					disconnected.agentId(), disconnectedRevision, "action-before-reconnect", ActionType.WAIT, replayArguments,
+					new ActionProvenance("codex", "gpt-5.6-sol", "high", "priority", "program-before-reconnect", 1L, "step-1", 1L)
+			);
+			programActions.accept(replayProtected);
 			savedData(manager).setRuntimeHooks(bridge);
 			bridge.start();
 			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
@@ -816,6 +824,7 @@ public final class MultiplexedServerBridgeVerification {
 				assertEquals("hello_ack", helloAck.type(), "reconnect fixture authenticates the bridge");
 				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
 						"reconnect fixture consumes verbose control");
+				assertThrowsCode(() -> programActions.accept(replayProtected), "ACTION_REPLAY");
 
 				JsonObject reconnectReady = new JsonObject();
 				reconnectReady.addProperty("goalRevision", disconnectedRevision);
@@ -1601,6 +1610,16 @@ public final class MultiplexedServerBridgeVerification {
 			return (AgentSavedData) field.get(manager);
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not read manager SavedData", exception);
+		}
+	}
+
+	private static ProgramActionLedger programActions(MultiplexedServerBridge bridge) {
+		try {
+			Field field = MultiplexedServerBridge.class.getDeclaredField("programActions");
+			field.setAccessible(true);
+			return (ProgramActionLedger) field.get(bridge);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not read bridge program action ledger", exception);
 		}
 	}
 

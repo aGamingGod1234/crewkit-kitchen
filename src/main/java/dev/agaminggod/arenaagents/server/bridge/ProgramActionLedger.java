@@ -9,25 +9,38 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Bounded, bridge-lifetime binding between a model program step and its action ID. */
+/** Bounded action diagnostics backed by a full replay fence for each active goal. */
 final class ProgramActionLedger {
 	private static final int MAX_TRACKED_ACTIONS_PER_AGENT = 4_096;
 	private final Map<AgentId, LinkedHashMap<String, ActionProvenance>> accepted = new HashMap<>();
 	private final Map<AgentId, LinkedHashMap<String, ActionProvenance>> terminal = new HashMap<>();
 	private final Map<AgentId, LinkedHashMap<ActionProvenance, String>> actionIdsByProgramStep = new HashMap<>();
+	private final Map<AgentId, GoalExecutionFence> executionFences = new HashMap<>();
+
+	synchronized void beginGoal(AgentId agentId, long goalRevision) {
+		GoalExecutionFence current = executionFences.get(agentId);
+		if (current != null && current.goalRevision() == goalRevision) return;
+		executionFences.put(agentId, new GoalExecutionFence(goalRevision, new HashMap<>(), new HashMap<>()));
+		accepted.remove(agentId);
+		terminal.remove(agentId);
+		actionIdsByProgramStep.remove(agentId);
+	}
 
 	synchronized void accept(ServerActionRequest request) {
-		ActionProvenance prior = lookup(accepted, request.agentId(), request.actionId());
-		if (prior == null) prior = lookup(terminal, request.agentId(), request.actionId());
+		beginGoal(request.agentId(), request.goalRevision());
+		GoalExecutionFence fence = executionFences.get(request.agentId());
+		ActionProvenance prior = fence.provenanceByActionId().get(request.actionId());
 		if (prior != null) {
 			if (!prior.equals(request.provenance())) {
 				throw new AgentDomainException("ACTION_PROVENANCE_MISMATCH", "Action ID is already bound to a different program step");
 			}
 			throw new AgentDomainException("ACTION_REPLAY", "Action ID has already been accepted");
 		}
-		LinkedHashMap<ActionProvenance, String> actionIds = actionIdsByProgramStep.computeIfAbsent(request.agentId(), ignored -> new LinkedHashMap<>());
-		String priorActionId = actionIds.get(request.provenance());
+		String priorActionId = fence.actionIdByProgramStep().get(request.provenance());
 		if (priorActionId != null) throw new AgentDomainException("ACTION_REPLAY", "Program step is already bound to action ID " + priorActionId);
+		fence.provenanceByActionId().put(request.actionId(), request.provenance());
+		fence.actionIdByProgramStep().put(request.provenance(), request.actionId());
+		LinkedHashMap<ActionProvenance, String> actionIds = actionIdsByProgramStep.computeIfAbsent(request.agentId(), ignored -> new LinkedHashMap<>());
 		actionIds.put(request.provenance(), request.actionId());
 		trim(actionIds);
 		LinkedHashMap<String, ActionProvenance> entries = accepted.computeIfAbsent(request.agentId(), ignored -> new LinkedHashMap<>());
@@ -36,6 +49,8 @@ final class ProgramActionLedger {
 	}
 
 	synchronized void terminal(ServerActionResult result) {
+		GoalExecutionFence fence = executionFences.get(result.agentId());
+		if (fence == null || fence.goalRevision() != result.goalRevision()) return;
 		LinkedHashMap<String, ActionProvenance> entries = accepted.get(result.agentId());
 		if (entries == null) return;
 		ActionProvenance provenance = entries.remove(result.actionId());
@@ -49,14 +64,16 @@ final class ProgramActionLedger {
 		accepted.remove(agentId);
 		terminal.remove(agentId);
 		actionIdsByProgramStep.remove(agentId);
-	}
-
-	private static ActionProvenance lookup(Map<AgentId, LinkedHashMap<String, ActionProvenance>> entries, AgentId agentId, String actionId) {
-		LinkedHashMap<String, ActionProvenance> perAgent = entries.get(agentId);
-		return perAgent == null ? null : perAgent.get(actionId);
+		executionFences.remove(agentId);
 	}
 
 	private static void trim(LinkedHashMap<?, ?> entries) {
 		while (entries.size() > MAX_TRACKED_ACTIONS_PER_AGENT) entries.remove(entries.keySet().iterator().next());
 	}
+
+	private record GoalExecutionFence(
+			long goalRevision,
+			Map<String, ActionProvenance> provenanceByActionId,
+			Map<ActionProvenance, String> actionIdByProgramStep
+	) { }
 }

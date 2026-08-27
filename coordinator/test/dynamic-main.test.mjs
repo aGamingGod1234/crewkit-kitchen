@@ -21,8 +21,8 @@ class FakeBridge extends EventEmitter {
 	sent = [];
 	start() { this.ready = true; }
 	stop() { this.ready = false; }
-	async send(type, agentId, payload) {
-		this.sent.push({ type, agentId, payload });
+	async send(type, agentId, payload, options = {}) {
+		this.sent.push({ type, agentId, payload, connectionEpoch: options.connectionEpoch });
 		if (type === 'goal_completed') {
 			queueMicrotask(() => this.emit('goal_completion_result', {
 				agentId,
@@ -47,8 +47,8 @@ class FakeBridge extends EventEmitter {
 }
 
 class DeferredCompletionBridge extends FakeBridge {
-	async send(type, agentId, payload) {
-		this.sent.push({ type, agentId, payload });
+	async send(type, agentId, payload, options = {}) {
+		this.sent.push({ type, agentId, payload, connectionEpoch: options.connectionEpoch });
 	}
 }
 
@@ -1972,6 +1972,121 @@ test('a transient reconciliation timeout cannot poison later agent lifecycle tra
 	}
 });
 
+test('a replacement connection discards the old reconciliation completion and its publications', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const reconciliations = [];
+	planner.beginReconcile = (records, options) => {
+		const reconciledRegistry = registry.reconcile(records, options);
+		let resolve;
+		const complete = new Promise((release) => { resolve = release; });
+		reconciliations.push({
+			resolve: () => resolve({
+				registry: reconciledRegistry,
+				providers: {
+					valid: reconciledRegistry.records,
+					invalid: [],
+					catalog: { refreshedAtEpochMs: reconciliations.length, models: [{ id: `epoch-${reconciliations.length}` }] },
+				},
+			}),
+		});
+		return { registry: reconciledRegistry, complete };
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, registry, planner, codexService: new FakeProvider() },
+	);
+	await coordinator.start();
+	try {
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'test', registry: [record()] });
+		await eventually(() => reconciliations.length === 1);
+		bridge.emit('disconnected', { connectionEpoch: 1 });
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'test', registry: [record()] });
+		for (let index = 0; index < 2; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(reconciliations.length, 1, 'a disconnected epoch cannot authenticate again');
+		bridge.emit('ready', { connectionEpoch: 2, serverInstanceId: 'test', registry: [record()] });
+		await eventually(() => reconciliations.length === 2);
+		reconciliations[1].resolve();
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.connectionEpoch === 2));
+		const currentPublications = bridge.sent.length;
+
+		reconciliations[0].resolve();
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(bridge.sent.length, currentPublications);
+		assert.equal(bridge.sent.some((message) => message.payload?.models?.some(({ id }) => id === 'epoch-1')), false);
+	} finally {
+		for (const reconciliation of reconciliations) reconciliation.resolve();
+		await coordinator.stop();
+	}
+});
+
+test('late provider completion from an older connection cannot install an action in the replacement session', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let releasePlan;
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		await new Promise((resolve) => { releasePlan = resolve; });
+		return withCompletionContract({ summary: 'Wait.', directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, registry, planner, codexService: new FakeProvider() },
+	);
+	await coordinator.start();
+	try {
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'test', registry: [record()] });
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready'));
+		bridge.emit('goal_control', { connectionEpoch: 1, agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		bridge.emit('observation', { connectionEpoch: 1, agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => planner.requests.length === 1);
+		bridge.emit('ready', {
+			connectionEpoch: 2,
+			serverInstanceId: 'test',
+			registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Wait.', goalRevision: 1 }],
+		});
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.connectionEpoch === 2));
+		releasePlan();
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(bridge.sent.some((message) => message.type === 'action_command'), false);
+	} finally {
+		releasePlan?.();
+		await coordinator.stop();
+	}
+});
+
+test('late action completion from an older connection cannot advance the live program', async () => {
+	const run = await start();
+	try {
+		run.bridge.emit('goal_control', { connectionEpoch: 1, agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
+		run.bridge.emit('observation', { connectionEpoch: 1, agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command'));
+		const command = run.bridge.sent.find((message) => message.type === 'action_command');
+		run.bridge.emit('ready', {
+			connectionEpoch: 2,
+			serverInstanceId: 'test',
+			registry: [{ ...record(), state: DynamicAgentState.ACTING, currentGoal: 'Wait.', goalRevision: 1 }],
+		});
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_ready' && message.connectionEpoch === 2));
+		const observationsBefore = run.bridge.sent.filter((message) => message.type === 'request_observation').length;
+		run.bridge.emit('action_result', { connectionEpoch: 1, agentId: 'agent-a', payload: {
+			goalRevision: 1, actionId: command.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE',
+		} });
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'request_observation').length, observationsBefore);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('does not submit a duplicate initial plan while the agent already has a scheduled turn', async () => {
 	let release;
 	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });
@@ -2539,19 +2654,20 @@ test('reconciliation reissues one dead-state turn to the selected session and pr
 	await coordinator.start();
 	try {
 		const dead = { ...record(), state: DynamicAgentState.DEAD, currentGoal: 'Survive.', goalRevision: 4, death: DEATH };
-		bridge.emit('ready', { serverInstanceId: 'first', registry: [dead] });
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'first', registry: [dead] });
 		await eventually(() => bridge.sent.some((message) => message.payload?.actionType === 'respawn'));
 		assert.equal(planner.requests.length, 1);
 		assert.equal(planner.requests[0].preserveState, true);
 		assert.match(planner.requests[0].input, /fell from a high place/);
 		assert.equal(bridge.sent.find((message) => message.payload?.actionType === 'respawn').payload.provenance.model, 'gpt-5.6-sol');
-		bridge.emit('ready', { serverInstanceId: 'first', registry: [dead] });
-		await eventually(() => bridge.sent.filter((message) => message.type === 'agent_ready').length >= 2);
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'first', registry: [dead] });
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(bridge.sent.filter((message) => message.type === 'agent_ready').length, 1);
 		assert.equal(planner.requests.length, 1, 'duplicate reconciliation does not create a second dead turn');
-		bridge.emit('disconnected');
+		bridge.emit('disconnected', { connectionEpoch: 1 });
 		await eventually(() => planner.interruptions.includes('agent-a'));
 		assert.equal(registry.get('agent-a').state, DynamicAgentState.DEAD, 'transport loss cannot erase persisted DEAD state');
-		bridge.emit('ready', { serverInstanceId: 'first', registry: [dead] });
+		bridge.emit('ready', { connectionEpoch: 2, serverInstanceId: 'first', registry: [dead] });
 		await eventually(() => planner.requests.length === 2);
 		assert.equal(planner.requests.length, 2, 'reconnect reissues exactly one replacement dead turn');
 	} finally { await coordinator.stop(); }

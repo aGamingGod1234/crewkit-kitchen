@@ -389,6 +389,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	@Override
 	public boolean onCreated(AgentRecord record) {
 		registryPublicationRevision.incrementAndGet();
+		programActions.beginGoal(record.agentId(), record.goalRevision());
 		synchronized (publicationLock) {
 			if (protocolKnownAgentIds.contains(record.agentId())) return true;
 			Session active = session;
@@ -405,6 +406,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	@Override
 	public void onTransition(AgentTransition transition) {
 		registryPublicationRevision.incrementAndGet();
+		programActions.beginGoal(transition.after().agentId(), transition.after().goalRevision());
 		ScenarioRuntimeService.onAgentState(
 				manager.server(),
 				transition.after().agentId().toString(),
@@ -606,6 +608,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					}
 				}
 				try {
+					for (AgentRecord record : visibleRecords) programActions.beginGoal(record.agentId(), record.goalRevision());
 					source.completeHandshake(handshake);
 					coordinatorLifecycleGeneration++;
 					markVerboseControlPublished(verboseControl);

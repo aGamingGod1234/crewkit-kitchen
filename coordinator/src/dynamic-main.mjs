@@ -85,6 +85,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#attentionFlushes = new Map();
 	#lifecycleGenerations = new Map();
 	#providerRetryAfter = new Map();
+	#programRuntimeEpochs = new Map();
+	#nativeRuntimeEpochs = new Map();
 	#verboseReporters = new Set();
 	#factLedgers = new Map();
 	#conversationMemories = new Map();
@@ -112,6 +114,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#clearStatusInterval;
 	#statusHandle = null;
 	#serverInstanceId = null;
+	#connectionEpoch = 0;
+	#connected = false;
 	#traceWriter;
 	#providerTurnRecorder;
 	#verboseEnabled = false;
@@ -136,12 +140,18 @@ export class DynamicCoordinator extends EventEmitter {
 		if (typeof epochNow !== 'function') throw new TypeError('epochNow must be a function');
 		this.#controlNow = controlNow;
 		this.#epochNow = epochNow;
+		const programBridge = {
+			send: (type, agentId, payload) => this.#sendRuntimeMessage('program', type, agentId, payload),
+		};
+		const nativeBridge = {
+			send: (type, agentId, payload) => this.#sendRuntimeMessage('native', type, agentId, payload),
+		};
 		this.#programRuntime = new ProgramRuntimeManager({
 			registry: this.#registry,
-			bridge: this.#bridge,
+			bridge: programBridge,
 			planner: this.#planner,
-			reportError: (agentId, error) => this.#reportAgentError(agentId, error),
-			onCompletionRequested: (request) => this.#publishGoalCompleted(request),
+			reportError: (agentId, error) => this.#reportAgentError(agentId, error, this.#programRuntimeEpochs.get(agentId)),
+			onCompletionRequested: (request) => this.#publishGoalCompleted(request, this.#programRuntimeEpochs.get(request.record.agentId)),
 			latencyRegistry: this.#latencyRegistry,
 			trace: (event, fields) => this.#writeTrace(event, fields),
 			plannerContext: (agentId) => this.#plannerContext(agentId),
@@ -149,10 +159,11 @@ export class DynamicCoordinator extends EventEmitter {
 			benchmarkRecorder,
 		});
 		this.#nativeRuntime = new NativeToolRuntime({
-			bridge: this.#bridge,
+			bridge: nativeBridge,
 			trace: (event, fields) => this.#writeTrace(event, fields),
 			onFinish: async ({ record, result, lifecycleGeneration }) => {
-				if (this.#stopping || this.#closed) return;
+				const connectionEpoch = this.#nativeRuntimeEpochs.get(record.agentId);
+				if (this.#stopping || this.#closed || !this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				const current = this.#registry.get(record.agentId);
 				if (current === null || current.goalRevision !== record.goalRevision
 					|| !this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return;
@@ -173,6 +184,8 @@ export class DynamicCoordinator extends EventEmitter {
 
 	handleLeaseExpired({ key, lease }) {
 		if (this.#stopping || this.#closed || !this.#isLifecycleGenerationCurrent(key.agentId, key.lifecycleGeneration)) return;
+		const connectionEpoch = this.#connectionEpoch;
+		if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 		const record = this.#registry.get(key.agentId);
 		if (record === null || record.goalRevision !== key.goalRevision) return;
 		this.#writeTrace('work_lease_expired', { ...key, kind: lease.kind, operationId: lease.operationId });
@@ -187,14 +200,14 @@ export class DynamicCoordinator extends EventEmitter {
 			}
 			try {
 				void Promise.resolve(this.#planner.interrupt(key.agentId, 'Provider work lease expired'))
-					.catch((error) => this.#reportAgentError(key.agentId, error));
+					.catch((error) => this.#reportAgentError(key.agentId, error, connectionEpoch));
 			} catch (error) {
-				void this.#reportAgentError(key.agentId, error);
+				void this.#reportAgentError(key.agentId, error, connectionEpoch);
 			}
 		}
 		if (['provider', 'action', 'completion'].includes(lease.kind)) {
 			void this.#nativeRuntime.dispose(key.agentId, `${lease.kind}_lease_expired`)
-				.catch((error) => this.#reportAgentError(key.agentId, error));
+				.catch((error) => this.#reportAgentError(key.agentId, error, connectionEpoch));
 		}
 	}
 
@@ -215,7 +228,10 @@ export class DynamicCoordinator extends EventEmitter {
 		try {
 			this.#bindBridge();
 			this.#bridge.start();
-			this.#statusHandle = this.#setStatusInterval(() => this.#run(() => this.#publishStatus()), 1_000);
+			this.#statusHandle = this.#setStatusInterval(() => {
+				const connectionEpoch = this.#connectionEpoch;
+				this.#run(() => this.#publishStatus(connectionEpoch), connectionEpoch);
+			}, 1_000);
 			this.#started = true;
 		} catch (error) {
 			if (this.#statusHandle !== null) this.#clearStatusInterval(this.#statusHandle);
@@ -230,6 +246,7 @@ export class DynamicCoordinator extends EventEmitter {
 	async stop() {
 		if (this.#stopping || this.#closed) return;
 		this.#stopping = true;
+		this.#connected = false;
 		this.#setVerboseEnabled(false);
 		if (this.#statusHandle !== null) this.#clearStatusInterval(this.#statusHandle);
 		this.#statusHandle = null;
@@ -246,6 +263,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#programRuntime.disposeAll();
 		await this.#nativeRuntime.disposeAll();
 		this.#providerRetryAfter.clear();
+		this.#programRuntimeEpochs.clear();
+		this.#nativeRuntimeEpochs.clear();
 		this.#factLedgers.clear();
 		this.#conversationMemories.clear();
 		this.#contextCursors.clear();
@@ -260,68 +279,81 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#bindBridge() {
-		this.#listen('ready', ({ serverInstanceId, registry }) => {
+		this.#listen('ready', (connection) => {
+			const connectionEpoch = this.#acceptReadyEpoch(connection);
+			if (connectionEpoch === null) return;
+			const { serverInstanceId, registry } = connection;
 			this.#setVerboseEnabled(false);
 			if (this.#serverInstanceId !== null && serverInstanceId !== this.#serverInstanceId) {
-				this.#invalidateServerInstance();
+				this.#invalidateServerInstance(connectionEpoch);
 			}
 			this.#serverInstanceId = serverInstanceId;
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
 			const startedReconciliation = this.#planner.beginReconcile(registry, { recovery: true });
 			const reconciliation = Promise.resolve().then(async () => {
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 			if (typeof this.#codexService.bootstrapCatalog === 'function') {
-				await this.#publishCatalog(await this.#codexService.bootstrapCatalog());
+				const catalog = await this.#codexService.bootstrapCatalog();
+				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+				await this.#publishCatalog(catalog, connectionEpoch);
 			}
 			const reconciliation = await startedReconciliation.complete;
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 			const providers = reconciliation.providers ?? reconciliation.codex;
-			await this.#publishCatalog(providers.catalog);
+			await this.#publishCatalog(providers.catalog, connectionEpoch);
 			for (const profile of providers.valid) {
+				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 				let record = this.#registry.get(profile.agentId);
 				if (record === null) throw new ProtocolV2Error('UNKNOWN_AGENT', `Reconciled provider profile references unknown agent '${profile.agentId}'`);
 				if (this.#usesNativeTools(record) && record.state === DynamicAgentState.STARTING && record.currentGoal !== null) {
 					this.#goalSupervisor.activate(this.#supervisionKey(record));
 				}
-				await this.#bridge.send('agent_ready', profile.agentId, { goalRevision: record.goalRevision, reconciled: true });
+				await this.#sendForEpoch(connectionEpoch, 'agent_ready', profile.agentId, { goalRevision: record.goalRevision, reconciled: true });
 				this.#supportedAgentIds.add(profile.agentId);
-				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent reconciled and ready.');
+				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent reconciled and ready.', connectionEpoch);
 				this.#prewarmNativeAgent(record);
-				if (record.state === DynamicAgentState.DEAD) await this.#installDeadStatePlan(record, record.death);
+				if (record.state === DynamicAgentState.DEAD) await this.#installDeadStatePlan(record, record.death, connectionEpoch);
 			}
 			for (const invalid of providers.invalid) {
+				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 				const agentId = invalid.agentId ?? invalid.profile?.agentId;
-				await this.#bridge.send('agent_error', agentId, { goalRevision: this.#registry.get(agentId)?.goalRevision ?? 0, code: invalid.code, message: invalid.message });
+				await this.#sendForEpoch(connectionEpoch, 'agent_error', agentId, { goalRevision: this.#registry.get(agentId)?.goalRevision ?? 0, code: invalid.code, message: invalid.message });
 			}
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 			this.#reconciledStatus = true;
 			if (this.#disconnectedAt !== null) this.#disconnectedAt = null;
-			await this.#publishStatus();
+			await this.#publishStatus(connectionEpoch);
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 			this.emit('reconciled', reconciliation);
+			return reconciliation;
 			});
 			this.#reconciliation = reconciliation.catch((error) => {
-				this.#emitRuntimeError(error);
+				if (this.#isConnectionEpochCurrent(connectionEpoch)) this.#emitRuntimeError(error);
 				return null;
 			});
-		});
+		}, { lifecycle: true });
 		this.#listen('verbose_control', (message) => {
 			this.#setVerboseEnabled(message.payload.enabled);
 		});
-		this.#listen('catalog_request', () => this.#run(async () => {
+		this.#listen('catalog_request', (_message, connectionEpoch) => this.#run(async () => {
 			await this.#reconciliation;
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 			const catalog = await this.#codexService.catalog.refresh({ force: true });
-			await this.#publishCatalog(catalog);
-		}));
-		this.#listen('agent_registered', (message) => this.#enqueueAgent(message.agentId, async () => {
+			await this.#publishCatalog(catalog, connectionEpoch);
+		}, connectionEpoch));
+		this.#listen('agent_registered', (message, connectionEpoch) => this.#enqueueAgent(message.agentId, async () => {
 			const record = this.#registry.register(message.payload.record === undefined
 				? { ...message.payload, agentId: message.agentId }
 				: { ...message.payload.record, agentId: message.agentId });
 			this.#codexService.catalog.assertSupported(record.provider, record.model, record.reasoningEffort, record.serviceTier ?? DEFAULT_SERVICE_TIER);
-			await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision, reconciled: false });
+			await this.#sendForEpoch(connectionEpoch, 'agent_ready', record.agentId, { goalRevision: record.goalRevision, reconciled: false });
 			this.#supportedAgentIds.add(record.agentId);
-			this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent registered and ready.');
+			this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent registered and ready.', connectionEpoch);
 			this.#prewarmNativeAgent(record);
-			await this.#publishStatus();
-		}));
-		this.#listen('agent_removed', (message) => this.#run(async () => {
+			await this.#publishStatus(connectionEpoch);
+		}, { connectionEpoch }));
+		this.#listen('agent_removed', (message, connectionEpoch) => this.#run(async () => {
 			await this.#reconciliation;
 			this.#publishVerbose(message.agentId, message.payload.goalRevision, 'lifecycle', 'Agent removed from the coordinator roster.');
 			const current = this.#registry.get(message.agentId);
@@ -329,6 +361,8 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#programRuntime.dispose(message.agentId);
 			await this.#nativeRuntime.dispose(message.agentId, 'agent_removed');
 			this.#providerWork.delete(message.agentId);
+			this.#programRuntimeEpochs.delete(message.agentId);
+			this.#nativeRuntimeEpochs.delete(message.agentId);
 			this.#pendingAttention.delete(message.agentId);
 			this.#attentionFlushes.delete(message.agentId);
 			await this.#planner.remove(message.agentId);
@@ -340,9 +374,9 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#forgetConversationWakes(message.agentId);
 			this.#cancelGoalSpecRequests(message.agentId);
 			this.#supportedAgentIds.delete(message.agentId);
-			await this.#publishStatus();
-		}));
-		this.#listen('goal_spec_request', (message) => {
+			await this.#publishStatus(connectionEpoch);
+		}, connectionEpoch));
+		this.#listen('goal_spec_request', (message, connectionEpoch) => {
 			const key = this.#goalSpecRequestKey(message.agentId, message.payload.requestId);
 			const fingerprint = JSON.stringify(message.payload);
 			const existing = this.#goalSpecRequests.get(key);
@@ -352,16 +386,16 @@ export class DynamicCoordinator extends EventEmitter {
 					return;
 				}
 				if (existing.proposal !== null) {
-					void this.#bridge.send('goal_spec_proposal', message.agentId, existing.proposal).catch((error) => this.#emitRuntimeError(error));
+					void this.#sendForEpoch(connectionEpoch, 'goal_spec_proposal', message.agentId, existing.proposal).catch((error) => this.#emitRuntimeError(error));
 				}
 				return;
 			}
 			const entry = {
 				agentId: message.agentId, requestId: message.payload.requestId, request: message.payload,
-				fingerprint, proposal: null, attempts: 0, translating: false, retryHandle: null,
+				fingerprint, proposal: null, attempts: 0, translating: false, retryHandle: null, connectionEpoch,
 			};
 			this.#goalSpecRequests.set(key, entry);
-			this.#run(() => this.#processGoalSpecRequest(key, entry));
+			this.#run(() => this.#processGoalSpecRequest(key, entry), connectionEpoch);
 		});
 		this.#listen('goal_spec_result', (message) => {
 			const key = this.#goalSpecRequestKey(message.agentId, message.payload.requestId);
@@ -371,13 +405,13 @@ export class DynamicCoordinator extends EventEmitter {
 			if (existing.retryHandle !== null) this.#clearGoalSpecTimeout(existing.retryHandle);
 			this.#planner.cancelGoalSpec?.(message.agentId, message.payload.requestId);
 		});
-		this.#listen('goal_control', (message) => {
+		this.#listen('goal_control', (message, connectionEpoch) => {
 			const previous = this.#registry.get(message.agentId);
 			let record;
 			try {
 				record = this.#registry.applyGoalControl(message.agentId, message.payload);
 			} catch (error) {
-				void this.#reportAgentError(message.agentId, error);
+				void this.#reportAgentError(message.agentId, error, connectionEpoch);
 				return;
 			}
 			const lifecycleChanged = previous !== null && message.payload.operation !== 'queue'
@@ -388,7 +422,7 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#cancelGoalSpecRequests(message.agentId);
 				this.#retireGoalSupervision(previous, message.payload.operation);
 				this.#invalidateAcceptedLifecycle(message.agentId);
-				this.#beginGoalControlInterruption(message);
+				this.#beginGoalControlInterruption(message, connectionEpoch);
 				this.#programRuntime.onGoalControl(previous, message.payload.operation);
 				nativeDisposal = Promise.resolve(this.#nativeRuntime.dispose(previous.agentId, `goal_${message.payload.operation}`));
 			}
@@ -397,16 +431,17 @@ export class DynamicCoordinator extends EventEmitter {
 				await nativeDisposal;
 				const acceptedStillCurrent = () => {
 					const current = this.#registry.get(message.agentId);
-					return current !== null && current.goalRevision === record.goalRevision
+					return this.#isConnectionEpochCurrent(connectionEpoch)
+						&& current !== null && current.goalRevision === record.goalRevision
 						&& this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration);
 				};
 				if (!acceptedStillCurrent()) return;
-				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', `Goal lifecycle operation '${message.payload.operation}' accepted.`);
+				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', `Goal lifecycle operation '${message.payload.operation}' accepted.`, connectionEpoch);
 				if (message.payload.operation !== 'queue') {
 					this.#providerRetryAfter.delete(message.agentId);
 				}
 				if (message.payload.operation === 'dead') {
-					void this.#installDeadStatePlan(record, message.payload.death).catch((error) => this.#reportAgentError(record.agentId, error));
+					void this.#installDeadStatePlan(record, message.payload.death, connectionEpoch).catch((error) => this.#reportAgentError(record.agentId, error, connectionEpoch));
 				}
 				const resumesGoal = ['start', 'resume', 'steer'].includes(message.payload.operation)
 					|| message.payload.operation === 'respawn' && record.state === DynamicAgentState.STARTING;
@@ -421,15 +456,15 @@ export class DynamicCoordinator extends EventEmitter {
 					});
 				}
 				if (resumesGoal) {
-					await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
+					await this.#sendForEpoch(connectionEpoch, 'agent_ready', record.agentId, { goalRevision: record.goalRevision });
 				}
 				if (!acceptedStillCurrent()) return;
 				this.emit('goalControl', record);
 			});
 		});
-		this.#listen('conversation_event', (message) => {
+		this.#listen('conversation_event', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
-				this.#publishVerbose(message.agentId, message.payload.goalRevision, 'conversation', `Conversation event '${message.payload.kind}' received from '${message.payload.sourceId}'.`);
+				this.#publishVerbose(message.agentId, message.payload.goalRevision, 'conversation', `Conversation event '${message.payload.kind}' received from '${message.payload.sourceId}'.`, connectionEpoch);
 				this.#conversationMemory(message.agentId).ingest(message.payload);
 				const record = this.#registry.get(message.agentId);
 				if (record !== null) {
@@ -438,11 +473,11 @@ export class DynamicCoordinator extends EventEmitter {
 					else this.#schedulePendingAttentionFlush(record);
 				}
 				this.emit('conversationEvent', message);
-			}, { waitForReconciliation: false });
+			}, { waitForReconciliation: false, connectionEpoch });
 		});
-		this.#listen('conversation_wake', (message) => {
+		this.#listen('conversation_wake', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
-				this.#publishVerbose(message.agentId, message.payload.event.goalRevision, 'conversation', `Conversation wake '${message.payload.event.kind}' received.`);
+				this.#publishVerbose(message.agentId, message.payload.event.goalRevision, 'conversation', `Conversation wake '${message.payload.event.kind}' received.`, connectionEpoch);
 				const fingerprint = JSON.stringify({ agentId: message.agentId, event: message.payload.event, control: message.payload.control });
 				const existing = this.#conversationWakeTransactions.get(message.payload.transactionId);
 				if (existing !== undefined) {
@@ -455,11 +490,11 @@ export class DynamicCoordinator extends EventEmitter {
 					this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation_wake' });
 					if (this.#usesNativeTools(record)) this.#scheduleNativeConversation(record, message.payload.event, 'conversation_wake');
 					else this.#schedulePendingAttentionFlush(record);
-					await this.#bridge.send('conversation_wake_ack', message.agentId, {
+					await this.#sendForEpoch(connectionEpoch, 'conversation_wake_ack', message.agentId, {
 						transactionId: message.payload.transactionId,
 						goalRevision: record.goalRevision,
 					});
-					await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
+					await this.#sendForEpoch(connectionEpoch, 'agent_ready', record.agentId, { goalRevision: record.goalRevision });
 					return;
 				}
 				const previous = this.#registry.get(message.agentId);
@@ -483,25 +518,27 @@ export class DynamicCoordinator extends EventEmitter {
 				if (this.#usesNativeTools(record)) this.#scheduleNativeConversation(record, message.payload.event, 'conversation_wake');
 				else this.#schedulePendingAttentionFlush(record);
 				this.#rememberConversationWake(message.payload.transactionId, message.agentId, fingerprint);
-				await this.#bridge.send('conversation_wake_ack', record.agentId, {
+				await this.#sendForEpoch(connectionEpoch, 'conversation_wake_ack', record.agentId, {
 					transactionId: message.payload.transactionId,
 					goalRevision: record.goalRevision,
 				});
-				await this.#bridge.send('agent_ready', record.agentId, { goalRevision: record.goalRevision });
+				await this.#sendForEpoch(connectionEpoch, 'agent_ready', record.agentId, { goalRevision: record.goalRevision });
 				this.emit('conversationEvent', { ...message, payload: message.payload.event });
 				this.emit('goalControl', record);
-			}, { waitForReconciliation: false });
+			}, { waitForReconciliation: false, connectionEpoch });
 		});
-		this.#listen('observation', (message) => {
+		this.#listen('observation', (message, connectionEpoch) => {
 			const receiptMonotonicMs = safeClockRead(this.#controlNow);
 			const receiptEpochMs = safeClockRead(this.#epochNow);
 			const lifecycleGeneration = this.#lifecycleGeneration(message.agentId);
 			this.#enqueueAgent(message.agentId, async () => {
+				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				if (!this.#isLifecycleGenerationCurrent(message.agentId, lifecycleGeneration)) return;
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 				if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
 				const wireObservation = message.payload.observation ?? message.payload;
 				if (this.#usesNativeTools(record)) {
+					this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 					const supervisionKey = this.#supervisionKey(record, lifecycleGeneration);
 					this.#goalSupervisor.observed(supervisionKey);
 					this.#goalSupervisor.factualProgress(supervisionKey, factualProgressSignature(wireObservation), factualProgressDetails(wireObservation));
@@ -526,6 +563,7 @@ export class DynamicCoordinator extends EventEmitter {
 						priority: attention.priority,
 						trigger: attention.trigger,
 						lifecycleGeneration,
+						connectionEpoch,
 						input: buildNativeEventInput(record, {
 							event: 'observation', trigger: attention.trigger, observation, conversation,
 						}),
@@ -556,6 +594,7 @@ export class DynamicCoordinator extends EventEmitter {
 					preserveState: false,
 					kind: 'initial',
 					lifecycleGeneration,
+					connectionEpoch,
 					input: buildPlannerInput({
 						agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
 						goal: record.currentGoal,
@@ -568,9 +607,9 @@ export class DynamicCoordinator extends EventEmitter {
 						conversationContext: this.#conversationMemory(record.agentId).toPlannerContext(),
 					}),
 				});
-			});
+			}, { connectionEpoch });
 		});
-		this.#listen('action_progress', (message) => {
+		this.#listen('action_progress', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
 				const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
 				const nativeWork = this.#providerWork.get(message.agentId);
@@ -585,9 +624,9 @@ export class DynamicCoordinator extends EventEmitter {
 				if (this.#usesNativeTools(record) && this.#nativeRuntime.isActionResultStale(record, message.payload)) return;
 				if (!this.#programRuntime.onActionProgress(record, message.payload)) throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
 				this.emit('actionProgress', message);
-			});
+			}, { connectionEpoch });
 		});
-		this.#listen('action_result', (message) => {
+		this.#listen('action_result', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
 			const current = this.#registry.get(message.agentId);
 			if (current === null || message.payload.goalRevision !== current.goalRevision) return;
@@ -603,18 +642,21 @@ export class DynamicCoordinator extends EventEmitter {
 				throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
 			}
 			this.emit('actionResult', message);
-			});
+			}, { connectionEpoch });
 		});
-		this.#listen('goal_completion_result', (message) => {
+		this.#listen('goal_completion_result', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
 				const current = this.#registry.get(message.agentId);
 				if (current === null || current.goalRevision !== message.payload.goalRevision) return;
 				if (this.#usesNativeTools(current) && this.#nativeRuntime.onCompletionResult(current, message.payload)) return;
 				const accepted = this.#programRuntime.onCompletionResult(current, message.payload);
 				if (!accepted) throw new ProtocolV2Error('UNEXPECTED_COMPLETION_RESULT', `Agent '${message.agentId}' has no matching completion request`);
-			});
+			}, { connectionEpoch });
 		});
-		this.#listen('disconnected', () => {
+		this.#listen('disconnected', (event) => {
+			const connectionEpoch = this.#eventConnectionEpoch(event);
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
+			this.#connected = false;
 			this.#setVerboseEnabled(false);
 			this.#cancelGoalSpecRequests();
 			for (const record of this.#registry.list()) {
@@ -622,9 +664,12 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#advanceLifecycleGeneration(record.agentId);
 			}
 			this.#run(async () => {
+			if (this.#connectionEpoch !== connectionEpoch) return;
 			this.#disconnectedAt ??= safeClockRead(this.#controlNow);
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
+			this.#programRuntimeEpochs.clear();
+			this.#nativeRuntimeEpochs.clear();
 			this.#programRuntime.disposeAll();
 			void this.#nativeRuntime.disposeAll('bridge_disconnected');
 			this.#pendingAttention.clear();
@@ -637,24 +682,59 @@ export class DynamicCoordinator extends EventEmitter {
 				}
 				await this.#planner.interrupt(record.agentId, 'Minecraft bridge disconnected');
 			}));
-			});
-		});
+			}, connectionEpoch, { requireConnected: false });
+		}, { lifecycle: true });
 		this.#listen('shutdown', () => this.#run(() => this.stop()));
-		this.#listen('protocolError', (error) => this.emit('runtimeError', error));
-		this.#listen('transportError', (error) => this.emit('runtimeError', error));
+		this.#listen('protocolError', (error) => this.emit('runtimeError', error), { lifecycle: true });
+		this.#listen('transportError', (error) => this.emit('runtimeError', error), { lifecycle: true });
 	}
 
-	#listen(event, listener) {
-		this.#bridge.on(event, listener);
-		this.#listeners.push([event, listener]);
+	#listen(event, listener, { lifecycle = false } = {}) {
+		const registered = lifecycle ? listener : (message) => {
+			const connectionEpoch = this.#eventConnectionEpoch(message);
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
+			return listener(message, connectionEpoch);
+		};
+		this.#bridge.on(event, registered);
+		this.#listeners.push([event, registered]);
 	}
 
-	async #installDeadStatePlan(record, death) {
+	#acceptReadyEpoch(connection) {
+		const supplied = connection?.connectionEpoch;
+		let connectionEpoch;
+		if (supplied === undefined) {
+			connectionEpoch = this.#connected && connection?.serverInstanceId === this.#serverInstanceId
+				? this.#connectionEpoch
+				: this.#connectionEpoch + 1;
+		} else if (!Number.isSafeInteger(supplied) || supplied < 1) {
+			this.#emitRuntimeError(new ProtocolV2Error('INVALID_CONNECTION_EPOCH', 'Bridge ready event requires a positive connection epoch'));
+			return null;
+		} else {
+			connectionEpoch = supplied;
+		}
+		if (connectionEpoch <= this.#connectionEpoch) return null;
+		this.#connectionEpoch = connectionEpoch;
+		this.#connected = true;
+		return connectionEpoch;
+	}
+
+	#eventConnectionEpoch(event) {
+		const supplied = event?.connectionEpoch;
+		return Number.isSafeInteger(supplied) && supplied >= 1 ? supplied : this.#connectionEpoch;
+	}
+
+	#isConnectionEpochCurrent(connectionEpoch) {
+		return this.#connected && Number.isSafeInteger(connectionEpoch) && connectionEpoch === this.#connectionEpoch;
+	}
+
+	async #installDeadStatePlan(record, death, connectionEpoch = this.#connectionEpoch) {
+		if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 		if (death === null || death === undefined) throw new ProtocolV2Error('MISSING_FIELD', `DEAD agent '${record.agentId}' requires death facts`);
 		if (record.currentGoal === null) return;
 		if (this.#programRuntime.hasCurrent(record)) return;
 		const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
 		if (this.#usesNativeTools(record)) {
+			this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 			const conversation = this.#conversationMemory(record.agentId).delta(null).entries.slice(-4);
 			const observation = { death: structuredClone(death) };
 			this.#nativeRuntime.updateObservation(record, observation, { eventSequence: 0, conversation });
@@ -667,6 +747,7 @@ export class DynamicCoordinator extends EventEmitter {
 				trigger: 'player_death',
 				preserveState: true,
 				lifecycleGeneration,
+				connectionEpoch,
 				input: buildNativeEventInput(record, { event: 'player_death', trigger: 'player_death', observation, conversation }),
 			});
 		}
@@ -681,6 +762,7 @@ export class DynamicCoordinator extends EventEmitter {
 			preserveState: true,
 			kind: 'death',
 			lifecycleGeneration,
+			connectionEpoch,
 			input: buildPlannerInput({
 				agent: { agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort },
 				goal: record.currentGoal,
@@ -712,6 +794,9 @@ export class DynamicCoordinator extends EventEmitter {
 		const conversationOnly = [DynamicAgentState.IDLE, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED].includes(record.state);
 		if (!conversationOnly && ![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
 		const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
+		const connectionEpoch = this.#connectionEpoch;
+		if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
+		this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 		const conversation = this.#conversationMemory(record.agentId).delta(null).entries.slice(-4);
 		this.#scheduleNativeTurn(record, {
 			agentId: record.agentId,
@@ -719,6 +804,7 @@ export class DynamicCoordinator extends EventEmitter {
 			priority: 'urgent',
 			trigger,
 			lifecycleGeneration,
+			connectionEpoch,
 			preserveState: conversationOnly,
 			conversationOnly,
 			input: buildNativeEventInput(record, {
@@ -732,13 +818,15 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#scheduleNativeTurn(record, request) {
-		if (!this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		if (!this.#isConnectionEpochCurrent(request.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
 		const existing = this.#providerWork.get(record.agentId);
 		if (existing !== undefined) {
 			if (
 				existing.kind === 'native'
 				&& existing.goalRevision === request.goalRevision
 				&& existing.lifecycleGeneration === request.lifecycleGeneration
+				&& existing.connectionEpoch === request.connectionEpoch
 				&& request.priority === 'urgent'
 			) {
 				this.#queueNativeSteer(existing, request);
@@ -753,6 +841,7 @@ export class DynamicCoordinator extends EventEmitter {
 			agentId: record.agentId,
 			goalRevision: record.goalRevision,
 			lifecycleGeneration: request.lifecycleGeneration,
+			connectionEpoch: request.connectionEpoch,
 			kind: 'native',
 			request,
 			pending: null,
@@ -769,15 +858,15 @@ export class DynamicCoordinator extends EventEmitter {
 		try {
 			if (request.preserveState !== true) {
 				if (record.state === DynamicAgentState.STARTING) this.#registry.setState(record.agentId, DynamicAgentState.PLANNING, { goalRevision: record.goalRevision });
-				void this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING })
-					.catch((error) => this.#reportAgentError(record.agentId, error));
+				void this.#sendForEpoch(request.connectionEpoch, 'planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING })
+					.catch((error) => this.#reportAgentError(record.agentId, error, request.connectionEpoch));
 			}
 		} catch (error) {
 			this.#providerWork.delete(record.agentId);
 			this.#goalSupervisor.end(work.supervisionToken);
 			throw error;
 		}
-		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision, { allowPublicAgentMessage: true });
+		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision, { allowPublicAgentMessage: true, connectionEpoch: request.connectionEpoch });
 		work.promise = Promise.resolve()
 			.then(() => this.#planner.requestNativeTurn({
 				agentId: record.agentId,
@@ -842,7 +931,9 @@ export class DynamicCoordinator extends EventEmitter {
 
 	async #executeNativeTool(work, toolRequest) {
 		const record = this.#registry.get(work.agentId);
-		if (work.expired === true || record === null || record.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+		if (work.expired === true || record === null || record.goalRevision !== work.goalRevision
+				|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 			throw Object.assign(new Error('Native tool belongs to an obsolete goal'), { code: 'STALE_PLAN' });
 		}
 		if (work.request.conversationOnly === true
@@ -871,6 +962,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#goalSupervisor.progress(work.supervisionToken);
 			const latest = this.#registry.get(work.agentId);
 			if (!this.#stopping && !this.#closed && executesBody && latest?.goalRevision === work.goalRevision && latest.state === DynamicAgentState.ACTING
+				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
 				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 				this.#registry.setState(latest.agentId, DynamicAgentState.PLANNING, { goalRevision: latest.goalRevision });
 			}
@@ -889,7 +981,9 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#providerRetryAfter.delete(work.agentId);
 		const pending = work.pending;
 		const record = this.#registry.get(work.agentId);
-		if (record !== null && record.goalRevision === work.goalRevision && this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+		if (record !== null && record.goalRevision === work.goalRevision
+				&& this.#isConnectionEpochCurrent(work.connectionEpoch)
+				&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 			this.#writeTrace('native_turn_completed', { agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId, toolCalls: result?.toolCalls ?? 0 });
 		}
 		if (work.request.conversationOnly === true && (result?.toolCalls ?? 0) === 0
@@ -898,7 +992,7 @@ export class DynamicCoordinator extends EventEmitter {
 				...work.request,
 				conversationRetry: true,
 				input: `${work.request.input}\nYour previous turn made no visible reply. Call say exactly once now.`,
-			});
+			}, { connectionEpoch });
 			return result;
 		}
 		const rescheduled = this.#reschedulePendingNativeTurn(pending);
@@ -923,7 +1017,9 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#providerWork.delete(work.agentId);
 		const pending = work.pending;
 		const record = this.#registry.get(work.agentId);
-		const staleLifecycle = record?.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
+		const staleLifecycle = record?.goalRevision !== work.goalRevision
+			|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
+			|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
 		if (staleLifecycle || classification === 'stale' || this.#stopping || this.#closed) {
 			this.#reschedulePendingNativeTurn(pending);
 			return null;
@@ -937,7 +1033,7 @@ export class DynamicCoordinator extends EventEmitter {
 					error: { code: String(error?.code ?? 'NATIVE_TURN_FAILED').slice(0, 128), message: String(error?.message ?? error).slice(0, 2_048) },
 				});
 			}
-			await this.#reportAgentError(work.agentId, error);
+			await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 		} else {
 			this.#goalSupervisor.recover(work.supervisionKey, { errorCode: error?.code ?? 'NATIVE_TURN_FAILED' });
 			this.#reschedulePendingNativeTurn(pending);
@@ -948,7 +1044,9 @@ export class DynamicCoordinator extends EventEmitter {
 	#reschedulePendingNativeTurn(request) {
 		if (request === null || request === undefined || this.#stopping || this.#closed) return false;
 		const record = this.#registry.get(request.agentId);
-		if (record === null || record.goalRevision !== request.goalRevision || !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return false;
+		if (record === null || record.goalRevision !== request.goalRevision
+				|| !this.#isConnectionEpochCurrent(request.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return false;
 		if (!this.#usesNativeTools(record) || ![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING, DynamicAgentState.DEAD].includes(record.state)) return false;
 		this.#scheduleNativeTurn(record, request);
 		return true;
@@ -959,13 +1057,15 @@ export class DynamicCoordinator extends EventEmitter {
 		const record = this.#registry.get(work.agentId);
 		return record !== null
 			&& record.goalRevision === work.goalRevision
+			&& this.#isConnectionEpochCurrent(work.connectionEpoch)
 			&& this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)
 			&& this.#usesNativeTools(record)
 			&& [DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING, DynamicAgentState.DEAD].includes(record.state);
 	}
 
 	#scheduleInitialPlan(record, request) {
-		if (!this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		if (!this.#isConnectionEpochCurrent(request.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
 		const existing = this.#providerWork.get(record.agentId);
 		if (existing !== undefined) {
 			if (existing.goalRevision !== record.goalRevision || existing.lifecycleGeneration !== request.lifecycleGeneration) {
@@ -985,16 +1085,20 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		if (this.#scheduler.hasScheduled(record.agentId)) return;
 		if (request.priority !== 'urgent' && request.receiptMonotonicMs !== null && (this.#providerRetryAfter.get(record.agentId) ?? 0) > request.receiptMonotonicMs) return;
-		void this.#bridge.send('planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING }).catch((error) => this.#reportAgentError(record.agentId, error));
+		void this.#sendForEpoch(request.connectionEpoch, 'planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING })
+			.catch((error) => this.#reportAgentError(record.agentId, error, request.connectionEpoch));
 		void this.#scheduleProviderPlan(record, request, { preserveState: false, kind: 'initial' });
 	}
 
 	#scheduleProviderPlan(record, request, { preserveState = false, kind = 'initial' } = {}) {
 		const lifecycleGeneration = request.lifecycleGeneration ?? this.#lifecycleGeneration(record.agentId);
-		if (!this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return Promise.resolve(null);
+		const connectionEpoch = request.connectionEpoch ?? this.#connectionEpoch;
+		if (!this.#isConnectionEpochCurrent(connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(record.agentId, lifecycleGeneration)) return Promise.resolve(null);
 		const existing = this.#providerWork.get(record.agentId);
 		if (existing !== undefined) {
-			if (existing.goalRevision !== record.goalRevision || existing.lifecycleGeneration !== lifecycleGeneration) {
+			if (existing.goalRevision !== record.goalRevision || existing.lifecycleGeneration !== lifecycleGeneration
+					|| existing.connectionEpoch !== connectionEpoch) {
 				existing.pending = mergePlannerRequest(existing.pending, request);
 				return existing.promise;
 			}
@@ -1005,6 +1109,7 @@ export class DynamicCoordinator extends EventEmitter {
 			agentId: record.agentId,
 			goalRevision: record.goalRevision,
 			lifecycleGeneration,
+			connectionEpoch,
 			kind,
 			preserveState,
 			request,
@@ -1014,7 +1119,7 @@ export class DynamicCoordinator extends EventEmitter {
 			promise: null,
 		};
 		this.#providerWork.set(record.agentId, work);
-		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision);
+		const verboseReporter = this.#verboseReporter(record.agentId, record.goalRevision, { connectionEpoch });
 		const providerRequest = {
 			agentId: record.agentId,
 			goalRevision: record.goalRevision,
@@ -1036,7 +1141,9 @@ export class DynamicCoordinator extends EventEmitter {
 	async #completeProviderPlan(work, decision) {
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		const record = this.#registry.get(work.agentId);
-		if (record === null || record.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+		if (record === null || record.goalRevision !== work.goalRevision
+				|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 			const pending = work.pending;
 			this.#providerWork.delete(work.agentId);
 			this.#reschedulePendingProviderPlan(pending);
@@ -1044,6 +1151,7 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 		let runtime = null;
 		try {
+			this.#programRuntimeEpochs.set(record.agentId, work.connectionEpoch);
 			runtime = await this.#programRuntime.installDecision(record, decision, {
 				observation: work.request.observation,
 				eventSequence: work.request.eventSequence,
@@ -1052,20 +1160,25 @@ export class DynamicCoordinator extends EventEmitter {
 		} catch (error) {
 			this.#providerWork.delete(work.agentId);
 			const current = this.#registry.get(work.agentId);
-			const stale = current?.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
-			if (!stale) await this.#reportAgentError(work.agentId, error);
+			const stale = current?.goalRevision !== work.goalRevision
+				|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
+			if (this.#programRuntimeEpochs.get(work.agentId) === work.connectionEpoch) this.#programRuntimeEpochs.delete(work.agentId);
+			if (!stale) await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 			if (stale || work.pending?.priority === 'urgent') this.#reschedulePendingProviderPlan(work.pending);
 			return null;
 		}
 		const pending = work.pending;
 		this.#providerWork.delete(work.agentId);
 		this.#providerRetryAfter.delete(work.agentId);
-		this.#publishVerbose(record.agentId, record.goalRevision, 'decision', verboseDecisionSummary(decision));
+		this.#publishVerbose(record.agentId, record.goalRevision, 'decision', verboseDecisionSummary(decision), work.connectionEpoch);
 		if (runtime === null) return runtime;
 		const latest = this.#registry.get(work.agentId);
-		if (latest === null || latest.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) return runtime;
+		if (latest === null || latest.goalRevision !== work.goalRevision
+				|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) return runtime;
 		this.#rememberAcceptedContextCursor(latest, work.contextSnapshot);
-		this.#flushPendingAttention(latest);
+		this.#flushPendingAttention(latest, work.connectionEpoch);
 		if (pending === null) return runtime;
 		try {
 			if (pending.observation !== undefined) {
@@ -1080,7 +1193,7 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#programRuntime.notifyAttention(latest, { priority: pending.priority, trigger: pending.trigger });
 			}
 		} catch (error) {
-			await this.#reportAgentError(work.agentId, error);
+			await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 		}
 		return runtime;
 	}
@@ -1088,18 +1201,20 @@ export class DynamicCoordinator extends EventEmitter {
 	async #failProviderPlan(work, record, error) {
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		const current = this.#registry.get(work.agentId);
-		const stale = current?.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
+		const stale = current?.goalRevision !== work.goalRevision
+			|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
+			|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
 		this.#promotePendingAttention(work, current);
 		const pending = work.pending;
 		this.#providerWork.delete(work.agentId);
 		const urgentRecovery = pending?.priority === 'urgent';
 		const quietRetry = QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code);
-		if (!stale && !urgentRecovery) await this.#reportAgentError(record.agentId, error);
+		if (!stale && !urgentRecovery) await this.#reportAgentError(record.agentId, error, work.connectionEpoch);
 		if (!stale && quietRetry && current?.state === DynamicAgentState.ERROR) {
 			try {
 				this.#registry.setState(record.agentId, DynamicAgentState.STARTING, { goalRevision: record.goalRevision });
 			} catch (stateError) {
-				void this.#reportAgentError(record.agentId, stateError);
+				void this.#reportAgentError(record.agentId, stateError, work.connectionEpoch);
 				return null;
 			}
 		}
@@ -1136,12 +1251,14 @@ export class DynamicCoordinator extends EventEmitter {
 	#reschedulePendingProviderPlan(request) {
 		if (request === null || request === undefined) return;
 		const record = this.#registry.get(request.agentId);
-		if (record === null || record.goalRevision !== request.goalRevision || !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		if (record === null || record.goalRevision !== request.goalRevision
+				|| !this.#isConnectionEpochCurrent(request.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
 		if (record.state === DynamicAgentState.ERROR && request.preserveState !== true) {
 			try {
 				this.#registry.setState(record.agentId, DynamicAgentState.STARTING, { goalRevision: record.goalRevision });
 			} catch (error) {
-				void this.#reportAgentError(record.agentId, error);
+				void this.#reportAgentError(record.agentId, error, request.connectionEpoch);
 				return;
 			}
 		}
@@ -1153,15 +1270,15 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listeners = [];
 	}
 
-	#beginGoalControlInterruption(message) {
+	#beginGoalControlInterruption(message, connectionEpoch) {
 		let reason = null;
 		if (['stop', 'disconnect', 'dead'].includes(message.payload.operation)) reason = `Goal ${message.payload.operation}`;
 		if (message.payload.operation === 'steer') reason = 'Goal steered';
 		if (reason === null) return;
 		try {
-			Promise.resolve(this.#planner.interrupt(message.agentId, reason)).catch((error) => this.#reportAgentError(message.agentId, error));
+			Promise.resolve(this.#planner.interrupt(message.agentId, reason)).catch((error) => this.#reportAgentError(message.agentId, error, connectionEpoch));
 		} catch (error) {
-			void this.#reportAgentError(message.agentId, error);
+			void this.#reportAgentError(message.agentId, error, connectionEpoch);
 		}
 	}
 
@@ -1214,27 +1331,28 @@ export class DynamicCoordinator extends EventEmitter {
 		if (!this.#programRuntime.hasCurrent(record)) return;
 		const existing = this.#attentionFlushes.get(record.agentId);
 		if (existing?.goalRevision === record.goalRevision) return;
-		const token = { goalRevision: record.goalRevision };
+		const token = { goalRevision: record.goalRevision, connectionEpoch: this.#connectionEpoch };
 		this.#attentionFlushes.set(record.agentId, token);
 		setImmediate(() => {
 			if (this.#attentionFlushes.get(record.agentId) !== token) return;
 			this.#attentionFlushes.delete(record.agentId);
-			if (this.#stopping || this.#closed) return;
+			if (this.#stopping || this.#closed || !this.#isConnectionEpochCurrent(token.connectionEpoch)) return;
 			const current = this.#registry.get(record.agentId);
 			const pending = this.#pendingAttention.get(record.agentId);
 			if (current === null || pending?.goalRevision !== token.goalRevision || current.goalRevision !== token.goalRevision) return;
-			this.#flushPendingAttention(current);
+			this.#flushPendingAttention(current, token.connectionEpoch);
 		});
 	}
 
-	#flushPendingAttention(record) {
+	#flushPendingAttention(record, connectionEpoch = this.#connectionEpoch) {
+		if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 		const pending = this.#pendingAttention.get(record.agentId);
 		if (pending?.goalRevision !== record.goalRevision || !this.#programRuntime.hasCurrent(record)) return;
 		try {
 			const notified = this.#programRuntime.notifyAttention(record, { priority: pending.priority, trigger: pending.trigger });
 			if (notified !== null) this.#pendingAttention.delete(record.agentId);
 		} catch (error) {
-			void this.#reportAgentError(record.agentId, error);
+			void this.#reportAgentError(record.agentId, error, connectionEpoch);
 		}
 	}
 
@@ -1242,23 +1360,43 @@ export class DynamicCoordinator extends EventEmitter {
 		return this.#lifecycleGeneration(agentId) === generation;
 	}
 
-	#enqueueAgent(agentId, operation, { waitForReconciliation = true } = {}) {
+	#enqueueAgent(agentId, operation, { waitForReconciliation = true, connectionEpoch = this.#connectionEpoch } = {}) {
 		const previous = this.#agentOperations.get(agentId) ?? Promise.resolve();
 		const current = previous.catch(() => {})
-			.then(() => waitForReconciliation ? this.#reconciliation : undefined)
-			.then(operation);
+			.then(() => this.#isConnectionEpochCurrent(connectionEpoch) && waitForReconciliation ? this.#reconciliation : undefined)
+			.then(() => this.#isConnectionEpochCurrent(connectionEpoch) ? operation() : undefined);
 		this.#agentOperations.set(agentId, current);
-		current.catch((error) => this.#reportAgentError(agentId, error)).finally(() => {
+		current.catch((error) => this.#reportAgentError(agentId, error, connectionEpoch)).finally(() => {
 			if (this.#agentOperations.get(agentId) === current) this.#agentOperations.delete(agentId);
 		});
 		return current;
 	}
 
-	#run(operation) {
-		Promise.resolve().then(operation).catch((error) => this.emit('runtimeError', error));
+	#run(operation, connectionEpoch = this.#connectionEpoch, { requireConnected = true } = {}) {
+		Promise.resolve().then(() => {
+			const current = requireConnected
+				? this.#isConnectionEpochCurrent(connectionEpoch)
+				: connectionEpoch === this.#connectionEpoch;
+			return current ? operation() : undefined;
+		}).catch((error) => this.emit('runtimeError', error));
 	}
 
-	async #reportAgentError(agentId, error) {
+	async #sendForEpoch(connectionEpoch, type, agentId, payload) {
+		if (!this.#isConnectionEpochCurrent(connectionEpoch)) {
+			throw codedRuntimeError('STALE_CONNECTION_EPOCH', `Bridge connection epoch ${connectionEpoch ?? 'unknown'} is no longer active`);
+		}
+		return this.#bridge.send(type, agentId, payload, { connectionEpoch });
+	}
+
+	async #sendRuntimeMessage(kind, type, agentId, payload) {
+		const epochs = kind === 'native' ? this.#nativeRuntimeEpochs : this.#programRuntimeEpochs;
+		const connectionEpoch = epochs.get(agentId);
+		if (type === 'action_cancel' && !this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+		return this.#sendForEpoch(connectionEpoch, type, agentId, payload);
+	}
+
+	async #reportAgentError(agentId, error, connectionEpoch = this.#connectionEpoch) {
+		if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 		try {
 			const verboseRecord = this.#registry.get(agentId);
 			if (QUIET_LIFECYCLE_ERRORS.has(error?.code)) return;
@@ -1276,7 +1414,7 @@ export class DynamicCoordinator extends EventEmitter {
 			if (!this.#bridge.ready || !this.#registry.has(agentId)) return;
 			const record = this.#registry.get(agentId);
 			try {
-				await this.#bridge.send('agent_error', agentId, {
+				await this.#sendForEpoch(connectionEpoch, 'agent_error', agentId, {
 					goalRevision: record.goalRevision,
 					code: String(error?.code ?? 'COORDINATOR_ERROR').slice(0, 128),
 					message: String(error?.message ?? error).slice(0, 2_048),
@@ -1302,7 +1440,7 @@ export class DynamicCoordinator extends EventEmitter {
 		} catch { /* diagnostics cannot interrupt agent control */ }
 	}
 
-	#verboseReporter(agentId, goalRevision, { allowPublicAgentMessage = false } = {}) {
+	#verboseReporter(agentId, goalRevision, { allowPublicAgentMessage = false, connectionEpoch = this.#connectionEpoch } = {}) {
 		let publishedAgentMessage = false;
 		const reporter = (stage, message) => {
 			try {
@@ -1312,7 +1450,7 @@ export class DynamicCoordinator extends EventEmitter {
 					const publicMessage = sanitizePublicAgentMessage(message);
 					if (publicMessage.length === 0) return;
 					publishedAgentMessage = true;
-					this.#publishVerbose(agentId, goalRevision, 'decision', publicMessage);
+					this.#publishVerbose(agentId, goalRevision, 'decision', publicMessage, connectionEpoch);
 					return;
 				}
 			} catch { /* verbose reporting is observational */ }
@@ -1331,27 +1469,27 @@ export class DynamicCoordinator extends EventEmitter {
 		for (const reporter of this.#verboseReporters) reporter.reset();
 	}
 
-	#publishVerbose(agentId, goalRevision, stage, message) {
+	#publishVerbose(agentId, goalRevision, stage, message, connectionEpoch = this.#connectionEpoch) {
 		try {
 			const bounded = sanitizeVerboseMessage(stage, message);
 			if (bounded.length === 0) return;
-			this.#sendVerbose(agentId, goalRevision, stage, bounded);
+			this.#sendVerbose(agentId, goalRevision, stage, bounded, connectionEpoch);
 		} catch { /* verbose delivery is best effort */ }
 	}
 
-	#sendVerbose(agentId, goalRevision, stage, message) {
-		if (!this.#verboseEnabled || !this.#bridge.ready || !VERBOSE_STAGES.includes(stage)) return;
+	#sendVerbose(agentId, goalRevision, stage, message, connectionEpoch) {
+		if (!this.#verboseEnabled || !this.#isConnectionEpochCurrent(connectionEpoch) || !this.#bridge.ready || !VERBOSE_STAGES.includes(stage)) return;
 		const current = this.#registry.get(agentId);
 		if (current === null || current.goalRevision !== goalRevision || message.length === 0 || message.length > MAX_VERBOSE_MESSAGE_LENGTH) return;
-		Promise.resolve(this.#bridge.send('verbose_event', agentId, { goalRevision, stage, message })).catch(() => {});
+		Promise.resolve(this.#sendForEpoch(connectionEpoch, 'verbose_event', agentId, { goalRevision, stage, message })).catch(() => {});
 	}
 
-	async #publishCatalog(snapshot) {
-		await this.#bridge.send('catalog_snapshot', 'server', snapshot);
+	async #publishCatalog(snapshot, connectionEpoch = this.#connectionEpoch) {
+		await this.#sendForEpoch(connectionEpoch, 'catalog_snapshot', 'server', snapshot);
 	}
 
-	async #publishGoalCompleted({ record, goalFingerprint, traceId }) {
-		if (!this.#bridge.ready) throw codedRuntimeError('BRIDGE_NOT_READY', 'Minecraft bridge is not ready for completion verification');
+	async #publishGoalCompleted({ record, goalFingerprint, traceId }, connectionEpoch = this.#connectionEpoch) {
+		if (!this.#isConnectionEpochCurrent(connectionEpoch) || !this.#bridge.ready) throw codedRuntimeError('BRIDGE_NOT_READY', 'Minecraft bridge is not ready for completion verification');
 		if (!this.#supportedAgentIds.has(record.agentId)) throw codedRuntimeError('AGENT_NOT_SUPPORTED', `Agent '${record.agentId}' is not in the reconciled bridge roster`);
 		const profile = {
 			provider: record.provider,
@@ -1360,7 +1498,7 @@ export class DynamicCoordinator extends EventEmitter {
 			serviceTier: record.serviceTier ?? DEFAULT_SERVICE_TIER,
 		};
 		try {
-			await this.#bridge.send('goal_completed', record.agentId, {
+			await this.#sendForEpoch(connectionEpoch, 'goal_completed', record.agentId, {
 				goalRevision: record.goalRevision,
 				goalFingerprint,
 				traceId,
@@ -1372,8 +1510,8 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 	}
 
-	async #publishStatus() {
-		if (!this.#bridge.ready) return;
+	async #publishStatus(connectionEpoch = this.#connectionEpoch) {
+		if (!this.#isConnectionEpochCurrent(connectionEpoch) || !this.#bridge.ready) return;
 		const records = this.#registry.list();
 		const readyStates = new Set([DynamicAgentState.IDLE, DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING, DynamicAgentState.PAUSED, DynamicAgentState.COMPLETED]);
 		const profiles = records
@@ -1389,7 +1527,7 @@ export class DynamicCoordinator extends EventEmitter {
 			.sort((left, right) => left.provider.localeCompare(right.provider)
 			|| left.model.localeCompare(right.model) || left.operation.localeCompare(right.operation));
 		const pressure = this.#scheduler.pressureSnapshot;
-		await this.#bridge.send('coordinator_status', 'server', {
+		await this.#sendForEpoch(connectionEpoch, 'coordinator_status', 'server', {
 			reconciled: this.#reconciledStatus,
 			profiles,
 			supportedProfileCount: profiles.length,
@@ -1506,7 +1644,7 @@ export class DynamicCoordinator extends EventEmitter {
 		}
 	}
 
-	#invalidateServerInstance() {
+	#invalidateServerInstance(connectionEpoch) {
 		this.#cancelGoalSpecRequests();
 		this.#healthRegistry.reset();
 		this.#factLedgers.clear();
@@ -1514,6 +1652,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#contextCursors.clear();
 		this.#conversationWakeTransactions.clear();
 		this.#providerWork.clear();
+		this.#programRuntimeEpochs.clear();
+		this.#nativeRuntimeEpochs.clear();
 		for (const record of this.#registry.list()) {
 			if (this.#usesNativeTools(record)) this.#goalSupervisor.terminate(this.#supervisionKey(record));
 			this.#advanceLifecycleGeneration(record.agentId);
@@ -1524,9 +1664,9 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#providerRetryAfter.delete(record.agentId);
 			try {
 				Promise.resolve(this.#planner.interrupt(record.agentId, 'Minecraft server instance changed'))
-					.catch((error) => this.#reportAgentError(record.agentId, error));
+					.catch((error) => this.#reportAgentError(record.agentId, error, connectionEpoch));
 			} catch (error) {
-				void this.#reportAgentError(record.agentId, error);
+				void this.#reportAgentError(record.agentId, error, connectionEpoch);
 			}
 		}
 	}
@@ -1536,14 +1676,15 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #processGoalSpecRequest(key, entry) {
-		if (this.#goalSpecRequests.get(key) !== entry || this.#serverInstanceId === null || entry.translating) return;
+		if (this.#goalSpecRequests.get(key) !== entry || this.#serverInstanceId === null
+				|| !this.#isConnectionEpochCurrent(entry.connectionEpoch) || entry.translating) return;
 		if (entry.retryHandle !== null) {
 			this.#clearGoalSpecTimeout(entry.retryHandle);
 			entry.retryHandle = null;
 		}
 		if (entry.proposal !== null) {
 			try {
-				await this.#bridge.send('goal_spec_proposal', entry.agentId, entry.proposal);
+				await this.#sendForEpoch(entry.connectionEpoch, 'goal_spec_proposal', entry.agentId, entry.proposal);
 			} catch (error) {
 				if (this.#goalSpecRequests.get(key) === entry) this.#emitRuntimeError(error);
 			}
@@ -1553,7 +1694,8 @@ export class DynamicCoordinator extends EventEmitter {
 		entry.translating = true;
 		try {
 			await this.#reconciliation;
-			if (this.#goalSpecRequests.get(key) !== entry || this.#serverInstanceId === null) return;
+			if (this.#goalSpecRequests.get(key) !== entry || this.#serverInstanceId === null
+					|| !this.#isConnectionEpochCurrent(entry.connectionEpoch)) return;
 			entry.proposal = await this.#planner.requestGoalSpec({ agentId: entry.agentId, request: entry.request });
 			entry.attempts = 0;
 		} catch (error) {
@@ -1573,7 +1715,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (entry.retryHandle !== null) this.#clearGoalSpecTimeout(entry.retryHandle);
 		entry.retryHandle = this.#setGoalSpecTimeout(() => {
 			entry.retryHandle = null;
-			this.#run(() => this.#processGoalSpecRequest(key, entry));
+			this.#run(() => this.#processGoalSpecRequest(key, entry), entry.connectionEpoch);
 		}, delayMs);
 	}
 
@@ -1673,6 +1815,8 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		socketFactory: dependencies.socketFactory,
 		schedule: dependencies.schedule,
 		cancelSchedule: dependencies.cancelSchedule,
+		scheduleDeadline: dependencies.scheduleDeadline,
+		cancelDeadline: dependencies.cancelDeadline,
 		currentRevision: (agentId) => registry.get(agentId)?.goalRevision ?? null,
 	});
 	let coordinator = null;
