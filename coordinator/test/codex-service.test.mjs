@@ -127,6 +127,7 @@ test('Codex service shares one initialized transport across isolated agent threa
 	const first = await service.createAgent(profile('agent-a'), { controlProtocol: 'arena_script' });
 	const second = await service.createAgent(profile('agent-b'), { controlProtocol: 'arena_script' });
 	assert.equal(transport.calls.filter((call) => call.method === 'initialize').length, 1);
+	assert.equal(transport.calls.find((call) => call.method === 'model/list').params.includeHidden, false);
 	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 2);
 	await first.setGoalRevision(1);
 	await second.setGoalRevision(3);

@@ -493,7 +493,7 @@ export class CodexAgent {
 		const models = [];
 		let cursor = null;
 		do {
-			const response = await this.#transport.request('model/list', { cursor, limit: 100, includeHidden: true });
+			const response = await this.#transport.request('model/list', { cursor, limit: 100, includeHidden: false });
 			if (!Array.isArray(response?.data)) throw new CodexProtocolError('INVALID_CATALOG', 'model/list response must contain a data array');
 			models.push(...response.data);
 			cursor = response.nextCursor ?? null;
@@ -558,7 +558,7 @@ export async function checkCodexModelProfile(configValue, transport = new CodexS
 		const models = [];
 		let cursor = null;
 		do {
-			const response = await transport.request('model/list', { cursor, limit: 100, includeHidden: true });
+			const response = await transport.request('model/list', { cursor, limit: 100, includeHidden: false });
 			if (!Array.isArray(response?.data)) throw new CodexProtocolError('INVALID_CATALOG', 'model/list response must contain a data array');
 			models.push(...response.data);
 			cursor = response.nextCursor ?? null;

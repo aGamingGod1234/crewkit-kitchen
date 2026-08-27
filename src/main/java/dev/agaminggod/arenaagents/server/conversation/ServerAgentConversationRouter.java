@@ -243,6 +243,11 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 	}
 
 	private void publishToAgent(AgentRecord target, ConversationEvent source) {
+		if ((source.kind() == ConversationKind.PLAYER_MESSAGE || source.kind() == ConversationKind.PROXIMITY_SPEECH)
+				&& target.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.PAUSED
+				&& isSteeringPhrase(source.text())) {
+			target = manager.resume(target.agentId().toString()).after();
+		}
 		long sequence = sequences.merge(target.agentId(), 1L, Long::sum);
 		ConversationEvent delivered = new ConversationEvent(
 				target.agentId(),

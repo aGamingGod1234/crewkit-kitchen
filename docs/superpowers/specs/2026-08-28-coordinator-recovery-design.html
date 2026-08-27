@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arena Agents coordinator recovery</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0e0c;
+      --panel: #121713;
+      --text: #edf4ee;
+      --muted: #9eaca1;
+      --line: #2a352c;
+      --green: #64d98b;
+      --amber: #f0bd5d;
+      --red: #f17b72;
+      --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.55; }
+    main { width: min(940px, calc(100% - 32px)); margin: 0 auto; padding: 56px 0 80px; }
+    header { padding-bottom: 32px; border-bottom: 1px solid var(--line); }
+    .eyebrow { color: var(--green); font: 700 12px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+    h1 { max-width: 780px; margin: 14px 0 12px; font-size: clamp(34px, 7vw, 62px); line-height: 1.03; letter-spacing: -.045em; }
+    .lead { max-width: 760px; margin: 0; color: var(--muted); font-size: clamp(17px, 2.3vw, 21px); }
+    .meta { display: flex; flex-wrap: wrap; gap: 10px 20px; margin-top: 24px; color: var(--muted); font: 13px/1.4 var(--mono); }
+    section { padding: 34px 0; border-bottom: 1px solid var(--line); }
+    h2 { margin: 0 0 14px; font-size: 22px; letter-spacing: -.02em; }
+    h3 { margin: 0 0 8px; font-size: 16px; }
+    p { max-width: 790px; margin: 10px 0; }
+    ul, ol { max-width: 800px; margin: 12px 0; padding-left: 22px; }
+    li + li { margin-top: 8px; }
+    code { font-family: var(--mono); color: #b9f4ca; }
+    pre { overflow-x: auto; margin: 16px 0; padding: 18px; border: 1px solid var(--line); background: #0e130f; color: #ccebd4; font: 13px/1.6 var(--mono); border-radius: 8px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 18px; }
+    .card { padding: 20px; border: 1px solid var(--line); background: var(--panel); border-radius: 8px; }
+    .card p { color: var(--muted); font-size: 14px; }
+    .status { color: var(--green); }
+    .warning { color: var(--amber); }
+    .failure { color: var(--red); }
+    .flow { font-family: var(--mono); color: var(--muted); }
+    .flow strong { color: var(--text); }
+    .table-wrap { overflow-x: auto; margin-top: 16px; }
+    table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 13px 14px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--panel); }
+    td { color: var(--muted); }
+    footer { padding-top: 30px; color: var(--muted); font-size: 13px; }
+    @media (max-width: 680px) {
+      main { width: min(100% - 24px, 940px); padding-top: 32px; }
+      .grid { grid-template-columns: 1fr; }
+      section { padding: 28px 0; }
+      .card { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">Arena Agents &middot; reliability design</div>
+      <h1>Coordinator recovery without dead ends</h1>
+      <p class="lead">Every supported failure gets a bounded fallback, a scheduled probe, and a tested route back to normal operation. Active goals remain owned by Minecraft and the selected AI profile never changes silently.</p>
+      <div class="meta">
+        <span>Status: <span class="warning">awaiting written-spec approval</span></span>
+        <span>Date: 28 August 2026</span>
+        <span>Next: implementation plan</span>
+      </div>
+    </header>
+
+    <section>
+      <h2>What is broken now</h2>
+      <div class="grid">
+        <article class="card"><h3 class="failure">Restart exhaustion</h3><p>Java stops restarting after the third unexpected coordinator exit.</p></article>
+        <article class="card"><h3 class="failure">Latched startup failures</h3><p>One startup failure blocks every future retry for the Minecraft session.</p></article>
+        <article class="card"><h3 class="failure">Provider blocks the core</h3><p>Codex initialization completes before the Minecraft bridge starts, so provider failure can take down reconciliation.</p></article>
+        <article class="card"><h3 class="failure">Fail-fast catalogs</h3><p>One failed provider catalog can reject the entire model catalog and roster reconciliation.</p></article>
+      </div>
+    </section>
+
+    <section>
+      <h2>The invariant</h2>
+      <p>An unfinished active goal must always own one of the following:</p>
+      <ul>
+        <li>queued or running provider work;</li>
+        <li>a Minecraft action or completion verification;</li>
+        <li>a pending fresh observation;</li>
+        <li>a recovery attempt with a deadline;</li>
+        <li>a named external blocker with periodic revalidation.</li>
+      </ul>
+      <p class="warning">Infrastructure failures never turn active work into <code>PAUSED</code>, <code>ERROR</code>, or completed work. Only the player can ordinarily pause an agent.</p>
+    </section>
+
+    <section>
+      <h2>Recovery state machine</h2>
+      <pre>STARTING -&gt; AUTHENTICATING -&gt; HEALTHY
+    ^              |              |
+    |              v              v
+    +----------- BACKOFF &lt;-- DEGRADED
+
+BLOCKED_RETRYABLE -&gt; BACKOFF
+STOPPED</pre>
+      <p><code>STOPPED</code> is reserved for explicit shutdown or disabled autostart. Runtime failures keep retrying with capped backoff. Missing dependencies remain visible as <code>BLOCKED_RETRYABLE</code> and recover automatically when their state changes.</p>
+    </section>
+
+    <section>
+      <h2>Process and runtime recovery</h2>
+      <ol>
+        <li>Restart unexpected exits forever with delays of 1, 2, 5, 15, then at most 30 seconds.</li>
+        <li>Replace a live process that misses its authentication deadline.</li>
+        <li>Replace an authenticated process that remains disconnected beyond its reconnect window.</li>
+        <li>Reset crash-loop history only after a stable authenticated interval.</li>
+        <li>Stage and validate runtime generations before activation.</li>
+        <li>Fall back to the last verified runtime if a candidate is corrupt, while repairing the preferred generation in the background.</li>
+        <li>Keep bridge secrets and credentials outside runtime generations.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Subsystem isolation</h2>
+      <div class="grid">
+        <article class="card"><h3>Coordinator core</h3><p>Configuration, persisted registry, Minecraft bridge, reconciliation, and work supervision start independently.</p></article>
+        <article class="card"><h3>Providers</h3><p>Start lazily for reconciled profiles. One failed provider cannot stop another provider or the bridge.</p></article>
+        <article class="card"><h3>Catalogs</h3><p>Use settled results. Failed sources contribute their last valid snapshot or deterministic fallback and refresh in the background.</p></article>
+        <article class="card"><h3>Voice and diagnostics</h3><p>Remain optional. Their failures use bounded fallbacks and cannot reject agent-control work.</p></article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Failure classes</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Class</th><th>Examples</th><th>Behavior</th></tr></thead>
+          <tbody>
+            <tr><td><code>TRANSIENT</code></td><td>Timeout, EOF, refused socket, rate limit</td><td>Keep the goal active, apply capped backoff, and reconstruct from fresh facts.</td></tr>
+            <tr><td><code>DEGRADED</code></td><td>Stale catalog, failed voice, unavailable diagnostics</td><td>Use the component fallback and keep probing the preferred path.</td></tr>
+            <tr><td><code>BLOCKED_RETRYABLE</code></td><td>Missing Node, invalid runtime, missing exact-profile credential, occupied port</td><td>Preserve goals, name the requirement, and resume when revalidation passes.</td></tr>
+            <tr><td><code>TERMINAL_DOMAIN</code></td><td>Explicit stop, verified completion, removed agent</td><td>End only because the domain requested it.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Exact-profile guarantee</h2>
+      <p class="flow"><strong>provider + model + reasoning effort + service tier</strong></p>
+      <p>That profile remains immutable through every recovery. A failed provider session is fenced and replaced with a fresh session using the same profile. An unavailable profile enters <code>BLOCKED_RETRYABLE</code> until it returns or the player explicitly changes it.</p>
+    </section>
+
+    <section>
+      <h2>Returning from fallback</h2>
+      <p>Every fallback records its primary component, fallback mode, reason, generation, next probe time, failure count, and promotion condition.</p>
+      <ul>
+        <li>Process promotion requires stable bridge authentication.</li>
+        <li>Provider promotion requires an accepted exact-profile operation.</li>
+        <li>Catalog promotion requires a complete valid snapshot.</li>
+        <li>Voice promotion requires a successful bounded synthesis or transcription.</li>
+        <li>Stale-generation success is discarded and cannot promote anything.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Fault-injection gate</h2>
+      <div class="grid">
+        <article class="card"><h3>Process</h3><p>Crash before startup, during authentication, after authentication, and during active work. Exceed three crashes and still recover.</p></article>
+        <article class="card"><h3>Runtime</h3><p>Corrupt a candidate, remove and restore Node, occupy and release ports, and repeat reconciliation.</p></article>
+        <article class="card"><h3>Providers</h3><p>Fail startup, catalog, session creation, active turns, circuit probes, and exact-profile recovery independently.</p></article>
+        <article class="card"><h3>Goals</h3><p>Lose each boundary during multi-step work and prove no pause, duplicate action, false completion, or silent stall.</p></article>
+        <article class="card"><h3>Optional systems</h3><p>Terminate voice and diagnostics independently, restore them, and prove promotion without affecting control.</p></article>
+        <article class="card"><h3>Soak</h3><p>Repeat recoverable faults while proving bounded processes, timers, listeners, queues, and logs.</p></article>
+      </div>
+    </section>
+
+    <section>
+      <h2>Acceptance criteria</h2>
+      <ol>
+        <li>No transient or degraded failure creates a permanent latch.</li>
+        <li>Every fallback has an automated, tested promotion path.</li>
+        <li>The selected AI profile changes only through an explicit player operation.</li>
+        <li>One component failure cannot stop unrelated healthy components.</li>
+        <li>Every unfinished goal owns live, scheduled, or explicitly blocked recovery work.</li>
+        <li>Restarts are idempotent and leave no duplicate actions or orphaned children.</li>
+        <li>Status identifies the failing boundary and next recovery action.</li>
+        <li>The full Java, coordinator, voice, protocol, simulator, headless, and fault-injection suites pass.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Limit</h2>
+      <p>The mod cannot act while Minecraft or Windows is not running. After a JVM, GPU, or operating-system failure, the next Minecraft launch must clean stale processes, validate the runtime, reconcile persisted goals, and resume automatically.</p>
+    </section>
+
+    <footer>Coordinator recovery specification. Implementation has not started.</footer>
+  </main>
+</body>
+</html>

@@ -8,6 +8,7 @@ import de.maxhenkel.voicechat.api.events.VoicechatServerStoppedEvent;
 import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
 
 public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
+	private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(ArenaAgentsVoiceChatPlugin.class);
 	private static volatile VoicechatServerApi serverApi;
 	private static volatile HumanSpeechCapture speechCapture;
 
@@ -42,7 +43,8 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 					try {
 						capture = new HumanSpeechCapture(new SpeechWorkerClient());
 						speechCapture = capture;
-					} catch (RuntimeException ignored) {
+					} catch (RuntimeException exception) {
+						LOGGER.error("Arena Agents proximity speech capture could not start", exception);
 						return;
 					}
 				}

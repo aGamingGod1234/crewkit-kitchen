@@ -42,6 +42,36 @@ public final class CodexAgentServerRuntime {
 	private CodexAgentServerRuntime() {
 	}
 
+	public static void confirmCurrentGoal(MinecraftServer server, AgentId agentId) {
+		GoalVerificationRuntime runtime = GOAL_VERIFIERS.get(server);
+		if (runtime == null) {
+			throw new dev.agaminggod.arenaagents.agent.AgentDomainException(
+					"GOAL_VERIFIER_UNAVAILABLE", "Goal verification is not running"
+			);
+		}
+		var goal = CodexAgentManager.get(server).registry().require(agentId).currentGoal()
+				.orElseThrow(() -> new dev.agaminggod.arenaagents.agent.AgentDomainException(
+						"NO_CURRENT_GOAL", "Agent has no current goal to confirm"
+				));
+		if (!containsOperatorConfirmation(goal.spec().completion())) {
+			throw new dev.agaminggod.arenaagents.agent.AgentDomainException(
+					"FACTUAL_GOAL_NOT_CONFIRMABLE", "Minecraft verifies this goal from in-game facts"
+			);
+		}
+		runtime.confirm(agentId, goal.goalId());
+	}
+
+	private static boolean containsOperatorConfirmation(dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate) {
+		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.OperatorConfirmed) return true;
+		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.AllOf all) {
+			return all.predicates().stream().anyMatch(CodexAgentServerRuntime::containsOperatorConfirmation);
+		}
+		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.AnyOf any) {
+			return any.predicates().stream().anyMatch(CodexAgentServerRuntime::containsOperatorConfirmation);
+		}
+		return false;
+	}
+
 	public static synchronized void register() {
 		if (registered) {
 			return;

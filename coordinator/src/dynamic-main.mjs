@@ -708,7 +708,8 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#scheduleNativeConversation(record, event, trigger) {
-		if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
+		const conversationOnly = [DynamicAgentState.IDLE, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED].includes(record.state);
+		if (!conversationOnly && ![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
 		const lifecycleGeneration = this.#lifecycleGeneration(record.agentId);
 		const conversation = this.#conversationMemory(record.agentId).delta(null).entries.slice(-4);
 		this.#scheduleNativeTurn(record, {
@@ -717,11 +718,14 @@ export class DynamicCoordinator extends EventEmitter {
 			priority: 'urgent',
 			trigger,
 			lifecycleGeneration,
+			preserveState: conversationOnly,
+			conversationOnly,
 			input: buildNativeEventInput(record, {
 				event: event?.kind ?? 'conversation',
 				trigger,
 				observation: {},
 				conversation,
+				conversationOnly,
 			}),
 		});
 	}
@@ -840,6 +844,11 @@ export class DynamicCoordinator extends EventEmitter {
 		if (work.expired === true || record === null || record.goalRevision !== work.goalRevision || !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 			throw Object.assign(new Error('Native tool belongs to an obsolete goal'), { code: 'STALE_PLAN' });
 		}
+		if (work.request.conversationOnly === true
+				&& toolRequest.tool.kind !== 'observe'
+				&& !(toolRequest.tool.kind === 'action' && toolRequest.tool.actionType === 'chat')) {
+			throw Object.assign(new Error('Idle conversation turns may only observe and reply with chat'), { code: 'CONVERSATION_ONLY' });
+		}
 		const executesBody = toolRequest.tool.kind === 'action' || toolRequest.tool.kind === 'sequence';
 		const supervisionKind = executesBody ? 'action' : toolRequest.tool.kind === 'finish' ? 'completion' : null;
 		let supervisionToken = null;
@@ -872,6 +881,7 @@ export class DynamicCoordinator extends EventEmitter {
 			await this.#settleNativeSteering(work);
 		} finally {
 			this.#goalSupervisor.end(work.supervisionToken, { progress: (result?.toolCalls ?? 0) > 0 });
+			if (work.request.conversationOnly === true) this.#goalSupervisor.terminate(work.supervisionKey);
 		}
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		this.#providerWork.delete(work.agentId);
@@ -880,6 +890,15 @@ export class DynamicCoordinator extends EventEmitter {
 		const record = this.#registry.get(work.agentId);
 		if (record !== null && record.goalRevision === work.goalRevision && this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
 			this.#writeTrace('native_turn_completed', { agentId: work.agentId, goalRevision: work.goalRevision, traceId: work.traceId, toolCalls: result?.toolCalls ?? 0 });
+		}
+		if (work.request.conversationOnly === true && (result?.toolCalls ?? 0) === 0
+				&& work.request.conversationRetry !== true && record !== null) {
+			this.#scheduleNativeTurn(record, {
+				...work.request,
+				conversationRetry: true,
+				input: `${work.request.input}\nYour previous turn made no visible reply. Call say exactly once now.`,
+			});
+			return result;
 		}
 		const rescheduled = this.#reschedulePendingNativeTurn(pending);
 		if (!rescheduled && this.#isActiveNativeGoal(work)) {
@@ -897,6 +916,7 @@ export class DynamicCoordinator extends EventEmitter {
 			classification = classifyNativeGoalError(error);
 		} finally {
 			this.#goalSupervisor.end(work.supervisionToken, { scheduleRecovery: classification !== 'stale' });
+			if (work.request.conversationOnly === true) this.#goalSupervisor.terminate(work.supervisionKey);
 		}
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		this.#providerWork.delete(work.agentId);
@@ -1917,7 +1937,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 	try {
 		await worker.start();
 		if (typeof localSpeechProvider?.warmup === 'function') {
-			try { void Promise.resolve(localSpeechProvider.warmup()).catch(() => {}); }
+			try { await localSpeechProvider.warmup(); }
 			catch { /* warmup is opportunistic; the first real request can retry model loading */ }
 		}
 		return localSpeechProvider === null ? worker : voiceWorkerWithOwnedProvider(worker, localSpeechProvider);
@@ -2184,7 +2204,7 @@ function mergePlannerRequest(previous, next) {
 	return { ...next, priority, trigger: winner.trigger };
 }
 
-export function buildNativeEventInput(record, { event, trigger, observation = {}, conversation = [] } = {}) {
+export function buildNativeEventInput(record, { event, trigger, observation = {}, conversation = [], conversationOnly = false } = {}) {
 	const compactObservation = {
 		player: observation.player ?? {},
 		inventory: { items: (observation.inventory?.items ?? []).slice(0, 32), ...(observation.inventory?.tagCounts === undefined ? {} : { tagCounts: observation.inventory.tagCounts }) },
@@ -2195,7 +2215,9 @@ export function buildNativeEventInput(record, { event, trigger, observation = {}
 	const payload = {
 		event: typeof event === 'string' && event.length > 0 ? event : 'observation',
 		trigger: typeof trigger === 'string' && trigger.length > 0 ? trigger : 'observation',
+		mode: conversationOnly === true ? 'conversation_only' : 'goal',
 		goal: record?.currentGoal ?? null,
+		goalSpec: record?.currentGoalSpec ?? null,
 		goalRevision: record?.goalRevision ?? 0,
 		observation: compactObservation,
 		conversation: Array.isArray(conversation) ? conversation.slice(-4) : [],

@@ -20,7 +20,13 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.item.Item;
 
 public final class GoalCompiler {
-	private static final Pattern POSITION = Pattern.compile("^(?:go|move|travel|get) to (-?\\d+)[, ]+(-?\\d+)[, ]+(-?\\d+)$");
+	private static final Pattern POSITION = Pattern.compile(
+			"^(?:go|move|travel|get)(?: to)?(?: coordinates?)?\\s+"
+					+ "(?:x\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
+					+ "(?:y\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
+					+ "(?:z\\s*=\\s*)?(-?\\d+)"
+					+ "(?:\\s+and\\s+stop(?:\\s+there)?)?$"
+	);
 	private static final Pattern ADVANCEMENT = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:the )?(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");

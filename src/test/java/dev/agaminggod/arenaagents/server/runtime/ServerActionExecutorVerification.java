@@ -271,7 +271,7 @@ public final class ServerActionExecutorVerification {
 		AgentRecord agent = manager.registry().create(
 				"codex", "gpt-5.6-sol", "high", Optional.of("SetupFailureTarget"), AgentGameMode.SURVIVAL, 1_000L
 		);
-		manager.start(agent.agentId().toString(), "Run the setup failure test");
+		manager.startSubjective(agent.agentId().toString(), "Set up the executor test");
 		manager.registry().setAutomaticProgress(agent.agentId(), false, 1_001L);
 		ActionProvenance provenance = new ActionProvenance(
 				"codex", "gpt-5.6-sol", "high", "priority", "program-setup", 1L, "step-setup", 1L, "trace-setup"

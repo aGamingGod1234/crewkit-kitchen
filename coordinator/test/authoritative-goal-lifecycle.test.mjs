@@ -71,7 +71,7 @@ test('death and respawn preserve the exact authoritative goal binding until fact
 test('authoritative coordinate predicates require the exact three-dimensional target', async () => {
 	const result = await createNativeGoalHarness({
 		goal: 'Go to 1 65 0',
-		goalPredicate: { type: 'position_within', x: 1, y: 65, z: 0, radius: 0, stableTicks: 1 },
+		goalPredicate: { type: 'position_within', x: 1, y: 65, z: 0, radius: 0.01, stableTicks: 1 },
 		turns: [
 			[{ kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 1_000 } }],
 			['finish'],

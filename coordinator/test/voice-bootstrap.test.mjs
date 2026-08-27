@@ -173,3 +173,27 @@ test('voice bootstrap prefers one local speech runtime for both expressive TTS a
 	assert.equal(serverCloses, 1);
 	assert.equal(localCloses, 1);
 });
+
+test('voice bootstrap does not report ready before local STT warmup settles', async () => {
+	let releaseWarmup;
+	const warmupGate = new Promise((resolve) => { releaseWarmup = resolve; });
+	const local = {
+		async warmup() { await warmupGate; },
+		async synthesize() { return {}; },
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() {},
+	};
+	let settled = false;
+	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+		platform: 'win32',
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createLocalSpeechProvider: async () => local,
+		createVoiceServer: () => ({ async start() {}, async close() {} }),
+	}).then((worker) => { settled = true; return worker; });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(settled, false);
+	releaseWarmup();
+	const worker = await starting;
+	assert.equal(settled, true);
+	await worker.close();
+});

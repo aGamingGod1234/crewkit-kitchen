@@ -113,7 +113,7 @@ public final class InputStateVerification {
 				new AgentInputStates.MotorTarget(-170.0F, -20.0F, true, true, true),
 				4L
 		);
-		assertEquals(false, held.jump(), "held jump request does not repeat every tick");
+		assertEquals(true, held.jump(), "held jump keeps Carpet's continuous jump action active across waypoints");
 		AgentInputStates.MotorStep released = AgentInputStates.stepMotor(
 				held.state(),
 				new AgentInputStates.MotorTarget(-170.0F, -20.0F, true, false, true),
@@ -125,7 +125,16 @@ public final class InputStateVerification {
 				6L
 		);
 		assertEquals(true, repulsed.jump(), "a released jump request can pulse again");
-		return 13;
+		AgentInputStates.MotorState facingEast = new AgentInputStates.MotorState(-90.0F, 0.0F, 0.0F, 1.0F, false);
+		AgentInputStates.MotorStep turningNorth = AgentInputStates.stepMotor(
+				facingEast,
+				new AgentInputStates.MotorTarget(0.0F, 0.0F, true, false, false),
+				7L
+		);
+		float remainingYaw = AgentInputStates.shortestAngleDelta(turningNorth.state().yaw(), 0.0F);
+		assertEquals((float) Math.sin(Math.toRadians(remainingYaw)), turningNorth.strafe(),
+				"movement is relative to the yaw applied this tick instead of the stale previous yaw");
+		return 14;
 	}
 
 	private static AgentInputState state(float forward, boolean attack, boolean use) {

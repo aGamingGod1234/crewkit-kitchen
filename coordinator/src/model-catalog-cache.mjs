@@ -1,6 +1,18 @@
 import { DEFAULT_SERVICE_TIER } from './constants.mjs';
 
 const DEFAULT_CATALOG_TTL_MS = 60_000;
+const PREFERRED_CODEX_MODELS = [
+	'gpt-5.6-luna',
+	'gpt-5.6-terra',
+	'gpt-5.6-sol',
+	'gpt-5.6-sol-wm',
+	'gpt-5.5',
+	'gpt-5.4',
+	'gpt-5.4-mini',
+	'gpt-5.3-codex-spark',
+];
+const PREFERRED_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const PREFERRED_SERVICE_TIERS = ['priority', 'fast'];
 
 export class ModelCatalogError extends Error {
 	constructor(code, message, options) {
@@ -84,7 +96,7 @@ export class ModelCatalogCache {
 export function normalizeCatalog(value) {
 	if (!Array.isArray(value)) throw new ModelCatalogError('INVALID_CATALOG', 'Model catalog must be an array');
 	const seen = new Set();
-	return value.map((entry) => {
+	const models = value.filter((entry) => entry?.hidden !== true).map((entry) => {
 		if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) throw new ModelCatalogError('INVALID_CATALOG', 'Each model catalog entry must be an object');
 		const id = requireText(entry.id ?? entry.model ?? entry.slug, 'model id');
 		if (seen.has(id)) throw new ModelCatalogError('INVALID_CATALOG', `Duplicate model '${id}'`);
@@ -93,20 +105,39 @@ export function normalizeCatalog(value) {
 			id,
 			model: requireText(entry.model ?? entry.slug ?? id, 'model'),
 			displayName: requireDisplayName(entry.displayName ?? entry.display_name, id),
-			reasoningEfforts: normalizeStringList(
+			reasoningEfforts: orderValues(normalizeStringList(
 				entry.supportedReasoningEfforts ?? entry.supportedReasoningLevels ?? entry.supported_reasoning_levels,
 				'reasoningEffort',
-			),
+			), PREFERRED_REASONING_EFFORTS),
 			serviceTiers: normalizeServiceTiers(entry),
 		};
 	});
+	return orderModels(models);
 }
 
 function normalizeServiceTiers(entry) {
-	return [...new Set([
+	return orderValues([...new Set([
 		...normalizeStringList(entry.serviceTiers ?? entry.service_tiers, 'id'),
 		...normalizeStringList(entry.additionalSpeedTiers ?? entry.additional_speed_tiers, 'id'),
-	])];
+	])], PREFERRED_SERVICE_TIERS);
+}
+
+function orderModels(models) {
+	const preferredRank = new Map(PREFERRED_CODEX_MODELS.map((model, index) => [model, index]));
+	return models.toSorted((left, right) => {
+		const leftRank = preferredRank.get(left.id) ?? Number.MAX_SAFE_INTEGER;
+		const rightRank = preferredRank.get(right.id) ?? Number.MAX_SAFE_INTEGER;
+		return leftRank - rightRank || left.id.localeCompare(right.id);
+	});
+}
+
+function orderValues(values, preferred) {
+	const preferredRank = new Map(preferred.map((value, index) => [value, index]));
+	return values.toSorted((left, right) => {
+		const leftRank = preferredRank.get(left) ?? Number.MAX_SAFE_INTEGER;
+		const rightRank = preferredRank.get(right) ?? Number.MAX_SAFE_INTEGER;
+		return leftRank - rightRank || left.localeCompare(right);
+	});
 }
 
 function normalizeStringList(value, objectKey) {

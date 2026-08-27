@@ -66,6 +66,11 @@ public final class GoalCompilerVerification {
 				"Go to 12 64 -8", RegistryAccess.EMPTY, 1_200L
 		).acceptedSpec().orElseThrow().completion();
 		assertEquals(new GoalPredicate.PositionWithin(12.0D, 64.0D, -8.0D, 1.0D, 20), position, "exact coordinates");
+		GoalPredicate.PositionWithin labelledPosition = (GoalPredicate.PositionWithin) compiler.compile(
+				"Move to coordinates x=-22, y=99, z=12 and stop there", RegistryAccess.EMPTY, 1_200L
+		).acceptedSpec().orElseThrow().completion();
+		assertEquals(new GoalPredicate.PositionWithin(-22.0D, 99.0D, 12.0D, 1.0D, 20), labelledPosition,
+				"labelled coordinates from the task UI compile to a positional verifier");
 		assertEquals(
 				new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true),
 				compiler.compile("Kill the ender dragon", RegistryAccess.EMPTY, 1_200L).acceptedSpec().orElseThrow().completion(),
@@ -88,7 +93,7 @@ public final class GoalCompilerVerification {
 				compiler.compile("Complete advancement minecraft:story/not_real", RegistryAccess.EMPTY, 1_200L, id -> false).kind(),
 				"nonexistent advancement ID requires clarification"
 		);
-		return 5;
+		return 6;
 	}
 
 	private static int verifyDraftRoundTrip() {

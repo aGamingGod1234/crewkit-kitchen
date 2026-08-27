@@ -223,6 +223,7 @@ test('initializes before catalog validation and thread start', async () => {
 	assert.deepEqual(transport.methods(), ['initialize', 'initialized', 'model/list', 'thread/start']);
 	const initialize = transport.calls.find((call) => call.method === 'initialize').params;
 	assert.deepEqual(initialize.capabilities, { experimentalApi: true, requestAttestation: false });
+	assert.equal(transport.calls.find((call) => call.method === 'model/list').params.includeHidden, false);
 	const thread = transport.calls.find((call) => call.method === 'thread/start').params;
 	assert.deepEqual({ model: thread.model, serviceTier: thread.serviceTier, approvalPolicy: thread.approvalPolicy, sandbox: thread.sandbox, dynamicTools: thread.dynamicTools, environments: thread.environments }, {
 		model: 'gpt-5.5', serviceTier: 'fast', approvalPolicy: 'never', sandbox: 'read-only', dynamicTools: [], environments: [],
@@ -289,6 +290,7 @@ test('checks a live catalog profile without starting a planner thread', async ()
 	const checked = await checkCodexModelProfile(config, transport);
 	assert.equal(checked.model, 'gpt-5.5');
 	assert.deepEqual(transport.methods(), ['initialize', 'initialized', 'model/list']);
+	assert.equal(transport.calls.find((call) => call.method === 'model/list').params.includeHidden, false);
 });
 
 test('restarts a failed app-server into a fresh persistent thread', async () => {

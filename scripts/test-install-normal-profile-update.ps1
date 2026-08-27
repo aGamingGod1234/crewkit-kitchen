@@ -12,6 +12,7 @@ $runtime = Join-Path $target 'arena-agents-runtime\runtime'
 New-Item -ItemType Directory -Force -Path $mods, $runtimeCoordinator, $runtime | Out-Null
 try {
     Copy-Item -LiteralPath (Join-Path $root 'build\libs\arena-agents-0.1.0.jar') -Destination (Join-Path $mods 'arena-agents-0.0.1.jar')
+    Set-Content -LiteralPath (Join-Path $mods 'arena-agents-voice-0.1.0.jar') -Value 'stale voice addon'
     Set-Content -LiteralPath (Join-Path $mods 'unrelated.jar') -Value 'keep'
     Set-Content -LiteralPath (Join-Path $mods 'fabric-api-0.150.0+26.1.2.jar') -Value 'api'
     Set-Content -LiteralPath (Join-Path $mods 'fabric-carpet-26.1+v260402.jar') -Value 'carpet'
@@ -20,6 +21,7 @@ try {
 
     & (Join-Path $root 'scripts\install-normal-profile-update.ps1') -ProjectRoot $root -GameDirectory $target
     if (-not (Test-Path -LiteralPath (Join-Path $mods 'arena-agents-0.1.0.jar'))) { throw 'Updated jar missing.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $mods 'arena-agents-voice-0.1.0.jar'))) { throw 'Updated voice addon missing.' }
     if (Test-Path -LiteralPath (Join-Path $mods 'arena-agents-0.0.1.jar')) { throw 'Stale Arena jar remains.' }
     if (-not (Test-Path -LiteralPath (Join-Path $mods 'unrelated.jar'))) { throw 'Unrelated mod was changed.' }
     if (Test-Path -LiteralPath (Join-Path $runtimeCoordinator 'stale.log')) { throw 'Stale coordinator state remains.' }
@@ -27,6 +29,9 @@ try {
     $installedHash = (Get-FileHash (Join-Path $mods 'arena-agents-0.1.0.jar') -Algorithm SHA256).Hash
     $sourceHash = (Get-FileHash (Join-Path $root 'build\libs\arena-agents-0.1.0.jar') -Algorithm SHA256).Hash
     if ($installedHash -ne $sourceHash) { throw 'Installed jar hash differs from source jar.' }
+    $installedVoiceHash = (Get-FileHash (Join-Path $mods 'arena-agents-voice-0.1.0.jar') -Algorithm SHA256).Hash
+    $sourceVoiceHash = (Get-FileHash (Join-Path $root 'voice-addon\build\libs\arena-agents-voice-0.1.0.jar') -Algorithm SHA256).Hash
+    if ($installedVoiceHash -ne $sourceVoiceHash) { throw 'Installed voice addon hash differs from source jar.' }
 
     $secretPath = Join-Path $target 'arena-agents-runtime\runtime\bridge-secret.txt'
     $secretBefore = (Get-FileHash $secretPath -Algorithm SHA256).Hash

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coordinator Recovery Implementation Plan</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0b0d10;--panel:#12161b;--line:#28313b;--text:#eef2f6;--muted:#9da9b6;--green:#61d79a;--amber:#f5bd50;--blue:#69a9ff}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+    main{width:min(1080px,calc(100% - 32px));margin:auto;padding:48px 0 72px}h1{font-size:clamp(2rem,6vw,4.5rem);line-height:.98;letter-spacing:-.055em;margin:0 0 22px;max-width:900px}h2{font-size:1.1rem;margin:0 0 12px}p{margin:0;color:var(--muted)}
+    .eyebrow{color:var(--green);text-transform:uppercase;letter-spacing:.14em;font-size:.76rem;font-weight:750;margin-bottom:18px}.lede{font-size:clamp(1rem,2vw,1.35rem);max-width:820px;color:#cbd4dd}
+    .meta{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin:34px 0 48px}.meta div{background:var(--panel);padding:18px}.meta strong{display:block;color:var(--text);font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
+    .section{border-top:1px solid var(--line);padding-top:28px;margin-top:38px}.rules{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.rule,.task{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px}.rule b{color:var(--green)}
+    .flow{display:flex;gap:8px;align-items:center;overflow:auto;padding:6px 0 14px}.flow span{white-space:nowrap;background:var(--panel);border:1px solid var(--line);padding:9px 12px;border-radius:8px}.flow i{color:var(--muted);font-style:normal}
+    .tasks{display:grid;gap:12px;counter-reset:task}.task{display:grid;grid-template-columns:44px 1fr;gap:14px}.task:before{counter-increment:task;content:counter(task);width:34px;height:34px;display:grid;place-items:center;border-radius:50%;background:#1a242d;color:var(--blue);font-weight:800}.task h3{font-size:1rem;margin:3px 0 5px}.task p{font-size:.93rem}.tag{display:inline-block;color:var(--amber);font-size:.74rem;text-transform:uppercase;letter-spacing:.08em;margin-top:10px}
+    .gates{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.gate{padding:18px;border:1px solid var(--line);border-radius:10px}.gate strong{color:var(--green);display:block;margin-bottom:4px}.foot{margin-top:44px;padding-top:22px;border-top:1px solid var(--line);font-size:.88rem}
+    @media(max-width:720px){main{width:min(100% - 22px,1080px);padding-top:30px}.meta,.rules,.gates{grid-template-columns:1fr}.task{grid-template-columns:36px 1fr;padding:15px}.flow{margin-right:-11px}.meta{margin-bottom:34px}}
+  </style>
+</head>
+<body><main>
+  <div class="eyebrow">Agents Arena · approved implementation</div>
+  <h1>The coordinator always has a recovery path.</h1>
+  <p class="lede">Keep exact-model agents and active Minecraft goals working through crashes, provider outages, stalled sockets, bad runtime updates, and optional-service failures, without restarting Minecraft or manually resuming work.</p>
+
+  <section class="meta" aria-label="Plan summary">
+    <div><strong>Scope</strong><p>Java supervisor, Node coordinator, providers, goal lifecycle, runtime deployment, voice and diagnostics.</p></div>
+    <div><strong>Method</strong><p>Deterministic fault injection first, one owner per boundary, fresh review after every task.</p></div>
+    <div><strong>Delivery</strong><p>Full suite, PR #8 update, bot review fixes, then a fresh specialist review swarm.</p></div>
+  </section>
+
+  <section class="section">
+    <h2>Non-negotiable behavior</h2>
+    <div class="rules">
+      <div class="rule"><b>Exact profile</b><p>No provider, model, reasoning, or service-tier fallback. Recovery recreates the selected profile exactly.</p></div>
+      <div class="rule"><b>No dead end</b><p>Runtime faults become degraded, retryable, or backoff states. Only explicit shutdown is terminal.</p></div>
+      <div class="rule"><b>Player intent</b><p>Only the player can pause a goal. Infrastructure failures keep active work recoverable.</p></div>
+      <div class="rule"><b>One of everything</b><p>Retries converge to one process, one session, one turn, and one physical action.</p></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Recovery loop</h2>
+    <div class="flow" aria-label="Recovery sequence">
+      <span>Detect boundary</span><i>→</i><span>Fence stale generation</span><i>→</i><span>Preserve goal + profile</span><i>→</i><span>Retry or roll back</span><i>→</i><span>Verify stable</span><i>→</i><span>Promote healthy</span>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Implementation sequence</h2>
+    <div class="tasks">
+      <article class="task"><div><h3>Recover active goals without pausing</h3><p>Add server-authoritative rearm semantics across reload, disconnect, and reconnect while preserving goal revision and exact profile.</p><span class="tag">Java + Node lifecycle</span></div></article>
+      <article class="task"><div><h3>Fence bridge sessions and dead sockets</h3><p>Add connection epochs, handshake and heartbeat deadlines, stale-callback rejection, and full-goal action dedupe.</p><span class="tag">Protocol</span></div></article>
+      <article class="task"><div><h3>Replace Java’s permanent failure latch</h3><p>Implement the seven-state supervisor, indefinite capped retries, owned launch IDs, auth/reconnect deadlines, and dependency revalidation.</p><span class="tag">Java supervisor</span></div></article>
+      <article class="task"><div><h3>Retain a verified runtime generation</h3><p>Keep one last-known-good coordinator, externalize mutable config and secrets, journal atomic swaps, and roll back only after process cleanup.</p><span class="tag">Installer + deployment</span></div></article>
+      <article class="task"><div><h3>Start core first and isolate providers</h3><p>Bring up the Minecraft bridge immediately, lazily start providers, and use settled per-provider catalogs and reconciliation.</p><span class="tag">Node startup</span></div></article>
+      <article class="task"><div><h3>Replace dead exact-profile sessions</h3><p>Fence transport generations, isolate health circuits by profile, reclaim hung turns, and give every recovery lease a real retry deadline.</p><span class="tag">Providers + scheduler</span></div></article>
+      <article class="task"><div><h3>Isolate voice and diagnostics</h3><p>Retry voice independently, release aborted TTS/STT capacity, make trace writes best-effort, and publish concise component recovery status.</p><span class="tag">Optional services</span></div></article>
+      <article class="task"><div><h3>Prove failure recovery deterministically</h3><p>Inject crashes, hangs, stale callbacks, corrupt runtime, provider outages, socket stalls, ignored aborts, voice bind failures, and diagnostic errors.</p><span class="tag">Fault matrix</span></div></article>
+      <article class="task"><div><h3>Run the complete suite and update PR #8</h3><p>Resolve every reproducible failure, run the full repository gate, audit packaging and secrets, then fast-forward the normal PR.</p><span class="tag">Delivery gate 1</span></div></article>
+      <article class="task"><div><h3>Resolve bot review and update again</h3><p>Wait for checks and comments, validate each finding, fix valid issues with tests, rerun the full gate, and push the review fixes.</p><span class="tag">Delivery gate 2</span></div></article>
+      <article class="task"><div><h3>Run a fresh specialist review swarm</h3><p>Audit coordinator reliability, performance, lifecycle correctness, movement/pathfinding, and faster complex in-game planning. Fix validated blockers and update PR #8 once more.</p><span class="tag">Independent final review</span></div></article>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Completion gates</h2>
+    <div class="gates">
+      <div class="gate"><strong>Behavior</strong><p>Failures recover automatically without model substitution, player resume, duplicate action, or Minecraft restart.</p></div>
+      <div class="gate"><strong>Evidence</strong><p>Focused red-to-green tests plus the complete automated, performance, packaging, and headless gates.</p></div>
+      <div class="gate"><strong>Review</strong><p>Valid bot comments resolved, required checks green, and fresh swarm findings adjudicated and verified.</p></div>
+    </div>
+  </section>
+
+  <p class="foot">Detailed file ownership, interfaces, red tests, commands, and commit boundaries are in the paired Markdown implementation plan. No credentials or private runtime values are included here.</p>
+</main></body></html>

@@ -79,6 +79,7 @@ public final class AgentVerboseState {
 
 	public synchronized void clearActivity() {
 		actions.clear();
+		goalVerifications.clear();
 	}
 
 	public synchronized boolean goalVerificationChanged(

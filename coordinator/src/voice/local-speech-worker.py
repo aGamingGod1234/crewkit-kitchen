@@ -73,19 +73,22 @@ def _load_stt():
 def _warmup_model(name, loader):
     try:
         loader()
+        return True
     except Exception as error:
         sys.stderr.write(f"Arena local speech {name} warmup failed: {type(error).__name__}: {error}\n")
         sys.stderr.flush()
+        return False
 
 
 def _warmup():
     global _warmup_started
     with _warmup_lock:
         if _warmup_started:
-            return
+            return {"sttReady": _stt_model is not None, "ttsReady": _tts_model is not None}
         _warmup_started = True
-        threading.Thread(target=_warmup_model, args=("STT", _load_stt), daemon=True).start()
-        threading.Thread(target=_warmup_model, args=("TTS", _load_tts), daemon=True).start()
+    stt_ready = _warmup_model("STT", _load_stt)
+    threading.Thread(target=_warmup_model, args=("TTS", _load_tts), daemon=True).start()
+    return {"sttReady": stt_ready, "ttsReady": _tts_model is not None}
 
 
 def _tts(request):
@@ -173,8 +176,7 @@ def main():
             elif operation == "stt":
                 result = _stt(request)
             elif operation == "warmup":
-                _warmup()
-                result = {"warming": True}
+                result = _warmup()
             else:
                 raise ValueError("Speech operation is invalid")
             _respond({"id": request_id, "ok": True, **result})

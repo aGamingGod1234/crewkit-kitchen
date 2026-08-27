@@ -1525,6 +1525,47 @@ test('a pre-disconnect native completion cannot complete the replacement lifecyc
 	}
 });
 
+test('idle native agents answer direct conversation without creating a physical goal', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		const result = await request.executeTool({
+			agentId: request.agentId,
+			goalRevision: request.goalRevision,
+			turnId: 'turn-idle-conversation',
+			callId: 'call-idle-conversation',
+			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Hi!', audience: 'direct', recipientId: 'player-a' } },
+		});
+		assert.equal(result.state, 'SUCCEEDED');
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+	});
+	try {
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Hi', goalRevision: 0, observedAtEpochMs: 10,
+		} });
+		await eventually(() => run.bridge.sent.some((message) => message.payload?.actionType === 'chat'));
+		const command = run.bridge.sent.find((message) => message.payload?.actionType === 'chat');
+		assert.equal(planner.requests[0].preserveState, true);
+		assert.match(planner.requests[0].input, /conversation_only/);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.IDLE);
+		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
+			goalRevision: 0, actionId: command.payload.actionId, actionType: 'chat', state: 'SUCCEEDED',
+			reasonCode: 'CHAT_SENT', executionStarted: true, eventSequence: 1,
+		} });
+		await eventually(() => planner.requests.length === 1 && run.registry.get('agent-a').state === DynamicAgentState.IDLE);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('an expired native provider turn is evicted so a fresh observation can start replacement work', async () => {
 	const timers = new ManualTimerQueue();
 	const registry = new AgentRegistry();

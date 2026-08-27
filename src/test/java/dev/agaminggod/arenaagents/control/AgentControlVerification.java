@@ -248,7 +248,12 @@ public final class AgentControlVerification {
 		}
 		assertEquals("gpt-5.6-luna", AgentControlCatalog.defaultModel("codex"),
 				"disconnect reset restores the safe fallback catalog");
-		return 7;
+		assertEquals(List.of("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-sol-wm"),
+				AgentControlCatalog.models("codex").subList(0, 4),
+				"fallback model sequence remains Luna, Terra, Sol, Sol WM");
+		assertTrue(!AgentControlCatalog.models("codex").contains("codex-auto-review"),
+				"fallback model sequence omits provider-internal hidden models");
+		return 9;
 	}
 
 	private static int verifyActionSafety() {

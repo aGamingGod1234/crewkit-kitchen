@@ -62,3 +62,34 @@ test('catalog cache does not retain decision-like provider output fields', async
 		serviceTiers: ['priority'],
 	});
 });
+
+test('catalog exposes a stable operator sequence and omits hidden provider models', async () => {
+	const cache = new ModelCatalogCache(async () => [
+		{
+			id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', hidden: false,
+			supportedReasoningEfforts: ['ultra', 'low', 'xhigh', 'medium', 'high', 'max'],
+			serviceTiers: ['fast', 'priority'],
+		},
+		{
+			id: 'gpt-reserve', model: 'gpt-reserve', hidden: true,
+			supportedReasoningEfforts: ['high'], serviceTiers: ['priority'],
+		},
+		{
+			id: 'gpt-5.6-luna', model: 'gpt-5.6-luna', hidden: false,
+			supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'],
+			serviceTiers: ['fast', 'priority'],
+		},
+		{
+			id: 'gpt-5.6-terra', model: 'gpt-5.6-terra', hidden: false,
+			supportedReasoningEfforts: ['high', 'low', 'max', 'medium', 'xhigh', 'ultra'],
+			serviceTiers: ['priority', 'fast'],
+		},
+	]);
+	const snapshot = await cache.refresh();
+	assert.deepEqual(snapshot.models.map((model) => model.id), [
+		'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol',
+	]);
+	assert.deepEqual(cache.find('gpt-5.6-luna').reasoningEfforts, ['low', 'medium', 'high', 'xhigh', 'max']);
+	assert.deepEqual(cache.find('gpt-5.6-sol').serviceTiers, ['priority', 'fast']);
+	assert.equal(cache.find('gpt-reserve'), null);
+});

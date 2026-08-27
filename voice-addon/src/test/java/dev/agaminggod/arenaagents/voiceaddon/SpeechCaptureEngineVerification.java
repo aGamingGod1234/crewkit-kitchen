@@ -27,7 +27,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyMaximumDurationBoundsDecodedSamples();
 		assertions += verifyMalformedPacketDoesNotWedgeLaterSpeech();
 		assertions += verifyTranscriptsDeliverInUtteranceOrder();
-		assertions += verifyUnavailableSttDisablesFurtherCapture();
+		assertions += verifyUnavailableSttRecoversAfterBackoff();
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		return assertions;
 	}
@@ -188,22 +188,36 @@ final class SpeechCaptureEngineVerification {
 		return 2;
 	}
 
-	private static int verifyUnavailableSttDisablesFurtherCapture() {
+	private static int verifyUnavailableSttRecoversAfterBackoff() {
 		int[] transcriptions = { 0 };
+		int[] decoders = { 0 };
+		long[] now = { 0L };
+		List<Delivered> delivered = new ArrayList<>();
 		SpeechCaptureEngine engine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
 			transcriptions[0]++;
-			return CompletableFuture.failedFuture(new VoiceWorkerClient.VoiceWorkerException(
-					"STT_UNAVAILABLE", "Speech recognition is not configured"
-			));
-		}, scheduler(), 5_000L, 1);
-		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
-				(playerId, text, whispering) -> { });
+			return transcriptions[0] == 1
+					? CompletableFuture.failedFuture(new VoiceWorkerClient.VoiceWorkerException(
+							"STT_UNAVAILABLE", "Speech recognition is not configured"))
+					: CompletableFuture.completedFuture(new SpeechWorkerClient.Transcript("recovered", 0.9));
+		}, scheduler(), 5_000L, 1, ignored -> { }, () -> now[0]);
+		SpeechCaptureEngine.DecoderFactory decoderFactory = () -> {
+			decoders[0]++;
+			return new RecordingDecoder();
+		};
+		engine.accept(PLAYER, false, new byte[] { 1 }, decoderFactory, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
 		engine.accept(PLAYER, false, new byte[] { 2 }, () -> {
-			throw new AssertionError("disabled capture must not create another decoder");
+			throw new AssertionError("capture must respect the bounded STT backoff");
 		}, Runnable::run, (playerId, text, whispering) -> { });
-		assertEquals(1, transcriptions[0], "STT_UNAVAILABLE permanently disables this capture engine");
+		now[0] = TimeUnit.SECONDS.toNanos(5L);
+		engine.accept(PLAYER, false, new byte[] { 3 }, decoderFactory, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		assertEquals(2, transcriptions[0], "STT capture probes again after its bounded backoff");
+		assertEquals(2, decoders[0], "backoff drops packets without decoding and recovery creates one decoder");
+		assertEquals(List.of(new Delivered(PLAYER, "recovered", false)), delivered,
+				"the recovered transcript remains sequenced after the unavailable utterance");
 		engine.close();
-		return 1;
+		return 3;
 	}
 
 	private static int verifyCloseDiscardsPartialSpeechAndClosesDecoder() {
