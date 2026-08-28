@@ -11,9 +11,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -51,6 +53,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private final ConcurrentLinkedQueue<MaintenanceResult> maintenanceResults = new ConcurrentLinkedQueue<>();
 	private final AtomicLong dependencyWakeGeneration = new AtomicLong();
 	private final AtomicBoolean dependencyWakeQueued = new AtomicBoolean();
+	private final Set<Path> reapedOrphanRoots = new LinkedHashSet<>();
 
 	private PreparedRuntime runtime;
 	private ChildProcess child;
@@ -58,6 +61,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private volatile boolean stopped;
 	private boolean maintenancePending;
 	private boolean orphanCleanupComplete;
+	private boolean coordinatorReconciled;
 	private boolean stabilityCredited;
 	private long generation;
 	private long nextRetryEpochMs;
@@ -274,6 +278,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			boolean fingerprintChanged,
 			boolean initial,
 			boolean orphanCleanupSucceeded,
+			List<Path> orphanRootsReaped,
 			long submittedWakeGeneration
 	) implements MaintenanceResult {
 	}
@@ -478,6 +483,23 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	synchronized void tick(boolean bridgeAuthenticated, String authenticatedLaunchId, long sessionGeneration) {
+		// The legacy verification overload predates the coordinator readiness gate. Keep
+		// it source-compatible for isolated supervisor tests; production uses the
+		// explicit readiness-aware overload below.
+		tick(bridgeAuthenticated, authenticatedLaunchId, sessionGeneration, true);
+	}
+
+	/**
+	 * Advances supervision with the authenticated bridge's reconciliation boundary.
+	 * Authentication proves transport ownership only; candidate generations are not
+	 * promoted until the coordinator has also reconciled its catalog and roster.
+	 */
+	synchronized void tick(
+			boolean bridgeAuthenticated,
+			String authenticatedLaunchId,
+			long sessionGeneration,
+			boolean coordinatorReady
+	) {
 		if (stopped) return;
 		long now = now();
 		drainMaintenanceResults(now);
@@ -488,7 +510,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		if (child != null) {
-			observeOwnedChild(now, bridgeAuthenticated, authenticatedLaunchId, sessionGeneration);
+			observeOwnedChild(now, bridgeAuthenticated, authenticatedLaunchId, sessionGeneration, coordinatorReady);
 			if (child != null) submitDependencyMaintenance(now, false, false);
 		}
 		if (pendingTermination != null) {
@@ -532,6 +554,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		if (bridgeAuthenticated && authenticatedLaunchId == null) {
 			state = CoordinatorRecoveryState.HEALTHY;
 			nextRetryEpochMs = 0L;
+			coordinatorReconciled = coordinatorReady;
+			clearDiagnostic();
 			submitDependencyMaintenance(now, false, false);
 			return;
 		}
@@ -565,7 +589,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			long now,
 			boolean bridgeAuthenticated,
 			String authenticatedLaunchId,
-			long sessionGeneration
+			long sessionGeneration,
+			boolean coordinatorReady
 	) {
 		boolean matchingAuthentication = bridgeAuthenticated
 				&& launchId != null
@@ -579,11 +604,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				stabilityCredited = false;
 			}
 			authenticatedSessionGeneration = sessionGeneration;
+			coordinatorReconciled = coordinatorReady;
 			failingBoundary = null;
+			clearDiagnostic();
 			authenticationDeadlineEpochMs = 0L;
 			reconnectDeadlineEpochMs = 0L;
 			nextRetryEpochMs = 0L;
-			if (!stabilityCredited && now - authenticatedSinceEpochMs >= STABILITY_INTERVAL_MS) {
+			if (!stabilityCredited && coordinatorReconciled
+					&& now - authenticatedSinceEpochMs >= STABILITY_INTERVAL_MS) {
 				if (runtime != null && runtime.candidate()) {
 					if (now >= nextGenerationMutationEpochMs) submitPromotionMaintenance();
 				} else {
@@ -596,6 +624,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		if (state == CoordinatorRecoveryState.HEALTHY || state == CoordinatorRecoveryState.DEGRADED) {
 			if (state == CoordinatorRecoveryState.HEALTHY) {
 				state = CoordinatorRecoveryState.DEGRADED;
+				coordinatorReconciled = false;
 				reconnectDeadlineEpochMs = now + RECONNECT_TIMEOUT_MS;
 				authenticatedSinceEpochMs = 0L;
 				stabilityCredited = false;
@@ -614,6 +643,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		state = CoordinatorRecoveryState.AUTHENTICATING;
+		coordinatorReconciled = false;
 		if (now >= authenticationDeadlineEpochMs) {
 			queueTermination(detachChild());
 			recordFailure(now, "COORDINATOR_AUTHENTICATION_TIMEOUT",
@@ -692,11 +722,25 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private void submitDependencyMaintenance(long requestedAt, boolean force, boolean initial) {
 		if (maintenancePending || stopped) return;
+		// Honor the deadline before touching dependency files. A no-op completion keeps
+		// the maintenance queue's ordering deterministic without calling safeFingerprint.
+		if (!force && orphanCleanupComplete && now() < nextDependencyCheckEpochMs) {
+			maintenancePending = true;
+			String observedFingerprint = dependencyFingerprint;
+			long submittedWakeGeneration = dependencyWakeGeneration.get();
+			submitMaintenance(() -> publishMaintenanceResult(new DependencyMaintenanceResult(
+					observedFingerprint, null, false, false, false, List.of(), submittedWakeGeneration
+			)));
+			return;
+		}
+		List<Path> cleanupRoots = orphanRuntimeRoots();
+		Set<Path> rootsAlreadyReaped = Set.copyOf(reapedOrphanRoots);
+		boolean reapRequired = !orphanCleanupComplete
+				|| cleanupRoots.stream().anyMatch(root -> !rootsAlreadyReaped.contains(root));
 		maintenancePending = true;
 		String previousFingerprint = dependencyFingerprint;
 		long scheduledCheck = nextDependencyCheckEpochMs;
 		long submittedWakeGeneration = dependencyWakeGeneration.get();
-		boolean reapRequired = !orphanCleanupComplete;
 		submitMaintenance(() -> {
 			String currentFingerprint = safeFingerprint();
 			dependencyChangeMonitor.observeSubmittedFingerprint(currentFingerprint);
@@ -704,14 +748,19 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			long checkedAt = now();
 			if (!force && !reapRequired && !changed && checkedAt < scheduledCheck) {
 				publishMaintenanceResult(new DependencyMaintenanceResult(
-						currentFingerprint, null, false, initial, false, submittedWakeGeneration
+						currentFingerprint, null, false, initial, false, List.of(), submittedWakeGeneration
 				));
 				return;
 			}
 			boolean reaped = !reapRequired;
 			if (reapRequired) {
 				try {
-					int count = orphanReaper.reap(gameDirectory.resolve("arena-agents-runtime"));
+					int count = 0;
+					for (Path root : cleanupRoots) {
+						if (rootsAlreadyReaped.contains(root)) continue;
+						int rootCount = orphanReaper.reap(root);
+						count += rootCount;
+					}
 					if (count > 0) {
 						LOGGER.warn("Stopped {} orphaned Arena Agents coordinator process(es) before updating the runtime", count);
 					}
@@ -722,17 +771,19 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 							DependencyResolution.blocked(
 									"COORDINATOR_ORPHAN_CLEANUP_FAILED",
 									failure.getMessage() == null ? "Owned coordinator cleanup is temporarily unavailable" : failure.getMessage()
-							),
-							changed,
-							initial,
-							false,
-							submittedWakeGeneration
-					));
+								),
+								changed,
+								initial,
+								false,
+								List.of(),
+								submittedWakeGeneration
+							));
 					return;
 				}
 			}
 			publishMaintenanceResult(new DependencyMaintenanceResult(
-					currentFingerprint, resolveDependencies(), changed, initial, reaped, submittedWakeGeneration
+				currentFingerprint, resolveDependencies(), changed, initial, reaped,
+				reaped ? List.copyOf(cleanupRoots) : List.of(), submittedWakeGeneration
 			));
 		});
 	}
@@ -850,7 +901,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			maintenancePending = false;
 			if (result instanceof DependencyMaintenanceResult dependency) {
 				dependencyFingerprint = dependency.fingerprint();
-				if (dependency.orphanCleanupSucceeded()) orphanCleanupComplete = true;
+				if (dependency.orphanCleanupSucceeded()) {
+					reapedOrphanRoots.addAll(dependency.orphanRootsReaped());
+					orphanCleanupComplete = orphanRuntimeRoots().stream().allMatch(reapedOrphanRoots::contains);
+				}
 				if (dependency.resolution() != null) {
 					applyDependencyResolution(
 							dependency.resolution(), now, dependency.initial(), dependency.fingerprintChanged()
@@ -874,6 +928,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				authenticationDeadlineEpochMs = launch.startedAtEpochMs() + AUTHENTICATION_TIMEOUT_MS;
 				reconnectDeadlineEpochMs = 0L;
 				authenticatedSinceEpochMs = 0L;
+				coordinatorReconciled = false;
 				stabilityCredited = false;
 				nextRetryEpochMs = 0L;
 				state = CoordinatorRecoveryState.AUTHENTICATING;
@@ -944,6 +999,28 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 	}
 
+	/**
+	 * Returns every runtime root that may contain an ownership record for this
+	 * server. The installed game-local root is retained for upgrades, while the
+	 * selected external package root covers packageRoot migrations without ever
+	 * broadening cleanup beyond known roots.
+	 */
+	private synchronized List<Path> orphanRuntimeRoots() {
+		LinkedHashSet<Path> roots = new LinkedHashSet<>();
+		String configured = System.getProperty("arenaagents.packageRoot");
+		if (configured != null && !configured.isBlank()) {
+			try {
+				roots.add(Path.of(configured).toAbsolutePath().normalize());
+			} catch (RuntimeException ignored) {
+				// Dependency resolution reports the malformed path; cleanup remains bounded.
+			}
+		}
+		Path discovered = findPackageRoot(gameDirectory);
+		if (discovered != null) roots.add(discovered);
+		roots.add(gameDirectory.resolve("arena-agents-runtime").toAbsolutePath().normalize());
+		return List.copyOf(roots);
+	}
+
 	private String safeFingerprint() {
 		try {
 			return Objects.toString(dependencyResolver.fingerprint(), "");
@@ -996,6 +1073,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		authenticationDeadlineEpochMs = 0L;
 		reconnectDeadlineEpochMs = 0L;
 		authenticatedSinceEpochMs = 0L;
+		coordinatorReconciled = false;
 		stabilityCredited = false;
 		setDiagnostic(code, message, boundary);
 	}
@@ -1018,6 +1096,12 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			LOGGER.warn("Arena Agents coordinator recovering [{}] at {}: {}", code, boundary,
 					message == null ? "retry scheduled" : message);
 		}
+	}
+
+	private void clearDiagnostic() {
+		failureCode = null;
+		failureMessage = null;
+		failingBoundary = null;
 	}
 
 	private ChildProcess detachChild() {

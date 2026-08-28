@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
+import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusStore;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
@@ -34,6 +35,7 @@ public final class CodexAgentServerRuntime {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CodexAgentServerRuntime.class);
 	private static final Map<MinecraftServer, BridgeSlot> BRIDGE_SLOTS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, CoordinatorProcessSupervisor> COORDINATORS = new ConcurrentHashMap<>();
+	private static final Map<MinecraftServer, Long> VOICE_REVISIONS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static boolean registered;
@@ -73,10 +75,8 @@ public final class CodexAgentServerRuntime {
 			}
 		}
 		try {
-			VoiceSubsystemRuntime.start(server);
 			tryStartBridge(server, manager, supervisor);
 		} catch (RuntimeException exception) {
-			VoiceSubsystemRuntime.close(server);
 			LOGGER.error(
 					"Codex agent bridge is unavailable; summoned agents will remain locally controllable but autonomous planning is disabled",
 					exception
@@ -143,13 +143,17 @@ public final class CodexAgentServerRuntime {
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		MultiplexedServerBridge bridge = bridge(server);
 		if (supervisor != null) {
+			boolean coordinatorReady = bridge != null && bridge.authenticated()
+					&& CoordinatorStatusStore.latest(server).map(status -> status.reconciled()).orElse(false);
 			supervisor.tick(
 					bridge != null && bridge.authenticated(),
 					bridge == null ? null : bridge.authenticatedLaunchId(),
-					bridge == null ? 0L : bridge.authenticatedSessionGeneration()
+					bridge == null ? 0L : bridge.authenticatedSessionGeneration(),
+					coordinatorReady
 			);
 			tryStartBridge(server, manager, supervisor);
 			bridge = bridge(server);
+			reconcileVoice(server, supervisor);
 		}
 		if (!ScenarioRuntimeService.restorePersistedState(server)) {
 			VoiceSubsystemRuntime.tick(server);
@@ -272,6 +276,7 @@ public final class CodexAgentServerRuntime {
 
 	private static void stop(MinecraftServer server) {
 		PLANNING_UPDATES.remove(server);
+		VOICE_REVISIONS.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);
 		try {
@@ -283,6 +288,33 @@ public final class CodexAgentServerRuntime {
 			if (bridgeSlot != null) bridgeSlot.close();
 			if (supervisor != null) supervisor.close();
 		}
+	}
+
+	/** Starts voice only after the supervisor has published the prepared secret/config paths. */
+	private static void reconcileVoice(MinecraftServer server, CoordinatorProcessSupervisor supervisor) {
+		if (supervisor == null) return;
+		boolean prepared = supervisor.configured()
+				|| (supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
+						&& propertyPresent("arenaagents.voiceSecretFile"));
+		if (!prepared) return;
+		long revision = java.util.Objects.hash(
+				supervisor.bridgeRevision(), supervisor.secretPath(),
+				System.getProperty("arenaagents.voiceSecretFile"), System.getProperty("arenaagents.voiceUrl")
+		);
+		Long active = VOICE_REVISIONS.get(server);
+		if (active != null && active == revision) return;
+		try {
+			if (active != null) VoiceSubsystemRuntime.close(server);
+			VoiceSubsystemRuntime.start(server);
+			VOICE_REVISIONS.put(server, revision);
+		} catch (RuntimeException failure) {
+			LOGGER.warn("Voice subsystem initialization will retry after coordinator paths are prepared", failure);
+		}
+	}
+
+	private static boolean propertyPresent(String name) {
+		String value = System.getProperty(name);
+		return value != null && !value.isBlank();
 	}
 
 	private static MultiplexedServerBridge bridge(MinecraftServer server) {
