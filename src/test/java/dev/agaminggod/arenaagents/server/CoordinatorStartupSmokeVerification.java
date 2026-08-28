@@ -43,6 +43,12 @@ public final class CoordinatorStartupSmokeVerification {
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
 			stageCoordinator(sourceCoordinator, packageRoot);
+			System.setProperty("arenaagents.packageRoot", packageRoot.toString());
+			assertEquals(2, CoordinatorProcessSupervisor.ownershipRoots(packageRoot.resolve("game")).size(),
+					"startup checks default and configured ownership roots");
+			assertEquals(packageRoot.toAbsolutePath().normalize(),
+					CoordinatorProcessSupervisor.ownershipRoots(packageRoot.resolve("game")).get(1),
+					"custom package ownership is reaped before launch");
 			int credentialAssertions = verifyOptionalVoiceCredential(packageRoot.resolve("credential-test"));
 			Path node = stageBundledNode(packageRoot);
 			Path fakeAppData = stageFakeCodex(packageRoot);
@@ -54,7 +60,6 @@ public final class CoordinatorStartupSmokeVerification {
 					"test-fish-api-key",
 					StandardCharsets.UTF_8
 			);
-			System.setProperty("arenaagents.packageRoot", packageRoot.toString());
 			System.clearProperty(NodeRuntimeLocator.PROPERTY);
 			System.clearProperty("arenaagents.bridgeSecretFile");
 			System.clearProperty("arenaagents.voiceSecretFile");
@@ -84,7 +89,7 @@ public final class CoordinatorStartupSmokeVerification {
 						if (completeHandshakeAndCatalog(socket)) {
 							assertTrue(awaitLoopbackListener(voicePort, 5_000L),
 									"runtime Fish credential starts the loopback voice worker");
-							return 8 + credentialAssertions;
+							return 10 + credentialAssertions;
 						}
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.

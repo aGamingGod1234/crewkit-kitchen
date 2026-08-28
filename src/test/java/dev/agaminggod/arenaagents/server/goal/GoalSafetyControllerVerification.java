@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.server.goal;
 
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController.HazardSnapshot;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController.SafetyDirective;
+import dev.agaminggod.arenaagents.server.goal.GoalSafetyController.DamageState;
 import java.util.Arrays;
 
 public final class GoalSafetyControllerVerification {
@@ -17,7 +18,15 @@ public final class GoalSafetyControllerVerification {
 		assertEquals(SafetyDirective.NONE, decide(false, false, false, false, 300, false, false, false, false), "healthy bodies receive no invented strategy");
 		assertTrue(Arrays.stream(SafetyDirective.values()).noneMatch(value -> value.name().equals("ATTACK")), "safety cannot represent attack");
 		assertTrue(Arrays.stream(SafetyDirective.values()).noneMatch(value -> value.name().equals("CONSUME_ITEM")), "safety cannot represent item spending");
-		return 8;
+		DamageState firstHit = GoalSafetyController.trackDamage(new DamageState(20.0F, Long.MIN_VALUE, 0), 18.0F, 100L);
+		DamageState secondHit = GoalSafetyController.trackDamage(firstHit, 16.0F, 120L);
+		assertTrue(secondHit.repeatedAt(120L), "second nearby hit activates the repeated-damage reflex");
+		DamageState betweenHits = GoalSafetyController.trackDamage(secondHit, 16.0F, 121L);
+		assertTrue(betweenHits.repeatedAt(159L), "repeated-damage reflex remains active between attacks");
+		assertTrue(!betweenHits.repeatedAt(161L), "repeated-damage reflex expires after its bounded window");
+		DamageState laterHit = GoalSafetyController.trackDamage(betweenHits, 14.0F, 200L);
+		assertTrue(!laterHit.repeatedAt(200L), "a hit after expiry starts a new damage streak");
+		return 12;
 	}
 
 	private static SafetyDirective decide(

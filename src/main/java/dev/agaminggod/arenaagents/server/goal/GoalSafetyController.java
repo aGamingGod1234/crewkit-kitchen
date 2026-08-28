@@ -113,12 +113,17 @@ public final class GoalSafetyController {
 
 	private boolean repeatedDamage(AgentId agentId, float health, long tick) {
 		DamageState previous = damage.get(agentId);
+		DamageState next = trackDamage(previous, health, tick);
+		damage.put(agentId, next);
+		return next.repeatedAt(tick);
+	}
+
+	static DamageState trackDamage(DamageState previous, float health, long tick) {
 		boolean damaged = previous != null && health < previous.health();
-		int streak = damaged && tick - previous.lastDamageTick() <= REPEATED_DAMAGE_WINDOW_TICKS
-				? previous.streak() + 1 : damaged ? 1 : previous == null ? 0 : previous.streak();
+		boolean withinWindow = previous != null && previous.withinWindow(tick);
+		int streak = damaged && withinWindow ? previous.streak() + 1 : damaged ? 1 : previous == null ? 0 : previous.streak();
 		long lastDamageTick = damaged ? tick : previous == null ? Long.MIN_VALUE : previous.lastDamageTick();
-		damage.put(agentId, new DamageState(health, lastDamageTick, streak));
-		return damaged && streak >= 2;
+		return new DamageState(health, lastDamageTick, streak);
 	}
 
 	private Vec3 verifiedEscape(ServerPlayer player, Vec3 threat) {
@@ -152,7 +157,16 @@ public final class GoalSafetyController {
 		}
 	}
 
-	private record DamageState(float health, long lastDamageTick, int streak) { }
+	record DamageState(float health, long lastDamageTick, int streak) {
+		boolean repeatedAt(long tick) {
+			return streak >= 2 && withinWindow(tick);
+		}
+
+		private boolean withinWindow(long tick) {
+			return lastDamageTick != Long.MIN_VALUE && tick >= lastDamageTick
+					&& tick - lastDamageTick <= REPEATED_DAMAGE_WINDOW_TICKS;
+		}
+	}
 
 	public enum SafetyDirective {
 		NONE,

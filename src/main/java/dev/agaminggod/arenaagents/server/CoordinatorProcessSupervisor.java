@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -51,7 +52,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		NodeRuntimeLocator.LocatedNode located = null;
 		try {
 			Path installedRoot = this.gameDirectory.resolve("arena-agents-runtime");
-			int reaped = CoordinatorProcessOwnership.reapOrphaned(installedRoot);
+			int reaped = 0;
+			for (Path ownershipRoot : ownershipRoots(this.gameDirectory)) {
+				reaped += CoordinatorProcessOwnership.reapOrphaned(ownershipRoot);
+			}
 			if (reaped > 0) LOGGER.warn("Stopped {} orphaned Arena Agents coordinator process(es) before updating the runtime", reaped);
 			IOException installFailure = null;
 			try {
@@ -261,14 +265,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	private static Path findPackageRoot(Path gameDirectory) {
-		String configured = System.getProperty("arenaagents.packageRoot");
-		if (configured != null && !configured.isBlank()) {
-			try {
-				return Path.of(configured).toAbsolutePath().normalize();
-			} catch (RuntimeException exception) {
-				return null;
-			}
-		}
+		Path configured = configuredPackageRoot();
+		if (configured != null) return configured;
 		Path installedRuntime = gameDirectory.resolve("arena-agents-runtime");
 		if (isPackageRoot(installedRuntime)) return installedRuntime;
 		Path cursor = Path.of(System.getProperty("user.dir", ".")).toAbsolutePath().normalize();
@@ -277,6 +275,25 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 		Path sibling = gameDirectory.getParent() == null ? null : gameDirectory.getParent().resolve("agent arena");
 		return sibling != null && isPackageRoot(sibling) ? sibling : null;
+	}
+
+	static List<Path> ownershipRoots(Path gameDirectory) {
+		Path installed = gameDirectory.toAbsolutePath().normalize().resolve("arena-agents-runtime").normalize();
+		ArrayList<Path> roots = new ArrayList<>();
+		roots.add(installed);
+		Path configured = configuredPackageRoot();
+		if (configured != null && !configured.equals(installed)) roots.add(configured);
+		return List.copyOf(roots);
+	}
+
+	private static Path configuredPackageRoot() {
+		String configured = System.getProperty("arenaagents.packageRoot");
+		if (configured == null || configured.isBlank()) return null;
+		try {
+			return Path.of(configured).toAbsolutePath().normalize();
+		} catch (RuntimeException exception) {
+			return null;
+		}
 	}
 
 	private static boolean isPackageRoot(Path candidate) {
