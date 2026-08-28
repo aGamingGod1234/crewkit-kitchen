@@ -2731,7 +2731,31 @@ export function buildNativeEventInput(record, { event, trigger, observation = {}
 }
 
 function nativeObservationSignature(observation) {
-	return createHash('sha256').update(JSON.stringify(sortFactualValue(observation))).digest('hex');
+	return createHash('sha256').update(JSON.stringify(sortFactualValue(nativeActionableObservationProjection(observation)))).digest('hex');
+}
+
+function nativeActionableObservationProjection(observation) {
+	const projection = { ...observation };
+	if (observation.player !== undefined) {
+		projection.player = { ...observation.player };
+		if (observation.player.effects !== undefined) {
+			projection.player.effects = observation.player.effects.map(({ duration, ...effect }) => effect);
+		}
+	}
+	if (observation.items !== undefined) projection.items = observation.items.map(({ distance, ...item }) => item);
+	if (observation.entities !== undefined) projection.entities = observation.entities.map(({ distance, ...entity }) => entity);
+	if (observation.nearbyContainers !== undefined) {
+		projection.nearbyContainers = observation.nearbyContainers.map(({ distance, ...container }) => container);
+	}
+	if (observation.world !== undefined) {
+		const { gameTime, dayTime, ...world } = observation.world;
+		projection.world = world;
+	}
+	if (observation.interaction !== undefined) {
+		const { useRemainingTicks, attackCooldown, ...interaction } = observation.interaction;
+		projection.interaction = { ...interaction, attackReady: attackCooldown >= 1 };
+	}
+	return projection;
 }
 
 function planningTraceId(agentId, goalRevision, lifecycleGeneration, kind) {

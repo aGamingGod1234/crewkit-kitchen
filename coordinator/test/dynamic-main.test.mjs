@@ -2144,6 +2144,47 @@ test('native scheduling drops unchanged quiet heartbeats but accepts the supervi
 	} finally { await run.coordinator.stop(); }
 });
 
+test('native scheduling ignores clock-only heartbeats but replans for actionable changes', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	const heartbeat = factToWireObservation({
+		player: { x: 0, y: 64, z: 0, health: 20 },
+		items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} },
+	}, 1, 1, false, 1);
+	heartbeat.player.effects = [{ effectId: 'minecraft:speed', amplifier: 0, duration: 100 }];
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: heartbeat });
+		await eventually(() => planner.requests.length === 1);
+
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			...heartbeat,
+			eventSequence: 2,
+			player: { ...heartbeat.player, effects: [{ ...heartbeat.player.effects[0], duration: 99 }] },
+			world: { ...heartbeat.world, gameTime: 2, dayTime: 2 },
+		} });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(planner.requests.length, 1, 'advancing clocks and effect countdowns do not queue another provider turn');
+
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			...heartbeat,
+			eventSequence: 3,
+			world: { ...heartbeat.world, gameTime: 3, dayTime: 3, raining: true },
+		} });
+		await eventually(() => planner.requests.length === 2);
+		assert.match(planner.requests[1].input, /\"raining\":true/);
+	} finally { await run.coordinator.stop(); }
+});
+
 test('native turns receive each conversation entry exactly once', async () => {
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
