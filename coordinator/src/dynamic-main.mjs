@@ -35,6 +35,7 @@ import { classifyRecoveryFailure } from './recovery-policy.mjs';
 import { ReportingTransitionDeduper } from './reporting-transition-deduper.mjs';
 import { NativeToolRuntime } from './native-tool-runtime.mjs';
 import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
+import { MAX_GOAL_SPEC_CORRECTION_ATTEMPTS } from './goal-spec-translator.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { TraceWriter } from './trace-writer.mjs';
@@ -56,6 +57,7 @@ const EMPTY_TURN_RETRY_DELAY_MS = 1_000;
 const GOAL_SPEC_RETRY_BASE_MS = 1_000;
 const GOAL_SPEC_RETRY_MAX_MS = 30_000;
 const GOAL_SPEC_PROPOSAL_RETRY_MS = 5_000;
+const TERMINAL_GOAL_SPEC_REJECTIONS = new Set(['UNKNOWN_GOAL_DRAFT', 'GOAL_DRAFT_AGENT_MISMATCH', 'STALE_GOAL_DRAFT']);
 const QUIET_LIFECYCLE_ERRORS = new Set(['PLAN_CANCELLED', 'STALE_PLAN', 'STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION']);
 const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
 const MAX_PUBLIC_NARRATIVE_RAW_CHARS = 1_024;
@@ -397,18 +399,42 @@ export class DynamicCoordinator extends EventEmitter {
 			}
 			const entry = {
 				agentId: message.agentId, requestId: message.payload.requestId, request: message.payload,
-				fingerprint, proposal: null, attempts: 0, translating: false, retryHandle: null, connectionEpoch,
+				fingerprint, proposal: null, attempts: 0, rejectionAttempts: 0, correctiveFeedback: null,
+				translating: false, retryHandle: null, connectionEpoch,
 			};
 			this.#goalSpecRequests.set(key, entry);
 			this.#run(() => this.#processGoalSpecRequest(key, entry), connectionEpoch);
 		});
-		this.#listen('goal_spec_result', (message) => {
+		this.#listen('goal_spec_result', (message, connectionEpoch) => {
 			const key = this.#goalSpecRequestKey(message.agentId, message.payload.requestId);
 			const existing = this.#goalSpecRequests.get(key);
-			if (existing === undefined) return;
-			this.#goalSpecRequests.delete(key);
-			if (existing.retryHandle !== null) this.#clearGoalSpecTimeout(existing.retryHandle);
-			this.#planner.cancelGoalSpec?.(message.agentId, message.payload.requestId);
+			if (existing === undefined || existing.proposal === null) return;
+			if (message.payload.status === 'accepted' || TERMINAL_GOAL_SPEC_REJECTIONS.has(message.payload.reasonCode)) {
+				this.#forgetGoalSpecRequest(key, existing);
+				return;
+			}
+			if (existing.retryHandle !== null) {
+				this.#clearGoalSpecTimeout(existing.retryHandle);
+				existing.retryHandle = null;
+			}
+			existing.rejectionAttempts += 1;
+			existing.correctiveFeedback = {
+				attempt: existing.rejectionAttempts,
+				reasonCode: message.payload.reasonCode,
+				rejectedProposal: existing.proposal,
+			};
+			existing.proposal = null;
+			try { this.#planner.cancelGoalSpec?.(message.agentId, message.payload.requestId); } catch { /* completed translation cleanup is best effort */ }
+			if (existing.rejectionAttempts <= MAX_GOAL_SPEC_CORRECTION_ATTEMPTS) {
+				const delay = Math.min(GOAL_SPEC_RETRY_MAX_MS, GOAL_SPEC_RETRY_BASE_MS * (2 ** (existing.rejectionAttempts - 1)));
+				this.#scheduleGoalSpecRequest(key, existing, delay);
+				return;
+			}
+			this.#forgetGoalSpecRequest(key, existing);
+			void this.#reportAgentError(message.agentId, codedRuntimeError(
+				'GOAL_SPEC_TRANSLATION_REJECTED',
+				`Minecraft rejected ${MAX_GOAL_SPEC_CORRECTION_ATTEMPTS + 1} goal translation proposals; the pending draft requires operator correction or cancellation`,
+			), connectionEpoch);
 		});
 		this.#listen('goal_control', (message, connectionEpoch) => {
 			const previous = this.#registry.get(message.agentId);
@@ -1978,7 +2004,11 @@ export class DynamicCoordinator extends EventEmitter {
 			await this.#reconciliation;
 			if (this.#goalSpecRequests.get(key) !== entry || this.#serverInstanceId === null
 					|| !this.#isConnectionEpochCurrent(entry.connectionEpoch)) return;
-			entry.proposal = await this.#planner.requestGoalSpec({ agentId: entry.agentId, request: entry.request });
+			entry.proposal = await this.#planner.requestGoalSpec({
+				agentId: entry.agentId,
+				request: entry.request,
+				...(entry.correctiveFeedback === null ? {} : { correctiveFeedback: entry.correctiveFeedback }),
+			});
 			entry.attempts = 0;
 		} catch (error) {
 			if (this.#goalSpecRequests.get(key) !== entry) return;
@@ -1999,6 +2029,13 @@ export class DynamicCoordinator extends EventEmitter {
 			entry.retryHandle = null;
 			this.#run(() => this.#processGoalSpecRequest(key, entry), entry.connectionEpoch);
 		}, delayMs);
+	}
+
+	#forgetGoalSpecRequest(key, entry) {
+		if (this.#goalSpecRequests.get(key) !== entry) return;
+		this.#goalSpecRequests.delete(key);
+		if (entry.retryHandle !== null) this.#clearGoalSpecTimeout(entry.retryHandle);
+		try { this.#planner.cancelGoalSpec?.(entry.agentId, entry.requestId); } catch { /* cancellation is best effort */ }
 	}
 
 	#cancelGoalSpecRequests(agentId = null) {

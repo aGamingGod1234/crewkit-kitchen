@@ -26,6 +26,25 @@ test('goal spec proposal accepts only the closed authoritative predicate schema'
 	assert.throws(() => parseGoalSpecProposal({ ...proposal, extra: true }), /field/i);
 });
 
+test('dimension-bound position and block predicates survive parsing and Java-compatible fingerprinting', () => {
+	const proposal = {
+		requestId: REQUEST_ID,
+		summary: 'Build a crafting table in the Nether',
+		predicate: {
+			type: 'all_of',
+			predicates: [
+				{ type: 'position_within', dimensionId: 'minecraft:the_nether', x: 12, y: 64, z: -8, radius: 1, stableTicks: 20 },
+				{ type: 'block_matches', dimensionId: 'minecraft:the_nether', x: 12, y: 64, z: -8, blockId: 'minecraft:crafting_table', properties: {} },
+			],
+		},
+	};
+	assert.deepEqual(parseGoalSpecProposal(proposal), proposal);
+	const fields = { originalRequest: 'Build in the Nether', predicate: proposal.predicate, createdAtTick: 1_200 };
+	const spec = { ...fields, fingerprint: goalSpecFingerprint(fields) };
+	assert.equal(spec.fingerprint, '48fcb7e75395224706e214bbf3f6e86ffbd7ff318ade762218664f80bb51b7d3');
+	assert.deepEqual(parseGoalSpec(spec), spec);
+});
+
 test('goal spec request is exact, bounded, and deduplicates no candidate IDs', () => {
 	const request = {
 		requestId: REQUEST_ID,

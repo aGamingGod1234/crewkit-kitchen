@@ -247,6 +247,88 @@ test('goal translation retries provider failure and retransmits until Minecraft 
 	}
 });
 
+test('Minecraft rejection keeps a current goal draft alive and retries with bounded corrective feedback', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestGoalSpec = async (request) => {
+		planner.goalSpecRequests.push(request);
+		return {
+			requestId: request.request.requestId,
+			summary: `Attempt ${planner.goalSpecRequests.length}`,
+			predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: planner.goalSpecRequests.length },
+		};
+	};
+	const run = await start({
+		registry, planner,
+		setGoalSpecTimeout: timers.schedule,
+		clearGoalSpecTimeout: timers.cancel,
+	});
+	const requestId = '00000000-0000-4000-8000-000000000104';
+	try {
+		run.bridge.emit('goal_spec_request', {
+			agentId: 'agent-a',
+			payload: { requestId, originalRequest: 'Get a good pickaxe', candidateIds: ['minecraft:iron_pickaxe'] },
+		});
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'goal_spec_proposal'));
+		const rejectedProposal = structuredClone(run.bridge.sent.find((message) => message.type === 'goal_spec_proposal').payload);
+		run.bridge.emit('goal_spec_result', {
+			agentId: 'agent-a', payload: { requestId, status: 'rejected', reasonCode: 'INVALID_GOAL_PREDICATE' },
+		});
+		await eventually(() => timers.pendingCount === 1);
+		await timers.runNext();
+		await eventually(() => planner.goalSpecRequests.length === 2);
+		assert.deepEqual(planner.goalSpecRequests[1].correctiveFeedback, {
+			attempt: 1,
+			reasonCode: 'INVALID_GOAL_PREDICATE',
+			rejectedProposal,
+		});
+		await eventually(() => run.bridge.sent.filter((message) => message.type === 'goal_spec_proposal').length === 2);
+		run.bridge.emit('goal_spec_result', {
+			agentId: 'agent-a', payload: { requestId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' },
+		});
+		await eventually(() => timers.pendingCount === 0);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('repeated Minecraft proposal rejection ends with an explicit operator-visible terminal report', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const run = await start({
+		registry, planner,
+		setGoalSpecTimeout: timers.schedule,
+		clearGoalSpecTimeout: timers.cancel,
+	});
+	const requestId = '00000000-0000-4000-8000-000000000105';
+	try {
+		run.bridge.emit('goal_spec_request', {
+			agentId: 'agent-a',
+			payload: { requestId, originalRequest: 'Get a good pickaxe', candidateIds: ['minecraft:iron_pickaxe'] },
+		});
+		for (let rejection = 1; rejection <= 4; rejection += 1) {
+			await eventually(() => run.bridge.sent.filter((message) => message.type === 'goal_spec_proposal').length === rejection);
+			run.bridge.emit('goal_spec_result', {
+				agentId: 'agent-a', payload: { requestId, status: 'rejected', reasonCode: 'INVALID_GOAL_PREDICATE' },
+			});
+			if (rejection <= 3) {
+				await eventually(() => timers.pendingCount === 1);
+				await timers.runNext();
+			}
+		}
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_error'));
+		const report = run.bridge.sent.find((message) => message.type === 'agent_error');
+		assert.equal(report.payload.code, 'GOAL_SPEC_TRANSLATION_REJECTED');
+		assert.match(report.payload.message, /pending draft requires operator correction or cancellation/i);
+		assert.equal(timers.pendingCount, 0);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('replacing a goal cancels stale goal translation and suppresses its late proposal', async () => {
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);

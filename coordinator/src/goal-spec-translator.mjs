@@ -7,6 +7,8 @@ import {
 	parseGoalSpecRequest,
 } from './goal-spec.mjs';
 
+export const MAX_GOAL_SPEC_CORRECTION_ATTEMPTS = 3;
+
 export class GoalSpecTranslator {
 	#generate;
 
@@ -15,12 +17,13 @@ export class GoalSpecTranslator {
 		this.#generate = generate;
 	}
 
-	async translate(requestValue, { signal } = {}) {
+	async translate(requestValue, { signal, correctiveFeedback = null } = {}) {
 		const request = parseGoalSpecRequest(requestValue);
+		const correction = normalizeCorrectiveFeedback(correctiveFeedback, request.requestId);
 		if (signal?.aborted) throw signal.reason ?? codedError('GOAL_SPEC_CANCELLED', 'Goal translation was cancelled');
 		const output = await this.#generate({
 			request,
-			prompt: buildGoalSpecTranslatorPrompt(request),
+			prompt: buildGoalSpecTranslatorPrompt(request, { correctiveFeedback: correction }),
 			schema: GOAL_SPEC_PROPOSAL_SCHEMA,
 			signal,
 		});
@@ -43,8 +46,9 @@ export class GoalSpecTranslator {
 	}
 }
 
-export function buildGoalSpecTranslatorPrompt(requestValue) {
+export function buildGoalSpecTranslatorPrompt(requestValue, { correctiveFeedback = null } = {}) {
 	const request = parseGoalSpecRequest(requestValue);
+	const correction = normalizeCorrectiveFeedback(correctiveFeedback, request.requestId);
 	return [
 		'Translate one Minecraft request into one factual, server-verifiable predicate.',
 		'Use only the predicate schema and candidate identifiers below. Do not invent identifiers.',
@@ -55,9 +59,30 @@ export function buildGoalSpecTranslatorPrompt(requestValue) {
 		'Return exactly one JSON object matching the supplied schema and nothing else.',
 		`Request: ${JSON.stringify(request.originalRequest)}`,
 		`Candidate identifiers: ${JSON.stringify(request.candidateIds)}`,
+		...(correction === null ? [] : [
+			`Correction attempt ${correction.attempt}: Minecraft rejected this exact proposal with reason code ${JSON.stringify(correction.reasonCode)}: ${JSON.stringify(correction.rejectedProposal)}. Return a corrected proposal and do not repeat it unchanged.`,
+		]),
 		`Predicate schema: ${JSON.stringify(GOAL_PREDICATE_SCHEMA)}`,
 		`The requestId field must be ${JSON.stringify(request.requestId)}.`,
 	].join('\n');
+}
+
+function normalizeCorrectiveFeedback(value, requestId) {
+	if (value === null || value === undefined) return null;
+	if (typeof value !== 'object' || Array.isArray(value)) throw new TypeError('correctiveFeedback must be an object or null');
+	const keys = Object.keys(value).sort();
+	if (keys.length !== 3 || keys[0] !== 'attempt' || keys[1] !== 'reasonCode' || keys[2] !== 'rejectedProposal') {
+		throw new TypeError('correctiveFeedback fields differ from the closed schema');
+	}
+	if (!Number.isSafeInteger(value.attempt) || value.attempt < 1 || value.attempt > MAX_GOAL_SPEC_CORRECTION_ATTEMPTS) {
+		throw new TypeError(`correctiveFeedback.attempt must be between 1 and ${MAX_GOAL_SPEC_CORRECTION_ATTEMPTS}`);
+	}
+	if (typeof value.reasonCode !== 'string' || !/^[A-Z0-9_]{1,128}$/.test(value.reasonCode)) {
+		throw new TypeError('correctiveFeedback.reasonCode must be a bounded error code');
+	}
+	const rejectedProposal = parseGoalSpecProposal(value.rejectedProposal);
+	if (rejectedProposal.requestId !== requestId) throw new TypeError('correctiveFeedback proposal must match requestId');
+	return Object.freeze({ attempt: value.attempt, reasonCode: value.reasonCode, rejectedProposal });
 }
 
 function codedError(code, message, cause) {

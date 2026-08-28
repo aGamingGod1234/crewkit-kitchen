@@ -14,7 +14,31 @@ test('translator prompt contains only the request, candidates, and allowlisted s
 	assert.match(prompt, /Get a good pickaxe/);
 	assert.match(prompt, /minecraft:iron_pickaxe/);
 	assert.match(prompt, /inventory_contains/);
+	assert.match(prompt, /dimensionId/);
 	assert.doesNotMatch(prompt, /finish tool|completion tool/i);
+});
+
+test('translator receives bounded Minecraft rejection feedback without changing the authoritative request', async () => {
+	const rejectedProposal = {
+		requestId: REQUEST.requestId,
+		summary: 'Stand at the requested position',
+		predicate: { type: 'position_within', dimensionId: 'minecraft:the_nether', x: 0, y: 1_000, z: 0, radius: 1, stableTicks: 20 },
+	};
+	const translator = new GoalSpecTranslator({
+		generate: async ({ request, prompt }) => {
+			assert.deepEqual(request, REQUEST);
+			assert.match(prompt, /Correction attempt 1/);
+			assert.match(prompt, /INVALID_GOAL_PREDICATE/);
+			assert.match(prompt, /"y":1000/);
+			return { requestId: REQUEST.requestId, summary: 'Ask the operator', predicate: { type: 'operator_confirmed' } };
+		},
+	});
+	await translator.translate(REQUEST, {
+		correctiveFeedback: { attempt: 1, reasonCode: 'INVALID_GOAL_PREDICATE', rejectedProposal },
+	});
+	await assert.rejects(() => translator.translate(REQUEST, {
+		correctiveFeedback: { attempt: 4, reasonCode: 'INVALID_GOAL_PREDICATE', rejectedProposal },
+	}), /between 1 and 3/);
 });
 
 test('translator accepts a constrained proposal from the provider adapter', async () => {

@@ -81,7 +81,7 @@ export class AgentPlanner {
 
 	get healthRegistry() { return this.#healthRegistry; }
 
-	requestGoalSpec({ agentId, request }) {
+	requestGoalSpec({ agentId, request, correctiveFeedback = null }) {
 		const record = this.#registry.get(agentId);
 		if (record === null || record === undefined) throw codedError('UNKNOWN_AGENT', `Agent '${agentId}' is not registered`);
 		const checkedRequest = parseGoalSpecRequest(request);
@@ -110,7 +110,7 @@ export class AgentPlanner {
 				}
 			}, { lane: record.provider, priority: 'ordinary' }),
 		});
-		return translator.translate(checkedRequest);
+		return translator.translate(checkedRequest, { correctiveFeedback });
 	}
 
 	cancelGoalSpec(agentId, requestId) {

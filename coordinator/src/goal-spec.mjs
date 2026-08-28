@@ -21,7 +21,7 @@ const predicateVariants = [
 		type: { const: 'inventory_contains' }, itemId: { type: 'string' }, count: { type: 'integer', minimum: 1 },
 	}),
 	objectSchema(['type', 'x', 'y', 'z', 'radius', 'stableTicks'], {
-		type: { const: 'position_within' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
+		type: { const: 'position_within' }, dimensionId: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
 		radius: { type: 'number', minimum: 0 }, stableTicks: { type: 'integer', minimum: 1 },
 	}),
 	objectSchema(['type', 'advancementId'], { type: { const: 'advancement_granted' }, advancementId: { type: 'string' } }),
@@ -29,7 +29,7 @@ const predicateVariants = [
 		type: { const: 'entity_killed_by_agent' }, entityType: { type: 'string' }, afterGoalStart: { type: 'boolean' },
 	}),
 	objectSchema(['type', 'x', 'y', 'z', 'blockId', 'properties'], {
-		type: { const: 'block_matches' }, x: { type: 'integer' }, y: { type: 'integer' }, z: { type: 'integer' },
+		type: { const: 'block_matches' }, dimensionId: { type: 'string' }, x: { type: 'integer' }, y: { type: 'integer' }, z: { type: 'integer' },
 		blockId: { type: 'string' }, properties: { type: 'object', additionalProperties: { type: 'string' }, maxProperties: 16 },
 	}),
 	objectSchema(['type', 'ticks'], { type: { const: 'survive_duration' }, ticks: { type: 'integer', minimum: 1 } }),
@@ -130,9 +130,12 @@ function parsePredicate(value, depth, budget) {
 			result = { type, itemId: identifier(value.itemId, 'itemId'), count: positiveInteger(value.count, 'count') };
 			break;
 		case 'position_within':
-			exactKeys(value, ['type', 'x', 'y', 'z', 'radius', 'stableTicks'], type);
+			exactKeys(value, value.dimensionId === undefined
+				? ['type', 'x', 'y', 'z', 'radius', 'stableTicks']
+				: ['type', 'dimensionId', 'x', 'y', 'z', 'radius', 'stableTicks'], type);
 			result = {
-				type, x: finiteNumber(value.x, 'x'), y: finiteNumber(value.y, 'y'), z: finiteNumber(value.z, 'z'),
+				type, ...(value.dimensionId === undefined ? {} : { dimensionId: identifier(value.dimensionId, 'dimensionId') }),
+				x: finiteNumber(value.x, 'x'), y: finiteNumber(value.y, 'y'), z: finiteNumber(value.z, 'z'),
 				radius: nonnegativeNumber(value.radius, 'radius'), stableTicks: positiveInteger(value.stableTicks, 'stableTicks'),
 			};
 			break;
@@ -146,7 +149,9 @@ function parsePredicate(value, depth, budget) {
 			result = { type, entityType: identifier(value.entityType, 'entityType'), afterGoalStart: value.afterGoalStart };
 			break;
 		case 'block_matches': {
-			exactKeys(value, ['type', 'x', 'y', 'z', 'blockId', 'properties'], type);
+			exactKeys(value, value.dimensionId === undefined
+				? ['type', 'x', 'y', 'z', 'blockId', 'properties']
+				: ['type', 'dimensionId', 'x', 'y', 'z', 'blockId', 'properties'], type);
 			requireObject(value.properties, 'properties');
 			const entries = Object.entries(value.properties);
 			if (entries.length > 16) fail('INVALID_GOAL_PREDICATE', 'properties exceeds 16 entries');
@@ -154,7 +159,8 @@ function parsePredicate(value, depth, budget) {
 				text(key, 'property name', 64), text(entry, `property '${key}'`, 128),
 			]));
 			result = {
-				type, x: integer(value.x, 'x'), y: integer(value.y, 'y'), z: integer(value.z, 'z'),
+				type, ...(value.dimensionId === undefined ? {} : { dimensionId: identifier(value.dimensionId, 'dimensionId') }),
+				x: integer(value.x, 'x'), y: integer(value.y, 'y'), z: integer(value.z, 'z'),
 				blockId: identifier(value.blockId, 'blockId'), properties,
 			};
 			break;
@@ -202,7 +208,7 @@ function canonicalPredicate(predicate) {
 		case 'inventory_contains':
 			return `{"type":"inventory_contains","item_id":${JSON.stringify(predicate.itemId)},"count":${predicate.count}}`;
 		case 'position_within':
-			return `{"type":"position_within","x":${javaDouble(predicate.x)},"y":${javaDouble(predicate.y)},"z":${javaDouble(predicate.z)},"radius":${javaDouble(predicate.radius)},"stable_ticks":${predicate.stableTicks}}`;
+			return `{"type":"position_within",${canonicalDimension(predicate)}"x":${javaDouble(predicate.x)},"y":${javaDouble(predicate.y)},"z":${javaDouble(predicate.z)},"radius":${javaDouble(predicate.radius)},"stable_ticks":${predicate.stableTicks}}`;
 		case 'advancement_granted':
 			return `{"type":"advancement_granted","advancement_id":${JSON.stringify(predicate.advancementId)}}`;
 		case 'entity_killed_by_agent':
@@ -210,7 +216,7 @@ function canonicalPredicate(predicate) {
 		case 'block_matches': {
 			const properties = Object.entries(predicate.properties)
 				.map(([key, value]) => `${JSON.stringify(key)}:${JSON.stringify(value)}`).join(',');
-			return `{"type":"block_matches","x":${predicate.x},"y":${predicate.y},"z":${predicate.z},"block_id":${JSON.stringify(predicate.blockId)},"properties":{${properties}}}`;
+			return `{"type":"block_matches",${canonicalDimension(predicate)}"x":${predicate.x},"y":${predicate.y},"z":${predicate.z},"block_id":${JSON.stringify(predicate.blockId)},"properties":{${properties}}}`;
 		}
 		case 'survive_duration':
 			return `{"type":"survive_duration","ticks":${predicate.ticks}}`;
@@ -222,6 +228,10 @@ function canonicalPredicate(predicate) {
 		default:
 			throw new GoalSpecError('UNKNOWN_GOAL_PREDICATE', `Unknown goal predicate '${predicate.type}'`);
 	}
+}
+
+function canonicalDimension(predicate) {
+	return predicate.dimensionId === undefined ? '' : `"dimension_id":${JSON.stringify(predicate.dimensionId)},`;
 }
 
 function javaDouble(value) {
