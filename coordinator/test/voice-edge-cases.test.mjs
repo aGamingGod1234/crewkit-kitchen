@@ -649,28 +649,8 @@ test('profile repair drains a second stale publish that lands while the first re
 	const file = path.join(root, 'assignments.json');
 	const firstController = new AbortController();
 	const secondController = new AbortController();
-	const delayedRename = () => {
-		let signalEntered;
-		const entered = new Promise((resolve) => { signalEntered = resolve; });
-		let release;
-		const gate = new Promise((resolve) => { release = resolve; });
-		let signalPublished;
-		const published = new Promise((resolve) => { signalPublished = resolve; });
-		return {
-			entered,
-			published,
-			release,
-			rename: async (source, destination) => {
-				const bytes = await readFile(source);
-				signalEntered();
-				await gate;
-				await writeFile(destination, bytes);
-				signalPublished();
-			},
-		};
-	};
-	const firstMove = delayedRename();
-	const secondMove = delayedRename();
+	const firstMove = delayedProfileRename();
+	const secondMove = delayedProfileRename();
 	let signalRepairMoved;
 	const repairMoved = new Promise((resolve) => { signalRepairMoved = resolve; });
 	let releaseRepair;
@@ -808,6 +788,119 @@ test('persistent profile close is bounded and idempotent when storage ignores ca
 	}
 });
 
+test('profile repair retries a transient publish failure and recovers before close', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-repair-retry-'));
+	const file = path.join(root, 'assignments.json');
+	const oldController = new AbortController();
+	const staleMove = delayedProfileRename();
+	let currentMoves = 0;
+	try {
+		const oldStore = await loadPersistentVoiceProfileStore(file, {
+			signal: oldController.signal,
+			rename: staleMove.rename,
+		});
+		oldStore.store.resolve(agentUuid(4_301));
+		await staleMove.entered;
+		oldController.abort();
+		await assert.rejects(oldStore.flush(), (error) => error.name === 'AbortError');
+
+		const current = await loadPersistentVoiceProfileStore(file, {
+			rename: async (source, destination) => {
+				currentMoves += 1;
+				if (currentMoves === 2) throw Object.assign(new Error('file temporarily locked'), { code: 'EPERM' });
+				await writeFile(destination, await readFile(source));
+			},
+		});
+		current.store.resolve(agentUuid(4_302));
+		await current.flush();
+		staleMove.release();
+		await staleMove.published;
+		await waitForCondition(() => currentMoves >= 3, 'profile repair did not retry');
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.ok(document.assignments[agentUuid(4_302)]);
+		await assert.rejects(oldStore.close(), (error) => error.name === 'AbortError');
+		await current.close();
+	} finally {
+		staleMove.release();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('permanent profile repair failure stops retrying and releases all retry work after close', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-repair-stop-'));
+	const file = path.join(root, 'assignments.json');
+	const oldController = new AbortController();
+	const staleMove = delayedProfileRename();
+	let currentMoves = 0;
+	try {
+		const oldStore = await loadPersistentVoiceProfileStore(file, {
+			signal: oldController.signal,
+			rename: staleMove.rename,
+		});
+		oldStore.store.resolve(agentUuid(4_401));
+		await staleMove.entered;
+		oldController.abort();
+		await assert.rejects(oldStore.flush(), (error) => error.name === 'AbortError');
+
+		const current = await loadPersistentVoiceProfileStore(file, {
+			closeTimeoutMs: 100,
+			rename: async (source, destination) => {
+				currentMoves += 1;
+				if (currentMoves > 1) throw Object.assign(new Error('file permanently locked'), { code: 'EPERM' });
+				await writeFile(destination, await readFile(source));
+			},
+		});
+		current.store.resolve(agentUuid(4_402));
+		await current.flush();
+		staleMove.release();
+		await staleMove.published;
+		await waitForCondition(() => currentMoves === 6, 'bounded profile repair attempts did not finish', 1_000);
+		await assert.rejects(current.close(), (error) => error.name === 'AbortError');
+		await assert.rejects(oldStore.close(), (error) => error.name === 'AbortError');
+		const attemptsAfterClose = currentMoves;
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.equal(currentMoves, attemptsAfterClose, 'closed profile ownership cannot retain retry timers or filesystem work');
+	} finally {
+		staleMove.release();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('persistent profile resolve rejects after close without changing its snapshot', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-closed-resolve-'));
+	const file = path.join(root, 'assignments.json');
+	try {
+		const persistent = await loadPersistentVoiceProfileStore(file);
+		persistent.store.resolve(agentUuid(4_501));
+		await persistent.close();
+		const before = persistent.store.snapshotAssignments();
+		assert.throws(
+			() => persistent.store.resolve(agentUuid(4_502)),
+			(error) => error.code === 'VOICE_PROFILE_STORE_CLOSED',
+		);
+		assert.deepEqual(persistent.store.snapshotAssignments(), before);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('closing an older profile store cannot cancel the latest store owner', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-owner-close-'));
+	const file = path.join(root, 'assignments.json');
+	try {
+		const oldStore = await loadPersistentVoiceProfileStore(file);
+		const latestStore = await loadPersistentVoiceProfileStore(file);
+		await oldStore.close();
+		const assigned = latestStore.store.resolve(agentUuid(4_601));
+		await latestStore.flush();
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.equal(document.assignments[agentUuid(4_601)], assigned.profileId);
+		await latestStore.close();
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test('Fish provider rejects odd-length PCM from the remote service', async () => {
 	const provider = new FishTtsProvider({
 		apiKey: 'fish-test-token',
@@ -917,4 +1010,33 @@ function sttHeaders(overrides = {}) {
 
 function agentUuid(value) {
 	return `00000000-0000-4000-8000-${value.toString(16).padStart(12, '0')}`;
+}
+
+function delayedProfileRename() {
+	let signalEntered;
+	const entered = new Promise((resolve) => { signalEntered = resolve; });
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	let signalPublished;
+	const published = new Promise((resolve) => { signalPublished = resolve; });
+	return {
+		entered,
+		published,
+		release,
+		rename: async (source, destination) => {
+			const bytes = await readFile(source);
+			signalEntered();
+			await gate;
+			await writeFile(destination, bytes);
+			signalPublished();
+		},
+	};
+}
+
+async function waitForCondition(condition, message, timeoutMs = 500) {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() >= deadline) throw new Error(message);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
 }

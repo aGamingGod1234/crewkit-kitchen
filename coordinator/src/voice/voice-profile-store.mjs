@@ -4,7 +4,9 @@ import path from 'node:path';
 const PERSISTENT_FILES = new Map();
 const PERSIST_RETRY_BASE_MS = 10;
 const PERSIST_RETRY_MAX_MS = 100;
-const REPAIR_RETRY_MS = 25;
+const REPAIR_RETRY_BASE_MS = 25;
+const REPAIR_RETRY_MAX_MS = 400;
+const REPAIR_MAX_ATTEMPTS = 5;
 
 const VOICE_PROFILES = Object.freeze([
 	profile('moss', 'c5f56a6cc2ec4fa8920cb4c5889a3fb7', ['measured', 'clear', 'calm'], ['bright', 'breathy'], 0.94),
@@ -85,6 +87,7 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 	const write = dependencies.writeFile ?? writeFile;
 	const move = dependencies.rename ?? rename;
 	const remove = dependencies.unlink ?? unlink;
+	const io = { makeDirectory, write, move, remove };
 	for (const [name, operation] of Object.entries({ readFile: read, mkdir: makeDirectory, writeFile: write, rename: move, unlink: remove })) {
 		if (typeof operation !== 'function') throw new TypeError(`${name} must be a function`);
 	}
@@ -93,7 +96,6 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 	const coordinator = persistentCoordinator(resolvedPath);
 	const ownerGeneration = ++coordinator.latestOwnerGeneration;
 	coordinator.version += 1;
-	coordinator.latestIo = { makeDirectory, write, move, remove };
 	let assignments = {};
 	try {
 		const document = JSON.parse(await awaitAbortable(
@@ -110,6 +112,7 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 	}
 	mergeLoadedAssignments(coordinator, assignments);
 	assignments = snapshotPersistentAssignments(coordinator);
+	registerCoordinatorOwner(coordinator, ownerGeneration, io);
 	const ownerController = new AbortController();
 	let desiredRevision = 0;
 	let persistedRevision = 0;
@@ -124,7 +127,6 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 		mergeOwnerSnapshot(coordinator, ownerGeneration, snapshot);
 		startDrain();
 	});
-	const io = { makeDirectory, write, move, remove };
 	const startDrain = (externalSignal) => {
 		if (pending !== null) return pending;
 		const combinedSignal = combineSignals(ownerController.signal, signal, externalSignal);
@@ -166,12 +168,27 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 	const close = () => {
 		if (closePromise !== null) return closePromise;
 		closed = true;
+		const ownsRepairDrain = beginCoordinatorClose(coordinator, ownerGeneration);
 		const drainForClose = async () => {
 			if (signal?.aborted) throw abortReason(signal);
 			let failures = 0;
-			while (persistedRevision < desiredRevision) {
+			for (;;) {
 				try {
-					await (pending ?? startDrain());
+					if (persistedRevision < desiredRevision) await (pending ?? startDrain());
+					if (ownsRepairDrain && coordinator.repairPromise !== null) {
+						await awaitAbortable(coordinator.repairPromise, ownerController.signal);
+					}
+					if (ownsRepairDrain && coordinator.repairCloseOwnerGeneration === ownerGeneration
+							&& coordinator.repairCompletedRevision < coordinator.repairRequestedRevision) {
+						const targetRevision = coordinator.repairRequestedRevision;
+						await persistCoordinator(coordinator, ownerGeneration, io, ownerController.signal);
+						coordinator.repairCompletedRevision = targetRevision;
+					}
+					const localDone = persistedRevision >= desiredRevision;
+					const repairDone = !ownsRepairDrain
+						|| coordinator.repairCloseOwnerGeneration !== ownerGeneration
+						|| coordinator.repairCompletedRevision >= coordinator.repairRequestedRevision;
+					if (localDone && repairDone) return;
 					failures = 0;
 				} catch (error) {
 					if (ownerController.signal.aborted) throw abortReason(ownerController.signal);
@@ -194,10 +211,19 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 		closePromise = Promise.race([draining, deadline]).finally(() => {
 			clearTimeout(timer);
 			ownerController.abort(abortError('Voice profile store was closed'));
+			releaseCoordinatorOwner(coordinator, ownerGeneration);
 		}).then(() => undefined);
 		return closePromise;
 	};
 	Object.defineProperties(store, {
+		resolve: { value: (agentId) => {
+			if (closed) {
+				const error = new Error('Voice profile store is closed');
+				error.code = 'VOICE_PROFILE_STORE_CLOSED';
+				throw error;
+			}
+			return VoiceProfileStore.prototype.resolve.call(store, agentId);
+		}, writable: true },
 		flush: { value: flush, writable: true },
 		close: { value: close, writable: true },
 	});
@@ -243,18 +269,24 @@ function persistentCoordinator(filePath) {
 	let coordinator = PERSISTENT_FILES.get(key);
 	if (coordinator !== undefined) return coordinator;
 	coordinator = {
+		key,
 		filePath,
 		assignments: new Map(),
 		assignmentOwners: new Map(),
 		latestOwnerGeneration: 0,
-		latestIo: null,
+		owners: new Map(),
 		version: 0,
 		writeSequence: 0,
+		inFlightPhysicalMoves: 0,
 		publishTail: Promise.resolve(),
 		repairPromise: null,
 		repairRequestedRevision: 0,
 		repairCompletedRevision: 0,
 		repairRetryTimer: null,
+		repairFailureCount: 0,
+		repairOwnerGeneration: null,
+		repairController: null,
+		repairCloseOwnerGeneration: null,
 	};
 	PERSISTENT_FILES.set(key, coordinator);
 	return coordinator;
@@ -316,15 +348,19 @@ async function persistCoordinator(coordinator, ownerGeneration, io, signal) {
 			const published = await withPublishOwnership(coordinator, async () => {
 				if (signal?.aborted) throw abortReason(signal);
 				if (version !== coordinator.version) return false;
+				coordinator.inFlightPhysicalMoves += 1;
 				const physicalMove = Promise.resolve().then(() => io.move(temporary, coordinator.filePath, { signal }));
 				physicalMove.then(
 					() => {
-						if (version !== coordinator.version || ownerGeneration < coordinator.latestOwnerGeneration) {
+						if (version !== coordinator.version || ownerGeneration !== latestCoordinatorOwnerGeneration(coordinator)) {
 							requestRepair(coordinator);
 						}
 					},
 					() => {},
-				);
+				).finally(() => {
+					coordinator.inFlightPhysicalMoves -= 1;
+					maybeReleasePersistentCoordinator(coordinator);
+				});
 				await awaitAbortable(physicalMove, signal);
 				return version === coordinator.version;
 			});
@@ -345,8 +381,9 @@ async function withPublishOwnership(coordinator, operation) {
 }
 
 function requestRepair(coordinator) {
-	if (coordinator.latestIo === null) return;
+	if (coordinator.owners.size === 0) return;
 	coordinator.repairRequestedRevision += 1;
+	coordinator.repairFailureCount = 0;
 	if (coordinator.repairRetryTimer !== null) {
 		clearTimeout(coordinator.repairRetryTimer);
 		coordinator.repairRetryTimer = null;
@@ -355,35 +392,115 @@ function requestRepair(coordinator) {
 }
 
 function startRepairDrain(coordinator) {
-	if (coordinator.repairPromise !== null || coordinator.latestIo === null) return;
+	if (coordinator.repairPromise !== null || coordinator.repairCloseOwnerGeneration !== null) return;
+	const owner = latestCoordinatorOwner(coordinator);
+	if (owner === null || coordinator.repairFailureCount >= REPAIR_MAX_ATTEMPTS) return;
+	const [ownerGeneration, io] = owner;
+	const controller = new AbortController();
 	let failed = false;
 	const operation = (async () => {
 		while (coordinator.repairCompletedRevision < coordinator.repairRequestedRevision) {
 			const targetRevision = coordinator.repairRequestedRevision;
 			await persistCoordinator(
 				coordinator,
-				coordinator.latestOwnerGeneration,
-				coordinator.latestIo,
-				undefined,
+				ownerGeneration,
+				io,
+				controller.signal,
 			);
 			coordinator.repairCompletedRevision = targetRevision;
+			coordinator.repairFailureCount = 0;
 		}
 	})();
+	coordinator.repairOwnerGeneration = ownerGeneration;
+	coordinator.repairController = controller;
 	coordinator.repairPromise = operation.catch(() => {
 		failed = true;
 	}).finally(() => {
 		coordinator.repairPromise = null;
+		coordinator.repairOwnerGeneration = null;
+		coordinator.repairController = null;
 		if (coordinator.repairCompletedRevision >= coordinator.repairRequestedRevision) return;
+		if (coordinator.repairCloseOwnerGeneration !== null || coordinator.owners.size === 0) return;
 		if (!failed) {
 			startRepairDrain(coordinator);
 			return;
 		}
+		coordinator.repairFailureCount += 1;
+		if (coordinator.repairFailureCount >= REPAIR_MAX_ATTEMPTS) return;
+		const retryDelayMs = Math.min(
+			REPAIR_RETRY_BASE_MS * (2 ** (coordinator.repairFailureCount - 1)),
+			REPAIR_RETRY_MAX_MS,
+		);
 		coordinator.repairRetryTimer = setTimeout(() => {
 			coordinator.repairRetryTimer = null;
 			startRepairDrain(coordinator);
-		}, REPAIR_RETRY_MS);
+		}, retryDelayMs);
 		coordinator.repairRetryTimer.unref?.();
+	}).finally(() => {
+		maybeReleasePersistentCoordinator(coordinator);
 	});
+}
+
+function registerCoordinatorOwner(coordinator, ownerGeneration, io) {
+	coordinator.owners.set(ownerGeneration, io);
+	if (coordinator.repairCloseOwnerGeneration !== null
+			&& ownerGeneration > coordinator.repairCloseOwnerGeneration) {
+		coordinator.repairCloseOwnerGeneration = null;
+	}
+	if (coordinator.repairOwnerGeneration !== null && ownerGeneration > coordinator.repairOwnerGeneration) {
+		coordinator.repairController?.abort(abortError('Voice profile repair ownership changed'));
+	}
+	if (coordinator.repairCompletedRevision < coordinator.repairRequestedRevision) startRepairDrain(coordinator);
+}
+
+function beginCoordinatorClose(coordinator, ownerGeneration) {
+	if (ownerGeneration !== latestCoordinatorOwnerGeneration(coordinator)) return false;
+	coordinator.repairCloseOwnerGeneration = ownerGeneration;
+	if (coordinator.repairRetryTimer !== null) {
+		clearTimeout(coordinator.repairRetryTimer);
+		coordinator.repairRetryTimer = null;
+	}
+	if (coordinator.repairOwnerGeneration === ownerGeneration) {
+		coordinator.repairController?.abort(abortError('Voice profile repair transferred to close'));
+	}
+	return true;
+}
+
+function releaseCoordinatorOwner(coordinator, ownerGeneration) {
+	coordinator.owners.delete(ownerGeneration);
+	if (coordinator.repairCloseOwnerGeneration === ownerGeneration) coordinator.repairCloseOwnerGeneration = null;
+	if (coordinator.repairOwnerGeneration === ownerGeneration) {
+		coordinator.repairController?.abort(abortError('Voice profile repair owner closed'));
+	}
+	if (coordinator.owners.size === 0) {
+		if (coordinator.repairRetryTimer !== null) clearTimeout(coordinator.repairRetryTimer);
+		coordinator.repairRetryTimer = null;
+		coordinator.repairController?.abort(abortError('Voice profile coordinator was closed'));
+	} else if (coordinator.repairCompletedRevision < coordinator.repairRequestedRevision) {
+		startRepairDrain(coordinator);
+	}
+	maybeReleasePersistentCoordinator(coordinator);
+}
+
+function latestCoordinatorOwner(coordinator) {
+	let latestGeneration = null;
+	let latestIo = null;
+	for (const [generation, io] of coordinator.owners) {
+		if (latestGeneration !== null && generation < latestGeneration) continue;
+		latestGeneration = generation;
+		latestIo = io;
+	}
+	return latestGeneration === null ? null : [latestGeneration, latestIo];
+}
+
+function latestCoordinatorOwnerGeneration(coordinator) {
+	return latestCoordinatorOwner(coordinator)?.[0] ?? null;
+}
+
+function maybeReleasePersistentCoordinator(coordinator) {
+	if (coordinator.owners.size !== 0 || coordinator.repairPromise !== null
+			|| coordinator.repairRetryTimer !== null || coordinator.inFlightPhysicalMoves !== 0) return;
+	if (PERSISTENT_FILES.get(coordinator.key) === coordinator) PERSISTENT_FILES.delete(coordinator.key);
 }
 
 async function removeTemporary(remove, temporary) {
