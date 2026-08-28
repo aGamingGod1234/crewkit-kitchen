@@ -11,6 +11,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
 import java.util.Objects;
@@ -49,6 +50,46 @@ public final class MinecraftNavigationWorld implements WalkabilityView {
 		return cellAt(position) == Cell.CLEAR
 				&& level.getBlockState(new BlockPos(position.x(), position.y(), position.z()))
 				.getFluidState().is(FluidTags.WATER);
+	}
+
+	double supportHeight(GridPosition feetPosition, double worldX, double worldZ) {
+		Objects.requireNonNull(feetPosition, "feetPosition must not be null");
+		BlockPos supportPosition = new BlockPos(
+				feetPosition.x(),
+				feetPosition.y() - 1,
+				feetPosition.z()
+		);
+		if (level.isOutsideBuildHeight(supportPosition.getY())
+				|| !level.hasChunk(supportPosition.getX() >> 4, supportPosition.getZ() >> 4)) {
+			return Double.NaN;
+		}
+		double localX = worldX - supportPosition.getX();
+		double localZ = worldZ - supportPosition.getZ();
+		BlockState support = level.getBlockState(supportPosition);
+		double collisionHeight = collisionHeightAt(
+				support.getCollisionShape(level, supportPosition),
+				localX,
+				localZ
+		);
+		return Double.isFinite(collisionHeight)
+				? supportPosition.getY() + collisionHeight
+				: Double.NaN;
+	}
+
+	static double collisionHeightAt(VoxelShape collision, double localX, double localZ) {
+		Objects.requireNonNull(collision, "collision must not be null");
+		if (!Double.isFinite(localX) || !Double.isFinite(localZ)
+				|| localX < 0.0D || localX >= 1.0D
+				|| localZ < 0.0D || localZ >= 1.0D) {
+			return Double.NaN;
+		}
+		double height = Double.NaN;
+		for (AABB box : collision.toAabbs()) {
+			if (localX < box.minX || localX > box.maxX
+					|| localZ < box.minZ || localZ > box.maxZ) continue;
+			height = Double.isNaN(height) ? box.maxY : Math.max(height, box.maxY);
+		}
+		return height;
 	}
 
 	static Cell classifyCell(BlockState state, VoxelShape collision, boolean boundedShallowWater) {

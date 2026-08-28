@@ -56,6 +56,9 @@ public final class NavigationProgressVerification {
 		PathNode jumpWaypoint = new PathNode(new GridPosition(2, 65, 2), TraversalType.JUMP_UP);
 		assertTrue(!intermediateNavigation.reachedTarget(new Vec3(2.5D, 64.0D, 2.5D), jumpWaypoint, false),
 				"an intermediate jump cannot complete while the player is one block below");
+		assertTrue(intermediateNavigation.reachedTarget(
+				new Vec3(2.5D, 64.5D, 2.5D), jumpWaypoint, false, 64.5D),
+				"a waypoint above bottom-slab support completes at the collision surface");
 		assertTrue(intermediateNavigation.reachedTarget(new Vec3(2.5D, 64.8D, 2.5D), jumpWaypoint, false),
 				"an intermediate jump completes only after the player reaches the landing height");
 		PathNode dropWaypoint = new PathNode(new GridPosition(2, 63, 2), TraversalType.DROP_DOWN);
@@ -76,17 +79,21 @@ public final class NavigationProgressVerification {
 				false, 1_000L, 0L, 10_000L),
 				"a genuine no-path result remains terminal");
 
-		Vec3 exactDestination = new Vec3(5.1D, 64.0D, 7.9D);
+		Vec3 exactDestination = new Vec3(5.1D, 64.1D, 7.9D);
 		ServerNavigationController exactNavigation = new ServerNavigationController(
 				exactDestination, 0.2D, false, 0L, 1_000L);
 		PathNode finalNode = new PathNode(new GridPosition(5, 64, 7), TraversalType.WALK);
 		Vec3 finalTarget = exactNavigation.targetFor(finalNode, true);
 		assertEquals(5.1D, finalTarget.x, "the final waypoint retains the requested x coordinate");
+		assertEquals(64.1D, finalTarget.y, "the final waypoint retains the requested y coordinate on full support");
 		assertEquals(7.9D, finalTarget.z, "the final waypoint retains the requested z coordinate");
 		assertTrue(!exactNavigation.reachedTarget(new Vec3(5.5D, 64.0D, 7.5D), finalNode, true),
 				"the block center does not finish a precise destination outside tolerance");
 		assertTrue(exactNavigation.reachedTarget(new Vec3(5.2D, 64.0D, 7.9D), finalNode, true),
 				"the exact final target finishes inside the requested tolerance");
+		assertTrue(exactNavigation.reachedTarget(
+				new Vec3(5.1D, 63.5D, 7.9D), finalNode, true, 63.5D),
+				"an exact destination on partial support uses the collision-surface height");
 		Vec3 adjustedTarget = exactNavigation.targetFor(
 				new PathNode(new GridPosition(4, 64, 7), TraversalType.WALK), true);
 		assertEquals(4.5D, adjustedTarget.x, "an adjusted safe goal retains its block-center x coordinate");
@@ -119,7 +126,7 @@ public final class NavigationProgressVerification {
 		longWaterPath.add(new PathNode(new GridPosition(5, 64, 0), TraversalType.WALK));
 		assertTrue(!ServerNavigationController.hasBoundedShallowWaterRun(longWaterPath, position -> position.x() > 0),
 				"a five-block swim is rejected instead of silently enabling open-water navigation");
-		return 34;
+		return 37;
 	}
 
 	private static void assertBounded(double value) {

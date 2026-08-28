@@ -77,7 +77,8 @@ public final class ServerNavigationController implements ServerController {
 		if (Math.max(0L, nowEpochMs - startedAt) >= timeoutMs) {
 			return fail(player, "ACTION_TIMEOUT", "Navigation timed out", currentProgress());
 		}
-		double remaining = player.position().distanceTo(destination);
+		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
+		double remaining = player.position().distanceTo(destinationTarget(world));
 		if (satisfiesDestinationTolerance(remaining, tolerance)) {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
@@ -90,15 +91,15 @@ public final class ServerNavigationController implements ServerController {
 			return replanOrResult(player, nowEpochMs, remaining);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
-		if (!new MinecraftNavigationWorld(player.level()).isStandable(waypoint.position())) {
+		if (!world.isStandable(waypoint.position())) {
 			TickResult replanned = replan(player, nowEpochMs, remaining, true);
 			if (replanned != null) return replanned;
 			nodes = plan.nodes();
 			waypoint = nodes.get(waypointIndex);
 		}
 		boolean finalWaypoint = waypointIndex == nodes.size() - 1;
-		Vec3 target = targetFor(waypoint, finalWaypoint);
-		boolean reached = reachedTarget(player.position(), waypoint, finalWaypoint);
+		Vec3 target = targetFor(world, waypoint, finalWaypoint);
+		boolean reached = reachedTarget(world, player.position(), waypoint, finalWaypoint);
 		double activeWaypointDistance = player.position().distanceTo(target);
 		WaypointProgress.Update update = progress.observe(activeWaypointDistance, reached, nowEpochMs);
 		lastProgressValue = update.progress();
@@ -109,7 +110,7 @@ public final class ServerNavigationController implements ServerController {
 			}
 			waypoint = nodes.get(waypointIndex);
 			finalWaypoint = waypointIndex == nodes.size() - 1;
-			target = targetFor(waypoint, finalWaypoint);
+			target = targetFor(world, waypoint, finalWaypoint);
 			progress.waypointAdvanced(player.position().distanceTo(target), nowEpochMs);
 		}
 		if (update.decision() == WaypointProgress.Decision.FAIL) {
@@ -119,7 +120,7 @@ public final class ServerNavigationController implements ServerController {
 			TickResult replanned = replan(player, nowEpochMs, remaining, true);
 			if (replanned != null) return replanned;
 			waypoint = plan.nodes().get(waypointIndex);
-			target = targetFor(waypoint, waypointIndex == plan.nodes().size() - 1);
+			target = targetFor(world, waypoint, waypointIndex == plan.nodes().size() - 1);
 		}
 		drive(player, waypoint, target, nowEpochMs);
 		return TickResult.running(update.progress());
@@ -155,14 +156,65 @@ public final class ServerNavigationController implements ServerController {
 
 	Vec3 targetFor(PathNode waypoint, boolean finalWaypoint) {
 		Objects.requireNonNull(waypoint, "waypoint must not be null");
-		return targetsExactDestination(waypoint, finalWaypoint) ? destination : center(waypoint.position());
+		return targetFor(waypoint, finalWaypoint, waypoint.position().y());
 	}
 
 	boolean reachedTarget(Vec3 playerPosition, PathNode waypoint, boolean finalWaypoint) {
+		return reachedTarget(playerPosition, waypoint, finalWaypoint, waypoint.position().y());
+	}
+
+	boolean reachedTarget(Vec3 playerPosition, PathNode waypoint, boolean finalWaypoint, double supportHeight) {
 		Objects.requireNonNull(playerPosition, "playerPosition must not be null");
+		if (!Double.isFinite(supportHeight)) return false;
+		Vec3 target = targetFor(waypoint, finalWaypoint, supportHeight);
 		return targetsExactDestination(waypoint, finalWaypoint)
-				? satisfiesDestinationTolerance(playerPosition.distanceTo(destination), tolerance)
-				: reachedWaypoint(playerPosition, center(waypoint.position()));
+				? satisfiesDestinationTolerance(playerPosition.distanceTo(target), tolerance)
+				: reachedWaypoint(playerPosition, target);
+	}
+
+	private Vec3 targetFor(MinecraftNavigationWorld world, PathNode waypoint, boolean finalWaypoint) {
+		Vec3 horizontalTarget = targetFor(waypoint, finalWaypoint);
+		double supportHeight = world.supportHeight(
+				waypoint.position(), horizontalTarget.x, horizontalTarget.z);
+		return Double.isFinite(supportHeight)
+				? targetFor(waypoint, finalWaypoint, supportHeight)
+				: horizontalTarget;
+	}
+
+	private Vec3 targetFor(PathNode waypoint, boolean finalWaypoint, double supportHeight) {
+		boolean exactDestination = targetsExactDestination(waypoint, finalWaypoint);
+		Vec3 horizontalTarget = exactDestination ? destination : center(waypoint.position());
+		double targetY = exactDestination && hasFullBlockSupportHeight(waypoint.position(), supportHeight)
+				? destination.y
+				: supportHeight;
+		return new Vec3(horizontalTarget.x, targetY, horizontalTarget.z);
+	}
+
+	private boolean reachedTarget(
+			MinecraftNavigationWorld world,
+			Vec3 playerPosition,
+			PathNode waypoint,
+			boolean finalWaypoint
+	) {
+		return reachedTarget(
+				playerPosition,
+				waypoint,
+				finalWaypoint,
+				world.supportHeight(waypoint.position(), playerPosition.x, playerPosition.z)
+		);
+	}
+
+	private Vec3 destinationTarget(MinecraftNavigationWorld world) {
+		GridPosition destinationPosition = grid(destination);
+		if (!world.isStandable(destinationPosition)) return destination;
+		double supportHeight = world.supportHeight(destinationPosition, destination.x, destination.z);
+		return Double.isFinite(supportHeight) && !hasFullBlockSupportHeight(destinationPosition, supportHeight)
+				? new Vec3(destination.x, supportHeight, destination.z)
+				: destination;
+	}
+
+	private static boolean hasFullBlockSupportHeight(GridPosition position, double supportHeight) {
+		return Math.abs(supportHeight - position.y()) < 1.0E-7D;
 	}
 
 	private boolean targetsExactDestination(PathNode waypoint, boolean finalWaypoint) {
@@ -225,7 +277,7 @@ public final class ServerNavigationController implements ServerController {
 		waypointIndex = Math.min(1, Math.max(0, candidate.nodes().size() - 1));
 		PathNode activeWaypoint = candidate.nodes().get(waypointIndex);
 		boolean finalWaypoint = waypointIndex == candidate.nodes().size() - 1;
-		double activeWaypointDistance = player.position().distanceTo(targetFor(activeWaypoint, finalWaypoint));
+		double activeWaypointDistance = player.position().distanceTo(targetFor(world, activeWaypoint, finalWaypoint));
 		if (progress == null) {
 			progress = new WaypointProgress(activeWaypointDistance, nowEpochMs, STALL_TIMEOUT_MS, MAX_REPLANS);
 		} else if (recovery) {

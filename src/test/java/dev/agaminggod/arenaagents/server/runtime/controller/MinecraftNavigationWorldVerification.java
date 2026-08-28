@@ -40,7 +40,25 @@ public final class MinecraftNavigationWorldVerification {
 				"damaging support remains hazardous");
 		assertEquals(WalkabilityView.Cell.BLOCKED, classify(Blocks.OAK_FENCE.defaultBlockState(), false),
 				"other partial collision such as fences remains blocked");
-		return 12;
+
+		assertEquals(0.5D, collisionHeight(Blocks.STONE_SLAB.defaultBlockState(), 0.5D, 0.5D),
+				"bottom slabs expose their half-block standing height");
+		double lowStairHeight = Double.POSITIVE_INFINITY;
+		double highStairHeight = Double.NEGATIVE_INFINITY;
+		for (double x : new double[]{0.25D, 0.75D}) {
+			for (double z : new double[]{0.25D, 0.75D}) {
+				double height = collisionHeight(Blocks.OAK_STAIRS.defaultBlockState(), x, z);
+				lowStairHeight = Math.min(lowStairHeight, height);
+				highStairHeight = Math.max(highStairHeight, height);
+			}
+		}
+		assertEquals(0.5D, lowStairHeight, "bottom stairs expose their lower collision surface");
+		assertEquals(1.0D, highStairHeight, "bottom stairs retain their upper collision surface");
+		assertTrue(Double.isNaN(collisionHeight(Blocks.AIR.defaultBlockState(), 0.5D, 0.5D)),
+				"empty space never invents support across a hole or cliff");
+		assertTrue(Double.isNaN(collisionHeight(Blocks.STONE.defaultBlockState(), 1.0D, 0.5D)),
+				"support from the adjacent block cannot complete a waypoint early");
+		return 17;
 	}
 
 	private static WalkabilityView.Cell classify(BlockState state, boolean boundedShallowWater) {
@@ -51,9 +69,21 @@ public final class MinecraftNavigationWorldVerification {
 		);
 	}
 
+	private static double collisionHeight(BlockState state, double localX, double localZ) {
+		return MinecraftNavigationWorld.collisionHeightAt(
+				state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO),
+				localX,
+				localZ
+		);
+	}
+
 	private static void assertEquals(Object expected, Object actual, String label) {
 		if (!expected.equals(actual)) {
 			throw new AssertionError(label + ": expected <" + expected + "> but was <" + actual + ">");
 		}
+	}
+
+	private static void assertTrue(boolean condition, String label) {
+		if (!condition) throw new AssertionError(label);
 	}
 }
