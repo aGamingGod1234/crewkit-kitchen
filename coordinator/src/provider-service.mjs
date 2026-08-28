@@ -115,8 +115,8 @@ export class ProviderService extends EventEmitter {
 		return [...this.#services.keys()].map((provider) => {
 			const record = this.#recovery.get(provider);
 			return record === undefined
-				? { provider, state: 'idle', fallbackMode: null, boundary: null, failureCode: null, consecutiveFailureCount: 0, nextProbeAtEpochMs: null, generation: 0, lastRecoveryAtEpochMs: null }
-				: { provider, ...record };
+				? { provider, state: 'idle', fallbackMode: null, boundary: null, failureCode: null, consecutiveFailureCount: 0, totalFailureCount: 0, boundaryFailureCounts: {}, nextProbeAtEpochMs: null, generation: 0, lastRecoveryAtEpochMs: null }
+				: { provider, ...record, boundaryFailureCounts: { ...record.boundaryFailureCounts } };
 		});
 	}
 
@@ -369,19 +369,14 @@ export class ProviderService extends EventEmitter {
 		if (failures?.size === 0) this.#failureBoundaries.delete(provider);
 		const remaining = this.#failureBoundaries.get(provider);
 		if (remaining?.size > 0) {
-			const [latestBoundary, latest] = [...remaining.entries()].at(-1);
-			this.#recovery.set(provider, {
-				state: 'degraded', fallbackMode: latest.fallbackMode, boundary: latestBoundary, failureCode: latest.failureCode,
-				consecutiveFailureCount: [...remaining.values()].reduce((sum, failure) => Math.min(1_000_000, sum + failure.count), 0),
-				nextProbeAtEpochMs: latest.nextProbeAtEpochMs, generation: previous?.generation ?? 1,
-				lastRecoveryAtEpochMs: previous?.lastRecoveryAtEpochMs ?? null,
-			});
+			this.#recovery.set(provider, degradedRecoveryRecord(remaining, previous, { enteringDegraded: false }));
 			this.#syncRecoveryTimer(provider);
 			return;
 		}
 		const recovered = previous?.state === 'degraded';
 		this.#recovery.set(provider, {
 			state: 'live', fallbackMode: null, boundary: null, failureCode: null, consecutiveFailureCount: 0,
+			totalFailureCount: 0, boundaryFailureCounts: {},
 			nextProbeAtEpochMs: null, generation: previous?.generation ?? 1,
 			lastRecoveryAtEpochMs: recovered ? safeNow(this.#now) : previous?.lastRecoveryAtEpochMs ?? null,
 		});
@@ -404,22 +399,13 @@ export class ProviderService extends EventEmitter {
 		};
 		failures.set(boundary, failure);
 		this.#failureBoundaries.set(provider, failures);
-		this.#recovery.set(provider, {
-			state: 'degraded', fallbackMode, boundary, failureCode: failure.failureCode,
-			consecutiveFailureCount: [...failures.values()].reduce((sum, entry) => Math.min(1_000_000, sum + entry.count), 0),
-			nextProbeAtEpochMs: failure.nextProbeAtEpochMs,
-			generation: (previous?.generation ?? 0) + (previous?.state === 'degraded' ? 0 : 1),
-			lastRecoveryAtEpochMs: previous?.lastRecoveryAtEpochMs ?? null,
-		});
+		this.#recovery.set(provider, degradedRecoveryRecord(failures, previous, { enteringDegraded: previous?.state !== 'degraded' }));
 		this.#syncRecoveryTimer(provider);
 	}
 
 	#syncRecoveryTimer(provider) {
 		const failures = this.#failureBoundaries.get(provider);
-		const candidates = failures === undefined ? [] : [...failures.entries()]
-			.filter(([boundary, failure]) => AUTOMATIC_RECOVERY_BOUNDARIES.has(boundary) && Number.isSafeInteger(failure.nextProbeAtEpochMs))
-			.sort((left, right) => left[1].nextProbeAtEpochMs - right[1].nextProbeAtEpochMs);
-		const next = candidates[0];
+		const next = selectRecoveryBoundary(failures, { automaticOnly: true, requireDeadline: true });
 		const existing = this.#recoveryTimers.get(provider);
 		if (next === undefined || this.#stopped) {
 			if (existing !== undefined) this.#cancelTimeout(existing.handle);
@@ -457,6 +443,39 @@ export class ProviderService extends EventEmitter {
 		} catch { /* the failed operation records and schedules its own next retry */ }
 		finally { this.#syncRecoveryTimer(provider); }
 	}
+}
+
+function degradedRecoveryRecord(failures, previous, { enteringDegraded }) {
+	const selected = selectRecoveryBoundary(failures, { automaticOnly: true }) ?? selectRecoveryBoundary(failures);
+	const [boundary, failure] = selected;
+	const boundaryFailureCounts = Object.fromEntries([...failures.entries()]
+		.sort(([left], [right]) => left.localeCompare(right))
+		.map(([name, entry]) => [name, entry.count]));
+	const totalFailureCount = Object.values(boundaryFailureCounts)
+		.reduce((sum, count) => Math.min(1_000_000, sum + count), 0);
+	return {
+		state: 'degraded',
+		fallbackMode: failure.fallbackMode,
+		boundary,
+		failureCode: failure.failureCode,
+		consecutiveFailureCount: totalFailureCount,
+		totalFailureCount,
+		boundaryFailureCounts,
+		nextProbeAtEpochMs: failure.nextProbeAtEpochMs,
+		generation: (previous?.generation ?? 0) + (enteringDegraded ? 1 : 0),
+		lastRecoveryAtEpochMs: previous?.lastRecoveryAtEpochMs ?? null,
+	};
+}
+
+function selectRecoveryBoundary(failures, { automaticOnly = false, requireDeadline = false } = {}) {
+	if (!(failures instanceof Map)) return undefined;
+	return [...failures.entries()]
+		.filter(([boundary, failure]) => (!automaticOnly || AUTOMATIC_RECOVERY_BOUNDARIES.has(boundary)) && (!requireDeadline || Number.isSafeInteger(failure.nextProbeAtEpochMs)))
+		.sort(([leftBoundary, left], [rightBoundary, right]) => {
+			const leftDeadline = Number.isSafeInteger(left.nextProbeAtEpochMs) ? left.nextProbeAtEpochMs : Number.POSITIVE_INFINITY;
+			const rightDeadline = Number.isSafeInteger(right.nextProbeAtEpochMs) ? right.nextProbeAtEpochMs : Number.POSITIVE_INFINITY;
+			return leftDeadline - rightDeadline || leftBoundary.localeCompare(rightBoundary);
+		})[0];
 }
 
 function freezeProfile(value) {

@@ -20,7 +20,7 @@ const PROFILE_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
 const RESOURCE_NAMES = Object.freeze([
 	'leases', 'sessions', 'actions', 'timers', 'promises', 'childProcesses', 'listeners',
 ]);
-const INSTRUMENTED_VALUES = new WeakSet();
+const TRUSTED_MEASUREMENTS = new WeakSet();
 
 const scenarios = [
 	['provider startup hang', providerStartupHang],
@@ -46,11 +46,14 @@ for (const [name, run] of scenarios) {
 
 test('recovery matrix evidence contract rejects omitted, null, and fabricated measurements', () => {
 	assert.throws(() => assertCompleteEvidence({}), /recovery evidence is required/);
-	assert.throws(() => observed(null, 'null measurement'), /non-null instrumented value/);
-	assert.throws(() => observed({ pending: 0, maximum: 0 }, 'hardcoded fixture counter'), /instrumented measurement/);
+	assert.throws(() => observed(null, 'null measurement'), /trusted sampler measurement/);
+	assert.throws(() => observed({ pending: 0, maximum: 0 }, 'hardcoded fixture counter'), /trusted sampler measurement/);
+	const maliciousHelper = (value) => ({ value, trusted: true, token: Symbol.for('arena.test.measurement') });
+	assert.throws(() => observed(maliciousHelper({ pending: 0, maximum: 0 }), 'forged helper measurement'), /trusted sampler measurement/);
+	assert.throws(() => observed(structuredClone(capturePromises(0, 0)), 'cloned genuine measurement'), /trusted sampler measurement/);
 	const invalid = {
 		recovery: { healthy: true, permanentLatch: false, stateBefore: 'fault', stateAfter: 'ready', nextProbeAtEpochMs: null, attemptTimes: [], probeDeadlines: [], retryDelays: [], attemptCount: 0 },
-		states: measured([], 'test registry sampler'),
+		states: observed(captureStates([]), 'test registry sampler'),
 		profile: notApplicable('No profile is selected in this contract test.'),
 		resources: Object.fromEntries(RESOURCE_NAMES.map((name) => [name, notApplicable(`${name} is deliberately absent from this evidence-contract-only fixture.`)])),
 	};
@@ -61,6 +64,104 @@ test('recovery matrix evidence contract rejects omitted, null, and fabricated me
 	invalid.resources.timers = { kind: 'notApplicable' };
 	assert.throws(() => assertCompleteEvidence(invalid), /notApplicable reason/);
 });
+
+for (const order of ['startup-first', 'catalog-first']) {
+	test(`provider recovery canonical selector survives overlapping tied failures (${order})`, async () => {
+		const fixture = await overlappingProviderFailures(order);
+		const { router, timers, startTimes, catalogTimes } = fixture;
+		try {
+			let recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+			assert.equal(recovery.boundary, 'catalog', 'same-deadline ties select the deterministic catalog boundary');
+			assert.equal(recovery.failureCode, 'SHARED_START_FAILURE');
+			assert.equal(recovery.nextProbeAtEpochMs, 1_000);
+			assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs, 'status and the owned physical timer share one canonical deadline');
+			assert.equal(recovery.totalFailureCount, 2);
+			assert.deepEqual(recovery.boundaryFailureCounts, { catalog: 1, startup: 1 });
+
+			timers.advanceTo(100);
+			const laterStartup = await router.start(['codex']);
+			assert.equal(laterStartup[0].reason?.code, 'LATER_START_FAILURE');
+			recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+			assert.equal(recovery.boundary, 'catalog', 'the advertised record stays on the physically earliest timer');
+			assert.equal(recovery.nextProbeAtEpochMs, 1_000);
+			assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs);
+			assert.equal(recovery.totalFailureCount, 3);
+			assert.deepEqual(recovery.boundaryFailureCounts, { catalog: 1, startup: 2 });
+
+			const staleCatalogCallback = timers.peekNextCallback();
+			timers.advanceTo(999);
+			await flush();
+			assert.deepEqual(catalogTimes, [], 'no catalog probe runs before the advertised deadline');
+			await timers.runNext();
+			assert.deepEqual(catalogTimes, [1_000], 'one catalog probe runs at its exact deadline');
+			recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+			assert.equal(recovery.boundary, 'startup', 'clearing the earliest boundary deterministically reselects the remaining failure');
+			assert.equal(recovery.failureCode, 'LATER_START_FAILURE');
+			assert.equal(recovery.nextProbeAtEpochMs, 2_100);
+			assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs, 'reselection updates status and timer atomically');
+			assert.deepEqual(recovery.boundaryFailureCounts, { startup: 2 });
+			const staleStartupCallback = timers.peekNextCallback();
+
+			await staleCatalogCallback();
+			assert.deepEqual(catalogTimes, [1_000], 'a stale fired callback cannot launch a duplicate probe');
+			timers.advanceTo(2_099);
+			await flush();
+			assert.deepEqual(startTimes, [0, 100, 1_000], 'the remaining boundary does not probe before its advertised deadline');
+			await timers.runNext();
+			recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+			assert.equal(recovery.state, 'live');
+			assert.equal(recovery.totalFailureCount, 0);
+			assert.deepEqual(recovery.boundaryFailureCounts, {});
+			await staleStartupCallback();
+			assert.deepEqual(startTimes, [0, 100, 1_000], 'a callback captured before restoration is fenced after live promotion');
+		} finally {
+			await router.stop();
+		}
+		assert.equal(timers.snapshot().pending, 0);
+	});
+}
+
+test('provider recovery stop fences a captured overlapping-boundary callback', async () => {
+	const { router, timers, startTimes, catalogTimes } = await overlappingProviderFailures('startup-first');
+	const staleCallback = timers.peekNextCallback();
+	await router.stop();
+	assert.equal(timers.snapshot().pending, 0);
+	await staleCallback();
+	assert.deepEqual(startTimes, [0]);
+	assert.deepEqual(catalogTimes, []);
+	assert.ok(router.recoverySnapshot().every(({ state }) => state === 'idle'));
+});
+
+async function overlappingProviderFailures(order) {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	const startTimes = [];
+	const catalogTimes = [];
+	let rejectShared;
+	let startAttempt = 0;
+	services.codex.start = () => {
+		startAttempt += 1;
+		startTimes.push(timers.now);
+		if (startAttempt === 1) return new Promise((_, reject) => { rejectShared = reject; });
+		if (startAttempt === 2) throw Object.assign(new Error('later startup failure'), { code: 'LATER_START_FAILURE' });
+		return Promise.resolve();
+	};
+	services.codex.catalog.refresh = async () => {
+		catalogTimes.push(timers.now);
+		return catalog('codex', PROFILE.model);
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 10_000, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	const calls = {
+		startup: () => router.start(['codex']),
+		catalog: () => router.catalog.refresh({ providers: ['codex'] }),
+	};
+	const first = order === 'startup-first' ? calls.startup() : calls.catalog();
+	const second = order === 'startup-first' ? calls.catalog() : calls.startup();
+	await flush();
+	rejectShared(Object.assign(new Error('shared startup failure'), { code: 'SHARED_START_FAILURE' }));
+	await Promise.all([first, second]);
+	return { router, timers, startTimes, catalogTimes };
+}
 
 async function providerStartupHang() {
 	const timers = new ManualTimers();
@@ -128,15 +229,15 @@ async function providerStartupHang() {
 	return evidence({
 		recovery: { healthy: restored?.state === 'live', permanentLatch: false, stateBefore: degraded?.state, stateAfter: restored?.state, nextProbeAtEpochMs: degraded?.nextProbeAtEpochMs, attemptTimes, probeDeadlines: [degraded?.nextProbeAtEpochMs], retryDelays: [1_000], attemptCount: attemptTimes.length },
 		states: notApplicable('Provider startup has no authority to mutate an agent domain lifecycle.'),
-		profile: measured({ before: PROFILE, after: session?.profile }, 'ProviderService exact session snapshot'),
+		profile: observed(captureProfile(PROFILE, session?.profile), 'ProviderService exact session snapshot'),
 		resources: resources({
 			leases: notApplicable('No work lease is allocated during provider-only startup.'),
-			sessions: measured(sessions, 'fake backend current-session counter around ProviderService'),
+			sessions: observed(captureSessions(sessions), 'fake backend current-session counter around ProviderService'),
 			actions: notApplicable('Provider startup cannot dispatch Minecraft actions.'),
-			timers: measured(timers.snapshot(), 'ProviderService injected timeout and recovery scheduler'),
-			promises: measured({ pending: pendingStarts, maximum: maxPendingStarts }, 'backend start-promise ownership counter'),
+			timers: observed(timers.evidence(), 'ProviderService injected timeout and recovery scheduler'),
+			promises: observed(capturePromises(pendingStarts, maxPendingStarts), 'backend start-promise ownership counter'),
 			childProcesses: notApplicable('This in-process provider fixture has no child-process creation capability.'),
-			listeners: measured(listeners.snapshot(), 'ProviderService EventEmitter listener sampler'),
+			listeners: observed(listeners.evidence(), 'ProviderService EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -195,15 +296,15 @@ async function providerOutageAndRestoration() {
 	return evidence({
 		recovery: { healthy: restored?.state === 'live', permanentLatch: false, stateBefore: degraded?.state, stateAfter: restored?.state, nextProbeAtEpochMs: degraded?.nextProbeAtEpochMs, attemptTimes: refreshTimes, probeDeadlines: degraded?.probeDeadlines, retryDelays: degraded?.retryDelays, attemptCount: refreshTimes.length },
 		states: notApplicable('Catalog recovery has no authority to mutate an agent domain lifecycle.'),
-		profile: measured({ before: PROFILE, after: session?.profile }, 'restored ProviderService session snapshot'),
+		profile: observed(captureProfile(PROFILE, session?.profile), 'restored ProviderService session snapshot'),
 		resources: resources({
 			leases: notApplicable('Catalog refresh owns bounded operations, not goal work leases.'),
-			sessions: measured(services.codex.sessionStats(), 'backend session counter after router cleanup'),
+			sessions: observed(captureSessions(services.codex.sessionStats()), 'backend session counter after router cleanup'),
 			actions: notApplicable('Catalog refresh cannot dispatch Minecraft actions.'),
-			timers: measured(timers.snapshot(), 'ProviderService injected timeout and recovery scheduler'),
-			promises: measured({ pending: pendingRefreshes, maximum: maxPendingRefreshes }, 'catalog refresh-promise ownership counter'),
+			timers: observed(timers.evidence(), 'ProviderService injected timeout and recovery scheduler'),
+			promises: observed(capturePromises(pendingRefreshes, maxPendingRefreshes), 'catalog refresh-promise ownership counter'),
 			childProcesses: notApplicable('This in-process catalog fixture has no child-process creation capability.'),
-			listeners: measured(listeners.snapshot(), 'ProviderService EventEmitter listener sampler'),
+			listeners: observed(listeners.evidence(), 'ProviderService EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -251,11 +352,11 @@ async function ignoredAbortReleasesCapacity() {
 		states: notApplicable('PlanningScheduler does not own agent domain lifecycle state.'),
 		profile: notApplicable('Scheduler capacity is provider-profile agnostic and cannot mutate a profile.'),
 		resources: resources({
-			leases: measured(schedulerLeases.snapshot(), 'PlanningScheduler active lease sampler'),
+			leases: observed(schedulerLeases.evidence(), 'PlanningScheduler active lease sampler'),
 			sessions: notApplicable('The scheduler test deliberately uses no provider session.'),
 			actions: notApplicable('Planning tasks do not invoke the Minecraft action bridge in this scenario.'),
-			timers: measured(timers.snapshot(), 'PlanningScheduler injected lease timer'),
-			promises: measured({ pending: activePromises, maximum: maxActivePromises }, 'underlying abort-ignoring task ownership counter'),
+			timers: observed(timers.evidence(), 'PlanningScheduler injected lease timer'),
+			promises: observed(capturePromises(activePromises, maxActivePromises), 'underlying abort-ignoring task ownership counter'),
 			childProcesses: notApplicable('This in-process scheduler fixture has no child-process creation capability.'),
 			listeners: notApplicable('PlanningScheduler exposes no event-listener surface.'),
 		}),
@@ -296,14 +397,16 @@ async function disconnectFencesOutstandingActionReplay() {
 	assert.equal(result.providerSessions.created, 1);
 	assert.equal(result.leaseStats.maxByKind.provider, 1);
 	assert.equal(result.leaseStats.maxByKind.action, 1);
+	assert.equal(result.listenerStats.maximum, 20, 'listener gauge samples the live bridge and coordinator registrations across reconnect');
+	assert.equal(result.listenerStats.current, 0, 'listener gauge samples final cleanup separately from the lifecycle maximum');
 	return evidence({
 		recovery: { healthy: result.connectionEpoch === 2 && replacementDispatches.length === 1, permanentLatch: false, stateBefore: 'bridge_disconnected', stateAfter: result.finalState, nextProbeAtEpochMs: null, attemptTimes: [1, 2], probeDeadlines: [], retryDelays: [], attemptCount: 2 },
-		states: measured(result.states, 'AgentRegistry snapshots sampled throughout native goal execution'),
-		profile: measured({ before: result.providerSessions.profile, after: result.profile }, 'provider session and final AgentRegistry snapshots'),
+		states: observed(captureStates(result.states), 'AgentRegistry snapshots sampled throughout native goal execution'),
+		profile: observed(captureProfile(result.providerSessions.profile, result.profile), 'provider session and final AgentRegistry snapshots'),
 		resources: resources({
-			leases: measured(result.leaseStats, 'tracking wrapper around the production ActiveGoalSupervisor'),
-			sessions: measured(result.providerSessions, 'scripted provider exact-session counters'),
-			actions: measured({
+			leases: observed(captureLeases(result.leaseStats), 'tracking wrapper around the production ActiveGoalSupervisor'),
+			sessions: observed(captureSessions(result.providerSessions), 'scripted provider exact-session counters'),
+			actions: observed(captureActions({
 				maxConcurrent: result.maxConcurrentPhysicalActions,
 				effects: result.actionEffects.length,
 				duplicates: duplicateDispatches,
@@ -311,11 +414,11 @@ async function disconnectFencesOutstandingActionReplay() {
 				pending: harness.bridge.deferredActionCount,
 				attempts: result.actionAttempts.length,
 				postFenceAccepted: result.acceptedActionResults.length,
-			}, 'FaultInjectingMinecraftBridge physical ledger and coordinator actionResult acceptance events'),
-			timers: measured(combinedTimerSnapshot(result.goalScheduler, result.stuckScheduler), 'injected work-lease and factual-progress schedulers'),
-			promises: measured({ pending: result.activeWork, maximum: result.providerSessions.maxTurnsPending }, 'scripted provider unsettled-turn ownership counter'),
+			}), 'FaultInjectingMinecraftBridge physical ledger and coordinator actionResult acceptance events'),
+			timers: observed(captureTimers(combinedTimerSnapshot(result.goalScheduler, result.stuckScheduler)), 'injected work-lease and factual-progress schedulers'),
+			promises: observed(capturePromises(result.activeWork, result.providerSessions.maxTurnsPending), 'scripted provider unsettled-turn ownership counter'),
 			childProcesses: notApplicable('This in-process native-provider fixture has no child-process creation capability.'),
-			listeners: measured(result.listenerStats, 'bridge and coordinator EventEmitter listener sampler'),
+			listeners: observed(captureListeners(result.listenerStats), 'bridge and coordinator EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -379,10 +482,10 @@ async function voiceBindFailureAndRecovery() {
 			leases: notApplicable('VoiceSupervisor owns retry timers rather than goal work leases.'),
 			sessions: notApplicable('Voice workers are not AI provider sessions.'),
 			actions: notApplicable('Voice recovery cannot dispatch Minecraft actions.'),
-			timers: measured(timers.snapshot(), 'VoiceSupervisor injected startup and retry scheduler'),
-			promises: measured({ pending: pendingStarts, maximum: maxPendingStarts }, 'voice startup-promise ownership counter'),
+			timers: observed(timers.evidence(), 'VoiceSupervisor injected startup and retry scheduler'),
+			promises: observed(capturePromises(pendingStarts, maxPendingStarts), 'voice startup-promise ownership counter'),
 			childProcesses: notApplicable('This in-process voice fixture has no child-process creation capability.'),
-			listeners: measured({ current: failureListeners, maximum: maxFailureListeners }, 'voice worker failure-listener registration counter'),
+			listeners: observed(captureListeners({ current: failureListeners, maximum: maxFailureListeners }), 'voice worker failure-listener registration counter'),
 		}),
 	});
 }
@@ -421,8 +524,8 @@ async function diagnosticHangAndRejection() {
 			leases: notApplicable('DiagnosticQueue owns bounded sink operations rather than goal leases.'),
 			sessions: notApplicable('Diagnostics create no provider sessions.'),
 			actions: notApplicable('Diagnostics cannot dispatch Minecraft actions.'),
-			timers: measured(timers.snapshot(), 'BestEffortDiagnosticQueue injected operation scheduler'),
-			promises: measured({ pending: pendingOperations, maximum: maxPendingOperations }, 'diagnostic sink-promise ownership counter'),
+			timers: observed(timers.evidence(), 'BestEffortDiagnosticQueue injected operation scheduler'),
+			promises: observed(capturePromises(pendingOperations, maxPendingOperations), 'diagnostic sink-promise ownership counter'),
 			childProcesses: notApplicable('This in-process diagnostic fixture has no child-process creation capability.'),
 			listeners: notApplicable('BestEffortDiagnosticQueue exposes no listener surface.'),
 		}),
@@ -458,12 +561,12 @@ async function exactProfileSessionAndLeasePreservation() {
 	return evidence({
 		recovery: { healthy: recovered.state === 'active', permanentLatch: false, stateBefore: 'session_epoch_1', stateAfter: 'session_epoch_2', nextProbeAtEpochMs: recovered.leases[0].deadline, attemptTimes: [first.sessionEpoch, second.sessionEpoch], probeDeadlines: [recovered.leases[0].deadline], retryDelays: [recovered.leases[0].deadline - timers.now], attemptCount: 2 },
 		states: notApplicable('WorkLeaseSupervisor cannot mutate the AgentRegistry lifecycle.'),
-		profile: measured({ before: { fingerprint: PROFILE_FINGERPRINT }, after: { fingerprint: recovered.key.profileFingerprint } }, 'production WorkLeaseSupervisor key snapshots'),
+		profile: observed(captureProfile({ fingerprint: PROFILE_FINGERPRINT }, { fingerprint: recovered.key.profileFingerprint }), 'production WorkLeaseSupervisor key snapshots'),
 		resources: resources({
-			leases: measured(leases.snapshot(), 'production WorkLeaseSupervisor lifecycle snapshots'),
+			leases: observed(leases.evidence(), 'production WorkLeaseSupervisor lifecycle snapshots'),
 			sessions: notApplicable('Lease fencing uses session keys but does not create provider sessions.'),
 			actions: notApplicable('Action lease fencing does not dispatch a physical Minecraft action.'),
-			timers: measured(timers.snapshot(), 'WorkLeaseSupervisor injected lease scheduler'),
+			timers: observed(timers.evidence(), 'WorkLeaseSupervisor injected lease scheduler'),
 			promises: notApplicable('WorkLeaseSupervisor lease operations are synchronous and own no promises.'),
 			childProcesses: notApplicable('WorkLeaseSupervisor has no child-process creation capability.'),
 			listeners: notApplicable('WorkLeaseSupervisor exposes no event-listener surface.'),
@@ -481,17 +584,11 @@ function resources(value) {
 	return Object.freeze(value);
 }
 
-function observed(value, source) {
+function observed(measurement, source) {
 	if (typeof source !== 'string' || source.trim().length < 8) throw new TypeError('observed evidence source must be descriptive');
-	if (value === null || value === undefined || (typeof value !== 'object' && typeof value !== 'function')) throw new TypeError('observed evidence requires a non-null instrumented value');
-	if (!INSTRUMENTED_VALUES.has(value)) throw new TypeError('observed evidence requires an instrumented measurement');
-	return Object.freeze({ kind: 'observed', value, source });
-}
-
-function measured(value, source) {
-	if (value === null || value === undefined || (typeof value !== 'object' && typeof value !== 'function')) throw new TypeError('measurement value must be a non-null object');
-	INSTRUMENTED_VALUES.add(value);
-	return observed(value, source);
+	if (measurement === null || typeof measurement !== 'object' || !TRUSTED_MEASUREMENTS.has(measurement)) throw new TypeError('observed evidence requires a trusted sampler measurement');
+	if (measurement.value === null || measurement.value === undefined) throw new TypeError('observed evidence requires a non-null instrumented value');
+	return Object.freeze({ kind: 'observed', value: measurement.value, measurement, source });
 }
 
 function notApplicable(reason) {
@@ -516,7 +613,7 @@ function assertCompleteEvidence(result) {
 function assertEvidenceEntry(entry, name) {
 	if (entry?.kind === 'observed') {
 		if (!Object.hasOwn(entry, 'value') || entry.value === null || entry.value === undefined) throw new TypeError(`${name} evidence requires a non-null instrumented value`);
-		if (!INSTRUMENTED_VALUES.has(entry.value)) throw new TypeError(`${name} evidence requires an instrumented measurement`);
+		if (!TRUSTED_MEASUREMENTS.has(entry.measurement) || entry.measurement.value !== entry.value) throw new TypeError(`${name} evidence requires a trusted sampler measurement`);
 		if (typeof entry.source !== 'string' || entry.source.trim().length < 8) throw new TypeError(`${name} evidence source is required`);
 		return;
 	}
@@ -525,6 +622,46 @@ function assertEvidenceEntry(entry, name) {
 		return;
 	}
 	throw new TypeError(`${name} evidence must be observed or explicitly notApplicable`);
+}
+
+function issueMeasurement(value) {
+	if (value === null || value === undefined || typeof value !== 'object') throw new TypeError('sampler produced no measurement');
+	const measurement = Object.freeze({ value });
+	TRUSTED_MEASUREMENTS.add(measurement);
+	return measurement;
+}
+
+function captureStates(states) {
+	if (!Array.isArray(states)) throw new TypeError('state sampler requires an array');
+	return issueMeasurement([...states]);
+}
+
+function captureProfile(before, after) {
+	return issueMeasurement({ before: structuredClone(before), after: structuredClone(after) });
+}
+
+function captureSessions(stats) {
+	return issueMeasurement(structuredClone(stats));
+}
+
+function captureLeases(stats) {
+	return issueMeasurement(structuredClone(stats));
+}
+
+function captureActions(stats) {
+	return issueMeasurement(structuredClone(stats));
+}
+
+function captureTimers(stats) {
+	return issueMeasurement(structuredClone(stats));
+}
+
+function capturePromises(pending, maximum) {
+	return issueMeasurement({ pending, maximum });
+}
+
+function captureListeners(stats) {
+	return issueMeasurement({ current: stats.current, maximum: stats.maximum });
 }
 
 function assertNoDomainFailure(entry) {
@@ -655,7 +792,7 @@ class ListenerGauge {
 		this.#maximum = Math.max(this.#maximum, this.#current);
 	}
 
-	snapshot() { return { current: this.#current, maximum: this.#maximum }; }
+	evidence() { return captureListeners({ current: this.#current, maximum: this.#maximum }); }
 }
 
 class SchedulerLeaseGauge {
@@ -673,7 +810,7 @@ class SchedulerLeaseGauge {
 		this.#maximum = Math.max(this.#maximum, this.#current);
 	}
 
-	snapshot() { return { maxByKind: { provider: this.#maximum }, pending: this.#current }; }
+	evidence() { return captureLeases({ maxByKind: { provider: this.#maximum }, pending: this.#current }); }
 }
 
 class LeaseSnapshotGauge {
@@ -689,7 +826,7 @@ class LeaseSnapshotGauge {
 		}
 	}
 
-	snapshot() { return { maxByKind: Object.fromEntries(this.#maximumByKind), pending: this.#pending }; }
+	evidence() { return captureLeases({ maxByKind: Object.fromEntries(this.#maximumByKind), pending: this.#pending }); }
 }
 
 class ManualTimers {
@@ -721,6 +858,18 @@ class ManualTimers {
 		this.now = target;
 	}
 
+	peekNextCallback() {
+		const entry = [...this.#timers.values()].sort((left, right) => left.deadline - right.deadline || left.handle.id - right.handle.id)[0];
+		if (entry === undefined) throw new Error('no deterministic timer is pending');
+		return entry.callback;
+	}
+
+	peekNextDeadline() {
+		const entry = [...this.#timers.values()].sort((left, right) => left.deadline - right.deadline || left.handle.id - right.handle.id)[0];
+		if (entry === undefined) throw new Error('no deterministic timer is pending');
+		return entry.deadline;
+	}
+
 	async runNext({ flushAfter = true } = {}) {
 		const entry = [...this.#timers.values()].sort((left, right) => left.deadline - right.deadline || left.handle.id - right.handle.id)[0];
 		if (entry === undefined) throw new Error('no deterministic timer is pending');
@@ -741,6 +890,8 @@ class ManualTimers {
 			maximum: this.#maxPending,
 		};
 	}
+
+	evidence() { return captureTimers(this.snapshot()); }
 }
 
 async function flush() {

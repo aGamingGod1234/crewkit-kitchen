@@ -150,6 +150,7 @@ export class NativeGoalHarness {
 	#acceptedActionResultListener;
 	#runtimeErrorListener;
 	#maxListenerCount;
+	#currentListenerCount = 0;
 	#observedStates = [];
 
 	constructor({ coordinator, registry, bridge, provider, scenario, goalScheduler, stuckScheduler, goalSupervisor, acceptedActionResults, acceptedActionResultListener, runtimeErrorListener }) {
@@ -164,7 +165,8 @@ export class NativeGoalHarness {
 		this.#acceptedActionResults = acceptedActionResults;
 		this.#acceptedActionResultListener = acceptedActionResultListener;
 		this.#runtimeErrorListener = runtimeErrorListener;
-		this.#maxListenerCount = emitterListenerCount(bridge) + emitterListenerCount(coordinator);
+		this.#maxListenerCount = 0;
+		this.#sampleListeners();
 	}
 
 	get bridge() { return this.#bridge; }
@@ -174,13 +176,17 @@ export class NativeGoalHarness {
 
 	async run({ stopAfter = null } = {}) {
 		await this.#coordinator.start();
+		this.#sampleListeners();
 		this.#bridge.start();
 		this.#bridge.ready({ revision: 0, state: DynamicAgentState.IDLE });
+		this.#sampleListeners();
 		await eventually(() => this.#bridge.sent.some((entry) => entry.type === 'agent_ready'));
 		await this.#bridge.startGoal(this.#scenario.goal, 1);
+		this.#sampleListeners();
 		const deadline = Date.now() + (this.#scenario.timeoutMs ?? 2_000);
 		while (Date.now() < deadline) {
 			await tick();
+			this.#sampleListeners();
 			if (this.#provider.activeWork === 0) this.#goalScheduler.runNext();
 			const record = this.#registry.get(AGENT_ID);
 			if (record?.state !== undefined) this.#observedStates.push(record.state);
@@ -191,6 +197,7 @@ export class NativeGoalHarness {
 		await this.#coordinator.stop();
 		this.#coordinator.off('actionResult', this.#acceptedActionResultListener);
 		this.#coordinator.off('runtimeError', this.#runtimeErrorListener);
+		this.#sampleListeners();
 		const result = this.#result();
 		return { ...result, activeWork: this.#provider.activeWork, recoveryHandles: this.#bridge.recoveryHandles };
 	}
@@ -224,13 +231,18 @@ export class NativeGoalHarness {
 			providerSessions: this.#provider.sessionStats(),
 			profile: this.#registry.get(AGENT_ID),
 			leaseStats: this.#goalSupervisor.stats(),
-			listenerStats: { current: emitterListenerCount(this.#bridge) + emitterListenerCount(this.#coordinator), maximum: this.#maxListenerCount },
+			listenerStats: { current: this.#currentListenerCount, maximum: this.#maxListenerCount },
 			recoveryCycles: this.#provider.recoveryCycles,
 			inventory: this.#bridge.inventory,
 			completionEvaluations: this.#bridge.completionEvaluations,
 			goalControls: this.#bridge.goalControls,
 			goalSpec: this.#bridge.goalSpec,
 		};
+	}
+
+	#sampleListeners() {
+		this.#currentListenerCount = emitterListenerCount(this.#bridge) + emitterListenerCount(this.#coordinator);
+		this.#maxListenerCount = Math.max(this.#maxListenerCount, this.#currentListenerCount);
 	}
 }
 
