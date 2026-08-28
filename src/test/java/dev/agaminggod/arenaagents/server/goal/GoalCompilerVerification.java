@@ -142,7 +142,17 @@ public final class GoalCompilerVerification {
 		);
 		GoalCompilation overBound = compiler.compile("Get apple" + " and apple".repeat(16), RegistryAccess.EMPTY, 1_200L);
 		assertEquals(GoalCompilation.Kind.REJECTED, overBound.kind(), "compound predicates reject more than sixteen factual leaves");
-		return 5;
+		GoalCompilation carriedCraft = compiler.compile("Craft an iron pickaxe and a shield", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, carriedCraft.kind(),
+				"compound craft wording cannot be reduced to possession predicates");
+		assertEquals(Optional.empty(), carriedCraft.acceptedSpec(),
+				"compound craft wording has no false possession completion predicate");
+		assertEquals(
+				GoalCompilation.Kind.NEEDS_TRANSLATION,
+				compiler.compile("Get an iron pickaxe and make a shield", RegistryAccess.EMPTY, 1_200L).kind(),
+				"an explicit make clause keeps the entire compound goal verifiable"
+		);
+		return 8;
 	}
 
 	private static int verifyDraftRoundTrip() {

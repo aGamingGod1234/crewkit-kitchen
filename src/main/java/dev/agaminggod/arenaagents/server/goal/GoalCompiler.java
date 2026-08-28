@@ -95,11 +95,7 @@ public final class GoalCompiler {
 
 		Matcher item = ITEM.matcher(command);
 		if (item.matches()) {
-			if (item.group(1).equals("craft") || item.group(1).equals("make")) {
-				return GoalCompilation.needsTranslation(
-						"I can verify possession, but not that this item was newly crafted. Clarify whether obtaining it counts."
-				);
-			}
+			if (isCraftingVerb(item.group(1))) return craftingNeedsTranslation();
 			int count;
 			try {
 				count = item.group(2) == null ? 1 : Integer.parseInt(item.group(2));
@@ -124,7 +120,7 @@ public final class GoalCompiler {
 					: "More than one Minecraft entity matches that request.");
 		}
 		if (item.matches()) {
-			List<String> matches = matchItems(item.group(2), registries);
+			List<String> matches = matchItems(item.group(3), registries);
 			return GoalCompilation.needsTranslation(matches.isEmpty()
 					? "I could not identify the exact Minecraft item you want."
 					: "More than one Minecraft item matches that request.");
@@ -196,6 +192,7 @@ public final class GoalCompiler {
 		ArrayList<GoalPredicate> predicates = new ArrayList<>();
 		for (GoalClause clause : clauses) {
 			if (clause.kind() == ClauseKind.ITEM) {
+				if (clause.requiresCreation()) return craftingNeedsTranslation();
 				if (clause.count() <= 0) return GoalCompilation.rejected("The requested item count must be positive.");
 				List<String> matches = matchItems(clause.target(), registries);
 				if (matches.size() != 1) return GoalCompilation.needsTranslation(matches.isEmpty()
@@ -218,42 +215,52 @@ public final class GoalCompiler {
 		String[] parts = command.split("\\s+and\\s+");
 		if (parts.length < 2) return List.of();
 		ArrayList<GoalClause> clauses = new ArrayList<>();
-		ClauseKind inherited = null;
+		GoalClause inherited = null;
 		for (String part : parts) {
 			GoalClause clause = parseClause(part.strip(), inherited);
 			if (clause == null) return List.of();
 			clauses.add(clause);
-			inherited = clause.kind();
+			inherited = clause;
 		}
 		return List.copyOf(clauses);
 	}
 
-	private static GoalClause parseClause(String value, ClauseKind inherited) {
+	private static GoalClause parseClause(String value, GoalClause inherited) {
 		Matcher kill = KILL.matcher(value);
-		if (kill.matches()) return new GoalClause(ClauseKind.KILL, kill.group(1), 1);
+		if (kill.matches()) return new GoalClause(ClauseKind.KILL, kill.group(1), 1, false);
 		Matcher item = ITEM.matcher(value);
 		if (item.matches()) {
 			try {
-				return new GoalClause(ClauseKind.ITEM, item.group(2), item.group(1) == null ? 1 : Integer.parseInt(item.group(1)));
+				return new GoalClause(ClauseKind.ITEM, item.group(3), item.group(2) == null ? 1 : Integer.parseInt(item.group(2)), isCraftingVerb(item.group(1)));
 			} catch (NumberFormatException exception) {
-				return new GoalClause(ClauseKind.ITEM, item.group(2), -1);
+				return new GoalClause(ClauseKind.ITEM, item.group(3), -1, isCraftingVerb(item.group(1)));
 			}
 		}
 		if (inherited == null) return null;
 		String target = value.replaceFirst("^(?:the|a|an|some)\\s+", "").strip();
 		if (target.isEmpty()) return null;
-		if (inherited == ClauseKind.KILL) return new GoalClause(ClauseKind.KILL, target, 1);
+		if (inherited.kind() == ClauseKind.KILL) return new GoalClause(ClauseKind.KILL, target, 1, false);
 		Matcher counted = Pattern.compile("^(?:(\\d+)\\s+)?(?:(?:the|a|an|some)\\s+)?(.+)$").matcher(value);
 		if (!counted.matches()) return null;
 		try {
-			return new GoalClause(ClauseKind.ITEM, counted.group(2), counted.group(1) == null ? 1 : Integer.parseInt(counted.group(1)));
+			return new GoalClause(ClauseKind.ITEM, counted.group(2), counted.group(1) == null ? 1 : Integer.parseInt(counted.group(1)), inherited.requiresCreation());
 		} catch (NumberFormatException exception) {
-			return new GoalClause(ClauseKind.ITEM, counted.group(2), -1);
+			return new GoalClause(ClauseKind.ITEM, counted.group(2), -1, inherited.requiresCreation());
 		}
 	}
 
 	private enum ClauseKind { ITEM, KILL }
-	private record GoalClause(ClauseKind kind, String target, int count) { }
+	private record GoalClause(ClauseKind kind, String target, int count, boolean requiresCreation) { }
+
+	private static boolean isCraftingVerb(String verb) {
+		return verb.equals("craft") || verb.equals("make");
+	}
+
+	private static GoalCompilation craftingNeedsTranslation() {
+		return GoalCompilation.needsTranslation(
+				"I can verify possession, but not that this item was newly crafted. Clarify whether obtaining it counts."
+		);
+	}
 
 	private static GoalCompilation accepted(String original, GoalPredicate predicate, long createdAtTick, String message) {
 		return GoalCompilation.accepted(GoalSpec.create(original, predicate, createdAtTick), message);
