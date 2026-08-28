@@ -169,7 +169,6 @@ def main():
     worker._load_tts = tracked_loader("_tts_model", tts_model)
     worker._load_stt = tracked_loader("_stt_model", stt_model)
     worker._warmup_started = False
-    worker._warmup_error = None
     warmup_start = threading.Barrier(5)
     warmup_errors = []
     warmup_results = []
@@ -205,6 +204,18 @@ def main():
     assert warmup_tracker.maximum == 1, (
         f"warmup overlapped local model work {warmup_tracker.maximum} times"
     )
+
+    worker._warmup_started = False
+    worker._tts_model = None
+    worker._stt_model = None
+    worker._load_stt = tracked_loader("_stt_model", stt_model)
+
+    def fail_tts_warmup():
+        raise RuntimeError("Chatterbox unavailable")
+
+    worker._load_tts = fail_tts_warmup
+    assert worker._warmup() == {"sttReady": True, "ttsReady": False}
+
     print(json.dumps({
         "requests": request_count,
         "warmupRequests": len(warmup_results),

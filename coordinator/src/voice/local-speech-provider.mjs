@@ -65,9 +65,10 @@ export class LocalSpeechProvider {
 
 	async warmup({ signal } = {}) {
 		const response = await this.#request({ op: 'warmup' }, signal);
-		if (response.sttReady !== true || response.ttsReady !== true) {
-			throw typedError('LOCAL_SPEECH_WARMUP_FAILED', 'Local speech model warmup did not initialize both STT and TTS');
+		if (typeof response.sttReady !== 'boolean' || typeof response.ttsReady !== 'boolean') {
+			throw typedError('LOCAL_SPEECH_WARMUP_FAILED', 'Local speech model warmup returned invalid channel readiness');
 		}
+		return Object.freeze({ sttReady: response.sttReady, ttsReady: response.ttsReady });
 	}
 
 	async synthesize({ text, voiceId = 'local.default.v1', speed = 1, signal } = {}) {

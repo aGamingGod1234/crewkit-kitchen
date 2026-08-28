@@ -544,6 +544,111 @@ test('local model warmup failure switches both channels to configured remote pro
 	assert.equal(localCloses, 1);
 });
 
+test('TTS-only warmup failure keeps ready local STT while routing speech to Fish', async () => {
+	let active;
+	let localCloses = 0;
+	let fishProviders = 0;
+	let warmupCalls = 0;
+	const local = {
+		async warmup() {
+			warmupCalls += 1;
+			await new Promise((resolve) => setImmediate(resolve));
+			return { sttReady: true, ttsReady: false };
+		},
+		async synthesize() { throw new Error('failed local TTS must not receive traffic'); },
+		async transcribe() { return { transcript: 'local Whisper stayed ready', confidence: 1 }; },
+		async close() { localCloses += 1; },
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_AUDIO_API_KEY: 'fish-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => {
+			fishProviders += 1;
+			return { async synthesize() { return { provider: 'fish' }; } };
+		},
+		createSttProvider: () => { throw new Error('Deepgram must not be created without a credential'); },
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		await Promise.all([worker.warmup(), worker.warmup()]);
+		assert.equal(warmupCalls, 1, 'concurrent warmup calls share one channel transition');
+		assert.equal(fishProviders, 1);
+		assert.equal((await active.provider.synthesize({ text: 'hello' })).provider, 'fish');
+		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'local Whisper stayed ready');
+		assert.equal(localCloses, 0, 'the shared worker remains owned by the ready STT channel');
+	} finally {
+		await worker.close();
+	}
+	assert.equal(localCloses, 1);
+});
+
+test('independent runtime channel failovers release the shared local worker exactly once', async () => {
+	let active;
+	let localCloses = 0;
+	let deepgramProviders = 0;
+	let fishProviders = 0;
+	let fishCloses = 0;
+	let deepgramCloses = 0;
+	const local = {
+		async synthesize() { throw Object.assign(new Error('local TTS failed'), { code: 'LOCAL_TTS_ERROR' }); },
+		async transcribe() {
+			await new Promise((resolve) => setImmediate(resolve));
+			throw Object.assign(new Error('local STT failed'), { code: 'LOCAL_STT_ERROR' });
+		},
+		async close() { localCloses += 1; },
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_AUDIO_API_KEY: 'fish-key',
+		DEEPGRAM_API_KEY: 'deepgram-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => {
+			fishProviders += 1;
+			return {
+				async synthesize() { return { provider: 'fish' }; },
+				async close() { fishCloses += 1; },
+			};
+		},
+		createSttProvider: () => {
+			deepgramProviders += 1;
+			return {
+				async transcribe() { return { transcript: 'deepgram', confidence: 1 }; },
+				async close() { deepgramCloses += 1; },
+			};
+		},
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		assert.equal((await active.provider.synthesize({ text: 'hello' })).provider, 'fish');
+		assert.equal(fishProviders, 1);
+		assert.equal(localCloses, 0, 'local STT still owns the shared worker');
+
+		const transcripts = await Promise.all([
+			active.sttProvider.transcribe({ pcm: Buffer.alloc(2) }),
+			active.sttProvider.transcribe({ pcm: Buffer.alloc(2) }),
+		]);
+		assert.deepEqual(transcripts.map(({ transcript }) => transcript), ['deepgram', 'deepgram']);
+		assert.equal(deepgramProviders, 1, 'concurrent failures share one STT fallback');
+		assert.equal(localCloses, 1, 'the second channel transition releases the unused model process');
+	} finally {
+		await Promise.all([worker.close(), worker.close()]);
+	}
+	assert.equal(localCloses, 1);
+	assert.equal(fishCloses, 1);
+	assert.equal(deepgramCloses, 1);
+});
+
 test('local model warmup failure preserves Deepgram-only STT on non-Windows hosts', async () => {
 	let active;
 	let localCloses = 0;

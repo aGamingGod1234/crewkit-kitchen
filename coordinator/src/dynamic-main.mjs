@@ -1728,11 +1728,16 @@ function createLocalSpeechFailover(localProvider, {
 	let localUnavailable = false;
 	let ttsTransitionPromise = null;
 	let sttTransitionPromise = null;
-	let fullTransitionPromise = null;
+	let warmupPromise = null;
 	let localClosePromise = null;
 	const closeLocal = () => {
 		localClosePromise ??= Promise.resolve().then(() => localProvider.close?.()).then(() => undefined, () => undefined);
 		return localClosePromise;
+	};
+	const closeLocalIfUnused = () => {
+		if (activeTts === localProvider || activeStt === localProvider) return Promise.resolve();
+		localUnavailable = true;
+		return closeLocal();
 	};
 	const fallbackTtsFactory = () => {
 		if (fallbackTts !== null) return fallbackTts;
@@ -1753,59 +1758,47 @@ function createLocalSpeechFailover(localProvider, {
 			: createSttProvider({ apiKey: deepgramApiKey });
 		return fallbackStt;
 	};
-	const switchAllToFallback = async (error, signal) => {
-		if (error?.name === 'AbortError' || signal?.aborted) throw error;
-		const hasFallbackTts = fishApiKey !== null || platform === 'win32';
-		const hasFallbackStt = deepgramApiKey !== null;
-		if (!hasFallbackTts && !hasFallbackStt) throw error;
-		if (localUnavailable) return;
-		fullTransitionPromise ??= (async () => {
-			await closeLocal();
-			throwIfVoiceStartupAborted(signal);
-			const nextTts = fallbackTtsFactory();
-			const nextStt = fallbackSttFactory();
-			activeTts = nextTts;
-			activeStt = nextStt;
-			localUnavailable = true;
-		})().catch((transitionError) => {
-			fullTransitionPromise = null;
-			throw transitionError;
-		});
-		await fullTransitionPromise;
-	};
-	const switchTtsToFallback = async (error, signal) => {
+	const switchTtsToFallback = async (error, signal, allowUnavailable = false) => {
 		if (!shouldUseLocalTtsFallback(error, signal)) throw error;
-		if (fishApiKey === null && platform !== 'win32') throw error;
+		if (fishApiKey === null && platform !== 'win32' && !allowUnavailable) throw error;
 		if (activeTts !== localProvider) return;
-		if (fullTransitionPromise !== null) {
-			await fullTransitionPromise;
-			return;
-		}
-		ttsTransitionPromise ??= Promise.resolve().then(() => {
+		ttsTransitionPromise ??= Promise.resolve().then(async () => {
 			throwIfVoiceStartupAborted(signal);
 			if (activeTts === localProvider) activeTts = fallbackTtsFactory();
+			await closeLocalIfUnused();
 		}).catch((transitionError) => {
 			ttsTransitionPromise = null;
 			throw transitionError;
 		});
 		await ttsTransitionPromise;
 	};
-	const switchSttToFallback = async (error, signal) => {
+	const switchSttToFallback = async (error, signal, allowUnavailable = false) => {
 		if (!shouldUseLocalSttFallback(error, signal)) throw error;
-		if (deepgramApiKey === null) throw error;
+		if (deepgramApiKey === null && !allowUnavailable) throw error;
 		if (activeStt !== localProvider) return;
-		if (fullTransitionPromise !== null) {
-			await fullTransitionPromise;
-			return;
-		}
-		sttTransitionPromise ??= Promise.resolve().then(() => {
+		sttTransitionPromise ??= Promise.resolve().then(async () => {
 			throwIfVoiceStartupAborted(signal);
 			if (activeStt === localProvider) activeStt = fallbackSttFactory();
+			await closeLocalIfUnused();
 		}).catch((transitionError) => {
 			sttTransitionPromise = null;
 			throw transitionError;
 		});
 		await sttTransitionPromise;
+	};
+	const switchFailedWarmupChannels = async ({ sttReady, ttsReady }, error, signal) => {
+		if (error?.name === 'AbortError' || signal?.aborted) throw error;
+		const ttsUsable = ttsReady || fishApiKey !== null || platform === 'win32';
+		const sttUsable = sttReady || deepgramApiKey !== null;
+		if (!ttsUsable && !sttUsable) throw error;
+		if (!ttsReady && !sttReady) {
+			await closeLocal();
+			throwIfVoiceStartupAborted(signal);
+		}
+		await Promise.all([
+			ttsReady ? undefined : switchTtsToFallback(error, signal, true),
+			sttReady ? undefined : switchSttToFallback(error, signal, true),
+		]);
 	};
 	return Object.freeze({
 		tts: Object.freeze({
@@ -1837,13 +1830,31 @@ function createLocalSpeechFailover(localProvider, {
 				}
 			},
 		}),
-		async warmup({ signal } = {}) {
+		warmup({ signal } = {}) {
 			if (localUnavailable || typeof localProvider.warmup !== 'function') return;
-			try {
-				await localProvider.warmup({ signal });
-			} catch (error) {
-				await switchAllToFallback(error, signal);
-			}
+			warmupPromise ??= (async () => {
+				let readiness;
+				try {
+					readiness = await localProvider.warmup({ signal });
+				} catch (error) {
+					await switchFailedWarmupChannels({ sttReady: false, ttsReady: false }, error, signal);
+					return;
+				}
+				if (readiness === undefined) return;
+				if (readiness === null || typeof readiness !== 'object'
+						|| typeof readiness.sttReady !== 'boolean' || typeof readiness.ttsReady !== 'boolean') {
+					throw new TypeError('local speech warmup must return channel readiness');
+				}
+				if (readiness.sttReady && readiness.ttsReady) return;
+				const error = Object.assign(new Error('Local speech warmup did not initialize every channel'), {
+					code: 'LOCAL_SPEECH_WARMUP_FAILED',
+				});
+				await switchFailedWarmupChannels(readiness, error, signal);
+			})().catch((error) => {
+				warmupPromise = null;
+				throw error;
+			});
+			return warmupPromise;
 		},
 		async close() {
 			await Promise.allSettled([

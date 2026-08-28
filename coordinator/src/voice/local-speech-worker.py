@@ -21,7 +21,6 @@ _stt_model = None
 _model_lock = threading.RLock()
 _warmup_lock = threading.Lock()
 _warmup_started = False
-_warmup_error = None
 _response_lock = threading.Lock()
 
 def _load_tts():
@@ -83,10 +82,8 @@ def _warmup_model(name, loader):
 
 
 def _warmup():
-    global _warmup_started, _warmup_error
+    global _warmup_started
     with _warmup_lock:
-        if _warmup_error is not None:
-            raise RuntimeError(_warmup_error)
         if _warmup_started:
             return {"sttReady": _stt_model is not None, "ttsReady": _tts_model is not None}
         _warmup_started = True
@@ -94,11 +91,7 @@ def _warmup():
             "stt": _warmup_model("STT", _load_stt),
             "tts": _warmup_model("TTS", _load_tts),
         }
-        if not results["stt"] or not results["tts"]:
-            failed = ", ".join(name for name in ("STT", "TTS") if not results[name.lower()])
-            _warmup_error = f"Local speech model warmup failed for: {failed}"
-            raise RuntimeError(_warmup_error)
-        return {"sttReady": True, "ttsReady": True}
+        return {"sttReady": results["stt"], "ttsReady": results["tts"]}
 
 
 def _tts(request):

@@ -86,7 +86,7 @@ test('local speech provider starts model warmup before the first utterance', asy
 		timeoutMs: 2_000,
 	});
 	try {
-		await provider.warmup();
+		assert.deepEqual(await provider.warmup(), { sttReady: true, ttsReady: true });
 		const synthesized = await provider.synthesize({ text: 'Warm response.', voiceId: 'ignored', speed: 1 });
 		assert.equal(synthesized.pcm.length, 4);
 	} finally {
