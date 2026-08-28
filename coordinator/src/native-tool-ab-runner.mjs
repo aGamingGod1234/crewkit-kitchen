@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
 import { runNativeToolCli } from './native-tool-cli-boundary.mjs';
 
-async function main() {
+async function main({ progress }) {
 const [baselineService, currentService, outputPath, repetitionsText = '10'] = process.argv.slice(2);
 if (!baselineService || !currentService || !outputPath) throw new TypeError('baseline service, current service, and output path are required');
 const repetitions = Number.parseInt(repetitionsText, 10);
@@ -19,7 +19,7 @@ for (let trial = 1; trial <= repetitions; trial += 1) {
 		const modulePath = variant === 'baseline' ? baselineService : currentService;
 		const row = await runTrial(modulePath, variant, trial);
 		rows.push(row);
-		process.stdout.write(`${JSON.stringify({ progress: rows.length, total: repetitions * 2, variant, trial, status: row.status, warmDmFirstMs: row.warmDm?.firstToolMs ?? null })}\n`);
+		progress({ progress: rows.length, total: repetitions * 2, variant, trial, trialStatus: row.status, warmDmFirstMs: row.warmDm?.firstToolMs ?? null });
 	}
 }
 
@@ -62,8 +62,7 @@ const result = {
 const resolvedOutputPath = path.resolve(outputPath);
 await mkdir(path.dirname(resolvedOutputPath), { recursive: true });
 await writeFile(resolvedOutputPath, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
-process.stdout.write(`${JSON.stringify({ status: result.failed === 0 ? 'PASSED' : 'FAILED', outputPath: publicArtifactName(resolvedOutputPath), summary, paired })}\n`);
-return result.failed === 0 ? 0 : 1;
+return { status: result.failed === 0 ? 'PASSED' : 'FAILED', outputPath: publicArtifactName(resolvedOutputPath), summary, paired };
 
 function runTrial(modulePath, variant, trial) {
 	return new Promise((resolve, reject) => {

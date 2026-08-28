@@ -111,7 +111,7 @@ try {
 		['sequence:navigate_to,break_block'],
 	);
 
-	process.stdout.write(`${JSON.stringify({
+	return {
 		status: firstDm.passed === agentCount && warmDm.passed === agentCount && moveThenMine.passed === agentCount && sequenceMoveThenMine.passed === agentCount ? 'PASSED' : 'FAILED',
 		profile: { model, reasoningEffort, serviceTier },
 		agentCount,
@@ -121,7 +121,7 @@ try {
 		initializationMs: Math.round(readyAt - startedAt),
 		totalMs: Math.round(performance.now() - startedAt),
 		phases: { firstDm, warmDm, moveThenMine, sequenceMoveThenMine },
-	})}\n`);
+	};
 } finally {
 	scheduler.close();
 	await service.stop();

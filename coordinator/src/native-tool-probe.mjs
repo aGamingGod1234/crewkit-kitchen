@@ -149,7 +149,7 @@ try {
 		calls: activeSteerCalls,
 		result: activeSteerResult,
 	};
-	process.stdout.write(`${JSON.stringify({
+	return {
 		status: 'PASSED',
 		profile: { model, reasoningEffort, serviceTier },
 		initializationMs: Math.round(readyAt - startedAt),
@@ -160,7 +160,7 @@ try {
 		chainTurn,
 		advancedTurn,
 		activeSteer,
-	})}\n`);
+	};
 } finally {
 	await service.stop();
 }

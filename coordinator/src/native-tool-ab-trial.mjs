@@ -61,12 +61,12 @@ try {
 	const warmDm = await runTurn(agent, 'event: Lucas sent a DM saying "how are you?". Call say exactly once with a short friendly reply, then end this turn.');
 	const moveMine = await runTurn(agent, 'event: active goal is to mine the known stone block at x=2,y=64,z=1. You are at x=0,y=64,z=0. Call moveTo near it, use the successful result, then call mine on that exact block. Do not finish this goal in this probe.');
 	const craft = await runTurn(agent, 'event: probe only. Call act exactly once with actionType craft_inventory and arguments recipeId minecraft:oak_planks, count 4, timeoutMs 15000. End this turn after the successful result.');
-	process.stdout.write(`${JSON.stringify({
+	return {
 		status: 'PASSED', variant, trial, profile: { model, reasoningEffort, serviceTier },
 		initializationMs: Math.round(readyAt - startedAt),
 		totalMs: Math.round(performance.now() - startedAt),
 		coldDm, warmDm, moveMine, craft,
-	})}\n`);
+	};
 } finally {
 	await service.stop();
 }

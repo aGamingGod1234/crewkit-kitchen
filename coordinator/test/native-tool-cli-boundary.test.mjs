@@ -49,6 +49,26 @@ function assertBoundedSanitizedFailure(result, expectedCode = null) {
 	assert.equal(typeof failure.stack, 'string');
 }
 
+async function writeFixtureService(filePath, { resultExpression = '{ toolCalls: 1 }', stopBody = '' } = {}) {
+	await writeFile(filePath, `
+export class CodexService {
+ async start() {}
+ async stop() { ${stopBody} }
+ async createAgent() {
+  return {
+   async setGoalRevision() {},
+   async act(input, context) {
+    const call = async (actionType) => context.executeTool({ tool: { kind: 'action', actionType } });
+    if (input.includes('mine the known')) { await call('navigate_to'); await call('break_block'); return ${resultExpression}; }
+    if (input.includes('craft_inventory')) { await call('craft_inventory'); return ${resultExpression}; }
+    await call('chat'); return ${resultExpression};
+   },
+  };
+ }
+}
+`, 'utf8');
+}
+
 test('native A/B trial contains missing service-module failures at the CLI root', async () => {
 	const first = await runCli('native-tool-ab-trial.mjs', [privateMissingModule, 'baseline', '1']);
 	const second = await runCli('native-tool-ab-trial.mjs', [privateMissingModule, 'baseline', '1']);
@@ -108,23 +128,7 @@ test('native A/B runner success reports only the artifact basename', async () =>
 	try {
 		const fixture = path.join(root, 'fixture-service.mjs');
 		const outputPath = path.join(root, 'private-artifacts', 'ab-result.json');
-		await writeFile(fixture, `
-export class CodexService {
- async start() {}
- async stop() {}
- async createAgent(profile) {
-  return {
-   async setGoalRevision() {},
-   async act(input, context) {
-    const call = async (actionType) => context.executeTool({ tool: { kind: 'action', actionType } });
-    if (input.includes('mine the known')) { await call('navigate_to'); await call('break_block'); return { toolCalls: 2 }; }
-    if (input.includes('craft_inventory')) { await call('craft_inventory'); return { toolCalls: 1 }; }
-    await call('chat'); return { toolCalls: 1 };
-   },
-  };
- }
-}
-`, 'utf8');
+		await writeFixtureService(fixture);
 		const result = await runCli('native-tool-ab-runner.mjs', [fixture, fixture, outputPath, '2']);
 		assert.equal(result.code, 0, result.stderr || result.stdout);
 		assert.equal(result.stderr, '');
@@ -135,6 +139,69 @@ export class CodexService {
 		assert.doesNotMatch(result.stdout, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
 		assert.doesNotMatch(result.stdout, /private-artifacts/i);
 		assert.equal(JSON.parse(await readFile(outputPath, 'utf8')).failed, 0);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('native trial sanitizes credential-shaped success fields through the common boundary', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'native-cli-sanitized-success-'));
+	try {
+		const fixture = path.join(root, 'fixture-service.mjs');
+		await writeFixtureService(fixture);
+		const result = await runCli('native-tool-ab-trial.mjs', [
+			fixture,
+			'C:\\private\\api-token-secret.mjs',
+			'1',
+			'/private/oauth-secret/model',
+			'credential=private-effort',
+			'api_key=private-tier',
+		]);
+		assert.equal(result.code, 0, result.stderr || result.stdout);
+		assert.equal(result.stderr, '');
+		assert.ok(Buffer.byteLength(result.stdout, 'utf8') <= maximumDiagnosticBytes);
+		assert.doesNotMatch(result.stdout, /private|api-token-secret|oauth-secret|private-effort|private-tier/i);
+		const outcome = JSON.parse(result.stdout);
+		assert.equal(outcome.status, 'PASSED');
+		assert.equal(outcome.trial, 1);
+		assert.equal(outcome.profile.model, '[location redacted]');
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('native terminal serializer bounds escaped JSON to 8 KiB and keeps it valid', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'native-cli-bounded-success-'));
+	try {
+		const fixture = path.join(root, 'fixture-service.mjs');
+		await writeFixtureService(fixture, { resultExpression: `{ toolCalls: 1, payload: ('"' + '\\\\').repeat(10_000) }` });
+		const result = await runCli('native-tool-ab-trial.mjs', [fixture, 'baseline', '1']);
+		assert.equal(result.code, 0, result.stderr || result.stdout);
+		assert.equal(result.stderr, '');
+		assert.ok(Buffer.byteLength(result.stdout, 'utf8') <= maximumDiagnosticBytes);
+		const outcome = JSON.parse(result.stdout);
+		assert.equal(outcome.status, 'PASSED');
+		assert.equal(outcome.variant, 'baseline');
+		assert.equal(outcome.profile.model, 'gpt-5.6-luna');
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('cleanup failure replaces success with exactly one failed terminal outcome', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'native-cli-cleanup-failure-'));
+	try {
+		const fixture = path.join(root, 'fixture-service.mjs');
+		await writeFixtureService(fixture, { stopBody: `throw Object.assign(new Error('cleanup at C:\\\\private\\\\api-token-secret.mjs'), { code: 'CLEANUP_FAILED' });` });
+		const result = await runCli('native-tool-ab-trial.mjs', [fixture, 'baseline', '1']);
+		assert.equal(result.code, 1);
+		assert.equal(result.stderr, '');
+		const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+		assert.equal(lines.length, 1);
+		const outcome = JSON.parse(lines[0]);
+		assert.equal(outcome.status, 'FAILED');
+		assert.equal(outcome.code, 'CLEANUP_FAILED');
+		assert.doesNotMatch(result.stdout, /C:\\private|api-token-secret/i);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
