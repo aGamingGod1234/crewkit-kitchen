@@ -11,7 +11,9 @@ import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -21,6 +23,7 @@ import java.util.function.LongSupplier;
 
 /** Main-thread service that proactively completes goals only from server-observed facts. */
 public final class GoalVerificationRuntime {
+	public static final long MAX_RETRY_DELAY_TICKS = 20L;
 	private final AgentRegistry registry;
 	private final Function<AgentId, Optional<GoalCompletionVerifier.FactSource>> facts;
 	private final LongSupplier serverTick;
@@ -28,6 +31,7 @@ public final class GoalVerificationRuntime {
 	private final GoalCompletionVerifier verifier;
 	private final AgentKillLedger killLedger;
 	private final Set<UUID> operatorConfirmed = new HashSet<>();
+	private final Map<AgentId, VerificationFault> faults = new LinkedHashMap<>();
 
 	public GoalVerificationRuntime(
 			AgentRegistry registry,
@@ -68,13 +72,7 @@ public final class GoalVerificationRuntime {
 			if (!record.state().isActive() || record.currentGoal().isEmpty()) continue;
 			GoalStatus status = record.currentGoal().orElseThrow().status();
 			if (status != GoalStatus.ACTIVE && status != GoalStatus.RECOVERING) continue;
-			GoalCompletionVerifier.VerificationResult result = verifier.verify(
-					record,
-					facts.apply(record.agentId()).orElse(null),
-					killLedger,
-					tick,
-					operatorConfirmed.contains(record.currentGoal().orElseThrow().goalId())
-			);
+			GoalCompletionVerifier.VerificationResult result = verifySafely(record, tick);
 			if (!result.verified()) continue;
 			transitions.add(registry.satisfyGoal(record.agentId(), record.goalRevision(), result.evidence(tick), now));
 		}
@@ -82,14 +80,17 @@ public final class GoalVerificationRuntime {
 				.map(AgentGoal::goalId).collect(java.util.stream.Collectors.toUnmodifiableSet());
 		verifier.retainGoals(currentGoals);
 		operatorConfirmed.retainAll(currentGoals);
+		faults.entrySet().removeIf(entry -> registry.records().stream().noneMatch(record ->
+				record.agentId().equals(entry.getKey())
+						&& record.currentGoal().isPresent()
+						&& record.goalRevision() == entry.getValue().goalRevision()));
 		return List.copyOf(transitions);
 	}
 
 	public GoalCompletionVerifier.VerificationResult evaluate(AgentId agentId) {
 		AgentRecord record = registry.require(agentId);
 		long tick = serverTick.getAsLong();
-		return verifier.verify(record, facts.apply(agentId).orElse(null), killLedger, tick,
-				record.currentGoal().map(AgentGoal::goalId).filter(operatorConfirmed::contains).isPresent());
+		return verifySafely(record, tick);
 	}
 
 	public GoalCompletionVerifier.VerificationResult evaluateRequest(
@@ -135,7 +136,7 @@ public final class GoalVerificationRuntime {
 	}
 
 	public void recordKill(AgentId agentId, String entityType) {
-		killLedger.record(agentId, entityType, serverTick.getAsLong());
+		killLedger.record(agentId, entityType, epochMillis.getAsLong());
 	}
 
 	public void confirm(AgentId agentId, UUID goalId) {
@@ -150,6 +151,57 @@ public final class GoalVerificationRuntime {
 
 	public AgentKillLedger killLedger() {
 		return killLedger;
+	}
+
+	public List<VerificationFault> faults() {
+		return List.copyOf(faults.values());
+	}
+
+	private GoalCompletionVerifier.VerificationResult verifySafely(AgentRecord record, long tick) {
+		VerificationFault existing = faults.get(record.agentId());
+		if (existing != null && existing.goalRevision() == record.goalRevision() && tick < existing.retryAtTick()) {
+			return failed(record.goalRevision(), "VERIFIER_RETRY_PENDING");
+		}
+		try {
+			GoalCompletionVerifier.VerificationResult result = verifier.verify(
+					record,
+					facts.apply(record.agentId()).orElse(null),
+					killLedger,
+					tick,
+					record.currentGoal().map(AgentGoal::goalId).filter(operatorConfirmed::contains).isPresent()
+			);
+			faults.remove(record.agentId());
+			return result;
+		} catch (RuntimeException exception) {
+			int failures = existing != null && existing.goalRevision() == record.goalRevision()
+					? existing.consecutiveFailures() + 1 : 1;
+			long delay = Math.min(MAX_RETRY_DELAY_TICKS, 1L << Math.min(failures - 1, 30));
+			String exceptionType = exception.getClass().getSimpleName();
+			if (exceptionType.isBlank()) exceptionType = exception.getClass().getName();
+			faults.put(record.agentId(), new VerificationFault(
+					record.agentId(), record.goalRevision(), exceptionType, failures, tick + delay));
+			return failed(record.goalRevision(), "VERIFIER_ERROR");
+		}
+	}
+
+	private static GoalCompletionVerifier.VerificationResult failed(long revision, String reasonCode) {
+		return new GoalCompletionVerifier.VerificationResult(false, revision, reasonCode, List.of());
+	}
+
+	public record VerificationFault(
+			AgentId agentId,
+			long goalRevision,
+			String exceptionType,
+			int consecutiveFailures,
+			long retryAtTick
+	) {
+		public VerificationFault {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(exceptionType, "exceptionType must not be null");
+			if (goalRevision < 0L || consecutiveFailures <= 0 || retryAtTick < 0L) {
+				throw new IllegalArgumentException("Verification fault fields are invalid");
+			}
+		}
 	}
 
 	private static boolean readyToPromote(AgentRecord record) {

@@ -31,7 +31,7 @@ const PROMOTION_SOURCE_STATES = new Set([
 	DynamicAgentState.PLANNING,
 	DynamicAgentState.ACTING,
 ]);
-const GOAL_OPERATIONS = new Set(['start', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn']);
+const GOAL_OPERATIONS = new Set(['start', 'replace', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn']);
 const ALLOWED_STATE_TRANSITIONS = Object.freeze({
 	[DynamicAgentState.IDLE]: new Set([DynamicAgentState.STARTING, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
 	[DynamicAgentState.STARTING]: new Set([DynamicAgentState.PLANNING, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
@@ -264,7 +264,7 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	}
 	const now = nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs');
 	const next = { ...record, goalRevision: revision, updatedAtEpochMs: now, lastError: null };
-	if (operation === 'start' || operation === 'steer') {
+	if (operation === 'start' || operation === 'replace' || operation === 'steer') {
 		const nextGoal = requireGoal(controlValue.goal);
 		const promotesQueuedGoal = PROMOTION_SOURCE_STATES.has(record.state)
 			|| (record.state === DynamicAgentState.COMPLETED && record.queue.length > 0);
@@ -370,6 +370,7 @@ function normalizeQueuedGoal(value, index) {
 
 function promotedGoalSpec(record, operation) {
 	if (operation === 'steer') return record.currentGoalSpec;
+	if (operation === 'replace') return null;
 	return record.queue[0]?.goalSpec ?? null;
 }
 

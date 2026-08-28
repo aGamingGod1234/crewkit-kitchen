@@ -52,6 +52,10 @@ public final class AgentGoalCodec {
 		GoalStatus status = json.has("status") && !json.get("status").isJsonNull()
 				? enumeration(GoalStatus.class, string(json, "status"), "status")
 				: legacyStatus;
+		if (status == GoalStatus.AWAITING_CLARIFICATION
+				&& spec.completion() instanceof GoalPredicate.OperatorConfirmed) {
+			status = GoalStatus.ACTIVE;
+		}
 		Optional<GoalEvidence> evidence = !json.has("evidence") || json.get("evidence").isJsonNull()
 				? Optional.empty()
 				: Optional.of(decodeEvidence(object(json.get("evidence"), "evidence")));

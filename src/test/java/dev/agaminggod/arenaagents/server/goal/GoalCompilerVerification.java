@@ -63,7 +63,15 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Get iron tools", RegistryAccess.EMPTY),
 				"tool-set clarification keeps the registered material tool family"
 		);
-		return 13;
+		GoalCompilation craft = compiler.compile("Craft an iron pickaxe", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, craft.kind(),
+				"craft wording cannot be reduced to already-held inventory");
+		assertEquals(Optional.empty(), craft.acceptedSpec(),
+				"craft wording has no false possession completion predicate");
+		GoalCompilation make = compiler.compile("Make an iron pickaxe", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, make.kind(),
+				"make wording cannot be reduced to already-held inventory");
+		return 17;
 	}
 
 	private static int verifyExactPositionEntityAndAdvancement() {

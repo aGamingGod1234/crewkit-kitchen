@@ -1003,14 +1003,14 @@ function normalizeProvider(value, field) {
 function normalizeGoalControl(value) {
 	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal', 'goalSpec', 'death', 'resumeGoal'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
 	const operation = boundedText(value.operation, 'operation', MAX_REASON_CODE_LENGTH);
-	if (!['start', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
+	if (!['start', 'replace', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
 	const normalized = { operation, goalRevision: revision(value.goalRevision, 'goalRevision'), updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, 'updatedAtEpochMs') };
 	if (value.goal !== undefined) normalized.goal = boundedText(value.goal, 'goal', MAX_GOAL_LENGTH);
 	if (value.goalSpec !== undefined) normalized.goalSpec = parseGoalSpec(value.goalSpec);
 	if (value.death !== undefined) normalized.death = normalizeDeath(value.death);
-	if (['start', 'steer', 'queue'].includes(operation) && normalized.goal === undefined) throw new ProtocolV2Error('MISSING_FIELD', `goal_control ${operation} requires goal`);
-	if (!['start', 'steer', 'queue'].includes(operation) && normalized.goal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goal`);
-	if (!['start', 'steer', 'queue'].includes(operation) && normalized.goalSpec !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goalSpec`);
+	if (['start', 'replace', 'steer', 'queue'].includes(operation) && normalized.goal === undefined) throw new ProtocolV2Error('MISSING_FIELD', `goal_control ${operation} requires goal`);
+	if (!['start', 'replace', 'steer', 'queue'].includes(operation) && normalized.goal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goal`);
+	if (!['start', 'replace', 'steer', 'queue'].includes(operation) && normalized.goalSpec !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goalSpec`);
 	if (operation === 'dead' && normalized.death === undefined) throw new ProtocolV2Error('MISSING_FIELD', 'goal_control dead requires death facts');
 	if (operation !== 'dead' && normalized.death !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include death facts`);
 	if (operation === 'respawn') normalized.resumeGoal = value.resumeGoal === undefined ? false : boolean(value.resumeGoal, 'resumeGoal');

@@ -78,7 +78,7 @@ public final class PendingConversationWakeCodec {
 	}
 
 	private static AgentGoal decodeGoal(JsonObject json) {
-		return GOAL_CODEC.decode(json, GoalStatus.AWAITING_CLARIFICATION);
+		return GOAL_CODEC.decode(json, GoalStatus.ACTIVE);
 	}
 
 	private static JsonElement element(JsonObject object, String field) {

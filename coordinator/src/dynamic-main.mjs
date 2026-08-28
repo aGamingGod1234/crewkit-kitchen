@@ -425,7 +425,7 @@ export class DynamicCoordinator extends EventEmitter {
 				if (message.payload.operation === 'dead') {
 					void this.#installDeadStatePlan(record, message.payload.death, connectionEpoch).catch((error) => this.#reportAgentError(record.agentId, error, connectionEpoch));
 				}
-				const resumesGoal = ['start', 'resume', 'steer'].includes(message.payload.operation)
+				const resumesGoal = ['start', 'replace', 'resume', 'steer'].includes(message.payload.operation)
 					|| message.payload.operation === 'respawn' && record.state === DynamicAgentState.STARTING;
 				const activatesQueuedGoal = message.payload.operation === 'complete' && record.state === DynamicAgentState.STARTING;
 				if (resumesGoal || activatesQueuedGoal) {
@@ -1446,6 +1446,7 @@ export class DynamicCoordinator extends EventEmitter {
 		let reason = null;
 		if (['stop', 'disconnect', 'dead'].includes(message.payload.operation)) reason = `Goal ${message.payload.operation}`;
 		if (message.payload.operation === 'steer') reason = 'Goal steered';
+		if (message.payload.operation === 'replace') reason = 'Goal replaced';
 		if (reason === null) return;
 		try {
 			Promise.resolve(this.#planner.interrupt(message.agentId, reason)).catch((error) => this.#reportAgentError(message.agentId, error, connectionEpoch));

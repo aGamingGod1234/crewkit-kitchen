@@ -308,6 +308,14 @@ test('goal lifecycle messages retain the full immutable server-authored goal spe
 	});
 	assert.deepEqual(control.goalSpec, goalSpec);
 	assert.throws(() => { control.goalSpec.predicate.count = 2; }, TypeError);
+	const replacement = validateProtocolV2Payload('goal_control', {
+		operation: 'replace', goalRevision: 2, updatedAtEpochMs: 3, goal: goalSpec.originalRequest, goalSpec,
+	});
+	assert.equal(replacement.operation, 'replace');
+	assert.deepEqual(replacement.goalSpec, goalSpec);
+	assert.throws(() => validateProtocolV2Payload('goal_control', {
+		operation: 'replace', goalRevision: 2, updatedAtEpochMs: 3,
+	}), /requires goal/i);
 	const registered = validateProtocolV2Payload('hello_ack', {
 		replyTo: 'coordinator-1', authenticated: true,
 		registry: [{

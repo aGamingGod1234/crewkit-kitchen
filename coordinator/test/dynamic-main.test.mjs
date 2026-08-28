@@ -1644,6 +1644,31 @@ test('an invalid higher-revision control cannot retire the live native goal', as
 	}
 });
 
+test('a replace control starts the new goal without consuming the queued head', async () => {
+	const run = await start();
+	try {
+		run.bridge.sent.length = 0;
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'start', goalRevision: 1, goal: 'Old goal.', updatedAtEpochMs: 1,
+		} });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'queue', goalRevision: 1, goal: 'Queued goal.', updatedAtEpochMs: 2,
+		} });
+		await eventually(() => run.registry.get('agent-a').queue.length === 1);
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'replace', goalRevision: 2, goal: 'New goal.', updatedAtEpochMs: 3,
+		} });
+		await eventually(() => run.bridge.sent.some(({ type, payload }) =>
+			type === 'agent_ready' && payload.goalRevision === 2));
+		const replaced = run.registry.get('agent-a');
+		assert.equal(replaced.currentGoal, 'New goal.');
+		assert.deepEqual(replaced.queue.map((entry) => entry.goal), ['Queued goal.']);
+		assert.equal(run.planner.interruptions.length, 1);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('back-to-back accepted controls do not publish stale lifecycle side effects', async () => {
 	const run = await start();
 	try {

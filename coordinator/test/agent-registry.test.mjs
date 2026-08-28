@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { AgentRegistry, AgentRegistryError, DynamicAgentState, decodeAgentRegistrySnapshot, encodeAgentRegistrySnapshot, normalizeAgentRecord } from '../src/agent-registry.mjs';
+import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 
 function record(agentId, overrides = {}) {
 	return {
@@ -92,6 +93,26 @@ test('server promotion after coordinator completion consumes the queued head', (
 	assert.equal(promoted.state, DynamicAgentState.STARTING);
 	assert.equal(promoted.currentGoal, 'B');
 	assert.deepEqual(promoted.queue.map((entry) => entry.goal), ['C']);
+});
+
+test('replace installs a new authoritative goal without consuming queued work', () => {
+	const registry = new AgentRegistry({ queueCap: 2 });
+	registry.register(record('agent-a'));
+	registry.applyGoalControl('agent-a', { operation: 'start', goalRevision: 1, goal: 'Old goal.' });
+	registry.applyGoalControl('agent-a', { operation: 'queue', goalRevision: 1, goal: 'Queued goal.' });
+	const replacementFields = {
+		originalRequest: 'New goal.',
+		predicate: { type: 'operator_confirmed' },
+		createdAtTick: 2,
+	};
+	const replacementSpec = { ...replacementFields, fingerprint: goalSpecFingerprint(replacementFields) };
+	const replaced = registry.applyGoalControl('agent-a', {
+		operation: 'replace', goalRevision: 2, goal: 'New goal.', goalSpec: replacementSpec,
+	});
+	assert.equal(replaced.currentGoal, 'New goal.');
+	assert.deepEqual(replaced.currentGoalSpec, replacementSpec);
+	assert.deepEqual(replaced.queue.map((entry) => entry.goal), ['Queued goal.']);
+	assert.equal(replaced.state, DynamicAgentState.STARTING);
 });
 
 test('a goal may complete during planning without fabricating a physical action', () => {

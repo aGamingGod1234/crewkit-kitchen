@@ -30,7 +30,7 @@ public final class GoalCompiler {
 	private static final Pattern ADVANCEMENT = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:the )?(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
-	private static final Pattern ITEM = Pattern.compile("^(?:get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
+	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
 	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
 	private static final Pattern LIVE_STEERING = Pattern.compile(
@@ -96,14 +96,19 @@ public final class GoalCompiler {
 
 		Matcher item = ITEM.matcher(command);
 		if (item.matches()) {
+			if (item.group(1).equals("craft") || item.group(1).equals("make")) {
+				return GoalCompilation.needsTranslation(
+						"I can verify possession, but not that this item was newly crafted. Clarify whether obtaining it counts."
+				);
+			}
 			int count;
 			try {
-				count = item.group(1) == null ? 1 : Integer.parseInt(item.group(1));
+				count = item.group(2) == null ? 1 : Integer.parseInt(item.group(2));
 			} catch (NumberFormatException exception) {
 				return GoalCompilation.rejected("The requested item count is outside the supported range.");
 			}
 			if (count <= 0) return GoalCompilation.rejected("The requested item count must be positive.");
-			List<String> matches = matchItems(item.group(2), registries);
+			List<String> matches = matchItems(item.group(3), registries);
 			if (matches.size() == 1) {
 				String itemId = matches.getFirst();
 				return accepted(original, new GoalPredicate.InventoryContains(itemId, count), createdAtTick,
@@ -149,7 +154,7 @@ public final class GoalCompiler {
 				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
 		Matcher item = ITEM.matcher(command);
 		if (item.matches()) {
-			String target = SUBJECTIVE.matcher(item.group(2)).replaceAll(" ").replaceAll("\\s+", " ").strip();
+			String target = SUBJECTIVE.matcher(item.group(3)).replaceAll(" ").replaceAll("\\s+", " ").strip();
 			return relatedItems(target, registries).stream().limit(64).toList();
 		}
 		Matcher kill = KILL.matcher(command);

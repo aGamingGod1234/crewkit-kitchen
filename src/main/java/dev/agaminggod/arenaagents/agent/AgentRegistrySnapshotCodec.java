@@ -98,7 +98,7 @@ public final class AgentRegistrySnapshotCodec {
 		AgentProfile profile = decodeProfile(requireObject(requireElement(json, "profile"), "profile"));
 		AgentLifecycleState state = parseEnum(AgentLifecycleState.class, requireString(json, "state"), "state");
 		for (JsonElement element : queueJson) {
-			queue.add(GOAL_CODEC.decode(requireObject(element, "queued goal"), dev.agaminggod.arenaagents.agent.goal.GoalStatus.AWAITING_CLARIFICATION));
+			queue.add(GOAL_CODEC.decode(requireObject(element, "queued goal"), dev.agaminggod.arenaagents.agent.goal.GoalStatus.ACTIVE));
 		}
 		return new AgentRecord(
 				requireInt(json, "schema_version"),
@@ -226,7 +226,7 @@ public final class AgentRegistrySnapshotCodec {
 		}
 		dev.agaminggod.arenaagents.agent.goal.GoalStatus legacyStatus = state == AgentLifecycleState.COMPLETED
 				? dev.agaminggod.arenaagents.agent.goal.GoalStatus.SATISFIED
-				: dev.agaminggod.arenaagents.agent.goal.GoalStatus.AWAITING_CLARIFICATION;
+				: dev.agaminggod.arenaagents.agent.goal.GoalStatus.ACTIVE;
 		return Optional.of(GOAL_CODEC.decode(requireObject(element, field), legacyStatus));
 	}
 

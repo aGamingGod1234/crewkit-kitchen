@@ -111,16 +111,33 @@ public final class GoalSpecVerification {
 		AgentRegistry registry = AgentRegistry.createDefault(() -> { }, transition -> { });
 		AgentRecord record = registry.create("gpt-5.6-sol", "high", Optional.of("Legacy"), 10_000L);
 		record = registry.start(record.agentId(), "Mine iron", 10_001L).after();
+		registry.queue(record.agentId(), "Bring coal", 10_002L);
 		AgentRegistrySnapshotCodec codec = new AgentRegistrySnapshotCodec();
 		JsonObject legacyRoot = JsonParser.parseString(codec.encode(registry.snapshot())).getAsJsonObject();
-		JsonObject legacyGoal = legacyRoot.getAsJsonArray("agents").get(0).getAsJsonObject().getAsJsonObject("current_goal");
-		legacyGoal.remove("spec");
-		legacyGoal.remove("status");
-		legacyGoal.remove("evidence");
-		AgentGoal migrated = codec.decode(legacyRoot.toString()).records().getFirst().currentGoal().orElseThrow();
-		assertEquals(GoalStatus.AWAITING_CLARIFICATION, migrated.status(), "legacy active goal awaits clarification");
+		JsonObject legacyRecord = legacyRoot.getAsJsonArray("agents").get(0).getAsJsonObject();
+		stripAuthoritativeFields(legacyRecord.getAsJsonObject("current_goal"));
+		stripAuthoritativeFields(legacyRecord.getAsJsonArray("queue").get(0).getAsJsonObject());
+		AgentRecord migratedRecord = codec.decode(legacyRoot.toString()).records().getFirst();
+		AgentGoal migrated = migratedRecord.currentGoal().orElseThrow();
+		assertEquals(GoalStatus.ACTIVE, migrated.status(), "legacy active goal remains explicitly confirmable");
 		assertEquals(new GoalPredicate.OperatorConfirmed(), migrated.spec().completion(), "legacy goal cannot auto-satisfy");
-		return 2;
+		assertEquals(GoalStatus.ACTIVE, migratedRecord.queuedGoals().getFirst().status(),
+				"legacy queued goal is confirmable after promotion");
+		assertEquals(GoalStatus.ACTIVE, AgentGoal.create("Subjective scenario goal", 10_003L).status(),
+				"the compatibility string path creates a resolvable confirmation goal");
+		JsonObject previouslyMigrated = JsonParser.parseString(codec.encode(registry.snapshot())).getAsJsonObject();
+		previouslyMigrated.getAsJsonArray("agents").get(0).getAsJsonObject()
+				.getAsJsonObject("current_goal").addProperty("status", GoalStatus.AWAITING_CLARIFICATION.name());
+		assertEquals(GoalStatus.ACTIVE,
+				codec.decode(previouslyMigrated.toString()).records().getFirst().currentGoal().orElseThrow().status(),
+				"a previously migrated confirmation placeholder is repaired on its next reload");
+		return 5;
+	}
+
+	private static void stripAuthoritativeFields(JsonObject goal) {
+		goal.remove("spec");
+		goal.remove("status");
+		goal.remove("evidence");
 	}
 
 	private static int verifyPromptCanonicalization() {

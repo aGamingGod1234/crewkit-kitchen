@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
+import dev.agaminggod.arenaagents.agent.AgentRegistrySnapshotCodec;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
@@ -25,6 +26,9 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyStablePositionAndReset();
 		assertions += verifyBlockAdvancementAndCompoundPredicates();
 		assertions += verifyAgentSpecificKillAttribution();
+		assertions += verifyKillGoalAfterServerTickReset();
+		assertions += verifyIndexedKillLookup();
+		assertions += verifyVerifierFailureIsolationAndRetry();
 		assertions += verifySurvivalAndOperatorConfirmation();
 		assertions += verifyQueuedPromotionAfterEvidence();
 		assertions += verifyRequestedCompletionLifecycle();
@@ -84,14 +88,93 @@ public final class GoalVerificationRuntimeVerification {
 	private static int verifyAgentSpecificKillAttribution() {
 		Fixture fixture = fixture(new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true), 400L);
 		AgentId other = AgentId.random();
-		fixture.runtime.killLedger().record(other, "minecraft:ender_dragon", 401L);
-		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", 399L);
-		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", 400L);
+		long goalCreated = fixture.record().currentGoal().orElseThrow().createdAtEpochMs();
+		fixture.runtime.killLedger().record(other, "minecraft:ender_dragon", goalCreated + 1L);
+		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", goalCreated - 1L);
+		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", goalCreated);
 		assertEquals(false, fixture.runtime.evaluate(fixture.agentId).verified(), "another player and pre-goal kills cannot satisfy attribution");
-		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", 401L);
+		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", goalCreated + 1L);
 		assertEquals(true, fixture.runtime.evaluate(fixture.agentId).verified(), "responsible agent kill after goal start satisfies attribution");
 		assertEquals(1, fixture.runtime.tick().size(), "attributed kill completes once");
 		return 3;
+	}
+
+	private static int verifyKillGoalAfterServerTickReset() {
+		Fixture original = fixture(new GoalPredicate.EntityKilledByAgent("minecraft:ender_dragon", true), 20_000L);
+		String persisted = new AgentRegistrySnapshotCodec().encode(original.registry.snapshot());
+		AgentRegistry.Snapshot decoded = new AgentRegistrySnapshotCodec().decode(persisted);
+		ArrayList<AgentTransition> transitions = new ArrayList<>();
+		long restartEpoch = original.record().currentGoal().orElseThrow().createdAtEpochMs() + 1_000L;
+		AgentRegistry restored = AgentRegistry.restore(decoded, () -> { }, transitions::add, restartEpoch);
+		long[] resetTick = { 1L };
+		long[] epoch = { restartEpoch + 1L };
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				restored, ignored -> Optional.of(original.facts), () -> resetTick[0], () -> epoch[0]);
+		runtime.recordKill(original.agentId, "minecraft:ender_dragon");
+		assertEquals(true, runtime.evaluate(original.agentId).verified(),
+				"a persisted kill goal remains satisfiable after the server tick resets");
+		assertEquals(1, runtime.tick().size(),
+				"post-restart kill evidence completes the restored goal once");
+		return 2;
+	}
+
+	private static int verifyIndexedKillLookup() {
+		AgentKillLedger ledger = new AgentKillLedger();
+		AgentId agentId = AgentId.random();
+		for (int index = 0; index < 4_096; index++) {
+			ledger.record(agentId, "minecraft:zombie", index);
+		}
+		assertEquals(16, ledger.count(agentId, "minecraft:zombie", 4_079L),
+				"indexed kill lookup returns the exact suffix count");
+		assertEquals(true, ledger.lastLookupProbeCount() <= 13,
+				"a full kill ledger lookup uses logarithmic probes instead of rescanning all events");
+		return 2;
+	}
+
+	private static int verifyVerifierFailureIsolationAndRetry() {
+		ArrayList<AgentTransition> transitions = new ArrayList<>();
+		AgentRegistry registry = new AgentRegistry(16, 8, () -> { }, transitions::add);
+		long now = 30_000L;
+		AgentRecord broken = registry.create("codex", "gpt-5.6-sol", "high", "priority", Optional.of("Broken"),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		AgentRecord healthy = registry.create("codex", "gpt-5.6-sol", "high", "priority", Optional.of("Healthy"),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now + 1L);
+		registry.start(broken.agentId(), GoalSpec.create("Broken verifier",
+				new GoalPredicate.InventoryContains("minecraft:stone", 1), 100L), now + 2L);
+		registry.start(healthy.agentId(), GoalSpec.create("Healthy verifier",
+				new GoalPredicate.InventoryContains("minecraft:stone", 1), 100L), now + 3L);
+		transitions.clear();
+		int[] brokenCalls = { 0 };
+		FakeFacts healthyFacts = new FakeFacts();
+		healthyFacts.items.put("minecraft:stone", 1);
+		GoalCompletionVerifier.FactSource brokenFacts = new FakeFacts() {
+			@Override public int inventoryCount(String itemId) {
+				brokenCalls[0]++;
+				throw new IllegalStateException("fixture verifier failure");
+			}
+		};
+		long[] tick = { 100L };
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				registry,
+				agentId -> Optional.of(agentId.equals(broken.agentId()) ? brokenFacts : healthyFacts),
+				() -> tick[0], () -> now + tick[0]);
+		assertEquals(1, runtime.tick().size(), "one verifier exception does not prevent a later agent from completing");
+		assertEquals(GoalStatus.ACTIVE, registry.require(broken.agentId()).currentGoal().orElseThrow().status(),
+				"a verifier exception leaves the affected goal active");
+		GoalVerificationRuntime.VerificationFault fault = runtime.faults().getFirst();
+		assertEquals(broken.agentId(), fault.agentId(), "the bounded diagnostic identifies the affected agent");
+		assertEquals(1, fault.consecutiveFailures(), "the first verifier failure is diagnosed once");
+
+		tick[0]++;
+		runtime.tick();
+		assertEquals(2, brokenCalls[0], "the verifier retries after the first bounded delay");
+		tick[0]++;
+		runtime.tick();
+		assertEquals(2, brokenCalls[0], "exponential retry backoff avoids retrying every server tick");
+		assertEquals(true, runtime.faults().getFirst().retryAtTick() - tick[0]
+				<= GoalVerificationRuntime.MAX_RETRY_DELAY_TICKS,
+				"verifier retry remains bounded");
+		return 7;
 	}
 
 	private static int verifySurvivalAndOperatorConfirmation() {
@@ -188,7 +271,7 @@ public final class GoalVerificationRuntimeVerification {
 		System.out.println("PASS: " + label);
 	}
 
-	private static final class FakeFacts implements GoalCompletionVerifier.FactSource {
+	private static class FakeFacts implements GoalCompletionVerifier.FactSource {
 		private final Map<String, Integer> items = new HashMap<>();
 		private final Map<String, GoalCompletionVerifier.BlockFact> blocks = new HashMap<>();
 		private final Map<String, Boolean> advancements = new HashMap<>();

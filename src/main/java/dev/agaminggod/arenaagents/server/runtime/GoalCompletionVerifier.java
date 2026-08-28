@@ -152,8 +152,8 @@ public final class GoalCompletionVerifier {
 			return leaf("advancement_granted", granted, advancement.advancementId(), granted ? "granted" : "not granted");
 		}
 		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
-			long afterTick = killed.afterGoalStart() ? record.currentGoal().orElseThrow().spec().createdAtTick() : Long.MIN_VALUE;
-			int observed = kills.count(record.agentId(), killed.entityType(), afterTick);
+			long afterTime = killed.afterGoalStart() ? record.currentGoal().orElseThrow().createdAtEpochMs() : Long.MIN_VALUE;
+			int observed = kills.count(record.agentId(), killed.entityType(), afterTime);
 			return leaf("entity_killed_by_agent", observed > 0, killed.entityType() + " x1", killed.entityType() + " x" + observed);
 		}
 		if (predicate instanceof GoalPredicate.BlockMatches block) {

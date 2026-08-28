@@ -132,7 +132,32 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 150;
+		verifyReplacementOperation();
+		return 154;
+	}
+
+	private static void verifyReplacementOperation() {
+		long now = 50_000L;
+		dev.agaminggod.arenaagents.agent.AgentRegistry registry =
+				dev.agaminggod.arenaagents.agent.AgentRegistry.createDefault(() -> { }, ignored -> { });
+		AgentRecord idle = registry.create("codex", "gpt-5.6-sol", "high", "priority", Optional.of("ReplaceWire"),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		GoalSpec first = GoalSpec.create("Get stone", new GoalPredicate.InventoryContains("minecraft:stone", 1), 1L);
+		GoalSpec replacement = GoalSpec.create("Get dirt", new GoalPredicate.InventoryContains("minecraft:dirt", 1), 2L);
+		registry.start(idle.agentId(), first, now + 1L);
+		AgentTransition replaced = registry.replace(idle.agentId(), replacement, now + 2L);
+		assertEquals("replace", invokeGoalOperation(replaced), "replacement retains a distinct bridge operation");
+		JsonObject payload = invokeGoalControlPayload(replaced, invokeGoalOperation(replaced));
+		assertEquals("Get dirt", payload.get("goal").getAsString(), "replacement serializes the new goal");
+		assertEquals(replacement.fingerprint(), payload.getAsJsonObject("goalSpec").get("fingerprint").getAsString(),
+				"replacement serializes the immutable new goal spec");
+
+		registry.queue(idle.agentId(), first, now + 3L);
+		GoalEvidence evidence = new GoalEvidence(3L, "COMPLETION_VERIFIED",
+				List.of(new GoalEvidence.Fact("inventory_contains", true, "minecraft:dirt x1", "minecraft:dirt x1")));
+		registry.satisfyGoal(idle.agentId(), registry.require(idle.agentId()).goalRevision(), evidence, now + 4L);
+		AgentTransition promoted = registry.promoteSatisfied(idle.agentId(), now + 5L);
+		assertEquals("start", invokeGoalOperation(promoted), "queued promotion remains a start operation");
 	}
 	private static void verifyEmptyCatalogRequestsLiveDiscovery() {
 		MultiplexedServerBridge bridge = null;
@@ -1523,6 +1548,16 @@ public final class MultiplexedServerBridgeVerification {
 			return (JsonObject) method.invoke(null, transition, operation);
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not serialize goal control payload", exception);
+		}
+	}
+
+	private static String invokeGoalOperation(AgentTransition transition) {
+		try {
+			var method = MultiplexedServerBridge.class.getDeclaredMethod("operation", AgentTransition.class);
+			method.setAccessible(true);
+			return (String) method.invoke(null, transition);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not classify goal control operation", exception);
 		}
 	}
 

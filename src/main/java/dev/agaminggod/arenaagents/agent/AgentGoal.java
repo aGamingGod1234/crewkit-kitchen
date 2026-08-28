@@ -51,7 +51,7 @@ public record AgentGoal(
 				AgentValidators.normalizePrompt(prompt),
 				steeringInstructions,
 				legacySpec(prompt),
-				GoalStatus.AWAITING_CLARIFICATION,
+				GoalStatus.ACTIVE,
 				Optional.empty(),
 				createdAtEpochMs,
 				updatedAtEpochMs
@@ -61,7 +61,7 @@ public record AgentGoal(
 	public static AgentGoal create(String prompt, long nowEpochMs) {
 		String checked = AgentValidators.normalizePrompt(prompt);
 		return new AgentGoal(UUID.randomUUID(), checked, List.of(), legacySpec(checked),
-				GoalStatus.AWAITING_CLARIFICATION, Optional.empty(), nowEpochMs, nowEpochMs);
+				GoalStatus.ACTIVE, Optional.empty(), nowEpochMs, nowEpochMs);
 	}
 
 	public static AgentGoal create(String prompt, GoalSpec spec, long nowEpochMs) {

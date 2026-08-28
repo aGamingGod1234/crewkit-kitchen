@@ -1610,7 +1610,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentGoal goal = queue.get(queue.size() - 1);
 			payload.addProperty("goal", goal.prompt());
 			payload.add("goalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec()));
-		} else if ("start".equals(operation) || "steer".equals(operation)) {
+		} else if ("start".equals(operation) || "replace".equals(operation) || "steer".equals(operation)) {
 			transition.after().currentGoal().ifPresent(goal -> {
 				payload.addProperty("goal", plannerGoal(goal));
 				payload.add("goalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec()));
@@ -1855,6 +1855,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (transition.before().currentGoal().isPresent() && transition.after().currentGoal().isPresent()
 				&& transition.before().currentGoal().get().goalId().equals(transition.after().currentGoal().get().goalId())) {
 			return "steer";
+		}
+		if (transition.before().currentGoal().isPresent()
+				&& transition.after().currentGoal().isPresent()
+				&& transition.cancelAction()
+				&& transition.interruptPlanner()) {
+			return "replace";
 		}
 		return "start";
 	}
