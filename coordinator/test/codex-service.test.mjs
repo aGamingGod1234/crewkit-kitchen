@@ -123,6 +123,66 @@ test('Codex initialization forwards its bounded startup deadline to the transpor
 	}
 });
 
+test('Codex startup owns its deadline and a later probe starts a fresh transport attempt', async () => {
+	const transport = new FakeSharedTransport();
+	const releases = [];
+	let starts = 0;
+	let stops = 0;
+	const liveAttempts = new Set();
+	transport.start = () => new Promise((resolve) => {
+		const attempt = ++starts;
+		releases.push(() => { liveAttempts.add(attempt); resolve(); });
+	});
+	transport.stop = async () => { stops += 1; liveAttempts.clear(); };
+	const catalog = {
+		stale: false,
+		refresh: async () => ({ models: [MODEL], source: 'live' }),
+		assertSupported() {},
+		reconcileProfiles: (records) => ({ valid: records, invalid: [] }),
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace', startupTimeoutMs: 5 }, { transport, catalog });
+	try {
+		const first = await Promise.race([
+			service.start().then(() => 'fulfilled', (error) => error?.code),
+			new Promise((resolve) => setTimeout(() => resolve('outer-timeout'), 30)),
+		]);
+		assert.equal(first, 'PROVIDER_START_TIMEOUT');
+		const second = service.start();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(starts, 2);
+		releases[0]();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(service.started, false, 'the obsolete startup cannot mark the backend live');
+		assert.deepEqual([...liveAttempts], [], 'late transport completion is torn down');
+		releases[1]();
+		await second;
+		assert.equal(service.started, true);
+		assert.ok(stops >= 2);
+	} finally {
+		for (const release of releases) release();
+		await service.stop();
+	}
+});
+
+test('Codex stop fences an already-entered thread creation from installing a late agent', async () => {
+	const transport = new FakeSharedTransport();
+	let releaseThread;
+	const originalRequest = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		if (method !== 'thread/start') return originalRequest(method, params, options);
+		transport.calls.push({ method, params, options });
+		return new Promise((resolve) => { releaseThread = () => resolve({ thread: { id: 'late-thread' } }); });
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const creating = service.createAgent(profile('late-agent'));
+	await new Promise((resolve) => setImmediate(resolve));
+	const stopping = service.stop();
+	releaseThread();
+	await assert.rejects(creating, (error) => error?.code === 'PROVIDER_STOPPED');
+	await stopping;
+	assert.equal(service.getAgent('late-agent'), null);
+});
+
 test('Codex service forwards app-server diagnostics to the coordinator error log', (t) => {
 	const diagnostics = [];
 	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));

@@ -26,6 +26,7 @@ export class CursorProviderService {
 	#workspaceManager;
 	#agents = new Map();
 	#creating = new Map();
+	#lifecycleGeneration = 0;
 
 	constructor(config, dependencies = {}) {
 		const platform = dependencies.platform ?? process.platform;
@@ -49,7 +50,9 @@ export class CursorProviderService {
 	getAgent(agentId) { return this.#agents.get(agentId) ?? null; }
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		await this.catalog.refresh();
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
 		const profile = validateProfile(profileValue, this.#config);
 		const existing = this.#agents.get(profile.agentId);
 		if (existing !== undefined) {
@@ -61,12 +64,12 @@ export class CursorProviderService {
 			if (!profilesMatch(creating.profile, profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', `cursor agent '${profile.agentId}' is being created with a different profile`);
 			return creating.promise;
 		}
-		const promise = this.#createAgentOnce(profile, recoverySummary);
+		const promise = this.#createAgentOnce(profile, recoverySummary, lifecycleGeneration);
 		this.#creating.set(profile.agentId, { profile, promise });
 		try { return await promise; } finally { this.#creating.delete(profile.agentId); }
 	}
 
-	async #createAgentOnce(profile, recoverySummary) {
+	async #createAgentOnce(profile, recoverySummary, lifecycleGeneration) {
 		let cwd;
 		try {
 			cwd = this.#workspaceManager === null
@@ -75,11 +78,16 @@ export class CursorProviderService {
 		} catch (error) {
 			throw new AcpProtocolError('PROVIDER_UNAVAILABLE', `Could not prepare the Cursor agent workspace: ${error?.message ?? String(error)}`, { cause: error });
 		}
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
 		const agent = new CursorAgent(profile, cwd, {
 			...this.#dependencies,
 			config: this.#config,
 			recoverySummary: normalizeRecoverySummary(recoverySummary),
 		});
+		if (lifecycleGeneration !== this.#lifecycleGeneration) {
+			await agent.dispose();
+			throw new AcpProtocolError('PROVIDER_STOPPED', 'Cursor service lifecycle was stopped');
+		}
 		this.#agents.set(profile.agentId, agent);
 		return agent;
 	}
@@ -101,7 +109,11 @@ export class CursorProviderService {
 		const removed = [];
 		for (const agentId of this.#agents.keys()) {
 			assertReconciliationActive(signal);
-			if (!desiredIds.has(agentId)) { await this.removeAgent(agentId); removed.push(agentId); }
+			if (!desiredIds.has(agentId)) {
+				await this.removeAgent(agentId);
+				assertReconciliationActive(signal);
+				removed.push(agentId);
+			}
 		}
 		const valid = [];
 		const invalid = [];
@@ -109,10 +121,13 @@ export class CursorProviderService {
 			try { valid.push(validateProfile(record, this.#config)); }
 			catch (error) { invalid.push({ profile: record, code: error.code ?? 'INVALID_PROFILE', message: error.message }); }
 		}
-		return { valid, invalid, removed, catalog: await this.catalog.refresh() };
+		const catalog = await this.catalog.refresh();
+		assertReconciliationActive(signal);
+		return { valid, invalid, removed, catalog };
 	}
 
 	async stop() {
+		this.#lifecycleGeneration += 1;
 		await Promise.allSettled([...this.#creating.values()].map((entry) => entry.promise));
 		this.#creating.clear();
 		const agents = [...this.#agents.values()];
@@ -123,6 +138,10 @@ export class CursorProviderService {
 
 function assertReconciliationActive(signal) {
 	if (signal?.aborted) throw new AcpProtocolError('STALE_RECONCILIATION', 'Cursor reconciliation was superseded');
+}
+
+function assertLifecycleActive(expected, current) {
+	if (expected !== current) throw new AcpProtocolError('PROVIDER_STOPPED', 'Cursor service lifecycle was stopped');
 }
 
 class CursorAgent {

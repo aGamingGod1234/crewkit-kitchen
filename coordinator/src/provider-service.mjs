@@ -84,6 +84,13 @@ export class ProviderService extends EventEmitter {
 			provider,
 		));
 		await Promise.allSettled([...backendStops, ...operations]);
+		await Promise.allSettled([...this.#services.entries()].map(([provider, service]) => withTimeout(
+			Promise.resolve().then(() => service.stop()),
+			this.#operationTimeoutMs,
+			this.#scheduleTimeout,
+			this.#cancelTimeout,
+			provider,
+		)));
 		this.#assignments.clear();
 		this.#creating.clear();
 		this.#starting.clear();
@@ -178,7 +185,7 @@ export class ProviderService extends EventEmitter {
 				return { provider, result: await this.#execute(provider, () => this.#services.get(provider).reconcile(groups.get(provider), {
 					signal: controller.signal,
 					generation: reconciliationGeneration,
-				}), 'reconcile') };
+				}), 'reconcile', { recordSuccess: false }) };
 			} catch (error) {
 				return { provider, error };
 			}
@@ -210,6 +217,7 @@ export class ProviderService extends EventEmitter {
 		const catalog = await this.catalog.refresh({ providers: selectedProviders, fallbackProviders: failures.map(({ provider }) => provider) });
 		this.#assertReconciliationCurrent(reconciliationGeneration, lifecycleGeneration);
 		this.#assignments = nextAssignments;
+		for (const { provider, result } of settled) if (result !== undefined) this.#recordLive(provider, 'reconcile');
 		return {
 			valid: settled.flatMap(({ result }) => result?.valid ?? []),
 			invalid: [

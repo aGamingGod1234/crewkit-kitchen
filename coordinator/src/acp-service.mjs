@@ -23,6 +23,7 @@ export class AcpProviderService {
 	#agents = new Map();
 	#creating = new Map();
 	#sessionGenerations = new Map();
+	#lifecycleGeneration = 0;
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -42,7 +43,9 @@ export class AcpProviderService {
 	getAgent(agentId) { return this.#agents.get(agentId) ?? null; }
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		await this.catalog.refresh();
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration, this.#config.provider);
 		const requested = profileIdentity(profileValue, this.#config);
 		const existing = this.#agents.get(requested.agentId);
 		if (existing !== undefined) {
@@ -55,15 +58,16 @@ export class AcpProviderService {
 			return creating.promise;
 		}
 		const profile = validateProfile(profileValue, this.#config);
-		const promise = this.#createAgentOnce(profile, recoverySummary);
+		const promise = this.#createAgentOnce(profile, recoverySummary, lifecycleGeneration);
 		this.#creating.set(profile.agentId, { profile, promise });
 		try { return await promise; } finally { this.#creating.delete(profile.agentId); }
 	}
 
-	async #createAgentOnce(profile, recoverySummary) {
+	async #createAgentOnce(profile, recoverySummary, lifecycleGeneration) {
 		const cwd = this.#workspaceManager === null
 			? this.#config.cwd
 			: await this.#workspaceManager.prepare(profile.provider, profile.agentId);
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration, this.#config.provider);
 		const transport = this.#transportFactory({ ...profile, cwd });
 		const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
 		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
@@ -74,8 +78,12 @@ export class AcpProviderService {
 			sessionGeneration,
 			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 		});
-		try { await agent.start(cwd); } catch (error) {
+		try {
+			await agent.start(cwd);
+			assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration, this.#config.provider);
+		} catch (error) {
 			await transport.stop();
+			if (error?.code === 'PROVIDER_STOPPED') throw error;
 			if (error instanceof AcpProtocolError && ['UNSUPPORTED_MODEL', 'UNSUPPORTED_THINKING'].includes(error.code)) throw error;
 			throw new AcpProtocolError('PROVIDER_UNAVAILABLE', `${profile.provider} CLI could not create an ACP session: ${error.message}`, { cause: error });
 		}
@@ -109,10 +117,13 @@ export class AcpProviderService {
 		for (const record of records) {
 			try { valid.push(validateProfile(record, this.#config)); } catch (error) { invalid.push({ profile: record, code: error.code ?? 'INVALID_PROFILE', message: error.message }); }
 		}
-		return { valid, invalid, removed, catalog: await this.catalog.refresh() };
+		const catalog = await this.catalog.refresh();
+		assertReconciliationActive(signal, this.#config.provider);
+		return { valid, invalid, removed, catalog };
 	}
 
 	async stop() {
+		this.#lifecycleGeneration += 1;
 		await Promise.allSettled([...this.#creating.values()].map((entry) => entry.promise));
 		this.#creating.clear();
 		const agents = [...this.#agents.values()];
@@ -123,6 +134,10 @@ export class AcpProviderService {
 
 function assertReconciliationActive(signal, provider) {
 	if (signal?.aborted) throw new AcpProtocolError('STALE_RECONCILIATION', `${provider} reconciliation was superseded`);
+}
+
+function assertLifecycleActive(expected, current, provider) {
+	if (expected !== current) throw new AcpProtocolError('PROVIDER_STOPPED', `${provider} service lifecycle was stopped`);
 }
 
 class AcpAgent {

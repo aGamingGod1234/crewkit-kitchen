@@ -133,3 +133,32 @@ test('catalog uses only its deterministic exact-profile builtin until live disco
 	assert.equal(live.source, 'live');
 	assert.deepEqual(live.models.map(({ id }) => id), ['gpt-5.6-sol']);
 });
+
+test('a timed-out catalog attempt is evicted and its late result cannot replace a fresh generation', async () => {
+	const releases = [];
+	let loaderCalls = 0;
+	const cache = new ModelCatalogCache(({ signal } = {}) => new Promise((resolve) => {
+		loaderCalls += 1;
+		const call = loaderCalls;
+		releases.push(() => resolve([{ ...MODEL, displayName: `attempt-${call}`, aborted: signal?.aborted === true }]));
+	}), { builtinModels: [MODEL], refreshTimeoutMs: 5 });
+	try {
+		const first = await Promise.race([
+			cache.refresh({ force: true }),
+			new Promise((resolve) => setTimeout(() => resolve('outer-timeout'), 30)),
+		]);
+		assert.notEqual(first, 'outer-timeout', 'the cache owns its refresh deadline');
+		assert.equal(first.source, 'builtin');
+
+		const secondAttempt = cache.refresh({ force: true });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(loaderCalls, 2, 'a timed-out loader promise is not cached into the next probe');
+		releases[0]();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(cache.snapshot().source, 'builtin', 'the obsolete loader cannot promote its late result live');
+		releases[1]();
+		assert.equal((await secondAttempt).source, 'live');
+	} finally {
+		for (const release of releases) release();
+	}
+});

@@ -261,6 +261,31 @@ test('stop fences a start-delayed creation before the backend can create or assi
 	assert.equal(router.getAgent('late-create'), null);
 });
 
+test('stop performs final backend cleanup after an already-entered create settles', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let releaseCreate;
+	let stopCalls = 0;
+	services.codex.createAgent = async (value) => {
+		await new Promise((resolve) => { releaseCreate = resolve; });
+		services.codex.created.push(value);
+		return { agentId: value.agentId, provider: value.provider };
+	};
+	services.codex.stop = async () => {
+		stopCalls += 1;
+		services.codex.created.length = 0;
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 100 });
+	const creating = router.createAgent(profile('codex', { agentId: 'entered-create' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	const stopping = router.stop();
+	await new Promise((resolve) => setImmediate(resolve));
+	releaseCreate();
+	await stopping;
+	await assert.rejects(creating, (error) => error?.code === 'PROVIDER_STOPPED');
+	assert.equal(services.codex.created.length, 0, 'no backend agent survives coordinator shutdown');
+	assert.equal(stopCalls, 2, 'a final stop cleans mutations that settled after the initial abort');
+});
+
 test('an explicit empty-roster bootstrap initializes no provider', async () => {
 	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
 	const started = [];
@@ -408,5 +433,37 @@ test('a stale reconciliation cannot remove or overwrite sessions installed by it
 	releaseFirst();
 	await assert.rejects(stale, (error) => error?.code === 'STALE_RECONCILIATION');
 	assert.notEqual(router.getAgent('new-agent'), null, 'the obsolete backend pass cannot delete the replacement session');
+	await router.stop();
+});
+
+test('a stale successful reconciliation cannot mark a degraded provider restored', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	services.codex.catalog.refresh = async () => ({
+		refreshedAtEpochMs: 1,
+		models: [{ id: 'codex-model', model: 'codex-model', displayName: 'Codex', reasoningEfforts: ['high'], serviceTiers: ['fast'] }],
+		source: 'live',
+	});
+	let calls = 0;
+	let releaseStale;
+	services.codex.reconcile = async (records) => {
+		calls += 1;
+		if (calls === 1) {
+			await new Promise((resolve) => { releaseStale = resolve; });
+			return { valid: records, invalid: [], removed: [] };
+		}
+		throw Object.assign(new Error('replacement provider unavailable'), { code: 'PROVIDER_UNAVAILABLE' });
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 100 });
+	let restored = 0;
+	router.on('providerRestored', () => { restored += 1; });
+	const stale = router.reconcile([profile('codex')]);
+	await new Promise((resolve) => setImmediate(resolve));
+	const replacement = await router.reconcile([profile('codex')]);
+	assert.equal(replacement.invalid.length, 1);
+	assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'degraded');
+	releaseStale();
+	await assert.rejects(stale, (error) => error?.code === 'STALE_RECONCILIATION');
+	assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'degraded');
+	assert.equal(restored, 0);
 	await router.stop();
 });

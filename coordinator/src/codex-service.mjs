@@ -30,9 +30,16 @@ export class CodexService {
 	#creating = new Map();
 	#started = false;
 	#starting = null;
+	#startupGeneration = 0;
+	#lifecycleGeneration = 0;
+	#startupSchedule;
+	#startupCancelSchedule;
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config, { requireLaunchProfile: dependencies.transport === undefined });
+		this.#startupSchedule = dependencies.startupSchedule ?? setTimeout;
+		this.#startupCancelSchedule = dependencies.startupCancelSchedule ?? clearTimeout;
+		if (typeof this.#startupSchedule !== 'function' || typeof this.#startupCancelSchedule !== 'function') throw new TypeError('Codex startup timeout dependencies must be functions');
 		this.#transport = dependencies.transport ?? new CodexStdioTransport(this.#config.launchProfile);
 		if (typeof this.#transport.on === 'function') {
 			this.#transport.on('diagnostic', (message) => {
@@ -54,6 +61,7 @@ export class CodexService {
 			ttlMs: this.#config.catalogTtlMs,
 			now: dependencies.now ?? Date.now,
 			builtinModels: exactLaunchProfileCatalog(this.#config.launchProfile),
+			refreshTimeoutMs: this.#config.startupTimeoutMs,
 		});
 	}
 
@@ -63,13 +71,17 @@ export class CodexService {
 
 	async start() {
 		if (this.#started) return;
-		if (this.#starting !== null) return this.#starting;
-		this.#starting = this.#startOnce();
-		try { await this.#starting; } finally { this.#starting = null; }
+		if (this.#starting !== null) return this.#starting.promise;
+		const attempt = { generation: ++this.#startupGeneration, controller: new AbortController(), promise: null };
+		attempt.promise = Promise.resolve().then(() => this.#startOnce(attempt));
+		this.#starting = attempt;
+		try { await attempt.promise; } finally { if (this.#starting === attempt) this.#starting = null; }
 	}
 
 	async createAgent(profileValue, { recoverySummary = null, controlProtocol = 'native_tools' } = {}) {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		await this.start();
+		this.#assertLifecycleCurrent(lifecycleGeneration);
 		const profile = validateProfile(profileValue, this.#config);
 		const protocol = validateControlProtocol(controlProtocol);
 		const existing = this.#agents.get(profile.agentId);
@@ -82,7 +94,7 @@ export class CodexService {
 			if (!profilesMatch(creating.profile, profile) || creating.controlProtocol !== protocol) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			return creating.promise;
 		}
-		const promise = this.#createAgentOnce(profile, recoverySummary, protocol);
+		const promise = this.#createAgentOnce(profile, recoverySummary, protocol, lifecycleGeneration);
 		this.#creating.set(profile.agentId, { profile, controlProtocol: protocol, promise });
 		try { return await promise; } finally { this.#creating.delete(profile.agentId); }
 	}
@@ -94,8 +106,9 @@ export class CodexService {
 		return agent;
 	}
 
-	async #createAgentOnce(profile, recoverySummary, controlProtocol) {
+	async #createAgentOnce(profile, recoverySummary, controlProtocol, lifecycleGeneration) {
 		if (this.#catalog.stale) await this.#catalog.refresh();
+		this.#assertLifecycleCurrent(lifecycleGeneration);
 		this.#catalog.assertSupported(profile.model, profile.reasoningEffort, profile.serviceTier);
 		let cwd;
 		let selectedCapabilityRoots = [];
@@ -111,6 +124,7 @@ export class CodexService {
 				? this.#config.cwd
 				: await this.#workspaceManager.prepare(profile.provider, profile.agentId);
 		}
+		this.#assertLifecycleCurrent(lifecycleGeneration);
 		const response = await this.#transport.request('thread/start', {
 			model: profile.model,
 			serviceTier: profile.serviceTier,
@@ -142,6 +156,10 @@ export class CodexService {
 			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 			controlProtocol,
 		});
+		if (lifecycleGeneration !== this.#lifecycleGeneration) {
+			await agent.dispose();
+			throw new CodexProtocolError('PROVIDER_STOPPED', 'Codex service lifecycle was stopped');
+		}
 		this.#agents.set(profile.agentId, agent);
 		return agent;
 	}
@@ -182,6 +200,9 @@ export class CodexService {
 	}
 
 	async stop() {
+		this.#lifecycleGeneration += 1;
+		this.#startupGeneration += 1;
+		this.#starting?.controller.abort();
 		await Promise.allSettled([...this.#creating.values()].map((entry) => entry.promise));
 		this.#creating.clear();
 		const agents = [...this.#agents.values()];
@@ -191,18 +212,37 @@ export class CodexService {
 		this.#started = false;
 	}
 
-	async #startOnce() {
-		await this.#transport.start();
+	async #startOnce(attempt) {
+		const transportStart = Promise.resolve().then(() => this.#transport.start({ signal: attempt.controller.signal }));
 		try {
+			await withStartupDeadline(transportStart, this.#config.startupTimeoutMs, this.#startupSchedule, this.#startupCancelSchedule, attempt.controller);
+			this.#assertStartupCurrent(attempt);
 			await this.#transport.request('initialize', { clientInfo: CLIENT_INFO, capabilities: CLIENT_CAPABILITIES }, { timeoutMs: this.#config.startupTimeoutMs });
+			this.#assertStartupCurrent(attempt);
 			this.#transport.notify('initialized', {});
-			this.#started = true;
 			await this.#catalog.refresh({ force: true });
+			this.#assertStartupCurrent(attempt);
+			this.#started = true;
 		} catch (error) {
+			attempt.controller.abort();
 			this.#started = false;
 			await this.#transport.stop();
+			void transportStart.then(async () => {
+				if (this.#started || (this.#starting === attempt && attempt.generation === this.#startupGeneration)) return;
+				await this.#transport.stop();
+			}).catch(() => {});
 			throw error;
 		}
+	}
+
+	#assertStartupCurrent(attempt) {
+		if (attempt.controller.signal.aborted || attempt.generation !== this.#startupGeneration || this.#starting !== attempt) {
+			throw new CodexProtocolError('STALE_PROVIDER_START', 'Codex startup attempt was superseded');
+		}
+	}
+
+	#assertLifecycleCurrent(lifecycleGeneration) {
+		if (lifecycleGeneration !== this.#lifecycleGeneration) throw new CodexProtocolError('PROVIDER_STOPPED', 'Codex service lifecycle was stopped');
 	}
 
 	async #listModels() {
@@ -860,6 +900,18 @@ function nativeRecoveryInstructions(summary) {
 	if (summary === null || summary === undefined || summary === '') return 'Use only the Minecraft tools. Act immediately on each compact event.';
 	if (typeof summary !== 'string' || summary.length > 2_048) throw new TypeError('recoverySummary must be at most 2048 characters');
 	return `Use only the Minecraft tools. Act immediately. Prior factual summary: ${JSON.stringify(summary)}`;
+}
+
+function withStartupDeadline(promise, timeoutMs, schedule, cancelSchedule, controller) {
+	let handle;
+	const timeout = new Promise((_, reject) => {
+		handle = schedule(() => {
+			controller.abort();
+			reject(new CodexProtocolError('PROVIDER_START_TIMEOUT', `Codex startup exceeded ${timeoutMs} ms`));
+		}, timeoutMs);
+		handle?.unref?.();
+	});
+	return Promise.race([promise, timeout]).finally(() => cancelSchedule(handle));
 }
 
 function exactLaunchProfileCatalog(profile) {

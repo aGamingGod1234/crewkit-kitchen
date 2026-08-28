@@ -33,6 +33,7 @@ export class AntigravityProviderService {
 	#agents = new Map();
 	#creating = new Map();
 	#sessionGenerations = new Map();
+	#lifecycleGeneration = 0;
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -55,7 +56,9 @@ export class AntigravityProviderService {
 	getAgent(agentId) { return this.#agents.get(agentId) ?? null; }
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		await this.catalog.refresh();
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
 		const profile = validateProfile(profileValue, this.#config);
 		const existing = this.#agents.get(profile.agentId);
 		if (existing !== undefined) {
@@ -71,7 +74,7 @@ export class AntigravityProviderService {
 			}
 			return creating.promise;
 		}
-		const promise = this.#createAgentOnce(profile, recoverySummary);
+		const promise = this.#createAgentOnce(profile, recoverySummary, lifecycleGeneration);
 		this.#creating.set(profile.agentId, { profile, promise });
 		try {
 			return await promise;
@@ -80,7 +83,7 @@ export class AntigravityProviderService {
 		}
 	}
 
-	async #createAgentOnce(profile, recoverySummary) {
+	async #createAgentOnce(profile, recoverySummary, lifecycleGeneration) {
 		let cwd;
 		try {
 			cwd = this.#workspaceManager === null
@@ -93,6 +96,7 @@ export class AntigravityProviderService {
 				{ cause: error },
 			);
 		}
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
 		const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
 		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
 		const agent = new AntigravityAgent(profile, cwd, {
@@ -102,6 +106,10 @@ export class AntigravityProviderService {
 			sessionGeneration,
 			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
 		});
+		if (lifecycleGeneration !== this.#lifecycleGeneration) {
+			await agent.dispose();
+			throw new AcpProtocolError('PROVIDER_STOPPED', 'Gemini service lifecycle was stopped');
+		}
 		this.#agents.set(profile.agentId, agent);
 		return agent;
 	}
@@ -138,10 +146,13 @@ export class AntigravityProviderService {
 				invalid.push({ profile: record, code: error.code ?? 'INVALID_PROFILE', message: error.message });
 			}
 		}
-		return { valid, invalid, removed, catalog: await this.catalog.refresh() };
+		const catalog = await this.catalog.refresh();
+		assertReconciliationActive(signal);
+		return { valid, invalid, removed, catalog };
 	}
 
 	async stop() {
+		this.#lifecycleGeneration += 1;
 		await Promise.allSettled([...this.#creating.values()].map((entry) => entry.promise));
 		this.#creating.clear();
 		const agents = [...this.#agents.values()];
@@ -152,6 +163,10 @@ export class AntigravityProviderService {
 
 function assertReconciliationActive(signal) {
 	if (signal?.aborted) throw new AcpProtocolError('STALE_RECONCILIATION', 'Gemini reconciliation was superseded');
+}
+
+function assertLifecycleActive(expected, current) {
+	if (expected !== current) throw new AcpProtocolError('PROVIDER_STOPPED', 'Gemini service lifecycle was stopped');
 }
 
 class AntigravityAgent {

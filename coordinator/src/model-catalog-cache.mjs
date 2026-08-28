@@ -1,6 +1,7 @@
 import { DEFAULT_SERVICE_TIER } from './constants.mjs';
 
 const DEFAULT_CATALOG_TTL_MS = 60_000;
+const DEFAULT_REFRESH_TIMEOUT_MS = 15_000;
 const PREFERRED_CODEX_MODELS = [
 	'gpt-5.6-luna',
 	'gpt-5.6-terra',
@@ -29,17 +30,26 @@ export class ModelCatalogCache {
 	#models = [];
 	#refreshedAtEpochMs = 0;
 	#refreshPromise = null;
+	#refreshGeneration = 0;
+	#refreshTimeoutMs;
+	#scheduleTimeout;
+	#cancelTimeout;
 	#source = null;
 	#failureCount = 0;
 	#failureCode = null;
 
-	constructor(loader, { ttlMs = DEFAULT_CATALOG_TTL_MS, now = Date.now, builtinModels = [] } = {}) {
+	constructor(loader, { ttlMs = DEFAULT_CATALOG_TTL_MS, now = Date.now, builtinModels = [], refreshTimeoutMs = DEFAULT_REFRESH_TIMEOUT_MS, scheduleTimeout = setTimeout, cancelTimeout = clearTimeout } = {}) {
 		if (typeof loader !== 'function') throw new TypeError('model catalog loader must be a function');
 		if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new TypeError('catalog ttlMs must be a positive safe integer');
 		if (typeof now !== 'function') throw new TypeError('catalog now dependency must be a function');
+		if (!Number.isSafeInteger(refreshTimeoutMs) || refreshTimeoutMs <= 0) throw new TypeError('catalog refreshTimeoutMs must be a positive safe integer');
+		if (typeof scheduleTimeout !== 'function' || typeof cancelTimeout !== 'function') throw new TypeError('catalog timeout dependencies must be functions');
 		this.#loader = loader;
 		this.#ttlMs = ttlMs;
 		this.#now = now;
+		this.#refreshTimeoutMs = refreshTimeoutMs;
+		this.#scheduleTimeout = scheduleTimeout;
+		this.#cancelTimeout = cancelTimeout;
 		if (!Array.isArray(builtinModels)) throw new TypeError('catalog builtinModels must be an array');
 		if (builtinModels.length > 0) {
 			this.#models = normalizeCatalog(builtinModels);
@@ -54,9 +64,18 @@ export class ModelCatalogCache {
 	async refresh({ force = false } = {}) {
 		if (!force && !this.stale) return this.snapshot();
 		if (this.#refreshPromise !== null) return this.#refreshPromise;
-		this.#refreshPromise = Promise.resolve()
-			.then(() => this.#loader())
+		const generation = ++this.#refreshGeneration;
+		const controller = new AbortController();
+		const loading = Promise.resolve().then(() => this.#loader({ signal: controller.signal, generation }));
+		const refresh = withRefreshDeadline(loading, {
+			controller,
+			timeoutMs: this.#refreshTimeoutMs,
+			scheduleTimeout: this.#scheduleTimeout,
+			cancelTimeout: this.#cancelTimeout,
+		});
+		this.#refreshPromise = refresh
 			.then((models) => {
+				if (generation !== this.#refreshGeneration) throw new ModelCatalogError('STALE_CATALOG_REFRESH', 'Model catalog refresh was superseded');
 				const normalized = normalizeCatalog(models);
 				if (normalized.length === 0) throw new ModelCatalogError('INVALID_CATALOG', 'Model catalog must contain at least one visible model');
 				this.#models = normalized;
@@ -73,7 +92,7 @@ export class ModelCatalogCache {
 				if (this.#source !== 'builtin') this.#source = 'last_valid';
 				return this.snapshot();
 			})
-			.finally(() => { this.#refreshPromise = null; });
+			.finally(() => { if (generation === this.#refreshGeneration) this.#refreshPromise = null; });
 		return this.#refreshPromise;
 	}
 
@@ -187,4 +206,16 @@ function requireText(value, field) {
 function boundedFailureCode(error) {
 	const value = typeof error?.code === 'string' && error.code.trim().length > 0 ? error.code : 'CATALOG_REFRESH_FAILED';
 	return value.slice(0, 128);
+}
+
+function withRefreshDeadline(promise, { controller, timeoutMs, scheduleTimeout, cancelTimeout }) {
+	let handle;
+	const timeout = new Promise((_, reject) => {
+		handle = scheduleTimeout(() => {
+			controller.abort();
+			reject(new ModelCatalogError('CATALOG_REFRESH_TIMEOUT', `Model catalog refresh timed out after ${timeoutMs} ms`));
+		}, timeoutMs);
+		handle?.unref?.();
+	});
+	return Promise.race([promise, timeout]).finally(() => cancelTimeout(handle));
 }
