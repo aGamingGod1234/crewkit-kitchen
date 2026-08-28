@@ -388,7 +388,7 @@ export class ProgramRuntimeManager {
 		return installed;
 	}
 
-	async #requestCompilerCorrection(state, record, source, error, observation, eventSequence, context = null, allowInfrastructureRetry = true) {
+	async #requestCompilerCorrection(state, record, source, error, observation, eventSequence, context = null) {
 		const correctionKey = context === null ? `initial:${eventSequence}` : requestKey(context);
 		const attempts = state.corrections.get(correctionKey) ?? 0;
 		if (attempts >= this.#compilerCorrectionLimit) {
@@ -450,15 +450,13 @@ export class ProgramRuntimeManager {
 		} catch (requestError) {
 			if (classifyRecoveryFailure(requestError).retryable) {
 				state.corrections.set(correctionKey, attempts);
-				if (allowInfrastructureRetry) {
-					state.reactiveRecovery = {
-						kind: 'compiler_correction',
-						context: Object.freeze({ source, error, observation, eventSequence, requestContext: context }),
-						fresh: false,
-					};
-					this.#ensureActing(record);
-					this.#requestRecoveryLease(record, state, 'compiler_correction_provider_failure', requestError);
-				}
+				state.reactiveRecovery = {
+					kind: 'compiler_correction',
+					context: Object.freeze({ source, error, observation, eventSequence, requestContext: context }),
+					fresh: false,
+				};
+				this.#ensureActing(record);
+				this.#requestRecoveryLease(record, state, 'compiler_correction_provider_failure', requestError);
 				return null;
 			}
 			this.#reportError(record.agentId, requestError);
@@ -563,10 +561,8 @@ export class ProgramRuntimeManager {
 			this.#syncState(record, state);
 		} catch (error) {
 			if (classifyRecoveryFailure(error).retryable) {
-				if (context.infrastructureRetry !== true) {
-					state.reactiveRecovery = { kind: 'reactive', context: Object.freeze({ ...context, infrastructureRetry: true }), fresh: false };
-					this.#requestRecoveryLease(record, state, 'reactive_provider_failure', error);
-				}
+				state.reactiveRecovery = { kind: 'reactive', context: Object.freeze({ ...context }), fresh: false };
+				this.#requestRecoveryLease(record, state, 'reactive_provider_failure', error);
 				this.#syncState(record, state);
 				return;
 			}
@@ -894,7 +890,6 @@ export class ProgramRuntimeManager {
 				retry.observation,
 				retry.eventSequence,
 				retry.requestContext,
-				false,
 			);
 			return;
 		}

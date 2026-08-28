@@ -774,7 +774,7 @@ test('reactive provider suspension stays active and retries once after fresh aut
 	assert.equal(actionCommands(sent).at(-1).payload.actionType, 'wait');
 });
 
-test('reactive infrastructure recovery stops after one fresh-fact retry', async () => {
+test('reactive infrastructure recovery rearms on a later fresh fact without retry looping', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const requests = [];
 	const recoveries = [];
@@ -783,7 +783,12 @@ test('reactive infrastructure recovery stops after one fresh-fact retry', async 
 		bridge: { send: async () => {} },
 		planner: { requestPlan: async (request) => {
 			requests.push(request);
-			throw Object.assign(new Error('provider still timed out'), { code: 'REQUEST_TIMEOUT' });
+			if (requests.length <= 2) throw Object.assign(new Error('provider still timed out'), { code: 'REQUEST_TIMEOUT' });
+			return withCompletionContract({
+				summary: 'Recovered from later facts.',
+				directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+			}, request.goalRevision);
 		} },
 		requestRecovery: (request) => recoveries.push(request),
 	});
@@ -804,7 +809,16 @@ test('reactive infrastructure recovery stops after one fresh-fact retry', async 
 	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(requests.length, 2);
-	assert.equal(recoveries.length, 1, 'the bounded retry cannot open a second recovery loop');
+	assert.equal(recoveries.length, 2, 'the second failed cycle requests one future recovery lease');
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2, 'a failed cycle cannot retry again without newer authoritative facts');
+
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation({ player: { health: 18 } }), eventSequence: 4,
+	});
+	for (let attempt = 0; attempt < 10 && requests.length < 3; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 3);
+	assert.equal(recoveries.length, 2);
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });
 
@@ -1066,7 +1080,7 @@ test('provider, session, scheduler, and blocked authentication failures share ac
 	}
 });
 
-test('compiler-correction infrastructure failure retries once after fresh authoritative facts', async () => {
+test('compiler-correction infrastructure recovery rearms on a later fresh fact without retry looping', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const requests = [];
 	const recoveries = [];
@@ -1076,7 +1090,7 @@ test('compiler-correction infrastructure failure retries once after fresh author
 		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
 		planner: { requestPlan: async (request) => {
 			requests.push(request);
-			if (requests.length === 1) throw Object.assign(new Error('provider request timed out'), { code: 'PROVIDER_TIMEOUT' });
+			if (requests.length <= 2) throw Object.assign(new Error('provider request timed out'), { code: 'PROVIDER_TIMEOUT' });
 			return withCompletionContract({ summary: 'Corrected.', directive: 'replace', source: SOURCE }, request.goalRevision);
 		} },
 		requestRecovery: (request) => recoveries.push(request),
@@ -1086,9 +1100,17 @@ test('compiler-correction infrastructure failure retries once after fresh author
 	assert.equal(recoveries.length, 1);
 	assert.notEqual(registry.get('agent-a').state, DynamicAgentState.ERROR);
 	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 2 });
-	for (let attempt = 0; attempt < 10 && actionCommands(sent).length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(requests.length, 2);
-	assert.equal(recoveries.length, 1);
+	assert.equal(recoveries.length, 2, 'the second failed correction requests one future recovery lease');
+	assert.equal(actionCommands(sent).length, 0);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2, 'the failed correction cannot retry again without newer authoritative facts');
+
+	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 18 } }), eventSequence: 3 });
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 3);
+	assert.equal(recoveries.length, 2);
 	assert.equal(actionCommands(sent).length, 1);
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });
