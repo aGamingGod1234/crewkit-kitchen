@@ -27,6 +27,7 @@ public final class GoalCompilerVerification {
 		net.minecraft.server.Bootstrap.bootStrap();
 		bindItemStackSize(Items.APPLE, 64);
 		bindItemStackSize(Items.COBBLESTONE, 64);
+		bindItemStackSize(Items.DIRT, 64);
 		bindItemStackSize(Items.DIAMOND_PICKAXE, 1);
 		bindItemStackSize(Items.DIAMOND_SWORD, 1);
 		bindItemStackSize(Items.IRON_AXE, 1);
@@ -129,7 +130,60 @@ public final class GoalCompilerVerification {
 				compiler.compile("Get 2369 cobblestone and kill a zombie", RegistryAccess.EMPTY, 1_200L).kind(),
 				"compound inventory predicates enforce the same carrying capacity"
 		);
-		return 7;
+		assertEquals(
+				GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 2304 cobblestone and 2304 dirt", RegistryAccess.EMPTY, 1_200L).kind(),
+				"distinct stackable items share the same inventory and offhand slots"
+		);
+		assertEquals(
+				GoalCompilation.Kind.ACCEPTED,
+				compiler.compile("Get 2304 cobblestone and 64 dirt", RegistryAccess.EMPTY, 1_200L).kind(),
+				"mixed stackable items may exactly fill the shared thirty-seven-slot budget"
+		);
+		assertEquals(
+				GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 2304 cobblestone and 65 dirt", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a partial extra stack cannot exceed the shared slot budget"
+		);
+		assertEquals(
+				GoalCompilation.Kind.ACCEPTED,
+				compiler.compile("Get 36 iron pickaxes and 64 cobblestone", RegistryAccess.EMPTY, 1_200L).kind(),
+				"unstackable and stackable requirements share inventory and offhand capacity"
+		);
+		assertEquals(
+				GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 36 iron pickaxes and 65 cobblestone", RegistryAccess.EMPTY, 1_200L).kind(),
+				"mixed stack limits count the partially occupied stack as another slot"
+		);
+		assertEquals(
+				GoalCompilation.Kind.ACCEPTED,
+				compiler.compile("Get 1152 cobblestone and 1152 cobblestone and 64 dirt", RegistryAccess.EMPTY, 1_200L).kind(),
+				"summed duplicate requirements participate in the shared slot calculation"
+		);
+
+		GoalPredicate translatedFeasible = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:cobblestone", 2_304),
+				new GoalPredicate.InventoryContains("minecraft:dirt", 64)
+		));
+		assertSucceeds(
+				() -> GoalInventoryCapacity.validateTranslated(translatedFeasible, RegistryAccess.EMPTY),
+				"translated compounds use the same exact shared-slot boundary"
+		);
+		expectCode("INVALID_GOAL_PREDICATE", () -> GoalInventoryCapacity.validateTranslated(
+				new GoalPredicate.AllOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:cobblestone", 2_304),
+						new GoalPredicate.InventoryContains("minecraft:dirt", 65)
+				)),
+				RegistryAccess.EMPTY
+		), "translated compounds reject the same impossible shared-slot demand");
+		assertSucceeds(() -> GoalInventoryCapacity.validateTranslated(new GoalPredicate.AllOf(List.of(
+					new GoalPredicate.AnyOf(List.of(
+							new GoalPredicate.InventoryContains("minecraft:cobblestone", 2_304),
+							new GoalPredicate.InventoryContains("minecraft:dirt", 1)
+					)),
+					new GoalPredicate.InventoryContains("minecraft:apple", 128)
+			)), RegistryAccess.EMPTY), "a feasible any-of branch keeps a translated compound satisfiable");
+		return 16;
 	}
 
 	private static int verifyExactPositionEntityAndAdvancement() {
@@ -616,6 +670,11 @@ public final class GoalCompilerVerification {
 
 	private static void assertTrue(boolean value, String label) {
 		if (!value) throw new AssertionError(label);
+		System.out.println("PASS: " + label);
+	}
+
+	private static void assertSucceeds(Runnable operation, String label) {
+		operation.run();
 		System.out.println("PASS: " + label);
 	}
 

@@ -360,7 +360,9 @@ public final class GoalCompiler {
 				predicates.add(new GoalPredicate.EntityKilledByAgent(matches.getFirst(), true));
 			}
 		}
-		return accepted(original, new GoalPredicate.AllOf(predicates), createdAtTick,
+		GoalPredicate compound = new GoalPredicate.AllOf(predicates);
+		if (GoalInventoryCapacity.exceeds(compound, registries)) return unrepresentableItemCount();
+		return accepted(original, compound, createdAtTick,
 				"Goal set: complete " + predicates.size() + " factual Minecraft results.");
 	}
 
