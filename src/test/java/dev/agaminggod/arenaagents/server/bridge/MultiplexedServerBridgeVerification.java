@@ -46,6 +46,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
@@ -119,6 +120,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyFailedBindClosesEverySocket();
 		verifyRealBridgeSessionLifecycle();
 		verifyLaunchIdentityAndReconnectGeneration();
+		verifyReplacementHandshakeDrainsPreviousDisconnect();
 		verifyHandshakeResnapshotsLifecycleRaces();
 		verifyHandshakeSnapshotDeadline();
 		verifyImmediateHandshakeClosePreservesDisconnect();
@@ -182,6 +184,9 @@ public final class MultiplexedServerBridgeVerification {
 			}
 			MultiplexedServerBridge activeBridge = bridge;
 			awaitCondition(() -> !activeBridge.authenticated(), "closed authenticated socket releases bridge authentication");
+			awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
+					"closed authenticated socket schedules coordinator cleanup");
+			bridge.tick();
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
@@ -191,6 +196,83 @@ public final class MultiplexedServerBridgeVerification {
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("launch identity bridge verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyReplacementHandshakeDrainsPreviousDisconnect() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-replacement-disconnect-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord record = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Disconnect"), 1_000L);
+			manager.registry().setAutomaticProgress(record.agentId(), false, 1_001L);
+			manager.registry().start(record.agentId(), "remain owned until cleanup", 1_002L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				authenticate(socket, reader, codec, secret, null, "hello-before-replacement");
+			}
+
+			MultiplexedServerBridge activeBridge = bridge;
+			awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
+					"previous authenticated session schedules coordinator cleanup");
+			assertEquals(AgentLifecycleState.STARTING, manager.registry().require(record.agentId()).state(),
+					"pending cleanup leaves the previous lifecycle active");
+			assertEquals(0L, coordinatorGeneration(bridge),
+					"pending cleanup has not fenced coordinator-owned actions early");
+
+			CountDownLatch replacementSnapshot = new CountDownLatch(1);
+			CountDownLatch replacementCommitted = new CountDownLatch(1);
+			AtomicBoolean cleanupVisibleAtCommit = new AtomicBoolean();
+			AtomicInteger commitCount = new AtomicInteger();
+			bridge.setHandshakeSnapshotHookForVerification(replacementSnapshot::countDown);
+			bridge.setHandshakeCommittedHookForVerification(ignored -> {
+				commitCount.incrementAndGet();
+				cleanupVisibleAtCommit.set(
+						manager.registry().require(record.agentId()).state() == AgentLifecycleState.DISCONNECTED
+								&& coordinatorGeneration(activeBridge) == 1L
+				);
+				replacementCommitted.countDown();
+			});
+
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				writeHello(socket, codec, secret, null, "hello-replacement-disconnect-race");
+				awaitLatch(replacementSnapshot, "replacement handshake captures its registry snapshot");
+				assertTrue(!replacementCommitted.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS),
+						"replacement handshake waits for the previous disconnect cleanup");
+				assertTrue(activeBridge.coordinatorDisconnectPendingForVerification(),
+						"replacement handshake preserves the previous disconnect marker");
+
+				bridge.tick();
+				awaitLatch(replacementCommitted, "replacement handshake commits after disconnect cleanup");
+				assertEquals("hello_ack", codec.decode(reader.readLine()).type(),
+						"replacement handshake acknowledges after cleanup");
+				assertTrue(cleanupVisibleAtCommit.get(),
+						"lifecycle and action cleanup complete before replacement commit");
+				assertEquals(1, commitCount.get(), "replacement handshake commits once");
+				assertEquals(AgentLifecycleState.DISCONNECTED, manager.registry().require(record.agentId()).state(),
+						"previous active lifecycle disconnects exactly once");
+				assertEquals(1L, coordinatorGeneration(bridge),
+						"previous coordinator action ownership is fenced exactly once");
+
+				bridge.tick();
+				assertEquals(1, commitCount.get(), "later ticks do not recommit the replacement handshake");
+				assertEquals(1L, coordinatorGeneration(bridge),
+						"later ticks do not repeat previous coordinator cleanup");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("replacement handshake disconnect cleanup verification failed", exception);
 		} finally {
 			if (bridge != null) bridge.close();
 			deleteIfExists(secretFile);
@@ -679,6 +761,17 @@ public final class MultiplexedServerBridgeVerification {
 		Field field = owner.getClass().getDeclaredField(fieldName);
 		field.setAccessible(true);
 		return field.get(owner);
+	}
+
+	private static long coordinatorGeneration(MultiplexedServerBridge bridge) {
+		try {
+			Object actionExecutor = readPrivateField(bridge, "actionExecutor");
+			Field field = actionExecutor.getClass().getDeclaredField("coordinatorGeneration");
+			field.setAccessible(true);
+			return field.getLong(actionExecutor);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not read coordinator action generation", exception);
+		}
 	}
 
 	private static void verifyConversationAttention(AgentId agentId) {

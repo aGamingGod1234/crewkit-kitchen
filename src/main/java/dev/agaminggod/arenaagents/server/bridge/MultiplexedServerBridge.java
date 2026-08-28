@@ -542,7 +542,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			handshakeSnapshotHook.run();
 			ensureHandshakeTimeRemaining(source);
 			synchronized (publicationLock) {
-				if (disconnectInProgress || snapshotRevision != registryPublicationRevision.get()) {
+				if (coordinatorDisconnectPending.get()
+						|| disconnectInProgress
+						|| snapshotRevision != registryPublicationRevision.get()) {
 					awaitHandshakeRetryLocked(source);
 					continue;
 				}
@@ -556,7 +558,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
 				try {
-					coordinatorDisconnectPending.set(false);
 					source.completeHandshake(handshake, suppliedLaunchId, sessionGenerations.incrementAndGet());
 					handshakeCommittedHook.accept(source);
 				} catch (RuntimeException exception) {
