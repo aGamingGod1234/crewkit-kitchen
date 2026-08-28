@@ -315,7 +315,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 			future = pending.remove(agentId);
 			synthesis = syntheses.remove(agentId);
 		}
-		if (future != null) future.complete(new VoiceReceipt(VoiceReceipt.Status.FAILED, "Speech stopped"));
+		if (future != null) future.complete(VoiceReceipt.cancelled());
 		if (synthesis != null) synthesis.cancel(true);
 		if (player != null) {
 			try {

@@ -108,13 +108,17 @@ final class VoicePlaybackCoordinatorVerification {
 		RecordingPlayback firstPlayback = transport.created.getFirst().playback;
 		CompletableFuture<VoiceReceipt> second = coordinator.speak(request(5L)).toCompletableFuture();
 		assertEquals(true, firstPlayback.stopped, "replacement stops active playback");
-		assertEquals(VoiceReceipt.Status.FAILED, first.join().status(), "replacement completes old receipt");
+		VoiceReceipt replaced = first.join();
+		assertEquals(VoiceReceipt.Status.CANCELLED, replaced.status(),
+				"intentional replacement does not request text fallback for old speech");
+		assertEquals(false, replaced.requiresTextFallback(),
+				"executor fallback policy ignores intentionally replaced speech");
 		synthesizer.completeNext(new short[] { 2 });
 		RecordingPlayback secondPlayback = transport.created.get(1).playback;
 		secondPlayback.finish();
 		assertEquals(VoiceReceipt.Status.PLAYED, second.join().status(), "replacement playback completes");
 		coordinator.close();
-		return 3;
+		return 4;
 	}
 
 	private static int verifyStopFailureCannotBlockReplacement() {
@@ -126,7 +130,7 @@ final class VoicePlaybackCoordinatorVerification {
 		CompletableFuture<VoiceReceipt> first = coordinator.speak(request(50L)).toCompletableFuture();
 		synthesizer.completeNext(new short[] { 1 });
 		CompletableFuture<VoiceReceipt> replacement = coordinator.speak(request(51L)).toCompletableFuture();
-		assertEquals(VoiceReceipt.Status.FAILED, first.join().status(),
+		assertEquals(VoiceReceipt.Status.CANCELLED, first.join().status(),
 				"failed playback cleanup still settles the displaced receipt");
 		transport.stopFailure = null;
 		synthesizer.completeNext(new short[] { 2 });
@@ -147,18 +151,18 @@ final class VoicePlaybackCoordinatorVerification {
 		CompletableFuture<short[]> replacedSynthesis = synthesizer.pending.remove();
 		CompletableFuture<VoiceReceipt> replacementReceipt = coordinator.speak(request(21L)).toCompletableFuture();
 		assertEquals(true, replacedSynthesis.isCancelled(), "replacement cancels pending synthesis");
-		assertEquals(VoiceReceipt.Status.FAILED, replacedReceipt.join().status(), "replacement completes replaced receipt");
+		assertEquals(VoiceReceipt.Status.CANCELLED, replacedReceipt.join().status(), "replacement completes replaced receipt");
 
 		CompletableFuture<short[]> replacementSynthesis = synthesizer.pending.remove();
 		coordinator.stop(AGENT);
 		assertEquals(true, replacementSynthesis.isCancelled(), "stop cancels pending synthesis");
-		assertEquals(VoiceReceipt.Status.FAILED, replacementReceipt.join().status(), "stop completes pending receipt");
+		assertEquals(VoiceReceipt.Status.CANCELLED, replacementReceipt.join().status(), "stop completes pending receipt");
 
 		CompletableFuture<VoiceReceipt> closeReceipt = coordinator.speak(request(22L)).toCompletableFuture();
 		CompletableFuture<short[]> closeSynthesis = synthesizer.pending.remove();
 		coordinator.close();
 		assertEquals(true, closeSynthesis.isCancelled(), "close cancels pending synthesis");
-		assertEquals(VoiceReceipt.Status.FAILED, closeReceipt.join().status(), "close completes pending receipt");
+		assertEquals(VoiceReceipt.Status.CANCELLED, closeReceipt.join().status(), "close completes pending receipt");
 		return 6;
 	}
 
@@ -217,17 +221,19 @@ final class VoicePlaybackCoordinatorVerification {
 		CompletableFuture<VoiceReceipt> providerFailure = coordinator.speak(request(6L)).toCompletableFuture();
 		synthesizer.failNext(new IllegalStateException("provider offline"));
 		assertEquals(VoiceReceipt.Status.FAILED, providerFailure.join().status(), "provider failure receipt");
+		assertEquals(true, providerFailure.join().requiresTextFallback(), "provider failure requests text fallback");
 		transport.createFailure = new IllegalStateException("channel unavailable");
 		CompletableFuture<VoiceReceipt> transportFailure = coordinator.speak(request(7L)).toCompletableFuture();
 		synthesizer.completeNext(new short[] { 3 });
 		assertEquals(VoiceReceipt.Status.FAILED, transportFailure.join().status(), "transport failure receipt");
+		assertEquals(true, transportFailure.join().requiresTextFallback(), "transport failure requests text fallback");
 		transport.createFailure = null;
 		CompletableFuture<VoiceReceipt> recovered = coordinator.speak(request(8L)).toCompletableFuture();
 		synthesizer.completeNext(new short[] { 4 });
 		transport.created.getLast().playback.finish();
 		assertEquals(VoiceReceipt.Status.PLAYED, recovered.join().status(), "speech recovers after failures");
 		coordinator.close();
-		return 3;
+		return 5;
 	}
 
 	private static int verifyStartFailureWinsOverSynchronousStopCallback() {
@@ -254,7 +260,7 @@ final class VoicePlaybackCoordinatorVerification {
 		RecordingPlayback unregisterPlayback = transport.created.getFirst().playback;
 		coordinator.unregisterAgent(AGENT);
 		assertEquals(true, unregisterPlayback.stopped, "unregister stops playback");
-		assertEquals(VoiceReceipt.Status.FAILED, unregisterReceipt.join().status(), "unregister completes receipt");
+		assertEquals(VoiceReceipt.Status.CANCELLED, unregisterReceipt.join().status(), "unregister completes receipt");
 		assertEquals(VoiceReceipt.Status.DEGRADED_TO_TEXT,
 				coordinator.speak(request(10L)).toCompletableFuture().join().status(), "unregister removes entity");
 		coordinator.registerAgent(AGENT, ENTITY);
@@ -263,7 +269,7 @@ final class VoicePlaybackCoordinatorVerification {
 		RecordingPlayback closePlayback = transport.created.getLast().playback;
 		coordinator.close();
 		assertEquals(true, closePlayback.stopped, "close stops playback");
-		assertEquals(VoiceReceipt.Status.FAILED, closeReceipt.join().status(), "close completes receipt");
+		assertEquals(VoiceReceipt.Status.CANCELLED, closeReceipt.join().status(), "close completes receipt");
 		assertEquals(false, coordinator.available(), "closed coordinator is unavailable");
 		return 6;
 	}

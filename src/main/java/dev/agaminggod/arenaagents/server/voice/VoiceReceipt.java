@@ -12,6 +12,7 @@ public record VoiceReceipt(Status status, String message) {
 		ACCEPTED,
 		PLAYED,
 		DEGRADED_TO_TEXT,
+		CANCELLED,
 		FAILED
 	}
 
@@ -21,5 +22,13 @@ public record VoiceReceipt(Status status, String message) {
 
 	public static VoiceReceipt degraded(String message) {
 		return new VoiceReceipt(Status.DEGRADED_TO_TEXT, message);
+	}
+
+	public static VoiceReceipt cancelled() {
+		return new VoiceReceipt(Status.CANCELLED, "Speech cancelled");
+	}
+
+	public boolean requiresTextFallback() {
+		return status == Status.DEGRADED_TO_TEXT || status == Status.FAILED;
 	}
 }

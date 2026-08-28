@@ -1134,9 +1134,7 @@ public final class ServerActionExecutor {
 				sequence
 		);
 		VoiceSubsystemRuntime.speak(manager.server(), voiceRequest).whenComplete((receipt, failure) -> {
-			boolean fallback = failure != null || receipt == null
-					|| receipt.status() == VoiceReceipt.Status.DEGRADED_TO_TEXT
-					|| receipt.status() == VoiceReceipt.Status.FAILED;
+			boolean fallback = failure != null || receipt == null || receipt.requiresTextFallback();
 			if (!fallback) return;
 			manager.server().execute(() -> {
 				try {
