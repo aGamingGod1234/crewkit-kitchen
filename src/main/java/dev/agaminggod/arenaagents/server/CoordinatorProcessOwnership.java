@@ -35,7 +35,7 @@ final class CoordinatorProcessOwnership {
 		Path root = normalizeRoot(runtimeRoot);
 		ProcessHandle owner = ProcessHandle.current();
 		record(root, process, main, BundledCoordinatorInstaller.validate(root).generationId(),
-				UUID.randomUUID().toString(), owner.pid(), ownerStartEpochMs(owner));
+				UUID.randomUUID().toString(), SupervisorIdentity.create(), owner.pid(), ownerStartEpochMs(owner));
 	}
 
 	static void record(Path runtimeRoot, Process process, Path main, long ownerPid) throws IOException {
@@ -43,7 +43,7 @@ final class CoordinatorProcessOwnership {
 		ProcessHandle owner = ProcessHandle.of(ownerPid)
 				.orElseThrow(() -> new IOException("coordinator owner process is unavailable"));
 		record(root, process, main, BundledCoordinatorInstaller.validate(root).generationId(),
-				UUID.randomUUID().toString(), ownerPid, ownerStartEpochMs(owner));
+				UUID.randomUUID().toString(), SupervisorIdentity.create(), ownerPid, ownerStartEpochMs(owner));
 	}
 
 	static void record(
@@ -54,7 +54,21 @@ final class CoordinatorProcessOwnership {
 			String launchId
 	) throws IOException {
 		ProcessHandle owner = ProcessHandle.current();
-		record(runtimeRoot, process, main, generationId, launchId, owner.pid(), ownerStartEpochMs(owner));
+		record(runtimeRoot, process, main, generationId, launchId, SupervisorIdentity.create(),
+				owner.pid(), ownerStartEpochMs(owner));
+	}
+
+	static void record(
+			Path runtimeRoot,
+			Process process,
+			Path main,
+			String generationId,
+			String launchId,
+			SupervisorIdentity supervisorIdentity
+	) throws IOException {
+		ProcessHandle owner = ProcessHandle.current();
+		record(runtimeRoot, process, main, generationId, launchId, supervisorIdentity,
+				owner.pid(), ownerStartEpochMs(owner));
 	}
 
 	static void record(
@@ -67,7 +81,8 @@ final class CoordinatorProcessOwnership {
 	) throws IOException {
 		ProcessHandle owner = ProcessHandle.of(ownerPid)
 				.orElseThrow(() -> new IOException("coordinator owner process is unavailable"));
-		record(runtimeRoot, process, main, generationId, launchId, ownerPid, ownerStartEpochMs(owner));
+		record(runtimeRoot, process, main, generationId, launchId, SupervisorIdentity.create(),
+				ownerPid, ownerStartEpochMs(owner));
 	}
 
 	private static synchronized void record(
@@ -76,6 +91,7 @@ final class CoordinatorProcessOwnership {
 			Path main,
 			String generationId,
 			String launchId,
+			SupervisorIdentity supervisorIdentity,
 			long ownerPid,
 			long ownerStartedAtEpochMs
 	) throws IOException {
@@ -83,6 +99,9 @@ final class CoordinatorProcessOwnership {
 		Path expectedMain = normalizeMain(root, main);
 		String expectedGeneration = normalizeGeneration(generationId);
 		String expectedLaunch = normalizeLaunchId(launchId);
+		SupervisorIdentity expectedSupervisor = java.util.Objects.requireNonNull(
+				supervisorIdentity, "supervisor identity must not be null"
+		);
 		if (ownerPid <= 0L) throw new IllegalArgumentException("coordinator owner pid must be positive");
 		if (ownerStartedAtEpochMs <= 0L) throw new IllegalArgumentException("coordinator owner start time must be positive");
 		long startedAtEpochMs = process.info().startInstant()
@@ -90,7 +109,7 @@ final class CoordinatorProcessOwnership {
 				.toEpochMilli();
 		write(root, new Ownership(
 				process.pid(), ownerPid, ownerStartedAtEpochMs, startedAtEpochMs,
-				expectedGeneration, expectedLaunch, List.of()
+				expectedGeneration, expectedLaunch, Optional.of(expectedSupervisor), List.of()
 		), expectedMain);
 	}
 
@@ -103,6 +122,8 @@ final class CoordinatorProcessOwnership {
 		values.setProperty("main", expectedMain.toString());
 		values.setProperty("generationId", ownership.generationId());
 		values.setProperty("launchId", ownership.launchId());
+		ownership.supervisorIdentity().ifPresent(identity ->
+				values.setProperty("supervisorId", identity.value()));
 		if (!ownership.descendants().isEmpty()) {
 			values.setProperty("descendants", ownership.descendants().stream()
 					.map(ProcessIdentity::serialized)
@@ -182,11 +203,27 @@ final class CoordinatorProcessOwnership {
 	static synchronized int reapOrphaned(Path runtimeRoot, String activeGenerationId) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
 		normalizeGeneration(activeGenerationId);
-		Path expectedMain = root.resolve("coordinator/src/dynamic-main.mjs").normalize();
 		Ownership ownership = read(root);
 		if (ownership != null && ownerAlive(ownership)) return 0;
 		if (ownership == null) return 0;
+		return reapOrphanedRecord(root, ownership);
+	}
 
+	static synchronized int reapOrphaned(Path runtimeRoot, SupervisorIdentity currentSupervisor) throws IOException {
+		Path root = normalizeRoot(runtimeRoot);
+		Path ownershipFile = ownershipFile(root);
+		if (!Files.isRegularFile(ownershipFile)) return 0;
+		Ownership ownership = read(root);
+		if (ownership == null) {
+			Files.deleteIfExists(ownershipFile);
+			return 0;
+		}
+		if (ownerAlive(ownership, currentSupervisor)) return 0;
+		return reapOrphanedRecord(root, ownership);
+	}
+
+	private static int reapOrphanedRecord(Path root, Ownership ownership) throws IOException {
+		Path expectedMain = root.resolve("coordinator/src/dynamic-main.mjs").normalize();
 		int reaped = 0;
 		Optional<ProcessHandle> recorded = ProcessHandle.of(ownership.pid());
 		if (recorded.isPresent() && matchesIdentity(recorded.get(), expectedMain, ownership.startedAtEpochMs())) {
@@ -266,6 +303,9 @@ final class CoordinatorProcessOwnership {
 			long startedAtEpochMs = Long.parseLong(values.getProperty("startedAtEpochMs", ""));
 			String generationId = normalizeGeneration(values.getProperty("generationId", ""));
 			String launchId = normalizeLaunchId(values.getProperty("launchId", ""));
+			String supervisorId = values.getProperty("supervisorId");
+			Optional<SupervisorIdentity> supervisorIdentity = supervisorId == null
+					? Optional.empty() : Optional.of(new SupervisorIdentity(supervisorId));
 			List<ProcessIdentity> descendants = parseDescendants(values.getProperty("descendants", ""));
 			Path main = Path.of(values.getProperty("main", "")).toAbsolutePath().normalize();
 			Path expectedMain = normalizeRoot(runtimeRoot).resolve("coordinator/src/dynamic-main.mjs").normalize();
@@ -273,7 +313,8 @@ final class CoordinatorProcessOwnership {
 					|| (ownerStartedAtValue != null && ownerStartedAtEpochMs <= 0L)
 					|| !samePath(main, expectedMain)) return null;
 			return new Ownership(
-					pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId, descendants
+					pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId,
+					supervisorIdentity, descendants
 			);
 		} catch (RuntimeException invalid) {
 			return null;
@@ -290,6 +331,12 @@ final class CoordinatorProcessOwnership {
 		return ProcessHandle.of(ownership.ownerPid())
 				.map(handle -> handle.isAlive() && sameStart(handle, ownership.ownerStartedAtEpochMs()))
 				.orElse(false);
+	}
+
+	private static boolean ownerAlive(Ownership ownership, SupervisorIdentity currentSupervisor) {
+		java.util.Objects.requireNonNull(currentSupervisor, "current supervisor identity must not be null");
+		return ownership.supervisorIdentity().filter(currentSupervisor::equals).isPresent()
+				&& ownerAlive(ownership);
 	}
 
 	private static long ownerStartEpochMs(ProcessHandle owner) throws IOException {
@@ -495,12 +542,26 @@ final class CoordinatorProcessOwnership {
 			long startedAtEpochMs,
 			String generationId,
 			String launchId,
+			Optional<SupervisorIdentity> supervisorIdentity,
 			List<ProcessIdentity> descendants
 	) {
 		private Ownership withDescendants(List<ProcessIdentity> tracked) {
 			return new Ownership(
-					pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId, List.copyOf(tracked)
+					pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId,
+					supervisorIdentity, List.copyOf(tracked)
 			);
+		}
+	}
+
+	record SupervisorIdentity(String value) {
+		SupervisorIdentity {
+			value = UUID.fromString(java.util.Objects.requireNonNull(
+					value, "supervisor identity must not be null"
+			)).toString();
+		}
+
+		static SupervisorIdentity create() {
+			return new SupervisorIdentity(UUID.randomUUID().toString());
 		}
 	}
 

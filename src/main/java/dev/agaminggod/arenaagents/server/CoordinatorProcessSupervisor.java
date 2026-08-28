@@ -51,6 +51,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private final OrphanReaper orphanReaper;
 	private final DependencyChangeMonitor dependencyChangeMonitor;
 	private final GenerationController generationController;
+	private final CoordinatorProcessOwnership.SupervisorIdentity supervisorIdentity =
+			CoordinatorProcessOwnership.SupervisorIdentity.create();
 	private final long createdAtEpochMs;
 	private final CoordinatorLaunchPolicy.RestartBudget restartBudget = new CoordinatorLaunchPolicy.RestartBudget();
 	private final ConcurrentLinkedQueue<MaintenanceResult> maintenanceResults = new ConcurrentLinkedQueue<>();
@@ -109,7 +111,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				null,
 				() -> UUID.randomUUID().toString(),
 				new OwnedMaintenanceWorker(),
-				CoordinatorProcessOwnership::reapOrphaned,
+				null,
 				new OwnedDependencyMonitorScheduler()
 		);
 	}
@@ -130,7 +132,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				processLauncher,
 				launchIds,
 				Runnable::run,
-				CoordinatorProcessOwnership::reapOrphaned,
+				null,
 				task -> { }
 		);
 	}
@@ -193,7 +195,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		this.processLauncher = processLauncher == null ? new DefaultProcessLauncher() : processLauncher;
 		this.launchIds = Objects.requireNonNull(launchIds, "launch IDs must not be null");
 		this.maintenanceWorker = Objects.requireNonNull(maintenanceWorker, "maintenance worker must not be null");
-		this.orphanReaper = Objects.requireNonNull(orphanReaper, "orphan reaper must not be null");
+		this.orphanReaper = orphanReaper == null
+				? root -> CoordinatorProcessOwnership.reapOrphaned(root, supervisorIdentity)
+				: orphanReaper;
 		this.generationController = Objects.requireNonNull(generationController,
 				"generation controller must not be null");
 		this.voiceEndpointExplicitOverride = configuredProperty("arenaagents.voiceUrl") != null;
@@ -423,7 +427,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			Path runtimeRoot,
 			Path main,
 			String generationId,
-			String launchId
+			String launchId,
+			CoordinatorProcessOwnership.SupervisorIdentity supervisorIdentity
 	) {
 		LaunchRequest {
 			command = List.copyOf(command);
@@ -435,6 +440,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			main = normalized(main, "coordinator main");
 			generationId = Objects.requireNonNull(generationId, "generation ID must not be null");
 			launchId = UUID.fromString(Objects.requireNonNull(launchId, "launch ID must not be null")).toString();
+			supervisorIdentity = Objects.requireNonNull(supervisorIdentity, "supervisor identity must not be null");
 		}
 
 		private static Path normalized(Path path, String label) {
@@ -1078,7 +1084,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				prepared.root(),
 				prepared.main(),
 				prepared.generationId(),
-				ownedLaunchId
+				ownedLaunchId,
+				supervisorIdentity
 		);
 	}
 
@@ -1437,7 +1444,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 						.orElseThrow(() -> new IOException("coordinator process start time is unavailable"))
 						.toEpochMilli();
 				CoordinatorProcessOwnership.record(
-						request.runtimeRoot(), process, request.main(), request.generationId(), request.launchId()
+						request.runtimeRoot(), process, request.main(), request.generationId(), request.launchId(),
+						request.supervisorIdentity()
 				);
 				return new OwnedProcessChild(
 						request.runtimeRoot(), process, startedAtEpochMs, request.generationId(), request.launchId()

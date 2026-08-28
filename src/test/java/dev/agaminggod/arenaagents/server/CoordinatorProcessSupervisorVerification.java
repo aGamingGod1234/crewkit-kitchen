@@ -56,6 +56,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBridgeBindFailureRecovery();
 		verifyOccupiedBridgePortRecoversAndAuthenticates();
 		verifyEightCrashesStillRecover();
+		verifySupervisorIdentityLifecycle();
 		verifyHungAuthenticationIsReplaced();
 		verifyStaleLaunchAuthenticationIsRejected();
 		verifyStaleLaunchCannotSuppressReplacement();
@@ -121,9 +122,18 @@ public final class CoordinatorProcessSupervisorVerification {
 					root,
 					main,
 					GENERATION_A,
-					"00000000-0000-0000-0000-000000000990"
+					"00000000-0000-0000-0000-000000000990",
+					new CoordinatorProcessOwnership.SupervisorIdentity(
+							"00000000-0000-0000-0000-000000000991"
+					)
 			);
 			owned = new CoordinatorProcessSupervisor.DefaultProcessLauncher().launch(request);
+			Properties ownership = new Properties();
+			try (var reader = Files.newBufferedReader(CoordinatorProcessOwnership.ownershipFile(root))) {
+				ownership.load(reader);
+			}
+			assertEquals(request.supervisorIdentity().value(), ownership.getProperty("supervisorId"),
+					"production launch persists the owning supervisor identity");
 			long rootPid = owned.pid();
 			awaitCondition(() -> readablePid(providerPid), "production child launches its provider descendant");
 			provider = ProcessHandle.of(Long.parseLong(Files.readString(providerPid).trim())).orElseThrow();
@@ -551,6 +561,30 @@ public final class CoordinatorProcessSupervisorVerification {
 		assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
 				"eighth replacement can still become healthy");
 		fixture.supervisor.close();
+	}
+
+	private static void verifySupervisorIdentityLifecycle() {
+		Fixture first = Fixture.ready();
+		first.startFirstProcess();
+		CoordinatorProcessOwnership.SupervisorIdentity initial =
+				first.launcher.launches.getFirst().supervisorIdentity();
+		first.launcher.latest().crash();
+		first.supervisor.tick(false, null);
+		first.clock.advance(1_000L);
+		first.supervisor.tick(false, null);
+		assertEquals(initial, first.launcher.launches.getLast().supervisorIdentity(),
+				"one supervisor keeps its identity across child restarts");
+		UUID.fromString(initial.value());
+		first.supervisor.close();
+
+		Fixture replacement = Fixture.ready();
+		try {
+			replacement.startFirstProcess();
+			assertFalse(initial.equals(replacement.launcher.launches.getFirst().supervisorIdentity()),
+					"a replacement supervisor in the same JVM receives a new identity");
+		} finally {
+			replacement.supervisor.close();
+		}
 	}
 
 	private static void verifyHungAuthenticationIsReplaced() {

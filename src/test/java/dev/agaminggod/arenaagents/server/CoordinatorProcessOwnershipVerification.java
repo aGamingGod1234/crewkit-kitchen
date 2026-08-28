@@ -13,6 +13,10 @@ public final class CoordinatorProcessOwnershipVerification {
 	private static final String GENERATION_B = "b".repeat(64);
 	private static final String LAUNCH_A = "00000000-0000-0000-0000-000000000101";
 	private static final String LAUNCH_B = "00000000-0000-0000-0000-000000000102";
+	private static final CoordinatorProcessOwnership.SupervisorIdentity SUPERVISOR_A =
+			new CoordinatorProcessOwnership.SupervisorIdentity("00000000-0000-0000-0000-000000000201");
+	private static final CoordinatorProcessOwnership.SupervisorIdentity SUPERVISOR_B =
+			new CoordinatorProcessOwnership.SupervisorIdentity("00000000-0000-0000-0000-000000000202");
 
 	private CoordinatorProcessOwnershipVerification() {
 	}
@@ -109,7 +113,8 @@ public final class CoordinatorProcessOwnershipVerification {
 			assertTrue(Thread.interrupted(), "tree termination preserves interruption status");
 			assertTrue(interruptedDescendants.stream().noneMatch(ProcessHandle::isAlive),
 					"interrupted tree termination still stops every child");
-			return 24 + clearAssertions + verifyStartupOwnershipRecordFailureCleanup(main)
+			return 24 + clearAssertions + verifySameJvmSupervisorRestart(root, main)
+					+ verifyStartupOwnershipRecordFailureCleanup(main)
 					+ verifyRefusedProcessTreeTerminationFailsClosed() + verifyDescendantIdentityRejectsPidReuse();
 		} finally {
 			if (orphan != null && orphan.isAlive()) orphan.destroyForcibly();
@@ -122,6 +127,55 @@ public final class CoordinatorProcessOwnershipVerification {
 			if (interruptedTree != null && interruptedTree.isAlive()) interruptedTree.destroyForcibly();
 			deleteTree(root);
 		}
+	}
+
+	private static int verifySameJvmSupervisorRestart(Path root, Path main) throws Exception {
+		Process stale = null;
+		Process current = null;
+		Process reusedPid = null;
+		try {
+			stale = startSleeper(main);
+			CoordinatorProcessOwnership.record(root, stale, main, GENERATION_A, LAUNCH_A, SUPERVISOR_A);
+			assertSupervisorIdentity(root, SUPERVISOR_A);
+			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, SUPERVISOR_B) == 1,
+					"a new supervisor in the same JVM reaps the previous supervisor's coordinator");
+			assertTrue(stale.waitFor(5, TimeUnit.SECONDS),
+					"the previous same-JVM supervisor's coordinator exits");
+
+			current = startSleeper(main);
+			CoordinatorProcessOwnership.record(root, current, main, GENERATION_A, LAUNCH_B, SUPERVISOR_B);
+			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, SUPERVISOR_B) == 0,
+					"the current supervisor preserves its own coordinator");
+			assertTrue(current.isAlive(), "the current supervisor's coordinator remains alive");
+			CoordinatorProcessOwnership.clear(root, current, GENERATION_A, LAUNCH_B);
+
+			reusedPid = startSleeper(main);
+			CoordinatorProcessOwnership.record(root, reusedPid, main, GENERATION_A, LAUNCH_A, SUPERVISOR_A);
+			invalidateStartTimestamp(root);
+			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, SUPERVISOR_B) == 0,
+					"a new supervisor does not terminate a reused coordinator PID");
+			assertTrue(reusedPid.isAlive(), "the process behind a reused PID remains alive");
+			assertTrue(!Files.exists(CoordinatorProcessOwnership.ownershipFile(root)),
+					"the stale reused-PID ownership record is cleared");
+			return 9;
+		} finally {
+			if (stale != null && stale.isAlive()) stale.destroyForcibly();
+			if (current != null && current.isAlive()) current.destroyForcibly();
+			if (reusedPid != null && reusedPid.isAlive()) reusedPid.destroyForcibly();
+			Files.deleteIfExists(CoordinatorProcessOwnership.ownershipFile(root));
+		}
+	}
+
+	private static void assertSupervisorIdentity(
+			Path root,
+			CoordinatorProcessOwnership.SupervisorIdentity expected
+	) throws Exception {
+		Properties values = new Properties();
+		try (var reader = Files.newBufferedReader(CoordinatorProcessOwnership.ownershipFile(root))) {
+			values.load(reader);
+		}
+		assertTrue(expected.value().equals(values.getProperty("supervisorId")),
+				"ownership records the exact supervisor identity");
 	}
 
 	private static void assertOwnershipIdentity(Path root, String generationId, String launchId) throws Exception {
