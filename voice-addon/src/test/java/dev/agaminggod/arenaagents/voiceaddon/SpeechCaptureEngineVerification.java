@@ -20,6 +20,8 @@ final class SpeechCaptureEngineVerification {
 
 	static int verify() throws Exception {
 		int assertions = 0;
+		assertions += verifyProductionSpeechEndpointFlushesWithinBudget();
+		assertions += verifyInputLatencyReportsOneCompletedUtterance();
 		assertions += verifySilenceFlushesOneOrderedUtterance();
 		assertions += verifyWhisperChangeSplitsAndSequencesUtterances();
 		assertions += verifyMaximumDurationBoundsDecodedSamples();
@@ -28,6 +30,48 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyUnavailableSttDisablesFurtherCapture();
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		return assertions;
+	}
+
+	private static int verifyInputLatencyReportsOneCompletedUtterance() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		List<SpeechCaptureEngine.InputLatency> latencies = new ArrayList<>();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler(), 5_000L, 1, latencies::add
+		);
+		engine.accept(
+				PLAYER, true, new byte[] { 7 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> { }
+		);
+		assertEquals(1, latencies.size(), "one input latency sample");
+		SpeechCaptureEngine.InputLatency latency = latencies.getFirst();
+		assertEquals(PLAYER, latency.playerId(), "input latency player identity");
+		assertEquals(1L, latency.utteranceSequence(), "input latency utterance sequence");
+		assertEquals(true, latency.endpointMilliseconds() >= 0L, "input endpoint latency is non-negative");
+		assertEquals(true, latency.transcriptionMilliseconds() >= 0L,
+				"input transcription latency is non-negative");
+		assertEquals(true, latency.totalMilliseconds() >= latency.transcriptionMilliseconds(),
+				"input total latency includes transcription");
+		engine.close();
+		return 6;
+	}
+
+	private static int verifyProductionSpeechEndpointFlushesWithinBudget() throws Exception {
+		var field = HumanSpeechCapture.class.getDeclaredField("SILENCE_MILLISECONDS");
+		field.setAccessible(true);
+		long productionSilenceMilliseconds = field.getLong(null);
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler(), productionSilenceMilliseconds, 32
+		);
+		CountDownLatch latch = new CountDownLatch(1);
+		engine.accept(
+				PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> latch.countDown()
+		);
+		assertEquals(true, latch.await(550, TimeUnit.MILLISECONDS),
+				"production speech endpoint flushes within the conversational latency budget");
+		engine.close();
+		return 1;
 	}
 
 	private static int verifySilenceFlushesOneOrderedUtterance() throws Exception {

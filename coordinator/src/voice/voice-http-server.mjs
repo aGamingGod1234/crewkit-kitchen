@@ -46,6 +46,9 @@ export function createVoiceHttpServer({
 		const controller = new AbortController();
 		controllers.add(controller);
 		request.once('aborted', () => controller.abort());
+		response.once('close', () => {
+			if (!response.writableFinished) controller.abort();
+		});
 		active++;
 		try {
 			if (request.url === '/v1/stt') {

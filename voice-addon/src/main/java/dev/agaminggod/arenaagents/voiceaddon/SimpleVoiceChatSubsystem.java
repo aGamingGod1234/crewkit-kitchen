@@ -13,15 +13,27 @@ import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.entity.Entity;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 final class SimpleVoiceChatSubsystem implements VoiceSubsystem {
+	private static final Logger LOGGER = LoggerFactory.getLogger(SimpleVoiceChatSubsystem.class);
 	private final MinecraftServer server;
 	private final VoicePlaybackCoordinator playback;
 
 	SimpleVoiceChatSubsystem(MinecraftServer server, VoiceWorkerClient worker) {
 		this.server = Objects.requireNonNull(server, "server must not be null");
 		Objects.requireNonNull(worker, "worker must not be null");
-		this.playback = new VoicePlaybackCoordinator(worker::synthesize, server::execute, new SimpleVoiceTransport());
+		this.playback = new VoicePlaybackCoordinator(
+				worker::synthesize,
+				server::execute,
+				new SimpleVoiceTransport(),
+				latency -> LOGGER.info(
+						"Voice output latency agent={} sequence={} synthesisMs={} firstPlaybackMs={}",
+						latency.agentId(), latency.conversationSequence(), latency.synthesisMilliseconds(),
+						latency.firstPlaybackMilliseconds()
+				)
+		);
 	}
 
 	@Override
