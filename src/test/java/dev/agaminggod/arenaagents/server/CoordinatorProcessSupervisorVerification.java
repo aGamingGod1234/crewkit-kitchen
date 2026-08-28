@@ -65,8 +65,10 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyExternalCoordinatorReconnectGrace();
 		verifyContinuousStabilityResetsFailures();
 		verifyCandidatePromotionUsesMaintenanceWorker();
+		verifyCandidatePromotionRefreshesOwnedFingerprintBaseline();
 		verifyCandidateReadinessGapRestartsStabilityWindow();
 		verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination();
+		verifyCandidateRollbackRefreshesOwnedFingerprintBaseline();
 		verifyCandidateRollbackWaitsForConfirmedTermination();
 		verifySoleCandidateFailureKeepsRetrying();
 		verifyConnectionGenerationResetsUnsampledStability();
@@ -77,6 +79,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBlockingMaintenanceNeverBlocksTicks();
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
+		verifyExternalFingerprintChangeStillReplacesHealthyChild();
 		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
 		verifyDependencyWakeSurvivesInflightFailure();
 		verifyDependencyMonitorCloseDoesNotWaitForPoll();
@@ -96,7 +99,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 250;
+		return 259;
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -454,6 +457,44 @@ public final class CoordinatorProcessSupervisorVerification {
 		supervisor.close();
 	}
 
+	private static void verifyCandidatePromotionRefreshesOwnedFingerprintBaseline() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		dependencies.fingerprint = "candidate-journal-before-promotion";
+		FakeLauncher launcher = new FakeLauncher();
+		QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+		FakeGenerationController generations = new FakeGenerationController();
+		generations.afterPromotion = () -> dependencies.fingerprint = "candidate-journal-after-promotion";
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-promotion-fingerprint-game"), Map.of(), clock, dependencies, launcher,
+				() -> "00000000-0000-0000-0000-000000000202", worker, runtimeRoot -> 0, task -> { }, generations
+		);
+		worker.runNext();
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		String launchId = supervisor.snapshot().launchId();
+		FakeChild promotedChild = launcher.latest();
+
+		supervisor.tick(true, launchId, 1L);
+		supervisor.tick(true, launchId, 1L);
+		clock.advance(STABILITY_INTERVAL_MS);
+		supervisor.tick(true, launchId, 1L);
+		worker.runNext();
+		supervisor.tick(true, launchId, 1L);
+		worker.runNext();
+		supervisor.tick(true, launchId, 1L);
+		worker.runNext();
+		supervisor.tick(true, launchId, 1L);
+
+		assertEquals(launchId, supervisor.snapshot().launchId(),
+				"promotion-owned generation journal writes preserve the authenticated child");
+		assertEquals(0, promotedChild.terminations,
+				"promotion-owned generation journal writes never terminate the healthy child");
+		supervisor.close();
+	}
+
 	private static void verifyCandidateReadinessGapRestartsStabilityWindow() {
 		FakeClock clock = new FakeClock();
 		MutableDependencies dependencies = MutableDependencies.candidate(true);
@@ -515,6 +556,46 @@ public final class CoordinatorProcessSupervisorVerification {
 				"rollback result publishes the verified last-known-good generation");
 		supervisor.tick(false, null, 0L);
 		assertEquals(1, generations.rollbacks, "repeated ticks do not repeat a completed rollback");
+		supervisor.close();
+	}
+
+	private static void verifyCandidateRollbackRefreshesOwnedFingerprintBaseline() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		dependencies.fingerprint = "candidate-journal-before-rollback";
+		FakeLauncher launcher = new FakeLauncher();
+		ManualDependencyMonitorScheduler monitor = new ManualDependencyMonitorScheduler();
+		FakeGenerationController generations = new FakeGenerationController();
+		generations.afterRollback = () -> dependencies.fingerprint = "restored-journal-after-rollback";
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-rollback-fingerprint-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(310), Runnable::run, runtimeRoot -> 0, monitor, generations
+		);
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		for (long retryDelay : new long[]{1_000L, 2_000L}) {
+			clock.advance(AUTHENTICATION_TIMEOUT_MS);
+			supervisor.tick(false, null, 0L);
+			clock.advance(retryDelay);
+			supervisor.tick(false, null, 0L);
+		}
+		clock.advance(AUTHENTICATION_TIMEOUT_MS);
+		supervisor.tick(false, null, 0L);
+		String restoredLaunchId = supervisor.snapshot().launchId();
+		FakeChild restoredChild = launcher.latest();
+		int resolutionsAfterRollback = dependencies.resolveCalls;
+
+		monitor.poll();
+		supervisor.tick(false, null, 0L);
+		supervisor.tick(false, null, 0L);
+
+		assertEquals(1, generations.rollbacks, "candidate rollback mutates its generation journal once");
+		assertEquals(restoredLaunchId, supervisor.snapshot().launchId(),
+				"rollback-owned generation journal writes preserve the restored child");
+		assertEquals(0, restoredChild.terminations,
+				"rollback-owned generation journal writes never terminate the restored child");
+		assertEquals(resolutionsAfterRollback, dependencies.resolveCalls,
+				"rollback-owned journal writes do not queue a redundant dependency wake");
 		supervisor.close();
 	}
 
@@ -998,6 +1079,36 @@ public final class CoordinatorProcessSupervisorVerification {
 			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
 			if (fixtureRoot != null) deleteTree(fixtureRoot);
 		}
+	}
+
+	private static void verifyExternalFingerprintChangeStillReplacesHealthyChild() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.ready();
+		dependencies.fingerprint = "external-dependency-before";
+		FakeLauncher launcher = new FakeLauncher();
+		ManualDependencyMonitorScheduler monitor = new ManualDependencyMonitorScheduler();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "external-fingerprint-control-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(458), Runnable::run, runtimeRoot -> 0, monitor
+		);
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		String launchId = supervisor.snapshot().launchId();
+		FakeChild originalChild = launcher.latest();
+		supervisor.tick(true, launchId, 1L);
+
+		dependencies.fingerprint = "external-dependency-after";
+		monitor.poll();
+		supervisor.tick(true, launchId, 1L);
+		supervisor.tick(true, launchId, 1L);
+
+		assertEquals(2, launcher.launches.size(),
+				"a real external fingerprint change launches one replacement child");
+		assertFalse(launchId.equals(supervisor.snapshot().launchId()),
+				"a real external fingerprint change fences the previous launch identity");
+		assertEquals(1, originalChild.terminations,
+				"a real external fingerprint change terminates the exact owned child");
+		supervisor.close();
 	}
 
 	private static void verifyWorkerFingerprintObservationAdvancesMonitorBaseline() {
@@ -1746,11 +1857,14 @@ public final class CoordinatorProcessSupervisorVerification {
 	private static final class FakeGenerationController implements CoordinatorProcessSupervisor.GenerationController {
 		private int promotions;
 		private int rollbacks;
+		private Runnable afterPromotion = () -> { };
 		private Runnable beforeRollback = () -> { };
+		private Runnable afterRollback = () -> { };
 
 		@Override
 		public CoordinatorProcessSupervisor.GenerationStatus promote(Path root, String generationId) {
 			promotions++;
+			afterPromotion.run();
 			return new CoordinatorProcessSupervisor.GenerationStatus(generationId, false, true);
 		}
 
@@ -1758,6 +1872,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		public CoordinatorProcessSupervisor.GenerationStatus rollback(Path root, String generationId) {
 			beforeRollback.run();
 			rollbacks++;
+			afterRollback.run();
 			return new CoordinatorProcessSupervisor.GenerationStatus(GENERATION_A, false, false);
 		}
 	}

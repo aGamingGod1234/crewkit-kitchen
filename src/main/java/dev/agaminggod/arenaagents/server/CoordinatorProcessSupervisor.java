@@ -315,12 +315,20 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private record TerminationMaintenanceResult(ChildProcess child, String failureMessage) implements MaintenanceResult {
 	}
 
-	private record PromotionMaintenanceResult(GenerationStatus status, String generationId, String failureMessage)
-			implements MaintenanceResult {
+	private record PromotionMaintenanceResult(
+			GenerationStatus status,
+			String generationId,
+			String fingerprint,
+			String failureMessage
+	) implements MaintenanceResult {
 	}
 
-	private record RollbackMaintenanceResult(GenerationStatus status, String generationId, String failureMessage)
-			implements MaintenanceResult {
+	private record RollbackMaintenanceResult(
+			GenerationStatus status,
+			String generationId,
+			String fingerprint,
+			String failureMessage
+	) implements MaintenanceResult {
 	}
 
 	record DependencyResolution(
@@ -897,10 +905,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		submitMaintenance(() -> {
 			try {
 				GenerationStatus status = generationController.promote(promoting.root(), promoting.generationId());
-				publishMaintenanceResult(new PromotionMaintenanceResult(status, promoting.generationId(), null));
+				publishMaintenanceResult(new PromotionMaintenanceResult(
+						status, promoting.generationId(), safeFingerprint(), null
+				));
 			} catch (IOException | RuntimeException failure) {
 				publishMaintenanceResult(new PromotionMaintenanceResult(
-						null, promoting.generationId(), Objects.toString(failure.getMessage(), "Candidate promotion failed")
+						null, promoting.generationId(), null,
+						Objects.toString(failure.getMessage(), "Candidate promotion failed")
 				));
 			}
 		});
@@ -917,10 +928,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		submitMaintenance(() -> {
 			try {
 				GenerationStatus status = generationController.rollback(failed.root(), failed.generationId());
-				publishMaintenanceResult(new RollbackMaintenanceResult(status, failed.generationId(), null));
+				publishMaintenanceResult(new RollbackMaintenanceResult(
+						status, failed.generationId(), safeFingerprint(), null
+				));
 			} catch (IOException | RuntimeException failure) {
 				publishMaintenanceResult(new RollbackMaintenanceResult(
-						null, failed.generationId(), Objects.toString(failure.getMessage(), "Candidate rollback failed")
+						null, failed.generationId(), null,
+						Objects.toString(failure.getMessage(), "Candidate rollback failed")
 				));
 			}
 		});
@@ -1016,6 +1030,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 							"Candidate promotion returned a different generation", "runtime_promotion");
 					continue;
 				}
+				acceptOwnedDependencyFingerprint(promotion.fingerprint());
 				runtime = withGeneration(runtime, promotion.status());
 				nextGenerationMutationEpochMs = 0L;
 				creditStability(now);
@@ -1026,6 +1041,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 					setDiagnostic("COORDINATOR_GENERATION_ROLLBACK_FAILED", rollback.failureMessage(), "runtime_rollback");
 					continue;
 				}
+				acceptOwnedDependencyFingerprint(rollback.fingerprint());
 				runtime = withGeneration(runtime, rollback.status());
 				candidateFailures = 0;
 				rollbackRequested = false;
@@ -1036,6 +1052,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 						rollback.generationId(), rollback.status().generationId());
 			}
 		}
+	}
+
+	private void acceptOwnedDependencyFingerprint(String fingerprint) {
+		dependencyFingerprint = Objects.requireNonNull(
+				fingerprint, "owned dependency fingerprint must not be null"
+		);
+		dependencyChangeMonitor.acceptOwnedFingerprint(fingerprint);
 	}
 
 	private static PreparedRuntime withGeneration(PreparedRuntime runtime, GenerationStatus status) {
@@ -1387,6 +1410,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 		private void observeSubmittedFingerprint(String submitted) {
 			if (observe(submitted)) changed.run();
+		}
+
+		private void acceptOwnedFingerprint(String current) {
+			synchronized (stateLock) {
+				if (closed.get()) return;
+				previous = current;
+				initialized = true;
+			}
 		}
 
 		private boolean observe(String current) {
