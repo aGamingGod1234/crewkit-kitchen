@@ -17,6 +17,7 @@ export class ProviderProfileConflictError extends Error {
 export class ProviderService extends EventEmitter {
 	#services;
 	#assignments = new Map();
+	#acceptedAgents = new Map();
 	#creating = new Map();
 	#replacing = new Map();
 	#starting = new Map();
@@ -67,7 +68,7 @@ export class ProviderService extends EventEmitter {
 
 	async start(providers = []) {
 		const selected = normalizeProviderSelection(providers, this.#services, { defaultToAll: false });
-		return Promise.allSettled(selected.map((provider) => this.#execute(provider, () => undefined, 'startup')));
+		return Promise.allSettled(selected.map((provider) => this.#startProvider(provider)));
 	}
 	stop() {
 		if (this.#stopPromise !== null) return this.#stopPromise;
@@ -102,6 +103,7 @@ export class ProviderService extends EventEmitter {
 			provider,
 		)));
 		this.#assignments.clear();
+		this.#acceptedAgents.clear();
 		this.#creating.clear();
 		this.#replacing.clear();
 		this.#starting.clear();
@@ -137,7 +139,9 @@ export class ProviderService extends EventEmitter {
 		const existing = this.#assignments.get(profile.agentId);
 		if (existing !== undefined) {
 			assertSameProfile(existing, profile);
-			return this.#execute(existing.provider, () => this.#services.get(existing.provider).createAgent(existing, this.#creationOptions(options)), 'create');
+			const agent = await this.#execute(existing.provider, () => this.#services.get(existing.provider).createAgent(existing, this.#creationOptions(options)), 'create', { outcomeIdentity: profileIdentity(existing) });
+			this.#acceptedAgents.set(profile.agentId, agent);
+			return agent;
 		}
 		const creating = this.#creating.get(profile.agentId);
 		if (creating !== undefined) {
@@ -146,12 +150,13 @@ export class ProviderService extends EventEmitter {
 		}
 		const service = this.#services.get(profile.provider);
 		if (service === undefined) throw new TypeError(`${profile.provider} service is unavailable`);
-		const promise = this.#execute(profile.provider, () => service.createAgent(profile, this.#creationOptions(options)), 'create');
+		const promise = this.#execute(profile.provider, () => service.createAgent(profile, this.#creationOptions(options)), 'create', { outcomeIdentity: profileIdentity(profile) });
 		this.#creating.set(profile.agentId, { profile, promise });
 		try {
 			const agent = await promise;
 			this.#assertActive(lifecycleGeneration);
 			this.#assignments.set(profile.agentId, profile);
+			this.#acceptedAgents.set(profile.agentId, agent);
 			return agent;
 		} finally {
 			this.#creating.delete(profile.agentId);
@@ -178,14 +183,16 @@ export class ProviderService extends EventEmitter {
 			}
 			const assigned = this.#assignments.get(profile.agentId);
 			if (assigned !== undefined) assertSameProfile(assigned, profile);
-			return this.#execute(profile.provider, async () => {
+			const agent = await this.#execute(profile.provider, async () => {
 				const agent = typeof service.replaceAgent === 'function'
 					? await service.replaceAgent(profile, this.#creationOptions(options))
 					: (await service.removeAgent(profile.agentId), await service.createAgent(profile, this.#creationOptions(options)));
-				this.#assertActive(lifecycleGeneration);
-				this.#assignments.set(profile.agentId, profile);
 				return agent;
-			}, 'replace');
+			}, 'replace', { outcomeIdentity: profileIdentity(profile) });
+			this.#assertActive(lifecycleGeneration);
+			this.#assignments.set(profile.agentId, profile);
+			this.#acceptedAgents.set(profile.agentId, agent);
+			return agent;
 		})();
 		const entry = { profile, promise };
 		this.#replacing.set(profile.agentId, entry);
@@ -195,10 +202,7 @@ export class ProviderService extends EventEmitter {
 
 	getAgent(agentId) {
 		if (this.#stopped) return null;
-		const assigned = this.#assignments.get(agentId);
-		if (assigned !== undefined) return this.#services.get(assigned.provider).getAgent(agentId);
-		for (const service of this.#services.values()) { const agent = service.getAgent?.(agentId); if (agent !== null && agent !== undefined) return agent; }
-		return null;
+		return this.#acceptedAgents.get(agentId) ?? null;
 	}
 
 	async removeAgent(agentId) {
@@ -212,8 +216,9 @@ export class ProviderService extends EventEmitter {
 		}
 		const assigned = this.#assignments.get(agentId);
 		this.#assignments.delete(agentId);
-		if (assigned !== undefined) return this.#execute(assigned.provider, () => this.#services.get(assigned.provider).removeAgent(agentId), 'remove');
-		const results = await Promise.all([...this.#startedProviders].map((provider) => this.#execute(provider, () => this.#services.get(provider).removeAgent(agentId), 'remove')));
+		this.#acceptedAgents.delete(agentId);
+		if (assigned !== undefined) return this.#execute(assigned.provider, () => this.#services.get(assigned.provider).removeAgent(agentId), 'remove', { outcomeIdentity: String(agentId) });
+		const results = await Promise.all([...this.#startedProviders].map((provider) => this.#execute(provider, () => this.#services.get(provider).removeAgent(agentId), 'remove', { outcomeIdentity: String(agentId) })));
 		return results.some(Boolean);
 	}
 
@@ -240,20 +245,26 @@ export class ProviderService extends EventEmitter {
 				return { provider, result: await this.#execute(provider, () => this.#services.get(provider).reconcile(groups.get(provider), {
 					signal: controller.signal,
 					generation: reconciliationGeneration,
-				}), 'reconcile', { recordSuccess: false }) };
+				}), 'reconcile', { recordSuccess: false, outcomeIdentity: 'provider-roster' }) };
 			} catch (error) {
 				return { provider, error };
 			}
 		}));
 		this.#assertReconciliationCurrent(reconciliationGeneration, lifecycleGeneration);
 		const previousAssignments = this.#assignments;
+		const previousAgents = this.#acceptedAgents;
 		const nextAssignments = new Map();
+		const nextAgents = new Map();
 		for (const { provider, result, error } of settled) {
 			if (error !== undefined) {
 				for (const profileValue of groups.get(provider)) {
 					const profile = freezeProfile(profileValue);
 					const previous = previousAssignments.get(profile.agentId);
-					if (previous !== undefined && profilesMatch(previous, profile)) nextAssignments.set(profile.agentId, previous);
+					if (previous !== undefined && profilesMatch(previous, profile)) {
+						nextAssignments.set(profile.agentId, previous);
+						const agent = previousAgents.get(profile.agentId);
+						if (agent !== undefined) nextAgents.set(profile.agentId, agent);
+					}
 				}
 				continue;
 			}
@@ -263,15 +274,20 @@ export class ProviderService extends EventEmitter {
 				if (existing !== undefined) {
 					assertSameProfile(existing, normalized);
 					nextAssignments.set(normalized.agentId, existing);
+					const agent = this.#services.get(provider).getAgent?.(normalized.agentId);
+					if (agent !== null && agent !== undefined) nextAgents.set(normalized.agentId, agent);
 					continue;
 				}
 				nextAssignments.set(normalized.agentId, normalized);
+				const agent = this.#services.get(provider).getAgent?.(normalized.agentId);
+				if (agent !== null && agent !== undefined) nextAgents.set(normalized.agentId, agent);
 			}
 		}
 		const failures = settled.filter(({ error }) => error !== undefined);
 		const catalog = await this.catalog.refresh({ providers: selectedProviders, fallbackProviders: failures.map(({ provider }) => provider) });
 		this.#assertReconciliationCurrent(reconciliationGeneration, lifecycleGeneration);
 		this.#assignments = nextAssignments;
+		this.#acceptedAgents = nextAgents;
 		for (const { provider, result } of settled) if (result !== undefined) this.#recordLive(provider, 'reconcile');
 		return {
 			valid: settled.flatMap(({ result }) => result?.valid ?? []),
@@ -288,20 +304,17 @@ export class ProviderService extends EventEmitter {
 		}
 	}
 
-	async #execute(provider, operation, boundary, { recordSuccess = true } = {}) {
+	async #execute(provider, operation, boundary, { recordSuccess = true, outcomeIdentity = boundary } = {}) {
 		if (this.#stopped) throw providerError('PROVIDER_STOPPED', 'Provider service is stopped');
 		const lifecycleGeneration = this.#lifecycleGeneration;
-		const outcomeAttempt = this.#beginOutcomeAttempt(provider, boundary, lifecycleGeneration);
-		let startup = null;
-		const task = Promise.resolve()
-			.then(() => {
-				startup = this.#ensureStarted(provider, lifecycleGeneration);
-				return startup?.promise;
-			})
-			.then(() => {
-				this.#assertActive(lifecycleGeneration);
-				return operation();
-			});
+		const startup = this.#ensureStarted(provider, lifecycleGeneration);
+		if (startup !== null) await startup.promise;
+		this.#assertActive(lifecycleGeneration);
+		const outcomeAttempt = this.#beginOutcomeAttempt(provider, boundary, lifecycleGeneration, outcomeIdentity);
+		const task = Promise.resolve().then(() => {
+			this.#assertActive(lifecycleGeneration);
+			return operation();
+		});
 		const observed = task.then((result) => {
 			this.#assertActive(lifecycleGeneration);
 			if (!this.#acceptsOutcome(outcomeAttempt) && outcomeAttempt.key !== null) throw providerError('STALE_PROVIDER_OUTCOME', 'Provider outcome attempt was superseded');
@@ -319,7 +332,6 @@ export class ProviderService extends EventEmitter {
 			return await bounded;
 		} catch (error) {
 			if (error?.code === 'PROVIDER_TIMEOUT' && this.#ownsOutcomeAttempt(outcomeAttempt)) {
-				if (startup !== null && !this.#startedProviders.has(provider) && this.#starting.get(provider) === startup) this.#starting.delete(provider);
 				this.#recordDegraded(provider, error, boundary);
 			}
 			throw error;
@@ -329,8 +341,8 @@ export class ProviderService extends EventEmitter {
 		}
 	}
 
-	#beginOutcomeAttempt(provider, boundary, lifecycleGeneration) {
-		const key = AUTOMATIC_RECOVERY_BOUNDARIES.has(boundary) ? `${provider}:${boundary}` : null;
+	#beginOutcomeAttempt(provider, boundary, lifecycleGeneration, outcomeIdentity) {
+		const key = `${provider}:${boundary}:${String(outcomeIdentity)}`;
 		const attempt = { key, provider, boundary, lifecycleGeneration, generation: ++this.#outcomeAttemptSequence, acceptOutcome: true };
 		if (key !== null) {
 			const previous = this.#outcomeAttempts.get(key);
@@ -342,7 +354,7 @@ export class ProviderService extends EventEmitter {
 
 	#ownsOutcomeAttempt(attempt) {
 		return !this.#stopped && attempt.lifecycleGeneration === this.#lifecycleGeneration
-			&& (attempt.key === null || this.#outcomeAttempts.get(attempt.key) === attempt);
+			&& this.#outcomeAttempts.get(attempt.key) === attempt;
 	}
 
 	#acceptsOutcome(attempt) {
@@ -351,7 +363,14 @@ export class ProviderService extends EventEmitter {
 
 	#finishOutcomeAttempt(attempt) {
 		attempt.acceptOutcome = false;
-		if (attempt.key !== null && this.#outcomeAttempts.get(attempt.key) === attempt) this.#outcomeAttempts.delete(attempt.key);
+		if (this.#outcomeAttempts.get(attempt.key) === attempt) this.#outcomeAttempts.delete(attempt.key);
+	}
+
+	async #startProvider(provider) {
+		if (this.#stopped) throw providerError('PROVIDER_STOPPED', 'Provider service is stopped');
+		const lifecycleGeneration = this.#lifecycleGeneration;
+		const starting = this.#ensureStarted(provider, lifecycleGeneration);
+		if (starting !== null) await starting.promise;
 	}
 
 	#ensureStarted(provider, lifecycleGeneration) {
@@ -360,16 +379,32 @@ export class ProviderService extends EventEmitter {
 		if (pending !== undefined) return pending;
 		const service = this.#services.get(provider);
 		if (service === undefined) throw new TypeError(`${provider} service is unavailable`);
+		const outcomeAttempt = this.#beginOutcomeAttempt(provider, 'startup', lifecycleGeneration, 'physical-start');
 		const starting = { promise: null };
-		starting.promise = Promise.resolve()
+		const task = Promise.resolve()
 			.then(() => this.#assertActive(lifecycleGeneration))
 			.then(() => service.start())
 			.then(() => {
 				this.#assertActive(lifecycleGeneration);
-				if (this.#starting.get(provider) !== starting) throw providerError('STALE_PROVIDER_START', 'Provider startup generation was superseded');
+				if (this.#starting.get(provider) !== starting || !this.#acceptsOutcome(outcomeAttempt)) throw providerError('STALE_PROVIDER_START', 'Provider startup generation was superseded');
 				this.#startedProviders.add(provider);
-			})
-			.finally(() => { if (this.#starting.get(provider) === starting) this.#starting.delete(provider); });
+				this.#recordLive(provider, 'startup');
+			}, (error) => {
+				if (!isLifecycleFenceError(error) && this.#acceptsOutcome(outcomeAttempt)) this.#recordDegraded(provider, error, 'startup');
+				throw error;
+			});
+		const bounded = withTimeout(task, this.#operationTimeoutMs, this.#scheduleTimeout, this.#cancelTimeout, provider, {
+			onTimeout: () => { outcomeAttempt.acceptOutcome = false; },
+		});
+		this.#inFlight.add(bounded);
+		starting.promise = bounded.catch((error) => {
+			if (error?.code === 'PROVIDER_TIMEOUT' && this.#ownsOutcomeAttempt(outcomeAttempt)) this.#recordDegraded(provider, error, 'startup');
+			throw error;
+		}).finally(() => {
+			this.#inFlight.delete(bounded);
+			this.#finishOutcomeAttempt(outcomeAttempt);
+			if (this.#starting.get(provider) === starting) this.#starting.delete(provider);
+		});
 		this.#starting.set(provider, starting);
 		return starting;
 	}
@@ -476,7 +511,7 @@ export class ProviderService extends EventEmitter {
 			return;
 		}
 		try {
-			if (token.boundary === 'startup') await this.#execute(provider, () => undefined, 'startup');
+			if (token.boundary === 'startup') await this.#startProvider(provider);
 			else await this.catalog.refresh({ providers: [provider] });
 		} catch { /* the failed operation records and schedules its own next retry */ }
 		finally { this.#syncRecoveryTimer(provider); }
@@ -610,6 +645,10 @@ function normalizeProviderSelection(values, services, { defaultToAll }) {
 
 function profilesMatch(left, right) {
 	return PROFILE_KEYS.every((key) => left[key] === right[key]);
+}
+
+function profileIdentity(profile) {
+	return JSON.stringify(PROFILE_KEYS.map((key) => profile[key] ?? null));
 }
 
 function providerFailure(profile, error) {

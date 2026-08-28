@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { types as utilTypes } from 'node:util';
 
 import { DynamicAgentState } from '../src/agent-registry.mjs';
 import { BestEffortDiagnosticQueue } from '../src/best-effort-diagnostic-queue.mjs';
@@ -56,6 +57,22 @@ test('recovery matrix evidence contract rejects omitted, null, and fabricated me
 	mutableSession.profile.model = 'after';
 	assert.equal(immutableSession.value.profile.model, 'before');
 	assert.equal(Object.isFrozen(immutableSession.value.profile), true);
+	let getterCalls = 0;
+	const accessor = {};
+	Object.defineProperty(accessor, 'pending', { enumerable: true, get() { getterCalls += 1; return 0; } });
+	assert.throws(() => sessionEvidence(accessor, 'accessor rejection sampler'), /cannot contain accessors/);
+	assert.equal(getterCalls, 0, 'evidence rejection never invokes an accessor');
+	const cyclic = {};
+	cyclic.self = cyclic;
+	assert.throws(() => sessionEvidence(cyclic, 'cyclic rejection sampler'), (error) => error instanceof TypeError && /cannot contain cycles/.test(error.message));
+	let proxyTrapCalls = 0;
+	const proxy = new Proxy({}, {
+		getPrototypeOf() { proxyTrapCalls += 1; throw new Error('proxy trap must not execute'); },
+		ownKeys() { proxyTrapCalls += 1; throw new Error('proxy trap must not execute'); },
+	});
+	assert.throws(() => sessionEvidence(proxy, 'proxy rejection sampler'), (error) => error instanceof TypeError && /cannot contain proxies/.test(error.message));
+	assert.equal(proxyTrapCalls, 0, 'proxy detection rejects before reflective traps');
+	assert.throws(() => sessionEvidence(Object.create({ hostile: true }), 'prototype rejection sampler'), /plain arrays and records/);
 	const invalid = {
 		recovery: { healthy: true, permanentLatch: false, stateBefore: 'fault', stateAfter: 'ready', nextProbeAtEpochMs: null, attemptTimes: [], probeDeadlines: [], retryDelays: [], attemptCount: 0 },
 		states: statesEvidence([], 'test registry sampler'),
@@ -71,60 +88,84 @@ test('recovery matrix evidence contract rejects omitted, null, and fabricated me
 });
 
 for (const order of ['startup-first', 'catalog-first']) {
-	test(`provider recovery canonical selector survives overlapping tied failures (${order})`, async () => {
+	test(`provider startup ownership is deduplicated across concurrent catalog and startup callers (${order})`, async () => {
 		const fixture = await overlappingProviderFailures(order);
 		const { router, timers, startTimes, catalogTimes } = fixture;
 		try {
 			let recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
-			assert.equal(recovery.boundary, 'catalog', 'same-deadline ties select the deterministic catalog boundary');
+			assert.equal(recovery.boundary, 'startup');
 			assert.equal(recovery.failureCode, 'SHARED_START_FAILURE');
 			assert.equal(recovery.nextProbeAtEpochMs, 1_000);
-			assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs, 'status and the owned physical timer share one canonical deadline');
-			assert.equal(recovery.totalFailureCount, 2);
-			assert.deepEqual(recovery.boundaryFailureCounts, { catalog: 1, startup: 1 });
+			assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs);
+			assert.equal(recovery.totalFailureCount, 1, 'one shared backend start publishes one failure');
+			assert.deepEqual(recovery.boundaryFailureCounts, { startup: 1 });
+			assert.deepEqual(startTimes, [0], 'both callers consume one physical provider start');
+			assert.deepEqual(catalogTimes, [], 'catalog discovery cannot run after its shared startup failed');
+			const staleFirstCallback = timers.peekNextCallback();
 
 			timers.advanceTo(100);
 			const laterStartup = await router.start(['codex']);
 			assert.equal(laterStartup[0].reason?.code, 'LATER_START_FAILURE');
 			recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
-			assert.equal(recovery.boundary, 'catalog', 'the advertised record stays on the physically earliest timer');
-			assert.equal(recovery.nextProbeAtEpochMs, 1_000);
-			assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs);
-			assert.equal(recovery.totalFailureCount, 3);
-			assert.deepEqual(recovery.boundaryFailureCounts, { catalog: 1, startup: 2 });
-
-			const staleCatalogCallback = timers.peekNextCallback();
-			timers.advanceTo(999);
-			await flush();
-			assert.deepEqual(catalogTimes, [], 'no catalog probe runs before the advertised deadline');
-			await timers.runNext();
-			assert.deepEqual(catalogTimes, [1_000], 'one catalog probe runs at its exact deadline');
-			recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
-			assert.equal(recovery.boundary, 'startup', 'clearing the earliest boundary deterministically reselects the remaining failure');
-			assert.equal(recovery.failureCode, 'LATER_START_FAILURE');
+			assert.equal(recovery.boundary, 'startup');
 			assert.equal(recovery.nextProbeAtEpochMs, 2_100);
-			assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs, 'reselection updates status and timer atomically');
+			assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs);
+			assert.equal(recovery.totalFailureCount, 2);
 			assert.deepEqual(recovery.boundaryFailureCounts, { startup: 2 });
-			const staleStartupCallback = timers.peekNextCallback();
+			await staleFirstCallback();
+			assert.deepEqual(startTimes, [0, 100], 'a replaced startup deadline cannot launch a stale probe');
 
-			await staleCatalogCallback();
-			assert.deepEqual(catalogTimes, [1_000], 'a stale fired callback cannot launch a duplicate probe');
 			timers.advanceTo(2_099);
 			await flush();
-			assert.deepEqual(startTimes, [0, 100, 1_000], 'the remaining boundary does not probe before its advertised deadline');
+			assert.deepEqual(startTimes, [0, 100], 'no probe runs before the advertised deadline');
 			await timers.runNext();
 			recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
 			assert.equal(recovery.state, 'live');
 			assert.equal(recovery.totalFailureCount, 0);
 			assert.deepEqual(recovery.boundaryFailureCounts, {});
-			await staleStartupCallback();
-			assert.deepEqual(startTimes, [0, 100, 1_000], 'a callback captured before restoration is fenced after live promotion');
+			assert.deepEqual(startTimes, [0, 100, 2_100], 'automatic recovery performs exactly one physical start at the deadline');
+			assert.equal(timers.snapshot().pending, 0, 'successful startup clears the shared failure without a no-op follow-up probe');
 		} finally {
 			await router.stop();
 		}
 		assert.equal(timers.snapshot().pending, 0);
 	});
 }
+
+test('catalog probe atomically restores a failed shared startup without a no-op startup interval', async () => {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	let startAttempts = 0;
+	let rejectShared;
+	let catalogAttempts = 0;
+	services.codex.start = () => {
+		startAttempts += 1;
+		if (startAttempts === 1) return new Promise((_, reject) => { rejectShared = reject; });
+	};
+	services.codex.catalog.refresh = async () => {
+		catalogAttempts += 1;
+		return catalog('codex', PROFILE.model);
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 10_000, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		const startup = router.start(['codex']);
+		const discovery = router.catalog.refresh({ providers: ['codex'] });
+		await flush();
+		rejectShared(Object.assign(new Error('shared failure'), { code: 'SHARED_START_FAILURE' }));
+		await Promise.all([startup, discovery]);
+		assert.equal(startAttempts, 1);
+		assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').totalFailureCount, 1);
+
+		const restored = await router.catalog.refresh({ providers: ['codex'] });
+		assert.equal(restored.source, 'live');
+		assert.equal(startAttempts, 2, 'the catalog probe owns one restored physical startup');
+		assert.equal(catalogAttempts, 1);
+		assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'live');
+		assert.equal(timers.snapshot().pending, 0, 'startup and catalog success clear recovery in one probe');
+	} finally {
+		await router.stop();
+	}
+});
 
 test('provider recovery stop fences a captured overlapping-boundary callback', async () => {
 	const { router, timers, startTimes, catalogTimes } = await overlappingProviderFailures('startup-first');
@@ -192,6 +233,77 @@ test('non-automatic provider failures publish no fictional probe deadline or tim
 		await router.stop();
 	}
 });
+
+for (const operation of ['create', 'replace']) {
+	for (const settlement of ['resolve', 'reject']) {
+		test(`${operation} timeout fences old ${settlement} after a newer operation failure`, async () => {
+			await assertNonAutomaticOutcomeFence({ operation, settlement });
+		});
+	}
+}
+
+async function assertNonAutomaticOutcomeFence({ operation, settlement }) {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	const initialAgent = { agentId: PROFILE.agentId, profile: PROFILE, sessionGeneration: 1 };
+	let backendCurrent = null;
+	let settleOld;
+	let attempt = 0;
+	if (operation === 'create') {
+		services.codex.createAgent = async () => {
+			attempt += 1;
+			if (attempt === 2) throw Object.assign(new Error('newer create failure'), { code: 'SECOND_CREATE_FAILURE' });
+			return new Promise((resolve, reject) => {
+				settleOld = () => {
+					if (settlement === 'reject') return reject(Object.assign(new Error('late create rejection'), { code: 'LATE_CREATE_REJECTION' }));
+					backendCurrent = { agentId: PROFILE.agentId, profile: PROFILE, sessionGeneration: 99 };
+					resolve(backendCurrent);
+				};
+			});
+		};
+	} else {
+		services.codex.createAgent = async () => {
+			backendCurrent = initialAgent;
+			return initialAgent;
+		};
+		services.codex.replaceAgent = async () => {
+			attempt += 1;
+			if (attempt === 2) throw Object.assign(new Error('newer replace failure'), { code: 'SECOND_REPLACE_FAILURE' });
+			return new Promise((resolve, reject) => {
+				settleOld = () => {
+					if (settlement === 'reject') return reject(Object.assign(new Error('late replace rejection'), { code: 'LATE_REPLACE_REJECTION' }));
+					backendCurrent = { agentId: PROFILE.agentId, profile: PROFILE, sessionGeneration: 99 };
+					resolve(backendCurrent);
+				};
+			});
+		};
+	}
+	services.codex.getAgent = (agentId) => backendCurrent?.agentId === agentId ? backendCurrent : null;
+	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		if (operation === 'replace') await router.createAgent(PROFILE);
+		const first = operation === 'create' ? router.createAgent(PROFILE) : router.replaceAgent(PROFILE);
+		const firstRejected = assert.rejects(first, (error) => error?.code === 'PROVIDER_TIMEOUT');
+		await flush();
+		await timers.runNext();
+		await firstRejected;
+		const second = operation === 'create' ? router.createAgent(PROFILE) : router.replaceAgent(PROFILE);
+		await assert.rejects(second, (error) => error?.code === `SECOND_${operation.toUpperCase()}_FAILURE`);
+		let recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.failureCode, `SECOND_${operation.toUpperCase()}_FAILURE`);
+		assert.equal(recovery.boundaryFailureCounts[operation], 2, 'timeout and newer physical failure are each counted once');
+		assert.equal(recovery.nextProbeAtEpochMs, null);
+		settleOld();
+		await flush();
+		recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.failureCode, `SECOND_${operation.toUpperCase()}_FAILURE`, 'late old settlement cannot overwrite the newer failure');
+		assert.equal(recovery.boundaryFailureCounts[operation], 2, 'late old settlement cannot count twice');
+		assert.equal(router.getAgent(PROFILE.agentId), operation === 'replace' ? initialAgent : null, 'late old settlement cannot replace the accepted provider session');
+	} finally {
+		settleOld?.();
+		await router.stop();
+	}
+}
 
 for (const boundary of ['startup', 'catalog']) {
 	for (const settlement of ['resolve', 'reject']) {
@@ -765,7 +877,7 @@ function assertEvidenceEntry(entry, name) {
 function issueEvidence(category, kind, value, source) {
 	if (![...RESOURCE_NAMES, 'states', 'profile'].includes(category)) throw new TypeError('evidence category is invalid');
 	if (value === null || value === undefined || typeof value !== 'object') throw new TypeError('sampler produced no evidence value');
-	const snapshot = deepFreeze(structuredClone(value));
+	const snapshot = cloneEvidenceValue(value);
 	const entry = Object.freeze({ kind, category, value: snapshot, source });
 	TRUSTED_EVIDENCE.add(entry);
 	return entry;
@@ -804,10 +916,52 @@ function listenerEvidence(stats, source) {
 	return issueEvidence('listeners', 'observed', { current: stats.current, maximum: stats.maximum }, source);
 }
 
-function deepFreeze(value) {
-	if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
-	for (const child of Object.values(value)) deepFreeze(child);
-	return Object.freeze(value);
+function cloneEvidenceValue(root) {
+	const clones = new WeakMap();
+	const active = new WeakSet();
+	let entries = 0;
+	const clone = (value, depth) => {
+		if (value === null || ['string', 'number', 'boolean', 'undefined'].includes(typeof value)) return value;
+		if (typeof value !== 'object') throw new TypeError('evidence values must contain only data');
+		if (utilTypes.isProxy(value)) throw new TypeError('evidence values cannot contain proxies');
+		if (depth > 32) throw new TypeError('evidence value exceeds maximum depth');
+		if (active.has(value)) throw new TypeError('evidence values cannot contain cycles');
+		if (clones.has(value)) return clones.get(value);
+		const prototype = Object.getPrototypeOf(value);
+		const array = Array.isArray(value);
+		if (prototype !== (array ? Array.prototype : Object.prototype) && prototype !== null) throw new TypeError('evidence values must contain only plain arrays and records');
+		const keys = Reflect.ownKeys(value);
+		if (keys.some((key) => typeof key === 'symbol')) throw new TypeError('evidence values cannot contain symbol properties');
+		entries += keys.length - (array && keys.includes('length') ? 1 : 0);
+		if (entries > 10_000) throw new TypeError('evidence value exceeds maximum entries');
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const copy = array ? [] : Object.create(prototype);
+		clones.set(value, copy);
+		active.add(value);
+		for (const key of keys) {
+			if (array && key === 'length') continue;
+			const descriptor = descriptors[key];
+			if (!Object.hasOwn(descriptor, 'value')) throw new TypeError('evidence values cannot contain accessors');
+			Object.defineProperty(copy, key, {
+				value: clone(descriptor.value, depth + 1),
+				enumerable: descriptor.enumerable,
+				configurable: true,
+				writable: true,
+			});
+		}
+		active.delete(value);
+		return copy;
+	};
+	const snapshot = clone(root, 0);
+	const frozen = new WeakSet();
+	const freeze = (value) => {
+		if (value === null || typeof value !== 'object' || frozen.has(value)) return;
+		frozen.add(value);
+		for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) if (Object.hasOwn(descriptor, 'value')) freeze(descriptor.value);
+		Object.freeze(value);
+	};
+	freeze(snapshot);
+	return snapshot;
 }
 
 function assertNoDomainFailure(entry) {
