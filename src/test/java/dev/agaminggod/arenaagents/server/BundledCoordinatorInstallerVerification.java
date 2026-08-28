@@ -27,6 +27,8 @@ public final class BundledCoordinatorInstallerVerification {
 		int assertions = 0;
 		assertions += verifyConfiguredSecretPathUsesPreparedRuntime();
 		assertions += verifyVerifiedGenerationCanRollbackCandidate();
+		assertions += verifyRejectedGenerationMarkerSafety();
+		assertions += verifyInterruptedRollbackRetainsRejectedGeneration();
 		assertions += verifyCorruptedActiveGenerationRollsBackToVerifiedRuntime();
 		assertions += verifySupervisorAutomaticallyRestoresCorruptedRuntime();
 		assertions += verifySupervisorRejectsCorruptionWithoutValidLastKnownGood();
@@ -392,17 +394,107 @@ public final class BundledCoordinatorInstallerVerification {
 			assertEquals(configHash, sha256(Files.readAllBytes(config)), "rollback preserves canonical config bytes");
 			assertEquals(secretHash, sha256(Files.readAllBytes(secret)), "rollback preserves bridge-secret bytes");
 
-			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestB, mainB, changedDefault))),
-					"generation B can be prepared again after rollback backoff");
-			assertTrue(BundledCoordinatorInstaller.promote(packageRoot, generationB),
-					"stable generation B becomes verified");
-			assertFalse(BundledCoordinatorInstaller.promote(packageRoot, generationB),
-					"repeating promotion is idempotent");
-			BundledCoordinatorInstaller.RuntimePackage promotedB = BundledCoordinatorInstaller.validate(packageRoot);
-			assertFalse(promotedB.candidate(), "promoted generation B is verified");
+			assertFalse(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestB, mainB, changedDefault))),
+					"a rejected generation is quarantined after rollback");
+			assertEquals("main A", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"dependency refresh does not immediately reinstall identical rejected bytes");
+			assertFalse(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestB, mainB, changedDefault))),
+					"the rejected-generation quarantine survives a fresh installer invocation");
+			assertEquals(configHash, sha256(Files.readAllBytes(config)), "quarantine preserves canonical config bytes");
+			assertEquals(secretHash, sha256(Files.readAllBytes(secret)), "quarantine preserves bridge-secret bytes");
+			Properties rolledBackState = loadProperties(packageRoot.resolve("runtime/coordinator-generation.properties"));
+			assertEquals(generationB, rolledBackState.getProperty("rejectedGeneration"),
+					"rollback persists only the rejected generation digest");
+
+			byte[] mainC = "main C".getBytes(StandardCharsets.UTF_8);
+			String manifestC = manifest(entry("src/dynamic-main.mjs", mainC), entry("config/dynamic-agents.json", changedDefault));
+			String generationC = sha256(manifestC.getBytes(StandardCharsets.UTF_8));
+			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestC, mainC, changedDefault))),
+					"a genuinely new bundled generation can replace the quarantined one");
+			assertEquals("main C", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"the new generation owns the active path");
+			Properties activatedState = loadProperties(packageRoot.resolve("runtime/coordinator-generation.properties"));
+			assertEquals("", activatedState.getProperty("rejectedGeneration", ""),
+					"successful activation of a new generation clears the quarantine");
+			assertTrue(BundledCoordinatorInstaller.promote(packageRoot, generationC),
+					"stable generation C becomes verified");
+			assertFalse(BundledCoordinatorInstaller.validate(packageRoot).candidate(),
+					"promoted generation C is verified");
 			assertEquals("main A", Files.readString(packageRoot.resolve("coordinator.last-known-good/src/dynamic-main.mjs")),
 					"promotion retains one prior verified generation for the next rollback");
-			return 25;
+			return 32;
+		} finally {
+			deleteTree(packageRoot);
+		}
+	}
+
+	private static int verifyRejectedGenerationMarkerSafety() throws Exception {
+		Path packageRoot = Files.createTempDirectory("arena-coordinator-rejected-marker");
+		try {
+			byte[] main = "valid generation".getBytes(StandardCharsets.UTF_8);
+			byte[] config = "{}".getBytes(StandardCharsets.UTF_8);
+			String manifest = manifest(entry("src/dynamic-main.mjs", main), entry("config/dynamic-agents.json", config));
+			BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifest, main, config)));
+			Path stateFile = packageRoot.resolve("runtime/coordinator-generation.properties");
+			Properties state = loadProperties(stateFile);
+			state.setProperty("rejectedGeneration", "../outside");
+			storeProperties(stateFile, state);
+			assertThrowsStateFailure(packageRoot, "an unsafe rejected-generation marker is refused");
+			assertEquals("valid generation", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"invalid marker parsing cannot mutate the active generation");
+
+			state.remove("rejectedGeneration");
+			storeProperties(stateFile, state);
+			Files.writeString(stateFile, "x".repeat(8_192), StandardCharsets.UTF_8);
+			assertThrowsStateFailure(packageRoot, "an oversized persisted generation marker journal is refused");
+			assertEquals("valid generation", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"oversized state parsing cannot mutate the active generation");
+			assertTrue(Files.size(stateFile) > 4_096L, "the oversized-state fixture exceeds the parser bound");
+			return 5;
+		} finally {
+			deleteTree(packageRoot);
+		}
+	}
+
+	private static int verifyInterruptedRollbackRetainsRejectedGeneration() throws Exception {
+		Path packageRoot = Files.createTempDirectory("arena-coordinator-rejected-recovery");
+		try {
+			byte[] config = "{}".getBytes(StandardCharsets.UTF_8);
+			byte[] mainA = "recovery A".getBytes(StandardCharsets.UTF_8);
+			String manifestA = manifest(entry("src/dynamic-main.mjs", mainA), entry("config/dynamic-agents.json", config));
+			String generationA = sha256(manifestA.getBytes(StandardCharsets.UTF_8));
+			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestA, mainA, config))),
+					"recovery fixture installs generation A");
+			assertTrue(BundledCoordinatorInstaller.promote(packageRoot, generationA),
+					"recovery fixture verifies generation A");
+
+			byte[] mainB = "recovery B".getBytes(StandardCharsets.UTF_8);
+			String manifestB = manifest(entry("src/dynamic-main.mjs", mainB), entry("config/dynamic-agents.json", config));
+			String generationB = sha256(manifestB.getBytes(StandardCharsets.UTF_8));
+			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestB, mainB, config))),
+					"recovery fixture activates generation B");
+
+			Path stateFile = packageRoot.resolve("runtime/coordinator-generation.properties");
+			Properties interrupted = loadProperties(stateFile);
+			interrupted.setProperty("phase", "rollback");
+			interrupted.setProperty("verifiedGeneration", generationA);
+			interrupted.setProperty("candidateGeneration", generationB);
+			interrupted.setProperty("lastKnownGoodGeneration", generationA);
+			interrupted.setProperty("stagingDirectory", "coordinator.staging-rollback-" + generationB);
+			interrupted.setProperty("previousActiveGeneration", generationB);
+			interrupted.setProperty("rejectedGeneration", generationB);
+			storeProperties(stateFile, interrupted);
+
+			BundledCoordinatorInstaller.RuntimePackage recovered = BundledCoordinatorInstaller.validate(packageRoot);
+			assertEquals(generationA, recovered.generationId(), "restart completes the interrupted rollback to generation A");
+			assertFalse(recovered.candidate(), "the recovered verified runtime is not a candidate");
+			assertEquals(generationB, loadProperties(stateFile).getProperty("rejectedGeneration"),
+					"rollback recovery preserves the rejected-generation quarantine");
+			assertFalse(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestB, mainB, config))),
+					"dependency refresh after recovery still refuses identical rejected bytes");
+			assertEquals("recovery A", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"recovery leaves the verified generation active");
+			return 8;
 		} finally {
 			deleteTree(packageRoot);
 		}
@@ -637,6 +729,29 @@ public final class BundledCoordinatorInstallerVerification {
 			return 6;
 		} finally {
 			deleteTree(packageRoot);
+		}
+	}
+
+	private static void assertThrowsStateFailure(Path packageRoot, String label) {
+		try {
+			BundledCoordinatorInstaller.validate(packageRoot);
+			throw new AssertionError(label);
+		} catch (IOException | IllegalArgumentException expected) {
+			// Expected validation boundary.
+		}
+	}
+
+	private static Properties loadProperties(Path path) throws IOException {
+		Properties properties = new Properties();
+		try (var reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+			properties.load(reader);
+		}
+		return properties;
+	}
+
+	private static void storeProperties(Path path, Properties properties) throws IOException {
+		try (var writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+			properties.store(writer, null);
 		}
 	}
 

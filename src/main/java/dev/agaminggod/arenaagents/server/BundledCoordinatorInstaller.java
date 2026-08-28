@@ -2,7 +2,6 @@ package dev.agaminggod.arenaagents.server;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.Reader;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -36,6 +35,7 @@ final class BundledCoordinatorInstaller {
 	private static final String LAST_KNOWN_GOOD_NAME = "coordinator.last-known-good";
 	private static final String STAGING_PREFIX = "coordinator.staging-";
 	private static final int MAX_STAGING_CLEANUP = 8;
+	private static final int MAX_STATE_BYTES = 4_096;
 	private static final int SWAP_ATTEMPTS = 21;
 	private static final long SWAP_RETRY_DELAY_MS = 50L;
 
@@ -86,6 +86,16 @@ final class BundledCoordinatorInstaller {
 		String generationId = sha256(manifest.getBytes(StandardCharsets.UTF_8));
 		Path active = root.resolve(ACTIVE_NAME);
 		GenerationState state = readState(root);
+		if (state.phase().equals(Phase.READY.value)
+				&& generationId.equals(state.rejectedGeneration())
+				&& state.activeGeneration().equals(state.verifiedGeneration())
+				&& !generationId.equals(state.activeGeneration())
+				&& generationMatches(active, state.activeGeneration())) {
+			ensureExternalConfig(root, active, entries, resources);
+			ensureSecret(root.resolve(SECRET_PATH));
+			cleanupStaging(root, null);
+			return false;
+		}
 		if (generationId.equals(generationOf(active)) && installedFilesMatch(active, entries)) {
 			ensureExternalConfig(root, active, entries, resources);
 			ensureSecret(root.resolve(SECRET_PATH));
@@ -115,7 +125,8 @@ final class BundledCoordinatorInstaller {
 				generationId,
 				retainedGeneration,
 				staging.getFileName().toString(),
-				previousActive
+				previousActive,
+				state.rejectedGeneration()
 		);
 		writeState(root, journal);
 		recoverInterruptedSwap(root, moveOperation);
@@ -137,7 +148,7 @@ final class BundledCoordinatorInstaller {
 		if (!generationId.equals(state.candidateGeneration())) return false;
 		writeState(root, new GenerationState(
 				Phase.READY.value, generationId, generationId, "",
-				state.lastKnownGoodGeneration(), "", ""
+				state.lastKnownGoodGeneration(), "", "", state.rejectedGeneration()
 		));
 		return true;
 	}
@@ -157,7 +168,7 @@ final class BundledCoordinatorInstaller {
 		if (Files.exists(holder, LinkOption.NOFOLLOW_LINKS)) deleteTree(root, holder);
 		writeState(root, new GenerationState(
 				Phase.ROLLBACK.value, failedGenerationId, retained, failedGenerationId, retained,
-				holder.getFileName().toString(), failedGenerationId
+				holder.getFileName().toString(), failedGenerationId, failedGenerationId
 		));
 		recoverInterruptedSwap(root, BundledCoordinatorInstaller::atomicMove);
 		cleanupStaging(root, null);
@@ -182,7 +193,7 @@ final class BundledCoordinatorInstaller {
 		if (Files.exists(holder, LinkOption.NOFOLLOW_LINKS)) deleteTree(root, holder);
 		writeState(root, new GenerationState(
 				Phase.ROLLBACK.value, failedGeneration, retained, failedGeneration, retained,
-				holder.getFileName().toString(), failedGeneration
+				holder.getFileName().toString(), failedGeneration, state.rejectedGeneration()
 		));
 		recoverInterruptedSwap(root, BundledCoordinatorInstaller::atomicMove);
 		cleanupStaging(root, null);
@@ -193,7 +204,7 @@ final class BundledCoordinatorInstaller {
 			throws IOException {
 		if (state.phase().equals(Phase.READY.value) && generationId.equals(state.activeGeneration())) return state;
 		String retained = validGeneration(root.resolve(LAST_KNOWN_GOOD_NAME));
-		return new GenerationState(Phase.READY.value, generationId, "", generationId, retained, "", "");
+		return new GenerationState(Phase.READY.value, generationId, "", generationId, retained, "", "", "");
 	}
 
 	private static void recoverInterruptedSwap(Path root, MoveOperation moveOperation) throws IOException {
@@ -248,7 +259,8 @@ final class BundledCoordinatorInstaller {
 		}
 		writeState(root, new GenerationState(
 				Phase.READY.value, state.activeGeneration(), state.verifiedGeneration(), state.candidateGeneration(),
-				retained, "", ""
+				retained, "", "", state.activeGeneration().equals(state.rejectedGeneration())
+						? state.rejectedGeneration() : ""
 		));
 	}
 
@@ -261,22 +273,32 @@ final class BundledCoordinatorInstaller {
 			MoveOperation moveOperation
 	) throws IOException {
 		if (generationMatches(active, state.previousActiveGeneration())) {
-			writeState(root, readyForRestored(state.previousActiveGeneration(), state.verifiedGeneration(), validGeneration(lkg)));
+			writeState(root, readyForRestored(
+					state.previousActiveGeneration(), state.verifiedGeneration(), validGeneration(lkg),
+					state.rejectedGeneration()
+			));
 			return;
 		}
 		if (generationMatches(lkg, state.verifiedGeneration())) {
 			if (Files.exists(active, LinkOption.NOFOLLOW_LINKS)) deleteTree(root, active);
 			moveDirectoryWithRetry(lkg, active, moveOperation);
-			writeState(root, readyForRestored(state.verifiedGeneration(), state.verifiedGeneration(), ""));
+			writeState(root, readyForRestored(
+					state.verifiedGeneration(), state.verifiedGeneration(), "", state.rejectedGeneration()
+			));
 			return;
 		}
 		if (Files.exists(staging, LinkOption.NOFOLLOW_LINKS)) deleteTree(root, staging);
 		throw new IOException("Interrupted coordinator activation has no validated runnable generation");
 	}
 
-	private static GenerationState readyForRestored(String active, String verified, String retained) {
+	private static GenerationState readyForRestored(
+			String active,
+			String verified,
+			String retained,
+			String rejected
+	) {
 		String candidate = active.equals(verified) ? "" : active;
-		return new GenerationState(Phase.READY.value, active, verified, candidate, retained, "", "");
+		return new GenerationState(Phase.READY.value, active, verified, candidate, retained, "", "", rejected);
 	}
 
 	private static void recoverRollback(Path root, GenerationState state, MoveOperation moveOperation)
@@ -304,7 +326,8 @@ final class BundledCoordinatorInstaller {
 		if (!Files.exists(active, LinkOption.NOFOLLOW_LINKS) && generationMatches(holder, state.candidateGeneration())) {
 			moveDirectoryWithRetry(holder, active, moveOperation);
 			writeState(root, new GenerationState(
-					Phase.READY.value, state.candidateGeneration(), "", state.candidateGeneration(), "", "", ""
+					Phase.READY.value, state.candidateGeneration(), "", state.candidateGeneration(), "", "", "",
+					state.rejectedGeneration()
 			));
 			return;
 		}
@@ -313,7 +336,8 @@ final class BundledCoordinatorInstaller {
 
 	private static void finishRollback(Path root, GenerationState state, Path holder) throws IOException {
 		writeState(root, new GenerationState(
-				Phase.READY.value, state.verifiedGeneration(), state.verifiedGeneration(), "", "", "", ""
+				Phase.READY.value, state.verifiedGeneration(), state.verifiedGeneration(), "", "", "", "",
+				state.rejectedGeneration()
 		));
 		if (Files.exists(holder, LinkOption.NOFOLLOW_LINKS)) deleteTree(root, holder);
 	}
@@ -525,19 +549,30 @@ final class BundledCoordinatorInstaller {
 		if (!Files.isRegularFile(stateFile, LinkOption.NOFOLLOW_LINKS) || linked(stateFile)) {
 			throw new IOException("Coordinator generation state is not a regular external file");
 		}
-		Properties values = new Properties();
-		try (Reader reader = Files.newBufferedReader(stateFile, StandardCharsets.UTF_8)) {
-			values.load(reader);
+		byte[] encoded;
+		try (InputStream input = Files.newInputStream(stateFile)) {
+			encoded = input.readNBytes(MAX_STATE_BYTES + 1);
 		}
-		GenerationState state = new GenerationState(
-				values.getProperty("phase", Phase.READY.value),
-				values.getProperty("activeGeneration", ""),
-				values.getProperty("verifiedGeneration", ""),
-				values.getProperty("candidateGeneration", ""),
-				values.getProperty("lastKnownGoodGeneration", ""),
-				values.getProperty("stagingDirectory", ""),
-				values.getProperty("previousActiveGeneration", "")
-		);
+		if (encoded.length > MAX_STATE_BYTES) {
+			throw new IOException("Coordinator generation state exceeds its size limit");
+		}
+		Properties values = new Properties();
+		values.load(new java.io.StringReader(new String(encoded, StandardCharsets.UTF_8)));
+		GenerationState state;
+		try {
+			state = new GenerationState(
+					values.getProperty("phase", Phase.READY.value),
+					values.getProperty("activeGeneration", ""),
+					values.getProperty("verifiedGeneration", ""),
+					values.getProperty("candidateGeneration", ""),
+					values.getProperty("lastKnownGoodGeneration", ""),
+					values.getProperty("stagingDirectory", ""),
+					values.getProperty("previousActiveGeneration", ""),
+					values.getProperty("rejectedGeneration", "")
+			);
+		} catch (IllegalArgumentException invalid) {
+			throw new IOException("Coordinator generation state contains an invalid generation ID", invalid);
+		}
 		state.validate();
 		return state;
 	}
@@ -555,6 +590,7 @@ final class BundledCoordinatorInstaller {
 		values.setProperty("lastKnownGoodGeneration", state.lastKnownGoodGeneration());
 		values.setProperty("stagingDirectory", state.stagingName());
 		values.setProperty("previousActiveGeneration", state.previousActiveGeneration());
+		values.setProperty("rejectedGeneration", state.rejectedGeneration());
 		try {
 			try (Writer writer = Files.newBufferedWriter(staging, StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW)) {
 				values.store(writer, "Arena Agents coordinator generation state");
@@ -746,7 +782,8 @@ final class BundledCoordinatorInstaller {
 			String candidateGeneration,
 			String lastKnownGoodGeneration,
 			String stagingName,
-			String previousActiveGeneration
+			String previousActiveGeneration,
+			String rejectedGeneration
 	) {
 		GenerationState {
 			phase = Objects.requireNonNull(phase, "generation phase must not be null");
@@ -756,10 +793,11 @@ final class BundledCoordinatorInstaller {
 			lastKnownGoodGeneration = boundedGeneration(lastKnownGoodGeneration);
 			stagingName = Objects.requireNonNull(stagingName, "staging name must not be null");
 			previousActiveGeneration = boundedGeneration(previousActiveGeneration);
+			rejectedGeneration = boundedGeneration(rejectedGeneration);
 		}
 
 		static GenerationState empty() {
-			return new GenerationState(Phase.READY.value, "", "", "", "", "", "");
+			return new GenerationState(Phase.READY.value, "", "", "", "", "", "", "");
 		}
 
 		void validate() throws IOException {

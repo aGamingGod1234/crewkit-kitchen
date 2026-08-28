@@ -61,6 +61,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyStaleLaunchAuthenticationIsRejected();
 		verifyStaleLaunchCannotSuppressReplacement();
 		verifyReconnectRecoveryAndExpiry();
+		verifyExternalCoordinatorReconnectGrace();
 		verifyContinuousStabilityResetsFailures();
 		verifyCandidatePromotionUsesMaintenanceWorker();
 		verifyCandidateReadinessGapRestartsStabilityWindow();
@@ -91,7 +92,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 225;
+		return 237;
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -661,6 +662,43 @@ public final class CoordinatorProcessSupervisorVerification {
 		assertEquals("COORDINATOR_RECONNECT_TIMEOUT", fixture.supervisor.failureCode(),
 				"expired reconnect reports its boundary");
 		assertEquals(1, child.terminations, "expired reconnect replaces the owned child");
+		fixture.supervisor.close();
+	}
+
+	private static void verifyExternalCoordinatorReconnectGrace() {
+		Fixture fixture = Fixture.ready();
+		fixture.supervisor.tick(true, null, 1L, true);
+		assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
+				"an authenticated coordinator without a launch ID is adopted");
+		assertEquals(0, fixture.launcher.launches.size(), "adoption does not launch a competing coordinator");
+
+		fixture.supervisor.tick(false, null, 1L, false);
+		CoordinatorRecoverySnapshot degraded = fixture.supervisor.snapshot();
+		assertEquals(CoordinatorRecoveryState.DEGRADED, degraded.state(),
+				"an adopted coordinator receives reconnect grace after disconnect");
+		assertEquals(fixture.clock.now + RECONNECT_TIMEOUT_MS, degraded.reconnectDeadlineEpochMs(),
+				"adopted coordinator reconnect grace is bounded");
+		assertEquals(0, fixture.launcher.launches.size(), "disconnect does not immediately launch a competitor");
+
+		fixture.clock.advance(RECONNECT_TIMEOUT_MS - 1L);
+		fixture.supervisor.tick(false, null, 1L, false);
+		assertEquals(0, fixture.launcher.launches.size(), "competitor remains suppressed throughout reconnect grace");
+		fixture.supervisor.tick(true, null, 2L, true);
+		assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
+				"an adopted coordinator can reconnect with a fresh authenticated session");
+		assertEquals(0, fixture.launcher.launches.size(), "successful reconnect keeps the external coordinator adopted");
+
+		fixture.supervisor.tick(false, null, 2L, false);
+		assertEquals(CoordinatorRecoveryState.DEGRADED, fixture.supervisor.snapshot().state(),
+				"a later disconnect starts a fresh reconnect window");
+		fixture.clock.advance(RECONNECT_TIMEOUT_MS - 1L);
+		fixture.supervisor.tick(false, null, 2L, false);
+		assertEquals(0, fixture.launcher.launches.size(), "the fresh reconnect window is honored in full");
+		fixture.clock.advance(1L);
+		fixture.supervisor.tick(false, null, 2L, false);
+		assertEquals(1, fixture.launcher.launches.size(), "a competitor launches only after reconnect grace expires");
+		assertEquals(CoordinatorRecoveryState.AUTHENTICATING, fixture.supervisor.snapshot().state(),
+				"the replacement must authenticate after the external grace expires");
 		fixture.supervisor.close();
 	}
 

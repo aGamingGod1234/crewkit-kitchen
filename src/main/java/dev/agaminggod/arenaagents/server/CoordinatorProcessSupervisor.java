@@ -576,10 +576,32 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		if (bridgeAuthenticated && authenticatedLaunchId == null) {
 			state = CoordinatorRecoveryState.HEALTHY;
 			nextRetryEpochMs = 0L;
+			reconnectDeadlineEpochMs = 0L;
 			coordinatorReconciled = coordinatorReady;
 			clearDiagnostic();
 			submitDependencyMaintenance(now, false, false);
 			return;
+		}
+		if (launchId == null
+				&& (state == CoordinatorRecoveryState.HEALTHY || state == CoordinatorRecoveryState.DEGRADED)) {
+			if (state == CoordinatorRecoveryState.HEALTHY) {
+				state = CoordinatorRecoveryState.DEGRADED;
+				coordinatorReconciled = false;
+				reconnectDeadlineEpochMs = now + RECONNECT_TIMEOUT_MS;
+				nextRetryEpochMs = reconnectDeadlineEpochMs;
+				authenticatedSinceEpochMs = 0L;
+				stabilityCredited = false;
+				setDiagnostic(
+						"COORDINATOR_BRIDGE_DISCONNECTED",
+						"Authenticated external coordinator bridge disconnected; waiting for reconnection",
+						"bridge_reconnect"
+				);
+			}
+			if (now < reconnectDeadlineEpochMs) {
+				submitDependencyMaintenance(now, false, false);
+				return;
+			}
+			reconnectDeadlineEpochMs = 0L;
 		}
 		if (now >= nextRetryEpochMs) {
 			submitLaunchMaintenance(now);
@@ -603,7 +625,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				child == null ? -1L : child.pid(),
 				child == null ? 0L : processStartedEpochMs,
 				child == null ? 0L : authenticationDeadlineEpochMs,
-				child == null ? 0L : reconnectDeadlineEpochMs
+				reconnectDeadlineEpochMs
 		);
 	}
 
