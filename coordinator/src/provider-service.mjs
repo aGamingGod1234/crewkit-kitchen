@@ -24,6 +24,9 @@ export class ProviderService extends EventEmitter {
 	#inFlight = new Set();
 	#recovery = new Map();
 	#recoveryTimers = new Map();
+	#outcomeAttempts = new Map();
+	#outcomeAttemptSequence = 0;
+	#failureSequence = 0;
 	#failureBoundaries = new Map();
 	#reconciliationGeneration = 0;
 	#activeReconciliations = new Map();
@@ -73,6 +76,8 @@ export class ProviderService extends EventEmitter {
 		this.#reconciliationGeneration += 1;
 		for (const timer of this.#recoveryTimers.values()) this.#cancelTimeout(timer.handle);
 		this.#recoveryTimers.clear();
+		for (const attempt of this.#outcomeAttempts.values()) attempt.acceptOutcome = false;
+		this.#outcomeAttempts.clear();
 		for (const { controller } of this.#activeReconciliations.values()) controller.abort(providerError('STALE_RECONCILIATION', 'Provider reconciliation was stopped'));
 		this.#starting.clear();
 		this.#stopPromise = this.#stopOnce();
@@ -115,8 +120,8 @@ export class ProviderService extends EventEmitter {
 		return [...this.#services.keys()].map((provider) => {
 			const record = this.#recovery.get(provider);
 			return record === undefined
-				? { provider, state: 'idle', fallbackMode: null, boundary: null, failureCode: null, consecutiveFailureCount: 0, totalFailureCount: 0, boundaryFailureCounts: {}, nextProbeAtEpochMs: null, generation: 0, lastRecoveryAtEpochMs: null }
-				: { provider, ...record, boundaryFailureCounts: { ...record.boundaryFailureCounts } };
+				? { provider, state: 'idle', fallbackMode: null, boundary: null, failureCode: null, consecutiveFailureCount: 0, totalFailureCount: 0, boundaryFailureCounts: {}, latestNonAutomaticFailure: null, nextProbeAtEpochMs: null, generation: 0, lastRecoveryAtEpochMs: null }
+				: { provider, ...record, boundaryFailureCounts: { ...record.boundaryFailureCounts }, latestNonAutomaticFailure: record.latestNonAutomaticFailure === null ? null : { ...record.latestNonAutomaticFailure } };
 		});
 	}
 
@@ -286,6 +291,7 @@ export class ProviderService extends EventEmitter {
 	async #execute(provider, operation, boundary, { recordSuccess = true } = {}) {
 		if (this.#stopped) throw providerError('PROVIDER_STOPPED', 'Provider service is stopped');
 		const lifecycleGeneration = this.#lifecycleGeneration;
+		const outcomeAttempt = this.#beginOutcomeAttempt(provider, boundary, lifecycleGeneration);
 		let startup = null;
 		const task = Promise.resolve()
 			.then(() => {
@@ -298,25 +304,54 @@ export class ProviderService extends EventEmitter {
 			});
 		const observed = task.then((result) => {
 			this.#assertActive(lifecycleGeneration);
+			if (!this.#acceptsOutcome(outcomeAttempt) && outcomeAttempt.key !== null) throw providerError('STALE_PROVIDER_OUTCOME', 'Provider outcome attempt was superseded');
 			if (recordSuccess) this.#recordLive(provider, boundary);
 			return result;
 		}, (error) => {
-			if (!isLifecycleFenceError(error)) this.#recordDegraded(provider, error, boundary);
+			if (!isLifecycleFenceError(error) && this.#acceptsOutcome(outcomeAttempt)) this.#recordDegraded(provider, error, boundary);
 			throw error;
 		});
-		const bounded = withTimeout(observed, this.#operationTimeoutMs, this.#scheduleTimeout, this.#cancelTimeout, provider);
+		const bounded = withTimeout(observed, this.#operationTimeoutMs, this.#scheduleTimeout, this.#cancelTimeout, provider, {
+			onTimeout: () => { outcomeAttempt.acceptOutcome = false; },
+		});
 		this.#inFlight.add(bounded);
 		try {
 			return await bounded;
 		} catch (error) {
-			if (error?.code === 'PROVIDER_TIMEOUT') {
+			if (error?.code === 'PROVIDER_TIMEOUT' && this.#ownsOutcomeAttempt(outcomeAttempt)) {
 				if (startup !== null && !this.#startedProviders.has(provider) && this.#starting.get(provider) === startup) this.#starting.delete(provider);
 				this.#recordDegraded(provider, error, boundary);
 			}
 			throw error;
 		} finally {
 			this.#inFlight.delete(bounded);
+			this.#finishOutcomeAttempt(outcomeAttempt);
 		}
+	}
+
+	#beginOutcomeAttempt(provider, boundary, lifecycleGeneration) {
+		const key = AUTOMATIC_RECOVERY_BOUNDARIES.has(boundary) ? `${provider}:${boundary}` : null;
+		const attempt = { key, provider, boundary, lifecycleGeneration, generation: ++this.#outcomeAttemptSequence, acceptOutcome: true };
+		if (key !== null) {
+			const previous = this.#outcomeAttempts.get(key);
+			if (previous !== undefined) previous.acceptOutcome = false;
+			this.#outcomeAttempts.set(key, attempt);
+		}
+		return attempt;
+	}
+
+	#ownsOutcomeAttempt(attempt) {
+		return !this.#stopped && attempt.lifecycleGeneration === this.#lifecycleGeneration
+			&& (attempt.key === null || this.#outcomeAttempts.get(attempt.key) === attempt);
+	}
+
+	#acceptsOutcome(attempt) {
+		return attempt.acceptOutcome && this.#ownsOutcomeAttempt(attempt);
+	}
+
+	#finishOutcomeAttempt(attempt) {
+		attempt.acceptOutcome = false;
+		if (attempt.key !== null && this.#outcomeAttempts.get(attempt.key) === attempt) this.#outcomeAttempts.delete(attempt.key);
 	}
 
 	#ensureStarted(provider, lifecycleGeneration) {
@@ -376,7 +411,7 @@ export class ProviderService extends EventEmitter {
 		const recovered = previous?.state === 'degraded';
 		this.#recovery.set(provider, {
 			state: 'live', fallbackMode: null, boundary: null, failureCode: null, consecutiveFailureCount: 0,
-			totalFailureCount: 0, boundaryFailureCounts: {},
+			totalFailureCount: 0, boundaryFailureCounts: {}, latestNonAutomaticFailure: null,
 			nextProbeAtEpochMs: null, generation: previous?.generation ?? 1,
 			lastRecoveryAtEpochMs: recovered ? safeNow(this.#now) : previous?.lastRecoveryAtEpochMs ?? null,
 		});
@@ -393,9 +428,12 @@ export class ProviderService extends EventEmitter {
 		const now = safeNow(this.#now);
 		const failure = {
 			count: failureCount,
+			sequence: ++this.#failureSequence,
 			failureCode: boundedFailureCode(error),
 			fallbackMode,
-			nextProbeAtEpochMs: now === null ? null : now + Math.min(30_000, 1_000 * (2 ** Math.min(5, failureCount - 1))),
+			nextProbeAtEpochMs: !AUTOMATIC_RECOVERY_BOUNDARIES.has(boundary) || now === null
+				? null
+				: now + Math.min(30_000, 1_000 * (2 ** Math.min(5, failureCount - 1))),
 		};
 		failures.set(boundary, failure);
 		this.#failureBoundaries.set(provider, failures);
@@ -446,8 +484,9 @@ export class ProviderService extends EventEmitter {
 }
 
 function degradedRecoveryRecord(failures, previous, { enteringDegraded }) {
-	const selected = selectRecoveryBoundary(failures, { automaticOnly: true }) ?? selectRecoveryBoundary(failures);
+	const selected = selectRecoveryBoundary(failures, { automaticOnly: true, requireDeadline: true }) ?? selectLatestFailure(failures);
 	const [boundary, failure] = selected;
+	const latestNonAutomatic = selectLatestFailure(new Map([...failures.entries()].filter(([name]) => !AUTOMATIC_RECOVERY_BOUNDARIES.has(name))));
 	const boundaryFailureCounts = Object.fromEntries([...failures.entries()]
 		.sort(([left], [right]) => left.localeCompare(right))
 		.map(([name, entry]) => [name, entry.count]));
@@ -461,10 +500,21 @@ function degradedRecoveryRecord(failures, previous, { enteringDegraded }) {
 		consecutiveFailureCount: totalFailureCount,
 		totalFailureCount,
 		boundaryFailureCounts,
+		latestNonAutomaticFailure: latestNonAutomatic === undefined ? null : {
+			boundary: latestNonAutomatic[0],
+			failureCode: latestNonAutomatic[1].failureCode,
+			count: latestNonAutomatic[1].count,
+		},
 		nextProbeAtEpochMs: failure.nextProbeAtEpochMs,
 		generation: (previous?.generation ?? 0) + (enteringDegraded ? 1 : 0),
 		lastRecoveryAtEpochMs: previous?.lastRecoveryAtEpochMs ?? null,
 	};
+}
+
+function selectLatestFailure(failures) {
+	if (!(failures instanceof Map)) return undefined;
+	return [...failures.entries()]
+		.sort(([leftBoundary, left], [rightBoundary, right]) => right.sequence - left.sequence || leftBoundary.localeCompare(rightBoundary))[0];
 }
 
 function selectRecoveryBoundary(failures, { automaticOnly = false, requireDeadline = false } = {}) {
@@ -572,17 +622,20 @@ function providerFailure(profile, error) {
 	};
 }
 
-function withTimeout(promise, timeoutMs, scheduleTimeout, cancelTimeout, provider) {
+function withTimeout(promise, timeoutMs, scheduleTimeout, cancelTimeout, provider, { onTimeout = null } = {}) {
 	let handle;
 	const timeout = new Promise((_, reject) => {
-		handle = scheduleTimeout(() => reject(providerError('PROVIDER_TIMEOUT', `${provider} provider operation timed out after ${timeoutMs} ms`)), timeoutMs);
+		handle = scheduleTimeout(() => {
+			onTimeout?.();
+			reject(providerError('PROVIDER_TIMEOUT', `${provider} provider operation timed out after ${timeoutMs} ms`));
+		}, timeoutMs);
 		handle?.unref?.();
 	});
 	return Promise.race([promise, timeout]).finally(() => cancelTimeout(handle));
 }
 
 function isLifecycleFenceError(error) {
-	return ['PROVIDER_STOPPED', 'STALE_PROVIDER_START', 'STALE_RECONCILIATION'].includes(error?.code);
+	return ['PROVIDER_STOPPED', 'STALE_PROVIDER_START', 'STALE_RECONCILIATION', 'STALE_PROVIDER_OUTCOME'].includes(error?.code);
 }
 
 function providerError(code, message) {

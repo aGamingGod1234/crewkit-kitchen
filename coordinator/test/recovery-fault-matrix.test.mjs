@@ -20,7 +20,7 @@ const PROFILE_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
 const RESOURCE_NAMES = Object.freeze([
 	'leases', 'sessions', 'actions', 'timers', 'promises', 'childProcesses', 'listeners',
 ]);
-const TRUSTED_MEASUREMENTS = new WeakSet();
+const TRUSTED_EVIDENCE = new WeakSet();
 
 const scenarios = [
 	['provider startup hang', providerStartupHang],
@@ -46,23 +46,28 @@ for (const [name, run] of scenarios) {
 
 test('recovery matrix evidence contract rejects omitted, null, and fabricated measurements', () => {
 	assert.throws(() => assertCompleteEvidence({}), /recovery evidence is required/);
-	assert.throws(() => observed(null, 'null measurement'), /trusted sampler measurement/);
-	assert.throws(() => observed({ pending: 0, maximum: 0 }, 'hardcoded fixture counter'), /trusted sampler measurement/);
-	const maliciousHelper = (value) => ({ value, trusted: true, token: Symbol.for('arena.test.measurement') });
-	assert.throws(() => observed(maliciousHelper({ pending: 0, maximum: 0 }), 'forged helper measurement'), /trusted sampler measurement/);
-	assert.throws(() => observed(structuredClone(capturePromises(0, 0)), 'cloned genuine measurement'), /trusted sampler measurement/);
+	const maliciousHelper = (category, value) => ({ kind: 'observed', category, value, source: 'forged helper measurement' });
+	assert.throws(() => assertEvidenceEntry(maliciousHelper('promises', { pending: 0, maximum: 0 }), 'promises'), /trusted category-bound entry/);
+	const genuinePromises = promiseEvidence(0, 0, 'genuine promise lifecycle sampler');
+	assert.throws(() => assertEvidenceEntry(structuredClone(genuinePromises), 'promises'), /trusted category-bound entry/);
+	assert.throws(() => assertEvidenceEntry(genuinePromises, 'timers'), /cannot reuse 'promises' evidence/);
+	const mutableSession = { current: 0, maximum: 1, profile: { model: 'before' } };
+	const immutableSession = sessionEvidence(mutableSession, 'mutable session snapshot sampler');
+	mutableSession.profile.model = 'after';
+	assert.equal(immutableSession.value.profile.model, 'before');
+	assert.equal(Object.isFrozen(immutableSession.value.profile), true);
 	const invalid = {
 		recovery: { healthy: true, permanentLatch: false, stateBefore: 'fault', stateAfter: 'ready', nextProbeAtEpochMs: null, attemptTimes: [], probeDeadlines: [], retryDelays: [], attemptCount: 0 },
-		states: observed(captureStates([]), 'test registry sampler'),
-		profile: notApplicable('No profile is selected in this contract test.'),
-		resources: Object.fromEntries(RESOURCE_NAMES.map((name) => [name, notApplicable(`${name} is deliberately absent from this evidence-contract-only fixture.`)])),
+		states: statesEvidence([], 'test registry sampler'),
+		profile: notApplicable('profile', 'No profile is selected in this contract test.'),
+		resources: Object.fromEntries(RESOURCE_NAMES.map((name) => [name, notApplicable(name, `${name} is deliberately absent from this evidence-contract-only fixture.`)])),
 	};
 	delete invalid.resources.timers;
 	assert.throws(() => assertCompleteEvidence(invalid), /timers evidence is required/);
-	invalid.resources.timers = { kind: 'observed', value: null, source: 'malicious all-null fixture' };
-	assert.throws(() => assertCompleteEvidence(invalid), /non-null instrumented value/);
+	invalid.resources.timers = { kind: 'observed', category: 'timers', value: null, source: 'malicious all-null fixture' };
+	assert.throws(() => assertCompleteEvidence(invalid), /trusted category-bound entry/);
 	invalid.resources.timers = { kind: 'notApplicable' };
-	assert.throws(() => assertCompleteEvidence(invalid), /notApplicable reason/);
+	assert.throws(() => assertCompleteEvidence(invalid), /trusted category-bound entry/);
 });
 
 for (const order of ['startup-first', 'catalog-first']) {
@@ -131,6 +136,145 @@ test('provider recovery stop fences a captured overlapping-boundary callback', a
 	assert.deepEqual(catalogTimes, []);
 	assert.ok(router.recoverySnapshot().every(({ state }) => state === 'idle'));
 });
+
+test('non-automatic provider failures publish no fictional probe deadline or timer', async () => {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	let createAvailable = false;
+	let catalogAvailable = false;
+	let catalogAttempts = 0;
+	services.codex.createAgent = async (profile) => {
+		if (!createAvailable) throw Object.assign(new Error('create unavailable'), { code: 'CREATE_UNAVAILABLE' });
+		return { profile };
+	};
+	services.codex.catalog.refresh = async () => {
+		catalogAttempts += 1;
+		if (!catalogAvailable) throw Object.assign(new Error('catalog unavailable'), { code: 'CATALOG_UNAVAILABLE' });
+		return catalog('codex', PROFILE.model);
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 100, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		await assert.rejects(router.createAgent(PROFILE), (error) => error?.code === 'CREATE_UNAVAILABLE');
+		let recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.boundary, 'create');
+		assert.equal(recovery.failureCode, 'CREATE_UNAVAILABLE');
+		assert.equal(recovery.nextProbeAtEpochMs, null);
+		assert.deepEqual(recovery.latestNonAutomaticFailure, { boundary: 'create', failureCode: 'CREATE_UNAVAILABLE', count: 1 });
+		assert.equal(timers.snapshot().pending, 0, 'caller-owned create recovery does not claim an automatic timer');
+
+		await router.catalog.refresh({ providers: ['codex'] });
+		recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.boundary, 'catalog', 'an automatic failure owns the primary status while mixed with nonautomatic diagnostics');
+		assert.equal(recovery.nextProbeAtEpochMs, 1_000);
+		assert.deepEqual(recovery.boundaryFailureCounts, { catalog: 1, create: 1 });
+		assert.deepEqual(recovery.latestNonAutomaticFailure, { boundary: 'create', failureCode: 'CREATE_UNAVAILABLE', count: 1 });
+		assert.equal(timers.peekNextDeadline(), recovery.nextProbeAtEpochMs);
+
+		catalogAvailable = true;
+		timers.advanceTo(999);
+		await flush();
+		assert.equal(catalogAttempts, 1);
+		await timers.runNext();
+		recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.boundary, 'create');
+		assert.equal(recovery.failureCode, 'CREATE_UNAVAILABLE');
+		assert.equal(recovery.nextProbeAtEpochMs, null);
+		assert.deepEqual(recovery.boundaryFailureCounts, { create: 1 });
+		assert.deepEqual(recovery.latestNonAutomaticFailure, { boundary: 'create', failureCode: 'CREATE_UNAVAILABLE', count: 1 });
+		assert.equal(timers.snapshot().pending, 0);
+
+		createAvailable = true;
+		await router.createAgent(PROFILE);
+		recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.state, 'live');
+		assert.equal(recovery.latestNonAutomaticFailure, null);
+	} finally {
+		await router.stop();
+	}
+});
+
+for (const boundary of ['startup', 'catalog']) {
+	for (const settlement of ['resolve', 'reject']) {
+		test(`${boundary} timeout fences old ${settlement} after a newer successful recovery`, async () => {
+			await assertTimedOutOutcomeFence({ boundary, settlement, settleBeforeRecovery: false });
+		});
+	}
+	for (const settlement of ['resolve', 'reject']) {
+		test(`${boundary} timeout observes an old ${settlement} before recovery without double-counting`, async () => {
+			await assertTimedOutOutcomeFence({ boundary, settlement, settleBeforeRecovery: true });
+		});
+	}
+}
+
+async function assertTimedOutOutcomeFence({ boundary, settlement, settleBeforeRecovery }) {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	const attemptTimes = [];
+	let settleOld;
+	let attempt = 0;
+	const controlled = () => {
+		attempt += 1;
+		attemptTimes.push(timers.now);
+		if (attempt > 1) return Promise.resolve(boundary === 'catalog' ? catalog('codex', PROFILE.model) : undefined);
+		return new Promise((resolve, reject) => {
+			settleOld = () => settlement === 'resolve'
+				? resolve(boundary === 'catalog' ? catalog('codex', 'stale-old-model') : undefined)
+				: reject(Object.assign(new Error('late old failure'), { code: 'LATE_OLD_FAILURE' }));
+		});
+	};
+	if (boundary === 'startup') services.codex.start = controlled;
+	else services.codex.catalog.refresh = controlled;
+	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		const first = boundary === 'startup' ? router.start(['codex']) : router.catalog.refresh({ providers: ['codex'] });
+		await flush();
+		await timers.runNext();
+		await first;
+		let recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.state, 'degraded');
+		assert.equal(recovery.boundary, boundary);
+		assert.equal(recovery.failureCode, 'PROVIDER_TIMEOUT');
+		assert.equal(recovery.totalFailureCount, 1, 'one physical timeout is counted exactly once');
+		assert.equal(recovery.nextProbeAtEpochMs, 1_025);
+		const deadline = recovery.nextProbeAtEpochMs;
+
+		if (settleBeforeRecovery) {
+			settleOld();
+			await flush();
+			recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+			assert.equal(recovery.totalFailureCount, 1);
+			assert.equal(recovery.failureCode, 'PROVIDER_TIMEOUT');
+			assert.equal(recovery.nextProbeAtEpochMs, deadline);
+		}
+
+		timers.advanceTo(deadline - 1);
+		await flush();
+		assert.deepEqual(attemptTimes, [0]);
+		await timers.runNext();
+		recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.state, 'live');
+		assert.equal(recovery.totalFailureCount, 0);
+		assert.deepEqual(attemptTimes, [0, deadline]);
+
+		if (!settleBeforeRecovery) {
+			settleOld();
+			await flush();
+		}
+		recovery = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.state, 'live');
+		assert.equal(recovery.totalFailureCount, 0);
+		assert.equal(recovery.nextProbeAtEpochMs, null);
+		assert.equal(timers.snapshot().pending, 0);
+		if (boundary === 'catalog' && settlement === 'resolve') {
+			services.codex.catalog.refresh = async () => { throw Object.assign(new Error('fallback inspection'), { code: 'INSPECTION_FAILURE' }); };
+			const fallback = await router.catalog.refresh({ providers: ['codex'] });
+			assert.deepEqual(fallback.models.map(({ model }) => model), [PROFILE.model], 'late old catalog resolution cannot overwrite the newer retained catalog');
+		}
+	} finally {
+		settleOld?.();
+		await router.stop();
+	}
+}
 
 async function overlappingProviderFailures(order) {
 	const timers = new ManualTimers();
@@ -228,16 +372,16 @@ async function providerStartupHang() {
 	const sessions = services.codex.sessionStats();
 	return evidence({
 		recovery: { healthy: restored?.state === 'live', permanentLatch: false, stateBefore: degraded?.state, stateAfter: restored?.state, nextProbeAtEpochMs: degraded?.nextProbeAtEpochMs, attemptTimes, probeDeadlines: [degraded?.nextProbeAtEpochMs], retryDelays: [1_000], attemptCount: attemptTimes.length },
-		states: notApplicable('Provider startup has no authority to mutate an agent domain lifecycle.'),
-		profile: observed(captureProfile(PROFILE, session?.profile), 'ProviderService exact session snapshot'),
+		states: notApplicable('states', 'Provider startup has no authority to mutate an agent domain lifecycle.'),
+		profile: profileEvidence(PROFILE, session?.profile, 'ProviderService exact session snapshot'),
 		resources: resources({
-			leases: notApplicable('No work lease is allocated during provider-only startup.'),
-			sessions: observed(captureSessions(sessions), 'fake backend current-session counter around ProviderService'),
-			actions: notApplicable('Provider startup cannot dispatch Minecraft actions.'),
-			timers: observed(timers.evidence(), 'ProviderService injected timeout and recovery scheduler'),
-			promises: observed(capturePromises(pendingStarts, maxPendingStarts), 'backend start-promise ownership counter'),
-			childProcesses: notApplicable('This in-process provider fixture has no child-process creation capability.'),
-			listeners: observed(listeners.evidence(), 'ProviderService EventEmitter listener sampler'),
+			leases: notApplicable('leases', 'No work lease is allocated during provider-only startup.'),
+			sessions: sessionEvidence(sessions, 'fake backend current-session counter around ProviderService'),
+			actions: notApplicable('actions', 'Provider startup cannot dispatch Minecraft actions.'),
+			timers: timers.evidence('ProviderService injected timeout and recovery scheduler'),
+			promises: promiseEvidence(pendingStarts, maxPendingStarts, 'backend start-promise ownership counter'),
+			childProcesses: notApplicable('childProcesses', 'This in-process provider fixture has no child-process creation capability.'),
+			listeners: listeners.evidence('ProviderService EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -295,16 +439,16 @@ async function providerOutageAndRestoration() {
 	}
 	return evidence({
 		recovery: { healthy: restored?.state === 'live', permanentLatch: false, stateBefore: degraded?.state, stateAfter: restored?.state, nextProbeAtEpochMs: degraded?.nextProbeAtEpochMs, attemptTimes: refreshTimes, probeDeadlines: degraded?.probeDeadlines, retryDelays: degraded?.retryDelays, attemptCount: refreshTimes.length },
-		states: notApplicable('Catalog recovery has no authority to mutate an agent domain lifecycle.'),
-		profile: observed(captureProfile(PROFILE, session?.profile), 'restored ProviderService session snapshot'),
+		states: notApplicable('states', 'Catalog recovery has no authority to mutate an agent domain lifecycle.'),
+		profile: profileEvidence(PROFILE, session?.profile, 'restored ProviderService session snapshot'),
 		resources: resources({
-			leases: notApplicable('Catalog refresh owns bounded operations, not goal work leases.'),
-			sessions: observed(captureSessions(services.codex.sessionStats()), 'backend session counter after router cleanup'),
-			actions: notApplicable('Catalog refresh cannot dispatch Minecraft actions.'),
-			timers: observed(timers.evidence(), 'ProviderService injected timeout and recovery scheduler'),
-			promises: observed(capturePromises(pendingRefreshes, maxPendingRefreshes), 'catalog refresh-promise ownership counter'),
-			childProcesses: notApplicable('This in-process catalog fixture has no child-process creation capability.'),
-			listeners: observed(listeners.evidence(), 'ProviderService EventEmitter listener sampler'),
+			leases: notApplicable('leases', 'Catalog refresh owns bounded operations, not goal work leases.'),
+			sessions: sessionEvidence(services.codex.sessionStats(), 'backend session counter after router cleanup'),
+			actions: notApplicable('actions', 'Catalog refresh cannot dispatch Minecraft actions.'),
+			timers: timers.evidence('ProviderService injected timeout and recovery scheduler'),
+			promises: promiseEvidence(pendingRefreshes, maxPendingRefreshes, 'catalog refresh-promise ownership counter'),
+			childProcesses: notApplicable('childProcesses', 'This in-process catalog fixture has no child-process creation capability.'),
+			listeners: listeners.evidence('ProviderService EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -349,16 +493,16 @@ async function ignoredAbortReleasesCapacity() {
 	schedulerLeases.sample();
 	return evidence({
 		recovery: { healthy: scheduler.activeCount === 0 && scheduler.pendingCount === 0, permanentLatch: false, stateBefore: 'lease_expired', stateAfter: 'capacity_available', nextProbeAtEpochMs: 20, attemptTimes: [0, 20], probeDeadlines: [20], retryDelays: [20], attemptCount: 2 },
-		states: notApplicable('PlanningScheduler does not own agent domain lifecycle state.'),
-		profile: notApplicable('Scheduler capacity is provider-profile agnostic and cannot mutate a profile.'),
+		states: notApplicable('states', 'PlanningScheduler does not own agent domain lifecycle state.'),
+		profile: notApplicable('profile', 'Scheduler capacity is provider-profile agnostic and cannot mutate a profile.'),
 		resources: resources({
-			leases: observed(schedulerLeases.evidence(), 'PlanningScheduler active lease sampler'),
-			sessions: notApplicable('The scheduler test deliberately uses no provider session.'),
-			actions: notApplicable('Planning tasks do not invoke the Minecraft action bridge in this scenario.'),
-			timers: observed(timers.evidence(), 'PlanningScheduler injected lease timer'),
-			promises: observed(capturePromises(activePromises, maxActivePromises), 'underlying abort-ignoring task ownership counter'),
-			childProcesses: notApplicable('This in-process scheduler fixture has no child-process creation capability.'),
-			listeners: notApplicable('PlanningScheduler exposes no event-listener surface.'),
+			leases: schedulerLeases.evidence('PlanningScheduler active lease sampler'),
+			sessions: notApplicable('sessions', 'The scheduler test deliberately uses no provider session.'),
+			actions: notApplicable('actions', 'Planning tasks do not invoke the Minecraft action bridge in this scenario.'),
+			timers: timers.evidence('PlanningScheduler injected lease timer'),
+			promises: promiseEvidence(activePromises, maxActivePromises, 'underlying abort-ignoring task ownership counter'),
+			childProcesses: notApplicable('childProcesses', 'This in-process scheduler fixture has no child-process creation capability.'),
+			listeners: notApplicable('listeners', 'PlanningScheduler exposes no event-listener surface.'),
 		}),
 	});
 }
@@ -401,12 +545,12 @@ async function disconnectFencesOutstandingActionReplay() {
 	assert.equal(result.listenerStats.current, 0, 'listener gauge samples final cleanup separately from the lifecycle maximum');
 	return evidence({
 		recovery: { healthy: result.connectionEpoch === 2 && replacementDispatches.length === 1, permanentLatch: false, stateBefore: 'bridge_disconnected', stateAfter: result.finalState, nextProbeAtEpochMs: null, attemptTimes: [1, 2], probeDeadlines: [], retryDelays: [], attemptCount: 2 },
-		states: observed(captureStates(result.states), 'AgentRegistry snapshots sampled throughout native goal execution'),
-		profile: observed(captureProfile(result.providerSessions.profile, result.profile), 'provider session and final AgentRegistry snapshots'),
+		states: statesEvidence(result.states, 'AgentRegistry snapshots sampled throughout native goal execution'),
+		profile: profileEvidence(result.providerSessions.profile, result.profile, 'provider session and final AgentRegistry snapshots'),
 		resources: resources({
-			leases: observed(captureLeases(result.leaseStats), 'tracking wrapper around the production ActiveGoalSupervisor'),
-			sessions: observed(captureSessions(result.providerSessions), 'scripted provider exact-session counters'),
-			actions: observed(captureActions({
+			leases: leaseEvidence(result.leaseStats, 'tracking wrapper around the production ActiveGoalSupervisor'),
+			sessions: sessionEvidence(result.providerSessions, 'scripted provider exact-session counters'),
+			actions: actionEvidence({
 				maxConcurrent: result.maxConcurrentPhysicalActions,
 				effects: result.actionEffects.length,
 				duplicates: duplicateDispatches,
@@ -414,11 +558,11 @@ async function disconnectFencesOutstandingActionReplay() {
 				pending: harness.bridge.deferredActionCount,
 				attempts: result.actionAttempts.length,
 				postFenceAccepted: result.acceptedActionResults.length,
-			}), 'FaultInjectingMinecraftBridge physical ledger and coordinator actionResult acceptance events'),
-			timers: observed(captureTimers(combinedTimerSnapshot(result.goalScheduler, result.stuckScheduler)), 'injected work-lease and factual-progress schedulers'),
-			promises: observed(capturePromises(result.activeWork, result.providerSessions.maxTurnsPending), 'scripted provider unsettled-turn ownership counter'),
-			childProcesses: notApplicable('This in-process native-provider fixture has no child-process creation capability.'),
-			listeners: observed(captureListeners(result.listenerStats), 'bridge and coordinator EventEmitter listener sampler'),
+			}, 'FaultInjectingMinecraftBridge physical ledger and coordinator actionResult acceptance events'),
+			timers: timerEvidence(combinedTimerSnapshot(result.goalScheduler, result.stuckScheduler), 'injected work-lease and factual-progress schedulers'),
+			promises: promiseEvidence(result.activeWork, result.providerSessions.maxTurnsPending, 'scripted provider unsettled-turn ownership counter'),
+			childProcesses: notApplicable('childProcesses', 'This in-process native-provider fixture has no child-process creation capability.'),
+			listeners: listenerEvidence(result.listenerStats, 'bridge and coordinator EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -476,16 +620,16 @@ async function voiceBindFailureAndRecovery() {
 	await supervisor.close();
 	return evidence({
 		recovery: { healthy: recovered, permanentLatch: false, stateBefore: 'degraded', stateAfter: 'ready', nextProbeAtEpochMs: probeDeadlines.at(-1), attemptTimes, probeDeadlines, retryDelays: [10, 20, 20], attemptCount: attemptTimes.length },
-		states: notApplicable('Voice is optional and cannot mutate an agent domain lifecycle.'),
-		profile: notApplicable('Voice workers do not select or mutate AI provider profiles.'),
+		states: notApplicable('states', 'Voice is optional and cannot mutate an agent domain lifecycle.'),
+		profile: notApplicable('profile', 'Voice workers do not select or mutate AI provider profiles.'),
 		resources: resources({
-			leases: notApplicable('VoiceSupervisor owns retry timers rather than goal work leases.'),
-			sessions: notApplicable('Voice workers are not AI provider sessions.'),
-			actions: notApplicable('Voice recovery cannot dispatch Minecraft actions.'),
-			timers: observed(timers.evidence(), 'VoiceSupervisor injected startup and retry scheduler'),
-			promises: observed(capturePromises(pendingStarts, maxPendingStarts), 'voice startup-promise ownership counter'),
-			childProcesses: notApplicable('This in-process voice fixture has no child-process creation capability.'),
-			listeners: observed(captureListeners({ current: failureListeners, maximum: maxFailureListeners }), 'voice worker failure-listener registration counter'),
+			leases: notApplicable('leases', 'VoiceSupervisor owns retry timers rather than goal work leases.'),
+			sessions: notApplicable('sessions', 'Voice workers are not AI provider sessions.'),
+			actions: notApplicable('actions', 'Voice recovery cannot dispatch Minecraft actions.'),
+			timers: timers.evidence('VoiceSupervisor injected startup and retry scheduler'),
+			promises: promiseEvidence(pendingStarts, maxPendingStarts, 'voice startup-promise ownership counter'),
+			childProcesses: notApplicable('childProcesses', 'This in-process voice fixture has no child-process creation capability.'),
+			listeners: listenerEvidence({ current: failureListeners, maximum: maxFailureListeners }, 'voice worker failure-listener registration counter'),
 		}),
 	});
 }
@@ -518,16 +662,16 @@ async function diagnosticHangAndRejection() {
 	await queue.close();
 	return evidence({
 		recovery: { healthy: queue.statusSnapshot().state === 'ready', permanentLatch: false, stateBefore: degradedState, stateAfter: queue.statusSnapshot().state, nextProbeAtEpochMs: null, attemptTimes: timers.firedDeadlines, probeDeadlines: timers.firedDeadlines, retryDelays: [5], attemptCount: 3 },
-		states: notApplicable('Diagnostics are observational and cannot mutate agent domain lifecycle.'),
-		profile: notApplicable('Diagnostics cannot select or mutate an AI provider profile.'),
+		states: notApplicable('states', 'Diagnostics are observational and cannot mutate agent domain lifecycle.'),
+		profile: notApplicable('profile', 'Diagnostics cannot select or mutate an AI provider profile.'),
 		resources: resources({
-			leases: notApplicable('DiagnosticQueue owns bounded sink operations rather than goal leases.'),
-			sessions: notApplicable('Diagnostics create no provider sessions.'),
-			actions: notApplicable('Diagnostics cannot dispatch Minecraft actions.'),
-			timers: observed(timers.evidence(), 'BestEffortDiagnosticQueue injected operation scheduler'),
-			promises: observed(capturePromises(pendingOperations, maxPendingOperations), 'diagnostic sink-promise ownership counter'),
-			childProcesses: notApplicable('This in-process diagnostic fixture has no child-process creation capability.'),
-			listeners: notApplicable('BestEffortDiagnosticQueue exposes no listener surface.'),
+			leases: notApplicable('leases', 'DiagnosticQueue owns bounded sink operations rather than goal leases.'),
+			sessions: notApplicable('sessions', 'Diagnostics create no provider sessions.'),
+			actions: notApplicable('actions', 'Diagnostics cannot dispatch Minecraft actions.'),
+			timers: timers.evidence('BestEffortDiagnosticQueue injected operation scheduler'),
+			promises: promiseEvidence(pendingOperations, maxPendingOperations, 'diagnostic sink-promise ownership counter'),
+			childProcesses: notApplicable('childProcesses', 'This in-process diagnostic fixture has no child-process creation capability.'),
+			listeners: notApplicable('listeners', 'BestEffortDiagnosticQueue exposes no listener surface.'),
 		}),
 	});
 }
@@ -560,16 +704,16 @@ async function exactProfileSessionAndLeasePreservation() {
 	leases.sample(null);
 	return evidence({
 		recovery: { healthy: recovered.state === 'active', permanentLatch: false, stateBefore: 'session_epoch_1', stateAfter: 'session_epoch_2', nextProbeAtEpochMs: recovered.leases[0].deadline, attemptTimes: [first.sessionEpoch, second.sessionEpoch], probeDeadlines: [recovered.leases[0].deadline], retryDelays: [recovered.leases[0].deadline - timers.now], attemptCount: 2 },
-		states: notApplicable('WorkLeaseSupervisor cannot mutate the AgentRegistry lifecycle.'),
-		profile: observed(captureProfile({ fingerprint: PROFILE_FINGERPRINT }, { fingerprint: recovered.key.profileFingerprint }), 'production WorkLeaseSupervisor key snapshots'),
+		states: notApplicable('states', 'WorkLeaseSupervisor cannot mutate the AgentRegistry lifecycle.'),
+		profile: profileEvidence({ fingerprint: PROFILE_FINGERPRINT }, { fingerprint: recovered.key.profileFingerprint }, 'production WorkLeaseSupervisor key snapshots'),
 		resources: resources({
-			leases: observed(leases.evidence(), 'production WorkLeaseSupervisor lifecycle snapshots'),
-			sessions: notApplicable('Lease fencing uses session keys but does not create provider sessions.'),
-			actions: notApplicable('Action lease fencing does not dispatch a physical Minecraft action.'),
-			timers: observed(timers.evidence(), 'WorkLeaseSupervisor injected lease scheduler'),
-			promises: notApplicable('WorkLeaseSupervisor lease operations are synchronous and own no promises.'),
-			childProcesses: notApplicable('WorkLeaseSupervisor has no child-process creation capability.'),
-			listeners: notApplicable('WorkLeaseSupervisor exposes no event-listener surface.'),
+			leases: leases.evidence('production WorkLeaseSupervisor lifecycle snapshots'),
+			sessions: notApplicable('sessions', 'Lease fencing uses session keys but does not create provider sessions.'),
+			actions: notApplicable('actions', 'Action lease fencing does not dispatch a physical Minecraft action.'),
+			timers: timers.evidence('WorkLeaseSupervisor injected lease scheduler'),
+			promises: notApplicable('promises', 'WorkLeaseSupervisor lease operations are synchronous and own no promises.'),
+			childProcesses: notApplicable('childProcesses', 'WorkLeaseSupervisor has no child-process creation capability.'),
+			listeners: notApplicable('listeners', 'WorkLeaseSupervisor exposes no event-listener surface.'),
 		}),
 	});
 }
@@ -584,16 +728,9 @@ function resources(value) {
 	return Object.freeze(value);
 }
 
-function observed(measurement, source) {
-	if (typeof source !== 'string' || source.trim().length < 8) throw new TypeError('observed evidence source must be descriptive');
-	if (measurement === null || typeof measurement !== 'object' || !TRUSTED_MEASUREMENTS.has(measurement)) throw new TypeError('observed evidence requires a trusted sampler measurement');
-	if (measurement.value === null || measurement.value === undefined) throw new TypeError('observed evidence requires a non-null instrumented value');
-	return Object.freeze({ kind: 'observed', value: measurement.value, measurement, source });
-}
-
-function notApplicable(reason) {
+function notApplicable(category, reason) {
 	if (typeof reason !== 'string' || reason.trim().length < 16) throw new TypeError('notApplicable evidence requires a specific reason');
-	return Object.freeze({ kind: 'notApplicable', reason });
+	return issueEvidence(category, 'notApplicable', { reason }, `${category} applicability decision`);
 }
 
 function assertCompleteEvidence(result) {
@@ -611,57 +748,66 @@ function assertCompleteEvidence(result) {
 }
 
 function assertEvidenceEntry(entry, name) {
+	if (entry === null || typeof entry !== 'object' || !TRUSTED_EVIDENCE.has(entry)) throw new TypeError(`${name} evidence requires a trusted category-bound entry`);
+	if (entry.category !== name) throw new TypeError(`${name} evidence cannot reuse '${entry.category}' evidence`);
 	if (entry?.kind === 'observed') {
 		if (!Object.hasOwn(entry, 'value') || entry.value === null || entry.value === undefined) throw new TypeError(`${name} evidence requires a non-null instrumented value`);
-		if (!TRUSTED_MEASUREMENTS.has(entry.measurement) || entry.measurement.value !== entry.value) throw new TypeError(`${name} evidence requires a trusted sampler measurement`);
 		if (typeof entry.source !== 'string' || entry.source.trim().length < 8) throw new TypeError(`${name} evidence source is required`);
 		return;
 	}
 	if (entry?.kind === 'notApplicable') {
-		if (typeof entry.reason !== 'string' || entry.reason.trim().length < 16) throw new TypeError(`${name} notApplicable reason is required`);
+		if (typeof entry.value?.reason !== 'string' || entry.value.reason.trim().length < 16) throw new TypeError(`${name} notApplicable reason is required`);
 		return;
 	}
 	throw new TypeError(`${name} evidence must be observed or explicitly notApplicable`);
 }
 
-function issueMeasurement(value) {
-	if (value === null || value === undefined || typeof value !== 'object') throw new TypeError('sampler produced no measurement');
-	const measurement = Object.freeze({ value });
-	TRUSTED_MEASUREMENTS.add(measurement);
-	return measurement;
+function issueEvidence(category, kind, value, source) {
+	if (![...RESOURCE_NAMES, 'states', 'profile'].includes(category)) throw new TypeError('evidence category is invalid');
+	if (value === null || value === undefined || typeof value !== 'object') throw new TypeError('sampler produced no evidence value');
+	const snapshot = deepFreeze(structuredClone(value));
+	const entry = Object.freeze({ kind, category, value: snapshot, source });
+	TRUSTED_EVIDENCE.add(entry);
+	return entry;
 }
 
-function captureStates(states) {
+function statesEvidence(states, source) {
 	if (!Array.isArray(states)) throw new TypeError('state sampler requires an array');
-	return issueMeasurement([...states]);
+	return issueEvidence('states', 'observed', states, source);
 }
 
-function captureProfile(before, after) {
-	return issueMeasurement({ before: structuredClone(before), after: structuredClone(after) });
+function profileEvidence(before, after, source) {
+	return issueEvidence('profile', 'observed', { before, after }, source);
 }
 
-function captureSessions(stats) {
-	return issueMeasurement(structuredClone(stats));
+function sessionEvidence(stats, source) {
+	return issueEvidence('sessions', 'observed', stats, source);
 }
 
-function captureLeases(stats) {
-	return issueMeasurement(structuredClone(stats));
+function leaseEvidence(stats, source) {
+	return issueEvidence('leases', 'observed', stats, source);
 }
 
-function captureActions(stats) {
-	return issueMeasurement(structuredClone(stats));
+function actionEvidence(stats, source) {
+	return issueEvidence('actions', 'observed', stats, source);
 }
 
-function captureTimers(stats) {
-	return issueMeasurement(structuredClone(stats));
+function timerEvidence(stats, source) {
+	return issueEvidence('timers', 'observed', stats, source);
 }
 
-function capturePromises(pending, maximum) {
-	return issueMeasurement({ pending, maximum });
+function promiseEvidence(pending, maximum, source) {
+	return issueEvidence('promises', 'observed', { pending, maximum }, source);
 }
 
-function captureListeners(stats) {
-	return issueMeasurement({ current: stats.current, maximum: stats.maximum });
+function listenerEvidence(stats, source) {
+	return issueEvidence('listeners', 'observed', { current: stats.current, maximum: stats.maximum }, source);
+}
+
+function deepFreeze(value) {
+	if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value)) deepFreeze(child);
+	return Object.freeze(value);
 }
 
 function assertNoDomainFailure(entry) {
@@ -792,7 +938,7 @@ class ListenerGauge {
 		this.#maximum = Math.max(this.#maximum, this.#current);
 	}
 
-	evidence() { return captureListeners({ current: this.#current, maximum: this.#maximum }); }
+	evidence(source) { return listenerEvidence({ current: this.#current, maximum: this.#maximum }, source); }
 }
 
 class SchedulerLeaseGauge {
@@ -810,7 +956,7 @@ class SchedulerLeaseGauge {
 		this.#maximum = Math.max(this.#maximum, this.#current);
 	}
 
-	evidence() { return captureLeases({ maxByKind: { provider: this.#maximum }, pending: this.#current }); }
+	evidence(source) { return leaseEvidence({ maxByKind: { provider: this.#maximum }, pending: this.#current }, source); }
 }
 
 class LeaseSnapshotGauge {
@@ -826,7 +972,7 @@ class LeaseSnapshotGauge {
 		}
 	}
 
-	evidence() { return captureLeases({ maxByKind: Object.fromEntries(this.#maximumByKind), pending: this.#pending }); }
+	evidence(source) { return leaseEvidence({ maxByKind: Object.fromEntries(this.#maximumByKind), pending: this.#pending }, source); }
 }
 
 class ManualTimers {
@@ -891,7 +1037,7 @@ class ManualTimers {
 		};
 	}
 
-	evidence() { return captureTimers(this.snapshot()); }
+	evidence(source) { return timerEvidence(this.snapshot(), source); }
 }
 
 async function flush() {
