@@ -58,6 +58,9 @@ const VOICE_WARMUP_GRACE_MS = 1_000;
 const DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE = 'FISH_AUDIO_API_KEY';
 const DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE = 'DEEPGRAM_API_KEY';
 const DEFAULT_LOCAL_SPEECH_PYTHON_DIRECTORY = path.join('runtime', 'local-speech', '.venv');
+const STT_ONLY_PROFILE_STORE = Object.freeze({
+	resolve() { throw new Error('voice profiles are unavailable without TTS'); },
+});
 const WINDOWS_TTS_FALLBACK_CODES = new Set([
 	'TTS_AUDIO_TOO_LONG',
 	'TTS_MALFORMED_AUDIO',
@@ -1570,24 +1573,29 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		});
 		throwIfVoiceStartupAborted(signal);
 		if (localSpeechProvider === null && fishApiKey === null && deepgramApiKey === null && platform !== 'win32') return null;
-		const profilePath = dependencies.profilePath
-			?? voice.profileAssignmentsPath
-			?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
-		const loadProfileStore = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
 		const createTtsProvider = dependencies.createTtsProvider ?? ((options) => new FishTtsProvider(options));
 		const createWindowsTtsProvider = dependencies.createWindowsTtsProvider ?? ((options) => new WindowsTtsProvider(options));
 		const createSttProvider = dependencies.createSttProvider ?? ((options) => new DeepgramSttProvider(options));
 		const createServer = dependencies.createVoiceServer ?? createVoiceHttpServer;
-		if (typeof loadProfileStore !== 'function') throw new TypeError('loadProfileStore must be a function');
 		if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
 		if (typeof createWindowsTtsProvider !== 'function') throw new TypeError('createWindowsTtsProvider must be a function');
 		if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
-		profiles = await loadProfileStore(profilePath, { ...(dependencies.voiceProfileIo ?? {}), signal });
-		throwIfVoiceStartupAborted(signal);
-		if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
-			throw new TypeError('loadProfileStore must return a profile store');
+		const hasTtsProvider = localSpeechProvider !== null || fishApiKey !== null || platform === 'win32';
+		if (hasTtsProvider) {
+			const profilePath = dependencies.profilePath
+				?? voice.profileAssignmentsPath
+				?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
+			const loadProfileStore = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
+			if (typeof loadProfileStore !== 'function') throw new TypeError('loadProfileStore must be a function');
+			profiles = await loadProfileStore(profilePath, { ...(dependencies.voiceProfileIo ?? {}), signal });
+			throwIfVoiceStartupAborted(signal);
+			if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
+				throw new TypeError('loadProfileStore must return a profile store');
+			}
+			profileStore = voiceProfileStoreWithLifecycle(profiles);
+		} else {
+			profileStore = voiceProfileStoreWithLifecycle({ store: STT_ONLY_PROFILE_STORE });
 		}
-		profileStore = voiceProfileStoreWithLifecycle(profiles);
 		if (deepgramApiKey !== null && typeof createSttProvider !== 'function') throw new TypeError('createSttProvider must be a function when Deepgram is configured');
 		let provider;
 		let sttProvider;

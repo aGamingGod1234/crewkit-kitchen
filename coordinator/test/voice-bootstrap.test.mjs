@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { startVoiceWorker } from '../src/dynamic-main.mjs';
@@ -51,13 +54,16 @@ test('voice bootstrap remains disabled without a provider on non-Windows hosts',
 
 test('voice bootstrap starts Deepgram-only STT with no TTS provider on non-Windows hosts', async () => {
 	let transcriptions = 0;
+	const root = await mkdtemp(path.join(tmpdir(), 'arena-deepgram-only-'));
+	const profilePath = path.join(root, 'voice-profile-assignments.json');
+	await writeFile(profilePath, '{ malformed assignments', 'utf8');
 	const created = await startVoiceWorker({
 		bridge: { secret: SECRET },
 		voice: { port: 0 },
 	}, { DEEPGRAM_API_KEY: 'deepgram-only-key' }, {
 		platform: 'linux',
+		profilePath,
 		createLocalSpeechProvider: async () => null,
-		loadProfileStore: async () => ({ store: { resolve() {} } }),
 		createWindowsTtsProvider: () => { throw new Error('Windows TTS must not be created on Linux'); },
 		createSttProvider: ({ apiKey }) => {
 			assert.equal(apiKey, 'deepgram-only-key');
@@ -73,6 +79,19 @@ test('voice bootstrap starts Deepgram-only STT with no TTS provider on non-Windo
 		const snapshots = created.statusSnapshots();
 		assert.equal(snapshots.find(({ component }) => component === 'voice:tts').failureCode, 'TTS_UNAVAILABLE');
 		assert.equal(snapshots.find(({ component }) => component === 'voice:stt').state, 'ready');
+		const ttsResponse = await fetch(`http://127.0.0.1:${created.server.address().port}/v1/tts`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				agentId: PLAYER,
+				conversationSequence: 1,
+				profileId: 'voice.auto.v1',
+				radius: 32,
+				text: 'No TTS is configured.',
+			}),
+		});
+		assert.equal(ttsResponse.status, 503);
+		assert.equal((await ttsResponse.json()).code, 'TTS_UNAVAILABLE');
 		const response = await fetch(`http://127.0.0.1:${created.server.address().port}/v1/stt`, {
 			method: 'POST',
 			headers: {
@@ -89,6 +108,29 @@ test('voice bootstrap starts Deepgram-only STT with no TTS provider on non-Windo
 		assert.equal(transcriptions, 1);
 	} finally {
 		await created.close();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('voice bootstrap keeps malformed profile assignments fatal when TTS is available', async () => {
+	const root = await mkdtemp(path.join(tmpdir(), 'arena-tts-profiles-'));
+	const profilePath = path.join(root, 'voice-profile-assignments.json');
+	await writeFile(profilePath, '{ malformed assignments', 'utf8');
+	try {
+		await assert.rejects(
+			startVoiceWorker({
+				bridge: { secret: SECRET },
+				voice: { port: 0 },
+			}, { FISH_AUDIO_API_KEY: 'fish-key' }, {
+				platform: 'linux',
+				profilePath,
+				createLocalSpeechProvider: async () => null,
+				createTtsProvider: () => ({ async synthesize() { return {}; } }),
+			}),
+			SyntaxError,
+		);
+	} finally {
+		await rm(root, { recursive: true, force: true });
 	}
 });
 
