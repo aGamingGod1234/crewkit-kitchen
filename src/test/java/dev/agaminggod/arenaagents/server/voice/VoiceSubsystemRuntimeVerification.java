@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiFunction;
 import net.minecraft.server.MinecraftServer;
 
 /** Verifies retryable voice provider startup with direct worker configuration. */
@@ -25,7 +26,7 @@ public final class VoiceSubsystemRuntimeVerification {
 	public static int verify() {
 		MinecraftServer server = uninitializedServer();
 		VoiceSubsystemConfiguration configuration = new VoiceSubsystemConfiguration(
-				"http://127.0.0.1:18771/v1/tts", "m".repeat(32)
+				"http://127.0.0.1:18771/v1/tts", "m".repeat(32), 45_678
 		);
 		VoiceSubsystemConfiguration replacementConfiguration = new VoiceSubsystemConfiguration(
 				"http://127.0.0.1:18772/v1/tts", "n".repeat(32)
@@ -33,42 +34,44 @@ public final class VoiceSubsystemRuntimeVerification {
 		AtomicReference<VoiceSubsystemConfiguration> received = new AtomicReference<>();
 		AtomicInteger closes = new AtomicInteger();
 		AtomicInteger constructions = new AtomicInteger();
-		boolean failed = VoiceSubsystemRuntime.start(server, configuration, List.of((actualServer, actualConfiguration) -> {
+		boolean failed = VoiceSubsystemRuntime.start(server, configuration, List.of(configuredProvider((actualServer, actualConfiguration) -> {
 			received.set(actualConfiguration);
 			throw new IllegalStateException("voice transport is starting");
-		}));
+		})));
 		assertFalse(failed, "a provider construction failure remains retryable instead of caching NoVoice");
 		assertEquals(configuration, received.get(), "provider receives the exact in-memory endpoint and secret");
+		assertEquals(45_678, received.get().requestTimeoutMs(),
+				"configuration-aware provider receives the configured request timeout");
 
 		RecordingVoiceSubsystem first = new RecordingVoiceSubsystem(closes);
-		boolean promoted = VoiceSubsystemRuntime.start(server, configuration, List.of((actualServer, actualConfiguration) -> {
+		boolean promoted = VoiceSubsystemRuntime.start(server, configuration, List.of(configuredProvider((actualServer, actualConfiguration) -> {
 			constructions.incrementAndGet();
 			return first;
-		}));
+		})));
 		assertTrue(promoted, "a later provider construction succeeds without restarting Minecraft");
 		assertTrue(VoiceSubsystemRuntime.available(server), "successful retry promotes the real voice subsystem");
-		assertTrue(VoiceSubsystemRuntime.start(server, configuration, List.of((actualServer, actualConfiguration) -> {
+		assertTrue(VoiceSubsystemRuntime.start(server, configuration, List.of(configuredProvider((actualServer, actualConfiguration) -> {
 			throw new AssertionError("identical configuration must not reconstruct voice");
-		})), "identical voice start is idempotent");
+		}))), "identical voice start is idempotent");
 		assertEquals(1, constructions.get(), "identical voice start preserves one runtime");
 
 		RecordingVoiceSubsystem reconfigured = new RecordingVoiceSubsystem(closes);
 		assertTrue(VoiceSubsystemRuntime.start(server, replacementConfiguration,
-				List.of((actualServer, actualConfiguration) -> {
+				List.of(configuredProvider((actualServer, actualConfiguration) -> {
 					assertEquals(replacementConfiguration, actualConfiguration,
 							"reconfigure retains exact endpoint and secret ownership");
 					constructions.incrementAndGet();
 					return reconfigured;
-				})), "configuration change replaces the live runtime");
+				}))), "configuration change replaces the live runtime");
 		assertEquals(1, closes.get(), "reconfigure closes the displaced runtime once");
 
 		reconfigured.available = false;
 		RecordingVoiceSubsystem recovered = new RecordingVoiceSubsystem(closes);
 		assertTrue(VoiceSubsystemRuntime.start(server, replacementConfiguration,
-				List.of((actualServer, actualConfiguration) -> {
+				List.of(configuredProvider((actualServer, actualConfiguration) -> {
 					constructions.incrementAndGet();
 					return recovered;
-				})), "a failed live runtime is reconstructed without restarting Minecraft");
+				}))), "a failed live runtime is reconstructed without restarting Minecraft");
 		assertEquals(2, closes.get(), "live failure closes the failed generation once");
 		assertTrue(VoiceSubsystemRuntime.available(server), "live failure recovery promotes the replacement");
 		java.util.UUID humanPlayer = java.util.UUID.randomUUID();
@@ -110,12 +113,12 @@ public final class VoiceSubsystemRuntimeVerification {
 		MinecraftServer startupRaceServer = uninitializedServer();
 		AtomicInteger startupAttempts = new AtomicInteger();
 		RecordingVoiceSubsystem startupRecovered = new RecordingVoiceSubsystem(new AtomicInteger());
-		VoiceSubsystemProvider startupRaceProvider = (actualServer, actualConfiguration) -> {
+		VoiceSubsystemProvider startupRaceProvider = configuredProvider((actualServer, actualConfiguration) -> {
 			if (startupAttempts.getAndIncrement() == 0) {
 				throw new IllegalStateException("Simple Voice Chat has not registered yet");
 			}
 			return startupRecovered;
-		};
+		});
 		assertFalse(VoiceSubsystemRuntime.start(startupRaceServer, configuration, List.of(startupRaceProvider)),
 				"a provider waiting for Simple Voice Chat remains retryable");
 		assertFalse(VoiceSubsystemRuntime.available(startupRaceServer),
@@ -125,7 +128,9 @@ public final class VoiceSubsystemRuntimeVerification {
 		assertTrue(VoiceSubsystemRuntime.available(startupRaceServer),
 				"the retry promotes the real voice subsystem without restarting Minecraft");
 		VoiceSubsystemRuntime.close(startupRaceServer);
-		return 26 + verifyOptionalConfigurationFailure() + verifyEndpointValidation()
+		return 27 + verifyLegacyProviderCompatibility(configuration)
+				+ verifyLinkageFailureFallback(configuration)
+				+ verifyOptionalConfigurationFailure() + verifyEndpointValidation()
 				+ verifyConsentCancellationLockOrder();
 	}
 
@@ -195,6 +200,54 @@ public final class VoiceSubsystemRuntimeVerification {
 			throw new AssertionError(message, exception);
 		}
 		if (thread.isAlive()) throw new AssertionError(message);
+	}
+
+	private static int verifyLegacyProviderCompatibility(VoiceSubsystemConfiguration configuration) {
+		MinecraftServer server = uninitializedServer();
+		AtomicInteger starts = new AtomicInteger();
+		VoiceSubsystemProvider legacyProvider = new LegacyVoiceProvider(starts);
+		try {
+			assertEquals(VoiceSubsystemProvider.class, legacyProvider.getClass().getMethod(
+					"create", MinecraftServer.class, VoiceSubsystemConfiguration.class
+			).getDeclaringClass(), "old provider resolves the configuration overload to the core default");
+		} catch (NoSuchMethodException exception) {
+			throw new AssertionError("configuration-aware provider overload is missing", exception);
+		}
+		assertTrue(VoiceSubsystemRuntime.start(server, configuration, List.of(legacyProvider)),
+				"a provider with only the original one-argument method starts on the current core");
+		assertEquals(1, starts.get(), "current core invokes the old provider exactly once");
+		assertTrue(VoiceSubsystemRuntime.available(server), "old provider remains usable after startup");
+		VoiceSubsystemRuntime.close(server);
+		return 4;
+	}
+
+	private static int verifyLinkageFailureFallback(VoiceSubsystemConfiguration configuration) {
+		MinecraftServer server = uninitializedServer();
+		VoiceSubsystemProvider incompatibleProvider = actualServer -> {
+			throw new NoClassDefFoundError("optional voice transport dependency");
+		};
+		assertFalse(VoiceSubsystemRuntime.start(server, configuration, List.of(incompatibleProvider)),
+				"an incompatible provider degrades to retryable text fallback instead of aborting startup");
+		assertFalse(VoiceSubsystemRuntime.available(server),
+				"a provider linkage failure does not install a broken voice subsystem");
+		VoiceSubsystemRuntime.close(server);
+		return 2;
+	}
+
+	private static VoiceSubsystemProvider configuredProvider(
+			BiFunction<MinecraftServer, VoiceSubsystemConfiguration, VoiceSubsystem> factory
+	) {
+		return new VoiceSubsystemProvider() {
+			@Override
+			public VoiceSubsystem create(MinecraftServer server) {
+				throw new IllegalStateException("configuration-aware test provider requires configuration");
+			}
+
+			@Override
+			public VoiceSubsystem create(MinecraftServer server, VoiceSubsystemConfiguration configuration) {
+				return factory.apply(server, configuration);
+			}
+		};
 	}
 
 	private static int verifyEndpointValidation() {
@@ -395,6 +448,20 @@ public final class VoiceSubsystemRuntimeVerification {
 			}
 		}
 		@Override public void close() { }
+	}
+
+	private static final class LegacyVoiceProvider implements VoiceSubsystemProvider {
+		private final AtomicInteger starts;
+
+		private LegacyVoiceProvider(AtomicInteger starts) {
+			this.starts = starts;
+		}
+
+		@Override
+		public VoiceSubsystem create(MinecraftServer server) {
+			starts.incrementAndGet();
+			return new RecordingVoiceSubsystem(new AtomicInteger());
+		}
 	}
 
 	private static void assertTrue(boolean value, String label) {

@@ -7,6 +7,11 @@ import net.minecraft.server.MinecraftServer;
 
 public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider {
 	@Override
+	public VoiceSubsystem create(MinecraftServer server) {
+		throw new IllegalStateException("Arena Agents Voice requires configuration-aware core startup");
+	}
+
+	@Override
 	public VoiceSubsystem create(MinecraftServer server, VoiceSubsystemConfiguration configuration) {
 		ArenaAgentsVoiceChatPlugin.ConfiguredServer configuredServer =
 				ArenaAgentsVoiceChatPlugin.configure(server, configuration);

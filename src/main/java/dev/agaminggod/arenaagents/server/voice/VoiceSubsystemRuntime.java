@@ -114,7 +114,7 @@ public final class VoiceSubsystemRuntime {
 				STARTUP_RETRIES.remove(server);
 				reportRuntimeRecovery(server);
 				return true;
-			} catch (RuntimeException exception) {
+			} catch (RuntimeException | LinkageError exception) {
 				reportRuntimeFailure(server, "VOICE_PROVIDER_START_FAILED", exception);
 			}
 		}
@@ -312,7 +312,7 @@ public final class VoiceSubsystemRuntime {
 		}
 	}
 
-	private static void reportRuntimeFailure(MinecraftServer server, String code, RuntimeException failure) {
+	private static void reportRuntimeFailure(MinecraftServer server, String code, Throwable failure) {
 		if (code.equals(RUNTIME_DIAGNOSTICS.get(server))) return;
 		RUNTIME_DIAGNOSTICS.put(server, code);
 		LOGGER.warn("Proximity voice degraded [{}] ({}); coordinator recovery remains available",
