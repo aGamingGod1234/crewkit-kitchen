@@ -7,9 +7,10 @@ import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
-import java.util.Optional;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.component.DataComponentMap;
@@ -219,7 +220,35 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Place stone at 10 64 -10", RegistryAccess.EMPTY),
 				"placement translation still exposes the requested placed block"
 		);
-		return 18;
+		Map<String, String> liveAdvancements = Map.of(
+				"minecraft:story/mine_stone", "Stone Age",
+				"minecraft:story/upgrade_tools", "Getting an Upgrade"
+		);
+		assertEquals(
+				List.of("minecraft:story/mine_stone"),
+				compiler.candidateIdsFor("Earn the Stone Age advancement", RegistryAccess.EMPTY, liveAdvancements),
+				"natural advancement titles resolve to matching live server IDs"
+		);
+		assertEquals(
+				List.of("minecraft:story/upgrade_tools"),
+				compiler.candidateIdsFor("Complete the advancement Getting an Upgrade", RegistryAccess.EMPTY, liveAdvancements),
+				"prefix-style natural advancement requests resolve from the same live catalog"
+		);
+		assertEquals(
+				List.of(),
+				compiler.candidateIdsFor("Earn the Stone Age advancement", RegistryAccess.EMPTY, Map.of()),
+				"advancement translation never invents IDs absent from the live server"
+		);
+		LinkedHashMap<String, String> manyLiveAdvancements = new LinkedHashMap<>();
+		for (int index = 0; index < 80; index++) {
+			manyLiveAdvancements.put("example:story/stone_age_" + index, "Stone Age challenge " + index);
+		}
+		assertEquals(
+				64,
+				compiler.candidateIdsFor("Earn the Stone Age advancement", RegistryAccess.EMPTY, manyLiveAdvancements).size(),
+				"natural advancement candidates remain bounded"
+		);
+		return 22;
 	}
 
 	private static int verifyCompoundItemsAndKills() {

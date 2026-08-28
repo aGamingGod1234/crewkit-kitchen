@@ -85,9 +85,7 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition stop(AgentRecord current, long nowEpochMs) {
-		if (current.currentGoal().isEmpty()) {
-			throw new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to stop");
-		}
+		requireUnfinishedGoal(current, "stop");
 		AgentRecord revised = current.withLifecycle(
 				AgentLifecycleState.PAUSED,
 				current.currentGoal(),
@@ -101,6 +99,7 @@ public final class AgentLifecycleReducer {
 
 	public static AgentTransition resume(AgentRecord current, long nowEpochMs) {
 		requireState(current, "resume", AgentLifecycleState.PAUSED, AgentLifecycleState.DISCONNECTED);
+		requireUnfinishedGoal(current, "resume");
 		AgentRecord revised = current.withLifecycle(
 				AgentLifecycleState.STARTING,
 				current.currentGoal(),
@@ -113,9 +112,7 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition steer(AgentRecord current, String instruction, long nowEpochMs) {
-		AgentGoal currentGoal = current.currentGoal().orElseThrow(
-				() -> new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to steer")
-		);
+		AgentGoal currentGoal = requireUnfinishedGoal(current, "steer");
 		AgentGoal steered = currentGoal.steer(instruction, nowEpochMs);
 		AgentRecord revised = current.withLifecycle(
 				AgentLifecycleState.STARTING,
@@ -267,6 +264,9 @@ public final class AgentLifecycleReducer {
 		if (current.currentGoal().isEmpty()) {
 			return transition(current, current, false, false);
 		}
+		if (isTerminal(current.currentGoal().orElseThrow())) {
+			return transition(current, current, false, false);
+		}
 		AgentRecord disconnected = current.withLifecycle(
 				AgentLifecycleState.DISCONNECTED,
 				current.currentGoal(),
@@ -284,9 +284,7 @@ public final class AgentLifecycleReducer {
 			long nowEpochMs
 	) {
 		requireRevision(current, expectedGoalRevision);
-		if (current.currentGoal().isEmpty()) {
-			throw new AgentDomainException("NO_CURRENT_GOAL", "Coordinator recovery requires an unfinished goal");
-		}
+		requireUnfinishedGoal(current, "re-arm after coordinator recovery");
 		if (current.state() == AgentLifecycleState.STARTING) {
 			return transition(current, current, false, false);
 		}
@@ -351,6 +349,20 @@ public final class AgentLifecycleReducer {
 					"Expected goal revision " + current.goalRevision() + " but received " + revision
 			);
 		}
+	}
+
+	private static AgentGoal requireUnfinishedGoal(AgentRecord current, String operation) {
+		AgentGoal goal = current.currentGoal().orElseThrow(
+				() -> new AgentDomainException("NO_CURRENT_GOAL", "Agent has no current goal to " + operation)
+		);
+		if (isTerminal(goal)) {
+			throw new AgentDomainException("TERMINAL_GOAL", "Cannot " + operation + " a terminal goal");
+		}
+		return goal;
+	}
+
+	private static boolean isTerminal(AgentGoal goal) {
+		return goal.status() == GoalStatus.SATISFIED || goal.status() == GoalStatus.CANCELLED;
 	}
 
 	private static long nextRevision(AgentRecord current) {

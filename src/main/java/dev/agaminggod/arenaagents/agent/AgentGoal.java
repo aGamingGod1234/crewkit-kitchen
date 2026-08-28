@@ -70,6 +70,9 @@ public record AgentGoal(
 	}
 
 	public AgentGoal steer(String instruction, long nowEpochMs) {
+		if (status == GoalStatus.SATISFIED || status == GoalStatus.CANCELLED) {
+			throw new AgentDomainException("TERMINAL_GOAL", "A terminal goal cannot be steered back into active work");
+		}
 		if (nowEpochMs < updatedAtEpochMs) {
 			throw new AgentDomainException("INVALID_GOAL_TIME", "Steering timestamp precedes the goal update");
 		}

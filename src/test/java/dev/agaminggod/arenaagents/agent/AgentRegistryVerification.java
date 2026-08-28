@@ -23,6 +23,7 @@ public final class AgentRegistryVerification {
 		assertions += verifyCoordinatorRecoveryRearm();
 		assertions += verifyCoordinatorCompletion();
 		assertions += verifyCoordinatorCompletionPromotesQueue();
+		assertions += verifyTerminalGoalControls();
 		assertions += verifyQueueAndSteeringBounds();
 		assertions += verifyIdentityResolution();
 		assertions += verifyPersistenceRecovery();
@@ -206,6 +207,30 @@ public final class AgentRegistryVerification {
 		assertEquals(3, transitions.size(), "queued completion promotion dispatches one lifecycle transition");
 		AgentTransition promotion = transitions.getLast();
 		assertEquals(AgentLifecycleState.STARTING, promotion.after().state(), "promotion is restartable by the coordinator");
+		return 7;
+	}
+
+	private static int verifyTerminalGoalControls() {
+		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transition -> { });
+		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("Completed"), START_TIME);
+		AgentRecord active = registry.start(created.agentId(), "Get an iron pickaxe", START_TIME + 1L).after();
+		GoalEvidence evidence = new GoalEvidence(2L, "inventory_contains", List.of(
+				new GoalEvidence.Fact("inventory_contains", true, "minecraft:iron_pickaxe x1", "minecraft:iron_pickaxe x1")
+		));
+		AgentRecord completed = registry.satisfyGoal(
+				created.agentId(), active.goalRevision(), evidence, START_TIME + 2L).after();
+
+		expectFailure(() -> registry.stop(created.agentId(), START_TIME + 3L), "TERMINAL_GOAL");
+		assertEquals(completed, registry.require(created.agentId()), "rejected stop preserves the completed record exactly");
+		expectFailure(() -> registry.steer(created.agentId(), "Continue", START_TIME + 4L), "TERMINAL_GOAL");
+		assertEquals(completed, registry.require(created.agentId()), "rejected steering cannot resurrect satisfied work");
+		expectFailure(
+				() -> completed.currentGoal().orElseThrow().steer("Continue", START_TIME + 4L),
+				"TERMINAL_GOAL"
+		);
+		AgentTransition disconnected = registry.disconnect(created.agentId(), START_TIME + 5L);
+		assertEquals(completed, disconnected.after(), "coordinator disconnect leaves completed work immutable");
+		assertEquals(completed, registry.require(created.agentId()), "disconnect cannot create a resumable terminal record");
 		return 7;
 	}
 

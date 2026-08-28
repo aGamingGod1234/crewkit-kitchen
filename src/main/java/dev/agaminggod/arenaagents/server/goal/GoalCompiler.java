@@ -41,6 +41,8 @@ public final class GoalCompiler {
 					+ "(?:\\s+and\\s+stop(?:\\s+there)?)?$"
 	);
 	private static final Pattern ADVANCEMENT = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
+	private static final Pattern ADVANCEMENT_NAME_PREFIX = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement (.+)$");
+	private static final Pattern ADVANCEMENT_NAME_SUFFIX = Pattern.compile("^(?:complete|get|earn) (?:the )?(.+?) advancement$");
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:(?:the|a|an) )?(.+)$");
 	private static final Pattern KILL_COUNT = Pattern.compile("^\\d+\\s+(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
@@ -236,9 +238,22 @@ public final class GoalCompiler {
 	}
 
 	public List<String> candidateIdsFor(String request, RegistryAccess registries) {
+		return candidateIdsFor(request, registries, Map.of());
+	}
+
+	public List<String> candidateIdsFor(
+			String request,
+			RegistryAccess registries,
+			Map<String, String> liveAdvancementTitles
+	) {
 		Objects.requireNonNull(registries, "registries must not be null");
+		Objects.requireNonNull(liveAdvancementTitles, "liveAdvancementTitles must not be null");
 		String command = stripTrailingPunctuation(stripPoliteness(
 				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		String advancementName = advancementName(command);
+		if (advancementName != null) {
+			return relatedAdvancements(advancementName, liveAdvancementTitles);
+		}
 		List<GoalClause> clauses = compoundClauses(command);
 		if (clauses.size() > 1) {
 			TreeSet<String> candidates = new TreeSet<>();
@@ -269,6 +284,40 @@ public final class GoalCompiler {
 			return sourceBlocks.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
 		}
 		return List.of();
+	}
+
+	private static String advancementName(String command) {
+		Matcher prefix = ADVANCEMENT_NAME_PREFIX.matcher(command);
+		if (prefix.matches()) return prefix.group(1);
+		Matcher suffix = ADVANCEMENT_NAME_SUFFIX.matcher(command);
+		return suffix.matches() ? suffix.group(1) : null;
+	}
+
+	private static List<String> relatedAdvancements(String rawTarget, Map<String, String> liveAdvancementTitles) {
+		String target = normalizedAdvancementText(rawTarget);
+		if (target.isEmpty()) return List.of();
+		TreeSet<String> matches = new TreeSet<>();
+		for (Map.Entry<String, String> entry : liveAdvancementTitles.entrySet()) {
+			String id = Objects.requireNonNull(entry.getKey(), "advancement ID must not be null");
+			String title = Objects.requireNonNull(entry.getValue(), "advancement title must not be null");
+			String normalizedId = normalizedAdvancementText(id);
+			String normalizedTitle = normalizedAdvancementText(title);
+			if (normalizedId.equals(target) || normalizedTitle.equals(target)
+					|| normalizedId.contains(" " + target) || normalizedTitle.contains(target)) {
+				matches.add(id);
+			}
+		}
+		return matches.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
+	}
+
+	private static String normalizedAdvancementText(String value) {
+		return value.toLowerCase(Locale.ROOT)
+				.replace(':', ' ')
+				.replace('/', ' ')
+				.replace('_', ' ')
+				.replaceAll("[^a-z0-9]+", " ")
+				.strip()
+				.replaceAll("\\s+", " ");
 	}
 
 	private static GoalCompilation compileCompound(String original, String command, RegistryAccess registries, long createdAtTick) {

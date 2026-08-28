@@ -313,9 +313,20 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		return new PendingGoalDraft(
 				UUID.randomUUID(), target.agentId(), playerId, event.text(),
 				sourceLevel.dimension().identifier().toString(),
-				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess()), proposed, intent,
+				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess(), liveAdvancementTitles()), proposed, intent,
 				manager.server().getTickCount(), target.goalRevision(), target.currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId)
 		);
+	}
+
+	private Map<String, String> liveAdvancementTitles() {
+		LinkedHashMap<String, String> titles = new LinkedHashMap<>();
+		for (var advancement : manager.server().getAdvancements().getAllAdvancements()) {
+			titles.put(
+					advancement.id().toString(),
+					advancement.value().display().map(display -> display.getTitle().getString()).orElse("")
+			);
+		}
+		return Map.copyOf(titles);
 	}
 
 	private void notifyRequester(PendingGoalDraft draft, String message) {
