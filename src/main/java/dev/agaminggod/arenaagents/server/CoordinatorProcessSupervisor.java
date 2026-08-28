@@ -658,6 +658,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		nextDependencyCheckEpochMs = now + DEPENDENCY_RECHECK_MS;
 		PreparedRuntime previous = runtime;
 		runtime = resolution.runtime();
+		boolean launchMaterialChanged = previous != null && runtime != null && (
+				!Objects.equals(previous.root(), runtime.root())
+						|| !Objects.equals(previous.coordinatorRoot(), runtime.coordinatorRoot())
+						|| !Objects.equals(previous.main(), runtime.main())
+						|| !Objects.equals(previous.config(), runtime.config())
+						|| !Objects.equals(previous.secret(), runtime.secret())
+						|| !Objects.equals(previous.nodeExecutable(), runtime.nodeExecutable())
+						|| !Objects.equals(previous.bridgeSecret(), runtime.bridgeSecret())
+						|| !Objects.equals(previous.generationId(), runtime.generationId())
+		);
 		if (runtime == null || previous == null || !previous.generationId().equals(runtime.generationId())) {
 			candidateFailures = 0;
 			rollbackRequested = false;
@@ -685,7 +695,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			return false;
 		}
 
-		if (fingerprintChanged && previous != null && child != null) {
+		if ((fingerprintChanged || launchMaterialChanged) && previous != null && child != null) {
 			queueTermination(detachChild());
 			state = CoordinatorRecoveryState.STARTING;
 			nextRetryEpochMs = now;
@@ -1443,6 +1453,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 					LOGGER.warn("Could not refresh the bundled Arena Agents runtime; attempting the last complete installed version", failure);
 				}
 				Path discoveredRoot = findPackageRoot(gameDirectory);
+				if (discoveredRoot == null && installFailure != null) {
+					try {
+						if (BundledCoordinatorInstaller.restoreLastKnownGoodIfActiveInvalid(installedRoot)) {
+							LOGGER.warn("Restored the verified Arena Agents coordinator runtime after the active installation became invalid");
+							discoveredRoot = findPackageRoot(gameDirectory);
+						}
+					} catch (IOException restoreFailure) {
+						installFailure.addSuppressed(restoreFailure);
+					}
+				}
 				if (discoveredRoot == null) {
 					if (installFailure != null) throw installFailure;
 					throw new IOException("Coordinator runtime package is unavailable");
@@ -1450,8 +1470,17 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				try {
 					prepared = BundledCoordinatorInstaller.validate(discoveredRoot);
 				} catch (IOException invalidRuntime) {
-					if (installFailure != null) invalidRuntime.addSuppressed(installFailure);
-					throw invalidRuntime;
+					try {
+						if (!BundledCoordinatorInstaller.restoreLastKnownGoodIfActiveInvalid(discoveredRoot)) {
+							throw invalidRuntime;
+						}
+						LOGGER.warn("Restored the verified Arena Agents coordinator runtime after active-generation corruption");
+						prepared = BundledCoordinatorInstaller.validate(discoveredRoot);
+					} catch (IOException restoreFailure) {
+						if (restoreFailure != invalidRuntime) invalidRuntime.addSuppressed(restoreFailure);
+						if (installFailure != null) invalidRuntime.addSuppressed(installFailure);
+						throw invalidRuntime;
+					}
 				}
 				String secret = Files.readString(prepared.secret(), StandardCharsets.UTF_8).trim();
 				validateConfig(prepared.config());

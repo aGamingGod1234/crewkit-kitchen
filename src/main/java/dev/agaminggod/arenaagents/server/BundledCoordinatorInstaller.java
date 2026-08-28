@@ -164,6 +164,31 @@ final class BundledCoordinatorInstaller {
 		return true;
 	}
 
+	/** Restores the verified retained generation only when the active runtime is no longer runnable. */
+	static boolean restoreLastKnownGoodIfActiveInvalid(Path packageRoot) throws IOException {
+		Path root = normalizedRoot(packageRoot);
+		ensureSafeMutationTargets(root);
+		recoverInterruptedSwap(root, BundledCoordinatorInstaller::atomicMove);
+		GenerationState state = readState(root);
+		if (!state.phase().equals(Phase.READY.value)) return false;
+		if (generationMatches(root.resolve(ACTIVE_NAME), state.activeGeneration())) return false;
+		String retained = state.lastKnownGoodGeneration();
+		if (retained.isBlank()) return false;
+		validateGeneration(root.resolve(LAST_KNOWN_GOOD_NAME), retained);
+
+		String failedGeneration = state.activeGeneration();
+		if (failedGeneration.isBlank()) return false;
+		Path holder = root.resolve(STAGING_PREFIX + "rollback-" + failedGeneration);
+		if (Files.exists(holder, LinkOption.NOFOLLOW_LINKS)) deleteTree(root, holder);
+		writeState(root, new GenerationState(
+				Phase.ROLLBACK.value, failedGeneration, retained, failedGeneration, retained,
+				holder.getFileName().toString(), failedGeneration
+		));
+		recoverInterruptedSwap(root, BundledCoordinatorInstaller::atomicMove);
+		cleanupStaging(root, null);
+		return true;
+	}
+
 	private static GenerationState reconcileReadyState(Path root, GenerationState state, String generationId)
 			throws IOException {
 		if (state.phase().equals(Phase.READY.value) && generationId.equals(state.activeGeneration())) return state;

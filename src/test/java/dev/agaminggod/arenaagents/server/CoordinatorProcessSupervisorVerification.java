@@ -51,6 +51,7 @@ public final class CoordinatorProcessSupervisorVerification {
 	public static int verifyFaultMatrix() {
 		verifyRecoveryContract();
 		verifyBridgeBindFailureRecovery();
+		verifyOccupiedBridgePortRecoversAndAuthenticates();
 		verifyEightCrashesStillRecover();
 		verifyHungAuthenticationIsReplaced();
 		verifyStaleLaunchAuthenticationIsRejected();
@@ -65,6 +66,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyMissingThenRestoredDependency();
 		verifyPeriodicDependencyRevalidation();
 		verifyHealthyDependencyRevalidation();
+		verifyLaunchMaterialChangeFencesOwnedChild();
 		verifyBlockingMaintenanceNeverBlocksTicks();
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
@@ -80,7 +82,142 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyCloseIsIdempotent();
-		return 151;
+		return 181;
+	}
+
+	private static void verifyLaunchMaterialChangeFencesOwnedChild() {
+		Fixture fixture = Fixture.ready();
+		fixture.startFirstProcess();
+		String oldLaunchId = fixture.supervisor.snapshot().launchId();
+		fixture.supervisor.tick(true, oldLaunchId, 1L);
+		FakeChild oldChild = fixture.launcher.latest();
+		CoordinatorProcessSupervisor.PreparedRuntime oldRuntime = fixture.dependencies.runtime;
+		fixture.dependencies.runtime = new CoordinatorProcessSupervisor.PreparedRuntime(
+				oldRuntime.root(), oldRuntime.coordinatorRoot(), oldRuntime.main(), oldRuntime.config(),
+				oldRuntime.secret(), oldRuntime.nodeExecutable(), oldRuntime.bridgeSecret(),
+				GENERATION_B, false, true
+		);
+		fixture.dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(fixture.dependencies.runtime);
+
+		fixture.clock.advance(5_000L);
+		fixture.supervisor.tick(true, oldLaunchId, 1L);
+		for (int tick = 0; tick < 4; tick++) fixture.supervisor.tick(true, oldLaunchId, 1L);
+
+		assertEquals(1, oldChild.terminations,
+				"runtime generation replacement terminates the exact owned child despite an unchanged fingerprint");
+		assertEquals(2, fixture.launcher.launches.size(),
+				"runtime generation replacement launches exactly one successor");
+		assertEquals(GENERATION_B, fixture.launcher.launches.getLast().generationId(),
+				"successor launches only from the newly resolved generation");
+		assertTrue(!fixture.launcher.children.getLast().equals(oldChild) && fixture.launcher.children.getLast().isAlive(),
+				"one distinct successor remains alive after generation fencing");
+		assertEquals(CoordinatorRecoveryState.AUTHENTICATING, fixture.supervisor.snapshot().state(),
+				"new generation waits for its own authenticated bridge");
+
+		fixture.supervisor.tick(true, oldLaunchId, 2L);
+		assertEquals(CoordinatorRecoveryState.AUTHENTICATING, fixture.supervisor.snapshot().state(),
+				"late authentication from the terminated generation cannot become healthy");
+		String replacementLaunchId = fixture.supervisor.snapshot().launchId();
+		assertTrue(!oldLaunchId.equals(replacementLaunchId),
+				"replacement generation receives a fresh launch identity");
+		fixture.supervisor.tick(true, replacementLaunchId, 2L);
+		assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
+				"exact replacement identity automatically returns the supervisor to healthy");
+		assertEquals(1L, fixture.launcher.children.stream().filter(FakeChild::isAlive).count(),
+				"generation replacement retains exactly one live owned child");
+		fixture.supervisor.close();
+	}
+
+	private static void verifyOccupiedBridgePortRecoversAndAuthenticates() {
+		Fixture fixture = Fixture.ready();
+		CodexAgentServerRuntime.BridgeSlot slot = null;
+		ServerSocket conflict = null;
+		Socket authenticated = null;
+		try {
+			fixture.startFirstProcess();
+			String secret = "p".repeat(32);
+			conflict = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+			int port = conflict.getLocalPort();
+			AtomicInteger constructions = new AtomicInteger();
+			CodexAgentManager manager = uninitializedManager();
+			slot = new CodexAgentServerRuntime.BridgeSlot(fixture.clock);
+			CodexAgentServerRuntime.BridgeSlot ownedSlot = slot;
+			java.util.function.Function<String, MultiplexedServerBridge> factory = preparedSecret -> {
+				constructions.incrementAndGet();
+				return MultiplexedServerBridge.withPreparedSecret(manager, port, preparedSecret);
+			};
+
+			CodexAgentServerRuntime.reconcilePreparedBridge(slot, 1L, secret, factory);
+			assertEquals(null, slot.bridge(), "occupied configured port leaves no partially active bridge");
+			assertEquals("BRIDGE_BIND_FAILED", slot.retry().failureCode(),
+					"BridgeSlot reports the real bind boundary");
+			assertEquals(fixture.clock.now + 1_000L, slot.retry().nextRetryEpochMs(),
+					"BridgeSlot schedules the first bind retry deadline");
+			assertEquals(1, constructions.get(), "occupied port creates one failed bridge candidate");
+
+			long started = System.nanoTime();
+			for (int tick = 0; tick < 50; tick++) {
+				fixture.supervisor.tick(false, null, 0L);
+				CodexAgentServerRuntime.reconcilePreparedBridge(ownedSlot, 1L, secret, factory);
+			}
+			long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+			assertTrue(elapsedMs < 250L, "bridge recovery ticks remain nonblocking: elapsed=" + elapsedMs + "ms");
+			assertEquals(1, constructions.get(), "BridgeSlot does not spin before its retry deadline");
+
+			conflict.close();
+			conflict = null;
+			fixture.clock.advance(1_000L);
+			fixture.supervisor.tick(false, null, 0L);
+			CodexAgentServerRuntime.reconcilePreparedBridge(slot, 1L, secret, factory);
+			MultiplexedServerBridge recovered = slot.bridge();
+			assertEquals(2, constructions.get(), "released port creates exactly one recovery bridge");
+			assertTrue(recovered != null, "BridgeSlot automatically binds after the retry deadline");
+			assertEquals(null, slot.retry().failureCode(), "successful bind clears the BridgeSlot failure");
+			assertEquals(0L, slot.retry().nextRetryEpochMs(), "successful bind clears the BridgeSlot deadline");
+
+			authenticated = authenticate(
+					port,
+					secret,
+					fixture.supervisor.snapshot().launchId(),
+					"bridge-slot-bind-recovery"
+			);
+			fixture.supervisor.tick(
+					recovered.authenticated(),
+					recovered.authenticatedLaunchId(),
+					recovered.authenticatedSessionGeneration()
+			);
+			assertTrue(recovered.authenticated(), "recovered bridge authenticates its coordinator");
+			assertEquals(CoordinatorRecoveryState.HEALTHY, fixture.supervisor.snapshot().state(),
+					"recovered BridgeSlot promotes the supervisor to healthy");
+			assertEquals(fixture.supervisor.snapshot().launchId(), recovered.authenticatedLaunchId(),
+					"recovered bridge retains the exact launch identity");
+			assertTrue(recovered.authenticatedSessionGeneration() > 0L,
+					"recovered bridge publishes one positive session generation");
+
+			CodexAgentServerRuntime.reconcilePreparedBridge(slot, 1L, secret, ignored -> {
+				throw new AssertionError("unchanged BridgeSlot revision must not construct another bridge");
+			});
+			assertEquals(recovered, slot.bridge(), "unchanged reconciliation retains exactly one active bridge");
+			closeSocket(authenticated);
+			authenticated = null;
+			slot.close();
+			slot = null;
+			try (ServerSocket rebound = new ServerSocket(port, 1, InetAddress.getLoopbackAddress())) {
+				assertEquals(port, rebound.getLocalPort(), "closing recovered BridgeSlot releases its listener once");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("occupied BridgeSlot recovery failed", exception);
+		} finally {
+			closeSocket(authenticated);
+			if (conflict != null) {
+				try {
+					conflict.close();
+				} catch (IOException ignored) {
+				}
+			}
+			if (slot != null) slot.close();
+			fixture.supervisor.close();
+		}
 	}
 
 	private static void verifyCandidatePromotionUsesMaintenanceWorker() {

@@ -8,7 +8,10 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class BundledCoordinatorInstallerVerification {
 	private BundledCoordinatorInstallerVerification() {
@@ -23,6 +26,8 @@ public final class BundledCoordinatorInstallerVerification {
 		assertions += verifyConfiguredSecretPathUsesPreparedRuntime();
 		assertions += verifyVerifiedGenerationCanRollbackCandidate();
 		assertions += verifyCorruptedActiveGenerationRollsBackToVerifiedRuntime();
+		assertions += verifySupervisorAutomaticallyRestoresCorruptedRuntime();
+		assertions += verifySupervisorRejectsCorruptionWithoutValidLastKnownGood();
 		assertions += verifySoleCandidateIsRetainedForRetry();
 		assertions += verifyStaleCoordinatorIsReplacedWithoutTouchingRuntimeState();
 		assertions += verifyIncompleteBundleLeavesExistingCoordinatorIntact();
@@ -30,6 +35,200 @@ public final class BundledCoordinatorInstallerVerification {
 		assertions += verifyInterruptedSwapRecoversPreviousCoordinator();
 		assertions += verifyTransientDirectoryLockIsRetried();
 		return assertions;
+	}
+
+	private static int verifySupervisorAutomaticallyRestoresCorruptedRuntime() throws Exception {
+		Path root = Files.createTempDirectory("arena-supervisor-corrupt-lkg");
+		String oldPackageRoot = System.getProperty("arenaagents.packageRoot");
+		CoordinatorProcessSupervisor supervisor = null;
+		try {
+			RuntimeFixture fixture = stageRuntimeFixture(root.resolve("package"), true);
+			Files.writeString(fixture.activeMain(), "corrupted active main", StandardCharsets.UTF_8);
+			Path game = blockBundledRefresh(root.resolve("game"));
+			System.setProperty("arenaagents.packageRoot", fixture.packageRoot().toString());
+			FakeClock clock = new FakeClock();
+			FakeLauncher launcher = new FakeLauncher();
+			AtomicInteger launchIds = new AtomicInteger();
+			supervisor = new CoordinatorProcessSupervisor(
+					game,
+					Map.of(),
+					clock,
+					null,
+					launcher,
+					() -> "00000000-0000-0000-0000-%012d".formatted(launchIds.incrementAndGet()),
+					Runnable::run,
+					runtimeRoot -> 0,
+					task -> { }
+			);
+
+			assertTrue(supervisor.configured(),
+					"supervisor restores a verified LKG when bundled refresh cannot repair the corrupt active runtime");
+			assertEquals(fixture.verifiedGeneration(), supervisor.runtimeGenerationId(),
+					"supervisor publishes the exact restored verified generation");
+			assertEquals("verified main", Files.readString(fixture.activeMain()),
+					"supervisor restores verified runtime bytes before launch");
+			assertFalse(Files.exists(fixture.packageRoot().resolve("coordinator.last-known-good")),
+					"automatic restoration consumes the retained generation once");
+
+			clock.advance(3_000L);
+			supervisor.tick(false, null, 0L);
+			assertEquals(1, launcher.launches.size(), "automatic restoration starts one coordinator generation");
+			assertEquals(fixture.verifiedGeneration(), launcher.launches.getFirst().generationId(),
+					"automatic restoration launches only the verified generation");
+			String launchId = supervisor.snapshot().launchId();
+			supervisor.tick(true, launchId, 1L);
+			assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
+					"restored verified runtime authenticates and returns automatically to healthy");
+			assertEquals(1L, launcher.children.stream().filter(FakeChild::isAlive).count(),
+					"automatic restoration owns exactly one live generation");
+			return 8;
+		} finally {
+			if (supervisor != null) supervisor.close();
+			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+			deleteTree(root);
+		}
+	}
+
+	private static int verifySupervisorRejectsCorruptionWithoutValidLastKnownGood() throws Exception {
+		int assertions = 0;
+		for (boolean retainThenCorruptLkg : List.of(false, true)) {
+			Path root = Files.createTempDirectory("arena-supervisor-invalid-lkg");
+			String oldPackageRoot = System.getProperty("arenaagents.packageRoot");
+			CoordinatorProcessSupervisor supervisor = null;
+			try {
+				RuntimeFixture fixture = stageRuntimeFixture(root.resolve("package"), retainThenCorruptLkg);
+				Files.writeString(fixture.activeMain(), "corrupted active main", StandardCharsets.UTF_8);
+				if (retainThenCorruptLkg) {
+					Files.writeString(
+							fixture.packageRoot().resolve("coordinator.last-known-good/src/dynamic-main.mjs"),
+							"corrupted retained main",
+							StandardCharsets.UTF_8
+					);
+				}
+				Path game = blockBundledRefresh(root.resolve("game"));
+				System.setProperty("arenaagents.packageRoot", fixture.packageRoot().toString());
+				FakeClock clock = new FakeClock();
+				FakeLauncher launcher = new FakeLauncher();
+				supervisor = new CoordinatorProcessSupervisor(
+						game,
+						Map.of(),
+						clock,
+						null,
+						launcher,
+						() -> "00000000-0000-0000-0000-000000000901",
+						Runnable::run,
+						runtimeRoot -> 0,
+						task -> { }
+				);
+
+				assertEquals(CoordinatorRecoveryState.BLOCKED_RETRYABLE, supervisor.snapshot().state(),
+						"corrupt runtime without a valid verified LKG remains safely retryable");
+				assertFalse(supervisor.configured(),
+						"corrupt runtime without a valid verified LKG is never launchable");
+				clock.advance(60_000L);
+				supervisor.tick(false, null, 0L);
+				assertTrue(launcher.launches.isEmpty(),
+						"blocked corruption never launches an unverified or empty fallback");
+				assertTrue(supervisor.snapshot().nextRetryEpochMs() > clock.now,
+						"blocked corruption retains a bounded automatic revalidation deadline");
+				assertions += 4;
+			} finally {
+				if (supervisor != null) supervisor.close();
+				restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+				deleteTree(root);
+			}
+		}
+		return assertions;
+	}
+
+	private static RuntimeFixture stageRuntimeFixture(Path packageRoot, boolean withLastKnownGood) throws Exception {
+		byte[] verifiedMain = "verified main".getBytes(StandardCharsets.UTF_8);
+		byte[] config = "{}".getBytes(StandardCharsets.UTF_8);
+		String verifiedManifest = manifest(
+				entry("src/dynamic-main.mjs", verifiedMain),
+				entry("config/dynamic-agents.json", config)
+		);
+		String verifiedGeneration = sha256(verifiedManifest.getBytes(StandardCharsets.UTF_8));
+		BundledCoordinatorInstaller.install(
+				packageRoot,
+				resource(resources(verifiedManifest, verifiedMain, config))
+		);
+		if (!withLastKnownGood) {
+			return new RuntimeFixture(
+					packageRoot,
+					packageRoot.resolve("coordinator/src/dynamic-main.mjs"),
+					verifiedGeneration
+			);
+		}
+		BundledCoordinatorInstaller.promote(packageRoot, verifiedGeneration);
+		byte[] candidateMain = "candidate main".getBytes(StandardCharsets.UTF_8);
+		String candidateManifest = manifest(
+				entry("src/dynamic-main.mjs", candidateMain),
+				entry("config/dynamic-agents.json", config)
+		);
+		BundledCoordinatorInstaller.install(
+				packageRoot,
+				resource(resources(candidateManifest, candidateMain, config))
+		);
+		return new RuntimeFixture(
+				packageRoot,
+				packageRoot.resolve("coordinator/src/dynamic-main.mjs"),
+				verifiedGeneration
+		);
+	}
+
+	private static Path blockBundledRefresh(Path game) throws IOException {
+		Files.createDirectories(game);
+		Files.writeString(game.resolve("arena-agents-runtime"), "bundled refresh blocked", StandardCharsets.UTF_8);
+		return game;
+	}
+
+	private record RuntimeFixture(Path packageRoot, Path activeMain, String verifiedGeneration) {
+	}
+
+	private static final class FakeClock implements java.util.function.LongSupplier {
+		private long now = 100_000L;
+
+		@Override
+		public long getAsLong() {
+			return now;
+		}
+
+		private void advance(long millis) {
+			now += millis;
+		}
+	}
+
+	private static final class FakeLauncher implements CoordinatorProcessSupervisor.ProcessLauncher {
+		private final List<CoordinatorProcessSupervisor.LaunchRequest> launches = new ArrayList<>();
+		private final List<FakeChild> children = new ArrayList<>();
+
+		@Override
+		public CoordinatorProcessSupervisor.ChildProcess launch(CoordinatorProcessSupervisor.LaunchRequest request) {
+			launches.add(request);
+			FakeChild child = new FakeChild();
+			children.add(child);
+			return child;
+		}
+	}
+
+	private static final class FakeChild implements CoordinatorProcessSupervisor.ChildProcess {
+		private boolean alive = true;
+
+		@Override
+		public boolean isAlive() {
+			return alive;
+		}
+
+		@Override
+		public long pid() {
+			return 90_901L;
+		}
+
+		@Override
+		public void terminate() {
+			alive = false;
+		}
 	}
 
 	private static int verifyCorruptedActiveGenerationRollsBackToVerifiedRuntime() throws Exception {

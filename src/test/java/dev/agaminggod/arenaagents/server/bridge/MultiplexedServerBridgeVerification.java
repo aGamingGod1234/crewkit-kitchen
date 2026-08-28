@@ -129,13 +129,14 @@ public final class MultiplexedServerBridgeVerification {
 		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyBindFailureClosesSocketBeforeRetry();
+		verifyHandshakeDeadlineReleasesHalfOpenSession();
 		verifyLaunchIdentityHandshake();
 		verifyEmptyCatalogRequestsLiveDiscovery();
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 157;
+		return 173;
 	}
 
 	private static void verifyBindFailureClosesSocketBeforeRetry() {
@@ -179,6 +180,108 @@ public final class MultiplexedServerBridgeVerification {
 				if (secretFile != null) Files.deleteIfExists(secretFile);
 			} catch (java.io.IOException exception) {
 				throw new AssertionError("could not clean bridge bind retry fixture", exception);
+			}
+		}
+	}
+
+	private static void verifyHandshakeDeadlineReleasesHalfOpenSession() {
+		Path secretFile = null;
+		MultiplexedServerBridge bridge = null;
+		Socket silent = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-handshake-deadline-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(
+					uninitializedManager(), 0, secretFile, ServerSocket::new, System::nanoTime, 150
+			);
+			bridge.start();
+			MultiplexedServerBridge activeBridge = bridge;
+			int port = activeBridge.boundPortForVerification();
+
+			long connectedAt = System.nanoTime();
+			silent = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, port);
+			silent.setSoTimeout(2_000);
+			awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
+					"silent unauthenticated socket owns exactly one pending session");
+			boolean closedByServer;
+			try {
+				closedByServer = silent.getInputStream().read() == -1;
+			} catch (java.net.SocketException expected) {
+				closedByServer = true;
+			}
+			long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - connectedAt);
+			assertTrue(closedByServer, "absolute handshake deadline closes the silent client");
+			assertTrue(elapsedMs >= 100L && elapsedMs < 1_500L,
+					"silent handshake closes near its bounded production deadline");
+			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
+					"expired handshake releases bridge session ownership");
+			assertEquals(port, activeBridge.boundPortForVerification(),
+					"handshake expiry keeps the same listener available without restart");
+			assertTrue(!activeBridge.authenticated(), "expired half-open socket cannot authenticate");
+
+			try (Socket trickle = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, port)) {
+				awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
+						"slow peer owns the pending session while its handshake is incomplete");
+				long trickleStartedAt = System.nanoTime();
+				while (activeBridge.observationPublicationForVerification().hasActiveSession()
+						&& TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - trickleStartedAt) < 1_000L) {
+					try {
+						trickle.getOutputStream().write('{');
+						trickle.getOutputStream().flush();
+					} catch (java.net.SocketException closed) {
+						break;
+					}
+					Thread.sleep(35L);
+				}
+				awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
+						"absolute deadline releases a peer even when bytes keep arriving");
+				long trickleElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - trickleStartedAt);
+				assertTrue(trickleElapsedMs >= 100L && trickleElapsedMs < 750L,
+						"byte trickle cannot extend the handshake deadline indefinitely");
+			}
+			assertEquals(port, activeBridge.boundPortForVerification(),
+					"slow-handshake eviction leaves the listener healthy for replacement");
+
+			String launchId = "00000000-0000-0000-0000-000000000321";
+			try (Socket replacement = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, port);
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(
+						 replacement.getInputStream(), StandardCharsets.UTF_8))) {
+				replacement.setSoTimeout(2_000);
+				BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+				JsonObject hello = new JsonObject();
+				hello.addProperty("secret", secret);
+				hello.addProperty("launchId", launchId);
+				writeEnvelope(replacement, codec, new BridgeEnvelope(
+						2, "coordinator", "server", "hello", "hello-after-half-open", hello
+				));
+				assertEquals("hello_ack", codec.decode(reader.readLine()).type(),
+						"replacement authenticates on the same bridge after deadline cleanup");
+				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
+						"replacement receives the complete handshake replay");
+				awaitCondition(activeBridge::authenticated,
+						"replacement becomes the bridge's authenticated session");
+				assertEquals(launchId, activeBridge.authenticatedLaunchId(),
+						"replacement owns the exact coordinator launch identity");
+				assertEquals(1L, activeBridge.authenticatedSessionGeneration(),
+						"failed half-open handshake does not consume an authenticated generation");
+			}
+			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
+					"replacement disconnect releases the session for another recovery");
+		} catch (Exception exception) {
+			throw new AssertionError("real half-open bridge recovery verification failed", exception);
+		} finally {
+			try {
+				if (silent != null) silent.close();
+			} catch (java.io.IOException ignored) {
+			}
+			if (bridge != null) bridge.close();
+			if (secretFile != null) {
+				try {
+					Files.deleteIfExists(secretFile);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove handshake-deadline secret", exception);
+				}
 			}
 		}
 	}

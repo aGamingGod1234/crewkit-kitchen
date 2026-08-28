@@ -75,6 +75,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -131,6 +132,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final int port;
 	private final ServerSocketFactory serverSockets;
 	private final LongSupplier nanoTime;
+	private final int handshakeTimeoutMs;
 	private final AgentVerboseState verboseState;
 	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(SERVER_TASK_CAP);
 	private final AtomicBoolean running = new AtomicBoolean();
@@ -244,7 +246,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			ServerSocketFactory serverSockets,
 			LongSupplier nanoTime
 	) {
-		this(manager, port, secretPath, new AgentVerboseState(), defaultGoalVerificationRuntime(manager), serverSockets, nanoTime);
+		this(manager, port, secretPath, serverSockets, nanoTime, HANDSHAKE_TIMEOUT_MS);
+	}
+
+	MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime,
+			int handshakeTimeoutMs
+	) {
+		this(
+				manager, port, secretPath, new AgentVerboseState(), defaultGoalVerificationRuntime(manager),
+				serverSockets, nanoTime, handshakeTimeoutMs
+		);
 	}
 
 	private MultiplexedServerBridge(
@@ -267,7 +283,26 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			ServerSocketFactory serverSockets,
 			LongSupplier nanoTime
 	) {
-		this(manager, port, readSecret(secretPath), verboseState, goalVerificationRuntime, serverSockets, nanoTime);
+		this(
+				manager, port, readSecret(secretPath), verboseState, goalVerificationRuntime, serverSockets,
+				nanoTime, HANDSHAKE_TIMEOUT_MS
+		);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime,
+			int handshakeTimeoutMs
+	) {
+		this(
+				manager, port, readSecret(secretPath), verboseState, goalVerificationRuntime, serverSockets,
+				nanoTime, handshakeTimeoutMs
+		);
 	}
 
 	private MultiplexedServerBridge(
@@ -290,11 +325,31 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			ServerSocketFactory serverSockets,
 			LongSupplier nanoTime
 	) {
+		this(
+				manager, port, preparedSecret, verboseState, goalVerificationRuntime, serverSockets,
+				nanoTime, HANDSHAKE_TIMEOUT_MS
+		);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			String preparedSecret,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime,
+			int handshakeTimeoutMs
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		this.port = port;
 		this.serverSockets = Objects.requireNonNull(serverSockets, "server socket factory must not be null");
 		this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime must not be null");
+		if (handshakeTimeoutMs < 1 || handshakeTimeoutMs > 60_000) {
+			throw new IllegalArgumentException("handshake timeout must be between 1 and 60000 ms");
+		}
+		this.handshakeTimeoutMs = handshakeTimeoutMs;
 		this.secret = validatePreparedSecret(preparedSecret);
 		this.verboseState = Objects.requireNonNull(verboseState, "verboseState must not be null");
 		this.goalVerificationRuntime = Objects.requireNonNull(goalVerificationRuntime, "goalVerificationRuntime must not be null");
@@ -2553,11 +2608,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private volatile long authenticatedSessionGeneration;
 		private volatile Thread readerThread;
 		private volatile Thread writerThread;
+		private final long handshakeStartedNanos;
+		private final long handshakeTimeoutNanos;
 
 		Session(Socket socket) throws IOException {
 			this.socket = socket;
+			handshakeStartedNanos = nanoTime.getAsLong();
+			handshakeTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(handshakeTimeoutMs);
 			socket.setTcpNoDelay(true);
-			socket.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+			socket.setSoTimeout(handshakeTimeoutMs);
 		}
 
 		void start() {
@@ -2637,7 +2696,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private void readLoop() {
 			try (BufferedInputStream input = new BufferedInputStream(socket.getInputStream())) {
 				while (open.get()) {
-					String line = readLine(input);
+					String line = authenticated.get() ? readLine(input) : readHandshakeLine(input);
 					if (line == null) break;
 					BridgeEnvelope envelope = codec.decode(line);
 					synchronized (this) {
@@ -2653,6 +2712,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				if (open.get()) LOGGER.warn("Codex bridge session closed: {}", exception.getMessage());
 			} finally {
 				close();
+			}
+		}
+
+		private String readHandshakeLine(BufferedInputStream input) throws IOException {
+			ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+			while (true) {
+				long elapsed = nanoTime.getAsLong() - handshakeStartedNanos;
+				long remaining = handshakeTimeoutNanos - elapsed;
+				if (remaining <= 0L) throw new SocketTimeoutException("Coordinator handshake deadline expired");
+				long remainingMs = Math.max(1L, Math.ceilDiv(remaining, 1_000_000L));
+				socket.setSoTimeout((int) Math.min(Integer.MAX_VALUE, remainingMs));
+				int value = input.read();
+				if (value < 0) return bytes.size() == 0 ? null : bytes.toString(StandardCharsets.UTF_8);
+				if (value == '\n') return bytes.toString(StandardCharsets.UTF_8);
+				if (value != '\r') bytes.write(value);
+				if (bytes.size() > BridgeEnvelopeCodec.MAX_LINE_BYTES) {
+					throw new BridgeProtocolException("LINE_TOO_LARGE", "Inbound line exceeds limit");
+				}
 			}
 		}
 
