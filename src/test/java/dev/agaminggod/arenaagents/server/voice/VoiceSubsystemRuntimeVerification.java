@@ -150,7 +150,7 @@ public final class VoiceSubsystemRuntimeVerification {
 				captureMonitor, cancellationStarted
 		);
 		assertTrue(VoiceSubsystemRuntime.start(server, configuration,
-				List.of((actualServer, actualConfiguration) -> subsystem)),
+				List.of(configuredProvider((actualServer, actualConfiguration) -> subsystem))),
 				"lock-order verification installs its voice subsystem");
 		VoiceConsentRegistry.grant(server, playerId);
 
