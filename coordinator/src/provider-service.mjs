@@ -195,6 +195,7 @@ export class ProviderService extends EventEmitter {
 			return await promise;
 		} finally {
 			if (this.#creating.get(profile.agentId) === entry) this.#creating.delete(profile.agentId);
+			this.#pruneAgentMutation(mutation);
 		}
 	}
 
@@ -263,7 +264,10 @@ export class ProviderService extends EventEmitter {
 		const entry = { profile, promise, get mutation() { return mutation; } };
 		this.#replacing.set(profile.agentId, entry);
 		try { return await promise; }
-		finally { if (this.#replacing.get(profile.agentId) === entry) this.#replacing.delete(profile.agentId); }
+		finally {
+			if (this.#replacing.get(profile.agentId) === entry) this.#replacing.delete(profile.agentId);
+			this.#pruneAgentMutation(mutation);
+		}
 	}
 
 	getAgent(agentId) {
@@ -325,7 +329,10 @@ export class ProviderService extends EventEmitter {
 		const entry = { promise, get mutation() { return mutation; } };
 		this.#removing.set(agentId, entry);
 		try { return await promise; }
-		finally { if (this.#removing.get(agentId) === entry) this.#removing.delete(agentId); }
+		finally {
+			if (this.#removing.get(agentId) === entry) this.#removing.delete(agentId);
+			this.#pruneAgentMutation(mutation);
+		}
 	}
 
 	async reconcile(records) {
@@ -401,6 +408,7 @@ export class ProviderService extends EventEmitter {
 		const nextAgents = new Map();
 		for (const { provider, result, error } of settled) {
 			if (error !== undefined) {
+				const desiredAgentIds = new Set(groups.get(provider).map(({ agentId }) => agentId));
 				for (const profileValue of groups.get(provider)) {
 					const profile = freezeProfile(profileValue);
 					const previous = previousAssignments.get(profile.agentId);
@@ -409,6 +417,9 @@ export class ProviderService extends EventEmitter {
 						const agent = previousAgents.get(profile.agentId);
 						if (agent !== undefined) nextAgents.set(profile.agentId, agent);
 					}
+				}
+				for (const [agentId, previous] of previousAssignments) {
+					if (previous.provider === provider && !desiredAgentIds.has(agentId)) nextAssignments.set(agentId, previous);
 				}
 				continue;
 			}
@@ -447,6 +458,7 @@ export class ProviderService extends EventEmitter {
 		} finally {
 			agentFence?.release();
 			if (agentFence !== null) for (const [agentId, entry] of this.#reconcilingAgents) if (entry === agentFence) this.#reconcilingAgents.delete(agentId);
+			for (const token of mutationTokens) this.#pruneAgentMutation(token);
 			this.#activeReconciliations.delete(reconciliationGeneration);
 		}
 	}
@@ -535,6 +547,14 @@ export class ProviderService extends EventEmitter {
 			&& this.#agentMutationTokens.get(token.agentId) === token;
 	}
 
+	#pruneAgentMutation(token) {
+		if (token === null || token === undefined || this.#agentMutationTokens.get(token.agentId) !== token) return;
+		const agentId = token.agentId;
+		if (this.#assignments.has(agentId) || this.#acceptedAgents.has(agentId) || this.#reconcilingAgents.has(agentId)) return;
+		if ([this.#creating, this.#replacing, this.#removing, this.#repairing].some((owners) => owners.has(agentId))) return;
+		this.#agentMutationTokens.delete(agentId);
+	}
+
 	async #disposeStaleAgent(provider, agentId, agent, staleMutation) {
 		await this.#discardPhysicalAgent(provider, agentId, agent);
 		await this.#repairAfterStaleMutation(provider, agentId, staleMutation);
@@ -572,7 +592,10 @@ export class ProviderService extends EventEmitter {
 		const entry = { mutation, promise };
 		this.#repairing.set(agentId, entry);
 		try { return await promise; }
-		finally { if (this.#repairing.get(agentId) === entry) this.#repairing.delete(agentId); }
+		finally {
+			if (this.#repairing.get(agentId) === entry) this.#repairing.delete(agentId);
+			this.#pruneAgentMutation(mutation);
+		}
 	}
 
 	async #repairPhysicalInvariantOnce(provider, agentId, mutation, lifecycleGeneration) {

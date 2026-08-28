@@ -367,7 +367,7 @@ export class AgentPlanner {
 			}));
 			return result;
 		} catch (error) {
-			const sessionFields = readSessionFields(sessionAgent);
+			const sessionFields = { ...readSessionFields(sessionAgent), profileFingerprint: healthIdentity.profileFingerprint };
 			const durationMs = elapsed(startedAt, this.#now());
 			this.#record('provider_response_failed', record, { ...fields, ...sessionFields, operation: fields.operation, durationMs, errorCode: error?.code ?? 'ERROR' });
 			safeVerbose(onVerbose, 'provider', verboseErrorMessage(`Provider ${fields.operation} request failed`, error));

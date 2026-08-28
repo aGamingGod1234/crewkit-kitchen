@@ -694,6 +694,74 @@ test('provider circuit rejects work before allocating a provider session', async
 	assert.equal(registry.states.some(({ state }) => state === DynamicAgentState.ERROR), false);
 });
 
+test('failed provider creation records the exact fingerprint admitted by the circuit', async () => {
+	const registry = new FakeRegistry();
+	const admitted = [];
+	const recorded = [];
+	const failure = Object.assign(new Error('login required'), { code: 'AUTHENTICATION_REQUIRED' });
+	const planner = new AgentPlanner({
+		registry,
+		healthRegistry: {
+			canAttempt(identity) { admitted.push(identity); return true; },
+			record(telemetry) { recorded.push(telemetry); },
+		},
+		scheduler: {
+			schedule(_agentId, operation) { return operation({ signal: new AbortController().signal }); },
+			cancel() { return false; },
+		},
+		codexService: {
+			async createAgent() { throw failure; },
+			getAgent() { return null; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	await assert.rejects(
+		planner.requestPlan({ agentId: AGENT_ID, input: 'state', goalRevision: GOAL_REVISION }),
+		failure,
+	);
+	assert.equal(admitted.length, 1);
+	assert.equal(recorded.length, 1);
+	assert.equal(recorded[0].operation, 'create_agent');
+	assert.equal(recorded[0].profileFingerprint, admitted[0].profileFingerprint);
+});
+
+test('failed goal-spec creation records the exact fingerprint admitted by the circuit', async () => {
+	const registry = new FakeRegistry();
+	const admitted = [];
+	const recorded = [];
+	const failure = Object.assign(new Error('provider unavailable'), { code: 'PROVIDER_UNAVAILABLE' });
+	const planner = new AgentPlanner({
+		registry,
+		healthRegistry: {
+			canAttempt(identity) { admitted.push(identity); return true; },
+			record(telemetry) { recorded.push(telemetry); },
+		},
+		scheduler: {
+			schedule(_agentId, operation) { return operation({ signal: new AbortController().signal }); },
+			cancel() { return false; },
+		},
+		codexService: {
+			async createAgent() { throw failure; },
+			getAgent() { return null; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	await assert.rejects(planner.requestGoalSpec({
+		agentId: AGENT_ID,
+		request: {
+			requestId: '00000000-0000-4000-8000-000000000002',
+			originalRequest: 'Get a good pickaxe',
+			candidateIds: ['minecraft:iron_pickaxe'],
+		},
+	}), failure);
+	assert.equal(admitted.length, 1);
+	assert.equal(recorded.length, 1);
+	assert.equal(recorded[0].operation, 'goal_spec_create');
+	assert.equal(recorded[0].profileFingerprint, admitted[0].profileFingerprint);
+});
+
 test('planning lease expiry tears down only the matching exact provider generation', async () => {
 	const registry = new FakeRegistry();
 	let scheduleOptions;

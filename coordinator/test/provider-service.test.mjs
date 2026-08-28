@@ -525,6 +525,119 @@ test('a stale successful reconciliation cannot mark a degraded provider restored
 	await router.stop();
 });
 
+test('failed desired-removal reconciliation retains hidden ownership until backend cleanup succeeds', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const backend = new Map();
+	let reconcileCalls = 0;
+	let failCleanup = true;
+	services.codex.createAgent = async (value) => {
+		const agent = { agentId: value.agentId, provider: value.provider };
+		backend.set(value.agentId, agent);
+		return agent;
+	};
+	services.codex.getAgent = (agentId) => backend.get(agentId) ?? null;
+	services.codex.removeAgent = async (agentId) => backend.delete(agentId);
+	services.codex.reconcile = async (records) => {
+		reconcileCalls += 1;
+		if (failCleanup) throw Object.assign(new Error('cleanup transport failed'), { code: 'PROVIDER_UNAVAILABLE' });
+		const desired = new Set(records.map(({ agentId }) => agentId));
+		const removed = [];
+		for (const agentId of backend.keys()) {
+			if (desired.has(agentId)) continue;
+			backend.delete(agentId);
+			removed.push(agentId);
+		}
+		return { valid: records, invalid: [], removed };
+	};
+	const router = new ProviderService(services);
+	const selected = profile('codex', { agentId: 'cleanup-retry' });
+	await router.createAgent(selected);
+
+	const failed = await router.reconcile([]);
+	assert.equal(failed.valid.length, 0);
+	assert.equal(router.getAgent(selected.agentId), null, 'removed desired state is no longer exposed');
+	assert.notEqual(backend.get(selected.agentId), undefined, 'failed physical cleanup remains owned for retry');
+
+	failCleanup = false;
+	const retried = await router.reconcile([]);
+	assert.deepEqual(retried.removed, [selected.agentId]);
+	assert.equal(reconcileCalls, 2, 'the empty roster retries the provider that still owns cleanup');
+	assert.equal(backend.has(selected.agentId), false);
+	await router.stop();
+});
+
+test('empty-roster reconciliation does not fence finalized absent-agent history', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	services.codex.createAgent = async () => { throw Object.assign(new Error('create failed'), { code: 'PROVIDER_UNAVAILABLE' }); };
+	const router = new ProviderService(services);
+	for (let index = 0; index < 128; index += 1) {
+		await assert.rejects(router.createAgent(profile('codex', { agentId: `absent-${index}` })));
+	}
+
+	let releaseCatalog;
+	router.catalog.refresh = () => new Promise((resolve) => { releaseCatalog = resolve; });
+	const reconciling = router.reconcile([]);
+	await new Promise((resolve) => setImmediate(resolve));
+	let createStarted = false;
+	services.codex.createAgent = async (value) => {
+		createStarted = true;
+		return { agentId: value.agentId, provider: value.provider };
+	};
+	const creating = router.createAgent(profile('codex', { agentId: 'absent-0' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	try {
+		assert.equal(createStarted, true, 'finalized absent agents are not fenced behind unrelated empty-roster work');
+	} finally {
+		releaseCatalog({ refreshedAtEpochMs: 1, models: [], recovery: [] });
+		await Promise.allSettled([reconciling, creating]);
+		await router.stop();
+	}
+});
+
+test('pruned mutation generations still fence a late timed-out create from the replacement session', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const backend = new Map();
+	let createCalls = 0;
+	let releaseFirst;
+	let repairFinished;
+	const repaired = new Promise((resolve) => { repairFinished = resolve; });
+	services.codex.getAgent = (agentId) => backend.get(agentId) ?? null;
+	services.codex.removeAgent = async (agentId) => backend.delete(agentId);
+	services.codex.createAgent = async (value) => {
+		createCalls += 1;
+		const agent = { agentId: value.agentId, provider: value.provider, generation: createCalls };
+		if (createCalls === 1) await new Promise((resolve) => { releaseFirst = resolve; });
+		backend.set(value.agentId, agent);
+		return agent;
+	};
+	services.codex.replaceAgent = async (value) => {
+		const agent = { agentId: value.agentId, provider: value.provider, generation: 3 };
+		backend.set(value.agentId, agent);
+		repairFinished(agent);
+		return agent;
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 5 });
+	const selected = profile('codex', { agentId: 'generation-fence' });
+	try {
+		await assert.rejects(router.createAgent(selected), (error) => error?.code === 'PROVIDER_TIMEOUT');
+		const replacement = await router.createAgent(selected);
+		assert.equal(replacement.generation, 2);
+
+		releaseFirst();
+		const repair = await Promise.race([
+			repaired,
+			new Promise((_, reject) => setTimeout(() => reject(new Error('late create was not repaired')), 100)),
+		]);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(repair.generation, 3);
+		assert.equal(router.getAgent(selected.agentId), repair);
+		assert.equal(backend.get(selected.agentId), repair);
+	} finally {
+		releaseFirst?.();
+		await router.stop();
+	}
+});
+
 test('provider recovery status retains the exact failing boundary', async () => {
 	const services = Object.fromEntries(['codex', 'gemini', 'kimi', 'cursor'].map((provider) => [provider, new FakeService(provider)]));
 	services.codex.createAgent = async () => { throw Object.assign(new Error('create failed'), { code: 'PROVIDER_UNAVAILABLE' }); };
