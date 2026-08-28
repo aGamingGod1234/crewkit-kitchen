@@ -118,6 +118,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyFailedBindClosesEverySocket();
+		verifyShutdownRejectsAcceptedSocketBeforePublication();
 		verifyRealBridgeSessionLifecycle();
 		verifyLaunchIdentityAndReconnectGeneration();
 		verifyReplacementHandshakeDrainsPreviousDisconnect();
@@ -128,7 +129,48 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyAtomicPublicationRacesSessionClose();
 		verifyCompletionResultFacts();
-		return 80;
+		return 88;
+	}
+
+	private static void verifyShutdownRejectsAcceptedSocketBeforePublication() {
+		MultiplexedServerBridge bridge = null;
+		ShutdownRaceServerSocket listener = null;
+		try {
+			long baselineBridgeThreads = bridgeThreadCount();
+			bridge = MultiplexedServerBridge.withPreparedSecret(
+					uninitializedManager(), 0, "0123456789abcdef0123456789abcdef");
+			listener = new ShutdownRaceServerSocket();
+			MultiplexedServerBridge activeBridge = bridge;
+			ShutdownRaceServerSocket activeListener = listener;
+			bridge.start(() -> activeListener);
+			activeListener.releaseAccept();
+			awaitLatch(activeListener.acceptedSocket.addressLookupStarted,
+					"accept returns before bridge shutdown");
+			Thread closer = Thread.ofPlatform().daemon().start(activeBridge::close);
+			closer.join(2_000L);
+			assertTrue(!closer.isAlive(), "bridge close completes after the publication boundary opens");
+			assertTrue(activeListener.isClosed(), "bridge close releases the obsolete listener");
+			activeListener.acceptedSocket.releaseAddressLookup();
+			awaitCondition(activeListener.acceptedSocket.closed::get,
+					"socket accepted by the obsolete listener closes instead of becoming a session");
+			assertTrue(readPrivateField(bridge, "session") == null,
+					"shutdown leaves no obsolete session published");
+			assertTrue(!bridge.observationPublicationForVerification().hasActiveSession(),
+					"shutdown leaves no obsolete observation publisher active");
+			BoundedServerTaskQueue tasks = (BoundedServerTaskQueue) readPrivateField(bridge, "serverTasks");
+			assertEquals(0, tasks.pendingCount(), "shutdown queues no inbound work from the rejected socket");
+			awaitCondition(() -> bridgeThreadCount() <= baselineBridgeThreads,
+					"shutdown leaves no accept, reader, or writer thread behind");
+		} catch (Exception exception) {
+			throw new AssertionError("accepted socket shutdown race verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (listener != null) {
+				listener.acceptedSocket.releaseAddressLookup();
+				listener.acceptedSocket.close();
+				listener.close();
+			}
+		}
 	}
 
 	private static void verifyFailedBindClosesEverySocket() {
@@ -915,6 +957,113 @@ public final class MultiplexedServerBridgeVerification {
 		@Override public ServerPlayer getPlayerByName(String name) { return null; }
 	}
 
+	private static final class ShutdownRaceServerSocket extends ServerSocket {
+		private final CountDownLatch releaseAccept = new CountDownLatch(1);
+		private final ShutdownRaceSocket acceptedSocket = new ShutdownRaceSocket();
+		private final AtomicBoolean closed = new AtomicBoolean();
+
+		private ShutdownRaceServerSocket() throws IOException {
+			super();
+		}
+
+		@Override
+		public void bind(java.net.SocketAddress endpoint, int backlog) {
+		}
+
+		@Override
+		public Socket accept() throws IOException {
+			try {
+				releaseAccept.await();
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+				throw new IOException("accept interrupted", exception);
+			}
+			return acceptedSocket;
+		}
+
+		@Override
+		public synchronized void close() {
+			closed.set(true);
+			releaseAccept.countDown();
+		}
+
+		@Override
+		public boolean isClosed() {
+			return closed.get();
+		}
+
+		@Override
+		public int getLocalPort() {
+			return 25_570;
+		}
+
+		private void releaseAccept() {
+			releaseAccept.countDown();
+		}
+	}
+
+	private static final class ShutdownRaceSocket extends Socket {
+		private final CountDownLatch addressLookupStarted = new CountDownLatch(1);
+		private final CountDownLatch allowAddressLookup = new CountDownLatch(1);
+		private final CountDownLatch closedLatch = new CountDownLatch(1);
+		private final AtomicBoolean closed = new AtomicBoolean();
+		private final java.io.InputStream input = new java.io.InputStream() {
+			@Override
+			public int read() throws IOException {
+				try {
+					closedLatch.await();
+					return -1;
+				} catch (InterruptedException exception) {
+					Thread.currentThread().interrupt();
+					throw new IOException("socket read interrupted", exception);
+				}
+			}
+		};
+
+		@Override
+		public InetAddress getInetAddress() {
+			addressLookupStarted.countDown();
+			try {
+				allowAddressLookup.await();
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+			}
+			return InetAddress.getLoopbackAddress();
+		}
+
+		private void releaseAddressLookup() {
+			allowAddressLookup.countDown();
+		}
+
+		@Override
+		public void setTcpNoDelay(boolean on) {
+		}
+
+		@Override
+		public void setSoTimeout(int timeout) {
+		}
+
+		@Override
+		public java.io.InputStream getInputStream() {
+			return input;
+		}
+
+		@Override
+		public java.io.OutputStream getOutputStream() {
+			return java.io.OutputStream.nullOutputStream();
+		}
+
+		@Override
+		public synchronized void close() {
+			if (closed.compareAndSet(false, true)) closedLatch.countDown();
+		}
+
+		@Override
+		public boolean isClosed() {
+			return closed.get();
+		}
+	}
+
 	@SuppressWarnings("unchecked")
 	private static Set<AgentId> pendingRegistrations(CodexAgentManager manager) {
 		try {
@@ -978,6 +1127,13 @@ public final class MultiplexedServerBridgeVerification {
 			Thread.onSpinWait();
 		}
 		assertTrue(condition.getAsBoolean(), label);
+	}
+
+	private static long bridgeThreadCount() {
+		return Thread.getAllStackTraces().keySet().stream()
+				.filter(Thread::isAlive)
+				.filter(thread -> thread.getName().startsWith("arenaagents-v2-"))
+				.count();
 	}
 
 	private static BridgeEnvelope pollBridgeResponse(

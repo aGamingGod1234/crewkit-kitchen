@@ -429,11 +429,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public synchronized void close() {
-		running.set(false);
-		CoordinatorStatusStore.clear(manager.server());
-		Session active = session;
-		if (active != null) {
-			active.close();
+		synchronized (publicationLock) {
+			running.set(false);
+			CoordinatorStatusStore.clear(manager.server());
+			Session active = session;
+			if (active != null) {
+				active.close();
+			}
 		}
 		try {
 			if (serverSocket != null) {
@@ -453,21 +455,20 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		while (running.get()) {
 			try {
 				Socket socket = serverSocket.accept();
-				if (!socket.getInetAddress().isLoopbackAddress()) {
-					socket.close();
-					continue;
-				}
-				Session accepted;
-				synchronized (publicationLock) {
-					if (session != null) {
-						socket.close();
-						continue;
+				boolean admitted = false;
+				try {
+					if (!socket.getInetAddress().isLoopbackAddress()) continue;
+					synchronized (publicationLock) {
+						if (!running.get() || session != null) continue;
+						Session accepted = new Session(socket);
+						session = accepted;
+						onSessionAccepted(observationPublication, accepted);
+						accepted.start();
+						admitted = true;
 					}
-					accepted = new Session(socket);
-					session = accepted;
-					onSessionAccepted(observationPublication, accepted);
+				} finally {
+					if (!admitted) socket.close();
 				}
-				accepted.start();
 			} catch (IOException exception) {
 				if (running.get()) {
 					LOGGER.error("Codex bridge accept failed", exception);
