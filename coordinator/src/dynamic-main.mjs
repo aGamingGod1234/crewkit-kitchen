@@ -52,6 +52,8 @@ const DEFAULT_VOICE_PORT = 8_766;
 const DEFAULT_VOICE_MAX_CONCURRENT = 5;
 const DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH = path.join('runtime', 'voice-profile-assignments.json');
 const DEFAULT_LOCAL_SPEECH_TIMEOUT_MS = 120_000;
+const DEFAULT_FISH_FALLBACK_BASE_DELAY_MS = 30_000;
+const DEFAULT_FISH_FALLBACK_MAX_DELAY_MS = 300_000;
 const VOICE_WARMUP_GRACE_MS = 1_000;
 const DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE = 'FISH_AUDIO_API_KEY';
 const DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE = 'DEEPGRAM_API_KEY';
@@ -1598,6 +1600,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 				createTtsProvider,
 				createWindowsTtsProvider,
 				createSttProvider,
+				fallbackCircuit: voiceFallbackCircuitOptions(dependencies),
 			});
 			provider = fallback.tts;
 			sttProvider = fallback.stt;
@@ -1606,7 +1609,9 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			provider = fishApiKey === null
 				? (platform === 'win32' ? createWindowsTtsProvider({}) : null)
 				: createTtsProvider({ apiKey: fishApiKey });
-			if (fishApiKey !== null && platform === 'win32') provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}));
+			if (fishApiKey !== null && platform === 'win32') {
+				provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}), voiceFallbackCircuitOptions(dependencies));
+			}
 			sttProvider = deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey });
 		}
 		worker = createServer({
@@ -1720,6 +1725,7 @@ function createLocalSpeechFailover(localProvider, {
 	createTtsProvider,
 	createWindowsTtsProvider,
 	createSttProvider,
+	fallbackCircuit,
 }) {
 	let activeTts = localProvider;
 	let activeStt = localProvider;
@@ -1744,7 +1750,7 @@ function createLocalSpeechFailover(localProvider, {
 		if (fishApiKey !== null) {
 			const fish = createTtsProvider({ apiKey: fishApiKey });
 			fallbackTts = platform === 'win32'
-				? ttsProviderWithFallback(fish, createWindowsTtsProvider({}))
+				? ttsProviderWithFallback(fish, createWindowsTtsProvider({}), fallbackCircuit)
 				: fish;
 			return fallbackTts;
 		}
@@ -1878,16 +1884,58 @@ function shouldUseLocalSttFallback(error, signal) {
 	return true;
 }
 
-function ttsProviderWithFallback(primary, fallback) {
+function voiceFallbackCircuitOptions(dependencies) {
+	return {
+		now: dependencies.voiceFallbackNow ?? Date.now,
+		baseDelayMs: dependencies.voiceFallbackBaseDelayMs ?? DEFAULT_FISH_FALLBACK_BASE_DELAY_MS,
+		maxDelayMs: dependencies.voiceFallbackMaxDelayMs ?? DEFAULT_FISH_FALLBACK_MAX_DELAY_MS,
+	};
+}
+
+function ttsProviderWithFallback(primary, fallback, {
+	now = Date.now,
+	baseDelayMs = DEFAULT_FISH_FALLBACK_BASE_DELAY_MS,
+	maxDelayMs = DEFAULT_FISH_FALLBACK_MAX_DELAY_MS,
+} = {}) {
+	if (typeof now !== 'function') throw new TypeError('Fish fallback clock must be a function');
+	if (!Number.isSafeInteger(baseDelayMs) || baseDelayMs < 1) throw new TypeError('Fish fallback base delay must be positive');
+	if (!Number.isSafeInteger(maxDelayMs) || maxDelayMs < baseDelayMs) throw new TypeError('Fish fallback maximum delay must not be less than its base delay');
+	let consecutiveFailures = 0;
+	let nextProbeAt = null;
+	let probePromise = null;
+	const readNow = () => {
+		const value = now();
+		if (!Number.isSafeInteger(value) || value < 0) throw new TypeError('Fish fallback clock must return a non-negative safe integer');
+		return value;
+	};
+	const recordFailure = () => {
+		consecutiveFailures = Math.min(consecutiveFailures + 1, 31);
+		const exponent = Math.min(consecutiveFailures - 1, 30);
+		const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** exponent));
+		nextProbeAt = Math.min(Number.MAX_SAFE_INTEGER, readNow() + delay);
+	};
+	const synthesizeFallback = async (request) => {
+		const output = await fallback.synthesize(request);
+		return Object.freeze({ ...output, cacheable: false });
+	};
+	const attemptPrimary = async (request) => {
+		try {
+			const output = await primary.synthesize(request);
+			consecutiveFailures = 0;
+			nextProbeAt = null;
+			return output;
+		} catch (error) {
+			if (!shouldUseWindowsTtsFallback(error)) throw error;
+			recordFailure();
+			return synthesizeFallback(request);
+		}
+	};
 	return Object.freeze({
 		async synthesize(request) {
-			try {
-				return await primary.synthesize(request);
-			} catch (error) {
-				if (!shouldUseWindowsTtsFallback(error)) throw error;
-				const output = await fallback.synthesize(request);
-				return Object.freeze({ ...output, cacheable: false });
-			}
+			if (nextProbeAt === null) return attemptPrimary(request);
+			if (probePromise !== null || readNow() < nextProbeAt) return synthesizeFallback(request);
+			probePromise = attemptPrimary(request).finally(() => { probePromise = null; });
+			return probePromise;
 		},
 	});
 }

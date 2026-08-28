@@ -171,6 +171,96 @@ test('Windows voice bootstrap falls back to local speech when Fish rejects a sta
 	await worker.close();
 });
 
+test('Windows Fish fallback opens a bounded circuit and recovers through one half-open probe', async () => {
+	const rejected = Object.assign(new Error('Fish is unavailable'), { code: 'TTS_PROVIDER_ERROR' });
+	let now = 0;
+	let fishCalls = 0;
+	let windowsCalls = 0;
+	let fishHealthy = false;
+	let cancelFish = false;
+	let pendingProbe = null;
+	let provider;
+	const worker = await startVoiceWorker({
+		bridge: { secret: SECRET },
+		voice: { port: 8_766 },
+	}, { FISH_AUDIO_API_KEY: 'configured-fish-credential' }, {
+		platform: 'win32',
+		voiceFallbackNow: () => now,
+		voiceFallbackBaseDelayMs: 10,
+		voiceFallbackMaxDelayMs: 40,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => ({
+			async synthesize() {
+				fishCalls += 1;
+				if (cancelFish) {
+					const error = new Error('request cancelled');
+					error.name = 'AbortError';
+					throw error;
+				}
+				if (pendingProbe !== null) await pendingProbe.promise;
+				if (!fishHealthy) throw rejected;
+				return { sampleRateHz: 44_100, channels: 1, sampleFormat: 's16le', pcm: Buffer.from([1, 1]) };
+			},
+		}),
+		createWindowsTtsProvider: () => ({
+			async synthesize() {
+				windowsCalls += 1;
+				return { sampleRateHz: 16_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.from([2, 2]) };
+			},
+		}),
+		createVoiceServer: (options) => {
+			provider = options.provider;
+			return { async start() {}, async close() {} };
+		},
+	});
+	const request = (text) => provider.synthesize({ text, voiceId: 'ignored', speed: 1 });
+
+	assert.equal((await request('failure zero')).cacheable, false);
+	now = 9;
+	assert.equal((await request('open zero')).cacheable, false);
+	assert.equal(fishCalls, 1, 'open circuit bypasses Fish until the first probe');
+	now = 10;
+	assert.equal((await request('failure one')).cacheable, false);
+	now = 29;
+	await request('open one');
+	assert.equal(fishCalls, 2);
+	now = 30;
+	await request('failure two');
+	now = 69;
+	await request('open two');
+	assert.equal(fishCalls, 3);
+
+	now = 70;
+	pendingProbe = Promise.withResolvers();
+	const halfOpen = request('half-open failure');
+	assert.equal(fishCalls, 4);
+	const concurrent = await request('concurrent fallback');
+	assert.equal(concurrent.cacheable, false);
+	assert.equal(fishCalls, 4, 'concurrent traffic cannot stampede the half-open Fish probe');
+	pendingProbe.resolve();
+	await halfOpen;
+	pendingProbe = null;
+	now = 109;
+	await request('bounded open interval');
+	assert.equal(fishCalls, 4, 'the exponential delay is capped at the configured maximum');
+
+	now = 110;
+	fishHealthy = true;
+	const recovered = await request('recovery probe');
+	assert.equal(recovered.sampleRateHz, 44_100);
+	assert.equal(recovered.cacheable, undefined, 'healthy Fish output keeps normal cache semantics');
+	await request('closed circuit');
+	assert.equal(fishCalls, 6, 'a successful half-open probe restores normal Fish traffic');
+	assert.equal(windowsCalls, 9);
+	cancelFish = true;
+	await assert.rejects(request('cancelled request'), (error) => error.name === 'AbortError');
+	assert.equal(windowsCalls, 9, 'request cancellation does not route stale work through Windows');
+	cancelFish = false;
+	await request('healthy after cancellation');
+	assert.equal(fishCalls, 8, 'request cancellation does not open the Fish circuit');
+	await worker.close();
+});
+
 test('voice bootstrap closes a worker when binding fails', async () => {
 	let closes = 0;
 	await assert.rejects(
