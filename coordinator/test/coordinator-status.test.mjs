@@ -55,3 +55,35 @@ test('missing or hostile optional component data is omitted without degrading co
 	assert.equal(status.runtimeGeneration, null);
 	assert.deepEqual(status.components.map(({ component }) => component), ['bridge']);
 });
+
+test('hostile optional arrays and proxies are omitted without throwing', () => {
+	const hostile = new Proxy([], { get() { throw new Error('hostile optional status'); } });
+	let status;
+	assert.doesNotThrow(() => {
+		status = buildCoordinatorStatus({
+			reconciled: true, records: [], supportedAgentIds: new Set(), readyStates: new Set(), pressure,
+			healthSnapshots: hostile, latencies: hostile, components: hostile,
+			bridgeSessionEpoch: 2, runtimeGeneration: null,
+		});
+	});
+	assert.deepEqual(status.circuits, []);
+	assert.deepEqual(status.latencies, []);
+	assert.deepEqual(status.components.map(({ component }) => component), ['bridge']);
+});
+
+test('voice lifecycle is represented as an independent truthful component', () => {
+	const status = buildCoordinatorStatus({
+		reconciled: true, records: [], supportedAgentIds: new Set(), readyStates: new Set(), pressure,
+		healthSnapshots: [], latencies: [], bridgeSessionEpoch: 3, runtimeGeneration: null,
+		components: [{
+			component: 'voice', state: 'degraded', fallbackMode: 'text', boundary: 'voice_provider',
+			failureCode: 'STT_TIMEOUT', consecutiveFailureCount: 2, nextProbeAtEpochMs: 12_000,
+			generation: 4, lastRecoveryAtEpochMs: 10_000,
+		}],
+	});
+	assert.deepEqual(status.components.find(({ component }) => component === 'voice'), {
+		component: 'voice', state: 'degraded', fallbackMode: 'text', boundary: 'voice_provider',
+		failureCode: 'STT_TIMEOUT', consecutiveFailureCount: 2, nextProbeAtEpochMs: 12_000,
+		generation: 4, lastRecoveryAtEpochMs: 10_000,
+	});
+});

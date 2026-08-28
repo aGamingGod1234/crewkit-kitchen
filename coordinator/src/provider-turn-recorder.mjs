@@ -1,13 +1,12 @@
 import { createHash } from 'node:crypto';
 import { appendFile as defaultAppendFile } from 'node:fs/promises';
 
+import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
+import { sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
+
 const MAX_PRIVATE_TEXT_BYTES = 65_536;
 const MAX_PUBLIC_EXCERPT_BYTES = 512;
 const MAX_ROW_BYTES = 262_143;
-const SENSITIVE_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
-const SECRET_SHAPED_TEXT = /((?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
-const BEARER_TEXT = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
-const QUOTED_SECRET_KEY = /(["'])(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\1\s*:\s*(["'])/gi;
 
 /** Bounded, serialized provider-turn capture with private source and public evidence. */
 export class ProviderTurnRecorder {
@@ -17,10 +16,11 @@ export class ProviderTurnRecorder {
 	#publicSink;
 	#appendFile;
 	#now;
-	#queue = Promise.resolve();
+	#queue;
 	#closed = false;
+	#closePromise = null;
 
-	constructor({ runId, scenarioId, privatePath, publicSink = null, appendFile = defaultAppendFile, now = Date.now } = {}) {
+	constructor({ runId, scenarioId, privatePath, publicSink = null, appendFile = defaultAppendFile, now = Date.now, ...queueOptions } = {}) {
 		if (typeof runId !== 'string' || runId.trim() === '') throw new TypeError('runId must be nonblank');
 		if (typeof scenarioId !== 'string' || scenarioId.trim() === '') throw new TypeError('scenarioId must be nonblank');
 		if (privatePath !== null && privatePath !== undefined && (typeof privatePath !== 'string' || privatePath.trim() === '')) throw new TypeError('privatePath must be nonblank or null');
@@ -33,34 +33,46 @@ export class ProviderTurnRecorder {
 		this.#publicSink = publicSink;
 		this.#appendFile = appendFile;
 		this.#now = now;
+		this.#queue = new BestEffortDiagnosticQueue(queueOptions);
 	}
 
 	record(fields = {}) {
-		if (this.#closed) return Promise.reject(new Error('provider turn recorder is closed'));
-		const row = normalizeRecord(fields, this.#runId, this.#scenarioId, this.#now());
-		const privateRow = privateRecord(row);
-		const publicRow = publicRecord(row);
-		if (this.#publicSink !== null) {
-			try { Promise.resolve(this.#publicSink(publicRow)).catch(() => {}); }
-			catch { /* public evidence is observational */ }
-		}
-		const encoded = `${JSON.stringify(privateRow)}\n`;
-		const operation = this.#queue.catch(() => {}).then(async () => {
-			if (this.#privatePath !== null) await this.#appendFile(this.#privatePath, encoded, { encoding: 'utf8', flag: 'a' });
-		});
-		this.#queue = operation;
-		return operation;
+		if (this.#closed) return Promise.resolve();
+		try {
+			const row = normalizeRecord(fields, this.#runId, this.#scenarioId, this.#now());
+			const privateRow = privateRecord(row);
+			const publicRow = publicRecord(row);
+			const encoded = `${JSON.stringify(privateRow)}\n`;
+			this.#queue.submit(() => {
+				const writes = [];
+				if (this.#publicSink !== null) {
+					try { writes.push(this.#publicSink(publicRow)); } catch { /* observational */ }
+				}
+				if (this.#privatePath !== null) {
+					try { writes.push(this.#appendFile(this.#privatePath, encoded, { encoding: 'utf8', flag: 'a' })); }
+					catch { /* observational */ }
+				}
+				return Promise.allSettled(writes);
+			});
+		} catch { /* invalid or hostile diagnostics are dropped */ }
+		return Promise.resolve();
 	}
 
-	async close() {
+	close() {
+		if (this.#closePromise !== null) return this.#closePromise;
 		this.#closed = true;
-		await this.#queue;
+		this.#closePromise = this.#queue.close();
+		return this.#closePromise;
+	}
+
+	statusSnapshot() {
+		return Object.freeze({ ...this.#queue.statusSnapshot('provider_audit'), droppedCount: this.#queue.droppedCount });
 	}
 }
 
-export async function recordProviderTurn(recorder, fields) {
+export function recordProviderTurn(recorder, fields) {
 	if (recorder === null || recorder === undefined) return;
-	try { await recorder.record(fields); }
+	try { void recorder.record(fields); }
 	catch { /* provider capture is observational and cannot affect control flow */ }
 }
 
@@ -175,44 +187,11 @@ function boundedMeta(value) {
 }
 
 function redactAndBound(value, bytes) {
-	const redacted = String(value ?? '');
-	// Scan quoted JSON values so delimiters, spaces, and escaped quotes cannot terminate redaction early.
-	const safelyRedacted = redactQuotedJsonSecrets(redacted)
-		.replace(BEARER_TEXT, 'Bearer [REDACTED]')
-		.replace(SENSITIVE_TEXT, '$1[REDACTED]')
-		.replace(SECRET_SHAPED_TEXT, '$1[REDACTED]');
-	return truncateUtf8(safelyRedacted, bytes);
-}
-
-function redactQuotedJsonSecrets(value) {
-	let result = '';
-	let cursor = 0;
-	QUOTED_SECRET_KEY.lastIndex = 0;
-	let match;
-	while ((match = QUOTED_SECRET_KEY.exec(value)) !== null) {
-		const valueStart = QUOTED_SECRET_KEY.lastIndex;
-		let valueEnd = valueStart;
-		while (valueEnd < value.length) {
-			if (value[valueEnd] === '\\') {
-				valueEnd += 2;
-				continue;
-			}
-			if (value[valueEnd] === match[2]) break;
-			valueEnd += 1;
-		}
-		if (valueEnd >= value.length) break;
-		result += value.slice(cursor, valueStart) + '[REDACTED]' + match[2];
-		cursor = valueEnd + 1;
-		QUOTED_SECRET_KEY.lastIndex = cursor;
-	}
-	return result + value.slice(cursor);
+	return sanitizeDiagnosticText(value, { maxBytes: bytes });
 }
 
 function truncateUtf8(value, bytes) {
-	if (Buffer.byteLength(value, 'utf8') <= bytes) return value;
-	let end = Math.min(value.length, bytes);
-	while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > bytes) end -= 1;
-	return value.slice(0, end);
+	return truncateDiagnosticUtf8(value, bytes);
 }
 
 function boundRow(row) {

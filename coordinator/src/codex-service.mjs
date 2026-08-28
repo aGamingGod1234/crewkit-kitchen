@@ -451,7 +451,7 @@ export class SharedCodexAgent {
 			try { decision = parseOutput(text); }
 			catch (error) { parseError = error; }
 			outputHandled = true;
-			await recordProviderTurn(turnRecorder, {
+			recordProviderTurn(turnRecorder, {
 				agentId: this.agentId, provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: text, error: parseError,
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
@@ -463,7 +463,7 @@ export class SharedCodexAgent {
 			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
-			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+			if (!outputHandled) recordProviderTurn(turnRecorder, {
 				agentId: this.agentId, provider: 'codex', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input, output: rawOutput, error,
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),

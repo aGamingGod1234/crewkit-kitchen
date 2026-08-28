@@ -1,3 +1,6 @@
+import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
+import { sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
+
 const MAX_CODE_LENGTH = 128;
 const MAX_MESSAGE_LENGTH = 512;
 const MAX_STACK_LENGTH = 4_096;
@@ -134,23 +137,10 @@ function sanitizeStackLine(value) {
 }
 
 function diagnosticText(value, limit) {
-	let text;
-	try { text = String(value); } catch { text = '[unavailable]'; }
-	text = text
-		.replace(/(?:Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
-		.replace(/(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*[^\s,;)}\]"']+/gi, '[REDACTED]')
-		.replace(/(?:raw\s+)?prompt\s*[:=]\s*[^\r\n]*/gi, '[REDACTED]')
-		.replace(/(["'])(?:file:\/\/\/)?[A-Za-z]:[\\/][^"'\r\n]+\1/gi, '[location redacted]')
-		.replace(/(["'])\/(?:home|Users|private|var|tmp)\/[^"'\r\n]+\1/g, '[location redacted]')
-		.replace(/(?:file:\/\/\/)?[A-Za-z]:[\\/][^\s,;)}\]"']+/gi, '[location redacted]')
-		.replace(/\/(?:home|Users|private|var|tmp)\/[^\s,;)}\]"']+/g, '[location redacted]')
-		.replace(/[\u0000-\u001f\u007f]+/g, ' ')
-		.trim();
-	return truncate(text, limit);
+	return sanitizeDiagnosticText(value, { maxBytes: limit });
 }
 
 function truncate(value, limit) {
 	if (value.length <= limit) return value;
 	return `${value.slice(0, Math.max(0, limit - 3))}...`;
 }
-import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';

@@ -47,3 +47,38 @@ test('diagnostic queue observes sync throws and async rejection then drains late
 	await queue.close();
 	assert.deepEqual(completed, ['healthy']);
 });
+
+test('diagnostic queue contains hostile then getters and continues draining', async () => {
+	const completed = [];
+	const queue = new BestEffortDiagnosticQueue({ operationTimeoutMs: 50, closeTimeoutMs: 100 });
+	const hostileThenable = Object.create(null, {
+		then: {
+			get() { throw new Error('hostile then getter'); },
+		},
+	});
+
+	queue.submit(() => hostileThenable);
+	queue.submit(() => { completed.push('healthy'); });
+
+	await queue.close();
+	assert.deepEqual(completed, ['healthy']);
+	assert.equal(queue.statusSnapshot().state, 'ready');
+});
+
+test('timed-out sink ownership stays bounded while later healthy work can recover', async () => {
+	let hungCalls = 0;
+	const completed = [];
+	const queue = new BestEffortDiagnosticQueue({
+		maxPending: 8, maxDetachedOperations: 2, operationTimeoutMs: 10, closeTimeoutMs: 100,
+	});
+	queue.submit(() => { hungCalls += 1; return new Promise(() => {}); });
+	queue.submit(() => { completed.push('healthy'); });
+	for (let index = 0; index < 10; index += 1) {
+		queue.submit(() => { hungCalls += 1; return new Promise(() => {}); });
+	}
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.deepEqual(completed, ['healthy']);
+	assert.equal(hungCalls, 2, 'detached hung sink ownership is capped');
+	assert.ok(queue.droppedCount > 0);
+	await queue.close();
+});

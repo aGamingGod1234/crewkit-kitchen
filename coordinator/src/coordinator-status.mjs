@@ -1,4 +1,5 @@
 import { DEFAULT_SERVICE_TIER } from './constants.mjs';
+import { types as nodeTypes } from 'node:util';
 
 const RUNTIME_GENERATION = /^[0-9a-f]{64}$/;
 const COMPONENT_STATES = new Set(['ready', 'degraded', 'backoff', 'blocked_retryable', 'unknown']);
@@ -28,11 +29,9 @@ export function buildCoordinatorStatus({
 		.sort((left, right) => left.agentId.localeCompare(right.agentId));
 	const recovery = new Map();
 	recovery.set('bridge', bridgeComponent(Boolean(reconciled), bridgeSessionEpoch));
-	if (Array.isArray(components)) {
-		for (const candidate of components.slice(0, 32)) {
+	for (const candidate of safeOptionalArray(components, 32)) {
 			const component = safeComponent(candidate);
 			if (component !== null && component.component !== 'bridge') recovery.set(component.component, component);
-		}
 	}
 	return {
 		reconciled: Boolean(reconciled),
@@ -41,8 +40,8 @@ export function buildCoordinatorStatus({
 		rosterReadyCount: records.filter((record) => supportedAgentIds.has(record.agentId) && readyStates.has(record.state)).length,
 		rosterCount: records.length,
 		scheduler: { ...pressure },
-		circuits: Array.isArray(healthSnapshots) ? healthSnapshots.slice(0, 32) : [],
-		latencies: Array.isArray(latencies) ? latencies.slice(0, 16) : [],
+		circuits: safeOptionalArray(healthSnapshots, 32),
+		latencies: safeOptionalArray(latencies, 16),
 		bridgeSessionEpoch: nonnegativeIntegerOrZero(bridgeSessionEpoch),
 		runtimeGeneration: typeof runtimeGeneration === 'string' && RUNTIME_GENERATION.test(runtimeGeneration) ? runtimeGeneration : null,
 		components: [...recovery.values()].sort((left, right) => left.component.localeCompare(right.component)).slice(0, 32),
@@ -50,9 +49,8 @@ export function buildCoordinatorStatus({
 }
 
 export function providerRecoveryComponents(value) {
-	if (!Array.isArray(value)) return [];
 	const result = [];
-	for (const recovery of value.slice(0, 16)) {
+	for (const recovery of safeOptionalArray(value, 16)) {
 		try {
 			if (recovery === null || typeof recovery !== 'object' || typeof recovery.provider !== 'string') continue;
 			result.push({
@@ -87,7 +85,7 @@ function bridgeComponent(reconciled, generation) {
 
 function safeComponent(value) {
 	try {
-		if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
+		if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value)) return null;
 		const component = boundedOptionalText(value.component, false);
 		const state = boundedOptionalText(value.state, false);
 		if (component === null || state === null || !COMPONENT_STATES.has(state)) return null;
@@ -104,6 +102,23 @@ function safeComponent(value) {
 		};
 	} catch {
 		return null;
+	}
+}
+
+function safeOptionalArray(value, maximum) {
+	try {
+		if (!Array.isArray(value) || nodeTypes.isProxy(value)) return [];
+		const result = [];
+		const length = Math.min(value.length, maximum);
+		for (let index = 0; index < length; index += 1) {
+			let descriptor;
+			try { descriptor = Object.getOwnPropertyDescriptor(value, String(index)); } catch { continue; }
+			if (!descriptor || !Object.hasOwn(descriptor, 'value') || nodeTypes.isProxy(descriptor.value)) continue;
+			result.push(descriptor.value);
+		}
+		return result;
+	} catch {
+		return [];
 	}
 }
 

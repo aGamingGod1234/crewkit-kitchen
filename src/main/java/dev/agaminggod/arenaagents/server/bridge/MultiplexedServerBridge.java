@@ -98,6 +98,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_CONVERSATION_SOURCES_PER_AGENT = 16;
+	private static final int CATALOG_DISCOVERY_RETRY_LIMIT = 3;
+	private static final long CATALOG_DISCOVERY_RETRY_BASE_NANOS = 50_000_000L;
 	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
 	private static final String COORDINATOR_OFFLINE_MESSAGE =
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
@@ -150,6 +152,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private volatile List<AgentControlModelOption> catalogModels = AgentControlCatalog.fallbackOptions();
 	private volatile boolean catalogLoaded;
 	private boolean catalogDiscoveryPending;
+	private int catalogDiscoveryAttempts;
+	private long catalogDiscoveryRetryAtNanos;
+	private long catalogDiscoveryGeneration;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
 		this(manager, configuredPort(), configuredSecretPath(), new AgentVerboseState());
@@ -298,6 +303,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void tick() {
 		publishPendingDisconnects();
 		publishPendingVerboseControl();
+		publishCatalogDiscoveryRetry();
 		serverTasks.drain(SERVER_TASKS_PER_TICK, task -> {
 			try {
 				task.run();
@@ -684,6 +690,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;
 				catalogDiscoveryPending = false;
+				catalogDiscoveryAttempts = 0;
+				catalogDiscoveryRetryAtNanos = 0L;
+				catalogDiscoveryGeneration = 0L;
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
 				coordinatorReadyAgentIds.clear();
@@ -1141,12 +1150,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private void acceptCatalog(JsonObject payload) {
 		List<AgentControlModelOption> decoded = decodeCatalog(payload);
 		if (decoded.isEmpty()) {
-			catalogProfiles = Set.of();
-			catalogModels = AgentControlCatalog.fallbackOptions();
-			catalogLoaded = false;
-			if (!catalogDiscoveryPending) {
-				catalogDiscoveryPending = true;
-				send("catalog_request", "server", new JsonObject());
+			synchronized (publicationLock) {
+				catalogProfiles = Set.of();
+				catalogModels = AgentControlCatalog.fallbackOptions();
+				catalogLoaded = false;
+				catalogDiscoveryPending = false;
+				if (catalogDiscoveryAttempts == 0) requestCatalogDiscovery();
+				else if (catalogDiscoveryAttempts < CATALOG_DISCOVERY_RETRY_LIMIT) {
+					catalogDiscoveryRetryAtNanos = System.nanoTime() + catalogRetryDelayNanos(catalogDiscoveryAttempts);
+				}
 			}
 			return;
 		}
@@ -1168,6 +1180,32 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		catalogModels = decoded;
 		catalogLoaded = true;
 		catalogDiscoveryPending = false;
+		catalogDiscoveryAttempts = 0;
+		catalogDiscoveryRetryAtNanos = 0L;
+		catalogDiscoveryGeneration = 0L;
+	}
+
+	private void publishCatalogDiscoveryRetry() {
+		synchronized (publicationLock) {
+			if (catalogLoaded || catalogDiscoveryAttempts == 0 || catalogDiscoveryAttempts >= CATALOG_DISCOVERY_RETRY_LIMIT) return;
+			if (catalogDiscoveryGeneration != coordinatorLifecycleGeneration || session == null || !session.authenticated.get()) return;
+			if (System.nanoTime() < catalogDiscoveryRetryAtNanos) return;
+			catalogDiscoveryPending = false;
+			requestCatalogDiscovery();
+		}
+	}
+
+	private void requestCatalogDiscovery() {
+		if (catalogDiscoveryAttempts >= CATALOG_DISCOVERY_RETRY_LIMIT || catalogLoaded) return;
+		send("catalog_request", "server", new JsonObject());
+		catalogDiscoveryPending = true;
+		catalogDiscoveryAttempts += 1;
+		catalogDiscoveryGeneration = coordinatorLifecycleGeneration;
+		catalogDiscoveryRetryAtNanos = System.nanoTime() + catalogRetryDelayNanos(catalogDiscoveryAttempts);
+	}
+
+	private static long catalogRetryDelayNanos(int completedAttempts) {
+		return CATALOG_DISCOVERY_RETRY_BASE_NANOS << Math.min(2, Math.max(0, completedAttempts - 1));
 	}
 
 	private void plannerReady(BridgeEnvelope envelope) {
@@ -2592,6 +2630,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;
 				catalogDiscoveryPending = false;
+				catalogDiscoveryAttempts = 0;
+				catalogDiscoveryRetryAtNanos = 0L;
+				catalogDiscoveryGeneration = 0L;
 				CoordinatorStatusStore.clear(manager.server());
 				if (wasAuthenticated) coordinatorDisconnectPending.set(true);
 				session = null;

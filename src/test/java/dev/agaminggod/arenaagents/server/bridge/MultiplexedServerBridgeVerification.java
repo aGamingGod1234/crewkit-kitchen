@@ -263,6 +263,41 @@ public final class MultiplexedServerBridgeVerification {
 				}
 				assertTrue(request != null && "catalog_request".equals(request.type()),
 						"an empty bootstrap catalog requests live provider discovery asynchronously");
+
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-2", catalog
+				));
+				BridgeEnvelope retry = null;
+				deadline = System.currentTimeMillis() + 2_000L;
+				while (retry == null && System.currentTimeMillis() < deadline) {
+					bridge.tick();
+					if (reader.ready()) retry = codec.decode(reader.readLine());
+					else Thread.sleep(10L);
+				}
+				assertTrue(retry != null && "catalog_request".equals(retry.type()),
+						"a second empty discovery schedules one bounded retry instead of latching fallback forever");
+
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-3", catalog
+				));
+				BridgeEnvelope finalRetry = null;
+				deadline = System.currentTimeMillis() + 2_000L;
+				while (finalRetry == null && System.currentTimeMillis() < deadline) {
+					bridge.tick();
+					if (reader.ready()) finalRetry = codec.decode(reader.readLine());
+					else Thread.sleep(10L);
+				}
+				assertTrue(finalRetry != null && "catalog_request".equals(finalRetry.type()),
+						"empty discovery retries are capped but include a final recovery probe");
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-4", catalog
+				));
+				deadline = System.currentTimeMillis() + 300L;
+				while (System.currentTimeMillis() < deadline) {
+					bridge.tick();
+					assertTrue(!reader.ready(), "catalog discovery must not exceed its per-session retry cap");
+					Thread.sleep(10L);
+				}
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("empty catalog discovery verification failed", exception);

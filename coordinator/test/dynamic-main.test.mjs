@@ -3255,6 +3255,11 @@ test('publishes exact profile and recovery identity in extended coordinator stat
 	const run = await start({
 		codexService: provider,
 		traceWriter: diagnostics,
+		voiceStatusSnapshot: () => ({
+			component: 'voice', state: 'degraded', fallbackMode: 'text', boundary: 'voice_provider',
+			failureCode: 'STT_TIMEOUT', consecutiveFailureCount: 1, nextProbeAtEpochMs: 5_000,
+			generation: 2, lastRecoveryAtEpochMs: null,
+		}),
 		runtimeGeneration: generation,
 		setStatusInterval: (callback) => { publishStatus = callback; return 1; },
 		clearStatusInterval: () => {},
@@ -3268,6 +3273,7 @@ test('publishes exact profile and recovery identity in extended coordinator stat
 		assert.equal(status.runtimeGeneration, generation);
 		assert.equal(status.components.find(({ component }) => component === 'provider:codex').boundary, 'create');
 		assert.equal(status.components.find(({ component }) => component === 'diagnostics').failureCode, 'DIAGNOSTIC_BACKPRESSURE');
+		assert.equal(status.components.find(({ component }) => component === 'voice').failureCode, 'STT_TIMEOUT');
 	} finally { await run.coordinator.stop(); }
 });
 

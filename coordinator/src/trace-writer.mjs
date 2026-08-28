@@ -4,8 +4,9 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
+import { DIAGNOSTIC_REDACTED, isSensitiveDiagnosticKey, sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
 
-const REDACTED = '[REDACTED]';
+const REDACTED = DIAGNOSTIC_REDACTED;
 const UNSAFE = '[UNSAFE_OBJECT]';
 const BOUNDED = '[BOUNDED]';
 const MAX_TRACE_STRING = 2_048;
@@ -16,8 +17,6 @@ const MAX_TRACE_NODES = 512;
 const MAX_TRACE_BYTES = 262_144;
 // The JSONL newline consumes one byte, so the serialized object reserves it.
 const MAX_TRACE_ROW_BYTES = MAX_TRACE_BYTES - 1;
-const SENSITIVE_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
-const SENSITIVE_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
 
 /** Append-only bounded traces. Public rows never contain source text or credentials. */
 export class TraceWriter {
@@ -93,12 +92,12 @@ export class TraceWriter {
 
 export function observationHash(observation) {
 	if (observation === null || observation === undefined) return null;
-	return createHash('sha256').update(JSON.stringify(sanitizeValue(observation, context(false))), 'utf8').digest('hex');
+	return createHash('sha256').update(JSON.stringify(sanitizeValue(observation, context(false, false))), 'utf8').digest('hex');
 }
 
 /** Returns a safe, null-prototype, own-data-only redacted copy. */
 export function redact(value) {
-	return sanitizeValue(value, context(false));
+	return sanitizeValue(value, context(false, false));
 }
 
 function normalizeRow(eventOrRow, fields) {
@@ -130,7 +129,7 @@ function ownData(value) {
 function publicTraceRow(row) {
 	const source = ownData(row).source;
 	const sourceHash = typeof source === 'string' ? `sha256:${hashSource(source)}` : null;
-	const result = sanitizeValue(row, context(false));
+	const result = sanitizeValue(row, context(false, true));
 	if (result && typeof result === 'object' && !Array.isArray(result)) {
 		delete result.source;
 		if (sourceHash !== null) result.sourceHash = sourceHash;
@@ -141,13 +140,13 @@ function publicTraceRow(row) {
 function privateTraceRow(row) {
 	const source = ownData(row).source;
 	const sourceHash = typeof source === 'string' ? `sha256:${hashSource(source)}` : null;
-	const result = sanitizeValue(row, context(true));
+	const result = sanitizeValue(row, context(true, true));
 	if (result && typeof result === 'object' && !Array.isArray(result) && sourceHash !== null) result.sourceHash = sourceHash;
 	return boundSerializedRow(result);
 }
 
-function context(allowSource) {
-	return { allowSource, seen: new WeakSet(), nodes: 0, bytes: 0 };
+function context(allowSource, redactPaths) {
+	return { allowSource, redactPaths, seen: new WeakSet(), nodes: 0, bytes: 0 };
 }
 
 function sanitizeValue(value, state, depth = 0, key = null) {
@@ -189,7 +188,7 @@ function sanitizeValue(value, state, depth = 0, key = null) {
 			try { descriptor = Object.getOwnPropertyDescriptor(input, property); } catch { continue; }
 			if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
 			entries += 1;
-			if (SENSITIVE_KEY.test(property)) output[property] = REDACTED;
+			if (isSensitiveDiagnosticKey(property)) output[property] = REDACTED;
 			else if (property === 'source' && !state.allowSource) continue;
 			else children.push({ value: descriptor.value, assign: (result) => { Object.defineProperty(output, property, { enumerable: true, configurable: true, writable: true, value: result }); }, depth: task.depth + 1, key: property });
 		}
@@ -217,23 +216,20 @@ function boundSerializedRow(row) {
 }
 
 function sanitizeString(value, state, allowLongSource) {
-	const redacted = value.replace(SENSITIVE_TEXT, `$1${REDACTED}`).replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`);
 	const limit = allowLongSource ? MAX_PRIVATE_SOURCE : MAX_TRACE_STRING;
 	const remaining = Math.max(0, MAX_TRACE_BYTES - state.bytes);
 	const boundedLimit = Math.min(limit, remaining);
 	if (boundedLimit <= 3) return '';
-	const bounded = truncateUtf8(redacted, boundedLimit);
-	const candidate = bounded.length < redacted.length ? `${bounded.slice(0, Math.max(0, bounded.length - 3))}...` : bounded;
+	const redacted = sanitizeDiagnosticText(value, { maxBytes: boundedLimit, redactPaths: state.redactPaths });
+	const candidate = Buffer.byteLength(redacted, 'utf8') < Buffer.byteLength(value, 'utf8')
+		? truncateDiagnosticUtf8(`${redacted}...`, boundedLimit) : redacted;
 	const result = truncateUtf8(candidate, remaining);
 	state.bytes += Buffer.byteLength(result, 'utf8');
 	return result;
 }
 
 function truncateUtf8(value, limit) {
-	if (Buffer.byteLength(value, 'utf8') <= limit) return value;
-	let end = Math.min(value.length, limit);
-	while (end > 0 && Buffer.byteLength(value.slice(0, end), 'utf8') > limit) end -= 1;
-	return value.slice(0, end);
+	return truncateDiagnosticUtf8(value, limit);
 }
 
 function hashSource(source) {

@@ -296,7 +296,7 @@ class CursorAgent {
 				parseError.category = 'decision_parse';
 			}
 			outputHandled = true;
-			await recordProviderTurn(turnRecorder, {
+			recordProviderTurn(turnRecorder, {
 				agentId: this.agentId,
 				provider: 'cursor', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: parseError === null ? result.result : '', error: structuredProviderError(parseError), timing,
@@ -307,7 +307,7 @@ class CursorAgent {
 			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
-			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+			if (!outputHandled) recordProviderTurn(turnRecorder, {
 				agentId: this.agentId,
 				provider: 'cursor', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error, timing,

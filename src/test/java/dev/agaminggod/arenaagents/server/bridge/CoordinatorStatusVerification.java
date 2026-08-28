@@ -9,6 +9,10 @@ public final class CoordinatorStatusVerification {
 	private CoordinatorStatusVerification() {
 	}
 
+	public static void main(String[] args) {
+		System.out.println("CoordinatorStatusVerification assertions=" + verify());
+	}
+
 	public static int verify() {
 		JsonObject payload = payload();
 		CoordinatorStatusSnapshot snapshot = MultiplexedServerBridge.decodeCoordinatorStatus(payload, 1_000L);

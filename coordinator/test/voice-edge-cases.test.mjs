@@ -14,11 +14,41 @@ const SECRET = 'voice-edge-verification-secret';
 const AGENT = '00000000-0000-4000-8000-000000000001';
 const PLAYER = '10000000-0000-4000-8000-000000000001';
 
+test('voice lifecycle snapshot reports provider failure and a later recovery', async () => {
+	let calls = 0;
+	await withWorker({
+		provider: { async synthesize() {
+			calls += 1;
+			if (calls === 1) {
+				const error = new Error('temporary provider failure');
+				error.code = 'TTS_UNAVAILABLE';
+				throw error;
+			}
+			return validSynthesis();
+		} },
+	}, async ({ worker, baseUrl }) => {
+		assert.equal(worker.statusSnapshot().state, 'ready');
+		const failed = await fetch(`${baseUrl}/v1/tts`, { method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()) });
+		assert.equal(failed.status, 502);
+		assert.deepEqual(worker.statusSnapshot(), {
+			component: 'voice', state: 'degraded', fallbackMode: 'text', boundary: 'voice_provider',
+			failureCode: 'TTS_UNAVAILABLE', consecutiveFailureCount: 1, nextProbeAtEpochMs: null,
+			generation: 2, lastRecoveryAtEpochMs: null,
+		});
+		const recovered = await fetch(`${baseUrl}/v1/tts`, { method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'recovery' }) });
+		assert.equal(recovered.status, 200);
+		const snapshot = worker.statusSnapshot();
+		assert.equal(snapshot.state, 'ready');
+		assert.equal(snapshot.generation, 3);
+		assert.ok(Number.isSafeInteger(snapshot.lastRecoveryAtEpochMs));
+	});
+});
+
 test('TTS route rejects a non-JSON content type before synthesis', async () => {
 	let calls = 0;
 	await withWorker({
 		provider: { async synthesize() { calls++; return validSynthesis(); } },
-	}, async ({ baseUrl }) => {
+	}, async ({ worker, baseUrl }) => {
 		const response = await fetch(`${baseUrl}/v1/tts`, {
 			method: 'POST',
 			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'text/plain' },
@@ -111,7 +141,7 @@ test('TTS route aborts synthesis when the client closes before the response', as
 				}, { once: true });
 			});
 		} },
-	}, async ({ baseUrl }) => {
+	}, async ({ worker, baseUrl }) => {
 		const controller = new AbortController();
 		const request = fetch(`${baseUrl}/v1/tts`, {
 			method: 'POST',
@@ -124,6 +154,7 @@ test('TTS route aborts synthesis when the client closes before the response', as
 		await assert.rejects(request, (error) => error?.name === 'AbortError');
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		assert.equal(providerSignal.aborted, true);
+		assert.equal(worker.statusSnapshot().state, 'ready', 'client cancellation is not a provider outage');
 	});
 });
 

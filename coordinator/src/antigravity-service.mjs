@@ -321,7 +321,7 @@ class AntigravityAgent {
 				);
 			}
 			outputHandled = true;
-			await recordProviderTurn(turnRecorder, {
+			recordProviderTurn(turnRecorder, {
 				agentId: this.agentId, provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: decisionText, error: parseError,
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
@@ -331,7 +331,7 @@ class AntigravityAgent {
 			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
-			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+			if (!outputHandled) recordProviderTurn(turnRecorder, {
 				agentId: this.agentId, provider: 'gemini', model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),

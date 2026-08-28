@@ -188,3 +188,38 @@ test('error rows retain only allowlisted structured fields', async () => {
 	assert.equal(JSON.stringify(rows[0]).includes('C:\\Users\\lucas\\secret'), false);
 	assert.equal(JSON.stringify(rows[0]).includes('env-value'), false);
 });
+
+test('hung provider diagnostics never delay control and close remains bounded and idempotent', async () => {
+	const recorder = new ProviderTurnRecorder({
+		runId: 'run-hung', scenarioId: 'scenario-hung', privatePath: 'private.jsonl',
+		appendFile: () => new Promise(() => {}),
+		maxPending: 2, operationTimeoutMs: 20, closeTimeoutMs: 30,
+	});
+	const startedAt = Date.now();
+	for (let index = 0; index < 100; index += 1) {
+		await recorder.record({ provider: 'codex', model: 'm', attempt: index });
+	}
+	assert.ok(Date.now() - startedAt < 100, 'recording must only transfer bounded ownership');
+	assert.ok(recorder.statusSnapshot().droppedCount > 0);
+	const firstClose = recorder.close();
+	assert.strictEqual(recorder.close(), firstClose);
+	await firstClose;
+	assert.ok(Date.now() - startedAt < 200, 'hung diagnostics must not hang shutdown');
+});
+
+test('provider recorder survives a rejected sink and writes later records', async () => {
+	const attempts = [];
+	let calls = 0;
+	const recorder = new ProviderTurnRecorder({
+		runId: 'run-recovery', scenarioId: 'scenario-recovery', privatePath: 'private.jsonl',
+		appendFile: async (_path, text) => {
+			calls += 1;
+			if (calls === 1) throw new Error('temporary sink failure');
+			attempts.push(JSON.parse(text).attempt);
+		},
+	});
+	await recorder.record({ provider: 'codex', model: 'm', attempt: 1 });
+	await recorder.record({ provider: 'codex', model: 'm', attempt: 2 });
+	await recorder.close();
+	assert.deepEqual(attempts, [2]);
+});

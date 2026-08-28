@@ -329,7 +329,7 @@ class AcpAgent {
 			}
 			outputHandled = true;
 			const tokens = acpTokenUsage(response?.usage) ?? (this.provider === 'gemini' ? geminiQuotaTokenUsage(response?._meta) : null);
-			await recordProviderTurn(turnRecorder, {
+			recordProviderTurn(turnRecorder, {
 				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: parseError === null ? decisionText : '', error: structuredProviderError(parseError),
@@ -340,7 +340,7 @@ class AcpAgent {
 			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
-			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+			if (!outputHandled) recordProviderTurn(turnRecorder, {
 				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,

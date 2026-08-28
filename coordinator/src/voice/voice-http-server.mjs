@@ -29,6 +29,28 @@ export function createVoiceHttpServer({
 	const controllers = new Set();
 	let startPromise = null;
 	let closePromise = null;
+	let lifecycleState = 'unknown';
+	let lifecycleBoundary = 'voice_start';
+	let lifecycleCode = 'VOICE_NOT_STARTED';
+	let lifecycleFailures = 0;
+	let lifecycleGeneration = 0;
+	let lastRecoveryAtEpochMs = null;
+	const recordFailure = (error, boundary) => {
+		lifecycleState = 'degraded';
+		lifecycleBoundary = boundary;
+		lifecycleCode = voiceFailureCode(error);
+		lifecycleFailures = Math.min(1_000_000, lifecycleFailures + 1);
+		lifecycleGeneration += 1;
+	};
+	const recordReady = () => {
+		if (lifecycleState === 'ready') return;
+		if (lifecycleState === 'degraded') lastRecoveryAtEpochMs = Date.now();
+		lifecycleState = 'ready';
+		lifecycleBoundary = null;
+		lifecycleCode = null;
+		lifecycleFailures = 0;
+		lifecycleGeneration += 1;
+	};
 	const server = createServer(async (request, response) => {
 		if (request.method === 'GET' && request.url === '/health') {
 			respondJson(response, 200, { ready: true, active, maxConcurrent });
@@ -68,6 +90,7 @@ export function createVoiceHttpServer({
 			error.name = 'TimeoutError';
 			controller.abort(error);
 		}, requestTimeoutMs);
+		let providerAttempted = false;
 		try {
 			if (request.url === '/v1/stt') {
 				requireContentType(request.headers['content-type'], 'audio/l16;rate=48000;channels=1');
@@ -76,10 +99,12 @@ export function createVoiceHttpServer({
 				}
 				const metadata = validateSttHeaders(request.headers);
 				const pcm = await awaitAbortable(readBytes(request, 48_000 * 2 * 20), controller.signal);
+				providerAttempted = true;
 				const result = validateTranscriptResult(await awaitAbortable(
 					Promise.resolve().then(() => sttProvider.transcribe({ pcm, signal: controller.signal })),
 					controller.signal,
 				));
+				recordReady();
 				respondJson(response, 200, {
 					playerId: metadata.playerId,
 					utteranceSequence: metadata.utteranceSequence,
@@ -104,6 +129,7 @@ export function createVoiceHttpServer({
 			});
 			let output = cache.get(cacheKey);
 			if (output === null) {
+				providerAttempted = true;
 				const synthesized = validateSynthesis(await awaitAbortable(
 					Promise.resolve().then(() => provider.synthesize({
 						text: payload.text,
@@ -115,6 +141,7 @@ export function createVoiceHttpServer({
 				));
 				output = resampleS16leMono(synthesized.pcm, synthesized.sampleRateHz, 48_000, 20);
 				if (output.length === 0) throw typedError('TTS_MALFORMED_AUDIO', 'TTS output was empty');
+				recordReady();
 				cache.set(cacheKey, output);
 			}
 			response.writeHead(200, {
@@ -127,6 +154,7 @@ export function createVoiceHttpServer({
 			});
 			response.end(output);
 		} catch (error) {
+			if (providerAttempted && error?.name !== 'AbortError') recordFailure(error, 'voice_provider');
 			if (!response.headersSent) respondJson(response, statusFor(error), {
 				code: String(error?.code ?? 'TTS_ERROR').slice(0, 64),
 				message: String(error?.message ?? error).slice(0, 256),
@@ -143,6 +171,13 @@ export function createVoiceHttpServer({
 
 	return Object.freeze({
 		server,
+		statusSnapshot() {
+			return Object.freeze({
+				component: 'voice', state: lifecycleState, fallbackMode: lifecycleState === 'ready' ? null : 'text',
+				boundary: lifecycleBoundary, failureCode: lifecycleCode, consecutiveFailureCount: lifecycleFailures,
+				nextProbeAtEpochMs: null, generation: lifecycleGeneration, lastRecoveryAtEpochMs,
+			});
+		},
 		async start() {
 			if (closePromise !== null) throw typedError('VOICE_WORKER_CLOSED', 'Voice worker has been closed');
 			if (server.listening) return server.address();
@@ -161,7 +196,12 @@ export function createVoiceHttpServer({
 				server.listen(port, host);
 			});
 			try {
-				return await startPromise;
+				const address = await startPromise;
+				recordReady();
+				return address;
+			} catch (error) {
+				recordFailure(error, 'voice_start');
+				throw error;
 			} finally {
 				startPromise = null;
 			}
@@ -182,6 +222,11 @@ export function createVoiceHttpServer({
 			return closePromise;
 		},
 	});
+}
+
+function voiceFailureCode(error) {
+	const value = error?.code;
+	return typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(value) ? value : 'VOICE_UNAVAILABLE';
 }
 
 async function readJson(request) {

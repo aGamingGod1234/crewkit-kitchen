@@ -40,6 +40,8 @@ import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { TraceWriter } from './trace-writer.mjs';
 import { wireRuntimeDiagnostics } from './runtime-diagnostics.mjs';
 import { RuntimeErrorReporter } from './runtime-error-reporter.mjs';
+import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
+import { sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
 import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
 import { LocalSpeechProvider } from './voice/local-speech-provider.mjs';
@@ -127,9 +129,10 @@ export class DynamicCoordinator extends EventEmitter {
 	#providerTurnRecorder;
 	#verboseEnabled = false;
 	#runtimeGeneration;
+	#voiceStatusSnapshot;
 	#verboseTransitions = new ReportingTransitionDeduper();
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, voiceStatusSnapshot = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -144,6 +147,8 @@ export class DynamicCoordinator extends EventEmitter {
 		if (providerTurnRecorder !== null && typeof providerTurnRecorder.close !== 'function') throw new TypeError('providerTurnRecorder.close must be a function');
 		this.#providerTurnRecorder = providerTurnRecorder;
 		this.#runtimeGeneration = runtimeGeneration;
+		if (voiceStatusSnapshot !== null && typeof voiceStatusSnapshot !== 'function') throw new TypeError('voiceStatusSnapshot must be a function or null');
+		this.#voiceStatusSnapshot = voiceStatusSnapshot;
 		if (!['arena_script', 'native_tools'].includes(codexControlProtocol)) throw new TypeError('codexControlProtocol must be arena_script or native_tools');
 		this.#codexControlProtocol = codexControlProtocol;
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
@@ -1740,6 +1745,10 @@ export class DynamicCoordinator extends EventEmitter {
 			const diagnostics = this.#traceWriter?.statusSnapshot?.();
 			if (diagnostics !== null && diagnostics !== undefined) components.push(diagnostics);
 		} catch { /* optional status must not affect coordinator control */ }
+		try {
+			const voice = this.#voiceStatusSnapshot?.();
+			if (voice !== null && voice !== undefined) components.push(voice);
+		} catch { /* optional voice status must not affect coordinator control */ }
 		await this.#sendForEpoch(connectionEpoch, 'coordinator_status', 'server', buildCoordinatorStatus({
 			reconciled: this.#reconciledStatus,
 			records,
@@ -2061,6 +2070,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		traceWriter: dependencies.traceWriter,
 		providerTurnRecorder,
 		runtimeGeneration: dependencies.runtimeGeneration,
+		voiceStatusSnapshot: dependencies.voiceStatusSnapshot,
 		controlNow: dependencies.controlNow,
 		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,
@@ -2207,9 +2217,19 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 		scenarioId: runtime.scenarioId,
 		privatePath: runtime.providerTurnsPath,
 	});
-	const coordinator = createDynamicCoordinator(config, { traceWriter, protocolAudit, providerTurnRecorder, runtimeGeneration: runtime.runtimeGeneration });
+	let voiceWorker = null;
+	let voiceFailureStatus = null;
+	const coordinator = createDynamicCoordinator(config, {
+		traceWriter, protocolAudit, providerTurnRecorder, runtimeGeneration: runtime.runtimeGeneration,
+		voiceStatusSnapshot: () => voiceWorker?.statusSnapshot?.() ?? voiceFailureStatus,
+	});
 	const disposeDiagnostics = wireRuntimeDiagnostics(coordinator, reporter);
-	let voiceWorker = await startVoiceWorker(config, process.env).catch(() => {
+	voiceWorker = await startVoiceWorker(config, process.env).catch((error) => {
+		voiceFailureStatus = {
+			component: 'voice', state: 'degraded', fallbackMode: 'text', boundary: 'voice_start',
+			failureCode: typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'VOICE_UNAVAILABLE', consecutiveFailureCount: 1,
+			nextProbeAtEpochMs: null, generation: 1, lastRecoveryAtEpochMs: null,
+		};
 		process.stderr.write('[voice-worker] unavailable; proximity speech will fall back to text\n');
 		return null;
 	});
@@ -2231,18 +2251,33 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 	process.once('SIGTERM', shutdown);
 }
 
-function createJsonlAudit(filePath, metadata) {
+export function createJsonlAudit(filePath, metadata, dependencies = {}) {
 	if (typeof filePath !== 'string' || filePath.trim() === '') throw new TypeError('protocol audit path must be nonblank');
-	let queue = Promise.resolve();
+	const write = dependencies.appendFile ?? appendFile;
+	const makeDirectory = dependencies.mkdir ?? mkdir;
+	const queue = new BestEffortDiagnosticQueue(dependencies);
 	let closed = false;
-	const ready = mkdir(path.dirname(path.resolve(filePath)), { recursive: true });
+	let closePromise = null;
+	const ready = Promise.resolve().then(() => makeDirectory(path.dirname(path.resolve(filePath)), { recursive: true }));
 	const audit = (direction, envelope) => {
-		if (closed) return Promise.reject(new Error('protocol audit is closed'));
-		const encoded = `${JSON.stringify({ ...metadata, direction, envelope })}\n`;
-		queue = queue.catch(() => {}).then(async () => { await ready; await appendFile(filePath, encoded, { encoding: 'utf8', flag: 'a' }); });
-		return queue;
+		if (closed) return Promise.resolve();
+		try {
+			const safeMetadata = sanitizeDiagnosticValue(metadata);
+			const row = Object.assign(Object.create(null),
+				safeMetadata !== null && typeof safeMetadata === 'object' && !Array.isArray(safeMetadata) ? safeMetadata : {},
+				{ direction: sanitizeDiagnosticValue(direction), envelope: sanitizeDiagnosticValue(envelope) });
+			const encoded = `${JSON.stringify(row)}\n`;
+			queue.submit(async () => { await ready; await write(filePath, encoded, { encoding: 'utf8', flag: 'a' }); });
+		} catch { /* invalid audit evidence is observational */ }
+		return Promise.resolve();
 	};
-	audit.close = async () => { closed = true; await queue; };
+	audit.close = () => {
+		if (closePromise !== null) return closePromise;
+		closed = true;
+		closePromise = queue.close();
+		return closePromise;
+	};
+	audit.statusSnapshot = () => Object.freeze({ ...queue.statusSnapshot('protocol_audit'), droppedCount: queue.droppedCount });
 	return audit;
 }
 

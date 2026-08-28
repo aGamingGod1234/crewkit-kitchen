@@ -63,3 +63,25 @@ test('local speech provider rejects malformed worker audio instead of forwarding
 		await provider.close();
 	}
 });
+
+test('aborting inference restarts the serial worker so replacement speech is not delayed', async () => {
+	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
+	const provider = new LocalSpeechProvider({
+		executable: process.execPath,
+		scriptPath: fileURLToPath(new URL('../test-support/local-speech-rpc-fixture.mjs', import.meta.url)),
+		timeoutMs: 1_000,
+	});
+	const controller = new AbortController();
+	try {
+		const blocked = provider.synthesize({ text: 'block-worker', voiceId: 'ignored', speed: 1, signal: controller.signal });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		controller.abort();
+		await assert.rejects(blocked, (error) => error?.name === 'AbortError');
+		const replacement = await provider.synthesize({ text: 'replacement', voiceId: 'ignored', speed: 1 });
+		assert.equal(replacement.pcm.length, 4);
+	} finally {
+		const firstClose = provider.close();
+		assert.strictEqual(provider.close(), firstClose);
+		await firstClose;
+	}
+});
