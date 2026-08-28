@@ -44,6 +44,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 	'request_observation',
 	'action_command',
 	'action_cancel',
+	'action_result_ack',
 	'agent_error',
 	'verbose_event',
 	'heartbeat',
@@ -136,7 +137,9 @@ export function validateProtocolV2Envelope(value, { direction } = {}) {
 	if ((type === 'hello' || type === 'hello_ack' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'verbose_control' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use agentId 'server'`);
 	}
-	if (type === 'verbose_event' && agentId === 'server') throw new ProtocolV2Error('INVALID_AGENT_SCOPE', "Message type 'verbose_event' must use an agent ID");
+	if ((type === 'verbose_event' || type === 'action_result_ack') && agentId === 'server') {
+		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use an agent ID`);
+	}
 	const payload = validateProtocolV2Payload(type, value.payload);
 	if (type === 'conversation_event' && payload.recipientId !== agentId) {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', 'conversation_event recipientId must match the envelope agentId');
@@ -189,6 +192,12 @@ export function validateProtocolV2Payload(type, value) {
 			return normalizeActionProgress(value);
 		case 'action_result':
 			return normalizeActionResult(value);
+		case 'action_result_ack':
+			exactKeys(value, ['goalRevision', 'actionId'], ['goalRevision', 'actionId'], type);
+			return {
+				goalRevision: revision(value.goalRevision, 'goalRevision'),
+				actionId: requireIdentifier(value.actionId, 'actionId'),
+			};
 		case 'agent_ready':
 			exactKeys(value, ['goalRevision', 'reconciled'], ['goalRevision'], type);
 			return value.reconciled === undefined
@@ -326,6 +335,8 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#inboundMessageIds = new Set();
 	#terminalActionIds = new Set();
 	#terminalActionsByGoal = new Map();
+	#terminalResultsByKey = new Map();
+	#acknowledgedTerminalActionIds = new Set();
 	#knownAgentIds = new Set();
 	#observedRevisions = new Map();
 
@@ -479,7 +490,11 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (envelope.serverInstanceId !== this.#serverInstanceId) throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Server instance changed during an authenticated session');
 		this.#trackInboundRevision(envelope);
 		this.#assertRevision(envelope, REVISION_GUARDED_INBOUND_TYPES);
-		this.#trackTerminalResult(envelope);
+		if (this.#trackTerminalResult(envelope)) {
+			this.#refreshHeartbeatDeadline(socket, connectionEpoch);
+			void this.acknowledgeActionResult(envelope.agentId, envelope.payload, { connectionEpoch }).catch(() => {});
+			return;
+		}
 		if (envelope.type === 'agent_registered') this.#knownAgentIds.add(envelope.agentId);
 		if (envelope.agentId !== 'server' && !this.#knownAgentIds.has(envelope.agentId) && envelope.type !== 'agent_registered') {
 			throw new ProtocolV2Error('UNKNOWN_AGENT', `Message references unknown agent '${envelope.agentId}'`);
@@ -593,10 +608,35 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (envelope.type !== 'action_result' || !TERMINAL_ACTION_STATES.has(envelope.payload.state)) return;
 		const actionId = requireIdentifier(envelope.payload.actionId ?? envelope.payload.commandId, 'actionId');
 		const goal = this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
+		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
+		const fingerprint = JSON.stringify(envelope.payload);
+		const previous = this.#terminalResultsByKey.get(key);
+		if (previous !== undefined) {
+			if (previous !== fingerprint) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Action '${actionId}' changed its terminal result`);
+			if (this.#acknowledgedTerminalActionIds.has(key)) return true;
+			throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
+		}
 		if (goal.actionIds.has(actionId)) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
 		goal.actionIds.add(actionId);
-		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
-		rememberBounded(this.#terminalActionIds, key, MAX_TRACKED_TERMINAL_ACTION_IDS);
+		this.#terminalResultsByKey.set(key, fingerprint);
+		const evicted = rememberBounded(this.#terminalActionIds, key, MAX_TRACKED_TERMINAL_ACTION_IDS);
+		if (evicted !== undefined) {
+			this.#terminalResultsByKey.delete(evicted);
+			this.#acknowledgedTerminalActionIds.delete(evicted);
+		}
+		return false;
+	}
+
+	/** Acknowledges a result after the application has accepted or safely ignored it. */
+	acknowledgeActionResult(agentId, payload, { connectionEpoch = this.#connectionEpoch } = {}) {
+		const goalRevision = revision(payload?.goalRevision, 'goalRevision');
+		const actionId = requireIdentifier(payload?.actionId ?? payload?.commandId, 'actionId');
+		const key = `${agentId}:${goalRevision}:${actionId}`;
+		return Promise.resolve(this.send('action_result_ack', agentId, { goalRevision, actionId }, { connectionEpoch }))
+			.then((value) => {
+				rememberBounded(this.#acknowledgedTerminalActionIds, key, MAX_TRACKED_TERMINAL_ACTION_IDS);
+				return value;
+			});
 	}
 
 	#synchronizeTerminalGoals(registry) {
@@ -606,17 +646,31 @@ export class MultiplexedServerBridge extends EventEmitter {
 			this.#ensureTerminalGoal(record.agentId, record.goalRevision);
 		}
 		for (const agentId of this.#terminalActionsByGoal.keys()) {
-			if (!visible.has(agentId)) this.#terminalActionsByGoal.delete(agentId);
+			if (!visible.has(agentId)) {
+				this.#terminalActionsByGoal.delete(agentId);
+				this.#dropTerminalResultKeys(agentId);
+			}
 		}
 	}
 
 	#ensureTerminalGoal(agentId, goalRevision) {
 		let goal = this.#terminalActionsByGoal.get(agentId);
 		if (goal?.goalRevision !== goalRevision) {
+			if (goal !== undefined) this.#dropTerminalResultKeys(agentId, goal.goalRevision);
 			goal = { goalRevision, actionIds: new Set() };
 			this.#terminalActionsByGoal.set(agentId, goal);
 		}
 		return goal;
+	}
+
+	#dropTerminalResultKeys(agentId, goalRevision = null) {
+		const prefix = goalRevision === null ? `${agentId}:` : `${agentId}:${goalRevision}:`;
+		for (const key of this.#terminalResultsByKey.keys()) {
+			if (!key.startsWith(prefix)) continue;
+			this.#terminalResultsByKey.delete(key);
+			this.#acknowledgedTerminalActionIds.delete(key);
+			this.#terminalActionIds.delete(key);
+		}
 	}
 
 	#enqueue(envelope) {
@@ -1691,5 +1745,8 @@ function isPlainObject(value) {
 
 function rememberBounded(set, value, maximum) {
 	set.add(value);
-	if (set.size > maximum) set.delete(set.values().next().value);
+	if (set.size <= maximum) return undefined;
+	const evicted = set.values().next().value;
+	set.delete(evicted);
+	return evicted;
 }

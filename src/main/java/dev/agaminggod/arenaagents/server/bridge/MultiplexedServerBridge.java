@@ -106,7 +106,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "request_observation", "action_command", "action_cancel", "agent_error", "verbose_event", "heartbeat"
+			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "request_observation", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -139,6 +139,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final AtomicLong messageIds = new AtomicLong();
 	private final AtomicLong registryPublicationRevision = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
+	private final TerminalResultLedger terminalResults = new TerminalResultLedger();
 	private final Object publicationLock = new Object();
 	private final Object verboseControlLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
@@ -291,6 +292,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				LOGGER.error("Codex bridge server task failed", exception);
 			}
 		});
+		replayPendingTerminalResults();
 		actionExecutor.tick();
 		List<AgentId> observationAgents = registeredObservationIds(manager.coordinatorVisibleRecords());
 		for (AgentId agentId : observations.changedActiveAgents()) {
@@ -314,6 +316,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public boolean authenticated() {
 		Session active = session;
 		return active != null && active.open.get() && active.authenticated.get();
+	}
+
+	TerminalResultLedger terminalResultsForVerification() {
+		return terminalResults;
 	}
 
 	public void setVerbose(boolean enabled) {
@@ -444,6 +450,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public boolean onCreated(AgentRecord record) {
 		registryPublicationRevision.incrementAndGet();
 		programActions.beginGoal(record.agentId(), record.goalRevision());
+		terminalResults.beginGoal(record.agentId(), record.goalRevision());
 		synchronized (publicationLock) {
 			if (protocolKnownAgentIds.contains(record.agentId())) return true;
 			Session active = session;
@@ -461,6 +468,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void onTransition(AgentTransition transition) {
 		registryPublicationRevision.incrementAndGet();
 		programActions.beginGoal(transition.after().agentId(), transition.after().goalRevision());
+		terminalResults.beginGoal(transition.after().agentId(), transition.after().goalRevision());
 		ScenarioRuntimeService.onAgentState(
 				manager.server(),
 				transition.after().agentId().toString(),
@@ -490,6 +498,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		registryPublicationRevision.incrementAndGet();
 		actionExecutor.cancel(agentId, "Agent removed");
 		programActions.remove(agentId);
+		terminalResults.remove(agentId);
 		observationPublication.remove(agentId);
 		synchronized (publicationLock) {
 			coordinatorReadyAgentIds.remove(agentId);
@@ -666,6 +675,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 						handshake.add(goalSpecRequestEnvelope(draft));
 					}
 				}
+				for (AgentRecord record : visibleRecords) terminalResults.beginGoal(record.agentId(), record.goalRevision());
+				List<ServerActionResult> terminalReplay = terminalResults.pending();
+				int replayCapacity = Math.max(0, CONNECTION_QUEUE_CAP - handshake.size());
+				Map<String, Integer> handshakeQueuedByAgent = new HashMap<>();
+				for (BridgeEnvelope queued : handshake) handshakeQueuedByAgent.merge(queued.agentId(), 1, Integer::sum);
+				List<ServerActionResult> claimedReplay = new ArrayList<>();
+				for (ServerActionResult result : terminalReplay) {
+					if (claimedReplay.size() >= replayCapacity) break;
+					if (!handshakeKnownAgentIds.contains(result.agentId())) continue;
+					if (handshakeQueuedByAgent.getOrDefault(result.agentId().toString(), 0) >= AGENT_QUEUE_CAP) continue;
+					if (!terminalResults.claim(result, source)) continue;
+					claimedReplay.add(result);
+					handshake.add(actionResultEnvelope(result));
+					handshakeQueuedByAgent.merge(result.agentId().toString(), 1, Integer::sum);
+				}
 				try {
 					for (AgentRecord record : visibleRecords) programActions.beginGoal(record.agentId(), record.goalRevision());
 					source.completeHandshake(handshake);
@@ -673,6 +697,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					markVerboseControlPublished(verboseControl);
 					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
+					for (ServerActionResult result : claimedReplay) terminalResults.release(result, source);
 					protocolKnownAgentIds.clear();
 					coordinatorReadyAgentIds.clear();
 					throw exception;
@@ -702,11 +727,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "request_observation" -> acceptObservationRequest(envelope);
 			case "action_command" -> acceptAction(envelope);
 			case "action_cancel" -> acceptActionCancel(envelope);
+			case "action_result_ack" -> acceptActionResultAck(envelope);
 			case "agent_error" -> acceptAgentError(envelope);
 			case "verbose_event" -> acceptVerboseEvent(envelope);
 			case "heartbeat" -> send("heartbeat", "server", new JsonObject());
 			default -> throw new BridgeProtocolException("UNKNOWN_MESSAGE_TYPE", envelope.type());
 		}
+	}
+
+	private void acceptActionResultAck(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("goalRevision", "actionId"), "action_result_ack");
+		terminalResults.acknowledge(agentId, requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"));
 	}
 
 	private void acceptGoalSpecProposal(BridgeEnvelope envelope) {
@@ -1412,7 +1445,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				result.state() == dev.agaminggod.arenaagents.server.runtime.ServerActionState.SUCCEEDED
 						&& !"TARGET_ALREADY_SATISFIED".equals(result.reasonCode())
 		);
-		send("action_result", result.agentId().toString(), actionResultPayload(result));
+		synchronized (publicationLock) {
+			terminalResults.retain(result);
+			Session active = session;
+			if (active != null && active.open.get() && active.authenticated.get()) {
+				enqueueTerminalResult(active, result);
+			}
+		}
 		reportVerbose(result.agentId(), AgentActivityPresentation.verboseResultStage(result), verboseResult(result));
 		verboseState.finishAction(result);
 		observationPublication.markAttention(result.agentId());
@@ -1546,17 +1585,28 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendRespawnResultBeforeControl(ServerActionResult result, AgentTransition transition, Runnable commit) {
-		Session active = session;
-		if (active == null || !active.authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Respawn result has no authenticated coordinator");
-		BridgeEnvelope resultEnvelope = new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
-				"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
-		BridgeEnvelope controlEnvelope = new BridgeEnvelope(2, serverInstanceId, transition.after().agentId().toString(), "goal_control",
-				"server-" + messageIds.incrementAndGet(), goalControlPayload(transition, "respawn"));
-		publishRespawnScenarioEvents(
-				() -> active.enqueuePair(resultEnvelope, controlEnvelope, commit),
-				() -> ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true),
-				() -> ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()))
-		);
+		synchronized (publicationLock) {
+			Session active = session;
+			if (active == null || !active.open.get() || !active.authenticated.get()) {
+				throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Respawn result has no authenticated coordinator");
+			}
+			BridgeEnvelope resultEnvelope = new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
+					"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
+			BridgeEnvelope controlEnvelope = new BridgeEnvelope(2, serverInstanceId, transition.after().agentId().toString(), "goal_control",
+					"server-" + messageIds.incrementAndGet(), goalControlPayload(transition, "respawn"));
+			terminalResults.retain(result);
+			try {
+				if (!terminalResults.claim(result, active)) throw new BridgeProtocolException("ACTION_RESULT_REPLAY_CONFLICT", "Respawn result is already queued");
+				publishRespawnScenarioEvents(
+						() -> active.enqueuePair(resultEnvelope, controlEnvelope, commit),
+						() -> ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true),
+						() -> ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()))
+				);
+			} catch (RuntimeException exception) {
+				terminalResults.discard(result, active);
+				throw exception;
+			}
+		}
 		programActions.terminal(result);
 		observations.invalidate(result.agentId());
 		reportVerbose(result.agentId(), AgentActivityPresentation.verboseResultStage(result), verboseResult(result));
@@ -1594,6 +1644,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("executionStarted", result.executionStarted());
 		payload.addProperty("physicalAttempted", result.physicalAttempted());
 		return payload;
+	}
+
+	private BridgeEnvelope actionResultEnvelope(ServerActionResult result) {
+		return new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
+				"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
 	}
 
 	private static String verboseResult(ServerActionResult result) {
@@ -1773,6 +1828,29 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case ERROR -> ScenarioAgentEvent.PublicState.FAILED;
 			case DEAD -> ScenarioAgentEvent.PublicState.DEAD;
 		};
+	}
+
+	/** Replays retained terminal results without ever re-entering physical action execution. */
+	private void replayPendingTerminalResults() {
+		synchronized (publicationLock) {
+			Session active = session;
+			if (active == null || !active.open.get() || !active.authenticated.get()) return;
+			for (ServerActionResult result : terminalResults.pending()) {
+				if (!enqueueTerminalResult(active, result)) break;
+			}
+		}
+	}
+
+	private boolean enqueueTerminalResult(Session target, ServerActionResult result) {
+		if (!terminalResults.claim(result, target)) return true;
+		try {
+			target.enqueue(actionResultEnvelope(result));
+			return true;
+		} catch (RuntimeException exception) {
+			terminalResults.release(result, target);
+			LOGGER.debug("Terminal action result will retry after coordinator reconnect: {}", exception.getMessage());
+			return false;
+		}
 	}
 
 	private void send(String type, String agentId, JsonObject payload) {
@@ -2583,31 +2661,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		@Override
 		public void close() {
 			boolean wasAuthenticated;
-			synchronized (this) {
-				if (!open.compareAndSet(true, false)) return;
-				wasAuthenticated = authenticated.get();
+			synchronized (publicationLock) {
+				synchronized (this) {
+					if (!open.compareAndSet(true, false)) return;
+					wasAuthenticated = authenticated.get();
+				}
+				terminalResults.sessionClosed(this);
+				if (session == this) {
+					verboseState.clearActivity();
+					MultiplexedServerBridge.onSessionClosed(observationPublication, this);
+					protocolKnownAgentIds.clear();
+					coordinatorReadyAgentIds.clear();
+					catalogProfiles = Set.of();
+					catalogModels = AgentControlCatalog.fallbackOptions();
+					catalogLoaded = false;
+					catalogDiscoveryPending = false;
+					catalogDiscoveryAttempts = 0;
+					catalogDiscoveryRetryAtNanos = 0L;
+					catalogDiscoveryGeneration = 0L;
+					catalogDiscoveryFailureCode = null;
+					CoordinatorStatusStore.clear(manager.server());
+					if (wasAuthenticated) coordinatorDisconnectPending.set(true);
+					session = null;
+				}
 			}
 			interruptPeer(readerThread);
 			interruptPeer(writerThread);
 			try { socket.close(); } catch (IOException ignored) { }
-			synchronized (publicationLock) {
-				if (session != this) return;
-				verboseState.clearActivity();
-				MultiplexedServerBridge.onSessionClosed(observationPublication, this);
-				protocolKnownAgentIds.clear();
-				coordinatorReadyAgentIds.clear();
-				catalogProfiles = Set.of();
-				catalogModels = AgentControlCatalog.fallbackOptions();
-				catalogLoaded = false;
-				catalogDiscoveryPending = false;
-				catalogDiscoveryAttempts = 0;
-				catalogDiscoveryRetryAtNanos = 0L;
-				catalogDiscoveryGeneration = 0L;
-				catalogDiscoveryFailureCode = null;
-				CoordinatorStatusStore.clear(manager.server());
-				if (wasAuthenticated) coordinatorDisconnectPending.set(true);
-				session = null;
-			}
 		}
 
 		private static void interruptPeer(Thread thread) {

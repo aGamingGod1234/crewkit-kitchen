@@ -418,6 +418,49 @@ test('traced action commands, progress, and results round-trip one bounded trace
 	}), /traceId/i);
 });
 
+test('terminal result acknowledgements are strict and make replay idempotent', async (t) => {
+	assert.deepEqual(
+		validateProtocolV2Payload('action_result_ack', { goalRevision: 4, actionId: 'action-ack-1' }),
+		{ goalRevision: 4, actionId: 'action-ack-1' },
+	);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('action_result_ack', 'server', 'ack-server', { goalRevision: 4, actionId: 'action-ack-1' }), { direction: 'coordinator_to_server' }),
+		(error) => error.code === 'INVALID_AGENT_SCOPE',
+	);
+
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-ack-ready', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+	const payload = actionResult('action-ack-1');
+	const delivered = [];
+	const errors = [];
+	bridge.on('action_result', (event) => delivered.push(event));
+	bridge.on('protocolError', (error) => errors.push(error));
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-ack-1', payload))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(delivered.length, 1);
+	await bridge.acknowledgeActionResult('agent-a', payload, { connectionEpoch: 1 });
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'action_result_ack');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-ack-replay', payload))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(delivered.length, 1, 'acknowledged replay is not emitted twice');
+	assert.deepEqual(errors, [], 'acknowledged replay does not tear down the bridge');
+	assert.equal(socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length, 2, 'replay is re-acknowledged');
+});
+
 test('protocol v2 accepts only coordinate-free respawn arguments', () => {
 	const payload = {
 		traceId: TRACE_ID, goalRevision: 7, actionId: 'respawn-1', actionType: 'respawn', arguments: {}, provenance: PROVENANCE,

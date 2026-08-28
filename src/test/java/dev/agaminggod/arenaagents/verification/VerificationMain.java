@@ -71,6 +71,7 @@ import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerificat
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodecVerification;
 import dev.agaminggod.arenaagents.server.bridge.BoundedServerTaskQueueVerification;
 import dev.agaminggod.arenaagents.server.bridge.ProgramActionLedgerVerification;
+import dev.agaminggod.arenaagents.server.bridge.TerminalResultLedgerVerification;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusVerification;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridgeVerification;
 import dev.agaminggod.arenaagents.server.bridge.AgentVerboseVerification;
@@ -252,6 +253,7 @@ public final class VerificationMain {
 		passedAssertions += BridgeEnvelopeCodecVerification.verify();
 		passedAssertions += BoundedServerTaskQueueVerification.verify();
 		passedAssertions += ProgramActionLedgerVerification.verify();
+		passedAssertions += TerminalResultLedgerVerification.verify();
 		passedAssertions += CoordinatorStatusVerification.verify();
 		passedAssertions += AgentRecoverySpawnPolicyVerification.verify();
 		passedAssertions += AgentRespawnSpawnPolicyVerification.verify();

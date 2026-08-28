@@ -651,20 +651,36 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 		this.#listen('action_result', (message, connectionEpoch) => {
 			this.#enqueueAgent(message.agentId, async () => {
-			const current = this.#registry.get(message.agentId);
-			if (current === null || message.payload.goalRevision !== current.goalRevision) return;
-			const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
-			this.#ledger(record.agentId).ingest('action_result', message.payload);
-			if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionResult(record, message.payload)) {
-				this.emit('actionResult', message);
-				return;
-			}
-			if (this.#usesNativeTools(record) && this.#nativeRuntime.isActionResultStale(record, message.payload)) return;
-			if (!await this.#programRuntime.onActionResult(record, message.payload)) {
-				if (this.#programRuntime.isActionResultStale(record, message.payload)) return;
-				throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
-			}
-			this.emit('actionResult', message);
+				let acknowledge = false;
+				try {
+					const current = this.#registry.get(message.agentId);
+					if (current === null || message.payload.goalRevision !== current.goalRevision) {
+						acknowledge = true;
+						return;
+					}
+					const record = this.#registry.assertCurrentRevision(message.agentId, message.payload.goalRevision);
+					this.#ledger(record.agentId).ingest('action_result', message.payload);
+					if (this.#usesNativeTools(record) && this.#nativeRuntime.onActionResult(record, message.payload)) {
+						acknowledge = true;
+						this.emit('actionResult', message);
+						return;
+					}
+					if (this.#usesNativeTools(record) && this.#nativeRuntime.isActionResultStale(record, message.payload)) {
+						acknowledge = true;
+						return;
+					}
+					if (!await this.#programRuntime.onActionResult(record, message.payload)) {
+						if (this.#programRuntime.isActionResultStale(record, message.payload)) {
+							acknowledge = true;
+							return;
+						}
+						throw new ProtocolV2Error('UNEXPECTED_ACTION_RESULT', `Agent '${message.agentId}' has no outstanding program action`);
+					}
+					acknowledge = true;
+					this.emit('actionResult', message);
+				} finally {
+					if (acknowledge) await this.#acknowledgeActionResult(message, connectionEpoch);
+				}
 			}, { connectionEpoch });
 		});
 		this.#listen('goal_completion_result', (message, connectionEpoch) => {
@@ -1620,6 +1636,16 @@ export class DynamicCoordinator extends EventEmitter {
 			throw codedRuntimeError('STALE_CONNECTION_EPOCH', `Bridge connection epoch ${connectionEpoch ?? 'unknown'} is no longer active`);
 		}
 		return this.#bridge.send(type, agentId, payload, { connectionEpoch });
+	}
+
+	async #acknowledgeActionResult(message, connectionEpoch) {
+		try {
+			if (typeof this.#bridge.acknowledgeActionResult === 'function') {
+				await this.#bridge.acknowledgeActionResult(message.agentId, message.payload, { connectionEpoch });
+			}
+		} catch {
+			// The retained Minecraft result is replayed after reconnect when this ack is lost.
+		}
 	}
 
 	async #sendRuntimeMessage(kind, type, agentId, payload) {
