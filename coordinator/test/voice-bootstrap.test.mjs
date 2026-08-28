@@ -239,6 +239,167 @@ test('voice bootstrap prefers one local speech runtime for both expressive TTS a
 	assert.equal(localCloses, 1);
 });
 
+test('runtime local TTS failures switch concurrent requests once to Fish while local STT stays available', async () => {
+	let localTtsCalls = 0;
+	let localCloses = 0;
+	let fishProviders = 0;
+	let fishCalls = 0;
+	let fishCloses = 0;
+	let profileCloses = 0;
+	const local = {
+		async synthesize() {
+			localTtsCalls += 1;
+			await new Promise((resolve) => setImmediate(resolve));
+			throw Object.assign(new Error('local CUDA allocation failed'), { code: 'LOCAL_TTS_ERROR' });
+		},
+		async transcribe() { return { transcript: 'local hearing remains active', confidence: 1 }; },
+		async close() { localCloses += 1; },
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 0 } }, {
+		FISH_AUDIO_API_KEY: 'fish-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({
+			store: { resolve() { return {
+				profileId: 'voice.test', provider: 'fish', model: 'test', voiceId: 'fish-id', revision: 1, speed: 1,
+			}; } },
+			async close() { profileCloses += 1; },
+		}),
+		createTtsProvider: () => {
+			fishProviders += 1;
+			return {
+				async synthesize() {
+					fishCalls += 1;
+					return { sampleRateHz: 24_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(960) };
+				},
+				async close() { fishCloses += 1; },
+			};
+		},
+	});
+	try {
+		const baseUrl = `http://127.0.0.1:${worker.server.address().port}`;
+		const request = (text, conversationSequence) => fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				agentId: '00000000-0000-4000-8000-000000000001',
+				conversationSequence,
+				profileId: 'voice.auto.v1',
+				radius: 48,
+				text,
+			}),
+		});
+		const responses = await Promise.all([request('first request', 1), request('second request', 2)]);
+		assert.deepEqual(responses.map(({ status }) => status), [200, 200], 'the failed local requests recover in the same HTTP attempts');
+		assert.equal(fishProviders, 1, 'concurrent local failures create one shared fallback provider');
+		assert.equal(localTtsCalls, 2);
+		assert.equal(fishCalls, 2);
+		assert.equal(localCloses, 0, 'local speech remains alive for STT after a TTS-only failover');
+		assert.equal((await local.transcribe()).transcript, 'local hearing remains active');
+	} finally {
+		await worker.close();
+	}
+	assert.equal(localCloses, 1);
+	assert.equal(fishCloses, 1);
+	assert.equal(profileCloses, 1);
+});
+
+test('runtime local TTS failure uses credential-free Windows speech when Fish is absent', async () => {
+	let provider;
+	let localCloses = 0;
+	let windowsProviders = 0;
+	const local = {
+		async synthesize() { throw Object.assign(new Error('local inference failed'), { code: 'LOCAL_TTS_ERROR' }); },
+		async transcribe() { return { transcript: 'still local', confidence: 1 }; },
+		async close() { localCloses += 1; },
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+		platform: 'win32',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createWindowsTtsProvider: () => {
+			windowsProviders += 1;
+			return { async synthesize() { return { provider: 'windows' }; } };
+		},
+		createVoiceServer: (options) => {
+			provider = options.provider;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		assert.equal((await provider.synthesize({ text: 'hello' })).provider, 'windows');
+		assert.equal(windowsProviders, 1);
+		assert.equal(localCloses, 0, 'TTS failover cannot stop the shared local STT process');
+	} finally {
+		await worker.close();
+	}
+	assert.equal(localCloses, 1);
+});
+
+test('replacement workers release each profile owner exactly once', async () => {
+	let profileLoads = 0;
+	let profileCloses = 0;
+	let serverCloses = 0;
+	for (let generation = 1; generation <= 2; generation += 1) {
+		const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+			FISH_AUDIO_API_KEY: 'fish-key',
+		}, {
+			platform: 'linux',
+			createLocalSpeechProvider: async () => null,
+			loadProfileStore: async () => {
+				profileLoads += 1;
+				return { store: { resolve() {} }, async close() { profileCloses += 1; } };
+			},
+			createTtsProvider: () => ({ async synthesize() { return {}; } }),
+			createVoiceServer: ({ profileStore }) => ({
+				async start() {},
+				async close() {
+					serverCloses += 1;
+					await Promise.all([profileStore.close(), profileStore.close()]);
+				},
+			}),
+		});
+		await worker.close();
+		assert.equal(profileCloses, generation);
+	}
+	assert.equal(profileLoads, 2);
+	assert.equal(profileCloses, 2);
+	assert.equal(serverCloses, 2);
+});
+
+test('pre-worker bootstrap failures close every loaded profile owner across retries', async () => {
+	let activeProfileOwners = 0;
+	let profileCloses = 0;
+	for (let attempt = 1; attempt <= 3; attempt += 1) {
+		await assert.rejects(
+			startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+				FISH_AUDIO_API_KEY: 'fish-key',
+			}, {
+				platform: 'linux',
+				createLocalSpeechProvider: async () => null,
+				loadProfileStore: async () => {
+					activeProfileOwners += 1;
+					let closed = false;
+					return {
+						store: { resolve() {} },
+						async close() {
+							if (closed) return;
+							closed = true;
+							activeProfileOwners -= 1;
+							profileCloses += 1;
+						},
+					};
+				},
+				createTtsProvider: () => { throw new Error(`provider construction failed ${attempt}`); },
+			}),
+			new RegExp(`provider construction failed ${attempt}`),
+		);
+		assert.equal(activeProfileOwners, 0, `retry ${attempt} did not retain a profile owner`);
+	}
+	assert.equal(profileCloses, 3);
+});
+
 test('voice bootstrap exposes slow local warmup without delaying the bound worker', async () => {
 	let releaseWarmup;
 	const warmupGate = new Promise((resolve) => { releaseWarmup = resolve; });

@@ -1549,6 +1549,8 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		?? ((options) => LocalSpeechProvider.createIfAvailable(options));
 	if (typeof createLocalSpeechProvider !== 'function') throw new TypeError('createLocalSpeechProvider must be a function');
 	let localSpeechProvider = null;
+	let profiles = null;
+	let profileStore = null;
 	let worker = null;
 	try {
 		localSpeechProvider = await createLocalSpeechProvider({
@@ -1574,11 +1576,12 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
 		if (typeof createWindowsTtsProvider !== 'function') throw new TypeError('createWindowsTtsProvider must be a function');
 		if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
-		const profiles = await loadProfileStore(profilePath, { ...(dependencies.voiceProfileIo ?? {}), signal });
+		profiles = await loadProfileStore(profilePath, { ...(dependencies.voiceProfileIo ?? {}), signal });
 		throwIfVoiceStartupAborted(signal);
 		if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
 			throw new TypeError('loadProfileStore must return a profile store');
 		}
+		profileStore = voiceProfileStoreWithLifecycle(profiles);
 		if (deepgramApiKey !== null && typeof createSttProvider !== 'function') throw new TypeError('createSttProvider must be a function when Deepgram is configured');
 		let provider;
 		let sttProvider;
@@ -1602,9 +1605,6 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			if (fishApiKey !== null && platform === 'win32') provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}));
 			sttProvider = deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey });
 		}
-		const profileStore = typeof profiles.flush === 'function'
-			? Object.assign(profiles.store, { flush: profiles.flush })
-			: profiles.store;
 		worker = createServer({
 			provider,
 			sttProvider,
@@ -1622,11 +1622,47 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		return localSpeechProvider === null ? worker : voiceWorkerWithOwnedProvider(worker, ownedSpeechProvider);
 	} catch (error) {
 		await settleVoiceBootstrapCleanup(
-			[() => worker?.close(), () => localSpeechProvider?.close()],
+			[
+				() => worker?.close(),
+				() => profileStore === null ? closeLoadedVoiceProfiles(profiles) : profileStore.close(),
+				() => localSpeechProvider?.close(),
+			],
 			dependencies.cleanupTimeoutMs ?? 1_000,
 		);
 		throw error;
 	}
+}
+
+function voiceProfileStoreWithLifecycle(profiles) {
+	const store = profiles.store;
+	const flush = profiles.flush ?? store.flush;
+	const close = profiles.close ?? store.close;
+	if (flush !== undefined && typeof flush !== 'function') throw new TypeError('profile store flush must be a function');
+	if (close !== undefined && typeof close !== 'function') throw new TypeError('profile store close must be a function');
+	const flushOperation = flush === undefined
+		? null
+		: flush.bind(typeof profiles.flush === 'function' ? profiles : store);
+	const closeOperation = close === undefined
+		? null
+		: close.bind(typeof profiles.close === 'function' ? profiles : store);
+	let closePromise = null;
+	return Object.freeze({
+		resolve(agentId) { return store.resolve(agentId); },
+		flush(options) { return flushOperation === null ? Promise.resolve() : flushOperation(options); },
+		close() {
+			closePromise ??= Promise.resolve().then(() => closeOperation === null ? flushOperation?.() : closeOperation());
+			return closePromise;
+		},
+	});
+}
+
+function closeLoadedVoiceProfiles(profiles) {
+	if (profiles === null || typeof profiles !== 'object') return undefined;
+	if (typeof profiles.close === 'function') return profiles.close();
+	if (typeof profiles.store?.close === 'function') return profiles.store.close();
+	if (typeof profiles.flush === 'function') return profiles.flush();
+	if (typeof profiles.store?.flush === 'function') return profiles.store.flush();
+	return undefined;
 }
 
 async function settleVoiceBootstrapCleanup(operations, timeoutMs) {
@@ -1684,7 +1720,9 @@ function createLocalSpeechFailover(localProvider, {
 	let activeStt = localProvider;
 	let fallbackTts = null;
 	let fallbackStt = null;
-	let switched = false;
+	let localUnavailable = false;
+	let ttsTransitionPromise = null;
+	let fullTransitionPromise = null;
 	let localClosePromise = null;
 	const closeLocal = () => {
 		localClosePromise ??= Promise.resolve().then(() => localProvider.close?.()).then(() => undefined, () => undefined);
@@ -1709,35 +1747,70 @@ function createLocalSpeechFailover(localProvider, {
 			: createSttProvider({ apiKey: deepgramApiKey });
 		return fallbackStt;
 	};
-	const switchToFallback = async (error, signal) => {
+	const switchAllToFallback = async (error, signal) => {
 		if (error?.name === 'AbortError' || signal?.aborted) throw error;
 		const hasFallbackTts = fishApiKey !== null || platform === 'win32';
 		const hasFallbackStt = deepgramApiKey !== null;
 		if (!hasFallbackTts && !hasFallbackStt) throw error;
-		await closeLocal();
-		throwIfVoiceStartupAborted(signal);
-		activeTts = fallbackTtsFactory();
-		activeStt = fallbackSttFactory();
-		switched = true;
+		if (localUnavailable) return;
+		fullTransitionPromise ??= (async () => {
+			await closeLocal();
+			throwIfVoiceStartupAborted(signal);
+			const nextTts = fallbackTtsFactory();
+			const nextStt = fallbackSttFactory();
+			activeTts = nextTts;
+			activeStt = nextStt;
+			localUnavailable = true;
+		})().catch((transitionError) => {
+			fullTransitionPromise = null;
+			throw transitionError;
+		});
+		await fullTransitionPromise;
+	};
+	const switchTtsToFallback = async (error, signal) => {
+		if (!shouldUseLocalTtsFallback(error, signal)) throw error;
+		if (fishApiKey === null && platform !== 'win32') throw error;
+		if (activeTts !== localProvider) return;
+		if (fullTransitionPromise !== null) {
+			await fullTransitionPromise;
+			return;
+		}
+		ttsTransitionPromise ??= Promise.resolve().then(() => {
+			throwIfVoiceStartupAborted(signal);
+			if (activeTts === localProvider) activeTts = fallbackTtsFactory();
+		}).catch((transitionError) => {
+			ttsTransitionPromise = null;
+			throw transitionError;
+		});
+		await ttsTransitionPromise;
 	};
 	return Object.freeze({
 		tts: Object.freeze({
-			synthesize(request) {
-				if (activeTts !== null) return activeTts.synthesize(request);
+			async synthesize(request) {
+				if (activeTts !== null) {
+					const attemptedProvider = activeTts;
+					try {
+						return await attemptedProvider.synthesize(request);
+					} catch (error) {
+						if (attemptedProvider !== localProvider) throw error;
+						await switchTtsToFallback(error, request?.signal);
+						return activeTts.synthesize(request);
+					}
+				}
 				const error = new Error('Speech synthesis is not configured');
 				error.code = 'TTS_UNAVAILABLE';
-				return Promise.reject(error);
+				throw error;
 			},
 		}),
 		stt: Object.freeze({
 			transcribe(request) { return activeStt.transcribe(request); },
 		}),
 		async warmup({ signal } = {}) {
-			if (switched || typeof localProvider.warmup !== 'function') return;
+			if (localUnavailable || typeof localProvider.warmup !== 'function') return;
 			try {
 				await localProvider.warmup({ signal });
 			} catch (error) {
-				await switchToFallback(error, signal);
+				await switchAllToFallback(error, signal);
 			}
 		},
 		async close() {
@@ -1748,6 +1821,12 @@ function createLocalSpeechFailover(localProvider, {
 			]);
 		},
 	});
+}
+
+function shouldUseLocalTtsFallback(error, signal) {
+	if (error?.name === 'AbortError' || signal?.aborted) return false;
+	if (error instanceof TypeError || error?.code === 'TTS_INVALID_REQUEST') return false;
+	return true;
 }
 
 function ttsProviderWithFallback(primary, fallback) {
