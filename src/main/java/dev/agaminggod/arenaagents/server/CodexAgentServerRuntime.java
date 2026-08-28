@@ -16,8 +16,14 @@ import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -40,6 +46,8 @@ public final class CodexAgentServerRuntime {
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static final long COORDINATOR_STATUS_MAXIMUM_AGE_MS = 2_500L;
+	private static final int MIN_EXPLICIT_SECRET_CHARACTERS = 32;
+	private static final int MAX_EXPLICIT_SECRET_CHARACTERS = 512;
 	private static boolean registered;
 
 	private CodexAgentServerRuntime() {
@@ -127,13 +135,9 @@ public final class CodexAgentServerRuntime {
 					? fallbackPath
 					: Path.of(configuredPath);
 			Path normalized = path.toAbsolutePath().normalize();
-			byte[] relevantContent;
-			try (var input = Files.newInputStream(normalized)) {
-				relevantContent = input.readNBytes(257);
-			}
 			return java.util.Objects.hash(
 					normalized, Files.size(normalized), Files.getLastModifiedTime(normalized).toMillis(),
-					java.util.Arrays.hashCode(relevantContent)
+					explicitSecretContentFingerprint(normalized)
 			);
 		} catch (java.io.IOException | RuntimeException unavailable) {
 			return java.util.Objects.hash(
@@ -141,6 +145,50 @@ public final class CodexAgentServerRuntime {
 					unavailable.getClass().getName()
 			);
 		}
+	}
+
+	static String explicitSecretContentFingerprint(Path path) throws IOException {
+		String secret = readAcceptedExplicitSecret(path);
+		try {
+			byte[] digest = MessageDigest.getInstance("SHA-256")
+					.digest(secret.getBytes(StandardCharsets.UTF_8));
+			return HexFormat.of().formatHex(digest);
+		} catch (NoSuchAlgorithmException unavailable) {
+			throw new IllegalStateException("SHA-256 is unavailable", unavailable);
+		}
+	}
+
+	private static String readAcceptedExplicitSecret(Path path) throws IOException {
+		StringBuilder content = new StringBuilder(MAX_EXPLICIT_SECRET_CHARACTERS);
+		StringBuilder pendingWhitespace = new StringBuilder(MAX_EXPLICIT_SECRET_CHARACTERS + 1);
+		boolean pendingWhitespaceOverflow = false;
+		try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+			char[] buffer = new char[256];
+			for (int read; (read = reader.read(buffer)) >= 0; ) {
+				for (int index = 0; index < read; index++) {
+					char character = buffer[index];
+					if (content.isEmpty() && character <= ' ') continue;
+					if (character <= ' ') {
+						if (pendingWhitespace.length() <= MAX_EXPLICIT_SECRET_CHARACTERS) {
+							pendingWhitespace.append(character);
+						} else {
+							pendingWhitespaceOverflow = true;
+						}
+						continue;
+					}
+					if (pendingWhitespaceOverflow
+							|| content.length() + pendingWhitespace.length() + 1 > MAX_EXPLICIT_SECRET_CHARACTERS) {
+						throw new IOException("Bridge secret exceeds the accepted character limit");
+					}
+					content.append(pendingWhitespace).append(character);
+					pendingWhitespace.setLength(0);
+				}
+			}
+		}
+		if (content.length() < MIN_EXPLICIT_SECRET_CHARACTERS) {
+			throw new IOException("Bridge secret is shorter than the accepted character limit");
+		}
+		return content.toString();
 	}
 
 	static void reconcilePreparedBridge(

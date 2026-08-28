@@ -509,7 +509,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!"hello".equals(envelope.type()) || !"server".equals(envelope.agentId())) {
 			throw new BridgeProtocolException("HANDSHAKE_REQUIRED", "hello must be the first coordinator message");
 		}
-		String supplied = requiredString(envelope.payload(), "secret");
+		String supplied = requiredSecret(envelope.payload());
 		if (!MessageDigest.isEqual(secret.getBytes(StandardCharsets.UTF_8), supplied.getBytes(StandardCharsets.UTF_8))) {
 			throw new BridgeProtocolException("AUTHENTICATION_FAILED", "Bridge secret did not match");
 		}
@@ -1472,12 +1472,29 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private static String requiredString(JsonObject object, String field) {
+		return requiredString(object, field, 256);
+	}
+
+	private static String requiredSecret(JsonObject object) {
+		String value = requiredString(object, "secret", MAX_SECRET_LENGTH);
+		if (value.length() < MIN_SECRET_LENGTH) {
+			throw new BridgeProtocolException(
+					"INVALID_FIELD",
+					"secret must contain " + MIN_SECRET_LENGTH + "-" + MAX_SECRET_LENGTH + " characters"
+			);
+		}
+		return value;
+	}
+
+	private static String requiredString(JsonObject object, String field, int maximumLength) {
 		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
 		if (!object.get(field).isJsonPrimitive() || !object.get(field).getAsJsonPrimitive().isString()) {
 			throw new BridgeProtocolException("INVALID_FIELD", field + " must be a JSON string");
 		}
 		String value = object.get(field).getAsString();
-		if (value.isBlank() || value.length() > 256) throw new BridgeProtocolException("INVALID_FIELD", field + " must be nonblank and bounded");
+		if (value.isBlank() || value.length() > maximumLength) {
+			throw new BridgeProtocolException("INVALID_FIELD", field + " must be nonblank and bounded");
+		}
 		return value;
 	}
 

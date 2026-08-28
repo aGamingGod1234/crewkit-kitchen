@@ -4,6 +4,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -107,7 +109,11 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			System.setProperty("arenaagents.coordinatorAutoStart", "false");
 			System.clearProperty("arenaagents.voiceSecretFile");
 			System.setProperty("arenaagents.bridgeSecretFile", manualSecret.toString());
-			Files.writeString(manualSecret, "m".repeat(32), StandardCharsets.UTF_8);
+			String initialTail = "TAIL_SECRET_MARKER_A";
+			String rotatedTail = "TAIL_SECRET_MARKER_B";
+			String initialManualSecret = "m".repeat(512 - initialTail.length()) + initialTail;
+			String rotatedManualSecret = "m".repeat(512 - rotatedTail.length()) + rotatedTail;
+			Files.writeString(manualSecret, initialManualSecret, StandardCharsets.UTF_8);
 			FileTime originalTimestamp = Files.getLastModifiedTime(manualSecret);
 			manual = supervisor(new MutableResolver(config, "unused-manual"),
 					"00000000-0000-0000-0000-000000000803");
@@ -120,16 +126,27 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 					);
 			assertTrue(manualGate.reconcile(true, initialManualRevision),
 					"manual secret configuration creates the initial worker client");
-			Files.writeString(manualSecret, "n".repeat(32), StandardCharsets.UTF_8);
+			String initialFingerprint = CodexAgentServerRuntime.explicitSecretContentFingerprint(manualSecret);
+			assertEquals(
+					HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+							.digest(initialManualSecret.getBytes(StandardCharsets.UTF_8))),
+					initialFingerprint,
+					"manual secret fingerprint covers the complete accepted credential"
+			);
+			assertFalse(initialFingerprint.contains(initialTail),
+					"manual secret fingerprint never exposes plaintext tail content");
+			Files.writeString(manualSecret, rotatedManualSecret, StandardCharsets.UTF_8);
 			Files.setLastModifiedTime(manualSecret, originalTimestamp);
+			assertEquals(512L, Files.size(manualSecret),
+					"tail-only rotation preserves the maximum accepted secret file size");
 			long rotatedManualRevision = CodexAgentServerRuntime.voiceConfigurationRevision(manual);
 			assertFalse(initialManualRevision == rotatedManualRevision,
-					"same-path manual secret content rotation advances the voice gate revision");
+					"same-size same-timestamp tail rotation advances the voice gate revision");
 			assertTrue(manualGate.reconcile(true, rotatedManualRevision),
 					"manual secret rotation recreates the worker client without restarting Minecraft");
 			assertEquals(4, voiceStarts.get(), "manual secret rotation starts one replacement worker client");
 			assertEquals(2, voiceCloses.get(), "manual secret rotation closes the stale worker client once");
-			return 24;
+			return 27;
 		} finally {
 			if (managed != null) managed.close();
 			if (overridden != null) overridden.close();

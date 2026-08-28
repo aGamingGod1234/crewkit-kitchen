@@ -18,6 +18,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Arrays;
@@ -1380,7 +1381,10 @@ public final class CoordinatorProcessSupervisorVerification {
 		CodexAgentServerRuntime.BridgeSlot slot = null;
 		try {
 			secretFile = Files.createTempFile("arena-explicit-bridge-", ".txt");
-			Files.writeString(secretFile, "e".repeat(32), StandardCharsets.UTF_8);
+			String authenticationSecret = "e".repeat(32);
+			String initialSecret = "e".repeat(511) + "a";
+			String rotatedSecret = "e".repeat(511) + "b";
+			Files.writeString(secretFile, authenticationSecret, StandardCharsets.UTF_8);
 			int port = unusedLoopbackPort();
 			System.setProperty("arenaagents.coordinatorAutoStart", "false");
 			System.setProperty("arenaagents.bridgeSecretFile", secretFile.toString());
@@ -1401,10 +1405,25 @@ public final class CoordinatorProcessSupervisorVerification {
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
 			assertTrue(slot.bridge() != null, "explicit bridge secret still constructs the Java listener");
 			try (Socket connection = authenticate(
-					port, "e".repeat(32), "00000000-0000-0000-0000-000000000773", "explicit-disabled-autostart"
+					port, authenticationSecret, "00000000-0000-0000-0000-000000000773", "explicit-disabled-autostart"
 			)) {
 				assertTrue(slot.bridge().authenticated(),
 						"explicit nondefault bridge port authenticates when coordinator autostart is disabled");
+			}
+			Files.writeString(secretFile, initialSecret, StandardCharsets.UTF_8);
+			FileTime originalTimestamp = Files.getLastModifiedTime(secretFile);
+			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			MultiplexedServerBridge initialBridge = slot.bridge();
+			Files.writeString(secretFile, rotatedSecret, StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(secretFile, originalTimestamp);
+			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			assertTrue(slot.bridge() != null && slot.bridge() != initialBridge,
+					"same-size same-timestamp rotation after byte 257 rebinds the explicit Java bridge");
+			try (Socket connection = authenticate(
+					port, rotatedSecret, "00000000-0000-0000-0000-000000000773", "explicit-tail-rotation"
+			)) {
+				assertTrue(slot.bridge().authenticated(),
+						"replacement Java bridge authenticates with the rotated 512-character secret");
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("disabled autostart explicit bridge verification failed", exception);
