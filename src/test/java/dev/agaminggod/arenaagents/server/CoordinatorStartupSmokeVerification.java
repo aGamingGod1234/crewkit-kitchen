@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodec;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
@@ -18,8 +19,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 
 /** Starts one staged coordinator with an isolated, empty PATH and validates its first catalog. */
@@ -187,10 +193,48 @@ public final class CoordinatorStartupSmokeVerification {
 	}
 
 	private static void stageCoordinator(Path source, Path root) throws IOException {
-		copyTree(source.resolve("src"), root.resolve("coordinator/src"));
-		copyTree(source.resolve("node_modules/acorn"), root.resolve("coordinator/node_modules/acorn"));
-		Files.createDirectories(root.resolve("coordinator/config"));
-		Files.copy(source.resolve("package.json"), root.resolve("coordinator/package.json"), StandardCopyOption.REPLACE_EXISTING);
+		String manifest = coordinatorManifest(source);
+		BundledCoordinatorInstaller.install(root, resourcePath -> {
+			String prefix = "arena-agents/coordinator/";
+			if (!resourcePath.startsWith(prefix)) throw new IOException("Unexpected coordinator resource: " + resourcePath);
+			String relative = resourcePath.substring(prefix.length());
+			if (relative.equals("coordinator-manifest.txt")) {
+				return new ByteArrayInputStream(manifest.getBytes(StandardCharsets.UTF_8));
+			}
+			Path file = source.resolve(relative).normalize();
+			if (!file.startsWith(source) || !Files.isRegularFile(file)) {
+				throw new IOException("Missing coordinator fixture resource: " + relative);
+			}
+			return Files.newInputStream(file);
+		});
+	}
+
+	private static String coordinatorManifest(Path source) throws IOException {
+		List<Path> files = new ArrayList<>();
+		for (String fixed : List.of("package.json", "package-lock.json")) {
+			Path file = source.resolve(fixed);
+			if (Files.isRegularFile(file)) files.add(file);
+		}
+		for (String directory : List.of("config", "src", "node_modules/acorn")) {
+			try (var paths = Files.walk(source.resolve(directory))) {
+				paths.filter(Files::isRegularFile).forEach(files::add);
+			}
+		}
+		files.sort(Comparator.comparing(file -> source.relativize(file).toString().replace('\\', '/')));
+		StringBuilder manifest = new StringBuilder();
+		for (Path file : files) {
+			manifest.append(sha256(Files.readAllBytes(file))).append(' ')
+					.append(source.relativize(file).toString().replace('\\', '/')).append('\n');
+		}
+		return manifest.toString();
+	}
+
+	private static String sha256(byte[] bytes) {
+		try {
+			return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+		} catch (NoSuchAlgorithmException impossible) {
+			throw new IllegalStateException(impossible);
+		}
 	}
 
 	private static Path stageBundledNode(Path root) throws IOException {
@@ -235,8 +279,8 @@ public final class CoordinatorStartupSmokeVerification {
 				  "limits": { "agentCap": 1, "goalQueueCap": 1, "planningConcurrency": 1, "planningMode": "fixed", "urgentReserve": 0, "invalidDecisionRetries": 0 }
 				}
 				""".formatted(port, root.toString().replace("\\", "\\\\"), voicePort);
-		Files.createDirectories(root.resolve("coordinator/config"));
-		Files.writeString(root.resolve("coordinator/config/dynamic-agents.json"), config, StandardCharsets.UTF_8);
+		Files.createDirectories(root.resolve("runtime"));
+		Files.writeString(root.resolve("runtime/dynamic-agents.json"), config, StandardCharsets.UTF_8);
 	}
 
 	private static int verifyOptionalVoiceCredential(Path runtimeRoot) throws IOException {

@@ -14,15 +14,109 @@ public final class BundledCoordinatorInstallerVerification {
 	private BundledCoordinatorInstallerVerification() {
 	}
 
+	public static void main(String[] arguments) throws Exception {
+		System.out.println("PASS: " + verify() + " coordinator generation assertions");
+	}
+
 	public static int verify() throws Exception {
 		int assertions = 0;
 		assertions += verifyConfiguredSecretPathUsesPreparedRuntime();
+		assertions += verifyVerifiedGenerationCanRollbackCandidate();
+		assertions += verifySoleCandidateIsRetainedForRetry();
 		assertions += verifyStaleCoordinatorIsReplacedWithoutTouchingRuntimeState();
 		assertions += verifyIncompleteBundleLeavesExistingCoordinatorIntact();
 		assertions += verifyFreshInstallCreatesSecretAndPreservesProviderConfig();
 		assertions += verifyInterruptedSwapRecoversPreviousCoordinator();
 		assertions += verifyTransientDirectoryLockIsRetried();
 		return assertions;
+	}
+
+	private static int verifyVerifiedGenerationCanRollbackCandidate() throws Exception {
+		Path packageRoot = Files.createTempDirectory("arena-coordinator-generations");
+		try {
+			byte[] mainA = "main A".getBytes(StandardCharsets.UTF_8);
+			byte[] configDefault = "{\"model\":\"default\"}".getBytes(StandardCharsets.UTF_8);
+			String manifestA = manifest(entry("src/dynamic-main.mjs", mainA), entry("config/dynamic-agents.json", configDefault));
+			String generationA = sha256(manifestA.getBytes(StandardCharsets.UTF_8));
+			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestA, mainA, configDefault))),
+					"generation A activates as the first candidate");
+			BundledCoordinatorInstaller.RuntimePackage candidateA = BundledCoordinatorInstaller.validate(packageRoot);
+			assertEquals(generationA, candidateA.generationId(), "generation ID is the bundle manifest digest");
+			assertTrue(candidateA.candidate(), "the first generation remains a candidate until stability promotion");
+			assertFalse(candidateA.lastKnownGoodAvailable(), "a fresh candidate has no rollback target");
+			assertTrue(BundledCoordinatorInstaller.promote(packageRoot, generationA),
+					"stable generation A becomes verified");
+
+			Path config = packageRoot.resolve("runtime/dynamic-agents.json");
+			Path secret = packageRoot.resolve("runtime/bridge-secret.txt");
+			Files.writeString(config, "{\"model\":\"custom\"}", StandardCharsets.UTF_8);
+			String configHash = sha256(Files.readAllBytes(config));
+			String secretHash = sha256(Files.readAllBytes(secret));
+			byte[] mainB = "main B".getBytes(StandardCharsets.UTF_8);
+			byte[] changedDefault = "{\"model\":\"new-default\"}".getBytes(StandardCharsets.UTF_8);
+			String manifestB = manifest(entry("src/dynamic-main.mjs", mainB), entry("config/dynamic-agents.json", changedDefault));
+			String generationB = sha256(manifestB.getBytes(StandardCharsets.UTF_8));
+			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestB, mainB, changedDefault))),
+					"generation B activates after full staging validation");
+			assertEquals("main B", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"generation B owns the active path");
+			assertEquals("main A", Files.readString(packageRoot.resolve("coordinator.last-known-good/src/dynamic-main.mjs")),
+					"verified generation A is retained as the only rollback target");
+			BundledCoordinatorInstaller.RuntimePackage candidateB = BundledCoordinatorInstaller.validate(packageRoot);
+			assertEquals(generationB, candidateB.generationId(), "prepared runtime identifies active generation B");
+			assertTrue(candidateB.candidate(), "generation B is not verified before supervisor stability");
+			assertTrue(candidateB.lastKnownGoodAvailable(), "generation B exposes its verified rollback target");
+			assertEquals(configHash, sha256(Files.readAllBytes(config)), "candidate activation preserves canonical config bytes");
+			assertEquals(secretHash, sha256(Files.readAllBytes(secret)), "candidate activation preserves bridge-secret bytes");
+
+			assertTrue(BundledCoordinatorInstaller.rollback(packageRoot, generationB),
+					"a failed generation B rolls back to verified generation A");
+			assertEquals("main A", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"rollback restores generation A to the active path");
+			assertFalse(Files.exists(packageRoot.resolve("coordinator.last-known-good")),
+					"rollback consumes the retained copy instead of accumulating generations");
+			BundledCoordinatorInstaller.RuntimePackage rolledBack = BundledCoordinatorInstaller.validate(packageRoot);
+			assertEquals(generationA, rolledBack.generationId(), "rollback republishes generation A state");
+			assertFalse(rolledBack.candidate(), "rolled-back verified generation A is not a candidate");
+			assertFalse(BundledCoordinatorInstaller.rollback(packageRoot, generationB),
+					"repeating a completed rollback is idempotent");
+			assertEquals(configHash, sha256(Files.readAllBytes(config)), "rollback preserves canonical config bytes");
+			assertEquals(secretHash, sha256(Files.readAllBytes(secret)), "rollback preserves bridge-secret bytes");
+
+			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifestB, mainB, changedDefault))),
+					"generation B can be prepared again after rollback backoff");
+			assertTrue(BundledCoordinatorInstaller.promote(packageRoot, generationB),
+					"stable generation B becomes verified");
+			assertFalse(BundledCoordinatorInstaller.promote(packageRoot, generationB),
+					"repeating promotion is idempotent");
+			BundledCoordinatorInstaller.RuntimePackage promotedB = BundledCoordinatorInstaller.validate(packageRoot);
+			assertFalse(promotedB.candidate(), "promoted generation B is verified");
+			assertEquals("main A", Files.readString(packageRoot.resolve("coordinator.last-known-good/src/dynamic-main.mjs")),
+					"promotion retains one prior verified generation for the next rollback");
+			return 25;
+		} finally {
+			deleteTree(packageRoot);
+		}
+	}
+
+	private static int verifySoleCandidateIsRetainedForRetry() throws Exception {
+		Path packageRoot = Files.createTempDirectory("arena-coordinator-sole-candidate");
+		try {
+			byte[] main = "only runnable candidate".getBytes(StandardCharsets.UTF_8);
+			byte[] config = "{}".getBytes(StandardCharsets.UTF_8);
+			String manifest = manifest(entry("src/dynamic-main.mjs", main), entry("config/dynamic-agents.json", config));
+			String generation = sha256(manifest.getBytes(StandardCharsets.UTF_8));
+			BundledCoordinatorInstaller.install(packageRoot, resource(resources(manifest, main, config)));
+			assertFalse(BundledCoordinatorInstaller.rollback(packageRoot, generation),
+					"a candidate without a verified rollback target is retained");
+			assertEquals("only runnable candidate", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"failed sole candidate remains runnable for retry");
+			assertTrue(BundledCoordinatorInstaller.validate(packageRoot).candidate(),
+					"sole failed generation remains a candidate until it becomes stable");
+			return 3;
+		} finally {
+			deleteTree(packageRoot);
+		}
 	}
 
 	private static int verifyTransientDirectoryLockIsRetried() throws Exception {
@@ -75,6 +169,9 @@ public final class BundledCoordinatorInstallerVerification {
 			Files.createDirectories(coordinator.resolve("src"));
 			Files.writeString(coordinator.resolve("src/dynamic-main.mjs"), "old main", StandardCharsets.UTF_8);
 			Files.writeString(coordinator.resolve("stale-file.mjs"), "stale", StandardCharsets.UTF_8);
+			byte[] legacyConfig = "{\"legacy\":\"preserve exactly\"}".getBytes(StandardCharsets.UTF_8);
+			Files.createDirectories(coordinator.resolve("config"));
+			Files.write(coordinator.resolve("config/dynamic-agents.json"), legacyConfig);
 			Files.createDirectories(packageRoot.resolve("runtime"));
 			Path secret = packageRoot.resolve("runtime/bridge-secret.txt");
 			byte[] existingSecret = new byte[64];
@@ -102,9 +199,11 @@ public final class BundledCoordinatorInstallerVerification {
 					"directory swap removes files absent from the new bundle");
 			assertEquals(secretFingerprint, sha256(Files.readAllBytes(secret)),
 					"coordinator refresh preserves runtime state outside its directory");
+			assertEquals(sha256(legacyConfig), sha256(Files.readAllBytes(packageRoot.resolve("runtime/dynamic-agents.json"))),
+					"legacy mutable config migrates once without changing its bytes");
 			assertFalse(BundledCoordinatorInstaller.install(packageRoot, resource(resources)),
 					"matching content manifest skips a redundant install");
-			return 6;
+			return 7;
 		} finally {
 			deleteTree(packageRoot);
 		}
@@ -157,15 +256,17 @@ public final class BundledCoordinatorInstallerVerification {
 					"preparation returns coordinator root");
 			assertEquals(packageRoot.resolve("coordinator/src/dynamic-main.mjs").toAbsolutePath().normalize(), prepared.main(),
 					"preparation returns coordinator entrypoint");
-			assertEquals(packageRoot.resolve("coordinator/config/dynamic-agents.json").toAbsolutePath().normalize(), prepared.config(),
-					"preparation returns coordinator config");
+			assertEquals(packageRoot.resolve("runtime/dynamic-agents.json").toAbsolutePath().normalize(), prepared.config(),
+					"preparation returns canonical external config");
 			assertEquals(secret.toAbsolutePath().normalize(), prepared.secret(), "preparation returns the canonical secret path");
 			assertFalse(Files.exists(packageRoot.resolve("coordinator/runtime/bridge-secret.txt")),
 					"preparation never copies the shared secret into the coordinator tree");
 			String secretFingerprint = sha256(Files.readAllBytes(secret));
 			assertTrue(Files.readString(secret, StandardCharsets.UTF_8).trim().length() >= 32,
 					"fresh shared bridge secret is bounded and usable");
-			Path config = packageRoot.resolve("coordinator/config/dynamic-agents.json");
+			assertFalse(Files.exists(packageRoot.resolve("coordinator/config/dynamic-agents.json")),
+					"mutable config is not copied into a runtime generation");
+			Path config = packageRoot.resolve("runtime/dynamic-agents.json");
 			Files.writeString(config, "{\"codex\":{\"model\":\"my-custom-model\"}}", StandardCharsets.UTF_8);
 
 			byte[] upgradedMain = "main v2".getBytes(StandardCharsets.UTF_8);
@@ -192,28 +293,45 @@ public final class BundledCoordinatorInstallerVerification {
 	private static int verifyInterruptedSwapRecoversPreviousCoordinator() throws Exception {
 		Path packageRoot = Files.createTempDirectory("arena-coordinator-install-recovery");
 		try {
-			Path previous = packageRoot.resolve("coordinator.previous-crash");
-			Path previousConfig = previous.resolve("config/dynamic-agents.json");
-			Files.createDirectories(previous.resolve("src"));
-			Files.createDirectories(previousConfig.getParent());
-			Files.writeString(previous.resolve("src/dynamic-main.mjs"), "working old main", StandardCharsets.UTF_8);
-			Files.writeString(previousConfig, "{\"codex\":{\"model\":\"crash-safe-custom\"}}", StandardCharsets.UTF_8);
-			String manifest = manifest(
-					entry("src/dynamic-main.mjs", "new main"),
-					entry("config/dynamic-agents.json", "new default"));
-			Map<String, byte[]> resources = resources(manifest,
-					"new main".getBytes(StandardCharsets.UTF_8),
-					"new default".getBytes(StandardCharsets.UTF_8));
+			byte[] oldMain = "working old main".getBytes(StandardCharsets.UTF_8);
+			byte[] oldConfig = "{\"codex\":{\"model\":\"crash-safe-custom\"}}".getBytes(StandardCharsets.UTF_8);
+			String oldManifest = manifest(entry("src/dynamic-main.mjs", oldMain), entry("config/dynamic-agents.json", oldConfig));
+			String oldGeneration = sha256(oldManifest.getBytes(StandardCharsets.UTF_8));
+			BundledCoordinatorInstaller.install(packageRoot, resource(resources(oldManifest, oldMain, oldConfig)));
+			BundledCoordinatorInstaller.promote(packageRoot, oldGeneration);
 
-			assertTrue(BundledCoordinatorInstaller.install(packageRoot, resource(resources)),
-					"an interrupted swap is recovered before installing the new coordinator");
+			byte[] newMain = "new main".getBytes(StandardCharsets.UTF_8);
+			byte[] newConfig = "new default".getBytes(StandardCharsets.UTF_8);
+			String manifest = manifest(entry("src/dynamic-main.mjs", newMain), entry("config/dynamic-agents.json", newConfig));
+			Map<String, byte[]> resources = resources(manifest, newMain, newConfig);
+			int[] moves = {0};
+			try {
+				BundledCoordinatorInstaller.install(packageRoot, resource(resources), (source, target) -> {
+					moves[0] += 1;
+					if (target.getFileName().toString().equals("coordinator")) {
+						throw new IOException("injected interruption before candidate activation");
+					}
+					Files.move(source, target);
+				});
+				throw new AssertionError("interrupted swap must fail");
+			} catch (IOException expected) {
+				assertFalse(Files.exists(packageRoot.resolve("coordinator")),
+						"interruption after retaining the verified runtime leaves no ambiguous active directory");
+				assertEquals("working old main", Files.readString(packageRoot.resolve("coordinator.last-known-good/src/dynamic-main.mjs")),
+						"interrupted swap retains the exact verified generation");
+			}
+
+			assertFalse(BundledCoordinatorInstaller.install(packageRoot, resource(resources)),
+					"a repeated install deterministically completes the journaled candidate activation");
 			assertEquals("new main", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
 					"recovered swap installs the new coordinator code");
 			assertEquals("{\"codex\":{\"model\":\"crash-safe-custom\"}}",
-					Files.readString(packageRoot.resolve("coordinator/config/dynamic-agents.json")),
+					Files.readString(packageRoot.resolve("runtime/dynamic-agents.json")),
 					"recovered swap retains the user provider config");
-			assertFalse(Files.exists(previous), "completed recovery cleans the old previous directory");
-			return 4;
+			assertEquals(0L, Files.list(packageRoot)
+					.filter(path -> path.getFileName().toString().startsWith("coordinator.staging-"))
+					.count(), "completed recovery cleans disposable staging directories");
+			return 6;
 		} finally {
 			deleteTree(packageRoot);
 		}

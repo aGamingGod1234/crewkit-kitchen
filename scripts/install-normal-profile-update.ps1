@@ -9,6 +9,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'distribution-runtime.ps1')
 
 function Resolve-ContainedPath([string] $Base, [string] $Child, [string] $Label) {
     $basePath = [IO.Path]::GetFullPath($Base).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
@@ -113,14 +114,6 @@ function Assert-ArchiveParity([string] $JarPath, [string] $CoordinatorRoot, [str
     } finally { $zip.Dispose() }
 }
 
-function Copy-ExpectedCoordinator([string] $Source, [string] $Destination, [string[]] $Expected) {
-    foreach ($relative in $Expected) {
-        $target = Join-Path $Destination ($relative.Replace('/', '\'))
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $Source ($relative.Replace('/', '\'))) -Destination $target -Force
-    }
-}
-
 $project = [IO.Path]::GetFullPath($ProjectRoot)
 $game = [IO.Path]::GetFullPath($GameDirectory)
 Assert-NoReparse $project 'project root'
@@ -158,24 +151,18 @@ Assert-ArchiveParity $jar $coordinator $expected
 $stage = Join-Path $game ('.arena-agents-update-' + [guid]::NewGuid().ToString('N'))
 $backup = Join-Path $game ('.arena-agents-backup-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [guid]::NewGuid().ToString('N'))
 $stageMods = Join-Path $stage 'mods'
-$stageCoordinator = Join-Path $stage 'coordinator'
 $installedCoordinator = Join-Path $runtime 'coordinator'
 $installedJar = Join-Path $mods 'arena-agents-0.1.0.jar'
 $installedVoiceJar = Join-Path $mods 'arena-agents-voice-0.1.0.jar'
 $backupMade = $false
 $oldArena = @()
+$coordinatorInstall = $null
 try {
     Assert-NoReparse $stage 'staging path'
     Assert-NoReparse $backup 'backup path'
-    New-Item -ItemType Directory -Force -Path $stageMods, $stageCoordinator | Out-Null
+    New-Item -ItemType Directory -Force -Path $stageMods | Out-Null
     Copy-Item -LiteralPath $jar -Destination (Join-Path $stageMods 'arena-agents-0.1.0.jar') -Force
     Copy-Item -LiteralPath $voiceJar -Destination (Join-Path $stageMods 'arena-agents-voice-0.1.0.jar') -Force
-    Copy-ExpectedCoordinator $coordinator $stageCoordinator $expected
-    foreach ($relative in $expected) {
-        $sourceHash = (Get-FileHash (Join-Path $coordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash
-        $stageHash = (Get-FileHash (Join-Path $stageCoordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash
-        if ($sourceHash -ne $stageHash) { throw "Staged coordinator hash mismatch: $relative" }
-    }
     New-Item -ItemType Directory -Force -Path $backup | Out-Null
     $oldArena = @(Get-ChildItem -LiteralPath $mods -File -ErrorAction SilentlyContinue | Where-Object {
         $_.Name -match '^arena-agents-(?:voice-)?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\.jar$'
@@ -183,11 +170,10 @@ try {
     foreach ($old in $oldArena) { Assert-NoReparseTree $old.FullName "Arena JAR $($old.Name)" }
     foreach ($old in $oldArena) { Copy-Item -LiteralPath $old.FullName -Destination (Join-Path $backup $old.Name) -Force }
     if ($FailurePoint -eq 'AfterJarsBackup') { throw 'Injected failure after JAR backup.' }
-    if (Test-Path -LiteralPath $installedCoordinator) { Copy-Item -LiteralPath $installedCoordinator -Destination (Join-Path $backup 'coordinator') -Recurse -Force }
     Assert-NoReparseTree $backup 'backup path'
     foreach ($item in @(Get-ChildItem -LiteralPath $backup -Recurse -File)) {
         $relative = $item.FullName.Substring($backup.Length + 1)
-        $source = if ($relative.StartsWith('coordinator\')) { Join-Path $installedCoordinator $relative.Substring('coordinator'.Length).TrimStart('\') } else { Join-Path $mods $relative }
+        $source = Join-Path $mods $relative
         if ((Get-FileHash $source -Algorithm SHA256).Hash -ne (Get-FileHash $item.FullName -Algorithm SHA256).Hash) { throw "Backup hash mismatch: $relative" }
     }
     if ((Get-FileHash $secret -Algorithm SHA256).Hash -ne $secretHash) { throw 'Bridge secret changed during backup.' }
@@ -202,32 +188,34 @@ try {
     Copy-Item -LiteralPath (Join-Path $stageMods 'arena-agents-0.1.0.jar') -Destination $installedJar -Force
     Copy-Item -LiteralPath (Join-Path $stageMods 'arena-agents-voice-0.1.0.jar') -Destination $installedVoiceJar -Force
     if ($FailurePoint -eq 'AfterJarSwap') { throw 'Injected failure after JAR swap.' }
-    New-Item -ItemType Directory -Force -Path $runtime | Out-Null
-    if (Test-Path -LiteralPath $installedCoordinator) { Remove-Item -LiteralPath $installedCoordinator -Recurse -Force }
-    Copy-Item -LiteralPath $stageCoordinator -Destination $installedCoordinator -Recurse -Force
+    $coordinatorInstall = Install-ArenaCoordinatorRuntime -SourceRoot $project -InstalledPackageRoot $runtime
     if ($FailurePoint -eq 'AfterCoordinatorSwap') { throw 'Injected failure after coordinator swap.' }
     if ((Get-FileHash $installedJar -Algorithm SHA256).Hash -ne (Get-FileHash $jar -Algorithm SHA256).Hash) { throw 'Installed JAR hash verification failed.' }
     if ((Get-FileHash $installedVoiceJar -Algorithm SHA256).Hash -ne (Get-FileHash $voiceJar -Algorithm SHA256).Hash) { throw 'Installed voice addon hash verification failed.' }
-    foreach ($relative in $expected) {
+    foreach ($relative in @($expected | Where-Object { $_ -cne 'config/dynamic-agents.json' })) {
         if ((Get-FileHash (Join-Path $installedCoordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash -ne (Get-FileHash (Join-Path $coordinator ($relative.Replace('/', '\'))) -Algorithm SHA256).Hash) { throw "Installed coordinator hash verification failed: $relative" }
     }
+    if ((Get-ArenaInstalledGeneration $installedCoordinator $coordinatorInstall.GenerationId) -cne $coordinatorInstall.GenerationId) { throw 'Installed coordinator generation verification failed.' }
     if ((Get-FileHash $secret -Algorithm SHA256).Hash -ne $secretHash) { throw 'Installed bridge secret changed.' }
     Write-Host "Normal profile updated: $game"
     Write-Host "Jar SHA-256: $((Get-FileHash $installedJar -Algorithm SHA256).Hash)"
     Write-Host "Voice addon SHA-256: $((Get-FileHash $installedVoiceJar -Algorithm SHA256).Hash)"
 } catch {
+    $failure = $_
+    if ($null -ne $coordinatorInstall -and $coordinatorInstall.Changed) {
+        if (-not (Restore-ArenaCoordinatorGeneration -InstalledPackageRoot $runtime -GenerationId $coordinatorInstall.GenerationId)) {
+            throw "Coordinator rollback failed; preserved backup: $backup"
+        }
+    }
     if ($backupMade) {
         if (Test-Path -LiteralPath $installedJar) { Remove-Item -LiteralPath $installedJar -Force }
         if (Test-Path -LiteralPath $installedVoiceJar) { Remove-Item -LiteralPath $installedVoiceJar -Force }
-        if (Test-Path -LiteralPath $installedCoordinator) { Remove-Item -LiteralPath $installedCoordinator -Recurse -Force }
         foreach ($old in $oldArena) { $saved = Join-Path $backup $old.Name; if (Test-Path -LiteralPath $saved) { Copy-Item -LiteralPath $saved -Destination $old.FullName -Force } }
-        $oldCoordinator = Join-Path $backup 'coordinator'
-        if (Test-Path -LiteralPath $oldCoordinator) { Copy-Item -LiteralPath $oldCoordinator -Destination $installedCoordinator -Recurse -Force }
         foreach ($old in $oldArena) { if ((Get-FileHash $old.FullName -Algorithm SHA256).Hash -ne (Get-FileHash (Join-Path $backup $old.Name) -Algorithm SHA256).Hash) { throw "Rollback hash verification failed; preserved backup: $backup" } }
         if ((Get-FileHash $secret -Algorithm SHA256).Hash -ne $secretHash) { throw "Rollback secret verification failed; preserved backup: $backup" }
         Write-Host "Rollback completed; verified backup preserved at $backup"
     }
-    throw
+    throw $failure
 } finally {
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 }

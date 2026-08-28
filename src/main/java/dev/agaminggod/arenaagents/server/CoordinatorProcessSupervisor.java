@@ -33,6 +33,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
+	private static final int CANDIDATE_FAILURES_BEFORE_ROLLBACK = 3;
 
 	private final Path gameDirectory;
 	private final Map<String, String> launchEnvironmentOverrides;
@@ -43,6 +44,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private final MaintenanceWorker maintenanceWorker;
 	private final OrphanReaper orphanReaper;
 	private final DependencyChangeMonitor dependencyChangeMonitor;
+	private final GenerationController generationController;
 	private final long createdAtEpochMs;
 	private final CoordinatorLaunchPolicy.RestartBudget restartBudget = new CoordinatorLaunchPolicy.RestartBudget();
 	private final ConcurrentLinkedQueue<MaintenanceResult> maintenanceResults = new ConcurrentLinkedQueue<>();
@@ -74,6 +76,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private long bridgeRevision;
 	private VoiceConfiguration voiceConfiguration;
 	private long voiceConfigurationRevision;
+	private int candidateFailures;
+	private boolean rollbackRequested;
+	private long nextGenerationMutationEpochMs;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -146,6 +151,24 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			OrphanReaper orphanReaper,
 			DependencyMonitorScheduler dependencyMonitorScheduler
 	) {
+		this(
+				gameDirectory, launchEnvironmentOverrides, clock, dependencyResolver, processLauncher, launchIds,
+				maintenanceWorker, orphanReaper, dependencyMonitorScheduler, new DefaultGenerationController()
+		);
+	}
+
+	CoordinatorProcessSupervisor(
+			Path gameDirectory,
+			Map<String, String> launchEnvironmentOverrides,
+			LongSupplier clock,
+			DependencyResolver dependencyResolver,
+			ProcessLauncher processLauncher,
+			Supplier<String> launchIds,
+			MaintenanceWorker maintenanceWorker,
+			OrphanReaper orphanReaper,
+			DependencyMonitorScheduler dependencyMonitorScheduler,
+			GenerationController generationController
+	) {
 		this.gameDirectory = Objects.requireNonNull(gameDirectory, "game directory must not be null")
 				.toAbsolutePath().normalize();
 		this.launchEnvironmentOverrides = Map.copyOf(Objects.requireNonNull(
@@ -160,6 +183,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		this.launchIds = Objects.requireNonNull(launchIds, "launch IDs must not be null");
 		this.maintenanceWorker = Objects.requireNonNull(maintenanceWorker, "maintenance worker must not be null");
 		this.orphanReaper = Objects.requireNonNull(orphanReaper, "orphan reaper must not be null");
+		this.generationController = Objects.requireNonNull(generationController,
+				"generation controller must not be null");
 		DependencyMonitorScheduler monitorScheduler = Objects.requireNonNull(
 				dependencyMonitorScheduler, "dependency monitor scheduler must not be null"
 		);
@@ -200,6 +225,21 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		DependencyResolution resolve();
 	}
 
+	interface GenerationController {
+		GenerationStatus promote(Path root, String generationId) throws IOException;
+
+		GenerationStatus rollback(Path root, String generationId) throws IOException;
+	}
+
+	record GenerationStatus(String generationId, boolean candidate, boolean lastKnownGoodAvailable) {
+		GenerationStatus {
+			generationId = Objects.requireNonNull(generationId, "generation ID must not be null");
+			if (!generationId.matches("[0-9a-f]{64}")) {
+				throw new IllegalArgumentException("coordinator generation ID is invalid");
+			}
+		}
+	}
+
 	@FunctionalInterface
 	interface MaintenanceWorker extends AutoCloseable {
 		void execute(Runnable task);
@@ -224,7 +264,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	private sealed interface MaintenanceResult permits DependencyMaintenanceResult,
-			DependencyFingerprintChanged, LaunchMaintenanceResult, TerminationMaintenanceResult {
+			DependencyFingerprintChanged, LaunchMaintenanceResult, TerminationMaintenanceResult,
+			PromotionMaintenanceResult, RollbackMaintenanceResult {
 	}
 
 	private record DependencyMaintenanceResult(
@@ -249,6 +290,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	private record TerminationMaintenanceResult() implements MaintenanceResult {
+	}
+
+	private record PromotionMaintenanceResult(GenerationStatus status, String generationId, String failureMessage)
+			implements MaintenanceResult {
+	}
+
+	private record RollbackMaintenanceResult(GenerationStatus status, String generationId, String failureMessage)
+			implements MaintenanceResult {
 	}
 
 	record DependencyResolution(
@@ -321,8 +370,26 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			Path config,
 			Path secret,
 			Path nodeExecutable,
-			String bridgeSecret
+			String bridgeSecret,
+			String generationId,
+			boolean candidate,
+			boolean lastKnownGoodAvailable
 	) {
+		PreparedRuntime(
+				Path root,
+				Path coordinatorRoot,
+				Path main,
+				Path config,
+				Path secret,
+				Path nodeExecutable,
+				String bridgeSecret
+		) {
+			this(
+					root, coordinatorRoot, main, config, secret, nodeExecutable, bridgeSecret,
+					"0".repeat(64), false, false
+			);
+		}
+
 		PreparedRuntime {
 			root = normalized(root, "runtime root");
 			coordinatorRoot = normalized(coordinatorRoot, "coordinator root");
@@ -333,6 +400,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			bridgeSecret = Objects.requireNonNull(bridgeSecret, "bridge secret value must not be null").strip();
 			if (bridgeSecret.length() < 32 || bridgeSecret.length() > 256) {
 				throw new IllegalArgumentException("bridge secret value is invalid");
+			}
+			generationId = Objects.requireNonNull(generationId, "generation ID must not be null");
+			if (!generationId.matches("[0-9a-f]{64}")) {
+				throw new IllegalArgumentException("coordinator generation ID is invalid");
 			}
 		}
 
@@ -348,7 +419,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			Path standardOutput,
 			Path standardError,
 			Path runtimeRoot,
-			Path main
+			Path main,
+			String generationId,
+			String launchId
 	) {
 		LaunchRequest {
 			command = List.copyOf(command);
@@ -358,6 +431,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			standardError = normalized(standardError, "standard error");
 			runtimeRoot = normalized(runtimeRoot, "runtime root");
 			main = normalized(main, "coordinator main");
+			generationId = Objects.requireNonNull(generationId, "generation ID must not be null");
+			launchId = UUID.fromString(Objects.requireNonNull(launchId, "launch ID must not be null")).toString();
 		}
 
 		private static Path normalized(Path path, String label) {
@@ -401,6 +476,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		return voiceConfigurationRevision;
 	}
 
+	synchronized String runtimeGenerationId() {
+		return runtime == null ? null : runtime.generationId();
+	}
+
 	void publishDependencyFingerprintChange() {
 		if (stopped) return;
 		long generation = dependencyWakeGeneration.incrementAndGet();
@@ -435,6 +514,12 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			submitTerminationMaintenance();
 			drainMaintenanceResults(now);
 			if (pendingTermination != null || maintenancePending) return;
+		}
+		if (rollbackRequested && child == null) {
+			if (now < nextGenerationMutationEpochMs) return;
+			submitRollbackMaintenance();
+			drainMaintenanceResults(now);
+			if (rollbackRequested || maintenancePending) return;
 		}
 		if (child != null) {
 			return;
@@ -518,9 +603,11 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			reconnectDeadlineEpochMs = 0L;
 			nextRetryEpochMs = 0L;
 			if (!stabilityCredited && now - authenticatedSinceEpochMs >= STABILITY_INTERVAL_MS) {
-				restartBudget.resetAfterStability();
-				lastStableEpochMs = now;
-				stabilityCredited = true;
+				if (runtime != null && runtime.candidate()) {
+					if (now >= nextGenerationMutationEpochMs) submitPromotionMaintenance();
+				} else {
+					creditStability(now);
+				}
 			}
 			return;
 		}
@@ -553,6 +640,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 	}
 
+	private void creditStability(long now) {
+		restartBudget.resetAfterStability();
+		lastStableEpochMs = now;
+		stabilityCredited = true;
+		candidateFailures = 0;
+	}
+
 	private boolean applyDependencyResolution(
 			DependencyResolution resolution,
 			long now,
@@ -562,6 +656,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		nextDependencyCheckEpochMs = now + DEPENDENCY_RECHECK_MS;
 		PreparedRuntime previous = runtime;
 		runtime = resolution.runtime();
+		if (runtime == null || previous == null || !previous.generationId().equals(runtime.generationId())) {
+			candidateFailures = 0;
+			rollbackRequested = false;
+		}
+		if (runtime != null && !runtime.candidate()) {
+			candidateFailures = 0;
+			rollbackRequested = false;
+		}
 		if (runtime != null) configureSharedBridgeSecretPath(runtime.secret());
 		publishVoiceConfiguration(resolution.voiceConfiguration());
 		if (runtime != null && (previous == null
@@ -690,6 +792,42 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		});
 	}
 
+	private void submitPromotionMaintenance() {
+		if (maintenancePending || stopped || runtime == null || !runtime.candidate()) return;
+		PreparedRuntime promoting = runtime;
+		maintenancePending = true;
+		submitMaintenance(() -> {
+			try {
+				GenerationStatus status = generationController.promote(promoting.root(), promoting.generationId());
+				publishMaintenanceResult(new PromotionMaintenanceResult(status, promoting.generationId(), null));
+			} catch (IOException | RuntimeException failure) {
+				publishMaintenanceResult(new PromotionMaintenanceResult(
+						null, promoting.generationId(), Objects.toString(failure.getMessage(), "Candidate promotion failed")
+				));
+			}
+		});
+	}
+
+	private void submitRollbackMaintenance() {
+		if (maintenancePending || stopped || runtime == null || !runtime.candidate()
+				|| !runtime.lastKnownGoodAvailable()) {
+			rollbackRequested = false;
+			return;
+		}
+		PreparedRuntime failed = runtime;
+		maintenancePending = true;
+		submitMaintenance(() -> {
+			try {
+				GenerationStatus status = generationController.rollback(failed.root(), failed.generationId());
+				publishMaintenanceResult(new RollbackMaintenanceResult(status, failed.generationId(), null));
+			} catch (IOException | RuntimeException failure) {
+				publishMaintenanceResult(new RollbackMaintenanceResult(
+						null, failed.generationId(), Objects.toString(failure.getMessage(), "Candidate rollback failed")
+				));
+			}
+		});
+	}
+
 	private void submitMaintenance(Runnable task) {
 		try {
 			maintenanceWorker.execute(task);
@@ -753,8 +891,47 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				state = CoordinatorRecoveryState.AUTHENTICATING;
 				failingBoundary = "bridge_authentication";
 				LOGGER.info("Started the Arena Agents coordinator (pid {}, generation {})", child.pid(), generation);
+			} else if (result instanceof PromotionMaintenanceResult promotion) {
+				if (runtime == null || !promotion.generationId().equals(runtime.generationId())) continue;
+				if (promotion.status() == null) {
+					nextGenerationMutationEpochMs = now + DEPENDENCY_RECHECK_MS;
+					setDiagnostic("COORDINATOR_GENERATION_PROMOTION_FAILED", promotion.failureMessage(), "runtime_promotion");
+					continue;
+				}
+				if (!promotion.generationId().equals(promotion.status().generationId())) {
+					nextGenerationMutationEpochMs = now + DEPENDENCY_RECHECK_MS;
+					setDiagnostic("COORDINATOR_GENERATION_PROMOTION_FAILED",
+							"Candidate promotion returned a different generation", "runtime_promotion");
+					continue;
+				}
+				runtime = withGeneration(runtime, promotion.status());
+				nextGenerationMutationEpochMs = 0L;
+				creditStability(now);
+			} else if (result instanceof RollbackMaintenanceResult rollback) {
+				if (runtime == null || !rollback.generationId().equals(runtime.generationId())) continue;
+				if (rollback.status() == null) {
+					nextGenerationMutationEpochMs = now + DEPENDENCY_RECHECK_MS;
+					setDiagnostic("COORDINATOR_GENERATION_ROLLBACK_FAILED", rollback.failureMessage(), "runtime_rollback");
+					continue;
+				}
+				runtime = withGeneration(runtime, rollback.status());
+				candidateFailures = 0;
+				rollbackRequested = false;
+				nextGenerationMutationEpochMs = 0L;
+				nextDependencyCheckEpochMs = now + DEPENDENCY_RECHECK_MS;
+				nextRetryEpochMs = now;
+				LOGGER.warn("Rolled back failed coordinator generation {} to verified generation {}",
+						rollback.generationId(), rollback.status().generationId());
 			}
 		}
+	}
+
+	private static PreparedRuntime withGeneration(PreparedRuntime runtime, GenerationStatus status) {
+		return new PreparedRuntime(
+				runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(),
+				runtime.nodeExecutable(), runtime.bridgeSecret(), status.generationId(), status.candidate(),
+				status.lastKnownGoodAvailable()
+		);
 	}
 
 	private DependencyResolution resolveDependencies() {
@@ -799,12 +976,22 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				logs.resolve("arena-agents-coordinator.log"),
 				logs.resolve("arena-agents-coordinator-error.log"),
 				prepared.root(),
-				prepared.main()
+				prepared.main(),
+				prepared.generationId(),
+				ownedLaunchId
 		);
 	}
 
 	private void recordFailure(long now, String code, String message, String boundary) {
 		restartBudget.recordUnexpectedExit();
+		if (runtime != null && runtime.candidate() && candidateFailure(code)) {
+			candidateFailures++;
+			if (candidateFailures >= CANDIDATE_FAILURES_BEFORE_ROLLBACK
+					&& runtime.lastKnownGoodAvailable()) {
+				rollbackRequested = true;
+				nextGenerationMutationEpochMs = 0L;
+			}
+		}
 		state = CoordinatorRecoveryState.BACKOFF;
 		nextRetryEpochMs = now + restartBudget.nextDelayMs();
 		processStartedEpochMs = 0L;
@@ -813,6 +1000,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		authenticatedSinceEpochMs = 0L;
 		stabilityCredited = false;
 		setDiagnostic(code, message, boundary);
+	}
+
+	private static boolean candidateFailure(String code) {
+		return "COORDINATOR_START_FAILED".equals(code)
+				|| "COORDINATOR_EXITED".equals(code)
+				|| "COORDINATOR_AUTHENTICATION_TIMEOUT".equals(code)
+				|| "COORDINATOR_RECONNECT_TIMEOUT".equals(code);
 	}
 
 	private void setDiagnostic(String code, String message, String boundary) {
@@ -969,7 +1163,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static boolean isPackageRoot(Path candidate) {
 		return Files.isRegularFile(candidate.resolve("runtime/bridge-secret.txt"))
 				&& Files.isRegularFile(candidate.resolve("coordinator/src/dynamic-main.mjs"))
-				&& Files.isRegularFile(candidate.resolve("coordinator/config/dynamic-agents.json"));
+				&& Files.isRegularFile(candidate.resolve("runtime/dynamic-agents.json"));
 	}
 
 	private static String dependencyFailureCode(IOException failure) {
@@ -1077,6 +1271,26 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 	}
 
+	private static final class DefaultGenerationController implements GenerationController {
+		@Override
+		public GenerationStatus promote(Path root, String generationId) throws IOException {
+			BundledCoordinatorInstaller.promote(root, generationId);
+			return status(BundledCoordinatorInstaller.validate(root));
+		}
+
+		@Override
+		public GenerationStatus rollback(Path root, String generationId) throws IOException {
+			BundledCoordinatorInstaller.rollback(root, generationId);
+			return status(BundledCoordinatorInstaller.validate(root));
+		}
+
+		private static GenerationStatus status(BundledCoordinatorInstaller.RuntimePackage runtime) {
+			return new GenerationStatus(
+					runtime.generationId(), runtime.candidate(), runtime.lastKnownGoodAvailable()
+			);
+		}
+	}
+
 	private static final class DefaultProcessLauncher implements ProcessLauncher {
 		@Override
 		public ChildProcess launch(LaunchRequest request) throws IOException {
@@ -1090,23 +1304,31 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			builder.redirectError(ProcessBuilder.Redirect.appendTo(request.standardError().toFile()));
 			Process process = builder.start();
 			try {
-				CoordinatorProcessOwnership.record(request.runtimeRoot(), process, request.main());
+				CoordinatorProcessOwnership.record(
+						request.runtimeRoot(), process, request.main(), request.generationId(), request.launchId()
+				);
 			} catch (IOException ownershipFailure) {
 				terminateFailedStart(process);
 				throw ownershipFailure;
 			}
-			return new OwnedProcessChild(request.runtimeRoot(), process);
+			return new OwnedProcessChild(
+					request.runtimeRoot(), process, request.generationId(), request.launchId()
+			);
 		}
 	}
 
 	private static final class OwnedProcessChild implements ChildProcess {
 		private final Path runtimeRoot;
 		private final Process process;
+		private final String generationId;
+		private final String launchId;
 		private final AtomicBoolean terminated = new AtomicBoolean();
 
-		private OwnedProcessChild(Path runtimeRoot, Process process) {
+		private OwnedProcessChild(Path runtimeRoot, Process process, String generationId, String launchId) {
 			this.runtimeRoot = runtimeRoot;
 			this.process = process;
+			this.generationId = generationId;
+			this.launchId = launchId;
 		}
 
 		@Override
@@ -1124,7 +1346,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			if (!terminated.compareAndSet(false, true)) return;
 			CoordinatorProcessOwnership.terminateTree(process.toHandle());
 			try {
-				CoordinatorProcessOwnership.clear(runtimeRoot, process);
+				CoordinatorProcessOwnership.clear(runtimeRoot, process, generationId, launchId);
 			} catch (IOException exception) {
 				LOGGER.warn("Could not clear the Arena Agents coordinator ownership record", exception);
 			}
@@ -1156,8 +1378,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			String path = effectiveEnvironmentValue("PATH");
 			values.add(Objects.toString(path, ""));
 			values.add(fileStamp(root.resolve("coordinator/.arena-agents-bundle-manifest")));
+			values.add(fileStamp(root.resolve("coordinator.last-known-good/.arena-agents-bundle-manifest")));
 			values.add(fileStamp(root.resolve("coordinator/src/dynamic-main.mjs")));
-			values.add(fileStamp(root.resolve("coordinator/config/dynamic-agents.json")));
+			values.add(fileStamp(root.resolve("runtime/coordinator-generation.properties")));
+			values.add(fileStamp(root.resolve("runtime/dynamic-agents.json")));
 			values.add(fileStamp(root.resolve("runtime/bridge-secret.txt")));
 			values.add(fileStamp(bundledNode(root)));
 			String explicit = System.getProperty(NodeRuntimeLocator.PROPERTY);
@@ -1256,7 +1480,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				String secret
 		) {
 			return new PreparedRuntime(
-					runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(), node, secret
+					runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(), node, secret,
+					runtime.generationId(), runtime.candidate(), runtime.lastKnownGoodAvailable()
 			);
 		}
 

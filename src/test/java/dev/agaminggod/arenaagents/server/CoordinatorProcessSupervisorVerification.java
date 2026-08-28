@@ -37,6 +37,8 @@ public final class CoordinatorProcessSupervisorVerification {
 	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
+	private static final String GENERATION_A = "a".repeat(64);
+	private static final String GENERATION_B = "b".repeat(64);
 
 	private CoordinatorProcessSupervisorVerification() {
 	}
@@ -50,6 +52,9 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyStaleLaunchCannotSuppressReplacement();
 		verifyReconnectRecoveryAndExpiry();
 		verifyContinuousStabilityResetsFailures();
+		verifyCandidatePromotionUsesMaintenanceWorker();
+		verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination();
+		verifySoleCandidateFailureKeepsRetrying();
 		verifyConnectionGenerationResetsUnsampledStability();
 		verifyMissingThenRestoredDependency();
 		verifyPeriodicDependencyRevalidation();
@@ -71,9 +76,106 @@ public final class CoordinatorProcessSupervisorVerification {
 		return 150;
 	}
 
+	private static void verifyCandidatePromotionUsesMaintenanceWorker() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		FakeLauncher launcher = new FakeLauncher();
+		QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+		FakeGenerationController generations = new FakeGenerationController();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-promotion-game"), Map.of(), clock, dependencies, launcher,
+				() -> "00000000-0000-0000-0000-000000000201", worker, runtimeRoot -> 0, task -> { }, generations
+		);
+		worker.runNext();
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		String launchId = supervisor.snapshot().launchId();
+		assertEquals(GENERATION_B, launcher.launches.getFirst().generationId(),
+				"launch request carries the prepared manifest generation");
+		supervisor.tick(true, launchId, 1L);
+		worker.runNext();
+		supervisor.tick(true, launchId, 1L);
+		clock.advance(STABILITY_INTERVAL_MS);
+		supervisor.tick(true, launchId, 1L);
+		assertEquals(0, generations.promotions, "server tick only queues candidate promotion");
+		assertEquals(0L, supervisor.snapshot().lastStableEpochMs(),
+				"candidate is not credited stable before promotion finishes");
+		worker.runNext();
+		supervisor.tick(true, launchId, 1L);
+		assertEquals(0, generations.promotions,
+				"polling completed dependency maintenance only queues the serialized promotion");
+		worker.runNext();
+		assertEquals(1, generations.promotions, "maintenance worker promotes the stable candidate once");
+		supervisor.tick(true, launchId, 1L);
+		assertEquals(clock.now, supervisor.snapshot().lastStableEpochMs(),
+				"promotion result credits the matching candidate stability interval");
+		assertEquals(0, supervisor.snapshot().consecutiveFailures(),
+				"successful candidate promotion resets crash-loop history");
+		supervisor.close();
+	}
+
+	private static void verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		FakeLauncher launcher = new FakeLauncher();
+		FakeGenerationController generations = new FakeGenerationController();
+		generations.beforeRollback = () -> assertEquals(1, launcher.latest().terminations,
+				"candidate rollback begins only after the failed owned child is terminated and cleared");
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-rollback-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(300), Runnable::run, runtimeRoot -> 0, task -> { }, generations
+		);
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		long[] retryDelays = {1_000L, 2_000L};
+		for (int failure = 0; failure < 3; failure++) {
+			clock.advance(AUTHENTICATION_TIMEOUT_MS);
+			supervisor.tick(false, null, 0L);
+			if (failure < retryDelays.length) {
+				assertEquals(0, generations.rollbacks, "one candidate authentication failure does not roll back early");
+				clock.advance(retryDelays[failure]);
+				supervisor.tick(false, null, 0L);
+			}
+		}
+		assertEquals(1, generations.rollbacks, "three candidate authentication failures roll back once");
+		assertEquals(GENERATION_A, supervisor.runtimeGenerationId(),
+				"rollback result publishes the verified last-known-good generation");
+		supervisor.tick(false, null, 0L);
+		assertEquals(1, generations.rollbacks, "repeated ticks do not repeat a completed rollback");
+		supervisor.close();
+	}
+
+	private static void verifySoleCandidateFailureKeepsRetrying() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(false);
+		FakeLauncher launcher = new FakeLauncher();
+		FakeGenerationController generations = new FakeGenerationController();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "sole-candidate-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(350), Runnable::run, runtimeRoot -> 0, task -> { }, generations
+		);
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		long[] retryDelays = {1_000L, 2_000L, 5_000L};
+		for (long delay : retryDelays) {
+			clock.advance(AUTHENTICATION_TIMEOUT_MS);
+			supervisor.tick(false, null, 0L);
+			clock.advance(delay);
+			supervisor.tick(false, null, 0L);
+		}
+		assertEquals(0, generations.rollbacks, "a sole runnable candidate is never rolled back or deleted");
+		assertEquals(4, launcher.launches.size(), "a sole candidate continues retrying after repeated failures");
+		assertEquals(GENERATION_B, supervisor.runtimeGenerationId(), "sole candidate generation remains active");
+		supervisor.close();
+	}
+
 	public static void main(String[] arguments) {
-		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
-		System.out.println("PASS: coordinator dependency monitor observation");
+		verifyCandidatePromotionUsesMaintenanceWorker();
+		verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination();
+		verifySoleCandidateFailureKeepsRetrying();
+		System.out.println("PASS: coordinator generation supervisor assertions");
 	}
 
 	private static void verifyRecoveryContract() {
@@ -379,7 +481,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		try {
 			fixtureRoot = Files.createTempDirectory("arena-dependency-monitor-");
 			Path packageRoot = fixtureRoot.resolve("package");
-			Path config = packageRoot.resolve("coordinator/config/dynamic-agents.json");
+			Path config = packageRoot.resolve("runtime/dynamic-agents.json");
 			Files.createDirectories(config.getParent());
 			Files.writeString(config, "{}", StandardCharsets.UTF_8);
 			System.setProperty("arenaagents.packageRoot", packageRoot.toString());
@@ -948,6 +1050,17 @@ public final class CoordinatorProcessSupervisorVerification {
 			return dependencies;
 		}
 
+		private static MutableDependencies candidate(boolean lastKnownGoodAvailable) {
+			MutableDependencies dependencies = ready();
+			CoordinatorProcessSupervisor.PreparedRuntime current = dependencies.runtime;
+			dependencies.runtime = new CoordinatorProcessSupervisor.PreparedRuntime(
+					current.root(), current.coordinatorRoot(), current.main(), current.config(), current.secret(),
+					current.nodeExecutable(), current.bridgeSecret(), GENERATION_B, true, lastKnownGoodAvailable
+			);
+			dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(dependencies.runtime);
+			return dependencies;
+		}
+
 		private static MutableDependencies ready(Path secretPath, String secret) {
 			MutableDependencies dependencies = ready();
 			dependencies.runtime = runtime(secretPath, secret);
@@ -1016,6 +1129,38 @@ public final class CoordinatorProcessSupervisorVerification {
 
 		private FakeChild latest() {
 			return children.getLast();
+		}
+	}
+
+	private static final class FakeGenerationController implements CoordinatorProcessSupervisor.GenerationController {
+		private int promotions;
+		private int rollbacks;
+		private Runnable beforeRollback = () -> { };
+
+		@Override
+		public CoordinatorProcessSupervisor.GenerationStatus promote(Path root, String generationId) {
+			promotions++;
+			return new CoordinatorProcessSupervisor.GenerationStatus(generationId, false, true);
+		}
+
+		@Override
+		public CoordinatorProcessSupervisor.GenerationStatus rollback(Path root, String generationId) {
+			beforeRollback.run();
+			rollbacks++;
+			return new CoordinatorProcessSupervisor.GenerationStatus(GENERATION_A, false, false);
+		}
+	}
+
+	private static final class SequentialLaunchIds implements java.util.function.Supplier<String> {
+		private final AtomicInteger value;
+
+		private SequentialLaunchIds(int initial) {
+			value = new AtomicInteger(initial);
+		}
+
+		@Override
+		public String get() {
+			return "00000000-0000-0000-0000-%012d".formatted(value.incrementAndGet());
 		}
 	}
 

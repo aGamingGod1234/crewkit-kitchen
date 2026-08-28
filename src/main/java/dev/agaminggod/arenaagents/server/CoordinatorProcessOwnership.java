@@ -26,12 +26,39 @@ final class CoordinatorProcessOwnership {
 	}
 
 	static void record(Path runtimeRoot, Process process, Path main) throws IOException {
-		record(runtimeRoot, process, main, ProcessHandle.current().pid());
+		Path root = normalizeRoot(runtimeRoot);
+		record(root, process, main, BundledCoordinatorInstaller.validate(root).generationId(),
+				UUID.randomUUID().toString(), ProcessHandle.current().pid());
 	}
 
 	static void record(Path runtimeRoot, Process process, Path main, long ownerPid) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
+		record(root, process, main, BundledCoordinatorInstaller.validate(root).generationId(),
+				UUID.randomUUID().toString(), ownerPid);
+	}
+
+	static void record(
+			Path runtimeRoot,
+			Process process,
+			Path main,
+			String generationId,
+			String launchId
+	) throws IOException {
+		record(runtimeRoot, process, main, generationId, launchId, ProcessHandle.current().pid());
+	}
+
+	static void record(
+			Path runtimeRoot,
+			Process process,
+			Path main,
+			String generationId,
+			String launchId,
+			long ownerPid
+	) throws IOException {
+		Path root = normalizeRoot(runtimeRoot);
 		Path expectedMain = normalizeMain(root, main);
+		String expectedGeneration = normalizeGeneration(generationId);
+		String expectedLaunch = normalizeLaunchId(launchId);
 		if (ownerPid <= 0L) throw new IllegalArgumentException("coordinator owner pid must be positive");
 		Properties values = new Properties();
 		values.setProperty("pid", Long.toString(process.pid()));
@@ -41,6 +68,8 @@ final class CoordinatorProcessOwnership {
 				.toEpochMilli();
 		values.setProperty("startedAtEpochMs", Long.toString(startedAtEpochMs));
 		values.setProperty("main", expectedMain.toString());
+		values.setProperty("generationId", expectedGeneration);
+		values.setProperty("launchId", expectedLaunch);
 		Path ownership = ownershipFile(root);
 		Files.createDirectories(ownership.getParent());
 		Path staging = ownership.resolveSibling(ownership.getFileName() + ".staging-" + UUID.randomUUID());
@@ -60,10 +89,28 @@ final class CoordinatorProcessOwnership {
 
 	static int reapOrphaned(Path runtimeRoot) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
+		Path ownershipFile = ownershipFile(root);
+		if (!Files.isRegularFile(ownershipFile)) return 0;
+		Ownership ownership = read(root);
+		if (ownership == null) {
+			Files.deleteIfExists(ownershipFile);
+			return 0;
+		}
+		if (ownerAlive(ownership.ownerPid())) return 0;
+		return reapOrphaned(root, BundledCoordinatorInstaller.validate(root).generationId());
+	}
+
+	static int reapOrphaned(Path runtimeRoot, String activeGenerationId) throws IOException {
+		Path root = normalizeRoot(runtimeRoot);
+		String expectedGeneration = normalizeGeneration(activeGenerationId);
 		Path expectedMain = root.resolve("coordinator/src/dynamic-main.mjs").normalize();
 		Ownership ownership = read(root);
 		if (ownership != null && ownerAlive(ownership.ownerPid())) return 0;
 		if (ownership == null) return 0;
+		if (!expectedGeneration.equals(ownership.generationId())) {
+			Files.deleteIfExists(ownershipFile(root));
+			return 0;
+		}
 
 		int reaped = 0;
 		Optional<ProcessHandle> recorded = ProcessHandle.of(ownership.pid());
@@ -90,10 +137,34 @@ final class CoordinatorProcessOwnership {
 		clear(runtimeRoot, process.pid(), startedAtEpochMs);
 	}
 
+	static void clear(Path runtimeRoot, Process process, String generationId, String launchId) throws IOException {
+		long startedAtEpochMs = process.info().startInstant()
+				.map(start -> start.toEpochMilli())
+				.orElse(-1L);
+		clear(runtimeRoot, process.pid(), startedAtEpochMs, normalizeGeneration(generationId), normalizeLaunchId(launchId));
+	}
+
 	private static void clear(Path runtimeRoot, long processPid, long startedAtEpochMs) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
 		Ownership ownership = read(root);
 		if (ownership == null || (ownership.pid() == processPid && ownership.startedAtEpochMs() == startedAtEpochMs)) {
+			Files.deleteIfExists(ownershipFile(root));
+		}
+	}
+
+	private static void clear(
+			Path runtimeRoot,
+			long processPid,
+			long startedAtEpochMs,
+			String generationId,
+			String launchId
+	) throws IOException {
+		Path root = normalizeRoot(runtimeRoot);
+		Ownership ownership = read(root);
+		if (ownership == null || (ownership.pid() == processPid
+				&& ownership.startedAtEpochMs() == startedAtEpochMs
+				&& ownership.generationId().equals(generationId)
+				&& ownership.launchId().equals(launchId))) {
 			Files.deleteIfExists(ownershipFile(root));
 		}
 	}
@@ -109,10 +180,12 @@ final class CoordinatorProcessOwnership {
 			long pid = Long.parseLong(values.getProperty("pid", ""));
 			long ownerPid = Long.parseLong(values.getProperty("ownerPid", ""));
 			long startedAtEpochMs = Long.parseLong(values.getProperty("startedAtEpochMs", ""));
+			String generationId = normalizeGeneration(values.getProperty("generationId", ""));
+			String launchId = normalizeLaunchId(values.getProperty("launchId", ""));
 			Path main = Path.of(values.getProperty("main", "")).toAbsolutePath().normalize();
 			Path expectedMain = normalizeRoot(runtimeRoot).resolve("coordinator/src/dynamic-main.mjs").normalize();
 			if (pid <= 0L || ownerPid <= 0L || startedAtEpochMs <= 0L || !samePath(main, expectedMain)) return null;
-			return new Ownership(pid, ownerPid, startedAtEpochMs);
+			return new Ownership(pid, ownerPid, startedAtEpochMs, generationId, launchId);
 		} catch (RuntimeException invalid) {
 			return null;
 		}
@@ -189,6 +262,16 @@ final class CoordinatorProcessOwnership {
 		return runtimeRoot.toAbsolutePath().normalize();
 	}
 
+	private static String normalizeGeneration(String generationId) {
+		String normalized = java.util.Objects.requireNonNull(generationId, "generation ID must not be null");
+		if (!normalized.matches("[0-9a-f]{64}")) throw new IllegalArgumentException("coordinator generation ID is invalid");
+		return normalized;
+	}
+
+	private static String normalizeLaunchId(String launchId) {
+		return UUID.fromString(java.util.Objects.requireNonNull(launchId, "launch ID must not be null")).toString();
+	}
+
 	static void terminateTree(ProcessHandle process) {
 		boolean interrupted = Thread.interrupted();
 		try {
@@ -223,6 +306,6 @@ final class CoordinatorProcessOwnership {
 		return System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
 	}
 
-	private record Ownership(long pid, long ownerPid, long startedAtEpochMs) {
+	private record Ownership(long pid, long ownerPid, long startedAtEpochMs, String generationId, String launchId) {
 	}
 }

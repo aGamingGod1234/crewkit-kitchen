@@ -14,6 +14,18 @@ Everything generated beneath `runtime/` is local evidence or executable state an
 - `bridge-secret.txt`: generated local bridge secret shared by the summonable-NPC server and dynamic coordinator; ignored by Git.
 - `toolchains/temurin-25/jdk-25.0.3+9`: project-local Java runtime.
 
+## Installed coordinator generations
+
+An installed `arena-agents-runtime` package keeps coordinator code separate from mutable runtime state:
+
+- `coordinator/`: the active immutable generation.
+- `coordinator.last-known-good/`: at most one previously verified generation, retained only while a candidate is being proven.
+- `coordinator.staging-*`: disposable, bounded activation or rollback staging directories.
+- `runtime/coordinator-generation.properties`: the atomic activation journal and generation state.
+- `runtime/dynamic-agents.json`: the canonical mutable agent configuration, migrated once from a legacy active generation and then preserved byte-for-byte.
+
+The bundled manifest digest identifies a generation. A candidate becomes verified only after the supervisor observes 30 seconds of stable authenticated operation for that same generation. Repeated candidate failures restore the retained verified generation after its child process is terminated. Bridge secrets, Fish Audio keys, provider credentials, logs, and traces remain outside coordinator generations and are never copied or replaced by deployment.
+
 The isolated client directories are outside the project:
 
 - `%APPDATA%\.minecraft-agent-55`
