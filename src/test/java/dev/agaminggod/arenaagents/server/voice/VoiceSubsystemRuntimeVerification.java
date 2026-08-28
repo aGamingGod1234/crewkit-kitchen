@@ -121,7 +121,54 @@ public final class VoiceSubsystemRuntimeVerification {
 		assertTrue(VoiceSubsystemRuntime.available(startupRaceServer),
 				"the retry promotes the real voice subsystem without restarting Minecraft");
 		VoiceSubsystemRuntime.close(startupRaceServer);
-		return 26 + verifyOptionalConfigurationFailure();
+		return 26 + verifyOptionalConfigurationFailure() + verifyEndpointValidation();
+	}
+
+	private static int verifyEndpointValidation() {
+		List<String> validEndpoints = List.of(
+				"http://127.0.0.1:1/v1/tts",
+				"https://127.0.0.1:65535/v1/tts"
+		);
+		for (String endpoint : validEndpoints) {
+			assertEquals(endpoint, new VoiceSubsystemConfiguration(endpoint, "s".repeat(32)).endpoint(),
+					"voice accepts the coordinator's loopback URI boundaries");
+		}
+
+		List<String> invalidEndpoints = List.of(
+				"http://example.com:8766/v1/tts",
+				"http://localhost:8766/v1/tts",
+				"http://127.0.0.2:8766/v1/tts",
+				"http://127.0.0.1.example.com:8766/v1/tts",
+				"http://2130706433:8766/v1/tts",
+				"http://0177.0.0.1:8766/v1/tts",
+				"http://[::1]:8766/v1/tts",
+				"ftp://127.0.0.1:8766/v1/tts",
+				"file://127.0.0.1:8766/v1/tts",
+				"//127.0.0.1:8766/v1/tts",
+				"http:127.0.0.1:8766/v1/tts",
+				"http://127.0.0.1/v1/tts",
+				"http://127.0.0.1:0/v1/tts",
+				"http://127.0.0.1:65536/v1/tts",
+				"http://user:secret@127.0.0.1:8766/v1/tts",
+				"http://127.0.0.1:8766/v1/tts?token=secret",
+				"http://127.0.0.1:8766/v1/tts#secret",
+				"http://127.0.0.1:8766/",
+				"http://127.0.0.1:8766/v1/stt",
+				"http://127.0.0.1:8766/v1/tts/",
+				"http://127.0.0.1:8766/v1%2Ftts",
+				"http://127.0.0.1:8766/v1/../v1/tts",
+				"http://%31%32%37.0.0.1:8766/v1/tts",
+				"http://127.0.0.1:8766//v1/tts"
+		);
+		for (String endpoint : invalidEndpoints) {
+			try {
+				new VoiceSubsystemConfiguration(endpoint, "s".repeat(32));
+				throw new AssertionError("unsafe voice endpoint must be rejected: " + endpoint);
+			} catch (IllegalArgumentException expected) {
+				// Every rejected form could redirect authenticated voice traffic outside the worker contract.
+			}
+		}
+		return validEndpoints.size() + invalidEndpoints.size();
 	}
 
 	private static int verifyOptionalConfigurationFailure() {
