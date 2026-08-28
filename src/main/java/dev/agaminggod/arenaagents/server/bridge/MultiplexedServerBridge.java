@@ -262,6 +262,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return active != null && active.open.get() && active.authenticated.get();
 	}
 
+	public String authenticatedLaunchId() {
+		Session active = session;
+		return active != null && active.open.get() && active.authenticated.get()
+				? active.authenticatedLaunchId
+				: null;
+	}
+
 	public void setVerbose(boolean enabled) {
 		synchronized (verboseControlLock) {
 			verboseState.setEnabled(enabled);
@@ -565,6 +572,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!MessageDigest.isEqual(secret.getBytes(StandardCharsets.UTF_8), supplied.getBytes(StandardCharsets.UTF_8))) {
 			throw new BridgeProtocolException("AUTHENTICATION_FAILED", "Bridge secret did not match");
 		}
+		String suppliedLaunchId = optionalLaunchId(envelope.payload());
 		while (true) {
 			awaitDisconnectPublication();
 			long snapshotRevision = registryPublicationRevision.get();
@@ -573,6 +581,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			JsonObject payload = new JsonObject();
 			payload.addProperty("replyTo", envelope.messageId());
 			payload.addProperty("authenticated", true);
+			if (suppliedLaunchId != null) payload.addProperty("launchId", suppliedLaunchId);
 			JsonArray registry = new JsonArray();
 			Set<AgentId> handshakeKnownAgentIds = new HashSet<>();
 			for (AgentRecord record : visibleRecords) {
@@ -609,7 +618,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 				try {
 					for (AgentRecord record : visibleRecords) programActions.beginGoal(record.agentId(), record.goalRevision());
-					source.completeHandshake(handshake);
+					source.completeHandshake(handshake, suppliedLaunchId);
 					coordinatorLifecycleGeneration++;
 					markVerboseControlPublished(verboseControl);
 					coordinatorDisconnectPending.set(false);
@@ -1777,6 +1786,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return value;
 	}
 
+	private static String optionalLaunchId(JsonObject object) {
+		if (!object.has("launchId")) return null;
+		String value = requiredString(object, "launchId");
+		try {
+			String canonical = UUID.fromString(value).toString();
+			if (value.length() != 36 || !canonical.equalsIgnoreCase(value)) throw new IllegalArgumentException();
+			return canonical;
+		} catch (IllegalArgumentException invalid) {
+			throw new BridgeProtocolException("INVALID_LAUNCH_ID", "launchId must be a UUID", invalid);
+		}
+	}
+
 	private static String requiredTraceId(JsonObject object, String field) {
 		String value = requiredString(object, field);
 		if (value.getBytes(StandardCharsets.UTF_8).length > 128
@@ -2285,6 +2306,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final Set<String> inboundIds = new java.util.LinkedHashSet<>();
 		private final AtomicBoolean open = new AtomicBoolean(true);
 		private final AtomicBoolean authenticated = new AtomicBoolean();
+		private volatile String authenticatedLaunchId;
 		private volatile Thread readerThread;
 		private volatile Thread writerThread;
 
@@ -2299,7 +2321,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			writerThread = Thread.ofPlatform().daemon().name("arenaagents-v2-writer").start(this::writeLoop);
 		}
 
-		synchronized void completeHandshake(List<BridgeEnvelope> envelopes) {
+		synchronized void completeHandshake(List<BridgeEnvelope> envelopes, String launchId) {
 			if (!open.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during authentication");
 			if (authenticated.get()) throw new BridgeProtocolException("DUPLICATE_HANDSHAKE", "Bridge session is already authenticated");
 			List<BridgeEnvelope> ordered = List.copyOf(Objects.requireNonNull(envelopes, "envelopes must not be null"));
@@ -2316,6 +2338,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
 				}
 			}
+			authenticatedLaunchId = launchId;
 			authenticated.set(true);
 			for (BridgeEnvelope envelope : ordered) {
 				if (!outbound.offer(envelope)) throw new IllegalStateException("preflighted handshake queue rejected an envelope");

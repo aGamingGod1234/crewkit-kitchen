@@ -125,11 +125,52 @@ public final class MultiplexedServerBridgeVerification {
 		verifyConversationAttention(registered.getFirst().agentId());
 		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
+		verifyLaunchIdentityHandshake();
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 147;
+		return 150;
+	}
+
+	private static void verifyLaunchIdentityHandshake() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			String launchId = "00000000-0000-0000-0000-000000000123";
+			secretFile = Files.createTempFile("arena-agents-launch-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge.start();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				JsonObject hello = new JsonObject();
+				hello.addProperty("secret", secret);
+				hello.addProperty("launchId", launchId);
+				writeEnvelope(socket, new BridgeEnvelopeCodec(), new BridgeEnvelope(
+						2, "coordinator", "server", "hello", "hello-launch-id", hello
+				));
+				BridgeEnvelope acknowledgement = new BridgeEnvelopeCodec().decode(reader.readLine());
+				assertEquals(launchId, acknowledgement.payload().get("launchId").getAsString(),
+						"hello acknowledgement echoes the authenticated launch identity");
+				String authenticatedLaunch = (String) MultiplexedServerBridge.class
+						.getMethod("authenticatedLaunchId")
+						.invoke(bridge);
+				assertEquals(launchId, authenticatedLaunch, "bridge exposes the authenticated launch identity");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("launch identity bridge handshake failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (secretFile != null) {
+				try {
+					Files.deleteIfExists(secretFile);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove launch identity bridge secret", exception);
+				}
+			}
+		}
 	}
 
 	private static void verifyGoalSpecProposalLifecycle() {

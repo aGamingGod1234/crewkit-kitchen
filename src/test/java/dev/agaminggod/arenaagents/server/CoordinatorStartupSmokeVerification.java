@@ -124,10 +124,13 @@ public final class CoordinatorStartupSmokeVerification {
 			String helloLine = reader.readLine();
 			JsonObject hello = JsonParser.parseString(helloLine).getAsJsonObject();
 			assertEquals("hello", hello.get("type").getAsString(), "coordinator starts with hello");
+			String launchId = hello.getAsJsonObject("payload").get("launchId").getAsString();
+			java.util.UUID.fromString(launchId);
 			JsonObject payload = new JsonObject();
 			payload.addProperty("replyTo", hello.get("messageId").getAsString());
 			payload.addProperty("authenticated", true);
 			payload.add("registry", new JsonArray());
+			payload.addProperty("launchId", launchId);
 			writer.write(codec.encode(new BridgeEnvelope(
 					2,
 					"startup-smoke-server",

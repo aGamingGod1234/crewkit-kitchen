@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
+import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
@@ -18,6 +19,7 @@ import java.util.List;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 import java.util.UUID;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
@@ -33,6 +35,7 @@ public final class CodexAgentServerRuntime {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CodexAgentServerRuntime.class);
 	private static final Map<MinecraftServer, MultiplexedServerBridge> BRIDGES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, CoordinatorProcessSupervisor> COORDINATORS = new ConcurrentHashMap<>();
+	private static final Map<MinecraftServer, BridgeRetry> BRIDGE_RETRIES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalSafetyController> GOAL_SAFETY = new ConcurrentHashMap<>();
@@ -93,9 +96,6 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void start(MinecraftServer server) {
-		if (BRIDGES.containsKey(server)) {
-			return;
-		}
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		GOAL_SAFETY.computeIfAbsent(server, ignored -> new GoalSafetyController(manager));
 		GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.computeIfAbsent(server, ignored -> new GoalVerificationRuntime(
@@ -104,54 +104,81 @@ public final class CodexAgentServerRuntime {
 				server::getTickCount,
 				System::currentTimeMillis
 		));
-		CoordinatorProcessSupervisor supervisor = null;
+		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
+		if (supervisor == null) {
+			CoordinatorProcessSupervisor candidate = new CoordinatorProcessSupervisor();
+			CoordinatorProcessSupervisor previous = COORDINATORS.putIfAbsent(server, candidate);
+			if (previous == null) supervisor = candidate;
+			else {
+				candidate.close();
+				supervisor = previous;
+			}
+		}
 		try {
-			// Prepare the package, Node executable, and canonical secret before any optional
-			// voice or catalog-dependent bridge work is constructed.
-			supervisor = new CoordinatorProcessSupervisor();
-			if (supervisor.configured() || supervisor.failureCode() != null) {
-				COORDINATORS.put(server, supervisor);
-			}
-			if (supervisor.failureCode() != null) {
-				LOGGER.error("Arena Agents automation startup stopped cleanly [{}]: {}",
-						supervisor.failureCode(), supervisor.failureMessage());
-				return;
-			}
 			VoiceSubsystemRuntime.start(server);
-			Path secretPath = supervisor.secretPath();
-			AgentVerboseState verboseState = AgentVerboseState.forServer(server);
-			MultiplexedServerBridge bridge = new MultiplexedServerBridge(
-					CodexAgentManager.get(server),
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Arena Agents voice startup is degraded; coordinator and Minecraft bridge recovery continue", exception);
+		}
+		tryStartBridge(server, manager, supervisor, goalVerifier);
+	}
+
+	private static void tryStartBridge(
+			MinecraftServer server,
+			CodexAgentManager manager,
+			CoordinatorProcessSupervisor supervisor,
+			GoalVerificationRuntime goalVerifier
+	) {
+		if (BRIDGES.containsKey(server)) return;
+		BridgeRetry retry = BRIDGE_RETRIES.computeIfAbsent(server, ignored -> new BridgeRetry(System::currentTimeMillis));
+		if (!retry.canAttempt()) return;
+		MultiplexedServerBridge candidate = null;
+		try {
+			Path secretPath = supervisor == null ? null : supervisor.secretPath();
+			candidate = new MultiplexedServerBridge(
+					manager,
 					secretPath == null ? Paths.get("runtime", "bridge-secret.txt") : secretPath,
-					verboseState,
+					AgentVerboseState.forServer(server),
 					goalVerifier
 			);
-			bridge.start();
-			MultiplexedServerBridge previous = BRIDGES.putIfAbsent(server, bridge);
-			if (previous != null) {
-				bridge.close();
+			candidate.start();
+			MultiplexedServerBridge previous = BRIDGES.putIfAbsent(server, candidate);
+			if (previous == null) {
+				retry.recordSuccess();
+				return;
 			}
+			candidate.close();
 		} catch (RuntimeException exception) {
-			if (supervisor != null) {
-				COORDINATORS.remove(server, supervisor);
-				supervisor.close();
-			}
-			VoiceSubsystemRuntime.close(server);
-			LOGGER.error(
-					"Codex agent bridge is unavailable; summoned agents will remain locally controllable but autonomous planning is disabled",
-					exception
-			);
+			if (candidate != null) candidate.close();
+			String code = exception instanceof BridgeProtocolException protocol
+					? protocol.code()
+					: "JAVA_BRIDGE_START_FAILED";
+			retry.recordFailure(code, exception.getMessage());
+			LOGGER.warn("Arena Agents Minecraft bridge is recovering [{}]; next bind attempt is scheduled", code, exception);
 		}
 	}
 
 	private static void tick(MinecraftServer server) {
-		if (!ScenarioRuntimeService.restorePersistedState(server)) {
-			return;
-		}
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		MultiplexedServerBridge bridge = BRIDGES.get(server);
-		if (supervisor != null) supervisor.tick(bridge != null && bridge.authenticated());
+		if (bridge == null) {
+			GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.get(server);
+			if (goalVerifier != null) {
+				tryStartBridge(server, manager, supervisor, goalVerifier);
+				bridge = BRIDGES.get(server);
+			}
+		}
+		if (supervisor != null) {
+			supervisor.tick(
+					bridge != null && bridge.authenticated(),
+					bridge == null ? null : bridge.authenticatedLaunchId()
+			);
+		}
+		if (!ScenarioRuntimeService.restorePersistedState(server)) {
+			VoiceSubsystemRuntime.tick(server);
+			if (bridge != null) bridge.tick();
+			return;
+		}
 		manager.reconcileDeaths();
 		manager.maintainChunkTickets();
 		GoalSafetyController safety = GOAL_SAFETY.get(server);
@@ -201,28 +228,37 @@ public final class CodexAgentServerRuntime {
 	}
 
 	public static String automationStatus(MinecraftServer server) {
-		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
-		if (supervisor != null && supervisor.failureCode() != null) {
-			return startupFailureStatus(supervisor.failureCode());
-		}
 		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		if (bridge != null && bridge.authenticated()) return "Automation ready";
 		if (bridge == null) {
-			return "Automation is offline. Restart Minecraft after checking the bridge setup.";
+			BridgeRetry retry = BRIDGE_RETRIES.get(server);
+			if (retry != null && retry.failureCode() != null) {
+				return "Automation recovery state BLOCKED_RETRYABLE at java_bridge [" + retry.failureCode()
+						+ "]. Next retry at " + retry.nextRetryEpochMs() + ".";
+			}
+			return "Automation recovery state STARTING at java_bridge. Next retry is immediate.";
 		}
-		return bridge.authenticated() ? "Automation ready" : "Waiting for the agent coordinator...";
-	}
-
-	private static String startupFailureStatus(String code) {
-		if (code.startsWith("NODE_RUNTIME")) {
-			return "Automation is offline. Node.js 22+ was not found; set -Darenaagents.nodePath to an absolute executable or install the bundled profile runtime.";
+		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
+		if (supervisor == null) return "Automation recovery state AUTHENTICATING at external_coordinator.";
+		CoordinatorRecoverySnapshot recovery = supervisor.snapshot();
+		String boundary = recovery.failingBoundary();
+		if (boundary == null) {
+			boundary = switch (recovery.state()) {
+				case STARTING -> "process_start";
+				case AUTHENTICATING -> "bridge_authentication";
+				case DEGRADED -> "bridge_reconnect";
+				case STOPPED -> "coordinator_autostart";
+				default -> "coordinator";
+			};
 		}
-		if ("BRIDGE_SECRET_PATH_CONFLICT".equals(code)) {
-			return "Automation is offline. Bridge and voice secret paths must point to the prepared runtime secret.";
-		}
-		if ("COORDINATOR_RESTART_EXHAUSTED".equals(code)) {
-			return "Automation is offline. The coordinator stopped repeatedly; check the coordinator error log and restart Minecraft.";
-		}
-		return "Automation is offline. Restart Minecraft after checking the coordinator setup.";
+		long nextAction = recovery.nextRetryEpochMs();
+		if (nextAction == 0L) nextAction = recovery.authenticationDeadlineEpochMs();
+		if (nextAction == 0L) nextAction = recovery.reconnectDeadlineEpochMs();
+		boolean currentFailure = recovery.state() == CoordinatorRecoveryState.BACKOFF
+				|| recovery.state() == CoordinatorRecoveryState.BLOCKED_RETRYABLE;
+		String code = !currentFailure || recovery.failureCode() == null ? "" : " [" + recovery.failureCode() + "]";
+		String retry = nextAction == 0L ? "" : " Next retry or deadline at " + nextAction + ".";
+		return "Automation recovery state " + recovery.state() + " at " + boundary + code + "." + retry;
 	}
 
 	public static List<AgentControlModelOption> modelCatalog(MinecraftServer server) {
@@ -311,6 +347,7 @@ public final class CodexAgentServerRuntime {
 	private static void stop(MinecraftServer server) {
 		PLANNING_UPDATES.remove(server);
 		GOAL_VERIFIERS.remove(server);
+		BRIDGE_RETRIES.remove(server);
 		GoalSafetyController safety = GOAL_SAFETY.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		MultiplexedServerBridge bridge = BRIDGES.remove(server);
@@ -326,6 +363,54 @@ public final class CodexAgentServerRuntime {
 			}
 			if (supervisor != null) supervisor.close();
 			AgentVerboseState.release(server);
+		}
+	}
+
+	static final class BridgeRetry {
+		private final LongSupplier clock;
+		private final CoordinatorLaunchPolicy.RestartBudget budget = new CoordinatorLaunchPolicy.RestartBudget();
+		private long nextRetryEpochMs;
+		private String failureCode;
+		private String failureMessage;
+
+		BridgeRetry(LongSupplier clock) {
+			this.clock = java.util.Objects.requireNonNull(clock, "clock must not be null");
+		}
+
+		synchronized boolean canAttempt() {
+			return nextRetryEpochMs == 0L || now() >= nextRetryEpochMs;
+		}
+
+		synchronized void recordFailure(String code, String message) {
+			budget.recordUnexpectedExit();
+			nextRetryEpochMs = now() + budget.nextDelayMs();
+			failureCode = java.util.Objects.requireNonNull(code, "failure code must not be null");
+			failureMessage = message;
+		}
+
+		synchronized void recordSuccess() {
+			budget.resetAfterStability();
+			nextRetryEpochMs = 0L;
+			failureCode = null;
+			failureMessage = null;
+		}
+
+		synchronized long nextRetryEpochMs() {
+			return nextRetryEpochMs;
+		}
+
+		synchronized String failureCode() {
+			return failureCode;
+		}
+
+		synchronized String failureMessage() {
+			return failureMessage;
+		}
+
+		private long now() {
+			long value = clock.getAsLong();
+			if (value < 0L) throw new IllegalStateException("bridge retry clock must not be negative");
+			return value;
 		}
 	}
 }

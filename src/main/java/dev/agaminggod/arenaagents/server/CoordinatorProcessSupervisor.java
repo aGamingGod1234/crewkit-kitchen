@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server;
 
+import com.google.gson.JsonParser;
 import net.fabricmc.loader.api.FabricLoader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -8,26 +9,52 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
-/** Starts the bundled localhost coordinator with one prepared runtime context. */
+/** Owns coordinator availability until explicit Minecraft shutdown. */
 final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CoordinatorProcessSupervisor.class);
 	private static final String FISH_API_KEY_FILE = "runtime/fish-api-key.txt";
+	private static final long DEPENDENCY_RECHECK_MS = 5_000L;
+	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
+	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
+	private static final long STABILITY_INTERVAL_MS = 30_000L;
 
 	private final Path gameDirectory;
-	private final BundledCoordinatorInstaller.RuntimePackage runtimePackage;
-	private final NodeRuntimeLocator.LocatedNode node;
 	private final Map<String, String> launchEnvironmentOverrides;
+	private final LongSupplier clock;
+	private final DependencyResolver dependencyResolver;
+	private final ProcessLauncher processLauncher;
+	private final Supplier<String> launchIds;
 	private final long createdAtEpochMs;
 	private final CoordinatorLaunchPolicy.RestartBudget restartBudget = new CoordinatorLaunchPolicy.RestartBudget();
-	private Process process;
-	private Process observedExit;
-	private long nextStartEpochMs;
+
+	private PreparedRuntime runtime;
+	private ChildProcess child;
+	private CoordinatorRecoveryState state;
+	private boolean stopped;
+	private boolean stabilityCredited;
+	private long generation;
+	private long nextRetryEpochMs;
+	private long nextDependencyCheckEpochMs;
+	private long lastStableEpochMs;
+	private long processStartedEpochMs;
+	private long authenticationDeadlineEpochMs;
+	private long reconnectDeadlineEpochMs;
+	private long authenticatedSinceEpochMs;
+	private String launchId;
+	private String dependencyFingerprint;
 	private String failureCode;
 	private String failureMessage;
+	private String failingBoundary;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -39,66 +66,143 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	/** Allows isolated startup fixtures to control inherited environment state without invoking a shell. */
 	CoordinatorProcessSupervisor(Path gameDirectory, Map<String, String> launchEnvironmentOverrides) {
-		this.gameDirectory = gameDirectory.toAbsolutePath().normalize();
-		this.launchEnvironmentOverrides = Map.copyOf(Objects.requireNonNull(launchEnvironmentOverrides, "launch environment overrides must not be null"));
-		this.createdAtEpochMs = System.currentTimeMillis();
-		if (!autoStartEnabled()) {
-			this.runtimePackage = null;
-			this.node = null;
-			return;
-		}
-		BundledCoordinatorInstaller.RuntimePackage prepared = null;
-		NodeRuntimeLocator.LocatedNode located = null;
-		try {
-			Path installedRoot = this.gameDirectory.resolve("arena-agents-runtime");
-			int reaped = CoordinatorProcessOwnership.reapOrphaned(installedRoot);
-			if (reaped > 0) LOGGER.warn("Stopped {} orphaned Arena Agents coordinator process(es) before updating the runtime", reaped);
-			IOException installFailure = null;
-			try {
-				if (BundledCoordinatorInstaller.installBundled(installedRoot)) {
-					LOGGER.info("Installed the bundled Arena Agents coordinator runtime");
-				}
-			} catch (IOException failure) {
-				installFailure = failure;
-				LOGGER.warn("Could not refresh the bundled Arena Agents runtime; attempting the last complete installed version", failure);
-			}
-			Path discoveredRoot = findPackageRoot(this.gameDirectory);
-			if (discoveredRoot != null) {
-				try {
-					prepared = BundledCoordinatorInstaller.validate(discoveredRoot);
-				} catch (IOException invalidRuntime) {
-					if (installFailure != null) invalidRuntime.addSuppressed(installFailure);
-					throw invalidRuntime;
-				}
-				configureSharedBridgeSecretPath(prepared.secret());
-				configureSharedVoiceEndpoint(prepared.config());
-				located = NodeRuntimeLocator.locate(prepared.root());
-			} else if (installFailure != null) {
-				throw installFailure;
-			}
-		} catch (NodeRuntimeLocator.NodeRuntimeFailure exception) {
-			failureCode = exception.code();
-			failureMessage = exception.getMessage();
-			logFailure(failureCode, failureMessage);
-		} catch (IOException | RuntimeException exception) {
-			failureCode = exception instanceof StartupFailure startup ? startup.code() : "COORDINATOR_STARTUP_INVALID";
-			failureMessage = exception.getMessage() == null ? "Coordinator startup dependencies are unavailable" : exception.getMessage();
-			logFailure(failureCode, failureMessage);
-		}
-		this.runtimePackage = prepared;
-		this.node = located;
+		this(gameDirectory, launchEnvironmentOverrides, System::currentTimeMillis, null, null, () -> UUID.randomUUID().toString());
 	}
 
-	private static boolean autoStartEnabled() {
-		return !"false".equalsIgnoreCase(System.getProperty("arenaagents.coordinatorAutoStart"));
+	CoordinatorProcessSupervisor(
+			Path gameDirectory,
+			Map<String, String> launchEnvironmentOverrides,
+			LongSupplier clock,
+			DependencyResolver dependencyResolver,
+			ProcessLauncher processLauncher,
+			Supplier<String> launchIds
+	) {
+		this.gameDirectory = Objects.requireNonNull(gameDirectory, "game directory must not be null")
+				.toAbsolutePath().normalize();
+		this.launchEnvironmentOverrides = Map.copyOf(Objects.requireNonNull(
+				launchEnvironmentOverrides,
+				"launch environment overrides must not be null"
+		));
+		this.clock = Objects.requireNonNull(clock, "clock must not be null");
+		this.dependencyResolver = dependencyResolver == null
+				? new DefaultDependencyResolver(this.gameDirectory, this.launchEnvironmentOverrides)
+				: dependencyResolver;
+		this.processLauncher = processLauncher == null ? new DefaultProcessLauncher() : processLauncher;
+		this.launchIds = Objects.requireNonNull(launchIds, "launch IDs must not be null");
+		this.createdAtEpochMs = now();
+		if (!autoStartEnabled()) {
+			stopped = true;
+			state = CoordinatorRecoveryState.STOPPED;
+			return;
+		}
+		state = CoordinatorRecoveryState.STARTING;
+		nextRetryEpochMs = createdAtEpochMs + CoordinatorLaunchPolicy.STARTUP_GRACE_MS;
+		dependencyFingerprint = safeFingerprint();
+		applyDependencyResolution(resolveDependencies(), createdAtEpochMs, true, false);
+	}
+
+	@FunctionalInterface
+	interface ProcessLauncher {
+		ChildProcess launch(LaunchRequest request) throws IOException;
+	}
+
+	interface ChildProcess {
+		boolean isAlive();
+
+		long pid();
+
+		void terminate();
+	}
+
+	interface DependencyResolver {
+		String fingerprint();
+
+		DependencyResolution resolve();
+	}
+
+	record DependencyResolution(PreparedRuntime runtime, String failureCode, String failureMessage) {
+		DependencyResolution {
+			if (runtime == null && (failureCode == null || failureCode.isBlank())) {
+				throw new IllegalArgumentException("unavailable coordinator dependencies require a failure code");
+			}
+		}
+
+		static DependencyResolution ready(PreparedRuntime runtime) {
+			PreparedRuntime prepared = Objects.requireNonNull(runtime, "runtime must not be null");
+			if (prepared.nodeExecutable() == null) throw new IllegalArgumentException("ready runtime requires Node");
+			return new DependencyResolution(prepared, null, null);
+		}
+
+		static DependencyResolution blocked(String code, String message) {
+			return blocked(null, code, message);
+		}
+
+		static DependencyResolution blocked(PreparedRuntime runtime, String code, String message) {
+			return new DependencyResolution(runtime, Objects.requireNonNull(code, "failure code must not be null"), message);
+		}
+
+		boolean ready() {
+			return runtime != null && runtime.nodeExecutable() != null && failureCode == null;
+		}
+	}
+
+	record PreparedRuntime(
+			Path root,
+			Path coordinatorRoot,
+			Path main,
+			Path config,
+			Path secret,
+			Path nodeExecutable,
+			String bridgeSecret
+	) {
+		PreparedRuntime {
+			root = normalized(root, "runtime root");
+			coordinatorRoot = normalized(coordinatorRoot, "coordinator root");
+			main = normalized(main, "coordinator main");
+			config = normalized(config, "coordinator config");
+			secret = normalized(secret, "bridge secret");
+			nodeExecutable = nodeExecutable == null ? null : normalized(nodeExecutable, "Node executable");
+			bridgeSecret = Objects.requireNonNull(bridgeSecret, "bridge secret value must not be null").strip();
+			if (bridgeSecret.length() < 32 || bridgeSecret.length() > 256) {
+				throw new IllegalArgumentException("bridge secret value is invalid");
+			}
+		}
+
+		private static Path normalized(Path path, String label) {
+			return Objects.requireNonNull(path, label + " must not be null").toAbsolutePath().normalize();
+		}
+	}
+
+	record LaunchRequest(
+			List<String> command,
+			Path workingDirectory,
+			Map<String, String> environment,
+			Path standardOutput,
+			Path standardError,
+			Path runtimeRoot,
+			Path main
+	) {
+		LaunchRequest {
+			command = List.copyOf(command);
+			workingDirectory = normalized(workingDirectory, "working directory");
+			environment = Map.copyOf(environment);
+			standardOutput = normalized(standardOutput, "standard output");
+			standardError = normalized(standardError, "standard error");
+			runtimeRoot = normalized(runtimeRoot, "runtime root");
+			main = normalized(main, "coordinator main");
+		}
+
+		private static Path normalized(Path path, String label) {
+			return Objects.requireNonNull(path, label + " must not be null").toAbsolutePath().normalize();
+		}
 	}
 
 	synchronized boolean configured() {
-		return runtimePackage != null;
+		return runtime != null && runtime.nodeExecutable() != null;
 	}
 
 	synchronized Path secretPath() {
-		return runtimePackage == null ? null : runtimePackage.secret();
+		return runtime == null ? null : runtime.secret();
 	}
 
 	synchronized String failureCode() {
@@ -110,108 +214,276 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	synchronized void tick(boolean bridgeAuthenticated) {
-		if (runtimePackage == null) return;
-		long now = System.currentTimeMillis();
-		if (bridgeAuthenticated) {
-			restartBudget.resetAfterAuthentication();
-			observedExit = null;
+		tick(bridgeAuthenticated, bridgeAuthenticated ? launchId : null);
+	}
+
+	synchronized void tick(boolean bridgeAuthenticated, String authenticatedLaunchId) {
+		if (stopped) return;
+		long now = now();
+		if (!revalidateIfNeeded(now)) return;
+
+		if (child != null && !child.isAlive()) {
+			releaseChild();
+			recordFailure(now, "COORDINATOR_EXITED", "Coordinator process exited unexpectedly", "process");
+			return;
 		}
-		if (process != null && !process.isAlive() && process != observedExit) {
-			observedExit = process;
-			if (!restartBudget.recordUnexpectedExit()) {
-				latchFailure("COORDINATOR_RESTART_EXHAUSTED",
-						"Coordinator exited three times; restart Minecraft after checking the coordinator log");
-				return;
-			}
-			nextStartEpochMs = now + restartBudget.nextDelayMs();
+
+		if (child != null) {
+			observeOwnedChild(now, bridgeAuthenticated, authenticatedLaunchId);
+			return;
 		}
-		if (failureCode != null || node == null) return;
-		if (!CoordinatorLaunchPolicy.shouldStart(
-				bridgeAuthenticated,
-				process != null && process.isAlive(),
-				createdAtEpochMs,
-				now
-		)) return;
-		if (now < nextStartEpochMs) return;
+
+		if (bridgeAuthenticated && authenticatedLaunchId == null) {
+			state = CoordinatorRecoveryState.HEALTHY;
+			nextRetryEpochMs = 0L;
+			return;
+		}
+		if (now < nextRetryEpochMs) return;
 		start(now);
 	}
 
-	private void start(long now) {
-		try {
-			String secret = Files.readString(runtimePackage.secret(), StandardCharsets.UTF_8).trim();
-			if (secret.length() < 32 || secret.length() > 256) {
-				throw new StartupFailure("BRIDGE_SECRET_INVALID", "Bridge secret is missing or invalid");
+	synchronized CoordinatorRecoverySnapshot snapshot() {
+		return new CoordinatorRecoverySnapshot(
+				state,
+				generation,
+				restartBudget.restartCount(),
+				lastStableEpochMs,
+				nextRetryEpochMs,
+				failureCode,
+				failureMessage,
+				failingBoundary,
+				child == null ? null : launchId,
+				child == null ? -1L : child.pid(),
+				child == null ? 0L : processStartedEpochMs,
+				child == null ? 0L : authenticationDeadlineEpochMs,
+				child == null ? 0L : reconnectDeadlineEpochMs
+		);
+	}
+
+	private void observeOwnedChild(long now, boolean bridgeAuthenticated, String authenticatedLaunchId) {
+		boolean matchingAuthentication = bridgeAuthenticated
+				&& launchId != null
+				&& launchId.equals(authenticatedLaunchId);
+		if (matchingAuthentication) {
+			if (state != CoordinatorRecoveryState.HEALTHY) {
+				state = CoordinatorRecoveryState.HEALTHY;
+				authenticatedSinceEpochMs = now;
+				stabilityCredited = false;
 			}
-			Files.createDirectories(gameDirectory.resolve("logs"));
-			ProcessBuilder builder = new ProcessBuilder(List.of(
-					node.executable().toString(),
-				runtimePackage.main().toString(),
-				"--config",
-				runtimePackage.config().toString()
-			));
-			builder.directory(runtimePackage.coordinatorRoot().toFile());
-			Map<String, String> environment = builder.environment();
-			// ProcessBuilder inherits the caller's provider credentials and environment by default.
-			for (Map.Entry<String, String> override : launchEnvironmentOverrides.entrySet()) {
-				for (String existing : List.copyOf(environment.keySet())) {
-					if (existing.equalsIgnoreCase(override.getKey())) environment.remove(existing);
-				}
-				environment.put(override.getKey(), override.getValue());
+			failingBoundary = null;
+			authenticationDeadlineEpochMs = 0L;
+			reconnectDeadlineEpochMs = 0L;
+			nextRetryEpochMs = 0L;
+			if (!stabilityCredited && now - authenticatedSinceEpochMs >= STABILITY_INTERVAL_MS) {
+				restartBudget.resetAfterStability();
+				lastStableEpochMs = now;
+				stabilityCredited = true;
 			}
-			configureVoiceProviderCredential(environment);
-			environment.put("ARENA_AGENT_BRIDGE_SECRET", secret);
-			Path logDirectory = gameDirectory.resolve("logs");
-			CoordinatorLogRotation.rotate(logDirectory);
-			builder.redirectOutput(ProcessBuilder.Redirect.appendTo(logDirectory.resolve("arena-agents-coordinator.log").toFile()));
-			builder.redirectError(ProcessBuilder.Redirect.appendTo(logDirectory.resolve("arena-agents-coordinator-error.log").toFile()));
-			Process started = builder.start();
-			try {
-				CoordinatorProcessOwnership.record(runtimePackage.root(), started, runtimePackage.main());
-			} catch (IOException ownershipFailure) {
-				terminateFailedStart(started);
-				throw ownershipFailure;
-			}
-			process = started;
-			observedExit = null;
-			nextStartEpochMs = now;
-			LOGGER.info("Started the Arena Agents coordinator (pid {})", process.pid());
-		} catch (StartupFailure exception) {
-			latchFailure(exception.code(), exception.getMessage());
-		} catch (IOException | RuntimeException exception) {
-			latchFailure("COORDINATOR_START_FAILED", "Could not start the Arena Agents coordinator");
+			return;
 		}
+
+		if (state == CoordinatorRecoveryState.HEALTHY || state == CoordinatorRecoveryState.DEGRADED) {
+			if (state == CoordinatorRecoveryState.HEALTHY) {
+				state = CoordinatorRecoveryState.DEGRADED;
+				reconnectDeadlineEpochMs = now + RECONNECT_TIMEOUT_MS;
+				authenticatedSinceEpochMs = 0L;
+				stabilityCredited = false;
+				setDiagnostic(
+						"COORDINATOR_BRIDGE_DISCONNECTED",
+						"Authenticated coordinator bridge disconnected; waiting for reconnection",
+						"bridge_reconnect"
+				);
+			}
+			if (now >= reconnectDeadlineEpochMs) {
+				releaseChild();
+				recordFailure(now, "COORDINATOR_RECONNECT_TIMEOUT",
+						"Coordinator stayed alive but did not restore its authenticated bridge", "bridge_reconnect");
+			}
+			return;
+		}
+
+		state = CoordinatorRecoveryState.AUTHENTICATING;
+		if (now >= authenticationDeadlineEpochMs) {
+			releaseChild();
+			recordFailure(now, "COORDINATOR_AUTHENTICATION_TIMEOUT",
+					"Coordinator process did not authenticate before its deadline", "bridge_authentication");
+		}
+	}
+
+	private boolean revalidateIfNeeded(long now) {
+		String currentFingerprint = safeFingerprint();
+		boolean changed = !Objects.equals(dependencyFingerprint, currentFingerprint);
+		if (!changed && now < nextDependencyCheckEpochMs) {
+			return runtime != null && runtime.nodeExecutable() != null;
+		}
+		dependencyFingerprint = currentFingerprint;
+		DependencyResolution resolution = resolveDependencies();
+		return applyDependencyResolution(resolution, now, false, changed);
+	}
+
+	private boolean applyDependencyResolution(
+			DependencyResolution resolution,
+			long now,
+			boolean initial,
+			boolean fingerprintChanged
+	) {
+		nextDependencyCheckEpochMs = now + DEPENDENCY_RECHECK_MS;
+		PreparedRuntime previous = runtime;
+		runtime = resolution.runtime();
+		if (!resolution.ready()) {
+			releaseChild();
+			state = CoordinatorRecoveryState.BLOCKED_RETRYABLE;
+			nextRetryEpochMs = nextDependencyCheckEpochMs;
+			authenticationDeadlineEpochMs = 0L;
+			reconnectDeadlineEpochMs = 0L;
+			authenticatedSinceEpochMs = 0L;
+			stabilityCredited = false;
+			setDiagnostic(resolution.failureCode(), resolution.failureMessage(), "startup_dependencies");
+			return false;
+		}
+
+		if (fingerprintChanged && previous != null && child != null) {
+			releaseChild();
+			state = CoordinatorRecoveryState.STARTING;
+			nextRetryEpochMs = now;
+		} else if (state == CoordinatorRecoveryState.BLOCKED_RETRYABLE) {
+			state = CoordinatorRecoveryState.STARTING;
+			nextRetryEpochMs = now;
+		} else if (initial) {
+			state = CoordinatorRecoveryState.STARTING;
+			nextRetryEpochMs = createdAtEpochMs + CoordinatorLaunchPolicy.STARTUP_GRACE_MS;
+		}
+		return true;
+	}
+
+	private DependencyResolution resolveDependencies() {
+		try {
+			DependencyResolution resolution = dependencyResolver.resolve();
+			return Objects.requireNonNull(resolution, "dependency resolution must not be null");
+		} catch (RuntimeException exception) {
+			return DependencyResolution.blocked(
+					"COORDINATOR_STARTUP_INVALID",
+					exception.getMessage() == null ? "Coordinator startup dependencies are unavailable" : exception.getMessage()
+			);
+		}
+	}
+
+	private String safeFingerprint() {
+		try {
+			return Objects.toString(dependencyResolver.fingerprint(), "");
+		} catch (RuntimeException exception) {
+			return "fingerprint-unavailable:" + exception.getClass().getName();
+		}
+	}
+
+	private void start(long now) {
+		generation++;
+		state = CoordinatorRecoveryState.STARTING;
+		try {
+			launchId = UUID.fromString(Objects.requireNonNull(launchIds.get(), "launch ID must not be null")).toString();
+			LaunchRequest request = launchRequest(launchId);
+			ChildProcess started = Objects.requireNonNull(processLauncher.launch(request), "process launcher returned no child");
+			child = started;
+			processStartedEpochMs = now;
+			authenticationDeadlineEpochMs = now + AUTHENTICATION_TIMEOUT_MS;
+			reconnectDeadlineEpochMs = 0L;
+			authenticatedSinceEpochMs = 0L;
+			stabilityCredited = false;
+			nextRetryEpochMs = 0L;
+			state = CoordinatorRecoveryState.AUTHENTICATING;
+			failingBoundary = "bridge_authentication";
+			LOGGER.info("Started the Arena Agents coordinator (pid {}, generation {})", child.pid(), generation);
+		} catch (IOException | RuntimeException exception) {
+			launchId = null;
+			recordFailure(now, "COORDINATOR_START_FAILED", "Could not start the Arena Agents coordinator", "process_start");
+		}
+	}
+
+	private LaunchRequest launchRequest(String ownedLaunchId) {
+		PreparedRuntime prepared = Objects.requireNonNull(runtime, "coordinator runtime is not prepared");
+		Map<String, String> environment = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+		environment.putAll(System.getenv());
+		for (Map.Entry<String, String> override : launchEnvironmentOverrides.entrySet()) {
+			environment.put(override.getKey(), override.getValue());
+		}
+		configureVoiceProviderCredential(prepared.root(), environment);
+		environment.put("ARENA_AGENT_BRIDGE_SECRET", prepared.bridgeSecret());
+		environment.put("ARENA_AGENT_COORDINATOR_LAUNCH_ID", ownedLaunchId);
+		Path logs = gameDirectory.resolve("logs");
+		return new LaunchRequest(
+				List.of(
+						prepared.nodeExecutable().toString(),
+						prepared.main().toString(),
+						"--config",
+						prepared.config().toString()
+				),
+				prepared.coordinatorRoot(),
+				environment,
+				logs.resolve("arena-agents-coordinator.log"),
+				logs.resolve("arena-agents-coordinator-error.log"),
+				prepared.root(),
+				prepared.main()
+		);
+	}
+
+	private void recordFailure(long now, String code, String message, String boundary) {
+		restartBudget.recordUnexpectedExit();
+		state = CoordinatorRecoveryState.BACKOFF;
+		nextRetryEpochMs = now + restartBudget.nextDelayMs();
+		processStartedEpochMs = 0L;
+		authenticationDeadlineEpochMs = 0L;
+		reconnectDeadlineEpochMs = 0L;
+		authenticatedSinceEpochMs = 0L;
+		stabilityCredited = false;
+		setDiagnostic(code, message, boundary);
+	}
+
+	private void setDiagnostic(String code, String message, String boundary) {
+		boolean changed = !Objects.equals(failureCode, code)
+				|| !Objects.equals(failureMessage, message)
+				|| !Objects.equals(failingBoundary, boundary);
+		failureCode = code;
+		failureMessage = message;
+		failingBoundary = boundary;
+		if (changed && code != null) {
+			LOGGER.warn("Arena Agents coordinator recovering [{}] at {}: {}", code, boundary,
+					message == null ? "retry scheduled" : message);
+		}
+	}
+
+	private void releaseChild() {
+		ChildProcess owned = child;
+		if (owned == null) return;
+		child = null;
+		launchId = null;
+		processStartedEpochMs = 0L;
+		authenticationDeadlineEpochMs = 0L;
+		reconnectDeadlineEpochMs = 0L;
+		owned.terminate();
 	}
 
 	static void terminateFailedStart(Process started) {
 		CoordinatorProcessOwnership.terminateTree(started.toHandle());
 	}
 
-	private void latchFailure(String code, String message) {
-		if (Objects.equals(failureCode, code) && Objects.equals(failureMessage, message)) return;
-		failureCode = code;
-		failureMessage = message;
-		logFailure(code, message);
-	}
-
-	private static void logFailure(String code, String message) {
-		LOGGER.error("Arena Agents coordinator unavailable [{}]: {}", code, message == null ? "check startup configuration" : message);
-	}
-
 	@Override
 	public synchronized void close() {
-		Process owned = process;
-		if (owned == null) return;
-		CoordinatorProcessOwnership.terminateTree(owned.toHandle());
-		try {
-			CoordinatorProcessOwnership.clear(runtimePackage.root(), owned);
-		} catch (IOException exception) {
-			LOGGER.warn("Could not clear the Arena Agents coordinator ownership record", exception);
-		}
-		process = null;
+		if (stopped) return;
+		stopped = true;
+		state = CoordinatorRecoveryState.STOPPED;
+		nextRetryEpochMs = 0L;
+		nextDependencyCheckEpochMs = 0L;
+		releaseChild();
 	}
 
-	private void configureVoiceProviderCredential(Map<String, String> environment) {
-		configureVoiceProviderCredential(runtimePackage.root(), environment);
+	private long now() {
+		long value = clock.getAsLong();
+		if (value < 0L) throw new IllegalStateException("coordinator clock must not be negative");
+		return value;
+	}
+
+	private static boolean autoStartEnabled() {
+		return !"false".equalsIgnoreCase(System.getProperty("arenaagents.coordinatorAutoStart"));
 	}
 
 	static void configureVoiceProviderCredential(Path runtimeRoot, Map<String, String> environment) {
@@ -253,7 +525,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
 	}
 
-	private void configureSharedVoiceEndpoint(Path configPath) throws IOException {
+	private static void configureSharedVoiceEndpoint(Path configPath, Map<String, String> launchEnvironmentOverrides)
+			throws IOException {
 		String configured = System.getProperty("arenaagents.voiceUrl");
 		if (configured != null && !configured.isBlank()) return;
 		CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
@@ -285,16 +558,231 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				&& Files.isRegularFile(candidate.resolve("coordinator/config/dynamic-agents.json"));
 	}
 
-	private static final class StartupFailure extends RuntimeException {
-		private final String code;
+	private static String dependencyFailureCode(IOException failure) {
+		String message = Objects.toString(failure.getMessage(), "").toLowerCase(java.util.Locale.ROOT);
+		if (message.contains("secret")) return "BRIDGE_SECRET_INVALID";
+		if (message.contains("config")) return "COORDINATOR_CONFIG_INVALID";
+		if (message.contains("manifest") || message.contains("package") || message.contains("runtime")) {
+			return "COORDINATOR_RUNTIME_INVALID";
+		}
+		return "COORDINATOR_STARTUP_INVALID";
+	}
 
-		private StartupFailure(String code, String message) {
-			super(message);
-			this.code = code;
+	private static final class DefaultProcessLauncher implements ProcessLauncher {
+		@Override
+		public ChildProcess launch(LaunchRequest request) throws IOException {
+			Files.createDirectories(request.standardOutput().getParent());
+			CoordinatorLogRotation.rotate(request.standardOutput().getParent());
+			ProcessBuilder builder = new ProcessBuilder(request.command());
+			builder.directory(request.workingDirectory().toFile());
+			builder.environment().clear();
+			builder.environment().putAll(request.environment());
+			builder.redirectOutput(ProcessBuilder.Redirect.appendTo(request.standardOutput().toFile()));
+			builder.redirectError(ProcessBuilder.Redirect.appendTo(request.standardError().toFile()));
+			Process process = builder.start();
+			try {
+				CoordinatorProcessOwnership.record(request.runtimeRoot(), process, request.main());
+			} catch (IOException ownershipFailure) {
+				terminateFailedStart(process);
+				throw ownershipFailure;
+			}
+			return new OwnedProcessChild(request.runtimeRoot(), process);
+		}
+	}
+
+	private static final class OwnedProcessChild implements ChildProcess {
+		private final Path runtimeRoot;
+		private final Process process;
+		private final AtomicBoolean terminated = new AtomicBoolean();
+
+		private OwnedProcessChild(Path runtimeRoot, Process process) {
+			this.runtimeRoot = runtimeRoot;
+			this.process = process;
 		}
 
-		private String code() {
-			return code;
+		@Override
+		public boolean isAlive() {
+			return process.isAlive();
+		}
+
+		@Override
+		public long pid() {
+			return process.pid();
+		}
+
+		@Override
+		public void terminate() {
+			if (!terminated.compareAndSet(false, true)) return;
+			CoordinatorProcessOwnership.terminateTree(process.toHandle());
+			try {
+				CoordinatorProcessOwnership.clear(runtimeRoot, process);
+			} catch (IOException exception) {
+				LOGGER.warn("Could not clear the Arena Agents coordinator ownership record", exception);
+			}
+		}
+	}
+
+	private static final class DefaultDependencyResolver implements DependencyResolver {
+		private final Path gameDirectory;
+		private final Map<String, String> environmentOverrides;
+		private boolean orphanCheckComplete;
+
+		private DefaultDependencyResolver(Path gameDirectory, Map<String, String> environmentOverrides) {
+			this.gameDirectory = gameDirectory;
+			this.environmentOverrides = environmentOverrides;
+		}
+
+		@Override
+		public String fingerprint() {
+			Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
+			Path packageRoot = findPackageRoot(gameDirectory);
+			Path root = packageRoot == null ? installedRoot : packageRoot;
+			ArrayList<String> values = new ArrayList<>();
+			values.add(Objects.toString(System.getProperty("arenaagents.packageRoot"), ""));
+			values.add(Objects.toString(System.getProperty(NodeRuntimeLocator.PROPERTY), ""));
+			String path = effectiveEnvironmentValue("PATH");
+			values.add(Objects.toString(path, ""));
+			values.add(fileStamp(root.resolve("coordinator/.arena-agents-bundle-manifest")));
+			values.add(fileStamp(root.resolve("coordinator/src/dynamic-main.mjs")));
+			values.add(fileStamp(root.resolve("coordinator/config/dynamic-agents.json")));
+			values.add(fileStamp(root.resolve("runtime/bridge-secret.txt")));
+			values.add(fileStamp(bundledNode(root)));
+			String explicit = System.getProperty(NodeRuntimeLocator.PROPERTY);
+			if (explicit != null && !explicit.isBlank()) {
+				try {
+					values.add(fileStamp(Path.of(explicit)));
+				} catch (RuntimeException invalid) {
+					values.add("invalid-explicit-node");
+				}
+			}
+			String executableName = System.getProperty("os.name", "")
+					.toLowerCase(java.util.Locale.ROOT).contains("win") ? "node.exe" : "node";
+			if (path != null && !path.isBlank()) {
+				for (String entry : path.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator), -1)) {
+					if (entry.isBlank()) continue;
+					try {
+						values.add(fileStamp(Path.of(entry).resolve(executableName)));
+					} catch (RuntimeException invalid) {
+						values.add("invalid-path-entry");
+					}
+				}
+			}
+			for (Map.Entry<String, String> override : environmentOverrides.entrySet()) {
+				if (override.getKey().equalsIgnoreCase("PATH") || override.getKey().equalsIgnoreCase("APPDATA")) {
+					values.add(override.getKey().toUpperCase(java.util.Locale.ROOT) + '=' + override.getValue());
+				}
+			}
+			return String.join("|", values);
+		}
+
+		@Override
+		public DependencyResolution resolve() {
+			BundledCoordinatorInstaller.RuntimePackage prepared = null;
+			try {
+				Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
+				if (!orphanCheckComplete) {
+					orphanCheckComplete = true;
+					int reaped = CoordinatorProcessOwnership.reapOrphaned(installedRoot);
+					if (reaped > 0) {
+						LOGGER.warn("Stopped {} orphaned Arena Agents coordinator process(es) before updating the runtime", reaped);
+					}
+				}
+				IOException installFailure = null;
+				try {
+					if (BundledCoordinatorInstaller.installBundled(installedRoot)) {
+						LOGGER.info("Installed the bundled Arena Agents coordinator runtime");
+					}
+				} catch (IOException failure) {
+					installFailure = failure;
+					LOGGER.warn("Could not refresh the bundled Arena Agents runtime; attempting the last complete installed version", failure);
+				}
+				Path discoveredRoot = findPackageRoot(gameDirectory);
+				if (discoveredRoot == null) {
+					if (installFailure != null) throw installFailure;
+					throw new IOException("Coordinator runtime package is unavailable");
+				}
+				try {
+					prepared = BundledCoordinatorInstaller.validate(discoveredRoot);
+				} catch (IOException invalidRuntime) {
+					if (installFailure != null) invalidRuntime.addSuppressed(installFailure);
+					throw invalidRuntime;
+				}
+				String secret = Files.readString(prepared.secret(), StandardCharsets.UTF_8).trim();
+				validateConfig(prepared.config());
+				configureSharedBridgeSecretPath(prepared.secret());
+				configureSharedVoiceEndpoint(prepared.config(), environmentOverrides);
+				PreparedRuntime partial = prepared(prepared, null, secret);
+				try {
+					NodeRuntimeLocator.LocatedNode node = NodeRuntimeLocator.locate(prepared.root());
+					return DependencyResolution.ready(prepared(prepared, node.executable(), secret));
+				} catch (NodeRuntimeLocator.NodeRuntimeFailure failure) {
+					return DependencyResolution.blocked(partial, failure.code(), failure.getMessage());
+				}
+			} catch (IOException failure) {
+				return DependencyResolution.blocked(
+						prepared == null ? null : safePartial(prepared),
+						dependencyFailureCode(failure),
+						failure.getMessage() == null ? "Coordinator startup dependencies are unavailable" : failure.getMessage()
+				);
+			} catch (RuntimeException failure) {
+				return DependencyResolution.blocked(
+						"COORDINATOR_STARTUP_INVALID",
+						failure.getMessage() == null ? "Coordinator startup dependencies are unavailable" : failure.getMessage()
+				);
+			}
+		}
+
+		private String effectiveEnvironmentValue(String name) {
+			for (Map.Entry<String, String> override : environmentOverrides.entrySet()) {
+				if (override.getKey().equalsIgnoreCase(name)) return override.getValue();
+			}
+			return System.getenv(name);
+		}
+
+		private static PreparedRuntime prepared(
+				BundledCoordinatorInstaller.RuntimePackage runtime,
+				Path node,
+				String secret
+		) {
+			return new PreparedRuntime(
+					runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(), node, secret
+			);
+		}
+
+		private static PreparedRuntime safePartial(BundledCoordinatorInstaller.RuntimePackage runtime) {
+			try {
+				String secret = Files.readString(runtime.secret(), StandardCharsets.UTF_8).trim();
+				return prepared(runtime, null, secret);
+			} catch (IOException | RuntimeException ignored) {
+				return null;
+			}
+		}
+
+		private static void validateConfig(Path config) throws IOException {
+			try {
+				if (!JsonParser.parseString(Files.readString(config, StandardCharsets.UTF_8)).isJsonObject()) {
+					throw new IOException("Coordinator config must be a JSON object");
+				}
+			} catch (com.google.gson.JsonParseException invalid) {
+				throw new IOException("Coordinator config is invalid JSON", invalid);
+			}
+		}
+
+		private static String fileStamp(Path path) {
+			try {
+				Path normalized = path.toAbsolutePath().normalize();
+				if (!Files.exists(normalized)) return normalized + ":missing";
+				return normalized + ":" + Files.size(normalized) + ":" + Files.getLastModifiedTime(normalized).toMillis();
+			} catch (IOException | RuntimeException failure) {
+				return Objects.toString(path) + ":unreadable";
+			}
+		}
+
+		private static Path bundledNode(Path root) {
+			boolean windows = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+			return windows
+					? root.resolve("runtime/toolchains/node/node.exe")
+					: root.resolve("runtime/toolchains/node/bin/node");
 		}
 	}
 }
