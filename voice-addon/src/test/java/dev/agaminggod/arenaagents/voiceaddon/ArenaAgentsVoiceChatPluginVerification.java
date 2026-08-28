@@ -38,6 +38,7 @@ final class ArenaAgentsVoiceChatPluginVerification {
 		VoiceSubsystemConfiguration reconfiguredA = configuration(18_103, 'c');
 		VoiceSubsystemConfiguration reopenedA = configuration(18_104, 'd');
 		VoiceSubsystemConfiguration configurationC = configuration(18_105, 'e');
+		VoiceSubsystemConfiguration restartConfiguration = configuration(18_106, 'f');
 		List<RecordingCapture> captures = new CopyOnWriteArrayList<>();
 		Map<MicrophonePacketEvent, Object> packetServers = Collections.synchronizedMap(new IdentityHashMap<>());
 		ArenaAgentsVoiceChatPlugin plugin = new ArenaAgentsVoiceChatPlugin(configuration -> {
@@ -121,7 +122,40 @@ final class ArenaAgentsVoiceChatPluginVerification {
 		assertSame(apiB, newestPending.voicechat(), "the newest unclaimed API generation is configured");
 		assertEquals(0, ambiguousCaptures.size(), "configuration remains lazy until a microphone packet");
 		newestPending.close();
-		return 27;
+
+		List<RecordingCapture> restartCaptures = new ArrayList<>();
+		ArenaAgentsVoiceChatPlugin restartPlugin = new ArenaAgentsVoiceChatPlugin(configuration -> {
+			RecordingCapture capture = new RecordingCapture(configuration);
+			restartCaptures.add(capture);
+			return capture;
+		}, packetServers::get);
+		RecordingEventRegistration restartEvents = new RecordingEventRegistration();
+		restartPlugin.registerEvents(restartEvents);
+		Object restartServer = new Object();
+		VoicechatServerApi beforeRestart = voicechatApi("before-restart");
+		VoicechatServerApi afterRestart = voicechatApi("after-restart");
+		restartEvents.fire(VoicechatServerStartedEvent.class,
+				serverEvent(VoicechatServerStartedEvent.class, beforeRestart));
+		ArenaAgentsVoiceChatPlugin.ConfiguredServer configuredBeforeRestart =
+				restartPlugin.configureServer(restartServer, restartConfiguration);
+		restartEvents.fire(VoicechatServerStoppedEvent.class,
+				serverEvent(VoicechatServerStoppedEvent.class, beforeRestart));
+		assertEquals(false, configuredBeforeRestart.active(),
+				"a stopped voice-chat generation is unavailable");
+		restartEvents.fire(VoicechatServerStartedEvent.class,
+				serverEvent(VoicechatServerStartedEvent.class, afterRestart));
+		dispatch(restartEvents, packetServers, restartServer, afterRestart);
+		assertEquals(true, configuredBeforeRestart.active(),
+				"the existing configured server recovers after a voice-chat-only restart");
+		assertSame(afterRestart, configuredBeforeRestart.voicechat(),
+				"playback switches to the restarted voice-chat API without restarting Minecraft");
+		RecordingCapture restartedCapture = onlyCapture(restartCaptures, restartConfiguration);
+		assertEquals(1, restartedCapture.accepts,
+				"microphone capture switches to the restarted API generation");
+		configuredBeforeRestart.close();
+		assertEquals(1, restartedCapture.closes,
+				"closing the live configured server still closes its capture once");
+		return 32;
 	}
 
 	private static RecordingCapture dispatchAndCapture(

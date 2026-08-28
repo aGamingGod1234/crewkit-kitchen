@@ -6,7 +6,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.WeakHashMap;
 
-/** Pairs each configured Minecraft server with one voice-chat lifecycle registration. */
+/** Keeps each configured Minecraft server paired with its current voice-chat lifecycle generation. */
 final class VoicechatServerBindings<S, O> {
 	private final Map<S, Association> associations = new WeakHashMap<>();
 	private final ServerSpeechCaptureRegistry<S, O> captures;
@@ -39,26 +39,25 @@ final class VoicechatServerBindings<S, O> {
 			associations.put(server, association);
 			pending = null;
 		} else if (!association.registration.live) {
-			if (pending == null || !pending.live) {
+			if (!adoptPending(association)) {
 				throw new IllegalStateException("Simple Voice Chat has no active server registration");
 			}
-			if (pending.generation <= association.stoppedAtGeneration) {
-				throw new IllegalStateException("Simple Voice Chat registration predates this server stop");
-			}
-			association = new Association(pending);
-			associations.put(server, association);
-			pending = null;
 		}
 
 		captures.configure(server, association.registration.owner, configuration);
 		association.revision++;
 		association.configured = true;
-		return new ConfiguredBinding(server, association.registration, association.revision);
+		association.configuration = configuration;
+		return new ConfiguredBinding(server, association, association.revision);
 	}
 
 	void accept(S server, O owner, MicrophonePacketEvent event) {
 		synchronized (this) {
 			Association association = associations.get(server);
+			if (association != null && association.configured && !association.registration.live
+					&& pending != null && pending.owner == owner && adoptPending(association)) {
+				captures.configure(server, association.registration.owner, association.configuration);
+			}
 			if (association == null || !association.configured || !association.registration.live
 					|| association.registration.owner != owner) return;
 		}
@@ -79,21 +78,41 @@ final class VoicechatServerBindings<S, O> {
 		captures.clearOwner(owner);
 	}
 
-	private synchronized boolean active(S server, Registration registration, long revision) {
+	private synchronized boolean active(S server, Association expected, long revision) {
 		Association association = associations.get(server);
-		return association != null
-				&& association.registration == registration
-				&& association.configured
-				&& association.revision == revision
-				&& registration.live;
+		if (association != expected || !association.configured || association.revision != revision) return false;
+		if (!association.registration.live && adoptPending(association)) {
+			captures.configure(server, association.registration.owner, association.configuration);
+		}
+		return association.registration.live;
 	}
 
-	private synchronized void clear(S server, Registration registration, long revision) {
+	private synchronized O owner(S server, Association expected, long revision) {
 		Association association = associations.get(server);
-		if (association == null || association.registration != registration
-				|| !association.configured || association.revision != revision) return;
+		if (association != expected || !association.configured || association.revision != revision) {
+			throw new IllegalStateException("Simple Voice Chat configuration is no longer current");
+		}
+		if (!association.registration.live && adoptPending(association)) {
+			captures.configure(server, association.registration.owner, association.configuration);
+		}
+		if (!association.registration.live) {
+			throw new IllegalStateException("Simple Voice Chat has no active server registration");
+		}
+		return association.registration.owner;
+	}
+
+	private synchronized void clear(S server, Association expected, long revision) {
+		Association association = associations.get(server);
+		if (association != expected || !association.configured || association.revision != revision) return;
 		captures.clear(server);
 		association.configured = false;
+	}
+
+	private boolean adoptPending(Association association) {
+		if (pending == null || !pending.live || pending.generation <= association.stoppedAtGeneration) return false;
+		association.registration = pending;
+		pending = null;
+		return true;
 	}
 
 	interface Binding<O> extends AutoCloseable {
@@ -107,36 +126,37 @@ final class VoicechatServerBindings<S, O> {
 
 	private final class ConfiguredBinding implements Binding<O> {
 		private final S server;
-		private final Registration registration;
+		private final Association association;
 		private final long revision;
 
-		private ConfiguredBinding(S server, Registration registration, long revision) {
+		private ConfiguredBinding(S server, Association association, long revision) {
 			this.server = server;
-			this.registration = registration;
+			this.association = association;
 			this.revision = revision;
 		}
 
 		@Override
 		public O owner() {
-			return registration.owner;
+			return VoicechatServerBindings.this.owner(server, association, revision);
 		}
 
 		@Override
 		public boolean active() {
-			return VoicechatServerBindings.this.active(server, registration, revision);
+			return VoicechatServerBindings.this.active(server, association, revision);
 		}
 
 		@Override
 		public void close() {
-			VoicechatServerBindings.this.clear(server, registration, revision);
+			VoicechatServerBindings.this.clear(server, association, revision);
 		}
 	}
 
 	private final class Association {
-		private final Registration registration;
+		private Registration registration;
 		private long revision;
 		private long stoppedAtGeneration;
 		private boolean configured;
+		private VoiceSubsystemConfiguration configuration;
 
 		private Association(Registration registration) {
 			this.registration = registration;

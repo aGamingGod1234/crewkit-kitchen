@@ -39,10 +39,17 @@ final class VoicechatServerBindingsVerification {
 		bindings.stopped(apiA);
 		assertEquals(false, reconfigured.active(), "stop fences the live registration");
 		bindings.started(apiB);
+		assertEquals(true, reconfigured.active(),
+				"the current binding adopts a newer voice-chat generation without reconfiguring Minecraft");
+		assertSame(apiB, reconfigured.owner(),
+				"the current binding exposes the restarted voice-chat API");
+		bindings.accept(server, apiB, null);
 		VoicechatServerBindings.Binding<Object> replacement = bindings.configure(server, restarted);
 		bindings.accept(server, apiB, null);
 		assertSame(apiB, replacement.owner(), "same Minecraft server adopts its restarted API");
 		assertEquals(1, captures.get(1).closes, "restart closes the displaced registration capture once");
+		assertEquals(1, captures.get(2).closes,
+				"explicit reconfiguration closes the dynamically rebound capture once");
 		reconfigured.close();
 		assertEquals(true, replacement.active(), "pre-restart close cannot clear the replacement");
 		replacement.close();
@@ -83,7 +90,7 @@ final class VoicechatServerBindingsVerification {
 		assertSame(apiB, repeatedB.owner(), "the newest pending API owns the configured server");
 		assertEquals(true, repeatedB.active(),
 				"stale stop and close from a displaced registration cannot clear the current API");
-		return 13;
+		return 16;
 	}
 
 	private static VoiceSubsystemConfiguration configuration(int port, char secret) {
