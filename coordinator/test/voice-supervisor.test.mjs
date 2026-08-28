@@ -190,6 +190,79 @@ test('post-bind server failure stays handled, replaces the exact worker, and fen
 	}
 });
 
+test('a stalled channel probe replaces the exact worker and recovers without overlapping physical probes', async () => {
+	const workers = [];
+	let unsettledProbes = 0;
+	let maxUnsettledProbes = 0;
+	const supervisor = new VoiceSupervisor({
+		startWorker: async () => {
+			let synthesisCalls = 0;
+			let releaseProbe;
+			const probe = new Promise((resolve) => { releaseProbe = resolve; });
+			const worker = createVoiceHttpServer({
+				provider: {
+					async synthesize() {
+						synthesisCalls += 1;
+						if (synthesisCalls === 1 || synthesisCalls === 3) {
+							throw Object.assign(new Error('temporary TTS failure'), { code: 'TTS_UNAVAILABLE' });
+						}
+						return validSynthesis();
+					},
+					probe: () => {
+						unsettledProbes += 1;
+						maxUnsettledProbes = Math.max(maxUnsettledProbes, unsettledProbes);
+						return probe.finally(() => { unsettledProbes -= 1; });
+					},
+				},
+				profileStore: new VoiceProfileStore(),
+				secret: SECRET,
+				initialProbeDelayMs: 5,
+				maxProbeDelayMs: 5,
+				probeTimeoutMs: 500,
+				port: 0,
+			});
+			const address = await worker.start();
+			const owned = {
+				...worker,
+				baseUrl: `http://127.0.0.1:${address.port}`,
+				async close() {
+					releaseProbe();
+					await worker.close();
+				},
+			};
+			workers.push(owned);
+			return owned;
+		},
+		initialRetryMs: 5,
+		maxRetryMs: 5,
+		startupTimeoutMs: 100,
+		warmupTimeoutMs: 100,
+		cleanupTimeoutMs: 50,
+	});
+	try {
+		supervisor.start();
+		await eventually(() => workers.length === 1 && component(supervisor, 'voice:tts').state === 'ready');
+		const first = workers[0];
+		const request = (text, sequence) => fetch(`${first.baseUrl}/v1/tts`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				agentId: '00000000-0000-4000-8000-000000000001', text,
+				profileId: 'voice.auto.v1', radius: 48, conversationSequence: sequence,
+			}),
+		});
+		assert.equal((await request('first failure', 1)).status, 502);
+		await eventually(() => unsettledProbes === 1);
+		assert.equal((await request('real recovery', 2)).status, 200);
+		assert.equal((await request('second failure', 3)).status, 502);
+		await eventually(() => workers.length === 2 && component(supervisor, 'voice:tts').state === 'ready');
+		assert.equal(maxUnsettledProbes, 1);
+		assert.equal(unsettledProbes, 0);
+	} finally {
+		await supervisor.close();
+	}
+});
+
 test('startup timeout aborts its one owned attempt before any replacement begins', async () => {
 	let attempts = 0;
 	let aborts = 0;

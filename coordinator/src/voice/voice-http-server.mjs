@@ -58,6 +58,7 @@ export function createVoiceHttpServer({
 	const ttsLifecycle = new VoiceChannelLifecycle({
 		component: 'voice:tts', boundary: 'voice_tts_provider',
 		probe: provider === null ? null : (signal) => probeTts(provider, profileStore, signal),
+		onStalled: (error) => recordTerminalFailure(error),
 		initialFailureCode: provider === null ? 'TTS_UNAVAILABLE' : null,
 		...lifecycleOptions,
 	});
@@ -65,6 +66,7 @@ export function createVoiceHttpServer({
 	const sttLifecycle = new VoiceChannelLifecycle({
 		component: 'voice:stt', boundary: 'voice_stt_provider',
 		probe: sttUnavailable ? null : (signal) => probeStt(sttProvider, signal),
+		onStalled: (error) => recordTerminalFailure(error),
 		initialFailureCode: sttUnavailable ? 'STT_UNAVAILABLE' : null,
 		...lifecycleOptions,
 	});
@@ -295,7 +297,8 @@ export function createVoiceHttpServer({
 				if (server.listening) {
 					await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 				}
-				if (typeof profileStore.flush === 'function') await profileStore.flush();
+				if (typeof profileStore.close === 'function') await profileStore.close();
+				else if (typeof profileStore.flush === 'function') await profileStore.flush();
 			})();
 			return closePromise;
 		},
@@ -306,6 +309,7 @@ class VoiceChannelLifecycle {
 	#component;
 	#boundary;
 	#probe;
+	#onStalled;
 	#now;
 	#schedule;
 	#cancelSchedule;
@@ -323,14 +327,17 @@ class VoiceChannelLifecycle {
 	#probeToken = null;
 	#retryEnabled;
 	#closed = false;
+	#broken = false;
 
 	constructor({
-		component, boundary, probe, initialFailureCode = null,
+		component, boundary, probe, onStalled, initialFailureCode = null,
 		now, schedule, cancelSchedule, initialRetryMs, maxRetryMs, probeTimeoutMs,
 	}) {
+		if (typeof onStalled !== 'function') throw new TypeError('voice stalled probe callback must be a function');
 		this.#component = component;
 		this.#boundary = boundary;
 		this.#probe = probe;
+		this.#onStalled = onStalled;
 		this.#retryEnabled = typeof probe === 'function';
 		this.#now = now;
 		this.#schedule = schedule;
@@ -347,6 +354,11 @@ class VoiceChannelLifecycle {
 
 	recordFailure(error) {
 		if (this.#closed) return;
+		if (this.#broken) return;
+		if (this.#probeToken?.invalidated) {
+			this.#markStalled();
+			return;
+		}
 		this.#state = 'degraded';
 		this.#failureCode = voiceFailureCode(error);
 		this.#failures = Math.min(1_000_000, this.#failures + 1);
@@ -355,7 +367,7 @@ class VoiceChannelLifecycle {
 	}
 
 	recordReady() {
-		if (this.#closed) return;
+		if (this.#closed || this.#broken) return;
 		const recovered = this.#state !== 'ready';
 		this.#epoch += 1;
 		if (this.#timer !== null) this.#cancelSchedule(this.#timer);
@@ -366,7 +378,6 @@ class VoiceChannelLifecycle {
 			if (staleProbe.timeout !== null) this.#cancelSchedule(staleProbe.timeout);
 			staleProbe.timeout = null;
 			staleProbe.controller.abort();
-			this.#probeToken = null;
 		}
 		this.#state = 'ready';
 		this.#failureCode = null;
@@ -423,9 +434,9 @@ class VoiceChannelLifecycle {
 			if (this.#closed || this.#probeToken !== token || token.epoch !== this.#epoch) return;
 			token.timeout = null;
 			token.timedOut = true;
+			this.#markStalled();
 			const error = typedError(`${this.#component === 'voice:stt' ? 'STT' : 'TTS'}_TIMEOUT`, 'Voice health probe timed out');
 			error.name = 'TimeoutError';
-			this.recordFailure(error);
 			controller.abort(error);
 		}, this.#probeTimeoutMs);
 		raw.then(
@@ -441,7 +452,7 @@ class VoiceChannelLifecycle {
 		this.#probeToken = null;
 		if (this.#closed) return;
 		if (token.invalidated) {
-			if (this.#state === 'degraded' && this.#retryEnabled && this.#timer === null) this.#scheduleRetry();
+			if (!this.#broken && this.#state === 'degraded' && this.#retryEnabled && this.#timer === null) this.#scheduleRetry();
 			return;
 		}
 		if (token.timedOut) {
@@ -450,6 +461,19 @@ class VoiceChannelLifecycle {
 		}
 		if (failure === null) this.recordReady();
 		else this.recordFailure(failure);
+	}
+
+	#markStalled() {
+		if (this.#closed || this.#broken) return;
+		this.#broken = true;
+		this.#retryEnabled = false;
+		this.#state = 'degraded';
+		this.#failureCode = `${this.#component === 'voice:stt' ? 'STT' : 'TTS'}_PROVIDER_STALLED`;
+		this.#failures = Math.min(1_000_000, this.#failures + 1);
+		this.#nextProbeAt = null;
+		this.#generation += 1;
+		const error = typedError(this.#failureCode, 'Voice provider ignored cancellation and requires replacement');
+		this.#onStalled(error);
 	}
 }
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -157,10 +157,11 @@ test('abort-ignoring provider probe never accumulates a replacement call', async
 	});
 });
 
-test('new real success releases a hung probe token so a later failure can recover', async () => {
+test('new real success recovers logically but a later failure replaces the generation with a hung probe', async () => {
 	let synthesisCalls = 0;
 	let probes = 0;
 	let oldProbeAborted = false;
+	let terminalFailure = null;
 	let releaseOldProbe;
 	const oldProbe = new Promise((resolve) => { releaseOldProbe = resolve; });
 	await withWorker({
@@ -183,6 +184,7 @@ test('new real success releases a hung probe token so a later failure can recove
 		maxProbeDelayMs: 5,
 		probeTimeoutMs: 500,
 	}, async ({ worker, baseUrl }) => {
+		worker.onFailure((error) => { terminalFailure = error; });
 		const first = await fetch(`${baseUrl}/v1/tts`, {
 			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'first failure' }),
 		});
@@ -197,11 +199,76 @@ test('new real success releases a hung probe token so a later failure can recove
 			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'second failure', conversationSequence: 3 }),
 		});
 		assert.equal(secondFailure.status, 502);
-		await eventually(() => probes === 2 && worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state === 'ready');
+		await eventually(() => terminalFailure !== null);
+		assert.equal(terminalFailure.code, 'TTS_PROVIDER_STALLED');
+		assert.equal(probes, 1, 'the unresolved physical probe prevents another call on this provider generation');
 		releaseOldProbe();
 		await new Promise((resolve) => setImmediate(resolve));
-		assert.equal(worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state, 'ready');
+		assert.equal(worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state, 'degraded');
 	});
+});
+
+test('repeated real recovery cannot accumulate abort-ignoring physical probes', async () => {
+	let probes = 0;
+	let terminalFailures = 0;
+	let releaseProbe;
+	const hungProbe = new Promise((resolve) => { releaseProbe = resolve; });
+	const worker = createVoiceHttpServer({
+		provider: {
+			async synthesize({ text }) {
+				if (text.startsWith('failure')) throw Object.assign(new Error('temporary TTS failure'), { code: 'TTS_UNAVAILABLE' });
+				return validSynthesis();
+			},
+			probe: ({ signal }) => {
+				probes += 1;
+				signal.addEventListener('abort', () => {}, { once: true });
+				return hungProbe;
+			},
+		},
+		profileStore: new VoiceProfileStore(),
+		secret: SECRET,
+		initialProbeDelayMs: 5,
+		maxProbeDelayMs: 5,
+		probeTimeoutMs: 500,
+		port: 0,
+	});
+	worker.onFailure((error) => {
+		assert.equal(error.code, 'TTS_PROVIDER_STALLED');
+		terminalFailures += 1;
+	});
+	const address = await worker.start();
+	const baseUrl = `http://127.0.0.1:${address.port}`;
+	try {
+		const firstFailure = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'failure-0' }),
+		});
+		assert.equal(firstFailure.status, 502);
+		await eventually(() => probes === 1);
+		const recovered = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'success-0', conversationSequence: 2 }),
+		});
+		assert.equal(recovered.status, 200);
+		assert.equal(worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state, 'ready');
+
+		for (let cycle = 1; cycle <= 110; cycle += 1) {
+			const failed = await fetch(`${baseUrl}/v1/tts`, {
+				method: 'POST', headers: ttsHeaders(),
+				body: JSON.stringify({ ...ttsPayload(), text: `failure-${cycle}`, conversationSequence: cycle * 2 + 1 }),
+			});
+			assert.equal(failed.status, 502);
+			const success = await fetch(`${baseUrl}/v1/tts`, {
+				method: 'POST', headers: ttsHeaders(),
+				body: JSON.stringify({ ...ttsPayload(), text: `success-${cycle}`, conversationSequence: cycle * 2 + 2 }),
+			});
+			assert.equal(success.status, 200);
+		}
+		assert.equal(probes, 1, 'one exact provider generation owns at most one unsettled probe');
+		assert.equal(terminalFailures, 1, 'the stalled generation requests one worker replacement');
+		assert.equal(worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state, 'degraded');
+	} finally {
+		releaseProbe();
+		await worker.close();
+	}
 });
 
 test('persistent profile discovery aborts a stalled production read seam', async () => {
@@ -479,6 +546,124 @@ test('persistent voice assignments survive a store reload', async () => {
 	}
 });
 
+test('a transient profile publish failure does not poison a later flush', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-retry-'));
+	const file = path.join(root, 'assignments.json');
+	let mkdirCalls = 0;
+	try {
+		const persistent = await loadPersistentVoiceProfileStore(file, {
+			mkdir: async (...arguments_) => {
+				mkdirCalls += 1;
+				if (mkdirCalls === 1) throw Object.assign(new Error('directory temporarily locked'), { code: 'EPERM' });
+				return mkdir(...arguments_);
+			},
+		});
+		persistent.store.resolve(agentUuid(1_001));
+		await assert.rejects(persistent.flush(), (error) => error.code === 'EPERM');
+		await persistent.flush();
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.ok(document.assignments[agentUuid(1_001)]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('paired persistent stores use unique writes and preserve 100 rounds of merged assignments', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-paired-'));
+	const file = path.join(root, 'assignments.json');
+	const temporaryPaths = new Set();
+	let collisions = 0;
+	const instrumentedWrite = async (temporary, contents, options) => {
+		if (temporaryPaths.has(temporary)) collisions += 1;
+		temporaryPaths.add(temporary);
+		try { return await writeFile(temporary, contents, options); }
+		finally { temporaryPaths.delete(temporary); }
+	};
+	try {
+		const [oldStore, newStore] = await Promise.all([
+			loadPersistentVoiceProfileStore(file, { writeFile: instrumentedWrite }),
+			loadPersistentVoiceProfileStore(file, { writeFile: instrumentedWrite }),
+		]);
+		for (let round = 0; round < 100; round += 1) {
+			oldStore.store.resolve(agentUuid(2_000 + round));
+			newStore.store.resolve(agentUuid(3_000 + round));
+		}
+		await Promise.all([oldStore.flush(), newStore.flush()]);
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.equal(Object.keys(document.assignments).length, 200);
+		assert.equal(collisions, 0, 'physical writes never share temporary ownership');
+		await Promise.all([oldStore.close(), newStore.close()]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('a timed-out old profile write cannot overwrite its replacement generation', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-fence-'));
+	const file = path.join(root, 'assignments.json');
+	const oldController = new AbortController();
+	let oldWriteEntered;
+	const entered = new Promise((resolve) => { oldWriteEntered = resolve; });
+	let releaseOldWrite;
+	const oldWriteGate = new Promise((resolve) => { releaseOldWrite = resolve; });
+	try {
+		const oldStore = await loadPersistentVoiceProfileStore(file, {
+			signal: oldController.signal,
+			writeFile: async (...arguments_) => {
+				oldWriteEntered();
+				await oldWriteGate;
+				return writeFile(...arguments_);
+			},
+		});
+		oldStore.store.resolve(agentUuid(4_001));
+		await entered;
+		oldController.abort();
+		await Promise.race([
+			assert.rejects(oldStore.flush(), (error) => error.name === 'AbortError'),
+			new Promise((_, reject) => setTimeout(() => reject(new Error('old flush did not observe cancellation')), 100)),
+		]);
+
+		const replacement = await loadPersistentVoiceProfileStore(file);
+		replacement.store.resolve(agentUuid(4_002));
+		await replacement.flush();
+		releaseOldWrite();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.ok(document.assignments[agentUuid(4_001)]);
+		assert.ok(document.assignments[agentUuid(4_002)]);
+		await Promise.all([oldStore.close(), oldStore.close(), replacement.close(), replacement.close()]);
+	} finally {
+		releaseOldWrite?.();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('persistent profile close is bounded and idempotent when storage ignores cancellation', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-close-'));
+	const file = path.join(root, 'assignments.json');
+	let writeEntered;
+	const entered = new Promise((resolve) => { writeEntered = resolve; });
+	try {
+		const persistent = await loadPersistentVoiceProfileStore(file, {
+			closeTimeoutMs: 10,
+			writeFile: () => {
+				writeEntered();
+				return new Promise(() => {});
+			},
+		});
+		persistent.store.resolve(agentUuid(5_001));
+		await entered;
+		const firstClose = persistent.close();
+		assert.equal(persistent.close(), firstClose);
+		await Promise.race([
+			firstClose,
+			new Promise((_, reject) => setTimeout(() => reject(new Error('profile close exceeded its bound')), 100)),
+		]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test('Fish provider rejects odd-length PCM from the remote service', async () => {
 	const provider = new FishTtsProvider({
 		apiKey: 'fish-test-token',
@@ -584,4 +769,8 @@ function sttHeaders(overrides = {}) {
 		'X-Whispering': 'false',
 		...overrides,
 	};
+}
+
+function agentUuid(value) {
+	return `00000000-0000-4000-8000-${value.toString(16).padStart(12, '0')}`;
 }

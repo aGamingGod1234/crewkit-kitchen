@@ -1,5 +1,7 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+
+const PERSISTENT_FILES = new Map();
 
 const VOICE_PROFILES = Object.freeze([
 	profile('moss', 'c5f56a6cc2ec4fa8920cb4c5889a3fb7', ['measured', 'clear', 'calm'], ['bright', 'breathy'], 0.94),
@@ -71,33 +73,116 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 		throw new TypeError('voice profile dependencies must be an object');
 	}
 	const signal = dependencies.signal;
+	const closeTimeoutMs = dependencies.closeTimeoutMs ?? 1_000;
+	if (!Number.isSafeInteger(closeTimeoutMs) || closeTimeoutMs < 1 || closeTimeoutMs > 120_000) {
+		throw new TypeError('closeTimeoutMs must be between 1 and 120000');
+	}
 	const read = dependencies.readFile ?? readFile;
-	if (typeof read !== 'function') throw new TypeError('readFile must be a function');
+	const makeDirectory = dependencies.mkdir ?? mkdir;
+	const write = dependencies.writeFile ?? writeFile;
+	const move = dependencies.rename ?? rename;
+	const remove = dependencies.unlink ?? unlink;
+	for (const [name, operation] of Object.entries({ readFile: read, mkdir: makeDirectory, writeFile: write, rename: move, unlink: remove })) {
+		if (typeof operation !== 'function') throw new TypeError(`${name} must be a function`);
+	}
 	if (signal?.aborted) throw abortReason(signal);
+	const resolvedPath = path.resolve(filePath);
+	const coordinator = persistentCoordinator(resolvedPath);
+	const ownerGeneration = ++coordinator.latestOwnerGeneration;
+	coordinator.version += 1;
+	coordinator.latestIo = { makeDirectory, write, move, remove };
 	let assignments = {};
 	try {
 		const document = JSON.parse(await awaitAbortable(
-			Promise.resolve().then(() => read(filePath, { encoding: 'utf8', signal })),
+			Promise.resolve().then(() => read(resolvedPath, { encoding: 'utf8', signal })),
 			signal,
 		));
 		if (document?.schemaVersion === 1 && document.assignments !== null
 				&& typeof document.assignments === 'object' && !Array.isArray(document.assignments)) {
-			assignments = document.assignments;
+			assignments = validAssignments(document.assignments);
 		}
 	} catch (error) {
 		if (signal?.aborted) throw abortReason(signal);
 		if (error?.code !== 'ENOENT') throw error;
 	}
-	let pending = Promise.resolve();
+	mergeLoadedAssignments(coordinator, assignments);
+	assignments = snapshotPersistentAssignments(coordinator);
+	const ownerController = new AbortController();
+	let desiredRevision = 0;
+	let persistedRevision = 0;
+	let pending = null;
+	let lastError = null;
+	let lastErrorReported = false;
+	let closed = false;
+	let closePromise = null;
 	const store = new VoiceProfileStore(assignments, (snapshot) => {
-		pending = pending.then(async () => {
-			await mkdir(path.dirname(filePath), { recursive: true });
-			const temporary = `${filePath}.tmp`;
-			await writeFile(temporary, `${JSON.stringify({ schemaVersion: 1, assignments: snapshot }, null, 2)}\n`, 'utf8');
-			await rename(temporary, filePath);
-		});
+		if (closed) return;
+		desiredRevision += 1;
+		mergeOwnerSnapshot(coordinator, ownerGeneration, snapshot);
+		startDrain();
 	});
-	return Object.freeze({ store, flush: () => pending });
+	const io = { makeDirectory, write, move, remove };
+	const startDrain = (externalSignal) => {
+		if (pending !== null) return pending;
+		const combinedSignal = combineSignals(ownerController.signal, signal, externalSignal);
+		const operation = (async () => {
+			while (persistedRevision < desiredRevision) {
+				const targetRevision = desiredRevision;
+				await persistCoordinator(coordinator, ownerGeneration, io, combinedSignal);
+				persistedRevision = targetRevision;
+			}
+			lastError = null;
+			lastErrorReported = false;
+		})();
+		pending = operation.catch((error) => {
+			lastError = error;
+			lastErrorReported = false;
+			throw error;
+		}).finally(() => { pending = null; });
+		pending.catch(() => {});
+		return pending;
+	};
+	const flush = ({ signal: flushSignal } = {}) => {
+		if (flushSignal !== undefined && (flushSignal === null || typeof flushSignal.aborted !== 'boolean')) {
+			return Promise.reject(new TypeError('voice profile flush signal must be an AbortSignal'));
+		}
+		if (closePromise !== null) return closePromise;
+		if (pending !== null) {
+			return pending.catch((error) => {
+				lastErrorReported = true;
+				throw error;
+			});
+		}
+		if (lastError !== null && !lastErrorReported) {
+			lastErrorReported = true;
+			return Promise.reject(lastError);
+		}
+		if (persistedRevision >= desiredRevision) return Promise.resolve();
+		return startDrain(flushSignal);
+	};
+	const close = () => {
+		if (closePromise !== null) return closePromise;
+		closed = true;
+		if (pending === null && persistedRevision < desiredRevision) startDrain();
+		const settling = Promise.resolve(pending).catch(() => {});
+		let timer;
+		const deadline = new Promise((resolve) => {
+			timer = setTimeout(() => {
+				ownerController.abort(abortError('Voice profile store close timed out'));
+				resolve();
+			}, closeTimeoutMs);
+		});
+		closePromise = Promise.race([settling, deadline]).finally(() => {
+			clearTimeout(timer);
+			ownerController.abort(abortError('Voice profile store was closed'));
+		}).then(() => undefined);
+		return closePromise;
+	};
+	Object.defineProperties(store, {
+		flush: { value: flush, writable: true },
+		close: { value: close, writable: true },
+	});
+	return Object.freeze({ store, flush, close });
 }
 
 export function builtInVoiceProfiles() {
@@ -134,6 +219,129 @@ function isUuid(value) {
 	return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
+function persistentCoordinator(filePath) {
+	const key = process.platform === 'win32' ? filePath.toLowerCase() : filePath;
+	let coordinator = PERSISTENT_FILES.get(key);
+	if (coordinator !== undefined) return coordinator;
+	coordinator = {
+		filePath,
+		assignments: new Map(),
+		assignmentOwners: new Map(),
+		latestOwnerGeneration: 0,
+		latestIo: null,
+		version: 0,
+		writeSequence: 0,
+		publishTail: Promise.resolve(),
+		repairPromise: null,
+	};
+	PERSISTENT_FILES.set(key, coordinator);
+	return coordinator;
+}
+
+function validAssignments(assignments) {
+	const valid = Object.create(null);
+	for (const [agentId, profileId] of Object.entries(assignments)) {
+		if (!isUuid(agentId) || !VOICE_PROFILES.some((entry) => entry.profileId === profileId)) continue;
+		valid[agentId] = profileId;
+	}
+	return valid;
+}
+
+function mergeLoadedAssignments(coordinator, assignments) {
+	let changed = false;
+	for (const [agentId, profileId] of Object.entries(validAssignments(assignments))) {
+		if (coordinator.assignments.has(agentId)) continue;
+		coordinator.assignments.set(agentId, profileId);
+		coordinator.assignmentOwners.set(agentId, 0);
+		changed = true;
+	}
+	if (changed) coordinator.version += 1;
+}
+
+function mergeOwnerSnapshot(coordinator, ownerGeneration, snapshot) {
+	let changed = false;
+	for (const [agentId, profileId] of Object.entries(validAssignments(snapshot))) {
+		const currentOwner = coordinator.assignmentOwners.get(agentId) ?? -1;
+		if (ownerGeneration < currentOwner) continue;
+		if (coordinator.assignments.get(agentId) !== profileId || currentOwner !== ownerGeneration) changed = true;
+		coordinator.assignments.set(agentId, profileId);
+		coordinator.assignmentOwners.set(agentId, ownerGeneration);
+	}
+	if (changed) coordinator.version += 1;
+}
+
+function snapshotPersistentAssignments(coordinator) {
+	return Object.fromEntries(coordinator.assignments);
+}
+
+async function persistCoordinator(coordinator, ownerGeneration, io, signal) {
+	for (;;) {
+		if (signal?.aborted) throw abortReason(signal);
+		const version = coordinator.version;
+		const assignments = snapshotPersistentAssignments(coordinator);
+		const temporary = `${coordinator.filePath}.tmp-${process.pid}-${ownerGeneration}-${++coordinator.writeSequence}`;
+		const encoded = `${JSON.stringify({ schemaVersion: 1, assignments }, null, 2)}\n`;
+		try {
+			await awaitAbortable(
+				Promise.resolve().then(() => io.makeDirectory(path.dirname(coordinator.filePath), { recursive: true, signal })),
+				signal,
+			);
+			const physicalWrite = Promise.resolve().then(() => io.write(temporary, encoded, { encoding: 'utf8', signal }));
+			physicalWrite.then(() => {}, () => {}).finally(() => {
+				if (signal?.aborted) void removeTemporary(io.remove, temporary);
+			});
+			await awaitAbortable(physicalWrite, signal);
+			const published = await withPublishOwnership(coordinator, async () => {
+				if (signal?.aborted) throw abortReason(signal);
+				if (version !== coordinator.version) return false;
+				const physicalMove = Promise.resolve().then(() => io.move(temporary, coordinator.filePath, { signal }));
+				physicalMove.then(
+					() => {
+						if (version !== coordinator.version || ownerGeneration < coordinator.latestOwnerGeneration) {
+							requestRepair(coordinator);
+						}
+					},
+					() => {},
+				);
+				await awaitAbortable(physicalMove, signal);
+				return version === coordinator.version;
+			});
+			if (published) return;
+		} finally {
+			await removeTemporary(io.remove, temporary);
+		}
+	}
+}
+
+async function withPublishOwnership(coordinator, operation) {
+	const previous = coordinator.publishTail;
+	let release;
+	coordinator.publishTail = new Promise((resolve) => { release = resolve; });
+	await previous;
+	try { return await operation(); }
+	finally { release(); }
+}
+
+function requestRepair(coordinator) {
+	if (coordinator.repairPromise !== null || coordinator.latestIo === null) return;
+	coordinator.repairPromise = persistCoordinator(
+		coordinator,
+		coordinator.latestOwnerGeneration,
+		coordinator.latestIo,
+		undefined,
+	).catch(() => {}).finally(() => { coordinator.repairPromise = null; });
+}
+
+async function removeTemporary(remove, temporary) {
+	try { await remove(temporary); }
+	catch (error) { if (error?.code !== 'ENOENT') return; }
+}
+
+function combineSignals(...signals) {
+	const present = signals.filter((candidate) => candidate !== undefined);
+	return present.length === 1 ? present[0] : AbortSignal.any(present);
+}
+
 function awaitAbortable(value, signal) {
 	if (signal === undefined) return value;
 	if (signal.aborted) return Promise.reject(abortReason(signal));
@@ -157,6 +365,12 @@ function awaitAbortable(value, signal) {
 function abortReason(signal) {
 	if (signal?.reason instanceof Error) return signal.reason;
 	const error = new Error('Voice profile discovery was cancelled');
+	error.name = 'AbortError';
+	return error;
+}
+
+function abortError(message) {
+	const error = new Error(message);
 	error.name = 'AbortError';
 	return error;
 }
