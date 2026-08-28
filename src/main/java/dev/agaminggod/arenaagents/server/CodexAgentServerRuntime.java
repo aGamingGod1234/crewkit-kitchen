@@ -16,9 +16,8 @@ import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import java.util.UUID;
@@ -36,6 +35,7 @@ public final class CodexAgentServerRuntime {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CodexAgentServerRuntime.class);
 	private static final Map<MinecraftServer, BridgeSlot> BRIDGE_SLOTS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, CoordinatorProcessSupervisor> COORDINATORS = new ConcurrentHashMap<>();
+	private static final Map<MinecraftServer, VoiceStartGate> VOICE_STARTS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalSafetyController> GOAL_SAFETY = new ConcurrentHashMap<>();
@@ -114,11 +114,7 @@ public final class CodexAgentServerRuntime {
 				supervisor = previous;
 			}
 		}
-		try {
-			VoiceSubsystemRuntime.start(server);
-		} catch (RuntimeException exception) {
-			LOGGER.warn("Arena Agents voice startup is degraded; coordinator and Minecraft bridge recovery continue", exception);
-		}
+		VOICE_STARTS.computeIfAbsent(server, ignored -> new VoiceStartGate());
 		tryStartBridge(server, manager, supervisor, goalVerifier);
 	}
 
@@ -129,19 +125,12 @@ public final class CodexAgentServerRuntime {
 			GoalVerificationRuntime goalVerifier
 	) {
 		BridgeSlot slot = BRIDGE_SLOTS.computeIfAbsent(server, ignored -> new BridgeSlot(System::currentTimeMillis));
-		Path secretPath = supervisor == null ? null : supervisor.secretPath();
 		String preparedSecret = supervisor == null ? null : supervisor.bridgeSecret();
 		long secretRevision = supervisor == null ? 0L : supervisor.bridgeRevision();
 		String previousFailure = slot.retry().failureCode();
-		slot.reconcile(secretRevision, () -> preparedSecret == null
-				? new MultiplexedServerBridge(
-						manager,
-						secretPath == null ? Paths.get("runtime", "bridge-secret.txt") : secretPath,
-						AgentVerboseState.forServer(server),
-						goalVerifier
-				)
-				: MultiplexedServerBridge.withPreparedSecret(
-						manager, preparedSecret, AgentVerboseState.forServer(server), goalVerifier
+		reconcilePreparedBridge(slot, secretRevision, preparedSecret, secret ->
+				MultiplexedServerBridge.withPreparedSecret(
+						manager, secret, AgentVerboseState.forServer(server), goalVerifier
 				));
 		String currentFailure = slot.retry().failureCode();
 		if (currentFailure != null && !java.util.Objects.equals(previousFailure, currentFailure)) {
@@ -150,13 +139,22 @@ public final class CodexAgentServerRuntime {
 		}
 	}
 
+	static void reconcilePreparedBridge(
+			BridgeSlot slot,
+			long secretRevision,
+			String preparedSecret,
+			Function<String, MultiplexedServerBridge> factory
+	) {
+		java.util.Objects.requireNonNull(slot, "bridge slot must not be null");
+		java.util.Objects.requireNonNull(factory, "bridge factory must not be null");
+		if (preparedSecret == null) return;
+		slot.reconcile(secretRevision, () -> factory.apply(preparedSecret));
+	}
+
 	private static void tick(MinecraftServer server) {
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		GoalVerificationRuntime bridgeGoalVerifier = GOAL_VERIFIERS.get(server);
-		if (bridgeGoalVerifier != null) {
-			tryStartBridge(server, manager, supervisor, bridgeGoalVerifier);
-		}
 		MultiplexedServerBridge bridge = bridge(server);
 		if (supervisor != null) {
 			supervisor.tick(
@@ -164,6 +162,16 @@ public final class CodexAgentServerRuntime {
 					bridge == null ? null : bridge.authenticatedLaunchId(),
 					bridge == null ? 0L : bridge.authenticatedSessionGeneration()
 			);
+			if (bridgeGoalVerifier != null) {
+				tryStartBridge(server, manager, supervisor, bridgeGoalVerifier);
+				bridge = bridge(server);
+			}
+			VoiceStartGate voiceStart = VOICE_STARTS.computeIfAbsent(server, ignored -> new VoiceStartGate());
+			try {
+				voiceStart.startIfPrepared(supervisor, () -> VoiceSubsystemRuntime.start(server));
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Arena Agents voice startup is degraded; coordinator and Minecraft bridge recovery continue", exception);
+			}
 		}
 		if (!ScenarioRuntimeService.restorePersistedState(server)) {
 			VoiceSubsystemRuntime.tick(server);
@@ -345,11 +353,12 @@ public final class CodexAgentServerRuntime {
 		PLANNING_UPDATES.remove(server);
 		GOAL_VERIFIERS.remove(server);
 		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);
+		VoiceStartGate voiceStart = VOICE_STARTS.remove(server);
 		GoalSafetyController safety = GOAL_SAFETY.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		try {
 			if (safety != null) safety.close();
-			VoiceSubsystemRuntime.close(server);
+			if (voiceStart != null) voiceStart.close(() -> VoiceSubsystemRuntime.close(server));
 			VoiceConsentRegistry.clear(server);
 			CodexAgentManager.release(server);
 		} finally {
@@ -357,6 +366,26 @@ public final class CodexAgentServerRuntime {
 			if (bridgeSlot != null) bridgeSlot.close();
 			if (supervisor != null) supervisor.close();
 			AgentVerboseState.release(server);
+		}
+	}
+
+	static final class VoiceStartGate {
+		private boolean started;
+		private boolean closed;
+
+		synchronized void startIfPrepared(CoordinatorProcessSupervisor supervisor, Runnable starter) {
+			java.util.Objects.requireNonNull(supervisor, "coordinator supervisor must not be null");
+			java.util.Objects.requireNonNull(starter, "voice starter must not be null");
+			if (closed || started || !supervisor.voiceConfigurationPublished()) return;
+			started = true;
+			starter.run();
+		}
+
+		synchronized void close(Runnable closer) {
+			java.util.Objects.requireNonNull(closer, "voice closer must not be null");
+			if (closed) return;
+			closed = true;
+			if (started) closer.run();
 		}
 	}
 

@@ -66,6 +66,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private String failingBoundary;
 	private ChildProcess pendingTermination;
 	private long bridgeRevision;
+	private VoiceConfiguration voiceConfiguration;
+	private long voiceConfigurationRevision;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -180,7 +182,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	private sealed interface MaintenanceResult permits DependencyMaintenanceResult,
-			LaunchMaintenanceResult, TerminationMaintenanceResult {
+			DependencyFingerprintChanged, LaunchMaintenanceResult, TerminationMaintenanceResult {
 	}
 
 	private record DependencyMaintenanceResult(
@@ -190,6 +192,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			boolean initial,
 			boolean orphanCleanupSucceeded
 	) implements MaintenanceResult {
+	}
+
+	private record DependencyFingerprintChanged() implements MaintenanceResult {
 	}
 
 	private record LaunchMaintenanceResult(
@@ -203,7 +208,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private record TerminationMaintenanceResult() implements MaintenanceResult {
 	}
 
-	record DependencyResolution(PreparedRuntime runtime, String failureCode, String failureMessage) {
+	record DependencyResolution(
+			PreparedRuntime runtime,
+			String failureCode,
+			String failureMessage,
+			VoiceConfiguration voiceConfiguration
+	) {
+		DependencyResolution(PreparedRuntime runtime, String failureCode, String failureMessage) {
+			this(runtime, failureCode, failureMessage, null);
+		}
+
 		DependencyResolution {
 			if (runtime == null && (failureCode == null || failureCode.isBlank())) {
 				throw new IllegalArgumentException("unavailable coordinator dependencies require a failure code");
@@ -211,9 +225,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		static DependencyResolution ready(PreparedRuntime runtime) {
+			return ready(runtime, null);
+		}
+
+		static DependencyResolution ready(PreparedRuntime runtime, VoiceConfiguration voiceConfiguration) {
 			PreparedRuntime prepared = Objects.requireNonNull(runtime, "runtime must not be null");
 			if (prepared.nodeExecutable() == null) throw new IllegalArgumentException("ready runtime requires Node");
-			return new DependencyResolution(prepared, null, null);
+			return new DependencyResolution(prepared, null, null, voiceConfiguration);
 		}
 
 		static DependencyResolution blocked(String code, String message) {
@@ -221,11 +239,33 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		static DependencyResolution blocked(PreparedRuntime runtime, String code, String message) {
-			return new DependencyResolution(runtime, Objects.requireNonNull(code, "failure code must not be null"), message);
+			return blocked(runtime, code, message, null);
+		}
+
+		static DependencyResolution blocked(
+				PreparedRuntime runtime,
+				String code,
+				String message,
+				VoiceConfiguration voiceConfiguration
+		) {
+			return new DependencyResolution(
+					runtime, Objects.requireNonNull(code, "failure code must not be null"), message, voiceConfiguration
+			);
 		}
 
 		boolean ready() {
 			return runtime != null && runtime.nodeExecutable() != null && failureCode == null;
+		}
+	}
+
+	record VoiceConfiguration(String endpoint, Path secretPath) {
+		VoiceConfiguration {
+			endpoint = Objects.requireNonNull(endpoint, "voice endpoint must not be null").strip();
+			if (endpoint.isEmpty() || endpoint.length() > 2_048) {
+				throw new IllegalArgumentException("voice endpoint must be nonblank and bounded");
+			}
+			secretPath = Objects.requireNonNull(secretPath, "voice secret path must not be null")
+					.toAbsolutePath().normalize();
 		}
 	}
 
@@ -304,6 +344,18 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		return bridgeRevision;
 	}
 
+	synchronized boolean voiceConfigurationPublished() {
+		return voiceConfiguration != null;
+	}
+
+	synchronized long voiceConfigurationRevision() {
+		return voiceConfigurationRevision;
+	}
+
+	void publishDependencyFingerprintChange() {
+		if (!stopped) maintenanceResults.add(new DependencyFingerprintChanged());
+	}
+
 	synchronized void tick(boolean bridgeAuthenticated) {
 		tick(bridgeAuthenticated, bridgeAuthenticated ? launchId : null, bridgeAuthenticated ? 1L : 0L);
 	}
@@ -337,6 +389,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		if (maintenancePending) return;
 
 		if (runtime == null || runtime.nodeExecutable() == null) {
+			if (now < nextDependencyCheckEpochMs) return;
 			submitDependencyMaintenance(now, false, false);
 			drainMaintenanceResults(now);
 			if (maintenancePending || runtime == null || runtime.nodeExecutable() == null) return;
@@ -456,6 +509,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		nextDependencyCheckEpochMs = now + DEPENDENCY_RECHECK_MS;
 		PreparedRuntime previous = runtime;
 		runtime = resolution.runtime();
+		if (runtime != null) configureSharedBridgeSecretPath(runtime.secret());
+		publishVoiceConfiguration(resolution.voiceConfiguration());
 		if (runtime != null && (previous == null
 				|| !previous.secret().equals(runtime.secret())
 				|| !previous.bridgeSecret().equals(runtime.bridgeSecret()))) {
@@ -485,6 +540,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			nextRetryEpochMs = createdAtEpochMs + CoordinatorLaunchPolicy.STARTUP_GRACE_MS;
 		}
 		return true;
+	}
+
+	private void publishVoiceConfiguration(VoiceConfiguration preparedVoice) {
+		if (preparedVoice == null || preparedVoice.equals(voiceConfiguration)) return;
+		System.setProperty("arenaagents.voiceUrl", preparedVoice.endpoint());
+		System.setProperty("arenaagents.voiceSecretFile", preparedVoice.secretPath().toString());
+		voiceConfiguration = preparedVoice;
+		voiceConfigurationRevision++;
 	}
 
 	private void submitDependencyMaintenance(long requestedAt, boolean force, boolean initial) {
@@ -599,6 +662,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private void drainMaintenanceResults(long now) {
 		MaintenanceResult result;
 		while ((result = maintenanceResults.poll()) != null) {
+			if (result instanceof DependencyFingerprintChanged) {
+				nextDependencyCheckEpochMs = 0L;
+				continue;
+			}
 			maintenancePending = false;
 			if (result instanceof DependencyMaintenanceResult dependency) {
 				dependencyFingerprint = dependency.fingerprint();
@@ -804,23 +871,21 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
 	}
 
-	private static void configureSharedVoiceEndpoint(Path configPath, Map<String, String> launchEnvironmentOverrides)
-			throws IOException {
-		String configured = System.getProperty("arenaagents.voiceUrl");
-		if (configured != null && !configured.isBlank()) return;
-		CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
-				.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
-	}
-
-	private static void configureOptionalVoiceEndpoint(
+	static VoiceConfiguration prepareOptionalVoiceConfiguration(
 			Path configPath,
-			Map<String, String> launchEnvironmentOverrides
+			Path secretPath,
+			Map<String, String> launchEnvironmentOverrides,
+			String endpointOverride
 	) {
 		try {
-			configureSharedVoiceEndpoint(configPath, launchEnvironmentOverrides);
+			String endpoint = endpointOverride != null && !endpointOverride.isBlank()
+					? endpointOverride
+					: CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides).orElse(null);
+			return endpoint == null ? null : new VoiceConfiguration(endpoint, secretPath);
 		} catch (IOException | RuntimeException invalidVoiceConfiguration) {
 			LOGGER.warn("Ignoring invalid optional voice endpoint; coordinator recovery will continue without voice",
 					invalidVoiceConfiguration);
+			return null;
 		}
 	}
 
@@ -934,10 +999,15 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final class DefaultDependencyResolver implements DependencyResolver {
 		private final Path gameDirectory;
 		private final Map<String, String> environmentOverrides;
+		private final String voiceEndpointOverride;
 
 		private DefaultDependencyResolver(Path gameDirectory, Map<String, String> environmentOverrides) {
 			this.gameDirectory = gameDirectory;
 			this.environmentOverrides = environmentOverrides;
+			String configuredVoiceEndpoint = System.getProperty("arenaagents.voiceUrl");
+			this.voiceEndpointOverride = configuredVoiceEndpoint == null || configuredVoiceEndpoint.isBlank()
+					? null
+					: configuredVoiceEndpoint;
 		}
 
 		@Override
@@ -986,6 +1056,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		@Override
 		public DependencyResolution resolve() {
 			BundledCoordinatorInstaller.RuntimePackage prepared = null;
+			VoiceConfiguration preparedVoice = null;
 			try {
 				Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
 				IOException installFailure = null;
@@ -1010,20 +1081,24 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				}
 				String secret = Files.readString(prepared.secret(), StandardCharsets.UTF_8).trim();
 				validateConfig(prepared.config());
-				configureSharedBridgeSecretPath(prepared.secret());
-				configureOptionalVoiceEndpoint(prepared.config(), environmentOverrides);
+				preparedVoice = prepareOptionalVoiceConfiguration(
+						prepared.config(), prepared.secret(), environmentOverrides, voiceEndpointOverride
+				);
 				PreparedRuntime partial = prepared(prepared, null, secret);
 				try {
 					NodeRuntimeLocator.LocatedNode node = NodeRuntimeLocator.locate(prepared.root());
-					return DependencyResolution.ready(prepared(prepared, node.executable(), secret));
+					return DependencyResolution.ready(prepared(prepared, node.executable(), secret), preparedVoice);
 				} catch (NodeRuntimeLocator.NodeRuntimeFailure failure) {
-					return DependencyResolution.blocked(partial, failure.code(), failure.getMessage());
+					return DependencyResolution.blocked(
+							partial, failure.code(), failure.getMessage(), preparedVoice
+					);
 				}
 			} catch (IOException failure) {
 				return DependencyResolution.blocked(
 						prepared == null ? null : safePartial(prepared),
 						dependencyFailureCode(failure),
-						failure.getMessage() == null ? "Coordinator startup dependencies are unavailable" : failure.getMessage()
+						failure.getMessage() == null ? "Coordinator startup dependencies are unavailable" : failure.getMessage(),
+						preparedVoice
 				);
 			} catch (RuntimeException failure) {
 				return DependencyResolution.blocked(

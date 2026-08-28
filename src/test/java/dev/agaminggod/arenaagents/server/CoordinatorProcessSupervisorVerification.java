@@ -29,6 +29,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /** Fault-injection verification for coordinator recovery ownership and deadlines. */
 public final class CoordinatorProcessSupervisorVerification {
@@ -54,11 +55,15 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyPeriodicDependencyRevalidation();
 		verifyHealthyDependencyRevalidation();
 		verifyBlockingMaintenanceNeverBlocksTicks();
+		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyOrphanReapRetriesBeforeLaunch();
+		verifyBridgeWaitsForWorkerPreparedSecret();
+		verifyVoiceWaitsForPublishedPreparation();
+		verifyPublishedVoicePropertyDoesNotFreezePreparation();
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyCloseIsIdempotent();
-		return 89;
+		return 114;
 	}
 
 	private static void verifyRecoveryContract() {
@@ -253,6 +258,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		assertEquals(CoordinatorRecoveryState.BLOCKED_RETRYABLE, fixture.supervisor.snapshot().state(),
 				"missing Node is retryable instead of latched");
 		fixture.dependencies.restore("node-restored");
+		fixture.supervisor.publishDependencyFingerprintChange();
 		fixture.supervisor.tick(false, null);
 		assertEquals(1, fixture.launcher.launches.size(), "dependency fingerprint change retries immediately");
 		assertEquals(CoordinatorRecoveryState.AUTHENTICATING, fixture.supervisor.snapshot().state(),
@@ -323,6 +329,36 @@ public final class CoordinatorProcessSupervisorVerification {
 				"ticks do not duplicate maintenance while termination is in flight");
 		launcher.child.releaseTermination.countDown();
 		join(terminator, "child termination completes after release");
+		supervisor.close();
+	}
+
+	private static void verifyBlockedMaintenanceWaitsForRetryDeadline() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.blocked(
+				"NODE_RUNTIME_NOT_FOUND", "Node.js 22+ is unavailable"
+		);
+		FakeLauncher launcher = new FakeLauncher();
+		QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "blocked-maintenance-game"), Map.of(), clock, dependencies, launcher,
+				() -> "00000000-0000-0000-0000-000000000151", worker, runtimeRoot -> 0
+		);
+		assertEquals(1, worker.submissions, "blocked startup schedules one dependency task");
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		for (int index = 0; index < 50; index++) supervisor.tick(false, null, 0L);
+		assertEquals(1, worker.submissions,
+				"persistent blocked dependencies do not resubmit maintenance before their deadline");
+		assertEquals(0, launcher.launches.size(), "blocked dependency churn never spawns a process");
+		clock.advance(4_999L);
+		supervisor.tick(false, null, 0L);
+		assertEquals(1, worker.submissions, "blocked maintenance stays idle one millisecond before retry");
+		clock.advance(1L);
+		supervisor.tick(false, null, 0L);
+		assertEquals(2, worker.submissions, "blocked maintenance submits exactly one task at the retry deadline");
+		for (int index = 0; index < 50; index++) supervisor.tick(false, null, 0L);
+		assertEquals(2, worker.submissions, "ticks coalesce the deadline retry while it remains queued");
+		assertEquals(1, dependencies.resolveCalls, "only the completed blocked attempt resolved dependencies");
 		supervisor.close();
 	}
 
@@ -425,6 +461,144 @@ public final class CoordinatorProcessSupervisorVerification {
 			closeSocket(originalConnection);
 			if (slot != null) slot.close();
 			if (supervisor != null) supervisor.close();
+			if (fixtureRoot != null) deleteTree(fixtureRoot);
+		}
+	}
+
+	private static void verifyBridgeWaitsForWorkerPreparedSecret() {
+		CoordinatorProcessSupervisor supervisor = null;
+		CodexAgentServerRuntime.BridgeSlot slot = null;
+		try {
+			FakeClock clock = new FakeClock();
+			MutableDependencies dependencies = MutableDependencies.ready();
+			QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+			supervisor = new CoordinatorProcessSupervisor(
+					Path.of("build", "deferred-bridge-game"), Map.of(), clock, dependencies, new FakeLauncher(),
+					() -> "00000000-0000-0000-0000-000000000252", worker, runtimeRoot -> 0
+			);
+			slot = new CodexAgentServerRuntime.BridgeSlot(clock);
+			AtomicInteger constructions = new AtomicInteger();
+			AtomicReference<String> suppliedSecret = new AtomicReference<>();
+			CodexAgentManager manager = uninitializedManager();
+			int port = unusedLoopbackPort();
+			long started = System.nanoTime();
+			for (int index = 0; index < 50; index++) {
+				supervisor.tick(false, null, 0L);
+				CodexAgentServerRuntime.reconcilePreparedBridge(
+						slot, supervisor.bridgeRevision(), supervisor.bridgeSecret(), secret -> {
+							constructions.incrementAndGet();
+							suppliedSecret.set(secret);
+							return MultiplexedServerBridge.withPreparedSecret(manager, port, secret);
+						}
+				);
+			}
+			long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+			assertTrue(elapsedMs < 250L, "server ticks stay prompt before a worker-prepared bridge secret exists");
+			assertEquals(0, constructions.get(), "no path-based bridge construction or secret read occurs before preparation");
+			assertEquals(null, slot.bridge(), "Java bridge does not bind before preparation publishes its secret");
+			assertEquals(1, worker.submissions, "preparation remains one coalesced worker task");
+
+			worker.runNext();
+			supervisor.tick(false, null, 0L);
+			CodexAgentServerRuntime.reconcilePreparedBridge(
+					slot, supervisor.bridgeRevision(), supervisor.bridgeSecret(), secret -> {
+						constructions.incrementAndGet();
+						suppliedSecret.set(secret);
+						return MultiplexedServerBridge.withPreparedSecret(manager, port, secret);
+					}
+			);
+			assertEquals(1, constructions.get(), "published in-memory secret enables exactly one Java bridge construction");
+			assertEquals("s".repeat(32), suppliedSecret.get(), "bridge receives only the worker-prevalidated in-memory secret");
+			assertTrue(slot.bridge() != null, "prepared bridge binds after worker result publication");
+		} catch (Exception exception) {
+			throw new AssertionError("deferred prepared bridge verification failed", exception);
+		} finally {
+			if (slot != null) slot.close();
+			if (supervisor != null) supervisor.close();
+		}
+	}
+
+	private static void verifyVoiceWaitsForPublishedPreparation() {
+		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
+		CoordinatorProcessSupervisor supervisor = null;
+		try {
+			System.clearProperty("arenaagents.voiceUrl");
+			System.clearProperty("arenaagents.voiceSecretFile");
+			FakeClock clock = new FakeClock();
+			MutableDependencies dependencies = MutableDependencies.ready();
+			String endpoint = "http://127.0.0.1:18766/v1/tts";
+			Path secretPath = dependencies.runtime.secret();
+			dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(
+					dependencies.runtime,
+					new CoordinatorProcessSupervisor.VoiceConfiguration(endpoint, secretPath)
+			);
+			QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+			supervisor = new CoordinatorProcessSupervisor(
+					Path.of("build", "deferred-voice-game"), Map.of(), clock, dependencies, new FakeLauncher(),
+					() -> "00000000-0000-0000-0000-000000000353", worker, runtimeRoot -> 0
+			);
+			CodexAgentServerRuntime.VoiceStartGate gate = new CodexAgentServerRuntime.VoiceStartGate();
+			AtomicInteger starts = new AtomicInteger();
+			AtomicInteger closes = new AtomicInteger();
+			gate.startIfPrepared(supervisor, starts::incrementAndGet);
+			assertEquals(0, starts.get(), "voice client is not constructed before dependency preparation begins");
+			worker.runNext();
+			gate.startIfPrepared(supervisor, starts::incrementAndGet);
+			assertEquals(0, starts.get(), "completed worker preparation is not visible before supervisor publication");
+			assertEquals(null, System.getProperty("arenaagents.voiceUrl"),
+					"background preparation does not mutate voice endpoint before publication");
+
+			supervisor.tick(false, null, 0L);
+			assertTrue(supervisor.voiceConfigurationPublished(), "supervisor publishes worker-prepared voice configuration");
+			assertEquals(endpoint, System.getProperty("arenaagents.voiceUrl"),
+					"published voice endpoint is installed before client construction");
+			assertEquals(secretPath.toAbsolutePath().normalize().toString(),
+					System.getProperty("arenaagents.voiceSecretFile"),
+					"published voice client uses the prepared bridge secret path");
+			gate.startIfPrepared(supervisor, starts::incrementAndGet);
+			gate.startIfPrepared(supervisor, starts::incrementAndGet);
+			assertEquals(1, starts.get(), "voice subsystem initializes exactly once after prepared configuration publication");
+			gate.close(closes::incrementAndGet);
+			gate.close(closes::incrementAndGet);
+			assertEquals(1, closes.get(), "voice deferred state closes exactly once after initialization");
+
+			CodexAgentServerRuntime.VoiceStartGate closedBeforeStart = new CodexAgentServerRuntime.VoiceStartGate();
+			closedBeforeStart.close(closes::incrementAndGet);
+			closedBeforeStart.startIfPrepared(supervisor, starts::incrementAndGet);
+			assertEquals(1, starts.get(), "closed deferred voice state never initializes later");
+			assertEquals(1, closes.get(), "closing before initialization does not close an unconstructed subsystem");
+		} finally {
+			if (supervisor != null) supervisor.close();
+			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+		}
+	}
+
+	private static void verifyPublishedVoicePropertyDoesNotFreezePreparation() {
+		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
+		Path fixtureRoot = null;
+		try {
+			fixtureRoot = Files.createTempDirectory("arena-deferred-voice-");
+			Path config = fixtureRoot.resolve("dynamic-agents.json");
+			Path secret = fixtureRoot.resolve("bridge-secret.txt");
+			Files.writeString(secret, "s".repeat(32), StandardCharsets.UTF_8);
+			System.setProperty("arenaagents.voiceUrl", "http://127.0.0.1:19999/v1/tts");
+			Files.writeString(config, "{\"voice\":{\"port\":18766}}", StandardCharsets.UTF_8);
+			CoordinatorProcessSupervisor.VoiceConfiguration first =
+					CoordinatorProcessSupervisor.prepareOptionalVoiceConfiguration(config, secret, Map.of(), null);
+			assertEquals("http://127.0.0.1:18766/v1/tts", first.endpoint(),
+					"a previously published voice property is not mistaken for a permanent user override");
+
+			Files.writeString(config, "{\"voice\":{\"port\":18767}}", StandardCharsets.UTF_8);
+			CoordinatorProcessSupervisor.VoiceConfiguration second =
+					CoordinatorProcessSupervisor.prepareOptionalVoiceConfiguration(config, secret, Map.of(), null);
+			assertEquals("http://127.0.0.1:18767/v1/tts", second.endpoint(),
+					"later worker preparation can observe a changed runtime voice endpoint for Task 7 promotion");
+		} catch (IOException exception) {
+			throw new AssertionError("voice preparation refresh verification failed", exception);
+		} finally {
+			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
 			if (fixtureRoot != null) deleteTree(fixtureRoot);
 		}
 	}
@@ -836,5 +1010,9 @@ public final class CoordinatorProcessSupervisorVerification {
 
 	private static void assertFalse(boolean condition, String label) {
 		if (condition) throw new AssertionError(label);
+	}
+
+	private static void assertTrue(boolean condition, String label) {
+		if (!condition) throw new AssertionError(label);
 	}
 }
