@@ -2,15 +2,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdir, readFile } from 'node:fs/promises';
 
-import { AgentWorkspaceManager } from './agent-workspace.mjs';
-import { CodexService } from './codex-service.mjs';
-import { PlanningScheduler } from './planning-scheduler.mjs';
-import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage } from './diagnostic-sanitizer.mjs';
+import { runNativeToolCli } from './native-tool-cli-boundary.mjs';
 
+async function main() {
 const [model = 'gpt-5.6-luna', reasoningEffort = 'low', serviceTier = 'fast', agentCountValue = '16', includeSamplesValue = 'false'] = process.argv.slice(2);
 const agentCount = Number(agentCountValue);
 if (!Number.isSafeInteger(agentCount) || agentCount < 1 || agentCount > 16) throw new TypeError('agentCount must be an integer from 1 to 16');
 const includeSamples = includeSamplesValue === 'true';
+
+const [{ AgentWorkspaceManager }, { CodexService }, { PlanningScheduler }] = await Promise.all([
+	import('./agent-workspace.mjs'),
+	import('./codex-service.mjs'),
+	import('./planning-scheduler.mjs'),
+]);
 
 const runIdentity = `${Date.now()}-${process.pid}`;
 const probeRoot = path.join(os.tmpdir(), 'arena-native-load-probe', runIdentity);
@@ -118,9 +122,6 @@ try {
 		totalMs: Math.round(performance.now() - startedAt),
 		phases: { firstDm, warmDm, moveThenMine, sequenceMoveThenMine },
 	})}\n`);
-} catch (error) {
-	process.stdout.write(`${JSON.stringify({ status: 'FAILED', code: sanitizeDiagnosticErrorCode(error, { fallback: 'ERROR' }), message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 1_024 }) })}\n`);
-	process.exitCode = 1;
 } finally {
 	scheduler.close();
 	await service.stop();
@@ -135,3 +136,6 @@ function summarize(values) {
 function percentile(sorted, fraction) {
 	return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)];
 }
+}
+
+process.exitCode = await runNativeToolCli(main);

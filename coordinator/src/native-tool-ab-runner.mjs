@@ -3,7 +3,9 @@ import { spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
+import { runNativeToolCli } from './native-tool-cli-boundary.mjs';
 
+async function main() {
 const [baselineService, currentService, outputPath, repetitionsText = '10'] = process.argv.slice(2);
 if (!baselineService || !currentService || !outputPath) throw new TypeError('baseline service, current service, and output path are required');
 const repetitions = Number.parseInt(repetitionsText, 10);
@@ -57,10 +59,11 @@ const result = {
 	pairedCurrentMinusBaseline: paired,
 	rows,
 };
-await mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
-await writeFile(path.resolve(outputPath), `${JSON.stringify(result, null, 2)}\n`, 'utf8');
-process.stdout.write(`${JSON.stringify({ status: result.failed === 0 ? 'PASSED' : 'FAILED', outputPath: path.resolve(outputPath), summary, paired })}\n`);
-if (result.failed !== 0) process.exitCode = 1;
+const resolvedOutputPath = path.resolve(outputPath);
+await mkdir(path.dirname(resolvedOutputPath), { recursive: true });
+await writeFile(resolvedOutputPath, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
+process.stdout.write(`${JSON.stringify({ status: result.failed === 0 ? 'PASSED' : 'FAILED', outputPath: publicArtifactName(resolvedOutputPath), summary, paired })}\n`);
+return result.failed === 0 ? 0 : 1;
 
 function runTrial(modulePath, variant, trial) {
 	return new Promise((resolve, reject) => {
@@ -109,3 +112,13 @@ function boundedAppend(current, chunk, limit) {
 	const next = current + chunk.toString('utf8');
 	return next.length <= limit ? next : next.slice(-limit);
 }
+
+function publicArtifactName(outputPath) {
+	const basename = path.basename(outputPath);
+	if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(basename)) return '[REDACTED]';
+	if (/(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)/i.test(basename)) return '[REDACTED]';
+	return basename;
+}
+}
+
+process.exitCode = await runNativeToolCli(main);

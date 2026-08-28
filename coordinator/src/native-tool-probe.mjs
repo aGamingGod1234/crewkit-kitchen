@@ -2,11 +2,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdir } from 'node:fs/promises';
 
-import { CodexService } from './codex-service.mjs';
-import { MinecraftAgentWorkspace } from './minecraft-agent-workspace.mjs';
-import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage } from './diagnostic-sanitizer.mjs';
+import { runNativeToolCli } from './native-tool-cli-boundary.mjs';
 
+async function main() {
 const [model = 'gpt-5.6-luna', reasoningEffort = 'low', serviceTier = 'fast'] = process.argv.slice(2);
+const [{ CodexService }, { MinecraftAgentWorkspace }] = await Promise.all([
+	import('./codex-service.mjs'),
+	import('./minecraft-agent-workspace.mjs'),
+]);
 const startedAt = performance.now();
 const probeRoot = path.join(os.tmpdir(), 'arena-native-probe');
 await mkdir(probeRoot, { recursive: true });
@@ -158,9 +161,9 @@ try {
 		advancedTurn,
 		activeSteer,
 	})}\n`);
-} catch (error) {
-	process.stdout.write(`${JSON.stringify({ status: 'FAILED', code: sanitizeDiagnosticErrorCode(error, { fallback: 'ERROR' }), message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 1_024 }) })}\n`);
-	process.exitCode = 1;
 } finally {
 	await service.stop();
 }
+}
+
+process.exitCode = await runNativeToolCli(main);
