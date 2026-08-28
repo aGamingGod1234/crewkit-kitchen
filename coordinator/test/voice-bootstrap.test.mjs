@@ -121,6 +121,7 @@ test('Windows voice bootstrap falls back to local speech when Fish rejects a sta
 
 	const result = await provider.synthesize({ text: 'Hello.', voiceId: 'ignored', speed: 1 });
 	assert.equal(result.sampleRateHz, 16_000);
+	assert.equal(result.cacheable, false, 'fallback audio cannot populate the Fish profile cache');
 	assert.equal(localCalls, 1);
 	assert.doesNotMatch(JSON.stringify(result), /stale-fish-credential|must-not-reach-output/);
 	await worker.close();
@@ -139,6 +140,24 @@ test('voice bootstrap closes a worker when binding fails', async () => {
 		/bind failed/,
 	);
 	assert.equal(closes, 1);
+});
+
+test('voice bootstrap closes a prepared local provider when later setup fails', async () => {
+	let closes = 0;
+	const local = {
+		async synthesize() { return {}; },
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() { closes += 1; },
+	};
+	await assert.rejects(
+		startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+			platform: 'win32',
+			createLocalSpeechProvider: async () => local,
+			loadProfileStore: async () => { throw new Error('profile setup failed'); },
+		}),
+		/profile setup failed/,
+	);
+	assert.equal(closes, 1, 'partially prepared provider is not leaked between retries');
 });
 
 test('voice bootstrap prefers one local speech runtime for both expressive TTS and STT', async () => {
@@ -168,8 +187,114 @@ test('voice bootstrap prefers one local speech runtime for both expressive TTS a
 
 	assert.equal(captured.options.provider, local);
 	assert.equal(captured.options.sttProvider, local);
+	assert.equal(warmups, 0, 'worker bind does not await optional model warmup');
+	await created.warmup();
 	assert.equal(warmups, 1);
 	await created.close();
 	assert.equal(serverCloses, 1);
 	assert.equal(localCloses, 1);
+});
+
+test('voice bootstrap exposes slow local warmup without delaying the bound worker', async () => {
+	let releaseWarmup;
+	const warmupGate = new Promise((resolve) => { releaseWarmup = resolve; });
+	const local = {
+		async warmup() { await warmupGate; },
+		async synthesize() { return {}; },
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() {},
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+		platform: 'win32',
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createLocalSpeechProvider: async () => local,
+		createVoiceServer: () => ({ async start() {}, async close() {} }),
+	});
+	let settled = false;
+	const warming = worker.warmup().then(() => { settled = true; });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(settled, false);
+	releaseWarmup();
+	await warming;
+	assert.equal(settled, true);
+	await worker.close();
+});
+
+test('voice bootstrap propagates startup cancellation into provider discovery', async () => {
+	const controller = new AbortController();
+	let observedSignal = null;
+	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+		platform: 'win32',
+		signal: controller.signal,
+		createLocalSpeechProvider: async ({ signal }) => {
+			observedSignal = signal;
+			if (signal === undefined) throw new Error('startup signal was not propagated');
+			return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
+				const error = new Error('provider discovery aborted');
+				error.name = 'AbortError';
+				reject(error);
+			}, { once: true }));
+		},
+	});
+	controller.abort();
+	await assert.rejects(starting, (error) => error.name === 'AbortError');
+	assert.equal(observedSignal, controller.signal);
+});
+
+test('voice bootstrap propagates startup cancellation into HTTP binding', async () => {
+	const controller = new AbortController();
+	let observedSignal = null;
+	let markStartEntered;
+	const startEntered = new Promise((resolve) => { markStartEntered = resolve; });
+	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_API_KEY: 'test-key',
+	}, {
+		signal: controller.signal,
+		platform: 'linux',
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => ({ async synthesize() { return {}; } }),
+		createVoiceServer: () => ({
+			start: ({ signal }) => {
+				observedSignal = signal;
+				markStartEntered();
+				return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
+					const error = new Error('bind aborted');
+					error.name = 'AbortError';
+					reject(error);
+				}, { once: true }));
+			},
+			async close() {},
+		}),
+	});
+	await startEntered;
+	controller.abort();
+	await assert.rejects(starting, (error) => error.name === 'AbortError');
+	assert.equal(observedSignal, controller.signal);
+});
+
+test('voice bootstrap keeps supervisor ownership over the production profile read seam', async () => {
+	const controller = new AbortController();
+	const unrelated = new AbortController();
+	let observedSignal = null;
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_API_KEY: 'test-key',
+	}, {
+		signal: controller.signal,
+		platform: 'linux',
+		localSpeechAccess: async () => { throw Object.assign(new Error('not installed'), { code: 'ENOENT' }); },
+		voiceProfileIo: {
+			signal: unrelated.signal,
+			readFile: async (filePath, options) => {
+				observedSignal = options.signal;
+				throw Object.assign(new Error('new store'), { code: 'ENOENT' });
+			},
+		},
+		createTtsProvider: () => ({ async synthesize() { return {}; } }),
+		createVoiceServer: () => ({ async start() {}, async close() {} }),
+	});
+	try {
+		assert.equal(observedSignal, controller.signal);
+	} finally {
+		await worker.close();
+	}
 });

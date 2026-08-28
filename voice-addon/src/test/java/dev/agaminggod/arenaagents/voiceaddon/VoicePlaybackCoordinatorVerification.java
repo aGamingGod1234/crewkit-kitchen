@@ -26,9 +26,11 @@ final class VoicePlaybackCoordinatorVerification {
 		assertions += verifyOutputLatencyReportsFirstPlayback();
 		assertions += verifySuccessfulPlaybackUsesRegisteredEntityAndRadius();
 		assertions += verifyReplacementStopsThePreviousUtterance();
+		assertions += verifyStopFailureCannotBlockReplacement();
 		assertions += verifyStopReplacementAndCloseCancelPendingSynthesis();
 		assertions += verifyFailuresCompleteAndDoNotWedgeLaterSpeech();
 		assertions += verifyUnavailableWorkerReportsSafeDiagnostic();
+		assertions += verifyDiagnosticsReportOnlyStateTransitions();
 		assertions += verifyStartFailureWinsOverSynchronousStopCallback();
 		assertions += verifyUnregisterAndCloseStopPlayback();
 		return assertions;
@@ -115,6 +117,26 @@ final class VoicePlaybackCoordinatorVerification {
 		return 3;
 	}
 
+	private static int verifyStopFailureCannotBlockReplacement() {
+		RecordingSynthesizer synthesizer = new RecordingSynthesizer();
+		RecordingTransport transport = new RecordingTransport();
+		transport.stopFailure = new IllegalStateException("audio player stop failed");
+		VoicePlaybackCoordinator coordinator = new VoicePlaybackCoordinator(synthesizer, Runnable::run, transport);
+		coordinator.registerAgent(AGENT, ENTITY);
+		CompletableFuture<VoiceReceipt> first = coordinator.speak(request(50L)).toCompletableFuture();
+		synthesizer.completeNext(new short[] { 1 });
+		CompletableFuture<VoiceReceipt> replacement = coordinator.speak(request(51L)).toCompletableFuture();
+		assertEquals(VoiceReceipt.Status.FAILED, first.join().status(),
+				"failed playback cleanup still settles the displaced receipt");
+		transport.stopFailure = null;
+		synthesizer.completeNext(new short[] { 2 });
+		transport.created.getLast().playback.finish();
+		assertEquals(VoiceReceipt.Status.PLAYED, replacement.join().status(),
+				"replacement proceeds after failed playback cleanup");
+		coordinator.close();
+		return 2;
+	}
+
 	private static int verifyStopReplacementAndCloseCancelPendingSynthesis() {
 		RecordingSynthesizer synthesizer = new RecordingSynthesizer();
 		RecordingTransport transport = new RecordingTransport();
@@ -156,6 +178,35 @@ final class VoicePlaybackCoordinatorVerification {
 		);
 		coordinator.close();
 		return 1;
+	}
+
+	private static int verifyDiagnosticsReportOnlyStateTransitions() {
+		RecordingSynthesizer synthesizer = new RecordingSynthesizer();
+		RecordingTransport transport = new RecordingTransport();
+		transport.available = false;
+		List<VoicePlaybackCoordinator.DiagnosticTransition> transitions = new ArrayList<>();
+		VoicePlaybackCoordinator coordinator = new VoicePlaybackCoordinator(
+				synthesizer, Runnable::run, transport, ignored -> { }, transitions::add
+		);
+		coordinator.registerAgent(AGENT, ENTITY);
+		coordinator.speak(request(40L)).toCompletableFuture().join();
+		coordinator.speak(request(41L)).toCompletableFuture().join();
+		assertEquals(1, transitions.size(), "repeated identical voice fallback emits one transition");
+		assertEquals("VOICE_TRANSPORT_UNAVAILABLE", transitions.getFirst().code(),
+				"fallback transition exposes only its bounded code");
+
+		transport.available = true;
+		CompletableFuture<VoiceReceipt> recovered = coordinator.speak(request(42L)).toCompletableFuture();
+		synthesizer.completeNext(new short[] { 1 });
+		transport.created.getFirst().playback.finish();
+		assertEquals(VoiceReceipt.Status.PLAYED, recovered.join().status(), "voice recovers after the fallback");
+		assertEquals(true, transitions.getLast().recovered(), "successful playback emits one recovery transition");
+
+		transport.available = false;
+		coordinator.speak(request(43L)).toCompletableFuture().join();
+		assertEquals(3, transitions.size(), "a new fallback after recovery emits one new transition");
+		coordinator.close();
+		return 5;
 	}
 
 	private static int verifyFailuresCompleteAndDoNotWedgeLaterSpeech() {
@@ -253,6 +304,7 @@ final class VoicePlaybackCoordinatorVerification {
 		private boolean available = true;
 		private RuntimeException createFailure;
 		private RuntimeException startFailure;
+		private RuntimeException stopFailure;
 		private boolean stopCompletes;
 
 		@Override
@@ -269,7 +321,7 @@ final class VoicePlaybackCoordinatorVerification {
 				Runnable onStopped
 		) {
 			if (createFailure != null) throw createFailure;
-			RecordingPlayback playback = new RecordingPlayback(onStopped, startFailure, stopCompletes);
+			RecordingPlayback playback = new RecordingPlayback(onStopped, startFailure, stopFailure, stopCompletes);
 			created.add(new CreatedPlayback(agentId, entityId, radius, samples.clone(), playback));
 			return playback;
 		}
@@ -278,13 +330,20 @@ final class VoicePlaybackCoordinatorVerification {
 	private static final class RecordingPlayback implements VoicePlaybackCoordinator.Playback {
 		private final Runnable onStopped;
 		private final RuntimeException startFailure;
+		private final RuntimeException stopFailure;
 		private final boolean stopCompletes;
 		private boolean started;
 		private boolean stopped;
 
-		private RecordingPlayback(Runnable onStopped, RuntimeException startFailure, boolean stopCompletes) {
+		private RecordingPlayback(
+				Runnable onStopped,
+				RuntimeException startFailure,
+				RuntimeException stopFailure,
+				boolean stopCompletes
+		) {
 			this.onStopped = onStopped;
 			this.startFailure = startFailure;
+			this.stopFailure = stopFailure;
 			this.stopCompletes = stopCompletes;
 		}
 
@@ -297,6 +356,7 @@ final class VoicePlaybackCoordinatorVerification {
 		@Override
 		public void stop() {
 			stopped = true;
+			if (stopFailure != null) throw stopFailure;
 			if (stopCompletes) onStopped.run();
 		}
 

@@ -4,9 +4,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
@@ -14,18 +17,26 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 final class SpeechCaptureEngine implements AutoCloseable {
+	private static final long STT_RETRY_BACKOFF_NANOS = TimeUnit.SECONDS.toNanos(5L);
+	private static final long INITIAL_DECODER_RETRY_NANOS = TimeUnit.SECONDS.toNanos(1L);
+	private static final long MAX_DECODER_RETRY_NANOS = TimeUnit.SECONDS.toNanos(30L);
 	private final Transcriber transcriber;
 	private final ScheduledExecutorService scheduler;
 	private final long silenceMilliseconds;
 	private final int maxSamples;
 	private final Consumer<InputLatency> latencyObserver;
+	private final LongSupplier monotonicNanos;
 	private final Map<UUID, Utterance> utterances = new LinkedHashMap<>();
 	private final Map<UUID, Long> sequences = new LinkedHashMap<>();
 	private final Map<UUID, TranscriptQueue> transcriptQueues = new LinkedHashMap<>();
+	private final Set<CompletableFuture<SpeechWorkerClient.Transcript>> transcriptions = new LinkedHashSet<>();
 	private boolean closed;
-	private boolean sttUnavailable;
+	private long sttRetryAfterNanos;
+	private int decoderFailures;
+	private long decoderRetryAfterNanos;
 
 	SpeechCaptureEngine(
 			Transcriber transcriber,
@@ -33,7 +44,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			long silenceMilliseconds,
 			int maxSamples
 	) {
-		this(transcriber, scheduler, silenceMilliseconds, maxSamples, ignored -> { });
+		this(transcriber, scheduler, silenceMilliseconds, maxSamples, ignored -> { }, System::nanoTime);
 	}
 
 	SpeechCaptureEngine(
@@ -43,6 +54,17 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			int maxSamples,
 			Consumer<InputLatency> latencyObserver
 	) {
+		this(transcriber, scheduler, silenceMilliseconds, maxSamples, latencyObserver, System::nanoTime);
+	}
+
+	SpeechCaptureEngine(
+			Transcriber transcriber,
+			ScheduledExecutorService scheduler,
+			long silenceMilliseconds,
+			int maxSamples,
+			Consumer<InputLatency> latencyObserver,
+			LongSupplier monotonicNanos
+	) {
 		this.transcriber = Objects.requireNonNull(transcriber, "transcriber must not be null");
 		this.scheduler = Objects.requireNonNull(scheduler, "scheduler must not be null");
 		if (silenceMilliseconds < 1L) throw new IllegalArgumentException("silenceMilliseconds must be positive");
@@ -50,6 +72,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		this.silenceMilliseconds = silenceMilliseconds;
 		this.maxSamples = maxSamples;
 		this.latencyObserver = Objects.requireNonNull(latencyObserver, "latencyObserver must not be null");
+		this.monotonicNanos = Objects.requireNonNull(monotonicNanos, "monotonicNanos must not be null");
 	}
 
 	void accept(
@@ -67,7 +90,8 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		Objects.requireNonNull(delivery, "delivery must not be null");
 		List<CompletedUtterance> completed = new ArrayList<>(2);
 		synchronized (this) {
-			if (closed || sttUnavailable) return;
+			long now = monotonicNanos.getAsLong();
+			if (closed || now < sttRetryAfterNanos || now < decoderRetryAfterNanos) return;
 			Utterance utterance = utterances.get(playerId);
 			if (utterance != null && utterance.whispering != whispering) {
 				completed.add(finishLocked(playerId, utterance));
@@ -75,6 +99,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			}
 			if (utterance == null) {
 				utterance = new Utterance(
+						playerId,
 						Objects.requireNonNull(decoderFactory.create(), "decoderFactory returned null"),
 						whispering,
 						sequences.merge(playerId, 1L, Long::sum),
@@ -89,15 +114,21 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				decoded = Objects.requireNonNull(utterance.decoder.decode(opus), "decoder returned null");
 			} catch (RuntimeException ignored) {
 				completed.add(discardLocked(playerId, utterance));
+				recordDecoderFailureLocked(now);
 				decoded = null;
 			}
 			if (decoded != null) {
+				decoderFailures = 0;
+				decoderRetryAfterNanos = 0L;
 				utterance.append(decoded);
 				utterance.lastPacketNanos = System.nanoTime();
 				if (utterance.timeout != null) utterance.timeout.cancel(false);
 				Utterance current = utterance;
+				long timeoutEpoch = ++utterance.timeoutEpoch;
 				utterance.timeout = scheduler.schedule(
-						() -> finishIfCurrent(playerId, current), silenceMilliseconds, TimeUnit.MILLISECONDS
+						() -> finishIfCurrent(playerId, current, timeoutEpoch),
+						silenceMilliseconds,
+						TimeUnit.MILLISECONDS
 				);
 				if (utterance.length >= maxSamples) completed.add(finishLocked(playerId, utterance));
 			}
@@ -105,10 +136,17 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		for (CompletedUtterance utterance : completed) transcribe(utterance);
 	}
 
-	private void finishIfCurrent(UUID playerId, Utterance expected) {
+	private void recordDecoderFailureLocked(long now) {
+		decoderFailures = Math.min(decoderFailures + 1, 31);
+		long multiplier = 1L << Math.min(decoderFailures - 1, 5);
+		long delay = Math.min(MAX_DECODER_RETRY_NANOS, INITIAL_DECODER_RETRY_NANOS * multiplier);
+		decoderRetryAfterNanos = now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
+	}
+
+	private void finishIfCurrent(UUID playerId, Utterance expected, long timeoutEpoch) {
 		CompletedUtterance completed;
 		synchronized (this) {
-			if (closed || utterances.get(playerId) != expected) return;
+			if (closed || utterances.get(playerId) != expected || expected.timeoutEpoch != timeoutEpoch) return;
 			completed = finishLocked(playerId, expected);
 		}
 		transcribe(completed);
@@ -116,13 +154,14 @@ final class SpeechCaptureEngine implements AutoCloseable {
 
 	private CompletedUtterance finishLocked(UUID playerId, Utterance utterance) {
 		utterances.remove(playerId, utterance);
+		utterance.timeoutEpoch++;
 		if (utterance.timeout != null) utterance.timeout.cancel(false);
-		utterance.decoder.close();
+		boolean decoderClosed = closeDecoder(utterance.decoder);
 		return new CompletedUtterance(
 				playerId,
 				utterance.sequence,
 				utterance.whispering,
-				Arrays.copyOf(utterance.samples, utterance.length),
+				decoderClosed ? Arrays.copyOf(utterance.samples, utterance.length) : new short[0],
 				utterance.deliveryExecutor,
 				utterance.delivery,
 				utterance.lastPacketNanos,
@@ -132,11 +171,9 @@ final class SpeechCaptureEngine implements AutoCloseable {
 
 	private CompletedUtterance discardLocked(UUID playerId, Utterance utterance) {
 		utterances.remove(playerId, utterance);
+		utterance.timeoutEpoch++;
 		if (utterance.timeout != null) utterance.timeout.cancel(false);
-		try {
-			utterance.decoder.close();
-		} catch (RuntimeException ignored) {
-		}
+		closeDecoder(utterance.decoder);
 		return new CompletedUtterance(
 				playerId,
 				utterance.sequence,
@@ -149,26 +186,45 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		);
 	}
 
+	private static boolean closeDecoder(Decoder decoder) {
+		try {
+			decoder.close();
+			return true;
+		} catch (RuntimeException ignored) {
+			return false;
+		}
+	}
+
 	private void transcribe(CompletedUtterance utterance) {
 		if (utterance.samples.length == 0) {
 			completeTranscription(utterance, null, null);
 			return;
 		}
 		long transcriptionStartedNanos = System.nanoTime();
-		CompletionStage<SpeechWorkerClient.Transcript> stage;
+		CompletableFuture<SpeechWorkerClient.Transcript> transcription;
 		try {
-			stage = Objects.requireNonNull(transcriber.transcribe(
+			transcription = Objects.requireNonNull(Objects.requireNonNull(transcriber.transcribe(
 					utterance.playerId,
 					utterance.sequence,
 					utterance.whispering,
 					utterance.samples
-			), "transcriber returned null");
+			), "transcriber returned null").toCompletableFuture(), "transcriber returned a null future");
 		} catch (RuntimeException failure) {
 			reportLatency(utterance, transcriptionStartedNanos, System.nanoTime());
 			completeTranscription(utterance, null, failure);
 			return;
 		}
-		stage.whenComplete((transcript, failure) -> {
+		synchronized (this) {
+			if (closed) {
+				transcription.cancel(true);
+				return;
+			}
+			transcriptions.add(transcription);
+		}
+		transcription.whenComplete((transcript, failure) -> {
+			synchronized (this) {
+				transcriptions.remove(transcription);
+			}
 			reportLatency(utterance, transcriptionStartedNanos, System.nanoTime());
 			completeTranscription(utterance, transcript, failure);
 		});
@@ -200,18 +256,23 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		synchronized (this) {
 			if (closed) return;
 			if (isSttUnavailable(failure)) {
-				sttUnavailable = true;
+				sttRetryAfterNanos = monotonicNanos.getAsLong() + STT_RETRY_BACKOFF_NANOS;
+				recordSkippedLocked(utterance);
 				for (Utterance active : utterances.values()) {
 					if (active.timeout != null) active.timeout.cancel(false);
 					try {
 						active.decoder.close();
 					} catch (RuntimeException ignored) {
 					}
+					recordSkippedLocked(new CompletedUtterance(
+							active.playerId, active.sequence, active.whispering, new short[0],
+							active.deliveryExecutor, active.delivery, active.lastPacketNanos, monotonicNanos.getAsLong()
+					));
 				}
 				utterances.clear();
-				transcriptQueues.clear();
 				return;
 			}
+			if (failure == null) sttRetryAfterNanos = 0L;
 			TranscriptQueue queue = transcriptQueues.computeIfAbsent(utterance.playerId, ignored -> new TranscriptQueue());
 			queue.completed.put(utterance.sequence, new TranscriptOutcome(utterance, failure == null ? transcript : null));
 			while (true) {
@@ -237,6 +298,12 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		}
 	}
 
+	private void recordSkippedLocked(CompletedUtterance utterance) {
+		TranscriptQueue queue = transcriptQueues.computeIfAbsent(utterance.playerId, ignored -> new TranscriptQueue());
+		queue.completed.put(utterance.sequence, new TranscriptOutcome(utterance, null));
+		while (queue.completed.remove(queue.nextSequence) != null) queue.nextSequence++;
+	}
+
 	private static boolean isSttUnavailable(Throwable failure) {
 		Throwable current = failure;
 		while (current instanceof CompletionException && current.getCause() != null) current = current.getCause();
@@ -249,11 +316,16 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		if (closed) return;
 		closed = true;
 		for (Utterance utterance : utterances.values()) {
+			utterance.timeoutEpoch++;
 			if (utterance.timeout != null) utterance.timeout.cancel(false);
-			utterance.decoder.close();
+			closeDecoder(utterance.decoder);
 		}
 		utterances.clear();
 		transcriptQueues.clear();
+		for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : List.copyOf(transcriptions)) {
+			transcription.cancel(true);
+		}
+		transcriptions.clear();
 		scheduler.shutdownNow();
 	}
 
@@ -284,6 +356,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	}
 
 	private static final class Utterance {
+		private final UUID playerId;
 		private final Decoder decoder;
 		private final boolean whispering;
 		private final long sequence;
@@ -294,8 +367,10 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		private int length;
 		private long lastPacketNanos;
 		private ScheduledFuture<?> timeout;
+		private long timeoutEpoch;
 
 		private Utterance(
+				UUID playerId,
 				Decoder decoder,
 				boolean whispering,
 				long sequence,
@@ -303,6 +378,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				TranscriptDelivery delivery,
 				int maxSamples
 		) {
+			this.playerId = playerId;
 			this.decoder = decoder;
 			this.whispering = whispering;
 			this.sequence = sequence;

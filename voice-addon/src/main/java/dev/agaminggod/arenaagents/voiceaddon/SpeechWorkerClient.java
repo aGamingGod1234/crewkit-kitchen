@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.voiceaddon;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -19,8 +20,8 @@ final class SpeechWorkerClient {
 	private final URI endpoint;
 	private final String secret;
 
-	SpeechWorkerClient() {
-		this(defaultClient(), configuredEndpoint(), VoiceWorkerClient.readSecret());
+	SpeechWorkerClient(VoiceSubsystemConfiguration configuration) {
+		this(defaultClient(), speechEndpoint(configuration.endpoint()), configuration.secret());
 	}
 
 	SpeechWorkerClient(HttpClient client, URI endpoint, String secret) {
@@ -53,8 +54,10 @@ final class SpeechWorkerClient {
 				.header("X-Whispering", Boolean.toString(whispering))
 				.POST(HttpRequest.BodyPublishers.ofByteArray(pcm.array()))
 				.build();
-		return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-				.thenApply(response -> {
+		CompletableFuture<HttpResponse<String>> exchange = client.sendAsync(
+				request, HttpResponse.BodyHandlers.ofString()
+		);
+		CompletableFuture<Transcript> result = exchange.thenApply(response -> {
 					if (response.statusCode() != 200) {
 						throw workerHttpFailure(response);
 					}
@@ -87,6 +90,10 @@ final class SpeechWorkerClient {
 						);
 					}
 				});
+		result.whenComplete((transcript, failure) -> {
+			if (result.isCancelled()) exchange.cancel(true);
+		});
+		return result;
 	}
 
 	private static VoiceWorkerClient.VoiceWorkerException workerHttpFailure(HttpResponse<String> response) {
@@ -113,9 +120,8 @@ final class SpeechWorkerClient {
 		return HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
 	}
 
-	private static URI configuredEndpoint() {
-		String voiceUrl = System.getProperty("arenaagents.voiceUrl", "http://127.0.0.1:8766/v1/tts");
-		return URI.create(System.getProperty("arenaagents.sttUrl", voiceUrl.replace("/v1/tts", "/v1/stt")));
+	private static URI speechEndpoint(String voiceEndpoint) {
+		return URI.create(voiceEndpoint.replace("/v1/tts", "/v1/stt"));
 	}
 
 	record Transcript(String text, double confidence) {

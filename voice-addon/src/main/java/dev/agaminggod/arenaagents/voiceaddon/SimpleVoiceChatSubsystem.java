@@ -19,11 +19,17 @@ import org.slf4j.LoggerFactory;
 final class SimpleVoiceChatSubsystem implements VoiceSubsystem {
 	private static final Logger LOGGER = LoggerFactory.getLogger(SimpleVoiceChatSubsystem.class);
 	private final MinecraftServer server;
+	private final ArenaAgentsVoiceChatPlugin.ConfiguredServer configuredServer;
 	private final VoicePlaybackCoordinator playback;
 
-	SimpleVoiceChatSubsystem(MinecraftServer server, VoiceWorkerClient worker) {
+	SimpleVoiceChatSubsystem(
+			MinecraftServer server,
+			VoiceWorkerClient worker,
+			ArenaAgentsVoiceChatPlugin.ConfiguredServer configuredServer
+	) {
 		this.server = Objects.requireNonNull(server, "server must not be null");
 		Objects.requireNonNull(worker, "worker must not be null");
+		this.configuredServer = Objects.requireNonNull(configuredServer, "configured server must not be null");
 		this.playback = new VoicePlaybackCoordinator(
 				worker::synthesize,
 				server::execute,
@@ -72,13 +78,17 @@ final class SimpleVoiceChatSubsystem implements VoiceSubsystem {
 
 	@Override
 	public void close() {
-		playback.close();
+		try {
+			playback.close();
+		} finally {
+			configuredServer.close();
+		}
 	}
 
 	private final class SimpleVoiceTransport implements VoicePlaybackCoordinator.Transport {
 		@Override
 		public boolean available() {
-			return ArenaAgentsVoiceChatPlugin.serverApi() != null;
+			return configuredServer.active();
 		}
 
 		@Override
@@ -89,8 +99,10 @@ final class SimpleVoiceChatSubsystem implements VoiceSubsystem {
 				short[] samples,
 				Runnable onStopped
 		) {
-			VoicechatServerApi api = ArenaAgentsVoiceChatPlugin.serverApi();
-			if (api == null) throw new VoicePlaybackCoordinator.UnavailableException("Voice channel is unavailable");
+			if (!configuredServer.active()) {
+				throw new VoicePlaybackCoordinator.UnavailableException("Voice channel is unavailable");
+			}
+			VoicechatServerApi api = configuredServer.voicechat();
 			Entity entity = findEntity(entityId);
 			if (entity == null) throw new VoicePlaybackCoordinator.UnavailableException("Agent entity is unavailable");
 			UUID channelId = UUID.nameUUIDFromBytes(

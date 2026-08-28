@@ -9,7 +9,7 @@ import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-final class HumanSpeechCapture implements AutoCloseable {
+final class HumanSpeechCapture implements ServerSpeechCaptureRegistry.Capture {
 	private static final Logger LOGGER = LoggerFactory.getLogger(HumanSpeechCapture.class);
 	private static final int MAX_SAMPLES = 48_000 * 20;
 	private static final long SILENCE_MILLISECONDS = 300L;
@@ -31,7 +31,8 @@ final class HumanSpeechCapture implements AutoCloseable {
 		);
 	}
 
-	void accept(MicrophonePacketEvent event) {
+	@Override
+	public void accept(MicrophonePacketEvent event) {
 		if (event.getSenderConnection() == null) return;
 		Object rawPlayer = event.getSenderConnection().getPlayer().getPlayer();
 		if (!(rawPlayer instanceof ServerPlayer player)) return;

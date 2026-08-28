@@ -23,14 +23,17 @@ import org.slf4j.LoggerFactory;
 
 final class VoicePlaybackCoordinator implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(VoicePlaybackCoordinator.class);
+	private static final int MAX_DIAGNOSTIC_AGENTS = 64;
 	private final Synthesizer synthesizer;
 	private final Executor playbackExecutor;
 	private final Transport transport;
 	private final Consumer<OutputLatency> latencyObserver;
+	private final Consumer<DiagnosticTransition> diagnosticObserver;
 	private final Map<AgentId, UUID> entities = new LinkedHashMap<>();
 	private final Map<AgentId, Playback> players = new LinkedHashMap<>();
 	private final Map<AgentId, CompletableFuture<VoiceReceipt>> pending = new LinkedHashMap<>();
 	private final Map<AgentId, CompletableFuture<short[]>> syntheses = new LinkedHashMap<>();
+	private final Map<AgentId, ActiveDiagnostic> diagnostics = new LinkedHashMap<>();
 	private boolean closed;
 
 	VoicePlaybackCoordinator(Synthesizer synthesizer, Executor playbackExecutor, Transport transport) {
@@ -43,10 +46,22 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 			Transport transport,
 			Consumer<OutputLatency> latencyObserver
 	) {
+		this(synthesizer, playbackExecutor, transport, latencyObserver,
+				VoicePlaybackCoordinator::logDiagnosticTransition);
+	}
+
+	VoicePlaybackCoordinator(
+			Synthesizer synthesizer,
+			Executor playbackExecutor,
+			Transport transport,
+			Consumer<OutputLatency> latencyObserver,
+			Consumer<DiagnosticTransition> diagnosticObserver
+	) {
 		this.synthesizer = Objects.requireNonNull(synthesizer, "synthesizer must not be null");
 		this.playbackExecutor = Objects.requireNonNull(playbackExecutor, "playbackExecutor must not be null");
 		this.transport = Objects.requireNonNull(transport, "transport must not be null");
 		this.latencyObserver = Objects.requireNonNull(latencyObserver, "latencyObserver must not be null");
+		this.diagnosticObserver = Objects.requireNonNull(diagnosticObserver, "diagnosticObserver must not be null");
 	}
 
 	synchronized boolean available() {
@@ -70,6 +85,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		stop(agentId);
 		synchronized (this) {
 			entities.remove(agentId);
+			diagnostics.remove(agentId);
 		}
 	}
 
@@ -159,9 +175,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		try {
 			playback = Objects.requireNonNull(transport.create(
 					request.agentId(), entityId, request.radius(), samples,
-					() -> complete(request.agentId(), result, new VoiceReceipt(
-							VoiceReceipt.Status.PLAYED, "Speech playback finished"
-					))
+					() -> completePlayed(request.agentId(), result)
 			), "transport returned null playback");
 		} catch (UnavailableException exception) {
 			completeDegraded(request, result, Boundary.PLAYBACK, new Diagnostic(
@@ -199,6 +213,19 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		}
 		expected.complete(receipt);
 		return true;
+	}
+
+	private void completePlayed(AgentId agentId, CompletableFuture<VoiceReceipt> expected) {
+		if (!complete(agentId, expected, new VoiceReceipt(
+				VoiceReceipt.Status.PLAYED, "Speech playback finished"
+		))) return;
+		ActiveDiagnostic recovered;
+		synchronized (this) {
+			recovered = diagnostics.remove(agentId);
+		}
+		if (recovered != null) publishDiagnostic(new DiagnosticTransition(
+				agentId, recovered.diagnostic().code(), recovered.boundary().label, true
+		));
 	}
 
 	private VoiceReceipt availabilityFailure(VoiceRequest request) {
@@ -245,11 +272,38 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		if (complete(request.agentId(), expected, receipt)) reportFallback(request, boundary, diagnostic);
 	}
 
-	private static void reportFallback(VoiceRequest request, Boundary boundary, Diagnostic diagnostic) {
-		LOGGER.warn(
-				"Proximity voice fallback [{}] at {} boundary for agent {} sequence {}: {}",
-				diagnostic.code(), boundary.label, request.agentId(), request.conversationSequence(), diagnostic.reason()
-		);
+	private void reportFallback(VoiceRequest request, Boundary boundary, Diagnostic diagnostic) {
+		recordDiagnostic(request.agentId(), boundary, diagnostic);
+	}
+
+	private void recordDiagnostic(AgentId agentId, Boundary boundary, Diagnostic diagnostic) {
+		ActiveDiagnostic transition = new ActiveDiagnostic(boundary, diagnostic);
+		synchronized (this) {
+			if (transition.equals(diagnostics.get(agentId))) return;
+			if (!diagnostics.containsKey(agentId) && diagnostics.size() >= MAX_DIAGNOSTIC_AGENTS) {
+				diagnostics.remove(diagnostics.keySet().iterator().next());
+			}
+			diagnostics.put(agentId, transition);
+		}
+		publishDiagnostic(new DiagnosticTransition(agentId, diagnostic.code(), boundary.label, false));
+	}
+
+	private void publishDiagnostic(DiagnosticTransition transition) {
+		try {
+			diagnosticObserver.accept(transition);
+		} catch (RuntimeException ignored) {
+			// Diagnostics are observational and cannot reject voice or control work.
+		}
+	}
+
+	private static void logDiagnosticTransition(DiagnosticTransition transition) {
+		if (transition.recovered()) {
+			LOGGER.info("Proximity voice recovered from [{}] at {} boundary for agent {}",
+					transition.code(), transition.boundary(), transition.agentId());
+		} else {
+			LOGGER.warn("Proximity voice entered text fallback [{}] at {} boundary for agent {}",
+					transition.code(), transition.boundary(), transition.agentId());
+		}
 	}
 
 	void stop(AgentId agentId) {
@@ -263,7 +317,15 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		}
 		if (future != null) future.complete(new VoiceReceipt(VoiceReceipt.Status.FAILED, "Speech stopped"));
 		if (synthesis != null) synthesis.cancel(true);
-		if (player != null) player.stop();
+		if (player != null) {
+			try {
+				player.stop();
+			} catch (RuntimeException exception) {
+				recordDiagnostic(agentId, Boundary.PLAYBACK, new Diagnostic(
+						"VOICE_PLAYBACK_CLEANUP_FAILED", "Voice playback cleanup failed"
+				));
+			}
+		}
 	}
 
 	@Override
@@ -278,6 +340,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 		for (AgentId agentId : active) stop(agentId);
 		synchronized (this) {
 			entities.clear();
+			diagnostics.clear();
 		}
 	}
 
@@ -360,6 +423,20 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 
 		private String message() {
 			return "[" + code + "] " + reason;
+		}
+	}
+
+	private record ActiveDiagnostic(Boundary boundary, Diagnostic diagnostic) {
+	}
+
+	record DiagnosticTransition(AgentId agentId, String code, String boundary, boolean recovered) {
+		DiagnosticTransition {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(code, "code must not be null");
+			Objects.requireNonNull(boundary, "boundary must not be null");
+			if (code.length() > 64 || boundary.length() > 32) {
+				throw new IllegalArgumentException("diagnostic transition fields are not bounded");
+			}
 		}
 	}
 

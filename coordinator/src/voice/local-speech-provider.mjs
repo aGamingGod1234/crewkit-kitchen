@@ -15,6 +15,8 @@ export class LocalSpeechProvider {
 	#pending = new Map();
 	#nextId = 1;
 	#closed = false;
+	#generation = 0;
+	#closePromise = null;
 
 	constructor({ executable, scriptPath, timeoutMs = 120_000 } = {}) {
 		if (typeof executable !== 'string' || executable.trim() === '') throw new TypeError('local speech executable must not be blank');
@@ -26,9 +28,16 @@ export class LocalSpeechProvider {
 	}
 
 	static async createIfAvailable(options = {}) {
+		const signal = options.signal;
+		const accessFile = options.accessFile ?? defaultAccess;
+		if (typeof accessFile !== 'function') throw new TypeError('accessFile must be a function');
+		if (signal?.aborted) throw abortReason(signal);
 		try {
-			await Promise.all([access(options.executable), access(options.scriptPath)]);
+			await awaitAbortable(Promise.all(
+				[options.executable, options.scriptPath].map((filePath) => Promise.resolve().then(() => accessFile(filePath, signal))),
+			), signal);
 		} catch (error) {
+			if (signal?.aborted) throw abortReason(signal);
 			if (error?.code === 'ENOENT') return null;
 			throw error;
 		}
@@ -67,23 +76,24 @@ export class LocalSpeechProvider {
 		});
 	}
 
-	async close() {
-		if (this.#closed) return;
+	close() {
+		if (this.#closePromise !== null) return this.#closePromise;
 		this.#closed = true;
 		const child = this.#child;
 		this.#failProcess(typedError('LOCAL_SPEECH_CLOSED', 'Local speech provider is closed'));
-		if (child === null || child.exitCode !== null) return;
-		await new Promise((resolve) => {
+		this.#closePromise = child === null || child.exitCode !== null ? Promise.resolve() : new Promise((resolve) => {
 			const timer = setTimeout(resolve, 1_000);
 			timer.unref?.();
 			child.once('close', () => { clearTimeout(timer); resolve(); });
 		});
+		return this.#closePromise;
 	}
 
 	#request(payload, signal) {
 		if (this.#closed) return Promise.reject(typedError('LOCAL_SPEECH_CLOSED', 'Local speech provider is closed'));
 		if (signal?.aborted) return Promise.reject(abortError());
 		const child = this.#ensureProcess();
+		const generation = this.#generation;
 		const id = this.#nextId++;
 		return new Promise((resolve, reject) => {
 			const finish = (operation) => {
@@ -94,21 +104,25 @@ export class LocalSpeechProvider {
 				signal?.removeEventListener('abort', pending.onAbort);
 				operation();
 			};
-			const onAbort = () => finish(() => reject(abortError()));
+			const onAbort = () => {
+				const error = abortError();
+				finish(() => reject(error));
+				this.#failProcess(error, child, generation);
+			};
 			const timer = setTimeout(() => {
 				const error = timeoutError();
 				finish(() => reject(error));
-				this.#failProcess(error);
+				this.#failProcess(error, child, generation);
 			}, this.#timeoutMs);
 			timer.unref?.();
-			this.#pending.set(id, { resolve, reject, timer, onAbort, signal });
+			this.#pending.set(id, { resolve, reject, timer, onAbort, signal, generation });
 			signal?.addEventListener('abort', onAbort, { once: true });
 			try {
 				child.stdin.write(`${JSON.stringify({ id, ...payload })}\n`, (error) => {
-					if (error) this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'));
+					if (error) this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'), child, generation);
 				});
 			} catch {
-				this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'));
+				this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'), child, generation);
 			}
 		});
 	}
@@ -121,18 +135,21 @@ export class LocalSpeechProvider {
 			env: { ...process.env, PYTHONUNBUFFERED: '1' },
 		});
 		this.#child = child;
+		this.#generation += 1;
+		const generation = this.#generation;
 		const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-		lines.on('line', (line) => this.#acceptResponse(line));
+		lines.on('line', (line) => this.#acceptResponse(line, child, generation));
 		child.stderr.resume();
-		child.once('error', () => this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker could not start'), child));
+		child.once('error', () => this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker could not start'), child, generation));
 		child.once('close', (code) => this.#failProcess(typedError(
 			'LOCAL_SPEECH_UNAVAILABLE',
 			code === 0 ? 'Local speech worker stopped' : `Local speech worker exited with code ${String(code)}`,
-		), child));
+		), child, generation));
 		return child;
 	}
 
-	#acceptResponse(line) {
+	#acceptResponse(line, child, generation) {
+		if (child !== this.#child || generation !== this.#generation) return;
 		if (line.length > MAX_RESPONSE_LINE_CHARS) {
 			this.#failProcess(typedError('LOCAL_SPEECH_PROTOCOL_ERROR', 'Local speech worker response exceeded its size limit'));
 			return;
@@ -148,7 +165,7 @@ export class LocalSpeechProvider {
 			return;
 		}
 		const pending = this.#pending.get(response.id);
-		if (pending === undefined) return;
+		if (pending === undefined || pending.generation !== generation) return;
 		this.#pending.delete(response.id);
 		clearTimeout(pending.timer);
 		pending.onAbort && pending.signal?.removeEventListener?.('abort', pending.onAbort);
@@ -159,8 +176,8 @@ export class LocalSpeechProvider {
 		pending.reject(typedError(workerErrorCode(response.code), workerErrorMessage(response.message)));
 	}
 
-	#failProcess(error, expectedChild = this.#child) {
-		if (expectedChild !== this.#child) return;
+	#failProcess(error, expectedChild = this.#child, expectedGeneration = this.#generation) {
+		if (expectedChild !== this.#child || expectedGeneration !== this.#generation) return;
 		const child = this.#child;
 		this.#child = null;
 		if (child !== null && child.exitCode === null && !child.killed) child.kill();
@@ -190,6 +207,35 @@ function abortError() {
 	const error = new Error('Local speech request was cancelled');
 	error.name = 'AbortError';
 	return error;
+}
+
+function abortReason(signal) {
+	if (signal?.reason instanceof Error) return signal.reason;
+	return abortError();
+}
+
+function awaitAbortable(value, signal) {
+	if (signal === undefined) return value;
+	if (signal.aborted) return Promise.reject(abortReason(signal));
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (operation, result) => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener('abort', onAbort);
+			operation(result);
+		};
+		const onAbort = () => finish(reject, abortReason(signal));
+		signal.addEventListener('abort', onAbort, { once: true });
+		Promise.resolve(value).then(
+			(result) => signal.aborted ? onAbort() : finish(resolve, result),
+			(error) => finish(reject, error),
+		);
+	});
+}
+
+function defaultAccess(filePath) {
+	return access(filePath);
 }
 
 function timeoutError() {

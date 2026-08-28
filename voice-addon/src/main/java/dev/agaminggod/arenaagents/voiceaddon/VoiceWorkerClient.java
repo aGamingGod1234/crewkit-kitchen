@@ -2,7 +2,7 @@ package dev.agaminggod.arenaagents.voiceaddon;
 
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.server.voice.VoiceRequest;
-import java.io.IOException;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -10,8 +10,6 @@ import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Set;
@@ -32,11 +30,11 @@ final class VoiceWorkerClient {
 	private final URI endpoint;
 	private final String secret;
 
-	VoiceWorkerClient() {
+	VoiceWorkerClient(VoiceSubsystemConfiguration configuration) {
 		this(
 				HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build(),
-				URI.create(System.getProperty("arenaagents.voiceUrl", "http://127.0.0.1:8766/v1/tts")),
-				readSecret()
+				URI.create(configuration.endpoint()),
+				configuration.secret()
 		);
 	}
 
@@ -108,20 +106,6 @@ final class VoiceWorkerClient {
 			}
 		}
 		return new VoiceWorkerException(code, "Voice worker returned HTTP " + response.statusCode());
-	}
-
-	static String readSecret() {
-		String configured = System.getProperty(
-				"arenaagents.voiceSecretFile",
-				System.getProperty("arenaagents.bridgeSecretFile", "runtime/bridge-secret.txt")
-		);
-		try {
-			String value = Files.readString(Path.of(configured), StandardCharsets.UTF_8).trim();
-			if (value.length() < 16) throw new IOException("secret is too short");
-			return value;
-		} catch (IOException exception) {
-			throw new VoiceWorkerException("VOICE_SECRET_UNAVAILABLE", "Voice worker secret is unavailable", exception);
-		}
 	}
 
 	static final class VoiceWorkerException extends RuntimeException {

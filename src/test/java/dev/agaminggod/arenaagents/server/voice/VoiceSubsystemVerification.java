@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.voice;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.server.CodexAgentServerRuntime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -17,24 +18,29 @@ public final class VoiceSubsystemVerification {
 		int assertions = 0;
 		UUID humanPlayer = UUID.randomUUID();
 		VoiceConsentRegistry.clear(null);
-		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("Human proximity hearing must start enabled every session");
-		}
-		assertions++;
-		VoiceConsentRegistry.revoke(null, humanPlayer);
 		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("A player must still be able to disable hearing for the current session");
+			throw new AssertionError("Human proximity transcription must default to disabled");
 		}
 		assertions++;
 		VoiceConsentRegistry.grant(null, humanPlayer);
 		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("A player must be able to re-enable hearing");
+			throw new AssertionError("Consent must survive a reconnect until explicitly revoked");
 		}
 		assertions++;
 		VoiceConsentRegistry.revoke(null, humanPlayer);
+		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
+			throw new AssertionError("A player must be able to revoke consent");
+		}
+		assertions++;
+		if (!CodexAgentServerRuntime.deliverHumanSpeech(null, humanPlayer, "must stay private", false)
+				.deliveredIds().isEmpty()) {
+			throw new AssertionError("Revoked consent must fence buffered or in-flight speech delivery");
+		}
+		assertions++;
+		VoiceConsentRegistry.grant(null, humanPlayer);
 		VoiceConsentRegistry.clear(null);
-		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("A new session must reset hearing to enabled");
+		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
+			throw new AssertionError("A server shutdown must clear prior consent");
 		}
 		assertions++;
 		AgentId first = AgentId.parse("00000000-0000-0000-0000-000000000001");
@@ -74,7 +80,7 @@ public final class VoiceSubsystemVerification {
 		if (!subsystem.unregistered.equals(List.of(second, first, first))) {
 			throw new AssertionError("Shutdown must unregister the remaining channel");
 		}
-		return assertions + 1;
+		return assertions + 1 + VoiceSubsystemRuntimeVerification.verify();
 	}
 
 	private static final class RecordingSubsystem implements VoiceSubsystem {
