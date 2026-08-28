@@ -91,12 +91,19 @@ export class AcpProviderService {
 		return true;
 	}
 
-	async reconcile(records) {
+	async reconcile(records, { signal } = {}) {
 		if (!Array.isArray(records)) throw new TypeError(`${this.#config.provider} reconciliation records must be an array`);
+		assertReconciliationActive(signal, this.#config.provider);
 		await this.catalog.refresh();
+		assertReconciliationActive(signal, this.#config.provider);
 		const desiredIds = new Set(records.map((record) => record.agentId));
 		const removed = [];
-		for (const agentId of this.#agents.keys()) if (!desiredIds.has(agentId)) { await this.removeAgent(agentId); removed.push(agentId); }
+		for (const agentId of this.#agents.keys()) if (!desiredIds.has(agentId)) {
+			assertReconciliationActive(signal, this.#config.provider);
+			await this.removeAgent(agentId);
+			assertReconciliationActive(signal, this.#config.provider);
+			removed.push(agentId);
+		}
 		const valid = [];
 		const invalid = [];
 		for (const record of records) {
@@ -112,6 +119,10 @@ export class AcpProviderService {
 		this.#agents.clear();
 		await Promise.allSettled(agents.map((agent) => agent.dispose()));
 	}
+}
+
+function assertReconciliationActive(signal, provider) {
+	if (signal?.aborted) throw new AcpProtocolError('STALE_RECONCILIATION', `${provider} reconciliation was superseded`);
 }
 
 class AcpAgent {

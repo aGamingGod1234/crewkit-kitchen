@@ -92,12 +92,15 @@ export class CursorProviderService {
 		return true;
 	}
 
-	async reconcile(records) {
+	async reconcile(records, { signal } = {}) {
 		if (!Array.isArray(records)) throw new TypeError('cursor reconciliation records must be an array');
+		assertReconciliationActive(signal);
 		await this.catalog.refresh();
+		assertReconciliationActive(signal);
 		const desiredIds = new Set(records.map((record) => record.agentId));
 		const removed = [];
 		for (const agentId of this.#agents.keys()) {
+			assertReconciliationActive(signal);
 			if (!desiredIds.has(agentId)) { await this.removeAgent(agentId); removed.push(agentId); }
 		}
 		const valid = [];
@@ -116,6 +119,10 @@ export class CursorProviderService {
 		this.#agents.clear();
 		await Promise.allSettled(agents.map((agent) => agent.dispose()));
 	}
+}
+
+function assertReconciliationActive(signal) {
+	if (signal?.aborted) throw new AcpProtocolError('STALE_RECONCILIATION', 'Cursor reconciliation was superseded');
 }
 
 class CursorAgent {

@@ -162,17 +162,21 @@ export class CodexService {
 		return true;
 	}
 
-	async reconcile(records) {
+	async reconcile(records, { signal } = {}) {
 		if (!Array.isArray(records)) throw new TypeError('Codex reconciliation records must be an array');
+		assertReconciliationActive(signal);
 		const desiredIds = new Set(records.map((record) => record.agentId));
 		const removed = [];
 		for (const agentId of this.#agents.keys()) {
+			assertReconciliationActive(signal);
 			if (!desiredIds.has(agentId)) {
 				await this.removeAgent(agentId);
+				assertReconciliationActive(signal);
 				removed.push(agentId);
 			}
 		}
 		const catalog = await this.#catalog.refresh();
+		assertReconciliationActive(signal);
 		const profiles = this.#catalog.reconcileProfiles(records);
 		return { ...profiles, removed, catalog };
 	}
@@ -868,6 +872,10 @@ function exactLaunchProfileCatalog(profile) {
 		supportedReasoningEfforts: [profile.reasoningEffort],
 		serviceTiers: [profile.serviceTier],
 	}];
+}
+
+function assertReconciliationActive(signal) {
+	if (signal?.aborted) throw new CodexProtocolError('STALE_RECONCILIATION', 'Codex reconciliation was superseded');
 }
 
 function goalSpecInstructions() {

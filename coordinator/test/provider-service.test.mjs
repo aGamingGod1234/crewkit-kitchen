@@ -212,6 +212,69 @@ test('concurrent creation coalesces one lazy startup for the selected provider',
 	}
 });
 
+test('a timed-out provider start is evicted so a later probe starts a fresh generation', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const releases = [];
+	let startCalls = 0;
+	services.codex.start = () => new Promise((resolve) => {
+		startCalls += 1;
+		releases.push(resolve);
+	});
+	const router = new ProviderService(services, { operationTimeoutMs: 5 });
+	try {
+		const first = await router.start(['codex']);
+		assert.equal(first[0].status, 'rejected');
+		const secondAttempt = router.start(['codex']);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(startCalls, 2, 'the timed-out startup promise is not cached forever');
+
+		releases[0]();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal((await Promise.race([
+			secondAttempt.then(() => 'settled'),
+			new Promise((resolve) => setTimeout(() => resolve('pending'), 1)),
+		])), 'pending', 'a late obsolete start cannot resurrect or satisfy the replacement generation');
+
+		releases[1]();
+		const second = await secondAttempt;
+		assert.equal(second[0].status, 'fulfilled');
+	} finally {
+		for (const release of releases) release();
+		await router.stop();
+	}
+});
+
+test('stop fences a start-delayed creation before the backend can create or assign it', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let releaseStart;
+	services.codex.start = () => new Promise((resolve) => { releaseStart = resolve; });
+	services.codex.stop = async () => {
+		services.codex.stopped = true;
+		releaseStart();
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 20 });
+	const creating = router.createAgent(profile('codex', { agentId: 'late-create' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	await router.stop();
+	await assert.rejects(creating, (error) => error?.code === 'PROVIDER_STOPPED');
+	assert.equal(services.codex.created.length, 0, 'the continuation after the released start is fenced');
+	assert.equal(router.getAgent('late-create'), null);
+});
+
+test('an explicit empty-roster bootstrap initializes no provider', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	const started = [];
+	for (const [provider, service] of Object.entries(services)) service.start = async () => { started.push(provider); };
+	const router = new ProviderService(services);
+	try {
+		const snapshot = await router.bootstrapCatalog([]);
+		assert.deepEqual(started, []);
+		assert.deepEqual(snapshot.models, []);
+	} finally {
+		await router.stop();
+	}
+});
+
 test('a hung provider is bounded while healthy provider reconciliation remains usable', async () => {
 	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
 	let releaseCodex;
@@ -272,5 +335,78 @@ test('provider catalog aggregation settles failures and promotes a restored prov
 	]);
 	assert.equal(retained.source, 'last_valid');
 	assert.equal(retained.recovery.find(({ provider }) => provider === 'codex').state, 'degraded');
+	await router.stop();
+});
+
+test('builtin catalog discovery remains degraded with a bounded retry deadline', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	services.codex.catalog.stale = true;
+	services.codex.catalog.refresh = async () => ({
+		refreshedAtEpochMs: 0,
+		models: [{ id: 'codex-model', model: 'codex-model', displayName: 'Codex', reasoningEfforts: ['high'], serviceTiers: ['priority'] }],
+		source: 'builtin',
+		recovery: { state: 'degraded', failureCode: 'REQUEST_TIMEOUT', consecutiveFailureCount: 1 },
+	});
+	const router = new ProviderService(services, { now: () => 10_000 });
+	try {
+		const snapshot = await router.catalog.refresh({ providers: ['codex'] });
+		assert.equal(snapshot.source, 'builtin');
+		const recovery = snapshot.recovery.find(({ provider }) => provider === 'codex');
+		assert.equal(recovery.state, 'degraded');
+		assert.equal(recovery.fallbackMode, 'builtin');
+		assert.equal(recovery.failureCode, 'REQUEST_TIMEOUT');
+		assert.equal(recovery.nextProbeAtEpochMs, 11_000);
+	} finally {
+		await router.stop();
+	}
+});
+
+test('an empty live catalog is degraded and cannot replace the retained valid catalog', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let empty = false;
+	services.codex.catalog.refresh = async () => ({
+		refreshedAtEpochMs: empty ? 2 : 1,
+		models: empty ? [] : [{ id: 'codex-model', model: 'codex-model', displayName: 'Codex', reasoningEfforts: ['high'], serviceTiers: ['priority'] }],
+		source: 'live',
+	});
+	const router = new ProviderService(services);
+	try {
+		await router.catalog.refresh({ providers: ['codex'] });
+		empty = true;
+		const retained = await router.catalog.refresh({ providers: ['codex'], force: true });
+		assert.equal(retained.source, 'last_valid');
+		assert.deepEqual(retained.models.map(({ id }) => id), ['codex-model']);
+		assert.equal(retained.recovery.find(({ provider }) => provider === 'codex').state, 'degraded');
+	} finally {
+		await router.stop();
+	}
+});
+
+test('a stale reconciliation cannot remove or overwrite sessions installed by its replacement', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let calls = 0;
+	let releaseFirst;
+	services.codex.reconcile = async (records, options = {}) => {
+		calls += 1;
+		if (calls === 1) await new Promise((resolve) => { releaseFirst = resolve; });
+		if (options.signal?.aborted) throw Object.assign(new Error('stale reconciliation'), { code: 'STALE_RECONCILIATION' });
+		const desired = new Set(records.map(({ agentId }) => agentId));
+		for (const created of [...services.codex.created]) {
+			if (!desired.has(created.agentId)) await services.codex.removeAgent(created.agentId);
+		}
+		return { valid: records, invalid: [], removed: [], catalog: { models: [] }, aborted: options.signal?.aborted === true };
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 100 });
+	const oldProfile = profile('codex', { agentId: 'old-agent' });
+	const newProfile = profile('codex', { agentId: 'new-agent' });
+	const stale = router.reconcile([oldProfile]);
+	await new Promise((resolve) => setImmediate(resolve));
+	const replacement = await router.reconcile([newProfile]);
+	assert.deepEqual(replacement.valid.map(({ agentId }) => agentId), ['new-agent']);
+	await router.createAgent(newProfile);
+	assert.notEqual(router.getAgent('new-agent'), null);
+	releaseFirst();
+	await assert.rejects(stale, (error) => error?.code === 'STALE_RECONCILIATION');
+	assert.notEqual(router.getAgent('new-agent'), null, 'the obsolete backend pass cannot delete the replacement session');
 	await router.stop();
 });

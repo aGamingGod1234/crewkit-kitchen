@@ -10,6 +10,7 @@ import { AgentPlanner } from '../src/agent-planner.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { createDynamicCoordinator, normalizeDynamicConfig } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
+import { ProviderService } from '../src/provider-service.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { completionContract, withCompletionContract } from './fixtures/completion-contract.mjs';
@@ -134,6 +135,34 @@ test('coordinator binds the Minecraft bridge without eagerly starting a provider
 	} finally {
 		releaseProvider?.();
 		await Promise.allSettled([starting]);
+		await coordinator.stop();
+	}
+});
+
+test('an empty ready roster does not initialize providers through bootstrap catalog discovery', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const starts = [];
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, {
+		catalog: { stale: false, refresh: async () => ({ refreshedAtEpochMs: 1, models: [] }), assertSupported() {} },
+		async start() { starts.push(provider); },
+		async stop() {},
+		async reconcile(records) { return { valid: records, invalid: [], removed: [], catalog: { models: [] } }; },
+		getAgent() { return null; },
+		async removeAgent() { return false; },
+	}]));
+	const provider = new ProviderService(services);
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, registry, planner, codexService: provider },
+	);
+	await coordinator.start();
+	try {
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'empty', registry: [] });
+		await eventually(() => bridge.sent.some(({ type }) => type === 'catalog_snapshot'));
+		assert.deepEqual(starts, []);
+	} finally {
 		await coordinator.stop();
 	}
 });

@@ -114,14 +114,18 @@ export class AntigravityProviderService {
 		return true;
 	}
 
-	async reconcile(records) {
+	async reconcile(records, { signal } = {}) {
 		if (!Array.isArray(records)) throw new TypeError('gemini reconciliation records must be an array');
+		assertReconciliationActive(signal);
 		await this.catalog.refresh();
+		assertReconciliationActive(signal);
 		const desiredIds = new Set(records.map((record) => record.agentId));
 		const removed = [];
 		for (const agentId of this.#agents.keys()) {
+			assertReconciliationActive(signal);
 			if (!desiredIds.has(agentId)) {
 				await this.removeAgent(agentId);
+				assertReconciliationActive(signal);
 				removed.push(agentId);
 			}
 		}
@@ -144,6 +148,10 @@ export class AntigravityProviderService {
 		this.#agents.clear();
 		await Promise.allSettled(agents.map((agent) => agent.dispose()));
 	}
+}
+
+function assertReconciliationActive(signal) {
+	if (signal?.aborted) throw new AcpProtocolError('STALE_RECONCILIATION', 'Gemini reconciliation was superseded');
 }
 
 class AntigravityAgent {
