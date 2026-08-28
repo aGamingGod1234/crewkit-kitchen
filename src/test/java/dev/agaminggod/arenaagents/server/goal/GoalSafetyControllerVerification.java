@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.server.goal;
 
+import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
+import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController.HazardSnapshot;
@@ -35,7 +37,18 @@ public final class GoalSafetyControllerVerification {
 		verifyHazardousEscapeRoutesAreRejected();
 		verifySafeEscapeWinsOverHazardousFirstCandidate();
 		verifyRetreatSkipsHazardousFarthestCandidate();
-		return 15;
+		verifyRaisedBankEscape();
+		verifySafeOneBlockDescent();
+		verifyCliffHasNoEscapeRoute();
+		assertTrue(GoalSafetyController.mayRunSafetyReflex(AgentLifecycleState.ACTING, GoalStatus.ACTIVE),
+				"active lifecycle with active goal may run safety reflexes");
+		assertTrue(GoalSafetyController.mayRunSafetyReflex(AgentLifecycleState.STARTING, GoalStatus.RECOVERING),
+				"active lifecycle with recovering goal may run safety reflexes");
+		assertTrue(!GoalSafetyController.mayRunSafetyReflex(AgentLifecycleState.PAUSED, GoalStatus.ACTIVE),
+				"paused lifecycle stays physically paused during hazards");
+		assertTrue(!GoalSafetyController.mayRunSafetyReflex(AgentLifecycleState.ACTING, GoalStatus.SATISFIED),
+				"terminal goal cannot run safety reflexes");
+		return 22;
 	}
 
 	private static void verifyHazardousEscapeRoutesAreRejected() {
@@ -95,6 +108,51 @@ public final class GoalSafetyControllerVerification {
 				"retreat selection skips the hazardous farthest cell and chooses the farthest safe route");
 	}
 
+	private static void verifyRaisedBankEscape() {
+		GridPosition origin = new GridPosition(0, 64, 0);
+		GridPosition northBank = origin.offset(0, 1, -1);
+		Map<GridPosition, WalkabilityView.Cell> cells = blockedRouteCells(origin);
+		makeStandable(cells, northBank);
+
+		GridPosition selected = GoalSafetyController.selectEscapeCandidate(
+				origin,
+				center(origin),
+				null,
+				cells::get
+		);
+		assertEquals(northBank, selected, "lava and fire escape can climb a one-block bank");
+	}
+
+	private static void verifySafeOneBlockDescent() {
+		GridPosition origin = new GridPosition(0, 64, 0);
+		GridPosition eastLower = origin.offset(1, -1, 0);
+		Map<GridPosition, WalkabilityView.Cell> cells = blockedRouteCells(origin);
+		makeStandable(cells, eastLower);
+
+		GridPosition selected = GoalSafetyController.selectEscapeCandidate(
+				origin,
+				center(origin),
+				null,
+				cells::get
+		);
+		assertEquals(eastLower, selected, "escape can descend one block onto verified support");
+	}
+
+	private static void verifyCliffHasNoEscapeRoute() {
+		GridPosition origin = new GridPosition(0, 64, 0);
+		GridPosition northDrop = origin.offset(0, -2, -1);
+		Map<GridPosition, WalkabilityView.Cell> cells = blockedRouteCells(origin);
+		makeStandable(cells, northDrop);
+
+		GridPosition selected = GoalSafetyController.selectEscapeCandidate(
+				origin,
+				center(origin),
+				null,
+				cells::get
+		);
+		assertEquals(null, selected, "escape refuses a two-block drop even when its landing is safe");
+	}
+
 	private static Map<GridPosition, WalkabilityView.Cell> openRouteCells(GridPosition origin) {
 		Map<GridPosition, WalkabilityView.Cell> cells = new HashMap<>();
 		for (int dx = -1; dx <= 1; dx++) {
@@ -106,6 +164,24 @@ public final class GoalSafetyControllerVerification {
 			}
 		}
 		return cells;
+	}
+
+	private static Map<GridPosition, WalkabilityView.Cell> blockedRouteCells(GridPosition origin) {
+		Map<GridPosition, WalkabilityView.Cell> cells = new HashMap<>();
+		for (int dx = -1; dx <= 1; dx++) {
+			for (int dy = -3; dy <= 2; dy++) {
+				for (int dz = -1; dz <= 1; dz++) {
+					cells.put(origin.offset(dx, dy, dz), WalkabilityView.Cell.BLOCKED);
+				}
+			}
+		}
+		return cells;
+	}
+
+	private static void makeStandable(Map<GridPosition, WalkabilityView.Cell> cells, GridPosition feet) {
+		cells.put(feet, WalkabilityView.Cell.CLEAR);
+		cells.put(feet.above(), WalkabilityView.Cell.CLEAR);
+		cells.put(feet.below(), WalkabilityView.Cell.SAFE_SUPPORT);
 	}
 
 	private static Vec3 center(GridPosition position) {

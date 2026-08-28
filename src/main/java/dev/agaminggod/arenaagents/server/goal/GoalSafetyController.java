@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.goal;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
 import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
@@ -29,6 +30,7 @@ public final class GoalSafetyController {
 	private static final int SAFETY_PRIORITY = 1_000;
 	private static final long REPEATED_DAMAGE_WINDOW_TICKS = 40L;
 	private static final Direction[] HORIZONTAL = { Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST };
+	private static final int[] REACHABLE_ELEVATIONS = { 0, 1, -1 };
 
 	private final CodexAgentManager manager;
 	private final LeasedServerInputController inputs;
@@ -55,10 +57,10 @@ public final class GoalSafetyController {
 		long tick = manager.server().getTickCount();
 		Set<AgentId> retained = new HashSet<>();
 		for (var record : manager.records()) {
-			boolean goalNeedsWork = record.currentGoal()
-					.map(goal -> goal.status() == GoalStatus.ACTIVE || goal.status() == GoalStatus.RECOVERING)
+			boolean safetyEligible = record.currentGoal()
+					.map(goal -> mayRunSafetyReflex(record.state(), goal.status()))
 					.orElse(false);
-			if (!goalNeedsWork) continue;
+			if (!safetyEligible) continue;
 			ServerPlayer player = manager.findAgentPlayer(record.agentId()).orElse(null);
 			if (player == null) continue;
 			retained.add(record.agentId());
@@ -76,6 +78,13 @@ public final class GoalSafetyController {
 			if (!retained.contains(agentId)) release(agentId);
 		}
 		damage.keySet().retainAll(retained);
+	}
+
+	static boolean mayRunSafetyReflex(AgentLifecycleState lifecycle, GoalStatus goalStatus) {
+		Objects.requireNonNull(lifecycle, "lifecycle must not be null");
+		Objects.requireNonNull(goalStatus, "goalStatus must not be null");
+		return lifecycle.isActive()
+				&& (goalStatus == GoalStatus.ACTIVE || goalStatus == GoalStatus.RECOVERING);
 	}
 
 	public void close() {
@@ -149,14 +158,16 @@ public final class GoalSafetyController {
 		Objects.requireNonNull(world, "world must not be null");
 		GridPosition best = null;
 		double bestDistance = threat == null ? Double.NEGATIVE_INFINITY : currentPosition.distanceToSqr(threat);
-		for (Direction direction : HORIZONTAL) {
-			GridPosition candidate = origin.offset(direction.getStepX(), 0, direction.getStepZ());
-			if (!world.isStandable(candidate)) continue;
-			Vec3 target = new Vec3(candidate.x() + 0.5D, candidate.y(), candidate.z() + 0.5D);
-			double distance = threat == null ? 0.0D : target.distanceToSqr(threat);
-			if (best == null || distance > bestDistance) {
-				best = candidate;
-				bestDistance = distance;
+		for (int elevation : REACHABLE_ELEVATIONS) {
+			for (Direction direction : HORIZONTAL) {
+				GridPosition candidate = origin.offset(direction.getStepX(), elevation, direction.getStepZ());
+				if (!world.isStandable(candidate)) continue;
+				Vec3 target = new Vec3(candidate.x() + 0.5D, candidate.y(), candidate.z() + 0.5D);
+				double distance = threat == null ? 0.0D : target.distanceToSqr(threat);
+				if (best == null || distance > bestDistance) {
+					best = candidate;
+					bestDistance = distance;
+				}
 			}
 		}
 		return best;
