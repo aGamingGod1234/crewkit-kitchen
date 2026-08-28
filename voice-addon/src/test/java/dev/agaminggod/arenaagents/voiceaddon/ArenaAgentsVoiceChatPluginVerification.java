@@ -116,12 +116,11 @@ final class ArenaAgentsVoiceChatPluginVerification {
 				serverEvent(VoicechatServerStartedEvent.class, apiA));
 		ambiguousEvents.fire(VoicechatServerStartedEvent.class,
 				serverEvent(VoicechatServerStartedEvent.class, apiB));
-		assertThrows(
-				IllegalStateException.class,
-				() -> ambiguousPlugin.configureServer(serverA, configurationA),
-				"an unclaimed stale generation cannot configure through the newer API"
-		);
-		assertEquals(0, ambiguousCaptures.size(), "rejected generation creates no speech capture");
+		ArenaAgentsVoiceChatPlugin.ConfiguredServer newestPending =
+				ambiguousPlugin.configureServer(serverA, configurationA);
+		assertSame(apiB, newestPending.voicechat(), "the newest unclaimed API generation is configured");
+		assertEquals(0, ambiguousCaptures.size(), "configuration remains lazy until a microphone packet");
+		newestPending.close();
 		return 27;
 	}
 

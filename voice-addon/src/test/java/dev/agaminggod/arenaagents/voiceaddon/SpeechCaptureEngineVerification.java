@@ -26,10 +26,12 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyWhisperChangeSplitsAndSequencesUtterances();
 		assertions += verifyMaximumDurationBoundsDecodedSamples();
 		assertions += verifyMalformedPacketDoesNotWedgeLaterSpeech();
+		assertions += verifyDecoderCloseFailureDoesNotWedgeLaterSpeech();
 		assertions += verifyTranscriptsDeliverInUtteranceOrder();
 		assertions += verifyUnavailableSttRecoversAfterBackoff();
 		assertions += verifyCloseCancelsPendingTranscription();
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
+		assertions += verifyCloseContinuesAfterDecoderCloseFailure();
 		return assertions;
 	}
 
@@ -146,26 +148,78 @@ final class SpeechCaptureEngineVerification {
 
 	private static int verifyMalformedPacketDoesNotWedgeLaterSpeech() throws Exception {
 		RecordingTranscriber transcriber = new RecordingTranscriber();
-		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 20L, 32);
+		long[] now = { 0L };
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler(), 20L, 32, ignored -> { }, () -> now[0]
+		);
 		RecordingDecoder broken = new RecordingDecoder();
 		broken.decodeFailure = new IllegalArgumentException("bad Opus frame");
 		RecordingDecoder recovered = new RecordingDecoder();
 		Queue<RecordingDecoder> decoders = new ArrayDeque<>(List.of(broken, recovered));
+		int[] decoderCreations = { 0 };
+		SpeechCaptureEngine.DecoderFactory decoderFactory = () -> {
+			decoderCreations[0]++;
+			return decoders.remove();
+		};
 		engine.accept(
-				PLAYER, false, new byte[] { 1 }, decoders::remove, Runnable::run,
+				PLAYER, false, new byte[] { 1 }, decoderFactory, Runnable::run,
 				(playerId, text, whispering) -> { }
 		);
 		CountDownLatch latch = new CountDownLatch(1);
 		engine.accept(
-				PLAYER, false, new byte[] { 12 }, decoders::remove, Runnable::run,
+				PLAYER, false, new byte[] { 2 }, decoderFactory, Runnable::run,
+				(playerId, text, whispering) -> latch.countDown()
+		);
+		assertEquals(1, decoderCreations[0], "decoder failure enters a packet-safe cooldown");
+		now[0] = TimeUnit.SECONDS.toNanos(60L);
+		engine.accept(
+				PLAYER, false, new byte[] { 12 }, decoderFactory, Runnable::run,
 				(playerId, text, whispering) -> latch.countDown()
 		);
 		assertEquals(true, broken.closed, "malformed packet closes broken decoder");
 		assertEquals(true, latch.await(2, TimeUnit.SECONDS), "speech recovers after malformed packet");
+		assertEquals(2, decoderCreations[0], "decoder is reconstructed once after the retry deadline");
 		assertEquals(true, Arrays.equals(new short[] { 12 }, transcriber.captured.getFirst().samples),
 				"recovered utterance excludes malformed packet");
 		engine.close();
-		return 3;
+		return 5;
+	}
+
+	private static int verifyDecoderCloseFailureDoesNotWedgeLaterSpeech() throws Exception {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 20L, 32);
+		RecordingDecoder broken = new RecordingDecoder();
+		broken.closeFailure = new IllegalStateException("decoder close failed");
+		broken.closeAttempted = new CountDownLatch(1);
+		RecordingDecoder recovered = new RecordingDecoder();
+		Queue<RecordingDecoder> decoders = new ArrayDeque<>(List.of(broken, recovered));
+		List<Delivered> delivered = new ArrayList<>();
+		CountDownLatch deliveredLatch = new CountDownLatch(1);
+
+		engine.accept(
+				PLAYER, false, new byte[] { 1 }, decoders::remove, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering))
+		);
+		assertEquals(true, broken.closeAttempted.await(2, TimeUnit.SECONDS),
+				"silence flush attempts the failing decoder close");
+		engine.accept(
+				PLAYER, true, new byte[] { 2 }, decoders::remove, Runnable::run,
+				(playerId, text, whispering) -> {
+					delivered.add(new Delivered(playerId, text, whispering));
+					deliveredLatch.countDown();
+				}
+		);
+
+		assertEquals(true, broken.closed, "failed decoder close is attempted once");
+		assertEquals(true, deliveredLatch.await(2, TimeUnit.SECONDS),
+				"later transcript is not wedged behind the failed silence flush");
+		assertEquals(1, transcriber.captured.size(), "failed utterance is skipped before transcription");
+		assertEquals(2L, transcriber.captured.getFirst().sequence,
+				"later utterance keeps its monotonic sequence");
+		assertEquals(List.of(new Delivered(PLAYER, "heard 1", true)), delivered,
+				"later transcript delivers after the skipped close failure");
+		engine.close();
+		return 6;
 	}
 
 	private static int verifyTranscriptsDeliverInUtteranceOrder() {
@@ -238,6 +292,30 @@ final class SpeechCaptureEngineVerification {
 		assertEquals(true, decoder.closed, "close closes active decoder");
 		assertEquals(0, transcriber.captured.size(), "close discards partial utterance");
 		return 2;
+	}
+
+	private static int verifyCloseContinuesAfterDecoderCloseFailure() {
+		ScheduledExecutorService scheduler = scheduler();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				new RecordingTranscriber(), scheduler, 5_000L, 32
+		);
+		RecordingDecoder broken = new RecordingDecoder();
+		broken.closeFailure = new IllegalStateException("first decoder close failed");
+		RecordingDecoder later = new RecordingDecoder();
+		engine.accept(PLAYER, false, new byte[] { 1 }, () -> broken, Runnable::run,
+				(playerId, text, whispering) -> { });
+		engine.accept(UUID.randomUUID(), false, new byte[] { 2 }, () -> later, Runnable::run,
+				(playerId, text, whispering) -> { });
+
+		long startedNanos = System.nanoTime();
+		engine.close();
+		long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
+
+		assertEquals(true, broken.closed, "close attempts the failing decoder");
+		assertEquals(true, later.closed, "close continues to later decoders");
+		assertEquals(true, scheduler.isShutdown(), "close still shuts down the scheduler");
+		assertEquals(true, elapsedMillis < 1_000L, "close remains bounded after cleanup failure");
+		return 4;
 	}
 
 	private static int verifyCloseCancelsPendingTranscription() {
@@ -318,6 +396,8 @@ final class SpeechCaptureEngineVerification {
 	private static final class RecordingDecoder implements SpeechCaptureEngine.Decoder {
 		private boolean closed;
 		private RuntimeException decodeFailure;
+		private RuntimeException closeFailure;
+		private CountDownLatch closeAttempted;
 
 		@Override
 		public short[] decode(byte[] opus) {
@@ -330,6 +410,8 @@ final class SpeechCaptureEngineVerification {
 		@Override
 		public void close() {
 			closed = true;
+			if (closeAttempted != null) closeAttempted.countDown();
+			if (closeFailure != null) throw closeFailure;
 		}
 	}
 

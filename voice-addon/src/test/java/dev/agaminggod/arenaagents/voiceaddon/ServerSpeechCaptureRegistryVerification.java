@@ -11,6 +11,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
+
 /** Per-server ownership verification for the real addon speech-capture registry. */
 public final class ServerSpeechCaptureRegistryVerification {
 	private ServerSpeechCaptureRegistryVerification() {
@@ -98,22 +100,110 @@ public final class ServerSpeechCaptureRegistryVerification {
 		assertEquals(1, cleanupCaptures.getLast().accepts,
 				"failed displaced cleanup cannot block the replacement capture");
 
+		long[] now = { 0L };
+		int[] factoryCalls = { 0 };
+		List<String> diagnostics = new ArrayList<>();
 		List<RecordingCapture> liveFailureCaptures = new ArrayList<>();
 		ServerSpeechCaptureRegistry<Object, Object> liveFailureRegistry = new ServerSpeechCaptureRegistry<>(configuration -> {
+			factoryCalls[0]++;
+			if (factoryCalls[0] == 1) throw new IllegalStateException("speech capture factory failed");
 			RecordingCapture capture = new RecordingCapture(configuration);
-			if (liveFailureCaptures.isEmpty()) {
-				capture.acceptFailure = new IllegalStateException("speech capture failed live");
-			}
 			liveFailureCaptures.add(capture);
 			return capture;
-		});
+		}, () -> now[0], diagnostics::add);
+		liveFailureRegistry.configure(cleanupServer, cleanupOwner, configurationA);
+		for (int packet = 0; packet < 20; packet++) {
+			liveFailureRegistry.accept(cleanupServer, cleanupOwner, null);
+		}
+		assertEquals(1, factoryCalls[0], "persistent factory failure is attempted once during cooldown");
+		assertEquals(List.of("CAPTURE_FACTORY_FAILED"), diagnostics,
+				"persistent factory failure emits one bounded transition diagnostic");
+
+		now[0] = SECONDS.toNanos(60L);
+		liveFailureRegistry.accept(cleanupServer, cleanupOwner, null);
+		assertEquals(2, factoryCalls[0], "capture retries once after the capped deadline");
+		assertEquals(1, liveFailureCaptures.getFirst().accepts,
+				"the recovered capture receives the retrying packet");
+		assertEquals(List.of("CAPTURE_FACTORY_FAILED", "CAPTURE_RECOVERED"), diagnostics,
+				"recovery emits one transition diagnostic");
+
+		RecordingCapture recovered = liveFailureCaptures.getFirst();
+		liveFailureRegistry.clear(cleanupServer);
+		now[0] = SECONDS.toNanos(120L);
+		liveFailureRegistry.accept(cleanupServer, cleanupOwner, null);
+		assertEquals(1, recovered.closes, "cleared capture closes once");
+		assertEquals(2, factoryCalls[0], "elapsed stale cooldown cannot resurrect a cleared entry");
+
+		int callsBeforeReconfigure = factoryCalls[0];
 		liveFailureRegistry.configure(cleanupServer, cleanupOwner, configurationA);
 		liveFailureRegistry.accept(cleanupServer, cleanupOwner, null);
+		liveFailureRegistry.configure(cleanupServer, cleanupOwner, configurationB);
 		liveFailureRegistry.accept(cleanupServer, cleanupOwner, null);
-		assertEquals(2, liveFailureCaptures.size(), "live capture failure reconstructs on the next packet");
-		assertEquals(1, liveFailureCaptures.getFirst().closes, "failed live capture closes once");
-		assertEquals(1, liveFailureCaptures.getLast().accepts, "replacement capture receives the next packet");
-		return 21;
+		assertEquals(callsBeforeReconfigure + 2, factoryCalls[0],
+				"reconfigure resets recovery state for the exact new generation");
+		assertEquals(configurationB, liveFailureCaptures.getLast().configuration,
+				"reconfigured recovery cannot reuse the stale endpoint or secret");
+
+		long[] captureNow = { 0L };
+		int[] captureFactoryCalls = { 0 };
+		List<String> captureDiagnostics = new ArrayList<>();
+		List<RecordingCapture> failedCaptures = new ArrayList<>();
+		ServerSpeechCaptureRegistry<Object, Object> captureFailureRegistry = new ServerSpeechCaptureRegistry<>(
+				configuration -> {
+					captureFactoryCalls[0]++;
+					RecordingCapture capture = new RecordingCapture(configuration);
+					if (captureFactoryCalls[0] == 1) {
+						capture.acceptFailure = new IllegalStateException("persistent capture failure");
+					}
+					failedCaptures.add(capture);
+					return capture;
+				},
+				() -> captureNow[0],
+				captureDiagnostics::add
+		);
+		captureFailureRegistry.configure(cleanupServer, cleanupOwner, configurationA);
+		for (int packet = 0; packet < 20; packet++) {
+			captureFailureRegistry.accept(cleanupServer, cleanupOwner, null);
+		}
+		assertEquals(1, captureFactoryCalls[0], "persistent live failure does not reconstruct per packet");
+		assertEquals(1, failedCaptures.getFirst().closes, "failed live capture closes once");
+		assertEquals(List.of("CAPTURE_FAILED"), captureDiagnostics,
+				"persistent live failure emits one transition diagnostic");
+		captureNow[0] = SECONDS.toNanos(60L);
+		captureFailureRegistry.accept(cleanupServer, cleanupOwner, null);
+		assertEquals(2, captureFactoryCalls[0], "live capture retries once after its deadline");
+		assertEquals(List.of("CAPTURE_FAILED", "CAPTURE_RECOVERED"), captureDiagnostics,
+				"live capture recovery emits one transition diagnostic");
+
+		long[] reconfigureNow = { 0L };
+		int[] reconfigureCalls = { 0 };
+		List<RecordingCapture> reconfiguredCaptures = new ArrayList<>();
+		ServerSpeechCaptureRegistry<Object, Object> reconfigureRegistry = new ServerSpeechCaptureRegistry<>(
+				configuration -> {
+					reconfigureCalls[0]++;
+					if (configuration.equals(configurationA)) {
+						throw new IllegalStateException("old generation failed");
+					}
+					RecordingCapture capture = new RecordingCapture(configuration);
+					reconfiguredCaptures.add(capture);
+					return capture;
+				},
+				() -> reconfigureNow[0],
+				ignored -> { }
+		);
+		reconfigureRegistry.configure(cleanupServer, cleanupOwner, configurationA);
+		reconfigureRegistry.accept(cleanupServer, cleanupOwner, null);
+		reconfigureRegistry.configure(cleanupServer, cleanupOwner, configurationB);
+		reconfigureRegistry.accept(cleanupServer, cleanupOwner, null);
+		assertEquals(2, reconfigureCalls[0], "reconfigure retries immediately with a fresh generation");
+		assertEquals(configurationB, reconfiguredCaptures.getFirst().configuration,
+				"fresh generation retains its exact endpoint and secret");
+		reconfigureNow[0] = SECONDS.toNanos(60L);
+		reconfigureRegistry.accept(cleanupServer, cleanupOwner, null);
+		assertEquals(2, reconfigureCalls[0], "old generation deadline cannot resurrect stale capture");
+		assertEquals(2, reconfiguredCaptures.getFirst().accepts,
+				"packets after stale deadline remain on the current generation");
+		return 38;
 	}
 
 	private static void acceptConcurrently(

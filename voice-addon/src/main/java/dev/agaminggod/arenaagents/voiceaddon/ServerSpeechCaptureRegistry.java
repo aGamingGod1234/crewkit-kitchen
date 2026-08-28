@@ -5,17 +5,42 @@ import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 /** Owns one lazily constructed speech capture for each configured server. */
 final class ServerSpeechCaptureRegistry<S, O> {
+	private static final long INITIAL_RETRY_NANOS = TimeUnit.SECONDS.toNanos(1L);
+	private static final long MAX_RETRY_NANOS = TimeUnit.SECONDS.toNanos(30L);
 	private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(
 			ServerSpeechCaptureRegistry.class
 	);
 	private final Map<S, Entry> entries = new ConcurrentHashMap<>();
 	private final CaptureFactory factory;
+	private final LongSupplier monotonicNanos;
+	private final Consumer<String> diagnosticObserver;
 
 	ServerSpeechCaptureRegistry(CaptureFactory factory) {
+		this(factory, System::nanoTime, ServerSpeechCaptureRegistry::logDiagnostic);
+	}
+
+	ServerSpeechCaptureRegistry(
+			CaptureFactory factory,
+			LongSupplier monotonicNanos,
+			Consumer<String> diagnosticObserver
+	) {
 		this.factory = Objects.requireNonNull(factory, "capture factory must not be null");
+		this.monotonicNanos = Objects.requireNonNull(monotonicNanos, "monotonic clock must not be null");
+		this.diagnosticObserver = Objects.requireNonNull(diagnosticObserver, "diagnostic observer must not be null");
+	}
+
+	private static void logDiagnostic(String transition) {
+		if ("CAPTURE_RECOVERED".equals(transition)) {
+			LOGGER.info("Proximity speech capture recovered");
+		} else {
+			LOGGER.warn("Proximity speech capture transition: {}", transition);
+		}
 	}
 
 	void configure(S server, O owner, VoiceSubsystemConfiguration configuration) {
@@ -66,6 +91,9 @@ final class ServerSpeechCaptureRegistry<S, O> {
 		private final VoiceSubsystemConfiguration configuration;
 		private Capture capture;
 		private boolean closed;
+		private int consecutiveFailures;
+		private long retryAfterNanos;
+		private String diagnostic;
 
 		private Entry(O owner, VoiceSubsystemConfiguration configuration) {
 			this.owner = owner;
@@ -76,8 +104,15 @@ final class ServerSpeechCaptureRegistry<S, O> {
 			if (closed) return;
 			if (owner == null) owner = currentOwner;
 			if (currentOwner != null && owner != currentOwner) return;
+			long now = monotonicNanos.getAsLong();
+			if (capture == null && now < retryAfterNanos) return;
 			if (capture == null) {
-				capture = Objects.requireNonNull(factory.create(configuration), "capture factory returned null");
+				try {
+					capture = Objects.requireNonNull(factory.create(configuration), "capture factory returned null");
+				} catch (RuntimeException exception) {
+					failed(now, "CAPTURE_FACTORY_FAILED");
+					return;
+				}
 			}
 			try {
 				capture.accept(event);
@@ -89,8 +124,35 @@ final class ServerSpeechCaptureRegistry<S, O> {
 				} catch (RuntimeException cleanupFailure) {
 					exception.addSuppressed(cleanupFailure);
 				}
-				LOGGER.warn("Proximity speech capture failed ({}); the next packet will reconstruct it",
-						exception.getClass().getSimpleName());
+				failed(now, "CAPTURE_FAILED");
+				return;
+			}
+			recovered();
+		}
+
+		private void failed(long now, String transition) {
+			consecutiveFailures = Math.min(consecutiveFailures + 1, 31);
+			long multiplier = 1L << Math.min(consecutiveFailures - 1, 5);
+			long delay = Math.min(MAX_RETRY_NANOS, INITIAL_RETRY_NANOS * multiplier);
+			retryAfterNanos = now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
+			if (transition.equals(diagnostic)) return;
+			diagnostic = transition;
+			notifyDiagnostic(transition);
+		}
+
+		private void recovered() {
+			consecutiveFailures = 0;
+			retryAfterNanos = 0L;
+			if (diagnostic == null) return;
+			diagnostic = null;
+			notifyDiagnostic("CAPTURE_RECOVERED");
+		}
+
+		private void notifyDiagnostic(String transition) {
+			try {
+				diagnosticObserver.accept(transition);
+			} catch (RuntimeException ignored) {
+				// Diagnostics cannot interrupt the microphone packet path.
 			}
 		}
 

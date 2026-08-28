@@ -10,7 +10,7 @@ import java.util.WeakHashMap;
 final class VoicechatServerBindings<S, O> {
 	private final Map<S, Association> associations = new WeakHashMap<>();
 	private final ServerSpeechCaptureRegistry<S, O> captures;
-	private Registration current;
+	private Registration pending;
 	private long generation;
 
 	VoicechatServerBindings(ServerSpeechCaptureRegistry.CaptureFactory captureFactory) {
@@ -19,16 +19,12 @@ final class VoicechatServerBindings<S, O> {
 
 	synchronized void started(O owner) {
 		Objects.requireNonNull(owner, "voice-chat API must not be null");
-		if (current != null && current.live && current.owner == owner) return;
+		if (pending != null && pending.live && pending.owner == owner) return;
 		for (Association association : associations.values()) {
 			if (association.registration.live && association.registration.owner == owner) return;
 		}
-		long displacedGeneration = 0L;
-		if (current != null && !current.claimed) {
-			current.live = false;
-			displacedGeneration = current.generation;
-		}
-		current = new Registration(owner, ++generation, displacedGeneration);
+		if (pending != null) pending.live = false;
+		pending = new Registration(owner, ++generation);
 	}
 
 	synchronized Binding<O> configure(S server, VoiceSubsystemConfiguration configuration) {
@@ -36,34 +32,22 @@ final class VoicechatServerBindings<S, O> {
 		Objects.requireNonNull(configuration, "voice configuration must not be null");
 		Association association = associations.get(server);
 		if (association == null) {
-			if (current == null || !current.live) {
+			if (pending == null || !pending.live) {
 				throw new IllegalStateException("Simple Voice Chat has no active server registration");
 			}
-			if (current.displacedGeneration != 0L) {
-				throw new IllegalStateException("Simple Voice Chat registration replaced an unclaimed generation");
-			}
-			if (current.claimed) {
-				throw new IllegalStateException("Active Simple Voice Chat registration belongs to another server");
-			}
-			current.claimed = true;
-			association = new Association(current);
+			association = new Association(pending);
 			associations.put(server, association);
+			pending = null;
 		} else if (!association.registration.live) {
-			if (current == null || !current.live) {
+			if (pending == null || !pending.live) {
 				throw new IllegalStateException("Simple Voice Chat has no active server registration");
 			}
-			if (current.displacedGeneration != 0L) {
-				throw new IllegalStateException("Simple Voice Chat registration replaced an unclaimed generation");
-			}
-			if (current.claimed) {
-				throw new IllegalStateException("Active Simple Voice Chat registration belongs to another server");
-			}
-			if (current.generation <= association.stoppedAtGeneration) {
+			if (pending.generation <= association.stoppedAtGeneration) {
 				throw new IllegalStateException("Simple Voice Chat registration predates this server stop");
 			}
-			current.claimed = true;
-			association = new Association(current);
+			association = new Association(pending);
 			associations.put(server, association);
+			pending = null;
 		}
 
 		captures.configure(server, association.registration.owner, configuration);
@@ -82,7 +66,10 @@ final class VoicechatServerBindings<S, O> {
 	}
 
 	synchronized void stopped(O owner) {
-		if (current != null && current.owner == owner) current = null;
+		if (pending != null && pending.owner == owner) {
+			pending.live = false;
+			pending = null;
+		}
 		for (Association association : associations.values()) {
 			if (association.registration.owner == owner) {
 				association.registration.live = false;
@@ -159,14 +146,11 @@ final class VoicechatServerBindings<S, O> {
 	private final class Registration {
 		private final O owner;
 		private final long generation;
-		private final long displacedGeneration;
 		private boolean live = true;
-		private boolean claimed;
 
-		private Registration(O owner, long generation, long displacedGeneration) {
+		private Registration(O owner, long generation) {
 			this.owner = owner;
 			this.generation = generation;
-			this.displacedGeneration = displacedGeneration;
 		}
 	}
 }

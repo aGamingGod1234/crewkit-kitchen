@@ -69,7 +69,21 @@ final class VoicechatServerBindingsVerification {
 		VoicechatServerBindings.Binding<Object> configuredC = multiServer.configure(serverC, restarted);
 		assertSame(apiC, configuredC.owner(),
 				"duplicate start for a non-current live API cannot displace the next server registration");
-		return 11;
+
+		VoicechatServerBindings<Object, Object> pending = new VoicechatServerBindings<>(configuration ->
+				new RecordingCapture(configuration));
+		Object pendingServer = new Object();
+		pending.started(apiA);
+		pending.started(apiB);
+		VoicechatServerBindings.Binding<Object> pendingB = pending.configure(pendingServer, first);
+		pending.started(apiB);
+		VoicechatServerBindings.Binding<Object> repeatedB = pending.configure(pendingServer, first);
+		pending.stopped(apiA);
+		pendingB.close();
+		assertSame(apiB, repeatedB.owner(), "the newest pending API owns the configured server");
+		assertEquals(true, repeatedB.active(),
+				"stale stop and close from a displaced registration cannot clear the current API");
+		return 13;
 	}
 
 	private static VoiceSubsystemConfiguration configuration(int port, char secret) {
