@@ -51,6 +51,8 @@ const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
 const DEFAULT_VOICE_PORT = 8_766;
 const DEFAULT_VOICE_MAX_CONCURRENT = 5;
 const DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH = path.join('runtime', 'voice-profile-assignments.json');
+const DEFAULT_LOCAL_SPEECH_TIMEOUT_MS = 120_000;
+const VOICE_WARMUP_GRACE_MS = 1_000;
 const DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE = 'FISH_AUDIO_API_KEY';
 const DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE = 'DEEPGRAM_API_KEY';
 const DEFAULT_LOCAL_SPEECH_PYTHON_DIRECTORY = path.join('runtime', 'local-speech', '.venv');
@@ -498,7 +500,12 @@ export class DynamicCoordinator extends EventEmitter {
 			}));
 			});
 		});
-		this.#listen('shutdown', () => this.#run(() => this.stop()));
+		this.#listen('shutdown', () => {
+			this.#run(async () => {
+				try { this.emit('shutdown'); }
+				finally { await this.stop(); }
+			});
+		});
 		this.#listen('protocolError', (error) => this.emit('runtimeError', error));
 		this.#listen('transportError', (error) => this.emit('runtimeError', error));
 	}
@@ -1442,9 +1449,7 @@ async function runCli() {
 		privatePath: runtime.providerTurnsPath,
 	});
 	const coordinator = createDynamicCoordinator(config, { traceWriter, protocolAudit, providerTurnRecorder });
-	const voiceSupervisor = new VoiceSupervisor({
-		startWorker: ({ signal }) => startVoiceWorker(config, process.env, { signal }),
-	});
+	const voiceSupervisor = createVoiceSupervisor(config, process.env);
 	coordinator.on('runtimeError', (error) => {
 		const summary = `[dynamic-coordinator] ${error?.code ?? 'ERROR'}: ${error?.message ?? String(error)}`;
 		const stack = typeof error?.stack === 'string' && !error.stack.startsWith(summary)
@@ -1482,6 +1487,30 @@ export async function startCoordinatorControl(coordinator, voiceSupervisor) {
 	await coordinator.start();
 	try { Promise.resolve(voiceSupervisor.start()).catch(() => {}); }
 	catch { /* optional voice startup cannot reject coordinator control */ }
+}
+
+export function createVoiceSupervisor(config, environment = process.env, dependencies = {}) {
+	if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+		throw new TypeError('voice supervisor config must be an object');
+	}
+	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) {
+		throw new TypeError('voice supervisor environment must be an object');
+	}
+	const localSpeechTimeoutMs = config.voice?.localSpeechTimeoutMs ?? DEFAULT_LOCAL_SPEECH_TIMEOUT_MS;
+	if (!Number.isSafeInteger(localSpeechTimeoutMs) || localSpeechTimeoutMs < 1 || localSpeechTimeoutMs > 600_000) {
+		throw new TypeError('voice.localSpeechTimeoutMs must be between 1 and 600000');
+	}
+	const startWorker = dependencies.startWorker
+		?? (({ signal }) => startVoiceWorker(config, environment, { signal }));
+	const reportFailure = dependencies.reportFailure ?? (({ failureCode }) => {
+		process.stderr.write(`[voice-supervisor] ${failureCode}: proximity speech unavailable; retrying automatically\n`);
+	});
+	return new VoiceSupervisor({
+		startWorker,
+		warmupTimeoutMs: Math.min(Number.MAX_SAFE_INTEGER, localSpeechTimeoutMs + VOICE_WARMUP_GRACE_MS),
+		onFailure: reportFailure,
+		...(dependencies.supervisorOptions ?? {}),
+	});
 }
 
 function createJsonlAudit(filePath, metadata) {
@@ -1523,7 +1552,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			executable: firstNonBlank(environment.ARENA_AGENT_SPEECH_PYTHON, voice.localSpeechPythonPath)
 				?? path.resolve(PROJECT_DIRECTORY, defaultLocalSpeechPythonPath(platform)),
 			scriptPath: path.join(SOURCE_DIRECTORY, 'voice', 'local-speech-worker.py'),
-			timeoutMs: voice.localSpeechTimeoutMs ?? 120_000,
+			timeoutMs: voice.localSpeechTimeoutMs ?? DEFAULT_LOCAL_SPEECH_TIMEOUT_MS,
 			environment,
 			signal,
 			accessFile: dependencies.localSpeechAccess,
@@ -1654,6 +1683,11 @@ function createLocalSpeechFailover(localProvider, {
 	let fallbackTts = null;
 	let fallbackStt = null;
 	let switched = false;
+	let localClosePromise = null;
+	const closeLocal = () => {
+		localClosePromise ??= Promise.resolve().then(() => localProvider.close?.()).then(() => undefined, () => undefined);
+		return localClosePromise;
+	};
 	const fallbackTtsFactory = () => {
 		if (fallbackTts !== null) return fallbackTts;
 		if (fishApiKey !== null) {
@@ -1679,6 +1713,7 @@ function createLocalSpeechFailover(localProvider, {
 		activeTts = fallbackTtsFactory();
 		activeStt = fallbackSttFactory();
 		switched = true;
+		await closeLocal();
 	};
 	return Object.freeze({
 		tts: Object.freeze({
@@ -1697,7 +1732,7 @@ function createLocalSpeechFailover(localProvider, {
 		},
 		async close() {
 			await Promise.allSettled([
-				localProvider.close?.(),
+				closeLocal(),
 				fallbackTts?.close?.(),
 				fallbackStt?.close?.(),
 			]);
@@ -1733,11 +1768,14 @@ function normalizeVoiceConfig(value, environment) {
 	const maxConcurrent = positiveInteger(source.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT, 'voice.maxConcurrent');
 	if (maxConcurrent > 5) throw new TypeError('voice.maxConcurrent must not exceed 5');
 	const profileAssignmentsPath = path.resolve(PROJECT_DIRECTORY, source.profileAssignmentsPath ?? DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
+	const localSpeechTimeoutMs = positiveInteger(source.localSpeechTimeoutMs ?? DEFAULT_LOCAL_SPEECH_TIMEOUT_MS, 'voice.localSpeechTimeoutMs');
+	if (localSpeechTimeoutMs > 600_000) throw new TypeError('voice.localSpeechTimeoutMs must not exceed 600000');
 	return {
 		...source,
 		port: configuredPort,
 		maxConcurrent,
 		profileAssignmentsPath,
+		localSpeechTimeoutMs,
 		fishApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.fishApiKeyEnvironmentVariable ?? DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE, 'voice.fishApiKeyEnvironmentVariable'),
 		deepgramApiKeyEnvironmentVariable: requireEnvironmentVariableName(source.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE, 'voice.deepgramApiKeyEnvironmentVariable'),
 	};

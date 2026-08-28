@@ -247,6 +247,7 @@ test('local model warmup failure switches both channels to configured remote pro
 	});
 	try {
 		await worker.warmup();
+		assert.equal(localCloses, 1, 'the unused local process is released as soon as routing changes');
 		assert.notEqual(active.provider, local);
 		assert.notEqual(active.sttProvider, local);
 		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'fallback');
@@ -254,6 +255,37 @@ test('local model warmup failure switches both channels to configured remote pro
 		await worker.close();
 	}
 	assert.equal(localCloses, 1);
+});
+
+test('local cleanup failure cannot roll back a successful external fallback switch', async () => {
+	let active;
+	const local = {
+		async warmup() { throw Object.assign(new Error('local models failed'), { code: 'LOCAL_SPEECH_WARMUP_FAILED' }); },
+		async synthesize() { throw new Error('closed local TTS must not receive traffic'); },
+		async transcribe() { throw new Error('closed local STT must not receive traffic'); },
+		async close() { throw new Error('local process already exited'); },
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_AUDIO_API_KEY: 'fish-key',
+		DEEPGRAM_API_KEY: 'deepgram-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => ({ async synthesize() { return { provider: 'fish' }; } }),
+		createSttProvider: () => ({ async transcribe() { return { transcript: 'remote', confidence: 1 }; } }),
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		await worker.warmup();
+		assert.equal((await active.provider.synthesize({ text: 'hi' })).provider, 'fish');
+		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'remote');
+	} finally {
+		await worker.close();
+	}
 });
 
 test('voice bootstrap propagates startup cancellation into provider discovery', async () => {

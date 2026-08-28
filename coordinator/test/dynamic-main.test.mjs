@@ -1415,6 +1415,15 @@ test('dynamic coordinator forwards protocol audit to its constructed bridge', ()
 	}), /audit must be a function or null/);
 });
 
+test('bridge protocol shutdown is re-emitted for owned worker cleanup', async () => {
+	const run = await start();
+	let shutdowns = 0;
+	run.coordinator.once('shutdown', () => { shutdowns += 1; });
+	run.bridge.emit('shutdown');
+	await eventually(() => shutdowns === 1 && run.bridge.ready === false);
+	assert.equal(shutdowns, 1);
+});
+
 test('accepts two hundred quiet wire observations without another provider turn', async () => {
 	const run = await start();
 	try {

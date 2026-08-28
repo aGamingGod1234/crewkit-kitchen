@@ -3,13 +3,14 @@ import { createServer } from 'node:http';
 import { NoSttProvider } from './deepgram-stt-provider.mjs';
 import { resampleS16leMono } from './pcm-audio.mjs';
 import { TtsCache } from './tts-cache.mjs';
+import { builtInVoiceProfiles } from './voice-profile-store.mjs';
 
 const MAX_REQUEST_BYTES = 8 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_INITIAL_PROBE_DELAY_MS = 1_000;
 const DEFAULT_MAX_PROBE_DELAY_MS = 30_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
-const PROBE_AGENT_ID = '00000000-0000-4000-8000-000000000000';
+const PROBE_PROFILE = builtInVoiceProfiles()[0];
 
 export function createVoiceHttpServer({
 	provider,
@@ -57,7 +58,7 @@ export function createVoiceHttpServer({
 	};
 	const ttsLifecycle = new VoiceChannelLifecycle({
 		component: 'voice:tts', boundary: 'voice_tts_provider',
-		probe: provider === null ? null : (signal) => probeTts(provider, profileStore, signal),
+		probe: provider === null ? null : (signal) => probeTts(provider, signal),
 		onStalled: (error) => recordTerminalFailure(error),
 		initialFailureCode: provider === null ? 'TTS_UNAVAILABLE' : null,
 		...lifecycleOptions,
@@ -497,11 +498,10 @@ function aggregateVoiceStatus(tts, stt) {
 	});
 }
 
-async function probeTts(provider, profileStore, signal) {
+async function probeTts(provider, signal) {
 	if (typeof provider.probe === 'function') return provider.probe({ signal });
 	if (typeof provider.warmup === 'function') return provider.warmup({ signal });
-	const profile = profileStore.resolve(PROBE_AGENT_ID);
-	validateSynthesis(await provider.synthesize({ text: '.', voiceId: profile.voiceId, speed: profile.speed, signal }));
+	validateSynthesis(await provider.synthesize({ text: '.', voiceId: PROBE_PROFILE.voiceId, speed: PROBE_PROFILE.speed, signal }));
 }
 
 async function probeStt(provider, signal) {

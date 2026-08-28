@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { createServer } from 'node:http';
 import test from 'node:test';
 
-import { startCoordinatorControl, startVoiceWorker } from '../src/dynamic-main.mjs';
+import { createVoiceSupervisor, startCoordinatorControl, startVoiceWorker } from '../src/dynamic-main.mjs';
 import { createVoiceHttpServer } from '../src/voice/voice-http-server.mjs';
 import { VoiceProfileStore } from '../src/voice/voice-profile-store.mjs';
 import { VoiceSupervisor } from '../src/voice/voice-supervisor.mjs';
@@ -35,6 +35,67 @@ test('protocol shutdown closes the voice supervisor and its worker ownership', a
 	coordinator.emit('shutdown');
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(closes, 1);
+});
+
+test('production voice supervision allows the configured local model deadline plus cleanup grace', async () => {
+	const timers = new ManualTimers();
+	let closes = 0;
+	const supervisor = createVoiceSupervisor({ voice: { localSpeechTimeoutMs: 75 } }, {}, {
+		startWorker: async () => ({
+			warmup: () => new Promise(() => {}),
+			async close() { closes += 1; },
+			statusSnapshots: readySnapshots,
+		}),
+		reportFailure() {},
+		supervisorOptions: {
+			now: () => timers.now,
+			schedule: timers.schedule,
+			cancelSchedule: timers.cancel,
+			startupTimeoutMs: 50,
+			cleanupTimeoutMs: 50,
+		},
+	});
+	supervisor.start();
+	await flush();
+	const warmupDeadline = timers.tasks.find((task) => !task.canceled);
+	assert.equal(warmupDeadline.at, 1_075, 'supervision does not preempt the configured 75 ms local deadline');
+	await timers.runNext();
+	assert.equal(component(supervisor, 'voice').failureCode, 'VOICE_WARMUP_TIMEOUT');
+	await supervisor.close();
+	assert.equal(closes, 1);
+});
+
+test('voice supervisor reports only bounded redacted failure codes during one outage', async () => {
+	const timers = new ManualTimers();
+	const reports = [];
+	let attempts = 0;
+	const codes = ['EADDRINUSE', 'EADDRINUSE', 'LOCAL_SPEECH_WARMUP_FAILED', 'TTS_UNAVAILABLE', 'STT_UNAVAILABLE'];
+	const supervisor = new VoiceSupervisor({
+		startWorker: async () => {
+			const error = new Error(`provider-secret-${attempts}`);
+			error.code = codes[Math.min(attempts, codes.length - 1)];
+			attempts += 1;
+			throw error;
+		},
+		onFailure: (report) => reports.push(report),
+		now: () => timers.now,
+		schedule: timers.schedule,
+		cancelSchedule: timers.cancel,
+		initialRetryMs: 1,
+		maxRetryMs: 1,
+		startupTimeoutMs: 100,
+		warmupTimeoutMs: 100,
+	});
+	supervisor.start();
+	await flush();
+	for (let index = 0; index < 4; index += 1) await timers.runNext();
+	assert.deepEqual(reports.map(({ failureCode }) => failureCode), [
+		'EADDRINUSE',
+		'LOCAL_SPEECH_WARMUP_FAILED',
+		'TTS_UNAVAILABLE',
+	]);
+	assert.doesNotMatch(JSON.stringify(reports), /provider-secret/);
+	await supervisor.close();
 });
 
 test('voice supervisor retries an occupied port and recovers after release without coordinator restart', async () => {

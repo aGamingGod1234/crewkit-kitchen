@@ -45,6 +45,44 @@ test('TTS lifecycle automatically probes and recovers while STT remains independ
 	});
 });
 
+test('fallback TTS health probes never allocate or persist a synthetic agent voice', async () => {
+	let syntheses = 0;
+	let profileResolutions = 0;
+	const profileStore = {
+		resolve() {
+			profileResolutions += 1;
+			return builtInProbeProfile();
+		},
+	};
+	const worker = createVoiceHttpServer({
+		provider: {
+			async synthesize() {
+				syntheses += 1;
+				if (syntheses === 1) throw Object.assign(new Error('temporary failure'), { code: 'TTS_UNAVAILABLE' });
+				return validSynthesis();
+			},
+		},
+		sttProvider: { async transcribe() { return { transcript: '', confidence: 1 }; } },
+		profileStore,
+		secret: SECRET,
+		port: 0,
+		initialProbeDelayMs: 5,
+		maxProbeDelayMs: 5,
+	});
+	const address = await worker.start();
+	try {
+		const response = await fetch(`http://127.0.0.1:${address.port}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		assert.equal(response.status, 502);
+		await eventually(() => worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state === 'ready');
+		assert.equal(syntheses, 2, 'the provider receives one real request and one non-persisting probe');
+		assert.equal(profileResolutions, 1, 'only the real agent request consumes a stored profile');
+	} finally {
+		await worker.close();
+	}
+});
+
 test('permanent STT failure remains degraded after successful TTS traffic', async () => {
 	let sttProbes = 0;
 	await withWorker({
@@ -1001,6 +1039,10 @@ async function eventually(predicate) {
 
 function validSynthesis() {
 	return { sampleRateHz: 44_100, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(4) };
+}
+
+function builtInProbeProfile() {
+	return { profileId: 'voice.test', provider: 'fish', model: 'test', voiceId: 'test', revision: 1, speed: 1 };
 }
 
 function ttsPayload() {
