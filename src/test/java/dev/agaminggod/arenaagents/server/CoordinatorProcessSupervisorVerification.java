@@ -63,6 +63,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyStaleLaunchCannotSuppressReplacement();
 		verifyReconnectRecoveryAndExpiry();
 		verifyExternalCoordinatorReconnectGrace();
+		verifySlowPreparationPreservesExternalAdoptionWindow();
 		verifyContinuousStabilityResetsFailures();
 		verifyCandidatePromotionUsesMaintenanceWorker();
 		verifyCandidatePromotionRefreshesOwnedFingerprintBaseline();
@@ -102,7 +103,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 275;
+		return 283;
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -982,6 +983,58 @@ public final class CoordinatorProcessSupervisorVerification {
 		assertEquals(CoordinatorRecoveryState.AUTHENTICATING, fixture.supervisor.snapshot().state(),
 				"the replacement must authenticate after the external grace expires");
 		fixture.supervisor.close();
+	}
+
+	private static void verifySlowPreparationPreservesExternalAdoptionWindow() {
+		FakeClock externalClock = new FakeClock();
+		MutableDependencies externalDependencies = MutableDependencies.ready();
+		FakeLauncher externalLauncher = new FakeLauncher();
+		SwitchingMaintenanceWorker externalWorker = new SwitchingMaintenanceWorker();
+		CoordinatorProcessSupervisor externalSupervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "slow-external-adoption-game"), Map.of(), externalClock, externalDependencies,
+				externalLauncher, new SequentialLaunchIds(910), externalWorker, runtimeRoot -> 0, task -> { }
+		);
+		try {
+			externalClock.advance(STARTUP_GRACE_MS + 2_000L);
+			externalWorker.completeInitialPreparationInlineAfterward();
+			externalSupervisor.tickWithBridgeListener(false, null, 0L, false, false);
+			assertTrue(externalSupervisor.configured(), "slow dependency preparation publishes the bridge configuration");
+			assertEquals(0, externalLauncher.launches.size(),
+					"expired process-start time does not launch before the prepared bridge can listen");
+			externalSupervisor.tickWithBridgeListener(true, null, 1L, true, true);
+			assertEquals(CoordinatorRecoveryState.HEALTHY, externalSupervisor.snapshot().state(),
+					"external coordinator authenticates after the delayed listener becomes available");
+			assertEquals(0, externalLauncher.launches.size(),
+					"delayed external authentication never races a supervisor-owned child");
+		} finally {
+			externalSupervisor.close();
+		}
+
+		FakeClock launchClock = new FakeClock();
+		MutableDependencies launchDependencies = MutableDependencies.ready();
+		FakeLauncher launchLauncher = new FakeLauncher();
+		SwitchingMaintenanceWorker launchWorker = new SwitchingMaintenanceWorker();
+		CoordinatorProcessSupervisor launchSupervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "slow-normal-launch-game"), Map.of(), launchClock, launchDependencies,
+				launchLauncher, new SequentialLaunchIds(920), launchWorker, runtimeRoot -> 0, task -> { }
+		);
+		try {
+			launchClock.advance(STARTUP_GRACE_MS + 2_000L);
+			launchWorker.completeInitialPreparationInlineAfterward();
+			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, false);
+			assertEquals(0, launchLauncher.launches.size(), "normal auto-start waits until the bridge listener exists");
+			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
+			launchClock.advance(STARTUP_GRACE_MS - 1L);
+			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
+			assertEquals(0, launchLauncher.launches.size(), "normal auto-start honors the listener adoption window in full");
+			launchClock.advance(1L);
+			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
+			assertEquals(1, launchLauncher.launches.size(), "normal auto-start launches after the listener adoption window");
+			assertEquals(CoordinatorRecoveryState.AUTHENTICATING, launchSupervisor.snapshot().state(),
+					"normal auto-start still enters coordinator authentication");
+		} finally {
+			launchSupervisor.close();
+		}
 	}
 
 	private static void verifyContinuousStabilityResetsFailures() {
@@ -2164,6 +2217,32 @@ public final class CoordinatorProcessSupervisorVerification {
 		private Thread startNext(String name) {
 			Thread thread = Thread.ofPlatform().daemon().name(name).start(removeNext());
 			return thread;
+		}
+	}
+
+	private static final class SwitchingMaintenanceWorker implements CoordinatorProcessSupervisor.MaintenanceWorker {
+		private final Deque<Runnable> tasks = new ArrayDeque<>();
+		private boolean inline;
+
+		@Override
+		public void execute(Runnable task) {
+			synchronized (this) {
+				if (!inline) {
+					tasks.addLast(task);
+					return;
+				}
+			}
+			task.run();
+		}
+
+		private void completeInitialPreparationInlineAfterward() {
+			Runnable task;
+			synchronized (this) {
+				task = tasks.pollFirst();
+				if (task == null) throw new AssertionError("initial dependency preparation was not queued");
+				inline = true;
+			}
+			task.run();
 		}
 	}
 

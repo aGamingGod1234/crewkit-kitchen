@@ -207,15 +207,18 @@ public final class CodexAgentServerRuntime {
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		MultiplexedServerBridge bridge = bridge(server);
 		if (supervisor != null) {
+			tryStartBridge(server, manager, supervisor);
+			bridge = bridge(server);
 			boolean coordinatorReady = bridge != null && bridge.authenticated()
 					&& CoordinatorStatusStore.latest(server)
 							.map(status -> coordinatorStatusReady(status, System.currentTimeMillis()))
 							.orElse(false);
-			supervisor.tick(
+			supervisor.tickWithBridgeListener(
 					bridge != null && bridge.authenticated(),
 					bridge == null ? null : bridge.authenticatedLaunchId(),
 					bridge == null ? 0L : bridge.authenticatedSessionGeneration(),
-					coordinatorReady
+					coordinatorReady,
+					bridge != null
 			);
 			tryStartBridge(server, manager, supervisor);
 			bridge = bridge(server);

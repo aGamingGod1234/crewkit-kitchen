@@ -94,6 +94,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private boolean voiceEndpointExplicitOverride;
 	private String managedVoiceEndpoint;
 	private long voiceConfigurationRevision;
+	private boolean initialBridgeListenerObserved;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -537,6 +538,39 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			long sessionGeneration,
 			boolean coordinatorReady
 	) {
+		tickInternal(bridgeAuthenticated, authenticatedLaunchId, sessionGeneration, coordinatorReady, true, false);
+	}
+
+	/**
+	 * Production startup also reports whether the prepared bridge is listening.
+	 * The initial adoption window cannot elapse before an external coordinator has
+	 * a real endpoint on which to authenticate.
+	 */
+	synchronized void tickWithBridgeListener(
+			boolean bridgeAuthenticated,
+			String authenticatedLaunchId,
+			long sessionGeneration,
+			boolean coordinatorReady,
+			boolean bridgeListenerAvailable
+	) {
+		tickInternal(
+				bridgeAuthenticated,
+				authenticatedLaunchId,
+				sessionGeneration,
+				coordinatorReady,
+				bridgeListenerAvailable,
+				true
+		);
+	}
+
+	private void tickInternal(
+			boolean bridgeAuthenticated,
+			String authenticatedLaunchId,
+			long sessionGeneration,
+			boolean coordinatorReady,
+			boolean bridgeListenerAvailable,
+			boolean requireInitialBridgeListener
+	) {
 		if (stopped) return;
 		long now = now();
 		drainMaintenanceResults(now);
@@ -586,6 +620,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				drainMaintenanceResults(now);
 				if (maintenancePending || pendingTermination != null) return;
 			}
+		}
+		if (requireInitialBridgeListener && !initialBridgeListenerObserved) {
+			if (!bridgeListenerAvailable && !bridgeAuthenticated) return;
+			initialBridgeListenerObserved = true;
+			nextRetryEpochMs = Math.max(
+					nextRetryEpochMs,
+					now + CoordinatorLaunchPolicy.STARTUP_GRACE_MS
+			);
 		}
 
 		if (bridgeAuthenticated && authenticatedLaunchId == null) {
