@@ -1,6 +1,5 @@
 package dev.agaminggod.arenaagents.server;
 
-import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridgeVerification;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -27,11 +26,7 @@ public final class CoordinatorRecoveryFaultMatrixVerification {
 		net.minecraft.SharedConstants.tryDetectVersion();
 		net.minecraft.server.Bootstrap.bootStrap();
 		int assertions = CoordinatorProcessSupervisorVerification.verifyFaultMatrix();
-		assertions += BundledCoordinatorInstallerVerification.verify();
-		assertions += MultiplexedServerBridgeVerification.verify();
 		assertions += verifyRealAuthenticationHangRecovers();
-		assertions += CoordinatorProcessOwnershipVerification.verify();
-		assertions += CoordinatorStartupSmokeVerification.verify();
 		return assertions;
 	}
 

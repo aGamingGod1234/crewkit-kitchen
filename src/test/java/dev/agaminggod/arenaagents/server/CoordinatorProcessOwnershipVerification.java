@@ -25,6 +25,8 @@ public final class CoordinatorProcessOwnershipVerification {
 		Path root = Files.createTempDirectory("arena-coordinator-ownership");
 		Process orphan = null;
 		Process liveOwned = null;
+		Process pidReused = null;
+		Process legacyOwned = null;
 		Process unrelated = null;
 		Process staleGeneration = null;
 		Process tree = null;
@@ -37,7 +39,8 @@ public final class CoordinatorProcessOwnershipVerification {
 			Files.writeString(unrelatedMain, "// unrelated fixture", StandardCharsets.UTF_8);
 
 			orphan = startSleeper(main);
-			CoordinatorProcessOwnership.record(root, orphan, main, GENERATION_A, LAUNCH_A, Long.MAX_VALUE);
+			CoordinatorProcessOwnership.record(root, orphan, main, GENERATION_A, LAUNCH_A);
+			invalidateOwnerProcess(root);
 			assertOwnershipIdentity(root, GENERATION_A, LAUNCH_A);
 			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root) == 1,
 					"a coordinator whose Minecraft owner is gone is reaped even when the active runtime is corrupt");
@@ -53,17 +56,35 @@ public final class CoordinatorProcessOwnershipVerification {
 			assertTrue(liveOwned.isAlive(), "the live owner's coordinator remains running");
 
 			int clearAssertions = verifyClearPreservesNewerRecord(root, liveOwned);
+			pidReused = startSleeper(main);
+			CoordinatorProcessOwnership.record(root, pidReused, main, GENERATION_A, LAUNCH_A);
+			invalidateOwnerStartTimestamp(root);
+			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, GENERATION_A) == 1,
+					"a reused Minecraft owner PID cannot suppress orphan cleanup when its start identity differs");
+			assertTrue(pidReused.waitFor(5, TimeUnit.SECONDS), "the PID-reuse orphaned coordinator exits");
+
+			legacyOwned = startSleeper(main);
+			CoordinatorProcessOwnership.record(root, legacyOwned, main, GENERATION_A, LAUNCH_A);
+			removeOwnerStartTimestamp(root);
+			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, GENERATION_A) == 0,
+					"a legacy ownership record remains compatible with its current Minecraft owner");
+			assertTrue(legacyOwned.isAlive(), "legacy ownership keeps the live owner coordinator running");
+			invalidateOwnerProcess(root);
+			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, GENERATION_A) == 1,
+					"a legacy record with a gone owner enters bounded coordinator cleanup");
+			assertTrue(legacyOwned.waitFor(5, TimeUnit.SECONDS), "legacy orphaned coordinator exits");
+
 			unrelated = startSleeper(unrelatedMain);
-			CoordinatorProcessOwnership.record(root, unrelated, main, GENERATION_A, LAUNCH_A, Long.MAX_VALUE);
-			if (unrelated.toHandle().info().arguments().isEmpty() && unrelated.toHandle().info().commandLine().isEmpty()) {
-				invalidateStartTimestamp(root);
-			}
+			CoordinatorProcessOwnership.record(root, unrelated, main, GENERATION_A, LAUNCH_A);
+			invalidateOwnerProcess(root);
+			invalidateStartTimestamp(root);
 			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, GENERATION_A) == 0,
 					"a stale PID with a different coordinator identity is not reaped");
 			assertTrue(unrelated.isAlive(), "an unrelated process with the recorded PID survives");
 
 			staleGeneration = startSleeper(main);
-			CoordinatorProcessOwnership.record(root, staleGeneration, main, GENERATION_A, LAUNCH_A, Long.MAX_VALUE);
+			CoordinatorProcessOwnership.record(root, staleGeneration, main, GENERATION_A, LAUNCH_A);
+			invalidateOwnerProcess(root);
 			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, GENERATION_B) == 1,
 					"a stale-generation record still reaps its exact PID, start time, main, generation, and launch identity");
 			assertTrue(staleGeneration.waitFor(5, TimeUnit.SECONDS),
@@ -72,7 +93,8 @@ public final class CoordinatorProcessOwnershipVerification {
 					"only the matching stale-generation ownership record is cleared");
 
 			tree = startTreeSleeper(main);
-			CoordinatorProcessOwnership.record(root, tree, main, GENERATION_A, LAUNCH_A, Long.MAX_VALUE);
+			CoordinatorProcessOwnership.record(root, tree, main, GENERATION_A, LAUNCH_A);
+			invalidateOwnerProcess(root);
 			var descendants = tree.toHandle().descendants().toList();
 			assertTrue(!descendants.isEmpty(), "ownership fixture creates a child process");
 			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, GENERATION_A) == 1,
@@ -87,11 +109,13 @@ public final class CoordinatorProcessOwnershipVerification {
 			assertTrue(Thread.interrupted(), "tree termination preserves interruption status");
 			assertTrue(interruptedDescendants.stream().noneMatch(ProcessHandle::isAlive),
 					"interrupted tree termination still stops every child");
-			return 17 + clearAssertions + verifyStartupOwnershipRecordFailureCleanup(main)
+			return 24 + clearAssertions + verifyStartupOwnershipRecordFailureCleanup(main)
 					+ verifyRefusedProcessTreeTerminationFailsClosed();
 		} finally {
 			if (orphan != null && orphan.isAlive()) orphan.destroyForcibly();
 			if (liveOwned != null && liveOwned.isAlive()) liveOwned.destroyForcibly();
+			if (pidReused != null && pidReused.isAlive()) pidReused.destroyForcibly();
+			if (legacyOwned != null && legacyOwned.isAlive()) legacyOwned.destroyForcibly();
 			if (unrelated != null && unrelated.isAlive()) unrelated.destroyForcibly();
 			if (staleGeneration != null && staleGeneration.isAlive()) staleGeneration.destroyForcibly();
 			if (tree != null && tree.isAlive()) tree.destroyForcibly();
@@ -109,6 +133,45 @@ public final class CoordinatorProcessOwnershipVerification {
 				"ownership records the exact runtime generation");
 		assertTrue(launchId.equals(values.getProperty("launchId")),
 				"ownership records the exact supervisor launch UUID");
+		long ownerStart = ProcessHandle.current().info().startInstant().orElseThrow().toEpochMilli();
+		assertTrue(Long.toString(ownerStart).equals(values.getProperty("ownerStartedAtEpochMs")),
+				"ownership records the exact Minecraft owner start identity");
+	}
+
+	private static void invalidateOwnerProcess(Path root) throws Exception {
+		Path ownership = CoordinatorProcessOwnership.ownershipFile(root);
+		Properties values = new Properties();
+		try (var reader = Files.newBufferedReader(ownership)) {
+			values.load(reader);
+		}
+		values.setProperty("ownerPid", Long.toString(Long.MAX_VALUE));
+		try (var writer = Files.newBufferedWriter(ownership)) {
+			values.store(writer, "owner process exited");
+		}
+	}
+
+	private static void invalidateOwnerStartTimestamp(Path root) throws Exception {
+		Path ownership = CoordinatorProcessOwnership.ownershipFile(root);
+		Properties values = new Properties();
+		try (var reader = Files.newBufferedReader(ownership)) {
+			values.load(reader);
+		}
+		values.setProperty("ownerStartedAtEpochMs", "1");
+		try (var writer = Files.newBufferedWriter(ownership)) {
+			values.store(writer, "reused owner PID fixture");
+		}
+	}
+
+	private static void removeOwnerStartTimestamp(Path root) throws Exception {
+		Path ownership = CoordinatorProcessOwnership.ownershipFile(root);
+		Properties values = new Properties();
+		try (var reader = Files.newBufferedReader(ownership)) {
+			values.load(reader);
+		}
+		values.remove("ownerStartedAtEpochMs");
+		try (var writer = Files.newBufferedWriter(ownership)) {
+			values.store(writer, "legacy ownership fixture");
+		}
 	}
 
 	private static void invalidateStartTimestamp(Path root) throws Exception {
