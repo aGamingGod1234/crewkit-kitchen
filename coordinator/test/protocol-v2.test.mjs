@@ -815,9 +815,11 @@ test('bridge preserves ready and disconnected events while exposing authenticate
 	});
 	t.after(() => bridge.stop());
 	const readyEvents = [];
+	const deliveredResults = [];
 	const activeRecord = { ...registeredRecord(), goalRevision: 4 };
 	const disconnected = once(bridge, 'disconnected');
 	bridge.on('ready', (event) => readyEvents.push(event));
+	bridge.on('action_result', (event) => deliveredResults.push(event));
 	const recovered = once(bridge, 'recovered');
 
 	bridge.start();
@@ -847,10 +849,11 @@ test('bridge preserves ready and disconnected events while exposing authenticate
 	assert.equal(recovery.serverInstanceId, 'server-instance');
 	assert.equal(recovery.registry.length, 1);
 	assert.equal(recovery.registry[0].agentId, 'agent-a');
-	const protocolError = once(bridge, 'protocolError');
 	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replayed', actionResult('action-before-reconnect')))}\n`);
-	const [replayError] = await protocolError;
-	assert.equal(replayError.code, 'DUPLICATE_TERMINAL_RESULT');
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(deliveredResults.length, 1, 'socket-drop replay must not be emitted twice');
+	await bridge.acknowledgeActionResult('agent-a', actionResult('action-before-reconnect'), { connectionEpoch: 2 });
+	assert.equal(JSON.parse(sockets[1].writes.at(-1)).type, 'action_result_ack');
 });
 
 test('bridge destroys and reconnects a connected peer that misses the handshake deadline', async (t) => {

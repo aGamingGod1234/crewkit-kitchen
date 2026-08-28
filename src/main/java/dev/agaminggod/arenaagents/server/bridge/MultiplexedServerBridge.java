@@ -670,7 +670,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
 				coordinatorReadyAgentIds.clear();
+				Map<AgentId, AgentRecord> allRecordsById = new HashMap<>();
+				for (AgentRecord record : manager.records()) allRecordsById.put(record.agentId(), record);
 				for (PendingGoalDraft draft : manager.goalDrafts()) {
+					AgentRecord record = allRecordsById.get(draft.agentId());
+					if (record == null) {
+						manager.removeGoalDraft(draft.draftId());
+						continue;
+					}
+					if (!draft.matches(record)) {
+						manager.removeGoalDraft(draft.draftId());
+						continue;
+					}
 					if (draft.proposedPredicate().isEmpty() && handshakeKnownAgentIds.contains(draft.agentId())) {
 						handshake.add(goalSpecRequestEnvelope(draft));
 					}

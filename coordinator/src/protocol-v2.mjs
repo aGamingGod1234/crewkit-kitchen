@@ -613,8 +613,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const previous = this.#terminalResultsByKey.get(key);
 		if (previous !== undefined) {
 			if (previous !== fingerprint) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Action '${actionId}' changed its terminal result`);
-			if (this.#acknowledgedTerminalActionIds.has(key)) return true;
-			throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
+			return true;
 		}
 		if (goal.actionIds.has(actionId)) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
 		goal.actionIds.add(actionId);

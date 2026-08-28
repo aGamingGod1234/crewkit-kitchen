@@ -132,6 +132,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
+		verifyStaleGoalDraftIsPrunedBeforeHandshake();
 		verifyCompletionResultFacts();
 		verifyReplacementOperation();
 		return 154;
@@ -488,6 +489,43 @@ public final class MultiplexedServerBridgeVerification {
 		predicate.addProperty("count", 1);
 		payload.add("predicate", predicate);
 		return payload;
+	}
+
+	private static void verifyStaleGoalDraftIsPrunedBeforeHandshake() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-stale-goal-draft-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord idle = manager.registry().create("gpt-5.6-sol", "high", Optional.of("StaleDraft"), 1_000L);
+			UUID draftId = UUID.fromString("00000000-0000-0000-0000-000000000311");
+			manager.stageGoalDraft(new PendingGoalDraft(
+					draftId, idle.agentId(), UUID.fromString("00000000-0000-0000-0000-000000000312"),
+					"Obtain an iron pickaxe", List.of("minecraft:iron_pickaxe"), Optional.empty(),
+					DraftIntent.CONFIRM_TRANSLATION, 1_001L, idle.goalRevision(), Optional.empty()
+			));
+			manager.registry().start(idle.agentId(), "a replacement goal", 1_002L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				authenticate(socket, reader, codec, secret, "hello-stale-goal-draft");
+				Thread.sleep(50L);
+				assertTrue(!reader.ready(), "stale goal draft is not replayed during authentication");
+			}
+			assertTrue(manager.goalDraft(draftId).isEmpty(), "stale goal draft is removed before handshake publication");
+		} catch (Exception exception) {
+			throw new AssertionError("stale goal draft handshake verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (secretFile != null) try { Files.deleteIfExists(secretFile); } catch (java.io.IOException exception) {
+				throw new AssertionError("could not remove stale goal draft secret", exception);
+			}
+		}
 	}
 
 	private static void verifyObsoletePlannerReadinessIsIgnored() {
