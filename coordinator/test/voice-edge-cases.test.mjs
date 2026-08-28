@@ -631,9 +631,153 @@ test('a timed-out old profile write cannot overwrite its replacement generation'
 		const document = JSON.parse(await readFile(file, 'utf8'));
 		assert.ok(document.assignments[agentUuid(4_001)]);
 		assert.ok(document.assignments[agentUuid(4_002)]);
-		await Promise.all([oldStore.close(), oldStore.close(), replacement.close(), replacement.close()]);
+		const oldClose = oldStore.close();
+		assert.equal(oldStore.close(), oldClose);
+		await Promise.all([
+			assert.rejects(oldClose, (error) => error.name === 'AbortError'),
+			replacement.close(),
+			replacement.close(),
+		]);
 	} finally {
 		releaseOldWrite?.();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('profile repair drains a second stale publish that lands while the first repair settles', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-repair-latch-'));
+	const file = path.join(root, 'assignments.json');
+	const firstController = new AbortController();
+	const secondController = new AbortController();
+	const delayedRename = () => {
+		let signalEntered;
+		const entered = new Promise((resolve) => { signalEntered = resolve; });
+		let release;
+		const gate = new Promise((resolve) => { release = resolve; });
+		let signalPublished;
+		const published = new Promise((resolve) => { signalPublished = resolve; });
+		return {
+			entered,
+			published,
+			release,
+			rename: async (source, destination) => {
+				const bytes = await readFile(source);
+				signalEntered();
+				await gate;
+				await writeFile(destination, bytes);
+				signalPublished();
+			},
+		};
+	};
+	const firstMove = delayedRename();
+	const secondMove = delayedRename();
+	let signalRepairMoved;
+	const repairMoved = new Promise((resolve) => { signalRepairMoved = resolve; });
+	let releaseRepair;
+	const repairGate = new Promise((resolve) => { releaseRepair = resolve; });
+	let signalFollowUpMoved;
+	const followUpMoved = new Promise((resolve) => { signalFollowUpMoved = resolve; });
+	let currentMoves = 0;
+	try {
+		const first = await loadPersistentVoiceProfileStore(file, {
+			signal: firstController.signal,
+			rename: firstMove.rename,
+		});
+		first.store.resolve(agentUuid(4_101));
+		await firstMove.entered;
+		firstController.abort();
+		await assert.rejects(first.flush(), (error) => error.name === 'AbortError');
+
+		const second = await loadPersistentVoiceProfileStore(file, {
+			signal: secondController.signal,
+			rename: secondMove.rename,
+		});
+		second.store.resolve(agentUuid(4_102));
+		await secondMove.entered;
+		secondController.abort();
+		await assert.rejects(second.flush(), (error) => error.name === 'AbortError');
+
+		const current = await loadPersistentVoiceProfileStore(file, {
+			rename: async (source, destination) => {
+				currentMoves += 1;
+				const bytes = await readFile(source);
+				await writeFile(destination, bytes);
+				if (currentMoves === 2) {
+					signalRepairMoved();
+					await repairGate;
+				}
+				if (currentMoves === 3) signalFollowUpMoved();
+			},
+		});
+		current.store.resolve(agentUuid(4_103));
+		await current.flush();
+
+		firstMove.release();
+		await repairMoved;
+		secondMove.release();
+		await secondMove.published;
+		await new Promise((resolve) => setImmediate(resolve));
+		releaseRepair();
+		let followUpTimeout;
+		try {
+			await Promise.race([
+				followUpMoved,
+				new Promise((_, reject) => {
+					followUpTimeout = setTimeout(() => reject(new Error('follow-up profile repair did not run')), 500);
+				}),
+			]);
+		} finally {
+			clearTimeout(followUpTimeout);
+		}
+		assert.equal(currentMoves, 3, 'the second stale publish requests exactly one follow-up repair');
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.ok(document.assignments[agentUuid(4_101)]);
+		assert.ok(document.assignments[agentUuid(4_102)]);
+		assert.ok(document.assignments[agentUuid(4_103)], 'the latest assignment is repaired after every stale publish');
+		await Promise.all([
+			assert.rejects(first.close(), (error) => error.name === 'AbortError'),
+			assert.rejects(second.close(), (error) => error.name === 'AbortError'),
+			current.close(),
+		]);
+	} finally {
+		firstMove.release();
+		secondMove.release();
+		releaseRepair?.();
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test('profile close retries a transient pending write and persists the latest assignment', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-close-retry-'));
+	const file = path.join(root, 'assignments.json');
+	let writes = 0;
+	let signalWriteEntered;
+	const writeEntered = new Promise((resolve) => { signalWriteEntered = resolve; });
+	let releaseWrite;
+	const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+	try {
+		const persistent = await loadPersistentVoiceProfileStore(file, {
+			writeFile: async (...arguments_) => {
+				writes += 1;
+				if (writes === 1) {
+					signalWriteEntered();
+					await writeGate;
+					throw Object.assign(new Error('file temporarily locked'), { code: 'EPERM' });
+				}
+				return writeFile(...arguments_);
+			},
+		});
+		persistent.store.resolve(agentUuid(4_201));
+		await writeEntered;
+		const closing = persistent.close();
+		assert.equal(persistent.close(), closing);
+		releaseWrite();
+		await closing;
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.ok(document.assignments[agentUuid(4_201)]);
+		assert.equal(writes, 2);
+	} finally {
+		releaseWrite?.();
 		await rm(root, { recursive: true, force: true });
 	}
 });
@@ -655,10 +799,10 @@ test('persistent profile close is bounded and idempotent when storage ignores ca
 		await entered;
 		const firstClose = persistent.close();
 		assert.equal(persistent.close(), firstClose);
-		await Promise.race([
+		await assert.rejects(Promise.race([
 			firstClose,
 			new Promise((_, reject) => setTimeout(() => reject(new Error('profile close exceeded its bound')), 100)),
-		]);
+		]), (error) => error.name === 'AbortError');
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

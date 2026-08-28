@@ -2,6 +2,9 @@ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const PERSISTENT_FILES = new Map();
+const PERSIST_RETRY_BASE_MS = 10;
+const PERSIST_RETRY_MAX_MS = 100;
+const REPAIR_RETRY_MS = 25;
 
 const VOICE_PROFILES = Object.freeze([
 	profile('moss', 'c5f56a6cc2ec4fa8920cb4c5889a3fb7', ['measured', 'clear', 'calm'], ['bright', 'breathy'], 0.94),
@@ -163,16 +166,32 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 	const close = () => {
 		if (closePromise !== null) return closePromise;
 		closed = true;
-		if (pending === null && persistedRevision < desiredRevision) startDrain();
-		const settling = Promise.resolve(pending).catch(() => {});
+		const drainForClose = async () => {
+			if (signal?.aborted) throw abortReason(signal);
+			let failures = 0;
+			while (persistedRevision < desiredRevision) {
+				try {
+					await (pending ?? startDrain());
+					failures = 0;
+				} catch (error) {
+					if (ownerController.signal.aborted) throw abortReason(ownerController.signal);
+					if (signal?.aborted) throw abortReason(signal);
+					failures += 1;
+					const retryDelayMs = Math.min(PERSIST_RETRY_BASE_MS * (2 ** (failures - 1)), PERSIST_RETRY_MAX_MS);
+					await waitForRetry(retryDelayMs, ownerController.signal);
+				}
+			}
+		};
+		const draining = drainForClose();
 		let timer;
-		const deadline = new Promise((resolve) => {
+		const deadline = new Promise((_, reject) => {
 			timer = setTimeout(() => {
-				ownerController.abort(abortError('Voice profile store close timed out'));
-				resolve();
+				const error = abortError('Voice profile store close timed out');
+				ownerController.abort(error);
+				reject(error);
 			}, closeTimeoutMs);
 		});
-		closePromise = Promise.race([settling, deadline]).finally(() => {
+		closePromise = Promise.race([draining, deadline]).finally(() => {
 			clearTimeout(timer);
 			ownerController.abort(abortError('Voice profile store was closed'));
 		}).then(() => undefined);
@@ -233,6 +252,9 @@ function persistentCoordinator(filePath) {
 		writeSequence: 0,
 		publishTail: Promise.resolve(),
 		repairPromise: null,
+		repairRequestedRevision: 0,
+		repairCompletedRevision: 0,
+		repairRetryTimer: null,
 	};
 	PERSISTENT_FILES.set(key, coordinator);
 	return coordinator;
@@ -323,13 +345,45 @@ async function withPublishOwnership(coordinator, operation) {
 }
 
 function requestRepair(coordinator) {
+	if (coordinator.latestIo === null) return;
+	coordinator.repairRequestedRevision += 1;
+	if (coordinator.repairRetryTimer !== null) {
+		clearTimeout(coordinator.repairRetryTimer);
+		coordinator.repairRetryTimer = null;
+	}
+	startRepairDrain(coordinator);
+}
+
+function startRepairDrain(coordinator) {
 	if (coordinator.repairPromise !== null || coordinator.latestIo === null) return;
-	coordinator.repairPromise = persistCoordinator(
-		coordinator,
-		coordinator.latestOwnerGeneration,
-		coordinator.latestIo,
-		undefined,
-	).catch(() => {}).finally(() => { coordinator.repairPromise = null; });
+	let failed = false;
+	const operation = (async () => {
+		while (coordinator.repairCompletedRevision < coordinator.repairRequestedRevision) {
+			const targetRevision = coordinator.repairRequestedRevision;
+			await persistCoordinator(
+				coordinator,
+				coordinator.latestOwnerGeneration,
+				coordinator.latestIo,
+				undefined,
+			);
+			coordinator.repairCompletedRevision = targetRevision;
+		}
+	})();
+	coordinator.repairPromise = operation.catch(() => {
+		failed = true;
+	}).finally(() => {
+		coordinator.repairPromise = null;
+		if (coordinator.repairCompletedRevision >= coordinator.repairRequestedRevision) return;
+		if (!failed) {
+			startRepairDrain(coordinator);
+			return;
+		}
+		coordinator.repairRetryTimer = setTimeout(() => {
+			coordinator.repairRetryTimer = null;
+			startRepairDrain(coordinator);
+		}, REPAIR_RETRY_MS);
+		coordinator.repairRetryTimer.unref?.();
+	});
 }
 
 async function removeTemporary(remove, temporary) {
@@ -359,6 +413,20 @@ function awaitAbortable(value, signal) {
 			(result) => signal.aborted ? onAbort() : finish(resolve, result),
 			(error) => finish(reject, error),
 		);
+	});
+}
+
+function waitForRetry(delayMs, signal) {
+	if (signal.aborted) return Promise.reject(abortReason(signal));
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => finish(resolve), delayMs);
+		const onAbort = () => finish(reject, abortReason(signal));
+		const finish = (operation, result) => {
+			clearTimeout(timer);
+			signal.removeEventListener('abort', onAbort);
+			operation(result);
+		};
+		signal.addEventListener('abort', onAbort, { once: true });
 	});
 }
 
