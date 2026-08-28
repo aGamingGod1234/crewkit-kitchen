@@ -11,12 +11,16 @@ import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import java.util.ArrayList;
 import java.util.Set;
+import java.util.UUID;
 
 /** Closed, versioned codec for the bounded kill ledger stored in Minecraft SavedData. */
 public final class AgentKillLedgerCodec {
 	private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
-	private static final Set<String> ROOT_FIELDS = Set.of("schema_version", "events");
+	private static final Set<String> ROOT_FIELDS_V1 = Set.of("schema_version", "events");
+	private static final Set<String> ROOT_FIELDS_V2 = Set.of("schema_version", "events", "progress");
 	private static final Set<String> EVENT_FIELDS = Set.of("agent_id", "entity_type", "occurred_at_epoch_ms");
+	private static final Set<String> PROGRESS_FIELDS = Set.of(
+			"goal_id", "agent_id", "entity_type", "after_exclusive", "required_count", "evicted_count");
 
 	public String encode(AgentKillLedger.Snapshot snapshot) {
 		JsonObject root = new JsonObject();
@@ -30,14 +34,28 @@ public final class AgentKillLedgerCodec {
 			events.add(encoded);
 		}
 		root.add("events", events);
+		JsonArray progress = new JsonArray();
+		for (AgentKillLedger.ProgressEvent event : snapshot.progress()) {
+			JsonObject encoded = new JsonObject();
+			encoded.addProperty("goal_id", event.goalId().toString());
+			encoded.addProperty("agent_id", event.agentId().toString());
+			encoded.addProperty("entity_type", event.entityType());
+			encoded.addProperty("after_exclusive", event.afterExclusive());
+			encoded.addProperty("required_count", event.requiredCount());
+			encoded.addProperty("evicted_count", event.evictedCount());
+			progress.add(encoded);
+		}
+		root.add("progress", progress);
 		return GSON.toJson(root);
 	}
 
 	public AgentKillLedger.Snapshot decode(String encoded) {
 		try {
 			JsonObject root = object(JsonParser.parseString(encoded), "kill ledger");
-			exactFields(root, ROOT_FIELDS, "kill ledger");
 			int version = exactInt(root, "schema_version");
+			if (version == 1) exactFields(root, ROOT_FIELDS_V1, "kill ledger");
+			else if (version == AgentKillLedger.SCHEMA_VERSION) exactFields(root, ROOT_FIELDS_V2, "kill ledger");
+			else throw failure("unsupported kill ledger schema: " + version);
 			JsonElement eventValue = field(root, "events");
 			if (!eventValue.isJsonArray()) throw failure("events must be an array");
 			JsonArray events = eventValue.getAsJsonArray();
@@ -52,7 +70,28 @@ public final class AgentKillLedgerCodec {
 						exactLong(event, "occurred_at_epoch_ms")
 				));
 			}
-			return new AgentKillLedger.Snapshot(version, decoded);
+			ArrayList<AgentKillLedger.ProgressEvent> decodedProgress = new ArrayList<>();
+			if (version >= 2) {
+				JsonElement progressValue = field(root, "progress");
+				if (!progressValue.isJsonArray()) throw failure("progress must be an array");
+				JsonArray progress = progressValue.getAsJsonArray();
+				if (progress.size() > AgentKillLedger.MAX_PROGRESS_ENTRIES) {
+					throw failure("progress count exceeds the bounded limit");
+				}
+				for (JsonElement value : progress) {
+					JsonObject entry = object(value, "kill progress");
+					exactFields(entry, PROGRESS_FIELDS, "kill progress");
+					decodedProgress.add(new AgentKillLedger.ProgressEvent(
+							UUID.fromString(string(entry, "goal_id")),
+							AgentId.parse(string(entry, "agent_id")),
+							string(entry, "entity_type"),
+							exactLong(entry, "after_exclusive"),
+							exactInt(entry, "required_count"),
+							exactInt(entry, "evicted_count")
+					));
+				}
+			}
+			return new AgentKillLedger.Snapshot(AgentKillLedger.SCHEMA_VERSION, decoded, decodedProgress);
 		} catch (AgentDomainException exception) {
 			throw exception;
 		} catch (JsonParseException | IllegalStateException | IllegalArgumentException exception) {

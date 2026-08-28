@@ -196,7 +196,7 @@ public final class GoalCompletionVerifier {
 		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
 			long afterTime = killed.afterGoalStart() ? record.currentGoal().orElseThrow().createdAtEpochMs() : Long.MIN_VALUE;
 			int required = killAllocation.claim(new KillRequirement(killed.entityType(), afterTime));
-			int observed = kills.count(record.agentId(), killed.entityType(), afterTime);
+			int observed = kills.count(goalId, record.agentId(), killed.entityType(), afterTime);
 			return leaf("entity_killed_by_agent", observed >= required,
 					killed.entityType() + " x" + required, killed.entityType() + " x" + observed);
 		}
@@ -261,7 +261,7 @@ public final class GoalCompletionVerifier {
 					? record.currentGoal().orElseThrow().createdAtEpochMs()
 					: Long.MIN_VALUE;
 			int required = claimed.claim(new KillRequirement(killed.entityType(), afterTime));
-			int observed = kills.count(record.agentId(), killed.entityType(), afterTime);
+			int observed = kills.count(goalId, record.agentId(), killed.entityType(), afterTime);
 			if (observed < required) return Optional.empty();
 			GoalEvidence.Fact fact = new GoalEvidence.Fact(
 					"entity_killed_by_agent", true,

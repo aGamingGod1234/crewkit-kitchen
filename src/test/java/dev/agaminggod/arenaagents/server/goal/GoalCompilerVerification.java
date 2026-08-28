@@ -229,6 +229,16 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Get a good pickaxe and kill a zombie", RegistryAccess.EMPTY),
 				"compound translation candidates include registered items and entities"
 		);
+		assertEquals(
+				List.of("minecraft:zombie"),
+				compiler.candidateIdsFor("Kill 3 zombies", RegistryAccess.EMPTY),
+				"a kill count is removed before collecting translation candidates"
+		);
+		assertEquals(
+				List.of("minecraft:apple", "minecraft:enchanted_golden_apple", "minecraft:golden_apple", "minecraft:zombie"),
+				compiler.candidateIdsFor("Get an apple and kill 3 zombies", RegistryAccess.EMPTY),
+				"compound translation strips kill counts without changing item candidates"
+		);
 		GoalCompilation overBound = compiler.compile("Get apple" + " and apple".repeat(16), RegistryAccess.EMPTY, 1_200L);
 		assertEquals(GoalCompilation.Kind.REJECTED, overBound.kind(), "compound predicates reject more than sixteen factual leaves");
 		GoalCompilation carriedCraft = compiler.compile("Craft an iron pickaxe and a shield", RegistryAccess.EMPTY, 1_200L);
@@ -241,7 +251,7 @@ public final class GoalCompilerVerification {
 				compiler.compile("Get an iron pickaxe and make a shield", RegistryAccess.EMPTY, 1_200L).kind(),
 				"an explicit make clause keeps the entire compound goal verifiable"
 		);
-		return 8;
+		return 10;
 	}
 
 	private static int verifyExplicitAlternativeCandidates() {

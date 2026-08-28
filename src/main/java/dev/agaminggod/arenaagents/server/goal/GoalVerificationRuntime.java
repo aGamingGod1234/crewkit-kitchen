@@ -7,9 +7,11 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -66,9 +68,11 @@ public final class GoalVerificationRuntime {
 		this.epochMillis = Objects.requireNonNull(epochMillis, "epochMillis must not be null");
 		this.verifier = Objects.requireNonNull(verifier, "verifier must not be null");
 		this.killLedger = Objects.requireNonNull(killLedger, "killLedger must not be null");
+		synchronizeKillProgress();
 	}
 
 	public List<AgentTransition> tick() {
+		synchronizeKillProgress();
 		long tick = serverTick.getAsLong();
 		long now = epochMillis.getAsLong();
 		if (tick < 0L) throw new IllegalStateException("Server tick must be nonnegative");
@@ -86,6 +90,7 @@ public final class GoalVerificationRuntime {
 			if (!result.verified()) continue;
 			transitions.add(registry.satisfyGoal(record.agentId(), record.goalRevision(), result.evidence(tick), now));
 		}
+		synchronizeKillProgress();
 		Set<UUID> currentGoals = registry.records().stream().flatMap(record -> record.currentGoal().stream())
 				.map(AgentGoal::goalId).collect(java.util.stream.Collectors.toUnmodifiableSet());
 		verifier.retainGoals(currentGoals);
@@ -98,6 +103,7 @@ public final class GoalVerificationRuntime {
 	}
 
 	public GoalCompletionVerifier.VerificationResult evaluate(AgentId agentId) {
+		synchronizeKillProgress();
 		AgentRecord record = registry.require(agentId);
 		long tick = serverTick.getAsLong();
 		return verifySafely(record, tick);
@@ -146,6 +152,7 @@ public final class GoalVerificationRuntime {
 	}
 
 	public void recordKill(AgentId agentId, String entityType) {
+		synchronizeKillProgress();
 		killLedger.record(agentId, entityType, epochMillis.getAsLong());
 	}
 
@@ -166,6 +173,45 @@ public final class GoalVerificationRuntime {
 	public List<VerificationFault> faults() {
 		return List.copyOf(faults.values());
 	}
+
+	private void synchronizeKillProgress() {
+		ArrayList<AgentKillLedger.KillProgressRequirement> requirements = new ArrayList<>();
+		for (AgentRecord record : registry.records()) {
+			AgentGoal goal = record.currentGoal().orElse(null);
+			if (goal == null || goal.status() != GoalStatus.ACTIVE && goal.status() != GoalStatus.RECOVERING) continue;
+			Map<KillRequirementKey, Integer> requiredByEntity = new HashMap<>();
+			collectKillRequirements(goal.spec().completion(), goal.createdAtEpochMs(), requiredByEntity);
+			for (Map.Entry<KillRequirementKey, Integer> entry : requiredByEntity.entrySet()) {
+				requirements.add(new AgentKillLedger.KillProgressRequirement(
+						goal.goalId(), record.agentId(), entry.getKey().entityType(),
+						entry.getKey().afterExclusive(), entry.getValue()));
+			}
+		}
+		killLedger.synchronizeProgress(requirements);
+	}
+
+	private static void collectKillRequirements(
+			GoalPredicate predicate, long goalStartedAt, Map<KillRequirementKey, Integer> requiredByEntity
+	) {
+		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
+			long afterExclusive = killed.afterGoalStart() ? goalStartedAt : Long.MIN_VALUE;
+			requiredByEntity.merge(new KillRequirementKey(killed.entityType(), afterExclusive), 1, Math::addExact);
+			return;
+		}
+		if (predicate instanceof GoalPredicate.AllOf all) {
+			for (GoalPredicate child : all.predicates()) {
+				collectKillRequirements(child, goalStartedAt, requiredByEntity);
+			}
+			return;
+		}
+		if (predicate instanceof GoalPredicate.AnyOf any) {
+			for (GoalPredicate child : any.predicates()) {
+				collectKillRequirements(child, goalStartedAt, requiredByEntity);
+			}
+		}
+	}
+
+	private record KillRequirementKey(String entityType, long afterExclusive) { }
 
 	private GoalCompletionVerifier.VerificationResult verifySafely(AgentRecord record, long tick) {
 		VerificationFault existing = faults.get(record.agentId());

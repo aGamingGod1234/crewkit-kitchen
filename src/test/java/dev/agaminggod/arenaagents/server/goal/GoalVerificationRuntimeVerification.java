@@ -19,6 +19,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
@@ -37,6 +38,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyDistinctRepeatedKillAttribution();
 		assertions += verifyKillGoalAfterServerTickReset();
 		assertions += verifyPersistedKillProgressAcrossRestart();
+		assertions += verifyActiveKillProgressSurvivesLedgerEviction();
 		assertions += verifyPersistedKillActivationFencing();
 		assertions += verifyKillLedgerPersistenceCompatibility();
 		assertions += verifyIndexedKillLookup();
@@ -323,6 +325,57 @@ public final class GoalVerificationRuntimeVerification {
 		return 2;
 	}
 
+	private static int verifyActiveKillProgressSurvivesLedgerEviction() {
+		AgentSavedData data = new AgentSavedData();
+		long now = 45_000L;
+		AgentRecord idle = data.registry().create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		GoalPredicate compound = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+				new GoalPredicate.InventoryContains("minecraft:iron_ingot", 1)
+		));
+		data.registry().start(idle.agentId(), GoalSpec.create(
+				"Kill two zombies and get iron", compound, 925L), now + 1L);
+		FakeFacts facts = new FakeFacts();
+		long[] tick = { 925L };
+		long[] epoch = { now + 2L };
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				data.registry(), ignored -> Optional.of(facts), () -> tick[0], () -> epoch[0], data.killLedger());
+		runtime.recordKill(idle.agentId(), "minecraft:zombie");
+		UUID goalId = data.registry().require(idle.agentId()).currentGoal().orElseThrow().goalId();
+		long activation = data.registry().require(idle.agentId()).currentGoal().orElseThrow().createdAtEpochMs();
+		AgentId noisyAgent = AgentId.random();
+		for (int index = 0; index < AgentKillLedger.MAX_EVENTS; index++) {
+			data.killLedger().record(noisyAgent, "minecraft:skeleton", now + 3L + index);
+		}
+		assertEquals(AgentKillLedger.MAX_EVENTS, data.killLedger().size(),
+				"global kill history stays bounded while an active goal is tracked");
+		assertEquals(0, data.killLedger().count(idle.agentId(), "minecraft:zombie", activation),
+				"the qualifying kill is no longer present in the bounded event suffix");
+		assertEquals(1, data.killLedger().count(goalId, idle.agentId(), "minecraft:zombie", activation),
+				"eviction compacts the qualifying kill into bounded active-goal progress");
+
+		AgentSavedData restored = roundTripSavedData(data, false);
+		long[] restartEpoch = { now + AgentKillLedger.MAX_EVENTS + 10L };
+		GoalVerificationRuntime restoredRuntime = new GoalVerificationRuntime(
+				restored.registry(), ignored -> Optional.of(facts), () -> 1L, () -> restartEpoch[0], restored.killLedger());
+		facts.items.put("minecraft:iron_ingot", 1);
+		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"one compacted kill cannot satisfy two repeated kill requirements after restart");
+		restoredRuntime.recordKill(idle.agentId(), "minecraft:zombie");
+		assertEquals(true, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"a new kill combines with persisted compacted progress to finish the repeated goal");
+		assertEquals(true, restored.isDirty(),
+				"persisted progress and its later update dirty Minecraft saved data");
+		assertEquals(1, restoredRuntime.tick().size(),
+				"compacted kill evidence completes the active goal exactly once");
+		assertEquals(0, restored.killLedger().snapshot().progress().size(),
+				"completed goals release their compacted kill progress");
+		return 8;
+	}
+
 	private static int verifyKillLedgerPersistenceCompatibility() {
 		AgentSavedData data = new AgentSavedData();
 		AgentId agentId = AgentId.random();
@@ -331,7 +384,12 @@ public final class GoalVerificationRuntimeVerification {
 		assertEquals(0, legacy.killLedger().size(), "saved data without the new optional field loads as an empty legacy ledger");
 
 		AgentKillLedgerCodec codec = new AgentKillLedgerCodec();
-		String unsupported = codec.encode(data.killLedger().snapshot()).replace("\"schema_version\":1", "\"schema_version\":2");
+		String encoded = codec.encode(data.killLedger().snapshot());
+		String legacyEncoding = encoded.replace("\"schema_version\":2", "\"schema_version\":1")
+				.replace(",\"progress\":[]", "");
+		assertEquals(1, codec.decode(legacyEncoding).events().size(),
+				"schema-one kill ledgers upgrade with empty compacted progress");
+		String unsupported = encoded.replace("\"schema_version\":2", "\"schema_version\":3");
 		try {
 			codec.decode(unsupported);
 			throw new AssertionError("unsupported kill-ledger schema must fail closed");
@@ -339,7 +397,7 @@ public final class GoalVerificationRuntimeVerification {
 			assertEquals("INVALID_PERSISTED_KILL_LEDGER", expected.code(),
 					"unsupported persisted kill-ledger versions are rejected explicitly");
 		}
-		return 2;
+		return 3;
 	}
 
 	private static int verifyIndexedKillLookup() {

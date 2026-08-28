@@ -40,6 +40,7 @@ public final class GoalCompiler {
 	);
 	private static final Pattern ADVANCEMENT = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:(?:the|a|an) )?(.+)$");
+	private static final Pattern KILL_COUNT = Pattern.compile("^\\d+\\s+(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(?:build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
@@ -221,7 +222,8 @@ public final class GoalCompiler {
 		if (clauses.size() > 1) {
 			TreeSet<String> candidates = new TreeSet<>();
 			for (GoalClause clause : clauses) {
-				candidates.addAll(relatedCandidates(clause.kind(), clause.target(), registries));
+				String target = clause.kind() == ClauseKind.KILL ? stripKillCount(clause.target()) : clause.target();
+				candidates.addAll(relatedCandidates(clause.kind(), target, registries));
 				if (candidates.size() >= MAX_TRANSLATION_CANDIDATES) break;
 			}
 			return candidates.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
@@ -233,7 +235,7 @@ public final class GoalCompiler {
 		Matcher kill = KILL.matcher(command);
 		if (BEAT_GAME.matcher(command).matches()) return List.of("minecraft:ender_dragon");
 		if (kill.matches()) {
-			return relatedCandidates(ClauseKind.KILL, kill.group(1), registries);
+			return relatedCandidates(ClauseKind.KILL, stripKillCount(kill.group(1)), registries);
 		}
 		Matcher block = BLOCK.matcher(command);
 		if (block.matches()) return relatedBlocks(block.group(1), registries).stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
@@ -310,6 +312,11 @@ public final class GoalCompiler {
 
 	private enum ClauseKind { ITEM, KILL }
 	private record GoalClause(ClauseKind kind, String target, int count, boolean requiresCreation) { }
+
+	private static String stripKillCount(String target) {
+		Matcher counted = KILL_COUNT.matcher(target);
+		return counted.matches() ? counted.group(1) : target;
+	}
 
 	private static List<String> relatedCandidates(ClauseKind kind, String rawTarget, RegistryAccess registries) {
 		String target = SUBJECTIVE.matcher(rawTarget).replaceAll(" ").replaceAll("\\s+", " ").strip();
@@ -465,9 +472,11 @@ public final class GoalCompiler {
 	private static List<String> relatedEntities(String target, RegistryAccess registries) {
 		String wanted = normalizedTarget(target);
 		if (wanted.isEmpty()) return List.of();
+		Set<String> forms = singularForms(wanted);
 		Registry<EntityType<?>> registry = registries.lookup(Registries.ENTITY_TYPE).orElse(BuiltInRegistries.ENTITY_TYPE);
 		return registry.keySet().stream()
-				.filter(id -> pathName(id).equals(wanted) || pathName(id).endsWith(" " + wanted))
+				.filter(id -> forms.stream().anyMatch(form ->
+						pathName(id).equals(form) || pathName(id).endsWith(" " + form)))
 				.map(Identifier::toString).distinct().sorted().toList();
 	}
 
