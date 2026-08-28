@@ -1024,34 +1024,25 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			if (closed.get()) return;
 			String current = fingerprint.get();
 			if (closed.get()) return;
-			boolean wake = false;
-			synchronized (stateLock) {
-				if (closed.get()) return;
-				if (!initialized) {
-					previous = current;
-					initialized = true;
-					return;
-				}
-				if (!Objects.equals(previous, current)) {
-					previous = current;
-					wake = true;
-				}
-			}
-			if (wake) changed.run();
+			if (observe(current)) changed.run();
 		}
 
 		private void observeSubmittedFingerprint(String submitted) {
-			boolean wake = false;
+			if (observe(submitted)) changed.run();
+		}
+
+		private boolean observe(String current) {
 			synchronized (stateLock) {
-				if (closed.get()) return;
+				if (closed.get()) return false;
 				if (!initialized) {
-					previous = submitted;
+					previous = current;
 					initialized = true;
-					return;
+					return false;
 				}
-				wake = !Objects.equals(previous, submitted);
+				if (Objects.equals(previous, current)) return false;
+				previous = current;
+				return true;
 			}
-			if (wake) changed.run();
 		}
 
 		@Override

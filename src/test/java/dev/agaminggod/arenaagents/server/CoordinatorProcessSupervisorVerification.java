@@ -57,6 +57,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBlockingMaintenanceNeverBlocksTicks();
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
 		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
+		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
 		verifyDependencyWakeSurvivesInflightFailure();
 		verifyDependencyMonitorCloseDoesNotWaitForPoll();
 		verifyOrphanReapRetriesBeforeLaunch();
@@ -67,7 +68,12 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyCloseIsIdempotent();
-		return 144;
+		return 150;
+	}
+
+	public static void main(String[] arguments) {
+		verifyWorkerFingerprintObservationAdvancesMonitorBaseline();
+		System.out.println("PASS: coordinator dependency monitor observation");
 	}
 
 	private static void verifyRecoveryContract() {
@@ -414,6 +420,49 @@ public final class CoordinatorProcessSupervisorVerification {
 			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
 			if (fixtureRoot != null) deleteTree(fixtureRoot);
 		}
+	}
+
+	private static void verifyWorkerFingerprintObservationAdvancesMonitorBaseline() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.blocked(
+				"NODE_RUNTIME_NOT_FOUND", "Node.js 22+ is unavailable"
+		);
+		dependencies.fingerprint = "fingerprint-a";
+		QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+		ManualDependencyMonitorScheduler monitor = new ManualDependencyMonitorScheduler();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "monotonic-dependency-observation-game"), Map.of(), clock, dependencies,
+				new FakeLauncher(), () -> "00000000-0000-0000-0000-000000000457",
+				worker, runtimeRoot -> 0, monitor
+		);
+
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		dependencies.fingerprint = "fingerprint-b";
+		clock.advance(5_000L);
+		supervisor.tick(false, null, 0L);
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		assertEquals(3, worker.submissions,
+				"the first worker observation of fingerprint B queues one replacement resolution");
+
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		assertEquals(3, worker.submissions,
+				"a second worker observation of fingerprint B cannot publish a duplicate wake");
+		assertEquals(3, dependencies.resolveCalls,
+				"fingerprint B performs only its deadline resolution and one wake-fenced replacement");
+
+		dependencies.fingerprint = "fingerprint-c";
+		monitor.poll();
+		monitor.poll();
+		supervisor.tick(false, null, 0L);
+		assertEquals(4, worker.submissions, "fingerprint C publishes exactly one later wake");
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		assertEquals(4, worker.submissions, "the C resolution cannot wake itself again");
+		assertEquals(4, dependencies.resolveCalls, "fingerprint C performs exactly one resolution");
+		supervisor.close();
 	}
 
 	private static void verifyDependencyWakeSurvivesInflightFailure() {
