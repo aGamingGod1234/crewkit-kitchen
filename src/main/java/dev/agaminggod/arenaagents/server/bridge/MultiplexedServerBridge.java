@@ -491,7 +491,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 		String suppliedLaunchId = optionalLaunchId(envelope.payload());
 		while (true) {
-			awaitDisconnectPublication();
+			ensureHandshakeTimeRemaining(source);
+			awaitDisconnectPublication(source);
+			ensureHandshakeTimeRemaining(source);
 			long snapshotRevision = registryPublicationRevision.get();
 			List<AgentRecord> visibleRecords = manager.coordinatorVisibleRecords();
 			List<PendingConversationWake> pendingWakes = manager.pendingConversationWakes();
@@ -514,9 +516,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				handshake.add(conversationWakeEnvelope(wake));
 			}
 			handshakeSnapshotHook.run();
+			ensureHandshakeTimeRemaining(source);
 			synchronized (publicationLock) {
 				if (disconnectInProgress || snapshotRevision != registryPublicationRevision.get()) {
-					awaitHandshakeRetryLocked();
+					awaitHandshakeRetryLocked(source);
 					continue;
 				}
 				if (session != source || !source.open.get()) {
@@ -724,11 +727,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
-	private void awaitDisconnectPublication() {
+	private void awaitDisconnectPublication(Session source) {
 		synchronized (publicationLock) {
 			while (disconnectInProgress) {
+				long remainingNanos = source.handshakeRemainingNanos();
+				if (remainingNanos <= 0L) throw handshakeTimeout();
 				try {
-					publicationLock.wait();
+					publicationLock.wait(Math.max(1L, Math.min(HANDSHAKE_RETRY_WAIT_MS,
+							TimeUnit.NANOSECONDS.toMillis(remainingNanos))));
 				} catch (InterruptedException exception) {
 					Thread.currentThread().interrupt();
 					throw new BridgeProtocolException(
@@ -739,6 +745,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
+	private static void ensureHandshakeTimeRemaining(Session source) {
+		if (source.handshakeRemainingNanos() <= 0L) throw handshakeTimeout();
+	}
+
+	private static BridgeProtocolException handshakeTimeout() {
+		return new BridgeProtocolException(
+				"AUTHENTICATION_TIMEOUT", "Coordinator handshake deadline expired while publishing the registry snapshot"
+		);
+	}
+
 	private void bumpRegistryPublicationRevision() {
 		registryPublicationRevision.incrementAndGet();
 		synchronized (publicationLock) {
@@ -746,9 +762,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
-	private void awaitHandshakeRetryLocked() {
+	private void awaitHandshakeRetryLocked(Session source) {
+		long remainingNanos = source.handshakeRemainingNanos();
+		if (remainingNanos <= 0L) throw handshakeTimeout();
 		try {
-			publicationLock.wait(HANDSHAKE_RETRY_WAIT_MS);
+			publicationLock.wait(Math.max(1L, Math.min(HANDSHAKE_RETRY_WAIT_MS,
+					TimeUnit.NANOSECONDS.toMillis(remainingNanos))));
 		} catch (InterruptedException exception) {
 			Thread.currentThread().interrupt();
 			throw new BridgeProtocolException(
@@ -1979,7 +1998,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			this.socket = socket;
 			handshakeStartedNanos = System.nanoTime();
 			socket.setTcpNoDelay(true);
-			socket.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+			 socket.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+		}
+
+		long handshakeRemainingNanos() {
+			return handshakeTimeoutNanos - (System.nanoTime() - handshakeStartedNanos);
 		}
 
 		void start() {
@@ -2013,47 +2036,59 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			}
 		}
 
-		synchronized void enqueue(BridgeEnvelope envelope) {
-			if (!open.get() || !authenticated.get()) {
-				throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before publication");
+		void enqueue(BridgeEnvelope envelope) {
+			synchronized (publicationLock) {
+				synchronized (this) {
+					if (!open.get() || !authenticated.get()) {
+						throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before publication");
+					}
+					int agentQueued = queuedByAgent.getOrDefault(envelope.agentId(), 0);
+					if (agentQueued >= AGENT_QUEUE_CAP) throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
+					if (!outbound.offer(envelope)) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue is full");
+					queuedByAgent.put(envelope.agentId(), agentQueued + 1);
+				}
 			}
-			int agentQueued = queuedByAgent.getOrDefault(envelope.agentId(), 0);
-			if (agentQueued >= AGENT_QUEUE_CAP) throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
-			if (!outbound.offer(envelope)) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue is full");
-			queuedByAgent.put(envelope.agentId(), agentQueued + 1);
 		}
 
-		synchronized void enqueuePair(BridgeEnvelope first, BridgeEnvelope second, Runnable beforeEnqueue) {
-			if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before paired publication");
-			if (!first.agentId().equals(second.agentId())) throw new IllegalArgumentException("paired envelopes must belong to one agent");
-			int agentQueued = queuedByAgent.getOrDefault(first.agentId(), 0);
-			if (agentQueued > AGENT_QUEUE_CAP - 2) throw new BridgeProtocolException("AGENT_BACKPRESSURE", first.agentId());
-			if (outbound.remainingCapacity() < 2) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot atomically publish paired messages");
-			beforeEnqueue.run();
-			if (!open.get() || !authenticated.get()) {
-				throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during paired publication");
+		void enqueuePair(BridgeEnvelope first, BridgeEnvelope second, Runnable beforeEnqueue) {
+			synchronized (publicationLock) {
+				synchronized (this) {
+					if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before paired publication");
+					if (!first.agentId().equals(second.agentId())) throw new IllegalArgumentException("paired envelopes must belong to one agent");
+					int agentQueued = queuedByAgent.getOrDefault(first.agentId(), 0);
+					if (agentQueued > AGENT_QUEUE_CAP - 2) throw new BridgeProtocolException("AGENT_BACKPRESSURE", first.agentId());
+					if (outbound.remainingCapacity() < 2) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot atomically publish paired messages");
+					beforeEnqueue.run();
+					if (!open.get() || !authenticated.get()) {
+						throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during paired publication");
+					}
+					if (!outbound.offer(first) || !outbound.offer(second)) {
+						outbound.remove(first);
+						outbound.remove(second);
+						throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Atomic paired publication failed");
+					}
+					queuedByAgent.put(first.agentId(), agentQueued + 2);
+				}
 			}
-			if (!outbound.offer(first) || !outbound.offer(second)) {
-				outbound.remove(first);
-				outbound.remove(second);
-				throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Atomic paired publication failed");
-			}
-			queuedByAgent.put(first.agentId(), agentQueued + 2);
 		}
 
-		synchronized void enqueueAtomically(BridgeEnvelope envelope, Runnable beforeEnqueue) {
-			if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before atomic publication");
-			int agentQueued = queuedByAgent.getOrDefault(envelope.agentId(), 0);
-			if (agentQueued >= AGENT_QUEUE_CAP) throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
-			if (outbound.remainingCapacity() < 1) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot publish transaction");
-			beforeEnqueue.run();
-			if (!open.get() || !authenticated.get()) {
-				throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during atomic publication");
+		void enqueueAtomically(BridgeEnvelope envelope, Runnable beforeEnqueue) {
+			synchronized (publicationLock) {
+				synchronized (this) {
+					if (!open.get() || !authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed before atomic publication");
+					int agentQueued = queuedByAgent.getOrDefault(envelope.agentId(), 0);
+					if (agentQueued >= AGENT_QUEUE_CAP) throw new BridgeProtocolException("AGENT_BACKPRESSURE", envelope.agentId());
+					if (outbound.remainingCapacity() < 1) throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Outbound queue cannot publish transaction");
+					beforeEnqueue.run();
+					if (!open.get() || !authenticated.get()) {
+						throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during atomic publication");
+					}
+					if (!outbound.offer(envelope)) {
+						throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Atomic publication failed");
+					}
+					queuedByAgent.put(envelope.agentId(), agentQueued + 1);
+				}
 			}
-			if (!outbound.offer(envelope)) {
-				throw new BridgeProtocolException("CONNECTION_BACKPRESSURE", "Atomic publication failed");
-			}
-			queuedByAgent.put(envelope.agentId(), agentQueued + 1);
 		}
 
 		private void readLoop() {

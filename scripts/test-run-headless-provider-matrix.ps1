@@ -264,7 +264,7 @@ function Import-WrapperFunction([string] $Name) {
 }
 
 function Test-FastExitResourceSampling([string] $WorkingDirectory) {
-	foreach ($name in @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit', 'Start-RedirectedProcess')) {
+	foreach ($name in @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Add-TrackedProcessIdentity', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit', 'Start-RedirectedProcess')) {
 		Import-WrapperFunction $name
 	}
 	$script:PollMilliseconds = 10
@@ -282,6 +282,28 @@ function Test-FastExitResourceSampling([string] $WorkingDirectory) {
 		$null = $handle.StdoutTask.Wait(1000)
 		$null = $handle.StderrTask.Wait(1000)
 		$handle.Process.Dispose()
+	}
+
+	# The launched root can exit before the first CIM sample while a child
+	# remains alive. The captured root identity must still seed the tree walk.
+	$childScript = Join-Path $WorkingDirectory 'fast-child.ps1'
+	$rootScript = Join-Path $WorkingDirectory 'fast-root.ps1'
+	Set-Content -LiteralPath $childScript -Value 'Start-Sleep -Seconds 30' -NoNewline
+	Set-Content -LiteralPath $rootScript -Value "Start-Process powershell -ArgumentList '-NoProfile','-File','$childScript'" -NoNewline
+	$treeHandle = Start-RedirectedProcess powershell.exe ("-NoProfile -File `"$rootScript`"") $WorkingDirectory (Join-Path $WorkingDirectory 'fast-tree.stdout.log') (Join-Path $WorkingDirectory 'fast-tree.stderr.log') @{}
+	$treeTracked = [System.Collections.Generic.List[object]]::new()
+	try {
+		$treeHandle.Process.WaitForExit(2000) | Out-Null
+		$treeMeasurement = Measure-RunnerResourcesUntilExit $treeHandle @($treeHandle) $treeTracked ([DateTime]::UtcNow.AddSeconds(5))
+		if ([int] $treeMeasurement.processCount -lt 1) { throw 'Fast-exit root descendant was not sampled after its root exited' }
+		Stop-TrackedProcessIds $treeTracked
+		Assert-TrackedProcessIdsGone $treeTracked
+	} finally {
+		if (-not $treeHandle.Process.HasExited) { $treeHandle.Process.Kill() }
+		$treeHandle.Process.WaitForExit()
+		$null = $treeHandle.StdoutTask.Wait(1000)
+		$null = $treeHandle.StderrTask.Wait(1000)
+		$treeHandle.Process.Dispose()
 	}
 }
 
@@ -301,7 +323,7 @@ try {
 	$fixture = Join-Path $project 'fixture'
 	New-Fixture $fixture
 	Test-FastExitResourceSampling $fixture
-	Write-Output 'PASS PowerShell wrapper samples a fast-exit tracked runner before completion'
+	Write-Output 'PASS PowerShell wrapper samples fast-exit roots and surviving descendants'
 	Set-TestEnvironment 'APPDATA' (Join-Path $fixture 'fake-appdata')
 	Set-TestEnvironment 'LOCALAPPDATA' (Join-Path $fixture 'fake-localappdata')
 	Set-TestEnvironment 'ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT' '1'

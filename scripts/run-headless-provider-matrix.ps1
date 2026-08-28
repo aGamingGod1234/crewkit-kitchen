@@ -233,6 +233,20 @@ function Get-TrackedResourceSnapshot([System.Collections.Generic.List[object]] $
 	return [pscustomobject]@{ processCount = $liveCount; rssBytes = $rssBytes }
 }
 
+function Add-TrackedProcessIdentity([System.Collections.Generic.List[object]] $ProcessIdentities, $Identity) {
+	if ($null -eq $Identity) { return }
+	$id = [int] $Identity.ProcessId
+	if ($id -le 0) { return }
+	$existing = @($ProcessIdentities.ToArray() | Where-Object { [int] $_.ProcessId -eq $id } | Select-Object -First 1)
+	if ($existing.Count -eq 0) {
+		$ProcessIdentities.Add([pscustomobject]@{
+			ProcessId = $id
+			ParentProcessId = [int] $Identity.ParentProcessId
+			CreationDate = [string] $Identity.CreationDate
+		})
+	}
+}
+
 function Measure-RunnerResourcesUntilExit(
 	$RunnerHandle,
 	[object[]] $TrackedHandles,
@@ -243,6 +257,10 @@ function Measure-RunnerResourcesUntilExit(
 	[long] $initialRssBytes = 0
 	foreach ($handle in $TrackedHandles) {
 		if ($null -eq $handle -or $null -eq $handle.Process -or -not $initialRoots.Add([int] $handle.Process.Id)) { continue }
+		# Capture each launched root before the first CIM sample. A fast root can
+		# exit before sampling, while its descendants remain live and must still be
+		# included in resource accounting and cleanup.
+		Add-TrackedProcessIdentity $ProcessIdentities $handle.Identity
 		if ($null -ne $handle.InitialRssBytes) { $initialRssBytes += [long] $handle.InitialRssBytes }
 	}
 	$peakProcessCount = $initialRoots.Count
