@@ -1,9 +1,41 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { WindowsTtsProvider } from '../src/voice/windows-tts-provider.mjs';
+import { createWindowsTtsEnvironment, WindowsTtsProvider } from '../src/voice/windows-tts-provider.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' };
+
+test('Windows TTS subprocess receives only its Windows runtime environment and speech rate', () => {
+	const environment = createWindowsTtsEnvironment({
+		SystemRoot: 'C:\\Windows',
+		WINDIR: 'C:\\Windows',
+		TEMP: 'C:\\Users\\tester\\AppData\\Local\\Temp',
+		TMP: 'C:\\Users\\tester\\AppData\\Local\\Temp',
+		Path: 'C:\\Windows\\System32',
+		PATHEXT: '.COM;.EXE',
+		ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+		USERPROFILE: 'C:\\Users\\tester',
+		APPDATA: 'C:\\Users\\tester\\AppData\\Roaming',
+		LOCALAPPDATA: 'C:\\Users\\tester\\AppData\\Local',
+		PROGRAMDATA: 'C:\\ProgramData',
+		ARENA_WINDOWS_TTS_RATE: 'untrusted-rate',
+		ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
+		ARENA_AGENT_BRIDGE_SECRET_FILE: 'bridge-secret-file',
+		FISH_AUDIO_API_KEY: 'fish-secret',
+		FISH_API_KEY: 'fish-secret-alias',
+		DEEPGRAM_API_KEY: 'deepgram-secret',
+		OPENAI_API_KEY: 'provider-secret',
+		CUSTOM_PROVIDER_CREDENTIAL: 'custom-secret',
+	}, -3);
+
+	assert.deepEqual(environment, {
+		SystemRoot: 'C:\\Windows',
+		WINDIR: 'C:\\Windows',
+		TEMP: 'C:\\Users\\tester\\AppData\\Local\\Temp',
+		TMP: 'C:\\Users\\tester\\AppData\\Local\\Temp',
+		ARENA_WINDOWS_TTS_RATE: '-3',
+	});
+});
 
 test('Windows TTS returns bounded mono signed 16-bit PCM without treating text as PowerShell', windowsOnly, async () => {
 	const provider = new WindowsTtsProvider({ timeoutMs: 10_000 });

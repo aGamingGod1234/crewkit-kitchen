@@ -3,6 +3,9 @@ import path from 'node:path';
 
 const SAMPLE_RATE_HZ = 16_000;
 const MAX_PCM_BYTES = SAMPLE_RATE_HZ * 2 * 20;
+const WINDOWS_TTS_ENVIRONMENT_KEYS = Object.freeze([
+	'SystemRoot', 'WINDIR', 'TEMP', 'TMP',
+]);
 const POWERSHELL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -80,7 +83,7 @@ function runPowerShell({ executable, text, rate, timeoutMs, signal }) {
 			'-EncodedCommand',
 			ENCODED_SCRIPT,
 		], {
-			env: { ...process.env, ARENA_WINDOWS_TTS_RATE: String(rate) },
+			env: createWindowsTtsEnvironment(process.env, rate),
 			stdio: ['pipe', 'pipe', 'pipe'],
 			windowsHide: true,
 		});
@@ -129,6 +132,18 @@ function runPowerShell({ executable, text, rate, timeoutMs, signal }) {
 		child.stdin.on('error', () => {});
 		child.stdin.end(text, 'utf8');
 	});
+}
+
+export function createWindowsTtsEnvironment(environment = process.env, rate = 0) {
+	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) {
+		throw new TypeError('Windows TTS environment must be an object');
+	}
+	const childEnvironment = {};
+	for (const name of WINDOWS_TTS_ENVIRONMENT_KEYS) {
+		if (typeof environment[name] === 'string') childEnvironment[name] = environment[name];
+	}
+	childEnvironment.ARENA_WINDOWS_TTS_RATE = String(rate);
+	return childEnvironment;
 }
 
 function defaultPowerShellExecutable() {
