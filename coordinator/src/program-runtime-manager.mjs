@@ -152,12 +152,7 @@ export class ProgramRuntimeManager {
 		});
 		this.#flushDeferredProgramTrace(state);
 		this.#syncState(record, state);
-		if (state.reactiveRecovery !== null) {
-			state.reactiveRecovery = {
-				...state.reactiveRecovery,
-				context: Object.freeze({ ...state.reactiveRecovery.context, observation }),
-				fresh: true,
-			};
+		if (this.#rearmReactiveRecovery(state, { observation, eventSequence })) {
 			if (!state.reactiveRequestActive) this.#resumeReactiveRecovery(state);
 		}
 		return state.engine.snapshot();
@@ -168,6 +163,9 @@ export class ProgramRuntimeManager {
 		const state = this.#states.get(record.agentId);
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return null;
 		const snapshot = state.engine.notifyAttention({ priority, trigger });
+		if (priority === 'urgent' && this.#rearmReactiveRecovery(state, { observation: state.observation })) {
+			if (!state.reactiveRequestActive) this.#resumeReactiveRecovery(state);
+		}
 		this.#syncState(record, state);
 		return snapshot;
 	}
@@ -894,6 +892,29 @@ export class ProgramRuntimeManager {
 			return;
 		}
 		void this.#requestReactiveDecision(state, recovery.context);
+	}
+
+	#rearmReactiveRecovery(state, { observation, eventSequence = null } = {}) {
+		const recovery = state.reactiveRecovery;
+		if (recovery === null || state.disposed) return false;
+		const latestRequest = state.engine.refreshDirectiveRequest();
+		if (recovery.kind === 'reactive') {
+			if (latestRequest === null) return false;
+			state.reactiveRecovery = { ...recovery, context: latestRequest, fresh: true };
+			return true;
+		}
+		if (recovery.context.requestContext !== null && latestRequest === null) return false;
+		state.reactiveRecovery = {
+			...recovery,
+			context: Object.freeze({
+				...recovery.context,
+				observation: latestRequest?.observation ?? observation ?? recovery.context.observation,
+				eventSequence: latestRequest?.eventSequence ?? eventSequence ?? recovery.context.eventSequence,
+				requestContext: latestRequest,
+			}),
+			fresh: true,
+		};
+		return true;
 	}
 
 	#requestRecoveryLease(record, state, reason, error = null) {

@@ -810,15 +810,89 @@ test('reactive infrastructure recovery rearms on a later fresh fact without retr
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(requests.length, 2);
 	assert.equal(recoveries.length, 2, 'the second failed cycle requests one future recovery lease');
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation({ player: { health: 17 } }), eventSequence: 3,
+	});
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(requests.length, 2, 'a failed cycle cannot retry again without newer authoritative facts');
+	assert.equal(requests.length, 2, 'a failed cycle cannot retry again from a duplicate authoritative sequence');
 
 	await manager.onObservation(registry.get('agent-a'), {
 		observation: observation({ player: { health: 18 } }), eventSequence: 4,
 	});
 	for (let attempt = 0; attempt < 10 && requests.length < 3; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(requests.length, 3);
+	assert.match(requests[2].input, /"eventSequence":4/, 'the resumed request uses the latest accepted fact identity');
 	assert.equal(recoveries.length, 2);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
+test('urgent non-observation attention rearms dormant reactive recovery once', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const requests = [];
+	const recoveries = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) throw Object.assign(new Error('provider timed out'), { code: 'REQUEST_TIMEOUT' });
+			return withCompletionContract({ summary: 'Heard the operator.', directive: 'continue' }, request.goalRevision);
+		} },
+		requestRecovery: (request) => recoveries.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage',
+	});
+	for (let attempt = 0; attempt < 10 && recoveries.length < 1; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 1);
+	assert.equal(recoveries.length, 1);
+
+	manager.notifyAttention(registry.get('agent-a'), { priority: 'urgent', trigger: 'conversation' });
+	manager.notifyAttention(registry.get('agent-a'), { priority: 'urgent', trigger: 'conversation' });
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2, 'duplicate attention coalesces into the one rearmed cycle');
+	assert.equal(recoveries.length, 1);
+	assert.match(requests[1].input, /"attentionTrigger":"conversation"/);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
+test('urgent non-observation attention rearms dormant compiler correction once', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const requests = [];
+	const recoveries = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) return withCompletionContract({ summary: 'Invalid replacement.', directive: 'replace', source: 'broken {' }, request.goalRevision);
+			if (requests.length === 2) throw Object.assign(new Error('provider timed out'), { code: 'REQUEST_TIMEOUT' });
+			return withCompletionContract({ summary: 'Corrected.', directive: 'replace', source: SOURCE }, request.goalRevision);
+		} },
+		requestRecovery: (request) => recoveries.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage',
+	});
+	for (let attempt = 0; attempt < 10 && recoveries.length < 1; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(recoveries.length, 1);
+
+	manager.notifyAttention(registry.get('agent-a'), { priority: 'urgent', trigger: 'conversation' });
+	manager.notifyAttention(registry.get('agent-a'), { priority: 'urgent', trigger: 'conversation' });
+	for (let attempt = 0; attempt < 10 && requests.length < 3; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 3, 'duplicate attention coalesces into one compiler-recovery cycle');
+	assert.equal(recoveries.length, 1);
+	assert.match(requests[2].input, /ArenaScript compiler correction/);
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });
 

@@ -187,6 +187,15 @@ export class ArenaScriptEngine {
 		this.#clear();
 	}
 
+	/** Promotes the latest coalesced request for a recovery retry without issuing another model call. */
+	refreshDirectiveRequest() {
+		if (this.#pendingRequest === null) return null;
+		const latest = this.#coalescedRequest ?? this.#pendingRequest;
+		this.#pendingRequest = latest;
+		this.#coalescedRequest = latest;
+		return latest;
+	}
+
 	snapshot() { const pending = this.#coalescedRequest ?? this.#pendingRequest; return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, generation: this.#generation, lifecycleEpoch: this.#lifecycleEpoch, continuationEpoch: this.#continuationEpoch, activeActionId: this.#active?.actionId ?? null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null, pendingRequestPriority: pending?.priority ?? null, pendingRequestTrigger: pending?.trigger ?? null }); }
 
 	#activate(target) {
