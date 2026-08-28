@@ -228,7 +228,10 @@ export class CodexService {
 			this.#started = false;
 			await this.#transport.stop();
 			void transportStart.then(async () => {
-				if (this.#started || (this.#starting === attempt && attempt.generation === this.#startupGeneration)) return;
+				const owner = this.#starting;
+				if (this.#started
+					|| (owner === attempt && attempt.generation === this.#startupGeneration)
+					|| (owner !== null && owner !== attempt && owner.generation > attempt.generation)) return;
 				await this.#transport.stop();
 			}).catch(() => {});
 			throw error;

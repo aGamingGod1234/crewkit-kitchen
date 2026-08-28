@@ -153,13 +153,59 @@ test('Codex startup owns its deadline and a later probe starts a fresh transport
 		releases[0]();
 		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(service.started, false, 'the obsolete startup cannot mark the backend live');
-		assert.deepEqual([...liveAttempts], [], 'late transport completion is torn down');
 		releases[1]();
 		await second;
 		assert.equal(service.started, true);
-		assert.ok(stops >= 2);
+		assert.ok(stops >= 1);
 	} finally {
 		for (const release of releases) release();
+		await service.stop();
+	}
+});
+
+test('late cleanup from a timed-out startup cannot stop a newer shared-transport initialization', async () => {
+	const transport = new FakeSharedTransport();
+	let startCalls = 0;
+	let releaseFirstStart;
+	let releaseInitialize;
+	let live = false;
+	transport.start = async () => {
+		startCalls += 1;
+		if (startCalls === 1) {
+			await new Promise((resolve) => { releaseFirstStart = resolve; });
+		}
+		live = true;
+	};
+	transport.stop = async () => { live = false; };
+	transport.request = async (method, params, options) => {
+		transport.calls.push({ method, params, options });
+		if (method === 'initialize') {
+			await new Promise((resolve) => { releaseInitialize = resolve; });
+			if (!live) throw Object.assign(new Error('shared transport was stopped'), { code: 'TRANSPORT_STOPPED' });
+			return { userAgent: 'fake' };
+		}
+		if (method === 'model/list') {
+			if (!live) throw Object.assign(new Error('shared transport was stopped'), { code: 'TRANSPORT_STOPPED' });
+			return { data: [MODEL], nextCursor: null };
+		}
+		throw new Error(`Unexpected method ${method}`);
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace', startupTimeoutMs: 5 }, { transport });
+	try {
+		await assert.rejects(service.start(), (error) => error?.code === 'PROVIDER_START_TIMEOUT');
+		const replacement = service.start();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(startCalls, 2);
+		assert.equal(typeof releaseInitialize, 'function', 'replacement reached authentication');
+
+		releaseFirstStart();
+		await new Promise((resolve) => setImmediate(resolve));
+		releaseInitialize();
+		await replacement;
+		assert.equal(service.started, true);
+	} finally {
+		releaseFirstStart?.();
+		releaseInitialize?.();
 		await service.stop();
 	}
 });
