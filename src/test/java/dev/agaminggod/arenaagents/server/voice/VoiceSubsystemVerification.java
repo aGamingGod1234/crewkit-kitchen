@@ -24,12 +24,12 @@ public final class VoiceSubsystemVerification {
 		assertions++;
 		VoiceConsentRegistry.grant(null, humanPlayer);
 		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("Consent must survive a reconnect until explicitly revoked");
+			throw new AssertionError("Granted consent must remain active during the current connection");
 		}
 		assertions++;
-		VoiceConsentRegistry.revoke(null, humanPlayer);
+		VoiceConsentRegistry.playerDisconnected(null, humanPlayer);
 		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("A player must be able to revoke consent");
+			throw new AssertionError("Disconnect must revoke consent before a later connection");
 		}
 		assertions++;
 		if (!CodexAgentServerRuntime.deliverHumanSpeech(null, humanPlayer, "must stay private", false)

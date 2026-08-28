@@ -24,6 +24,14 @@ public final class VoiceConsentRegistry {
 		if (players.isEmpty()) ENABLED.remove(server);
 	}
 
+	/**
+	 * Clears a player's opt-in at the server's disconnect boundary. Consent is
+	 * deliberately session-scoped and must be granted again after reconnecting.
+	 */
+	public static synchronized void playerDisconnected(MinecraftServer server, UUID playerId) {
+		revoke(server, playerId);
+	}
+
 	public static synchronized boolean granted(MinecraftServer server, UUID playerId) {
 		return ENABLED.getOrDefault(server, Set.of()).contains(playerId);
 	}

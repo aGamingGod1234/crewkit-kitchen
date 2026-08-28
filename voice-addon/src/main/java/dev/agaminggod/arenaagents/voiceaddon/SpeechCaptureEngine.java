@@ -32,11 +32,10 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	private final Map<UUID, Utterance> utterances = new LinkedHashMap<>();
 	private final Map<UUID, Long> sequences = new LinkedHashMap<>();
 	private final Map<UUID, TranscriptQueue> transcriptQueues = new LinkedHashMap<>();
+	private final Map<UUID, DecoderRetry> decoderRetries = new LinkedHashMap<>();
 	private final Set<CompletableFuture<SpeechWorkerClient.Transcript>> transcriptions = new LinkedHashSet<>();
 	private boolean closed;
 	private long sttRetryAfterNanos;
-	private int decoderFailures;
-	private long decoderRetryAfterNanos;
 
 	SpeechCaptureEngine(
 			Transcriber transcriber,
@@ -91,21 +90,25 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		List<CompletedUtterance> completed = new ArrayList<>(2);
 		synchronized (this) {
 			long now = monotonicNanos.getAsLong();
-			if (closed || now < sttRetryAfterNanos || now < decoderRetryAfterNanos) return;
+			if (closed || now < sttRetryAfterNanos) return;
+			DecoderRetry decoderRetry = decoderRetries.get(playerId);
+			if (decoderRetry != null && now < decoderRetry.retryAfterNanos) return;
 			Utterance utterance = utterances.get(playerId);
 			if (utterance != null && utterance.whispering != whispering) {
 				completed.add(finishLocked(playerId, utterance));
 				utterance = null;
 			}
 			if (utterance == null) {
+				Decoder decoder;
+				try {
+					decoder = Objects.requireNonNull(decoderFactory.create(), "decoderFactory returned null");
+				} catch (RuntimeException ignored) {
+					recordDecoderFailureLocked(playerId, now);
+					return;
+				}
 				utterance = new Utterance(
-						playerId,
-						Objects.requireNonNull(decoderFactory.create(), "decoderFactory returned null"),
-						whispering,
-						sequences.merge(playerId, 1L, Long::sum),
-						deliveryExecutor,
-						delivery,
-						maxSamples
+						playerId, decoder, whispering, sequences.merge(playerId, 1L, Long::sum),
+						deliveryExecutor, delivery, maxSamples
 				);
 				utterances.put(playerId, utterance);
 			}
@@ -114,12 +117,11 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				decoded = Objects.requireNonNull(utterance.decoder.decode(opus), "decoder returned null");
 			} catch (RuntimeException ignored) {
 				completed.add(discardLocked(playerId, utterance));
-				recordDecoderFailureLocked(now);
+				recordDecoderFailureLocked(playerId, now);
 				decoded = null;
 			}
 			if (decoded != null) {
-				decoderFailures = 0;
-				decoderRetryAfterNanos = 0L;
+				decoderRetries.remove(playerId);
 				utterance.append(decoded);
 				utterance.lastPacketNanos = System.nanoTime();
 				if (utterance.timeout != null) utterance.timeout.cancel(false);
@@ -136,11 +138,13 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		for (CompletedUtterance utterance : completed) transcribe(utterance);
 	}
 
-	private void recordDecoderFailureLocked(long now) {
-		decoderFailures = Math.min(decoderFailures + 1, 31);
-		long multiplier = 1L << Math.min(decoderFailures - 1, 5);
+	private void recordDecoderFailureLocked(UUID playerId, long now) {
+		DecoderRetry previous = decoderRetries.get(playerId);
+		int failures = Math.min(previous == null ? 1 : previous.failures + 1, 31);
+		long multiplier = 1L << Math.min(failures - 1, 5);
 		long delay = Math.min(MAX_DECODER_RETRY_NANOS, INITIAL_DECODER_RETRY_NANOS * multiplier);
-		decoderRetryAfterNanos = now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
+		long retryAfter = now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
+		decoderRetries.put(playerId, new DecoderRetry(failures, retryAfter));
 	}
 
 	private void finishIfCurrent(UUID playerId, Utterance expected, long timeoutEpoch) {
@@ -322,6 +326,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		}
 		utterances.clear();
 		transcriptQueues.clear();
+		decoderRetries.clear();
 		for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : List.copyOf(transcriptions)) {
 			transcription.cancel(true);
 		}
@@ -424,6 +429,9 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	private static final class TranscriptQueue {
 		private long nextSequence = 1L;
 		private final Map<Long, TranscriptOutcome> completed = new LinkedHashMap<>();
+	}
+
+	private record DecoderRetry(int failures, long retryAfterNanos) {
 	}
 
 	private record TranscriptOutcome(

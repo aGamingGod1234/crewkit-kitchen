@@ -2,11 +2,14 @@ package dev.agaminggod.arenaagents.server.voice;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.WeakHashMap;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeUnit;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -20,7 +23,10 @@ public final class VoiceSubsystemRuntime {
 	public static final String ENTRYPOINT = "arenaagents_voice";
 	private static final Logger LOGGER = LoggerFactory.getLogger(VoiceSubsystemRuntime.class);
 	private static final int MAX_DIAGNOSTIC_AGENTS = 64;
+	private static final long INITIAL_START_RETRY_NANOS = TimeUnit.SECONDS.toNanos(1L);
+	private static final long MAX_START_RETRY_NANOS = TimeUnit.SECONDS.toNanos(30L);
 	private static final Map<MinecraftServer, Holder> INSTANCES = new WeakHashMap<>();
+	private static final Map<MinecraftServer, StartupRetry> STARTUP_RETRIES = new WeakHashMap<>();
 	private static final Map<MinecraftServer, LinkedHashMap<AgentId, String>> AVAILABILITY_DIAGNOSTICS =
 			new WeakHashMap<>();
 	private static final Map<MinecraftServer, String> RUNTIME_DIAGNOSTICS = new WeakHashMap<>();
@@ -60,6 +66,8 @@ public final class VoiceSubsystemRuntime {
 		Objects.requireNonNull(server, "server must not be null");
 		Objects.requireNonNull(configuration, "voice configuration must not be null");
 		Objects.requireNonNull(providers, "voice providers must not be null");
+		List<VoiceSubsystemProvider> providerList = new ArrayList<>();
+		providers.forEach(providerList::add);
 		Holder existing = INSTANCES.get(server);
 		if (existing != null && existing.configuration().equals(configuration)
 				&& safelyAvailable(server, existing.subsystem())) return true;
@@ -68,7 +76,7 @@ public final class VoiceSubsystemRuntime {
 			close(server, existing);
 		}
 		boolean foundProvider = false;
-		for (VoiceSubsystemProvider provider : providers) {
+		for (VoiceSubsystemProvider provider : providerList) {
 			foundProvider = true;
 			try {
 				VoiceSubsystem candidate = Objects.requireNonNull(
@@ -77,13 +85,18 @@ public final class VoiceSubsystemRuntime {
 				INSTANCES.put(server, new Holder(
 						configuration, candidate, new VoiceRegistrationTracker(), new LinkedHashMap<>()
 				));
+				STARTUP_RETRIES.remove(server);
 				reportRuntimeRecovery(server);
 				return true;
 			} catch (RuntimeException exception) {
 				reportRuntimeFailure(server, "VOICE_PROVIDER_START_FAILED", exception);
 			}
 		}
-		if (foundProvider) return false;
+		if (foundProvider) {
+			scheduleStartupRetry(server, configuration, providerList);
+			return false;
+		}
+		STARTUP_RETRIES.remove(server);
 		INSTANCES.put(server, new Holder(
 				configuration, NoVoiceSubsystem.INSTANCE, new VoiceRegistrationTracker(), new LinkedHashMap<>()
 		));
@@ -91,6 +104,7 @@ public final class VoiceSubsystemRuntime {
 	}
 
 	public static synchronized void tick(MinecraftServer server) {
+		if (!INSTANCES.containsKey(server)) retryPending(server, System.nanoTime());
 		Holder holder = INSTANCES.get(server);
 		if (holder == null) return;
 		CodexAgentManager manager = CodexAgentManager.get(server);
@@ -193,9 +207,32 @@ public final class VoiceSubsystemRuntime {
 
 	public static synchronized void close(MinecraftServer server) {
 		AVAILABILITY_DIAGNOSTICS.remove(server);
+		STARTUP_RETRIES.remove(server);
 		Holder holder = INSTANCES.remove(server);
 		if (holder != null) close(server, holder);
 		RUNTIME_DIAGNOSTICS.remove(server);
+	}
+
+	/** Retries a provider that was temporarily unavailable during server startup. */
+	static synchronized boolean retryPending(MinecraftServer server, long nowNanos) {
+		StartupRetry retry = STARTUP_RETRIES.get(server);
+		if (retry == null || nowNanos < retry.retryAfterNanos()) return false;
+		return start(server, retry.configuration(), retry.providers());
+	}
+
+	private static void scheduleStartupRetry(
+			MinecraftServer server,
+			VoiceSubsystemConfiguration configuration,
+			List<VoiceSubsystemProvider> providers
+	) {
+		StartupRetry previous = STARTUP_RETRIES.get(server);
+		int failures = previous != null && previous.configuration().equals(configuration)
+				? Math.min(previous.failures() + 1, 31) : 1;
+		long multiplier = 1L << Math.min(failures - 1, 5);
+		long delay = Math.min(MAX_START_RETRY_NANOS, INITIAL_START_RETRY_NANOS * multiplier);
+		long now = System.nanoTime();
+		long retryAfter = now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
+		STARTUP_RETRIES.put(server, new StartupRetry(configuration, List.copyOf(providers), failures, retryAfter));
 	}
 
 	private static boolean safelyAvailable(MinecraftServer server, VoiceSubsystem subsystem) {
@@ -240,6 +277,14 @@ public final class VoiceSubsystemRuntime {
 			VoiceSubsystem subsystem,
 			VoiceRegistrationTracker tracker,
 			Map<AgentId, Long> sequences
+	) {
+	}
+
+	private record StartupRetry(
+			VoiceSubsystemConfiguration configuration,
+			List<VoiceSubsystemProvider> providers,
+			int failures,
+			long retryAfterNanos
 	) {
 	}
 }

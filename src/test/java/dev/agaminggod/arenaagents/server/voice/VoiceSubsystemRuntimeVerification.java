@@ -95,7 +95,26 @@ public final class VoiceSubsystemRuntimeVerification {
 		VoiceSubsystemRuntime.close(server);
 		VoiceSubsystemRuntime.close(server);
 		assertEquals(3, closes.get(), "current voice runtime closes exactly once");
-		return 21;
+
+		MinecraftServer startupRaceServer = uninitializedServer();
+		AtomicInteger startupAttempts = new AtomicInteger();
+		RecordingVoiceSubsystem startupRecovered = new RecordingVoiceSubsystem(new AtomicInteger());
+		VoiceSubsystemProvider startupRaceProvider = (actualServer, actualConfiguration) -> {
+			if (startupAttempts.getAndIncrement() == 0) {
+				throw new IllegalStateException("Simple Voice Chat has not registered yet");
+			}
+			return startupRecovered;
+		};
+		assertFalse(VoiceSubsystemRuntime.start(startupRaceServer, configuration, List.of(startupRaceProvider)),
+				"a provider waiting for Simple Voice Chat remains retryable");
+		assertFalse(VoiceSubsystemRuntime.available(startupRaceServer),
+				"a startup registration race does not install a permanent no-voice runtime");
+		assertTrue(VoiceSubsystemRuntime.retryPending(startupRaceServer, Long.MAX_VALUE),
+				"the pending voice provider retries after Simple Voice Chat registration");
+		assertTrue(VoiceSubsystemRuntime.available(startupRaceServer),
+				"the retry promotes the real voice subsystem without restarting Minecraft");
+		VoiceSubsystemRuntime.close(startupRaceServer);
+		return 25;
 	}
 
 	private static MinecraftServer uninitializedServer() {

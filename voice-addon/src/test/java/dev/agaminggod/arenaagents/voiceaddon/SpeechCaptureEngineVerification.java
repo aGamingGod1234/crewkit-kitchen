@@ -31,6 +31,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyWhisperChangeSplitsAndSequencesUtterances();
 		assertions += verifyMaximumDurationBoundsDecodedSamples();
 		assertions += verifyMalformedPacketDoesNotWedgeLaterSpeech();
+		assertions += verifyDecoderBackoffIsPerPlayer();
 		assertions += verifyDecoderCloseFailureDoesNotWedgeLaterSpeech();
 		assertions += verifyTranscriptsDeliverInUtteranceOrder();
 		assertions += verifyUnavailableSttRecoversAfterBackoff();
@@ -255,6 +256,46 @@ final class SpeechCaptureEngineVerification {
 				"later transcript delivers after the skipped close failure");
 		engine.close();
 		return 6;
+	}
+
+	private static int verifyDecoderBackoffIsPerPlayer() throws Exception {
+		UUID otherPlayer = UUID.fromString("20000000-0000-4000-8000-000000000002");
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		long[] now = { 0L };
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(
+				transcriber, scheduler(), 20L, 1, ignored -> { }, () -> now[0]
+		);
+		RecordingDecoder broken = new RecordingDecoder();
+		broken.decodeFailure = new IllegalArgumentException("bad Opus frame");
+		RecordingDecoder other = new RecordingDecoder();
+		RecordingDecoder recovered = new RecordingDecoder();
+		java.util.Queue<RecordingDecoder> decoders = new java.util.ArrayDeque<>(
+				List.of(broken, other, recovered)
+		);
+		int[] decoderCreations = { 0 };
+		SpeechCaptureEngine.DecoderFactory decoderFactory = () -> {
+			decoderCreations[0]++;
+			return decoders.remove();
+		};
+
+		engine.accept(PLAYER, false, new byte[] { 1 }, decoderFactory, Runnable::run,
+				(playerId, text, whispering) -> { });
+		engine.accept(PLAYER, false, new byte[] { 2 }, decoderFactory, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(1, decoderCreations[0], "one player's malformed packet enters only that player's cooldown");
+
+		engine.accept(otherPlayer, false, new byte[] { 3 }, decoderFactory, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(2, decoderCreations[0], "another player's packet is not blocked by the first player's cooldown");
+
+		now[0] = TimeUnit.SECONDS.toNanos(1L);
+		engine.accept(PLAYER, false, new byte[] { 4 }, decoderFactory, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(3, decoderCreations[0], "the malformed player's decoder retries after its own deadline");
+		assertEquals(true, broken.closed, "the malformed player's decoder is closed");
+		assertEquals(true, other.closed, "the other player's decoder remains independently active");
+		engine.close();
+		return 5;
 	}
 
 	private static int verifyTranscriptsDeliverInUtteranceOrder() {
