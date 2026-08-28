@@ -41,6 +41,7 @@ public final class CoordinatorStartupSmokeVerification {
 		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
 		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
 		CoordinatorProcessSupervisor supervisor = null;
+		CoordinatorProcessSupervisor invalidVoiceSupervisor = null;
 		try {
 			stageCoordinator(sourceCoordinator, packageRoot);
 			int credentialAssertions = verifyOptionalVoiceCredential(packageRoot.resolve("credential-test"));
@@ -68,7 +69,31 @@ public final class CoordinatorStartupSmokeVerification {
 				emptyPath.put("APPDATA", fakeAppData.toString());
 				emptyPath.put("FISH_AUDIO_API_KEY", "");
 				emptyPath.put("FISH_API_KEY", "");
+				Map<String, String> invalidVoice = new HashMap<>(emptyPath);
+				invalidVoice.put("ARENA_AGENT_VOICE_PORT", "invalid");
+				invalidVoiceSupervisor = new CoordinatorProcessSupervisor(
+						packageRoot.resolve("invalid-voice-game"),
+						invalidVoice,
+						System::currentTimeMillis,
+						null,
+						null,
+						() -> "00000000-0000-0000-0000-000000000303",
+						Runnable::run,
+						runtimeRoot -> 0
+				);
+				assertTrue(invalidVoiceSupervisor.configured(),
+						"invalid optional voice endpoint preserves the prepared coordinator runtime");
+				assertEquals(secret.toAbsolutePath().normalize(), invalidVoiceSupervisor.secretPath(),
+						"invalid optional voice endpoint preserves the validated bridge secret");
+				invalidVoiceSupervisor.close();
+				invalidVoiceSupervisor = null;
+				System.clearProperty("arenaagents.voiceUrl");
 				supervisor = new CoordinatorProcessSupervisor(packageRoot.resolve("game"), emptyPath);
+				long configurationDeadline = System.currentTimeMillis() + STARTUP_TIMEOUT_MS;
+				while (!supervisor.configured() && System.currentTimeMillis() < configurationDeadline) {
+					supervisor.tick(false);
+					Thread.sleep(10L);
+				}
 				assertTrue(supervisor.configured(), "staged package is configured");
 				assertEquals("http://127.0.0.1:" + voicePort + "/v1/tts", System.getProperty("arenaagents.voiceUrl"),
 						"coordinator voice endpoint is shared with the addon before voice startup");
@@ -84,7 +109,7 @@ public final class CoordinatorStartupSmokeVerification {
 						if (completeHandshakeAndCatalog(socket)) {
 							assertTrue(awaitLoopbackListener(voicePort, 5_000L),
 									"runtime Fish credential starts the loopback voice worker");
-							return 8 + credentialAssertions;
+							return 10 + credentialAssertions;
 						}
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
@@ -96,13 +121,22 @@ public final class CoordinatorStartupSmokeVerification {
 		} finally {
 			AssertionError ownershipFailure = null;
 			try {
+				if (invalidVoiceSupervisor != null) invalidVoiceSupervisor.close();
 				if (supervisor != null) {
 					supervisor.close();
 					try {
+						long ownershipDeadline = System.currentTimeMillis() + 5_000L;
+						while (Files.exists(CoordinatorProcessOwnership.ownershipFile(packageRoot))
+								&& System.currentTimeMillis() < ownershipDeadline) {
+							Thread.sleep(25L);
+						}
 						assertTrue(!Files.exists(CoordinatorProcessOwnership.ownershipFile(packageRoot)),
 								"coordinator close clears the ownership record");
 					} catch (AssertionError failure) {
 						ownershipFailure = failure;
+					} catch (InterruptedException interrupted) {
+						Thread.currentThread().interrupt();
+						ownershipFailure = new AssertionError("ownership cleanup wait was interrupted", interrupted);
 					}
 				}
 			} finally {

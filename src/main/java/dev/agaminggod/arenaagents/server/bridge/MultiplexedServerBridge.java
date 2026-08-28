@@ -126,6 +126,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	);
 	private final String secret;
 	private final int port;
+	private final ServerSocketFactory serverSockets;
 	private final AgentVerboseState verboseState;
 	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(SERVER_TASK_CAP);
 	private final AtomicBoolean running = new AtomicBoolean();
@@ -194,10 +195,63 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentVerboseState verboseState,
 			GoalVerificationRuntime goalVerificationRuntime
 	) {
+		this(manager, port, secretPath, verboseState, goalVerificationRuntime, ServerSocket::new);
+	}
+
+	public static MultiplexedServerBridge withPreparedSecret(
+			CodexAgentManager manager,
+			String secret,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime
+	) {
+		return new MultiplexedServerBridge(
+				manager, DEFAULT_PORT, secret, verboseState, goalVerificationRuntime, ServerSocket::new
+		);
+	}
+
+	public static MultiplexedServerBridge withPreparedSecret(
+			CodexAgentManager manager,
+			int port,
+			String secret
+	) {
+		return new MultiplexedServerBridge(
+				manager, port, secret, new AgentVerboseState(), defaultGoalVerificationRuntime(manager), ServerSocket::new
+		);
+	}
+
+	MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			ServerSocketFactory serverSockets
+	) {
+		this(manager, port, secretPath, new AgentVerboseState(), defaultGoalVerificationRuntime(manager), serverSockets);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets
+	) {
+		this(manager, port, readSecret(secretPath), verboseState, goalVerificationRuntime, serverSockets);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			String preparedSecret,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		this.port = port;
-		this.secret = readSecret(secretPath);
+		this.serverSockets = Objects.requireNonNull(serverSockets, "server socket factory must not be null");
+		this.secret = validatePreparedSecret(preparedSecret);
 		this.verboseState = Objects.requireNonNull(verboseState, "verboseState must not be null");
 		this.goalVerificationRuntime = Objects.requireNonNull(goalVerificationRuntime, "goalVerificationRuntime must not be null");
 		this.conversationRouter = new ServerAgentConversationRouter(
@@ -215,16 +269,29 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!running.compareAndSet(false, true)) {
 			return;
 		}
+		ServerSocket socket = null;
 		try {
-			ServerSocket socket = new ServerSocket();
+			socket = serverSockets.open();
 			socket.bind(new InetSocketAddress(InetAddress.getByName(LOOPBACK_HOST), port), 1);
 			serverSocket = socket;
 			manager.setRuntimeHooks(this);
 			Thread.ofPlatform().daemon().name("arenaagents-v2-accept").start(this::acceptLoop);
-		} catch (IOException exception) {
+		} catch (IOException | RuntimeException exception) {
 			running.set(false);
+			serverSocket = null;
+			if (socket != null) {
+				try {
+					socket.close();
+				} catch (IOException ignored) {
+				}
+			}
 			throw new BridgeProtocolException("BRIDGE_BIND_FAILED", "Could not bind " + LOOPBACK_HOST + ":" + port, exception);
 		}
+	}
+
+	@FunctionalInterface
+	interface ServerSocketFactory {
+		ServerSocket open() throws IOException;
 	}
 
 	public void tick() {
@@ -267,6 +334,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return active != null && active.open.get() && active.authenticated.get()
 				? active.authenticatedLaunchId
 				: null;
+	}
+
+	public long authenticatedSessionGeneration() {
+		Session active = session;
+		return active != null && active.open.get() && active.authenticated.get()
+				? active.authenticatedSessionGeneration
+				: 0L;
 	}
 
 	public void setVerbose(boolean enabled) {
@@ -618,8 +692,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 				try {
 					for (AgentRecord record : visibleRecords) programActions.beginGoal(record.agentId(), record.goalRevision());
-					source.completeHandshake(handshake, suppliedLaunchId);
-					coordinatorLifecycleGeneration++;
+					long authenticatedGeneration = coordinatorLifecycleGeneration + 1L;
+					source.completeHandshake(handshake, suppliedLaunchId, authenticatedGeneration);
+					coordinatorLifecycleGeneration = authenticatedGeneration;
 					markVerboseControlPublished(verboseControl);
 					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
@@ -1786,6 +1861,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return value;
 	}
 
+	private static String validatePreparedSecret(String secret) {
+		String value = Objects.requireNonNull(secret, "prepared bridge secret must not be null").trim();
+		if (value.length() < MIN_SECRET_LENGTH || value.length() > MAX_SECRET_LENGTH) {
+			throw new BridgeProtocolException(
+					"BRIDGE_SECRET_INVALID",
+					"Bridge secret must contain " + MIN_SECRET_LENGTH + "-" + MAX_SECRET_LENGTH + " characters"
+			);
+		}
+		return value;
+	}
+
 	private static String optionalLaunchId(JsonObject object) {
 		if (!object.has("launchId")) return null;
 		String value = requiredString(object, "launchId");
@@ -2307,6 +2393,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		private final AtomicBoolean open = new AtomicBoolean(true);
 		private final AtomicBoolean authenticated = new AtomicBoolean();
 		private volatile String authenticatedLaunchId;
+		private volatile long authenticatedSessionGeneration;
 		private volatile Thread readerThread;
 		private volatile Thread writerThread;
 
@@ -2321,7 +2408,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			writerThread = Thread.ofPlatform().daemon().name("arenaagents-v2-writer").start(this::writeLoop);
 		}
 
-		synchronized void completeHandshake(List<BridgeEnvelope> envelopes, String launchId) {
+		synchronized void completeHandshake(List<BridgeEnvelope> envelopes, String launchId, long sessionGeneration) {
 			if (!open.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during authentication");
 			if (authenticated.get()) throw new BridgeProtocolException("DUPLICATE_HANDSHAKE", "Bridge session is already authenticated");
 			List<BridgeEnvelope> ordered = List.copyOf(Objects.requireNonNull(envelopes, "envelopes must not be null"));
@@ -2339,6 +2426,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				}
 			}
 			authenticatedLaunchId = launchId;
+			authenticatedSessionGeneration = sessionGeneration;
 			authenticated.set(true);
 			for (BridgeEnvelope envelope : ordered) {
 				if (!outbound.offer(envelope)) throw new IllegalStateException("preflighted handshake queue rejected an envelope");

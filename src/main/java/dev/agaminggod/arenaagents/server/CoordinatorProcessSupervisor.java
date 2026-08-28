@@ -15,6 +15,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -34,13 +37,18 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private final DependencyResolver dependencyResolver;
 	private final ProcessLauncher processLauncher;
 	private final Supplier<String> launchIds;
+	private final MaintenanceWorker maintenanceWorker;
+	private final OrphanReaper orphanReaper;
 	private final long createdAtEpochMs;
 	private final CoordinatorLaunchPolicy.RestartBudget restartBudget = new CoordinatorLaunchPolicy.RestartBudget();
+	private final ConcurrentLinkedQueue<MaintenanceResult> maintenanceResults = new ConcurrentLinkedQueue<>();
 
 	private PreparedRuntime runtime;
 	private ChildProcess child;
 	private CoordinatorRecoveryState state;
-	private boolean stopped;
+	private volatile boolean stopped;
+	private boolean maintenancePending;
+	private boolean orphanCleanupComplete;
 	private boolean stabilityCredited;
 	private long generation;
 	private long nextRetryEpochMs;
@@ -50,11 +58,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private long authenticationDeadlineEpochMs;
 	private long reconnectDeadlineEpochMs;
 	private long authenticatedSinceEpochMs;
+	private long authenticatedSessionGeneration;
 	private String launchId;
 	private String dependencyFingerprint;
 	private String failureCode;
 	private String failureMessage;
 	private String failingBoundary;
+	private ChildProcess pendingTermination;
+	private long bridgeRevision;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -66,7 +77,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	/** Allows isolated startup fixtures to control inherited environment state without invoking a shell. */
 	CoordinatorProcessSupervisor(Path gameDirectory, Map<String, String> launchEnvironmentOverrides) {
-		this(gameDirectory, launchEnvironmentOverrides, System::currentTimeMillis, null, null, () -> UUID.randomUUID().toString());
+		this(
+				gameDirectory,
+				launchEnvironmentOverrides,
+				System::currentTimeMillis,
+				null,
+				null,
+				() -> UUID.randomUUID().toString(),
+				new OwnedMaintenanceWorker(),
+				CoordinatorProcessOwnership::reapOrphaned
+		);
 	}
 
 	CoordinatorProcessSupervisor(
@@ -76,6 +96,28 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			DependencyResolver dependencyResolver,
 			ProcessLauncher processLauncher,
 			Supplier<String> launchIds
+	) {
+		this(
+				gameDirectory,
+				launchEnvironmentOverrides,
+				clock,
+				dependencyResolver,
+				processLauncher,
+				launchIds,
+				Runnable::run,
+				CoordinatorProcessOwnership::reapOrphaned
+		);
+	}
+
+	CoordinatorProcessSupervisor(
+			Path gameDirectory,
+			Map<String, String> launchEnvironmentOverrides,
+			LongSupplier clock,
+			DependencyResolver dependencyResolver,
+			ProcessLauncher processLauncher,
+			Supplier<String> launchIds,
+			MaintenanceWorker maintenanceWorker,
+			OrphanReaper orphanReaper
 	) {
 		this.gameDirectory = Objects.requireNonNull(gameDirectory, "game directory must not be null")
 				.toAbsolutePath().normalize();
@@ -89,16 +131,19 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				: dependencyResolver;
 		this.processLauncher = processLauncher == null ? new DefaultProcessLauncher() : processLauncher;
 		this.launchIds = Objects.requireNonNull(launchIds, "launch IDs must not be null");
+		this.maintenanceWorker = Objects.requireNonNull(maintenanceWorker, "maintenance worker must not be null");
+		this.orphanReaper = Objects.requireNonNull(orphanReaper, "orphan reaper must not be null");
 		this.createdAtEpochMs = now();
 		if (!autoStartEnabled()) {
 			stopped = true;
 			state = CoordinatorRecoveryState.STOPPED;
+			this.maintenanceWorker.close();
 			return;
 		}
 		state = CoordinatorRecoveryState.STARTING;
 		nextRetryEpochMs = createdAtEpochMs + CoordinatorLaunchPolicy.STARTUP_GRACE_MS;
-		dependencyFingerprint = safeFingerprint();
-		applyDependencyResolution(resolveDependencies(), createdAtEpochMs, true, false);
+		submitDependencyMaintenance(createdAtEpochMs, true, true);
+		drainMaintenanceResults(createdAtEpochMs);
 	}
 
 	@FunctionalInterface
@@ -118,6 +163,44 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		String fingerprint();
 
 		DependencyResolution resolve();
+	}
+
+	@FunctionalInterface
+	interface MaintenanceWorker extends AutoCloseable {
+		void execute(Runnable task);
+
+		@Override
+		default void close() {
+		}
+	}
+
+	@FunctionalInterface
+	interface OrphanReaper {
+		int reap(Path runtimeRoot) throws IOException;
+	}
+
+	private sealed interface MaintenanceResult permits DependencyMaintenanceResult,
+			LaunchMaintenanceResult, TerminationMaintenanceResult {
+	}
+
+	private record DependencyMaintenanceResult(
+			String fingerprint,
+			DependencyResolution resolution,
+			boolean fingerprintChanged,
+			boolean initial,
+			boolean orphanCleanupSucceeded
+	) implements MaintenanceResult {
+	}
+
+	private record LaunchMaintenanceResult(
+			ChildProcess child,
+			String launchId,
+			long startedAtEpochMs,
+			String failureMessage
+	) implements MaintenanceResult {
+	}
+
+	private record TerminationMaintenanceResult() implements MaintenanceResult {
 	}
 
 	record DependencyResolution(PreparedRuntime runtime, String failureCode, String failureMessage) {
@@ -205,6 +288,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		return runtime == null ? null : runtime.secret();
 	}
 
+	synchronized String bridgeSecret() {
+		return runtime == null ? null : runtime.bridgeSecret();
+	}
+
 	synchronized String failureCode() {
 		return failureCode;
 	}
@@ -213,33 +300,75 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		return failureMessage;
 	}
 
+	synchronized long bridgeRevision() {
+		return bridgeRevision;
+	}
+
 	synchronized void tick(boolean bridgeAuthenticated) {
-		tick(bridgeAuthenticated, bridgeAuthenticated ? launchId : null);
+		tick(bridgeAuthenticated, bridgeAuthenticated ? launchId : null, bridgeAuthenticated ? 1L : 0L);
 	}
 
 	synchronized void tick(boolean bridgeAuthenticated, String authenticatedLaunchId) {
+		tick(bridgeAuthenticated, authenticatedLaunchId, bridgeAuthenticated ? 1L : 0L);
+	}
+
+	synchronized void tick(boolean bridgeAuthenticated, String authenticatedLaunchId, long sessionGeneration) {
 		if (stopped) return;
 		long now = now();
-		if (!revalidateIfNeeded(now)) return;
+		drainMaintenanceResults(now);
 
 		if (child != null && !child.isAlive()) {
-			releaseChild();
+			queueTermination(detachChild());
 			recordFailure(now, "COORDINATOR_EXITED", "Coordinator process exited unexpectedly", "process");
-			return;
 		}
 
 		if (child != null) {
-			observeOwnedChild(now, bridgeAuthenticated, authenticatedLaunchId);
+			observeOwnedChild(now, bridgeAuthenticated, authenticatedLaunchId, sessionGeneration);
+			if (child != null) submitDependencyMaintenance(now, false, false);
+		}
+		if (pendingTermination != null) {
+			submitTerminationMaintenance();
+			drainMaintenanceResults(now);
+			if (pendingTermination != null || maintenancePending) return;
+		}
+		if (child != null) {
 			return;
+		}
+		if (maintenancePending) return;
+
+		if (runtime == null || runtime.nodeExecutable() == null) {
+			submitDependencyMaintenance(now, false, false);
+			drainMaintenanceResults(now);
+			if (maintenancePending || runtime == null || runtime.nodeExecutable() == null) return;
+			if (pendingTermination != null) {
+				submitTerminationMaintenance();
+				drainMaintenanceResults(now);
+				if (maintenancePending || pendingTermination != null) return;
+			}
+		}
+		if (now >= nextDependencyCheckEpochMs) {
+			submitDependencyMaintenance(now, false, false);
+			drainMaintenanceResults(now);
+			if (maintenancePending || runtime == null || runtime.nodeExecutable() == null) return;
+			if (pendingTermination != null) {
+				submitTerminationMaintenance();
+				drainMaintenanceResults(now);
+				if (maintenancePending || pendingTermination != null) return;
+			}
 		}
 
 		if (bridgeAuthenticated && authenticatedLaunchId == null) {
 			state = CoordinatorRecoveryState.HEALTHY;
 			nextRetryEpochMs = 0L;
+			submitDependencyMaintenance(now, false, false);
 			return;
 		}
-		if (now < nextRetryEpochMs) return;
-		start(now);
+		if (now >= nextRetryEpochMs) {
+			submitLaunchMaintenance(now);
+			drainMaintenanceResults(now);
+			return;
+		}
+		submitDependencyMaintenance(now, false, false);
 	}
 
 	synchronized CoordinatorRecoverySnapshot snapshot() {
@@ -260,16 +389,24 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		);
 	}
 
-	private void observeOwnedChild(long now, boolean bridgeAuthenticated, String authenticatedLaunchId) {
+	private void observeOwnedChild(
+			long now,
+			boolean bridgeAuthenticated,
+			String authenticatedLaunchId,
+			long sessionGeneration
+	) {
 		boolean matchingAuthentication = bridgeAuthenticated
 				&& launchId != null
-				&& launchId.equals(authenticatedLaunchId);
+				&& launchId.equals(authenticatedLaunchId)
+				&& sessionGeneration > 0L;
 		if (matchingAuthentication) {
-			if (state != CoordinatorRecoveryState.HEALTHY) {
+			if (state != CoordinatorRecoveryState.HEALTHY
+					|| authenticatedSessionGeneration != sessionGeneration) {
 				state = CoordinatorRecoveryState.HEALTHY;
 				authenticatedSinceEpochMs = now;
 				stabilityCredited = false;
 			}
+			authenticatedSessionGeneration = sessionGeneration;
 			failingBoundary = null;
 			authenticationDeadlineEpochMs = 0L;
 			reconnectDeadlineEpochMs = 0L;
@@ -295,7 +432,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				);
 			}
 			if (now >= reconnectDeadlineEpochMs) {
-				releaseChild();
+				queueTermination(detachChild());
 				recordFailure(now, "COORDINATOR_RECONNECT_TIMEOUT",
 						"Coordinator stayed alive but did not restore its authenticated bridge", "bridge_reconnect");
 			}
@@ -304,21 +441,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 		state = CoordinatorRecoveryState.AUTHENTICATING;
 		if (now >= authenticationDeadlineEpochMs) {
-			releaseChild();
+			queueTermination(detachChild());
 			recordFailure(now, "COORDINATOR_AUTHENTICATION_TIMEOUT",
 					"Coordinator process did not authenticate before its deadline", "bridge_authentication");
 		}
-	}
-
-	private boolean revalidateIfNeeded(long now) {
-		String currentFingerprint = safeFingerprint();
-		boolean changed = !Objects.equals(dependencyFingerprint, currentFingerprint);
-		if (!changed && now < nextDependencyCheckEpochMs) {
-			return runtime != null && runtime.nodeExecutable() != null;
-		}
-		dependencyFingerprint = currentFingerprint;
-		DependencyResolution resolution = resolveDependencies();
-		return applyDependencyResolution(resolution, now, false, changed);
 	}
 
 	private boolean applyDependencyResolution(
@@ -330,8 +456,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		nextDependencyCheckEpochMs = now + DEPENDENCY_RECHECK_MS;
 		PreparedRuntime previous = runtime;
 		runtime = resolution.runtime();
+		if (runtime != null && (previous == null
+				|| !previous.secret().equals(runtime.secret())
+				|| !previous.bridgeSecret().equals(runtime.bridgeSecret()))) {
+			bridgeRevision++;
+		}
 		if (!resolution.ready()) {
-			releaseChild();
+			queueTermination(detachChild());
 			state = CoordinatorRecoveryState.BLOCKED_RETRYABLE;
 			nextRetryEpochMs = nextDependencyCheckEpochMs;
 			authenticationDeadlineEpochMs = 0L;
@@ -343,7 +474,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		if (fingerprintChanged && previous != null && child != null) {
-			releaseChild();
+			queueTermination(detachChild());
 			state = CoordinatorRecoveryState.STARTING;
 			nextRetryEpochMs = now;
 		} else if (state == CoordinatorRecoveryState.BLOCKED_RETRYABLE) {
@@ -354,6 +485,151 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			nextRetryEpochMs = createdAtEpochMs + CoordinatorLaunchPolicy.STARTUP_GRACE_MS;
 		}
 		return true;
+	}
+
+	private void submitDependencyMaintenance(long requestedAt, boolean force, boolean initial) {
+		if (maintenancePending || stopped) return;
+		maintenancePending = true;
+		String previousFingerprint = dependencyFingerprint;
+		long scheduledCheck = nextDependencyCheckEpochMs;
+		boolean reapRequired = !orphanCleanupComplete;
+		submitMaintenance(() -> {
+			String currentFingerprint = safeFingerprint();
+			boolean changed = !Objects.equals(previousFingerprint, currentFingerprint);
+			long checkedAt = now();
+			if (!force && !reapRequired && !changed && checkedAt < scheduledCheck) {
+				publishMaintenanceResult(new DependencyMaintenanceResult(
+						currentFingerprint, null, false, initial, false
+				));
+				return;
+			}
+			boolean reaped = !reapRequired;
+			if (reapRequired) {
+				try {
+					int count = orphanReaper.reap(gameDirectory.resolve("arena-agents-runtime"));
+					if (count > 0) {
+						LOGGER.warn("Stopped {} orphaned Arena Agents coordinator process(es) before updating the runtime", count);
+					}
+					reaped = true;
+				} catch (IOException | RuntimeException failure) {
+					publishMaintenanceResult(new DependencyMaintenanceResult(
+							currentFingerprint,
+							DependencyResolution.blocked(
+									"COORDINATOR_ORPHAN_CLEANUP_FAILED",
+									failure.getMessage() == null ? "Owned coordinator cleanup is temporarily unavailable" : failure.getMessage()
+							),
+							changed,
+							initial,
+							false
+					));
+					return;
+				}
+			}
+			publishMaintenanceResult(new DependencyMaintenanceResult(
+					currentFingerprint, resolveDependencies(), changed, initial, reaped
+			));
+		});
+	}
+
+	private void submitLaunchMaintenance(long requestedAt) {
+		if (maintenancePending || stopped) return;
+		generation++;
+		state = CoordinatorRecoveryState.STARTING;
+		String ownedLaunchId;
+		try {
+			ownedLaunchId = UUID.fromString(Objects.requireNonNull(launchIds.get(), "launch ID must not be null")).toString();
+		} catch (RuntimeException failure) {
+			recordFailure(requestedAt, "COORDINATOR_START_FAILED", "Could not start the Arena Agents coordinator", "process_start");
+			return;
+		}
+		PreparedRuntime prepared = Objects.requireNonNull(runtime, "coordinator runtime is not prepared");
+		launchId = ownedLaunchId;
+		maintenancePending = true;
+		submitMaintenance(() -> {
+			try {
+				LaunchRequest request = launchRequest(prepared, ownedLaunchId);
+				ChildProcess started = Objects.requireNonNull(processLauncher.launch(request), "process launcher returned no child");
+				publishMaintenanceResult(new LaunchMaintenanceResult(started, ownedLaunchId, now(), null));
+			} catch (IOException | RuntimeException failure) {
+				publishMaintenanceResult(new LaunchMaintenanceResult(
+						null, ownedLaunchId, now(), failure.getMessage()
+				));
+			}
+		});
+	}
+
+	private void submitTerminationMaintenance() {
+		if (maintenancePending || pendingTermination == null || stopped) return;
+		ChildProcess terminating = pendingTermination;
+		pendingTermination = null;
+		maintenancePending = true;
+		submitMaintenance(() -> {
+			try {
+				terminating.terminate();
+			} catch (RuntimeException failure) {
+				LOGGER.warn("Could not finish coordinator process-tree termination", failure);
+			}
+			publishMaintenanceResult(new TerminationMaintenanceResult());
+		});
+	}
+
+	private void submitMaintenance(Runnable task) {
+		try {
+			maintenanceWorker.execute(task);
+		} catch (RuntimeException failure) {
+			maintenancePending = false;
+			state = CoordinatorRecoveryState.BLOCKED_RETRYABLE;
+			nextRetryEpochMs = now() + DEPENDENCY_RECHECK_MS;
+			setDiagnostic("COORDINATOR_MAINTENANCE_UNAVAILABLE", failure.getMessage(), "maintenance_worker");
+		}
+	}
+
+	private void publishMaintenanceResult(MaintenanceResult result) {
+		ChildProcess cleanup = null;
+		synchronized (this) {
+			if (stopped && result instanceof LaunchMaintenanceResult launch && launch.child() != null) {
+				cleanup = launch.child();
+			} else if (!stopped) {
+				maintenanceResults.add(result);
+			}
+		}
+		if (cleanup != null) cleanup.terminate();
+	}
+
+	private void drainMaintenanceResults(long now) {
+		MaintenanceResult result;
+		while ((result = maintenanceResults.poll()) != null) {
+			maintenancePending = false;
+			if (result instanceof DependencyMaintenanceResult dependency) {
+				dependencyFingerprint = dependency.fingerprint();
+				if (dependency.orphanCleanupSucceeded()) orphanCleanupComplete = true;
+				if (dependency.resolution() != null) {
+					applyDependencyResolution(
+							dependency.resolution(), now, dependency.initial(), dependency.fingerprintChanged()
+					);
+				}
+			} else if (result instanceof LaunchMaintenanceResult launch) {
+				if (launch.child() == null) {
+					launchId = null;
+					recordFailure(now, "COORDINATOR_START_FAILED", "Could not start the Arena Agents coordinator", "process_start");
+					continue;
+				}
+				if (!Objects.equals(launchId, launch.launchId())) {
+					queueTermination(launch.child());
+					continue;
+				}
+				child = launch.child();
+				processStartedEpochMs = launch.startedAtEpochMs();
+				authenticationDeadlineEpochMs = launch.startedAtEpochMs() + AUTHENTICATION_TIMEOUT_MS;
+				reconnectDeadlineEpochMs = 0L;
+				authenticatedSinceEpochMs = 0L;
+				stabilityCredited = false;
+				nextRetryEpochMs = 0L;
+				state = CoordinatorRecoveryState.AUTHENTICATING;
+				failingBoundary = "bridge_authentication";
+				LOGGER.info("Started the Arena Agents coordinator (pid {}, generation {})", child.pid(), generation);
+			}
+		}
 	}
 
 	private DependencyResolution resolveDependencies() {
@@ -376,31 +652,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 	}
 
-	private void start(long now) {
-		generation++;
-		state = CoordinatorRecoveryState.STARTING;
-		try {
-			launchId = UUID.fromString(Objects.requireNonNull(launchIds.get(), "launch ID must not be null")).toString();
-			LaunchRequest request = launchRequest(launchId);
-			ChildProcess started = Objects.requireNonNull(processLauncher.launch(request), "process launcher returned no child");
-			child = started;
-			processStartedEpochMs = now;
-			authenticationDeadlineEpochMs = now + AUTHENTICATION_TIMEOUT_MS;
-			reconnectDeadlineEpochMs = 0L;
-			authenticatedSinceEpochMs = 0L;
-			stabilityCredited = false;
-			nextRetryEpochMs = 0L;
-			state = CoordinatorRecoveryState.AUTHENTICATING;
-			failingBoundary = "bridge_authentication";
-			LOGGER.info("Started the Arena Agents coordinator (pid {}, generation {})", child.pid(), generation);
-		} catch (IOException | RuntimeException exception) {
-			launchId = null;
-			recordFailure(now, "COORDINATOR_START_FAILED", "Could not start the Arena Agents coordinator", "process_start");
-		}
-	}
-
-	private LaunchRequest launchRequest(String ownedLaunchId) {
-		PreparedRuntime prepared = Objects.requireNonNull(runtime, "coordinator runtime is not prepared");
+	private LaunchRequest launchRequest(PreparedRuntime prepared, String ownedLaunchId) {
 		Map<String, String> environment = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 		environment.putAll(System.getenv());
 		for (Map.Entry<String, String> override : launchEnvironmentOverrides.entrySet()) {
@@ -451,15 +703,23 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 	}
 
-	private void releaseChild() {
+	private ChildProcess detachChild() {
 		ChildProcess owned = child;
-		if (owned == null) return;
+		if (owned == null) return null;
 		child = null;
 		launchId = null;
 		processStartedEpochMs = 0L;
 		authenticationDeadlineEpochMs = 0L;
 		reconnectDeadlineEpochMs = 0L;
-		owned.terminate();
+		return owned;
+	}
+
+	private void queueTermination(ChildProcess owned) {
+		if (owned == null) return;
+		if (pendingTermination != null && pendingTermination != owned) {
+			throw new IllegalStateException("coordinator termination is already pending");
+		}
+		pendingTermination = owned;
 	}
 
 	static void terminateFailedStart(Process started) {
@@ -473,7 +733,26 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		state = CoordinatorRecoveryState.STOPPED;
 		nextRetryEpochMs = 0L;
 		nextDependencyCheckEpochMs = 0L;
-		releaseChild();
+		ArrayList<ChildProcess> cleanup = new ArrayList<>();
+		ChildProcess active = detachChild();
+		if (active != null) cleanup.add(active);
+		if (pendingTermination != null && !cleanup.contains(pendingTermination)) cleanup.add(pendingTermination);
+		pendingTermination = null;
+		MaintenanceResult result;
+		while ((result = maintenanceResults.poll()) != null) {
+			if (result instanceof LaunchMaintenanceResult launch && launch.child() != null
+					&& !cleanup.contains(launch.child())) {
+				cleanup.add(launch.child());
+			}
+		}
+		for (ChildProcess process : cleanup) {
+			try {
+				maintenanceWorker.execute(process::terminate);
+			} catch (RuntimeException rejected) {
+				LOGGER.warn("Could not schedule coordinator shutdown cleanup", rejected);
+			}
+		}
+		maintenanceWorker.close();
 	}
 
 	private long now() {
@@ -533,6 +812,18 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
 	}
 
+	private static void configureOptionalVoiceEndpoint(
+			Path configPath,
+			Map<String, String> launchEnvironmentOverrides
+	) {
+		try {
+			configureSharedVoiceEndpoint(configPath, launchEnvironmentOverrides);
+		} catch (IOException | RuntimeException invalidVoiceConfiguration) {
+			LOGGER.warn("Ignoring invalid optional voice endpoint; coordinator recovery will continue without voice",
+					invalidVoiceConfiguration);
+		}
+	}
+
 	private static Path findPackageRoot(Path gameDirectory) {
 		String configured = System.getProperty("arenaagents.packageRoot");
 		if (configured != null && !configured.isBlank()) {
@@ -566,6 +857,24 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			return "COORDINATOR_RUNTIME_INVALID";
 		}
 		return "COORDINATOR_STARTUP_INVALID";
+	}
+
+	private static final class OwnedMaintenanceWorker implements MaintenanceWorker {
+		private final ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
+			Thread thread = new Thread(runnable, "arenaagents-coordinator-maintenance");
+			thread.setDaemon(true);
+			return thread;
+		});
+
+		@Override
+		public void execute(Runnable task) {
+			executor.execute(Objects.requireNonNull(task, "maintenance task must not be null"));
+		}
+
+		@Override
+		public void close() {
+			executor.shutdown();
+		}
 	}
 
 	private static final class DefaultProcessLauncher implements ProcessLauncher {
@@ -625,7 +934,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final class DefaultDependencyResolver implements DependencyResolver {
 		private final Path gameDirectory;
 		private final Map<String, String> environmentOverrides;
-		private boolean orphanCheckComplete;
 
 		private DefaultDependencyResolver(Path gameDirectory, Map<String, String> environmentOverrides) {
 			this.gameDirectory = gameDirectory;
@@ -680,13 +988,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			BundledCoordinatorInstaller.RuntimePackage prepared = null;
 			try {
 				Path installedRoot = gameDirectory.resolve("arena-agents-runtime");
-				if (!orphanCheckComplete) {
-					orphanCheckComplete = true;
-					int reaped = CoordinatorProcessOwnership.reapOrphaned(installedRoot);
-					if (reaped > 0) {
-						LOGGER.warn("Stopped {} orphaned Arena Agents coordinator process(es) before updating the runtime", reaped);
-					}
-				}
 				IOException installFailure = null;
 				try {
 					if (BundledCoordinatorInstaller.installBundled(installedRoot)) {
@@ -710,7 +1011,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				String secret = Files.readString(prepared.secret(), StandardCharsets.UTF_8).trim();
 				validateConfig(prepared.config());
 				configureSharedBridgeSecretPath(prepared.secret());
-				configureSharedVoiceEndpoint(prepared.config(), environmentOverrides);
+				configureOptionalVoiceEndpoint(prepared.config(), environmentOverrides);
 				PreparedRuntime partial = prepared(prepared, null, secret);
 				try {
 					NodeRuntimeLocator.LocatedNode node = NodeRuntimeLocator.locate(prepared.root());

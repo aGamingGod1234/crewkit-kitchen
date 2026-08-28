@@ -1,13 +1,34 @@
 package dev.agaminggod.arenaagents.server;
 
+import com.google.gson.JsonObject;
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelope;
+import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodec;
+import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
+
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.lang.reflect.Field;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Deque;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /** Fault-injection verification for coordinator recovery ownership and deadlines. */
 public final class CoordinatorProcessSupervisorVerification {
@@ -28,12 +49,16 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyStaleLaunchCannotSuppressReplacement();
 		verifyReconnectRecoveryAndExpiry();
 		verifyContinuousStabilityResetsFailures();
+		verifyConnectionGenerationResetsUnsampledStability();
 		verifyMissingThenRestoredDependency();
 		verifyPeriodicDependencyRevalidation();
 		verifyHealthyDependencyRevalidation();
+		verifyBlockingMaintenanceNeverBlocksTicks();
+		verifyOrphanReapRetriesBeforeLaunch();
+		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyCloseIsIdempotent();
-		return 78;
+		return 89;
 	}
 
 	private static void verifyRecoveryContract() {
@@ -199,6 +224,30 @@ public final class CoordinatorProcessSupervisorVerification {
 		fixture.supervisor.close();
 	}
 
+	private static void verifyConnectionGenerationResetsUnsampledStability() {
+		Fixture fixture = Fixture.ready();
+		fixture.startFirstProcess();
+		fixture.launcher.latest().crash();
+		fixture.supervisor.tick(false, null, 0L);
+		fixture.clock.advance(1_000L);
+		fixture.supervisor.tick(false, null, 0L);
+		String launchId = fixture.supervisor.snapshot().launchId();
+		fixture.supervisor.tick(true, launchId, 1L);
+		fixture.clock.advance(STABILITY_INTERVAL_MS);
+		fixture.supervisor.tick(true, launchId, 2L);
+		assertEquals(1, fixture.supervisor.snapshot().consecutiveFailures(),
+				"a reconnect between sampled ticks resets stability when its session generation changes");
+		fixture.clock.advance(STABILITY_INTERVAL_MS - 1L);
+		fixture.supervisor.tick(true, launchId, 2L);
+		assertEquals(1, fixture.supervisor.snapshot().consecutiveFailures(),
+				"replacement session must remain continuously authenticated for the full interval");
+		fixture.clock.advance(1L);
+		fixture.supervisor.tick(true, launchId, 2L);
+		assertEquals(0, fixture.supervisor.snapshot().consecutiveFailures(),
+				"one continuous matching session generation eventually clears crash-loop history");
+		fixture.supervisor.close();
+	}
+
 	private static void verifyMissingThenRestoredDependency() {
 		Fixture fixture = Fixture.blocked("NODE_RUNTIME_NOT_FOUND", "Node.js 22+ is unavailable");
 		assertEquals(CoordinatorRecoveryState.BLOCKED_RETRYABLE, fixture.supervisor.snapshot().state(),
@@ -228,6 +277,156 @@ public final class CoordinatorProcessSupervisorVerification {
 		assertEquals(2, fixture.dependencies.resolveCalls,
 				"healthy Node, runtime, config, and secret dependencies are periodically revalidated");
 		fixture.supervisor.close();
+	}
+
+	private static void verifyBlockingMaintenanceNeverBlocksTicks() {
+		FakeClock clock = new FakeClock();
+		BlockingDependencies dependencies = new BlockingDependencies();
+		BlockingLauncher launcher = new BlockingLauncher();
+		QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "blocking-supervisor-game"),
+				Map.of(),
+				clock,
+				dependencies,
+				launcher,
+				() -> "00000000-0000-0000-0000-000000000101",
+				worker,
+				runtimeRoot -> 0
+		);
+		assertEquals(1, worker.submissions, "construction schedules one dependency maintenance task");
+		Thread resolver = worker.startNext("blocking-dependency-resolution");
+		await(dependencies.started, "blocking dependency resolver started on maintenance worker");
+		assertTicksPrompt(supervisor, 20, "ticks stay prompt while dependency resolution blocks");
+		assertEquals(1, worker.submissions, "ticks coalesce while dependency maintenance is in flight");
+		dependencies.release.countDown();
+		join(resolver, "dependency maintenance completes after release");
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		assertEquals(2, worker.submissions, "completed dependency maintenance schedules one launch task");
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		assertEquals(CoordinatorRecoveryState.AUTHENTICATING, supervisor.snapshot().state(),
+				"off-thread launch result is promoted by a later tick");
+
+		clock.advance(AUTHENTICATION_TIMEOUT_MS);
+		supervisor.tick(false, null, 0L);
+		assertEquals(CoordinatorRecoveryState.BACKOFF, supervisor.snapshot().state(),
+				"authentication timeout enters backoff before slow termination finishes");
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		Thread terminator = worker.startNext("blocking-child-termination");
+		await(launcher.child.terminationStarted, "blocking child termination started on maintenance worker");
+		int submissionsBeforeTicks = worker.submissions;
+		assertTicksPrompt(supervisor, 20, "ticks stay prompt while process-tree termination blocks");
+		assertEquals(submissionsBeforeTicks, worker.submissions,
+				"ticks do not duplicate maintenance while termination is in flight");
+		launcher.child.releaseTermination.countDown();
+		join(terminator, "child termination completes after release");
+		supervisor.close();
+	}
+
+	private static void verifyOrphanReapRetriesBeforeLaunch() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.ready();
+		FakeLauncher launcher = new FakeLauncher();
+		AtomicInteger reapAttempts = new AtomicInteger();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "orphan-retry-game"),
+				Map.of(),
+				clock,
+				dependencies,
+				launcher,
+				() -> "00000000-0000-0000-0000-000000000202",
+				Runnable::run,
+				runtimeRoot -> {
+					if (reapAttempts.incrementAndGet() == 1) throw new IOException("ownership file is temporarily locked");
+					return 1;
+				}
+		);
+		assertEquals(CoordinatorRecoveryState.BLOCKED_RETRYABLE, supervisor.snapshot().state(),
+				"failed orphan cleanup is retryable");
+		assertEquals(0, launcher.launches.size(), "no replacement launches before orphan cleanup succeeds");
+		clock.advance(5_000L);
+		supervisor.tick(false, null, 0L);
+		assertEquals(2, reapAttempts.get(), "orphan cleanup retries after its first failure");
+		assertEquals(1, launcher.launches.size(), "replacement launches only after successful orphan cleanup");
+		supervisor.close();
+	}
+
+	private static void verifySecretRepairRebindsBridgeAndAuthenticatesReplacement() {
+		Path fixtureRoot = null;
+		CoordinatorProcessSupervisor supervisor = null;
+		CodexAgentServerRuntime.BridgeSlot slot = null;
+		Socket originalConnection = null;
+		Socket repairedConnection = null;
+		try {
+			fixtureRoot = Files.createTempDirectory("arena-secret-repair-");
+			Path secretFile = fixtureRoot.resolve("bridge-secret.txt");
+			String originalSecret = "a".repeat(32);
+			String repairedSecret = "b".repeat(32);
+			Files.writeString(secretFile, originalSecret, StandardCharsets.UTF_8);
+			FakeClock clock = new FakeClock();
+			MutableDependencies dependencies = MutableDependencies.ready(secretFile, originalSecret);
+			FakeLauncher launcher = new FakeLauncher();
+			AtomicInteger launchIds = new AtomicInteger();
+			supervisor = new CoordinatorProcessSupervisor(
+					fixtureRoot.resolve("game"), Map.of(), clock, dependencies, launcher,
+					() -> "00000000-0000-0000-0000-%012d".formatted(400 + launchIds.incrementAndGet()),
+					Runnable::run, runtimeRoot -> 0
+			);
+			clock.advance(STARTUP_GRACE_MS);
+			supervisor.tick(false, null, 0L);
+
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord active = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Keeper"), 1_000L);
+			manager.registry().start(active.agentId(), "keep gathering stone", 1_001L);
+			var originalProfile = manager.registry().require(active.agentId()).profile();
+			var originalGoal = manager.registry().require(active.agentId()).currentGoal();
+			int port = unusedLoopbackPort();
+			slot = new CodexAgentServerRuntime.BridgeSlot(clock);
+			CoordinatorProcessSupervisor ownedSupervisor = supervisor;
+			CodexAgentServerRuntime.BridgeSlot ownedSlot = slot;
+			slot.reconcile(supervisor.bridgeRevision(), () ->
+					MultiplexedServerBridge.withPreparedSecret(manager, port, ownedSupervisor.bridgeSecret()));
+			MultiplexedServerBridge originalBridge = slot.bridge();
+			originalConnection = authenticate(port, originalSecret, supervisor.snapshot().launchId(), "original-secret");
+			supervisor.tick(true, originalBridge.authenticatedLaunchId(), originalBridge.authenticatedSessionGeneration());
+			assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
+					"original coordinator child authenticates through the initial Java bridge");
+
+			Files.writeString(secretFile, repairedSecret, StandardCharsets.UTF_8);
+			dependencies.rotate("repaired-secret", secretFile, repairedSecret);
+			clock.advance(5_000L);
+			supervisor.tick(true, originalBridge.authenticatedLaunchId(), originalBridge.authenticatedSessionGeneration());
+			supervisor.tick(true, originalBridge.authenticatedLaunchId(), originalBridge.authenticatedSessionGeneration());
+			assertEquals(2, launcher.launches.size(), "secret repair relaunches one matching coordinator child");
+			long repairedRevision = supervisor.bridgeRevision();
+			slot.reconcile(repairedRevision, () ->
+					MultiplexedServerBridge.withPreparedSecret(manager, port, ownedSupervisor.bridgeSecret()));
+			MultiplexedServerBridge repairedBridge = slot.bridge();
+			assertFalse(originalBridge == repairedBridge, "secret repair replaces the cached Java bridge instance");
+			repairedConnection = authenticate(port, repairedSecret, supervisor.snapshot().launchId(), "repaired-secret");
+			supervisor.tick(true, repairedBridge.authenticatedLaunchId(), repairedBridge.authenticatedSessionGeneration());
+			assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
+					"matching repaired child authenticates automatically through the rebound bridge");
+			assertEquals(originalProfile, manager.registry().require(active.agentId()).profile(),
+					"bridge replacement preserves the active agent profile");
+			assertEquals(originalGoal, manager.registry().require(active.agentId()).currentGoal(),
+					"bridge replacement preserves the active goal");
+			slot.reconcile(repairedRevision, () -> {
+				throw new AssertionError("unchanged bridge revision must not create another listener");
+			});
+			assertEquals(repairedBridge, ownedSlot.bridge(), "repeated reconciliation is idempotent");
+		} catch (Exception exception) {
+			throw new AssertionError("bridge secret repair recovery failed", exception);
+		} finally {
+			closeSocket(repairedConnection);
+			closeSocket(originalConnection);
+			if (slot != null) slot.close();
+			if (supervisor != null) supervisor.close();
+			if (fixtureRoot != null) deleteTree(fixtureRoot);
+		}
 	}
 
 	private static void verifyLaunchFailureRecovers() {
@@ -322,7 +521,7 @@ public final class CoordinatorProcessSupervisorVerification {
 	}
 
 	private static final class MutableDependencies implements CoordinatorProcessSupervisor.DependencyResolver {
-		private final CoordinatorProcessSupervisor.PreparedRuntime runtime = new CoordinatorProcessSupervisor.PreparedRuntime(
+		private CoordinatorProcessSupervisor.PreparedRuntime runtime = new CoordinatorProcessSupervisor.PreparedRuntime(
 				Path.of("build", "supervisor-runtime"),
 				Path.of("build", "supervisor-runtime", "coordinator"),
 				Path.of("build", "supervisor-runtime", "coordinator", "src", "dynamic-main.mjs"),
@@ -346,6 +545,13 @@ public final class CoordinatorProcessSupervisorVerification {
 			return dependencies;
 		}
 
+		private static MutableDependencies ready(Path secretPath, String secret) {
+			MutableDependencies dependencies = ready();
+			dependencies.runtime = runtime(secretPath, secret);
+			dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(dependencies.runtime);
+			return dependencies;
+		}
+
 		private static MutableDependencies blocked(String code, String message) {
 			MutableDependencies dependencies = new MutableDependencies("blocked", null);
 			dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.blocked(code, message);
@@ -355,6 +561,24 @@ public final class CoordinatorProcessSupervisorVerification {
 		private void restore(String fingerprint) {
 			this.fingerprint = fingerprint;
 			this.result = CoordinatorProcessSupervisor.DependencyResolution.ready(runtime);
+		}
+
+		private void rotate(String fingerprint, Path secretPath, String secret) {
+			this.fingerprint = fingerprint;
+			this.runtime = runtime(secretPath, secret);
+			this.result = CoordinatorProcessSupervisor.DependencyResolution.ready(runtime);
+		}
+
+		private static CoordinatorProcessSupervisor.PreparedRuntime runtime(Path secretPath, String secret) {
+			return new CoordinatorProcessSupervisor.PreparedRuntime(
+					Path.of("build", "supervisor-runtime"),
+					Path.of("build", "supervisor-runtime", "coordinator"),
+					Path.of("build", "supervisor-runtime", "coordinator", "src", "dynamic-main.mjs"),
+					Path.of("build", "supervisor-runtime", "coordinator", "config", "dynamic-agents.json"),
+					secretPath,
+					Path.of("build", "supervisor-runtime", "runtime", "toolchains", "node", "node.exe"),
+					secret
+			);
 		}
 
 		@Override
@@ -419,6 +643,183 @@ public final class CoordinatorProcessSupervisorVerification {
 		public void terminate() {
 			terminations++;
 			alive = false;
+		}
+	}
+
+	private static final class BlockingDependencies implements CoordinatorProcessSupervisor.DependencyResolver {
+		private final CountDownLatch started = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
+		private final CoordinatorProcessSupervisor.PreparedRuntime runtime = MutableDependencies.ready().runtime;
+
+		@Override
+		public String fingerprint() {
+			return "blocking-ready";
+		}
+
+		@Override
+		public CoordinatorProcessSupervisor.DependencyResolution resolve() {
+			started.countDown();
+			await(release, "blocking dependency resolver released");
+			return CoordinatorProcessSupervisor.DependencyResolution.ready(runtime);
+		}
+	}
+
+	private static final class BlockingLauncher implements CoordinatorProcessSupervisor.ProcessLauncher {
+		private final BlockingChild child = new BlockingChild();
+
+		@Override
+		public CoordinatorProcessSupervisor.ChildProcess launch(CoordinatorProcessSupervisor.LaunchRequest request) {
+			return child;
+		}
+	}
+
+	private static final class BlockingChild implements CoordinatorProcessSupervisor.ChildProcess {
+		private final CountDownLatch terminationStarted = new CountDownLatch(1);
+		private final CountDownLatch releaseTermination = new CountDownLatch(1);
+		private volatile boolean alive = true;
+
+		@Override
+		public boolean isAlive() {
+			return alive;
+		}
+
+		@Override
+		public long pid() {
+			return 42_424L;
+		}
+
+		@Override
+		public void terminate() {
+			terminationStarted.countDown();
+			await(releaseTermination, "blocking child termination released");
+			alive = false;
+		}
+	}
+
+	private static final class QueuedMaintenanceWorker implements CoordinatorProcessSupervisor.MaintenanceWorker {
+		private final Deque<Runnable> tasks = new ArrayDeque<>();
+		private int submissions;
+
+		@Override
+		public synchronized void execute(Runnable task) {
+			tasks.addLast(task);
+			submissions++;
+		}
+
+		private synchronized Runnable removeNext() {
+			Runnable task = tasks.pollFirst();
+			if (task == null) throw new AssertionError("no maintenance task is queued");
+			return task;
+		}
+
+		private void runNext() {
+			removeNext().run();
+		}
+
+		private Thread startNext(String name) {
+			Thread thread = Thread.ofPlatform().daemon().name(name).start(removeNext());
+			return thread;
+		}
+	}
+
+	private static void assertTicksPrompt(
+			CoordinatorProcessSupervisor supervisor,
+			int count,
+			String label
+	) {
+		long started = System.nanoTime();
+		for (int index = 0; index < count; index++) supervisor.tick(false, null, 0L);
+		long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+		if (elapsedMs >= 250L) throw new AssertionError(label + ": elapsed " + elapsedMs + "ms");
+	}
+
+	private static Socket authenticate(
+			int port,
+			String secret,
+			String launchId,
+			String messageId
+	) throws Exception {
+		BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+		Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, port);
+		try {
+			BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+			socket.setSoTimeout(2_000);
+			JsonObject hello = new JsonObject();
+			hello.addProperty("secret", secret);
+			hello.addProperty("launchId", launchId);
+			socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
+					2, "coordinator", "server", "hello", messageId, hello
+			)).getBytes(StandardCharsets.UTF_8));
+			socket.getOutputStream().flush();
+			assertEquals("hello_ack", codec.decode(reader.readLine()).type(), "matching child receives hello acknowledgement");
+			assertEquals("verbose_control", codec.decode(reader.readLine()).type(), "matching child receives initial control state");
+			return socket;
+		} catch (Exception failure) {
+			closeSocket(socket);
+			throw failure;
+		}
+	}
+
+	private static void closeSocket(Socket socket) {
+		if (socket == null) return;
+		try {
+			socket.close();
+		} catch (IOException ignored) {
+		}
+	}
+
+	private static int unusedLoopbackPort() throws IOException {
+		try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+			return socket.getLocalPort();
+		}
+	}
+
+	private static CodexAgentManager uninitializedManager() {
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+			CodexAgentManager manager = (CodexAgentManager) unsafe.allocateInstance(CodexAgentManager.class);
+			Field savedData = CodexAgentManager.class.getDeclaredField("savedData");
+			unsafe.putObject(manager, unsafe.objectFieldOffset(savedData), new AgentSavedData());
+			Field pendingRegistrations = CodexAgentManager.class.getDeclaredField("pendingAgentRegistrations");
+			unsafe.putObject(manager, unsafe.objectFieldOffset(pendingRegistrations), new LinkedHashSet<AgentId>());
+			return manager;
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not allocate lifecycle-only manager", exception);
+		}
+	}
+
+	private static void deleteTree(Path root) {
+		try (var paths = Files.walk(root)) {
+			paths.sorted(java.util.Comparator.reverseOrder()).forEach(path -> {
+				try {
+					Files.deleteIfExists(path);
+				} catch (IOException exception) {
+					throw new java.io.UncheckedIOException(exception);
+				}
+			});
+		} catch (IOException | java.io.UncheckedIOException exception) {
+			throw new AssertionError("could not clean secret repair fixture", exception);
+		}
+	}
+
+	private static void await(CountDownLatch latch, String label) {
+		try {
+			if (!latch.await(5L, TimeUnit.SECONDS)) throw new AssertionError(label + " timed out");
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError(label + " was interrupted", exception);
+		}
+	}
+
+	private static void join(Thread thread, String label) {
+		try {
+			thread.join(5_000L);
+			if (thread.isAlive()) throw new AssertionError(label + " timed out");
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError(label + " was interrupted", exception);
 		}
 	}
 

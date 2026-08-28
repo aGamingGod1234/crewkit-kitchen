@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.UUID;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
@@ -33,9 +34,8 @@ import org.slf4j.LoggerFactory;
 
 public final class CodexAgentServerRuntime {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CodexAgentServerRuntime.class);
-	private static final Map<MinecraftServer, MultiplexedServerBridge> BRIDGES = new ConcurrentHashMap<>();
+	private static final Map<MinecraftServer, BridgeSlot> BRIDGE_SLOTS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, CoordinatorProcessSupervisor> COORDINATORS = new ConcurrentHashMap<>();
-	private static final Map<MinecraftServer, BridgeRetry> BRIDGE_RETRIES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalVerificationRuntime> GOAL_VERIFIERS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, GoalSafetyController> GOAL_SAFETY = new ConcurrentHashMap<>();
@@ -128,50 +128,41 @@ public final class CodexAgentServerRuntime {
 			CoordinatorProcessSupervisor supervisor,
 			GoalVerificationRuntime goalVerifier
 	) {
-		if (BRIDGES.containsKey(server)) return;
-		BridgeRetry retry = BRIDGE_RETRIES.computeIfAbsent(server, ignored -> new BridgeRetry(System::currentTimeMillis));
-		if (!retry.canAttempt()) return;
-		MultiplexedServerBridge candidate = null;
-		try {
-			Path secretPath = supervisor == null ? null : supervisor.secretPath();
-			candidate = new MultiplexedServerBridge(
-					manager,
-					secretPath == null ? Paths.get("runtime", "bridge-secret.txt") : secretPath,
-					AgentVerboseState.forServer(server),
-					goalVerifier
-			);
-			candidate.start();
-			MultiplexedServerBridge previous = BRIDGES.putIfAbsent(server, candidate);
-			if (previous == null) {
-				retry.recordSuccess();
-				return;
-			}
-			candidate.close();
-		} catch (RuntimeException exception) {
-			if (candidate != null) candidate.close();
-			String code = exception instanceof BridgeProtocolException protocol
-					? protocol.code()
-					: "JAVA_BRIDGE_START_FAILED";
-			retry.recordFailure(code, exception.getMessage());
-			LOGGER.warn("Arena Agents Minecraft bridge is recovering [{}]; next bind attempt is scheduled", code, exception);
+		BridgeSlot slot = BRIDGE_SLOTS.computeIfAbsent(server, ignored -> new BridgeSlot(System::currentTimeMillis));
+		Path secretPath = supervisor == null ? null : supervisor.secretPath();
+		String preparedSecret = supervisor == null ? null : supervisor.bridgeSecret();
+		long secretRevision = supervisor == null ? 0L : supervisor.bridgeRevision();
+		String previousFailure = slot.retry().failureCode();
+		slot.reconcile(secretRevision, () -> preparedSecret == null
+				? new MultiplexedServerBridge(
+						manager,
+						secretPath == null ? Paths.get("runtime", "bridge-secret.txt") : secretPath,
+						AgentVerboseState.forServer(server),
+						goalVerifier
+				)
+				: MultiplexedServerBridge.withPreparedSecret(
+						manager, preparedSecret, AgentVerboseState.forServer(server), goalVerifier
+				));
+		String currentFailure = slot.retry().failureCode();
+		if (currentFailure != null && !java.util.Objects.equals(previousFailure, currentFailure)) {
+			LOGGER.warn("Arena Agents Minecraft bridge is recovering [{}]; next bind attempt is scheduled: {}",
+					currentFailure, slot.retry().failureMessage());
 		}
 	}
 
 	private static void tick(MinecraftServer server) {
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
-		MultiplexedServerBridge bridge = BRIDGES.get(server);
-		if (bridge == null) {
-			GoalVerificationRuntime goalVerifier = GOAL_VERIFIERS.get(server);
-			if (goalVerifier != null) {
-				tryStartBridge(server, manager, supervisor, goalVerifier);
-				bridge = BRIDGES.get(server);
-			}
+		GoalVerificationRuntime bridgeGoalVerifier = GOAL_VERIFIERS.get(server);
+		if (bridgeGoalVerifier != null) {
+			tryStartBridge(server, manager, supervisor, bridgeGoalVerifier);
 		}
+		MultiplexedServerBridge bridge = bridge(server);
 		if (supervisor != null) {
 			supervisor.tick(
 					bridge != null && bridge.authenticated(),
-					bridge == null ? null : bridge.authenticatedLaunchId()
+					bridge == null ? null : bridge.authenticatedLaunchId(),
+					bridge == null ? 0L : bridge.authenticatedSessionGeneration()
 			);
 		}
 		if (!ScenarioRuntimeService.restorePersistedState(server)) {
@@ -216,22 +207,23 @@ public final class CodexAgentServerRuntime {
 	}
 
 	public static boolean automationAvailable(MinecraftServer server) {
-		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		MultiplexedServerBridge bridge = bridge(server);
 		return bridge != null && bridge.authenticated();
 	}
 
 	public static void setVerbose(MinecraftServer server, boolean enabled) {
 		AgentVerboseState state = AgentVerboseState.forServer(server);
 		state.setEnabled(enabled);
-		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge != null) bridge.setVerbose(enabled);
 	}
 
 	public static String automationStatus(MinecraftServer server) {
-		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge != null && bridge.authenticated()) return "Automation ready";
 		if (bridge == null) {
-			BridgeRetry retry = BRIDGE_RETRIES.get(server);
+			BridgeSlot slot = BRIDGE_SLOTS.get(server);
+			BridgeRetry retry = slot == null ? null : slot.retry();
 			if (retry != null && retry.failureCode() != null) {
 				return "Automation recovery state BLOCKED_RETRYABLE at java_bridge [" + retry.failureCode()
 						+ "]. Next retry at " + retry.nextRetryEpochMs() + ".";
@@ -262,7 +254,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	public static List<AgentControlModelOption> modelCatalog(MinecraftServer server) {
-		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		MultiplexedServerBridge bridge = bridge(server);
 		return bridge == null ? AgentControlCatalog.fallbackOptions() : bridge.catalogModels();
 	}
 
@@ -279,7 +271,7 @@ public final class CodexAgentServerRuntime {
 			String text
 	) {
 		requireAutomation(server);
-		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge == null) throw new AgentDomainException("AUTOMATION_UNAVAILABLE", automationStatus(server));
 		return bridge.sendPlayerDirectMessage(source, recipientAgentId, text);
 	}
@@ -291,7 +283,7 @@ public final class CodexAgentServerRuntime {
 			String text
 	) {
 		requireAutomation(server);
-		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge == null) throw new AgentDomainException("AUTOMATION_UNAVAILABLE", automationStatus(server));
 		return bridge.sendNativePlayerDirectMessage(source, recipientAgentId, text);
 	}
@@ -302,7 +294,7 @@ public final class CodexAgentServerRuntime {
 			String transcript,
 			boolean whispering
 	) {
-		MultiplexedServerBridge bridge = BRIDGES.get(server);
+		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge == null || !bridge.authenticated()) return new DeliveryReceipt(List.of(), List.of());
 		ServerPlayer source = server.getPlayerList().getPlayer(sourcePlayerId);
 		if (source == null) return new DeliveryReceipt(List.of(), List.of());
@@ -344,13 +336,17 @@ public final class CodexAgentServerRuntime {
 		}
 	}
 
+	private static MultiplexedServerBridge bridge(MinecraftServer server) {
+		BridgeSlot slot = BRIDGE_SLOTS.get(server);
+		return slot == null ? null : slot.bridge();
+	}
+
 	private static void stop(MinecraftServer server) {
 		PLANNING_UPDATES.remove(server);
 		GOAL_VERIFIERS.remove(server);
-		BRIDGE_RETRIES.remove(server);
+		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);
 		GoalSafetyController safety = GOAL_SAFETY.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
-		MultiplexedServerBridge bridge = BRIDGES.remove(server);
 		try {
 			if (safety != null) safety.close();
 			VoiceSubsystemRuntime.close(server);
@@ -358,11 +354,63 @@ public final class CodexAgentServerRuntime {
 			CodexAgentManager.release(server);
 		} finally {
 			ScenarioRuntimeService.release(server);
-			if (bridge != null) {
-				bridge.close();
-			}
+			if (bridgeSlot != null) bridgeSlot.close();
 			if (supervisor != null) supervisor.close();
 			AgentVerboseState.release(server);
+		}
+	}
+
+	static final class BridgeSlot implements AutoCloseable {
+		private final BridgeRetry retry;
+		private MultiplexedServerBridge bridge;
+		private long activeRevision = Long.MIN_VALUE;
+		private long attemptedRevision = Long.MIN_VALUE;
+		private boolean closed;
+
+		BridgeSlot(LongSupplier clock) {
+			retry = new BridgeRetry(clock);
+		}
+
+		synchronized void reconcile(long desiredRevision, Supplier<MultiplexedServerBridge> factory) {
+			java.util.Objects.requireNonNull(factory, "bridge factory must not be null");
+			if (closed || bridge != null && activeRevision == desiredRevision) return;
+			if (bridge != null) {
+				bridge.close();
+				bridge = null;
+				activeRevision = Long.MIN_VALUE;
+			}
+			if (attemptedRevision == desiredRevision && !retry.canAttempt()) return;
+			attemptedRevision = desiredRevision;
+			MultiplexedServerBridge candidate = null;
+			try {
+				candidate = java.util.Objects.requireNonNull(factory.get(), "bridge factory returned no bridge");
+				candidate.start();
+				bridge = candidate;
+				activeRevision = desiredRevision;
+				retry.recordSuccess();
+			} catch (RuntimeException exception) {
+				if (candidate != null) candidate.close();
+				String code = exception instanceof BridgeProtocolException protocol
+						? protocol.code()
+						: "JAVA_BRIDGE_START_FAILED";
+				retry.recordFailure(code, exception.getMessage());
+			}
+		}
+
+		synchronized MultiplexedServerBridge bridge() {
+			return bridge;
+		}
+
+		BridgeRetry retry() {
+			return retry;
+		}
+
+		@Override
+		public synchronized void close() {
+			if (closed) return;
+			closed = true;
+			if (bridge != null) bridge.close();
+			bridge = null;
 		}
 	}
 

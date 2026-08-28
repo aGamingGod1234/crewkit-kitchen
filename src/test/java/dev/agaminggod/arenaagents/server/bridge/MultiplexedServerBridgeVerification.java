@@ -34,6 +34,8 @@ import dev.agaminggod.arenaagents.protocol.ActionType;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
+import java.net.InetAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -125,12 +127,58 @@ public final class MultiplexedServerBridgeVerification {
 		verifyConversationAttention(registered.getFirst().agentId());
 		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
+		verifyBindFailureClosesSocketBeforeRetry();
 		verifyLaunchIdentityHandshake();
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 150;
+		return 154;
+	}
+
+	private static void verifyBindFailureClosesSocketBeforeRetry() {
+		Path secretFile = null;
+		ServerSocket conflict = null;
+		MultiplexedServerBridge bridge = null;
+		try {
+			secretFile = Files.createTempFile("arena-agents-bind-secret-", ".txt");
+			Files.writeString(secretFile, "b".repeat(32));
+			conflict = new ServerSocket(0, 1, InetAddress.getLoopbackAddress());
+			int port = conflict.getLocalPort();
+			AtomicReference<ServerSocket> lastOpened = new AtomicReference<>();
+			bridge = new MultiplexedServerBridge(uninitializedManager(), port, secretFile, () -> {
+				ServerSocket socket = new ServerSocket();
+				lastOpened.set(socket);
+				return socket;
+			});
+			try {
+				bridge.start();
+				throw new AssertionError("occupied bridge port must reject the first bind");
+			} catch (BridgeProtocolException expected) {
+				assertEquals("BRIDGE_BIND_FAILED", expected.code(), "real bind conflict reports its recovery boundary");
+			}
+			assertTrue(lastOpened.get().isClosed(), "failed bind closes its locally opened server socket");
+			conflict.close();
+			conflict = null;
+			bridge.start();
+			try (Socket connected = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, port)) {
+				assertTrue(connected.isConnected(), "same bridge retries the released port without leaked handles");
+			}
+			bridge.close();
+			try (ServerSocket rebound = new ServerSocket(port, 1, InetAddress.getLoopbackAddress())) {
+				assertEquals(port, rebound.getLocalPort(), "closing the retry releases the listener exactly once");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("real bridge bind retry cleanup failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			try {
+				if (conflict != null) conflict.close();
+				if (secretFile != null) Files.deleteIfExists(secretFile);
+			} catch (java.io.IOException exception) {
+				throw new AssertionError("could not clean bridge bind retry fixture", exception);
+			}
+		}
 	}
 
 	private static void verifyLaunchIdentityHandshake() {
@@ -158,6 +206,8 @@ public final class MultiplexedServerBridgeVerification {
 						.getMethod("authenticatedLaunchId")
 						.invoke(bridge);
 				assertEquals(launchId, authenticatedLaunch, "bridge exposes the authenticated launch identity");
+				assertTrue(bridge.authenticatedSessionGeneration() > 0L,
+						"bridge exposes the generation of the authenticated connection");
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("launch identity bridge handshake failed", exception);
