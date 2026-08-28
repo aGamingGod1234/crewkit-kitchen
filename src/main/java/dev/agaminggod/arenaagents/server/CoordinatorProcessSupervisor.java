@@ -15,6 +15,7 @@ import java.util.Objects;
 /** Starts the bundled localhost coordinator with one prepared runtime context. */
 final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CoordinatorProcessSupervisor.class);
+	private static final String VOICE_REQUEST_TIMEOUT_PROPERTY = "arenaagents.voiceRequestTimeoutMs";
 
 	private final Path gameDirectory;
 	private final BundledCoordinatorInstaller.RuntimePackage runtimePackage;
@@ -27,6 +28,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private long nextStartEpochMs;
 	private String failureCode;
 	private String failureMessage;
+	private String previousVoiceRequestTimeout;
+	private String derivedVoiceRequestTimeout;
+	private boolean ownsVoiceRequestTimeout;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -169,23 +173,27 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	@Override
 	public synchronized void close() {
-		Process owned = process;
-		if (owned == null) return;
-		ProcessHandle handle = owned.toHandle();
-		handle.descendants().forEach(ProcessHandle::destroy);
-		if (owned.isAlive()) owned.destroy();
 		try {
-			if (!owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+			Process owned = process;
+			if (owned == null) return;
+			ProcessHandle handle = owned.toHandle();
+			handle.descendants().forEach(ProcessHandle::destroy);
+			if (owned.isAlive()) owned.destroy();
+			try {
+				if (!owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+					handle.descendants().forEach(ProcessHandle::destroyForcibly);
+					owned.destroyForcibly();
+					owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+				}
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
 				handle.descendants().forEach(ProcessHandle::destroyForcibly);
 				owned.destroyForcibly();
-				owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
 			}
-		} catch (InterruptedException exception) {
-			Thread.currentThread().interrupt();
-			handle.descendants().forEach(ProcessHandle::destroyForcibly);
-			owned.destroyForcibly();
+			process = null;
+		} finally {
+			releaseDerivedVoiceRequestTimeout();
 		}
-		process = null;
 	}
 
 	static void configureSharedBridgeSecretPath(Path secretPath) {
@@ -194,19 +202,30 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
 	}
 
-	private void configureSharedVoiceEndpoint(Path configPath) throws IOException {
+	void configureSharedVoiceEndpoint(Path configPath) throws IOException {
 		String configured = System.getProperty("arenaagents.voiceUrl");
 		if (configured == null || configured.isBlank()) {
 			CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
 					.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
 		}
-		String configuredTimeout = System.getProperty("arenaagents.voiceRequestTimeoutMs");
+		String configuredTimeout = System.getProperty(VOICE_REQUEST_TIMEOUT_PROPERTY);
 		if (configuredTimeout == null || configuredTimeout.isBlank()) {
-			System.setProperty(
-					"arenaagents.voiceRequestTimeoutMs",
-					Integer.toString(CoordinatorVoiceEndpoint.requestTimeoutMs(configPath))
-			);
+			previousVoiceRequestTimeout = configuredTimeout;
+			derivedVoiceRequestTimeout = Integer.toString(CoordinatorVoiceEndpoint.requestTimeoutMs(configPath));
+			System.setProperty(VOICE_REQUEST_TIMEOUT_PROPERTY, derivedVoiceRequestTimeout);
+			ownsVoiceRequestTimeout = true;
 		}
+	}
+
+	private void releaseDerivedVoiceRequestTimeout() {
+		if (!ownsVoiceRequestTimeout) return;
+		if (Objects.equals(System.getProperty(VOICE_REQUEST_TIMEOUT_PROPERTY), derivedVoiceRequestTimeout)) {
+			if (previousVoiceRequestTimeout == null) System.clearProperty(VOICE_REQUEST_TIMEOUT_PROPERTY);
+			else System.setProperty(VOICE_REQUEST_TIMEOUT_PROPERTY, previousVoiceRequestTimeout);
+		}
+		previousVoiceRequestTimeout = null;
+		derivedVoiceRequestTimeout = null;
+		ownsVoiceRequestTimeout = false;
 	}
 
 	private static Path findPackageRoot(Path gameDirectory) {

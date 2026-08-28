@@ -58,6 +58,7 @@ import dev.agaminggod.arenaagents.server.BundledCoordinatorInstallerVerification
 import dev.agaminggod.arenaagents.server.NodeRuntimeLocatorVerification;
 import dev.agaminggod.arenaagents.server.CoordinatorLaunchPolicyVerification;
 import dev.agaminggod.arenaagents.server.CoordinatorStartupSmokeVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorVoiceTimeoutLifecycleVerification;
 import dev.agaminggod.arenaagents.server.CoordinatorVoiceEndpointVerification;
 import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayersVerification;
@@ -174,6 +175,7 @@ public final class VerificationMain {
 		passedAssertions += NodeRuntimeLocatorVerification.verify();
 		passedAssertions += CoordinatorLaunchPolicyVerification.verify();
 		passedAssertions += CoordinatorStartupSmokeVerification.verify();
+		passedAssertions += CoordinatorVoiceTimeoutLifecycleVerification.verify();
 		passedAssertions += CoordinatorVoiceEndpointVerification.verify();
 		passedAssertions += AgentActivityPresentationVerification.verify();
 		passedAssertions += AgentDeathCaptureVerification.verify();
