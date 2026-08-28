@@ -75,6 +75,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyDependencyMonitorCloseDoesNotWaitForPoll();
 		verifyOrphanReapRetriesBeforeLaunch();
 		verifyBridgeWaitsForWorkerPreparedSecret();
+		verifyDeferredVoiceInitialization();
 		verifyAutoStartDisabledStillBindsExplicitBridge();
 		verifyPortOnlyChangeAdvancesBridgeRevision();
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
@@ -987,6 +988,25 @@ public final class CoordinatorProcessSupervisorVerification {
 		assertEquals(CoordinatorRecoveryState.STOPPED, fixture.supervisor.snapshot().state(), "close is terminal by explicit shutdown only");
 		assertEquals(1, child.terminations, "repeated close terminates the child once");
 		assertEquals(1, fixture.launcher.launches.size(), "ticks after close never restart the coordinator");
+	}
+
+	private static void verifyDeferredVoiceInitialization() {
+		AtomicInteger starts = new AtomicInteger();
+		AtomicInteger closes = new AtomicInteger();
+		CodexAgentServerRuntime.VoiceInitializationGate gate =
+				new CodexAgentServerRuntime.VoiceInitializationGate(starts::incrementAndGet, closes::incrementAndGet);
+
+		assertFalse(gate.reconcile(false, 1L),
+				"voice remains deferred while the coordinator has not published its prepared paths");
+		assertEquals(0, starts.get(), "unprepared auto-start does not permanently select the NoVoice fallback");
+		assertEquals(0, closes.get(), "unprepared auto-start does not close an uninitialized voice runtime");
+		assertTrue(gate.reconcile(true, 1L),
+				"voice initializes after dependency preparation publishes the secret and endpoint properties");
+		assertEquals(1, starts.get(), "prepared voice runtime is created exactly once");
+		assertFalse(gate.reconcile(true, 1L), "stable prepared voice configuration is idempotent");
+		assertTrue(gate.reconcile(true, 2L), "changed prepared voice configuration recreates the runtime");
+		assertEquals(2, starts.get(), "voice runtime is recreated for a changed prepared revision");
+		assertEquals(1, closes.get(), "the prior voice runtime is closed exactly once before recreation");
 	}
 
 	private static void verifyPortOnlyChangeAdvancesBridgeRevision() {

@@ -35,7 +35,7 @@ public final class CodexAgentServerRuntime {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CodexAgentServerRuntime.class);
 	private static final Map<MinecraftServer, BridgeSlot> BRIDGE_SLOTS = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, CoordinatorProcessSupervisor> COORDINATORS = new ConcurrentHashMap<>();
-	private static final Map<MinecraftServer, Long> VOICE_REVISIONS = new ConcurrentHashMap<>();
+	private static final Map<MinecraftServer, VoiceInitializationGate> VOICE_GATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
 	private static boolean registered;
@@ -276,7 +276,7 @@ public final class CodexAgentServerRuntime {
 
 	private static void stop(MinecraftServer server) {
 		PLANNING_UPDATES.remove(server);
-		VOICE_REVISIONS.remove(server);
+		VOICE_GATES.remove(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.remove(server);
 		BridgeSlot bridgeSlot = BRIDGE_SLOTS.remove(server);
 		try {
@@ -301,12 +301,14 @@ public final class CodexAgentServerRuntime {
 				supervisor.bridgeRevision(), supervisor.secretPath(),
 				System.getProperty("arenaagents.voiceSecretFile"), System.getProperty("arenaagents.voiceUrl")
 		);
-		Long active = VOICE_REVISIONS.get(server);
-		if (active != null && active == revision) return;
+		VoiceInitializationGate gate = VOICE_GATES.computeIfAbsent(server, ignored ->
+				new VoiceInitializationGate(
+						() -> VoiceSubsystemRuntime.start(server),
+						() -> VoiceSubsystemRuntime.close(server)
+				)
+		);
 		try {
-			if (active != null) VoiceSubsystemRuntime.close(server);
-			VoiceSubsystemRuntime.start(server);
-			VOICE_REVISIONS.put(server, revision);
+			gate.reconcile(true, revision);
 		} catch (RuntimeException failure) {
 			LOGGER.warn("Voice subsystem initialization will retry after coordinator paths are prepared", failure);
 		}
@@ -315,6 +317,30 @@ public final class CodexAgentServerRuntime {
 	private static boolean propertyPresent(String name) {
 		String value = System.getProperty(name);
 		return value != null && !value.isBlank();
+	}
+
+	/** Small lifecycle seam that keeps unprepared startup from permanently selecting NoVoice. */
+	static final class VoiceInitializationGate {
+		private static final long UNINITIALIZED = Long.MIN_VALUE;
+		private final Runnable starter;
+		private final Runnable closer;
+		private long activeRevision = UNINITIALIZED;
+
+		VoiceInitializationGate(Runnable starter, Runnable closer) {
+			this.starter = java.util.Objects.requireNonNull(starter, "voice starter must not be null");
+			this.closer = java.util.Objects.requireNonNull(closer, "voice closer must not be null");
+		}
+
+		synchronized boolean reconcile(boolean prepared, long desiredRevision) {
+			if (!prepared || activeRevision == desiredRevision) return false;
+			if (activeRevision != UNINITIALIZED) {
+				activeRevision = UNINITIALIZED;
+				closer.run();
+			}
+			starter.run();
+			activeRevision = desiredRevision;
+			return true;
+		}
 	}
 
 	private static MultiplexedServerBridge bridge(MinecraftServer server) {
