@@ -3,8 +3,10 @@ package dev.agaminggod.arenaagents.server.conversation;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
+import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.OutgoingChatMessage;
 import net.minecraft.network.chat.PlayerChatMessage;
@@ -25,6 +27,7 @@ public final class AgentConversationRouterVerification {
 		assertions += verifyPublicDelivery();
 		assertions += verifyUnicodeSafeTextBound();
 		assertions += verifyPlayerConversationWakePolicy();
+		assertions += verifySpeechGoalCompilationRouting();
 		assertions += verifyNativeWhisperPayload();
 		assertions += verifyNativeWhisperContentSelection();
 		return assertions;
@@ -83,6 +86,39 @@ public final class AgentConversationRouterVerification {
 			), state + " agent is not auto-started by conversation");
 		}
 		return 15;
+	}
+
+	private static int verifySpeechGoalCompilationRouting() {
+		String buildHeightMessage = "The requested position is outside the selected dimension's build height";
+		GoalCompilation rejected = GoalCompilation.rejected(buildHeightMessage);
+		for (AgentLifecycleState state : List.of(AgentLifecycleState.IDLE, AgentLifecycleState.COMPLETED)) {
+			AtomicInteger coordinatorDrafts = new AtomicInteger();
+			java.util.ArrayList<String> playerMessages = new java.util.ArrayList<>();
+			var route = ServerAgentConversationRouter.routeCompiledSpeechGoal(
+					state, state == AgentLifecycleState.IDLE
+							? ConversationKind.PLAYER_MESSAGE : ConversationKind.PROXIMITY_SPEECH,
+					rejected,
+					coordinatorDrafts::incrementAndGet, playerMessages::add
+			);
+			assertEquals(false, route.publish(), state + " rejected speech is consumed without waking a goal");
+			assertEquals(true, route.wakeSpec().isEmpty(), state + " rejected speech cannot install a fallback goal");
+			assertEquals(List.of(buildHeightMessage), playerMessages,
+					state + " rejected speech reports the compiler player message verbatim");
+			assertEquals(0, coordinatorDrafts.get(),
+					state + " rejected speech cannot publish a translation draft or operator-confirmed bypass");
+		}
+
+		AtomicInteger translationDrafts = new AtomicInteger();
+		var translation = ServerAgentConversationRouter.routeCompiledSpeechGoal(
+				AgentLifecycleState.IDLE,
+				ConversationKind.PLAYER_MESSAGE,
+				GoalCompilation.needsTranslation("Choose an exact result."),
+				translationDrafts::incrementAndGet,
+				message -> { throw new AssertionError("translation must not report a rejection"); }
+		);
+		assertEquals(false, translation.publish(), "translation speech is consumed while its draft is staged");
+		assertEquals(1, translationDrafts.get(), "only NEEDS_TRANSLATION stages one coordinator draft");
+		return 10;
 	}
 
 	private static int verifyDirectDeliveryAndOperatorMirror() {

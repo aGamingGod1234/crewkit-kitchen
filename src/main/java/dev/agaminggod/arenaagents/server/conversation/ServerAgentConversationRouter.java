@@ -19,6 +19,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -286,15 +287,42 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				Objects.requireNonNull(sourceLevel, "sourceLevel must not be null")
 		);
 
-		if (!ConversationWakePolicy.shouldStartGoal(target.state(), event.kind())) return GoalRoute.EVENT_ONLY;
-		if (compilation.kind() == GoalCompilation.Kind.ACCEPTED) {
-			return new GoalRoute(true, compilation.acceptedSpec());
-		}
-		PendingGoalDraft draft = draft(target, event, sourceLevel, Optional.empty(), DraftIntent.CONFIRM_TRANSLATION);
-		manager.stageGoalDraft(draft);
-		goalSpecRequestSink.publish(draft);
-		notifyRequester(draft, compilation.playerMessage() + " Draft " + draft.draftId() + " is waiting for clarification.");
-		return GoalRoute.CONSUMED;
+		return routeCompiledSpeechGoal(
+				target.state(), event.kind(), compilation,
+				() -> {
+					PendingGoalDraft draft = draft(
+							target, event, sourceLevel, Optional.empty(), DraftIntent.CONFIRM_TRANSLATION);
+					manager.stageGoalDraft(draft);
+					goalSpecRequestSink.publish(draft);
+					notifyRequester(draft, compilation.playerMessage()
+							+ " Draft " + draft.draftId() + " is waiting for clarification.");
+				},
+				message -> notifyRequester(requestingPlayerId(event), message)
+		);
+	}
+
+	static GoalRoute routeCompiledSpeechGoal(
+			dev.agaminggod.arenaagents.agent.AgentLifecycleState state,
+			ConversationKind kind,
+			GoalCompilation compilation,
+			Runnable stageTranslation,
+			Consumer<String> reportRejection
+	) {
+		Objects.requireNonNull(compilation, "compilation must not be null");
+		Objects.requireNonNull(stageTranslation, "stageTranslation must not be null");
+		Objects.requireNonNull(reportRejection, "reportRejection must not be null");
+		if (!ConversationWakePolicy.shouldStartGoal(state, kind)) return GoalRoute.EVENT_ONLY;
+		return switch (compilation.kind()) {
+			case ACCEPTED -> new GoalRoute(true, compilation.acceptedSpec());
+			case NEEDS_TRANSLATION -> {
+				stageTranslation.run();
+				yield GoalRoute.CONSUMED;
+			}
+			case REJECTED -> {
+				reportRejection.accept(compilation.playerMessage());
+				yield GoalRoute.CONSUMED;
+			}
+		};
 	}
 
 	private PendingGoalDraft draft(
@@ -304,18 +332,21 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 			Optional<dev.agaminggod.arenaagents.agent.goal.GoalPredicate> proposed,
 			DraftIntent intent
 	) {
-		UUID playerId;
-		try {
-			playerId = UUID.fromString(event.sourceId());
-		} catch (IllegalArgumentException exception) {
-			throw new AgentDomainException("INVALID_GOAL_REQUESTER", "Goal clarification requires a player identity");
-		}
+		UUID playerId = requestingPlayerId(event);
 		return new PendingGoalDraft(
 				UUID.randomUUID(), target.agentId(), playerId, event.text(),
 				sourceLevel.dimension().identifier().toString(),
 				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess(), liveAdvancementTitles()), proposed, intent,
 				manager.server().getTickCount(), target.goalRevision(), target.currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId)
 		);
+	}
+
+	private static UUID requestingPlayerId(ConversationEvent event) {
+		try {
+			return UUID.fromString(event.sourceId());
+		} catch (IllegalArgumentException exception) {
+			throw new AgentDomainException("INVALID_GOAL_REQUESTER", "Goal clarification requires a player identity");
+		}
 	}
 
 	private Map<String, String> liveAdvancementTitles() {
@@ -330,7 +361,11 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 	}
 
 	private void notifyRequester(PendingGoalDraft draft, String message) {
-		ServerPlayer player = manager.server().getPlayerList().getPlayer(draft.requestingPlayerId());
+		notifyRequester(draft.requestingPlayerId(), message);
+	}
+
+	private void notifyRequester(UUID playerId, String message) {
+		ServerPlayer player = manager.server().getPlayerList().getPlayer(playerId);
 		if (player != null) player.sendSystemMessage(Component.literal(message));
 	}
 
@@ -344,11 +379,11 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				|| normalized.equals("resume");
 	}
 
-	private record GoalRoute(boolean publish, Optional<GoalSpec> wakeSpec) {
+	static record GoalRoute(boolean publish, Optional<GoalSpec> wakeSpec) {
 		private static final GoalRoute EVENT_ONLY = new GoalRoute(true, Optional.empty());
 		private static final GoalRoute CONSUMED = new GoalRoute(false, Optional.empty());
 
-		private GoalRoute {
+		GoalRoute {
 			Objects.requireNonNull(wakeSpec, "wakeSpec must not be null");
 		}
 	}
