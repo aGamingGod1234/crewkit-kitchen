@@ -4,9 +4,11 @@ import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
+import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.OutgoingChatMessage;
 import net.minecraft.network.chat.PlayerChatMessage;
@@ -89,8 +91,12 @@ public final class AgentConversationRouterVerification {
 	}
 
 	private static int verifySpeechGoalCompilationRouting() {
-		String buildHeightMessage = "The requested position is outside the selected dimension's build height";
-		GoalCompilation rejected = GoalCompilation.rejected(buildHeightMessage);
+		String rejectionMessage = "That advancement ID does not exist on this server.";
+		GoalCompilation rejected = new GoalCompiler().compile(
+				"Earn advancement mod:removed", RegistryAccess.EMPTY, 1_200L, ignored -> false
+		);
+		assertEquals(GoalCompilation.Kind.REJECTED, rejected.kind(),
+				"exact missing advancement IDs reach the rejected speech route");
 		for (AgentLifecycleState state : List.of(AgentLifecycleState.IDLE, AgentLifecycleState.COMPLETED)) {
 			AtomicInteger coordinatorDrafts = new AtomicInteger();
 			java.util.ArrayList<String> playerMessages = new java.util.ArrayList<>();
@@ -102,7 +108,7 @@ public final class AgentConversationRouterVerification {
 			);
 			assertEquals(false, route.publish(), state + " rejected speech is consumed without waking a goal");
 			assertEquals(true, route.wakeSpec().isEmpty(), state + " rejected speech cannot install a fallback goal");
-			assertEquals(List.of(buildHeightMessage), playerMessages,
+			assertEquals(List.of(rejectionMessage), playerMessages,
 					state + " rejected speech reports the compiler player message verbatim");
 			assertEquals(0, coordinatorDrafts.get(),
 					state + " rejected speech cannot publish a translation draft or operator-confirmed bypass");
@@ -118,7 +124,7 @@ public final class AgentConversationRouterVerification {
 		);
 		assertEquals(false, translation.publish(), "translation speech is consumed while its draft is staged");
 		assertEquals(1, translationDrafts.get(), "only NEEDS_TRANSLATION stages one coordinator draft");
-		return 10;
+		return 11;
 	}
 
 	private static int verifyDirectDeliveryAndOperatorMirror() {

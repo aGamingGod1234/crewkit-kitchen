@@ -127,7 +127,7 @@ public final class GoalCompiler {
 		Matcher advancement = ADVANCEMENT.matcher(command);
 		if (advancement.matches()) {
 			if (!advancementExists.test(advancement.group(1))) {
-				return GoalCompilation.needsTranslation("That advancement ID does not exist on this server.");
+				return GoalCompilation.rejected("That advancement ID does not exist on this server.");
 			}
 			return accepted(original, new GoalPredicate.AdvancementGranted(advancement.group(1)), createdAtTick,
 					"Goal set: earn " + advancement.group(1) + ".");

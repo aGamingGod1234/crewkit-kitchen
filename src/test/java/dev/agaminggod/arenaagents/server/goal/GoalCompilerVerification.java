@@ -215,9 +215,14 @@ public final class GoalCompilerVerification {
 				"exact advancement ID"
 		);
 		assertEquals(
-				GoalCompilation.Kind.NEEDS_TRANSLATION,
+				GoalCompilation.Kind.REJECTED,
 				compiler.compile("Complete advancement minecraft:story/not_real", RegistryAccess.EMPTY, 1_200L, id -> false).kind(),
-				"nonexistent advancement ID requires clarification"
+				"an exact nonexistent advancement ID is rejected instead of translated"
+		);
+		assertEquals(
+				GoalCompilation.Kind.NEEDS_TRANSLATION,
+				compiler.compile("Earn the Stone Age advancement", RegistryAccess.EMPTY, 1_200L, id -> false).kind(),
+				"a natural advancement title may still be resolved through translation"
 		);
 		GoalPredicate.PositionWithin netherPosition = (GoalPredicate.PositionWithin) compiler.compile(
 				"Go to 12 64 -8", RegistryAccess.EMPTY, 1_200L, "minecraft:the_nether"
@@ -326,7 +331,7 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Earn the Stone Age advancement", RegistryAccess.EMPTY, manyLiveAdvancements).size(),
 				"natural advancement candidates remain bounded"
 		);
-		return 27;
+		return 28;
 	}
 
 	private static int verifyCompoundItemsAndKills() {
