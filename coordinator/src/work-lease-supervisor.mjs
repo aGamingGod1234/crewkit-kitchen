@@ -11,6 +11,7 @@ export const FACTUAL_PROGRESS_TIMEOUT_MS = 30_000;
 
 const AUTOMATED_KINDS = new Set(['scheduled', 'recovery']);
 const MAX_HISTORY = 8;
+const MAX_RECOVERY_DELAY_MS = 600_000;
 
 /** Fences every unfinished goal behind deadline-bound work and factual-progress leases. */
 export class WorkLeaseSupervisor {
@@ -25,6 +26,7 @@ export class WorkLeaseSupervisor {
 	#onExpire;
 	#onStuck;
 	#closed = false;
+	#lastNow = 0;
 
 	constructor({
 		clock = Date.now,
@@ -112,7 +114,7 @@ export class WorkLeaseSupervisor {
 		this.#removeAutomatedLeases(entry);
 		entry.state = 'recovering';
 		entry.recoveryDetails = safeClone(details);
-		this.#createLease(entry, 'scheduled', true);
+		this.#createLease(entry, 'scheduled', true, recoveryDelay(details));
 		return true;
 	}
 
@@ -165,6 +167,7 @@ export class WorkLeaseSupervisor {
 			key: entry.key,
 			state: entry.state,
 			lastFactualProgressAt: entry.lastFactualProgressAt,
+			recoveryDetails: safeClone(entry.recoveryDetails),
 			leases: Object.freeze([...entry.leases.values()]
 				.sort((left, right) => left.operationId - right.operationId)
 				.map(publicLease)),
@@ -184,15 +187,16 @@ export class WorkLeaseSupervisor {
 		return true;
 	}
 
-	#createLease(entry, kind, automated) {
+	#createLease(entry, kind, automated, delayOverride = null) {
 		const now = this.#now();
+		const delay = delayOverride ?? LEASE_TIMEOUTS_MS[kind];
 		const lease = {
 			key: entry.key,
 			kind,
 			operationId: ++this.#sequence,
 			createdAt: now,
 			lastProgressAt: now,
-			deadline: now + LEASE_TIMEOUTS_MS[kind],
+			deadline: now + delay,
 			automated,
 			handle: null,
 		};
@@ -299,9 +303,11 @@ export class WorkLeaseSupervisor {
 	}
 
 	#now() {
-		const value = this.#clock();
-		if (!Number.isFinite(value) || value < 0) throw new TypeError('work lease clock must return a nonnegative finite number');
-		return value;
+		try {
+			const value = this.#clock();
+			if (Number.isFinite(value) && value >= 0) this.#lastNow = Math.max(this.#lastNow, value);
+		} catch { /* a diagnostic clock cannot disable recovery supervision */ }
+		return this.#lastNow;
 	}
 }
 
@@ -351,6 +357,12 @@ function isNewer(next, current) {
 function safeClone(value) {
 	if (value === undefined) return undefined;
 	try { return structuredClone(value); } catch { return null; }
+}
+
+function recoveryDelay(details) {
+	const value = details?.retryDelayMs;
+	if (!Number.isFinite(value) || value < 0) return null;
+	return Math.min(MAX_RECOVERY_DELAY_MS, Math.ceil(value));
 }
 
 function defaultSchedule(callback, delay) {

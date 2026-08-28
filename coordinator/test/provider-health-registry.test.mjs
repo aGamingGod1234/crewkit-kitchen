@@ -121,3 +121,26 @@ test('circuits isolate exact profile fingerprints and expose the next half-open 
 	registry.record({ ...first, durationMs: 10, errorCode: 'PROVIDER_UNAVAILABLE' });
 	assert.equal(registry.snapshot(first).nextProbeAtEpochMs, 11_000, 'failed half-open probes own a fresh cooldown');
 });
+
+test('a hung half-open probe releases ownership at its absolute deadline', () => {
+	let now = 1_000;
+	const key = { provider: 'codex', model: 'sol', operation: 'decide', profileFingerprint: `sha256:${'a'.repeat(64)}` };
+	const registry = new ProviderHealthRegistry({
+		minimumSamples: 1,
+		failureRateToOpen: 1,
+		cooldownMs: 100,
+		probeTimeoutMs: 200,
+		now: () => now,
+	});
+	registry.record({ ...key, durationMs: 10, errorCode: 'PROVIDER_UNAVAILABLE' });
+	now = 1_100;
+	assert.equal(registry.canAttempt(key), true);
+	assert.equal(registry.snapshot(key).circuit, 'half_open');
+	assert.equal(registry.snapshot(key).nextProbeAtEpochMs, 1_300);
+	now = 1_299;
+	assert.equal(registry.canAttempt(key), false);
+	now = 1_300;
+	assert.equal(registry.canAttempt(key), true, 'expired probe ownership permits exactly one replacement probe');
+	assert.equal(registry.canAttempt(key), false, 'replacement probe still has exclusive ownership');
+	assert.equal(registry.snapshot(key).nextProbeAtEpochMs, 1_500);
+});

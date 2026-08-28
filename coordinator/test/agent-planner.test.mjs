@@ -4,6 +4,7 @@ import test from 'node:test';
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
+import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { profileFingerprint } from '../src/provider-session.mjs';
 
 const AGENT_ID = 'agent-1';
@@ -20,6 +21,13 @@ const VALID_DECISION = Object.freeze({
 	summary: 'Wait safely',
 	directive: 'replace',
 	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(100);',
+});
+
+test('provider profile fingerprints include the exact agent identity', () => {
+	assert.notEqual(
+		profileFingerprint(RECORD),
+		profileFingerprint({ ...RECORD, agentId: 'agent-b' }),
+	);
 });
 
 test('goal spec translation uses an isolated structured provider session without changing lifecycle state', async () => {
@@ -391,6 +399,39 @@ test('routes planning through the provider lane and preserves priority and provi
 	assert.equal(replacements, 1, 'provider retry replaces the failed exact session once');
 });
 
+test('provider recovery fails closed instead of reusing a mismatched Sol-to-Terra session', async () => {
+	const registry = new FakeRegistry();
+	const timeout = Object.assign(new Error('Sol transport timed out'), { code: 'PLANNING_TIMEOUT' });
+	const selectedFingerprint = profileFingerprint(RECORD);
+	const terraFingerprint = profileFingerprint({ ...RECORD, model: 'terra' });
+	const staleSol = {
+		sessionGeneration: 1,
+		sessionMetadata: () => ({ profileFingerprint: selectedFingerprint, sessionGeneration: 1 }),
+		async setGoalRevision() {},
+		async decide() { throw timeout; },
+	};
+	let mismatchedTurns = 0;
+	const currentTerra = {
+		sessionGeneration: 2,
+		sessionMetadata: () => ({ profileFingerprint: terraFingerprint, sessionGeneration: 2 }),
+		async setGoalRevision() {},
+		async decide() { mismatchedTurns += 1; return VALID_DECISION; },
+	};
+	let replacements = 0;
+	const planner = createPlannerForService(registry, {
+		async createAgent() { return staleSol; },
+		getAgent() { return currentTerra; },
+		async replaceAgent() { replacements += 1; return currentTerra; },
+		async removeAgent() { return false; },
+	}, 1);
+	await assert.rejects(
+		planner.requestPlan({ agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION }),
+		(error) => error?.code === 'SESSION_PROFILE_MISMATCH',
+	);
+	assert.equal(mismatchedTurns, 0, 'Terra must never execute work captured for Sol');
+	assert.equal(replacements, 0, 'a mismatched current owner is not replaced by a stale callback');
+});
+
 test('retries one empty Codex turn without changing authoritative input', async () => {
 	const registry = new FakeRegistry();
 	const inputs = [];
@@ -435,19 +476,33 @@ test('exhausted empty Codex turns remain planning for quiet observation retry', 
 	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
 });
 
-test('exhausted infrastructure errors remain active for observation-driven recovery', async () => {
-	const registry = new FakeRegistry();
-	const timeout = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
-	const agent = {
-		async setGoalRevision() {},
-		async decide() { throw timeout; },
-	};
-	const planner = createPlanner(registry, agent, 1);
-	await assert.rejects(planner.requestPlan({
-		agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION,
-	}), (error) => error === timeout);
-	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
-	assert.equal(registry.states.some(({ state }) => state === DynamicAgentState.ERROR), false);
+test('exhausted recovery-policy failures remain active for observation-driven recovery', async () => {
+	for (const code of [
+		'PROVIDER_TIMEOUT', 'REQUEST_TIMEOUT', 'PLANNING_TIMEOUT', 'PROCESS_TERMINATION_FAILED',
+		'PROVIDER_UNAVAILABLE', 'PROVIDER_STOPPED', 'SESSION_INVALIDATED', 'TRANSPORT_STOPPED',
+		'PROVIDER_CIRCUIT_OPEN', 'SCHEDULER_CAPACITY', 'AUTHENTICATION_REQUIRED', 'MISSING_CREDENTIALS',
+		'AGENT_NOT_STARTED', 'AGENT_PROFILE_CONFLICT', 'INCOMPLETE_TURN', 'INVALID_CATALOG',
+		'INVALID_PROVIDER_OUTPUT', 'MODEL_PROFILE_UNAVAILABLE', 'PROCESS_EXITED', 'PROVIDER_DOWN',
+		'PROVIDER_OVERLOADED', 'REQUEST_ID_EXHAUSTED', 'SESSION_GENERATION_MISMATCH',
+		'SESSION_PROFILE_MISMATCH', 'STALE_PROVIDER_START', 'STALE_RECONCILIATION',
+		'STALE_SESSION_GENERATION', 'TURN_IN_PROGRESS', 'TURN_INTERRUPTED', 'TURN_NOT_ACTIVE',
+		'UNKNOWN_RESPONSE_ID', 'CONTROL_PROTOCOL_MISMATCH', 'INVALID_CONFIG_OPTIONS', 'MODEL_UNAVAILABLE',
+		'NATIVE_TOOLS_UNAVAILABLE', 'PROVIDER_MISMATCH', 'REASONING_EFFORT_UNAVAILABLE',
+		'SERVICE_TIER_UNAVAILABLE', 'UNSUPPORTED_MODEL', 'UNSUPPORTED_SERVICE_TIER', 'UNSUPPORTED_THINKING',
+	]) {
+		const registry = new FakeRegistry();
+		const failure = Object.assign(new Error(`provider failure ${code}`), { code });
+		const agent = {
+			async setGoalRevision() {},
+			async decide() { throw failure; },
+		};
+		const planner = createPlanner(registry, agent, 1);
+		await assert.rejects(planner.requestPlan({
+			agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION,
+		}), (error) => error === failure, code);
+		assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING, code);
+		assert.equal(registry.states.some(({ state }) => state === DynamicAgentState.ERROR), false, code);
+	}
 });
 
 test('retries one transient provider initialization failure', async () => {
@@ -478,7 +533,7 @@ test('retries one transient provider initialization failure', async () => {
 	assert.equal(createAttempts, 2);
 });
 
-test('records a non-transient provider initialization failure', async () => {
+test('keeps blocked authentication initialization active for credential recovery', async () => {
 	const registry = new FakeRegistry();
 	const failure = Object.assign(new Error('login required'), { code: 'AUTHENTICATION_REQUIRED' });
 	const planner = createPlannerForService(registry, {
@@ -494,11 +549,8 @@ test('records a non-transient provider initialization failure', async () => {
 	}), failure);
 
 	assert.deepEqual(registry.states.at(-1), {
-		state: DynamicAgentState.ERROR,
-		options: {
-			goalRevision: GOAL_REVISION,
-			error: { code: 'AUTHENTICATION_REQUIRED', message: 'login required' },
-		},
+		state: DynamicAgentState.PLANNING,
+		options: { goalRevision: GOAL_REVISION },
 	});
 });
 
@@ -721,6 +773,87 @@ test('native turn keeps scheduler and selected Codex profile while delegating bo
 	assert.deepEqual(calls.find((call) => call[0] === 'create')[2], { recoverySummary: null, controlProtocol: 'native_tools' });
 	assert.equal(typeof calls.find((call) => call[0] === 'act')[3], 'function');
 	assert.equal(states[0].state, DynamicAgentState.PLANNING);
+});
+
+test('hung native turn releases scheduler capacity without tearing down a newer exact generation', async () => {
+	const nativeRecord = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' };
+	const fingerprint = profileFingerprint(nativeRecord);
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1 });
+	let actStarted;
+	const started = new Promise((resolve) => { actStarted = resolve; });
+	const first = {
+		sessionGeneration: 1,
+		sessionMetadata: () => ({ profileFingerprint: fingerprint, sessionGeneration: 1 }),
+		async setGoalRevision() {},
+		async act() { actStarted(); return new Promise(() => {}); },
+	};
+	const second = {
+		sessionGeneration: 2,
+		sessionMetadata: () => ({ profileFingerprint: fingerprint, sessionGeneration: 2 }),
+	};
+	let current = first;
+	const replacements = [];
+	const planner = new AgentPlanner({
+		registry: {
+			assertCurrentRevision() { return nativeRecord; },
+			setState() {},
+		},
+		scheduler,
+		planningLeaseTimeoutMs: 15,
+		codexService: {
+			async createAgent() { return first; },
+			getAgent() { return current; },
+			async replaceAgent(record, options) { replacements.push({ record, options }); return second; },
+			async removeAgent() { return false; },
+		},
+	});
+	const turn = planner.requestNativeTurn({ agentId: AGENT_ID, input: 'keep working', goalRevision: GOAL_REVISION, executeTool: async () => ({ state: 'SUCCEEDED' }) });
+	await started;
+	current = second;
+	await assert.rejects(
+		Promise.race([
+			turn,
+			new Promise((_, reject) => setTimeout(() => reject(Object.assign(new Error('native lease did not expire'), { code: 'TEST_TIMEOUT' })), 75)),
+		]),
+		(error) => error?.code === 'PLANNING_LEASE_EXPIRED',
+	);
+	assert.equal(await scheduler.schedule('agent-2', async () => 'capacity released', { lane: 'codex' }), 'capacity released');
+	assert.equal(replacements.length, 0, 'generation-one expiry cannot replace generation two');
+	scheduler.close();
+});
+
+test('a native lease expiring during initial creation cannot replace a newly installed generation', async () => {
+	const nativeRecord = { ...RECORD, provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' };
+	const fingerprint = profileFingerprint(nativeRecord);
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1 });
+	let creationStarted;
+	const started = new Promise((resolve) => { creationStarted = resolve; });
+	const second = {
+		sessionGeneration: 2,
+		sessionMetadata: () => ({ profileFingerprint: fingerprint, sessionGeneration: 2 }),
+	};
+	let current = null;
+	const replacements = [];
+	const planner = new AgentPlanner({
+		registry: {
+			assertCurrentRevision() { return nativeRecord; },
+			setState() {},
+		},
+		scheduler,
+		planningLeaseTimeoutMs: 15,
+		codexService: {
+			async createAgent() { creationStarted(); return new Promise(() => {}); },
+			getAgent() { return current; },
+			async replaceAgent(record, options) { replacements.push({ record, options }); return second; },
+			async removeAgent() { return false; },
+		},
+	});
+	const turn = planner.requestNativeTurn({ agentId: AGENT_ID, input: 'keep working', goalRevision: GOAL_REVISION, executeTool: async () => ({ state: 'SUCCEEDED' }) });
+	await started;
+	current = second;
+	await assert.rejects(turn, (error) => error?.code === 'PLANNING_LEASE_EXPIRED');
+	assert.equal(replacements.length, 0, 'an unowned creation lease cannot tear down a later current generation');
+	scheduler.close();
 });
 
 test('native turn leaves lifecycle error decisions to the coordinator', async () => {

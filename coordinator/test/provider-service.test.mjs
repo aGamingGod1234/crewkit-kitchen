@@ -43,6 +43,37 @@ test('provider router coalesces one exact-profile replacement and rejects tier m
 	await router.stop();
 });
 
+test('replacement requests during initial creation coalesce into one replacement generation', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let releaseCreate;
+	const createGate = new Promise((resolve) => { releaseCreate = resolve; });
+	let creates = 0;
+	let replacements = 0;
+	services.codex.createAgent = async (value) => {
+		creates += 1;
+		services.codex.created.push(value);
+		if (creates === 1) await createGate;
+		return { agentId: value.agentId, provider: value.provider, sessionGeneration: creates };
+	};
+	services.codex.replaceAgent = async (value) => {
+		replacements += 1;
+		return services.codex.createAgent(value);
+	};
+	const router = new ProviderService(services);
+	const selected = profile('codex');
+	const initial = router.createAgent(selected);
+	const first = router.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	const second = router.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	releaseCreate();
+	assert.equal((await initial).sessionGeneration, 1);
+	const [replacement, duplicate] = await Promise.all([first, second]);
+	assert.equal(replacement, duplicate);
+	assert.equal(replacement.sessionGeneration, 2);
+	assert.equal(replacements, 1);
+	assert.equal(creates, 2);
+	await router.stop();
+});
+
 function profile(provider, overrides = {}) {
 	return {
 		agentId: 'shared-agent',

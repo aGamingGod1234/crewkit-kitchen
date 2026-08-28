@@ -159,23 +159,25 @@ export class ProviderService extends EventEmitter {
 			return replacing.promise;
 		}
 		const creating = this.#creating.get(profile.agentId);
-		if (creating !== undefined) {
-			assertSameProfile(creating.profile, profile);
-			try { await creating.promise; } catch { /* replacement recreates a failed attempt */ }
-			this.#assertActive(lifecycleGeneration);
-		}
-		const assigned = this.#assignments.get(profile.agentId);
-		if (assigned !== undefined) assertSameProfile(assigned, profile);
+		if (creating !== undefined) assertSameProfile(creating.profile, profile);
 		const service = this.#services.get(profile.provider);
 		if (service === undefined) throw new TypeError(`${profile.provider} service is unavailable`);
-		const promise = this.#execute(profile.provider, async () => {
-			const agent = typeof service.replaceAgent === 'function'
-				? await service.replaceAgent(profile, this.#creationOptions(options))
-				: (await service.removeAgent(profile.agentId), await service.createAgent(profile, this.#creationOptions(options)));
-			this.#assertActive(lifecycleGeneration);
-			this.#assignments.set(profile.agentId, profile);
-			return agent;
-		}, 'replace');
+		const promise = (async () => {
+			if (creating !== undefined) {
+				try { await creating.promise; } catch { /* replacement recreates a failed attempt */ }
+				this.#assertActive(lifecycleGeneration);
+			}
+			const assigned = this.#assignments.get(profile.agentId);
+			if (assigned !== undefined) assertSameProfile(assigned, profile);
+			return this.#execute(profile.provider, async () => {
+				const agent = typeof service.replaceAgent === 'function'
+					? await service.replaceAgent(profile, this.#creationOptions(options))
+					: (await service.removeAgent(profile.agentId), await service.createAgent(profile, this.#creationOptions(options)));
+				this.#assertActive(lifecycleGeneration);
+				this.#assignments.set(profile.agentId, profile);
+				return agent;
+			}, 'replace');
+		})();
 		const entry = { profile, promise };
 		this.#replacing.set(profile.agentId, entry);
 		try { return await promise; }

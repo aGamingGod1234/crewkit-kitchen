@@ -113,6 +113,22 @@ class FakePlanner {
 	async remove(agentId) { return this.registry.remove(agentId); }
 }
 
+class RecordingGoalSupervisor {
+	activations = [];
+	terminations = [];
+	activate(key) { this.activations.push(key); }
+	terminate(key) { this.terminations.push(key); }
+	begin(key, kind) { return { ...key, kind, operationId: `operation-${kind}` }; }
+	end() {}
+	progress() {}
+	observed() {}
+	recover() {}
+	ensure() {}
+	factualProgress() {}
+	suspend() {}
+	close() {}
+}
+
 test('coordinator binds the Minecraft bridge without eagerly starting a provider', async () => {
 	const bridge = new FakeBridge();
 	let providerStarts = 0;
@@ -778,10 +794,10 @@ test('native turns alone may publish one safe agent message and decision summari
 	}
 });
 
-test('verbose errors classify authentication and planning timeout by trusted code', async () => {
+test('verbose recovery keeps authentication and planning infrastructure out of Error', async () => {
 	for (const [code, expected] of [
-		['AUTHENTICATION_REQUIRED', 'Provider error (AUTHENTICATION_REQUIRED).'],
-		['PLANNING_TIMEOUT', 'Planning error (PLANNING_TIMEOUT).'],
+		['AUTHENTICATION_REQUIRED', 'Provider access is unavailable; retrying automatically from fresh state.'],
+		['PLANNING_TIMEOUT', 'Provider work failed; recovering automatically from fresh state.'],
 	]) {
 		const registry = new AgentRegistry();
 		const planner = new FakePlanner(registry);
@@ -797,11 +813,12 @@ test('verbose errors classify authentication and planning timeout by trusted cod
 				goalRevision: 1, eventSequence: 1,
 				observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
 			} });
-			await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'error'));
+			await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'retry'));
 			assert.deepEqual(
-				run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'error').map(({ payload }) => payload.message),
+				run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && payload.stage === 'retry').map(({ payload }) => payload.message),
 				[expected],
 			);
+			assert.equal(run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'error'), false);
 		} finally {
 			await run.coordinator.stop();
 		}
@@ -859,12 +876,12 @@ test('quiet lifecycle failures publish neither Problem nor Error', async () => {
 	}
 });
 
-test('non-retryable failures publish one correctly scoped Error and no Problem', async () => {
+test('non-retryable domain failures publish one correctly scoped Error and no Problem', async () => {
 	const registry = new AgentRegistry();
 	const planner = new FakePlanner(registry);
 	planner.requestPlan = async (request) => {
 		planner.requests.push(request);
-		throw Object.assign(new Error('private provider diagnostics'), { code: 'PROVIDER_DOWN' });
+		throw Object.assign(new Error('private domain diagnostics'), { code: 'INVALID_GOAL_SPEC' });
 	};
 	const run = await start({ registry, planner });
 	try {
@@ -877,7 +894,7 @@ test('non-retryable failures publish one correctly scoped Error and no Problem',
 		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'verbose_event' && payload.stage === 'error'));
 		assert.deepEqual(
 			run.bridge.sent.filter(({ type, payload }) => type === 'verbose_event' && ['retry', 'error'].includes(payload.stage)).map(({ payload }) => ({ stage: payload.stage, message: payload.message })),
-			[{ stage: 'error', message: 'Provider error (PROVIDER_DOWN).' }],
+			[{ stage: 'error', message: 'Coordinator error (INVALID_GOAL_SPEC).' }],
 		);
 	} finally {
 		await run.coordinator.stop();
@@ -1351,35 +1368,41 @@ test('a rejected native planning transition releases its supervisor token', asyn
 	}
 });
 
-test('a recoverable native provider failure stays active and schedules observation recovery', async () => {
-	const timers = new ManualTimerQueue();
-	const registry = new AgentRegistry();
-	const planner = new FakePlanner(registry);
-	planner.requestNativeTurn = async (request) => {
-		planner.requests.push(request);
-		throw Object.assign(new Error('provider planning timed out'), { code: 'PLANNING_TIMEOUT' });
-	};
-	const run = await start({
-		registry,
-		planner,
-		goalSchedule: timers.schedule,
-		cancelGoalSchedule: timers.cancel,
-		config: {
-			bridge: { port: 25570, secret: 's'.repeat(32) },
-			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
-		},
-	});
-	try {
-		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
-		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
-		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
-		await timers.runNext();
-		assert.equal(run.bridge.sent.filter(({ type }) => type === 'request_observation').length, 1);
-		assert.equal(run.bridge.sent.some(({ type }) => type === 'agent_error'), false);
-		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.ERROR);
-		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.PAUSED);
-	} finally {
-		await run.coordinator.stop();
+test('recovery-policy failures stay active and schedule bounded fresh-fact recovery', async () => {
+	for (const code of [
+		'PROVIDER_TIMEOUT', 'REQUEST_TIMEOUT', 'PLANNING_TIMEOUT', 'PROCESS_TERMINATION_FAILED',
+		'AUTHENTICATION_REQUIRED', 'INVALID_PROVIDER_OUTPUT', 'PROVIDER_DOWN',
+		'SESSION_GENERATION_MISMATCH', 'TURN_NOT_ACTIVE', 'UNKNOWN_RESPONSE_ID',
+	]) {
+		const timers = new ManualTimerQueue();
+		const registry = new AgentRegistry();
+		const planner = new FakePlanner(registry);
+		planner.requestNativeTurn = async (request) => {
+			planner.requests.push(request);
+			throw Object.assign(new Error(`provider failure ${code}`), { code });
+		};
+		const run = await start({
+			registry,
+			planner,
+			goalSchedule: timers.schedule,
+			cancelGoalSchedule: timers.cancel,
+			config: {
+				bridge: { port: 25570, secret: 's'.repeat(32) },
+				codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+			},
+		});
+		try {
+			run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+			await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+			await timers.runNext();
+			assert.equal(run.bridge.sent.filter(({ type }) => type === 'request_observation').length, 1, code);
+			assert.equal(run.bridge.sent.some(({ type }) => type === 'agent_error'), false, code);
+			assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.ERROR, code);
+			assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.PAUSED, code);
+		} finally {
+			await run.coordinator.stop();
+		}
 	}
 });
 
@@ -1426,6 +1449,141 @@ test('ArenaScript infrastructure failure replaces the exact session and retries 
 		assert.equal(replacements.length, 1);
 		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.PAUSED);
 		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.ERROR);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('circuit recovery defers observations until the absolute probe deadline and uses the latest facts once', async () => {
+	let epochNow = 1_000;
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let attempts = 0;
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		attempts += 1;
+		if (attempts === 1) {
+			throw Object.assign(new Error('circuit is cooling down'), { code: 'PROVIDER_CIRCUIT_OPEN', nextProbeAtEpochMs: 5_000 });
+		}
+		assert.match(request.input, /"x":3/);
+		return withCompletionContract({ summary: 'Probe recovered.', directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const run = await start({
+		registry,
+		planner,
+		epochNow: () => epochNow,
+		goalClock: () => epochNow,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => attempts === 1 && timers.pendingCount === 1);
+		assert.equal(timers.history.at(-1).delay, 4_000);
+		for (const [eventSequence, x] of [[2, 1], [3, 2]]) {
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence, observation: { player: { x, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		}
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(attempts, 1, 'fresh observations are coalesced while the circuit owns its deadline');
+		epochNow = 5_000;
+		await timers.runNext();
+		assert.equal(run.bridge.sent.filter(({ type }) => type === 'request_observation').length, 1);
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 4, observation: { player: { x: 3, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => attempts === 2 && run.bridge.sent.some(({ type }) => type === 'action_command'));
+		assert.equal(attempts, 2);
+		assert.equal(run.bridge.sent.some(({ type }) => type === 'agent_error'), false);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('an observation pending behind a circuit failure cannot bypass its probe deadline', async () => {
+	let epochNow = 1_000;
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let attempts = 0;
+	let rejectFirst;
+	const first = new Promise((_resolve, reject) => { rejectFirst = reject; });
+	planner.requestPlan = (request) => {
+		planner.requests.push(request);
+		attempts += 1;
+		if (attempts === 1) return first;
+		assert.match(request.input, /"x":2/);
+		return Promise.resolve(withCompletionContract({ summary: 'Probe recovered.', directive: 'replace', source: SOURCE }, request.goalRevision));
+	};
+	const run = await start({
+		registry,
+		planner,
+		epochNow: () => epochNow,
+		goalClock: () => epochNow,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => attempts === 1);
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, observation: { player: { x: 1, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await new Promise((resolve) => setImmediate(resolve));
+		rejectFirst(Object.assign(new Error('circuit is cooling down'), { code: 'PROVIDER_CIRCUIT_OPEN', nextProbeAtEpochMs: 5_000 }));
+		await eventually(() => timers.pendingCount === 1);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(attempts, 1, 'pending provider work waits for the exact-profile circuit deadline');
+
+		epochNow = 5_000;
+		await timers.runNext();
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 3, observation: { player: { x: 2, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => attempts === 2);
+		assert.equal(attempts, 2);
+	} finally {
+		rejectFirst?.(Object.assign(new Error('test cleanup'), { code: 'STALE_PLAN' }));
+		await run.coordinator.stop();
+	}
+});
+
+test('native circuit recovery also defers observations until its absolute probe deadline', async () => {
+	let epochNow = 1_000;
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let attempts = 0;
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		attempts += 1;
+		if (attempts === 1) {
+			throw Object.assign(new Error('circuit is cooling down'), { code: 'PROVIDER_CIRCUIT_OPEN', nextProbeAtEpochMs: 5_000 });
+		}
+		assert.match(request.input, /"x":2/);
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		epochNow: () => epochNow,
+		goalClock: () => epochNow,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'native_tools', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => attempts === 1 && timers.pendingCount === 1);
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, observation: { player: { x: 1, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(attempts, 1);
+
+		epochNow = 5_000;
+		await timers.runNext();
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 3, observation: { player: { x: 2, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => attempts === 2);
+		assert.equal(attempts, 2);
 	} finally {
 		await run.coordinator.stop();
 	}
@@ -1545,6 +1703,80 @@ test('an invalid higher-revision conversation wake cannot retire the live native
 		assert.equal(run.registry.get('agent-a').goalRevision, 1);
 		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING);
 		assert.equal(timers.pendingCount, 1);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('agent removal terminates ArenaScript supervision for the removed goal', async () => {
+	const goalSupervisor = new RecordingGoalSupervisor();
+	const run = await start({ goalSupervisor });
+	try {
+		run.bridge.emit('goal_control', {
+			agentId: 'agent-a',
+			payload: { operation: 'start', goalRevision: 1, goal: 'Gather wood.' },
+		});
+		await eventually(() => run.registry.get('agent-a')?.goalRevision === 1);
+		goalSupervisor.terminations.length = 0;
+
+		run.bridge.emit('agent_removed', { agentId: 'agent-a', payload: { goalRevision: 1 } });
+		await eventually(() => run.registry.get('agent-a') === null);
+
+		assert.equal(goalSupervisor.terminations.length, 1);
+		assert.equal(goalSupervisor.terminations[0].goalRevision, 1);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('direct conversation and composite wake activate bounded ArenaScript supervision', async () => {
+	const goalSupervisor = new RecordingGoalSupervisor();
+	const run = await start({ goalSupervisor });
+	try {
+		run.bridge.emit('conversation_event', {
+			agentId: 'agent-a',
+			payload: {
+				sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+				text: 'Hello?', goalRevision: 0, observedAtEpochMs: 1,
+			},
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(goalSupervisor.activations.length, 0, 'conversation without a goal does not create supervision work');
+		run.bridge.emit('goal_control', {
+			agentId: 'agent-a',
+			payload: { operation: 'start', goalRevision: 1, goal: 'Gather wood.' },
+		});
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'agent_ready' && payload.goalRevision === 1));
+		goalSupervisor.activations.length = 0;
+
+		run.bridge.emit('conversation_event', {
+			agentId: 'agent-a',
+			payload: {
+				sequence: 2, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+				text: 'Keep going.', goalRevision: 1, observedAtEpochMs: 2,
+			},
+		});
+		await eventually(() => goalSupervisor.activations.length === 1);
+		assert.equal(goalSupervisor.activations[0].goalRevision, 1);
+		run.bridge.emit('goal_control', {
+			agentId: 'agent-a', payload: { operation: 'stop', goalRevision: 2 },
+		});
+		await eventually(() => run.registry.get('agent-a')?.state === DynamicAgentState.PAUSED);
+
+		run.bridge.emit('conversation_wake', {
+			agentId: 'agent-a',
+			payload: {
+				transactionId: 'arena-wake-0001',
+				event: {
+					sequence: 3, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+					text: 'Resume now.', goalRevision: 2, observedAtEpochMs: 3,
+				},
+				control: { operation: 'start', goalRevision: 2, updatedAtEpochMs: 4, goal: 'Gather wood.' },
+			},
+		});
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'conversation_wake_ack' && payload.goalRevision === 2));
+		assert.equal(goalSupervisor.activations.length, 2);
+		assert.equal(goalSupervisor.activations[1].goalRevision, 2);
 	} finally {
 		await run.coordinator.stop();
 	}
@@ -2669,7 +2901,7 @@ test('flushes conversation attention that arrived during initial planning after 
 	}
 });
 
-test('reports a non-quiet initial provider failure when no urgent recovery is pending', async () => {
+test('keeps a non-quiet initial provider failure active when no urgent recovery is pending', async () => {
 	const run = await start();
 	const runtimeErrors = [];
 	run.coordinator.on('runtimeError', (error) => runtimeErrors.push(error));
@@ -2680,8 +2912,12 @@ test('reports a non-quiet initial provider failure when no urgent recovery is pe
 	try {
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
-		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_error'));
-		assert.equal(runtimeErrors.some((error) => error.code === 'PROVIDER_DOWN'), true);
+		await eventually(() => run.planner.requests.length === 1);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+		assert.equal(runtimeErrors.some((error) => error.code === 'PROVIDER_DOWN'), false);
+		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.ERROR);
+		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.PAUSED);
 	} finally {
 		await run.coordinator.stop();
 	}
@@ -2737,7 +2973,7 @@ test('keeps REQUEST_TIMEOUT retryable with a real planner and retries after back
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
 		await eventually(() => attempts === 1);
-		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.STARTING);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.PLANNING);
 		now = 1_200;
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, observation: { player: { x: 1, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
 		await eventually(() => attempts === 2);

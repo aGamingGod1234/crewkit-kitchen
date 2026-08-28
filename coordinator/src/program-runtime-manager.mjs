@@ -6,6 +6,7 @@ import { parseArenaScript } from './arena-script/parser.mjs';
 import { ArenaScriptEngine } from './arena-script/program-engine.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { buildPlannerInput } from './prompts.mjs';
+import { classifyRecoveryFailure } from './recovery-policy.mjs';
 
 /** Coordinates model-authored ArenaScript programs for independent agents. */
 export class ProgramRuntimeManager {
@@ -153,6 +154,7 @@ export class ProgramRuntimeManager {
 		this.#syncState(record, state);
 		if (state.reactiveRecovery !== null) {
 			state.reactiveRecovery = {
+				...state.reactiveRecovery,
 				context: Object.freeze({ ...state.reactiveRecovery.context, observation }),
 				fresh: true,
 			};
@@ -386,7 +388,7 @@ export class ProgramRuntimeManager {
 		return installed;
 	}
 
-	async #requestCompilerCorrection(state, record, source, error, observation, eventSequence, context = null) {
+	async #requestCompilerCorrection(state, record, source, error, observation, eventSequence, context = null, allowInfrastructureRetry = true) {
 		const correctionKey = context === null ? `initial:${eventSequence}` : requestKey(context);
 		const attempts = state.corrections.get(correctionKey) ?? 0;
 		if (attempts >= this.#compilerCorrectionLimit) {
@@ -446,6 +448,19 @@ export class ProgramRuntimeManager {
 			this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			return state.engine.snapshot();
 		} catch (requestError) {
+			if (classifyRecoveryFailure(requestError).retryable) {
+				state.corrections.set(correctionKey, attempts);
+				if (allowInfrastructureRetry) {
+					state.reactiveRecovery = {
+						kind: 'compiler_correction',
+						context: Object.freeze({ source, error, observation, eventSequence, requestContext: context }),
+						fresh: false,
+					};
+					this.#ensureActing(record);
+					this.#requestRecoveryLease(record, state, 'compiler_correction_provider_failure', requestError);
+				}
+				return null;
+			}
 			this.#reportError(record.agentId, requestError);
 			return null;
 		}
@@ -547,19 +562,22 @@ export class ProgramRuntimeManager {
 			}
 			this.#syncState(record, state);
 		} catch (error) {
-			if (isInfrastructureFailure(error) && context.decisionContext !== 'completion_verification_failed') {
-				state.reactiveRecovery = { context, fresh: false };
-				this.#requestRecoveryLease(record, state, 'reactive_provider_failure', error);
+			if (classifyRecoveryFailure(error).retryable) {
+				if (context.infrastructureRetry !== true) {
+					state.reactiveRecovery = { kind: 'reactive', context: Object.freeze({ ...context, infrastructureRetry: true }), fresh: false };
+					this.#requestRecoveryLease(record, state, 'reactive_provider_failure', error);
+				}
 				this.#syncState(record, state);
 				return;
 			}
 			state.engine.failDirectiveRequest(context);
 			if (context.decisionContext === 'completion_verification_failed') {
-				this.#setTerminalState(record, DynamicAgentState.ERROR);
+				this.#ensureActing(record);
 				const correctionError = codedError('COMPLETION_CORRECTION_FAILED', 'The selected model could not correct a rejected completion claim');
 				correctionError.cause = error;
 				this.#reportError(record.agentId, correctionError);
 			} else this.#reportError(record.agentId, error);
+			this.#syncState(record, state);
 		}
 	}
 
@@ -861,10 +879,26 @@ export class ProgramRuntimeManager {
 
 	#resumeReactiveRecovery(state) {
 		if (state.reactiveRecovery?.fresh !== true || state.disposed) return;
-		const retry = state.reactiveRecovery.context;
+		const recovery = state.reactiveRecovery;
 		state.reactiveRecovery = null;
 		state.recoveryRequested = false;
-		void this.#requestReactiveDecision(state, retry);
+		if (recovery.kind === 'compiler_correction') {
+			const record = this.#registry.get(state.agentId);
+			if (record?.goalRevision !== state.goalRevision) return;
+			const retry = recovery.context;
+			void this.#requestCompilerCorrection(
+				state,
+				record,
+				retry.source,
+				retry.error,
+				retry.observation,
+				retry.eventSequence,
+				retry.requestContext,
+				false,
+			);
+			return;
+		}
+		void this.#requestReactiveDecision(state, recovery.context);
 	}
 
 	#requestRecoveryLease(record, state, reason, error = null) {
@@ -873,7 +907,7 @@ export class ProgramRuntimeManager {
 		const request = Object.freeze({
 			record,
 			reason,
-			...(typeof error?.code === 'string' ? { errorCode: error.code.slice(0, 128) } : {}),
+			...recoveryRequestFields(error),
 		});
 		try { void Promise.resolve(this.#requestRecovery(request)).catch(() => undefined); }
 		catch { /* recovery scheduling cannot terminate the program */ }
@@ -1041,12 +1075,14 @@ function isRetryableCompletionError(error) {
 	return ['BRIDGE_NOT_READY', 'BRIDGE_DISCONNECTED', 'CONNECTION_BACKPRESSURE', 'AGENT_BACKPRESSURE', 'AGENT_NOT_SUPPORTED'].includes(error?.code);
 }
 
-function isInfrastructureFailure(error) {
-	return [
-		'PLANNING_TIMEOUT', 'PLANNING_LEASE_EXPIRED', 'PROVIDER_UNAVAILABLE', 'PROVIDER_CIRCUIT_OPEN',
-		'SPAWN_FAILED', 'SESSION_INVALIDATED', 'TRANSPORT_STOPPED', 'PROVIDER_STOPPED',
-		'MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE',
-	].includes(error?.code);
+function recoveryRequestFields(error) {
+	const recovery = classifyRecoveryFailure(error);
+	if (recovery.code === 'UNKNOWN_ERROR') return {};
+	return {
+		errorCode: recovery.code,
+		recoveryKind: recovery.kind,
+		...(recovery.nextProbeAtEpochMs === undefined ? {} : { nextProbeAtEpochMs: recovery.nextProbeAtEpochMs }),
+	};
 }
 
 function monotonicTimestamp(value) {

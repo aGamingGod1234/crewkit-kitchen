@@ -30,6 +30,7 @@ import { adaptObservation } from './observation-adapter.mjs';
 import { advanceContextCursor, buildPlannerInput, createContextCursor } from './prompts.mjs';
 import { profileFingerprint } from './provider-session.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
+import { classifyRecoveryFailure } from './recovery-policy.mjs';
 import { NativeToolRuntime } from './native-tool-runtime.mjs';
 import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
@@ -53,13 +54,7 @@ const EMPTY_TURN_RETRY_DELAY_MS = 1_000;
 const GOAL_SPEC_RETRY_BASE_MS = 1_000;
 const GOAL_SPEC_RETRY_MAX_MS = 30_000;
 const GOAL_SPEC_PROPOSAL_RETRY_MS = 5_000;
-const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set(['MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE', 'REQUEST_TIMEOUT']);
 const QUIET_LIFECYCLE_ERRORS = new Set(['PLAN_CANCELLED', 'STALE_PLAN', 'STALE_GOAL_REVISION', 'GOAL_REVISION_COLLISION']);
-const RECOVERABLE_PROVIDER_ERRORS = new Set([
-	'PLANNING_TIMEOUT', 'PLANNING_LEASE_EXPIRED', 'PROVIDER_UNAVAILABLE', 'PROVIDER_CIRCUIT_OPEN',
-	'SPAWN_FAILED', 'SESSION_INVALIDATED', 'TRANSPORT_STOPPED', 'PROVIDER_STOPPED',
-	'MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE', 'REQUEST_TIMEOUT',
-]);
 const MAX_CONVERSATION_WAKE_TRANSACTIONS = 4_096;
 const MAX_PUBLIC_NARRATIVE_RAW_CHARS = 1_024;
 const DEFAULT_VOICE_PORT = 8_766;
@@ -91,6 +86,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#attentionFlushes = new Map();
 	#lifecycleGenerations = new Map();
 	#providerRetryAfter = new Map();
+	#providerProbeDeadlines = new Map();
+	#deferredProviderRecovery = new Map();
 	#programRuntimeEpochs = new Map();
 	#nativeRuntimeEpochs = new Map();
 	#verboseReporters = new Set();
@@ -159,14 +156,15 @@ export class DynamicCoordinator extends EventEmitter {
 			bridge: programBridge,
 			planner: this.#planner,
 			reportError: (agentId, error) => this.#reportAgentError(agentId, error, this.#programRuntimeEpochs.get(agentId)),
-			requestRecovery: ({ record, reason, errorCode }) => {
+			requestRecovery: ({ record, reason, errorCode, recoveryKind, nextProbeAtEpochMs }) => {
 				const connectionEpoch = this.#programRuntimeEpochs.get(record.agentId);
 				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return false;
 				const current = this.#registry.get(record.agentId);
 				if (current === null || current.goalRevision !== record.goalRevision) return false;
 				const key = this.#supervisionKey(current);
 				this.#goalSupervisor.activate(key);
-				return this.#goalSupervisor.recover(key, { reason, errorCode });
+				const details = this.#recoveryDetails(record.agentId, { errorCode, recoveryKind, nextProbeAtEpochMs });
+				return this.#goalSupervisor.recover(key, { reason, ...details });
 			},
 			onCompletionRequested: (request) => this.#publishGoalCompleted(request, this.#programRuntimeEpochs.get(request.record.agentId)),
 			latencyRegistry: this.#latencyRegistry,
@@ -282,6 +280,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#programRuntime.disposeAll();
 		await this.#nativeRuntime.disposeAll();
 		this.#providerRetryAfter.clear();
+		this.#providerProbeDeadlines.clear();
+		this.#deferredProviderRecovery.clear();
 		this.#programRuntimeEpochs.clear();
 		this.#nativeRuntimeEpochs.clear();
 		this.#factLedgers.clear();
@@ -338,7 +338,7 @@ export class DynamicCoordinator extends EventEmitter {
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 			this.#publishVerbose(message.agentId, message.payload.goalRevision, 'lifecycle', 'Agent removed from the coordinator roster.', connectionEpoch);
 			const current = this.#registry.get(message.agentId);
-			if (current !== null && this.#usesNativeTools(current)) this.#goalSupervisor.terminate(this.#supervisionKey(current));
+			if (current !== null) this.#goalSupervisor.terminate(this.#supervisionKey(current));
 			this.#programRuntime.dispose(message.agentId);
 			await this.#nativeRuntime.dispose(message.agentId, 'agent_removed');
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
@@ -351,6 +351,8 @@ export class DynamicCoordinator extends EventEmitter {
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 			this.#lifecycleGenerations.delete(message.agentId);
 			this.#providerRetryAfter.delete(message.agentId);
+			this.#providerProbeDeadlines.delete(message.agentId);
+			this.#deferredProviderRecovery.delete(message.agentId);
 			this.#factLedgers.delete(message.agentId);
 			this.#conversationMemories.delete(message.agentId);
 			this.#contextCursors.delete(message.agentId);
@@ -453,7 +455,12 @@ export class DynamicCoordinator extends EventEmitter {
 				if (record !== null) {
 					this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation' });
 					if (this.#usesNativeTools(record)) this.#scheduleNativeConversation(record, message.payload, 'conversation');
-					else this.#schedulePendingAttentionFlush(record);
+					else {
+						if ([DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING, DynamicAgentState.DEAD].includes(record.state)) {
+							this.#goalSupervisor.activate(this.#supervisionKey(record));
+						}
+						this.#schedulePendingAttentionFlush(record);
+					}
 				}
 				this.emit('conversationEvent', message);
 			}, { waitForReconciliation: false, connectionEpoch });
@@ -468,7 +475,7 @@ export class DynamicCoordinator extends EventEmitter {
 						throw new ProtocolV2Error('TRANSACTION_COLLISION', `Conversation wake '${message.payload.transactionId}' changed during replay`);
 					}
 					const record = this.#registry.applyConversationWake(message.agentId, message.payload.control);
-					if (this.#usesNativeTools(record)) this.#goalSupervisor.activate(this.#supervisionKey(record));
+					this.#goalSupervisor.activate(this.#supervisionKey(record));
 					this.#providerRetryAfter.delete(message.agentId);
 					this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation_wake' });
 					if (this.#usesNativeTools(record)) this.#scheduleNativeConversation(record, message.payload.event, 'conversation_wake');
@@ -496,7 +503,7 @@ export class DynamicCoordinator extends EventEmitter {
 					if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				}
 				this.#conversationMemory(message.agentId).ingest(message.payload.event);
-				if (this.#usesNativeTools(record)) this.#goalSupervisor.activate(this.#supervisionKey(record));
+				this.#goalSupervisor.activate(this.#supervisionKey(record));
 				this.#providerRetryAfter.delete(message.agentId);
 				this.#rememberPendingAttention(record.agentId, record.goalRevision, { priority: 'urgent', trigger: 'conversation_wake' });
 				if (this.#usesNativeTools(record)) this.#scheduleNativeConversation(record, message.payload.event, 'conversation_wake');
@@ -657,6 +664,8 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#pendingAttention.clear();
 			this.#attentionFlushes.clear();
 			this.#providerRetryAfter.clear();
+			this.#providerProbeDeadlines.clear();
+			this.#deferredProviderRecovery.clear();
 			this.#providerWork.clear();
 			await Promise.allSettled(this.#registry.list().map(async (record) => {
 				if ([DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) {
@@ -890,6 +899,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#scheduleNativeTurn(record, request) {
 		if (!this.#isConnectionEpochCurrent(request.connectionEpoch)
 				|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		request = this.#afterProviderProbeDeadline(record, request);
+		if (request === null) return;
 		const existing = this.#providerWork.get(record.agentId);
 		if (existing !== undefined) {
 			if (
@@ -1074,12 +1085,14 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #failNativeTurn(work, error) {
-		let classification = classifyNativeGoalError(error);
+		let recovery = classifyRecoveryFailure(error);
+		let classification = recovery.retryable ? 'recoverable' : classifyNativeGoalError(error);
 		try {
 			await this.#settleNativeSteering(work);
 		} catch (steeringError) {
 			error = steeringError;
-			classification = classifyNativeGoalError(error);
+			recovery = classifyRecoveryFailure(error);
+			classification = recovery.retryable ? 'recoverable' : classifyNativeGoalError(error);
 		} finally {
 			this.#goalSupervisor.end(work.supervisionToken, { scheduleRecovery: classification !== 'stale' });
 			if (work.request.conversationOnly === true) this.#goalSupervisor.terminate(work.supervisionKey);
@@ -1106,7 +1119,11 @@ export class DynamicCoordinator extends EventEmitter {
 			}
 			await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 		} else {
-			this.#goalSupervisor.recover(work.supervisionKey, { errorCode: error?.code ?? 'NATIVE_TURN_FAILED' });
+			this.#goalSupervisor.recover(work.supervisionKey, this.#recoveryDetails(work.agentId, {
+				errorCode: recovery.code,
+				recoveryKind: recovery.kind,
+				nextProbeAtEpochMs: recovery.nextProbeAtEpochMs,
+			}));
 			this.#reschedulePendingNativeTurn(pending);
 		}
 		return null;
@@ -1137,6 +1154,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#scheduleInitialPlan(record, request) {
 		if (!this.#isConnectionEpochCurrent(request.connectionEpoch)
 				|| !this.#isLifecycleGenerationCurrent(record.agentId, request.lifecycleGeneration)) return;
+		request = this.#afterProviderProbeDeadline(record, request);
+		if (request === null) return;
 		const existing = this.#providerWork.get(record.agentId);
 		if (existing !== undefined) {
 			if (existing.goalRevision !== record.goalRevision || existing.lifecycleGeneration !== request.lifecycleGeneration) {
@@ -1159,6 +1178,23 @@ export class DynamicCoordinator extends EventEmitter {
 		void this.#sendForEpoch(request.connectionEpoch, 'planning_state', record.agentId, { goalRevision: record.goalRevision, state: DynamicAgentState.PLANNING })
 			.catch((error) => this.#reportAgentError(record.agentId, error, request.connectionEpoch));
 		void this.#scheduleProviderPlan(record, request, { preserveState: false, kind: 'initial' });
+	}
+
+	#afterProviderProbeDeadline(record, request) {
+		const probeDeadline = this.#providerProbeDeadlines.get(record.agentId);
+		const now = safeClockRead(this.#epochNow);
+		if (probeDeadline !== undefined && now !== null && now < probeDeadline) {
+			const deferred = this.#deferredProviderRecovery.get(record.agentId);
+			this.#deferredProviderRecovery.set(record.agentId, mergePlannerRequest(deferred, request));
+			return null;
+		}
+		if (probeDeadline !== undefined) {
+			this.#providerProbeDeadlines.delete(record.agentId);
+			const deferred = this.#deferredProviderRecovery.get(record.agentId);
+			this.#deferredProviderRecovery.delete(record.agentId);
+			request = mergePlannerRequest(deferred, request);
+		}
+		return request;
 	}
 
 	#scheduleProviderPlan(record, request, { preserveState = false, kind = 'initial' } = {}) {
@@ -1294,8 +1330,14 @@ export class DynamicCoordinator extends EventEmitter {
 		const pending = work.pending;
 		this.#providerWork.delete(work.agentId);
 		const urgentRecovery = pending?.priority === 'urgent';
-		const quietRetry = QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code);
-		if (!stale && RECOVERABLE_PROVIDER_ERRORS.has(error?.code)) {
+		const recovery = classifyRecoveryFailure(error);
+		const quietRetry = recovery.quiet;
+		if (!stale && recovery.retryable) {
+			if (quietRetry) {
+				const retryAt = safeClockRead(this.#controlNow);
+				if (retryAt !== null) this.#providerRetryAfter.set(record.agentId, retryAt + EMPTY_TURN_RETRY_DELAY_MS);
+			}
+			this.#publishVerbose(record.agentId, record.goalRevision, 'retry', verboseRecoveryMessage(recovery), work.connectionEpoch);
 			try {
 				const latest = this.#registry.get(record.agentId);
 				if (latest?.state === DynamicAgentState.ERROR) this.#registry.setState(record.agentId, DynamicAgentState.STARTING, { goalRevision: record.goalRevision });
@@ -1319,9 +1361,14 @@ export class DynamicCoordinator extends EventEmitter {
 					});
 				}
 			}
+			const recoveryDetails = this.#recoveryDetails(record.agentId, {
+				errorCode: recovery.code,
+				recoveryKind: recovery.kind,
+				nextProbeAtEpochMs: recovery.nextProbeAtEpochMs,
+			});
 			const supervisionKey = this.#supervisionKey(record, work.lifecycleGeneration);
 			this.#goalSupervisor.activate(supervisionKey);
-			this.#goalSupervisor.recover(supervisionKey, { errorCode: error.code });
+			this.#goalSupervisor.recover(supervisionKey, recoveryDetails);
 			this.#reschedulePendingProviderPlan(pending);
 			return null;
 		}
@@ -1378,6 +1425,8 @@ export class DynamicCoordinator extends EventEmitter {
 				return;
 			}
 		}
+		request = this.#afterProviderProbeDeadline(record, request);
+		if (request === null) return;
 		void this.#scheduleProviderPlan(record, request, { preserveState: request.preserveState === true, kind: request.kind ?? 'initial' });
 	}
 
@@ -1416,6 +1465,21 @@ export class DynamicCoordinator extends EventEmitter {
 		};
 	}
 
+	#recoveryDetails(agentId, { errorCode, recoveryKind, nextProbeAtEpochMs }) {
+		const deadline = Number.isFinite(nextProbeAtEpochMs) && nextProbeAtEpochMs >= 0 ? nextProbeAtEpochMs : null;
+		if (deadline === null) this.#providerProbeDeadlines.delete(agentId);
+		else this.#providerProbeDeadlines.set(agentId, deadline);
+		const now = safeClockRead(this.#epochNow);
+		return {
+			errorCode,
+			...(recoveryKind === undefined ? {} : { recoveryKind }),
+			...(deadline === null ? {} : {
+				nextProbeAtEpochMs: deadline,
+				retryDelayMs: now === null ? 0 : Math.max(0, deadline - now),
+			}),
+		};
+	}
+
 	#retireGoalSupervision(record, operation) {
 		const key = this.#supervisionKey(record);
 		if (['disconnect', 'dead'].includes(operation)) this.#goalSupervisor.suspend(key);
@@ -1439,6 +1503,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#pendingAttention.delete(agentId);
 		this.#attentionFlushes.delete(agentId);
 		this.#contextCursors.delete(agentId);
+		this.#providerProbeDeadlines.delete(agentId);
+		this.#deferredProviderRecovery.delete(agentId);
 		this.#advanceLifecycleGeneration(agentId);
 	}
 
@@ -1525,7 +1591,7 @@ export class DynamicCoordinator extends EventEmitter {
 		try {
 			const verboseRecord = this.#registry.get(agentId);
 			if (QUIET_LIFECYCLE_ERRORS.has(error?.code)) return;
-			if (QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)) {
+			if (classifyRecoveryFailure(error).quiet) {
 				// App-server transport silence is retried from the next fresh observation.
 				// It is not a world-action failure that the player or agent must repair.
 				if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'retry', 'Provider output was incomplete; retrying from the next fresh observation.');
@@ -1727,6 +1793,7 @@ export class DynamicCoordinator extends EventEmitter {
 		let metadata = null;
 		try { metadata = session?.sessionMetadata?.() ?? null; } catch { metadata = null; }
 		const selectedProfile = {
+			agentId: record.agentId,
 			provider: record.provider,
 			model: record.model,
 			reasoningEffort: record.reasoningEffort,
@@ -1780,6 +1847,8 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#contextCursors.clear();
 		this.#conversationWakeTransactions.clear();
 		this.#providerWork.clear();
+		this.#providerProbeDeadlines.clear();
+		this.#deferredProviderRecovery.clear();
 		this.#programRuntimeEpochs.clear();
 		this.#nativeRuntimeEpochs.clear();
 		for (const record of this.#registry.list()) {
@@ -2320,6 +2389,12 @@ function isTransientCompletionSendError(error) {
 function verboseErrorMessage(error) {
 	const code = String(error?.code ?? 'COORDINATOR_ERROR').slice(0, 128);
 	return `${verboseErrorScope(code)} error (${code}).`;
+}
+
+function verboseRecoveryMessage(recovery) {
+	if (recovery.quiet) return 'Provider output was incomplete; retrying from the next fresh observation.';
+	if (recovery.blocked) return 'Provider access is unavailable; retrying automatically from fresh state.';
+	return 'Provider work failed; recovering automatically from fresh state.';
 }
 
 function sanitizeVerboseMessage(stage, message) {
