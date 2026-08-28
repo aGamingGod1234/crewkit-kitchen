@@ -110,7 +110,7 @@ public final class CoordinatorProcessOwnershipVerification {
 			assertTrue(interruptedDescendants.stream().noneMatch(ProcessHandle::isAlive),
 					"interrupted tree termination still stops every child");
 			return 24 + clearAssertions + verifyStartupOwnershipRecordFailureCleanup(main)
-					+ verifyRefusedProcessTreeTerminationFailsClosed();
+					+ verifyRefusedProcessTreeTerminationFailsClosed() + verifyDescendantIdentityRejectsPidReuse();
 		} finally {
 			if (orphan != null && orphan.isAlive()) orphan.destroyForcibly();
 			if (liveOwned != null && liveOwned.isAlive()) liveOwned.destroyForcibly();
@@ -219,6 +219,20 @@ public final class CoordinatorProcessOwnershipVerification {
 		assertTrue(parent.isAlive() && child.isAlive(),
 				"refused process handles remain visibly alive to the caller");
 		return 4;
+	}
+
+	private static int verifyDescendantIdentityRejectsPidReuse() {
+		ProcessHandle current = ProcessHandle.current();
+		CoordinatorProcessOwnership.ProcessIdentity exact =
+				CoordinatorProcessOwnership.ProcessIdentity.from(current).orElseThrow();
+		assertTrue(exact.resolve().filter(current::equals).isPresent(),
+				"captured descendant identity resolves the exact live process");
+		CoordinatorProcessOwnership.ProcessIdentity reused = new CoordinatorProcessOwnership.ProcessIdentity(
+				current.pid(), exact.startedAtEpochMs() + 1L
+		);
+		assertTrue(reused.resolve().isEmpty(),
+				"a reused PID with a different start identity cannot be terminated as an owned descendant");
+		return 2;
 	}
 
 	private static int verifyClearPreservesNewerRecord(Path root, Process process) throws Exception {

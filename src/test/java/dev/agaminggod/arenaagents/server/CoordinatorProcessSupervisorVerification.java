@@ -26,11 +26,13 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 /** Fault-injection verification for coordinator recovery ownership and deadlines. */
 public final class CoordinatorProcessSupervisorVerification {
@@ -82,10 +84,95 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyPortOnlyChangeAdvancesBridgeRevision();
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
+		verifyProductionChildPreservesDescendantsAcrossRootExit();
+		verifyProductionBridgePortValidation();
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 209;
+		return 221;
+	}
+
+	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
+		Path root = null;
+		CoordinatorProcessSupervisor.ChildProcess owned = null;
+		ProcessHandle provider = null;
+		try {
+			root = Files.createTempDirectory("arena-supervisor-descendants-");
+			Path runtimeRoot = root;
+			Path main = root.resolve("coordinator/src/dynamic-main.mjs").toAbsolutePath().normalize();
+			Path providerPid = root.resolve("runtime/provider.pid");
+			Path releaseRoot = root.resolve("runtime/release-root");
+			Files.createDirectories(main.getParent());
+			Files.createDirectories(providerPid.getParent());
+			Files.writeString(main, "// process ownership fixture", StandardCharsets.UTF_8);
+			String java = Path.of(
+					System.getProperty("java.home"), "bin", isWindows() ? "java.exe" : "java"
+			).toString();
+			CoordinatorProcessSupervisor.LaunchRequest request = new CoordinatorProcessSupervisor.LaunchRequest(
+					List.of(
+							java, "-cp", System.getProperty("java.class.path"),
+							RootExitFixture.class.getName(), providerPid.toString(), releaseRoot.toString()
+					),
+					root,
+					Map.of(),
+					root.resolve("logs/coordinator.log"),
+					root.resolve("logs/coordinator-error.log"),
+					root,
+					main,
+					GENERATION_A,
+					"00000000-0000-0000-0000-000000000990"
+			);
+			owned = new CoordinatorProcessSupervisor.DefaultProcessLauncher().launch(request);
+			long rootPid = owned.pid();
+			awaitCondition(() -> readablePid(providerPid), "production child launches its provider descendant");
+			provider = ProcessHandle.of(Long.parseLong(Files.readString(providerPid).trim())).orElseThrow();
+			assertTrue(owned.isAlive(), "production coordinator root is alive while descendants are captured");
+			ProcessHandle exactProvider = provider;
+			awaitCondition(
+					() -> ownershipTracks(runtimeRoot, exactProvider),
+					"production ownership persists the provider PID and start identity"
+			);
+
+			Files.writeString(releaseRoot, "exit", StandardCharsets.UTF_8);
+			awaitCondition(
+					() -> ProcessHandle.of(rootPid).map(handle -> !handle.isAlive()).orElse(true),
+					"coordinator root exits before provider cleanup"
+			);
+			assertTrue(provider.isAlive(), "provider remains alive after coordinator root exit");
+			owned.terminate();
+			awaitCondition(() -> !exactProvider.isAlive(), "captured provider is terminated after root reparenting");
+			assertFalse(Files.exists(CoordinatorProcessOwnership.ownershipFile(root)),
+					"ownership clears only after the captured provider exits");
+		} catch (Exception exception) {
+			throw new AssertionError("production descendant preservation verification failed", exception);
+		} finally {
+			if (owned != null) {
+				try { owned.terminate(); } catch (RuntimeException ignored) { }
+			}
+			if (provider != null && provider.isAlive()) provider.destroyForcibly();
+			if (root != null) deleteTree(root);
+		}
+	}
+
+	private static void verifyProductionBridgePortValidation() {
+		Path config = null;
+		try {
+			config = Files.createTempFile("arena-bridge-port-", ".json");
+			assertEquals(1_024, productionBridgePort(config, "1024.0"),
+					"production bridge parser accepts an exact JSON integer at the lower bound");
+			assertEquals(65_535, productionBridgePort(config, "65535"),
+					"production bridge parser accepts the upper bound");
+			assertInvalidBridgePort(config, "1023", "production bridge parser rejects privileged ports");
+			assertInvalidBridgePort(config, "65536", "production bridge parser rejects ports above 65535");
+			assertInvalidBridgePort(config, "1024.5", "production bridge parser rejects fractional JSON numbers");
+			assertInvalidBridgePort(config, "\"25570\"", "production bridge parser rejects numeric strings");
+		} catch (IOException exception) {
+			throw new AssertionError("production bridge port verification failed", exception);
+		} finally {
+			if (config != null) {
+				try { Files.deleteIfExists(config); } catch (IOException ignored) { }
+			}
+		}
 	}
 
 	private static void verifyLaunchMaterialChangeFencesOwnedChild() {
@@ -1632,6 +1719,32 @@ public final class CoordinatorProcessSupervisorVerification {
 		}
 	}
 
+	public static final class RootExitFixture {
+		private RootExitFixture() {
+		}
+
+		public static void main(String[] arguments) throws Exception {
+			String java = Path.of(
+					System.getProperty("java.home"), "bin", isWindows() ? "java.exe" : "java"
+			).toString();
+			Process provider = new ProcessBuilder(
+					java, "-cp", System.getProperty("java.class.path"), ProviderFixture.class.getName()
+			).start();
+			Files.writeString(Path.of(arguments[0]), Long.toString(provider.pid()), StandardCharsets.UTF_8);
+			Path release = Path.of(arguments[1]);
+			while (!Files.exists(release)) Thread.sleep(10L);
+		}
+	}
+
+	public static final class ProviderFixture {
+		private ProviderFixture() {
+		}
+
+		public static void main(String[] arguments) throws Exception {
+			Thread.sleep(TimeUnit.MINUTES.toMillis(5L));
+		}
+	}
+
 	private static void assertTicksPrompt(
 			CoordinatorProcessSupervisor supervisor,
 			int count,
@@ -1681,6 +1794,52 @@ public final class CoordinatorProcessSupervisorVerification {
 		try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
 			return socket.getLocalPort();
 		}
+	}
+
+	private static boolean readablePid(Path path) {
+		try {
+			return Files.isRegularFile(path) && !Files.readString(path).trim().isEmpty();
+		} catch (IOException ignored) {
+			return false;
+		}
+	}
+
+	private static boolean ownershipTracks(Path root, ProcessHandle process) {
+		try {
+			Properties ownership = new Properties();
+			try (var reader = Files.newBufferedReader(CoordinatorProcessOwnership.ownershipFile(root))) {
+				ownership.load(reader);
+			}
+			long startedAt = process.info().startInstant().orElseThrow().toEpochMilli();
+			String expected = process.pid() + ":" + startedAt;
+			return Arrays.asList(ownership.getProperty("descendants", "").split(",")).contains(expected);
+		} catch (IOException | RuntimeException ignored) {
+			return false;
+		}
+	}
+
+	private static int productionBridgePort(Path config, String jsonValue) throws IOException {
+		Files.writeString(config, "{\"bridge\":{\"port\":" + jsonValue + "}}", StandardCharsets.UTF_8);
+		return CoordinatorProcessSupervisor.DefaultDependencyResolver.bridgePort(config);
+	}
+
+	private static void assertInvalidBridgePort(Path config, String jsonValue, String label) throws IOException {
+		try {
+			productionBridgePort(config, jsonValue);
+		} catch (IllegalArgumentException expected) {
+			return;
+		}
+		throw new AssertionError(label);
+	}
+
+	private static void awaitCondition(BooleanSupplier condition, String label) {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+		while (!condition.getAsBoolean() && System.nanoTime() < deadline) Thread.onSpinWait();
+		assertTrue(condition.getAsBoolean(), label);
+	}
+
+	private static boolean isWindows() {
+		return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
 	}
 
 	private static CodexAgentManager uninitializedManager() {

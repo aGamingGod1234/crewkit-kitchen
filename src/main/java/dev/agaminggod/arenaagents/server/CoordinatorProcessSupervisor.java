@@ -37,6 +37,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
 	private static final long TERMINATION_RETRY_MS = 1_000L;
 	private static final long SHUTDOWN_WAIT_MS = 10_000L;
+	private static final long DESCENDANT_TRACK_INTERVAL_MS = 100L;
 	private static final int CANDIDATE_FAILURES_BEFORE_ROLLBACK = 3;
 
 	private final Path gameDirectory;
@@ -397,8 +398,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			if (bridgeSecret.length() < 32 || bridgeSecret.length() > 256) {
 				throw new IllegalArgumentException("bridge secret value is invalid");
 			}
-			if (bridgePort < 1 || bridgePort > 65_535) {
-				throw new IllegalArgumentException("bridge port must be between 1 and 65535");
+			if (bridgePort < 1_024 || bridgePort > 65_535) {
+				throw new IllegalArgumentException("bridge port must be between 1024 and 65535");
 			}
 			generationId = Objects.requireNonNull(generationId, "generation ID must not be null");
 			if (!generationId.matches("[0-9a-f]{64}")) {
@@ -1394,7 +1395,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 	}
 
-	private static final class DefaultProcessLauncher implements ProcessLauncher {
+	static final class DefaultProcessLauncher implements ProcessLauncher {
 		@Override
 		public ChildProcess launch(LaunchRequest request) throws IOException {
 			Files.createDirectories(request.standardOutput().getParent());
@@ -1407,35 +1408,53 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			builder.redirectError(ProcessBuilder.Redirect.appendTo(request.standardError().toFile()));
 			Process process = builder.start();
 			try {
+				long startedAtEpochMs = process.info().startInstant()
+						.orElseThrow(() -> new IOException("coordinator process start time is unavailable"))
+						.toEpochMilli();
 				CoordinatorProcessOwnership.record(
 						request.runtimeRoot(), process, request.main(), request.generationId(), request.launchId()
+				);
+				return new OwnedProcessChild(
+						request.runtimeRoot(), process, startedAtEpochMs, request.generationId(), request.launchId()
 				);
 			} catch (IOException ownershipFailure) {
 				terminateFailedStart(process);
 				throw ownershipFailure;
 			}
-			return new OwnedProcessChild(
-					request.runtimeRoot(), process, request.generationId(), request.launchId()
-			);
 		}
 	}
 
 	private static final class OwnedProcessChild implements ChildProcess {
 		private final Path runtimeRoot;
 		private final Process process;
+		private final long startedAtEpochMs;
 		private final String generationId;
 		private final String launchId;
 		private final AtomicBoolean terminated = new AtomicBoolean();
+		private final AtomicBoolean trackingFailureLogged = new AtomicBoolean();
+		private final LinkedHashSet<CoordinatorProcessOwnership.ProcessIdentity> descendants = new LinkedHashSet<>();
 
-		private OwnedProcessChild(Path runtimeRoot, Process process, String generationId, String launchId) {
+		private OwnedProcessChild(
+				Path runtimeRoot,
+				Process process,
+				long startedAtEpochMs,
+				String generationId,
+				String launchId
+		) {
 			this.runtimeRoot = runtimeRoot;
 			this.process = process;
+			this.startedAtEpochMs = startedAtEpochMs;
 			this.generationId = generationId;
 			this.launchId = launchId;
+			Thread.ofPlatform()
+					.name("arenaagents-coordinator-descendants-" + process.pid())
+					.daemon(true)
+					.start(this::trackWhileRootLives);
 		}
 
 		@Override
 		public boolean isAlive() {
+			captureDescendants();
 			return process.isAlive();
 		}
 
@@ -1447,17 +1466,50 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		@Override
 		public synchronized void terminate() {
 			if (terminated.get()) return;
-			CoordinatorProcessOwnership.terminateTree(process.toHandle());
+			captureDescendants();
+			CoordinatorProcessOwnership.terminateTree(process.toHandle(), List.copyOf(descendants));
 			try {
-				CoordinatorProcessOwnership.clear(runtimeRoot, process, generationId, launchId);
+				CoordinatorProcessOwnership.clear(
+						runtimeRoot, process.pid(), startedAtEpochMs, generationId, launchId
+				);
 			} catch (IOException exception) {
 				throw new IllegalStateException("Could not safely clear coordinator ownership", exception);
 			}
 			terminated.set(true);
 		}
+
+		private void trackWhileRootLives() {
+			while (!terminated.get() && process.isAlive()) {
+				captureDescendants();
+				try {
+					Thread.sleep(DESCENDANT_TRACK_INTERVAL_MS);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					return;
+				}
+			}
+			captureDescendants();
+		}
+
+		private synchronized void captureDescendants() {
+			try {
+				List<CoordinatorProcessOwnership.ProcessIdentity> observed =
+						CoordinatorProcessOwnership.captureDescendants(process.toHandle());
+				boolean changed = descendants.removeIf(identity -> !identity.isAlive());
+				changed |= descendants.addAll(observed);
+				if (!changed) return;
+				CoordinatorProcessOwnership.trackDescendants(
+						runtimeRoot, process.pid(), startedAtEpochMs, generationId, launchId, List.copyOf(descendants)
+				);
+			} catch (IOException | RuntimeException failure) {
+				if (trackingFailureLogged.compareAndSet(false, true)) {
+					LOGGER.warn("Could not preserve coordinator descendant ownership", failure);
+				}
+			}
+		}
 	}
 
-	private static final class DefaultDependencyResolver implements DependencyResolver {
+	static final class DefaultDependencyResolver implements DependencyResolver {
 		private final Path gameDirectory;
 		private final Map<String, String> environmentOverrides;
 
@@ -1615,7 +1667,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			}
 		}
 
-		private static int bridgePort(Path config) {
+		static int bridgePort(Path config) {
 			try {
 				JsonObject root = JsonParser.parseString(Files.readString(config, StandardCharsets.UTF_8)).getAsJsonObject();
 				if (!root.has("bridge")) return 25_570;
@@ -1625,8 +1677,15 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 						|| !bridge.getAsJsonPrimitive("port").isNumber()) {
 					throw new IllegalArgumentException("Coordinator config bridge.port is missing");
 				}
-				int port = bridge.get("port").getAsInt();
-				if (port < 1 || port > 65_535) throw new IllegalArgumentException("Coordinator config bridge.port is invalid");
+				int port;
+				try {
+					port = bridge.get("port").getAsBigDecimal().intValueExact();
+				} catch (ArithmeticException invalidInteger) {
+					throw new IllegalArgumentException("Coordinator config bridge.port is invalid", invalidInteger);
+				}
+				if (port < 1_024 || port > 65_535) {
+					throw new IllegalArgumentException("Coordinator config bridge.port is invalid");
+				}
 				return port;
 			} catch (IOException | com.google.gson.JsonParseException failure) {
 				throw new IllegalArgumentException("Coordinator config bridge.port is invalid", failure);

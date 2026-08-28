@@ -21,6 +21,8 @@ import java.util.concurrent.TimeUnit;
 final class CoordinatorProcessOwnership {
 	private static final String OWNERSHIP_PATH = "runtime/coordinator-process.properties";
 	private static final long EXIT_TIMEOUT_MS = 2_000L;
+	/** Bounds persisted process identities while covering the coordinator's maximum practical provider fan-out. */
+	static final int MAX_TRACKED_DESCENDANTS = 256;
 
 	private CoordinatorProcessOwnership() {
 	}
@@ -68,7 +70,7 @@ final class CoordinatorProcessOwnership {
 		record(runtimeRoot, process, main, generationId, launchId, ownerPid, ownerStartEpochMs(owner));
 	}
 
-	private static void record(
+	private static synchronized void record(
 			Path runtimeRoot,
 			Process process,
 			Path main,
@@ -83,35 +85,85 @@ final class CoordinatorProcessOwnership {
 		String expectedLaunch = normalizeLaunchId(launchId);
 		if (ownerPid <= 0L) throw new IllegalArgumentException("coordinator owner pid must be positive");
 		if (ownerStartedAtEpochMs <= 0L) throw new IllegalArgumentException("coordinator owner start time must be positive");
-		Properties values = new Properties();
-		values.setProperty("pid", Long.toString(process.pid()));
-		values.setProperty("ownerPid", Long.toString(ownerPid));
-		values.setProperty("ownerStartedAtEpochMs", Long.toString(ownerStartedAtEpochMs));
 		long startedAtEpochMs = process.info().startInstant()
 				.orElseThrow(() -> new IOException("coordinator process start time is unavailable"))
 				.toEpochMilli();
-		values.setProperty("startedAtEpochMs", Long.toString(startedAtEpochMs));
+		write(root, new Ownership(
+				process.pid(), ownerPid, ownerStartedAtEpochMs, startedAtEpochMs,
+				expectedGeneration, expectedLaunch, List.of()
+		), expectedMain);
+	}
+
+	private static void write(Path root, Ownership ownership, Path expectedMain) throws IOException {
+		Properties values = new Properties();
+		values.setProperty("pid", Long.toString(ownership.pid()));
+		values.setProperty("ownerPid", Long.toString(ownership.ownerPid()));
+		values.setProperty("ownerStartedAtEpochMs", Long.toString(ownership.ownerStartedAtEpochMs()));
+		values.setProperty("startedAtEpochMs", Long.toString(ownership.startedAtEpochMs()));
 		values.setProperty("main", expectedMain.toString());
-		values.setProperty("generationId", expectedGeneration);
-		values.setProperty("launchId", expectedLaunch);
-		Path ownership = ownershipFile(root);
-		Files.createDirectories(ownership.getParent());
-		Path staging = ownership.resolveSibling(ownership.getFileName() + ".staging-" + UUID.randomUUID());
+		values.setProperty("generationId", ownership.generationId());
+		values.setProperty("launchId", ownership.launchId());
+		if (!ownership.descendants().isEmpty()) {
+			values.setProperty("descendants", ownership.descendants().stream()
+					.map(ProcessIdentity::serialized)
+					.collect(java.util.stream.Collectors.joining(",")));
+		}
+		Path ownershipFile = ownershipFile(root);
+		Files.createDirectories(ownershipFile.getParent());
+		Path staging = ownershipFile.resolveSibling(ownershipFile.getFileName() + ".staging-" + UUID.randomUUID());
 		try {
 			try (Writer writer = Files.newBufferedWriter(staging)) {
 				values.store(writer, "Arena Agents coordinator ownership");
 			}
 			try {
-				Files.move(staging, ownership, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+				Files.move(staging, ownershipFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
 			} catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
-				Files.move(staging, ownership, StandardCopyOption.REPLACE_EXISTING);
+				Files.move(staging, ownershipFile, StandardCopyOption.REPLACE_EXISTING);
 			}
 		} finally {
 			Files.deleteIfExists(staging);
 		}
 	}
 
-	static int reapOrphaned(Path runtimeRoot) throws IOException {
+	static synchronized void trackDescendants(
+			Path runtimeRoot,
+			long processPid,
+			long startedAtEpochMs,
+			String generationId,
+			String launchId,
+			List<ProcessIdentity> descendants
+	) throws IOException {
+		Path root = normalizeRoot(runtimeRoot);
+		String expectedGeneration = normalizeGeneration(generationId);
+		String expectedLaunch = normalizeLaunchId(launchId);
+		if (descendants.size() > MAX_TRACKED_DESCENDANTS) {
+			throw new IllegalStateException("coordinator descendant count exceeds the ownership limit");
+		}
+		Ownership ownership = read(root);
+		if (ownership == null || ownership.pid() != processPid
+				|| ownership.startedAtEpochMs() != startedAtEpochMs
+				|| !ownership.generationId().equals(expectedGeneration)
+				|| !ownership.launchId().equals(expectedLaunch)) return;
+		LinkedHashSet<ProcessIdentity> merged = new LinkedHashSet<>();
+		ownership.descendants().stream().filter(ProcessIdentity::isAlive).forEach(merged::add);
+		descendants.stream().filter(ProcessIdentity::isAlive).forEach(merged::add);
+		if (merged.size() > MAX_TRACKED_DESCENDANTS) {
+			throw new IllegalStateException("coordinator descendant count exceeds the ownership limit");
+		}
+		List<ProcessIdentity> tracked = List.copyOf(merged);
+		if (tracked.equals(ownership.descendants())) return;
+		write(root, ownership.withDescendants(tracked), root.resolve("coordinator/src/dynamic-main.mjs").normalize());
+	}
+
+	static List<ProcessIdentity> captureDescendants(ProcessHandle process) {
+		List<ProcessHandle> handles = process.descendants().limit(MAX_TRACKED_DESCENDANTS + 1L).toList();
+		if (handles.size() > MAX_TRACKED_DESCENDANTS) {
+			throw new IllegalStateException("coordinator descendant count exceeds the ownership limit");
+		}
+		return handles.stream().map(ProcessIdentity::from).flatMap(Optional::stream).toList();
+	}
+
+	static synchronized int reapOrphaned(Path runtimeRoot) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
 		Path ownershipFile = ownershipFile(root);
 		if (!Files.isRegularFile(ownershipFile)) return 0;
@@ -127,7 +179,7 @@ final class CoordinatorProcessOwnership {
 		return reapOrphaned(root, ownership.generationId());
 	}
 
-	static int reapOrphaned(Path runtimeRoot, String activeGenerationId) throws IOException {
+	static synchronized int reapOrphaned(Path runtimeRoot, String activeGenerationId) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
 		normalizeGeneration(activeGenerationId);
 		Path expectedMain = root.resolve("coordinator/src/dynamic-main.mjs").normalize();
@@ -138,7 +190,10 @@ final class CoordinatorProcessOwnership {
 		int reaped = 0;
 		Optional<ProcessHandle> recorded = ProcessHandle.of(ownership.pid());
 		if (recorded.isPresent() && matchesIdentity(recorded.get(), expectedMain, ownership.startedAtEpochMs())) {
-			terminateTree(recorded.get());
+			terminateTree(recorded.get(), ownership.descendants());
+			reaped += 1;
+		} else if (ownership.descendants().stream().anyMatch(ProcessIdentity::isAlive)) {
+			terminateDescendants(ownership.descendants(), EXIT_TIMEOUT_MS);
 			reaped += 1;
 		}
 		clearIfMatching(root, ownership);
@@ -167,7 +222,7 @@ final class CoordinatorProcessOwnership {
 		clear(runtimeRoot, process.pid(), startedAtEpochMs, normalizeGeneration(generationId), normalizeLaunchId(launchId));
 	}
 
-	private static void clear(Path runtimeRoot, long processPid, long startedAtEpochMs) throws IOException {
+	private static synchronized void clear(Path runtimeRoot, long processPid, long startedAtEpochMs) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
 		Ownership ownership = read(root);
 		if (ownership == null || (ownership.pid() == processPid && ownership.startedAtEpochMs() == startedAtEpochMs)) {
@@ -175,7 +230,7 @@ final class CoordinatorProcessOwnership {
 		}
 	}
 
-	private static void clear(
+	static synchronized void clear(
 			Path runtimeRoot,
 			long processPid,
 			long startedAtEpochMs,
@@ -211,12 +266,15 @@ final class CoordinatorProcessOwnership {
 			long startedAtEpochMs = Long.parseLong(values.getProperty("startedAtEpochMs", ""));
 			String generationId = normalizeGeneration(values.getProperty("generationId", ""));
 			String launchId = normalizeLaunchId(values.getProperty("launchId", ""));
+			List<ProcessIdentity> descendants = parseDescendants(values.getProperty("descendants", ""));
 			Path main = Path.of(values.getProperty("main", "")).toAbsolutePath().normalize();
 			Path expectedMain = normalizeRoot(runtimeRoot).resolve("coordinator/src/dynamic-main.mjs").normalize();
 			if (pid <= 0L || ownerPid <= 0L || startedAtEpochMs <= 0L
 					|| (ownerStartedAtValue != null && ownerStartedAtEpochMs <= 0L)
 					|| !samePath(main, expectedMain)) return null;
-			return new Ownership(pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId);
+			return new Ownership(
+					pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId, descendants
+			);
 		} catch (RuntimeException invalid) {
 			return null;
 		}
@@ -346,23 +404,61 @@ final class CoordinatorProcessOwnership {
 		return UUID.fromString(java.util.Objects.requireNonNull(launchId, "launch ID must not be null")).toString();
 	}
 
+	private static List<ProcessIdentity> parseDescendants(String serialized) {
+		if (serialized == null || serialized.isBlank()) return List.of();
+		String[] entries = serialized.split(",", -1);
+		if (entries.length > MAX_TRACKED_DESCENDANTS) {
+			throw new IllegalArgumentException("coordinator descendant count exceeds the ownership limit");
+		}
+		LinkedHashSet<ProcessIdentity> identities = new LinkedHashSet<>();
+		for (String entry : entries) identities.add(ProcessIdentity.parse(entry));
+		return List.copyOf(identities);
+	}
+
 	static void terminateTree(ProcessHandle process) {
 		terminateTree(process, EXIT_TIMEOUT_MS);
 	}
 
 	static void terminateTree(ProcessHandle process, long exitTimeoutMs) {
+		terminateTree(process, List.of(), exitTimeoutMs);
+	}
+
+	static void terminateTree(ProcessHandle process, List<ProcessIdentity> preservedDescendants) {
+		terminateTree(process, preservedDescendants, EXIT_TIMEOUT_MS);
+	}
+
+	private static void terminateTree(
+			ProcessHandle process,
+			List<ProcessIdentity> preservedDescendants,
+			long exitTimeoutMs
+	) {
+		terminateOwned(process, preservedDescendants, exitTimeoutMs);
+	}
+
+	private static void terminateDescendants(List<ProcessIdentity> identities, long exitTimeoutMs) {
+		terminateOwned(null, identities, exitTimeoutMs);
+	}
+
+	private static void terminateOwned(
+			ProcessHandle process,
+			List<ProcessIdentity> preservedDescendants,
+			long exitTimeoutMs
+	) {
 		if (exitTimeoutMs < 0L) throw new IllegalArgumentException("process exit timeout must not be negative");
 		boolean interrupted = Thread.interrupted();
 		try {
-			LinkedHashSet<ProcessHandle> descendants = new LinkedHashSet<>(process.descendants().toList());
+			LinkedHashSet<ProcessHandle> descendants = new LinkedHashSet<>();
+			if (process != null) descendants.addAll(process.descendants().toList());
+			resolveAlive(preservedDescendants).forEach(descendants::add);
 			descendants.forEach(ProcessHandle::destroy);
-			process.destroy();
+			if (process != null && process.isAlive()) process.destroy();
 			interrupted |= awaitExit(process, List.copyOf(descendants), exitTimeoutMs);
-			descendants.addAll(process.descendants().toList());
+			if (process != null) descendants.addAll(process.descendants().toList());
+			resolveAlive(preservedDescendants).forEach(descendants::add);
 			descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
-			if (process.isAlive()) process.destroyForcibly();
+			if (process != null && process.isAlive()) process.destroyForcibly();
 			interrupted |= awaitExit(process, List.copyOf(descendants), exitTimeoutMs);
-			if (process.isAlive() || descendants.stream().anyMatch(ProcessHandle::isAlive)) {
+			if ((process != null && process.isAlive()) || descendants.stream().anyMatch(ProcessHandle::isAlive)) {
 				throw new IllegalStateException("Owned coordinator process tree is still alive after termination");
 			}
 		} finally {
@@ -370,10 +466,15 @@ final class CoordinatorProcessOwnership {
 		}
 	}
 
+	private static List<ProcessHandle> resolveAlive(List<ProcessIdentity> identities) {
+		return identities.stream().map(ProcessIdentity::resolve).flatMap(Optional::stream).toList();
+	}
+
 	private static boolean awaitExit(ProcessHandle process, List<ProcessHandle> descendants, long timeoutMs) {
 		boolean interrupted = false;
 		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
-		while ((process.isAlive() || descendants.stream().anyMatch(ProcessHandle::isAlive)) && System.nanoTime() < deadline) {
+		while (((process != null && process.isAlive()) || descendants.stream().anyMatch(ProcessHandle::isAlive))
+				&& System.nanoTime() < deadline) {
 			try {
 				Thread.sleep(10L);
 			} catch (InterruptedException interruption) {
@@ -393,7 +494,45 @@ final class CoordinatorProcessOwnership {
 			long ownerStartedAtEpochMs,
 			long startedAtEpochMs,
 			String generationId,
-			String launchId
+			String launchId,
+			List<ProcessIdentity> descendants
 	) {
+		private Ownership withDescendants(List<ProcessIdentity> tracked) {
+			return new Ownership(
+					pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId, List.copyOf(tracked)
+			);
+		}
+	}
+
+	record ProcessIdentity(long pid, long startedAtEpochMs) {
+		ProcessIdentity {
+			if (pid <= 0L || startedAtEpochMs <= 0L) {
+				throw new IllegalArgumentException("coordinator descendant identity is invalid");
+			}
+		}
+
+		static Optional<ProcessIdentity> from(ProcessHandle process) {
+			if (!process.isAlive()) return Optional.empty();
+			return process.info().startInstant()
+					.map(start -> new ProcessIdentity(process.pid(), start.toEpochMilli()));
+		}
+
+		static ProcessIdentity parse(String serialized) {
+			String[] values = serialized.split(":", -1);
+			if (values.length != 2) throw new IllegalArgumentException("coordinator descendant identity is invalid");
+			return new ProcessIdentity(Long.parseLong(values[0]), Long.parseLong(values[1]));
+		}
+
+		String serialized() {
+			return pid + ":" + startedAtEpochMs;
+		}
+
+		Optional<ProcessHandle> resolve() {
+			return ProcessHandle.of(pid).filter(process -> process.isAlive() && sameStart(process, startedAtEpochMs));
+		}
+
+		boolean isAlive() {
+			return resolve().isPresent();
+		}
 	}
 }
