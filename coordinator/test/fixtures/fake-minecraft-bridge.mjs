@@ -260,6 +260,10 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	#world;
 	#reconnectTimer = null;
 	#actionResults = [];
+	#connectionEpoch = 0;
+	#deferredActionResults = new Map();
+	#replayedActionIds = new Set();
+	#activePhysicalActions = 0;
 
 	sent = [];
 	states = [];
@@ -271,6 +275,9 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	recoveryDispatches = 0;
 	completionEvaluations = [];
 	goalControls = [];
+	actionEffects = [];
+	staleActionReplays = [];
+	maxConcurrentPhysicalActions = 0;
 
 	constructor(scenario = {}) {
 		super();
@@ -301,6 +308,10 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	get inventory() { return new Map(this.#world.inventory); }
 	get world() { return structuredClone({ ...this.#world, inventory: Object.fromEntries(this.#world.inventory) }); }
 	get goalSpec() { return this.#record.goalSpec === undefined ? null : structuredClone(this.#record.goalSpec); }
+	get connectionEpoch() { return this.#connectionEpoch; }
+	get actionDispatches() { return this.sent.filter(({ type }) => type === 'action_command').map((entry) => structuredClone(entry)); }
+	get staleActionEffectCount() { return this.actionEffects.filter(({ actionId }) => this.#replayedActionIds.has(actionId)).length; }
+	get deferredActionCount() { return this.#deferredActionResults.size; }
 
 	start() {
 		this.#stopped = false;
@@ -316,6 +327,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 
 	ready({ revision = this.#record.goalRevision, state = 'IDLE' } = {}) {
 		this.#connected = true;
+		this.#connectionEpoch += 1;
 		this.#record.goalRevision = revision;
 		const profile = {
 			schemaVersion: 1,
@@ -333,7 +345,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			createdAtEpochMs: 1,
 			updatedAtEpochMs: 1,
 		};
-		this.emit('ready', { serverInstanceId: this.#serverInstanceId, registry: [profile] });
+		this.emit('ready', { connectionEpoch: this.#connectionEpoch, serverInstanceId: this.#serverInstanceId, registry: [profile] });
 	}
 
 	startGoal(goal = this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe', revision = 1) {
@@ -364,7 +376,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		});
 		validateProtocolV2Envelope(envelope, { direction: 'coordinator_to_server' });
 		this.validatedOutbound += 1;
-		this.sent.push({ type, agentId, payload: envelope.payload });
+		this.sent.push({ type, agentId, payload: envelope.payload, connectionEpoch: this.#connectionEpoch });
 		if (type === 'planning_state') this.states.push(envelope.payload.state);
 		if (type === 'agent_error') this.recoveries.push(envelope.payload.code);
 		if (type === 'agent_error' && this.#scenario.unsupportedProfile) {
@@ -380,7 +392,10 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 				finally { this.recoveryHandles = Math.max(0, this.recoveryHandles - 1); }
 			});
 		}
-		if (type === 'action_command') queueMicrotask(() => { void this.#executeAction(envelope.payload); });
+		if (type === 'action_command') {
+			const dispatchEpoch = this.#connectionEpoch;
+			queueMicrotask(() => { void this.#executeAction(envelope.payload, dispatchEpoch); });
+		}
 		if (type === 'goal_completed') queueMicrotask(() => { void this.#completeGoal(envelope.payload); });
 		if (type === 'action_cancel') this.recoveries.push('ACTION_CANCELLED');
 	}
@@ -410,6 +425,22 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		});
 	}
 
+	releaseDeferredActionResults() {
+		const deferred = [...this.#deferredActionResults.values()];
+		this.#deferredActionResults.clear();
+		for (const entry of deferred) {
+			this.#replayedActionIds.add(entry.result.actionId);
+			this.staleActionReplays.push({
+				actionId: entry.result.actionId,
+				originConnectionEpoch: entry.connectionEpoch,
+				replayConnectionEpoch: this.#connectionEpoch,
+				goalRevision: entry.result.goalRevision,
+			});
+			this.#emitInbound('action_result', entry.result);
+		}
+		return deferred.length;
+	}
+
 	#emitGoalControl(operation, revision, extra = {}) {
 		this.#record.goalRevision = revision;
 		const control = {
@@ -420,13 +451,19 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		this.emit('goal_control', control);
 	}
 
-	async #executeAction(command) {
+	async #executeAction(command, connectionEpoch) {
 		if (!this.#connected || this.#stopped) return;
 		this.#actionNumber += 1;
 		const actionFault = this.#scenario.actionResults?.[this.#actionNumber - 1] ?? 'SUCCEEDED';
 		const actionType = command.actionType;
 		const succeeded = actionFault === 'SUCCEEDED';
-		if (succeeded) this.#applySuccessfulAction(command);
+		const disconnectOutstanding = this.#scenario.disconnectWhileActionOutstandingAtAction === this.#actionNumber;
+		if (succeeded && !disconnectOutstanding) {
+			this.#activePhysicalActions += 1;
+			this.maxConcurrentPhysicalActions = Math.max(this.maxConcurrentPhysicalActions, this.#activePhysicalActions);
+			try { this.#applySuccessfulAction(command, connectionEpoch); }
+			finally { this.#activePhysicalActions -= 1; }
+		}
 		const respawned = succeeded && actionType === 'respawn';
 		const died = this.#scenario.dieAtAction === this.#actionNumber;
 		if (died) {
@@ -462,6 +499,11 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			elapsedMs: 1,
 			observedAtEpochMs: this.#eventSequence,
 		});
+		if (disconnectOutstanding) {
+			this.#deferredActionResults.set(command.actionId, { command, result, connectionEpoch });
+			this.#disconnectAndResume();
+			return;
+		}
 		this.#emitInbound('action_result', result);
 		if (respawned) this.#emitGoalControl('respawn', this.#record.goalRevision, { resumeGoal: true });
 		if (died) this.#emitGoalControl('dead', this.#record.goalRevision, { death: {
@@ -510,7 +552,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		});
 	}
 
-	#applySuccessfulAction(command) {
+	#applySuccessfulAction(command, connectionEpoch) {
 		const actionType = command.actionType;
 		const args = command.arguments ?? {};
 		if (actionType === 'break_block' || actionType === 'mine') {
@@ -540,6 +582,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			this.#world.dead = false;
 			this.#world.health = 20;
 		}
+		this.actionEffects.push({ actionId: command.actionId, actionType, goalRevision: command.goalRevision, connectionEpoch });
 	}
 
 	#evaluateGoalPredicate(predicate) {
@@ -595,7 +638,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	#disconnectAndResume() {
 		this.#connected = false;
 		this.recoveries.push('BRIDGE_DISCONNECTED');
-		this.emit('disconnected');
+		this.emit('disconnected', { connectionEpoch: this.#connectionEpoch });
 		if (this.#stopped) return;
 		const reconnect = { cancelled: false };
 		this.#reconnectTimer = reconnect;
