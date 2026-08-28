@@ -312,17 +312,27 @@ test('existing-session create cannot publish after a newer replacement generatio
 	let createAttempt = 0;
 	let releaseStaleCreate;
 	let staleDisposals = 0;
+	let displacedDisposals = 0;
+	let finalDisposals = 0;
+	let replacementGeneration = 2;
 	services.codex.createAgent = async () => {
 		createAttempt += 1;
 		if (createAttempt === 1) return (current = mutationAgent(1));
 		return new Promise((resolve) => {
+			let released = false;
 			releaseStaleCreate = () => {
+				if (released) return;
+				released = true;
 				current = mutationAgent(2, () => { staleDisposals += 1; });
 				resolve(current);
 			};
 		});
 	};
-	services.codex.replaceAgent = async () => (current = mutationAgent(3));
+	services.codex.replaceAgent = async () => {
+		replacementGeneration += 1;
+		current = mutationAgent(replacementGeneration, replacementGeneration === 3 ? () => { displacedDisposals += 1; } : () => { finalDisposals += 1; });
+		return current;
+	};
 	services.codex.getAgent = (agentId) => current?.agentId === agentId ? current : null;
 	services.codex.removeAgent = async (agentId) => {
 		if (current?.agentId !== agentId) return false;
@@ -330,6 +340,11 @@ test('existing-session create cannot publish after a newer replacement generatio
 		current = null;
 		await removed.dispose();
 		return true;
+	};
+	services.codex.stop = async () => {
+		const owned = current;
+		current = null;
+		await owned?.dispose();
 	};
 	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
 	try {
@@ -344,11 +359,60 @@ test('existing-session create cannot publish after a newer replacement generatio
 		assert.equal(generationThree.sessionGeneration, 3);
 		assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'live', 'successful replacement clears the older session-mutation timeout');
 		releaseStaleCreate();
-		await flush();
-		assert.equal(router.getAgent(PROFILE.agentId), generationThree, 'late generation two cannot overwrite accepted generation three');
+		await eventually(() => router.getAgent(PROFILE.agentId)?.sessionGeneration === 4);
+		const repaired = router.getAgent(PROFILE.agentId);
+		assert.equal(current, repaired, 'backend and wrapper converge on the exact repaired session');
+		assert.equal(repaired.sessionGeneration, 4, 'physical repair advances monotonically beyond the displaced accepted generation');
 		assert.equal(staleDisposals, 1, 'the stale produced session is disposed exactly once');
+		assert.equal(displacedDisposals, 1, 'the displaced accepted generation is disposed after repair');
 	} finally {
 		releaseStaleCreate?.();
+		await router.stop();
+	}
+	assert.equal(current, null);
+	assert.equal(finalDisposals, 1, 'provider stop disposes the final repaired current session');
+});
+
+test('empty reconciliation fences a pending initial create and cleans its late session', async () => {
+	const services = providerServices();
+	let current = null;
+	let releaseCreate;
+	let disposals = 0;
+	services.codex.createAgent = async () => new Promise((resolve) => {
+		let released = false;
+		releaseCreate = () => {
+			if (released) return;
+			released = true;
+			current = mutationAgent(1, () => { disposals += 1; });
+			resolve(current);
+		};
+	});
+	services.codex.getAgent = (agentId) => current?.agentId === agentId ? current : null;
+	services.codex.removeAgent = async (agentId) => {
+		if (current?.agentId !== agentId) return false;
+		const removed = current;
+		current = null;
+		await removed.dispose();
+		return true;
+	};
+	services.codex.reconcile = async (records) => ({ valid: records, invalid: [], removed: [], catalog: catalog('codex', PROFILE.model) });
+	const router = new ProviderService(services, { operationTimeoutMs: 100 });
+	try {
+		const create = router.createAgent(PROFILE);
+		const createRejected = assert.rejects(create, (error) => error?.code === 'STALE_PROVIDER_OUTCOME');
+		await flush();
+		const reconcile = router.reconcile([]);
+		await flush();
+		releaseCreate();
+		await createRejected;
+		const result = await reconcile;
+		assert.deepEqual(result.valid, []);
+		assert.equal(router.getAgent(PROFILE.agentId), null);
+		assert.equal(current, null);
+		assert.equal(disposals, 1);
+		assert.notEqual(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'degraded', 'stale physical creation cannot latch provider health');
+	} finally {
+		releaseCreate?.();
 		await router.stop();
 	}
 });
@@ -361,7 +425,10 @@ test('remove waits for a timed-out create and stale production cannot undo termi
 	let staleDisposals = 0;
 	let physicalRemovals = 0;
 	services.codex.createAgent = async () => new Promise((resolve) => {
+		let released = false;
 		releaseStaleCreate = () => {
+			if (released) return;
+			released = true;
 			current = mutationAgent(1, () => { staleDisposals += 1; });
 			resolve(current);
 		};
@@ -405,7 +472,10 @@ test('remove waits for a timed-out replacement and late replacement cannot recre
 	let staleDisposals = 0;
 	services.codex.createAgent = async () => (current = mutationAgent(1));
 	services.codex.replaceAgent = async () => new Promise((resolve) => {
+		let released = false;
 		releaseStaleReplace = () => {
+			if (released) return;
+			released = true;
 			current = mutationAgent(2, () => { staleDisposals += 1; });
 			resolve(current);
 		};

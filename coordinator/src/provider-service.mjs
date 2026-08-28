@@ -22,6 +22,7 @@ export class ProviderService extends EventEmitter {
 	#creating = new Map();
 	#replacing = new Map();
 	#removing = new Map();
+	#repairing = new Map();
 	#reconcilingAgents = new Map();
 	#starting = new Map();
 	#startedProviders = new Set();
@@ -111,6 +112,7 @@ export class ProviderService extends EventEmitter {
 		this.#creating.clear();
 		this.#replacing.clear();
 		this.#removing.clear();
+		this.#repairing.clear();
 		this.#reconcilingAgents.clear();
 		this.#starting.clear();
 		this.#startedProviders.clear();
@@ -137,6 +139,12 @@ export class ProviderService extends EventEmitter {
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		this.#assertActive(lifecycleGeneration);
 		const profile = freezeProfile(profileValue);
+		const repairing = this.#repairing.get(profile.agentId);
+		if (repairing !== undefined) {
+			await repairing.promise;
+			this.#assertActive(lifecycleGeneration);
+			return this.createAgent(profile, options);
+		}
 		const reconciling = this.#reconcilingAgents.get(profile.agentId);
 		if (reconciling !== undefined) {
 			await reconciling.promise;
@@ -169,11 +177,11 @@ export class ProviderService extends EventEmitter {
 				recordSuccess: false,
 				outcomeIdentity: profileIdentity(profile),
 				acceptResult: () => this.#acceptsAgentMutation(mutation),
-				onStaleResult: (result) => this.#disposeStaleAgent(profile.provider, profile.agentId, result),
+				onStaleResult: (result) => this.#disposeStaleAgent(profile.provider, profile.agentId, result, mutation),
 			});
 			this.#assertActive(lifecycleGeneration);
 			if (!this.#acceptsAgentMutation(mutation)) {
-				await this.#disposeStaleAgent(profile.provider, profile.agentId, agent);
+				await this.#disposeStaleAgent(profile.provider, profile.agentId, agent, mutation);
 				throw providerError('STALE_PROVIDER_OUTCOME', 'Agent creation was superseded by a newer session mutation');
 			}
 			this.#assignments.set(profile.agentId, existing ?? profile);
@@ -194,6 +202,12 @@ export class ProviderService extends EventEmitter {
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		this.#assertActive(lifecycleGeneration);
 		const profile = freezeProfile(profileValue);
+		const repairing = this.#repairing.get(profile.agentId);
+		if (repairing !== undefined) {
+			await repairing.promise;
+			this.#assertActive(lifecycleGeneration);
+			return this.replaceAgent(profile, options);
+		}
 		const reconciling = this.#reconcilingAgents.get(profile.agentId);
 		if (reconciling !== undefined) {
 			await reconciling.promise;
@@ -234,11 +248,11 @@ export class ProviderService extends EventEmitter {
 				recordSuccess: false,
 				outcomeIdentity: profileIdentity(profile),
 				acceptResult: () => this.#acceptsAgentMutation(mutation),
-				onStaleResult: (result) => this.#disposeStaleAgent(profile.provider, profile.agentId, result),
+				onStaleResult: (result) => this.#disposeStaleAgent(profile.provider, profile.agentId, result, mutation),
 			});
 			this.#assertActive(lifecycleGeneration);
 			if (!this.#acceptsAgentMutation(mutation)) {
-				await this.#disposeStaleAgent(profile.provider, profile.agentId, agent);
+				await this.#disposeStaleAgent(profile.provider, profile.agentId, agent, mutation);
 				throw providerError('STALE_PROVIDER_OUTCOME', 'Agent replacement was superseded by a newer session mutation');
 			}
 			this.#assignments.set(profile.agentId, profile);
@@ -246,7 +260,7 @@ export class ProviderService extends EventEmitter {
 			this.#recordSessionMutationLive(profile.provider);
 			return agent;
 		})();
-		const entry = { profile, promise };
+		const entry = { profile, promise, get mutation() { return mutation; } };
 		this.#replacing.set(profile.agentId, entry);
 		try { return await promise; }
 		finally { if (this.#replacing.get(profile.agentId) === entry) this.#replacing.delete(profile.agentId); }
@@ -258,6 +272,11 @@ export class ProviderService extends EventEmitter {
 	}
 
 	async removeAgent(agentId) {
+		const repairing = this.#repairing.get(agentId);
+		if (repairing !== undefined) {
+			await repairing.promise;
+			return this.removeAgent(agentId);
+		}
 		const reconciling = this.#reconcilingAgents.get(agentId);
 		if (reconciling !== undefined) {
 			await reconciling.promise;
@@ -299,7 +318,7 @@ export class ProviderService extends EventEmitter {
 			else for (const provider of this.#startedProviders) this.#recordSessionMutationLive(provider);
 			return Boolean(removed || hadOwnedSession);
 		})();
-		const entry = { promise };
+		const entry = { promise, get mutation() { return mutation; } };
 		this.#removing.set(agentId, entry);
 		try { return await promise; }
 		finally { if (this.#removing.get(agentId) === entry) this.#removing.delete(agentId); }
@@ -323,10 +342,18 @@ export class ProviderService extends EventEmitter {
 			if (!groups.has(provider)) throw new TypeError(`${provider} service is unavailable`);
 			groups.get(provider).push({ ...record, provider });
 		}
-		const affectedAgentIds = new Set([...this.#assignments.keys(), ...records.map((record) => record?.agentId).filter((agentId) => agentId !== undefined)]);
+		const affectedAgentIds = new Set([
+			...this.#assignments.keys(),
+			...this.#creating.keys(),
+			...this.#replacing.keys(),
+			...this.#removing.keys(),
+			...this.#repairing.keys(),
+			...this.#agentMutationTokens.keys(),
+			...records.map((record) => record?.agentId).filter((agentId) => agentId !== undefined),
+		]);
 		const blockers = new Set();
 		for (const agentId of affectedAgentIds) {
-			for (const entries of [this.#creating, this.#replacing, this.#removing]) {
+			for (const entries of [this.#creating, this.#replacing, this.#removing, this.#repairing]) {
 				const entry = entries.get(agentId);
 				if (entry !== undefined) blockers.add(entry.promise);
 			}
@@ -334,9 +361,10 @@ export class ProviderService extends EventEmitter {
 		let releaseAgentFence;
 		agentFence = { promise: new Promise((resolve) => { releaseAgentFence = resolve; }), release: releaseAgentFence };
 		for (const agentId of affectedAgentIds) this.#reconcilingAgents.set(agentId, agentFence);
+		mutationTokens = [...affectedAgentIds].map((agentId) => this.#beginAgentMutation(agentId, lifecycleGeneration));
 		await Promise.allSettled([...blockers]);
 		this.#assertReconciliationCurrent(reconciliationGeneration, lifecycleGeneration);
-		mutationTokens = [...affectedAgentIds].map((agentId) => this.#beginAgentMutation(agentId, lifecycleGeneration));
+		if (mutationTokens.some((token) => !this.#acceptsAgentMutation(token))) throw providerError('STALE_RECONCILIATION', 'Provider reconciliation session mutations were superseded');
 		const assignedProviders = new Set([...this.#assignments.values()].map(({ provider }) => provider));
 		const selectedProviders = availableProviders.filter((provider) => groups.get(provider).length > 0 || assignedProviders.has(provider));
 		const settled = await Promise.all(selectedProviders.map(async (provider) => {
@@ -487,18 +515,108 @@ export class ProviderService extends EventEmitter {
 			&& this.#agentMutationTokens.get(token.agentId) === token;
 	}
 
-	async #disposeStaleAgent(provider, agentId, agent) {
+	async #disposeStaleAgent(provider, agentId, agent, staleMutation) {
+		await this.#discardPhysicalAgent(provider, agentId, agent);
+		const owner = this.#newerAgentOwnerPromise(agentId, staleMutation);
+		if (owner !== null) {
+			void Promise.resolve(owner).catch(() => {}).then(() => this.#repairPhysicalInvariant(provider, agentId)).catch(() => {});
+			return;
+		}
+		await this.#repairPhysicalInvariant(provider, agentId);
+	}
+
+	#newerAgentOwnerPromise(agentId, staleMutation) {
+		const reconciliation = this.#reconcilingAgents.get(agentId);
+		if (reconciliation !== undefined) return reconciliation.promise;
+		const repair = this.#repairing.get(agentId);
+		if (repair !== undefined) return repair.promise;
+		for (const owners of [this.#creating, this.#replacing, this.#removing]) {
+			const owner = owners.get(agentId);
+			if (owner !== undefined && owner.mutation !== staleMutation) return owner.promise;
+		}
+		return null;
+	}
+
+	async #repairPhysicalInvariant(provider, agentId) {
+		if (this.#stopped) return null;
+		const existing = this.#repairing.get(agentId);
+		if (existing !== undefined) return existing.promise;
+		const lifecycleGeneration = this.#lifecycleGeneration;
+		const mutation = this.#beginAgentMutation(agentId, lifecycleGeneration);
+		const promise = this.#repairPhysicalInvariantOnce(provider, agentId, mutation, lifecycleGeneration)
+			.catch(() => null);
+		const entry = { mutation, promise };
+		this.#repairing.set(agentId, entry);
+		try { return await promise; }
+		finally { if (this.#repairing.get(agentId) === entry) this.#repairing.delete(agentId); }
+	}
+
+	async #repairPhysicalInvariantOnce(provider, agentId, mutation, lifecycleGeneration) {
+		const service = this.#services.get(provider);
+		if (service === undefined) return null;
+		this.#assertActive(lifecycleGeneration);
+		const profile = this.#assignments.get(agentId);
+		const accepted = this.#acceptedAgents.get(agentId);
+		let backend = service.getAgent?.(agentId) ?? null;
+		if (profile === undefined || accepted === undefined) {
+			this.#assignments.delete(agentId);
+			this.#acceptedAgents.delete(agentId);
+			if (backend !== null) await this.#discardPhysicalAgent(provider, agentId, backend);
+			return null;
+		}
+		if (backend === accepted) return accepted;
+		try {
+			const repaired = await this.#execute(provider, () => service.replaceAgent(profile, this.#creationOptions({
+				...(Number.isSafeInteger(backend?.sessionGeneration) ? { expectedSessionGeneration: backend.sessionGeneration } : {}),
+			})), 'replace', {
+				recordSuccess: false,
+				outcomeIdentity: profileIdentity(profile),
+				acceptResult: () => this.#acceptsAgentMutation(mutation),
+				onStaleResult: (result) => this.#discardPhysicalAgent(provider, agentId, result),
+			});
+			this.#assertActive(lifecycleGeneration);
+			if (!this.#acceptsAgentMutation(mutation)) {
+				await this.#discardPhysicalAgent(provider, agentId, repaired);
+				return null;
+			}
+			backend = service.getAgent?.(agentId) ?? repaired;
+			if (backend !== repaired) {
+				await this.#discardPhysicalAgent(provider, agentId, repaired);
+				throw providerError('PROVIDER_SESSION_DIVERGED', 'Provider repair did not install its produced session');
+			}
+			this.#acceptedAgents.set(agentId, repaired);
+			this.#assignments.set(agentId, profile);
+			if (accepted !== repaired) await this.#disposeDetachedAgent(provider, accepted);
+			this.#recordSessionMutationLive(provider);
+			return repaired;
+		} catch {
+			if (!this.#acceptsAgentMutation(mutation)) return null;
+			backend = service.getAgent?.(agentId) ?? null;
+			if (backend === accepted) return accepted;
+			this.#assignments.delete(agentId);
+			this.#acceptedAgents.delete(agentId);
+			if (backend !== null) await this.#discardPhysicalAgent(provider, agentId, backend);
+			await this.#disposeDetachedAgent(provider, accepted);
+			return null;
+		}
+	}
+
+	async #discardPhysicalAgent(provider, agentId, agent) {
 		if (agent === null || typeof agent !== 'object') return;
 		const service = this.#services.get(provider);
 		const cleanup = Promise.resolve().then(async () => {
-			if (service?.getAgent?.(agentId) === agent && typeof service.removeAgent === 'function') {
-				await service.removeAgent(agentId);
-				return;
-			}
-			await agent.dispose?.();
+			if (service?.getAgent?.(agentId) === agent && typeof service.removeAgent === 'function') await service.removeAgent(agentId);
+			else await agent.dispose?.();
 		});
 		try { await withTimeout(cleanup, this.#operationTimeoutMs, this.#scheduleTimeout, this.#cancelTimeout, provider); }
-		catch { /* stale sessions never regain publication authority because cleanup failed */ }
+		catch { /* exact stale cleanup is bounded and cannot regain authority */ }
+	}
+
+	async #disposeDetachedAgent(provider, agent) {
+		if (agent === null || typeof agent !== 'object') return;
+		const cleanup = Promise.resolve().then(() => agent.dispose?.());
+		try { await withTimeout(cleanup, this.#operationTimeoutMs, this.#scheduleTimeout, this.#cancelTimeout, provider); }
+		catch { /* detached accepted sessions cannot block repair convergence */ }
 	}
 
 	#recordSessionMutationLive(provider) {
