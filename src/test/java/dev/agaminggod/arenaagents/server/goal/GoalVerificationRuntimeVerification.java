@@ -27,6 +27,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyDimensionBinding();
 		assertions += verifyBlockAdvancementAndCompoundPredicates();
 		assertions += verifyAgentSpecificKillAttribution();
+		assertions += verifyDistinctRepeatedKillAttribution();
 		assertions += verifyKillGoalAfterServerTickReset();
 		assertions += verifyIndexedKillLookup();
 		assertions += verifyVerifierFailureIsolationAndRetry();
@@ -107,6 +108,33 @@ public final class GoalVerificationRuntimeVerification {
 		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", goalCreated + 1L);
 		assertEquals(true, fixture.runtime.evaluate(fixture.agentId).verified(), "responsible agent kill after goal start satisfies attribution");
 		assertEquals(1, fixture.runtime.tick().size(), "attributed kill completes once");
+		return 3;
+	}
+
+	private static int verifyDistinctRepeatedKillAttribution() {
+		GoalPredicate repeatedKills = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)
+		));
+		Fixture fixture = fixture(repeatedKills, 450L);
+		long goalCreated = fixture.record().currentGoal().orElseThrow().createdAtEpochMs();
+		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:zombie", goalCreated + 1L);
+		assertEquals(false, fixture.runtime.evaluate(fixture.agentId).verified(),
+				"one kill cannot satisfy two repeated kill requirements");
+		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:zombie", goalCreated + 2L);
+		assertEquals(true, fixture.runtime.evaluate(fixture.agentId).verified(),
+				"two distinct kills satisfy two repeated kill requirements");
+
+		GoalPredicate alternatives = new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)
+		));
+		Fixture alternativeFixture = fixture(alternatives, 451L);
+		long alternativeStart = alternativeFixture.record().currentGoal().orElseThrow().createdAtEpochMs();
+		alternativeFixture.runtime.killLedger().record(
+				alternativeFixture.agentId, "minecraft:zombie", alternativeStart + 1L);
+		assertEquals(true, alternativeFixture.runtime.evaluate(alternativeFixture.agentId).verified(),
+				"alternative kill branches share the same single-event requirement");
 		return 3;
 	}
 

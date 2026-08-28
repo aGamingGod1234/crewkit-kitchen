@@ -44,7 +44,7 @@ public final class GoalCompletionVerifier {
 		Evaluation evaluation = evaluate(
 				goal.goalId(), goal.spec().completion(), "root", facts,
 				killLedger == null ? new AgentKillLedger() : killLedger,
-				record, serverTick, operatorConfirmed, new Counter()
+				record, serverTick, operatorConfirmed, new Counter(), new KillAllocation()
 		);
 		return new VerificationResult(
 				evaluation.satisfied(), record.goalRevision(),
@@ -119,13 +119,15 @@ public final class GoalCompletionVerifier {
 			AgentRecord record,
 			long tick,
 			boolean operatorConfirmed,
-			Counter counter
+			Counter counter,
+			KillAllocation killAllocation
 	) {
 		if (predicate instanceof GoalPredicate.AllOf all) {
 			boolean satisfied = true;
 			ArrayList<GoalEvidence.Fact> facts = new ArrayList<>();
 			for (int index = 0; index < all.predicates().size(); index++) {
-				Evaluation child = evaluate(goalId, all.predicates().get(index), path + "." + index, source, kills, record, tick, operatorConfirmed, counter);
+				Evaluation child = evaluate(goalId, all.predicates().get(index), path + "." + index, source, kills,
+						record, tick, operatorConfirmed, counter, killAllocation);
 				satisfied &= child.satisfied();
 				facts.addAll(child.facts());
 			}
@@ -134,11 +136,17 @@ public final class GoalCompletionVerifier {
 		if (predicate instanceof GoalPredicate.AnyOf any) {
 			boolean satisfied = false;
 			ArrayList<GoalEvidence.Fact> facts = new ArrayList<>();
+			KillAllocation baseAllocation = killAllocation.copy();
+			KillAllocation selectedAllocation = null;
 			for (int index = 0; index < any.predicates().size(); index++) {
-				Evaluation child = evaluate(goalId, any.predicates().get(index), path + "." + index, source, kills, record, tick, operatorConfirmed, counter);
+				KillAllocation branchAllocation = baseAllocation.copy();
+				Evaluation child = evaluate(goalId, any.predicates().get(index), path + "." + index, source, kills,
+						record, tick, operatorConfirmed, counter, branchAllocation);
+				if (!satisfied && child.satisfied()) selectedAllocation = branchAllocation;
 				satisfied |= child.satisfied();
 				facts.addAll(child.facts());
 			}
+			if (selectedAllocation != null) killAllocation.replaceWith(selectedAllocation);
 			return new Evaluation(satisfied, facts);
 		}
 		if (counter.next() > 16) throw new IllegalStateException("Goal predicate leaf limit was not enforced");
@@ -174,8 +182,10 @@ public final class GoalCompletionVerifier {
 		}
 		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
 			long afterTime = killed.afterGoalStart() ? record.currentGoal().orElseThrow().createdAtEpochMs() : Long.MIN_VALUE;
+			int required = killAllocation.claim(new KillRequirement(killed.entityType(), afterTime));
 			int observed = kills.count(record.agentId(), killed.entityType(), afterTime);
-			return leaf("entity_killed_by_agent", observed > 0, killed.entityType() + " x1", killed.entityType() + " x" + observed);
+			return leaf("entity_killed_by_agent", observed >= required,
+					killed.entityType() + " x" + required, killed.entityType() + " x" + observed);
 		}
 		if (predicate instanceof GoalPredicate.BlockMatches block) {
 			if (!block.dimensionId().equals(source.dimensionId())) {
@@ -278,6 +288,25 @@ public final class GoalCompletionVerifier {
 	private record PredicateKey(UUID goalId, String path) { }
 	private record PositionCounter(int ticks, long lastTick) { }
 	private record SurvivalCounter(long ticks, long lastTick) { }
+	private record KillRequirement(String entityType, long afterTime) { }
 	private record Evaluation(boolean satisfied, List<GoalEvidence.Fact> facts) { }
 	private static final class Counter { private int value; int next() { return ++value; } }
+	private static final class KillAllocation {
+		private final Map<KillRequirement, Integer> required = new HashMap<>();
+
+		private KillAllocation copy() {
+			KillAllocation copy = new KillAllocation();
+			copy.required.putAll(required);
+			return copy;
+		}
+
+		private int claim(KillRequirement requirement) {
+			return required.merge(requirement, 1, Math::addExact);
+		}
+
+		private void replaceWith(KillAllocation selected) {
+			required.clear();
+			required.putAll(selected.required);
+		}
+	}
 }
