@@ -305,6 +305,200 @@ async function assertNonAutomaticOutcomeFence({ operation, settlement }) {
 	}
 }
 
+test('existing-session create cannot publish after a newer replacement generation', async () => {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	let current = null;
+	let createAttempt = 0;
+	let releaseStaleCreate;
+	let staleDisposals = 0;
+	services.codex.createAgent = async () => {
+		createAttempt += 1;
+		if (createAttempt === 1) return (current = mutationAgent(1));
+		return new Promise((resolve) => {
+			releaseStaleCreate = () => {
+				current = mutationAgent(2, () => { staleDisposals += 1; });
+				resolve(current);
+			};
+		});
+	};
+	services.codex.replaceAgent = async () => (current = mutationAgent(3));
+	services.codex.getAgent = (agentId) => current?.agentId === agentId ? current : null;
+	services.codex.removeAgent = async (agentId) => {
+		if (current?.agentId !== agentId) return false;
+		const removed = current;
+		current = null;
+		await removed.dispose();
+		return true;
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		await router.createAgent(PROFILE);
+		const staleCreate = router.createAgent(PROFILE);
+		const staleRejected = assert.rejects(staleCreate, (error) => error?.code === 'PROVIDER_TIMEOUT');
+		const replacement = router.replaceAgent(PROFILE);
+		await flush();
+		await timers.runNext();
+		await staleRejected;
+		const generationThree = await replacement;
+		assert.equal(generationThree.sessionGeneration, 3);
+		assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'live', 'successful replacement clears the older session-mutation timeout');
+		releaseStaleCreate();
+		await flush();
+		assert.equal(router.getAgent(PROFILE.agentId), generationThree, 'late generation two cannot overwrite accepted generation three');
+		assert.equal(staleDisposals, 1, 'the stale produced session is disposed exactly once');
+	} finally {
+		releaseStaleCreate?.();
+		await router.stop();
+	}
+});
+
+test('remove waits for a timed-out create and stale production cannot undo terminal cleanup', async () => {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	let current = null;
+	let releaseStaleCreate;
+	let staleDisposals = 0;
+	let physicalRemovals = 0;
+	services.codex.createAgent = async () => new Promise((resolve) => {
+		releaseStaleCreate = () => {
+			current = mutationAgent(1, () => { staleDisposals += 1; });
+			resolve(current);
+		};
+	});
+	services.codex.getAgent = (agentId) => current?.agentId === agentId ? current : null;
+	services.codex.removeAgent = async (agentId) => {
+		physicalRemovals += 1;
+		if (current?.agentId !== agentId) return false;
+		const removed = current;
+		current = null;
+		await removed.dispose();
+		return true;
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		const create = router.createAgent(PROFILE);
+		const createRejected = assert.rejects(create, (error) => error?.code === 'PROVIDER_TIMEOUT');
+		const remove = router.removeAgent(PROFILE.agentId);
+		await flush();
+		await timers.runNext();
+		await createRejected;
+		assert.equal(await remove, true, 'cleanup of an owned pending creation is idempotent success');
+		assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'live');
+		assert.equal(physicalRemovals, 1);
+		releaseStaleCreate();
+		await flush();
+		assert.equal(router.getAgent(PROFILE.agentId), null);
+		assert.equal(staleDisposals, 1);
+		assert.equal(physicalRemovals, 2, 'late physical production receives one exact stale-session cleanup');
+	} finally {
+		releaseStaleCreate?.();
+		await router.stop();
+	}
+});
+
+test('remove waits for a timed-out replacement and late replacement cannot recreate the session', async () => {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	let current = null;
+	let releaseStaleReplace;
+	let staleDisposals = 0;
+	services.codex.createAgent = async () => (current = mutationAgent(1));
+	services.codex.replaceAgent = async () => new Promise((resolve) => {
+		releaseStaleReplace = () => {
+			current = mutationAgent(2, () => { staleDisposals += 1; });
+			resolve(current);
+		};
+	});
+	services.codex.getAgent = (agentId) => current?.agentId === agentId ? current : null;
+	services.codex.removeAgent = async (agentId) => {
+		if (current?.agentId !== agentId) return false;
+		const removed = current;
+		current = null;
+		await removed.dispose();
+		return true;
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		await router.createAgent(PROFILE);
+		const replace = router.replaceAgent(PROFILE);
+		const replaceRejected = assert.rejects(replace, (error) => error?.code === 'PROVIDER_TIMEOUT');
+		const remove = router.removeAgent(PROFILE.agentId);
+		await flush();
+		await timers.runNext();
+		await replaceRejected;
+		assert.equal(await remove, true);
+		assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'live');
+		releaseStaleReplace();
+		await flush();
+		assert.equal(router.getAgent(PROFILE.agentId), null);
+		assert.equal(staleDisposals, 1);
+	} finally {
+		releaseStaleReplace?.();
+		await router.stop();
+	}
+});
+
+test('concurrent removal coalesces one physical cleanup and a new create runs afterward', async () => {
+	const services = providerServices();
+	const events = [];
+	let current = null;
+	let generation = 0;
+	let releaseRemoval;
+	let removalCalls = 0;
+	services.codex.createAgent = async () => {
+		events.push('create');
+		current = mutationAgent(++generation);
+		return current;
+	};
+	services.codex.getAgent = (agentId) => current?.agentId === agentId ? current : null;
+	services.codex.removeAgent = async (agentId) => {
+		removalCalls += 1;
+		events.push('remove:start');
+		await new Promise((resolve) => { releaseRemoval = resolve; });
+		if (current?.agentId !== agentId) return false;
+		const removed = current;
+		current = null;
+		await removed.dispose();
+		events.push('remove:end');
+		return true;
+	};
+	const router = new ProviderService(services);
+	try {
+		await router.createAgent(PROFILE);
+		const first = router.removeAgent(PROFILE.agentId);
+		const second = router.removeAgent(PROFILE.agentId);
+		const recreated = router.createAgent(PROFILE);
+		await flush();
+		assert.equal(removalCalls, 1, 'duplicate remove calls share one backend operation');
+		assert.deepEqual(events, ['create', 'remove:start']);
+		releaseRemoval();
+		assert.deepEqual(await Promise.all([first, second]), [true, true]);
+		const agent = await recreated;
+		assert.equal(agent.sessionGeneration, 2);
+		assert.equal(removalCalls, 1);
+		assert.deepEqual(events, ['create', 'remove:start', 'remove:end', 'create']);
+		assert.equal(router.getAgent(PROFILE.agentId), agent);
+	} finally {
+		releaseRemoval?.();
+		await router.stop();
+	}
+});
+
+function mutationAgent(sessionGeneration, onDispose = () => {}) {
+	let disposed = false;
+	return {
+		agentId: PROFILE.agentId,
+		profile: PROFILE,
+		sessionGeneration,
+		async dispose() {
+			if (disposed) return;
+			disposed = true;
+			onDispose();
+		},
+	};
+}
+
 for (const boundary of ['startup', 'catalog']) {
 	for (const settlement of ['resolve', 'reject']) {
 		test(`${boundary} timeout fences old ${settlement} after a newer successful recovery`, async () => {

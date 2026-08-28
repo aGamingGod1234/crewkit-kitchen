@@ -18,8 +18,11 @@ export class ProviderService extends EventEmitter {
 	#services;
 	#assignments = new Map();
 	#acceptedAgents = new Map();
+	#agentMutationTokens = new Map();
 	#creating = new Map();
 	#replacing = new Map();
+	#removing = new Map();
+	#reconcilingAgents = new Map();
 	#starting = new Map();
 	#startedProviders = new Set();
 	#inFlight = new Set();
@@ -104,8 +107,11 @@ export class ProviderService extends EventEmitter {
 		)));
 		this.#assignments.clear();
 		this.#acceptedAgents.clear();
+		this.#agentMutationTokens.clear();
 		this.#creating.clear();
 		this.#replacing.clear();
+		this.#removing.clear();
+		this.#reconcilingAgents.clear();
 		this.#starting.clear();
 		this.#startedProviders.clear();
 		this.#inFlight.clear();
@@ -131,35 +137,56 @@ export class ProviderService extends EventEmitter {
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		this.#assertActive(lifecycleGeneration);
 		const profile = freezeProfile(profileValue);
+		const reconciling = this.#reconcilingAgents.get(profile.agentId);
+		if (reconciling !== undefined) {
+			await reconciling.promise;
+			this.#assertActive(lifecycleGeneration);
+			return this.createAgent(profile, options);
+		}
+		const removing = this.#removing.get(profile.agentId);
+		if (removing !== undefined) {
+			try { await removing.promise; } catch { /* a new create is ordered after terminal cleanup even if cleanup failed */ }
+			this.#assertActive(lifecycleGeneration);
+			return this.createAgent(profile, options);
+		}
 		const replacing = this.#replacing.get(profile.agentId);
 		if (replacing !== undefined) {
 			assertSameProfile(replacing.profile, profile);
 			return replacing.promise;
-		}
-		const existing = this.#assignments.get(profile.agentId);
-		if (existing !== undefined) {
-			assertSameProfile(existing, profile);
-			const agent = await this.#execute(existing.provider, () => this.#services.get(existing.provider).createAgent(existing, this.#creationOptions(options)), 'create', { outcomeIdentity: profileIdentity(existing) });
-			this.#acceptedAgents.set(profile.agentId, agent);
-			return agent;
 		}
 		const creating = this.#creating.get(profile.agentId);
 		if (creating !== undefined) {
 			assertSameProfile(creating.profile, profile);
 			return creating.promise;
 		}
+		const existing = this.#assignments.get(profile.agentId);
+		if (existing !== undefined) assertSameProfile(existing, profile);
 		const service = this.#services.get(profile.provider);
 		if (service === undefined) throw new TypeError(`${profile.provider} service is unavailable`);
-		const promise = this.#execute(profile.provider, () => service.createAgent(profile, this.#creationOptions(options)), 'create', { outcomeIdentity: profileIdentity(profile) });
-		this.#creating.set(profile.agentId, { profile, promise });
-		try {
-			const agent = await promise;
+		const mutation = this.#beginAgentMutation(profile.agentId, lifecycleGeneration);
+		const promise = (async () => {
+			const agent = await this.#execute(profile.provider, () => service.createAgent(existing ?? profile, this.#creationOptions(options)), 'create', {
+				recordSuccess: false,
+				outcomeIdentity: profileIdentity(profile),
+				acceptResult: () => this.#acceptsAgentMutation(mutation),
+				onStaleResult: (result) => this.#disposeStaleAgent(profile.provider, profile.agentId, result),
+			});
 			this.#assertActive(lifecycleGeneration);
-			this.#assignments.set(profile.agentId, profile);
+			if (!this.#acceptsAgentMutation(mutation)) {
+				await this.#disposeStaleAgent(profile.provider, profile.agentId, agent);
+				throw providerError('STALE_PROVIDER_OUTCOME', 'Agent creation was superseded by a newer session mutation');
+			}
+			this.#assignments.set(profile.agentId, existing ?? profile);
 			this.#acceptedAgents.set(profile.agentId, agent);
+			this.#recordSessionMutationLive(profile.provider);
 			return agent;
+		})();
+		const entry = { profile, mutation, promise };
+		this.#creating.set(profile.agentId, entry);
+		try {
+			return await promise;
 		} finally {
-			this.#creating.delete(profile.agentId);
+			if (this.#creating.get(profile.agentId) === entry) this.#creating.delete(profile.agentId);
 		}
 	}
 
@@ -167,6 +194,18 @@ export class ProviderService extends EventEmitter {
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		this.#assertActive(lifecycleGeneration);
 		const profile = freezeProfile(profileValue);
+		const reconciling = this.#reconcilingAgents.get(profile.agentId);
+		if (reconciling !== undefined) {
+			await reconciling.promise;
+			this.#assertActive(lifecycleGeneration);
+			return this.replaceAgent(profile, options);
+		}
+		const removing = this.#removing.get(profile.agentId);
+		if (removing !== undefined) {
+			try { await removing.promise; } catch { /* replacement is ordered after terminal cleanup */ }
+			this.#assertActive(lifecycleGeneration);
+			return this.replaceAgent(profile, options);
+		}
 		const replacing = this.#replacing.get(profile.agentId);
 		if (replacing !== undefined) {
 			assertSameProfile(replacing.profile, profile);
@@ -176,11 +215,14 @@ export class ProviderService extends EventEmitter {
 		if (creating !== undefined) assertSameProfile(creating.profile, profile);
 		const service = this.#services.get(profile.provider);
 		if (service === undefined) throw new TypeError(`${profile.provider} service is unavailable`);
+		let mutation = null;
 		const promise = (async () => {
 			if (creating !== undefined) {
 				try { await creating.promise; } catch { /* replacement recreates a failed attempt */ }
 				this.#assertActive(lifecycleGeneration);
 			}
+			mutation = this.#beginAgentMutation(profile.agentId, lifecycleGeneration);
+			if (!this.#acceptsAgentMutation(mutation)) throw providerError('STALE_PROVIDER_OUTCOME', 'Agent replacement was superseded by a newer session mutation');
 			const assigned = this.#assignments.get(profile.agentId);
 			if (assigned !== undefined) assertSameProfile(assigned, profile);
 			const agent = await this.#execute(profile.provider, async () => {
@@ -188,10 +230,20 @@ export class ProviderService extends EventEmitter {
 					? await service.replaceAgent(profile, this.#creationOptions(options))
 					: (await service.removeAgent(profile.agentId), await service.createAgent(profile, this.#creationOptions(options)));
 				return agent;
-			}, 'replace', { outcomeIdentity: profileIdentity(profile) });
+			}, 'replace', {
+				recordSuccess: false,
+				outcomeIdentity: profileIdentity(profile),
+				acceptResult: () => this.#acceptsAgentMutation(mutation),
+				onStaleResult: (result) => this.#disposeStaleAgent(profile.provider, profile.agentId, result),
+			});
 			this.#assertActive(lifecycleGeneration);
+			if (!this.#acceptsAgentMutation(mutation)) {
+				await this.#disposeStaleAgent(profile.provider, profile.agentId, agent);
+				throw providerError('STALE_PROVIDER_OUTCOME', 'Agent replacement was superseded by a newer session mutation');
+			}
 			this.#assignments.set(profile.agentId, profile);
 			this.#acceptedAgents.set(profile.agentId, agent);
+			this.#recordSessionMutationLive(profile.provider);
 			return agent;
 		})();
 		const entry = { profile, promise };
@@ -206,20 +258,51 @@ export class ProviderService extends EventEmitter {
 	}
 
 	async removeAgent(agentId) {
+		const reconciling = this.#reconcilingAgents.get(agentId);
+		if (reconciling !== undefined) {
+			await reconciling.promise;
+			return this.removeAgent(agentId);
+		}
+		const existingRemoval = this.#removing.get(agentId);
+		if (existingRemoval !== undefined) return existingRemoval.promise;
+		const lifecycleGeneration = this.#lifecycleGeneration;
+		this.#assertActive(lifecycleGeneration);
 		const replacing = this.#replacing.get(agentId);
-		if (replacing !== undefined) {
-			try { await replacing.promise; } catch { /* failed replacement has no live runtime */ }
-		}
 		const creating = this.#creating.get(agentId);
-		if (creating !== undefined) {
-			try { await creating.promise; } catch { /* failed creation has no runtime to remove */ }
-		}
-		const assigned = this.#assignments.get(agentId);
-		this.#assignments.delete(agentId);
-		this.#acceptedAgents.delete(agentId);
-		if (assigned !== undefined) return this.#execute(assigned.provider, () => this.#services.get(assigned.provider).removeAgent(agentId), 'remove', { outcomeIdentity: String(agentId) });
-		const results = await Promise.all([...this.#startedProviders].map((provider) => this.#execute(provider, () => this.#services.get(provider).removeAgent(agentId), 'remove', { outcomeIdentity: String(agentId) })));
-		return results.some(Boolean);
+		const hadOwnedSession = replacing !== undefined || creating !== undefined || this.#assignments.has(agentId) || this.#acceptedAgents.has(agentId);
+		let mutation = null;
+		const promise = (async () => {
+			await Promise.allSettled([replacing?.promise, creating?.promise].filter(Boolean));
+			this.#assertActive(lifecycleGeneration);
+			mutation = this.#beginAgentMutation(agentId, lifecycleGeneration);
+			if (!this.#acceptsAgentMutation(mutation)) throw providerError('STALE_PROVIDER_OUTCOME', 'Agent removal was superseded by a newer session mutation');
+			const assigned = this.#assignments.get(agentId);
+			this.#assignments.delete(agentId);
+			this.#acceptedAgents.delete(agentId);
+			let removed;
+			if (assigned !== undefined) {
+				removed = await this.#execute(assigned.provider, () => this.#services.get(assigned.provider).removeAgent(agentId), 'remove', {
+					recordSuccess: false,
+					outcomeIdentity: String(agentId),
+					acceptResult: () => this.#acceptsAgentMutation(mutation),
+				});
+			} else {
+				const results = await Promise.all([...this.#startedProviders].map((provider) => this.#execute(provider, () => this.#services.get(provider).removeAgent(agentId), 'remove', {
+					recordSuccess: false,
+					outcomeIdentity: String(agentId),
+					acceptResult: () => this.#acceptsAgentMutation(mutation),
+				})));
+				removed = results.some(Boolean);
+			}
+			if (!this.#acceptsAgentMutation(mutation)) throw providerError('STALE_PROVIDER_OUTCOME', 'Agent removal was superseded by a newer session mutation');
+			if (assigned !== undefined) this.#recordSessionMutationLive(assigned.provider);
+			else for (const provider of this.#startedProviders) this.#recordSessionMutationLive(provider);
+			return Boolean(removed || hadOwnedSession);
+		})();
+		const entry = { promise };
+		this.#removing.set(agentId, entry);
+		try { return await promise; }
+		finally { if (this.#removing.get(agentId) === entry) this.#removing.delete(agentId); }
 	}
 
 	async reconcile(records) {
@@ -230,6 +313,8 @@ export class ProviderService extends EventEmitter {
 		for (const { controller } of this.#activeReconciliations.values()) controller.abort(providerError('STALE_RECONCILIATION', 'Provider reconciliation was superseded'));
 		const controller = new AbortController();
 		this.#activeReconciliations.set(reconciliationGeneration, { controller });
+		let agentFence = null;
+		let mutationTokens = [];
 		try {
 		const availableProviders = [...this.#services.keys()];
 		const groups = new Map(availableProviders.map((provider) => [provider, []]));
@@ -238,6 +323,20 @@ export class ProviderService extends EventEmitter {
 			if (!groups.has(provider)) throw new TypeError(`${provider} service is unavailable`);
 			groups.get(provider).push({ ...record, provider });
 		}
+		const affectedAgentIds = new Set([...this.#assignments.keys(), ...records.map((record) => record?.agentId).filter((agentId) => agentId !== undefined)]);
+		const blockers = new Set();
+		for (const agentId of affectedAgentIds) {
+			for (const entries of [this.#creating, this.#replacing, this.#removing]) {
+				const entry = entries.get(agentId);
+				if (entry !== undefined) blockers.add(entry.promise);
+			}
+		}
+		let releaseAgentFence;
+		agentFence = { promise: new Promise((resolve) => { releaseAgentFence = resolve; }), release: releaseAgentFence };
+		for (const agentId of affectedAgentIds) this.#reconcilingAgents.set(agentId, agentFence);
+		await Promise.allSettled([...blockers]);
+		this.#assertReconciliationCurrent(reconciliationGeneration, lifecycleGeneration);
+		mutationTokens = [...affectedAgentIds].map((agentId) => this.#beginAgentMutation(agentId, lifecycleGeneration));
 		const assignedProviders = new Set([...this.#assignments.values()].map(({ provider }) => provider));
 		const selectedProviders = availableProviders.filter((provider) => groups.get(provider).length > 0 || assignedProviders.has(provider));
 		const settled = await Promise.all(selectedProviders.map(async (provider) => {
@@ -286,6 +385,7 @@ export class ProviderService extends EventEmitter {
 		const failures = settled.filter(({ error }) => error !== undefined);
 		const catalog = await this.catalog.refresh({ providers: selectedProviders, fallbackProviders: failures.map(({ provider }) => provider) });
 		this.#assertReconciliationCurrent(reconciliationGeneration, lifecycleGeneration);
+		if (mutationTokens.some((token) => !this.#acceptsAgentMutation(token))) throw providerError('STALE_RECONCILIATION', 'Provider reconciliation session mutations were superseded');
 		this.#assignments = nextAssignments;
 		this.#acceptedAgents = nextAgents;
 		for (const { provider, result } of settled) if (result !== undefined) this.#recordLive(provider, 'reconcile');
@@ -300,11 +400,13 @@ export class ProviderService extends EventEmitter {
 			recovery: this.recoverySnapshot(),
 		};
 		} finally {
+			agentFence?.release();
+			if (agentFence !== null) for (const [agentId, entry] of this.#reconcilingAgents) if (entry === agentFence) this.#reconcilingAgents.delete(agentId);
 			this.#activeReconciliations.delete(reconciliationGeneration);
 		}
 	}
 
-	async #execute(provider, operation, boundary, { recordSuccess = true, outcomeIdentity = boundary } = {}) {
+	async #execute(provider, operation, boundary, { recordSuccess = true, outcomeIdentity = boundary, acceptResult = () => true, onStaleResult = null } = {}) {
 		if (this.#stopped) throw providerError('PROVIDER_STOPPED', 'Provider service is stopped');
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		const startup = this.#ensureStarted(provider, lifecycleGeneration);
@@ -315,13 +417,16 @@ export class ProviderService extends EventEmitter {
 			this.#assertActive(lifecycleGeneration);
 			return operation();
 		});
-		const observed = task.then((result) => {
+		const observed = task.then(async (result) => {
 			this.#assertActive(lifecycleGeneration);
-			if (!this.#acceptsOutcome(outcomeAttempt) && outcomeAttempt.key !== null) throw providerError('STALE_PROVIDER_OUTCOME', 'Provider outcome attempt was superseded');
+			if (!this.#acceptsOutcome(outcomeAttempt) || !acceptResult()) {
+				try { await onStaleResult?.(result); } catch { /* stale cleanup is best effort and cannot revive the outcome */ }
+				throw providerError('STALE_PROVIDER_OUTCOME', 'Provider outcome attempt was superseded');
+			}
 			if (recordSuccess) this.#recordLive(provider, boundary);
 			return result;
 		}, (error) => {
-			if (!isLifecycleFenceError(error) && this.#acceptsOutcome(outcomeAttempt)) this.#recordDegraded(provider, error, boundary);
+			if (!isLifecycleFenceError(error) && this.#acceptsOutcome(outcomeAttempt) && acceptResult()) this.#recordDegraded(provider, error, boundary);
 			throw error;
 		});
 		const bounded = withTimeout(observed, this.#operationTimeoutMs, this.#scheduleTimeout, this.#cancelTimeout, provider, {
@@ -331,7 +436,7 @@ export class ProviderService extends EventEmitter {
 		try {
 			return await bounded;
 		} catch (error) {
-			if (error?.code === 'PROVIDER_TIMEOUT' && this.#ownsOutcomeAttempt(outcomeAttempt)) {
+			if (error?.code === 'PROVIDER_TIMEOUT' && this.#ownsOutcomeAttempt(outcomeAttempt) && acceptResult()) {
 				this.#recordDegraded(provider, error, boundary);
 			}
 			throw error;
@@ -364,6 +469,41 @@ export class ProviderService extends EventEmitter {
 	#finishOutcomeAttempt(attempt) {
 		attempt.acceptOutcome = false;
 		if (this.#outcomeAttempts.get(attempt.key) === attempt) this.#outcomeAttempts.delete(attempt.key);
+	}
+
+	#beginAgentMutation(agentId, lifecycleGeneration) {
+		const previous = this.#agentMutationTokens.get(agentId);
+		const token = {
+			agentId,
+			generation: (previous?.generation ?? 0) + 1,
+			lifecycleGeneration,
+		};
+		this.#agentMutationTokens.set(agentId, token);
+		return token;
+	}
+
+	#acceptsAgentMutation(token) {
+		return !this.#stopped && token.lifecycleGeneration === this.#lifecycleGeneration
+			&& this.#agentMutationTokens.get(token.agentId) === token;
+	}
+
+	async #disposeStaleAgent(provider, agentId, agent) {
+		if (agent === null || typeof agent !== 'object') return;
+		const service = this.#services.get(provider);
+		const cleanup = Promise.resolve().then(async () => {
+			if (service?.getAgent?.(agentId) === agent && typeof service.removeAgent === 'function') {
+				await service.removeAgent(agentId);
+				return;
+			}
+			await agent.dispose?.();
+		});
+		try { await withTimeout(cleanup, this.#operationTimeoutMs, this.#scheduleTimeout, this.#cancelTimeout, provider); }
+		catch { /* stale sessions never regain publication authority because cleanup failed */ }
+	}
+
+	#recordSessionMutationLive(provider) {
+		if (provider === undefined) return;
+		for (const boundary of ['create', 'replace', 'remove']) this.#recordLive(provider, boundary);
 	}
 
 	async #startProvider(provider) {
