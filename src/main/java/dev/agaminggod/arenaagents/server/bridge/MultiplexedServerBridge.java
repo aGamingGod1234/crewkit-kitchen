@@ -90,6 +90,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public static final int AGENT_QUEUE_CAP = 32;
 	private static final int OBSERVATIONS_PER_TICK = AgentConstants.DEFAULT_AGENT_LIMIT;
 	private static final int HANDSHAKE_TIMEOUT_MS = 5_000;
+	static final long HANDSHAKE_RETRY_WAIT_MS = 25L;
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
 	private static final int MAX_TRACKED_IDS = 4_096;
@@ -386,7 +387,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public boolean onCreated(AgentRecord record) {
-		registryPublicationRevision.incrementAndGet();
+		bumpRegistryPublicationRevision();
 		synchronized (publicationLock) {
 			if (protocolKnownAgentIds.contains(record.agentId())) return true;
 			Session active = session;
@@ -402,7 +403,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public void onTransition(AgentTransition transition) {
-		registryPublicationRevision.incrementAndGet();
+		bumpRegistryPublicationRevision();
 		ScenarioRuntimeService.onAgentState(
 				manager.server(),
 				transition.after().agentId().toString(),
@@ -429,7 +430,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public void onRemoved(AgentId agentId, long terminalRevision) {
-		registryPublicationRevision.incrementAndGet();
+		bumpRegistryPublicationRevision();
 		actionExecutor.cancel(agentId, "Agent removed");
 		programActions.remove(agentId);
 		observationPublication.remove(agentId);
@@ -458,13 +459,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public <T> T withinPublicationBoundary(java.util.function.Supplier<T> publication) {
-		registryPublicationRevision.incrementAndGet();
+		bumpRegistryPublicationRevision();
 		try {
 			synchronized (publicationLock) {
 				return AgentRuntimeHooks.super.withinPublicationBoundary(publication);
 			}
 		} finally {
-			registryPublicationRevision.incrementAndGet();
+			bumpRegistryPublicationRevision();
 		}
 	}
 
@@ -585,7 +586,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				handshake.add(conversationWakeEnvelope(wake));
 			}
 			synchronized (publicationLock) {
-				if (disconnectInProgress || snapshotRevision != registryPublicationRevision.get()) continue;
+				if (disconnectInProgress || snapshotRevision != registryPublicationRevision.get()) {
+					awaitHandshakeRetryLocked();
+					continue;
+				}
 				if (session != source || !source.open.get()) {
 					throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during authentication");
 				}
@@ -969,6 +973,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					);
 				}
 			}
+		}
+	}
+
+	private void bumpRegistryPublicationRevision() {
+		registryPublicationRevision.incrementAndGet();
+		synchronized (publicationLock) {
+			publicationLock.notifyAll();
+		}
+	}
+
+	private void awaitHandshakeRetryLocked() {
+		try {
+			publicationLock.wait(HANDSHAKE_RETRY_WAIT_MS);
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new BridgeProtocolException(
+					"COORDINATOR_DISCONNECTED", "Bridge authentication was interrupted", exception
+			);
 		}
 	}
 

@@ -264,26 +264,15 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		if (event.kind() != ConversationKind.PLAYER_MESSAGE && event.kind() != ConversationKind.PROXIMITY_SPEECH) {
 			return GoalRoute.EVENT_ONLY;
 		}
-		if (isSteeringPhrase(event.text())) return GoalRoute.EVENT_ONLY;
-		if (!GoalCompiler.looksLikeGoalRequest(event.text())) return GoalRoute.EVENT_ONLY;
+		// Replace/queue is an explicit /agent goal choice, not inferred from live speech.
+		if (!GoalCompiler.consumePlayerSpeechAsGoal(target.currentGoal().isPresent(), event.text(), false)) {
+			return GoalRoute.EVENT_ONLY;
+		}
 
 		GoalCompilation compilation = goalCompiler.compile(
 				event.text(), manager.server().registryAccess(), manager.server().getTickCount(),
 				id -> manager.server().getAdvancements().get(net.minecraft.resources.Identifier.parse(id)) != null
 		);
-		if (target.currentGoal().isPresent()) {
-			Optional<dev.agaminggod.arenaagents.agent.goal.GoalPredicate> proposed = compilation.acceptedSpec()
-					.map(GoalSpec::completion);
-			PendingGoalDraft draft = draft(target, event, proposed, proposed.isPresent()
-					? DraftIntent.REPLACE_OR_QUEUE
-					: DraftIntent.CONFIRM_TRANSLATION);
-			manager.stageGoalDraft(draft);
-			if (proposed.isEmpty()) goalSpecRequestSink.publish(draft);
-			notifyRequester(draft, proposed.isPresent()
-					? "That agent already has a goal. Choose Replace, Queue, or Cancel for draft " + draft.draftId() + "."
-					: compilation.playerMessage() + " Draft " + draft.draftId() + " is waiting for clarification.");
-			return GoalRoute.CONSUMED;
-		}
 
 		if (!ConversationWakePolicy.shouldStartGoal(target.state(), event.kind())) return GoalRoute.EVENT_ONLY;
 		if (compilation.kind() == GoalCompilation.Kind.ACCEPTED) {
@@ -318,16 +307,6 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 	private void notifyRequester(PendingGoalDraft draft, String message) {
 		ServerPlayer player = manager.server().getPlayerList().getPlayer(draft.requestingPlayerId());
 		if (player != null) player.sendSystemMessage(Component.literal(message));
-	}
-
-	private static boolean isSteeringPhrase(String text) {
-		String normalized = text.strip().toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", " ");
-		return normalized.equals("continue")
-				|| normalized.equals("keep going")
-				|| normalized.equals("watch out")
-				|| normalized.equals("try another route")
-				|| normalized.equals("retry")
-				|| normalized.equals("resume");
 	}
 
 	private record GoalRoute(boolean publish, Optional<GoalSpec> wakeSpec) {

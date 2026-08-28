@@ -14,20 +14,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Locale;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 final class VoiceWorkerClient {
 	private static final int MAX_SAMPLES = 48_000 * 20;
-	private static final Set<String> TTS_WORKER_ERROR_CODES = Set.of(
-			"TTS_AUDIO_TOO_LONG",
-			"TTS_CAPACITY",
-			"TTS_MALFORMED_AUDIO",
-			"TTS_PROVIDER_ERROR",
-			"TTS_RATE_LIMITED",
-			"TTS_TIMEOUT",
-			"TTS_UNAVAILABLE"
-	);
 	private final HttpClient client;
 	private final URI endpoint;
 	private final String secret;
@@ -59,12 +49,10 @@ final class VoiceWorkerClient {
 				.header("Content-Type", "application/json")
 				.POST(HttpRequest.BodyPublishers.ofString(payload.toString(), StandardCharsets.UTF_8))
 				.build();
-		CompletableFuture<HttpResponse<byte[]>> exchange = client.sendAsync(
-				httpRequest, HttpResponse.BodyHandlers.ofByteArray()
-		);
-		CompletableFuture<short[]> result = exchange.thenApply(response -> {
+		return client.sendAsync(httpRequest, HttpResponse.BodyHandlers.ofByteArray())
+				.thenApply(response -> {
 					if (response.statusCode() != 200) {
-						throw workerHttpFailure(response);
+						throw new VoiceWorkerException("VOICE_WORKER_HTTP", "Voice worker returned HTTP " + response.statusCode());
 					}
 					String contentType = response.headers().firstValue("Content-Type").orElse("")
 							.toLowerCase(Locale.ROOT).split(";", 2)[0].strip();
@@ -84,30 +72,6 @@ final class VoiceWorkerClient {
 					buffer.asShortBuffer().get(samples);
 					return samples;
 				});
-		result.whenComplete((samples, failure) -> {
-			if (result.isCancelled()) exchange.cancel(true);
-		});
-		return result;
-	}
-
-	private static VoiceWorkerException workerHttpFailure(HttpResponse<byte[]> response) {
-		String code = "VOICE_WORKER_HTTP";
-		String contentType = response.headers().firstValue("Content-Type").orElse("")
-				.toLowerCase(Locale.ROOT).split(";", 2)[0].strip();
-		if (contentType.equals("application/json") && response.body().length <= 1_024) {
-			try {
-				JsonObject payload = com.google.gson.JsonParser.parseString(
-						new String(response.body(), StandardCharsets.UTF_8)
-				).getAsJsonObject();
-				if (payload.has("code") && payload.get("code").isJsonPrimitive()) {
-					String candidate = payload.get("code").getAsString();
-					if (TTS_WORKER_ERROR_CODES.contains(candidate)) code = candidate;
-				}
-			} catch (RuntimeException ignored) {
-				// Invalid error bodies remain a generic bounded HTTP failure.
-			}
-		}
-		return new VoiceWorkerException(code, "Voice worker returned HTTP " + response.statusCode());
 	}
 
 	static String readSecret() {

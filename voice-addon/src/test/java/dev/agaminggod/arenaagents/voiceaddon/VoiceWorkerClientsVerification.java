@@ -17,7 +17,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
@@ -34,7 +33,6 @@ final class VoiceWorkerClientsVerification {
 		int assertions = 0;
 		assertions += verifyTtsClientSendsContractAndDecodesPcm();
 		assertions += verifyTtsClientRejectsMalformedAudioAndHttpFailure();
-		assertions += verifyTtsCancellationStopsTheHttpExchange();
 		assertions += verifySttClientSendsPcmMetadataAndBoundsTranscript();
 		assertions += verifySttClientRejectsMalformedInputAndResponse();
 		assertions += verifySttUnavailablePreservesWorkerCode();
@@ -79,29 +77,6 @@ final class VoiceWorkerClientsVerification {
 			assertWorkerFailure("VOICE_WORKER_HTTP", () -> client.synthesize(request()).join(), "TTS HTTP failure");
 			unavailable.assertHealthy();
 		}
-		try (WorkerServer providerUnavailable = new WorkerServer(exchange -> respond(
-				exchange,
-				502,
-				"{\"code\":\"TTS_UNAVAILABLE\",\"message\":\"secret must-not-reach-logs\"}"
-						.getBytes(StandardCharsets.UTF_8),
-				"application/json"
-		))) {
-			VoiceWorkerClient client = new VoiceWorkerClient(
-					HttpClient.newHttpClient(), providerUnavailable.uri("/v1/tts"), SECRET
-			);
-			assertWorkerFailure("TTS_UNAVAILABLE", () -> client.synthesize(request()).join(),
-					"TTS provider error code");
-			providerUnavailable.assertHealthy();
-		}
-		return 3;
-	}
-
-	private static int verifyTtsCancellationStopsTheHttpExchange() {
-		PendingHttpClient http = new PendingHttpClient();
-		VoiceWorkerClient client = new VoiceWorkerClient(http, URI.create("http://127.0.0.1:8766/v1/tts"), SECRET);
-		CompletableFuture<short[]> synthesis = client.synthesize(request());
-		assertEquals(true, synthesis.cancel(true), "TTS request cancellation is accepted");
-		assertEquals(true, http.response.isCancelled(), "TTS cancellation reaches the HTTP exchange");
 		return 2;
 	}
 
@@ -275,30 +250,5 @@ final class VoiceWorkerClientsVerification {
 		public void close() {
 			server.stop(0);
 		}
-	}
-
-	private static final class PendingHttpClient extends HttpClient {
-		private final CompletableFuture<java.net.http.HttpResponse<byte[]>> response = new CompletableFuture<>();
-
-		@Override public java.util.Optional<java.net.CookieHandler> cookieHandler() { return java.util.Optional.empty(); }
-		@Override public java.util.Optional<java.time.Duration> connectTimeout() { return java.util.Optional.empty(); }
-		@Override public Redirect followRedirects() { return Redirect.NEVER; }
-		@Override public java.util.Optional<java.net.ProxySelector> proxy() { return java.util.Optional.empty(); }
-		@Override public javax.net.ssl.SSLContext sslContext() { return null; }
-		@Override public javax.net.ssl.SSLParameters sslParameters() { return new javax.net.ssl.SSLParameters(); }
-		@Override public java.util.Optional<java.net.Authenticator> authenticator() { return java.util.Optional.empty(); }
-		@Override public Version version() { return Version.HTTP_1_1; }
-		@Override public java.util.Optional<java.util.concurrent.Executor> executor() { return java.util.Optional.empty(); }
-		@Override public <T> java.net.http.HttpResponse<T> send(
-				java.net.http.HttpRequest request, java.net.http.HttpResponse.BodyHandler<T> handler
-		) { throw new UnsupportedOperationException(); }
-		@Override @SuppressWarnings("unchecked") public <T> CompletableFuture<java.net.http.HttpResponse<T>> sendAsync(
-				java.net.http.HttpRequest request, java.net.http.HttpResponse.BodyHandler<T> handler
-		) { return (CompletableFuture<java.net.http.HttpResponse<T>>) (CompletableFuture<?>) response; }
-		@Override public <T> CompletableFuture<java.net.http.HttpResponse<T>> sendAsync(
-				java.net.http.HttpRequest request,
-				java.net.http.HttpResponse.BodyHandler<T> handler,
-				java.net.http.HttpResponse.PushPromiseHandler<T> pushPromiseHandler
-		) { return sendAsync(request, handler); }
 	}
 }

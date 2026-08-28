@@ -52,12 +52,18 @@ public final class GoalCompilerVerification {
 		);
 		assertEquals(false, GoalCompiler.looksLikeGoalRequest("Hi, can you hear me?"), "casual speech remains conversation");
 		assertEquals(true, GoalCompiler.looksLikeGoalRequest("Can you get an iron pickaxe?"), "actionable speech is a goal request");
+		assertEquals(false, GoalCompiler.looksLikeGoalRequest("come here"), "come here is live steering, not a new goal");
+		assertEquals(false, GoalCompiler.looksLikeGoalRequest("Follow me"), "follow me is live steering, not a new goal");
+		assertEquals(true, GoalCompiler.isLiveSteeringRequest("Can you come here?"), "polite come-here stays steering");
+		assertEquals(false, GoalCompiler.consumePlayerSpeechAsGoal(true, "come here", false), "busy agents still hear come here");
+		assertEquals(false, GoalCompiler.consumePlayerSpeechAsGoal(true, "get an iron pickaxe", false), "busy agents keep working unless replace/queue was chosen");
+		assertEquals(true, GoalCompiler.consumePlayerSpeechAsGoal(false, "get an iron pickaxe", false), "idle agents still compile exact goal speech");
 		assertEquals(
 				List.of("minecraft:iron_axe", "minecraft:iron_hoe", "minecraft:iron_pickaxe", "minecraft:iron_shovel", "minecraft:iron_sword"),
 				compiler.candidateIdsFor("Get iron tools", RegistryAccess.EMPTY),
 				"tool-set clarification keeps the registered material tool family"
 		);
-		return 7;
+		return 13;
 	}
 
 	private static int verifyExactPositionEntityAndAdvancement() {

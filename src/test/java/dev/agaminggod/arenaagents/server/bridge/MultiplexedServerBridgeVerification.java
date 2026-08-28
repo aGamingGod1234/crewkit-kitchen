@@ -63,6 +63,8 @@ public final class MultiplexedServerBridgeVerification {
 	}
 
 	public static int verify() {
+		assertEquals(true, MultiplexedServerBridge.HANDSHAKE_RETRY_WAIT_MS > 0L,
+				"hello retries wait instead of spinning when the registry snapshot moves");
 		verifyPendingRegistrationBoundary();
 		verifyRemovalBackpressureForcesReconciliation();
 		verifyHandshakeWaitsForPendingMarker();
@@ -129,7 +131,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 134;
+		return 135;
 	}
 
 	private static void verifyGoalSpecProposalLifecycle() {

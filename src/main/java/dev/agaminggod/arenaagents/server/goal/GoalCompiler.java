@@ -27,6 +27,9 @@ public final class GoalCompiler {
 	private static final Pattern ITEM = Pattern.compile("^(?:get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
 	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
+	private static final Pattern LIVE_STEERING = Pattern.compile(
+			"^(?:continue|keep going|watch out|try another route|retry|resume|come here|come to me|come with me|come|over here|this way|follow me|follow us|follow|stay close|stay with me|wait|stop|hold on|go there|behind me|to me)$"
+	);
 
 	public GoalCompilation compile(String request, RegistryAccess registries, long createdAtTick) {
 		return compile(request, registries, createdAtTick, ignored -> true);
@@ -109,8 +112,29 @@ public final class GoalCompiler {
 	}
 
 	public static boolean looksLikeGoalRequest(String request) {
-		String normalized = stripTrailingPunctuation(stripPoliteness(AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		String normalized = normalizedCommand(request);
+		if (LIVE_STEERING.matcher(normalized).matches()) return false;
 		return GOAL_LEAD.matcher(normalized).find();
+	}
+
+	/** Live steering such as "come here" / "follow me" must reach the coordinator, not start a new goal. */
+	public static boolean isLiveSteeringRequest(String request) {
+		return LIVE_STEERING.matcher(normalizedCommand(request)).matches();
+	}
+
+	/**
+	 * Speech is only consumed as a goal change when the agent is idle, or the player already
+	 * opted into replace/queue through {@code /agent goal}. Busy agents keep working and still hear the line.
+	 */
+	public static boolean consumePlayerSpeechAsGoal(boolean hasActiveGoal, String text, boolean replaceOrQueueOptIn) {
+		if (replaceOrQueueOptIn) return looksLikeGoalRequest(text) || isLiveSteeringRequest(text);
+		if (hasActiveGoal) return false;
+		if (isLiveSteeringRequest(text)) return false;
+		return looksLikeGoalRequest(text);
+	}
+
+	private static String normalizedCommand(String request) {
+		return stripTrailingPunctuation(stripPoliteness(AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
 	}
 
 	public List<String> candidateIdsFor(String request, RegistryAccess registries) {

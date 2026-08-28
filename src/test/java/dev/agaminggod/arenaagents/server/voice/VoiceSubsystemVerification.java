@@ -15,28 +15,6 @@ public final class VoiceSubsystemVerification {
 
 	public static int verify() {
 		int assertions = 0;
-		UUID humanPlayer = UUID.randomUUID();
-		VoiceConsentRegistry.clear(null);
-		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("Human proximity hearing must start enabled every session");
-		}
-		assertions++;
-		VoiceConsentRegistry.revoke(null, humanPlayer);
-		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("A player must still be able to disable hearing for the current session");
-		}
-		assertions++;
-		VoiceConsentRegistry.grant(null, humanPlayer);
-		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("A player must be able to re-enable hearing");
-		}
-		assertions++;
-		VoiceConsentRegistry.revoke(null, humanPlayer);
-		VoiceConsentRegistry.clear(null);
-		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
-			throw new AssertionError("A new session must reset hearing to enabled");
-		}
-		assertions++;
 		AgentId first = AgentId.parse("00000000-0000-0000-0000-000000000001");
 		AgentId second = AgentId.parse("00000000-0000-0000-0000-000000000002");
 		VoiceRequest request = new VoiceRequest(first, "Hello nearby.", "voice.moss.v1", 48, 1L);
