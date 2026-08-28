@@ -215,6 +215,30 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Destroy stone at coordinates x=10, y=64, z=-10", RegistryAccess.EMPTY),
 				"destructive coordinate translation exposes only the post-break state"
 		);
+		GoalCompilation genericBreak = compiler.compile(
+				"Break the block at 10 64 -10", RegistryAccess.EMPTY, 1_200L, "minecraft:the_nether");
+		assertEquals(GoalCompilation.Kind.ACCEPTED, genericBreak.kind(),
+				"a generic block target still compiles when destructive coordinates determine the postcondition");
+		assertEquals(
+				new GoalPredicate.BlockMatches("minecraft:the_nether", 10, 64, -10, "minecraft:air", Map.of()),
+				genericBreak.acceptedSpec().orElseThrow().completion(),
+				"a generic destructive request freezes air at the requested coordinates"
+		);
+		assertEquals(
+				List.of("minecraft:air"),
+				compiler.candidateIdsFor("Break the block at 10 64 -10", RegistryAccess.EMPTY),
+				"generic destructive coordinate translation exposes the safe post-break candidate"
+		);
+		assertEquals(
+				List.of(),
+				compiler.candidateIdsFor("Break the block", RegistryAccess.EMPTY),
+				"a generic destructive request without coordinates does not invent a completion ID"
+		);
+		assertEquals(
+				List.of(),
+				compiler.candidateIdsFor("Place the block at 10 64 -10", RegistryAccess.EMPTY),
+				"generic placement coordinates do not reuse the destructive air candidate"
+		);
 		assertEquals(
 				List.of("minecraft:stone"),
 				compiler.candidateIdsFor("Place stone at 10 64 -10", RegistryAccess.EMPTY),
@@ -248,7 +272,7 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Earn the Stone Age advancement", RegistryAccess.EMPTY, manyLiveAdvancements).size(),
 				"natural advancement candidates remain bounded"
 		);
-		return 22;
+		return 27;
 	}
 
 	private static int verifyCompoundItemsAndKills() {
@@ -289,6 +313,11 @@ public final class GoalCompilerVerification {
 				List.of("minecraft:apple", "minecraft:enchanted_golden_apple", "minecraft:golden_apple", "minecraft:zombie"),
 				compiler.candidateIdsFor("Get an apple and kill 3 zombies", RegistryAccess.EMPTY),
 				"compound translation strips kill counts without changing item candidates"
+		);
+		assertEquals(
+				List.of("minecraft:air", "minecraft:apple", "minecraft:enchanted_golden_apple", "minecraft:golden_apple"),
+				compiler.candidateIdsFor("Get an apple and break the block at 10 64 -10", RegistryAccess.EMPTY),
+				"compound translation retains the safe post-break candidate for a generic block target"
 		);
 		String everyPredicateKind = "Place a crafting table at 10 64 10 and get an iron pickaxe"
 				+ " and go to 12 64 12 and complete the Stone Age advancement"
@@ -338,7 +367,7 @@ public final class GoalCompilerVerification {
 				compiler.compile("Get 20 diamond swords and 18 diamond swords", RegistryAccess.EMPTY, 1_200L).kind(),
 				"summed duplicate requirements are revalidated against inventory capacity"
 		);
-		return 15;
+		return 16;
 	}
 
 	private static int verifyExplicitAlternativeCandidates() {

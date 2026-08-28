@@ -167,10 +167,6 @@ public final class GoalCompiler {
 		}
 		Matcher block = BLOCK.matcher(command);
 		if (block.matches()) {
-			List<String> sourceBlocks = relatedBlocks(block.group(2), registries);
-			if (sourceBlocks.isEmpty()) {
-				return GoalCompilation.needsTranslation("I could not identify the exact Minecraft block for that request.");
-			}
 			Matcher location = BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(block.group(2)));
 			if (isDestructiveBlockVerb(block.group(1)) && location.find()) {
 				try {
@@ -186,6 +182,10 @@ public final class GoalCompiler {
 				} catch (NumberFormatException | AgentDomainException exception) {
 					return GoalCompilation.rejected("Those block coordinates are outside Minecraft's supported range.");
 				}
+			}
+			List<String> sourceBlocks = relatedBlocks(block.group(2), registries);
+			if (sourceBlocks.isEmpty()) {
+				return GoalCompilation.needsTranslation("I could not identify the exact Minecraft block for that request.");
 			}
 		}
 
@@ -270,12 +270,11 @@ public final class GoalCompiler {
 		}
 		Matcher block = BLOCK.matcher(command);
 		if (block.matches()) {
-			List<String> sourceBlocks = relatedBlocks(block.group(2), registries);
-			if (!sourceBlocks.isEmpty()
-					&& isDestructiveBlockVerb(block.group(1))
+			if (isDestructiveBlockVerb(block.group(1))
 					&& BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(block.group(2))).find()) {
 				return List.of("minecraft:air");
 			}
+			List<String> sourceBlocks = relatedBlocks(block.group(2), registries);
 			return sourceBlocks.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
 		}
 		return List.of();
@@ -433,11 +432,11 @@ public final class GoalCompiler {
 			case ITEM -> relatedCandidates(ClauseKind.ITEM, clause.target(), registries);
 			case KILL -> relatedCandidates(ClauseKind.KILL, stripKillCount(clause.target()), registries);
 			case BLOCK -> {
-				List<String> blocks = relatedBlocks(clause.target(), registries);
-				if (!blocks.isEmpty() && clause.destructiveBlock()
+				if (clause.destructiveBlock()
 						&& BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(clause.target())).find()) {
 					yield List.of("minecraft:air");
 				}
+				List<String> blocks = relatedBlocks(clause.target(), registries);
 				yield blocks.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
 			}
 			case ADVANCEMENT -> relatedAdvancements(clause.target(), liveAdvancementTitles);
