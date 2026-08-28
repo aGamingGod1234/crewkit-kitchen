@@ -183,11 +183,32 @@ public final class CoordinatorStartupSmokeVerification {
 					payload
 			)));
 			writer.flush();
-			String catalogLine = reader.readLine();
-			JsonObject catalog = JsonParser.parseString(catalogLine).getAsJsonObject();
-			assertEquals("catalog_snapshot", catalog.get("type").getAsString(), "coordinator publishes catalog after handshake");
-			assertTrue(catalog.getAsJsonObject("payload").getAsJsonArray("models").toString().contains("gpt-5.6-luna"),
-				"catalog-ready boundary contains the staged Codex model");
+			boolean discoveryRequested = false;
+			boolean stagedModelReady = false;
+			long deadline = System.currentTimeMillis() + STARTUP_TIMEOUT_MS;
+			while (System.currentTimeMillis() < deadline) {
+				String line = reader.readLine();
+				if (line == null) break;
+				JsonObject message = JsonParser.parseString(line).getAsJsonObject();
+				if (!"catalog_snapshot".equals(message.get("type").getAsString())) continue;
+				JsonArray models = message.getAsJsonObject("payload").getAsJsonArray("models");
+				if (models.toString().contains("gpt-5.6-luna")) {
+					stagedModelReady = true;
+					break;
+				}
+				if (discoveryRequested) continue;
+				discoveryRequested = true;
+				writer.write(codec.encode(new BridgeEnvelope(
+						2,
+						"startup-smoke-server",
+						"server",
+						"catalog_request",
+						"startup-smoke-catalog-request",
+						new JsonObject()
+				)));
+				writer.flush();
+			}
+			assertTrue(stagedModelReady, "catalog-ready boundary contains the staged Codex model");
 			return true;
 		}
 	}

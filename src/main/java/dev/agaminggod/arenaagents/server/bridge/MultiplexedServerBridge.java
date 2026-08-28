@@ -149,6 +149,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private volatile Set<String> catalogProfiles = Set.of();
 	private volatile List<AgentControlModelOption> catalogModels = AgentControlCatalog.fallbackOptions();
 	private volatile boolean catalogLoaded;
+	private boolean catalogDiscoveryPending;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
 		this(manager, configuredPort(), configuredSecretPath(), new AgentVerboseState());
@@ -682,6 +683,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;
+				catalogDiscoveryPending = false;
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
 				coordinatorReadyAgentIds.clear();
@@ -1112,7 +1114,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			requireKeys(payload, Set.of("refreshedAtEpochMs", "models"), "catalog_snapshot");
 			requiredLong(payload, "refreshedAtEpochMs");
 			JsonArray models = requiredArray(payload, "models", AgentControlModelOption.MAX_OPTIONS);
-			if (models.isEmpty()) throw new BridgeProtocolException("INVALID_MODEL_CATALOG", "models must not be empty");
 			ArrayList<AgentControlModelOption> decoded = new ArrayList<>(models.size());
 			for (var element : models) {
 				if (!element.isJsonObject()) {
@@ -1139,6 +1140,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void acceptCatalog(JsonObject payload) {
 		List<AgentControlModelOption> decoded = decodeCatalog(payload);
+		if (decoded.isEmpty()) {
+			catalogProfiles = Set.of();
+			catalogModels = AgentControlCatalog.fallbackOptions();
+			catalogLoaded = false;
+			if (!catalogDiscoveryPending) {
+				catalogDiscoveryPending = true;
+				send("catalog_request", "server", new JsonObject());
+			}
+			return;
+		}
 		JsonArray models = payload.getAsJsonArray("models");
 		HashSet<String> profiles = new HashSet<>();
 		for (var element : models) {
@@ -1156,6 +1167,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		catalogProfiles = Set.copyOf(profiles);
 		catalogModels = decoded;
 		catalogLoaded = true;
+		catalogDiscoveryPending = false;
 	}
 
 	private void plannerReady(BridgeEnvelope envelope) {
@@ -2579,6 +2591,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;
+				catalogDiscoveryPending = false;
 				CoordinatorStatusStore.clear(manager.server());
 				if (wasAuthenticated) coordinatorDisconnectPending.set(true);
 				session = null;

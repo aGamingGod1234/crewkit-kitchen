@@ -129,11 +129,12 @@ public final class MultiplexedServerBridgeVerification {
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyBindFailureClosesSocketBeforeRetry();
 		verifyLaunchIdentityHandshake();
+		verifyEmptyCatalogRequestsLiveDiscovery();
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 154;
+		return 157;
 	}
 
 	private static void verifyBindFailureClosesSocketBeforeRetry() {
@@ -218,6 +219,60 @@ public final class MultiplexedServerBridgeVerification {
 					Files.deleteIfExists(secretFile);
 				} catch (java.io.IOException exception) {
 					throw new AssertionError("could not remove launch identity bridge secret", exception);
+				}
+			}
+		}
+	}
+
+	private static void verifyEmptyCatalogRequestsLiveDiscovery() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-catalog-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				JsonObject hello = new JsonObject();
+				hello.addProperty("secret", secret);
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, "coordinator", "server", "hello", "hello-empty-catalog", hello
+				));
+				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
+				assertEquals("hello_ack", acknowledgement.type(), "empty-catalog fixture authenticates the bridge");
+				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
+						"empty-catalog fixture consumes handshake state before catalog discovery");
+
+				JsonObject catalog = new JsonObject();
+				catalog.addProperty("refreshedAtEpochMs", 0L);
+				catalog.add("models", new JsonArray());
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog", catalog
+				));
+
+				BridgeEnvelope request = null;
+				long deadline = System.currentTimeMillis() + 2_000L;
+				while (request == null && System.currentTimeMillis() < deadline) {
+					bridge.tick();
+					if (reader.ready()) request = codec.decode(reader.readLine());
+					else Thread.sleep(10L);
+				}
+				assertTrue(request != null && "catalog_request".equals(request.type()),
+						"an empty bootstrap catalog requests live provider discovery asynchronously");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("empty catalog discovery verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (secretFile != null) {
+				try {
+					Files.deleteIfExists(secretFile);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove empty catalog bridge secret", exception);
 				}
 			}
 		}
