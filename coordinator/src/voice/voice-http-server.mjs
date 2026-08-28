@@ -114,12 +114,12 @@ export function createVoiceHttpServer({
 		try {
 			if (request.url === '/v1/stt') {
 				requireContentType(request.headers['content-type'], 'audio/l16;rate=48000;channels=1');
-				attemptedLifecycle = sttLifecycle;
 				if (sttProvider === null || typeof sttProvider.transcribe !== 'function') {
 					throw typedError('STT_UNAVAILABLE', 'Speech recognition is not configured');
 				}
 				const metadata = validateSttHeaders(request.headers);
 				const pcm = await awaitAbortable(readBytes(request, 48_000 * 2 * 20), controller.signal);
+				attemptedLifecycle = sttLifecycle;
 				const result = validateTranscriptResult(await awaitAbortable(
 					Promise.resolve().then(() => sttProvider.transcribe({ pcm, signal: controller.signal })),
 					controller.signal,

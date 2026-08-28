@@ -364,6 +364,39 @@ test('STT route rejects a non-PCM content type before transcription', async () =
 	});
 });
 
+test('invalid STT client input does not degrade or probe the provider lifecycle', async () => {
+	let calls = 0;
+	let probes = 0;
+	await withWorker({
+		sttProvider: {
+			async transcribe() { calls++; return { transcript: 'ignored', confidence: 1 }; },
+			async probe() { probes++; },
+		},
+		initialProbeDelayMs: 5,
+		maxProbeDelayMs: 5,
+	}, async ({ worker, baseUrl }) => {
+		const invalidRequests = [
+			{ headers: sttHeaders({ 'X-Player-Id': 'not-a-uuid' }), body: Buffer.alloc(2) },
+			{ headers: sttHeaders({ 'X-Utterance-Sequence': '0' }), body: Buffer.alloc(2) },
+			{ headers: sttHeaders({ 'X-Whispering': 'sometimes' }), body: Buffer.alloc(2) },
+			{ headers: sttHeaders(), body: Buffer.alloc(1) },
+			{ headers: sttHeaders(), body: Buffer.alloc(48_000 * 2 * 20 + 2) },
+		];
+		for (const invalid of invalidRequests) {
+			const response = await fetch(`${baseUrl}/v1/stt`, {
+				method: 'POST', headers: invalid.headers, body: invalid.body,
+			});
+			assert.equal(response.ok, false);
+			const stt = worker.statusSnapshots().find(({ component }) => component === 'voice:stt');
+			assert.equal(stt.state, 'ready');
+			assert.equal(stt.consecutiveFailureCount, 0);
+			assert.equal(stt.nextProbeAtEpochMs, null);
+		}
+		assert.equal(calls, 0);
+		assert.equal(probes, 0);
+	});
+});
+
 test('TTS route rejects provider audio that is not mono signed 16-bit PCM', async () => {
 	await withWorker({
 		provider: { async synthesize() {

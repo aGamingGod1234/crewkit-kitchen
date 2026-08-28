@@ -1541,6 +1541,9 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		environment[voice.fishApiKeyEnvironmentVariable ?? DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE],
 		environment.FISH_API_KEY,
 	);
+	const deepgramApiKey = firstNonBlank(
+		environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
+	);
 	const platform = dependencies.platform ?? process.platform;
 	const createLocalSpeechProvider = dependencies.createLocalSpeechProvider
 		?? ((options) => LocalSpeechProvider.createIfAvailable(options));
@@ -1558,7 +1561,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			accessFile: dependencies.localSpeechAccess,
 		});
 		throwIfVoiceStartupAborted(signal);
-		if (localSpeechProvider === null && fishApiKey === null && platform !== 'win32') return null;
+		if (localSpeechProvider === null && fishApiKey === null && deepgramApiKey === null && platform !== 'win32') return null;
 		const profilePath = dependencies.profilePath
 			?? voice.profileAssignmentsPath
 			?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
@@ -1576,9 +1579,6 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
 			throw new TypeError('loadProfileStore must return a profile store');
 		}
-		const deepgramApiKey = firstNonBlank(
-			environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
-		);
 		if (deepgramApiKey !== null && typeof createSttProvider !== 'function') throw new TypeError('createSttProvider must be a function when Deepgram is configured');
 		let provider;
 		let sttProvider;
@@ -1596,7 +1596,9 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			sttProvider = fallback.stt;
 			ownedSpeechProvider = fallback;
 		} else {
-			provider = fishApiKey === null ? createWindowsTtsProvider({}) : createTtsProvider({ apiKey: fishApiKey });
+			provider = fishApiKey === null
+				? (platform === 'win32' ? createWindowsTtsProvider({}) : null)
+				: createTtsProvider({ apiKey: fishApiKey });
 			if (fishApiKey !== null && platform === 'win32') provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}));
 			sttProvider = deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey });
 		}

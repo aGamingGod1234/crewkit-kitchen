@@ -4,6 +4,7 @@ import test from 'node:test';
 import { startVoiceWorker } from '../src/dynamic-main.mjs';
 
 const SECRET = 'voice-bootstrap-test-secret';
+const PLAYER = '10000000-0000-4000-8000-000000000001';
 
 test('voice bootstrap uses credential-free Windows speech when Fish is not configured', async () => {
 	let profileLoads = 0;
@@ -46,6 +47,49 @@ test('voice bootstrap remains disabled without a provider on non-Windows hosts',
 
 	assert.equal(worker, null);
 	assert.equal(profileLoads, 0);
+});
+
+test('voice bootstrap starts Deepgram-only STT with no TTS provider on non-Windows hosts', async () => {
+	let transcriptions = 0;
+	const created = await startVoiceWorker({
+		bridge: { secret: SECRET },
+		voice: { port: 0 },
+	}, { DEEPGRAM_API_KEY: 'deepgram-only-key' }, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => null,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createWindowsTtsProvider: () => { throw new Error('Windows TTS must not be created on Linux'); },
+		createSttProvider: ({ apiKey }) => {
+			assert.equal(apiKey, 'deepgram-only-key');
+			return { async transcribe() {
+				transcriptions += 1;
+				return { transcript: 'heard', confidence: 1 };
+			} };
+		},
+	});
+
+	try {
+		assert.equal(created.server.listening, true);
+		const snapshots = created.statusSnapshots();
+		assert.equal(snapshots.find(({ component }) => component === 'voice:tts').failureCode, 'TTS_UNAVAILABLE');
+		assert.equal(snapshots.find(({ component }) => component === 'voice:stt').state, 'ready');
+		const response = await fetch(`http://127.0.0.1:${created.server.address().port}/v1/stt`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${SECRET}`,
+				'Content-Type': 'audio/l16;rate=48000;channels=1',
+				'X-Player-Id': PLAYER,
+				'X-Utterance-Sequence': '1',
+				'X-Whispering': 'false',
+			},
+			body: Buffer.alloc(2),
+		});
+		assert.equal(response.status, 200);
+		assert.equal((await response.json()).transcript, 'heard');
+		assert.equal(transcriptions, 1);
+	} finally {
+		await created.close();
+	}
 });
 
 test('voice bootstrap reads Fish and optional STT credentials from environment only', async () => {
