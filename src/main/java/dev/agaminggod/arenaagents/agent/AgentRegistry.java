@@ -349,6 +349,19 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.disconnect(require(id), nowEpochMs));
 	}
 
+	public synchronized AgentRecord rearmAfterCoordinatorRecovery(
+			UUID agentId,
+			long expectedGoalRevision,
+			long nowEpochMs
+	) {
+		AgentTransition transition = AgentLifecycleReducer.rearmAfterCoordinatorRecovery(
+				require(new AgentId(Objects.requireNonNull(agentId, "agentId must not be null"))),
+				expectedGoalRevision,
+				nowEpochMs
+		);
+		return apply(transition).after();
+	}
+
 	/** Re-arms a durable wake after transport loss without manufacturing a new goal revision. */
 	public synchronized AgentTransition rearmConversationWake(
 			AgentId id,

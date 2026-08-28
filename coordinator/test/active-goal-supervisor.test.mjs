@@ -3,7 +3,13 @@ import test from 'node:test';
 
 import { ActiveGoalSupervisor } from '../src/active-goal-supervisor.mjs';
 
-const key = Object.freeze({ agentId: 'luna', goalRevision: 4, lifecycleGeneration: 2 });
+const key = Object.freeze({
+	agentId: 'luna',
+	goalRevision: 4,
+	lifecycleGeneration: 2,
+	sessionEpoch: 7,
+	profileFingerprint: `sha256:${'a'.repeat(64)}`,
+});
 
 function timerFixture(requests = []) {
 	let nextId = 0;

@@ -3,14 +3,18 @@ import { createHash } from 'node:crypto';
 import { AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
+import { profileFingerprint } from './provider-session.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
 import { parseGoalSpecRequest } from './goal-spec.mjs';
 import { GoalSpecTranslator } from './goal-spec-translator.mjs';
+import { classifyRecoveryFailure } from './recovery-policy.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage } from './diagnostic-sanitizer.mjs';
 
 const DEFAULT_INVALID_DECISION_RETRIES = 1;
 const MAX_RETRY_ERROR_LENGTH = 512;
 const MAX_VERBOSE_MESSAGE_LENGTH = 256;
+const DEFAULT_PLANNING_LEASE_TIMEOUT_MS = 125_000;
 const RETRYABLE_DECISION_ERRORS = new Set([
 	'EMPTY_DECISION',
 	'MALFORMED_DECISION',
@@ -19,19 +23,6 @@ const RETRYABLE_DECISION_ERRORS = new Set([
 	'MISSING_DECISION_FIELD',
 	'DECISION_FIELD_MISMATCH',
 	'DUPLICATE_DECISION_FIELD',
-]);
-const RETRYABLE_PROVIDER_ERRORS = new Set([
-	'PLANNING_TIMEOUT',
-	'PROVIDER_UNAVAILABLE',
-	'SPAWN_FAILED',
-	// Codex app-server can complete a turn without emitting an agent-message
-	// item. A single clean retry is safer than permanently erroring the agent.
-	'MISSING_AGENT_MESSAGE',
-	'MISSING_FINAL_MESSAGE',
-]);
-const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set([
-	'MISSING_AGENT_MESSAGE',
-	'MISSING_FINAL_MESSAGE',
 ]);
 
 export class AgentPlanner {
@@ -45,6 +36,7 @@ export class AgentPlanner {
 	#now;
 	#recorder;
 	#turnRecorder;
+	#planningLeaseTimeoutMs;
 
 	constructor({
 		registry,
@@ -58,6 +50,7 @@ export class AgentPlanner {
 		recorder = null,
 		benchmarkRecorder = null,
 		turnRecorder = null,
+		planningLeaseTimeoutMs = DEFAULT_PLANNING_LEASE_TIMEOUT_MS,
 	}) {
 		if (registry === null || registry === undefined) throw new TypeError('registry is required');
 		if (scheduler === null || scheduler === undefined) throw new TypeError('scheduler is required');
@@ -72,6 +65,7 @@ export class AgentPlanner {
 		const selectedRecorder = recorder ?? benchmarkRecorder;
 		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
+		if (!Number.isSafeInteger(planningLeaseTimeoutMs) || planningLeaseTimeoutMs <= 0) throw new TypeError('planningLeaseTimeoutMs must be a positive safe integer');
 		this.#registry = registry;
 		this.#scheduler = scheduler;
 		this.#codexService = codexService;
@@ -82,6 +76,7 @@ export class AgentPlanner {
 		this.#now = now;
 		this.#recorder = selectedRecorder;
 		this.#turnRecorder = turnRecorder;
+		this.#planningLeaseTimeoutMs = planningLeaseTimeoutMs;
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
@@ -129,6 +124,7 @@ export class AgentPlanner {
 		if (typeof executeTool !== 'function') throw new TypeError('executeTool must be a function');
 		const traceId = requestedTraceId === null ? defaultTraceId(agentId, goalRevision) : validateTraceId(requestedTraceId);
 		const queuedAt = this.#now();
+		let leaseAgent = null;
 		safeVerbose(onVerbose, 'planner', `Native turn queued with ${priority} priority.`);
 		this.#record('planner_requested', record, { operation: 'native_turn', preserveState, retry: false, lane: record.provider, priority, traceId });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
@@ -138,6 +134,7 @@ export class AgentPlanner {
 			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
+			leaseAgent = currentProviderAgent(this.#codexService, agentId);
 			try {
 				const agent = await this.#providerAttempt(record, {
 					operation: 'create_agent', attempt: 1, queueWaitMs, retry: false, traceId,
@@ -146,6 +143,7 @@ export class AgentPlanner {
 					await created.setGoalRevision(goalRevision);
 					return created;
 				}, null, onVerbose);
+				leaseAgent = agent;
 				let firstToolAt = null;
 				const result = await this.#providerAttempt(record, {
 					operation: 'native_turn', attempt: 1, queueWaitMs, retry: false, traceId,
@@ -172,7 +170,12 @@ export class AgentPlanner {
 				safeVerbose(onVerbose, 'error', verboseErrorMessage('Native turn failed', error));
 				throw error;
 			}
-		}, { lane: record.provider, priority });
+		}, {
+			lane: record.provider,
+			priority,
+			leaseTimeoutMs: this.#planningLeaseTimeoutMs,
+			onLeaseExpired: () => this.#replaceExactSession(record, leaseAgent, 'native_tools', 'planning_lease_expired'),
+		});
 	}
 
 	async steerNativeTurn({ agentId, input, goalRevision }) {
@@ -191,6 +194,7 @@ export class AgentPlanner {
 		const selectedPriority = planningPriority ?? priority ?? record.planningPriority ?? record.priority ?? 'ordinary';
 		const queuedAt = this.#now();
 		const trace = { retryReason: null, phasesRecorded: false };
+		let leaseAgent = null;
 		safeVerbose(onVerbose, 'planner', `Planning request queued with ${selectedPriority} priority.`);
 		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false, lane: record.provider, priority: selectedPriority, traceId });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
@@ -201,6 +205,7 @@ export class AgentPlanner {
 			this.#recordTracePhase(record, traceId, 'queue_wait', queuedAt, admittedAt, 'completed');
 			this.#registry.assertCurrentRevision(agentId, goalRevision);
 			if (!preserveState) this.#registry.setState(agentId, DynamicAgentState.PLANNING, { goalRevision });
+			leaseAgent = currentProviderAgent(this.#codexService, agentId);
 			try {
 				let agent;
 				let initializationRetryCount = 0;
@@ -215,18 +220,27 @@ export class AgentPlanner {
 						}, async () => {
 							const created = await this.#codexService.createAgent(record, { recoverySummary, controlProtocol: 'arena_script' });
 							await created.setGoalRevision(goalRevision);
+							leaseAgent = created;
 							return created;
 						}, null, onVerbose);
 						break;
 					} catch (error) {
+						const recovery = classifyRecoveryFailure(error);
 						if (
-							RETRYABLE_PROVIDER_ERRORS.has(error?.code)
+							recovery.immediateRetry
 							&& initializationRetryCount < 1
 							&& this.#isCurrent(agentId, goalRevision)
 							&& !signal.aborted
 						) {
 							initializationRetryCount += 1;
 							safeVerbose(onVerbose, 'retry', verboseErrorMessage('Retrying provider initialization', error));
+							const replacement = await this.#replaceExactSession(record, leaseAgent, 'arena_script', 'provider_initialization_retry');
+							if (replacement !== null) {
+								agent = replacement;
+								leaseAgent = replacement;
+								await replacement.setGoalRevision(goalRevision);
+								break;
+							}
 							continue;
 						}
 						throw error;
@@ -260,6 +274,7 @@ export class AgentPlanner {
 						safeVerbose(onVerbose, 'decision', `Planner decision accepted with directive '${decision?.directive ?? 'unknown'}'.`);
 						return { ...decision, goalRevision, ...(traceIdProvided ? { traceId } : {}) };
 					} catch (error) {
+						const recovery = classifyRecoveryFailure(error);
 						if (
 							RETRYABLE_DECISION_ERRORS.has(error?.code)
 							&& retryCount < this.#invalidDecisionRetries
@@ -273,13 +288,19 @@ export class AgentPlanner {
 							continue;
 						}
 						if (
-							RETRYABLE_PROVIDER_ERRORS.has(error?.code)
+							recovery.immediateRetry
 							&& providerRetryCount < 1
 							&& this.#isCurrent(agentId, goalRevision)
 							&& !signal.aborted
 						) {
 							providerRetryCount += 1;
 							safeVerbose(onVerbose, 'retry', verboseErrorMessage(`Provider retry ${providerRetryCount}`, error));
+							const replacement = await this.#replaceExactSession(record, agent, 'arena_script', 'provider_turn_retry');
+							if (replacement !== null) {
+								agent = replacement;
+								leaseAgent = replacement;
+								await replacement.setGoalRevision(goalRevision);
+							}
 							plannerInput = input;
 							continue;
 						}
@@ -287,30 +308,39 @@ export class AgentPlanner {
 					}
 				}
 			} catch (error) {
+				const recovery = classifyRecoveryFailure(error);
 				this.#record('planner_failed', record, { operation: 'plan', errorCode: error?.code ?? 'PLANNING_FAILED', retry: true, traceId });
 				safeVerbose(onVerbose, 'error', verboseErrorMessage('Planning failed', error));
 				if (
 					error?.code !== 'STALE_PLAN'
 					&& error?.code !== 'PLAN_CANCELLED'
-					&& !QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)
+					&& !recovery.quiet
+					&& !recovery.retryable
 					&& this.#isCurrent(agentId, goalRevision)
 					&& !preserveState
 				) {
 					this.#registry.setState(agentId, DynamicAgentState.ERROR, {
 						goalRevision,
-						error: { code: String(error?.code ?? 'PLANNING_FAILED').slice(0, 128), message: String(error?.message ?? error).slice(0, 2_048) },
+						error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'PLANNING_FAILED' }), message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 2_048 }) },
 					});
 				}
 				throw error;
 			}
-		}, { lane: record.provider, priority: selectedPriority });
+		}, {
+			lane: record.provider,
+			priority: selectedPriority,
+			leaseTimeoutMs: this.#planningLeaseTimeoutMs,
+			onLeaseExpired: () => this.#replaceExactSession(record, leaseAgent, 'arena_script', 'planning_lease_expired'),
+		});
 	}
 
 	async #providerAttempt(record, fields, operation, sessionAgent = null, onVerbose = null) {
-		const healthIdentity = { provider: record.provider, model: record.model, operation: fields.operation };
+		const healthIdentity = { provider: record.provider, model: record.model, operation: fields.operation, profileFingerprint: profileFingerprint(record) };
 		if (!this.#healthRegistry.canAttempt(healthIdentity)) {
 			const error = new Error(`Provider circuit is open for '${record.provider}/${record.model}/${fields.operation}'`);
 			error.code = 'PROVIDER_CIRCUIT_OPEN';
+			const deadline = this.#healthRegistry.snapshot?.(healthIdentity)?.nextProbeAtEpochMs;
+			if (Number.isFinite(deadline)) error.nextProbeAtEpochMs = deadline;
 			this.#record('provider_attempt_rejected', record, { ...fields, operation: fields.operation, errorCode: error.code });
 			safeVerbose(onVerbose, 'error', `Provider circuit rejected ${fields.operation}.`);
 			throw error;
@@ -348,12 +378,39 @@ export class AgentPlanner {
 				...sessionFields,
 				durationMs,
 				error,
-				retryReason: error?.code ?? 'ERROR',
+				retryReason: safeRetryReason(error?.code),
 				timeout: error?.code === 'PLANNING_TIMEOUT',
 				restart: false,
 			}));
 			throw error;
 		}
+	}
+
+	async #replaceExactSession(record, expectedAgent, controlProtocol, recoverySummary) {
+		if (typeof this.#codexService.replaceAgent !== 'function') return null;
+		const capturedFingerprint = profileFingerprint(record);
+		const latestRecord = this.#registry.assertCurrentRevision(record.agentId, record.goalRevision);
+		if (profileFingerprint(latestRecord) !== capturedFingerprint) {
+			throw codedError('SESSION_PROFILE_MISMATCH', 'The selected agent profile changed before recovery');
+		}
+		const expectedFingerprint = sessionProfileFingerprint(expectedAgent);
+		if (expectedFingerprint !== null && expectedFingerprint !== capturedFingerprint) {
+			throw codedError('SESSION_PROFILE_MISMATCH', 'The failed provider session does not own the selected profile');
+		}
+		const current = typeof this.#codexService.getAgent === 'function' ? this.#codexService.getAgent(record.agentId) : null;
+		if (expectedAgent === null && current !== null) return current;
+		if (current !== null && expectedAgent !== null && current !== expectedAgent) {
+			if (sessionProfileFingerprint(current) !== capturedFingerprint) {
+				throw codedError('SESSION_PROFILE_MISMATCH', 'The current provider session does not own the selected profile');
+			}
+			return current;
+		}
+		const owned = expectedAgent ?? current;
+		return this.#codexService.replaceAgent(record, {
+			recoverySummary,
+			controlProtocol,
+			...(Number.isSafeInteger(owned?.sessionGeneration) ? { expectedSessionGeneration: owned.sessionGeneration } : {}),
+		});
 	}
 
 	#publishTelemetry(telemetry) {
@@ -430,8 +487,8 @@ export class AgentPlanner {
 		return (await this.beginReconcile(snapshot).complete);
 	}
 
-	beginReconcile(snapshot) {
-		const result = this.#registry.reconcile(snapshot);
+	beginReconcile(snapshot, options = undefined) {
+		const result = this.#registry.reconcile(snapshot, options);
 		for (const agentId of result.removed) this.#scheduler.cancel(agentId, 'Agent absent from reconciled server snapshot');
 		const complete = Promise.resolve(this.#codexService.reconcile(result.records)).then((providers) =>
 			({ registry: result, providers, codex: providers }));
@@ -466,6 +523,27 @@ function readSessionFields(agent) {
 
 function defaultTraceId(agentId, goalRevision) {
 	return `trace-${String(agentId).replace(/[^A-Za-z0-9._:-]/g, '_')}-${goalRevision}`.slice(0, 128);
+}
+
+function sessionProfileFingerprint(agent) {
+	if (agent === null || agent === undefined) return null;
+	if (typeof agent.profileFingerprint === 'string') return agent.profileFingerprint;
+	if (typeof agent.sessionMetadata !== 'function') return null;
+	try {
+		const fingerprint = agent.sessionMetadata()?.profileFingerprint;
+		return typeof fingerprint === 'string' ? fingerprint : null;
+	} catch { return null; }
+}
+
+function currentProviderAgent(service, agentId) {
+	if (typeof service.getAgent !== 'function') return null;
+	try { return service.getAgent(agentId); }
+	catch { return null; }
+}
+
+function safeRetryReason(value) {
+	try { return normalizeRetryReason(value ?? 'ERROR'); }
+	catch { return 'ERROR'; }
 }
 
 function goalSpecTranslatorId(agentId, requestId) {

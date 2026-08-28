@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, resolveCodexLaunch } from '../src/codex-app-server.mjs';
+import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, CodexStdioTransport, resolveCodexLaunch } from '../src/codex-app-server.mjs';
 import { finishDecisionJson } from './provider-decision-fixtures.mjs';
 
 const model = {
@@ -39,6 +39,24 @@ class FakeCodexTransport extends EventEmitter {
 		}
 		if (method === 'turn/interrupt') return {};
 		throw new Error(`Unexpected method ${method}`);
+	}
+}
+
+class FakeStdioChild extends EventEmitter {
+	constructor() {
+		super();
+		this.stdout = new EventEmitter();
+		this.stderr = new EventEmitter();
+		this.writes = [];
+		this.stdin = { write: (line) => this.writes.push(JSON.parse(String(line).trim())) };
+		this.killed = false;
+		this.exitCode = null;
+		this.signalCode = null;
+	}
+
+	kill() {
+		this.killed = true;
+		return true;
 	}
 }
 
@@ -216,6 +234,70 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined);
 });
 
+test('a stopped child late spawn error cannot orphan its running replacement transport', async () => {
+	const first = new FakeStdioChild();
+	const replacement = new FakeStdioChild();
+	let spawnCalls = 0;
+	const transport = new CodexStdioTransport(config, {
+		spawn: () => {
+			spawnCalls += 1;
+			if (spawnCalls === 1) return first;
+			queueMicrotask(() => replacement.emit('spawn'));
+			return replacement;
+		},
+		stopTimeoutMs: 1,
+	});
+	const obsoleteStart = transport.start();
+	const obsoleteFailure = assert.rejects(obsoleteStart, (error) => error?.code === 'SPAWN_FAILED');
+	try {
+		await transport.stop();
+		await transport.start();
+
+		first.emit('error', new Error('old child failed after replacement started'));
+		await obsoleteFailure;
+		assert.doesNotThrow(() => transport.notify('replacement/alive'));
+		assert.deepEqual(replacement.writes, [{ method: 'replacement/alive', params: {} }]);
+	} finally {
+		await transport.stop();
+	}
+});
+
+test('Codex child stderr crosses the shared bounded diagnostic sanitizer', async () => {
+	const child = new FakeStdioChild();
+	const diagnostics = [];
+	const transport = new CodexStdioTransport(config, { spawn: () => child, stopTimeoutMs: 1 });
+	transport.on('diagnostic', (message) => diagnostics.push(message));
+	const started = transport.start();
+	child.emit('spawn');
+	await started;
+	try {
+		child.stderr.emit('data', Buffer.from('Authorization: Bearer child-secret at C:\\private\\codex.log ' + 'x'.repeat(8_000)));
+		assert.equal(diagnostics.length, 1);
+		assert.doesNotMatch(diagnostics[0], /child-secret|private/);
+		assert.ok(Buffer.byteLength(diagnostics[0], 'utf8') <= 4_096);
+	} finally {
+		await transport.stop();
+	}
+});
+
+test('Codex desktop discovery writes a shared-sanitized bounded failure', (t) => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-secret-path-'));
+	const diagnostics = [];
+	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));
+	try {
+		resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { ProgramFiles: path.join(root, 'Program Files'), LOCALAPPDATA: path.join(root, 'Local') },
+			windowsPackageLocations: [],
+		});
+		assert.equal(diagnostics.length, 1);
+		assert.doesNotMatch(diagnostics[0], /arena-codex-secret-path/i);
+		assert.ok(Buffer.byteLength(diagnostics[0], 'utf8') <= 4_096);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test('initializes before catalog validation and thread start', async () => {
 	const transport = new FakeCodexTransport();
 	const agent = new CodexAgent(config, transport);
@@ -223,6 +305,7 @@ test('initializes before catalog validation and thread start', async () => {
 	assert.deepEqual(transport.methods(), ['initialize', 'initialized', 'model/list', 'thread/start']);
 	const initialize = transport.calls.find((call) => call.method === 'initialize').params;
 	assert.deepEqual(initialize.capabilities, { experimentalApi: true, requestAttestation: false });
+	assert.equal(transport.calls.find((call) => call.method === 'model/list').params.includeHidden, false);
 	const thread = transport.calls.find((call) => call.method === 'thread/start').params;
 	assert.deepEqual({ model: thread.model, serviceTier: thread.serviceTier, approvalPolicy: thread.approvalPolicy, sandbox: thread.sandbox, dynamicTools: thread.dynamicTools, environments: thread.environments }, {
 		model: 'gpt-5.5', serviceTier: 'fast', approvalPolicy: 'never', sandbox: 'read-only', dynamicTools: [], environments: [],
@@ -289,6 +372,7 @@ test('checks a live catalog profile without starting a planner thread', async ()
 	const checked = await checkCodexModelProfile(config, transport);
 	assert.equal(checked.model, 'gpt-5.5');
 	assert.deepEqual(transport.methods(), ['initialize', 'initialized', 'model/list']);
+	assert.equal(transport.calls.find((call) => call.method === 'model/list').params.includeHidden, false);
 });
 
 test('restarts a failed app-server into a fresh persistent thread', async () => {

@@ -88,6 +88,147 @@ test('Codex service defaults dynamic profiles to the priority app-server tier', 
 	await service.stop();
 });
 
+test('Codex catalog fallback contains only the configured exact launch profile', async () => {
+	const transport = new FakeSharedTransport();
+	transport.request = async (method, params, options) => {
+		transport.calls.push({ method, params, options });
+		if (method === 'initialize') return { userAgent: 'fake' };
+		if (method === 'model/list') throw Object.assign(new Error('catalog offline'), { code: 'PROVIDER_UNAVAILABLE' });
+		throw new Error(`Unexpected method ${method}`);
+	};
+	const service = new CodexService({
+		cwd: 'C:\\workspace',
+		launchProfile: { model: 'gpt-5.6-terra', reasoningEffort: 'xhigh', serviceTier: 'priority' },
+	}, { transport });
+	await service.start();
+	try {
+		const snapshot = service.catalog.snapshot();
+		assert.equal(snapshot.source, 'builtin');
+		assert.deepEqual(snapshot.models.map(({ id, reasoningEfforts, serviceTiers }) => ({ id, reasoningEfforts, serviceTiers })), [{
+			id: 'gpt-5.6-terra', reasoningEfforts: ['xhigh'], serviceTiers: ['priority'],
+		}]);
+	} finally {
+		await service.stop();
+	}
+});
+
+test('Codex initialization forwards its bounded startup deadline to the transport', async () => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace', startupTimeoutMs: 321 }, { transport });
+	await service.start();
+	try {
+		assert.deepEqual(transport.calls.find(({ method }) => method === 'initialize').options, { timeoutMs: 321 });
+	} finally {
+		await service.stop();
+	}
+});
+
+test('Codex startup owns its deadline and a later probe starts a fresh transport attempt', async () => {
+	const transport = new FakeSharedTransport();
+	const releases = [];
+	let starts = 0;
+	let stops = 0;
+	const liveAttempts = new Set();
+	transport.start = () => new Promise((resolve) => {
+		const attempt = ++starts;
+		releases.push(() => { liveAttempts.add(attempt); resolve(); });
+	});
+	transport.stop = async () => { stops += 1; liveAttempts.clear(); };
+	const catalog = {
+		stale: false,
+		refresh: async () => ({ models: [MODEL], source: 'live' }),
+		assertSupported() {},
+		reconcileProfiles: (records) => ({ valid: records, invalid: [] }),
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace', startupTimeoutMs: 5 }, { transport, catalog });
+	try {
+		const first = await Promise.race([
+			service.start().then(() => 'fulfilled', (error) => error?.code),
+			new Promise((resolve) => setTimeout(() => resolve('outer-timeout'), 30)),
+		]);
+		assert.equal(first, 'PROVIDER_START_TIMEOUT');
+		const second = service.start();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(starts, 2);
+		releases[0]();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(service.started, false, 'the obsolete startup cannot mark the backend live');
+		releases[1]();
+		await second;
+		assert.equal(service.started, true);
+		assert.ok(stops >= 1);
+	} finally {
+		for (const release of releases) release();
+		await service.stop();
+	}
+});
+
+test('late cleanup from a timed-out startup cannot stop a newer shared-transport initialization', async () => {
+	const transport = new FakeSharedTransport();
+	let startCalls = 0;
+	let releaseFirstStart;
+	let releaseInitialize;
+	let live = false;
+	transport.start = async () => {
+		startCalls += 1;
+		if (startCalls === 1) {
+			await new Promise((resolve) => { releaseFirstStart = resolve; });
+		}
+		live = true;
+	};
+	transport.stop = async () => { live = false; };
+	transport.request = async (method, params, options) => {
+		transport.calls.push({ method, params, options });
+		if (method === 'initialize') {
+			await new Promise((resolve) => { releaseInitialize = resolve; });
+			if (!live) throw Object.assign(new Error('shared transport was stopped'), { code: 'TRANSPORT_STOPPED' });
+			return { userAgent: 'fake' };
+		}
+		if (method === 'model/list') {
+			if (!live) throw Object.assign(new Error('shared transport was stopped'), { code: 'TRANSPORT_STOPPED' });
+			return { data: [MODEL], nextCursor: null };
+		}
+		throw new Error(`Unexpected method ${method}`);
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace', startupTimeoutMs: 5 }, { transport });
+	try {
+		await assert.rejects(service.start(), (error) => error?.code === 'PROVIDER_START_TIMEOUT');
+		const replacement = service.start();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(startCalls, 2);
+		assert.equal(typeof releaseInitialize, 'function', 'replacement reached authentication');
+
+		releaseFirstStart();
+		await new Promise((resolve) => setImmediate(resolve));
+		releaseInitialize();
+		await replacement;
+		assert.equal(service.started, true);
+	} finally {
+		releaseFirstStart?.();
+		releaseInitialize?.();
+		await service.stop();
+	}
+});
+
+test('Codex stop fences an already-entered thread creation from installing a late agent', async () => {
+	const transport = new FakeSharedTransport();
+	let releaseThread;
+	const originalRequest = transport.request.bind(transport);
+	transport.request = async (method, params, options) => {
+		if (method !== 'thread/start') return originalRequest(method, params, options);
+		transport.calls.push({ method, params, options });
+		return new Promise((resolve) => { releaseThread = () => resolve({ thread: { id: 'late-thread' } }); });
+	};
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const creating = service.createAgent(profile('late-agent'));
+	await new Promise((resolve) => setImmediate(resolve));
+	const stopping = service.stop();
+	releaseThread();
+	await assert.rejects(creating, (error) => error?.code === 'PROVIDER_STOPPED');
+	await stopping;
+	assert.equal(service.getAgent('late-agent'), null);
+});
+
 test('Codex service forwards app-server diagnostics to the coordinator error log', (t) => {
 	const diagnostics = [];
 	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));
@@ -95,6 +236,17 @@ test('Codex service forwards app-server diagnostics to the coordinator error log
 	new CodexService({ cwd: 'C:\\workspace' }, { transport });
 	transport.emit('diagnostic', 'failed to spawn required runtime sidecar');
 	assert.deepEqual(diagnostics, ['[codex-app-server] failed to spawn required runtime sidecar']);
+});
+
+test('Codex service sanitizes forwarded transport diagnostics at the console boundary', (t) => {
+	const diagnostics = [];
+	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));
+	const transport = new FakeSharedTransport();
+	new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	transport.emit('diagnostic', 'Authorization: Bearer forwarded-secret at C:\\private\\provider.log ' + 'x'.repeat(8_000));
+	assert.equal(diagnostics.length, 1);
+	assert.doesNotMatch(diagnostics[0], /forwarded-secret|private/);
+	assert.ok(Buffer.byteLength(diagnostics[0], 'utf8') <= 4_128);
 });
 
 test('direct Codex callers default to native Minecraft tools when protocol is omitted', async () => {
@@ -127,6 +279,7 @@ test('Codex service shares one initialized transport across isolated agent threa
 	const first = await service.createAgent(profile('agent-a'), { controlProtocol: 'arena_script' });
 	const second = await service.createAgent(profile('agent-b'), { controlProtocol: 'arena_script' });
 	assert.equal(transport.calls.filter((call) => call.method === 'initialize').length, 1);
+	assert.equal(transport.calls.find((call) => call.method === 'model/list').params.includeHidden, false);
 	assert.equal(transport.calls.filter((call) => call.method === 'thread/start').length, 2);
 	await first.setGoalRevision(1);
 	await second.setGoalRevision(3);
@@ -190,6 +343,24 @@ test('Codex session replacement increments generation and reports a reset reason
 	assert.equal(replacement.sessionGeneration, 2);
 	assert.equal(replacement.profileFingerprint, first.profileFingerprint);
 	assert.equal(replacement.sessionMetadata().resetReason, 'session_replaced');
+	await service.stop();
+});
+
+test('Codex transport loss fences the owning threads and coalesces one exact replacement generation', async () => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const selected = profile('agent-transport-loss');
+	const stale = await service.createAgent(selected, { controlProtocol: 'arena_script' });
+	transport.emit('exit', Object.assign(new Error('app server exited'), { code: 'PROCESS_EXITED' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(service.getAgent(selected.agentId), null);
+	await assert.rejects(stale.decide('late work', { goalRevision: 0 }), (error) => error?.code === 'SESSION_INVALIDATED');
+	const first = service.replaceAgent(selected, { controlProtocol: 'arena_script', expectedSessionGeneration: 1 });
+	const second = service.replaceAgent(selected, { controlProtocol: 'arena_script', expectedSessionGeneration: 1 });
+	const [replacement, duplicate] = await Promise.all([first, second]);
+	assert.equal(replacement, duplicate);
+	assert.equal(replacement.sessionGeneration, 2);
+	assert.equal(replacement.profileFingerprint, stale.profileFingerprint);
 	await service.stop();
 });
 

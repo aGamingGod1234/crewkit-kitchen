@@ -18,6 +18,7 @@ public final class AgentRegistryVerification {
 		assertions += verifyLifecycleAndRevisions();
 		assertions += verifyAtomicStartPublication();
 		assertions += verifyPendingConversationWakeRecovery();
+		assertions += verifyCoordinatorRecoveryRearm();
 		assertions += verifyCoordinatorCompletion();
 		assertions += verifyCoordinatorCompletionPromotesQueue();
 		assertions += verifyQueueAndSteeringBounds();
@@ -87,6 +88,31 @@ public final class AgentRegistryVerification {
 				"durable conversation wake recovery preserves its exact goal identity");
 		assertEquals("", rearmed.lastError(), "durable conversation wake recovery does not report a false reload pause");
 		return 4;
+	}
+
+	private static int verifyCoordinatorRecoveryRearm() {
+		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transition -> { });
+		AgentRecord created = registry.create(
+				"kimi", "kimi-code/k3", "max", "priority", Optional.of("Recovery"), AgentGameMode.CREATIVE, START_TIME
+		);
+		AgentRecord active = registry.start(created.agentId(), "Keep the exact profile", START_TIME + 1L).after();
+		AgentRecord disconnected = registry.disconnect(created.agentId(), START_TIME + 2L).after();
+
+		AgentRecord rearmed = registry.rearmAfterCoordinatorRecovery(
+				created.agentId().value(), disconnected.goalRevision(), START_TIME + 3L
+		);
+		assertEquals(AgentLifecycleState.STARTING, rearmed.state(), "coordinator recovery re-arms disconnected work");
+		assertEquals(disconnected.goalRevision(), rearmed.goalRevision(), "coordinator recovery preserves the goal revision");
+		assertEquals(active.currentGoal(), rearmed.currentGoal(), "coordinator recovery preserves the exact unfinished goal");
+		assertEquals(created.profile(), rearmed.profile(), "coordinator recovery preserves the exact selected profile");
+		assertEquals(rearmed, registry.rearmAfterCoordinatorRecovery(
+				created.agentId().value(), disconnected.goalRevision(), START_TIME + 4L
+		), "duplicate coordinator recovery is idempotent");
+		expectFailure(
+				() -> registry.rearmAfterCoordinatorRecovery(created.agentId().value(), disconnected.goalRevision() - 1L, START_TIME + 5L),
+				"STALE_REVISION"
+		);
+		return 6;
 	}
 
 	private static int verifyLifecycleAndRevisions() {
@@ -231,15 +257,16 @@ public final class AgentRegistryVerification {
 		AgentRegistry.Snapshot decoded = codec.decode(encoded);
 		AgentRegistry recovered = AgentRegistry.restore(decoded, () -> { }, transition -> { }, START_TIME + 5L);
 		AgentRecord restored = recovered.require(created.agentId());
-		assertEquals(AgentLifecycleState.DISCONNECTED, restored.state(), "active reload state");
-		assertEquals(2L, restored.goalRevision(), "reload revision");
+		assertEquals(AgentLifecycleState.STARTING, restored.state(), "active reload re-arms unfinished work");
+		assertEquals(1L, restored.goalRevision(), "reload preserves the active goal revision");
 		assertEquals("Mine iron", restored.currentGoal().orElseThrow().prompt(), "reload goal");
+		assertEquals(registry.require(created.agentId()).profile(), restored.profile(), "reload preserves the exact selected profile");
 		AgentRecord restoredPaused = recovered.require(paused.agentId());
 		assertEquals(AgentLifecycleState.PAUSED, restoredPaused.state(), "explicit pause survives reload");
 		assertEquals(paused.goalRevision(), restoredPaused.goalRevision(), "explicit pause revision survives reload");
 		assertEquals(paused.currentGoal().orElseThrow().prompt(), restoredPaused.currentGoal().orElseThrow().prompt(),
 				"explicit pause goal survives reload");
-		return 6;
+		return 7;
 	}
 
 	private static int verifyProviderPersistenceAndMigration() {

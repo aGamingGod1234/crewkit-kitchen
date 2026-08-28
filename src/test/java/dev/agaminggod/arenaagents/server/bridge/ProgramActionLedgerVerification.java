@@ -24,15 +24,33 @@ public final class ProgramActionLedgerVerification {
 		expectFailure(() -> ledger.accept(request(agent, "action-1", provenance("program-2", 1L, "step-1", 4L))), "ACTION_PROVENANCE_MISMATCH");
 		ledger.terminal(new ServerActionResult(agent, 7L, "action-1", ActionType.WAIT, ServerActionState.FAILED, "REJECTED", "Rejected", 0L, 1L));
 		expectFailure(() -> ledger.accept(first), "ACTION_REPLAY");
+		for (int index = 0; index <= 4_096; index++) {
+			String actionId = "history-" + index;
+			ServerActionRequest historical = request(agent, actionId, provenance("program-history", 1L, "step-" + index, index));
+			ledger.accept(historical);
+			ledger.terminal(new ServerActionResult(agent, 7L, actionId, ActionType.WAIT, ServerActionState.SUCCEEDED, "DONE", "Done", 0L, 1L));
+		}
+		expectFailure(
+				() -> ledger.accept(request(agent, "history-0", provenance("program-history", 1L, "step-0", 0L))),
+				"ACTION_REPLAY"
+		);
+		ledger.beginGoal(agent, 7L);
+		expectFailure(() -> ledger.accept(first), "ACTION_REPLAY");
+		ledger.beginGoal(agent, 8L);
+		ledger.accept(request(agent, 8L, "action-1", provenance));
 		ledger.remove(agent);
 		ledger.accept(first);
-		return 6;
+		return 4_107;
 	}
 
 	private static ServerActionRequest request(AgentId agent, String actionId, ActionProvenance provenance) {
+		return request(agent, 7L, actionId, provenance);
+	}
+
+	private static ServerActionRequest request(AgentId agent, long goalRevision, String actionId, ActionProvenance provenance) {
 		JsonObject arguments = new JsonObject();
 		arguments.addProperty("durationMs", 25L);
-		return new ServerActionRequest(agent, 7L, actionId, ActionType.WAIT, arguments, provenance);
+		return new ServerActionRequest(agent, goalRevision, actionId, ActionType.WAIT, arguments, provenance);
 	}
 
 	private static ActionProvenance provenance(String programId, long version, String step, long sequence) {

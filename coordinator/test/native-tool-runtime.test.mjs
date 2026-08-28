@@ -44,7 +44,12 @@ test('native observe returns latest compact facts without sending a body command
 	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
 	runtime.updateObservation(record(), { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] }, { eventSequence: 4 });
 	const result = await runtime.execute({ agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'observe-1', tool: { kind: 'observe' } }, record());
-	assert.deepEqual(result, { eventSequence: 4, goal: 'get one stone', observation: { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] } });
+	assert.deepEqual(result, {
+		eventSequence: 4,
+		goal: 'get one stone',
+		goalSpec: record().currentGoalSpec,
+		observation: { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] },
+	});
 	assert.deepEqual(sent, []);
 });
 
@@ -105,7 +110,40 @@ test('native observe ignores a stale observation event sequence', async () => {
 	assert.deepEqual(result, {
 		eventSequence: 8,
 		goal: 'get one stone',
+		goalSpec: record().currentGoalSpec,
 		observation: { player: { health: 20 } },
+	});
+});
+
+test('goal-bound navigation cannot succeed outside the immutable position radius', async () => {
+	const sent = [];
+	const fields = {
+		originalRequest: 'Move to 12 64 12',
+		predicate: { type: 'position_within', x: 12, y: 64, z: 12, radius: 1, stableTicks: 20 },
+		createdAtTick: 10,
+	};
+	const positioned = record({
+		currentGoal: fields.originalRequest,
+		currentGoalSpec: { ...fields, fingerprint: goalSpecFingerprint(fields) },
+	});
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-position', callId: 'move-position',
+		tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 12, y: 64, z: 12, tolerance: 4, sprint: true, timeoutMs: 30_000 } },
+	}, positioned);
+	await Promise.resolve();
+	assert.equal(sent[0][2].arguments.tolerance, 1);
+	runtime.onActionResult(positioned, {
+		goalRevision: 3,
+		actionId: sent[0][2].actionId,
+		state: 'FAILED',
+		reasonCode: 'PATH_BLOCKED',
+		message: 'Navigation could not recover from repeated stalls',
+		executionStarted: true,
+	});
+	assert.deepEqual(await pending, {
+		state: 'FAILED', reasonCode: 'PATH_BLOCKED',
+		message: 'Navigation could not recover from repeated stalls', executionStarted: true,
 	});
 });
 

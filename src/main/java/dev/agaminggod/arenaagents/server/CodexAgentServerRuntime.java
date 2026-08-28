@@ -22,7 +22,6 @@ import java.util.UUID;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -42,6 +41,36 @@ public final class CodexAgentServerRuntime {
 	private CodexAgentServerRuntime() {
 	}
 
+	public static void confirmCurrentGoal(MinecraftServer server, AgentId agentId) {
+		GoalVerificationRuntime runtime = GOAL_VERIFIERS.get(server);
+		if (runtime == null) {
+			throw new dev.agaminggod.arenaagents.agent.AgentDomainException(
+					"GOAL_VERIFIER_UNAVAILABLE", "Goal verification is not running"
+			);
+		}
+		var goal = CodexAgentManager.get(server).registry().require(agentId).currentGoal()
+				.orElseThrow(() -> new dev.agaminggod.arenaagents.agent.AgentDomainException(
+						"NO_CURRENT_GOAL", "Agent has no current goal to confirm"
+				));
+		if (!containsOperatorConfirmation(goal.spec().completion())) {
+			throw new dev.agaminggod.arenaagents.agent.AgentDomainException(
+					"FACTUAL_GOAL_NOT_CONFIRMABLE", "Minecraft verifies this goal from in-game facts"
+			);
+		}
+		runtime.confirm(agentId, goal.goalId());
+	}
+
+	private static boolean containsOperatorConfirmation(dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate) {
+		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.OperatorConfirmed) return true;
+		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.AllOf all) {
+			return all.predicates().stream().anyMatch(CodexAgentServerRuntime::containsOperatorConfirmation);
+		}
+		if (predicate instanceof dev.agaminggod.arenaagents.agent.goal.GoalPredicate.AnyOf any) {
+			return any.predicates().stream().anyMatch(CodexAgentServerRuntime::containsOperatorConfirmation);
+		}
+		return false;
+	}
+
 	public static synchronized void register() {
 		if (registered) {
 			return;
@@ -49,8 +78,6 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STARTED.register(CodexAgentServerRuntime::start);
 		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::tick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
-		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
-				VoiceConsentRegistry.clearPlayer(server, handler.getPlayer().getUUID()));
 		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) -> {
 			if (!(entity instanceof net.minecraft.server.level.ServerPlayer player)) return true;
 			return AgentDeathCapture.allowVanillaDeath(

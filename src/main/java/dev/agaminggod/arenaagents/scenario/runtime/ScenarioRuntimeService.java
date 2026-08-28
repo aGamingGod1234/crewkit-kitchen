@@ -735,7 +735,7 @@ public final class ScenarioRuntimeService {
 							ScenarioParticipantPolicy.effectiveGameMode(
 									activation.config.preset().category(), contestant.pending.spec.gameMode())
 					),
-					contestant -> manager.start(
+					contestant -> manager.startSubjective(
 							contestant.pending.record.agentId().toString(),
 							contestantPrompt(
 									activation.config.preset(),

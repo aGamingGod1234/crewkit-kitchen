@@ -58,7 +58,13 @@ public final class NavigationProgressVerification {
 				new PathNode(new GridPosition(4, 64, 7), TraversalType.WALK), true);
 		assertEquals(4.5D, adjustedTarget.x, "an adjusted safe goal retains its block-center x coordinate");
 		assertEquals(7.5D, adjustedTarget.z, "an adjusted safe goal retains its block-center z coordinate");
-		return 17;
+		GridPosition adjusted = new GridPosition(4, 64, 7);
+		assertTrue(!ServerNavigationController.candidateSatisfiesTolerance(adjusted, exactDestination, 0.2D),
+				"an adjusted endpoint outside the requested tolerance is never selected");
+		assertTrue(ServerNavigationController.candidateSatisfiesTolerance(
+				new GridPosition(5, 64, 7), exactDestination, 0.6D),
+				"a safe endpoint inside the requested tolerance remains eligible");
+		return 19;
 	}
 
 	private static void assertBounded(double value) {

@@ -46,3 +46,42 @@ test('returns a disposer that detaches both diagnostic listeners', () => {
 	assert.equal(reportCount, 0);
 	assert.equal(recoveryCount, 0);
 });
+
+test('sync reporter failures cannot escape coordinator event delivery', () => {
+	const coordinator = new EventEmitter();
+	const reporter = {
+		report() { throw new Error('diagnostic sink failed'); },
+		recovered() { throw new Error('diagnostic sink failed'); },
+	};
+	wireRuntimeDiagnostics(coordinator, reporter);
+
+	assert.doesNotThrow(() => coordinator.emit('runtimeError', new Error('control failure')));
+	assert.doesNotThrow(() => coordinator.emit('reconciled'));
+});
+
+test('async reporter failures are observed instead of becoming unhandled rejections', async () => {
+	const coordinator = new EventEmitter();
+	let observed = 0;
+	const rejectedThenable = {
+		then(_resolve, reject) {
+			observed += 1;
+			reject(new Error('async diagnostic sink failed'));
+		},
+	};
+	const reporter = { report: () => rejectedThenable, recovered: () => rejectedThenable };
+	wireRuntimeDiagnostics(coordinator, reporter);
+
+	coordinator.emit('runtimeError', new Error('control failure'));
+	coordinator.emit('reconciled');
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(observed, 2);
+});
+
+test('diagnostic disposal is idempotent even when listener cleanup throws', () => {
+	const coordinator = new EventEmitter();
+	coordinator.off = () => { throw new Error('cleanup failure'); };
+	const dispose = wireRuntimeDiagnostics(coordinator, { report() {}, recovered() {} });
+
+	assert.doesNotThrow(dispose);
+	assert.doesNotThrow(dispose);
+});

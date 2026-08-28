@@ -18,6 +18,7 @@ class FakeAcpTransport extends EventEmitter {
 		this.message = DECISION;
 		this.hiddenMessage = null;
 		this.promptResponse = { stopReason: 'end_turn' };
+		this.promptGate = null;
 	}
 
 	async start() { this.started = true; }
@@ -42,6 +43,7 @@ class FakeAcpTransport extends EventEmitter {
 				method: 'session/update',
 				params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: this.message } } },
 			}));
+			if (this.promptGate !== null) await this.promptGate;
 			await new Promise((resolve) => setImmediate(resolve));
 			return this.promptResponse;
 		}
@@ -131,6 +133,49 @@ test('ACP keeps the exact service profile for recovery and rejects profile mutat
 		);
 	}
 	assert.equal(transport.calls.filter((call) => call.method === 'session/new').length, 1);
+	await service.stop();
+});
+
+test('ACP transport loss clears the owning session and coalesces one exact replacement', async () => {
+	const transports = [];
+	const service = new AcpProviderService(
+		{ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] },
+		{ transportFactory: () => {
+			const transport = new FakeAcpTransport(options());
+			transports.push(transport);
+			return transport;
+		} },
+	);
+	const selected = { agentId: 'gemini-lost', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'fast' };
+	const stale = await service.createAgent(selected);
+	transports[0].emit('exit', Object.assign(new Error('ACP exited'), { code: 'PROCESS_EXITED' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(service.getAgent(selected.agentId), null);
+	await assert.rejects(stale.decide('late work', { goalRevision: 0 }), (error) => error?.code === 'SESSION_INVALIDATED');
+	const [replacement, duplicate] = await Promise.all([
+		service.replaceAgent(selected, { expectedSessionGeneration: 1 }),
+		service.replaceAgent(selected, { expectedSessionGeneration: 1 }),
+	]);
+	assert.equal(replacement, duplicate);
+	assert.equal(replacement.sessionGeneration, 2);
+	assert.equal(transports.length, 2);
+	await service.stop();
+});
+
+test('ACP transport loss rejects an in-flight response that arrives after invalidation', async () => {
+	let releasePrompt;
+	const transport = new FakeAcpTransport(options());
+	transport.promptGate = new Promise((resolve) => { releasePrompt = resolve; });
+	const service = new AcpProviderService(
+		{ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] },
+		{ transportFactory: () => transport },
+	);
+	const agent = await service.createAgent({ agentId: 'gemini-late', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'fast' });
+	const decision = agent.decide('late in-flight work', { goalRevision: 0 });
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('protocolError', Object.assign(new Error('ACP protocol lost'), { code: 'PROTOCOL_LOST' }));
+	releasePrompt();
+	await assert.rejects(decision, (error) => error?.code === 'SESSION_INVALIDATED');
 	await service.stop();
 });
 

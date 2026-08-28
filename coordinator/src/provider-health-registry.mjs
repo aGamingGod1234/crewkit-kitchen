@@ -4,12 +4,14 @@ const DEFAULT_WINDOW_SIZE = 50;
 const DEFAULT_MINIMUM_SAMPLES = 5;
 const DEFAULT_FAILURE_RATE = 0.6;
 const DEFAULT_COOLDOWN_MS = 30_000;
+const DEFAULT_PROBE_TIMEOUT_MS = 125_000;
 
 export class ProviderHealthRegistry {
 	#windowSize;
 	#minimumSamples;
 	#failureRateToOpen;
 	#cooldownMs;
+	#probeTimeoutMs;
 	#now;
 	#operations = new Map();
 
@@ -18,17 +20,20 @@ export class ProviderHealthRegistry {
 		minimumSamples = DEFAULT_MINIMUM_SAMPLES,
 		failureRateToOpen = DEFAULT_FAILURE_RATE,
 		cooldownMs = DEFAULT_COOLDOWN_MS,
+		probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
 		now = Date.now,
 	} = {}) {
 		if (!Number.isSafeInteger(windowSize) || windowSize < 1) throw new TypeError('windowSize must be a positive safe integer');
 		if (!Number.isSafeInteger(minimumSamples) || minimumSamples < 1 || minimumSamples > windowSize) throw new TypeError('minimumSamples must be between 1 and windowSize');
 		if (!Number.isFinite(failureRateToOpen) || failureRateToOpen <= 0 || failureRateToOpen > 1) throw new TypeError('failureRateToOpen must be in (0, 1]');
 		if (!Number.isSafeInteger(cooldownMs) || cooldownMs < 1) throw new TypeError('cooldownMs must be a positive safe integer');
+		if (!Number.isSafeInteger(probeTimeoutMs) || probeTimeoutMs < 1) throw new TypeError('probeTimeoutMs must be a positive safe integer');
 		if (typeof now !== 'function') throw new TypeError('now must be a function');
 		this.#windowSize = windowSize;
 		this.#minimumSamples = minimumSamples;
 		this.#failureRateToOpen = failureRateToOpen;
 		this.#cooldownMs = cooldownMs;
+		this.#probeTimeoutMs = probeTimeoutMs;
 		this.#now = now;
 	}
 
@@ -45,12 +50,16 @@ export class ProviderHealthRegistry {
 		});
 		const state = this.#state(telemetry);
 		if (isNeutralOutcome(telemetry.errorCode)) {
-			if (state.circuit === 'half_open') state.probeInFlight = false;
+			if (state.circuit === 'half_open') {
+				state.probeInFlight = false;
+				state.probeDeadlineAt = null;
+			}
 			return telemetry;
 		}
 		const failed = telemetry.errorCode !== null;
 		if (state.circuit === 'half_open') {
 			state.probeInFlight = false;
+			state.probeDeadlineAt = null;
 			if (failed) {
 				this.#open(state);
 			} else {
@@ -74,8 +83,10 @@ export class ProviderHealthRegistry {
 			if (nowValue - state.openedAt < this.#cooldownMs) return false;
 			state.circuit = 'half_open';
 		}
-		if (state.probeInFlight) return false;
+		if (state.probeInFlight && nowValue < state.probeDeadlineAt) return false;
+		if (state.probeInFlight) state.probeInFlight = false;
 		state.probeInFlight = true;
+		state.probeDeadlineAt = nowValue + this.#probeTimeoutMs;
 		return true;
 	}
 
@@ -91,6 +102,8 @@ export class ProviderHealthRegistry {
 			p95Ms: percentile(durations, 0.95),
 			failureRate: durations.length === 0 ? 0 : failures / durations.length,
 			circuit: state.circuit,
+			...(state.circuit === 'open' && state.openedAt !== null ? { nextProbeAtEpochMs: state.openedAt + this.#cooldownMs } : {}),
+			...(state.circuit === 'half_open' && state.probeDeadlineAt !== null ? { nextProbeAtEpochMs: state.probeDeadlineAt } : {}),
 		});
 	}
 
@@ -100,10 +113,10 @@ export class ProviderHealthRegistry {
 
 	#state(identityValue) {
 		const identity = requireIdentity(identityValue);
-		const key = JSON.stringify([identity.provider, identity.model, identity.operation]);
+		const key = JSON.stringify([identity.profileFingerprint ?? `legacy:${identity.provider}:${identity.model}`, identity.operation]);
 		let state = this.#operations.get(key);
 		if (state === undefined) {
-			state = { samples: [], circuit: 'closed', openedAt: null, probeInFlight: false };
+			state = { samples: [], circuit: 'closed', openedAt: null, probeInFlight: false, probeDeadlineAt: null };
 			this.#operations.set(key, state);
 		}
 		return state;
@@ -118,6 +131,7 @@ export class ProviderHealthRegistry {
 		state.circuit = 'open';
 		state.openedAt = this.#now();
 		state.probeInFlight = false;
+		state.probeDeadlineAt = null;
 	}
 }
 
@@ -127,7 +141,13 @@ function requireIdentity(value) {
 		provider: requirePart(value.provider, 'provider'),
 		model: requirePart(value.model, 'model'),
 		operation: requirePart(value.operation, 'operation'),
+		...(value.profileFingerprint === undefined ? {} : { profileFingerprint: requireFingerprint(value.profileFingerprint) }),
 	});
+}
+
+function requireFingerprint(value) {
+	if (typeof value !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(value)) throw new TypeError('profileFingerprint must be a sha256 fingerprint');
+	return value;
 }
 
 function requirePart(value, field) {

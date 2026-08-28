@@ -75,6 +75,9 @@ const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state'
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15_000;
 const PENDING_SERVER_INSTANCE_ID = 'pending';
 const MAX_CATALOG_MODELS = 512;
 const MAX_MODEL_CAPABILITIES = 32;
@@ -82,6 +85,7 @@ const MAX_REGISTRY_SNAPSHOT_AGENTS = 1_024;
 const MAX_NEARBY_TRANSACTION_TARGETS = 16;
 const MAX_COMPLETION_FACTS = 16;
 const MAX_CHANGED_FACTS = 256;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const MAX_VERBOSE_MESSAGE_LENGTH = 256;
 export const VERBOSE_STAGES = Object.freeze([
 	'conversation', 'lifecycle', 'planner', 'provider', 'output', 'decision',
@@ -147,15 +151,19 @@ export function validateProtocolV2Payload(type, value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${type} payload must be an object`);
 	switch (type) {
 		case 'hello':
-			exactKeys(value, ['secret'], ['secret'], type);
-			return { secret: boundedText(value.secret, 'secret', MAX_BRIDGE_SECRET_LENGTH, 32) };
+			exactKeys(value, ['secret', 'launchId'], ['secret'], type);
+			return {
+				secret: boundedText(value.secret, 'secret', MAX_BRIDGE_SECRET_LENGTH, 32),
+				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
+			};
 		case 'hello_ack':
-			exactKeys(value, ['replyTo', 'authenticated', 'registry'], ['replyTo', 'authenticated', 'registry'], type);
+			exactKeys(value, ['replyTo', 'authenticated', 'registry', 'launchId'], ['replyTo', 'authenticated', 'registry'], type);
 			if (value.authenticated !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'hello_ack authenticated must be true');
 			return {
 				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
 				authenticated: true,
 				registry: boundedArray(value.registry, 'registry', MAX_REGISTRY_SNAPSHOT_AGENTS).map((entry) => normalizeRegisteredAgent(entry, 'registry entry')),
+				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
 			};
 		case 'catalog_request':
 			exactKeys(value, [], [], type);
@@ -279,12 +287,18 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#host;
 	#port;
 	#secret;
+	#launchId;
 	#expectedServerInstanceId;
 	#serverInstanceId;
 	#socketFactory;
 	#schedule;
 	#cancelSchedule;
+	#scheduleDeadline;
+	#cancelDeadline;
 	#currentRevision;
+	#handshakeTimeoutMs;
+	#heartbeatIntervalMs;
+	#heartbeatTimeoutMs;
 	#initialReconnectDelayMs;
 	#maxReconnectDelayMs;
 	#reconnectDelayMs;
@@ -299,11 +313,19 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#recovering = false;
 	#helloMessageId = null;
 	#reconnectHandle = null;
+	#handshakeDeadlineHandle = null;
+	#handshakeDeadlineToken = 0;
+	#heartbeatDeadlineHandle = null;
+	#heartbeatDeadlineToken = 0;
+	#heartbeatProbeHandle = null;
+	#heartbeatProbeToken = 0;
+	#connectionEpoch = 0;
 	#outboundQueue = [];
 	#queuedByAgent = new Map();
 	#writeBlocked = false;
 	#inboundMessageIds = new Set();
 	#terminalActionIds = new Set();
+	#terminalActionsByGoal = new Map();
 	#knownAgentIds = new Set();
 	#observedRevisions = new Map();
 
@@ -314,12 +336,22 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (this.#host !== LOOPBACK_HOST) throw new ProtocolV2Error('LOOPBACK_REQUIRED', `Multiplexed bridge host must be ${LOOPBACK_HOST}`);
 		this.#port = requirePort(config.port);
 		this.#secret = requireSecret(config.secret);
+		const configuredLaunchId = config.launchId ?? process.env.ARENA_AGENT_COORDINATOR_LAUNCH_ID;
+		this.#launchId = configuredLaunchId === undefined || configuredLaunchId === null || configuredLaunchId === ''
+			? null
+			: launchIdentity(configuredLaunchId);
 		this.#expectedServerInstanceId = config.serverInstanceId === undefined ? null : requireIdentifier(config.serverInstanceId, 'serverInstanceId');
 		this.#serverInstanceId = this.#expectedServerInstanceId ?? PENDING_SERVER_INSTANCE_ID;
 		this.#socketFactory = dependencies.socketFactory ?? (() => net.createConnection({ host: this.#host, port: this.#port }));
 		this.#schedule = dependencies.schedule ?? ((callback, delay) => setTimeout(callback, delay));
 		this.#cancelSchedule = dependencies.cancelSchedule ?? clearTimeout;
+		this.#scheduleDeadline = dependencies.scheduleDeadline ?? defaultDeadlineSchedule;
+		this.#cancelDeadline = dependencies.cancelDeadline ?? clearTimeout;
 		this.#currentRevision = dependencies.currentRevision ?? (() => null);
+		this.#handshakeTimeoutMs = positiveInteger(config.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS, 'handshakeTimeoutMs');
+		this.#heartbeatIntervalMs = positiveInteger(config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS, 'heartbeatIntervalMs');
+		this.#heartbeatTimeoutMs = positiveInteger(config.heartbeatTimeoutMs ?? DEFAULT_HEARTBEAT_TIMEOUT_MS, 'heartbeatTimeoutMs');
+		if (this.#heartbeatTimeoutMs <= this.#heartbeatIntervalMs) throw new TypeError('heartbeatTimeoutMs must be greater than heartbeatIntervalMs');
 		this.#initialReconnectDelayMs = positiveInteger(config.reconnectDelayMs ?? 500, 'reconnectDelayMs');
 		this.#maxReconnectDelayMs = positiveInteger(config.maxReconnectDelayMs ?? 5_000, 'maxReconnectDelayMs');
 		if (this.#maxReconnectDelayMs < this.#initialReconnectDelayMs) throw new TypeError('maxReconnectDelayMs must be at least reconnectDelayMs');
@@ -332,6 +364,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	}
 
 	get ready() { return this.#ready; }
+	get connectionEpoch() { return this.#connectionEpoch; }
 	get serverInstanceId() { return this.#ready ? this.#serverInstanceId : null; }
 	get knownAgentIds() { return [...this.#knownAgentIds]; }
 
@@ -346,6 +379,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#running = false;
 		this.#ready = false;
 		this.#recovering = false;
+		this.#clearConnectionDeadlines();
 		if (this.#reconnectHandle !== null) {
 			this.#cancelSchedule(this.#reconnectHandle);
 			this.#reconnectHandle = null;
@@ -355,8 +389,9 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#socket = null;
 	}
 
-	async send(type, agentId, payload) {
+	async send(type, agentId, payload, { connectionEpoch = this.#connectionEpoch } = {}) {
 		if (!this.#ready) return Promise.reject(new ProtocolV2Error('BRIDGE_NOT_READY', 'Multiplexed bridge handshake is incomplete'));
+		if (connectionEpoch !== this.#connectionEpoch) return Promise.reject(new ProtocolV2Error('STALE_CONNECTION_EPOCH', `Bridge connection epoch ${connectionEpoch} is no longer active`));
 		if (agentId !== 'server' && !this.#knownAgentIds.has(agentId)) throw new ProtocolV2Error('UNKNOWN_AGENT', `Cannot send a message for unknown agent '${agentId}'`);
 		const envelope = createProtocolV2Envelope({
 			serverInstanceId: this.#serverInstanceId,
@@ -373,19 +408,22 @@ export class MultiplexedServerBridge extends EventEmitter {
 
 	#connect() {
 		if (!this.#running) return;
+		const connectionEpoch = ++this.#connectionEpoch;
 		const socket = this.#socketFactory();
 		this.#socket = socket;
 		this.#decoder = new JsonlDecoder({ maxBytes: MAX_LINE_BYTES });
 		socket.setNoDelay?.(true);
-		socket.on('connect', () => this.#onConnect(socket));
-		socket.on('data', (chunk) => this.#onData(socket, chunk));
-		socket.on('drain', () => { this.#writeBlocked = false; this.#flush(); });
-		socket.on('error', (error) => this.emit('transportError', error));
-		socket.on('close', () => this.#onClose(socket));
+		socket.on('connect', () => this.#onConnect(socket, connectionEpoch));
+		socket.on('data', (chunk) => this.#onData(socket, connectionEpoch, chunk));
+		socket.on('drain', () => this.#onDrain(socket, connectionEpoch));
+		socket.on('error', (error) => {
+			if (this.#isCurrentConnection(socket, connectionEpoch)) this.emit('transportError', error);
+		});
+		socket.on('close', () => this.#onClose(socket, connectionEpoch));
 	}
 
-	#onConnect(socket) {
-		if (socket !== this.#socket || !this.#running) return;
+	#onConnect(socket, connectionEpoch) {
+		if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
 		this.#inboundMessageIds.clear();
 		this.#observedRevisions.clear();
 		const messageId = this.#messageIds.next();
@@ -395,39 +433,47 @@ export class MultiplexedServerBridge extends EventEmitter {
 			agentId: 'server',
 			type: 'hello',
 			messageId,
-			payload: { secret: this.#secret },
+			payload: {
+				secret: this.#secret,
+				...(this.#launchId === null ? {} : { launchId: this.#launchId }),
+			},
 		});
 		const encoded = encodeJsonLine(hello);
 		this.#invokeAudit('coordinator_to_server', { ...hello, payload: { secret: '[REDACTED]' } });
-		socket.write(encoded);
+		try {
+			socket.write(encoded);
+			this.#scheduleHandshakeDeadline(socket, connectionEpoch);
+		} catch (error) {
+			this.#fail(error, socket, connectionEpoch);
+		}
 	}
 
-	#onData(socket, chunk) {
-		if (socket !== this.#socket || !this.#running) return;
+	#onData(socket, connectionEpoch, chunk) {
+		if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
 		let messages;
 		try {
 			messages = this.#decoder.push(chunk);
 		} catch (error) {
-			this.#fail(error);
+			this.#fail(error, socket, connectionEpoch);
 			return;
 		}
 		for (const value of messages) {
 			try {
-				this.#accept(value);
+				this.#accept(value, socket, connectionEpoch);
 			} catch (error) {
-				this.#fail(withInboundEnvelopeContext(error, value));
+				this.#fail(withInboundEnvelopeContext(error, value), socket, connectionEpoch);
 				return;
 			}
 		}
 	}
 
-	#accept(value) {
+	#accept(value, socket, connectionEpoch) {
 		const envelope = validateProtocolV2Envelope(value, { direction: 'server_to_coordinator' });
 		this.#invokeAudit('server_to_coordinator', envelope);
 		if (this.#inboundMessageIds.has(envelope.messageId)) throw new ProtocolV2Error('DUPLICATE_MESSAGE', `Duplicate message ID '${envelope.messageId}'`);
 		rememberBounded(this.#inboundMessageIds, envelope.messageId, MAX_TRACKED_MESSAGE_IDS);
 		if (!this.#ready) {
-			this.#acceptHelloAck(envelope);
+			this.#acceptHelloAck(envelope, socket, connectionEpoch);
 			return;
 		}
 		if (envelope.serverInstanceId !== this.#serverInstanceId) throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Server instance changed during an authenticated session');
@@ -441,15 +487,21 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (envelope.type === 'agent_removed') {
 			this.#knownAgentIds.delete(envelope.agentId);
 			this.#observedRevisions.delete(envelope.agentId);
+			this.#terminalActionsByGoal.delete(envelope.agentId);
 		}
-		this.emit(envelope.type, envelope);
-		this.emit('message', envelope);
+		this.#refreshHeartbeatDeadline(socket, connectionEpoch);
+		const event = { ...envelope, connectionEpoch };
+		this.emit(envelope.type, event);
+		this.emit('message', event);
 	}
 
-	#acceptHelloAck(envelope) {
+	#acceptHelloAck(envelope, socket, connectionEpoch) {
 		if (envelope.type !== 'hello_ack' || envelope.agentId !== 'server') throw new ProtocolV2Error('HANDSHAKE_REQUIRED', 'hello_ack must be the first server message');
 		if (envelope.payload.replyTo !== this.#helloMessageId) throw new ProtocolV2Error('HANDSHAKE_MISMATCH', 'hello_ack does not match the active hello');
 		if (envelope.payload.authenticated !== true) throw new ProtocolV2Error('AUTHENTICATION_FAILED', 'Server rejected bridge authentication');
+		if (this.#launchId !== null && envelope.payload.launchId !== this.#launchId) {
+			throw new ProtocolV2Error('LAUNCH_ID_MISMATCH', 'Server acknowledgement does not match this coordinator launch');
+		}
 		if (this.#expectedServerInstanceId !== null && envelope.serverInstanceId !== this.#expectedServerInstanceId) throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Connected server instance does not match configuration');
 		const registry = envelope.payload.registry ?? [];
 		if (!Array.isArray(registry)) throw new ProtocolV2Error('INVALID_REGISTRY_SNAPSHOT', 'hello_ack registry must be an array');
@@ -460,13 +512,22 @@ export class MultiplexedServerBridge extends EventEmitter {
 			revision(entry?.goalRevision, 'registry goalRevision'),
 		]));
 		if (this.#knownAgentIds.size !== registry.length) throw new ProtocolV2Error('DUPLICATE_AGENT', 'hello_ack registry contains duplicate agents');
+		this.#synchronizeTerminalGoals(registry);
 		const recovered = this.#recovering;
 		this.#recovering = false;
 		this.#ready = true;
 		this.#reconnectDelayMs = this.#initialReconnectDelayMs;
-		const connection = { serverInstanceId: this.#serverInstanceId, registry: structuredClone(registry) };
+		this.#clearHandshakeDeadline();
+		this.#refreshHeartbeatDeadline(socket, connectionEpoch);
+		this.#scheduleHeartbeatProbe(socket, connectionEpoch);
+		const connection = {
+			connectionEpoch,
+			serverInstanceId: this.#serverInstanceId,
+			registry: structuredClone(registry),
+			...(this.#launchId === null ? {} : { launchId: this.#launchId }),
+		};
 		this.emit('ready', connection);
-		if (recovered) this.emit('recovered', { serverInstanceId: this.#serverInstanceId, registry: structuredClone(registry) });
+		if (recovered) this.emit('recovered', { ...connection, registry: structuredClone(registry) });
 	}
 
 	#assertRevision(envelope, guardedTypes) {
@@ -480,6 +541,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#trackInboundRevision(envelope) {
 		if (envelope.type === 'agent_registered') {
 			this.#observedRevisions.set(envelope.agentId, envelope.payload.goalRevision);
+			this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
 			return;
 		}
 		if (envelope.type !== 'goal_control' && envelope.type !== 'conversation_wake') return;
@@ -495,6 +557,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 			}
 		}
 		this.#observedRevisions.set(envelope.agentId, next);
+		this.#ensureTerminalGoal(envelope.agentId, next);
 		if (control.operation !== 'queue' && (current === null || current === undefined || next > current)) {
 			this.#dropSupersededQueuedMessages(envelope.agentId, next);
 		}
@@ -529,9 +592,31 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#trackTerminalResult(envelope) {
 		if (envelope.type !== 'action_result' || !TERMINAL_ACTION_STATES.has(envelope.payload.state)) return;
 		const actionId = requireIdentifier(envelope.payload.actionId ?? envelope.payload.commandId, 'actionId');
-		const key = `${envelope.agentId}:${actionId}`;
-		if (this.#terminalActionIds.has(key)) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
+		const goal = this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
+		if (goal.actionIds.has(actionId)) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
+		goal.actionIds.add(actionId);
+		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
 		rememberBounded(this.#terminalActionIds, key, MAX_TRACKED_TERMINAL_ACTION_IDS);
+	}
+
+	#synchronizeTerminalGoals(registry) {
+		const visible = new Set();
+		for (const record of registry) {
+			visible.add(record.agentId);
+			this.#ensureTerminalGoal(record.agentId, record.goalRevision);
+		}
+		for (const agentId of this.#terminalActionsByGoal.keys()) {
+			if (!visible.has(agentId)) this.#terminalActionsByGoal.delete(agentId);
+		}
+	}
+
+	#ensureTerminalGoal(agentId, goalRevision) {
+		let goal = this.#terminalActionsByGoal.get(agentId);
+		if (goal?.goalRevision !== goalRevision) {
+			goal = { goalRevision, actionIds: new Set() };
+			this.#terminalActionsByGoal.set(agentId, goal);
+		}
+		return goal;
 	}
 
 	#enqueue(envelope) {
@@ -577,6 +662,12 @@ export class MultiplexedServerBridge extends EventEmitter {
 		}
 	}
 
+	#onDrain(socket, connectionEpoch) {
+		if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
+		this.#writeBlocked = false;
+		this.#flush();
+	}
+
 	#invokeAudit(direction, envelope) {
 		if (this.#audit === null) return;
 		let result;
@@ -602,13 +693,15 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#queuedByAgent.clear();
 	}
 
-	#fail(error) {
+	#fail(error, socket = this.#socket, connectionEpoch = this.#connectionEpoch) {
+		if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
 		this.emit('protocolError', error instanceof Error ? error : new ProtocolV2Error('PROTOCOL_ERROR', String(error)));
-		this.#socket?.destroy();
+		socket.destroy();
 	}
 
-	#onClose(socket) {
-		if (socket !== this.#socket) return;
+	#onClose(socket, connectionEpoch) {
+		if (!this.#isCurrentConnection(socket, connectionEpoch, { requireRunning: false })) return;
+		this.#clearConnectionDeadlines();
 		if (this.#running) this.#recovering = true;
 		const wasReady = this.#ready;
 		this.#socket = null;
@@ -617,14 +710,73 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#helloMessageId = null;
 		this.#knownAgentIds.clear();
 		this.#clearOutboundQueue(new ProtocolV2Error('BRIDGE_DISCONNECTED', 'Multiplexed bridge disconnected'));
-		if (wasReady) this.emit('disconnected');
+		if (wasReady) this.emit('disconnected', { connectionEpoch, serverInstanceId: this.#serverInstanceId });
 		if (!this.#running || this.#reconnectHandle !== null) return;
 		const delay = this.#reconnectDelayMs;
 		this.#reconnectDelayMs = Math.min(this.#maxReconnectDelayMs, this.#reconnectDelayMs * 2);
 		this.#reconnectHandle = this.#schedule(() => {
 			this.#reconnectHandle = null;
-			this.#connect();
+			if (this.#running && this.#socket === null) this.#connect();
 		}, delay);
+	}
+
+	#scheduleHandshakeDeadline(socket, connectionEpoch) {
+		this.#clearHandshakeDeadline();
+		const token = this.#handshakeDeadlineToken;
+		this.#handshakeDeadlineHandle = this.#scheduleDeadline(() => {
+			if (token !== this.#handshakeDeadlineToken || this.#ready || !this.#isCurrentConnection(socket, connectionEpoch)) return;
+			this.#fail(new ProtocolV2Error('HANDSHAKE_TIMEOUT', 'Multiplexed bridge handshake timed out'), socket, connectionEpoch);
+		}, this.#handshakeTimeoutMs);
+		this.#handshakeDeadlineHandle?.unref?.();
+	}
+
+	#refreshHeartbeatDeadline(socket, connectionEpoch) {
+		this.#clearHeartbeatDeadline();
+		const token = this.#heartbeatDeadlineToken;
+		this.#heartbeatDeadlineHandle = this.#scheduleDeadline(() => {
+			if (token !== this.#heartbeatDeadlineToken || !this.#ready || !this.#isCurrentConnection(socket, connectionEpoch)) return;
+			this.#fail(new ProtocolV2Error('HEARTBEAT_TIMEOUT', 'Authenticated Minecraft bridge became silent'), socket, connectionEpoch);
+		}, this.#heartbeatTimeoutMs);
+		this.#heartbeatDeadlineHandle?.unref?.();
+	}
+
+	#scheduleHeartbeatProbe(socket, connectionEpoch) {
+		this.#clearHeartbeatProbe();
+		const token = this.#heartbeatProbeToken;
+		this.#heartbeatProbeHandle = this.#scheduleDeadline(() => {
+			if (token !== this.#heartbeatProbeToken || !this.#ready || !this.#isCurrentConnection(socket, connectionEpoch)) return;
+			void this.send('heartbeat', 'server', {}, { connectionEpoch }).catch(() => {});
+			this.#scheduleHeartbeatProbe(socket, connectionEpoch);
+		}, this.#heartbeatIntervalMs);
+		this.#heartbeatProbeHandle?.unref?.();
+	}
+
+	#clearConnectionDeadlines() {
+		this.#clearHandshakeDeadline();
+		this.#clearHeartbeatDeadline();
+		this.#clearHeartbeatProbe();
+	}
+
+	#clearHandshakeDeadline() {
+		this.#handshakeDeadlineToken += 1;
+		if (this.#handshakeDeadlineHandle !== null) this.#cancelDeadline(this.#handshakeDeadlineHandle);
+		this.#handshakeDeadlineHandle = null;
+	}
+
+	#clearHeartbeatDeadline() {
+		this.#heartbeatDeadlineToken += 1;
+		if (this.#heartbeatDeadlineHandle !== null) this.#cancelDeadline(this.#heartbeatDeadlineHandle);
+		this.#heartbeatDeadlineHandle = null;
+	}
+
+	#clearHeartbeatProbe() {
+		this.#heartbeatProbeToken += 1;
+		if (this.#heartbeatProbeHandle !== null) this.#cancelDeadline(this.#heartbeatProbeHandle);
+		this.#heartbeatProbeHandle = null;
+	}
+
+	#isCurrentConnection(socket, connectionEpoch, { requireRunning = true } = {}) {
+		return socket !== null && socket === this.#socket && connectionEpoch === this.#connectionEpoch && (!requireRunning || this.#running);
 	}
 }
 
@@ -635,18 +787,25 @@ export function secretsEqual(left, right) {
 	return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }
 
+function defaultDeadlineSchedule(callback, delay) {
+	const handle = setTimeout(callback, delay);
+	handle.unref?.();
+	return handle;
+}
+
 function normalizeCoordinatorStatus(value) {
 	const requiredKeys = ['reconciled', 'profiles', 'supportedProfileCount', 'rosterReadyCount', 'rosterCount', 'scheduler', 'circuits'];
-	const allowedKeys = [...requiredKeys, 'latencies'];
+	const allowedKeys = [...requiredKeys, 'latencies', 'bridgeSessionEpoch', 'runtimeGeneration', 'components'];
 	exactKeys(value, allowedKeys, requiredKeys, 'coordinator_status');
 	const profiles = boundedArray(value.profiles, 'coordinator_status.profiles', 16).map((profile, index) => {
 		const field = `coordinator_status.profiles[${index}]`;
-		exactKeys(profile, ['agentId', 'provider', 'model', 'reasoningEffort'], ['agentId', 'provider', 'model', 'reasoningEffort'], field);
+		exactKeys(profile, ['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier'], ['agentId', 'provider', 'model', 'reasoningEffort'], field);
 		return {
 			agentId: requireIdentifier(profile.agentId, `${field}.agentId`),
 			provider: requireIdentifier(profile.provider, `${field}.provider`),
 			model: boundedText(profile.model, `${field}.model`, MAX_IDENTIFIER_LENGTH),
 			reasoningEffort: requireIdentifier(profile.reasoningEffort, `${field}.reasoningEffort`),
+			...(profile.serviceTier === undefined ? {} : { serviceTier: requireIdentifier(profile.serviceTier, `${field}.serviceTier`) }),
 		};
 	});
 	const supportedProfileCount = nonnegativeInteger(value.supportedProfileCount, 'coordinator_status.supportedProfileCount');
@@ -732,7 +891,44 @@ function normalizeCoordinatorStatus(value) {
 	if (new Set(latencies.map((latency) => latency.operation)).size !== latencies.length) {
 		throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status latency operations must be unique');
 	}
-	return { reconciled: boolean(value.reconciled, 'coordinator_status.reconciled'), profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits, latencies };
+	const extendedFields = ['bridgeSessionEpoch', 'runtimeGeneration', 'components'];
+	const presentExtendedFields = extendedFields.filter((field) => value[field] !== undefined);
+	if (presentExtendedFields.length !== 0 && presentExtendedFields.length !== extendedFields.length) {
+		throw new ProtocolV2Error('MISSING_FIELD', 'extended coordinator_status recovery fields must be published together');
+	}
+	if (presentExtendedFields.length === 0) {
+		return { reconciled: boolean(value.reconciled, 'coordinator_status.reconciled'), profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits, latencies };
+	}
+	const components = boundedArray(value.components, 'coordinator_status.components', 32).map((component, index) => {
+		const field = `coordinator_status.components[${index}]`;
+		const keys = ['component', 'state', 'fallbackMode', 'boundary', 'failureCode', 'consecutiveFailureCount', 'nextProbeAtEpochMs', 'generation', 'lastRecoveryAtEpochMs'];
+		exactKeys(component, keys, keys, field);
+		const state = requireIdentifier(component.state, `${field}.state`);
+		if (!['ready', 'degraded', 'backoff', 'blocked_retryable', 'unknown'].includes(state)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.state is invalid`);
+		return {
+			component: boundedText(component.component, `${field}.component`, 128),
+			state,
+			fallbackMode: nullableBoundedText(component.fallbackMode, `${field}.fallbackMode`, 128),
+			boundary: nullableBoundedText(component.boundary, `${field}.boundary`, 128),
+			failureCode: nullableBoundedText(component.failureCode, `${field}.failureCode`, 128),
+			consecutiveFailureCount: nonnegativeInteger(component.consecutiveFailureCount, `${field}.consecutiveFailureCount`),
+			nextProbeAtEpochMs: nullableNonnegativeInteger(component.nextProbeAtEpochMs, `${field}.nextProbeAtEpochMs`),
+			generation: nonnegativeInteger(component.generation, `${field}.generation`),
+			lastRecoveryAtEpochMs: nullableNonnegativeInteger(component.lastRecoveryAtEpochMs, `${field}.lastRecoveryAtEpochMs`),
+		};
+	});
+	if (new Set(components.map((component) => component.component)).size !== components.length) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status component identities must be unique');
+	const runtimeGeneration = value.runtimeGeneration === null
+		? null
+		: boundedText(value.runtimeGeneration, 'coordinator_status.runtimeGeneration', 64);
+	if (runtimeGeneration !== null && !/^[0-9a-f]{64}$/.test(runtimeGeneration)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status.runtimeGeneration must be a lowercase SHA-256 value');
+	return {
+		reconciled: boolean(value.reconciled, 'coordinator_status.reconciled'), profiles, supportedProfileCount, rosterReadyCount,
+		rosterCount, scheduler, circuits, latencies,
+		bridgeSessionEpoch: nonnegativeInteger(value.bridgeSessionEpoch, 'coordinator_status.bridgeSessionEpoch'),
+		runtimeGeneration,
+		components,
+	};
 }
 
 function normalizeRegisteredAgent(value, field) {
@@ -1372,6 +1568,12 @@ function boundedText(value, field, maximum, minimum = 1) {
 	return value;
 }
 
+function launchIdentity(value) {
+	const launchId = boundedText(value, 'launchId', 36);
+	if (!UUID_PATTERN.test(launchId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'launchId must be a UUID');
+	return launchId.toLowerCase();
+}
+
 function boundedCodePointText(value, field, maximum) {
 	if (typeof value !== 'string') throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a string`);
 	if (value.trim().length === 0) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must not be blank`);
@@ -1387,6 +1589,14 @@ function boolean(value, field) {
 
 function nullableIdentifier(value, field) {
 	return value === null ? null : requireIdentifier(value, field);
+}
+
+function nullableBoundedText(value, field, maximum) {
+	return value === null ? null : boundedText(value, field, maximum);
+}
+
+function nullableNonnegativeInteger(value, field) {
+	return value === null ? null : nonnegativeInteger(value, field);
 }
 
 function nullableBoolean(value, field) {

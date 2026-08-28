@@ -9,8 +9,12 @@ export function wireRuntimeDiagnostics(coordinator, reporter) {
 		throw new TypeError('runtime diagnostics reporter must support report and recovered');
 	}
 
-	const onRuntimeError = (error) => reporter.report(error);
-	const onReconciled = () => reporter.recovered();
+	const invoke = (operation) => {
+		try { Promise.resolve(operation()).catch(() => {}); }
+		catch { /* diagnostics cannot interrupt coordinator work */ }
+	};
+	const onRuntimeError = (error) => invoke(() => reporter.report(error));
+	const onReconciled = () => invoke(() => reporter.recovered());
 	coordinator.on('runtimeError', onRuntimeError);
 	coordinator.on('reconciled', onReconciled);
 
@@ -18,7 +22,7 @@ export function wireRuntimeDiagnostics(coordinator, reporter) {
 	return () => {
 		if (disposed) return;
 		disposed = true;
-		coordinator.off('runtimeError', onRuntimeError);
-		coordinator.off('reconciled', onReconciled);
+		try { coordinator.off('runtimeError', onRuntimeError); } catch { /* cleanup is best effort */ }
+		try { coordinator.off('reconciled', onReconciled); } catch { /* cleanup is best effort */ }
 	};
 }

@@ -34,6 +34,7 @@ import dev.agaminggod.arenaagents.protocol.ActionType;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -48,6 +49,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
@@ -63,8 +65,6 @@ public final class MultiplexedServerBridgeVerification {
 	}
 
 	public static int verify() {
-		assertEquals(true, MultiplexedServerBridge.HANDSHAKE_RETRY_WAIT_MS > 0L,
-				"hello retries wait instead of spinning when the registry snapshot moves");
 		verifyPendingRegistrationBoundary();
 		verifyRemovalBackpressureForcesReconciliation();
 		verifyHandshakeWaitsForPendingMarker();
@@ -127,11 +127,152 @@ public final class MultiplexedServerBridgeVerification {
 		verifyConversationAttention(registered.getFirst().agentId());
 		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
+		verifyEmptyCatalogRequestsLiveDiscovery();
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyCompletionResultFacts();
-		return 135;
+		return 150;
+	}
+	private static void verifyEmptyCatalogRequestsLiveDiscovery() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			assertEquals(50_000_000L, MultiplexedServerBridge.catalogRetryDelayNanos(1),
+					"catalog retry starts at the bounded base interval");
+			assertEquals(3_200_000_000L, MultiplexedServerBridge.catalogRetryDelayNanos(7),
+					"catalog retry reaches its capped interval");
+			assertEquals(3_200_000_000L, MultiplexedServerBridge.catalogRetryDelayNanos(10_000),
+					"catalog retry remains capped across indefinite attempts");
+			AtomicLong nanoTime = new AtomicLong(Long.MAX_VALUE - 25_000_000L);
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-catalog-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile, ServerSocket::new, nanoTime::get);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				JsonObject hello = new JsonObject();
+				hello.addProperty("secret", secret);
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, "coordinator", "server", "hello", "hello-empty-catalog", hello
+				));
+				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
+				assertEquals("hello_ack", acknowledgement.type(), "empty-catalog fixture authenticates the bridge");
+				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
+						"empty-catalog fixture consumes handshake state before catalog discovery");
+				nanoTime.addAndGet(1_000_000L);
+				for (int tick = 0; tick < 8; tick++) bridge.tick();
+				assertTrue(!reader.ready(), "catalog discovery does not start eagerly before an empty snapshot");
+
+				JsonObject catalog = new JsonObject();
+				catalog.addProperty("refreshedAtEpochMs", 0L);
+				catalog.add("models", new JsonArray());
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog", catalog
+				));
+
+				BridgeEnvelope request = null;
+				long deadline = System.currentTimeMillis() + 2_000L;
+				while (request == null && System.currentTimeMillis() < deadline) {
+					bridge.tick();
+					if (reader.ready()) request = codec.decode(reader.readLine());
+					else Thread.sleep(10L);
+				}
+				assertTrue(request != null && "catalog_request".equals(request.type()),
+						"an empty bootstrap catalog requests live provider discovery asynchronously");
+				assertTrue(!bridge.catalogModels().isEmpty(),
+						"fallback model choices remain visible while live discovery retries");
+				nanoTime.addAndGet(49_000_000L);
+				for (int tick = 0; tick < 8; tick++) bridge.tick();
+				assertTrue(!reader.ready(), "catalog retry remains pending immediately before a wrapping deadline");
+				nanoTime.addAndGet(1_000_000L);
+				BridgeEnvelope wrappedRetry = null;
+				deadline = System.currentTimeMillis() + 2_000L;
+				while (wrappedRetry == null && System.currentTimeMillis() < deadline) {
+					bridge.tick();
+					if (reader.ready()) wrappedRetry = codec.decode(reader.readLine());
+					else Thread.sleep(1L);
+				}
+				assertTrue(wrappedRetry != null && "catalog_request".equals(wrappedRetry.type()),
+						"catalog retry fires when nanoTime crosses Long.MAX_VALUE into Long.MIN_VALUE");
+
+				for (int attempt = 3; attempt <= 6; attempt++) {
+					writeEnvelope(socket, codec, new BridgeEnvelope(
+							2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-" + attempt, catalog
+					));
+					nanoTime.addAndGet(60_000_000_000L);
+					if (attempt == 4) {
+						setQueuedCount(bridge, "server", MultiplexedServerBridge.AGENT_QUEUE_CAP);
+						assertDoesNotThrow(bridge::tick,
+								"catalog retry backpressure remains best effort outside Minecraft tick control");
+						setQueuedCount(bridge, "server", 0);
+						long noSpinDeadline = System.nanoTime() + 100_000_000L;
+						while (System.nanoTime() < noSpinDeadline) {
+							bridge.tick();
+							Thread.sleep(1L);
+						}
+						assertTrue(!reader.ready(), "failed catalog publication retains one future retry instead of spinning");
+						nanoTime.addAndGet(60_000_000_000L);
+					}
+					BridgeEnvelope retry = null;
+					deadline = System.currentTimeMillis() + 2_000L;
+					while (retry == null && System.currentTimeMillis() < deadline) {
+						bridge.tick();
+						if (reader.ready()) retry = codec.decode(reader.readLine());
+						else Thread.sleep(1L);
+					}
+					assertTrue(retry != null && "catalog_request".equals(retry.type()),
+							"empty catalog discovery keeps probing after attempt " + attempt);
+					for (int tick = 0; tick < 8; tick++) bridge.tick();
+					assertTrue(!reader.ready(), "one exact catalog request owns each retry deadline");
+				}
+
+				JsonObject liveModel = new JsonObject();
+				liveModel.addProperty("provider", "codex");
+				liveModel.addProperty("id", "codex:review-recovered");
+				liveModel.addProperty("model", "gpt-5.6-sol");
+				liveModel.addProperty("displayName", "Recovered Sol");
+				JsonArray efforts = new JsonArray();
+				efforts.add("high");
+				liveModel.add("reasoningEfforts", efforts);
+				JsonArray tiers = new JsonArray();
+				tiers.add("priority");
+				liveModel.add("serviceTiers", tiers);
+				JsonObject recoveredCatalog = new JsonObject();
+				recoveredCatalog.addProperty("refreshedAtEpochMs", 1L);
+				JsonArray liveModels = new JsonArray();
+				liveModels.add(liveModel);
+				recoveredCatalog.add("models", liveModels);
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "recovered-catalog", recoveredCatalog
+				));
+				deadline = System.currentTimeMillis() + 2_000L;
+				while (bridge.catalogModels().stream().noneMatch(model -> "codex:review-recovered".equals(model.model()))
+						&& System.currentTimeMillis() < deadline) {
+					bridge.tick();
+					Thread.sleep(1L);
+				}
+				assertTrue(bridge.catalogModels().stream().anyMatch(model -> "codex:review-recovered".equals(model.model())),
+						"eventual provider recovery promotes the live model catalog automatically");
+				nanoTime.addAndGet(60_000_000_000L);
+				for (int tick = 0; tick < 8; tick++) bridge.tick();
+				assertTrue(!reader.ready(), "live catalog promotion cancels the fallback retry timer");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("empty catalog discovery verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (secretFile != null) {
+				try {
+					Files.deleteIfExists(secretFile);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove empty catalog bridge secret", exception);
+				}
+			}
+		}
 	}
 
 	private static void verifyGoalSpecProposalLifecycle() {
@@ -247,6 +388,45 @@ public final class MultiplexedServerBridgeVerification {
 			));
 			assertEquals(AgentLifecycleState.STARTING, manager.registry().require(started.agentId()).state(),
 					"an obsolete readiness frame cannot mutate the current lifecycle");
+
+			AgentRecord disconnected = manager.registry().disconnect(started.agentId(), 1_702L).after();
+			JsonObject recoveredPayload = new JsonObject();
+			recoveredPayload.addProperty("goalRevision", disconnected.goalRevision());
+			recoveredPayload.addProperty("reconciled", true);
+			BridgeEnvelope recoveredReady = new BridgeEnvelope(
+					2, "coordinator", disconnected.agentId().toString(), "agent_ready", "ready-recovered", recoveredPayload
+			);
+			invokePlannerReady(bridge, recoveredReady);
+			AgentRecord recovered = manager.registry().require(disconnected.agentId());
+			assertEquals(disconnected.goalRevision(), recovered.goalRevision(),
+					"coordinator readiness preserves the authoritative goal revision");
+			assertEquals(disconnected.profile(), recovered.profile(),
+					"coordinator readiness preserves the exact selected profile");
+			assertEquals(1, bridge.observationPublicationForVerification().pendingCount(),
+					"coordinator readiness requests one fresh Minecraft observation");
+			invokePlannerReady(bridge, recoveredReady);
+			assertEquals(1, bridge.observationPublicationForVerification().pendingCount(),
+					"duplicate readiness coalesces to one fresh observation request");
+			assertEquals(AgentLifecycleState.STARTING, manager.registry().require(disconnected.agentId()).state(),
+					"duplicate recovery readiness leaves the same re-armed lifecycle state");
+			List<AgentId> recoveryObservations = new ArrayList<>();
+			bridge.observationPublicationForVerification().drain(recoveryObservations::add);
+			assertEquals(List.of(disconnected.agentId()), recoveryObservations,
+					"the first recovery readiness drains one observation request");
+			assertEquals(0, bridge.observationPublicationForVerification().pendingCount(),
+					"the first recovery observation is fully drained");
+			JsonObject planningPayload = new JsonObject();
+			planningPayload.addProperty("goalRevision", disconnected.goalRevision());
+			invokePlannerReady(bridge, new BridgeEnvelope(
+					2, "coordinator", disconnected.agentId().toString(), "planning_state", "planning-recovered", planningPayload
+			));
+			assertEquals(AgentLifecycleState.PLANNING, manager.registry().require(disconnected.agentId()).state(),
+					"the first recovery observation progresses into planning");
+			invokePlannerReady(bridge, recoveredReady);
+			assertEquals(0, bridge.observationPublicationForVerification().pendingCount(),
+					"late duplicate readiness cannot queue a second recovery observation");
+			assertEquals(AgentLifecycleState.PLANNING, manager.registry().require(disconnected.agentId()).state(),
+					"late duplicate readiness cannot restart the progressed recovery lifecycle");
 
 			manager.registry().remove(started.agentId());
 			JsonObject removedPayload = new JsonObject();
@@ -702,6 +882,14 @@ public final class MultiplexedServerBridgeVerification {
 				assertEquals(started.after().agentId().toString(),
 						firstAck.payload().getAsJsonArray("registry").get(0).getAsJsonObject().get("agentId").getAsString(),
 						"first session knows the active agent");
+				JsonObject emptyCatalog = new JsonObject();
+				emptyCatalog.addProperty("refreshedAtEpochMs", 0L);
+				emptyCatalog.add("models", new JsonArray());
+				writeEnvelope(first, codec, new BridgeEnvelope(
+						2, firstAck.serverInstanceId(), "server", "catalog_snapshot", "old-session-empty-catalog", emptyCatalog
+				));
+				assertEquals("catalog_request", pollBridgeResponse(bridge, first, firstReader, codec).type(),
+						"old session owns its catalog discovery request");
 			}
 			MultiplexedServerBridge activeBridge = bridge;
 			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
@@ -719,6 +907,13 @@ public final class MultiplexedServerBridgeVerification {
 				bridge.tick();
 				assertEquals(AgentLifecycleState.STARTING, manager.registry().require(active.agentId()).state(),
 						"replacement authentication consumes the old session disconnect without disconnecting the agent");
+				long staleRetryDeadline = System.nanoTime() + 150_000_000L;
+				while (System.nanoTime() < staleRetryDeadline) {
+					bridge.tick();
+					Thread.sleep(1L);
+				}
+				assertEquals(0, replacement.getInputStream().available(),
+						"replacement session never receives the closed session catalog retry");
 
 				JsonObject ready = new JsonObject();
 				ready.addProperty("goalRevision", started.after().goalRevision());
@@ -764,6 +959,14 @@ public final class MultiplexedServerBridgeVerification {
 			long pausedRevision = paused.goalRevision();
 
 			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			ProgramActionLedger programActions = programActions(bridge);
+			JsonObject replayArguments = new JsonObject();
+			replayArguments.addProperty("durationMs", 25L);
+			ServerActionRequest replayProtected = new ServerActionRequest(
+					disconnected.agentId(), disconnectedRevision, "action-before-reconnect", ActionType.WAIT, replayArguments,
+					new ActionProvenance("codex", "gpt-5.6-sol", "high", "priority", "program-before-reconnect", 1L, "step-1", 1L)
+			);
+			programActions.accept(replayProtected);
 			savedData(manager).setRuntimeHooks(bridge);
 			bridge.start();
 			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
@@ -779,6 +982,7 @@ public final class MultiplexedServerBridgeVerification {
 				assertEquals("hello_ack", helloAck.type(), "reconnect fixture authenticates the bridge");
 				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
 						"reconnect fixture consumes verbose control");
+				assertThrowsCode(() -> programActions.accept(replayProtected), "ACTION_REPLAY");
 
 				JsonObject reconnectReady = new JsonObject();
 				reconnectReady.addProperty("goalRevision", disconnectedRevision);
@@ -787,22 +991,24 @@ public final class MultiplexedServerBridgeVerification {
 						2, helloAck.serverInstanceId(), disconnected.agentId().toString(), "agent_ready",
 						"ready-reconnected", reconnectReady
 				));
-				BridgeEnvelope resume = pollBridgeResponse(bridge, socket, reader, codec);
-				assertEquals("goal_control", resume.type(), "reconciliation publishes a lifecycle recovery control");
-				assertEquals(disconnected.agentId().toString(), resume.agentId(),
-						"recovery control retains the disconnected agent identity");
-				assertEquals("resume", resume.payload().get("operation").getAsString(),
-						"authenticated reconciliation resumes rather than steering the unfinished goal");
-				assertEquals(disconnectedRevision + 1L, resume.payload().get("goalRevision").getAsLong(),
-						"automatic reconnect recovery advances the authoritative goal revision once");
+				writeEnvelope(socket, codec, new BridgeEnvelope(
+						2, helloAck.serverInstanceId(), "server", "heartbeat", "heartbeat-after-recovery", new JsonObject()
+				));
+				BridgeEnvelope heartbeat = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("heartbeat", heartbeat.type(),
+						"infrastructure recovery emits no player resume command");
 				assertEquals(AgentLifecycleState.STARTING, manager.registry().require(disconnected.agentId()).state(),
 						"disconnected goal re-enters STARTING after authenticated reconciliation");
+				assertEquals(disconnectedRevision, manager.registry().require(disconnected.agentId()).goalRevision(),
+						"authenticated recovery preserves the authoritative goal revision");
+				assertEquals(disconnected.profile(), manager.registry().require(disconnected.agentId()).profile(),
+						"authenticated recovery preserves the exact selected profile");
 				assertEquals("finish the interrupted task",
 						manager.registry().require(disconnected.agentId()).currentGoal().orElseThrow().prompt(),
 						"automatic reconnect recovery preserves the unfinished goal");
 
 				JsonObject resumedReady = new JsonObject();
-				resumedReady.addProperty("goalRevision", disconnectedRevision + 1L);
+				resumedReady.addProperty("goalRevision", disconnectedRevision);
 				writeEnvelope(socket, codec, new BridgeEnvelope(
 						2, helloAck.serverInstanceId(), disconnected.agentId().toString(), "agent_ready",
 						"ready-resumed", resumedReady
@@ -1565,6 +1771,16 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
+	private static ProgramActionLedger programActions(MultiplexedServerBridge bridge) {
+		try {
+			Field field = MultiplexedServerBridge.class.getDeclaredField("programActions");
+			field.setAccessible(true);
+			return (ProgramActionLedger) field.get(bridge);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not read bridge program action ledger", exception);
+		}
+	}
+
 	private static GoalSpec testGoal(String request) {
 		return GoalSpec.create(request, new GoalPredicate.OperatorConfirmed(), 0L);
 	}
@@ -1630,5 +1846,13 @@ public final class MultiplexedServerBridgeVerification {
 			throw new AssertionError(label + " threw " + throwable.getClass().getSimpleName(), throwable);
 		}
 		throw new AssertionError(label + " did not throw " + type.getSimpleName());
+	}
+
+	private static void assertDoesNotThrow(Runnable action, String label) {
+		try {
+			action.run();
+		} catch (Throwable throwable) {
+			throw new AssertionError(label + ": " + throwable.getClass().getSimpleName(), throwable);
+		}
 	}
 }

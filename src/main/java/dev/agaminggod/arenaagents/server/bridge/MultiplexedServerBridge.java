@@ -77,6 +77,7 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import net.minecraft.server.level.ServerPlayer;
@@ -90,7 +91,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public static final int AGENT_QUEUE_CAP = 32;
 	private static final int OBSERVATIONS_PER_TICK = AgentConstants.DEFAULT_AGENT_LIMIT;
 	private static final int HANDSHAKE_TIMEOUT_MS = 5_000;
-	static final long HANDSHAKE_RETRY_WAIT_MS = 25L;
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
 	private static final int MAX_TRACKED_IDS = 4_096;
@@ -99,6 +99,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_CONVERSATION_SOURCES_PER_AGENT = 16;
+	private static final long CATALOG_DISCOVERY_RETRY_BASE_NANOS = 50_000_000L;
+	private static final int CATALOG_DISCOVERY_MAX_BACKOFF_SHIFT = 6;
 	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
 	private static final String COORDINATOR_OFFLINE_MESSAGE =
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
@@ -127,6 +129,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	);
 	private final String secret;
 	private final int port;
+	private final ServerSocketFactory serverSockets;
+	private final LongSupplier nanoTime;
 	private final AgentVerboseState verboseState;
 	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(SERVER_TASK_CAP);
 	private final AtomicBoolean running = new AtomicBoolean();
@@ -139,7 +143,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final Object verboseControlLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
 	private final Set<AgentId> coordinatorReadyAgentIds = new HashSet<>();
+	private final Map<AgentId, RecoveryObservationIdentity> recoveryObservationIdentities = new HashMap<>();
 	private boolean disconnectInProgress;
+	private long coordinatorLifecycleGeneration;
 	private long verboseControlRevision;
 	private long publishedVerboseControlRevision;
 	private volatile Session session;
@@ -147,6 +153,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private volatile Set<String> catalogProfiles = Set.of();
 	private volatile List<AgentControlModelOption> catalogModels = AgentControlCatalog.fallbackOptions();
 	private volatile boolean catalogLoaded;
+	private boolean catalogDiscoveryPending;
+	private int catalogDiscoveryAttempts;
+	private long catalogDiscoveryRetryAtNanos;
+	private long catalogDiscoveryGeneration;
+	private String catalogDiscoveryFailureCode;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
 		this(manager, configuredPort(), configuredSecretPath(), new AgentVerboseState());
@@ -193,9 +204,47 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentVerboseState verboseState,
 			GoalVerificationRuntime goalVerificationRuntime
 	) {
+		this(manager, port, secretPath, verboseState, goalVerificationRuntime, ServerSocket::new, System::nanoTime);
+	}
+
+	MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime
+	) {
+		this(
+				manager, port, secretPath, new AgentVerboseState(), defaultGoalVerificationRuntime(manager),
+				serverSockets, nanoTime
+		);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets
+	) {
+		this(manager, port, secretPath, verboseState, goalVerificationRuntime, serverSockets, System::nanoTime);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		this.port = port;
+		this.serverSockets = Objects.requireNonNull(serverSockets, "server socket factory must not be null");
+		this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime must not be null");
 		this.secret = readSecret(secretPath);
 		this.verboseState = Objects.requireNonNull(verboseState, "verboseState must not be null");
 		this.goalVerificationRuntime = Objects.requireNonNull(goalVerificationRuntime, "goalVerificationRuntime must not be null");
@@ -215,7 +264,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			return;
 		}
 		try {
-			ServerSocket socket = new ServerSocket();
+			ServerSocket socket = serverSockets.open();
 			socket.bind(new InetSocketAddress(InetAddress.getByName(LOOPBACK_HOST), port), 1);
 			serverSocket = socket;
 			manager.setRuntimeHooks(this);
@@ -226,9 +275,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
+	@FunctionalInterface
+	interface ServerSocketFactory {
+		ServerSocket open() throws IOException;
+	}
+
 	public void tick() {
 		publishPendingDisconnects();
 		publishPendingVerboseControl();
+		publishCatalogDiscoveryRetry();
 		serverTasks.drain(SERVER_TASKS_PER_TICK, task -> {
 			try {
 				task.run();
@@ -387,7 +442,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public boolean onCreated(AgentRecord record) {
-		bumpRegistryPublicationRevision();
+		registryPublicationRevision.incrementAndGet();
+		programActions.beginGoal(record.agentId(), record.goalRevision());
 		synchronized (publicationLock) {
 			if (protocolKnownAgentIds.contains(record.agentId())) return true;
 			Session active = session;
@@ -403,7 +459,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public void onTransition(AgentTransition transition) {
-		bumpRegistryPublicationRevision();
+		registryPublicationRevision.incrementAndGet();
+		programActions.beginGoal(transition.after().agentId(), transition.after().goalRevision());
 		ScenarioRuntimeService.onAgentState(
 				manager.server(),
 				transition.after().agentId().toString(),
@@ -430,12 +487,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public void onRemoved(AgentId agentId, long terminalRevision) {
-		bumpRegistryPublicationRevision();
+		registryPublicationRevision.incrementAndGet();
 		actionExecutor.cancel(agentId, "Agent removed");
 		programActions.remove(agentId);
 		observationPublication.remove(agentId);
 		synchronized (publicationLock) {
 			coordinatorReadyAgentIds.remove(agentId);
+			recoveryObservationIdentities.remove(agentId);
 			if (!protocolKnownAgentIds.contains(agentId)) return;
 			Session active = session;
 			if (active == null || !active.open.get() || !active.authenticated.get()) {
@@ -459,13 +517,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public <T> T withinPublicationBoundary(java.util.function.Supplier<T> publication) {
-		bumpRegistryPublicationRevision();
+		registryPublicationRevision.incrementAndGet();
 		try {
 			synchronized (publicationLock) {
 				return AgentRuntimeHooks.super.withinPublicationBoundary(publication);
 			}
 		} finally {
-			bumpRegistryPublicationRevision();
+			registryPublicationRevision.incrementAndGet();
 		}
 	}
 
@@ -586,10 +644,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				handshake.add(conversationWakeEnvelope(wake));
 			}
 			synchronized (publicationLock) {
-				if (disconnectInProgress || snapshotRevision != registryPublicationRevision.get()) {
-					awaitHandshakeRetryLocked();
-					continue;
-				}
+				if (disconnectInProgress || snapshotRevision != registryPublicationRevision.get()) continue;
 				if (session != source || !source.open.get()) {
 					throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during authentication");
 				}
@@ -598,6 +653,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;
+				catalogDiscoveryPending = false;
+				catalogDiscoveryAttempts = 0;
+				catalogDiscoveryRetryAtNanos = 0L;
+				catalogDiscoveryGeneration = 0L;
+				catalogDiscoveryFailureCode = null;
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
 				coordinatorReadyAgentIds.clear();
@@ -607,7 +667,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					}
 				}
 				try {
+					for (AgentRecord record : visibleRecords) programActions.beginGoal(record.agentId(), record.goalRevision());
 					source.completeHandshake(handshake);
+					coordinatorLifecycleGeneration++;
 					markVerboseControlPublished(verboseControl);
 					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
@@ -747,7 +809,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		try {
 		Set<String> legacyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits");
 		Set<String> latencyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "latencies");
-		if (!payload.keySet().equals(legacyKeys) && !payload.keySet().equals(latencyKeys)) {
+		Set<String> recoveryKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "bridgeSessionEpoch", "runtimeGeneration", "components");
+		Set<String> recoveryLatencyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "latencies", "bridgeSessionEpoch", "runtimeGeneration", "components");
+		boolean extendedRecovery = payload.keySet().equals(recoveryKeys) || payload.keySet().equals(recoveryLatencyKeys);
+		if (!payload.keySet().equals(legacyKeys) && !payload.keySet().equals(latencyKeys) && !extendedRecovery) {
 			throw new BridgeProtocolException("INVALID_FIELD", "coordinator_status");
 		}
 		JsonArray profileValues = requiredArray(payload, "profiles", CoordinatorStatusSnapshot.MAX_PROFILES);
@@ -755,10 +820,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		for (var element : profileValues) {
 			if (!element.isJsonObject()) throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", "profile must be an object");
 			JsonObject profile = element.getAsJsonObject();
-			requireKeys(profile, Set.of("agentId", "provider", "model", "reasoningEffort"), "profile");
+			Set<String> legacyProfileKeys = Set.of("agentId", "provider", "model", "reasoningEffort");
+			Set<String> exactProfileKeys = Set.of("agentId", "provider", "model", "reasoningEffort", "serviceTier");
+			if (!profile.keySet().equals(legacyProfileKeys) && !profile.keySet().equals(exactProfileKeys)) throw new BridgeProtocolException("INVALID_FIELD", "profile");
 			profiles.add(new CoordinatorStatusSnapshot.SupportedProfile(
 					requiredStatusString(profile, "agentId"), requiredStatusString(profile, "provider"),
-					requiredStatusString(profile, "model"), requiredStatusString(profile, "reasoningEffort")
+					requiredStatusString(profile, "model"), requiredStatusString(profile, "reasoningEffort"),
+					profile.has("serviceTier") ? requiredStatusString(profile, "serviceTier") : "priority"
 			));
 		}
 		JsonObject scheduler = requiredObject(payload, "scheduler");
@@ -804,9 +872,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					requiredNonNegativeDouble(latency, "p50Ms"), requiredNonNegativeDouble(latency, "p95Ms")
 			));
 		}
+		long bridgeSessionEpoch = 0L;
+		String runtimeGeneration = null;
+		ArrayList<CoordinatorStatusSnapshot.ComponentRecovery> components = new ArrayList<>();
+		if (extendedRecovery) {
+			bridgeSessionEpoch = requiredLong(payload, "bridgeSessionEpoch");
+			runtimeGeneration = requiredNullableStatusString(payload, "runtimeGeneration");
+			JsonArray componentValues = requiredArray(payload, "components", CoordinatorStatusSnapshot.MAX_COMPONENTS);
+			for (var element : componentValues) {
+				if (!element.isJsonObject()) throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", "component must be an object");
+				JsonObject component = element.getAsJsonObject();
+				requireKeys(component, Set.of(
+						"component", "state", "fallbackMode", "boundary", "failureCode", "consecutiveFailureCount",
+						"nextProbeAtEpochMs", "generation", "lastRecoveryAtEpochMs"
+				), "component");
+				components.add(new CoordinatorStatusSnapshot.ComponentRecovery(
+						requiredStatusString(component, "component"), requiredStatusString(component, "state"),
+						requiredNullableStatusString(component, "fallbackMode"), requiredNullableStatusString(component, "boundary"),
+						requiredNullableStatusString(component, "failureCode"), requiredInt(component, "consecutiveFailureCount"),
+						requiredNullableStatusLong(component, "nextProbeAtEpochMs"), requiredLong(component, "generation"),
+						requiredNullableStatusLong(component, "lastRecoveryAtEpochMs")
+				));
+			}
+		}
 			return new CoordinatorStatusSnapshot(
 					requiredBoolean(payload, "reconciled"), profiles, requiredInt(payload, "supportedProfileCount"),
 					requiredInt(payload, "rosterReadyCount"), requiredInt(payload, "rosterCount"), schedulerStatus, circuits, latencies,
+					bridgeSessionEpoch, runtimeGeneration, components,
 					receivedAtEpochMs
 			);
 		} catch (BridgeProtocolException exception) {
@@ -976,24 +1068,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
-	private void bumpRegistryPublicationRevision() {
-		registryPublicationRevision.incrementAndGet();
-		synchronized (publicationLock) {
-			publicationLock.notifyAll();
-		}
-	}
-
-	private void awaitHandshakeRetryLocked() {
-		try {
-			publicationLock.wait(HANDSHAKE_RETRY_WAIT_MS);
-		} catch (InterruptedException exception) {
-			Thread.currentThread().interrupt();
-			throw new BridgeProtocolException(
-					"COORDINATOR_DISCONNECTED", "Bridge authentication was interrupted", exception
-			);
-		}
-	}
-
 	private void disconnectActiveAgents() {
 		long now = System.currentTimeMillis();
 		for (AgentRecord record : manager.records()) {
@@ -1013,7 +1087,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			requireKeys(payload, Set.of("refreshedAtEpochMs", "models"), "catalog_snapshot");
 			requiredLong(payload, "refreshedAtEpochMs");
 			JsonArray models = requiredArray(payload, "models", AgentControlModelOption.MAX_OPTIONS);
-			if (models.isEmpty()) throw new BridgeProtocolException("INVALID_MODEL_CATALOG", "models must not be empty");
 			ArrayList<AgentControlModelOption> decoded = new ArrayList<>(models.size());
 			for (var element : models) {
 				if (!element.isJsonObject()) {
@@ -1040,6 +1113,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void acceptCatalog(JsonObject payload) {
 		List<AgentControlModelOption> decoded = decodeCatalog(payload);
+		if (decoded.isEmpty()) {
+			synchronized (publicationLock) {
+				catalogProfiles = Set.of();
+				catalogModels = AgentControlCatalog.fallbackOptions();
+				catalogLoaded = false;
+				catalogDiscoveryPending = false;
+				if (catalogDiscoveryAttempts == 0) requestCatalogDiscovery();
+				else catalogDiscoveryRetryAtNanos = catalogRetryDeadline(catalogDiscoveryAttempts);
+			}
+			return;
+		}
 		JsonArray models = payload.getAsJsonArray("models");
 		HashSet<String> profiles = new HashSet<>();
 		for (var element : models) {
@@ -1057,6 +1141,62 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		catalogProfiles = Set.copyOf(profiles);
 		catalogModels = decoded;
 		catalogLoaded = true;
+		catalogDiscoveryPending = false;
+		catalogDiscoveryAttempts = 0;
+		catalogDiscoveryRetryAtNanos = 0L;
+		catalogDiscoveryGeneration = 0L;
+		catalogDiscoveryFailureCode = null;
+	}
+
+	private void publishCatalogDiscoveryRetry() {
+		synchronized (publicationLock) {
+			if (catalogLoaded || catalogDiscoveryAttempts == 0) return;
+			if (catalogDiscoveryGeneration != coordinatorLifecycleGeneration || session == null || !session.authenticated.get()) return;
+			if (!catalogRetryDue(nanoTime.getAsLong(), catalogDiscoveryRetryAtNanos)) return;
+			catalogDiscoveryPending = false;
+			requestCatalogDiscovery();
+		}
+	}
+
+	private void requestCatalogDiscovery() {
+		if (catalogLoaded || catalogDiscoveryPending) return;
+		if (catalogDiscoveryAttempts < Integer.MAX_VALUE) catalogDiscoveryAttempts += 1;
+		catalogDiscoveryGeneration = coordinatorLifecycleGeneration;
+		catalogDiscoveryRetryAtNanos = catalogRetryDeadline(catalogDiscoveryAttempts);
+		try {
+			send("catalog_request", "server", new JsonObject());
+			catalogDiscoveryPending = true;
+			if (catalogDiscoveryFailureCode != null) {
+				LOGGER.debug("Catalog discovery publication recovered after {}", catalogDiscoveryFailureCode);
+				catalogDiscoveryFailureCode = null;
+			}
+		} catch (RuntimeException exception) {
+			catalogDiscoveryPending = false;
+			String failureCode = catalogPublicationFailureCode(exception);
+			if (!failureCode.equals(catalogDiscoveryFailureCode)) {
+				LOGGER.debug("Catalog discovery publication unavailable ({}); retry remains scheduled", failureCode);
+				catalogDiscoveryFailureCode = failureCode;
+			}
+		}
+	}
+
+	static long catalogRetryDelayNanos(int completedAttempts) {
+		return CATALOG_DISCOVERY_RETRY_BASE_NANOS
+				<< Math.min(CATALOG_DISCOVERY_MAX_BACKOFF_SHIFT, Math.max(0, completedAttempts - 1));
+	}
+
+	private long catalogRetryDeadline(int completedAttempts) {
+		return nanoTime.getAsLong() + catalogRetryDelayNanos(completedAttempts);
+	}
+
+	static boolean catalogRetryDue(long now, long deadline) {
+		return now - deadline >= 0L;
+	}
+
+	private static String catalogPublicationFailureCode(RuntimeException exception) {
+		String code = exception instanceof BridgeProtocolException protocol ? protocol.code() : exception.getClass().getSimpleName();
+		if (code == null || code.isBlank()) return "RUNTIME_FAILURE";
+		return code.length() <= 64 ? code : code.substring(0, 64);
 	}
 
 	private void plannerReady(BridgeEnvelope envelope) {
@@ -1073,22 +1213,30 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (revision < record.goalRevision()) return;
 			throw new AgentDomainException("STALE_REVISION", "Coordinator planning revision is stale");
 		}
-		if ("agent_ready".equals(envelope.type())) coordinatorReadyAgentIds.add(id);
-		boolean reconciledReconnect = "agent_ready".equals(envelope.type())
+		boolean agentReady = "agent_ready".equals(envelope.type());
+		if (agentReady) coordinatorReadyAgentIds.add(id);
+		boolean recoveryReady = agentReady
 				&& envelope.payload().has("reconciled")
-				&& requiredBoolean(envelope.payload(), "reconciled")
-				&& record.state() == AgentLifecycleState.DISCONNECTED
-				&& record.currentGoal().isPresent();
-		if (reconciledReconnect) {
-			manager.registry().resume(id, System.currentTimeMillis());
+				&& requiredBoolean(envelope.payload(), "reconciled");
+		if (recoveryReady && record.state() == AgentLifecycleState.DISCONNECTED
+				&& record.currentGoal().isPresent()) {
+			manager.registry().rearmAfterCoordinatorRecovery(id.value(), revision, System.currentTimeMillis());
 		}
-		if (record.state() == AgentLifecycleState.STARTING) {
+		if (!recoveryReady && record.state() == AgentLifecycleState.STARTING) {
 			router.plannerStarted(id);
 		}
-		if ("agent_ready".equals(envelope.type())) {
+		if (agentReady && shouldRequestReadyObservation(id, revision, recoveryReady)) {
 			observationPublication.markAttention(id);
 			queueUrgentObservation(id);
 		}
+	}
+
+	private boolean shouldRequestReadyObservation(AgentId agentId, long goalRevision, boolean recoveryReady) {
+		if (!recoveryReady) return true;
+		RecoveryObservationIdentity identity = new RecoveryObservationIdentity(
+				coordinatorLifecycleGeneration, goalRevision
+		);
+		return !identity.equals(recoveryObservationIdentities.put(agentId, identity));
 	}
 
 	private void acceptAction(BridgeEnvelope envelope) {
@@ -1180,6 +1328,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private record RejectionIdentity(String agentId, long goalRevision, String actionId, String actionType, String traceId) { }
+	private record RecoveryObservationIdentity(long coordinatorLifecycleGeneration, long goalRevision) { }
 
 	static String boundedRejectionMessage(String message) {
 		String fallback = "Action rejected";
@@ -1805,6 +1954,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", field + " must be nonblank and at most 256 characters");
 		}
 		return value;
+	}
+
+	private static String requiredNullableStatusString(JsonObject object, String field) {
+		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		if (object.get(field).isJsonNull()) return null;
+		return requiredStatusString(object, field);
+	}
+
+	private static Long requiredNullableStatusLong(JsonObject object, String field) {
+		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		return object.get(field).isJsonNull() ? null : requiredLong(object, field);
 	}
 
 	private static String requiredProvenanceString(JsonObject object, String field) {
@@ -2433,6 +2593,11 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;
+				catalogDiscoveryPending = false;
+				catalogDiscoveryAttempts = 0;
+				catalogDiscoveryRetryAtNanos = 0L;
+				catalogDiscoveryGeneration = 0L;
+				catalogDiscoveryFailureCode = null;
 				CoordinatorStatusStore.clear(manager.server());
 				if (wasAuthenticated) coordinatorDisconnectPending.set(true);
 				session = null;

@@ -141,7 +141,26 @@ public final class CodexAgentCommands {
 				.then(goalDraftChoice("confirm", GoalDraftChoice.CONFIRM))
 				.then(goalDraftChoice("replace", GoalDraftChoice.REPLACE))
 				.then(goalDraftChoice("queue", GoalDraftChoice.QUEUE))
-				.then(goalDraftChoice("cancel", GoalDraftChoice.CANCEL));
+				.then(goalDraftChoice("cancel", GoalDraftChoice.CANCEL))
+				.then(Commands.literal("complete")
+						.requires(GoalControl::mayControl)
+						.then(agentArgument().executes(CodexAgentCommands::confirmCompletion)));
+	}
+
+	private static int confirmCompletion(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			AgentRecord record = manager(context).resolve(StringArgumentType.getString(context, ARGUMENT_AGENT));
+			CodexAgentServerRuntime.confirmCurrentGoal(context.getSource().getServer(), record.agentId());
+			context.getSource().sendSuccess(
+					() -> Component.literal("Confirmed completion for " + manager(context).displayName(record) + "."),
+					false
+			);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("goal completion confirmation", exception);
+		}
 	}
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> goalDraftChoice(

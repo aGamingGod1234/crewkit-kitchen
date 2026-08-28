@@ -129,9 +129,9 @@ test('uses the bounded default first-turn probe for Gemini after session creatio
 	await provider.stop();
 });
 
-test('classifies startup failures and cleans up without exposing credentials', async () => {
+test('classifies startup failures through shared diagnostic redaction and cleans up', async () => {
 	const secret = 'fixture-start-token-123';
-	const service = fakeService({ startError: new Error(`authorization token=${secret}`) });
+	const service = fakeService({ startError: new Error(`Authorization: Bearer ${secret} at C:\\private\\provider.json`) });
 	const factory = createLiveProviderFactory('kimi', {
 		service,
 		environment: { KIMI_API_KEY: secret, ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret' },
@@ -145,6 +145,8 @@ test('classifies startup failures and cleans up without exposing credentials', a
 	assert.equal(result.preflight.realAvailability, false);
 	assert.match(result.reason, /REDACTED/);
 	assert.equal(result.reason.includes(secret), false);
+	assert.doesNotMatch(result.reason, /private/);
+	assert.ok(Buffer.byteLength(result.reason, 'utf8') <= 512);
 	assert.deepEqual(service.calls, ['start', 'stop']);
 });
 

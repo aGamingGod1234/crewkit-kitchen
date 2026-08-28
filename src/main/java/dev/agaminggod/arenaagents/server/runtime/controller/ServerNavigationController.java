@@ -18,12 +18,15 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Objects;
 
 public final class ServerNavigationController implements ServerController {
 	public static final int DEFAULT_MAX_PATH_LENGTH = 256;
 	private static final long STALL_TIMEOUT_MS = 4_000L;
 	private static final int MAX_REPLANS = 3;
+	private static final int MAX_PRODUCTIVE_PLANNING_DEFERRALS = 3;
 
 	private final Vec3 destination;
 	private final double tolerance;
@@ -37,6 +40,7 @@ public final class ServerNavigationController implements ServerController {
 	private double lastProgressValue;
 	private InputLease inputLease;
 	private AgentInputStates.MotorState motorState;
+	private int productivePlanningDeferrals;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -80,6 +84,12 @@ public final class ServerNavigationController implements ServerController {
 			return replanOrResult(player, nowEpochMs, remaining);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
+		if (!new MinecraftNavigationWorld(player.level()).isStandable(waypoint.position())) {
+			TickResult replanned = replan(player, nowEpochMs, remaining, true);
+			if (replanned != null) return replanned;
+			nodes = plan.nodes();
+			waypoint = nodes.get(waypointIndex);
+		}
 		boolean finalWaypoint = waypointIndex == nodes.size() - 1;
 		Vec3 target = targetFor(waypoint, finalWaypoint);
 		boolean reached = reachedTarget(player.position(), waypoint, finalWaypoint);
@@ -162,23 +172,33 @@ public final class ServerNavigationController implements ServerController {
 				player.blockPosition().getY(),
 				player.blockPosition().getZ()
 		), 1, 2);
-		GridPosition goal = nearestStandable(world, grid(destination), 4, 3);
-		if (start == null || goal == null) {
+		List<GridPosition> goals = standableGoalsWithinTolerance(world, destination, tolerance, 4, 3);
+		if (start == null || goals.isEmpty()) {
 			return fail(player, "NO_STANDABLE_PATH", "Start or destination has no safe standing position", currentProgress());
 		}
-		ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
-		if (planning.deferred()) {
-			// Shared server-tick exhaustion is transient. Keep the action alive so the
-			// fair executor rotation can admit it on a later tick.
-			return TickResult.running(currentProgress());
+		PathPlan candidate = null;
+		boolean pathLimitReached = false;
+		for (GridPosition goal : goals) {
+			ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
+			if (planning.deferred()) {
+				if (planning.plan().expandedNodes() > 0) productivePlanningDeferrals++;
+				if (productivePlanningDeferrals >= MAX_PRODUCTIVE_PLANNING_DEFERRALS) {
+					return fail(player, "PATH_LIMIT_REACHED", "Path planning repeatedly exhausted its bounded search budget", currentProgress());
+				}
+				return TickResult.running(currentProgress());
+			}
+			PathPlan planned = planning.plan();
+			if (planned.outcome() == PathOutcome.FOUND && planned.nodes().size() <= DEFAULT_MAX_PATH_LENGTH) {
+				candidate = planned;
+				break;
+			}
+			pathLimitReached |= planned.outcome() == PathOutcome.NODE_LIMIT || planned.outcome() == PathOutcome.TIME_LIMIT;
 		}
-		PathPlan candidate = planning.plan();
-		if (candidate.outcome() != PathOutcome.FOUND || candidate.nodes().size() > DEFAULT_MAX_PATH_LENGTH) {
-			String reason = candidate.outcome() == PathOutcome.NODE_LIMIT
-					|| candidate.outcome() == PathOutcome.TIME_LIMIT
-					? "PATH_LIMIT_REACHED" : "NO_PATH";
-			return fail(player, reason, "No bounded safe path is currently available", currentProgress());
+		if (candidate == null) {
+			return fail(player, pathLimitReached ? "PATH_LIMIT_REACHED" : "NO_PATH",
+					"No bounded safe path is currently available", currentProgress());
 		}
+		productivePlanningDeferrals = 0;
 		plan = candidate;
 		waypointIndex = Math.min(1, Math.max(0, candidate.nodes().size() - 1));
 		if (progress == null) {
@@ -284,5 +304,32 @@ public final class ServerNavigationController implements ServerController {
 			}
 		}
 		return null;
+	}
+
+	private static List<GridPosition> standableGoalsWithinTolerance(
+			MinecraftNavigationWorld world,
+			Vec3 destination,
+			double tolerance,
+			int horizontalRadius,
+			int verticalRadius
+	) {
+		GridPosition origin = grid(destination);
+		ArrayList<GridPosition> candidates = new ArrayList<>();
+		for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
+			for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
+				for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
+					GridPosition candidate = new GridPosition(origin.x() + dx, origin.y() + dy, origin.z() + dz);
+					if (world.isStandable(candidate) && candidateSatisfiesTolerance(candidate, destination, tolerance)) {
+						candidates.add(candidate);
+					}
+				}
+			}
+		}
+		candidates.sort(Comparator.comparingDouble(value -> center(value).distanceToSqr(destination)));
+		return List.copyOf(candidates);
+	}
+
+	static boolean candidateSatisfiesTolerance(GridPosition candidate, Vec3 destination, double tolerance) {
+		return candidate.equals(grid(destination)) || center(candidate).distanceTo(destination) <= tolerance;
 	}
 }

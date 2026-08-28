@@ -28,6 +28,7 @@ export class NativeToolRuntime {
 			goalRevision: record.goalRevision,
 			eventSequence,
 			goal: record.currentGoal ?? null,
+			goalSpec: record.currentGoalSpec ?? null,
 			observation: structuredClone(observation ?? {}),
 			...(conversation === undefined ? {} : { conversation: structuredClone(conversation) }),
 		});
@@ -45,14 +46,20 @@ export class NativeToolRuntime {
 		if (lifecycleGeneration !== null && (!Number.isSafeInteger(lifecycleGeneration) || lifecycleGeneration < 0)) throw new TypeError('lifecycleGeneration must be a nonnegative safe integer or null');
 		if (request.tool.kind === 'observe') {
 			const latest = this.#observations.get(record.agentId);
-			if (latest?.goalRevision !== record.goalRevision) return { eventSequence: 0, goal: record.currentGoal ?? null, observation: {} };
+			if (latest?.goalRevision !== record.goalRevision) return {
+				eventSequence: 0,
+				goal: record.currentGoal ?? null,
+				goalSpec: record.currentGoalSpec ?? null,
+				observation: {},
+			};
 			const { goalRevision: _goalRevision, ...facts } = latest;
 			return structuredClone(facts);
 		}
 		if (request.tool.kind === 'finish') return this.#finish(request, record, lifecycleGeneration);
-		if (request.tool.kind === 'sequence') return this.#executeSequence(request, record);
-		if (request.tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
-		return this.#executeAction(request, record, request.tool);
+		const tool = constrainGoalBoundNavigation(request.tool, record.currentGoalSpec);
+		if (tool.kind === 'sequence') return this.#executeSequence({ ...request, tool }, record);
+		if (tool.kind !== 'action') throw codedError('INVALID_NATIVE_TOOL', 'Native tool did not normalize to an action');
+		return this.#executeAction(request, record, tool);
 	}
 
 	async #executeSequence(request, record) {
@@ -121,6 +128,7 @@ export class NativeToolRuntime {
 		const result = {
 			state: String(payload.state ?? 'FAILED').slice(0, 64),
 			reasonCode: String(payload.reasonCode ?? '').slice(0, 128),
+			...(payload.message === undefined ? {} : { message: String(payload.message).slice(0, 2_048) }),
 			...(payload.executionStarted === undefined ? {} : { executionStarted: payload.executionStarted === true }),
 		};
 		this.#trace('native_tool_action_completed', { agentId: record.agentId, goalRevision: record.goalRevision, actionId: active.actionId, ...result });
@@ -220,6 +228,26 @@ export class NativeToolRuntime {
 		if (result.verified) await this.#onFinish({ record, request, result, lifecycleGeneration });
 		return result;
 	}
+}
+
+export function constrainGoalBoundNavigation(tool, goalSpec) {
+	if (tool?.kind === 'sequence') {
+		return { ...tool, actions: tool.actions.map((action) => constrainNavigationAction(action, goalSpec)) };
+	}
+	if (tool?.kind === 'action') return constrainNavigationAction(tool, goalSpec);
+	return tool;
+}
+
+function constrainNavigationAction(action, goalSpec) {
+	const predicate = goalSpec?.predicate;
+	if (action?.actionType !== 'navigate_to' || predicate?.type !== 'position_within') return action;
+	const args = action.arguments ?? {};
+	if (args.x !== predicate.x || args.y !== predicate.y || args.z !== predicate.z) return action;
+	if (predicate.radius < 0.01) {
+		throw codedError('GOAL_TOLERANCE_UNREPRESENTABLE', 'The active position goal radius is below the navigation tool minimum');
+	}
+	if (args.tolerance <= predicate.radius) return action;
+	return { ...action, arguments: { ...args, tolerance: predicate.radius } };
 }
 
 function validateRecord(record) {

@@ -6,6 +6,7 @@ import { parseArenaScript } from './arena-script/parser.mjs';
 import { ArenaScriptEngine } from './arena-script/program-engine.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { buildPlannerInput } from './prompts.mjs';
+import { classifyRecoveryFailure } from './recovery-policy.mjs';
 
 /** Coordinates model-authored ArenaScript programs for independent agents. */
 export class ProgramRuntimeManager {
@@ -28,14 +29,16 @@ export class ProgramRuntimeManager {
 	#completionRetryDelayMs;
 	#setTimeout;
 	#clearTimeout;
+	#requestRecovery;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, requestRecovery = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
 		if (typeof trace !== 'function') throw new TypeError('trace must be a function');
 		if (typeof onCompleted !== 'function') throw new TypeError('onCompleted must be a function');
 		if (typeof onCompletionRequested !== 'function') throw new TypeError('onCompletionRequested must be a function');
+		if (typeof requestRecovery !== 'function') throw new TypeError('requestRecovery must be a function');
 		if (typeof plannerContext !== 'function') throw new TypeError('plannerContext must be a function');
 		this.#registry = registry;
 		this.#bridge = bridge;
@@ -44,6 +47,7 @@ export class ProgramRuntimeManager {
 		this.#trace = trace;
 		this.#onCompleted = onCompleted;
 		this.#onCompletionRequested = onCompletionRequested;
+		this.#requestRecovery = requestRecovery;
 		this.#plannerContext = plannerContext;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
@@ -148,6 +152,9 @@ export class ProgramRuntimeManager {
 		});
 		this.#flushDeferredProgramTrace(state);
 		this.#syncState(record, state);
+		if (this.#rearmReactiveRecovery(state, { observation, eventSequence })) {
+			if (!state.reactiveRequestActive) this.#resumeReactiveRecovery(state);
+		}
 		return state.engine.snapshot();
 	}
 
@@ -156,6 +163,9 @@ export class ProgramRuntimeManager {
 		const state = this.#states.get(record.agentId);
 		if (!state || state.disposed || state.goalRevision !== record.goalRevision) return null;
 		const snapshot = state.engine.notifyAttention({ priority, trigger });
+		if (priority === 'urgent' && this.#rearmReactiveRecovery(state, { observation: state.observation })) {
+			if (!state.reactiveRequestActive) this.#resumeReactiveRecovery(state);
+		}
 		this.#syncState(record, state);
 		return snapshot;
 	}
@@ -317,6 +327,9 @@ export class ProgramRuntimeManager {
 			lastReceiptEpochMs: null,
 			reactiveRequest: null,
 			reactiveRequestActive: false,
+			reactiveRecovery: null,
+			recoveryRequested: false,
+			explicitPause: false,
 			pendingReplacementTrace: null,
 			dispatchTraceRecorded: false,
 			worldActionTraceIds: new Set(),
@@ -433,6 +446,17 @@ export class ProgramRuntimeManager {
 			this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			return state.engine.snapshot();
 		} catch (requestError) {
+			if (classifyRecoveryFailure(requestError).retryable) {
+				state.corrections.set(correctionKey, attempts);
+				state.reactiveRecovery = {
+					kind: 'compiler_correction',
+					context: Object.freeze({ source, error, observation, eventSequence, requestContext: context }),
+					fresh: false,
+				};
+				this.#ensureActing(record);
+				this.#requestRecoveryLease(record, state, 'compiler_correction_provider_failure', requestError);
+				return null;
+			}
 			this.#reportError(record.agentId, requestError);
 			return null;
 		}
@@ -455,6 +479,11 @@ export class ProgramRuntimeManager {
 			state.reactiveRequest = null;
 			state.reactiveRequestActive = false;
 			if (pending !== null) void this.#requestReactiveDecision(state, pending);
+			else if (state.reactiveRecovery?.fresh === true) this.#resumeReactiveRecovery(state);
+			else {
+				const record = this.#registry.get(state.agentId);
+				if (!state.disposed && record?.goalRevision === state.goalRevision) this.#syncState(record, state);
+			}
 		}
 	}
 
@@ -520,6 +549,7 @@ export class ProgramRuntimeManager {
 				this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			} else {
 				const accepted = sameEngineRequest(state.engine.snapshot(), context);
+				state.explicitPause = decision?.directive === 'pause';
 				state.engine.applyDirective({ ...context, directive: decision?.directive, status: decision?.status });
 				if (accepted && decision?.directive === 'finish') {
 					state.terminalStatus = decision.status;
@@ -528,13 +558,20 @@ export class ProgramRuntimeManager {
 			}
 			this.#syncState(record, state);
 		} catch (error) {
+			if (classifyRecoveryFailure(error).retryable) {
+				state.reactiveRecovery = { kind: 'reactive', context: Object.freeze({ ...context }), fresh: false };
+				this.#requestRecoveryLease(record, state, 'reactive_provider_failure', error);
+				this.#syncState(record, state);
+				return;
+			}
 			state.engine.failDirectiveRequest(context);
 			if (context.decisionContext === 'completion_verification_failed') {
-				this.#setTerminalState(record, DynamicAgentState.ERROR);
+				this.#ensureActing(record);
 				const correctionError = codedError('COMPLETION_CORRECTION_FAILED', 'The selected model could not correct a rejected completion claim');
 				correctionError.cause = error;
 				this.#reportError(record.agentId, correctionError);
 			} else this.#reportError(record.agentId, error);
+			this.#syncState(record, state);
 		}
 	}
 
@@ -824,7 +861,72 @@ export class ProgramRuntimeManager {
 			if (state.terminalStatus === 'impossible') this.#setTerminalState(record, DynamicAgentState.ERROR);
 			else this.#requestCompletion(record, state);
 		}
-		if (snapshot.status === 'PAUSED' || snapshot.status === 'SUSPENDED') this.#setTerminalState(record, DynamicAgentState.PAUSED);
+		if (snapshot.status === 'PAUSED' || (snapshot.status === 'SUSPENDED' && state.explicitPause)) {
+			this.#setTerminalState(record, DynamicAgentState.PAUSED);
+			return;
+		}
+		if (snapshot.status === 'SUSPENDED') {
+			this.#ensureActing(record);
+			if (!state.reactiveRequestActive && state.reactiveRequest === null) this.#requestRecoveryLease(record, state, 'reactive_suspended');
+		}
+	}
+
+	#resumeReactiveRecovery(state) {
+		if (state.reactiveRecovery?.fresh !== true || state.disposed) return;
+		const recovery = state.reactiveRecovery;
+		state.reactiveRecovery = null;
+		state.recoveryRequested = false;
+		if (recovery.kind === 'compiler_correction') {
+			const record = this.#registry.get(state.agentId);
+			if (record?.goalRevision !== state.goalRevision) return;
+			const retry = recovery.context;
+			void this.#requestCompilerCorrection(
+				state,
+				record,
+				retry.source,
+				retry.error,
+				retry.observation,
+				retry.eventSequence,
+				retry.requestContext,
+			);
+			return;
+		}
+		void this.#requestReactiveDecision(state, recovery.context);
+	}
+
+	#rearmReactiveRecovery(state, { observation, eventSequence = null } = {}) {
+		const recovery = state.reactiveRecovery;
+		if (recovery === null || state.disposed) return false;
+		const latestRequest = state.engine.refreshDirectiveRequest();
+		if (recovery.kind === 'reactive') {
+			if (latestRequest === null) return false;
+			state.reactiveRecovery = { ...recovery, context: latestRequest, fresh: true };
+			return true;
+		}
+		if (recovery.context.requestContext !== null && latestRequest === null) return false;
+		state.reactiveRecovery = {
+			...recovery,
+			context: Object.freeze({
+				...recovery.context,
+				observation: latestRequest?.observation ?? observation ?? recovery.context.observation,
+				eventSequence: latestRequest?.eventSequence ?? eventSequence ?? recovery.context.eventSequence,
+				requestContext: latestRequest,
+			}),
+			fresh: true,
+		};
+		return true;
+	}
+
+	#requestRecoveryLease(record, state, reason, error = null) {
+		if (state.recoveryRequested || state.disposed) return;
+		state.recoveryRequested = true;
+		const request = Object.freeze({
+			record,
+			reason,
+			...recoveryRequestFields(error),
+		});
+		try { void Promise.resolve(this.#requestRecovery(request)).catch(() => undefined); }
+		catch { /* recovery scheduling cannot terminate the program */ }
 	}
 
 	#setTerminalState(record, state) {
@@ -987,6 +1089,16 @@ function stableFailureCode(error) {
 
 function isRetryableCompletionError(error) {
 	return ['BRIDGE_NOT_READY', 'BRIDGE_DISCONNECTED', 'CONNECTION_BACKPRESSURE', 'AGENT_BACKPRESSURE', 'AGENT_NOT_SUPPORTED'].includes(error?.code);
+}
+
+function recoveryRequestFields(error) {
+	const recovery = classifyRecoveryFailure(error);
+	if (recovery.code === 'UNKNOWN_ERROR') return {};
+	return {
+		errorCode: recovery.code,
+		recoveryKind: recovery.kind,
+		...(recovery.nextProbeAtEpochMs === undefined ? {} : { nextProbeAtEpochMs: recovery.nextProbeAtEpochMs }),
+	};
 }
 
 function monotonicTimestamp(value) {

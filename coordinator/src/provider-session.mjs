@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-const PROFILE_FIELDS = Object.freeze(['provider', 'model', 'reasoningEffort', 'serviceTier']);
+const PROFILE_FIELDS = Object.freeze(['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier']);
 const SESSION_STATES = new Set(['cold', 'warm', 'reset']);
 const CONTINUATIONS = new Set(['durable', 'best_effort']);
 

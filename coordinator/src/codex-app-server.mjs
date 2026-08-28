@@ -8,6 +8,7 @@ import { JsonlDecoder, encodeJsonLine } from './jsonl.mjs';
 import { parseDecision } from './decision-parser.mjs';
 import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
 
 const APP_SERVER_MAX_LINE_BYTES = 4 * 1_024 * 1_024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -84,7 +85,7 @@ function cacheInstalledCodexDesktopCli(environment, dependencies = {}) {
 		?? inferredProgramFiles(environment);
 	const localAppDataRoots = candidateLocalAppDataRoots(environment);
 	if (programFiles === null || localAppDataRoots.length === 0) {
-		console.error('[codex] Installed desktop CLI discovery skipped: Windows profile directories are unavailable');
+		try { console.error('[codex] Installed desktop CLI discovery skipped: Windows profile directories are unavailable'); } catch { /* discovery diagnostics are best effort */ }
 		return null;
 	}
 	for (const localAppData of localAppDataRoots) {
@@ -128,8 +129,9 @@ function cacheInstalledCodexDesktopCli(environment, dependencies = {}) {
 			return cachedCli;
 		}
 	} catch (error) {
-		const code = typeof error?.code === 'string' ? `${error.code}: ` : '';
-		console.error(`[codex] Installed desktop CLI discovery failed: ${code}${error?.message ?? 'unknown filesystem error'}`);
+		const code = sanitizeDiagnosticErrorCode(error, { fallback: 'FILESYSTEM_ERROR', maxBytes: 64 });
+		const message = sanitizeDiagnosticErrorMessage(error, { fallback: 'unknown filesystem error', maxBytes: 3_840 });
+		try { console.error(`[codex] Installed desktop CLI discovery failed (${code}): ${message}`); } catch { /* discovery diagnostics are best effort */ }
 		return null;
 	}
 	return null;
@@ -257,15 +259,21 @@ export class CodexStdioTransport extends EventEmitter {
 				windowsHide: true,
 			});
 		} catch (error) {
-			throw new CodexProtocolError('SPAWN_FAILED', `Could not start Codex app-server: ${error.message}`, { cause: error });
+			throw new CodexProtocolError('SPAWN_FAILED', `Could not start Codex app-server: ${sanitizeDiagnosticErrorMessage(error)}`, { cause: error });
 		}
 		this.#child = child;
 		child.stdout.on('data', (chunk) => this.#onStdout(child, chunk));
-		child.stderr.on('data', (chunk) => this.emit('diagnostic', redact(String(chunk))));
+		child.stderr.on('data', (chunk) => {
+			try { this.emit('diagnostic', sanitizeDiagnosticText(chunk, { maxBytes: 4_096 })); } catch { /* diagnostics cannot interrupt provider IO */ }
+		});
 		child.on('exit', (code, signal) => this.#onExit(child, code, signal));
 		await new Promise((resolve, reject) => {
 			const onSpawn = () => { cleanup(); resolve(); };
-			const onError = (error) => { cleanup(); this.#child = null; reject(new CodexProtocolError('SPAWN_FAILED', `Could not start Codex app-server: ${error.message}`, { cause: error })); };
+			const onError = (error) => {
+				cleanup();
+				if (child === this.#child) this.#child = null;
+				reject(new CodexProtocolError('SPAWN_FAILED', `Could not start Codex app-server: ${sanitizeDiagnosticErrorMessage(error)}`, { cause: error }));
+			};
 			const cleanup = () => { child.off('spawn', onSpawn); child.off('error', onError); };
 			child.once('spawn', onSpawn);
 			child.once('error', onError);
@@ -493,7 +501,7 @@ export class CodexAgent {
 		const models = [];
 		let cursor = null;
 		do {
-			const response = await this.#transport.request('model/list', { cursor, limit: 100, includeHidden: true });
+			const response = await this.#transport.request('model/list', { cursor, limit: 100, includeHidden: false });
 			if (!Array.isArray(response?.data)) throw new CodexProtocolError('INVALID_CATALOG', 'model/list response must contain a data array');
 			models.push(...response.data);
 			cursor = response.nextCursor ?? null;
@@ -558,7 +566,7 @@ export async function checkCodexModelProfile(configValue, transport = new CodexS
 		const models = [];
 		let cursor = null;
 		do {
-			const response = await transport.request('model/list', { cursor, limit: 100, includeHidden: true });
+			const response = await transport.request('model/list', { cursor, limit: 100, includeHidden: false });
 			if (!Array.isArray(response?.data)) throw new CodexProtocolError('INVALID_CATALOG', 'model/list response must contain a data array');
 			models.push(...response.data);
 			cursor = response.nextCursor ?? null;
@@ -628,7 +636,5 @@ function rpcErrorMessage(error) {
 }
 
 function redact(value) {
-	return value
-		.replace(/(?:Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
-		.replace(/(?:api[_-]?key|token|secret)(\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]');
+	return sanitizeDiagnosticText(value, { maxBytes: 4_096 });
 }

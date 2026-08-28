@@ -243,6 +243,11 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 	}
 
 	private void publishToAgent(AgentRecord target, ConversationEvent source) {
+		if ((source.kind() == ConversationKind.PLAYER_MESSAGE || source.kind() == ConversationKind.PROXIMITY_SPEECH)
+				&& target.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.PAUSED
+				&& isSteeringPhrase(source.text())) {
+			target = manager.resume(target.agentId().toString()).after();
+		}
 		long sequence = sequences.merge(target.agentId(), 1L, Long::sum);
 		ConversationEvent delivered = new ConversationEvent(
 				target.agentId(),
@@ -307,6 +312,16 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 	private void notifyRequester(PendingGoalDraft draft, String message) {
 		ServerPlayer player = manager.server().getPlayerList().getPlayer(draft.requestingPlayerId());
 		if (player != null) player.sendSystemMessage(Component.literal(message));
+	}
+
+	private static boolean isSteeringPhrase(String text) {
+		String normalized = text.strip().toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", " ");
+		return normalized.equals("continue")
+				|| normalized.equals("keep going")
+				|| normalized.equals("watch out")
+				|| normalized.equals("try another route")
+				|| normalized.equals("retry")
+				|| normalized.equals("resume");
 	}
 
 	private record GoalRoute(boolean publish, Optional<GoalSpec> wakeSpec) {

@@ -7,6 +7,7 @@ import { completionContractFingerprint } from '../src/goal-contract.mjs';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 
 const SECRET = 's'.repeat(32);
+const LAUNCH_ID = '00000000-0000-0000-0000-000000000123';
 const TRACE_ID = 'trace-wire-1';
 const DESIRED_OAK_STAIRS_STATE = 'minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]';
 const PROVENANCE = Object.freeze({
@@ -37,6 +38,80 @@ class FakeSocket extends EventEmitter {
 		this.emit('close');
 	}
 }
+
+class ManualTimerQueue {
+	#nextId = 0;
+	#timers = new Map();
+
+	schedule = (callback, delay) => {
+		const handle = { id: ++this.#nextId };
+		this.#timers.set(handle.id, { handle, callback, delay });
+		return handle;
+	};
+
+	cancel = (handle) => this.#timers.delete(handle?.id);
+
+	async runDelay(delay) {
+		const timer = [...this.#timers.values()].find((candidate) => candidate.delay === delay);
+		if (timer === undefined) throw new Error(`no ${delay}ms timer is pending`);
+		this.#timers.delete(timer.handle.id);
+		await timer.callback();
+	}
+}
+
+test('optional launch identity is authenticated without weakening manual coordinators', async () => {
+	assert.deepEqual(validateProtocolV2Payload('hello', { secret: SECRET }), { secret: SECRET });
+	assert.deepEqual(validateProtocolV2Payload('hello', { secret: SECRET, launchId: LAUNCH_ID }), {
+		secret: SECRET,
+		launchId: LAUNCH_ID,
+	});
+	assert.deepEqual(validateProtocolV2Payload('hello_ack', {
+		replyTo: 'coordinator-v2-1', authenticated: true, registry: [], launchId: LAUNCH_ID,
+	}), { replyTo: 'coordinator-v2-1', authenticated: true, registry: [], launchId: LAUNCH_ID });
+
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, launchId: LAUNCH_ID }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	assert.equal(hello.payload.launchId, LAUNCH_ID);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-launch-ack', {
+		replyTo: hello.messageId,
+		authenticated: true,
+		registry: [],
+		launchId: LAUNCH_ID,
+	}))}\n`);
+	const [connection] = await ready;
+	assert.equal(connection.launchId, LAUNCH_ID);
+	bridge.stop();
+
+	const staleSocket = new FakeSocket();
+	const staleBridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, launchId: LAUNCH_ID }, {
+		socketFactory: () => staleSocket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	staleBridge.start();
+	staleSocket.emit('connect');
+	const staleHello = JSON.parse(staleSocket.writes[0]);
+	const rejected = once(staleBridge, 'protocolError');
+	staleSocket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-stale-launch-ack', {
+		replyTo: staleHello.messageId,
+		authenticated: true,
+		registry: [],
+		launchId: '00000000-0000-0000-0000-000000000999',
+	}))}\n`);
+	const [error] = await rejected;
+	assert.equal(error.code, 'LAUNCH_ID_MISMATCH');
+	staleBridge.stop();
+});
 
 function serverEnvelope(type, agentId, messageId, payload = {}) {
 	return { protocolVersion: 2, serverInstanceId: 'server-instance', agentId, type, messageId, payload };
@@ -80,6 +155,22 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 		circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 100, p95Ms: 200, failureRate: 0, circuit: 'closed' }],
 	};
 	assert.deepEqual(validateProtocolV2Payload('coordinator_status', payload), { ...payload, latencies: [] });
+	const extended = {
+		...payload,
+		profiles: [{ ...payload.profiles[0], serviceTier: 'priority' }],
+		bridgeSessionEpoch: 3,
+		runtimeGeneration: 'a'.repeat(64),
+		components: [{
+			component: 'provider:codex', state: 'degraded', fallbackMode: 'last_valid', boundary: 'create',
+			failureCode: 'PROVIDER_TIMEOUT', consecutiveFailureCount: 2, nextProbeAtEpochMs: 4_000,
+			generation: 3, lastRecoveryAtEpochMs: null,
+		}],
+	};
+	assert.deepEqual(validateProtocolV2Payload('coordinator_status', extended), { ...extended, latencies: [] });
+	assert.throws(() => validateProtocolV2Payload('coordinator_status', {
+		...extended,
+		components: [{ ...extended.components[0], privatePath: 'C:\\private\\secret.txt' }],
+	}), /field/i);
 	assert.deepEqual(validateProtocolV2Payload('coordinator_status', {
 		...payload,
 		scheduler: { ...payload.scheduler, active: 3, target: 2 },
@@ -673,6 +764,7 @@ test('bridge preserves ready and disconnected events while exposing authenticate
 	});
 	t.after(() => bridge.stop());
 	const readyEvents = [];
+	const activeRecord = { ...registeredRecord(), goalRevision: 4 };
 	const disconnected = once(bridge, 'disconnected');
 	bridge.on('ready', (event) => readyEvents.push(event));
 	const recovered = once(bridge, 'recovered');
@@ -681,25 +773,128 @@ test('bridge preserves ready and disconnected events while exposing authenticate
 	sockets[0].emit('connect');
 	const firstHello = JSON.parse(sockets[0].writes[0]);
 	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
-		replyTo: firstHello.messageId, authenticated: true, registry: [registeredRecord()],
+		replyTo: firstHello.messageId, authenticated: true, registry: [activeRecord],
 	}))}\n`);
 	await new Promise((resolve) => setImmediate(resolve));
+	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-before-reconnect', actionResult('action-before-reconnect')))}\n`);
 	sockets[0].destroy();
-	await disconnected;
+	const [disconnectedEvent] = await disconnected;
+	assert.equal(disconnectedEvent.connectionEpoch, 1);
 	assert.equal(typeof scheduledReconnect, 'function');
 
 	scheduledReconnect();
 	sockets[1].emit('connect');
 	const secondHello = JSON.parse(sockets[1].writes[0]);
 	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-2', {
-		replyTo: secondHello.messageId, authenticated: true, registry: [registeredRecord()],
+		replyTo: secondHello.messageId, authenticated: true, registry: [activeRecord],
 	}))}\n`);
 	const [recovery] = await recovered;
 
 	assert.equal(readyEvents.length, 2);
+	assert.deepEqual(readyEvents.map(({ connectionEpoch }) => connectionEpoch), [1, 2]);
+	assert.equal(recovery.connectionEpoch, 2);
 	assert.equal(recovery.serverInstanceId, 'server-instance');
 	assert.equal(recovery.registry.length, 1);
 	assert.equal(recovery.registry[0].agentId, 'agent-a');
+	const protocolError = once(bridge, 'protocolError');
+	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replayed', actionResult('action-before-reconnect')))}\n`);
+	const [replayError] = await protocolError;
+	assert.equal(replayError.code, 'DUPLICATE_TERMINAL_RESULT');
+});
+
+test('bridge destroys and reconnects a connected peer that misses the handshake deadline', async (t) => {
+	const socket = new FakeSocket();
+	const deadlines = new ManualTimerQueue();
+	let reconnect = null;
+	const bridge = new MultiplexedServerBridge({
+		port: 25570,
+		secret: SECRET,
+		reconnectDelayMs: 7,
+		handshakeTimeoutMs: 11,
+		heartbeatIntervalMs: 13,
+		heartbeatTimeoutMs: 29,
+	}, {
+		socketFactory: () => socket,
+		schedule: (callback) => { reconnect = callback; return 1; },
+		cancelSchedule: () => {},
+		scheduleDeadline: deadlines.schedule,
+		cancelDeadline: deadlines.cancel,
+		currentRevision: () => 0,
+	});
+	t.after(() => bridge.stop());
+	const errors = [];
+	bridge.on('protocolError', (error) => errors.push(error));
+	bridge.start();
+	socket.emit('connect');
+
+	await deadlines.runDelay(11);
+	assert.equal(socket.destroyed, true);
+	assert.equal(errors.at(-1)?.code, 'HANDSHAKE_TIMEOUT');
+	assert.equal(typeof reconnect, 'function');
+});
+
+test('bridge probes an authenticated peer and reconnects when heartbeat silence reaches its deadline', async (t) => {
+	const socket = new FakeSocket();
+	const deadlines = new ManualTimerQueue();
+	let reconnect = null;
+	const bridge = new MultiplexedServerBridge({
+		port: 25570,
+		secret: SECRET,
+		reconnectDelayMs: 7,
+		handshakeTimeoutMs: 11,
+		heartbeatIntervalMs: 13,
+		heartbeatTimeoutMs: 29,
+	}, {
+		socketFactory: () => socket,
+		schedule: (callback) => { reconnect = callback; return 1; },
+		cancelSchedule: () => {},
+		scheduleDeadline: deadlines.schedule,
+		cancelDeadline: deadlines.cancel,
+		currentRevision: () => 0,
+	});
+	t.after(() => bridge.stop());
+	const errors = [];
+	bridge.on('protocolError', (error) => errors.push(error));
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await deadlines.runDelay(13);
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'heartbeat');
+
+	await deadlines.runDelay(29);
+	assert.equal(socket.destroyed, true);
+	assert.equal(errors.at(-1)?.code, 'HEARTBEAT_TIMEOUT');
+	assert.equal(typeof reconnect, 'function');
+});
+
+test('terminal action replay stays rejected after bounded diagnostic history rolls over', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 0,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	for (let index = 0; index <= 4_096; index += 1) {
+		const actionId = `action-${index}`;
+		socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', `server-result-${index}`, actionResult(actionId, 0)))}\n`);
+	}
+	const errors = [];
+	bridge.on('protocolError', (error) => errors.push(error));
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replay', actionResult('action-0', 0)))}\n`);
+
+	assert.equal(socket.destroyed, true);
+	assert.equal(errors.at(-1)?.code, 'DUPLICATE_TERMINAL_RESULT');
 });
 
 test('multiplexed bridge rejects stale revisions before writing', async () => {

@@ -3,7 +3,13 @@ import test from 'node:test';
 
 import { LEASE_TIMEOUTS_MS, WorkLeaseSupervisor } from '../src/work-lease-supervisor.mjs';
 
-const key = Object.freeze({ agentId: 'luna', goalRevision: 7, lifecycleGeneration: 3 });
+const key = Object.freeze({
+	agentId: 'luna',
+	goalRevision: 7,
+	lifecycleGeneration: 3,
+	sessionEpoch: 11,
+	profileFingerprint: `sha256:${'a'.repeat(64)}`,
+});
 
 class FakeClock {
 	#now = 0;
@@ -63,6 +69,20 @@ test('work lease recovers an unfinished goal within the scheduled two-second bou
 	assert.deepEqual(observations[0].key, key);
 	assert.equal(observations[0].reason, 'scheduled_lease_expired');
 	assert.equal(supervisor.snapshot(key).state, 'recovering');
+});
+
+test('circuit recovery preserves its absolute probe deadline before requesting fresh facts', async () => {
+	const { clock, observations, supervisor } = fixture();
+	supervisor.activate(key);
+	assert.equal(supervisor.recover(key, { nextProbeAtEpochMs: 10_000, retryDelayMs: 9_000 }), true);
+	clock.advance(LEASE_TIMEOUTS_MS.scheduled + 1);
+	await clock.runDue();
+	assert.equal(observations.length, 0, 'ordinary scheduled timeout cannot bypass the circuit deadline');
+	clock.advance(6_999);
+	await clock.runDue();
+	assert.equal(observations.length, 1);
+	assert.equal(observations[0].key.profileFingerprint, key.profileFingerprint);
+	assert.equal(supervisor.snapshot(key).recoveryDetails.nextProbeAtEpochMs, 10_000);
 });
 
 test('provider and action leases expire independently and preserve the fenced goal key', async () => {
@@ -133,4 +153,16 @@ test('newer lifecycle keys fence callbacks and suspension cancels every lease', 
 	await clock.runDue();
 	assert.deepEqual(observations, []);
 	assert.equal(clock.pendingCount, 0);
+});
+
+test('recovery lease identity fences stale session epochs and exact-profile mutations', () => {
+	const { supervisor } = fixture();
+	supervisor.activate(key);
+	const stale = supervisor.acquire(key, 'provider');
+	const nextSession = { ...key, sessionEpoch: key.sessionEpoch + 1 };
+	assert.equal(supervisor.activate(nextSession), true);
+	assert.equal(supervisor.release(stale), false, 'an earlier bridge session cannot release replacement work');
+	assert.equal(supervisor.snapshot(key), null);
+	assert.equal(supervisor.snapshot(nextSession)?.key.profileFingerprint, key.profileFingerprint);
+	assert.equal(supervisor.activate({ ...nextSession, profileFingerprint: `sha256:${'b'.repeat(64)}` }), false, 'same-generation profile mutation is not newer work');
 });

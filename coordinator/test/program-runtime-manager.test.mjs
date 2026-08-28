@@ -122,16 +122,23 @@ test('routes failed factual completion back through the selected brain', async (
 	assert.match(run.requests[0].input, /"observedValue":"minecraft:iron_pickaxe x0"/);
 });
 
-test('turns an exhausted silent completion correction into an explicit agent error', async () => {
+test('completion verification infrastructure failure stays active and retries once from fresh facts', async () => {
 	let completionRequest;
 	const registry = new AgentRegistry();
 	registry.register(record());
 	const errors = [];
+	const recoveries = [];
+	const requests = [];
 	const manager = new ProgramRuntimeManager({
 		registry,
 		bridge: { send: async () => {} },
-		planner: { requestPlan: async () => { throw Object.assign(new Error('provider timed out'), { code: 'REQUEST_TIMEOUT' }); } },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) throw Object.assign(new Error('provider timed out'), { code: 'REQUEST_TIMEOUT' });
+			return withCompletionContract({ summary: 'Continue from verified facts.', directive: 'replace', source: SOURCE }, request.goalRevision);
+		} },
 		reportError: (_agentId, error) => errors.push(error),
+		requestRecovery: (request) => recoveries.push(request),
 		onCompletionRequested: (request) => { completionRequest = request; },
 	});
 	await manager.installDecision(registry.get('agent-a'), withCompletionContract({
@@ -146,8 +153,43 @@ test('turns an exhausted silent completion correction into an explicit agent err
 		facts: [{ type: 'inventory_contains', satisfied: false, expectedValue: 'minecraft:iron_pickaxe x1', observedValue: 'minecraft:iron_pickaxe x0' }],
 	});
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(registry.get('agent-a').state, DynamicAgentState.ERROR);
-	assert.equal(errors[0].code, 'COMPLETION_CORRECTION_FAILED');
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	assert.equal(recoveries.length, 1);
+	assert.equal(errors.length, 0);
+	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 2 });
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(recoveries.length, 1);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
+test('a bounded completion correction rejection cannot turn an unverified goal into ERROR', async () => {
+	let completionRequest;
+	const registry = new AgentRegistry();
+	registry.register(record());
+	const errors = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner: { requestPlan: async () => { throw Object.assign(new Error('unsupported correction protocol'), { code: 'UNSUPPORTED_PROTOCOL' }); } },
+		reportError: (_agentId, error) => errors.push(error),
+		onCompletionRequested: (request) => { completionRequest = request; },
+	});
+	await manager.installDecision(registry.get('agent-a'), withCompletionContract({
+		summary: 'Done.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("done");',
+	}, 1), { observation: observation(), eventSequence: 1 });
+	manager.onCompletionResult(registry.get('agent-a'), {
+		goalRevision: 1,
+		traceId: completionRequest.traceId,
+		goalFingerprint: completionRequest.goalFingerprint,
+		verified: false,
+		reasonCode: 'PREDICATE_FAILED',
+		facts: [{ type: 'inventory_contains', satisfied: false, expectedValue: 'minecraft:iron_pickaxe x1', observedValue: 'minecraft:iron_pickaxe x0' }],
+	});
+	for (let attempt = 0; attempt < 10 && errors.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(errors.at(-1)?.code, 'COMPLETION_CORRECTION_FAILED');
+	assert.notEqual(registry.get('agent-a').state, DynamicAgentState.ERROR);
+	assert.notEqual(registry.get('agent-a').state, DynamicAgentState.PAUSED);
 });
 
 test('clears a scheduled completion retry before a newer publication and correction', async () => {
@@ -624,21 +666,24 @@ test('wires full watcher provenance and preserves the exact profile on reactive 
 	assert.equal(watcher.provenance.watcherId, 'watcher-0');
 });
 
-test('cancel-send rejection pauses an unmatched urgent wake and fences late results', async () => {
+test('cancel-send rejection keeps an unmatched urgent wake active for recovery and fences late results', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const sent = [];
 	const errors = [];
+	const recoveries = [];
 	const manager = new ProgramRuntimeManager({
 		registry,
 		bridge: { send: async (type, agentId, payload) => { sent.push({ type, agentId, payload }); if (type === 'action_cancel') throw Object.assign(new Error('cancel unavailable'), { code: 'CANCEL_UNAVAILABLE' }); } },
 		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
 		reportError: (_agentId, error) => errors.push(error),
+		requestRecovery: (request) => recoveries.push(request),
 	});
 	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: 'program.onUnhandledAttention("pause_and_notify"); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
 	const active = sent[0].payload;
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage' });
-	for (let attempt = 0; attempt < 5 && registry.get('agent-a').state !== DynamicAgentState.PAUSED; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(registry.get('agent-a').state, DynamicAgentState.PAUSED);
+	for (let attempt = 0; attempt < 5 && recoveries.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	assert.equal(recoveries.length, 1);
 	assert.equal(sent.filter((message) => message.type === 'action_cancel').length, 1);
 	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3 }), false);
 	assert.equal(errors.at(-1)?.code, 'CANCEL_UNAVAILABLE');
@@ -679,6 +724,176 @@ test('replans from bounded failed-action context instead of pausing after a repe
 	assert.match(requests[0].input, /"recipeId":"minecraft:planks"/);
 	assert.equal(actionCommands(sent).length, 3);
 	assert.equal(actionCommands(sent)[2].payload.actionType, 'wait');
+});
+
+test('reactive provider suspension stays active and retries once after fresh authoritative facts', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [];
+	const requests = [];
+	const recoveries = [];
+	const timeout = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) throw timeout;
+			return withCompletionContract({
+				summary: 'Recover with fresh facts.',
+				directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+			}, request.goalRevision);
+		} },
+		requestRecovery: (request) => recoveries.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace',
+		source: `
+			program.onUnhandledAttention("continue_and_notify");
+			await program.repeatUntil(() => false, { maxIterations: 8 }, async () => {
+				await player.craftInventory({ recipeId: "minecraft:planks", count: 1, timeoutMs: 5000 });
+			});
+		`,
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onActionResult(registry.get('agent-a'), { actionId: actionCommands(sent)[0].payload.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND' });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	await manager.onActionResult(registry.get('agent-a'), { actionId: actionCommands(sent)[1].payload.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND' });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
+	for (let attempt = 0; attempt < 10 && recoveries.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 1);
+	assert.equal(recoveries.length, 1);
+	assert.equal(recoveries[0].reason, 'reactive_provider_failure');
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+
+	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 4 });
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(recoveries.length, 1, 'one failure schedules only one recovery before fresh facts');
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).at(-1)?.payload.actionType !== 'wait'; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(actionCommands(sent).at(-1).payload.actionType, 'wait');
+});
+
+test('reactive infrastructure recovery rearms on a later fresh fact without retry looping', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const requests = [];
+	const recoveries = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length <= 2) throw Object.assign(new Error('provider still timed out'), { code: 'REQUEST_TIMEOUT' });
+			return withCompletionContract({
+				summary: 'Recovered from later facts.',
+				directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+			}, request.goalRevision);
+		} },
+		requestRecovery: (request) => recoveries.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'conversation',
+	});
+	for (let attempt = 0; attempt < 10 && recoveries.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 1);
+	assert.equal(recoveries.length, 1);
+
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation({ player: { health: 19 } }), eventSequence: 3,
+	});
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(recoveries.length, 2, 'the second failed cycle requests one future recovery lease');
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation({ player: { health: 17 } }), eventSequence: 3,
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2, 'a failed cycle cannot retry again from a duplicate authoritative sequence');
+
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation({ player: { health: 18 } }), eventSequence: 4,
+	});
+	for (let attempt = 0; attempt < 10 && requests.length < 3; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 3);
+	assert.match(requests[2].input, /"eventSequence":4/, 'the resumed request uses the latest accepted fact identity');
+	assert.equal(recoveries.length, 2);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
+test('urgent non-observation attention rearms dormant reactive recovery once', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const requests = [];
+	const recoveries = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) throw Object.assign(new Error('provider timed out'), { code: 'REQUEST_TIMEOUT' });
+			return withCompletionContract({ summary: 'Heard the operator.', directive: 'continue' }, request.goalRevision);
+		} },
+		requestRecovery: (request) => recoveries.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage',
+	});
+	for (let attempt = 0; attempt < 10 && recoveries.length < 1; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 1);
+	assert.equal(recoveries.length, 1);
+
+	manager.notifyAttention(registry.get('agent-a'), { priority: 'urgent', trigger: 'conversation' });
+	manager.notifyAttention(registry.get('agent-a'), { priority: 'urgent', trigger: 'conversation' });
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2, 'duplicate attention coalesces into the one rearmed cycle');
+	assert.equal(recoveries.length, 1);
+	assert.match(requests[1].input, /"attentionTrigger":"conversation"/);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
+test('urgent non-observation attention rearms dormant compiler correction once', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const requests = [];
+	const recoveries = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) return withCompletionContract({ summary: 'Invalid replacement.', directive: 'replace', source: 'broken {' }, request.goalRevision);
+			if (requests.length === 2) throw Object.assign(new Error('provider timed out'), { code: 'REQUEST_TIMEOUT' });
+			return withCompletionContract({ summary: 'Corrected.', directive: 'replace', source: SOURCE }, request.goalRevision);
+		} },
+		requestRecovery: (request) => recoveries.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage',
+	});
+	for (let attempt = 0; attempt < 10 && recoveries.length < 1; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(recoveries.length, 1);
+
+	manager.notifyAttention(registry.get('agent-a'), { priority: 'urgent', trigger: 'conversation' });
+	manager.notifyAttention(registry.get('agent-a'), { priority: 'urgent', trigger: 'conversation' });
+	for (let attempt = 0; attempt < 10 && requests.length < 3; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 3, 'duplicate attention coalesces into one compiler-recovery cycle');
+	assert.equal(recoveries.length, 1);
+	assert.match(requests[2].input, /ArenaScript compiler correction/);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 });
 
 test('serializes coalesced reactive planner requests for one program', async () => {
@@ -907,6 +1122,73 @@ test('caps recursive compiler correction and reports exhaustion without a fallba
 	assert.equal(errors.at(-1).code, 'ARENA_SCRIPT_COMPILER_EXHAUSTED');
 });
 
+test('provider, session, scheduler, and blocked authentication failures share active recovery policy', async () => {
+	for (const code of [
+		'PROVIDER_TIMEOUT', 'REQUEST_TIMEOUT', 'PLANNING_TIMEOUT', 'PROCESS_TERMINATION_FAILED',
+		'PROVIDER_UNAVAILABLE', 'PROVIDER_STOPPED', 'SESSION_INVALIDATED', 'TRANSPORT_STOPPED',
+		'PROVIDER_CIRCUIT_OPEN', 'SCHEDULER_CAPACITY', 'AUTHENTICATION_REQUIRED', 'MISSING_CREDENTIALS',
+		'AGENT_NOT_STARTED', 'AGENT_PROFILE_CONFLICT', 'INCOMPLETE_TURN', 'INVALID_CATALOG',
+		'INVALID_PROVIDER_OUTPUT', 'MODEL_PROFILE_UNAVAILABLE', 'PROCESS_EXITED', 'PROVIDER_DOWN',
+		'PROVIDER_OVERLOADED', 'REQUEST_ID_EXHAUSTED', 'SESSION_GENERATION_MISMATCH',
+		'SESSION_PROFILE_MISMATCH', 'STALE_PROVIDER_START', 'STALE_RECONCILIATION',
+		'STALE_SESSION_GENERATION', 'TURN_IN_PROGRESS', 'TURN_INTERRUPTED', 'TURN_NOT_ACTIVE',
+		'UNKNOWN_RESPONSE_ID', 'CONTROL_PROTOCOL_MISMATCH', 'INVALID_CONFIG_OPTIONS', 'MODEL_UNAVAILABLE',
+		'NATIVE_TOOLS_UNAVAILABLE', 'PROVIDER_MISMATCH', 'REASONING_EFFORT_UNAVAILABLE',
+		'SERVICE_TIER_UNAVAILABLE', 'UNSUPPORTED_MODEL', 'UNSUPPORTED_SERVICE_TIER', 'UNSUPPORTED_THINKING',
+	]) {
+		const registry = new AgentRegistry(); registry.register(record());
+		const recoveries = [];
+		const errors = [];
+		const manager = new ProgramRuntimeManager({
+			registry,
+			bridge: { send: async () => assert.fail('invalid source must not dispatch') },
+			planner: { requestPlan: async () => { throw Object.assign(new Error(`failure ${code}`), { code }); } },
+			requestRecovery: (request) => recoveries.push(request),
+			reportError: (_agentId, error) => errors.push(error),
+		});
+		await manager.installDecision(registry.get('agent-a'), withCompletionContract({ summary: 'Invalid.', directive: 'replace', source: 'broken {' }, 1), { observation: observation(), eventSequence: 1 });
+		assert.equal(registry.get('agent-a').state === DynamicAgentState.ERROR || registry.get('agent-a').state === DynamicAgentState.PAUSED, false, code);
+		assert.equal(recoveries.length, 1, `${code} requests one bounded recovery`);
+		assert.equal(recoveries[0].errorCode, code);
+		assert.equal(errors.length, 0, `${code} is not published as a domain failure`);
+	}
+});
+
+test('compiler-correction infrastructure recovery rearms on a later fresh fact without retry looping', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const requests = [];
+	const recoveries = [];
+	const sent = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length <= 2) throw Object.assign(new Error('provider request timed out'), { code: 'PROVIDER_TIMEOUT' });
+			return withCompletionContract({ summary: 'Corrected.', directive: 'replace', source: SOURCE }, request.goalRevision);
+		} },
+		requestRecovery: (request) => recoveries.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'), withCompletionContract({ summary: 'Invalid.', directive: 'replace', source: 'broken {' }, 1), { observation: observation(), eventSequence: 1 });
+	assert.equal(requests.length, 1);
+	assert.equal(recoveries.length, 1);
+	assert.notEqual(registry.get('agent-a').state, DynamicAgentState.ERROR);
+	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 2 });
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(recoveries.length, 2, 'the second failed correction requests one future recovery lease');
+	assert.equal(actionCommands(sent).length, 0);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2, 'the failed correction cannot retry again without newer authoritative facts');
+
+	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 18 } }), eventSequence: 3 });
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 3);
+	assert.equal(recoveries.length, 2);
+	assert.equal(actionCommands(sent).length, 1);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+});
+
 test('bridge send rejection unwedges the active program with a stable failed result', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const errors = [];
@@ -923,21 +1205,24 @@ test('bridge send rejection unwedges the active program with a stable failed res
 	assert.equal(snapshot.activeActionId, null, 'failed send is terminally acknowledged instead of wedging the engine');
 });
 
-test('bridge send rejection contains a model execution error without terminating the coordinator', async () => {
+test('bridge send rejection contains a model execution error and schedules active recovery', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const errors = [];
+	const recoveries = [];
 	const manager = new ProgramRuntimeManager({
 		registry,
 		bridge: { send: async () => { throw Object.assign(new Error('stale revision'), { code: 'STALE_GOAL_REVISION' }); } },
 		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
 		reportError: (_id, error) => errors.push(error),
+		requestRecovery: (request) => recoveries.push(request),
 	});
 	await manager.installDecision(registry.get('agent-a'), {
 		directive: 'replace',
 		source: 'program.onUnhandledAttention("continue_and_notify"); const result = await tryResult(player.wait(1)); const invalid = result.yaw; program.finish("done");',
 	}, { observation: observation(), eventSequence: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(registry.get('agent-a').state, DynamicAgentState.PAUSED);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	assert.equal(recoveries.length, 1);
 	assert.equal(errors.some((error) => error.code === 'STALE_GOAL_REVISION'), true);
 	assert.equal(errors.some((error) => error.code === 'UNKNOWN_MEMBER'), true);
 });

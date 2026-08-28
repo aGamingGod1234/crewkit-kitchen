@@ -5,6 +5,7 @@ import { AgentWorkspaceManager } from '../agent-workspace.mjs';
 import { AntigravityProviderService } from '../antigravity-service.mjs';
 import { CodexService } from '../codex-service.mjs';
 import { createProviderChildEnvironment } from '../provider-environment.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from '../diagnostic-sanitizer.mjs';
 
 const PROVIDERS = new Set(['codex', 'gemini', 'kimi']);
 const DEFAULT_BRIDGE_SECRET_ENVIRONMENT_VARIABLE = 'ARENA_AGENT_BRIDGE_SECRET';
@@ -272,15 +273,13 @@ function collectConfigSecrets(value, target, key = '') {
 }
 
 function safeReason(error, phase, secrets) {
-	let message = typeof error?.message === 'string' ? error.message : `${phase} preflight failed`;
+	let message = sanitizeDiagnosticErrorMessage(error, { fallback: `${phase} preflight failed`, maxBytes: 2_048 });
 	for (const secret of secrets) message = message.split(secret).join('[REDACTED]');
-	message = message.replace(/((?:api[_-]?key|token|secret|password|authorization|credential)s?)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]');
-	message = message.replace(/Bearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]');
-	return message.replace(/\s+/g, ' ').trim().slice(0, 512) || `${phase} preflight failed`;
+	return sanitizeDiagnosticText(message, { maxBytes: 512 }).replace(/\s+/g, ' ').trim() || `${phase} preflight failed`;
 }
 
 function safeErrorCode(error) {
-	return typeof error?.code === 'string' && /^[A-Z0-9_:-]{1,64}$/.test(error.code) ? error.code : 'PROVIDER_UNAVAILABLE';
+	return sanitizeDiagnosticErrorCode(error, { fallback: 'PROVIDER_UNAVAILABLE', maxBytes: 64 });
 }
 
 function coded(code, message) {
