@@ -378,10 +378,14 @@ public final class CodexAgentCommands {
 		if (enabled) VoiceConsentRegistry.grant(context.getSource().getServer(), player.getUUID());
 		else VoiceConsentRegistry.revoke(context.getSource().getServer(), player.getUUID());
 		context.getSource().sendSuccess(
-				() -> Component.literal("Agent voice transcription " + (enabled ? "enabled." : "disabled.")),
+				() -> Component.literal(voiceConsentConfirmation(enabled)),
 				false
 		);
 		return enabled ? 1 : 0;
+	}
+
+	static String voiceConsentConfirmation(boolean enabled) {
+		return "Agent voice transcription " + (enabled ? "enabled for this session." : "disabled.");
 	}
 
 	private static int voiceConsentStatus(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {

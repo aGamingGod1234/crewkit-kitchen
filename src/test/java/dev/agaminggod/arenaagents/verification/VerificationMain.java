@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.agent.AgentRegistryVerification;
 import dev.agaminggod.arenaagents.agent.AgentIdentityVerification;
 import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
 import dev.agaminggod.arenaagents.server.AgentDeathCaptureVerification;
+import dev.agaminggod.arenaagents.server.VoiceConsentCommandVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
 import dev.agaminggod.arenaagents.client.gui.AgentControlLayoutVerification;
@@ -179,6 +180,7 @@ public final class VerificationMain {
 		passedAssertions += CoordinatorVoiceEndpointVerification.verify();
 		passedAssertions += AgentActivityPresentationVerification.verify();
 		passedAssertions += AgentDeathCaptureVerification.verify();
+		passedAssertions += VoiceConsentCommandVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();
 		passedAssertions += OfflineAgentPlayersVerification.verify();
 		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();

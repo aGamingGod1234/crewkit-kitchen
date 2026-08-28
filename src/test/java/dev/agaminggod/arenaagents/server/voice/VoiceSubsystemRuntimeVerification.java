@@ -213,12 +213,23 @@ public final class VoiceSubsystemRuntimeVerification {
 		} catch (NoSuchMethodException exception) {
 			throw new AssertionError("configuration-aware provider overload is missing", exception);
 		}
+		try {
+			assertTrue(VoiceSubsystem.class.getMethod("cancelHumanSpeech", UUID.class).isDefault(),
+					"human speech cancellation remains a binary-compatible interface default");
+		} catch (NoSuchMethodException exception) {
+			throw new AssertionError("human speech cancellation method is missing", exception);
+		}
 		assertTrue(VoiceSubsystemRuntime.start(server, configuration, List.of(legacyProvider)),
 				"a provider with only the original one-argument method starts on the current core");
 		assertEquals(1, starts.get(), "current core invokes the old provider exactly once");
 		assertTrue(VoiceSubsystemRuntime.available(server), "old provider remains usable after startup");
+		UUID playerId = UUID.randomUUID();
+		VoiceConsentRegistry.grant(server, playerId);
+		VoiceConsentRegistry.revoke(server, playerId);
+		assertTrue(VoiceSubsystemRuntime.available(server),
+				"disconnect and voice-off cancellation remain safe for an old subsystem implementation");
 		VoiceSubsystemRuntime.close(server);
-		return 4;
+		return 6;
 	}
 
 	private static int verifyLinkageFailureFallback(VoiceSubsystemConfiguration configuration) {
@@ -460,8 +471,19 @@ public final class VoiceSubsystemRuntimeVerification {
 		@Override
 		public VoiceSubsystem create(MinecraftServer server) {
 			starts.incrementAndGet();
-			return new RecordingVoiceSubsystem(new AtomicInteger());
+			return new LegacyVoiceSubsystem();
 		}
+	}
+
+	private static final class LegacyVoiceSubsystem implements VoiceSubsystem {
+		@Override public boolean available() { return true; }
+		@Override public void registerAgent(dev.agaminggod.arenaagents.agent.AgentId agentId, UUID entityId) { }
+		@Override public void unregisterAgent(dev.agaminggod.arenaagents.agent.AgentId agentId) { }
+		@Override public java.util.concurrent.CompletionStage<VoiceReceipt> speak(VoiceRequest request) {
+			return java.util.concurrent.CompletableFuture.completedFuture(VoiceReceipt.accepted());
+		}
+		@Override public void stop(dev.agaminggod.arenaagents.agent.AgentId agentId) { }
+		@Override public void close() { }
 	}
 
 	private static void assertTrue(boolean value, String label) {
