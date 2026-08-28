@@ -355,17 +355,20 @@ export class DynamicCoordinator extends EventEmitter {
 		}, { connectionEpoch }));
 		this.#listen('agent_removed', (message, connectionEpoch) => this.#run(async () => {
 			await this.#reconciliation;
-			this.#publishVerbose(message.agentId, message.payload.goalRevision, 'lifecycle', 'Agent removed from the coordinator roster.');
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
+			this.#publishVerbose(message.agentId, message.payload.goalRevision, 'lifecycle', 'Agent removed from the coordinator roster.', connectionEpoch);
 			const current = this.#registry.get(message.agentId);
 			if (current !== null && this.#usesNativeTools(current)) this.#goalSupervisor.terminate(this.#supervisionKey(current));
 			this.#programRuntime.dispose(message.agentId);
 			await this.#nativeRuntime.dispose(message.agentId, 'agent_removed');
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 			this.#providerWork.delete(message.agentId);
 			this.#programRuntimeEpochs.delete(message.agentId);
 			this.#nativeRuntimeEpochs.delete(message.agentId);
 			this.#pendingAttention.delete(message.agentId);
 			this.#attentionFlushes.delete(message.agentId);
 			await this.#planner.remove(message.agentId);
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 			this.#lifecycleGenerations.delete(message.agentId);
 			this.#providerRetryAfter.delete(message.agentId);
 			this.#factLedgers.delete(message.agentId);
@@ -510,6 +513,7 @@ export class DynamicCoordinator extends EventEmitter {
 					this.#invalidateAcceptedLifecycle(message.agentId);
 					this.#programRuntime.onGoalControl(previous, 'start');
 					await this.#nativeRuntime.dispose(previous.agentId, 'conversation_wake');
+					if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 				}
 				this.#conversationMemory(message.agentId).ingest(message.payload.event);
 				if (this.#usesNativeTools(record)) this.#goalSupervisor.activate(this.#supervisionKey(record));
@@ -990,9 +994,10 @@ export class DynamicCoordinator extends EventEmitter {
 				&& work.request.conversationRetry !== true && record !== null) {
 			this.#scheduleNativeTurn(record, {
 				...work.request,
+				connectionEpoch: work.connectionEpoch,
 				conversationRetry: true,
 				input: `${work.request.input}\nYour previous turn made no visible reply. Call say exactly once now.`,
-			}, { connectionEpoch });
+			});
 			return result;
 		}
 		const rescheduled = this.#reschedulePendingNativeTurn(pending);
@@ -1158,6 +1163,7 @@ export class DynamicCoordinator extends EventEmitter {
 				traceId: work.traceId,
 			});
 		} catch (error) {
+			if (this.#providerWork.get(work.agentId) !== work) return null;
 			this.#providerWork.delete(work.agentId);
 			const current = this.#registry.get(work.agentId);
 			const stale = current?.goalRevision !== work.goalRevision
@@ -1166,6 +1172,20 @@ export class DynamicCoordinator extends EventEmitter {
 			if (this.#programRuntimeEpochs.get(work.agentId) === work.connectionEpoch) this.#programRuntimeEpochs.delete(work.agentId);
 			if (!stale) await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 			if (stale || work.pending?.priority === 'urgent') this.#reschedulePendingProviderPlan(work.pending);
+			return null;
+		}
+		if (this.#providerWork.get(work.agentId) !== work) return null;
+		const current = this.#registry.get(work.agentId);
+		if (current?.goalRevision !== work.goalRevision
+				|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
+				|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration)) {
+			const pending = work.pending;
+			this.#providerWork.delete(work.agentId);
+			if (this.#programRuntimeEpochs.get(work.agentId) === work.connectionEpoch) {
+				this.#programRuntime.dispose(work.agentId);
+				this.#programRuntimeEpochs.delete(work.agentId);
+			}
+			this.#reschedulePendingProviderPlan(pending);
 			return null;
 		}
 		const pending = work.pending;

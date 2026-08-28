@@ -52,6 +52,21 @@ class DeferredCompletionBridge extends FakeBridge {
 	}
 }
 
+class GatedActionCancelBridge extends FakeBridge {
+	#releaseCancel;
+	#cancelGate = new Promise((resolve) => { this.#releaseCancel = resolve; });
+	cancelPending = false;
+
+	async send(type, agentId, payload, options = {}) {
+		await super.send(type, agentId, payload, options);
+		if (type !== 'action_cancel') return;
+		this.cancelPending = true;
+		await this.#cancelGate;
+	}
+
+	releaseCancel() { this.#releaseCancel(); }
+}
+
 class GatedAgentReadyBridge extends FakeBridge {
 	blocked = false;
 	#release;
@@ -1816,6 +1831,231 @@ test('native Codex control reissues a resumed goal after the interrupted turn fa
 		assert.match(planner.requests[1].input, /Old goal/);
 	} finally {
 		rejectFirst(Object.assign(new Error('test cleanup'), { code: 'STALE_PLAN' }));
+		await run.coordinator.stop();
+	}
+});
+
+test('old agent removal awaiting reconciliation cannot remove replacement-session state', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let reconciliationCount = 0;
+	let releaseOldReconciliation;
+	planner.beginReconcile = (records, options) => {
+		const reconciledRegistry = registry.reconcile(records, options);
+		const result = {
+			registry: reconciledRegistry,
+			providers: { valid: reconciledRegistry.records, invalid: [], catalog: { models: [] } },
+		};
+		reconciliationCount += 1;
+		if (reconciliationCount !== 1) return { registry: reconciledRegistry, complete: Promise.resolve(result) };
+		return {
+			registry: reconciledRegistry,
+			complete: new Promise((resolve) => { releaseOldReconciliation = () => resolve(result); }),
+		};
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, registry, planner, codexService: new FakeProvider() },
+	);
+	await coordinator.start();
+	try {
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'test', registry: [record()] });
+		await eventually(() => reconciliationCount === 1 && typeof releaseOldReconciliation === 'function');
+		bridge.emit('agent_removed', { connectionEpoch: 1, agentId: 'agent-a', payload: { goalRevision: 0 } });
+		await new Promise((resolve) => setImmediate(resolve));
+
+		const replacement = { ...record(), model: 'gpt-5.6-luna' };
+		bridge.emit('ready', { connectionEpoch: 2, serverInstanceId: 'test', registry: [replacement] });
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.connectionEpoch === 2));
+		releaseOldReconciliation();
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(registry.get('agent-a')?.model, 'gpt-5.6-luna');
+		assert.equal(registry.get('agent-a')?.state, DynamicAgentState.IDLE);
+	} finally {
+		releaseOldReconciliation?.();
+		await coordinator.stop();
+	}
+});
+
+test('old compiler correction cannot delete replacement provider work after reconnect', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let releaseOldCorrection;
+	let releaseReplacementPlan;
+	const oldCorrection = new Promise((resolve) => { releaseOldCorrection = resolve; });
+	const replacementPlan = new Promise((resolve) => { releaseReplacementPlan = resolve; });
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) {
+			return withCompletionContract({ summary: 'Compile invalid source.', directive: 'replace', source: 'not valid ArenaScript {' }, request.goalRevision);
+		}
+		if (planner.requests.length === 2) {
+			await oldCorrection;
+			return withCompletionContract({ summary: 'Old corrected source.', directive: 'replace', source: SOURCE }, request.goalRevision);
+		}
+		if (planner.requests.length === 3) {
+			await replacementPlan;
+			return withCompletionContract({ summary: 'Replacement source.', directive: 'replace', source: SOURCE }, request.goalRevision);
+		}
+		throw new Error('unexpected provider request');
+	};
+	const run = await start({ registry, planner });
+	try {
+		run.bridge.emit('goal_control', { connectionEpoch: 1, agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait safely.' } });
+		run.bridge.emit('observation', { connectionEpoch: 1, agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => planner.requests.length === 2);
+
+		run.bridge.emit('disconnected', { connectionEpoch: 1 });
+		await eventually(() => registry.get('agent-a')?.state === DynamicAgentState.DISCONNECTED);
+		run.bridge.emit('ready', {
+			connectionEpoch: 2,
+			serverInstanceId: 'test',
+			registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Wait safely.', goalRevision: 1 }],
+		});
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_ready' && message.connectionEpoch === 2));
+		run.bridge.emit('observation', { connectionEpoch: 2, agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 2,
+			observation: { player: { x: 1, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => planner.requests.length === 3);
+
+		releaseOldCorrection();
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(run.bridge.sent.some((message) => message.type === 'action_command'), false, 'old correction cannot install into epoch 2');
+
+		releaseReplacementPlan();
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'action_command' && message.connectionEpoch === 2));
+	} finally {
+		releaseOldCorrection?.();
+		releaseReplacementPlan?.();
+		await run.coordinator.stop();
+	}
+});
+
+test('old conversation wake awaiting native disposal cannot repopulate replacement state', async () => {
+	const bridge = new GatedActionCancelBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length !== 1) return { status: 'completed', toolCalls: 1 };
+		return request.executeTool({
+			agentId: request.agentId,
+			goalRevision: request.goalRevision,
+			turnId: 'turn-before-wake',
+			callId: 'call-before-wake',
+			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Waiting.', audience: 'direct', recipientId: 'player-a' } },
+		});
+	};
+	const run = await start({
+		bridge,
+		registry,
+		planner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	const wake = {
+		transactionId: 'wake-obsolete-epoch',
+		event: {
+			sequence: 2, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Obsolete wake text.', goalRevision: 0, observedAtEpochMs: 20,
+		},
+		control: { operation: 'start', goalRevision: 1, updatedAtEpochMs: 21, goal: 'Respond after reconnect.' },
+	};
+	try {
+		bridge.emit('conversation_event', { connectionEpoch: 1, agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Start the first turn.', goalRevision: 0, observedAtEpochMs: 10,
+		} });
+		await eventually(() => bridge.sent.some((message) => message.payload?.actionType === 'chat'));
+		bridge.emit('conversation_wake', { connectionEpoch: 1, agentId: 'agent-a', payload: wake });
+		await eventually(() => bridge.cancelPending);
+
+		bridge.emit('disconnected', { connectionEpoch: 1 });
+		await eventually(() => registry.get('agent-a')?.state === DynamicAgentState.DISCONNECTED);
+		bridge.emit('ready', {
+			connectionEpoch: 2,
+			serverInstanceId: 'test',
+			registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: wake.control.goal, goalRevision: 1 }],
+		});
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.connectionEpoch === 2));
+		bridge.releaseCancel();
+		for (let index = 0; index < 5; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(planner.requests.length, 1, 'old wake cannot schedule replacement-session work');
+
+		bridge.emit('conversation_event', { connectionEpoch: 2, agentId: 'agent-a', payload: {
+			sequence: 3, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Fresh replacement text.', goalRevision: 1, observedAtEpochMs: 30,
+		} });
+		await eventually(() => planner.requests.length === 2);
+		assert.doesNotMatch(planner.requests[1].input, /Obsolete wake text/);
+	} finally {
+		bridge.releaseCancel();
+		await run.coordinator.stop();
+	}
+});
+
+test('zero-tool native conversation retries visibly under the replacement work epoch', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let releaseOldTurn;
+	const oldTurn = new Promise((resolve) => { releaseOldTurn = resolve; });
+	planner.requestPlan = async () => assert.fail('native control must not use ArenaScript planning');
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) {
+			await oldTurn;
+			return { status: 'completed', toolCalls: 0 };
+		}
+		if (planner.requests.length === 2) return { status: 'completed', toolCalls: 0 };
+		const result = await request.executeTool({
+			agentId: request.agentId,
+			goalRevision: request.goalRevision,
+			turnId: 'turn-visible-retry',
+			callId: 'call-visible-retry',
+			tool: { kind: 'action', actionType: 'chat', arguments: { message: 'Visible reply.', audience: 'direct', recipientId: 'player-a' } },
+		});
+		assert.equal(result.state, 'SUCCEEDED');
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	try {
+		run.bridge.emit('conversation_event', { connectionEpoch: 1, agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Old pending turn.', goalRevision: 0, observedAtEpochMs: 10,
+		} });
+		await eventually(() => planner.requests.length === 1);
+		run.bridge.emit('disconnected', { connectionEpoch: 1 });
+		await eventually(() => planner.interruptions.includes('agent-a'));
+		run.bridge.emit('ready', { connectionEpoch: 2, serverInstanceId: 'test', registry: [record()] });
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'agent_ready' && message.connectionEpoch === 2));
+		releaseOldTurn();
+		for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
+
+		run.bridge.emit('conversation_event', { connectionEpoch: 2, agentId: 'agent-a', payload: {
+			sequence: 2, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Reply in the replacement session.', goalRevision: 0, observedAtEpochMs: 20,
+		} });
+		await eventually(() => planner.requests.length === 3);
+		assert.match(planner.requests[2].input, /previous turn made no visible reply/);
+		await eventually(() => run.bridge.sent.some((message) => message.payload?.actionType === 'chat' && message.connectionEpoch === 2));
+		const command = run.bridge.sent.find((message) => message.payload?.actionType === 'chat' && message.connectionEpoch === 2);
+		run.bridge.emit('action_result', { connectionEpoch: 2, agentId: 'agent-a', payload: {
+			goalRevision: 0, actionId: command.payload.actionId, actionType: 'chat', state: 'SUCCEEDED',
+			reasonCode: 'CHAT_SENT', executionStarted: true, eventSequence: 2,
+		} });
+		await eventually(() => registry.get('agent-a')?.state === DynamicAgentState.IDLE);
+	} finally {
+		releaseOldTurn?.();
 		await run.coordinator.stop();
 	}
 });
