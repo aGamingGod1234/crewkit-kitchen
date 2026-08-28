@@ -239,15 +239,29 @@ export function constrainGoalBoundNavigation(tool, goalSpec) {
 }
 
 function constrainNavigationAction(action, goalSpec) {
-	const predicate = goalSpec?.predicate;
-	if (action?.actionType !== 'navigate_to' || predicate?.type !== 'position_within') return action;
+	if (action?.actionType !== 'navigate_to') return action;
 	const args = action.arguments ?? {};
-	if (args.x !== predicate.x || args.y !== predicate.y || args.z !== predicate.z) return action;
-	if (predicate.radius < 0.01) {
+	const radius = matchingPositionRadius(goalSpec?.predicate, args);
+	if (radius === undefined) return action;
+	if (radius < 0.01) {
 		throw codedError('GOAL_TOLERANCE_UNREPRESENTABLE', 'The active position goal radius is below the navigation tool minimum');
 	}
-	if (args.tolerance <= predicate.radius) return action;
-	return { ...action, arguments: { ...args, tolerance: predicate.radius } };
+	if (args.tolerance <= radius) return action;
+	return { ...action, arguments: { ...args, tolerance: radius } };
+}
+
+function matchingPositionRadius(predicate, args) {
+	if (predicate?.type === 'position_within') {
+		return args.x === predicate.x && args.y === predicate.y && args.z === predicate.z
+			? predicate.radius
+			: undefined;
+	}
+	let radius;
+	for (const child of predicate?.predicates ?? []) {
+		const childRadius = matchingPositionRadius(child, args);
+		if (childRadius !== undefined) radius = radius === undefined ? childRadius : Math.min(radius, childRadius);
+	}
+	return radius;
 }
 
 function validateRecord(record) {

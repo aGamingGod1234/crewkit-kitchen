@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
-import { NativeToolRuntime } from '../src/native-tool-runtime.mjs';
+import { constrainGoalBoundNavigation, NativeToolRuntime } from '../src/native-tool-runtime.mjs';
 
 function record(overrides = {}) {
 	const fields = {
@@ -145,6 +145,68 @@ test('goal-bound navigation cannot succeed outside the immutable position radius
 		state: 'FAILED', reasonCode: 'PATH_BLOCKED',
 		message: 'Navigation could not recover from repeated stalls', executionStarted: true,
 	});
+});
+
+test('goal-bound navigation honors a matching position nested in a compound goal', async () => {
+	const sent = [];
+	const fields = {
+		originalRequest: 'Move to 12 64 12 and survive for a minute',
+		predicate: {
+			type: 'all_of',
+			predicates: [
+				{ type: 'survive_duration', ticks: 1_200 },
+				{ type: 'position_within', x: 12, y: 64, z: 12, radius: 0.01, stableTicks: 20 },
+			],
+		},
+		createdAtTick: 10,
+	};
+	const positioned = record({
+		currentGoal: fields.originalRequest,
+		currentGoalSpec: { ...fields, fingerprint: goalSpecFingerprint(fields) },
+	});
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-position', callId: 'move-position',
+		tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 12, y: 64, z: 12, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
+	}, positioned);
+	await Promise.resolve();
+	assert.equal(sent[0][2].arguments.tolerance, 0.01);
+	runtime.onActionResult(positioned, {
+		goalRevision: 3,
+		actionId: sent[0][2].actionId,
+		state: 'FAILED',
+		reasonCode: 'PATH_BLOCKED',
+		executionStarted: true,
+	});
+	await pending;
+});
+
+test('nested position constraints do not clamp navigation to unrelated coordinates', () => {
+	const goalSpec = {
+		predicate: {
+			type: 'any_of',
+			predicates: [
+				{ type: 'position_within', x: 12, y: 64, z: 12, radius: 0.5, stableTicks: 20 },
+				{
+					type: 'all_of',
+					predicates: [
+						{ type: 'position_within', x: 99, y: 70, z: -4, radius: 0.01, stableTicks: 20 },
+						{ type: 'survive_duration', ticks: 1_200 },
+					],
+				},
+			],
+		},
+	};
+	const matching = constrainGoalBoundNavigation({
+		kind: 'action', actionType: 'navigate_to',
+		arguments: { x: 12, y: 64, z: 12, tolerance: 1, sprint: true, timeoutMs: 30_000 },
+	}, goalSpec);
+	const unrelated = constrainGoalBoundNavigation({
+		kind: 'action', actionType: 'navigate_to',
+		arguments: { x: 20, y: 64, z: 20, tolerance: 1, sprint: true, timeoutMs: 30_000 },
+	}, goalSpec);
+	assert.equal(matching.arguments.tolerance, 0.5);
+	assert.equal(unrelated.arguments.tolerance, 1);
 });
 
 test('a false finish stays active and returns Minecraft evidence to the same turn', async () => {
