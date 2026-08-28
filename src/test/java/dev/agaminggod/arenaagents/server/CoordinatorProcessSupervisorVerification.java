@@ -80,9 +80,10 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyPortOnlyChangeAdvancesBridgeRevision();
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
+		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 198;
+		return 204;
 	}
 
 	private static void verifyLaunchMaterialChangeFencesOwnedChild() {
@@ -1140,6 +1141,56 @@ public final class CoordinatorProcessSupervisorVerification {
 		join(blocked, "blocked close maintenance exits after release");
 	}
 
+	private static void verifyCloseWaitsForInflightOwnedLaunchCleanup() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.ready();
+		CountDownLatch dependenciesResolved = new CountDownLatch(1);
+		CoordinatorProcessSupervisor.DependencyResolver signallingDependencies =
+				new CoordinatorProcessSupervisor.DependencyResolver() {
+					@Override
+					public String fingerprint() {
+						return dependencies.fingerprint();
+					}
+
+					@Override
+					public CoordinatorProcessSupervisor.DependencyResolution resolve() {
+						CoordinatorProcessSupervisor.DependencyResolution resolution = dependencies.resolve();
+						dependenciesResolved.countDown();
+						return resolution;
+					}
+				};
+		DelayedLauncher launcher = new DelayedLauncher();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "inflight-close-supervisor"), Map.of(), clock, signallingDependencies, launcher,
+				() -> "00000000-0000-0000-0000-000000000774",
+				new CoordinatorProcessSupervisor.OwnedMaintenanceWorker(), runtimeRoot -> 0, task -> { }
+		);
+		await(dependenciesResolved, "production maintenance worker resolves startup dependencies");
+		supervisor.tick(false, null, 0L);
+		assertTrue(supervisor.configured(), "startup dependencies publish before the launch race");
+
+		clock.advance(STARTUP_GRACE_MS);
+		long launchDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+		while (launcher.started.getCount() > 0L && System.nanoTime() < launchDeadline) {
+			supervisor.tick(false, null, 0L);
+			Thread.onSpinWait();
+		}
+		await(launcher.started, "owned launch enters the production maintenance worker");
+		Thread closing = Thread.ofPlatform().daemon().name("inflight-owned-launch-close").start(supervisor::close);
+		awaitState(supervisor, CoordinatorRecoveryState.STOPPED,
+				"close publishes its terminal state before awaiting maintenance");
+		assertTrue(closing.isAlive(), "close waits while the owned launch can still publish a child");
+
+		launcher.release.countDown();
+		join(closing, "close waits for in-flight owned launch cleanup");
+		assertEquals(1, launcher.child.terminationAttempts,
+				"the late owned child receives exactly one shutdown cleanup attempt");
+		assertEquals(1, launcher.child.terminations,
+				"close returns only after the late owned child is confirmed terminated");
+		assertFalse(launcher.child.ownershipPresent,
+				"close returns only after the late owned child's ownership is cleared");
+	}
+
 	private static final class Fixture {
 		private final FakeClock clock = new FakeClock();
 		private final MutableDependencies dependencies;
@@ -1461,6 +1512,19 @@ public final class CoordinatorProcessSupervisorVerification {
 		}
 	}
 
+	private static final class DelayedLauncher implements CoordinatorProcessSupervisor.ProcessLauncher {
+		private final CountDownLatch started = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
+		private final FakeChild child = new FakeChild(42_425L);
+
+		@Override
+		public CoordinatorProcessSupervisor.ChildProcess launch(CoordinatorProcessSupervisor.LaunchRequest request) {
+			started.countDown();
+			await(release, "delayed owned launch released");
+			return child;
+		}
+	}
+
 	private static final class BlockingChild implements CoordinatorProcessSupervisor.ChildProcess {
 		private final CountDownLatch terminationStarted = new CountDownLatch(1);
 		private final CountDownLatch releaseTermination = new CountDownLatch(1);
@@ -1635,6 +1699,16 @@ public final class CoordinatorProcessSupervisorVerification {
 			Thread.currentThread().interrupt();
 			throw new AssertionError(label + " was interrupted", exception);
 		}
+	}
+
+	private static void awaitState(
+			CoordinatorProcessSupervisor supervisor,
+			CoordinatorRecoveryState expected,
+			String label
+	) {
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+		while (supervisor.snapshot().state() != expected && System.nanoTime() < deadline) Thread.onSpinWait();
+		assertEquals(expected, supervisor.snapshot().state(), label);
 	}
 
 	private static void restoreProperty(String name, String value) {

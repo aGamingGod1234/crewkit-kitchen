@@ -11,6 +11,8 @@ import java.util.HexFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class BundledCoordinatorInstallerVerification {
@@ -41,9 +43,17 @@ public final class BundledCoordinatorInstallerVerification {
 		Path root = Files.createTempDirectory("arena-supervisor-corrupt-lkg");
 		String oldPackageRoot = System.getProperty("arenaagents.packageRoot");
 		CoordinatorProcessSupervisor supervisor = null;
+		Process staleCoordinator = null;
 		try {
 			RuntimeFixture fixture = stageRuntimeFixture(root.resolve("package"), true);
-			Files.writeString(fixture.activeMain(), "corrupted active main", StandardCharsets.UTF_8);
+			String failedGeneration = BundledCoordinatorInstaller.validate(fixture.packageRoot()).generationId();
+			staleCoordinator = startOwnedSleeper(fixture.activeMain());
+			CoordinatorProcessOwnership.record(
+					fixture.packageRoot(), staleCoordinator, fixture.activeMain(), failedGeneration,
+					"00000000-0000-0000-0000-000000000898"
+			);
+			invalidateOwnershipOwner(fixture.packageRoot());
+			Files.delete(fixture.activeMain());
 			Path game = blockBundledRefresh(root.resolve("game"));
 			System.setProperty("arenaagents.packageRoot", fixture.packageRoot().toString());
 			FakeClock clock = new FakeClock();
@@ -57,10 +67,14 @@ public final class BundledCoordinatorInstallerVerification {
 					launcher,
 					() -> "00000000-0000-0000-0000-%012d".formatted(launchIds.incrementAndGet()),
 					Runnable::run,
-					runtimeRoot -> 0,
+					CoordinatorProcessOwnership::reapOrphaned,
 					task -> { }
 			);
 
+			assertTrue(staleCoordinator.waitFor(5L, TimeUnit.SECONDS),
+					"production startup reaps the exact stale coordinator before touching corrupt active bytes");
+			assertFalse(Files.exists(CoordinatorProcessOwnership.ownershipFile(fixture.packageRoot())),
+					"production startup clears the stale ownership record before restoring the runtime");
 			assertTrue(supervisor.configured(),
 					"supervisor restores a verified LKG when bundled refresh cannot repair the corrupt active runtime");
 			assertEquals(fixture.verifiedGeneration(), supervisor.runtimeGenerationId(),
@@ -81,11 +95,45 @@ public final class BundledCoordinatorInstallerVerification {
 					"restored verified runtime authenticates and returns automatically to healthy");
 			assertEquals(1L, launcher.children.stream().filter(FakeChild::isAlive).count(),
 					"automatic restoration owns exactly one live generation");
-			return 8;
+			return 10;
 		} finally {
 			if (supervisor != null) supervisor.close();
+			if (staleCoordinator != null && staleCoordinator.isAlive()) {
+				CoordinatorProcessOwnership.terminateTree(staleCoordinator.toHandle());
+			}
 			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
 			deleteTree(root);
+		}
+	}
+
+	private static Process startOwnedSleeper(Path main) throws Exception {
+		String executable = Path.of(
+				System.getProperty("java.home"),
+				"bin",
+				System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win")
+						? "java.exe" : "java"
+		).toString();
+		Process process = new ProcessBuilder(
+				executable,
+				"-cp",
+				System.getProperty("java.class.path"),
+				CoordinatorProcessOwnershipVerification.Sleeper.class.getName(),
+				main.toString()
+		).start();
+		Thread.sleep(100L);
+		assertTrue(process.isAlive(), "stale coordinator fixture starts before runtime corruption");
+		return process;
+	}
+
+	private static void invalidateOwnershipOwner(Path runtimeRoot) throws IOException {
+		Path ownership = CoordinatorProcessOwnership.ownershipFile(runtimeRoot);
+		Properties values = new Properties();
+		try (var reader = Files.newBufferedReader(ownership)) {
+			values.load(reader);
+		}
+		values.setProperty("ownerPid", Long.toString(Long.MAX_VALUE));
+		try (var writer = Files.newBufferedWriter(ownership)) {
+			values.store(writer, "stale Minecraft owner fixture");
 		}
 	}
 

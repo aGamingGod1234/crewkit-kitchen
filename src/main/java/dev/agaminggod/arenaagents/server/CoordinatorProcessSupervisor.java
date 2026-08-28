@@ -36,6 +36,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
 	private static final long TERMINATION_RETRY_MS = 1_000L;
+	private static final long SHUTDOWN_WAIT_MS = 10_000L;
 	private static final int CANDIDATE_FAILURES_BEFORE_ROLLBACK = 3;
 
 	private final Path gameDirectory;
@@ -1128,33 +1129,41 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	@Override
-	public synchronized void close() {
-		if (stopped) return;
-		stopped = true;
-		state = CoordinatorRecoveryState.STOPPED;
-		nextRetryEpochMs = 0L;
-		nextDependencyCheckEpochMs = 0L;
+	public void close() {
 		ArrayList<ChildProcess> cleanup = new ArrayList<>();
-		ChildProcess active = detachChild();
-		if (active != null) cleanup.add(active);
-		if (pendingTermination != null && !cleanup.contains(pendingTermination)) cleanup.add(pendingTermination);
-		pendingTermination = null;
-		MaintenanceResult result;
-		while ((result = maintenanceResults.poll()) != null) {
-			if (result instanceof LaunchMaintenanceResult launch && launch.child() != null
-					&& !cleanup.contains(launch.child())) {
-				cleanup.add(launch.child());
+		synchronized (this) {
+			if (stopped) return;
+			stopped = true;
+			state = CoordinatorRecoveryState.STOPPED;
+			nextRetryEpochMs = 0L;
+			nextDependencyCheckEpochMs = 0L;
+			ChildProcess active = detachChild();
+			if (active != null) cleanup.add(active);
+			if (pendingTermination != null && !cleanup.contains(pendingTermination)) cleanup.add(pendingTermination);
+			pendingTermination = null;
+			MaintenanceResult result;
+			while ((result = maintenanceResults.poll()) != null) {
+				if (result instanceof LaunchMaintenanceResult launch && launch.child() != null
+						&& !cleanup.contains(launch.child())) {
+					cleanup.add(launch.child());
+				}
 			}
 		}
-		for (ChildProcess process : cleanup) {
-			try {
-				process.terminate();
-			} catch (RuntimeException failure) {
-				LOGGER.warn("Could not complete coordinator shutdown cleanup", failure);
-			}
-		}
-		maintenanceWorker.close();
 		if (dependencyChangeMonitor != null) dependencyChangeMonitor.close();
+		try {
+			for (ChildProcess process : cleanup) {
+				try {
+					process.terminate();
+				} catch (RuntimeException failure) {
+					LOGGER.warn("Could not complete coordinator shutdown cleanup", failure);
+				}
+			}
+		} finally {
+			// Do not hold the supervisor monitor while waiting. An in-flight launch must
+			// reacquire it to observe stopped=true, terminate its owned child, and clear
+			// the ownership record before the daemon worker can finish.
+			maintenanceWorker.close();
+		}
 	}
 
 	private long now() {
@@ -1219,7 +1228,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		return "COORDINATOR_STARTUP_INVALID";
 	}
 
-	private static final class OwnedMaintenanceWorker implements MaintenanceWorker {
+	static final class OwnedMaintenanceWorker implements MaintenanceWorker {
 		private final ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
 			Thread thread = new Thread(runnable, "arenaagents-coordinator-maintenance");
 			thread.setDaemon(true);
@@ -1234,6 +1243,25 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		@Override
 		public void close() {
 			executor.shutdown();
+			boolean interrupted = Thread.interrupted();
+			long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SHUTDOWN_WAIT_MS);
+			try {
+				while (!executor.isTerminated()) {
+					long remaining = deadline - System.nanoTime();
+					if (remaining <= 0L) break;
+					try {
+						executor.awaitTermination(remaining, TimeUnit.NANOSECONDS);
+					} catch (InterruptedException interruption) {
+						interrupted = true;
+					}
+				}
+				if (!executor.isTerminated()) {
+					executor.shutdownNow();
+					LOGGER.warn("Timed out waiting for coordinator shutdown cleanup");
+				}
+			} finally {
+				if (interrupted) Thread.currentThread().interrupt();
+			}
 		}
 	}
 
