@@ -1532,6 +1532,10 @@ export async function startVoiceWorker(config, environment = process.env, depend
 	if (config === null || typeof config !== 'object' || Array.isArray(config)) throw new TypeError('voice worker config must be an object');
 	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) throw new TypeError('voice worker environment must be an object');
 	const voice = config.voice ?? {};
+	const localSpeechTimeoutMs = voice.localSpeechTimeoutMs ?? DEFAULT_LOCAL_SPEECH_TIMEOUT_MS;
+	if (!Number.isSafeInteger(localSpeechTimeoutMs) || localSpeechTimeoutMs < 1 || localSpeechTimeoutMs > 600_000) {
+		throw new TypeError('voice.localSpeechTimeoutMs must be between 1 and 600000');
+	}
 	const signal = dependencies.signal;
 	if (signal !== undefined && (signal === null || typeof signal !== 'object' || typeof signal.aborted !== 'boolean')) {
 		throw new TypeError('voice startup signal must be an AbortSignal');
@@ -1557,7 +1561,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			executable: firstNonBlank(environment.ARENA_AGENT_SPEECH_PYTHON, voice.localSpeechPythonPath)
 				?? path.resolve(PROJECT_DIRECTORY, defaultLocalSpeechPythonPath(platform)),
 			scriptPath: path.join(SOURCE_DIRECTORY, 'voice', 'local-speech-worker.py'),
-			timeoutMs: voice.localSpeechTimeoutMs ?? DEFAULT_LOCAL_SPEECH_TIMEOUT_MS,
+			timeoutMs: localSpeechTimeoutMs,
 			environment,
 			signal,
 			accessFile: dependencies.localSpeechAccess,
@@ -1612,6 +1616,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			secret: config.bridge?.secret,
 			port: voice.port ?? DEFAULT_VOICE_PORT,
 			maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT,
+			requestTimeoutMs: localSpeechTimeoutMs,
 		});
 		throwIfVoiceStartupAborted(signal);
 		if (worker === null || typeof worker !== 'object' || typeof worker.start !== 'function' || typeof worker.close !== 'function') {
@@ -1722,6 +1727,7 @@ function createLocalSpeechFailover(localProvider, {
 	let fallbackStt = null;
 	let localUnavailable = false;
 	let ttsTransitionPromise = null;
+	let sttTransitionPromise = null;
 	let fullTransitionPromise = null;
 	let localClosePromise = null;
 	const closeLocal = () => {
@@ -1784,6 +1790,23 @@ function createLocalSpeechFailover(localProvider, {
 		});
 		await ttsTransitionPromise;
 	};
+	const switchSttToFallback = async (error, signal) => {
+		if (!shouldUseLocalSttFallback(error, signal)) throw error;
+		if (deepgramApiKey === null) throw error;
+		if (activeStt !== localProvider) return;
+		if (fullTransitionPromise !== null) {
+			await fullTransitionPromise;
+			return;
+		}
+		sttTransitionPromise ??= Promise.resolve().then(() => {
+			throwIfVoiceStartupAborted(signal);
+			if (activeStt === localProvider) activeStt = fallbackSttFactory();
+		}).catch((transitionError) => {
+			sttTransitionPromise = null;
+			throw transitionError;
+		});
+		await sttTransitionPromise;
+	};
 	return Object.freeze({
 		tts: Object.freeze({
 			async synthesize(request) {
@@ -1803,7 +1826,16 @@ function createLocalSpeechFailover(localProvider, {
 			},
 		}),
 		stt: Object.freeze({
-			transcribe(request) { return activeStt.transcribe(request); },
+			async transcribe(request) {
+				const attemptedProvider = activeStt;
+				try {
+					return await attemptedProvider.transcribe(request);
+				} catch (error) {
+					if (attemptedProvider !== localProvider) throw error;
+					await switchSttToFallback(error, request?.signal);
+					return activeStt.transcribe(request);
+				}
+			},
 		}),
 		async warmup({ signal } = {}) {
 			if (localUnavailable || typeof localProvider.warmup !== 'function') return;
@@ -1826,6 +1858,12 @@ function createLocalSpeechFailover(localProvider, {
 function shouldUseLocalTtsFallback(error, signal) {
 	if (error?.name === 'AbortError' || signal?.aborted) return false;
 	if (error instanceof TypeError || error?.code === 'TTS_INVALID_REQUEST') return false;
+	return true;
+}
+
+function shouldUseLocalSttFallback(error, signal) {
+	if (error?.name === 'AbortError' || signal?.aborted) return false;
+	if (error instanceof TypeError || ['STT_INVALID_REQUEST', 'STT_MALFORMED_AUDIO'].includes(error?.code)) return false;
 	return true;
 }
 

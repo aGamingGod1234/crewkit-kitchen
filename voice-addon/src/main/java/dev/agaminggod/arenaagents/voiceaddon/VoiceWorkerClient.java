@@ -29,19 +29,26 @@ final class VoiceWorkerClient {
 	private final HttpClient client;
 	private final URI endpoint;
 	private final String secret;
+	private final Duration requestTimeout;
 
 	VoiceWorkerClient(VoiceSubsystemConfiguration configuration) {
 		this(
 				HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build(),
 				URI.create(configuration.endpoint()),
-				configuration.secret()
+				configuration.secret(),
+				Duration.ofMillis(configuration.requestTimeoutMs())
 		);
 	}
 
 	VoiceWorkerClient(HttpClient client, URI endpoint, String secret) {
+		this(client, endpoint, secret, Duration.ofMillis(VoiceSubsystemConfiguration.DEFAULT_REQUEST_TIMEOUT_MS));
+	}
+
+	VoiceWorkerClient(HttpClient client, URI endpoint, String secret, Duration requestTimeout) {
 		this.client = client;
 		this.endpoint = endpoint;
 		this.secret = secret;
+		this.requestTimeout = requestTimeout;
 	}
 
 	CompletableFuture<short[]> synthesize(VoiceRequest request) {
@@ -52,7 +59,7 @@ final class VoiceWorkerClient {
 		payload.addProperty("radius", request.radius());
 		payload.addProperty("conversationSequence", request.conversationSequence());
 		HttpRequest httpRequest = HttpRequest.newBuilder(endpoint)
-				.timeout(Duration.ofSeconds(35))
+				.timeout(requestTimeout)
 				.header("Authorization", "Bearer " + secret)
 				.header("Content-Type", "application/json")
 				.POST(HttpRequest.BodyPublishers.ofString(payload.toString(), StandardCharsets.UTF_8))

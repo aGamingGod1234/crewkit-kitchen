@@ -133,6 +133,22 @@ public final class VoiceSubsystemRuntimeVerification {
 			assertEquals(endpoint, new VoiceSubsystemConfiguration(endpoint, "s".repeat(32)).endpoint(),
 					"voice accepts the coordinator's loopback URI boundaries");
 		}
+		assertEquals(1, new VoiceSubsystemConfiguration(
+				"http://127.0.0.1:8766/v1/tts", "s".repeat(32), 1
+		).requestTimeoutMs(), "voice accepts the minimum request timeout");
+		assertEquals(600_000, new VoiceSubsystemConfiguration(
+				"http://127.0.0.1:8766/v1/tts", "s".repeat(32), 600_000
+		).requestTimeoutMs(), "voice accepts the maximum request timeout");
+		for (int invalidTimeout : List.of(0, 600_001)) {
+			try {
+				new VoiceSubsystemConfiguration(
+						"http://127.0.0.1:8766/v1/tts", "s".repeat(32), invalidTimeout
+				);
+				throw new AssertionError("unsafe voice request timeout must be rejected: " + invalidTimeout);
+			} catch (IllegalArgumentException expected) {
+				// The HTTP worker and client share this bounded deadline.
+			}
+		}
 
 		List<String> invalidEndpoints = List.of(
 				"http://example.com:8766/v1/tts",
@@ -168,7 +184,7 @@ public final class VoiceSubsystemRuntimeVerification {
 				// Every rejected form could redirect authenticated voice traffic outside the worker contract.
 			}
 		}
-		return validEndpoints.size() + invalidEndpoints.size();
+		return validEndpoints.size() + invalidEndpoints.size() + 4;
 	}
 
 	private static int verifyOptionalConfigurationFailure() {

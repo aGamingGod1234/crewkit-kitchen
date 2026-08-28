@@ -483,7 +483,7 @@ test('TTS route aborts synthesis when the client closes before the response', as
 	});
 });
 
-test('client cancellation releases its shared slot even when TTS ignores abort', async () => {
+test('client cancellation retains its shared slot until abort-ignoring TTS settles', async () => {
 	let first = true;
 	let releaseLate;
 	const late = new Promise((resolve) => { releaseLate = resolve; });
@@ -501,16 +501,50 @@ test('client cancellation releases its shared slot even when TTS ignores abort',
 		await eventuallyActive(baseUrl, 1);
 		controller.abort();
 		await assert.rejects(cancelled, (error) => error?.name === 'AbortError');
-		await eventuallyActive(baseUrl, 0);
-
+		assert.equal((await health(baseUrl)).active, 1);
 		try {
 			const replacement = await fetch(`${baseUrl}/v1/tts`, {
 				method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'replacement' }),
 			});
-			assert.equal(replacement.status, 200);
+			assert.equal(replacement.status, 429);
 		} finally {
 			releaseLate(validSynthesis());
 		}
+		await eventuallyActive(baseUrl, 0);
+		const replacement = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'replacement' }),
+		});
+		assert.equal(replacement.status, 200);
+	});
+});
+
+test('STT timeout retains its shared slot until abort-ignoring transcription settles', async () => {
+	let releaseLate;
+	const late = new Promise((resolve) => { releaseLate = resolve; });
+	let first = true;
+	await withWorker({
+		maxConcurrent: 1,
+		requestTimeoutMs: 20,
+		sttProvider: { transcribe() {
+			if (first) { first = false; return late; }
+			return { transcript: 'heard', confidence: 1 };
+		} },
+	}, async ({ baseUrl }) => {
+		const timedOut = await fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+		});
+		assert.equal(timedOut.status, 504);
+		assert.equal((await health(baseUrl)).active, 1);
+		const blocked = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		assert.equal(blocked.status, 429);
+		releaseLate({ transcript: 'late', confidence: 1 });
+		await eventuallyActive(baseUrl, 0);
+		const recovered = await fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders({ 'X-Utterance-Sequence': '2' }), body: Buffer.alloc(2),
+		});
+		assert.equal(recovered.status, 200);
 	});
 });
 

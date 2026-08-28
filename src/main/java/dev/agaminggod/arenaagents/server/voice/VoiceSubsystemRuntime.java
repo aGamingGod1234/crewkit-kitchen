@@ -50,15 +50,31 @@ public final class VoiceSubsystemRuntime {
 
 	private static VoiceSubsystemConfiguration legacyConfiguration() {
 		String endpoint = System.getProperty("arenaagents.voiceUrl", "http://127.0.0.1:8766/v1/tts");
+		int requestTimeoutMs = parseRequestTimeout(System.getProperty(
+				"arenaagents.voiceRequestTimeoutMs",
+				Integer.toString(VoiceSubsystemConfiguration.DEFAULT_REQUEST_TIMEOUT_MS)
+		));
 		String secretPath = System.getProperty(
 				"arenaagents.voiceSecretFile",
 				System.getProperty("arenaagents.bridgeSecretFile", "runtime/bridge-secret.txt")
 		);
 		try {
 			String secret = Files.readString(Path.of(secretPath), StandardCharsets.UTF_8).trim();
-			return new VoiceSubsystemConfiguration(endpoint, secret);
+			return new VoiceSubsystemConfiguration(endpoint, secret, requestTimeoutMs);
 		} catch (IOException exception) {
 			throw new IllegalStateException("Voice worker secret is unavailable", exception);
+		}
+	}
+
+	private static int parseRequestTimeout(String value) {
+		try {
+			int timeoutMs = Integer.parseInt(value);
+			if (timeoutMs < 1 || timeoutMs > VoiceSubsystemConfiguration.MAX_REQUEST_TIMEOUT_MS) {
+				throw new IllegalArgumentException("voice request timeout is outside the supported range");
+			}
+			return timeoutMs;
+		} catch (NumberFormatException exception) {
+			throw new IllegalArgumentException("voice request timeout must be an integer", exception);
 		}
 	}
 

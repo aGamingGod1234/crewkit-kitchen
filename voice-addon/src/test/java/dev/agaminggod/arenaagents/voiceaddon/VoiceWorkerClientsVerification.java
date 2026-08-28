@@ -42,7 +42,36 @@ final class VoiceWorkerClientsVerification {
 		assertions += verifySttClientRejectsMalformedInputAndResponse();
 		assertions += verifySttUnavailablePreservesWorkerCode();
 		assertions += verifyClientsRejectWrongResponseMediaTypes();
+		assertions += verifyConfiguredDeadlineReachesBothHttpClients();
 		return assertions;
+	}
+
+	private static int verifyConfiguredDeadlineReachesBothHttpClients() {
+		VoiceSubsystemConfiguration configuration = new VoiceSubsystemConfiguration(
+				"http://127.0.0.1:8766/v1/tts", SECRET, 91_234
+		);
+		PendingHttpClient ttsHttp = new PendingHttpClient();
+		CompletableFuture<short[]> synthesis = new VoiceWorkerClient(
+				ttsHttp,
+				URI.create(configuration.endpoint()),
+				configuration.secret(),
+				java.time.Duration.ofMillis(configuration.requestTimeoutMs())
+		).synthesize(request());
+		assertEquals(91_234L, ttsHttp.request.get().timeout().orElseThrow().toMillis(),
+				"configured TTS HTTP deadline");
+		synthesis.cancel(true);
+
+		PendingHttpClient sttHttp = new PendingHttpClient();
+		CompletableFuture<SpeechWorkerClient.Transcript> transcription = new SpeechWorkerClient(
+				sttHttp,
+				URI.create("http://127.0.0.1:8766/v1/stt"),
+				configuration.secret(),
+				java.time.Duration.ofMillis(configuration.requestTimeoutMs())
+		).transcribe(PLAYER, 1L, false, new short[] { 1 });
+		assertEquals(91_234L, sttHttp.request.get().timeout().orElseThrow().toMillis(),
+				"configured STT HTTP deadline");
+		transcription.cancel(true);
+		return 2;
 	}
 
 	private static int verifyPreparedSecretDoesNotReadGlobalSecretPath() throws Exception {
@@ -324,6 +353,7 @@ final class VoiceWorkerClientsVerification {
 
 	private static final class PendingHttpClient extends HttpClient {
 		private final CompletableFuture<java.net.http.HttpResponse<byte[]>> response = new CompletableFuture<>();
+		private final AtomicReference<java.net.http.HttpRequest> request = new AtomicReference<>();
 
 		@Override public java.util.Optional<java.net.CookieHandler> cookieHandler() { return java.util.Optional.empty(); }
 		@Override public java.util.Optional<java.time.Duration> connectTimeout() { return java.util.Optional.empty(); }
@@ -339,7 +369,10 @@ final class VoiceWorkerClientsVerification {
 		) { throw new UnsupportedOperationException(); }
 		@Override @SuppressWarnings("unchecked") public <T> CompletableFuture<java.net.http.HttpResponse<T>> sendAsync(
 				java.net.http.HttpRequest request, java.net.http.HttpResponse.BodyHandler<T> handler
-		) { return (CompletableFuture<java.net.http.HttpResponse<T>>) (CompletableFuture<?>) response; }
+		) {
+			this.request.set(request);
+			return (CompletableFuture<java.net.http.HttpResponse<T>>) (CompletableFuture<?>) response;
+		}
 		@Override public <T> CompletableFuture<java.net.http.HttpResponse<T>> sendAsync(
 				java.net.http.HttpRequest request,
 				java.net.http.HttpResponse.BodyHandler<T> handler,

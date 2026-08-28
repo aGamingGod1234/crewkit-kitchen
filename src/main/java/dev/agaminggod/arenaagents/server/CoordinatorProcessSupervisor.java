@@ -196,9 +196,17 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private void configureSharedVoiceEndpoint(Path configPath) throws IOException {
 		String configured = System.getProperty("arenaagents.voiceUrl");
-		if (configured != null && !configured.isBlank()) return;
-		CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
-				.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
+		if (configured == null || configured.isBlank()) {
+			CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
+					.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
+		}
+		String configuredTimeout = System.getProperty("arenaagents.voiceRequestTimeoutMs");
+		if (configuredTimeout == null || configuredTimeout.isBlank()) {
+			System.setProperty(
+					"arenaagents.voiceRequestTimeoutMs",
+					Integer.toString(CoordinatorVoiceEndpoint.requestTimeoutMs(configPath))
+			);
+		}
 	}
 
 	private static Path findPackageRoot(Path gameDirectory) {

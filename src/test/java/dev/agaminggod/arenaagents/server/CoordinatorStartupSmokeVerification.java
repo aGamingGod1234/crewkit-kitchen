@@ -40,6 +40,7 @@ public final class CoordinatorStartupSmokeVerification {
 		String oldBridgeSecret = System.getProperty("arenaagents.bridgeSecretFile");
 		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
 		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
+		String oldVoiceRequestTimeout = System.getProperty("arenaagents.voiceRequestTimeoutMs");
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
 			stageCoordinator(sourceCoordinator, packageRoot);
@@ -53,6 +54,7 @@ public final class CoordinatorStartupSmokeVerification {
 			System.clearProperty("arenaagents.bridgeSecretFile");
 			System.clearProperty("arenaagents.voiceSecretFile");
 			System.clearProperty("arenaagents.voiceUrl");
+			System.clearProperty("arenaagents.voiceRequestTimeoutMs");
 
 			try (ServerSocket bridge = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
 				writeSmokeConfig(packageRoot, bridge.getLocalPort());
@@ -65,6 +67,8 @@ public final class CoordinatorStartupSmokeVerification {
 				assertTrue(supervisor.configured(), "staged package is configured");
 				assertEquals("http://127.0.0.1:9123/v1/tts", System.getProperty("arenaagents.voiceUrl"),
 						"coordinator voice endpoint is shared with the addon before voice startup");
+				assertEquals("91234", System.getProperty("arenaagents.voiceRequestTimeoutMs"),
+						"coordinator local inference deadline is shared with the addon before voice startup");
 				assertEquals(node.toAbsolutePath().normalize(), NodeRuntimeLocator.locate(packageRoot).executable(),
 						"bundled runtime is selected before the empty PATH");
 
@@ -74,7 +78,7 @@ public final class CoordinatorStartupSmokeVerification {
 					if (bridge.getSoTimeout() == 0) bridge.setSoTimeout(250);
 					try (Socket socket = bridge.accept()) {
 						socket.setSoTimeout(15_000);
-						if (completeHandshakeAndCatalog(socket)) return 7;
+						if (completeHandshakeAndCatalog(socket)) return 8;
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
 					}
@@ -89,6 +93,7 @@ public final class CoordinatorStartupSmokeVerification {
 			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
 			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
 			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
+			restoreProperty("arenaagents.voiceRequestTimeoutMs", oldVoiceRequestTimeout);
 			deleteTree(packageRoot);
 		}
 	}
@@ -167,7 +172,7 @@ public final class CoordinatorStartupSmokeVerification {
 				{
 				  "bridge": { "host": "127.0.0.1", "port": %d, "secretEnvironmentVariable": "ARENA_AGENT_BRIDGE_SECRET", "reconnectDelayMs": 50, "maxReconnectDelayMs": 100 },
 				  "codex": { "cwd": "%s", "planningTimeoutMs": 1000, "catalogTtlMs": 60000, "serviceTier": "fast", "launchProfile": { "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "serviceTier": "fast" } },
-				  "voice": { "port": 9123, "maxConcurrent": 1 },
+				  "voice": { "port": 9123, "maxConcurrent": 1, "localSpeechTimeoutMs": 91234 },
 				  "limits": { "agentCap": 1, "goalQueueCap": 1, "planningConcurrency": 1, "planningMode": "fixed", "urgentReserve": 0, "invalidDecisionRetries": 0 }
 				}
 				""".formatted(port, root.toString().replace("\\", "\\\\"));

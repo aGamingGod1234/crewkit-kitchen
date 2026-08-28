@@ -19,16 +19,27 @@ final class SpeechWorkerClient {
 	private final HttpClient client;
 	private final URI endpoint;
 	private final String secret;
+	private final Duration requestTimeout;
 
 	SpeechWorkerClient(VoiceSubsystemConfiguration configuration) {
-		this(defaultClient(), speechEndpoint(configuration.endpoint()), configuration.secret());
+		this(
+				defaultClient(),
+				speechEndpoint(configuration.endpoint()),
+				configuration.secret(),
+				Duration.ofMillis(configuration.requestTimeoutMs())
+		);
 	}
 
 	SpeechWorkerClient(HttpClient client, URI endpoint, String secret) {
+		this(client, endpoint, secret, Duration.ofMillis(VoiceSubsystemConfiguration.DEFAULT_REQUEST_TIMEOUT_MS));
+	}
+
+	SpeechWorkerClient(HttpClient client, URI endpoint, String secret, Duration requestTimeout) {
 		this.client = java.util.Objects.requireNonNull(client, "client must not be null");
 		this.endpoint = java.util.Objects.requireNonNull(endpoint, "endpoint must not be null");
 		if (secret == null || secret.length() < 16) throw new IllegalArgumentException("secret is too short");
 		this.secret = secret;
+		this.requestTimeout = java.util.Objects.requireNonNull(requestTimeout, "requestTimeout must not be null");
 	}
 
 	CompletableFuture<Transcript> transcribe(
@@ -46,7 +57,7 @@ final class SpeechWorkerClient {
 		ByteBuffer pcm = ByteBuffer.allocate(samples.length * 2).order(ByteOrder.LITTLE_ENDIAN);
 		pcm.asShortBuffer().put(samples);
 		HttpRequest request = HttpRequest.newBuilder(endpoint)
-				.timeout(Duration.ofSeconds(35))
+				.timeout(requestTimeout)
 				.header("Authorization", "Bearer " + secret)
 				.header("Content-Type", "audio/l16;rate=48000;channels=1")
 				.header("X-Player-Id", playerId.toString())

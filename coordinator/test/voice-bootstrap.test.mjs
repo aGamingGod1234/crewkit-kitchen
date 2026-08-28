@@ -305,6 +305,88 @@ test('runtime local TTS failures switch concurrent requests once to Fish while l
 	assert.equal(profileCloses, 1);
 });
 
+test('runtime local STT failures switch concurrent requests once to Deepgram while local TTS stays available', async () => {
+	let active;
+	let localSttCalls = 0;
+	let localCloses = 0;
+	let deepgramProviders = 0;
+	let deepgramCalls = 0;
+	const local = {
+		async synthesize() { return { provider: 'local' }; },
+		async transcribe() {
+			localSttCalls += 1;
+			await new Promise((resolve) => setImmediate(resolve));
+			throw Object.assign(new Error('local Whisper inference failed'), { code: 'LOCAL_STT_ERROR' });
+		},
+		async close() { localCloses += 1; },
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		DEEPGRAM_API_KEY: 'deepgram-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createSttProvider: () => {
+			deepgramProviders += 1;
+			return {
+				async transcribe() {
+					deepgramCalls += 1;
+					return { transcript: 'remote transcript', confidence: 1 };
+				},
+			};
+		},
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		const results = await Promise.all([
+			active.sttProvider.transcribe({ pcm: Buffer.alloc(2) }),
+			active.sttProvider.transcribe({ pcm: Buffer.alloc(2) }),
+		]);
+		assert.deepEqual(results.map(({ transcript }) => transcript), ['remote transcript', 'remote transcript']);
+		assert.equal(localSttCalls, 2);
+		assert.equal(deepgramProviders, 1, 'concurrent local failures create one shared Deepgram provider');
+		assert.equal(deepgramCalls, 2);
+		assert.equal((await active.provider.synthesize({ text: 'still local' })).provider, 'local');
+		assert.equal(localCloses, 0, 'STT-only failover cannot stop local TTS');
+	} finally {
+		await worker.close();
+	}
+	assert.equal(localCloses, 1);
+});
+
+test('voice bootstrap applies the configured local inference deadline to live HTTP requests', async () => {
+	let localOptions;
+	let serverOptions;
+	const worker = await startVoiceWorker({
+		bridge: { secret: SECRET },
+		voice: { port: 8_766, localSpeechTimeoutMs: 91_234 },
+	}, {}, {
+		platform: 'win32',
+		createLocalSpeechProvider: async (options) => {
+			localOptions = options;
+			return {
+				async synthesize() { return {}; },
+				async transcribe() { return { transcript: '', confidence: 0 }; },
+				async close() {},
+			};
+		},
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createVoiceServer: (options) => {
+			serverOptions = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		assert.equal(localOptions.timeoutMs, 91_234);
+		assert.equal(serverOptions.requestTimeoutMs, 91_234);
+	} finally {
+		await worker.close();
+	}
+});
+
 test('runtime local TTS failure uses credential-free Windows speech when Fish is absent', async () => {
 	let provider;
 	let localCloses = 0;
