@@ -264,10 +264,11 @@ function Import-WrapperFunction([string] $Name) {
 }
 
 function Test-FastExitResourceSampling([string] $WorkingDirectory) {
-	foreach ($name in @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Add-TrackedProcessIdentity', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit', 'Start-RedirectedProcess')) {
+	foreach ($name in @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Add-TrackedProcessIdentity', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit', 'Stop-TrackedProcessIds', 'Assert-TrackedProcessIdsGone', 'Start-RedirectedProcess')) {
 		Import-WrapperFunction $name
 	}
 	$script:PollMilliseconds = 10
+	$script:CleanupTimeoutSeconds = 30
 	$stdout = Join-Path $WorkingDirectory 'fast-runner.stdout.log'
 	$stderr = Join-Path $WorkingDirectory 'fast-runner.stderr.log'
 	$handle = Start-RedirectedProcess powershell.exe '-NoProfile -Command "Start-Sleep -Milliseconds 150"' $WorkingDirectory $stdout $stderr @{}
@@ -289,7 +290,7 @@ function Test-FastExitResourceSampling([string] $WorkingDirectory) {
 	$childScript = Join-Path $WorkingDirectory 'fast-child.ps1'
 	$rootScript = Join-Path $WorkingDirectory 'fast-root.ps1'
 	Set-Content -LiteralPath $childScript -Value 'Start-Sleep -Seconds 30' -NoNewline
-	Set-Content -LiteralPath $rootScript -Value "Start-Process powershell -ArgumentList '-NoProfile','-File','$childScript'" -NoNewline
+	Set-Content -LiteralPath $rootScript -Value "Start-Process powershell -ArgumentList '-NoProfile','-File','$childScript'; Start-Sleep -Milliseconds 100" -NoNewline
 	$treeHandle = Start-RedirectedProcess powershell.exe ("-NoProfile -File `"$rootScript`"") $WorkingDirectory (Join-Path $WorkingDirectory 'fast-tree.stdout.log') (Join-Path $WorkingDirectory 'fast-tree.stderr.log') @{}
 	$treeTracked = [System.Collections.Generic.List[object]]::new()
 	try {
@@ -298,7 +299,13 @@ function Test-FastExitResourceSampling([string] $WorkingDirectory) {
 		if ([int] $treeMeasurement.processCount -lt 1) { throw 'Fast-exit root descendant was not sampled after its root exited' }
 		Stop-TrackedProcessIds $treeTracked
 		Assert-TrackedProcessIdsGone $treeTracked
+	} catch {
+		Write-Output "FAST_TREE_FAILURE: $($_.Exception.Message) tracked=$($treeTracked.Count)"
+		throw
 	} finally {
+		foreach ($child in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { [string] $_.CommandLine -like "*$childScript*" })) {
+			Stop-Process -Id ([int] $child.ProcessId) -Force -ErrorAction SilentlyContinue
+		}
 		if (-not $treeHandle.Process.HasExited) { $treeHandle.Process.Kill() }
 		$treeHandle.Process.WaitForExit()
 		$null = $treeHandle.StdoutTask.Wait(1000)

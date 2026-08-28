@@ -116,9 +116,11 @@ public final class MultiplexedServerBridgeVerification {
 		verifyRealBridgeSessionLifecycle();
 		verifyLaunchIdentityAndReconnectGeneration();
 		verifyHandshakeResnapshotsLifecycleRaces();
+		verifyHandshakeSnapshotDeadline();
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicConversationWakePublication();
+		verifyAtomicPublicationRacesSessionClose();
 		verifyCompletionResultFacts();
 		return 74;
 	}
@@ -166,6 +168,40 @@ public final class MultiplexedServerBridgeVerification {
 	private static void verifyHandshakeResnapshotsLifecycleRaces() {
 		verifyRemovalDuringHandshakeResnapshots();
 		verifyTransitionDuringHandshakePublishesOnce();
+	}
+
+	private static void verifyHandshakeSnapshotDeadline() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-handshake-deadline-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			MultiplexedServerBridge activeBridge = bridge;
+			AtomicBoolean churn = new AtomicBoolean(true);
+			java.util.concurrent.atomic.AtomicInteger snapshots = new java.util.concurrent.atomic.AtomicInteger();
+			bridge.setHandshakeSnapshotHookForVerification(() -> {
+				if (!churn.get()) return;
+				snapshots.incrementAndGet();
+				activeBridge.withinPublicationBoundary(() -> null);
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(8_000);
+				writeHello(socket, codec, secret, null, "hello-deadline-churn");
+				assertTrue(reader.readLine() == null, "snapshot churn closes the session at the handshake deadline");
+				assertTrue(snapshots.get() > 1, "snapshot churn retried before the handshake deadline");
+			}
+			awaitCondition(() -> !activeBridge.authenticated(), "expired handshake releases the bridge session");
+		} catch (Exception exception) {
+			throw new AssertionError("handshake snapshot deadline verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
 	}
 
 	private static void verifyRemovalDuringHandshakeResnapshots() {
@@ -534,6 +570,83 @@ public final class MultiplexedServerBridgeVerification {
 				}
 			}
 		}
+	}
+
+	private static void verifyAtomicPublicationRacesSessionClose() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-publication-close-race-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			MultiplexedServerBridge activeBridge = bridge;
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				authenticate(socket, reader, codec, secret, null, "hello-publication-close-race");
+				Object session = readPrivateField(bridge, "session");
+				Object publicationLock = readPrivateField(bridge, "publicationLock");
+				Method enqueueAtomically = session.getClass().getDeclaredMethod("enqueueAtomically", BridgeEnvelope.class, Runnable.class);
+				enqueueAtomically.setAccessible(true);
+				BridgeEnvelope envelope = new BridgeEnvelope(2, "server-instance", "server", "heartbeat", "publication-close-race", new JsonObject());
+				CountDownLatch callbackEntered = new CountDownLatch(1);
+				java.util.concurrent.atomic.AtomicReference<Throwable> enqueueFailure = new java.util.concurrent.atomic.AtomicReference<>();
+				Thread enqueuer;
+				Thread closer;
+				synchronized (publicationLock) {
+					enqueuer = Thread.ofPlatform().daemon().start(() -> {
+						try {
+							enqueueAtomically.invoke(session, envelope, (Runnable) () -> {
+								callbackEntered.countDown();
+								activeBridge.withinPublicationBoundary(() -> null);
+							});
+						} catch (java.lang.reflect.InvocationTargetException exception) {
+							enqueueFailure.set(exception.getCause());
+						} catch (ReflectiveOperationException exception) {
+							enqueueFailure.set(exception);
+						}
+					});
+					closer = Thread.ofPlatform().daemon().start(() -> sessionClose(session, enqueueFailure));
+					assertTrue(!callbackEntered.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS),
+							"atomic enqueue acquires publicationLock before entering its transition callback");
+				}
+				enqueuer.join(2_000L);
+				closer.join(2_000L);
+				assertTrue(!enqueuer.isAlive() && !closer.isAlive(),
+						"atomic publication and session close complete without lock-order deadlock");
+				Throwable failure = enqueueFailure.get();
+				if (failure != null && !(failure instanceof BridgeProtocolException)) {
+					throw new AssertionError("atomic publication failed with an unexpected exception", failure);
+				}
+			} finally {
+				if (bridge != null) bridge.close();
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("atomic publication/session close race verification failed", exception);
+		} finally {
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void sessionClose(Object session, java.util.concurrent.atomic.AtomicReference<Throwable> failure) {
+		try {
+			Method close = session.getClass().getDeclaredMethod("close");
+			close.setAccessible(true);
+			close.invoke(session);
+		} catch (java.lang.reflect.InvocationTargetException exception) {
+			failure.compareAndSet(null, exception.getCause());
+		} catch (ReflectiveOperationException exception) {
+			failure.compareAndSet(null, exception);
+		}
+	}
+
+	private static Object readPrivateField(Object owner, String fieldName) throws ReflectiveOperationException {
+		Field field = owner.getClass().getDeclaredField(fieldName);
+		field.setAccessible(true);
+		return field.get(owner);
 	}
 
 	private static void verifyConversationAttention(AgentId agentId) {
