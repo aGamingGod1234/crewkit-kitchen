@@ -31,13 +31,16 @@ export class VoiceProfileStore {
 	#assignments = new Map();
 	#used = new Set();
 	#onChange;
+	#reserve;
 
-	constructor(assignments = {}, onChange = () => {}) {
+	constructor(assignments = {}, onChange = () => {}, reserve = null) {
 		if (assignments === null || typeof assignments !== 'object' || Array.isArray(assignments)) {
 			throw new TypeError('voice profile assignments must be an object');
 		}
 		if (typeof onChange !== 'function') throw new TypeError('onChange must be a function');
+		if (reserve !== null && typeof reserve !== 'function') throw new TypeError('reserve must be a function');
 		this.#onChange = onChange;
+		this.#reserve = reserve;
 		for (const [agentId, profileId] of Object.entries(assignments)) {
 			const profileIndex = VOICE_PROFILES.findIndex((entry) => entry.profileId === profileId);
 			if (!isUuid(agentId) || profileIndex < 0 || this.#used.has(profileIndex)) continue;
@@ -50,14 +53,12 @@ export class VoiceProfileStore {
 		if (!isUuid(agentId)) throw new TypeError('agentId must be a UUID');
 		let index = this.#assignments.get(agentId);
 		if (index === undefined) {
-			const start = stableHash(agentId) % VOICE_PROFILES.length;
-			for (let offset = 0; offset < VOICE_PROFILES.length; offset++) {
-				const candidate = (start + offset) % VOICE_PROFILES.length;
-				if (this.#used.has(candidate)) continue;
-				index = candidate;
-				break;
+			index = this.#reserve === null
+				? selectProfileIndex(agentId, this.#used)
+				: this.#reserve(agentId);
+			if (!Number.isSafeInteger(index) || index < 0 || index >= VOICE_PROFILES.length) {
+				throw new TypeError('reserve must return a voice profile index');
 			}
-			index ??= start;
 			this.#assignments.set(agentId, index);
 			this.#used.add(index);
 			this.#onChange(this.snapshotAssignments());
@@ -126,7 +127,7 @@ export async function loadPersistentVoiceProfileStore(filePath, dependencies = {
 		desiredRevision += 1;
 		mergeOwnerSnapshot(coordinator, ownerGeneration, snapshot);
 		startDrain();
-	});
+	}, (agentId) => reserveCoordinatorProfile(coordinator, ownerGeneration, agentId));
 	const startDrain = (externalSignal) => {
 		if (pending !== null) return pending;
 		const combinedSignal = combineSignals(ownerController.signal, signal, externalSignal);
@@ -260,6 +261,15 @@ function stableHash(value) {
 	return hash;
 }
 
+function selectProfileIndex(agentId, usedProfileIndexes) {
+	const start = stableHash(agentId) % VOICE_PROFILES.length;
+	for (let offset = 0; offset < VOICE_PROFILES.length; offset++) {
+		const candidate = (start + offset) % VOICE_PROFILES.length;
+		if (!usedProfileIndexes.has(candidate)) return candidate;
+	}
+	return start;
+}
+
 function isUuid(value) {
 	return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
@@ -302,14 +312,10 @@ function validAssignments(assignments) {
 }
 
 function mergeLoadedAssignments(coordinator, assignments) {
-	let changed = false;
 	for (const [agentId, profileId] of Object.entries(validAssignments(assignments))) {
 		if (coordinator.assignments.has(agentId)) continue;
-		coordinator.assignments.set(agentId, profileId);
-		coordinator.assignmentOwners.set(agentId, 0);
-		changed = true;
+		reserveCoordinatorProfile(coordinator, 0, agentId, profileId);
 	}
-	if (changed) coordinator.version += 1;
 }
 
 function mergeOwnerSnapshot(coordinator, ownerGeneration, snapshot) {
@@ -317,11 +323,35 @@ function mergeOwnerSnapshot(coordinator, ownerGeneration, snapshot) {
 	for (const [agentId, profileId] of Object.entries(validAssignments(snapshot))) {
 		const currentOwner = coordinator.assignmentOwners.get(agentId) ?? -1;
 		if (ownerGeneration < currentOwner) continue;
-		if (coordinator.assignments.get(agentId) !== profileId || currentOwner !== ownerGeneration) changed = true;
-		coordinator.assignments.set(agentId, profileId);
+		if (!coordinator.assignments.has(agentId)) {
+			reserveCoordinatorProfile(coordinator, ownerGeneration, agentId, profileId);
+			continue;
+		}
+		if (currentOwner !== ownerGeneration) changed = true;
 		coordinator.assignmentOwners.set(agentId, ownerGeneration);
 	}
 	if (changed) coordinator.version += 1;
+}
+
+function reserveCoordinatorProfile(coordinator, ownerGeneration, agentId, preferredProfileId = null) {
+	const existingProfileId = coordinator.assignments.get(agentId);
+	if (existingProfileId !== undefined) {
+		return VOICE_PROFILES.findIndex(({ profileId }) => profileId === existingProfileId);
+	}
+	const usedProfileIndexes = new Set(
+		[...coordinator.assignments.values()]
+			.map((profileId) => VOICE_PROFILES.findIndex((profile) => profile.profileId === profileId))
+			.filter((index) => index >= 0),
+	);
+	const preferredIndex = VOICE_PROFILES.findIndex(({ profileId }) => profileId === preferredProfileId);
+	const index = preferredIndex >= 0
+			&& (!usedProfileIndexes.has(preferredIndex) || usedProfileIndexes.size >= VOICE_PROFILES.length)
+		? preferredIndex
+		: selectProfileIndex(agentId, usedProfileIndexes);
+	coordinator.assignments.set(agentId, VOICE_PROFILES[index].profileId);
+	coordinator.assignmentOwners.set(agentId, ownerGeneration);
+	coordinator.version += 1;
+	return index;
 }
 
 function snapshotPersistentAssignments(coordinator) {

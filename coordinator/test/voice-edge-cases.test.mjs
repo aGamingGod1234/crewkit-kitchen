@@ -689,6 +689,34 @@ test('paired persistent stores use unique writes and preserve 100 rounds of merg
 	}
 });
 
+test('overlapping persistent stores reserve colliding voice profiles once and keep them stable after reload', async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-reservation-'));
+	const file = path.join(root, 'assignments.json');
+	const firstAgent = agentUuid(1);
+	const secondAgent = agentUuid(10);
+	try {
+		const [first, second] = await Promise.all([
+			loadPersistentVoiceProfileStore(file),
+			loadPersistentVoiceProfileStore(file),
+		]);
+		const firstProfile = first.store.resolve(firstAgent).profileId;
+		const secondProfile = second.store.resolve(secondAgent).profileId;
+		assert.notEqual(firstProfile, secondProfile, 'the shared file coordinator reserves profiles across live stores');
+		await Promise.all([first.flush(), second.flush()]);
+		const document = JSON.parse(await readFile(file, 'utf8'));
+		assert.equal(document.assignments[firstAgent], firstProfile);
+		assert.equal(document.assignments[secondAgent], secondProfile);
+		await Promise.all([first.close(), second.close()]);
+
+		const reloaded = await loadPersistentVoiceProfileStore(file);
+		assert.equal(reloaded.store.resolve(firstAgent).profileId, firstProfile);
+		assert.equal(reloaded.store.resolve(secondAgent).profileId, secondProfile);
+		await reloaded.close();
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test('a timed-out old profile write cannot overwrite its replacement generation', async () => {
 	const root = await mkdtemp(path.join(os.tmpdir(), 'arena-voice-profile-fence-'));
 	const file = path.join(root, 'assignments.json');
@@ -885,6 +913,8 @@ test('profile repair retries a transient publish failure and recovers before clo
 	const oldController = new AbortController();
 	const staleMove = delayedProfileRename();
 	let currentMoves = 0;
+	let signalRepairPublished;
+	const repairPublished = new Promise((resolve) => { signalRepairPublished = resolve; });
 	try {
 		const oldStore = await loadPersistentVoiceProfileStore(file, {
 			signal: oldController.signal,
@@ -897,16 +927,27 @@ test('profile repair retries a transient publish failure and recovers before clo
 
 		const current = await loadPersistentVoiceProfileStore(file, {
 			rename: async (source, destination) => {
-				currentMoves += 1;
-				if (currentMoves === 2) throw Object.assign(new Error('file temporarily locked'), { code: 'EPERM' });
+				const attempt = ++currentMoves;
+				if (attempt === 2) throw Object.assign(new Error('file temporarily locked'), { code: 'EPERM' });
 				await writeFile(destination, await readFile(source));
+				if (attempt === 3) signalRepairPublished();
 			},
 		});
 		current.store.resolve(agentUuid(4_302));
 		await current.flush();
 		staleMove.release();
 		await staleMove.published;
-		await waitForCondition(() => currentMoves >= 3, 'profile repair did not retry');
+		let repairTimeout;
+		try {
+			await Promise.race([
+				repairPublished,
+				new Promise((_, reject) => {
+					repairTimeout = setTimeout(() => reject(new Error('profile repair did not publish')), 500);
+				}),
+			]);
+		} finally {
+			clearTimeout(repairTimeout);
+		}
 		const document = JSON.parse(await readFile(file, 'utf8'));
 		assert.ok(document.assignments[agentUuid(4_302)]);
 		await assert.rejects(oldStore.close(), (error) => error.name === 'AbortError');
