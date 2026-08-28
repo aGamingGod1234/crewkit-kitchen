@@ -304,12 +304,16 @@ export class ProviderService extends EventEmitter {
 					recordSuccess: false,
 					outcomeIdentity: String(agentId),
 					acceptResult: () => this.#acceptsAgentMutation(mutation),
+					onStaleResult: () => this.#repairAfterStaleMutation(assigned.provider, agentId, mutation),
+					onStaleError: () => this.#repairAfterStaleMutation(assigned.provider, agentId, mutation),
 				});
 			} else {
 				const results = await Promise.all([...this.#startedProviders].map((provider) => this.#execute(provider, () => this.#services.get(provider).removeAgent(agentId), 'remove', {
 					recordSuccess: false,
 					outcomeIdentity: String(agentId),
 					acceptResult: () => this.#acceptsAgentMutation(mutation),
+					onStaleResult: () => this.#repairAfterStaleMutation(provider, agentId, mutation),
+					onStaleError: () => this.#repairAfterStaleMutation(provider, agentId, mutation),
 				})));
 				removed = results.some(Boolean);
 			}
@@ -362,17 +366,30 @@ export class ProviderService extends EventEmitter {
 		agentFence = { promise: new Promise((resolve) => { releaseAgentFence = resolve; }), release: releaseAgentFence };
 		for (const agentId of affectedAgentIds) this.#reconcilingAgents.set(agentId, agentFence);
 		mutationTokens = [...affectedAgentIds].map((agentId) => this.#beginAgentMutation(agentId, lifecycleGeneration));
+		const mutationByAgentId = new Map(mutationTokens.map((token) => [token.agentId, token]));
 		await Promise.allSettled([...blockers]);
 		this.#assertReconciliationCurrent(reconciliationGeneration, lifecycleGeneration);
 		if (mutationTokens.some((token) => !this.#acceptsAgentMutation(token))) throw providerError('STALE_RECONCILIATION', 'Provider reconciliation session mutations were superseded');
 		const assignedProviders = new Set([...this.#assignments.values()].map(({ provider }) => provider));
 		const selectedProviders = availableProviders.filter((provider) => groups.get(provider).length > 0 || assignedProviders.has(provider));
+		const affectedByProvider = new Map(availableProviders.map((provider) => [provider, new Set()]));
+		for (const agentId of affectedAgentIds) {
+			const profile = this.#assignments.get(agentId) ?? this.#creating.get(agentId)?.profile ?? this.#replacing.get(agentId)?.profile
+				?? records.find((record) => record?.agentId === agentId);
+			if (profile?.provider !== undefined && affectedByProvider.has(profile.provider)) affectedByProvider.get(profile.provider).add(agentId);
+			else for (const provider of availableProviders) affectedByProvider.get(provider).add(agentId);
+		}
 		const settled = await Promise.all(selectedProviders.map(async (provider) => {
 			try {
 				return { provider, result: await this.#execute(provider, () => this.#services.get(provider).reconcile(groups.get(provider), {
 					signal: controller.signal,
 					generation: reconciliationGeneration,
-				}), 'reconcile', { recordSuccess: false, outcomeIdentity: 'provider-roster' }) };
+				}), 'reconcile', {
+					recordSuccess: false,
+					outcomeIdentity: 'provider-roster',
+					onStaleResult: () => Promise.allSettled([...affectedByProvider.get(provider)].map((agentId) => this.#repairAfterStaleMutation(provider, agentId, mutationByAgentId.get(agentId)))),
+					onStaleError: () => Promise.allSettled([...affectedByProvider.get(provider)].map((agentId) => this.#repairAfterStaleMutation(provider, agentId, mutationByAgentId.get(agentId)))),
+				}) };
 			} catch (error) {
 				return { provider, error };
 			}
@@ -434,7 +451,7 @@ export class ProviderService extends EventEmitter {
 		}
 	}
 
-	async #execute(provider, operation, boundary, { recordSuccess = true, outcomeIdentity = boundary, acceptResult = () => true, onStaleResult = null } = {}) {
+	async #execute(provider, operation, boundary, { recordSuccess = true, outcomeIdentity = boundary, acceptResult = () => true, onStaleResult = null, onStaleError = null } = {}) {
 		if (this.#stopped) throw providerError('PROVIDER_STOPPED', 'Provider service is stopped');
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		const startup = this.#ensureStarted(provider, lifecycleGeneration);
@@ -453,8 +470,11 @@ export class ProviderService extends EventEmitter {
 			}
 			if (recordSuccess) this.#recordLive(provider, boundary);
 			return result;
-		}, (error) => {
-			if (!isLifecycleFenceError(error) && this.#acceptsOutcome(outcomeAttempt) && acceptResult()) this.#recordDegraded(provider, error, boundary);
+		}, async (error) => {
+			const accepts = this.#acceptsOutcome(outcomeAttempt) && acceptResult();
+			if (!accepts) {
+				try { await onStaleError?.(error); } catch { /* stale repair cannot change the original outcome */ }
+			} else if (!isLifecycleFenceError(error)) this.#recordDegraded(provider, error, boundary);
 			throw error;
 		});
 		const bounded = withTimeout(observed, this.#operationTimeoutMs, this.#scheduleTimeout, this.#cancelTimeout, provider, {
@@ -517,6 +537,10 @@ export class ProviderService extends EventEmitter {
 
 	async #disposeStaleAgent(provider, agentId, agent, staleMutation) {
 		await this.#discardPhysicalAgent(provider, agentId, agent);
+		await this.#repairAfterStaleMutation(provider, agentId, staleMutation);
+	}
+
+	async #repairAfterStaleMutation(provider, agentId, staleMutation) {
 		const owner = this.#newerAgentOwnerPromise(agentId, staleMutation);
 		if (owner !== null) {
 			void Promise.resolve(owner).catch(() => {}).then(() => this.#repairPhysicalInvariant(provider, agentId)).catch(() => {});
@@ -558,9 +582,11 @@ export class ProviderService extends EventEmitter {
 		const profile = this.#assignments.get(agentId);
 		const accepted = this.#acceptedAgents.get(agentId);
 		let backend = service.getAgent?.(agentId) ?? null;
-		if (profile === undefined || accepted === undefined) {
-			this.#assignments.delete(agentId);
-			this.#acceptedAgents.delete(agentId);
+		if (profile === undefined || accepted === undefined || profile.provider !== provider) {
+			if (profile === undefined || accepted === undefined) {
+				this.#assignments.delete(agentId);
+				this.#acceptedAgents.delete(agentId);
+			}
 			if (backend !== null) await this.#discardPhysicalAgent(provider, agentId, backend);
 			return null;
 		}
@@ -621,7 +647,7 @@ export class ProviderService extends EventEmitter {
 
 	#recordSessionMutationLive(provider) {
 		if (provider === undefined) return;
-		for (const boundary of ['create', 'replace', 'remove']) this.#recordLive(provider, boundary);
+		for (const boundary of ['create', 'replace', 'remove', 'reconcile']) this.#recordLive(provider, boundary);
 	}
 
 	async #startProvider(provider) {

@@ -417,6 +417,218 @@ test('empty reconciliation fences a pending initial create and cleans its late s
 	}
 });
 
+for (const settlement of ['resolve', 'reject']) {
+	test(`timed-out remove late ${settlement} repairs the newer accepted physical session`, async () => {
+		await assertLateRemoveRepair(settlement);
+	});
+}
+
+async function assertLateRemoveRepair(settlement) {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	let current = null;
+	let generation = 0;
+	let removeAttempt = 0;
+	let settleOldRemove;
+	let finalDisposals = 0;
+	services.codex.createAgent = async () => {
+		await current?.dispose();
+		current = mutationAgent(++generation);
+		return current;
+	};
+	services.codex.replaceAgent = async () => {
+		await current?.dispose();
+		current = mutationAgent(++generation, generation === 3 ? () => { finalDisposals += 1; } : undefined);
+		return current;
+	};
+	services.codex.getAgent = (agentId) => current?.agentId === agentId ? current : null;
+	services.codex.removeAgent = async (agentId) => {
+		removeAttempt += 1;
+		if (removeAttempt > 1) {
+			if (current?.agentId !== agentId) return false;
+			const removed = current;
+			current = null;
+			await removed.dispose();
+			return true;
+		}
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			settleOldRemove = async () => {
+				if (settled) return;
+				settled = true;
+				const removed = current;
+				current = null;
+				await removed?.dispose();
+				if (settlement === 'reject') reject(Object.assign(new Error('late remove failure'), { code: 'LATE_REMOVE_FAILURE' }));
+				else resolve(true);
+			};
+		});
+	};
+	services.codex.stop = async () => {
+		const owned = current;
+		current = null;
+		await owned?.dispose();
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		await router.createAgent(PROFILE);
+		const oldRemove = router.removeAgent(PROFILE.agentId);
+		const oldRejected = assert.rejects(oldRemove, (error) => error?.code === 'PROVIDER_TIMEOUT');
+		await flush();
+		await timers.runNext();
+		await oldRejected;
+		const generationTwo = await router.createAgent(PROFILE);
+		assert.equal(generationTwo.sessionGeneration, 2);
+		await settleOldRemove();
+		await eventually(() => router.getAgent(PROFILE.agentId)?.sessionGeneration === 3);
+		assert.equal(current, router.getAgent(PROFILE.agentId));
+		assert.equal(current.sessionGeneration, 3);
+		assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'live');
+	} finally {
+		await settleOldRemove?.();
+		await router.stop();
+	}
+	assert.equal(current, null);
+	assert.equal(finalDisposals, 1, 'stop disposes the repaired final session');
+}
+
+for (const settlement of ['resolve', 'reject']) {
+	test(`timed-out reconcile late ${settlement} repairs every partially mutated agent`, async () => {
+		await assertLateReconcileRepair(settlement);
+	});
+}
+
+async function assertLateReconcileRepair(settlement) {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	const profiles = [PROFILE, Object.freeze({ ...PROFILE, agentId: `${PROFILE.agentId}-b` })];
+	const current = new Map();
+	const generations = new Map();
+	let settleOldReconcile;
+	let reconcileAttempts = 0;
+	services.codex.createAgent = async (profile) => {
+		await current.get(profile.agentId)?.dispose();
+		const generation = (generations.get(profile.agentId) ?? 0) + 1;
+		generations.set(profile.agentId, generation);
+		const agent = mutationAgentFor(profile, generation);
+		current.set(profile.agentId, agent);
+		return agent;
+	};
+	services.codex.replaceAgent = services.codex.createAgent;
+	services.codex.getAgent = (agentId) => current.get(agentId) ?? null;
+	services.codex.removeAgent = async (agentId) => {
+		const agent = current.get(agentId);
+		if (agent === undefined) return false;
+		current.delete(agentId);
+		await agent.dispose();
+		return true;
+	};
+	services.codex.reconcile = async (records) => {
+		reconcileAttempts += 1;
+		if (reconcileAttempts > 1) return { valid: records, invalid: [], removed: [], catalog: catalog('codex', PROFILE.model) };
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			settleOldReconcile = async () => {
+				if (settled) return;
+				settled = true;
+				const mutated = settlement === 'resolve' ? profiles : profiles.slice(0, 1);
+				for (const profile of mutated) {
+					const agent = current.get(profile.agentId);
+					current.delete(profile.agentId);
+					await agent?.dispose();
+				}
+				if (settlement === 'reject') reject(Object.assign(new Error('late partial reconcile failure'), { code: 'LATE_RECONCILE_FAILURE' }));
+				else resolve({ valid: records, invalid: [], removed: [], catalog: catalog('codex', PROFILE.model) });
+			};
+		});
+	};
+	services.codex.stop = async () => {
+		const agents = [...current.values()];
+		current.clear();
+		await Promise.all(agents.map((agent) => agent.dispose()));
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		for (const profile of profiles) await router.createAgent(profile);
+		const oldReconcile = router.reconcile(profiles);
+		await flush();
+		await timers.runNext();
+		await oldReconcile;
+		for (const profile of profiles) assert.equal((await router.createAgent(profile)).sessionGeneration, 2);
+		await settleOldReconcile();
+		const repairedIds = settlement === 'resolve' ? profiles.map(({ agentId }) => agentId) : [profiles[0].agentId];
+		await eventually(() => repairedIds.every((agentId) => router.getAgent(agentId)?.sessionGeneration === 3));
+		for (const profile of profiles) {
+			assert.equal(current.get(profile.agentId), router.getAgent(profile.agentId), `backend and wrapper converge for ${profile.agentId}`);
+			assert.equal(router.getAgent(profile.agentId).sessionGeneration, repairedIds.includes(profile.agentId) ? 3 : 2);
+		}
+		assert.equal(router.recoverySnapshot().find(({ provider }) => provider === 'codex').state, 'live');
+	} finally {
+		await settleOldReconcile?.();
+		await router.stop();
+	}
+	assert.equal(current.size, 0);
+}
+
+test('a newer terminal remove suppresses stale remove repair resurrection', async () => {
+	const timers = new ManualTimers();
+	const services = providerServices();
+	let current = null;
+	let generation = 0;
+	let removeAttempt = 0;
+	let settleOldRemove;
+	let repairReplacements = 0;
+	services.codex.createAgent = async () => (current = mutationAgent(++generation));
+	services.codex.replaceAgent = async () => {
+		repairReplacements += 1;
+		return (current = mutationAgent(++generation));
+	};
+	services.codex.getAgent = (agentId) => current?.agentId === agentId ? current : null;
+	services.codex.removeAgent = async (agentId) => {
+		removeAttempt += 1;
+		if (removeAttempt === 1) return new Promise((resolve) => { settleOldRemove = () => resolve(true); });
+		if (current?.agentId !== agentId) return false;
+		const removed = current;
+		current = null;
+		await removed.dispose();
+		return true;
+	};
+	const router = new ProviderService(services, { operationTimeoutMs: 25, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel, now: () => timers.now });
+	try {
+		await router.createAgent(PROFILE);
+		const stale = router.removeAgent(PROFILE.agentId);
+		const staleRejected = assert.rejects(stale, (error) => error?.code === 'PROVIDER_TIMEOUT');
+		await flush();
+		await timers.runNext();
+		await staleRejected;
+		await router.createAgent(PROFILE);
+		assert.equal(await router.removeAgent(PROFILE.agentId), true);
+		settleOldRemove();
+		await flush();
+		assert.equal(router.getAgent(PROFILE.agentId), null);
+		assert.equal(current, null);
+		assert.equal(repairReplacements, 0, 'intentional terminal absence cannot trigger resurrection repair');
+	} finally {
+		settleOldRemove?.();
+		await router.stop();
+	}
+});
+
+function mutationAgentFor(profile, sessionGeneration, onDispose = () => {}) {
+	let disposed = false;
+	return {
+		agentId: profile.agentId,
+		profile,
+		sessionGeneration,
+		get disposed() { return disposed; },
+		async dispose() {
+			if (disposed) return;
+			disposed = true;
+			onDispose();
+		},
+	};
+}
+
 test('remove waits for a timed-out create and stale production cannot undo terminal cleanup', async () => {
 	const timers = new ManualTimers();
 	const services = providerServices();
