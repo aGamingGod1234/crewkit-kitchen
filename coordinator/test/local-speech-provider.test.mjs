@@ -1,13 +1,30 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import test from 'node:test';
+
+const execFileAsync = promisify(execFile);
 
 test('local speech RPC responses use the original stdout outside global redirects', async () => {
 	const source = await readFile(fileURLToPath(new URL('../src/voice/local-speech-worker.py', import.meta.url)), 'utf8');
 	assert.match(source, /_RPC_STDOUT\s*=\s*sys\.stdout/);
 	assert.match(source, /def _respond\(value\):[\s\S]*?_RPC_STDOUT\.write\(/);
 	assert.doesNotMatch(source, /def _respond\(value\):\s+sys\.stdout\.write\(/);
+});
+
+test('local speech worker serializes concurrent TTS, STT, and warmup model work', async () => {
+	const python = process.env.ARENA_AGENT_SPEECH_PYTHON
+		?? (process.platform === 'win32' ? 'python' : 'python3');
+	const fixture = fileURLToPath(new URL('../test-support/local-speech-inference-concurrency-check.py', import.meta.url));
+	const { stdout } = await execFileAsync(python, [fixture], { timeout: 10_000, windowsHide: true });
+	assert.deepEqual(JSON.parse(stdout.trim()), {
+		requests: 8,
+		warmupRequests: 2,
+		maximumConcurrentInference: 1,
+		maximumConcurrentWarmupOrInference: 1,
+	});
 });
 
 test('local speech provider keeps one bounded process for TTS and STT', async () => {

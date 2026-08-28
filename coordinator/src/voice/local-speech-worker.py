@@ -16,8 +16,9 @@ MAX_STT_PCM_BYTES = 48_000 * 2 * 20
 
 _tts_model = None
 _stt_model = None
-_tts_lock = threading.Lock()
-_stt_lock = threading.Lock()
+# Chatterbox and Whisper can share one GPU. Hold this lock across model loading
+# and inference even when the RPC worker handles several requests concurrently.
+_model_lock = threading.RLock()
 _warmup_lock = threading.Lock()
 _warmup_started = False
 _warmup_error = None
@@ -37,9 +38,7 @@ _LOCAL_VOICE_STYLES = (
 
 def _load_tts():
     global _tts_model
-    if _tts_model is not None:
-        return _tts_model
-    with _tts_lock:
+    with _model_lock:
         if _tts_model is not None:
             return _tts_model
         with contextlib.redirect_stdout(sys.stderr):
@@ -54,9 +53,7 @@ def _load_tts():
 
 def _load_stt():
     global _stt_model
-    if _stt_model is not None:
-        return _stt_model
-    with _stt_lock:
+    with _model_lock:
         if _stt_model is not None:
             return _stt_model
         with contextlib.redirect_stdout(sys.stderr):
@@ -88,7 +85,8 @@ def _load_stt():
 
 def _warmup_model(name, loader):
     try:
-        loader()
+        with _model_lock:
+            loader()
         return True
     except Exception as error:
         sys.stderr.write(f"Arena local speech {name} warmup failed: {type(error).__name__}: {error}\n")
@@ -104,24 +102,15 @@ def _warmup():
         if _warmup_started:
             return {"sttReady": _stt_model is not None, "ttsReady": _tts_model is not None}
         _warmup_started = True
-    results = {}
-
-    def warm(name, loader):
-        results[name] = _warmup_model(name, loader)
-
-    threads = [
-        threading.Thread(target=warm, args=("STT", _load_stt), daemon=True),
-        threading.Thread(target=warm, args=("TTS", _load_tts), daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    if not results.get("stt", False) or not results.get("tts", False):
-        failed = ", ".join(name for name in ("STT", "TTS") if not results.get(name, False))
-        _warmup_error = f"Local speech model warmup failed for: {failed}"
-        raise RuntimeError(_warmup_error)
-    return {"sttReady": True, "ttsReady": True}
+        results = {
+            "stt": _warmup_model("STT", _load_stt),
+            "tts": _warmup_model("TTS", _load_tts),
+        }
+        if not results["stt"] or not results["tts"]:
+            failed = ", ".join(name for name in ("STT", "TTS") if not results[name.lower()])
+            _warmup_error = f"Local speech model warmup failed for: {failed}"
+            raise RuntimeError(_warmup_error)
+        return {"sttReady": True, "ttsReady": True}
 
 
 def _tts(request):
@@ -134,15 +123,16 @@ def _tts(request):
         raise ValueError("TTS voice ID is invalid")
     if not isinstance(speed, (int, float)) or not math.isfinite(speed) or speed < 0.5 or speed > 2:
         raise ValueError("TTS speed is invalid")
-    model = _load_tts()
     exaggeration, cfg_weight = _voice_style(voice_id)
-    with contextlib.redirect_stdout(sys.stderr):
-        import torch
+    with _model_lock:
+        model = _load_tts()
+        with contextlib.redirect_stdout(sys.stderr):
+            import torch
 
-        with torch.inference_mode():
-            waveform = model.generate(text, exaggeration=exaggeration, cfg_weight=cfg_weight)
-            waveform = _apply_speed(waveform, speed, torch)
-        pcm = (waveform.detach().float().cpu().flatten().clamp(-1, 1) * 32767).to(torch.int16).numpy().tobytes()
+            with torch.inference_mode():
+                waveform = model.generate(text, exaggeration=exaggeration, cfg_weight=cfg_weight)
+                waveform = _apply_speed(waveform, speed, torch)
+            pcm = (waveform.detach().float().cpu().flatten().clamp(-1, 1) * 32767).to(torch.int16).numpy().tobytes()
     if not pcm or len(pcm) % 2 or len(pcm) > MAX_TTS_PCM_BYTES:
         raise RuntimeError("Generated speech exceeded the 20 second PCM limit")
     return {
@@ -193,21 +183,22 @@ def _stt(request):
         raise ValueError("STT audio is invalid") from error
     if not pcm or len(pcm) % 2 or len(pcm) > MAX_STT_PCM_BYTES:
         raise ValueError("STT audio must be at most 20 seconds of 48 kHz mono PCM")
-    with contextlib.redirect_stdout(sys.stderr):
-        import numpy as np
-        import torch
-        import torchaudio.functional as audio_functional
+    with _model_lock:
+        with contextlib.redirect_stdout(sys.stderr):
+            import numpy as np
+            import torch
+            import torchaudio.functional as audio_functional
 
-        waveform = torch.from_numpy(np.frombuffer(pcm, dtype="<i2").copy()).float().div_(32768.0)
-        audio_16khz = audio_functional.resample(waveform, 48_000, 16_000).numpy()
-        segments, _ = _load_stt().transcribe(
-            audio_16khz,
-            language="en",
-            beam_size=1,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
-        completed = list(segments)
+            waveform = torch.from_numpy(np.frombuffer(pcm, dtype="<i2").copy()).float().div_(32768.0)
+            audio_16khz = audio_functional.resample(waveform, 48_000, 16_000).numpy()
+            segments, _ = _load_stt().transcribe(
+                audio_16khz,
+                language="en",
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+            completed = list(segments)
     transcript = " ".join(segment.text.strip() for segment in completed if segment.text.strip()).strip()
     if not completed:
         confidence = 0.0
