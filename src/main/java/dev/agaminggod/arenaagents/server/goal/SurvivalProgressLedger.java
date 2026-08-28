@@ -86,6 +86,18 @@ public final class SurvivalProgressLedger {
 		}
 	}
 
+	public synchronized void resetAgent(AgentId agentId) {
+		AgentId resetAgent = Objects.requireNonNull(agentId, "agentId must not be null");
+		boolean changed = false;
+		for (Map.Entry<Key, Progress> entry : progress.entrySet()) {
+			if (!entry.getKey().agentId().equals(resetAgent) || entry.getValue().observedTicks() == 0L) continue;
+			entry.setValue(new Progress(entry.getValue().requiredTicks(), 0L));
+			changed = true;
+		}
+		lastObservedTick.keySet().removeIf(key -> key.agentId().equals(resetAgent));
+		if (changed) mutationListener.run();
+	}
+
 	public synchronized void retainGoals(Set<UUID> goalIds) {
 		Set<UUID> retained = Set.copyOf(
 				Objects.requireNonNull(goalIds, "goalIds must not be null"));

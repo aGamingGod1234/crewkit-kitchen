@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.goal;
 
 import com.mojang.serialization.Codec;
+import dev.agaminggod.arenaagents.agent.AgentDeathSnapshot;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
@@ -47,6 +48,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyOperatorConfirmationAcrossRestart();
 		assertions += verifySurvivalProgressAcrossRestart();
 		assertions += verifySurvivalDeathResetAcrossRestart();
+		assertions += verifyLifecycleDeathResetsPartialCompoundSurvival();
 		assertions += verifySurvivalProgressBoundsAndPruning();
 		assertions += verifySurvivalProgressPersistenceCompatibility();
 		assertions += verifyQueuedPromotionAfterEvidence();
@@ -607,6 +609,62 @@ public final class GoalVerificationRuntimeVerification {
 		assertEquals(true, restoredRuntime.evaluate(idle.agentId()).verified(),
 				"the full post-death duration eventually satisfies");
 		return 4;
+	}
+
+	private static int verifyLifecycleDeathResetsPartialCompoundSurvival() {
+		AgentSavedData data = new AgentSavedData();
+		long now = 75_000L;
+		AgentRecord idle = data.registry().create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		GoalPredicate compound = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.SurviveDuration(1_200L),
+				new GoalPredicate.InventoryContains("minecraft:iron_ingot", 1)
+		));
+		data.registry().start(idle.agentId(), GoalSpec.create(
+				"Survive and retain iron", compound, 750L), now + 1L);
+		FakeFacts facts = new FakeFacts();
+		facts.items.put("minecraft:iron_ingot", 1);
+		long[] tick = { 750L };
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				data.registry(), ignored -> Optional.of(facts), () -> tick[0], () -> now + tick[0],
+				data.killLedger(), data.survivalProgress());
+
+		GoalCompletionVerifier.VerificationResult beforeDeath = null;
+		for (int observed = 0; observed < 1_199; observed++) {
+			beforeDeath = runtime.evaluate(idle.agentId());
+			tick[0]++;
+		}
+		assertEquals(false, beforeDeath.verified(),
+				"1199 of 1200 survival ticks do not satisfy the compound goal");
+		assertEquals(1_199L, data.survivalProgress().snapshot().entries().getFirst().observedTicks(),
+				"partial survival progress reaches the exact pre-death boundary");
+
+		AgentDeathSnapshot death = new AgentDeathSnapshot(
+				"Agent fell", "minecraft:overworld", 0.0D, 64.0D, 0.0D,
+				Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty(), now + tick[0]);
+		data.registry().die(idle.agentId(), death, now + tick[0]);
+		assertEquals(AgentLifecycleState.DEAD, data.registry().require(idle.agentId()).state(),
+				"the authoritative lifecycle transition records death");
+		assertEquals(0L, data.survivalProgress().snapshot().entries().getFirst().observedTicks(),
+				"the death transition resets partial survival progress immediately");
+		assertEquals(0, runtime.tick().size(),
+				"a dead inactive agent cannot complete survival at end of tick");
+
+		data.registry().respawn(idle.agentId(), UUID.randomUUID(), now + tick[0] + 1L);
+		assertEquals(AgentLifecycleState.STARTING, data.registry().require(idle.agentId()).state(),
+				"respawn resumes the unfinished compound goal");
+		GoalCompletionVerifier.VerificationResult afterRespawn = null;
+		for (int observed = 0; observed < 1_199; observed++) {
+			tick[0]++;
+			afterRespawn = runtime.evaluate(idle.agentId());
+		}
+		assertEquals(false, afterRespawn.verified(),
+				"1199 post-respawn ticks still do not satisfy survival");
+		tick[0]++;
+		assertEquals(true, runtime.evaluate(idle.agentId()).verified(),
+				"only 1200 continuous post-respawn ticks satisfy the compound goal");
+		return 8;
 	}
 
 	private static int verifySurvivalProgressBoundsAndPruning() {

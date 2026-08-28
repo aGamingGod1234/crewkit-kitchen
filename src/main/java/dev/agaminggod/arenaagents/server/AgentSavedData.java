@@ -5,6 +5,7 @@ import com.mojang.serialization.codecs.RecordCodecBuilder;
 import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentRegistrySnapshotCodec;
@@ -338,6 +339,10 @@ public final class AgentSavedData extends SavedData {
 
 	private void dispatchTransition(AgentTransition transition) {
 		clearSupersededConversationWake(transition.after());
+		if (transition.before().state() != AgentLifecycleState.DEAD
+				&& transition.after().state() == AgentLifecycleState.DEAD) {
+			survivalProgress.resetAgent(transition.after().agentId());
+		}
 		try {
 			runtimeHooks.onTransition(transition);
 		} catch (RuntimeException exception) {
