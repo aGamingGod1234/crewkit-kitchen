@@ -3,13 +3,15 @@ import { types as nodeTypes } from 'node:util';
 export const DIAGNOSTIC_REDACTED = '[REDACTED]';
 export const DIAGNOSTIC_UNSAFE = '[UNSAFE_OBJECT]';
 
-const CREDENTIAL_KEY = '[A-Za-z0-9_-]{0,64}(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth|launcherAccount|accountData)[A-Za-z0-9_-]{0,64}';
+const CREDENTIAL_KEY = '[A-Za-z0-9_-]{0,64}(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth|launcher[_-]?account|account[_-]?data)[A-Za-z0-9_-]{0,64}';
 const ASSIGNMENT_VALUE = '("(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|[^\\s,;)}\\]]+)';
 const QUOTED_ASSIGNMENT = new RegExp(`(["'])(${CREDENTIAL_KEY})\\1(\\s*[:=]\\s*)${ASSIGNMENT_VALUE}`, 'gi');
 const BARE_ASSIGNMENT = new RegExp(`\\b(${CREDENTIAL_KEY})(\\s*[:=]\\s*)${ASSIGNMENT_VALUE}`, 'gi');
 const AUTHORIZATION = /\b(authorization\s*[:=]\s*)(Basic|Bearer)\s+("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z0-9._~+/=-]+)/gi;
 const BEARER = /\b(Bearer)\s+("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z0-9._~+/=-]+)/gi;
 const RAW_PROMPT = /(?:raw\s+)?prompt\s*[:=]\s*[^\r\n]*/gi;
+const QUOTED_FILE_URI = /(["'])file:\/\/(?=\/|[^\/\s"']+\/)[^"'\r\n]+\1/gi;
+const FILE_URI = /(^|[\s(=\[])file:\/\/(?:\/(?:[A-Za-z]:[\\/])?|[^\/\s,;)}\]"']+[\\/])[^\s,;)}\]"']+/gi;
 const QUOTED_ABSOLUTE_PATH = /(["'])((?:[A-Za-z]:[\\/]|\\\\[^\\/\r\n"']+[\\/][^\\/\r\n"']+[\\/]|\/(?!\/))[^"'\r\n]+)\1/g;
 const WINDOWS_PATH = /\b[A-Za-z]:[\\/][^\s,;)}\]"']+/g;
 const UNC_PATH = /\\\\[^\\/\s]+[\\/][^\s,;)}\]"']+/g;
@@ -23,7 +25,9 @@ export function isSensitiveDiagnosticKey(value) {
 		.toLowerCase();
 	if (/^(?:(?:input|output|prompt|completion|cached|reasoning|total)_tokens?(?:_count)?|tokens?_count|token_(?:bucket|latency_ms|budget|limit|usage|remaining))$/.test(normalized)) return false;
 	return /(?:^|_)(?:authorization|api_key|access_token|refresh_token|client_secret|secret|password|token|credential|oauth)(?:_|$)/.test(normalized)
+		|| normalized === 'launcher_account'
 		|| normalized === 'launcheraccount'
+		|| normalized === 'account_data'
 		|| normalized === 'accountdata';
 }
 
@@ -39,6 +43,8 @@ export function sanitizeDiagnosticText(value, { maxBytes = 2_048, redactPaths = 
 		.replace(RAW_PROMPT, DIAGNOSTIC_REDACTED);
 	if (redactPaths) {
 		text = text
+			.replace(QUOTED_FILE_URI, '[location redacted]')
+			.replace(FILE_URI, (_match, prefix) => `${prefix}[location redacted]`)
 			.replace(QUOTED_ABSOLUTE_PATH, '[location redacted]')
 			.replace(UNC_PATH, '[location redacted]')
 			.replace(WINDOWS_PATH, '[location redacted]')

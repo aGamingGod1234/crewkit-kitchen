@@ -157,6 +157,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private int catalogDiscoveryAttempts;
 	private long catalogDiscoveryRetryAtNanos;
 	private long catalogDiscoveryGeneration;
+	private String catalogDiscoveryFailureCode;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
 		this(manager, configuredPort(), configuredSecretPath(), new AgentVerboseState());
@@ -730,6 +731,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogDiscoveryAttempts = 0;
 				catalogDiscoveryRetryAtNanos = 0L;
 				catalogDiscoveryGeneration = 0L;
+				catalogDiscoveryFailureCode = null;
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
 				coordinatorReadyAgentIds.clear();
@@ -1218,13 +1220,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		catalogDiscoveryAttempts = 0;
 		catalogDiscoveryRetryAtNanos = 0L;
 		catalogDiscoveryGeneration = 0L;
+		catalogDiscoveryFailureCode = null;
 	}
 
 	private void publishCatalogDiscoveryRetry() {
 		synchronized (publicationLock) {
 			if (catalogLoaded || catalogDiscoveryAttempts == 0) return;
 			if (catalogDiscoveryGeneration != coordinatorLifecycleGeneration || session == null || !session.authenticated.get()) return;
-			if (nanoTime.getAsLong() < catalogDiscoveryRetryAtNanos) return;
+			if (!catalogRetryDue(nanoTime.getAsLong(), catalogDiscoveryRetryAtNanos)) return;
 			catalogDiscoveryPending = false;
 			requestCatalogDiscovery();
 		}
@@ -1232,11 +1235,24 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void requestCatalogDiscovery() {
 		if (catalogLoaded || catalogDiscoveryPending) return;
-		send("catalog_request", "server", new JsonObject());
-		catalogDiscoveryPending = true;
 		if (catalogDiscoveryAttempts < Integer.MAX_VALUE) catalogDiscoveryAttempts += 1;
 		catalogDiscoveryGeneration = coordinatorLifecycleGeneration;
 		catalogDiscoveryRetryAtNanos = catalogRetryDeadline(catalogDiscoveryAttempts);
+		try {
+			send("catalog_request", "server", new JsonObject());
+			catalogDiscoveryPending = true;
+			if (catalogDiscoveryFailureCode != null) {
+				LOGGER.debug("Catalog discovery publication recovered after {}", catalogDiscoveryFailureCode);
+				catalogDiscoveryFailureCode = null;
+			}
+		} catch (RuntimeException exception) {
+			catalogDiscoveryPending = false;
+			String failureCode = catalogPublicationFailureCode(exception);
+			if (!failureCode.equals(catalogDiscoveryFailureCode)) {
+				LOGGER.debug("Catalog discovery publication unavailable ({}); retry remains scheduled", failureCode);
+				catalogDiscoveryFailureCode = failureCode;
+			}
+		}
 	}
 
 	static long catalogRetryDelayNanos(int completedAttempts) {
@@ -1245,9 +1261,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private long catalogRetryDeadline(int completedAttempts) {
-		long now = nanoTime.getAsLong();
-		long delay = catalogRetryDelayNanos(completedAttempts);
-		return now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
+		return nanoTime.getAsLong() + catalogRetryDelayNanos(completedAttempts);
+	}
+
+	static boolean catalogRetryDue(long now, long deadline) {
+		return now - deadline >= 0L;
+	}
+
+	private static String catalogPublicationFailureCode(RuntimeException exception) {
+		String code = exception instanceof BridgeProtocolException protocol ? protocol.code() : exception.getClass().getSimpleName();
+		if (code == null || code.isBlank()) return "RUNTIME_FAILURE";
+		return code.length() <= 64 ? code : code.substring(0, 64);
 	}
 
 	private void plannerReady(BridgeEnvelope envelope) {
@@ -2675,6 +2699,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogDiscoveryAttempts = 0;
 				catalogDiscoveryRetryAtNanos = 0L;
 				catalogDiscoveryGeneration = 0L;
+				catalogDiscoveryFailureCode = null;
 				CoordinatorStatusStore.clear(manager.server());
 				if (wasAuthenticated) coordinatorDisconnectPending.set(true);
 				session = null;

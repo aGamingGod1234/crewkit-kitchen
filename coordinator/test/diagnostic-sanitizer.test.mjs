@@ -82,3 +82,29 @@ test('structured token metrics remain visible but actual token credentials are r
 	assert.equal(sanitized.access_token, '[REDACTED]');
 	assert.equal(sanitized.github_token, '[REDACTED]');
 });
+
+test('launcher and account credential aliases redact in text and structured diagnostics', () => {
+	const aliases = ['launcherAccount', 'launcher_account', 'launcher-account', 'launcheraccount', 'accountData', 'account_data', 'account-data', 'accountdata'];
+	for (const [index, alias] of aliases.entries()) {
+		const secret = `private-value-${index}`;
+		const text = sanitizeDiagnosticText(`${alias} = "${secret}"`);
+		assert.equal(text.includes(secret), false, `${alias} text assignment leaked`);
+		assert.match(text, /\[REDACTED\]/);
+		const structured = sanitizeDiagnosticValue({ [alias]: secret });
+		assert.equal(structured[alias], '[REDACTED]', `${alias} structured field leaked`);
+	}
+});
+
+test('file absolute URIs redact without changing network URLs or relative paths', () => {
+	for (const location of [
+		'file:///C:/Users/lucas/Arena%20Agents/secret.json',
+		'file:///var/lib/arena%20agents/secret.json',
+		'file://server/share/Arena%20Agents/secret.json',
+	]) {
+		const sanitized = sanitizeDiagnosticText(`failure at ${location}`);
+		assert.equal(sanitized.includes(location), false, `${location} leaked`);
+		assert.match(sanitized, /\[location redacted\]/);
+	}
+	const safe = 'https://example.com/file:///docs http://127.0.0.1:8766/v1/tts relative/file.txt inputTokens=4';
+	assert.equal(sanitizeDiagnosticText(safe), safe);
+});

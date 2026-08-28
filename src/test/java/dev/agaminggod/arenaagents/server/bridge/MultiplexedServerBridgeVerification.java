@@ -235,7 +235,7 @@ public final class MultiplexedServerBridgeVerification {
 					"catalog retry reaches its capped interval");
 			assertEquals(3_200_000_000L, MultiplexedServerBridge.catalogRetryDelayNanos(10_000),
 					"catalog retry remains capped across indefinite attempts");
-			AtomicLong nanoTime = new AtomicLong(1_000_000L);
+			AtomicLong nanoTime = new AtomicLong(Long.MAX_VALUE - 25_000_000L);
 			String secret = "0123456789abcdef0123456789abcdef";
 			secretFile = Files.createTempFile("arena-agents-catalog-secret-", ".txt");
 			Files.writeString(secretFile, secret);
@@ -254,7 +254,7 @@ public final class MultiplexedServerBridgeVerification {
 				assertEquals("hello_ack", acknowledgement.type(), "empty-catalog fixture authenticates the bridge");
 				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
 						"empty-catalog fixture consumes handshake state before catalog discovery");
-				nanoTime.addAndGet(60_000_000_000L);
+				nanoTime.addAndGet(1_000_000L);
 				for (int tick = 0; tick < 8; tick++) bridge.tick();
 				assertTrue(!reader.ready(), "catalog discovery does not start eagerly before an empty snapshot");
 
@@ -276,12 +276,38 @@ public final class MultiplexedServerBridgeVerification {
 						"an empty bootstrap catalog requests live provider discovery asynchronously");
 				assertTrue(!bridge.catalogModels().isEmpty(),
 						"fallback model choices remain visible while live discovery retries");
+				nanoTime.addAndGet(49_000_000L);
+				for (int tick = 0; tick < 8; tick++) bridge.tick();
+				assertTrue(!reader.ready(), "catalog retry remains pending immediately before a wrapping deadline");
+				nanoTime.addAndGet(1_000_000L);
+				BridgeEnvelope wrappedRetry = null;
+				deadline = System.currentTimeMillis() + 2_000L;
+				while (wrappedRetry == null && System.currentTimeMillis() < deadline) {
+					bridge.tick();
+					if (reader.ready()) wrappedRetry = codec.decode(reader.readLine());
+					else Thread.sleep(1L);
+				}
+				assertTrue(wrappedRetry != null && "catalog_request".equals(wrappedRetry.type()),
+						"catalog retry fires when nanoTime crosses Long.MAX_VALUE into Long.MIN_VALUE");
 
-				for (int attempt = 2; attempt <= 6; attempt++) {
+				for (int attempt = 3; attempt <= 6; attempt++) {
 					writeEnvelope(socket, codec, new BridgeEnvelope(
 							2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-" + attempt, catalog
 					));
 					nanoTime.addAndGet(60_000_000_000L);
+					if (attempt == 4) {
+						setQueuedCount(bridge, "server", MultiplexedServerBridge.AGENT_QUEUE_CAP);
+						assertDoesNotThrow(bridge::tick,
+								"catalog retry backpressure remains best effort outside Minecraft tick control");
+						setQueuedCount(bridge, "server", 0);
+						long noSpinDeadline = System.nanoTime() + 100_000_000L;
+						while (System.nanoTime() < noSpinDeadline) {
+							bridge.tick();
+							Thread.sleep(1L);
+						}
+						assertTrue(!reader.ready(), "failed catalog publication retains one future retry instead of spinning");
+						nanoTime.addAndGet(60_000_000_000L);
+					}
 					BridgeEnvelope retry = null;
 					deadline = System.currentTimeMillis() + 2_000L;
 					while (retry == null && System.currentTimeMillis() < deadline) {
@@ -1911,5 +1937,13 @@ public final class MultiplexedServerBridgeVerification {
 			throw new AssertionError(label + " threw " + throwable.getClass().getSimpleName(), throwable);
 		}
 		throw new AssertionError(label + " did not throw " + type.getSimpleName());
+	}
+
+	private static void assertDoesNotThrow(Runnable action, String label) {
+		try {
+			action.run();
+		} catch (Throwable throwable) {
+			throw new AssertionError(label + ": " + throwable.getClass().getSimpleName(), throwable);
+		}
 	}
 }
