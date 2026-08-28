@@ -24,6 +24,7 @@ import net.minecraft.world.item.Item;
 
 public final class GoalCompiler {
 	private static final int MAX_COMPOUND_LEAVES = 16;
+	private static final int MAX_TRANSLATION_CANDIDATES = 64;
 	private static final Pattern POSITION = Pattern.compile(
 			"^(?:go|move|travel|get)(?: to)?(?: coordinates?)?\\s+"
 					+ "(?:x\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
@@ -188,23 +189,23 @@ public final class GoalCompiler {
 			for (GoalClause clause : clauses) {
 				String target = SUBJECTIVE.matcher(clause.target()).replaceAll(" ").replaceAll("\\s+", " ").strip();
 				candidates.addAll(clause.kind() == ClauseKind.ITEM ? relatedItems(target, registries) : relatedEntities(target, registries));
-				if (candidates.size() >= 64) break;
+				if (candidates.size() >= MAX_TRANSLATION_CANDIDATES) break;
 			}
-			return candidates.stream().limit(64).toList();
+			return candidates.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
 		}
 		Matcher item = ITEM.matcher(command);
 		if (item.matches()) {
 			String target = SUBJECTIVE.matcher(item.group(3)).replaceAll(" ").replaceAll("\\s+", " ").strip();
-			return relatedItems(target, registries).stream().limit(64).toList();
+			return relatedItems(target, registries).stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
 		}
 		Matcher kill = KILL.matcher(command);
 		if (BEAT_GAME.matcher(command).matches()) return List.of("minecraft:ender_dragon");
 		if (kill.matches()) {
 			String target = SUBJECTIVE.matcher(kill.group(1)).replaceAll(" ").replaceAll("\\s+", " ").strip();
-			return relatedEntities(target, registries).stream().limit(64).toList();
+			return relatedEntities(target, registries).stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
 		}
 		Matcher block = BLOCK.matcher(command);
-		if (block.matches()) return relatedBlocks(block.group(1), registries).stream().limit(64).toList();
+		if (block.matches()) return relatedBlocks(block.group(1), registries).stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
 		return List.of();
 	}
 
@@ -329,18 +330,21 @@ public final class GoalCompiler {
 	private static List<String> relatedBlocks(String target, RegistryAccess registries) {
 		String wanted = normalizedTarget(target).replaceFirst("^(?:with|using|from|of)\\s+", "");
 		if (wanted.isEmpty()) return List.of();
-		Set<String> forms = singularForms(wanted);
-		Set<String> terms = Set.of(wanted.split("\\s+"));
+		Set<String> wantedForms = blockPhraseForms(wanted);
 		Registry<Block> blockRegistry = registries.lookup(Registries.BLOCK).orElse(BuiltInRegistries.BLOCK);
-		return blockRegistry.keySet().stream().filter(id -> {
+		ArrayList<Identifier> ids = new ArrayList<>(blockRegistry.keySet());
+		ids.sort(Identifier::compareTo);
+		ArrayList<String> matches = new ArrayList<>();
+		for (Identifier id : ids) {
 			Block block = blockRegistry.getValue(id);
 			String path = pathName(id);
 			String description = block == null ? "" : descriptionName(block.getDescriptionId());
-			if (forms.contains(id.toString()) || forms.contains(path) || forms.contains(description)
-					|| path.endsWith(" " + wanted) || description.endsWith(" " + wanted)) return true;
-			return terms.stream().filter(term -> term.length() > 1 && !Set.of("block", "blocks", "the", "and").contains(term))
-					.anyMatch(term -> path.equals(term) || path.contains(term) || description.equals(term) || description.contains(term));
-		}).map(Identifier::toString).distinct().sorted().toList();
+			if (wantedForms.contains(normalizedTarget(path)) || wantedForms.contains(normalizedTarget(description))) {
+				matches.add(id.toString());
+				if (matches.size() == MAX_TRANSLATION_CANDIDATES) break;
+			}
+		}
+		return List.copyOf(matches);
 	}
 
 	private static List<String> matchEntities(String target, RegistryAccess registries) {
@@ -385,6 +389,35 @@ public final class GoalCompiler {
 			return Set.of(value, value.substring(0, value.length() - 1));
 		}
 		return Set.of(value);
+	}
+
+	/**
+	 * Returns the bounded phrase variants used to match natural-language block names to registry paths.
+	 * Variants only change the final word, which keeps multiword names precise and avoids substring matches.
+	 */
+	private static Set<String> blockPhraseForms(String value) {
+		String normalized = normalizedTarget(value).replace('_', ' ');
+		String[] words = normalized.split("\\s+");
+		if (words.length == 0 || normalized.isEmpty()) return Set.of();
+		String last = words[words.length - 1];
+		TreeSet<String> forms = new TreeSet<>();
+		for (String lastForm : singularForms(last)) {
+			forms.add(withLastWord(words, lastForm));
+		}
+		if (last.length() > 1 && !last.endsWith("s") && !last.endsWith("ss")) {
+			forms.add(withLastWord(words, last + "s"));
+		}
+		return Set.copyOf(forms);
+	}
+
+	private static String withLastWord(String[] words, String last) {
+		StringBuilder result = new StringBuilder();
+		for (int index = 0; index < words.length - 1; index++) {
+			if (index > 0) result.append(' ');
+			result.append(words[index]);
+		}
+		if (words.length > 1) result.append(' ');
+		return result.append(last).toString();
 	}
 
 	private static String stripPoliteness(String request) {

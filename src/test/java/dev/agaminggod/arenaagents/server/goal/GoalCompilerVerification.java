@@ -115,9 +115,26 @@ public final class GoalCompilerVerification {
 		assertEquals(GoalCompilation.Kind.REJECTED,
 				compiler.compile("Go to 30000000 64 0", RegistryAccess.EMPTY, 1_200L).kind(),
 				"out-of-world horizontal coordinates are rejected before a goal is accepted");
-		assertTrue(compiler.candidateIdsFor("Place oak planks", RegistryAccess.EMPTY).contains("minecraft:oak_planks"),
-				"block translation candidates include matching registered block IDs");
-		return 9;
+		assertEquals(
+				List.of("minecraft:oak_planks"),
+				compiler.candidateIdsFor("Place oak planks", RegistryAccess.EMPTY),
+				"plural multiword block names resolve to the exact registered block ID"
+		);
+		assertEquals(
+				List.of("minecraft:oak_planks"),
+				compiler.candidateIdsFor("Place oak plank", RegistryAccess.EMPTY),
+				"singular and plural block wording resolve to the same registered block ID"
+		);
+		assertEquals(
+				List.of("minecraft:oak_planks"),
+				compiler.candidateIdsFor("Build with oak_planks", RegistryAccess.EMPTY),
+				"registry path spelling is normalized as a multiword block name"
+		);
+		assertTrue(
+				!compiler.candidateIdsFor("Place oak planks", RegistryAccess.EMPTY).contains("minecraft:oak_button"),
+				"phrase matching does not expand a block request to unrelated same-material blocks"
+		);
+		return 12;
 	}
 
 	private static int verifyCompoundItemsAndKills() {
