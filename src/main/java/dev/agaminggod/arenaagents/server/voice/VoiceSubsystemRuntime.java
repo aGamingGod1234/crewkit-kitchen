@@ -27,6 +27,7 @@ public final class VoiceSubsystemRuntime {
 	private static final long MAX_START_RETRY_NANOS = TimeUnit.SECONDS.toNanos(30L);
 	private static final Map<MinecraftServer, Holder> INSTANCES = new WeakHashMap<>();
 	private static final Map<MinecraftServer, StartupRetry> STARTUP_RETRIES = new WeakHashMap<>();
+	private static final Map<MinecraftServer, LegacyStartupRetry> LEGACY_STARTUP_RETRIES = new WeakHashMap<>();
 	private static final Map<MinecraftServer, LinkedHashMap<AgentId, String>> AVAILABILITY_DIAGNOSTICS =
 			new WeakHashMap<>();
 	private static final Map<MinecraftServer, String> RUNTIME_DIAGNOSTICS = new WeakHashMap<>();
@@ -35,7 +36,16 @@ public final class VoiceSubsystemRuntime {
 	}
 
 	public static synchronized boolean start(MinecraftServer server) {
-		return start(server, legacyConfiguration());
+		Objects.requireNonNull(server, "server must not be null");
+		try {
+			VoiceSubsystemConfiguration configuration = legacyConfiguration();
+			LEGACY_STARTUP_RETRIES.remove(server);
+			return start(server, configuration);
+		} catch (RuntimeException exception) {
+			reportRuntimeFailure(server, "VOICE_CONFIGURATION_UNAVAILABLE", exception);
+			scheduleLegacyStartupRetry(server);
+			return false;
+		}
 	}
 
 	private static VoiceSubsystemConfiguration legacyConfiguration() {
@@ -104,7 +114,11 @@ public final class VoiceSubsystemRuntime {
 	}
 
 	public static synchronized void tick(MinecraftServer server) {
-		if (!INSTANCES.containsKey(server)) retryPending(server, System.nanoTime());
+		if (!INSTANCES.containsKey(server)) {
+			long now = System.nanoTime();
+			if (LEGACY_STARTUP_RETRIES.containsKey(server)) retryLegacyPending(server, now);
+			else retryPending(server, now);
+		}
 		Holder holder = INSTANCES.get(server);
 		if (holder == null) return;
 		CodexAgentManager manager = CodexAgentManager.get(server);
@@ -213,6 +227,7 @@ public final class VoiceSubsystemRuntime {
 	public static synchronized void close(MinecraftServer server) {
 		AVAILABILITY_DIAGNOSTICS.remove(server);
 		STARTUP_RETRIES.remove(server);
+		LEGACY_STARTUP_RETRIES.remove(server);
 		Holder holder = INSTANCES.remove(server);
 		if (holder != null) close(server, holder);
 		RUNTIME_DIAGNOSTICS.remove(server);
@@ -223,6 +238,22 @@ public final class VoiceSubsystemRuntime {
 		StartupRetry retry = STARTUP_RETRIES.get(server);
 		if (retry == null || nowNanos < retry.retryAfterNanos()) return false;
 		return start(server, retry.configuration(), retry.providers());
+	}
+
+	static synchronized boolean retryLegacyPending(MinecraftServer server, long nowNanos) {
+		LegacyStartupRetry retry = LEGACY_STARTUP_RETRIES.get(server);
+		if (retry == null || nowNanos < retry.retryAfterNanos()) return false;
+		return start(server);
+	}
+
+	private static void scheduleLegacyStartupRetry(MinecraftServer server) {
+		LegacyStartupRetry previous = LEGACY_STARTUP_RETRIES.get(server);
+		int failures = previous == null ? 1 : Math.min(previous.failures() + 1, 31);
+		long multiplier = 1L << Math.min(failures - 1, 5);
+		long delay = Math.min(MAX_START_RETRY_NANOS, INITIAL_START_RETRY_NANOS * multiplier);
+		long now = System.nanoTime();
+		long retryAfter = now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
+		LEGACY_STARTUP_RETRIES.put(server, new LegacyStartupRetry(failures, retryAfter));
 	}
 
 	private static void scheduleStartupRetry(
@@ -291,5 +322,8 @@ public final class VoiceSubsystemRuntime {
 			int failures,
 			long retryAfterNanos
 	) {
+	}
+
+	private record LegacyStartupRetry(int failures, long retryAfterNanos) {
 	}
 }

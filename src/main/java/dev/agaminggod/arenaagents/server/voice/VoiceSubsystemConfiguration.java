@@ -10,7 +10,7 @@ public record VoiceSubsystemConfiguration(String endpoint, String secret) {
 			throw new IllegalArgumentException("voice endpoint must be nonblank and bounded");
 		}
 		secret = Objects.requireNonNull(secret, "voice secret must not be null").strip();
-		if (secret.length() < 16 || secret.length() > 256) {
+		if (secret.length() < 16 || secret.length() > 512) {
 			throw new IllegalArgumentException("voice secret is invalid");
 		}
 	}

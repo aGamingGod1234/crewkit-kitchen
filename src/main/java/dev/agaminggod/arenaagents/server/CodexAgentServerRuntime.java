@@ -67,7 +67,6 @@ public final class CodexAgentServerRuntime {
 			if (supervisor.configured() || supervisor.failureCode() != null) {
 				COORDINATORS.put(server, supervisor);
 			}
-			VoiceSubsystemRuntime.start(server);
 			Path secretPath = supervisor.secretPath();
 			MultiplexedServerBridge bridge = secretPath == null
 					? new MultiplexedServerBridge(CodexAgentManager.get(server))
@@ -77,6 +76,7 @@ public final class CodexAgentServerRuntime {
 			if (previous != null) {
 				bridge.close();
 			}
+			startOptionalVoice(server);
 		} catch (RuntimeException exception) {
 			if (supervisor != null) {
 				COORDINATORS.remove(server, supervisor);
@@ -87,6 +87,15 @@ public final class CodexAgentServerRuntime {
 					"Codex agent bridge is unavailable; summoned agents will remain locally controllable but autonomous planning is disabled",
 					exception
 			);
+		}
+	}
+
+	private static void startOptionalVoice(MinecraftServer server) {
+		try {
+			VoiceSubsystemRuntime.start(server);
+		} catch (RuntimeException exception) {
+			VoiceSubsystemRuntime.close(server);
+			LOGGER.warn("Optional proximity voice could not start; text and autonomous planning remain available", exception);
 		}
 	}
 

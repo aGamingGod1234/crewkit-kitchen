@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.server.voice;
 
 import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -119,7 +121,63 @@ public final class VoiceSubsystemRuntimeVerification {
 		assertTrue(VoiceSubsystemRuntime.available(startupRaceServer),
 				"the retry promotes the real voice subsystem without restarting Minecraft");
 		VoiceSubsystemRuntime.close(startupRaceServer);
-		return 26;
+		return 26 + verifyOptionalConfigurationFailure();
+	}
+
+	private static int verifyOptionalConfigurationFailure() {
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
+		Path directory = null;
+		MinecraftServer unreadableServer = uninitializedServer();
+		MinecraftServer longSecretServer = uninitializedServer();
+		try {
+			directory = Files.createTempDirectory("arena-optional-voice-secret");
+			System.setProperty("arenaagents.voiceSecretFile", directory.resolve("missing.txt").toString());
+			assertFalse(VoiceSubsystemRuntime.start(unreadableServer),
+					"an unreadable optional voice secret degrades without throwing into bridge startup");
+			dev.agaminggod.arenaagents.agent.AgentId agentId = dev.agaminggod.arenaagents.agent.AgentId.parse(
+					"00000000-0000-4000-8000-000000000778"
+			);
+			VoiceRequest request = new VoiceRequest(agentId, "Text remains available.", "voice.auto.v1", 48, 1L);
+			assertEquals(VoiceReceipt.Status.DEGRADED_TO_TEXT,
+					VoiceSubsystemRuntime.speak(unreadableServer, request).toCompletableFuture().join().status(),
+					"unreadable optional voice configuration keeps text fallback available");
+			Files.writeString(directory.resolve("missing.txt"), "r".repeat(32));
+			assertTrue(VoiceSubsystemRuntime.retryLegacyPending(unreadableServer, Long.MAX_VALUE),
+					"voice configuration retries automatically after its secret becomes readable");
+
+			for (int length : List.of(257, 512)) {
+				VoiceSubsystemConfiguration longSecret = new VoiceSubsystemConfiguration(
+						"http://127.0.0.1:18773/v1/tts", "s".repeat(length)
+				);
+				assertEquals(length, longSecret.secret().length(),
+						"voice accepts every tested bridge-valid shared-secret boundary");
+				assertTrue(VoiceSubsystemRuntime.start(longSecretServer, longSecret, List.of()),
+						"bridge-valid shared secret cannot disable optional voice startup");
+				VoiceSubsystemRuntime.close(longSecretServer);
+			}
+			try {
+				new VoiceSubsystemConfiguration("http://127.0.0.1:18773/v1/tts", "s".repeat(513));
+				throw new AssertionError("voice secret above the bridge boundary must be rejected");
+			} catch (IllegalArgumentException expected) {
+				// Exact bridge boundary is enforced.
+			}
+			return 8;
+		} catch (java.io.IOException exception) {
+			throw new AssertionError("could not prepare optional voice configuration verification", exception);
+		} finally {
+			VoiceSubsystemRuntime.close(unreadableServer);
+			VoiceSubsystemRuntime.close(longSecretServer);
+			if (oldVoiceSecret == null) System.clearProperty("arenaagents.voiceSecretFile");
+			else System.setProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+			if (directory != null) {
+				try {
+					Files.deleteIfExists(directory.resolve("missing.txt"));
+					Files.deleteIfExists(directory);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not clean optional voice configuration verification", exception);
+				}
+			}
+		}
 	}
 
 	private static MinecraftServer uninitializedServer() {
