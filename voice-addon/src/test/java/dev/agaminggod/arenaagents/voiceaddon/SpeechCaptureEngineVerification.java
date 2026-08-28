@@ -34,6 +34,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyDecoderBackoffIsPerPlayer();
 		assertions += verifyDecoderCloseFailureDoesNotWedgeLaterSpeech();
 		assertions += verifyTranscriptsDeliverInUtteranceOrder();
+		assertions += verifyFailedEarlierTranscriptReleasesCompletedSuccessor();
 		assertions += verifyUnavailableSttRecoversAfterBackoff();
 		assertions += verifyCloseCancelsPendingTranscription();
 		assertions += verifyConsentRevocationCancelsOnlyOwnedSpeech();
@@ -320,6 +321,26 @@ final class SpeechCaptureEngineVerification {
 		return 2;
 	}
 
+	private static int verifyFailedEarlierTranscriptReleasesCompletedSuccessor() {
+		ControlledTranscriber transcriber = new ControlledTranscriber();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 5_000L, 1);
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine.TranscriptDelivery delivery = (playerId, text, whispering) ->
+				delivered.add(new Delivered(playerId, text, whispering));
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run, delivery);
+		engine.accept(PLAYER, true, new byte[] { 2 }, RecordingDecoder::new, Runnable::run, delivery);
+
+		transcriber.complete(2L, "second");
+		assertEquals(List.of(), delivered, "completed successor waits while the earlier STT request is active");
+		transcriber.fail(1L, new VoiceWorkerClient.VoiceWorkerException(
+				"STT_UNAVAILABLE", "Speech recognition became unavailable"
+		));
+		assertEquals(List.of(new Delivered(PLAYER, "second", true)), delivered,
+				"failed earlier STT releases the already-completed successor in sequence order");
+		engine.close();
+		return 2;
+	}
+
 	private static int verifyUnavailableSttRecoversAfterBackoff() {
 		int[] transcriptions = { 0 };
 		int[] decoders = { 0 };
@@ -513,6 +534,10 @@ final class SpeechCaptureEngineVerification {
 
 		private void complete(long sequence, String text) {
 			pending.get(sequence).complete(new SpeechWorkerClient.Transcript(text, 0.9));
+		}
+
+		private void fail(long sequence, Throwable failure) {
+			pending.get(sequence).completeExceptionally(failure);
 		}
 	}
 

@@ -257,56 +257,61 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			SpeechWorkerClient.Transcript transcript,
 			Throwable failure
 	) {
-		List<TranscriptOutcome> ready = new ArrayList<>();
+		Map<UUID, List<TranscriptOutcome>> readyByPlayer = new LinkedHashMap<>();
 		synchronized (this) {
 			if (closed || !ownsPlayerGeneration(utterance)) return;
 			if (isSttUnavailable(failure)) {
 				sttRetryAfterNanos = monotonicNanos.getAsLong() + STT_RETRY_BACKOFF_NANOS;
-				recordSkippedLocked(utterance);
+				recordOutcomeLocked(utterance, null, readyByPlayer);
 				for (Utterance active : utterances.values()) {
 					if (active.timeout != null) active.timeout.cancel(false);
 					try {
 						active.decoder.close();
 					} catch (RuntimeException ignored) {
 					}
-					recordSkippedLocked(new CompletedUtterance(
+					recordOutcomeLocked(new CompletedUtterance(
 							active.playerId, active.sequence, active.whispering, active.playerGeneration, new short[0],
 							active.deliveryExecutor, active.delivery, active.lastPacketNanos, monotonicNanos.getAsLong()
-					));
+					), null, readyByPlayer);
 				}
 				utterances.clear();
-				return;
-			}
-			if (failure == null) sttRetryAfterNanos = 0L;
-			TranscriptQueue queue = transcriptQueues.computeIfAbsent(utterance.playerId, ignored -> new TranscriptQueue());
-			queue.completed.put(utterance.sequence, new TranscriptOutcome(utterance, failure == null ? transcript : null));
-			while (true) {
-				TranscriptOutcome outcome = queue.completed.remove(queue.nextSequence);
-				if (outcome == null) break;
-				queue.nextSequence++;
-				if (outcome.transcript != null && !outcome.transcript.text().isBlank()) ready.add(outcome);
+			} else {
+				if (failure == null) sttRetryAfterNanos = 0L;
+				recordOutcomeLocked(utterance, failure == null ? transcript : null, readyByPlayer);
 			}
 		}
-		if (ready.isEmpty()) return;
-		try {
-			ready.getFirst().utterance.deliveryExecutor.execute(() -> {
-				for (TranscriptOutcome outcome : ready) {
-					outcome.utterance.delivery.deliver(
-							outcome.utterance.playerId,
-							outcome.transcript.text(),
-							outcome.utterance.whispering
-					);
-				}
-			});
-		} catch (RuntimeException ignored) {
-			// The Minecraft server may be stopping while transcription completes.
+		for (List<TranscriptOutcome> ready : readyByPlayer.values()) {
+			try {
+				ready.getFirst().utterance.deliveryExecutor.execute(() -> {
+					for (TranscriptOutcome outcome : ready) {
+						outcome.utterance.delivery.deliver(
+								outcome.utterance.playerId,
+								outcome.transcript.text(),
+								outcome.utterance.whispering
+						);
+					}
+				});
+			} catch (RuntimeException ignored) {
+				// The Minecraft server may be stopping while transcription completes.
+			}
 		}
 	}
 
-	private void recordSkippedLocked(CompletedUtterance utterance) {
+	private void recordOutcomeLocked(
+			CompletedUtterance utterance,
+			SpeechWorkerClient.Transcript transcript,
+			Map<UUID, List<TranscriptOutcome>> readyByPlayer
+	) {
 		TranscriptQueue queue = transcriptQueues.computeIfAbsent(utterance.playerId, ignored -> new TranscriptQueue());
-		queue.completed.put(utterance.sequence, new TranscriptOutcome(utterance, null));
-		while (queue.completed.remove(queue.nextSequence) != null) queue.nextSequence++;
+		queue.completed.put(utterance.sequence, new TranscriptOutcome(utterance, transcript));
+		while (true) {
+			TranscriptOutcome outcome = queue.completed.remove(queue.nextSequence);
+			if (outcome == null) break;
+			queue.nextSequence++;
+			if (outcome.transcript != null && !outcome.transcript.text().isBlank()) {
+				readyByPlayer.computeIfAbsent(utterance.playerId, ignored -> new ArrayList<>()).add(outcome);
+			}
+		}
 	}
 
 	void cancel(UUID playerId) {
