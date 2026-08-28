@@ -33,6 +33,19 @@ public final class AgentKillLedgerCodec {
 
 	public String encode(AgentKillLedger.Snapshot snapshot) {
 		JsonObject root = new JsonObject();
+		if (snapshot.legacyTimestampProgressMigration()) {
+			root.addProperty("schema_version", 1);
+			JsonArray events = new JsonArray();
+			for (AgentKillLedger.KillEvent event : snapshot.events()) {
+				JsonObject encoded = new JsonObject();
+				encoded.addProperty("agent_id", event.agentId().toString());
+				encoded.addProperty("entity_type", event.entityType());
+				encoded.addProperty("occurred_at_epoch_ms", event.occurredAtEpochMs());
+				events.add(encoded);
+			}
+			root.add("events", events);
+			return GSON.toJson(root);
+		}
 		root.addProperty("schema_version", snapshot.schemaVersion());
 		root.addProperty("last_sequence", snapshot.lastSequence());
 		JsonArray events = new JsonArray();
@@ -127,7 +140,7 @@ public final class AgentKillLedgerCodec {
 				}
 			}
 			return new AgentKillLedger.Snapshot(
-					AgentKillLedger.SCHEMA_VERSION, lastSequence, decoded, decodedProgress);
+					AgentKillLedger.SCHEMA_VERSION, lastSequence, decoded, decodedProgress, version == 1);
 		} catch (AgentDomainException exception) {
 			throw exception;
 		} catch (JsonParseException | IllegalStateException | IllegalArgumentException exception) {

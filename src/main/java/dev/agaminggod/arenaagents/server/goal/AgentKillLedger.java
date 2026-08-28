@@ -23,6 +23,7 @@ public final class AgentKillLedger {
 	private final Map<KillKey, List<ProgressKey>> progressByAgentAndType = new HashMap<>();
 	private final Runnable mutationListener;
 	private long lastSequence;
+	private boolean legacyTimestampProgressMigration;
 	private int lastLookupProbeCount;
 
 	public AgentKillLedger() {
@@ -33,6 +34,7 @@ public final class AgentKillLedger {
 		this.mutationListener = Objects.requireNonNull(mutationListener, "mutationListener must not be null");
 		Snapshot persisted = Objects.requireNonNull(snapshot, "snapshot must not be null");
 		lastSequence = persisted.lastSequence();
+		legacyTimestampProgressMigration = persisted.legacyTimestampProgressMigration();
 		long previousSequence = 0L;
 		for (KillEvent event : persisted.events()) {
 			if (event.sequence() <= previousSequence || event.sequence() > lastSequence) {
@@ -105,7 +107,8 @@ public final class AgentKillLedger {
 				lastSequence,
 				kills.stream().map(kill -> new KillEvent(
 						kill.key().agentId(), kill.key().entityType(), kill.occurredAt(), kill.sequence())).toList(),
-				persistedProgress
+				persistedProgress,
+				legacyTimestampProgressMigration
 		);
 	}
 
@@ -115,30 +118,45 @@ public final class AgentKillLedger {
 
 	public synchronized void synchronizeProgress(List<KillProgressRequirement> requirements) {
 		Objects.requireNonNull(requirements, "requirements must not be null");
-		Map<ProgressKey, Integer> desired = new HashMap<>();
+		Map<ProgressKey, KillProgressRequirement> desired = new HashMap<>();
 		for (KillProgressRequirement requirement : requirements) {
 			ProgressKey key = new ProgressKey(
 					requirement.goalId(), requirement.agentId(), requirement.entityType(), requirement.afterGoalStart());
-			desired.merge(key, requirement.requiredCount(), Math::max);
+			desired.merge(key, requirement, (left, right) -> left.requiredCount() >= right.requiredCount() ? left : right);
 		}
 		if (desired.size() > MAX_PROGRESS_ENTRIES) {
 			throw new IllegalArgumentException("Active kill-goal progress exceeds the bounded limit");
 		}
 		Map<ProgressKey, Progress> next = new HashMap<>();
-		for (Map.Entry<ProgressKey, Integer> entry : desired.entrySet()) {
+		for (Map.Entry<ProgressKey, KillProgressRequirement> entry : desired.entrySet()) {
 			Progress previous = progress.get(entry.getKey());
-			int credited = previous == null ? 0 : Math.min(previous.evictedCount(), entry.getValue());
+			int requiredCount = entry.getValue().requiredCount();
+			int credited = previous == null ? 0 : Math.min(previous.evictedCount(), requiredCount);
 			long boundary = previous == null
-					? (entry.getKey().afterGoalStart() ? lastSequence : 0L)
+					? initialBoundary(entry.getKey(), entry.getValue())
 					: previous.afterSequenceExclusive();
-			next.put(entry.getKey(), new Progress(entry.getValue(), credited, boundary));
+			next.put(entry.getKey(), new Progress(requiredCount, credited, boundary));
 		}
-		if (!next.equals(progress)) {
+		boolean completedLegacyMigration = legacyTimestampProgressMigration;
+		legacyTimestampProgressMigration = false;
+		if (!next.equals(progress) || completedLegacyMigration) {
 			progress.clear();
 			progress.putAll(next);
 			rebuildProgressIndex();
 			mutationListener.run();
 		}
+	}
+
+	private long initialBoundary(ProgressKey key, KillProgressRequirement requirement) {
+		if (!key.afterGoalStart()) return 0L;
+		if (!legacyTimestampProgressMigration) return lastSequence;
+		long boundary = 0L;
+		for (Kill kill : kills) {
+			if (kill.occurredAt() <= requirement.goalStartedAtEpochMs()) {
+				boundary = Math.max(boundary, kill.sequence());
+			}
+		}
+		return boundary;
 	}
 
 	private void rebuildProgressIndex() {
@@ -203,8 +221,16 @@ public final class AgentKillLedger {
 	}
 
 	public record Snapshot(
-			int schemaVersion, long lastSequence, List<KillEvent> events, List<ProgressEvent> progress
+			int schemaVersion,
+			long lastSequence,
+			List<KillEvent> events,
+			List<ProgressEvent> progress,
+			boolean legacyTimestampProgressMigration
 	) {
+		public Snapshot(int schemaVersion, long lastSequence, List<KillEvent> events, List<ProgressEvent> progress) {
+			this(schemaVersion, lastSequence, events, progress, false);
+		}
+
 		public Snapshot {
 			if (schemaVersion != SCHEMA_VERSION) {
 				throw new IllegalArgumentException("Unsupported kill ledger schema: " + schemaVersion);
@@ -217,6 +243,9 @@ public final class AgentKillLedger {
 			}
 			if (progress.size() > MAX_PROGRESS_ENTRIES) {
 				throw new IllegalArgumentException("Kill ledger exceeds the bounded progress limit");
+			}
+			if (legacyTimestampProgressMigration && !progress.isEmpty()) {
+				throw new IllegalArgumentException("Legacy timestamp migration cannot contain compacted progress");
 			}
 			if (events.stream().anyMatch(event -> event.sequence() > lastSequence)
 					|| progress.stream().anyMatch(entry -> entry.afterSequenceExclusive() > lastSequence)) {
@@ -238,17 +267,17 @@ public final class AgentKillLedger {
 	}
 
 	public record KillProgressRequirement(
-			UUID goalId, AgentId agentId, String entityType, boolean afterGoalStart, int requiredCount
+			UUID goalId,
+			AgentId agentId,
+			String entityType,
+			boolean afterGoalStart,
+			long goalStartedAtEpochMs,
+			int requiredCount
 	) {
 		public KillProgressRequirement {
-			Objects.requireNonNull(goalId, "goalId must not be null");
-			Objects.requireNonNull(agentId, "agentId must not be null");
-			Objects.requireNonNull(entityType, "entityType must not be null");
-			if (!entityType.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
-				throw new IllegalArgumentException("entityType must be namespaced");
-			}
-			if (requiredCount <= 0 || requiredCount > 16) {
-				throw new IllegalArgumentException("requiredCount must be between 1 and 16");
+			validateProgressIdentity(goalId, agentId, entityType, requiredCount);
+			if (goalStartedAtEpochMs < 0L || afterGoalStart && goalStartedAtEpochMs == 0L) {
+				throw new IllegalArgumentException("goalStartedAtEpochMs must identify a positive active-goal boundary");
 			}
 		}
 	}
@@ -258,7 +287,7 @@ public final class AgentKillLedger {
 			long afterSequenceExclusive, int requiredCount, int evictedCount
 	) {
 		public ProgressEvent {
-			new KillProgressRequirement(goalId, agentId, entityType, afterGoalStart, requiredCount);
+			validateProgressIdentity(goalId, agentId, entityType, requiredCount);
 			if (afterSequenceExclusive < 0L) {
 				throw new IllegalArgumentException("afterSequenceExclusive must be nonnegative");
 			}
@@ -268,6 +297,20 @@ public final class AgentKillLedger {
 			if (evictedCount < 0 || evictedCount > requiredCount) {
 				throw new IllegalArgumentException("evictedCount must be between zero and requiredCount");
 			}
+		}
+	}
+
+	private static void validateProgressIdentity(
+			UUID goalId, AgentId agentId, String entityType, int requiredCount
+	) {
+		Objects.requireNonNull(goalId, "goalId must not be null");
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Objects.requireNonNull(entityType, "entityType must not be null");
+		if (!entityType.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
+			throw new IllegalArgumentException("entityType must be namespaced");
+		}
+		if (requiredCount <= 0 || requiredCount > 16) {
+			throw new IllegalArgumentException("requiredCount must be between 1 and 16");
 		}
 	}
 

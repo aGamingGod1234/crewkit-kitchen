@@ -39,7 +39,7 @@ public final class GoalCompiler {
 	private static final Pattern ADVANCEMENT_NAME_PREFIX = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement (.+)$");
 	private static final Pattern ADVANCEMENT_NAME_SUFFIX = Pattern.compile("^(?:complete|get|earn) (?:the )?(.+?) advancement$");
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:(?:the|a|an) )?(.+)$");
-	private static final Pattern KILL_COUNT = Pattern.compile("^\\d+\\s+(.+)$");
+	private static final Pattern KILL_COUNT = Pattern.compile("^([+-]?\\d+)\\s+(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
@@ -139,6 +139,8 @@ public final class GoalCompiler {
 					"Goal set: defeat minecraft:ender_dragon.");
 		}
 		if (kill.matches()) {
+			TranslationLeafBudget budget = killLeafBudget(kill.group(1));
+			if (!budget.valid()) return GoalCompilation.rejected(budget.rejection());
 			List<String> matches = matchEntities(kill.group(1), registries);
 			if (matches.size() == 1) {
 				String entityId = matches.getFirst();
@@ -247,6 +249,7 @@ public final class GoalCompiler {
 		String command = stripTrailingPunctuation(stripPoliteness(
 				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
 		List<GoalClause> clauses = compoundClauses(command);
+		if (!candidateTranslationBudget(command, clauses).valid()) return List.of();
 		if (clauses.size() > 1) {
 			TreeSet<String> candidates = new TreeSet<>();
 			for (GoalClause clause : clauses) {
@@ -320,6 +323,8 @@ public final class GoalCompiler {
 		if (clauses.size() > MAX_COMPOUND_LEAVES) {
 			return GoalCompilation.rejected("A compound goal may contain at most " + MAX_COMPOUND_LEAVES + " factual results.");
 		}
+		TranslationLeafBudget budget = compoundTranslationBudget(clauses);
+		if (!budget.valid()) return GoalCompilation.rejected(budget.rejection());
 		if (clauses.stream().anyMatch(clause -> clause.kind() != ClauseKind.ITEM && clause.kind() != ClauseKind.KILL)) {
 			return GoalCompilation.needsTranslation("Confirm the exact factual results for this compound goal.");
 		}
@@ -448,7 +453,83 @@ public final class GoalCompiler {
 
 	private static String stripKillCount(String target) {
 		Matcher counted = KILL_COUNT.matcher(target);
-		return counted.matches() ? counted.group(1) : target;
+		return counted.matches() ? counted.group(2) : target;
+	}
+
+	private static TranslationLeafBudget candidateTranslationBudget(String command, List<GoalClause> clauses) {
+		if (clauses.size() > 1) return compoundTranslationBudget(clauses);
+		Matcher kill = KILL.matcher(command);
+		return kill.matches() && !BEAT_GAME.matcher(command).matches()
+				? killLeafBudget(kill.group(1))
+				: TranslationLeafBudget.valid(0);
+	}
+
+	private static TranslationLeafBudget compoundTranslationBudget(List<GoalClause> clauses) {
+		if (clauses.size() > MAX_COMPOUND_LEAVES) return TranslationLeafBudget.overBudget();
+		int leaves = 0;
+		for (GoalClause clause : clauses) {
+			TranslationLeafBudget clauseBudget = switch (clause.kind()) {
+				case KILL -> killLeafBudget(clause.target());
+				case ITEM -> alternativeLeafBudget(clause.target());
+				default -> TranslationLeafBudget.valid(1);
+			};
+			if (!clauseBudget.valid()) return clauseBudget;
+			leaves += clauseBudget.leaves();
+			if (leaves > MAX_COMPOUND_LEAVES) return TranslationLeafBudget.overBudget();
+		}
+		return TranslationLeafBudget.valid(leaves);
+	}
+
+	private static TranslationLeafBudget alternativeLeafBudget(String target) {
+		String[] alternatives = target.split("\\s+or\\s+", -1);
+		if (alternatives.length > MAX_COMPOUND_LEAVES) return TranslationLeafBudget.overBudget();
+		for (String alternative : alternatives) {
+			if (alternative.isBlank()) return TranslationLeafBudget.overBudget();
+		}
+		return TranslationLeafBudget.valid(alternatives.length);
+	}
+
+	private static TranslationLeafBudget killLeafBudget(String target) {
+		String[] alternatives = target.split("\\s+or\\s+", -1);
+		int leaves = 0;
+		for (String alternative : alternatives) {
+			Matcher counted = KILL_COUNT.matcher(alternative.strip());
+			int count = 1;
+			if (counted.matches()) {
+				try {
+					java.math.BigInteger parsed = new java.math.BigInteger(counted.group(1));
+					if (parsed.signum() <= 0) return TranslationLeafBudget.nonpositive();
+					if (parsed.compareTo(java.math.BigInteger.valueOf(MAX_COMPOUND_LEAVES)) > 0) {
+						return TranslationLeafBudget.overBudget();
+					}
+					count = parsed.intValueExact();
+				} catch (NumberFormatException | ArithmeticException exception) {
+					return TranslationLeafBudget.overBudget();
+				}
+			}
+			leaves += count;
+			if (leaves > MAX_COMPOUND_LEAVES) return TranslationLeafBudget.overBudget();
+		}
+		return TranslationLeafBudget.valid(leaves);
+	}
+
+	private record TranslationLeafBudget(int leaves, String rejection) {
+		private boolean valid() {
+			return rejection.isEmpty();
+		}
+
+		private static TranslationLeafBudget valid(int leaves) {
+			return new TranslationLeafBudget(leaves, "");
+		}
+
+		private static TranslationLeafBudget nonpositive() {
+			return new TranslationLeafBudget(0, "The requested kill count must be positive.");
+		}
+
+		private static TranslationLeafBudget overBudget() {
+			return new TranslationLeafBudget(0,
+					"The requested kills exceed the limit of " + MAX_COMPOUND_LEAVES + " factual results.");
+		}
 	}
 
 	private static List<String> relatedCandidates(ClauseKind kind, String rawTarget, RegistryAccess registries) {

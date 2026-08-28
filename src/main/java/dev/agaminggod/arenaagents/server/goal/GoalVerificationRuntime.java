@@ -210,7 +210,7 @@ public final class GoalVerificationRuntime {
 			for (Map.Entry<KillRequirementKey, Integer> entry : requiredByEntity.entrySet()) {
 				requirements.add(new AgentKillLedger.KillProgressRequirement(
 						goal.goalId(), record.agentId(), entry.getKey().entityType(),
-						entry.getKey().afterGoalStart(), entry.getValue()));
+						entry.getKey().afterGoalStart(), goal.createdAtEpochMs(), entry.getValue()));
 			}
 			collectSurvivalRequirements(
 					goal.goalId(), record.agentId(), goal.spec().completion(), "root", survivalRequirements);

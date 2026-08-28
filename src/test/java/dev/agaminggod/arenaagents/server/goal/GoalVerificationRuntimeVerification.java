@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.goal;
 
 import com.mojang.serialization.Codec;
+import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentDeathSnapshot;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
@@ -39,6 +40,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyDistinctRepeatedKillAttribution();
 		assertions += verifyKillGoalAfterServerTickReset();
 		assertions += verifyPersistedKillProgressAcrossRestart();
+		assertions += verifyLegacySchemaOneActiveKillProgressMigration();
 		assertions += verifyActiveKillProgressSurvivesLedgerEviction();
 		assertions += verifyPersistedKillActivationFencing();
 		assertions += verifyKillLedgerPersistenceCompatibility();
@@ -296,6 +298,51 @@ public final class GoalVerificationRuntimeVerification {
 		return 4;
 	}
 
+	private static int verifyLegacySchemaOneActiveKillProgressMigration() {
+		long goalStartedAt = 42_000L;
+		AgentSavedData data = new AgentSavedData();
+		AgentRecord idle = data.registry().create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, goalStartedAt - 1L);
+		GoalPredicate repeatedKills = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)
+		));
+		data.registry().start(idle.agentId(), GoalSpec.create("Kill two zombies", repeatedKills, 910L), goalStartedAt);
+
+		String schemaOne = "{\"schema_version\":1,\"events\":["
+				+ "{\"agent_id\":\"" + idle.agentId()
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":" + (goalStartedAt - 1L) + "},"
+				+ "{\"agent_id\":\"" + idle.agentId()
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":" + (goalStartedAt + 1L) + "}]}";
+		AgentKillLedgerCodec codec = new AgentKillLedgerCodec();
+		AgentKillLedger.Snapshot pendingMigration = codec.decode(schemaOne);
+		assertEquals(1, JsonParser.parseString(codec.encode(pendingMigration)).getAsJsonObject()
+				.get("schema_version").getAsInt(),
+				"a save before runtime synchronization retains the schema-one migration boundary");
+
+		int[] mutations = { 0 };
+		AgentKillLedger migrated = new AgentKillLedger(
+				codec.decode(codec.encode(pendingMigration)), () -> mutations[0]++);
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				data.registry(), ignored -> Optional.of(new FakeFacts()), () -> 910L, () -> goalStartedAt + 2L,
+				migrated);
+		UUID goalId = data.registry().require(idle.agentId()).currentGoal().orElseThrow().goalId();
+		assertEquals(1, migrated.count(goalId, idle.agentId(), "minecraft:zombie", true),
+				"schema-one migration keeps the qualifying post-activation kill as partial progress");
+		assertEquals(false, runtime.evaluate(idle.agentId()).verified(),
+				"one migrated kill cannot satisfy a two-kill active goal");
+		migrated.record(idle.agentId(), "minecraft:zombie", goalStartedAt + 2L);
+		assertEquals(true, runtime.evaluate(idle.agentId()).verified(),
+				"one new kill combines with migrated schema-one partial progress");
+		assertEquals(3, JsonParser.parseString(codec.encode(migrated.snapshot())).getAsJsonObject()
+				.get("schema_version").getAsInt(),
+				"completed migration persists the sequence-fenced schema");
+		assertEquals(true, mutations[0] >= 1,
+				"consuming the migration boundary dirties saved data");
+		return 6;
+	}
+
 	private static int verifyPersistedKillActivationFencing() {
 		AgentSavedData data = new AgentSavedData();
 		long now = 50_000L;
@@ -409,7 +456,7 @@ public final class GoalVerificationRuntimeVerification {
 				+ "\"required_count\":1,\"evicted_count\":0}]}";
 		AgentKillLedger migrated = new AgentKillLedger(codec.decode(schemaTwo), () -> { });
 		migrated.synchronizeProgress(List.of(new AgentKillLedger.KillProgressRequirement(
-				legacyGoalId, agentId, "minecraft:zombie", true, 1)));
+				legacyGoalId, agentId, "minecraft:zombie", true, 7L, 1)));
 		assertEquals(0, migrated.count(legacyGoalId, agentId, "minecraft:zombie", true),
 				"schema-two timestamps migrate to an exclusive sequence boundary");
 		migrated.record(agentId, "minecraft:zombie", 7L);

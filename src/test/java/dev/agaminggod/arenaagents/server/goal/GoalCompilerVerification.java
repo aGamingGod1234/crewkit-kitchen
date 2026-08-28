@@ -38,6 +38,7 @@ public final class GoalCompilerVerification {
 		assertions += verifyInventoryCapacity();
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyCompoundItemsAndKills();
+		assertions += verifyKillCountTranslationBounds();
 		assertions += verifyExplicitAlternativeCandidates();
 		assertions += verifyDraftRoundTrip();
 		assertions += verifyWorldValidation();
@@ -488,6 +489,58 @@ public final class GoalCompilerVerification {
 				"alternative candidate unions retain the draft schema limit"
 		);
 		return 10;
+	}
+
+	private static int verifyKillCountTranslationBounds() {
+		GoalCompiler compiler = new GoalCompiler();
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Kill 0 zombies", RegistryAccess.EMPTY, 1_200L).kind(),
+				"zero kills are rejected before translation");
+		assertEquals(List.of(), compiler.candidateIdsFor("Kill 0 zombies", RegistryAccess.EMPTY),
+				"zero kills publish no entity candidates");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Kill -1 zombies", RegistryAccess.EMPTY, 1_200L).kind(),
+				"negative kills are rejected before translation");
+		assertEquals(List.of(), compiler.candidateIdsFor("Kill -1 zombies", RegistryAccess.EMPTY),
+				"negative kills publish no entity candidates");
+		assertEquals(List.of("minecraft:zombie"),
+				compiler.candidateIdsFor("Kill 16 zombies", RegistryAccess.EMPTY),
+				"the exact sixteen-leaf boundary remains translatable");
+		assertEquals(List.of(), compiler.candidateIdsFor("Kill 17 zombies", RegistryAccess.EMPTY),
+				"a count above the predicate leaf limit publishes no candidates");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Kill 17 zombies", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a count above the predicate leaf limit is rejected");
+		assertEquals(
+				List.of("minecraft:skeleton", "minecraft:wither_skeleton", "minecraft:zombie"),
+				compiler.candidateIdsFor("Kill 8 zombies or 8 skeletons", RegistryAccess.EMPTY),
+				"counted alternatives may consume exactly sixteen leaves");
+		assertEquals(List.of(),
+				compiler.candidateIdsFor("Kill 8 zombies or 9 skeletons", RegistryAccess.EMPTY),
+				"counted alternatives cannot exceed sixteen leaves in total");
+		assertEquals(
+				List.of("minecraft:apple", "minecraft:enchanted_golden_apple", "minecraft:golden_apple", "minecraft:zombie"),
+				compiler.candidateIdsFor("Get an apple and kill 15 zombies", RegistryAccess.EMPTY),
+				"a compound request may consume exactly sixteen leaves");
+		assertEquals(List.of(),
+				compiler.candidateIdsFor("Get an apple and kill 16 zombies", RegistryAccess.EMPTY),
+				"compound non-kill leaves count against the translation limit");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get an apple and kill 16 zombies", RegistryAccess.EMPTY, 1_200L).kind(),
+				"an over-budget compound count is rejected before translation");
+		assertEquals(
+				List.of("minecraft:diamond_pickaxe", "minecraft:iron_pickaxe", "minecraft:zombie"),
+				compiler.candidateIdsFor(
+						"Get an iron or diamond pickaxe and kill 14 zombies", RegistryAccess.EMPTY),
+				"item alternatives and counted kills may consume exactly sixteen leaves");
+		assertEquals(List.of(),
+				compiler.candidateIdsFor(
+						"Get an iron or diamond pickaxe and kill 15 zombies", RegistryAccess.EMPTY),
+				"item alternatives count separately from kill leaves in a compound translation");
+		assertEquals(List.of(),
+				compiler.candidateIdsFor("Kill 8 zombies and 9 skeletons", RegistryAccess.EMPTY),
+				"separate counted kill clauses cannot exceed the shared leaf limit");
+		return 15;
 	}
 
 	private static int verifyDraftRoundTrip() {
