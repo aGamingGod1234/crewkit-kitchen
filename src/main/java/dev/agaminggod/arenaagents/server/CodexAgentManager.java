@@ -17,6 +17,7 @@ import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
 import dev.agaminggod.arenaagents.server.goal.GoalDraftResolution;
 import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
 import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
+import dev.agaminggod.arenaagents.server.goal.GoalPredicateWorldValidator;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntities;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntity;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
@@ -205,9 +206,9 @@ public final class CodexAgentManager {
 		}
 	}
 
-	public AgentTransition start(String selector, String prompt) {
+	public AgentTransition start(String selector, String prompt, ServerLevel sourceLevel) {
 		AgentRecord record = resolve(selector);
-		return savedData.registry().start(record.agentId(), compileGoal(prompt), System.currentTimeMillis());
+		return savedData.registry().start(record.agentId(), compileGoal(prompt, sourceLevel), System.currentTimeMillis());
 	}
 
 	public AgentTransition startSubjective(String selector, String prompt) {
@@ -218,11 +219,12 @@ public final class CodexAgentManager {
 	public AgentTransition startAtomically(
 			AgentId agentId,
 			String prompt,
+			ServerLevel sourceLevel,
 			BiConsumer<AgentTransition, Runnable> publicationBarrier
 	) {
 		return savedData.registry().startAtomically(
 				Objects.requireNonNull(agentId, "agentId must not be null"),
-				compileGoal(prompt),
+				compileGoal(prompt, sourceLevel),
 				System.currentTimeMillis(),
 				Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null")
 		);
@@ -304,8 +306,13 @@ public final class CodexAgentManager {
 		}
 		AgentRecord record = savedData.registry().require(draft.agentId());
 		if (!draft.matches(record)) throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
+		dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate = draft.proposedPredicate().orElseThrow();
+		if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
+			GoalPredicateWorldValidator.validate(
+					GoalPredicateWorldValidator.requireLevel(server, draft.dimensionId()), predicate);
+		}
 		GoalSpec spec = GoalSpec.create(
-				draft.originalRequest(), draft.proposedPredicate().orElseThrow(), draft.createdAtTick());
+				draft.originalRequest(), predicate, draft.createdAtTick());
 		long now = System.currentTimeMillis();
 		AgentTransition transition = switch (operation) {
 			case START -> savedData.registry().start(draft.agentId(), spec, now);
@@ -346,17 +353,18 @@ public final class CodexAgentManager {
 		return savedData.registry().resume(record.agentId(), System.currentTimeMillis());
 	}
 
-	public AgentTransition queue(String selector, String prompt) {
+	public AgentTransition queue(String selector, String prompt, ServerLevel sourceLevel) {
 		AgentRecord record = resolve(selector);
-		return savedData.registry().queue(record.agentId(), compileGoal(prompt), System.currentTimeMillis());
+		return savedData.registry().queue(record.agentId(), compileGoal(prompt, sourceLevel), System.currentTimeMillis());
 	}
 
-	private GoalSpec compileGoal(String prompt) {
+	private GoalSpec compileGoal(String prompt, ServerLevel sourceLevel) {
 		GoalCompilation compilation = goalCompiler.compile(
 				prompt,
 				server.registryAccess(),
 				server.getTickCount(),
-				id -> server.getAdvancements().get(net.minecraft.resources.Identifier.parse(id)) != null
+				id -> server.getAdvancements().get(net.minecraft.resources.Identifier.parse(id)) != null,
+				Objects.requireNonNull(sourceLevel, "sourceLevel must not be null")
 		);
 		return compilation.acceptedSpec().orElseThrow(() -> new AgentDomainException(
 				"GOAL_REQUIRES_CLARIFICATION",

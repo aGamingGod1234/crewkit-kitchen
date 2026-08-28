@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import java.util.Optional;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import net.minecraft.core.RegistryAccess;
 
@@ -23,6 +24,7 @@ public final class GoalCompilerVerification {
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyCompoundItemsAndKills();
 		assertions += verifyDraftRoundTrip();
+		assertions += verifyWorldValidation();
 		assertions += verifyDraftRevisionBinding();
 		assertions += verifyDraftAuthorizationAndChoices();
 		assertions += verifySpecAwareLifecycleStart();
@@ -187,6 +189,7 @@ public final class GoalCompilerVerification {
 				new AgentId(UUID.fromString("00000000-0000-0000-0000-000000000102")),
 				UUID.fromString("00000000-0000-0000-0000-000000000103"),
 				"Get a good pickaxe",
+				"minecraft:the_nether",
 				List.of("minecraft:diamond_pickaxe", "minecraft:iron_pickaxe"),
 				Optional.of(new GoalPredicate.AnyOf(java.util.List.of(
 						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1),
@@ -204,7 +207,42 @@ public final class GoalCompilerVerification {
 				codec.decode(codec.encode(draft.withProposedPredicate(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)))),
 				"atomic proposal replacement retains draft identity and candidate IDs"
 		);
-		return 2;
+		String legacy = codec.encode(draft).replace("\"dimension_id\":\"minecraft:the_nether\",", "");
+		assertEquals(GoalPredicate.DEFAULT_DIMENSION, codec.decode(legacy).dimensionId(),
+				"legacy persisted drafts retain their historical Overworld interpretation");
+		return 3;
+	}
+
+	private static int verifyWorldValidation() {
+		GoalPredicate translated = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.PositionWithin(12, 64, -8, 1, 20),
+				new GoalPredicate.BlockMatches(12, 64, -8, "minecraft:oak_stairs", Map.of("facing", "north"))
+		));
+		GoalPredicate bound = GoalPredicateWorldValidator.bindToDimension(translated, "minecraft:the_nether");
+		GoalPredicate.AllOf compound = (GoalPredicate.AllOf) bound;
+		assertEquals("minecraft:the_nether", ((GoalPredicate.PositionWithin) compound.predicates().get(0)).dimensionId(),
+				"translated position binds to the requester's live dimension");
+		assertEquals("minecraft:the_nether", ((GoalPredicate.BlockMatches) compound.predicates().get(1)).dimensionId(),
+				"translated block binds to the requester's live dimension");
+		GoalPredicateWorldValidator.validate("minecraft:the_nether", y -> y >= 0 && y < 128, bound);
+		assertTrue(GoalPredicateWorldValidator.requiresLiveLevel(bound),
+				"spatial compounds require a live dimension before staging or activation");
+		expectCode("GOAL_COORDINATES_OUT_OF_BUILD_HEIGHT", () -> GoalPredicateWorldValidator.validate(
+				"minecraft:overworld", y -> y >= -64 && y < 320,
+				new GoalPredicate.PositionWithin("minecraft:overworld", 0, 1_000, 0, 1, 20)),
+				"coordinates outside the selected dimension build height are rejected");
+		expectCode("GOAL_DIMENSION_MISMATCH", () -> GoalPredicateWorldValidator.validate(
+				"minecraft:the_nether", y -> true,
+				new GoalPredicate.PositionWithin("minecraft:overworld", 0, 64, 0, 1, 20)),
+				"a spatial predicate cannot escape its selected dimension");
+		GoalPredicateWorldValidator.validateBlockProperties("minecraft:oak_stairs", Map.of("facing", "north"));
+		expectCode("INVALID_GOAL_BLOCK_PROPERTY", () -> GoalPredicateWorldValidator.validateBlockProperties(
+				"minecraft:oak_stairs", Map.of("imaginary", "north")),
+				"unknown block-state properties are rejected before staging");
+		expectCode("INVALID_GOAL_BLOCK_PROPERTY_VALUE", () -> GoalPredicateWorldValidator.validateBlockProperties(
+				"minecraft:oak_stairs", Map.of("facing", "upwards")),
+				"unknown block-state values are rejected before staging");
+		return 7;
 	}
 
 	private static int verifySpecAwareLifecycleStart() {

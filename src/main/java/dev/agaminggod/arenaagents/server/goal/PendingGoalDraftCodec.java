@@ -18,9 +18,13 @@ import java.util.UUID;
 
 public final class PendingGoalDraftCodec {
 	private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
-	private static final Set<String> FIELDS = Set.of(
+	private static final Set<String> LEGACY_FIELDS = Set.of(
 			"draft_id", "agent_id", "requesting_player_id", "original_request", "candidate_ids", "proposed_predicate", "intent", "created_at_tick",
 			"expected_goal_revision", "expected_goal_id"
+	);
+	private static final Set<String> FIELDS = Set.of(
+			"draft_id", "agent_id", "requesting_player_id", "original_request", "dimension_id", "candidate_ids", "proposed_predicate", "intent",
+			"created_at_tick", "expected_goal_revision", "expected_goal_id"
 	);
 	private final GoalSpecCodec goalCodec = new GoalSpecCodec();
 
@@ -30,6 +34,7 @@ public final class PendingGoalDraftCodec {
 		json.addProperty("agent_id", draft.agentId().toString());
 		json.addProperty("requesting_player_id", draft.requestingPlayerId().toString());
 		json.addProperty("original_request", draft.originalRequest());
+		json.addProperty("dimension_id", draft.dimensionId());
 		json.add("candidate_ids", GSON.toJsonTree(draft.candidateIds()));
 		draft.proposedPredicate().ifPresentOrElse(
 				predicate -> json.add("proposed_predicate", goalCodec.encodePredicateObject(predicate)),
@@ -48,7 +53,8 @@ public final class PendingGoalDraftCodec {
 	public PendingGoalDraft decode(String encoded) {
 		try {
 			JsonObject json = object(JsonParser.parseString(encoded), "draft");
-			if (!json.keySet().equals(FIELDS)) throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Draft fields differ from the closed schema");
+			boolean legacy = json.keySet().equals(LEGACY_FIELDS);
+			if (!legacy && !json.keySet().equals(FIELDS)) throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Draft fields differ from the closed schema");
 			JsonElement proposed = field(json, "proposed_predicate");
 			Optional<GoalPredicate> predicate = proposed.isJsonNull()
 					? Optional.empty()
@@ -59,6 +65,7 @@ public final class PendingGoalDraftCodec {
 					AgentId.parse(string(json, "agent_id")),
 					uuid(string(json, "requesting_player_id"), "requesting_player_id"),
 					string(json, "original_request"),
+					legacy ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimension_id"),
 					strings(json, "candidate_ids"),
 					predicate,
 					enumeration(DraftIntent.class, string(json, "intent"), "intent"),

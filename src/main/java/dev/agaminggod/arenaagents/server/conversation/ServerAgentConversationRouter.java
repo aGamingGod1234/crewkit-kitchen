@@ -20,6 +20,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 
 public final class ServerAgentConversationRouter implements AgentConversationRouter {
@@ -176,7 +177,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 					System.currentTimeMillis(),
 					0L,
 					dimensionId(source)
-			));
+			), source.level());
 			delivered.add(target.agentId().toString());
 		}
 		return new DeliveryReceipt(List.copyOf(delivered), List.of());
@@ -236,13 +237,13 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 			}
 			if (deliverToAgents && participant.agentRecord() != null
 					&& !event.sourceId().equals(participant.agentRecord().agentId().toString())) {
-				publishToAgent(participant.agentRecord(), event);
+				publishToAgent(participant.agentRecord(), event, source.level());
 			}
 		}
 		return receipt;
 	}
 
-	private void publishToAgent(AgentRecord target, ConversationEvent source) {
+	private void publishToAgent(AgentRecord target, ConversationEvent source, ServerLevel sourceLevel) {
 		if ((source.kind() == ConversationKind.PLAYER_MESSAGE || source.kind() == ConversationKind.PROXIMITY_SPEECH)
 				&& target.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.PAUSED
 				&& isSteeringPhrase(source.text())) {
@@ -261,13 +262,17 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				sequence,
 				source.dimensionId()
 		);
-		GoalRoute route = routePlayerGoal(target, delivered);
+		GoalRoute route = routePlayerGoal(target, delivered, sourceLevel);
 		if (route.publish()) eventSink.publish(delivered, route.wakeSpec());
 	}
 
-	private GoalRoute routePlayerGoal(AgentRecord target, ConversationEvent event) {
+	private GoalRoute routePlayerGoal(AgentRecord target, ConversationEvent event, ServerLevel sourceLevel) {
 		if (event.kind() != ConversationKind.PLAYER_MESSAGE && event.kind() != ConversationKind.PROXIMITY_SPEECH) {
 			return GoalRoute.EVENT_ONLY;
+		}
+		if (!sourceLevel.dimension().identifier().toString().equals(event.dimensionId())) {
+			throw new AgentDomainException("GOAL_SOURCE_DIMENSION_CHANGED",
+					"The requester's live dimension changed before the goal could be compiled");
 		}
 		// Replace/queue is an explicit /agent goal choice, not inferred from live speech.
 		if (!GoalCompiler.consumePlayerSpeechAsGoal(target.currentGoal().isPresent(), event.text(), false)) {
@@ -276,14 +281,15 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 
 		GoalCompilation compilation = goalCompiler.compile(
 				event.text(), manager.server().registryAccess(), manager.server().getTickCount(),
-				id -> manager.server().getAdvancements().get(net.minecraft.resources.Identifier.parse(id)) != null
+				id -> manager.server().getAdvancements().get(net.minecraft.resources.Identifier.parse(id)) != null,
+				Objects.requireNonNull(sourceLevel, "sourceLevel must not be null")
 		);
 
 		if (!ConversationWakePolicy.shouldStartGoal(target.state(), event.kind())) return GoalRoute.EVENT_ONLY;
 		if (compilation.kind() == GoalCompilation.Kind.ACCEPTED) {
 			return new GoalRoute(true, compilation.acceptedSpec());
 		}
-		PendingGoalDraft draft = draft(target, event, Optional.empty(), DraftIntent.CONFIRM_TRANSLATION);
+		PendingGoalDraft draft = draft(target, event, sourceLevel, Optional.empty(), DraftIntent.CONFIRM_TRANSLATION);
 		manager.stageGoalDraft(draft);
 		goalSpecRequestSink.publish(draft);
 		notifyRequester(draft, compilation.playerMessage() + " Draft " + draft.draftId() + " is waiting for clarification.");
@@ -293,6 +299,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 	private PendingGoalDraft draft(
 			AgentRecord target,
 			ConversationEvent event,
+			ServerLevel sourceLevel,
 			Optional<dev.agaminggod.arenaagents.agent.goal.GoalPredicate> proposed,
 			DraftIntent intent
 	) {
@@ -304,6 +311,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		}
 		return new PendingGoalDraft(
 				UUID.randomUUID(), target.agentId(), playerId, event.text(),
+				sourceLevel.dimension().identifier().toString(),
 				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess()), proposed, intent,
 				manager.server().getTickCount(), target.goalRevision(), target.currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId)
 		);

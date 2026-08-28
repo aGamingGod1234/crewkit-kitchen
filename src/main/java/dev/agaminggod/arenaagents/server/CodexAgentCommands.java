@@ -22,6 +22,7 @@ import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
@@ -121,7 +122,7 @@ public final class CodexAgentCommands {
 								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::respawn)))
 						.then(promptCommand("queue", CodexAgentManager::queue))
-						.then(promptCommand("steer", CodexAgentManager::steer))
+						.then(promptCommand("steer", (manager, selector, prompt, ignored) -> manager.steer(selector, prompt)))
 						.then(Commands.literal("status")
 								.requires(GoalControl::mayControl)
 								.executes(CodexAgentCommands::statusAll)
@@ -377,7 +378,7 @@ public final class CodexAgentCommands {
 			CodexAgentServerRuntime.requireAutomation(context.getSource().getServer());
 			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
 			String prompt = StringArgumentType.getString(context, ARGUMENT_PROMPT);
-			AgentTransition transition = operation.apply(manager(context), selector, prompt);
+			AgentTransition transition = operation.apply(manager(context), selector, prompt, context.getSource().getLevel());
 			reportTransition(context, operationName, transition);
 			return 1;
 		} catch (AgentDomainException exception) {
@@ -635,7 +636,7 @@ public final class CodexAgentCommands {
 
 	@FunctionalInterface
 	private interface PromptOperation {
-		AgentTransition apply(CodexAgentManager manager, String selector, String prompt);
+		AgentTransition apply(CodexAgentManager manager, String selector, String prompt, ServerLevel sourceLevel);
 	}
 
 	@FunctionalInterface

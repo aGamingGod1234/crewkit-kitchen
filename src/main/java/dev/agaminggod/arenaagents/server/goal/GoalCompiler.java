@@ -18,6 +18,7 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.item.Item;
@@ -54,10 +55,31 @@ public final class GoalCompiler {
 	public GoalCompilation compile(
 			String request,
 			RegistryAccess registries,
-		long createdAtTick,
-		Predicate<String> advancementExists
+			long createdAtTick,
+			Predicate<String> advancementExists
 	) {
 		return compile(request, registries, createdAtTick, advancementExists, GoalPredicate.DEFAULT_DIMENSION);
+	}
+
+	public GoalCompilation compile(
+			String request,
+			RegistryAccess registries,
+			long createdAtTick,
+			Predicate<String> advancementExists,
+			ServerLevel sourceLevel
+	) {
+		Objects.requireNonNull(sourceLevel, "sourceLevel must not be null");
+		GoalCompilation compilation = compile(
+				request, registries, createdAtTick, advancementExists,
+				sourceLevel.dimension().identifier().toString()
+		);
+		if (compilation.kind() != GoalCompilation.Kind.ACCEPTED) return compilation;
+		try {
+			GoalPredicateWorldValidator.validate(sourceLevel, compilation.acceptedSpec().orElseThrow().completion());
+			return compilation;
+		} catch (AgentDomainException exception) {
+			return GoalCompilation.rejected(exception.getMessage());
+		}
 	}
 
 	public GoalCompilation compile(

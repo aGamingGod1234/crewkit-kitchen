@@ -36,6 +36,7 @@ import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWake;
 import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
+import dev.agaminggod.arenaagents.server.goal.GoalPredicateWorldValidator;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
@@ -783,8 +784,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			if (!draft.matches(manager.registry().require(agentId))) {
 				throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
 			}
-			GoalPredicate predicate = GOAL_SPEC_WIRE_CODEC.decodePredicate(predicateElement.getAsJsonObject());
+			GoalPredicate predicate = GoalPredicateWorldValidator.bindToDimension(
+					GOAL_SPEC_WIRE_CODEC.decodePredicate(predicateElement.getAsJsonObject()), draft.dimensionId());
 			validateProposalIdentifiers(predicate, Set.copyOf(draft.candidateIds()));
+			if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
+				GoalPredicateWorldValidator.validate(
+						GoalPredicateWorldValidator.requireLevel(manager.server(), draft.dimensionId()), predicate);
+			}
 			boolean duplicate = draft.proposedPredicate().isPresent();
 			PendingGoalDraft updated = manager.updateGoalDraftProposal(requestId, agentId, predicate);
 			ServerPlayer player = manager.server() == null ? null : manager.server().getPlayerList().getPlayer(updated.requestingPlayerId());
