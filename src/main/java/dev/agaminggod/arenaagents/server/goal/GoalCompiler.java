@@ -221,22 +221,19 @@ public final class GoalCompiler {
 		if (clauses.size() > 1) {
 			TreeSet<String> candidates = new TreeSet<>();
 			for (GoalClause clause : clauses) {
-				String target = SUBJECTIVE.matcher(clause.target()).replaceAll(" ").replaceAll("\\s+", " ").strip();
-				candidates.addAll(clause.kind() == ClauseKind.ITEM ? relatedItems(target, registries) : relatedEntities(target, registries));
+				candidates.addAll(relatedCandidates(clause.kind(), clause.target(), registries));
 				if (candidates.size() >= MAX_TRANSLATION_CANDIDATES) break;
 			}
 			return candidates.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
 		}
 		Matcher item = ITEM.matcher(command);
 		if (item.matches()) {
-			String target = SUBJECTIVE.matcher(item.group(3)).replaceAll(" ").replaceAll("\\s+", " ").strip();
-			return relatedItems(target, registries).stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
+			return relatedCandidates(ClauseKind.ITEM, item.group(3), registries);
 		}
 		Matcher kill = KILL.matcher(command);
 		if (BEAT_GAME.matcher(command).matches()) return List.of("minecraft:ender_dragon");
 		if (kill.matches()) {
-			String target = SUBJECTIVE.matcher(kill.group(1)).replaceAll(" ").replaceAll("\\s+", " ").strip();
-			return relatedEntities(target, registries).stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
+			return relatedCandidates(ClauseKind.KILL, kill.group(1), registries);
 		}
 		Matcher block = BLOCK.matcher(command);
 		if (block.matches()) return relatedBlocks(block.group(1), registries).stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
@@ -313,6 +310,50 @@ public final class GoalCompiler {
 
 	private enum ClauseKind { ITEM, KILL }
 	private record GoalClause(ClauseKind kind, String target, int count, boolean requiresCreation) { }
+
+	private static List<String> relatedCandidates(ClauseKind kind, String rawTarget, RegistryAccess registries) {
+		String target = SUBJECTIVE.matcher(rawTarget).replaceAll(" ").replaceAll("\\s+", " ").strip();
+		List<String> alternatives = explicitAlternatives(target);
+		String sharedNoun = kind == ClauseKind.ITEM && alternatives.size() > 1
+				? sharedItemNoun(alternatives.getLast())
+				: "";
+		TreeSet<String> candidates = new TreeSet<>();
+		for (int index = 0; index < alternatives.size(); index++) {
+			String alternative = alternatives.get(index);
+			List<String> related;
+			if (kind == ClauseKind.ITEM) {
+				related = index < alternatives.size() - 1 && !sharedNoun.isEmpty() && !alternative.contains(" ")
+						? relatedItems(alternative + " " + sharedNoun, registries)
+						: List.of();
+				if (related.isEmpty()) related = relatedItems(alternative, registries);
+			} else {
+				related = relatedEntities(alternative, registries);
+			}
+			if (alternatives.size() > 1 && related.isEmpty()) return List.of();
+			for (String candidate : related) {
+				if (candidates.size() >= MAX_TRANSLATION_CANDIDATES) break;
+				candidates.add(candidate);
+			}
+		}
+		return List.copyOf(candidates);
+	}
+
+	private static List<String> explicitAlternatives(String target) {
+		String[] parts = target.split("\\s+or\\s+", MAX_COMPOUND_LEAVES + 1);
+		if (parts.length < 2 || parts.length > MAX_COMPOUND_LEAVES) return List.of(target);
+		ArrayList<String> alternatives = new ArrayList<>(parts.length);
+		for (String part : parts) {
+			String alternative = part.replaceFirst("^(?:the|a|an|some)\\s+", "").strip();
+			if (alternative.isEmpty()) return List.of(target);
+			alternatives.add(alternative);
+		}
+		return List.copyOf(alternatives);
+	}
+
+	private static String sharedItemNoun(String finalAlternative) {
+		int nounSeparator = finalAlternative.lastIndexOf(' ');
+		return nounSeparator > 0 ? finalAlternative.substring(nounSeparator + 1) : "";
+	}
 
 	private static boolean isCraftingVerb(String verb) {
 		return verb.equals("craft") || verb.equals("make");

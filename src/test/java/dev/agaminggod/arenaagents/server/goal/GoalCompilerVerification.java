@@ -33,6 +33,7 @@ public final class GoalCompilerVerification {
 		assertions += verifyInventoryCapacity();
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyCompoundItemsAndKills();
+		assertions += verifyExplicitAlternativeCandidates();
 		assertions += verifyDraftRoundTrip();
 		assertions += verifyWorldValidation();
 		assertions += verifyDraftRevisionBinding();
@@ -241,6 +242,61 @@ public final class GoalCompilerVerification {
 				"an explicit make clause keeps the entire compound goal verifiable"
 		);
 		return 8;
+	}
+
+	private static int verifyExplicitAlternativeCandidates() {
+		GoalCompiler compiler = new GoalCompiler();
+		assertEquals(
+				List.of("minecraft:diamond_pickaxe", "minecraft:iron_pickaxe"),
+				compiler.candidateIdsFor("Get an iron or diamond pickaxe", RegistryAccess.EMPTY),
+				"shared item nouns publish each explicit alternative"
+		);
+		assertEquals(
+				List.of("minecraft:skeleton", "minecraft:wither_skeleton", "minecraft:zombie"),
+				compiler.candidateIdsFor("Kill a zombie or a skeleton", RegistryAccess.EMPTY),
+				"kill alternatives publish each bounded related entity"
+		);
+		assertEquals(
+				List.of("minecraft:iron_pickaxe"),
+				compiler.candidateIdsFor("Get an iron or iron pickaxe", RegistryAccess.EMPTY),
+				"duplicate alternatives publish one candidate identifier"
+		);
+		assertTrue(
+				compiler.candidateIdsFor("Get a sword or diamond pickaxe", RegistryAccess.EMPTY)
+						.containsAll(List.of("minecraft:iron_sword", "minecraft:diamond_pickaxe")),
+				"a standalone item alternative is not forced to share the final noun"
+		);
+		assertEquals(
+				List.of(
+						"minecraft:diamond_pickaxe", "minecraft:iron_pickaxe", "minecraft:skeleton",
+						"minecraft:wither_skeleton", "minecraft:zombie"
+				),
+				compiler.candidateIdsFor(
+						"Get an iron or diamond pickaxe and kill a zombie or skeleton", RegistryAccess.EMPTY
+				),
+				"compound clauses union item and kill alternatives"
+		);
+		assertEquals(
+				List.of(),
+				compiler.candidateIdsFor("Get a compass to find iron or diamond", RegistryAccess.EMPTY),
+				"or in an unrelated purpose phrase does not publish a partial candidate list"
+		);
+		assertEquals(
+				List.of("minecraft:diamond"),
+				compiler.candidateIdsFor("Get diamond" + " or diamond".repeat(15), RegistryAccess.EMPTY),
+				"sixteen explicit alternatives stay within the predicate leaf bound"
+		);
+		assertEquals(
+				List.of(),
+				compiler.candidateIdsFor("Get diamond" + " or diamond".repeat(16), RegistryAccess.EMPTY),
+				"more than sixteen alternatives are not expanded into an invalid predicate"
+		);
+		assertEquals(
+				64,
+				compiler.candidateIdsFor("Get stairs or slab", RegistryAccess.EMPTY).size(),
+				"alternative candidate unions retain the draft schema limit"
+		);
+		return 9;
 	}
 
 	private static int verifyDraftRoundTrip() {
