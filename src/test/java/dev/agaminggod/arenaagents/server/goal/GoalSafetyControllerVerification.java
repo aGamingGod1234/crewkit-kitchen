@@ -1,9 +1,15 @@
 package dev.agaminggod.arenaagents.server.goal;
 
+import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController.HazardSnapshot;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController.SafetyDirective;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController.DamageState;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import net.minecraft.world.phys.Vec3;
 
 public final class GoalSafetyControllerVerification {
 	private GoalSafetyControllerVerification() {
@@ -26,7 +32,84 @@ public final class GoalSafetyControllerVerification {
 		assertTrue(!betweenHits.repeatedAt(161L), "repeated-damage reflex expires after its bounded window");
 		DamageState laterHit = GoalSafetyController.trackDamage(betweenHits, 14.0F, 200L);
 		assertTrue(!laterHit.repeatedAt(200L), "a hit after expiry starts a new damage streak");
-		return 12;
+		verifyHazardousEscapeRoutesAreRejected();
+		verifySafeEscapeWinsOverHazardousFirstCandidate();
+		verifyRetreatSkipsHazardousFarthestCandidate();
+		return 15;
+	}
+
+	private static void verifyHazardousEscapeRoutesAreRejected() {
+		GridPosition origin = new GridPosition(0, 64, 0);
+		GridPosition northFire = origin.offset(0, 0, -1);
+		GridPosition eastLava = origin.offset(1, 0, 0);
+		GridPosition southDeepWater = origin.offset(0, 0, 1);
+		GridPosition westMagmaSupport = origin.offset(-1, 0, 0);
+		Map<GridPosition, WalkabilityView.Cell> cells = openRouteCells(origin);
+		cells.put(northFire, WalkabilityView.Cell.HAZARD);
+		cells.put(eastLava, WalkabilityView.Cell.HAZARD);
+		cells.put(southDeepWater, WalkabilityView.Cell.HAZARD);
+		cells.put(westMagmaSupport.below(), WalkabilityView.Cell.HAZARD);
+
+		GridPosition selected = GoalSafetyController.selectEscapeCandidate(
+				origin,
+				center(origin),
+				null,
+				cells::get
+		);
+		assertEquals(null, selected, "escape selection rejects fire, lava, deep water, and magma support");
+	}
+
+	private static void verifySafeEscapeWinsOverHazardousFirstCandidate() {
+		GridPosition origin = new GridPosition(0, 64, 0);
+		GridPosition northFire = origin.offset(0, 0, -1);
+		GridPosition eastSafe = origin.offset(1, 0, 0);
+		Map<GridPosition, WalkabilityView.Cell> cells = openRouteCells(origin);
+		cells.put(northFire, WalkabilityView.Cell.HAZARD);
+		cells.put(origin.offset(0, 0, 1), WalkabilityView.Cell.BLOCKED);
+		cells.put(origin.offset(-1, 0, 0), WalkabilityView.Cell.BLOCKED);
+
+		GridPosition selected = GoalSafetyController.selectEscapeCandidate(
+				origin,
+				center(origin),
+				null,
+				cells::get
+		);
+		assertEquals(eastSafe, selected, "escape selection skips an intrinsic hazard for the next safe route");
+	}
+
+	private static void verifyRetreatSkipsHazardousFarthestCandidate() {
+		GridPosition origin = new GridPosition(0, 64, 0);
+		GridPosition northSafe = origin.offset(0, 0, -1);
+		GridPosition westHazard = origin.offset(-1, 0, 0);
+		Map<GridPosition, WalkabilityView.Cell> cells = openRouteCells(origin);
+		cells.put(westHazard, WalkabilityView.Cell.HAZARD);
+		cells.put(origin.offset(0, 0, 1), WalkabilityView.Cell.BLOCKED);
+
+		GridPosition selected = GoalSafetyController.selectEscapeCandidate(
+				origin,
+				center(origin),
+				new Vec3(2.5D, 64.0D, 0.5D),
+				cells::get
+		);
+		assertEquals(northSafe, selected,
+				"retreat selection skips the hazardous farthest cell and chooses the farthest safe route");
+	}
+
+	private static Map<GridPosition, WalkabilityView.Cell> openRouteCells(GridPosition origin) {
+		Map<GridPosition, WalkabilityView.Cell> cells = new HashMap<>();
+		for (int dx = -1; dx <= 1; dx++) {
+			for (int dz = -1; dz <= 1; dz++) {
+				GridPosition feet = origin.offset(dx, 0, dz);
+				cells.put(feet, WalkabilityView.Cell.CLEAR);
+				cells.put(feet.above(), WalkabilityView.Cell.CLEAR);
+				cells.put(feet.below(), WalkabilityView.Cell.SAFE_SUPPORT);
+			}
+		}
+		return cells;
+	}
+
+	private static Vec3 center(GridPosition position) {
+		return new Vec3(position.x() + 0.5D, position.y(), position.z() + 0.5D);
 	}
 
 	private static SafetyDirective decide(
@@ -38,7 +121,7 @@ public final class GoalSafetyControllerVerification {
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {
-		if (!expected.equals(actual)) throw new AssertionError(label + ": expected=" + expected + ", actual=" + actual);
+		if (!Objects.equals(expected, actual)) throw new AssertionError(label + ": expected=" + expected + ", actual=" + actual);
 		System.out.println("PASS: " + label);
 	}
 

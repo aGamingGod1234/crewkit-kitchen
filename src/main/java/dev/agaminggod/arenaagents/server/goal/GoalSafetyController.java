@@ -2,7 +2,10 @@ package dev.agaminggod.arenaagents.server.goal;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
+import dev.agaminggod.arenaagents.client.navigation.GridPosition;
+import dev.agaminggod.arenaagents.client.navigation.WalkabilityView;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
+import dev.agaminggod.arenaagents.server.runtime.controller.MinecraftNavigationWorld;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates;
@@ -14,10 +17,8 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.tags.FluidTags;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.item.Items;
@@ -127,20 +128,34 @@ public final class GoalSafetyController {
 	}
 
 	private Vec3 verifiedEscape(ServerPlayer player, Vec3 threat) {
-		BlockPos origin = player.blockPosition();
-		Vec3 best = null;
-		double bestDistance = threat == null ? Double.NEGATIVE_INFINITY : player.position().distanceToSqr(threat);
+		var origin = player.blockPosition();
+		GridPosition selected = selectEscapeCandidate(
+				new GridPosition(origin.getX(), origin.getY(), origin.getZ()),
+				player.position(),
+				threat,
+				new MinecraftNavigationWorld(player.level())
+		);
+		return selected == null ? null : new Vec3(selected.x() + 0.5D, selected.y(), selected.z() + 0.5D);
+	}
+
+	static GridPosition selectEscapeCandidate(
+			GridPosition origin,
+			Vec3 currentPosition,
+			Vec3 threat,
+			WalkabilityView world
+	) {
+		Objects.requireNonNull(origin, "origin must not be null");
+		Objects.requireNonNull(currentPosition, "current position must not be null");
+		Objects.requireNonNull(world, "world must not be null");
+		GridPosition best = null;
+		double bestDistance = threat == null ? Double.NEGATIVE_INFINITY : currentPosition.distanceToSqr(threat);
 		for (Direction direction : HORIZONTAL) {
-			BlockPos candidate = origin.relative(direction);
-			BlockPos below = candidate.below();
-			if (!player.level().getBlockState(candidate).getCollisionShape(player.level(), candidate).isEmpty()) continue;
-			if (!player.level().getBlockState(candidate.above()).getCollisionShape(player.level(), candidate.above()).isEmpty()) continue;
-			if (!player.level().getBlockState(below).isFaceSturdy(player.level(), below, Direction.UP)) continue;
-			if (player.level().getFluidState(candidate).is(FluidTags.LAVA)) continue;
-			Vec3 target = Vec3.atBottomCenterOf(candidate);
+			GridPosition candidate = origin.offset(direction.getStepX(), 0, direction.getStepZ());
+			if (!world.isStandable(candidate)) continue;
+			Vec3 target = new Vec3(candidate.x() + 0.5D, candidate.y(), candidate.z() + 0.5D);
 			double distance = threat == null ? 0.0D : target.distanceToSqr(threat);
 			if (best == null || distance > bestDistance) {
-				best = target;
+				best = candidate;
 				bestDistance = distance;
 			}
 		}
