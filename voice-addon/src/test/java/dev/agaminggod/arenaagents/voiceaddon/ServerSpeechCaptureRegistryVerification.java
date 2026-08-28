@@ -285,5 +285,9 @@ public final class ServerSpeechCaptureRegistryVerification {
 			closes++;
 			if (closeFailure != null) throw closeFailure;
 		}
+
+		@Override
+		public void cancel(java.util.UUID playerId) {
+		}
 	}
 }

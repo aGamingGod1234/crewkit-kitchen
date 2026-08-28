@@ -36,6 +36,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyTranscriptsDeliverInUtteranceOrder();
 		assertions += verifyUnavailableSttRecoversAfterBackoff();
 		assertions += verifyCloseCancelsPendingTranscription();
+		assertions += verifyConsentRevocationCancelsOnlyOwnedSpeech();
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		assertions += verifyCloseContinuesAfterDecoderCloseFailure();
 		return assertions;
@@ -413,6 +414,52 @@ final class SpeechCaptureEngineVerification {
 		assertEquals(true, secondPending.isCancelled(), "close cancels the replacement STT request");
 		assertEquals(List.of(), delivered, "a late cancelled transcript cannot deliver after close");
 		return 3;
+	}
+
+	private static int verifyConsentRevocationCancelsOnlyOwnedSpeech() {
+		ManualScheduledExecutor partialScheduler = new ManualScheduledExecutor();
+		RecordingTranscriber partialTranscriber = new RecordingTranscriber();
+		SpeechCaptureEngine partialEngine = new SpeechCaptureEngine(partialTranscriber, partialScheduler, 20L, 32);
+		RecordingDecoder partialDecoder = new RecordingDecoder();
+		partialEngine.accept(PLAYER, false, new byte[] { 1 }, () -> partialDecoder, Runnable::run,
+				(playerId, text, whispering) -> { throw new AssertionError("revoked speech must not deliver"); });
+		partialEngine.cancel(PLAYER);
+		partialScheduler.runEvenIfCancelled(0);
+		assertEquals(true, partialDecoder.closed, "revocation closes the player's buffered decoder");
+		assertEquals(0, partialTranscriber.captured.size(), "revocation discards audio before STT submission");
+		partialEngine.close();
+
+		UUID otherPlayer = UUID.fromString("20000000-0000-4000-8000-000000000002");
+		java.util.Map<UUID, CompletableFuture<SpeechWorkerClient.Transcript>> pending =
+				new java.util.LinkedHashMap<>();
+		SpeechCaptureEngine pendingEngine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
+			CompletableFuture<SpeechWorkerClient.Transcript> future = new CompletableFuture<>();
+			pending.put(playerId, future);
+			return future;
+		}, scheduler(), 5_000L, 1);
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine.TranscriptDelivery delivery = (playerId, text, whispering) ->
+				delivered.add(new Delivered(playerId, text, whispering));
+		pendingEngine.accept(PLAYER, false, new byte[] { 2 }, RecordingDecoder::new, Runnable::run, delivery);
+		CompletableFuture<SpeechWorkerClient.Transcript> revoked = pending.get(PLAYER);
+		pendingEngine.accept(otherPlayer, false, new byte[] { 3 }, RecordingDecoder::new, Runnable::run, delivery);
+		CompletableFuture<SpeechWorkerClient.Transcript> unrelated = pending.get(otherPlayer);
+		pendingEngine.cancel(PLAYER);
+		assertEquals(true, revoked.isCancelled(), "revocation cancels the player's owned STT request");
+		assertEquals(false, unrelated.isCancelled(), "revocation leaves another player's STT request active");
+		unrelated.complete(new SpeechWorkerClient.Transcript("other", 0.9));
+		assertEquals(List.of(new Delivered(otherPlayer, "other", false)), delivered,
+				"another player's transcript still delivers");
+
+		pendingEngine.accept(PLAYER, false, new byte[] { 4 }, RecordingDecoder::new, Runnable::run, delivery);
+		CompletableFuture<SpeechWorkerClient.Transcript> regranted = pending.get(PLAYER);
+		regranted.complete(new SpeechWorkerClient.Transcript("new", 0.9));
+		assertEquals(List.of(
+				new Delivered(otherPlayer, "other", false),
+				new Delivered(PLAYER, "new", false)
+		), delivered, "a later consent generation starts a fresh ordered transcript stream");
+		pendingEngine.close();
+		return 6;
 	}
 
 	private static ScheduledExecutorService scheduler() {

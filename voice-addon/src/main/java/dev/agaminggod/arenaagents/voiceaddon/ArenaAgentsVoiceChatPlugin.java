@@ -99,6 +99,10 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 			return binding.active();
 		}
 
+		void cancelHumanSpeech(java.util.UUID playerId) {
+			binding.cancelHumanSpeech(playerId);
+		}
+
 		@Override
 		public void close() {
 			binding.close();

@@ -65,6 +65,11 @@ public final class VoiceSubsystemRuntimeVerification {
 				})), "a failed live runtime is reconstructed without restarting Minecraft");
 		assertEquals(2, closes.get(), "live failure closes the failed generation once");
 		assertTrue(VoiceSubsystemRuntime.available(server), "live failure recovery promotes the replacement");
+		java.util.UUID humanPlayer = java.util.UUID.randomUUID();
+		VoiceConsentRegistry.grant(server, humanPlayer);
+		VoiceConsentRegistry.revoke(server, humanPlayer);
+		assertEquals(humanPlayer, recovered.cancelledHumanSpeech,
+				"consent revocation cancels the live subsystem's buffered and in-flight speech");
 		dev.agaminggod.arenaagents.agent.AgentId agentId = dev.agaminggod.arenaagents.agent.AgentId.parse(
 				"00000000-0000-4000-8000-000000000777"
 		);
@@ -114,7 +119,7 @@ public final class VoiceSubsystemRuntimeVerification {
 		assertTrue(VoiceSubsystemRuntime.available(startupRaceServer),
 				"the retry promotes the real voice subsystem without restarting Minecraft");
 		VoiceSubsystemRuntime.close(startupRaceServer);
-		return 25;
+		return 26;
 	}
 
 	private static MinecraftServer uninitializedServer() {
@@ -132,6 +137,7 @@ public final class VoiceSubsystemRuntimeVerification {
 		private final AtomicInteger closes;
 		private boolean available = true;
 		private RuntimeException speakFailure;
+		private java.util.UUID cancelledHumanSpeech;
 
 		private RecordingVoiceSubsystem(AtomicInteger closes) {
 			this.closes = closes;
@@ -158,6 +164,11 @@ public final class VoiceSubsystemRuntimeVerification {
 
 		@Override
 		public void stop(dev.agaminggod.arenaagents.agent.AgentId agentId) {
+		}
+
+		@Override
+		public void cancelHumanSpeech(java.util.UUID playerId) {
+			cancelledHumanSpeech = playerId;
 		}
 
 		@Override

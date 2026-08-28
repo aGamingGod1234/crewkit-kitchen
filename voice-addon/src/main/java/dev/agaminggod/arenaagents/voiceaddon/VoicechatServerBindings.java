@@ -64,6 +64,10 @@ final class VoicechatServerBindings<S, O> {
 		captures.accept(server, owner, event);
 	}
 
+	void cancel(S server, java.util.UUID playerId) {
+		captures.cancel(server, playerId);
+	}
+
 	synchronized void stopped(O owner) {
 		if (pending != null && pending.owner == owner) {
 			pending.live = false;
@@ -120,6 +124,8 @@ final class VoicechatServerBindings<S, O> {
 
 		boolean active();
 
+		void cancelHumanSpeech(java.util.UUID playerId);
+
 		@Override
 		void close();
 	}
@@ -143,6 +149,11 @@ final class VoicechatServerBindings<S, O> {
 		@Override
 		public boolean active() {
 			return VoicechatServerBindings.this.active(server, association, revision);
+		}
+
+		@Override
+		public void cancelHumanSpeech(java.util.UUID playerId) {
+			VoicechatServerBindings.this.cancel(server, playerId);
 		}
 
 		@Override

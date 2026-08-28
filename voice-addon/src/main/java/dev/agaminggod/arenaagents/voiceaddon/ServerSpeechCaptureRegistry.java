@@ -54,6 +54,11 @@ final class ServerSpeechCaptureRegistry<S, O> {
 		if (entry != null) entry.accept(owner, event);
 	}
 
+	void cancel(S server, java.util.UUID playerId) {
+		Entry entry = entries.get(server);
+		if (entry != null) entry.cancel(playerId);
+	}
+
 	void clear(S server) {
 		Entry removed = entries.remove(server);
 		if (removed != null) safeClose(removed);
@@ -77,6 +82,8 @@ final class ServerSpeechCaptureRegistry<S, O> {
 
 	interface Capture {
 		void accept(MicrophonePacketEvent event);
+
+		void cancel(java.util.UUID playerId);
 
 		void close();
 	}
@@ -158,6 +165,10 @@ final class ServerSpeechCaptureRegistry<S, O> {
 
 		private synchronized boolean ownedBy(O candidate) {
 			return owner == candidate;
+		}
+
+		private synchronized void cancel(java.util.UUID playerId) {
+			if (!closed && capture != null) capture.cancel(playerId);
 		}
 
 		private synchronized void close() {

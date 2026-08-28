@@ -322,5 +322,9 @@ final class ArenaAgentsVoiceChatPluginVerification {
 		public synchronized void close() {
 			closes++;
 		}
+
+		@Override
+		public void cancel(java.util.UUID playerId) {
+		}
 	}
 }

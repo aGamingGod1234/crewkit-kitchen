@@ -137,6 +137,37 @@ test('aborting one inference preserves unrelated pending speech work', async () 
 	}
 });
 
+test('aborting replayed inference stops its current worker before replacement work', async () => {
+	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
+	const provider = new LocalSpeechProvider({
+		executable: process.execPath,
+		scriptPath: fileURLToPath(new URL('../test-support/local-speech-rpc-fixture.mjs', import.meta.url)),
+		timeoutMs: 5_000,
+	});
+	const firstController = new AbortController();
+	const replayedController = new AbortController();
+	try {
+		const first = provider.synthesize({ text: 'block-worker', signal: firstController.signal });
+		const replayed = provider.synthesize({ text: 'block-worker', signal: replayedController.signal });
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		firstController.abort();
+		await assert.rejects(first, (error) => error?.name === 'AbortError');
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		replayedController.abort();
+		await assert.rejects(replayed, (error) => error?.name === 'AbortError');
+
+		const replacement = provider.synthesize({ text: 'replacement' });
+		const completed = await Promise.race([
+			replacement.then(() => true),
+			new Promise((resolve) => setTimeout(() => resolve(false), 1_000)),
+		]);
+		assert.equal(completed, true, 'replayed cancellation relinquishes the current serial worker');
+		assert.equal((await replacement).pcm.length, 4);
+	} finally {
+		await provider.close();
+	}
+});
+
 test('default provider discovery aborts promptly through its production access seam', async () => {
 	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
 	const controller = new AbortController();

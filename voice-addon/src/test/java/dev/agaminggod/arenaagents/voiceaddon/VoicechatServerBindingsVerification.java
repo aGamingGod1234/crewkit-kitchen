@@ -27,6 +27,10 @@ final class VoicechatServerBindingsVerification {
 		bindings.started(apiA);
 		VoicechatServerBindings.Binding<Object> original = bindings.configure(server, first);
 		bindings.accept(server, apiA, null);
+		java.util.UUID speakingPlayer = java.util.UUID.randomUUID();
+		bindings.cancel(server, speakingPlayer);
+		assertEquals(speakingPlayer, captures.getFirst().cancelledPlayer,
+				"consent revocation reaches the configured server capture");
 		assertSame(apiA, original.owner(), "duplicate same-API start is one registration");
 		bindings.started(apiA);
 		VoicechatServerBindings.Binding<Object> reconfigured = bindings.configure(server, second);
@@ -90,7 +94,7 @@ final class VoicechatServerBindingsVerification {
 		assertSame(apiB, repeatedB.owner(), "the newest pending API owns the configured server");
 		assertEquals(true, repeatedB.active(),
 				"stale stop and close from a displaced registration cannot clear the current API");
-		return 16;
+		return 17;
 	}
 
 	private static VoiceSubsystemConfiguration configuration(int port, char secret) {
@@ -113,6 +117,7 @@ final class VoicechatServerBindingsVerification {
 	private static final class RecordingCapture implements ServerSpeechCaptureRegistry.Capture {
 		private final VoiceSubsystemConfiguration configuration;
 		private int closes;
+		private java.util.UUID cancelledPlayer;
 
 		private RecordingCapture(VoiceSubsystemConfiguration configuration) {
 			this.configuration = configuration;
@@ -120,6 +125,11 @@ final class VoicechatServerBindingsVerification {
 
 		@Override
 		public void accept(de.maxhenkel.voicechat.api.events.MicrophonePacketEvent event) {
+		}
+
+		@Override
+		public void cancel(java.util.UUID playerId) {
+			cancelledPlayer = playerId;
 		}
 
 		@Override

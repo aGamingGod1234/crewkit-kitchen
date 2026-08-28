@@ -36,25 +36,34 @@ final class HumanSpeechCapture implements ServerSpeechCaptureRegistry.Capture {
 		if (event.getSenderConnection() == null) return;
 		Object rawPlayer = event.getSenderConnection().getPlayer().getPlayer();
 		if (!(rawPlayer instanceof ServerPlayer player)) return;
-		byte[] opus = event.getPacket().getOpusEncodedData().clone();
-		if (opus.length == 0 || opus.length > 8_192) return;
-		VoicechatServerApi api = event.getVoicechat();
 		var server = player.level().getServer();
-		engine.accept(
-				player.getUUID(),
-				event.getPacket().isWhispering(),
-				opus,
-				() -> decoder(api.createDecoder()),
-				server::execute,
-				(playerId, transcript, whispering) -> CodexAgentServerRuntime.deliverHumanSpeech(
-						server, playerId, transcript, whispering
-				)
+		dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry.captureWhileGranted(
+				server, player.getUUID(), () -> {
+					byte[] opus = event.getPacket().getOpusEncodedData().clone();
+					if (opus.length == 0 || opus.length > 8_192) return;
+					VoicechatServerApi api = event.getVoicechat();
+					engine.accept(
+							player.getUUID(),
+							event.getPacket().isWhispering(),
+							opus,
+							() -> decoder(api.createDecoder()),
+							server::execute,
+							(playerId, transcript, whispering) -> CodexAgentServerRuntime.deliverHumanSpeech(
+									server, playerId, transcript, whispering
+							)
+					);
+				}
 		);
 	}
 
 	@Override
 	public void close() {
 		engine.close();
+	}
+
+	@Override
+	public void cancel(UUID playerId) {
+		engine.cancel(playerId);
 	}
 
 	private static SpeechCaptureEngine.Decoder decoder(OpusDecoder decoder) {

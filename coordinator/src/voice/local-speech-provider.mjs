@@ -136,18 +136,22 @@ export class LocalSpeechProvider {
 				operation();
 			};
 			const onAbort = () => {
+				const pending = this.#pending.get(id);
+				if (pending === undefined) return;
 				const error = abortError();
 				finish(() => reject(error));
-				this.#failProcess(error, child, generation, true);
+				this.#failProcess(error, pending.child, pending.generation, true);
 			};
 			const timer = setTimeout(() => {
+				const pending = this.#pending.get(id);
+				if (pending === undefined) return;
 				const error = timeoutError();
 				finish(() => reject(error));
-				this.#failProcess(error, child, generation, true);
+				this.#failProcess(error, pending.child, pending.generation, true);
 			}, this.#timeoutMs);
 			timer.unref?.();
 			this.#pending.set(id, {
-				id, payload: { id, ...payload }, resolve, reject, timer, onAbort, signal, generation,
+				id, payload: { id, ...payload }, resolve, reject, timer, onAbort, signal, child, generation,
 			});
 			signal?.addEventListener('abort', onAbort, { once: true });
 			this.#writeRequest(child, generation, this.#pending.get(id));
@@ -233,6 +237,7 @@ export class LocalSpeechProvider {
 				continue;
 			}
 			request.generation = this.#generation;
+			request.child = child;
 			this.#writeRequest(child, this.#generation, request);
 		}
 	}

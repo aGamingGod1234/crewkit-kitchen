@@ -205,6 +205,11 @@ public final class VoiceSubsystemRuntime {
 		if (holder != null) holder.subsystem().stop(agentId);
 	}
 
+	public static synchronized void cancelHumanSpeech(MinecraftServer server, java.util.UUID playerId) {
+		Holder holder = INSTANCES.get(server);
+		if (holder != null) holder.subsystem().cancelHumanSpeech(playerId);
+	}
+
 	public static synchronized void close(MinecraftServer server) {
 		AVAILABILITY_DIAGNOSTICS.remove(server);
 		STARTUP_RETRIES.remove(server);

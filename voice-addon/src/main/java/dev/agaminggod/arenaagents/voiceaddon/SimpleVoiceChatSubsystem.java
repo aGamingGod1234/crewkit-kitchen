@@ -77,6 +77,11 @@ final class SimpleVoiceChatSubsystem implements VoiceSubsystem {
 	}
 
 	@Override
+	public void cancelHumanSpeech(UUID playerId) {
+		configuredServer.cancelHumanSpeech(playerId);
+	}
+
+	@Override
 	public void close() {
 		try {
 			playback.close();

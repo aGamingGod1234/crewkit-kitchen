@@ -37,6 +37,12 @@ public final class VoiceSubsystemVerification {
 			throw new AssertionError("Revoked consent must fence buffered or in-flight speech delivery");
 		}
 		assertions++;
+		if (VoiceConsentRegistry.captureWhileGranted(null, humanPlayer, () -> {
+			throw new AssertionError("Revoked consent must fence a racing microphone packet");
+		})) {
+			throw new AssertionError("Revoked consent must reject new capture work");
+		}
+		assertions++;
 		VoiceConsentRegistry.grant(null, humanPlayer);
 		VoiceConsentRegistry.clear(null);
 		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
@@ -94,6 +100,7 @@ public final class VoiceSubsystemVerification {
 			return CompletableFuture.completedFuture(VoiceReceipt.accepted());
 		}
 		@Override public void stop(AgentId agentId) { }
+		@Override public void cancelHumanSpeech(UUID playerId) { }
 		@Override public void close() { }
 	}
 }

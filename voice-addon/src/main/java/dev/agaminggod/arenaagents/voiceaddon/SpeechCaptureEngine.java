@@ -4,10 +4,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -31,9 +29,11 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	private final LongSupplier monotonicNanos;
 	private final Map<UUID, Utterance> utterances = new LinkedHashMap<>();
 	private final Map<UUID, Long> sequences = new LinkedHashMap<>();
+	private final Map<UUID, Long> playerGenerations = new LinkedHashMap<>();
 	private final Map<UUID, TranscriptQueue> transcriptQueues = new LinkedHashMap<>();
 	private final Map<UUID, DecoderRetry> decoderRetries = new LinkedHashMap<>();
-	private final Set<CompletableFuture<SpeechWorkerClient.Transcript>> transcriptions = new LinkedHashSet<>();
+	private final Map<CompletableFuture<SpeechWorkerClient.Transcript>, CompletedUtterance> transcriptions =
+			new LinkedHashMap<>();
 	private boolean closed;
 	private long sttRetryAfterNanos;
 
@@ -108,7 +108,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				}
 				utterance = new Utterance(
 						playerId, decoder, whispering, sequences.merge(playerId, 1L, Long::sum),
-						deliveryExecutor, delivery, maxSamples
+						playerGenerations.getOrDefault(playerId, 0L), deliveryExecutor, delivery, maxSamples
 				);
 				utterances.put(playerId, utterance);
 			}
@@ -165,6 +165,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				playerId,
 				utterance.sequence,
 				utterance.whispering,
+				utterance.playerGeneration,
 				decoderClosed ? Arrays.copyOf(utterance.samples, utterance.length) : new short[0],
 				utterance.deliveryExecutor,
 				utterance.delivery,
@@ -182,6 +183,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				playerId,
 				utterance.sequence,
 				utterance.whispering,
+				utterance.playerGeneration,
 				new short[0],
 				utterance.deliveryExecutor,
 				utterance.delivery,
@@ -199,7 +201,8 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		}
 	}
 
-	private void transcribe(CompletedUtterance utterance) {
+	private synchronized void transcribe(CompletedUtterance utterance) {
+		if (closed || !ownsPlayerGeneration(utterance)) return;
 		if (utterance.samples.length == 0) {
 			completeTranscription(utterance, null, null);
 			return;
@@ -218,13 +221,11 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			completeTranscription(utterance, null, failure);
 			return;
 		}
-		synchronized (this) {
-			if (closed) {
-				transcription.cancel(true);
-				return;
-			}
-			transcriptions.add(transcription);
+		if (closed || !ownsPlayerGeneration(utterance)) {
+			transcription.cancel(true);
+			return;
 		}
+		transcriptions.put(transcription, utterance);
 		transcription.whenComplete((transcript, failure) -> {
 			synchronized (this) {
 				transcriptions.remove(transcription);
@@ -258,7 +259,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	) {
 		List<TranscriptOutcome> ready = new ArrayList<>();
 		synchronized (this) {
-			if (closed) return;
+			if (closed || !ownsPlayerGeneration(utterance)) return;
 			if (isSttUnavailable(failure)) {
 				sttRetryAfterNanos = monotonicNanos.getAsLong() + STT_RETRY_BACKOFF_NANOS;
 				recordSkippedLocked(utterance);
@@ -269,7 +270,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 					} catch (RuntimeException ignored) {
 					}
 					recordSkippedLocked(new CompletedUtterance(
-							active.playerId, active.sequence, active.whispering, new short[0],
+							active.playerId, active.sequence, active.whispering, active.playerGeneration, new short[0],
 							active.deliveryExecutor, active.delivery, active.lastPacketNanos, monotonicNanos.getAsLong()
 					));
 				}
@@ -308,6 +309,37 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		while (queue.completed.remove(queue.nextSequence) != null) queue.nextSequence++;
 	}
 
+	void cancel(UUID playerId) {
+		Objects.requireNonNull(playerId, "playerId must not be null");
+		List<CompletableFuture<SpeechWorkerClient.Transcript>> ownedTranscriptions = new ArrayList<>();
+		synchronized (this) {
+			playerGenerations.merge(playerId, 1L, Long::sum);
+			Utterance active = utterances.remove(playerId);
+			if (active != null) {
+				active.timeoutEpoch++;
+				if (active.timeout != null) active.timeout.cancel(false);
+				closeDecoder(active.decoder);
+			}
+			sequences.remove(playerId);
+			transcriptQueues.remove(playerId);
+			decoderRetries.remove(playerId);
+			for (Map.Entry<CompletableFuture<SpeechWorkerClient.Transcript>, CompletedUtterance> entry
+					: transcriptions.entrySet()) {
+				if (entry.getValue().playerId.equals(playerId)) ownedTranscriptions.add(entry.getKey());
+			}
+			for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : ownedTranscriptions) {
+				transcriptions.remove(transcription);
+			}
+		}
+		for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : ownedTranscriptions) {
+			transcription.cancel(true);
+		}
+	}
+
+	private boolean ownsPlayerGeneration(CompletedUtterance utterance) {
+		return playerGenerations.getOrDefault(utterance.playerId, 0L) == utterance.playerGeneration;
+	}
+
 	private static boolean isSttUnavailable(Throwable failure) {
 		Throwable current = failure;
 		while (current instanceof CompletionException && current.getCause() != null) current = current.getCause();
@@ -325,9 +357,10 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			closeDecoder(utterance.decoder);
 		}
 		utterances.clear();
+		playerGenerations.clear();
 		transcriptQueues.clear();
 		decoderRetries.clear();
-		for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : List.copyOf(transcriptions)) {
+		for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : List.copyOf(transcriptions.keySet())) {
 			transcription.cancel(true);
 		}
 		transcriptions.clear();
@@ -365,6 +398,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		private final Decoder decoder;
 		private final boolean whispering;
 		private final long sequence;
+		private final long playerGeneration;
 		private final Executor deliveryExecutor;
 		private final TranscriptDelivery delivery;
 		private final int maxSamples;
@@ -379,6 +413,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				Decoder decoder,
 				boolean whispering,
 				long sequence,
+				long playerGeneration,
 				Executor deliveryExecutor,
 				TranscriptDelivery delivery,
 				int maxSamples
@@ -387,6 +422,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			this.decoder = decoder;
 			this.whispering = whispering;
 			this.sequence = sequence;
+			this.playerGeneration = playerGeneration;
 			this.deliveryExecutor = deliveryExecutor;
 			this.delivery = delivery;
 			this.maxSamples = maxSamples;
@@ -409,6 +445,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			UUID playerId,
 			long sequence,
 			boolean whispering,
+			long playerGeneration,
 			short[] samples,
 			Executor deliveryExecutor,
 			TranscriptDelivery delivery,

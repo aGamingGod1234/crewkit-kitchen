@@ -19,9 +19,11 @@ public final class VoiceConsentRegistry {
 
 	public static synchronized void revoke(MinecraftServer server, UUID playerId) {
 		Set<UUID> players = ENABLED.get(server);
-		if (players == null) return;
-		players.remove(playerId);
-		if (players.isEmpty()) ENABLED.remove(server);
+		if (players != null) {
+			players.remove(playerId);
+			if (players.isEmpty()) ENABLED.remove(server);
+		}
+		VoiceSubsystemRuntime.cancelHumanSpeech(server, playerId);
 	}
 
 	/**
@@ -34,6 +36,17 @@ public final class VoiceConsentRegistry {
 
 	public static synchronized boolean granted(MinecraftServer server, UUID playerId) {
 		return ENABLED.getOrDefault(server, Set.of()).contains(playerId);
+	}
+
+	public static synchronized boolean captureWhileGranted(
+			MinecraftServer server,
+			UUID playerId,
+			Runnable capture
+	) {
+		java.util.Objects.requireNonNull(capture, "capture must not be null");
+		if (!ENABLED.getOrDefault(server, Set.of()).contains(playerId)) return false;
+		capture.run();
+		return true;
 	}
 
 	public static synchronized void clear(MinecraftServer server) {
