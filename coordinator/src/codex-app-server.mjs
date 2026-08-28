@@ -265,7 +265,11 @@ export class CodexStdioTransport extends EventEmitter {
 		child.on('exit', (code, signal) => this.#onExit(child, code, signal));
 		await new Promise((resolve, reject) => {
 			const onSpawn = () => { cleanup(); resolve(); };
-			const onError = (error) => { cleanup(); this.#child = null; reject(new CodexProtocolError('SPAWN_FAILED', `Could not start Codex app-server: ${error.message}`, { cause: error })); };
+			const onError = (error) => {
+				cleanup();
+				if (child === this.#child) this.#child = null;
+				reject(new CodexProtocolError('SPAWN_FAILED', `Could not start Codex app-server: ${error.message}`, { cause: error }));
+			};
 			const cleanup = () => { child.off('spawn', onSpawn); child.off('error', onError); };
 			child.once('spawn', onSpawn);
 			child.once('error', onError);

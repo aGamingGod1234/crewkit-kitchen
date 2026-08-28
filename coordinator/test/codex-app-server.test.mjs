@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, resolveCodexLaunch } from '../src/codex-app-server.mjs';
+import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, CodexStdioTransport, resolveCodexLaunch } from '../src/codex-app-server.mjs';
 import { finishDecisionJson } from './provider-decision-fixtures.mjs';
 
 const model = {
@@ -39,6 +39,24 @@ class FakeCodexTransport extends EventEmitter {
 		}
 		if (method === 'turn/interrupt') return {};
 		throw new Error(`Unexpected method ${method}`);
+	}
+}
+
+class FakeStdioChild extends EventEmitter {
+	constructor() {
+		super();
+		this.stdout = new EventEmitter();
+		this.stderr = new EventEmitter();
+		this.writes = [];
+		this.stdin = { write: (line) => this.writes.push(JSON.parse(String(line).trim())) };
+		this.killed = false;
+		this.exitCode = null;
+		this.signalCode = null;
+	}
+
+	kill() {
+		this.killed = true;
+		return true;
 	}
 }
 
@@ -214,6 +232,34 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 	assert.equal(launch.environment.PATH, 'C:\\Windows\\System32');
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET, undefined);
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined);
+});
+
+test('a stopped child late spawn error cannot orphan its running replacement transport', async () => {
+	const first = new FakeStdioChild();
+	const replacement = new FakeStdioChild();
+	let spawnCalls = 0;
+	const transport = new CodexStdioTransport(config, {
+		spawn: () => {
+			spawnCalls += 1;
+			if (spawnCalls === 1) return first;
+			queueMicrotask(() => replacement.emit('spawn'));
+			return replacement;
+		},
+		stopTimeoutMs: 1,
+	});
+	const obsoleteStart = transport.start();
+	const obsoleteFailure = assert.rejects(obsoleteStart, (error) => error?.code === 'SPAWN_FAILED');
+	try {
+		await transport.stop();
+		await transport.start();
+
+		first.emit('error', new Error('old child failed after replacement started'));
+		await obsoleteFailure;
+		assert.doesNotThrow(() => transport.notify('replacement/alive'));
+		assert.deepEqual(replacement.writes, [{ method: 'replacement/alive', params: {} }]);
+	} finally {
+		await transport.stop();
+	}
 });
 
 test('initializes before catalog validation and thread start', async () => {
