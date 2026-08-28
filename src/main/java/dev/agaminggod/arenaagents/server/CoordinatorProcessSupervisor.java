@@ -39,6 +39,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long SHUTDOWN_WAIT_MS = 10_000L;
 	private static final int SHUTDOWN_TERMINATION_ATTEMPTS = 3;
 	private static final long DESCENDANT_TRACK_INTERVAL_MS = 100L;
+	private static final int MAX_BRIDGE_SECRET_LENGTH = 512;
 	private static final int CANDIDATE_FAILURES_BEFORE_ROLLBACK = 3;
 
 	private final Path gameDirectory;
@@ -227,6 +228,11 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		ChildProcess launch(LaunchRequest request) throws IOException;
 	}
 
+	@FunctionalInterface
+	interface ProcessStarter {
+		Process start(ProcessBuilder builder) throws IOException;
+	}
+
 	interface ChildProcess {
 		boolean isAlive();
 
@@ -401,7 +407,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			secret = normalized(secret, "bridge secret");
 			nodeExecutable = nodeExecutable == null ? null : normalized(nodeExecutable, "Node executable");
 			bridgeSecret = Objects.requireNonNull(bridgeSecret, "bridge secret value must not be null").strip();
-			if (bridgeSecret.length() < 32 || bridgeSecret.length() > 256) {
+			if (bridgeSecret.length() < 32 || bridgeSecret.length() > MAX_BRIDGE_SECRET_LENGTH) {
 				throw new IllegalArgumentException("bridge secret value is invalid");
 			}
 			if (bridgePort < 1_024 || bridgePort > 65_535) {
@@ -1450,6 +1456,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	static final class DefaultProcessLauncher implements ProcessLauncher {
+		private final ProcessStarter processStarter;
+
+		DefaultProcessLauncher() {
+			this(ProcessBuilder::start);
+		}
+
+		DefaultProcessLauncher(ProcessStarter processStarter) {
+			this.processStarter = Objects.requireNonNull(processStarter, "process starter must not be null");
+		}
+
 		@Override
 		public ChildProcess launch(LaunchRequest request) throws IOException {
 			Files.createDirectories(request.standardOutput().getParent());
@@ -1460,7 +1476,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			builder.environment().putAll(request.environment());
 			builder.redirectOutput(ProcessBuilder.Redirect.appendTo(request.standardOutput().toFile()));
 			builder.redirectError(ProcessBuilder.Redirect.appendTo(request.standardError().toFile()));
-			Process process = builder.start();
+			Process process = processStarter.start(builder);
 			try {
 				long startedAtEpochMs = process.info().startInstant()
 						.orElseThrow(() -> new IOException("coordinator process start time is unavailable"))
@@ -1472,7 +1488,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				return new OwnedProcessChild(
 						request.runtimeRoot(), process, startedAtEpochMs, request.generationId(), request.launchId()
 				);
-			} catch (IOException ownershipFailure) {
+			} catch (IOException | RuntimeException ownershipFailure) {
 				terminateFailedStart(process);
 				throw ownershipFailure;
 			}
@@ -1495,12 +1511,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				long startedAtEpochMs,
 				String generationId,
 				String launchId
-		) {
+		) throws IOException {
 			this.runtimeRoot = runtimeRoot;
 			this.process = process;
 			this.startedAtEpochMs = startedAtEpochMs;
 			this.generationId = generationId;
 			this.launchId = launchId;
+			captureDescendantsOrThrow();
 			Thread.ofPlatform()
 					.name("arenaagents-coordinator-descendants-" + process.pid())
 					.daemon(true)
@@ -1548,19 +1565,23 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 		private synchronized void captureDescendants() {
 			try {
-				List<CoordinatorProcessOwnership.ProcessIdentity> observed =
-						CoordinatorProcessOwnership.captureDescendants(process.toHandle());
-				boolean changed = descendants.removeIf(identity -> !identity.isAlive());
-				changed |= descendants.addAll(observed);
-				if (!changed) return;
-				CoordinatorProcessOwnership.trackDescendants(
-						runtimeRoot, process.pid(), startedAtEpochMs, generationId, launchId, List.copyOf(descendants)
-				);
+				captureDescendantsOrThrow();
 			} catch (IOException | RuntimeException failure) {
 				if (trackingFailureLogged.compareAndSet(false, true)) {
 					LOGGER.warn("Could not preserve coordinator descendant ownership", failure);
 				}
 			}
+		}
+
+		private synchronized void captureDescendantsOrThrow() throws IOException {
+			List<CoordinatorProcessOwnership.ProcessIdentity> observed =
+					CoordinatorProcessOwnership.captureDescendants(process.toHandle());
+			boolean changed = descendants.removeIf(identity -> !identity.isAlive());
+			changed |= descendants.addAll(observed);
+			if (!changed) return;
+			CoordinatorProcessOwnership.trackDescendants(
+					runtimeRoot, process.pid(), startedAtEpochMs, generationId, launchId, List.copyOf(descendants)
+			);
 		}
 	}
 

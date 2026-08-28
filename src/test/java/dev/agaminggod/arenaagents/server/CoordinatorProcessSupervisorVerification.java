@@ -89,11 +89,13 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyProductionChildPreservesDescendantsAcrossRootExit();
+		verifySynchronousInitialCaptureSurvivesFastRootExit();
 		verifyProductionBridgePortValidation();
+		verifyProductionBridgeSecretValidation();
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 242;
+		return 250;
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -186,6 +188,95 @@ public final class CoordinatorProcessSupervisorVerification {
 				try { Files.deleteIfExists(config); } catch (IOException ignored) { }
 			}
 		}
+	}
+
+	private static void verifySynchronousInitialCaptureSurvivesFastRootExit() {
+		Path root = null;
+		Process coordinator = null;
+		ProcessHandle provider = null;
+		CoordinatorProcessSupervisor.ChildProcess owned = null;
+		try {
+			root = Files.createTempDirectory("arena-supervisor-initial-descendants-");
+			Path runtimeRoot = root;
+			Path main = root.resolve("coordinator/src/dynamic-main.mjs").toAbsolutePath().normalize();
+			Path providerPid = root.resolve("runtime/provider.pid");
+			Path releaseRoot = root.resolve("runtime/release-root");
+			Files.createDirectories(main.getParent());
+			Files.createDirectories(providerPid.getParent());
+			Files.writeString(main, "// initial process ownership fixture", StandardCharsets.UTF_8);
+			String java = Path.of(
+					System.getProperty("java.home"), "bin", isWindows() ? "java.exe" : "java"
+			).toString();
+			coordinator = new ProcessBuilder(
+					java, "-cp", System.getProperty("java.class.path"),
+					RootExitFixture.class.getName(), providerPid.toString(), releaseRoot.toString()
+			).start();
+			awaitCondition(() -> readablePid(providerPid), "fast-exit fixture launches its provider descendant");
+			provider = ProcessHandle.of(Long.parseLong(Files.readString(providerPid).trim())).orElseThrow();
+			Process startedCoordinator = coordinator;
+			CoordinatorProcessSupervisor.LaunchRequest request = new CoordinatorProcessSupervisor.LaunchRequest(
+					List.of(java),
+					root,
+					Map.of(),
+					root.resolve("logs/coordinator.log"),
+					root.resolve("logs/coordinator-error.log"),
+					root,
+					main,
+					GENERATION_A,
+					"00000000-0000-0000-0000-000000000992",
+					new CoordinatorProcessOwnership.SupervisorIdentity(
+							"00000000-0000-0000-0000-000000000993"
+					)
+			);
+			owned = new CoordinatorProcessSupervisor.DefaultProcessLauncher(ignored -> startedCoordinator)
+					.launch(request);
+			assertTrue(ownershipTracks(runtimeRoot, provider),
+					"launch persists existing descendants before returning the owned child");
+
+			Files.writeString(releaseRoot, "exit", StandardCharsets.UTF_8);
+			Process exactCoordinator = coordinator;
+			awaitCondition(() -> !exactCoordinator.isAlive(), "fast coordinator root exits immediately after launch returns");
+			assertTrue(provider.isAlive(), "fast root exit leaves its provider available for ownership cleanup");
+			ProcessHandle exactProvider = provider;
+			owned.terminate();
+			awaitCondition(() -> !exactProvider.isAlive(), "synchronously captured provider is terminated after reparenting");
+			assertFalse(Files.exists(CoordinatorProcessOwnership.ownershipFile(root)),
+					"fast-exit ownership clears after descendant cleanup");
+		} catch (Exception exception) {
+			throw new AssertionError("synchronous initial descendant capture verification failed", exception);
+		} finally {
+			if (owned != null) {
+				try { owned.terminate(); } catch (RuntimeException ignored) { }
+			}
+			if (coordinator != null && coordinator.isAlive()) coordinator.destroyForcibly();
+			if (provider != null && provider.isAlive()) provider.destroyForcibly();
+			if (root != null) deleteTree(root);
+		}
+	}
+
+	private static void verifyProductionBridgeSecretValidation() {
+		String maximumSecret = "s".repeat(512);
+		CoordinatorProcessSupervisor.PreparedRuntime runtime = preparedRuntime(maximumSecret);
+		assertEquals(maximumSecret, runtime.bridgeSecret(),
+				"production supervisor accepts the protocol bridge-secret upper bound");
+		try {
+			preparedRuntime("s".repeat(513));
+		} catch (IllegalArgumentException expected) {
+			return;
+		}
+		throw new AssertionError("production supervisor rejects bridge secrets above the protocol upper bound");
+	}
+
+	private static CoordinatorProcessSupervisor.PreparedRuntime preparedRuntime(String bridgeSecret) {
+		return new CoordinatorProcessSupervisor.PreparedRuntime(
+				Path.of("build/supervisor-secret-runtime"),
+				Path.of("build/supervisor-secret-runtime/coordinator"),
+				Path.of("build/supervisor-secret-runtime/coordinator/src/dynamic-main.mjs"),
+				Path.of("build/supervisor-secret-runtime/runtime/dynamic-agents.json"),
+				Path.of("build/supervisor-secret-runtime/runtime/bridge-secret.txt"),
+				Path.of("build/supervisor-secret-runtime/runtime/node/bin/node"),
+				bridgeSecret
+		);
 	}
 
 	private static void verifyLaunchMaterialChangeFencesOwnedChild() {
