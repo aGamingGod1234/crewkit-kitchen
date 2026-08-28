@@ -67,7 +67,10 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCandidatePromotionUsesMaintenanceWorker();
 		verifyCandidatePromotionRefreshesOwnedFingerprintBaseline();
 		verifyCandidateReadinessGapRestartsStabilityWindow();
-		verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination();
+		verifyExternalAuthenticationFailuresRecoverWithoutQuarantine();
+		verifyTemporaryProcessStartFailuresRecoverWithoutQuarantine();
+		verifyMissingCandidatePrerequisitesRecoverWithoutQuarantine();
+		verifyQualifiedCandidateFailuresRollBackAfterTermination();
 		verifyCandidateRollbackRefreshesOwnedFingerprintBaseline();
 		verifyCandidateRollbackWaitsForConfirmedTermination();
 		verifySoleCandidateFailureKeepsRetrying();
@@ -99,7 +102,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 259;
+		return 275;
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -528,7 +531,99 @@ public final class CoordinatorProcessSupervisorVerification {
 		supervisor.close();
 	}
 
-	private static void verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination() {
+	private static void verifyExternalAuthenticationFailuresRecoverWithoutQuarantine() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		FakeLauncher launcher = new FakeLauncher();
+		FakeGenerationController generations = new FakeGenerationController();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-external-auth-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(300), Runnable::run, runtimeRoot -> 0, task -> { }, generations
+		);
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		long[] retryDelays = {1_000L, 2_000L, 5_000L};
+		for (int failure = 0; failure < 3; failure++) {
+			clock.advance(AUTHENTICATION_TIMEOUT_MS);
+			supervisor.tick(false, null, 0L);
+			assertEquals(0, generations.rollbacks,
+					"an unqualified authentication timeout never quarantines candidate bytes");
+			clock.advance(retryDelays[failure]);
+			supervisor.tick(false, null, 0L);
+		}
+		assertEquals(4, launcher.launches.size(), "the candidate remains eligible after three external failures");
+		String recoveredLaunchId = supervisor.snapshot().launchId();
+		supervisor.tick(true, recoveredLaunchId, 1L, true);
+		assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
+				"the unchanged candidate recovers when the external bridge prerequisite returns");
+		assertEquals(GENERATION_B, supervisor.runtimeGenerationId(),
+				"external recovery keeps the original candidate generation active");
+		supervisor.close();
+	}
+
+	private static void verifyTemporaryProcessStartFailuresRecoverWithoutQuarantine() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		FakeLauncher launcher = new FakeLauncher();
+		launcher.failuresRemaining = 3;
+		FakeGenerationController generations = new FakeGenerationController();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-external-launch-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(305), Runnable::run, runtimeRoot -> 0, task -> { }, generations
+		);
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		for (long retryDelay : new long[]{1_000L, 2_000L, 5_000L}) {
+			assertEquals(0, generations.rollbacks,
+					"a temporary OS process-start failure never quarantines candidate bytes");
+			clock.advance(retryDelay);
+			supervisor.tick(false, null, 0L);
+		}
+		String recoveredLaunchId = supervisor.snapshot().launchId();
+		supervisor.tick(true, recoveredLaunchId, 1L, true);
+		assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
+				"the unchanged candidate starts after the OS process launcher recovers");
+		assertEquals(0, generations.rollbacks, "process-start recovery leaves the candidate unquarantined");
+		supervisor.close();
+	}
+
+	private static void verifyMissingCandidatePrerequisitesRecoverWithoutQuarantine() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.blocked(
+				dependencies.runtime, "PROVIDER_AUTH_MISSING", "Required external provider credentials are unavailable"
+		);
+		FakeLauncher launcher = new FakeLauncher();
+		FakeGenerationController generations = new FakeGenerationController();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-missing-prerequisite-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(306), Runnable::run, runtimeRoot -> 0, task -> { }, generations
+		);
+		for (int retry = 0; retry < 3; retry++) {
+			clock.advance(5_000L);
+			supervisor.tick(false, null, 0L, false);
+		}
+		assertEquals(CoordinatorRecoveryState.BLOCKED_RETRYABLE, supervisor.snapshot().state(),
+				"a missing external prerequisite remains retryable after three checks");
+		assertEquals(0, generations.rollbacks,
+				"missing external prerequisites never quarantine prepared candidate bytes");
+
+		dependencies.fingerprint = "candidate-prerequisite-restored";
+		dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(dependencies.runtime);
+		clock.advance(5_000L);
+		supervisor.tick(false, null, 0L, false);
+		assertTrue(supervisor.snapshot().launchId() != null,
+				"the unchanged candidate launches when its external prerequisite returns");
+		String recoveredLaunchId = supervisor.snapshot().launchId();
+		supervisor.tick(true, recoveredLaunchId, 1L, true);
+		assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
+				"the candidate reaches healthy after prerequisite recovery");
+		assertEquals(GENERATION_B, supervisor.runtimeGenerationId(),
+				"prerequisite recovery keeps the original candidate generation active");
+		supervisor.close();
+	}
+
+	private static void verifyQualifiedCandidateFailuresRollBackAfterTermination() {
 		FakeClock clock = new FakeClock();
 		MutableDependencies dependencies = MutableDependencies.candidate(true);
 		FakeLauncher launcher = new FakeLauncher();
@@ -536,27 +631,39 @@ public final class CoordinatorProcessSupervisorVerification {
 		generations.beforeRollback = () -> assertEquals(1, launcher.latest().terminations,
 				"candidate rollback begins only after the failed owned child is terminated and cleared");
 		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
-				Path.of("build", "candidate-rollback-game"), Map.of(), clock, dependencies, launcher,
-				new SequentialLaunchIds(300), Runnable::run, runtimeRoot -> 0, task -> { }, generations
+				Path.of("build", "candidate-qualified-failure-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(307), Runnable::run, runtimeRoot -> 0, task -> { }, generations
 		);
 		clock.advance(STARTUP_GRACE_MS);
 		supervisor.tick(false, null, 0L);
+		long sessionGeneration = 1L;
 		long[] retryDelays = {1_000L, 2_000L};
 		for (int failure = 0; failure < 3; failure++) {
-			clock.advance(AUTHENTICATION_TIMEOUT_MS);
-			supervisor.tick(false, null, 0L);
+			failQualifiedCandidateAttempt(supervisor, launcher, sessionGeneration++);
 			if (failure < retryDelays.length) {
-				assertEquals(0, generations.rollbacks, "one candidate authentication failure does not roll back early");
+				assertEquals(0, generations.rollbacks,
+						"one candidate failure after readiness does not roll back early");
 				clock.advance(retryDelays[failure]);
-				supervisor.tick(false, null, 0L);
+				supervisor.tick(false, null, 0L, false);
 			}
 		}
-		assertEquals(1, generations.rollbacks, "three candidate authentication failures roll back once");
+		assertEquals(1, generations.rollbacks, "three failures after candidate readiness roll back once");
 		assertEquals(GENERATION_A, supervisor.runtimeGenerationId(),
-				"rollback result publishes the verified last-known-good generation");
+				"candidate-attributable rollback publishes the verified last-known-good generation");
 		supervisor.tick(false, null, 0L);
 		assertEquals(1, generations.rollbacks, "repeated ticks do not repeat a completed rollback");
 		supervisor.close();
+	}
+
+	private static void failQualifiedCandidateAttempt(
+			CoordinatorProcessSupervisor supervisor,
+			FakeLauncher launcher,
+			long sessionGeneration
+	) {
+		String launchId = supervisor.snapshot().launchId();
+		supervisor.tick(true, launchId, sessionGeneration, true);
+		launcher.latest().crash();
+		supervisor.tick(false, null, 0L, false);
 	}
 
 	private static void verifyCandidateRollbackRefreshesOwnedFingerprintBaseline() {
@@ -573,14 +680,13 @@ public final class CoordinatorProcessSupervisorVerification {
 		);
 		clock.advance(STARTUP_GRACE_MS);
 		supervisor.tick(false, null, 0L);
+		long sessionGeneration = 1L;
 		for (long retryDelay : new long[]{1_000L, 2_000L}) {
-			clock.advance(AUTHENTICATION_TIMEOUT_MS);
-			supervisor.tick(false, null, 0L);
+			failQualifiedCandidateAttempt(supervisor, launcher, sessionGeneration++);
 			clock.advance(retryDelay);
-			supervisor.tick(false, null, 0L);
+			supervisor.tick(false, null, 0L, false);
 		}
-		clock.advance(AUTHENTICATION_TIMEOUT_MS);
-		supervisor.tick(false, null, 0L);
+		failQualifiedCandidateAttempt(supervisor, launcher, sessionGeneration);
 		String restoredLaunchId = supervisor.snapshot().launchId();
 		FakeChild restoredChild = launcher.latest();
 		int resolutionsAfterRollback = dependencies.resolveCalls;
@@ -610,16 +716,15 @@ public final class CoordinatorProcessSupervisorVerification {
 		);
 		clock.advance(STARTUP_GRACE_MS);
 		supervisor.tick(false, null, 0L);
+		long sessionGeneration = 1L;
 		for (long retryDelay : new long[]{1_000L, 2_000L}) {
-			clock.advance(AUTHENTICATION_TIMEOUT_MS);
-			supervisor.tick(false, null, 0L);
+			failQualifiedCandidateAttempt(supervisor, launcher, sessionGeneration++);
 			clock.advance(retryDelay);
-			supervisor.tick(false, null, 0L);
+			supervisor.tick(false, null, 0L, false);
 		}
 		FakeChild failedCandidate = launcher.latest();
 		failedCandidate.terminationFailuresRemaining = 1;
-		clock.advance(AUTHENTICATION_TIMEOUT_MS);
-		supervisor.tick(false, null, 0L);
+		failQualifiedCandidateAttempt(supervisor, launcher, sessionGeneration);
 		assertEquals(1, failedCandidate.terminationAttempts,
 				"failed candidate termination is attempted before rollback");
 		assertEquals(0, failedCandidate.terminations,
@@ -668,7 +773,10 @@ public final class CoordinatorProcessSupervisorVerification {
 
 	public static void main(String[] arguments) {
 		verifyCandidatePromotionUsesMaintenanceWorker();
-		verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination();
+		verifyExternalAuthenticationFailuresRecoverWithoutQuarantine();
+		verifyTemporaryProcessStartFailuresRecoverWithoutQuarantine();
+		verifyMissingCandidatePrerequisitesRecoverWithoutQuarantine();
+		verifyQualifiedCandidateFailuresRollBackAfterTermination();
 		verifyCandidateRollbackWaitsForConfirmedTermination();
 		verifySoleCandidateFailureKeepsRetrying();
 		System.out.println("PASS: coordinator generation supervisor assertions");

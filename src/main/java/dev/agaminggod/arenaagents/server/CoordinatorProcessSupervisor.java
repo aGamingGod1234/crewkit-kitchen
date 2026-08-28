@@ -87,6 +87,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private long bridgeRevision;
 	private long sharedSecretRevision;
 	private int candidateFailures;
+	private boolean candidateAttemptQualified;
 	private boolean rollbackRequested;
 	private long nextGenerationMutationEpochMs;
 	private long nextTerminationRetryEpochMs;
@@ -670,6 +671,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				stabilityCredited = false;
 			}
 			coordinatorReconciled = coordinatorReady;
+			if (runtime != null && runtime.candidate() && coordinatorReady) {
+				candidateAttemptQualified = true;
+			}
 			failingBoundary = null;
 			clearDiagnostic();
 			authenticationDeadlineEpochMs = 0L;
@@ -745,10 +749,12 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		);
 		if (runtime == null || previous == null || !previous.generationId().equals(runtime.generationId())) {
 			candidateFailures = 0;
+			candidateAttemptQualified = false;
 			rollbackRequested = false;
 		}
 		if (runtime != null && !runtime.candidate()) {
 			candidateFailures = 0;
+			candidateAttemptQualified = false;
 			rollbackRequested = false;
 		}
 		if (runtime != null) configureSharedBridgeSecretPath(runtime.secret());
@@ -859,6 +865,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		if (maintenancePending || stopped) return;
 		generation++;
 		state = CoordinatorRecoveryState.STARTING;
+		candidateAttemptQualified = false;
 		String ownedLaunchId;
 		try {
 			ownedLaunchId = UUID.fromString(Objects.requireNonNull(launchIds.get(), "launch ID must not be null")).toString();
@@ -1044,6 +1051,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				acceptOwnedDependencyFingerprint(rollback.fingerprint());
 				runtime = withGeneration(runtime, rollback.status());
 				candidateFailures = 0;
+				candidateAttemptQualified = false;
 				rollbackRequested = false;
 				nextGenerationMutationEpochMs = 0L;
 				nextDependencyCheckEpochMs = now + DEPENDENCY_RECHECK_MS;
@@ -1142,7 +1150,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private void recordFailure(long now, String code, String message, String boundary) {
 		restartBudget.recordUnexpectedExit();
-		if (runtime != null && runtime.candidate() && candidateFailure(code)) {
+		boolean candidateAttributable = candidateAttemptQualified && candidateRuntimeFailure(code);
+		candidateAttemptQualified = false;
+		if (runtime != null && runtime.candidate() && candidateAttributable) {
 			candidateFailures++;
 			if (candidateFailures >= CANDIDATE_FAILURES_BEFORE_ROLLBACK
 					&& runtime.lastKnownGoodAvailable()) {
@@ -1161,10 +1171,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		setDiagnostic(code, message, boundary);
 	}
 
-	private static boolean candidateFailure(String code) {
-		return "COORDINATOR_START_FAILED".equals(code)
-				|| "COORDINATOR_EXITED".equals(code)
-				|| "COORDINATOR_AUTHENTICATION_TIMEOUT".equals(code)
+	private static boolean candidateRuntimeFailure(String code) {
+		return "COORDINATOR_EXITED".equals(code)
 				|| "COORDINATOR_RECONNECT_TIMEOUT".equals(code);
 	}
 
