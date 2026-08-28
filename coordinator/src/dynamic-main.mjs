@@ -588,7 +588,6 @@ export class DynamicCoordinator extends EventEmitter {
 				if (![DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) return;
 				const wireObservation = message.payload.observation ?? message.payload;
 				const supervisionKey = this.#supervisionKey(record, lifecycleGeneration);
-				this.#goalSupervisor.observed(supervisionKey);
 				this.#goalSupervisor.factualProgress(supervisionKey, factualProgressSignature(wireObservation), factualProgressDetails(wireObservation));
 				if (this.#usesNativeTools(record)) this.#nativeRuntimeEpochs.set(record.agentId, connectionEpoch);
 				const observation = adaptObservation(wireObservation);
@@ -622,6 +621,7 @@ export class DynamicCoordinator extends EventEmitter {
 						signature: observationSignature,
 					});
 					if (unchangedHeartbeat) return;
+					this.#goalSupervisor.observed(supervisionKey);
 					this.#scheduleNativeTurn(record, {
 						agentId: record.agentId,
 						goalRevision: record.goalRevision,
@@ -635,6 +635,7 @@ export class DynamicCoordinator extends EventEmitter {
 					});
 					return;
 				}
+				this.#goalSupervisor.observed(supervisionKey);
 				const installed = await this.#programRuntime.onObservation(record, {
 					observation,
 					eventSequence: message.payload.eventSequence,

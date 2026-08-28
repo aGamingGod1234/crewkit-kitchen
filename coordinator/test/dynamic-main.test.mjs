@@ -116,12 +116,13 @@ class FakePlanner {
 class RecordingGoalSupervisor {
 	activations = [];
 	terminations = [];
+	observations = [];
 	activate(key) { this.activations.push(key); }
 	terminate(key) { this.terminations.push(key); }
 	begin(key, kind) { return { ...key, kind, operationId: `operation-${kind}` }; }
 	end() {}
 	progress() {}
-	observed() {}
+	observed(key) { this.observations.push(key); }
 	recover() {}
 	ensure() {}
 	factualProgress() {}
@@ -2131,16 +2132,52 @@ test('native scheduling drops unchanged quiet heartbeats but accepts the supervi
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, attention: false, observation } });
 		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+		const scheduledLeaseCount = timers.history.length;
+		const scheduledLeaseHandle = timers.history.at(-1).handle.id;
 		for (let sequence = 2; sequence <= 20; sequence += 1) {
 			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: sequence, attention: false, observation } });
+			await new Promise((resolve) => setImmediate(resolve));
 		}
-		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(planner.requests.length, 1);
+		assert.equal(timers.history.length, scheduledLeaseCount, 'quiet heartbeats preserve the existing recovery deadline');
+		assert.equal(timers.history.at(-1).handle.id, scheduledLeaseHandle, 'quiet heartbeats preserve recovery lease identity');
 		await timers.runNext();
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'request_observation'));
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 21, attention: false, observation } });
 		await eventually(() => planner.requests.length === 2);
 		assert.match(planner.requests[1].input, /"trigger":"continuation"/);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('native supervision resets only when an observation starts actionable work', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const goalSupervisor = new RecordingGoalSupervisor();
+	const run = await start({
+		registry,
+		planner,
+		goalSupervisor,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	const observation = { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } };
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, attention: false, observation } });
+		await eventually(() => planner.requests.length === 1 && goalSupervisor.observations.length === 1);
+
+		for (let sequence = 2; sequence <= 17; sequence += 1) {
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: sequence, attention: false, observation } });
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+		assert.equal(goalSupervisor.observations.length, 1, 'ignored heartbeats do not reset supervision');
+
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 18, attention: true, trigger: 'damage', observation } });
+		await eventually(() => planner.requests.length === 2 && goalSupervisor.observations.length === 2);
+		assert.equal(goalSupervisor.observations[1].goalRevision, 1);
 	} finally { await run.coordinator.stop(); }
 });
 
