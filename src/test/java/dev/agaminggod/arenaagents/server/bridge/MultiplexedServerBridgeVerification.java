@@ -70,6 +70,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyHandshakeWaitsForPendingMarker();
 		verifyReplacementHandshakeSupersedesPendingDisconnect();
 		verifyAuthenticatedReconnectRecovery();
+		verifyTerminalReplaySurvivesDisconnectRevision();
 		verifyObsoletePlannerReadinessIsIgnored();
 		verifyAgentErrorRevisionGate();
 		verifyRespawnContinuationPayload();
@@ -134,6 +135,99 @@ public final class MultiplexedServerBridgeVerification {
 		verifyCompletionResultFacts();
 		verifyReplacementOperation();
 		return 154;
+	}
+
+	/**
+	 * A terminal result may be queued when the coordinator disappears. The disconnect tick
+	 * advances the lifecycle revision, but it must not fence a result belonging to the same
+	 * logical goal before a replacement handshake can replay and acknowledge it.
+	 */
+	private static void verifyTerminalReplaySurvivesDisconnectRevision() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-terminal-replay-reconnect-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord active = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Replay"), 2_500L);
+			manager.registry().start(active.agentId(), "finish the queued action", 2_501L);
+			AgentRecord started = manager.registry().require(active.agentId());
+			ServerActionResult result = new ServerActionResult(
+					started.agentId(), started.goalRevision(), "terminal-after-close", ActionType.WAIT,
+					"trace-terminal-after-close", ServerActionState.SUCCEEDED, "DONE", "done", 1L,
+					1_750_000_000_001L, true, true
+			);
+
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			bridge.start();
+			TerminalResultLedger ledger = bridge.terminalResultsForVerification();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket first = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader firstReader = new BufferedReader(new InputStreamReader(first.getInputStream(), StandardCharsets.UTF_8))) {
+				first.setSoTimeout(2_000);
+				authenticate(first, firstReader, codec, secret, "hello-terminal-replay-first");
+				assertTrue(ledger.retain(result), "terminal result is retained before the coordinator closes");
+				assertTrue(ledger.claim(result, session(bridge)), "first session owns the initial result delivery");
+				bridge.tick();
+				assertTrue(!firstReader.ready(), "claimed terminal result is not replayed twice on the first session");
+			}
+
+			MultiplexedServerBridge activeBridge = bridge;
+			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
+					"closed coordinator session releases terminal result delivery ownership");
+			// Drive the same registry transition the bridge's disconnect tick would perform. The
+			// lifecycle-only fixture has no Minecraft server for the chat reporter, so publishing
+			// it directly keeps this race check focused on bridge fencing and replay.
+			manager.registry().disconnect(active.agentId(), 2_502L);
+			bridge.tick();
+			AgentRecord disconnected = manager.registry().require(active.agentId());
+			assertEquals(AgentLifecycleState.DISCONNECTED, disconnected.state(),
+					"disconnect reconciliation advances the lifecycle after the close");
+			assertEquals(2L, disconnected.goalRevision(), "disconnect reconciliation advances the goal revision");
+			assertTrue(disconnected.currentGoal().isPresent(), "disconnect reconciliation retains the logical goal");
+
+			try (Socket replacement = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader replacementReader = new BufferedReader(new InputStreamReader(replacement.getInputStream(), StandardCharsets.UTF_8))) {
+				replacement.setSoTimeout(2_000);
+				BridgeEnvelope replacementAck = authenticate(
+						replacement, replacementReader, codec, secret, "hello-terminal-replay-replacement"
+				);
+				BridgeEnvelope replay = codec.decode(replacementReader.readLine());
+				assertEquals("action_result", replay.type(),
+						"replacement handshake replays a terminal result after the disconnect revision");
+				assertEquals("terminal-after-close", replay.payload().get("actionId").getAsString(),
+						"replacement handshake replays the original action exactly once");
+				assertEquals(2L, replacementAck.payload().getAsJsonArray("registry").get(0)
+						.getAsJsonObject().get("goalRevision").getAsLong(),
+						"replacement handshake reports the reconciled lifecycle revision");
+
+				JsonObject acknowledgement = new JsonObject();
+				acknowledgement.addProperty("goalRevision", result.goalRevision());
+				acknowledgement.addProperty("actionId", result.actionId());
+				writeEnvelope(replacement, codec, new BridgeEnvelope(
+						2, replacementAck.serverInstanceId(), result.agentId().toString(), "action_result_ack",
+						"ack-terminal-after-close", acknowledgement
+				));
+				awaitCondition(() -> {
+					activeBridge.tick();
+					return ledger.pendingCount() == 0;
+				}, "replacement acknowledgement removes the replayed result");
+				bridge.tick();
+				assertTrue(!replacementReader.ready(), "acknowledged terminal result is not replayed again");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("terminal replay disconnect revision verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (secretFile != null) {
+				try {
+					Files.deleteIfExists(secretFile);
+				} catch (java.io.IOException exception) {
+					throw new AssertionError("could not remove terminal replay bridge secret", exception);
+				}
+			}
+		}
 	}
 
 	private static void verifyReplacementOperation() {
@@ -1813,6 +1907,18 @@ public final class MultiplexedServerBridgeVerification {
 			return (ProgramActionLedger) field.get(bridge);
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not read bridge program action ledger", exception);
+		}
+	}
+
+	private static Object session(MultiplexedServerBridge bridge) {
+		try {
+			Field field = MultiplexedServerBridge.class.getDeclaredField("session");
+			field.setAccessible(true);
+			Object current = field.get(bridge);
+			if (current == null) throw new AssertionError("bridge has no active session");
+			return current;
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not read bridge session", exception);
 		}
 	}
 

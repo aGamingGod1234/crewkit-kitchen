@@ -7,6 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 
 /**
  * Retains terminal action results until the authenticated coordinator acknowledges them.
@@ -18,26 +19,28 @@ import java.util.Objects;
  */
 final class TerminalResultLedger {
 	private static final int MAX_RESULTS_PER_AGENT = 4_096;
-	private final Map<AgentId, Long> goalRevisions = new LinkedHashMap<>();
+	private final Map<AgentId, GoalFence> goalFences = new LinkedHashMap<>();
 	private final LinkedHashMap<Key, Entry> pending = new LinkedHashMap<>();
 
-	synchronized void beginGoal(AgentId agentId, long goalRevision) {
+	/** Advances a lifecycle revision while retaining terminal results for the same logical goal. */
+	synchronized void beginGoal(AgentId agentId, long goalRevision, UUID logicalGoalId) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		if (goalRevision < 0L) throw new IllegalArgumentException("goalRevision must be nonnegative");
-		Long current = goalRevisions.put(agentId, goalRevision);
-		if (current != null && current == goalRevision) return;
-		removeOtherRevisions(agentId, goalRevision);
+		GoalFence previous = goalFences.put(agentId, new GoalFence(goalRevision, logicalGoalId));
+		if (previous != null && logicalGoalId != null && logicalGoalId.equals(previous.logicalGoalId())) return;
+		removeOtherGoals(agentId, logicalGoalId);
 	}
 
 	/** Retains a result only when it belongs to the current goal fence. */
 	synchronized boolean retain(ServerActionResult result) {
 		Objects.requireNonNull(result, "result must not be null");
-		Long current = goalRevisions.get(result.agentId());
-		if (current != null && current.longValue() != result.goalRevision()) return false;
-		goalRevisions.putIfAbsent(result.agentId(), result.goalRevision());
+		GoalFence current = goalFences.get(result.agentId());
+		if (current != null && current.goalRevision() != result.goalRevision()) return false;
+		UUID logicalGoalId = current == null ? null : current.logicalGoalId();
+		if (current == null) goalFences.put(result.agentId(), new GoalFence(result.goalRevision(), null));
 		Key key = new Key(result.agentId(), result.goalRevision(), result.actionId());
 		if (pending.containsKey(key)) return true;
-		pending.put(key, new Entry(result));
+		pending.put(key, new Entry(result, logicalGoalId));
 		trimAgent(result.agentId());
 		return true;
 	}
@@ -82,7 +85,7 @@ final class TerminalResultLedger {
 
 	synchronized void remove(AgentId agentId) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
-		goalRevisions.remove(agentId);
+		goalFences.remove(agentId);
 		for (Iterator<Key> iterator = pending.keySet().iterator(); iterator.hasNext();) {
 			if (iterator.next().agentId().equals(agentId)) iterator.remove();
 		}
@@ -92,10 +95,11 @@ final class TerminalResultLedger {
 		return pending.size();
 	}
 
-	private void removeOtherRevisions(AgentId agentId, long goalRevision) {
+	private void removeOtherGoals(AgentId agentId, UUID logicalGoalId) {
 		for (Iterator<Key> iterator = pending.keySet().iterator(); iterator.hasNext();) {
 			Key key = iterator.next();
-			if (key.agentId().equals(agentId) && key.goalRevision() != goalRevision) iterator.remove();
+			if (key.agentId().equals(agentId)
+					&& (logicalGoalId == null || !logicalGoalId.equals(pending.get(key).logicalGoalId()))) iterator.remove();
 		}
 	}
 
@@ -117,15 +121,20 @@ final class TerminalResultLedger {
 
 	private record Key(AgentId agentId, long goalRevision, String actionId) { }
 
+	private record GoalFence(long goalRevision, UUID logicalGoalId) { }
+
 	private static final class Entry {
 		private final ServerActionResult result;
+		private final UUID logicalGoalId;
 		private Object queuedSession;
 
-		private Entry(ServerActionResult result) {
+		private Entry(ServerActionResult result, UUID logicalGoalId) {
 			this.result = result;
+			this.logicalGoalId = logicalGoalId;
 		}
 
 		private ServerActionResult result() { return result; }
+		private UUID logicalGoalId() { return logicalGoalId; }
 		private Object queuedSession() { return queuedSession; }
 	}
 }

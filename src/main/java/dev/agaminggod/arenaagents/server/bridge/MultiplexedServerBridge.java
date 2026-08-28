@@ -450,7 +450,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public boolean onCreated(AgentRecord record) {
 		registryPublicationRevision.incrementAndGet();
 		programActions.beginGoal(record.agentId(), record.goalRevision());
-		terminalResults.beginGoal(record.agentId(), record.goalRevision());
+		terminalResults.beginGoal(record.agentId(), record.goalRevision(), logicalGoalId(record));
 		synchronized (publicationLock) {
 			if (protocolKnownAgentIds.contains(record.agentId())) return true;
 			Session active = session;
@@ -468,7 +468,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public void onTransition(AgentTransition transition) {
 		registryPublicationRevision.incrementAndGet();
 		programActions.beginGoal(transition.after().agentId(), transition.after().goalRevision());
-		terminalResults.beginGoal(transition.after().agentId(), transition.after().goalRevision());
+		terminalResults.beginGoal(transition.after().agentId(), transition.after().goalRevision(), logicalGoalId(transition.after()));
 		ScenarioRuntimeService.onAgentState(
 				manager.server(),
 				transition.after().agentId().toString(),
@@ -675,7 +675,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 						handshake.add(goalSpecRequestEnvelope(draft));
 					}
 				}
-				for (AgentRecord record : visibleRecords) terminalResults.beginGoal(record.agentId(), record.goalRevision());
+				for (AgentRecord record : visibleRecords) terminalResults.beginGoal(record.agentId(), record.goalRevision(), logicalGoalId(record));
 				List<ServerActionResult> terminalReplay = terminalResults.pending();
 				int replayCapacity = Math.max(0, CONNECTION_QUEUE_CAP - handshake.size());
 				Map<String, Integer> handshakeQueuedByAgent = new HashMap<>();
@@ -1941,6 +1941,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			return "replace";
 		}
 		return "start";
+	}
+
+	private static UUID logicalGoalId(AgentRecord record) {
+		return record.currentGoal().map(AgentGoal::goalId).orElse(null);
 	}
 
 	private static String plannerGoal(AgentGoal goal) {
