@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.MinecraftCoordinateBounds;
 import dev.agaminggod.arenaagents.server.goal.AgentKillLedger;
+import dev.agaminggod.arenaagents.server.goal.SurvivalProgressLedger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -28,7 +29,15 @@ import net.minecraft.world.level.block.state.BlockState;
 /** Evaluates only the immutable goal stored by Minecraft against live server facts. */
 public final class GoalCompletionVerifier {
 	private final Map<PredicateKey, PositionCounter> stablePositionTicks = new HashMap<>();
-	private final Map<PredicateKey, SurvivalCounter> survivalCounters = new HashMap<>();
+	private final SurvivalProgressLedger survivalProgress;
+
+	public GoalCompletionVerifier() {
+		this(new SurvivalProgressLedger());
+	}
+
+	public GoalCompletionVerifier(SurvivalProgressLedger survivalProgress) {
+		this.survivalProgress = Objects.requireNonNull(survivalProgress, "survivalProgress must not be null");
+	}
 
 	public VerificationResult verify(
 			AgentRecord record,
@@ -66,7 +75,7 @@ public final class GoalCompletionVerifier {
 	public void retainGoals(Set<UUID> goalIds) {
 		Set<UUID> retained = Set.copyOf(Objects.requireNonNull(goalIds, "goalIds must not be null"));
 		stablePositionTicks.keySet().removeIf(key -> !retained.contains(key.goalId()));
-		survivalCounters.keySet().removeIf(key -> !retained.contains(key.goalId()));
+		survivalProgress.retainGoals(retained);
 	}
 
 	public static FactSource minecraftFacts(ServerPlayer player) {
@@ -213,11 +222,8 @@ public final class GoalCompletionVerifier {
 			return leaf("block_matches", satisfied, block.blockId() + sortedProperties(block.properties()), observed.blockId() + sortedProperties(observed.properties()));
 		}
 		if (predicate instanceof GoalPredicate.SurviveDuration survive) {
-			SurvivalCounter previous = survivalCounters.getOrDefault(key, new SurvivalCounter(0L, tick - 1L));
-			long observed = source.alive()
-					? (previous.lastTick() == tick ? previous.ticks() : previous.lastTick() == tick - 1L ? previous.ticks() + 1L : 1L)
-					: 0L;
-			survivalCounters.put(key, new SurvivalCounter(observed, tick));
+			long observed = survivalProgress.observe(new SurvivalProgressLedger.Requirement(
+					goalId, record.agentId(), path, survive.ticks()), source.alive(), tick);
 			return leaf("survive_duration", observed >= survive.ticks(), survive.ticks() + " ticks", observed + " ticks");
 		}
 		if (predicate instanceof GoalPredicate.OperatorConfirmed) {
@@ -243,14 +249,14 @@ public final class GoalCompletionVerifier {
 			AllocationContinuation continuation
 	) {
 		if (predicate instanceof GoalPredicate.AllOf all) {
-			return satisfyAllWithBacktracking(goalId, all.predicates(), 0, path, source, kills, record,
-					tick, operatorConfirmed, allocation, continuation);
+			return satisfyAllWithBacktracking(goalId, all.predicates(), 0, path, source, kills,
+					record, tick, operatorConfirmed, allocation, continuation);
 		}
 		if (predicate instanceof GoalPredicate.AnyOf any) {
 			for (int index = 0; index < any.predicates().size(); index++) {
 				Optional<List<GoalEvidence.Fact>> satisfied = satisfyWithBacktracking(
-						goalId, any.predicates().get(index), path + "." + index, source, kills, record,
-						tick, operatorConfirmed, allocation.copy(), continuation);
+						goalId, any.predicates().get(index), path + "." + index, source, kills,
+						record, tick, operatorConfirmed, allocation.copy(), continuation);
 				if (satisfied.isPresent()) return satisfied;
 			}
 			return Optional.empty();
@@ -290,8 +296,8 @@ public final class GoalCompletionVerifier {
 	) {
 		if (index == predicates.size()) return continuation.apply(allocation);
 		return satisfyWithBacktracking(
-				goalId, predicates.get(index), path + "." + index, source, kills, record,
-				tick, operatorConfirmed, allocation,
+				goalId, predicates.get(index), path + "." + index, source, kills,
+				record, tick, operatorConfirmed, allocation,
 				next -> satisfyAllWithBacktracking(goalId, predicates, index + 1, path, source, kills,
 						record, tick, operatorConfirmed, next, continuation));
 	}
@@ -377,7 +383,6 @@ public final class GoalCompletionVerifier {
 
 	private record PredicateKey(UUID goalId, String path) { }
 	private record PositionCounter(int ticks, long lastTick) { }
-	private record SurvivalCounter(long ticks, long lastTick) { }
 	private record KillRequirement(String entityType, long afterTime) { }
 	private record Evaluation(boolean satisfied, List<GoalEvidence.Fact> facts) { }
 	@FunctionalInterface

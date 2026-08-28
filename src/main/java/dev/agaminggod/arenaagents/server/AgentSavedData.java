@@ -15,6 +15,8 @@ import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraftCodec;
 import dev.agaminggod.arenaagents.server.goal.AgentKillLedger;
 import dev.agaminggod.arenaagents.server.goal.AgentKillLedgerCodec;
+import dev.agaminggod.arenaagents.server.goal.SurvivalProgressLedger;
+import dev.agaminggod.arenaagents.server.goal.SurvivalProgressLedgerCodec;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -36,16 +38,19 @@ public final class AgentSavedData extends SavedData {
 	private static final String CONVERSATION_WAKES_FIELD = "conversation_wakes";
 	private static final String GOAL_DRAFTS_FIELD = "goal_drafts";
 	private static final String KILL_LEDGER_CHUNKS_FIELD = "kill_ledger_chunks";
+	private static final String SURVIVAL_PROGRESS_CHUNKS_FIELD = "survival_progress_chunks";
 	private static final AgentRegistrySnapshotCodec SNAPSHOT_CODEC = new AgentRegistrySnapshotCodec();
 	private static final PendingConversationWakeCodec WAKE_CODEC = new PendingConversationWakeCodec();
 	private static final PendingGoalDraftCodec DRAFT_CODEC = new PendingGoalDraftCodec();
 	private static final AgentKillLedgerCodec KILL_LEDGER_CODEC = new AgentKillLedgerCodec();
+	private static final SurvivalProgressLedgerCodec SURVIVAL_PROGRESS_CODEC = new SurvivalProgressLedgerCodec();
 	private static final Codec<AgentSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
 			Codec.STRING.optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
 			Codec.STRING.listOf().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload())),
 			Codec.STRING.listOf().optionalFieldOf(CONVERSATION_WAKES_FIELD, List.of()).forGetter(AgentSavedData::encodeConversationWakes),
 			Codec.STRING.listOf().optionalFieldOf(GOAL_DRAFTS_FIELD, List.of()).forGetter(AgentSavedData::encodeGoalDrafts),
-			Codec.STRING.listOf().optionalFieldOf(KILL_LEDGER_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeKillLedger)
+			Codec.STRING.listOf().optionalFieldOf(KILL_LEDGER_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeKillLedger),
+			Codec.STRING.listOf().optionalFieldOf(SURVIVAL_PROGRESS_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeSurvivalProgress)
 	).apply(instance, AgentSavedData::decodePayload));
 	public static final SavedDataType<AgentSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "codex_agents"),
@@ -58,6 +63,7 @@ public final class AgentSavedData extends SavedData {
 	private final Map<AgentId, PendingConversationWake> conversationWakes = new LinkedHashMap<>();
 	private final Map<UUID, PendingGoalDraft> goalDrafts = new LinkedHashMap<>();
 	private final AgentKillLedger killLedger;
+	private final SurvivalProgressLedger survivalProgress;
 	private AgentRuntimeHooks runtimeHooks = AgentRuntimeHooks.NO_OP;
 
 	public AgentSavedData() {
@@ -70,16 +76,18 @@ public final class AgentSavedData extends SavedData {
 	}
 
 	private AgentSavedData(AgentRegistry.Snapshot snapshot) {
-		this(snapshot, List.of(), List.of(), AgentKillLedger.emptySnapshot());
+		this(snapshot, List.of(), List.of(), AgentKillLedger.emptySnapshot(), SurvivalProgressLedger.emptySnapshot());
 	}
 
 	private AgentSavedData(
 			AgentRegistry.Snapshot snapshot,
 			List<PendingConversationWake> persistedWakes,
 			List<PendingGoalDraft> persistedDrafts,
-			AgentKillLedger.Snapshot persistedKillLedger
+			AgentKillLedger.Snapshot persistedKillLedger,
+			SurvivalProgressLedger.Snapshot persistedSurvivalProgress
 	) {
 		this.killLedger = new AgentKillLedger(persistedKillLedger, this::setDirty);
+		this.survivalProgress = new SurvivalProgressLedger(persistedSurvivalProgress, this::setDirty);
 		if (persistedWakes.size() > snapshot.maxAgents()) {
 			throw new AgentDomainException("INVALID_PERSISTED_CONVERSATION_WAKE", "Persisted conversation wake count exceeds the agent limit");
 		}
@@ -135,6 +143,10 @@ public final class AgentSavedData extends SavedData {
 		return killLedger;
 	}
 
+	public SurvivalProgressLedger survivalProgress() {
+		return survivalProgress;
+	}
+
 	public void setRuntimeHooks(AgentRuntimeHooks runtimeHooks) {
 		this.runtimeHooks = Objects.requireNonNull(runtimeHooks, "runtimeHooks must not be null");
 	}
@@ -155,12 +167,17 @@ public final class AgentSavedData extends SavedData {
 		return ChunkedSavedPayload.split(KILL_LEDGER_CODEC.encode(killLedger.snapshot()));
 	}
 
+	private List<String> encodeSurvivalProgress() {
+		return ChunkedSavedPayload.split(SURVIVAL_PROGRESS_CODEC.encode(survivalProgress.snapshot()));
+	}
+
 	private static AgentSavedData decodePayload(
 			String legacyPayload,
 			List<String> chunks,
 			List<String> encodedWakes,
 			List<String> encodedDrafts,
-			List<String> killLedgerChunks
+			List<String> killLedgerChunks,
+			List<String> survivalProgressChunks
 	) {
 		return new AgentSavedData(
 				SNAPSHOT_CODEC.decode(ChunkedSavedPayload.join(legacyPayload, chunks)),
@@ -168,7 +185,10 @@ public final class AgentSavedData extends SavedData {
 				encodedDrafts.stream().map(DRAFT_CODEC::decode).toList(),
 				killLedgerChunks.isEmpty()
 						? AgentKillLedger.emptySnapshot()
-						: KILL_LEDGER_CODEC.decode(ChunkedSavedPayload.join("", killLedgerChunks))
+						: KILL_LEDGER_CODEC.decode(ChunkedSavedPayload.join("", killLedgerChunks)),
+				survivalProgressChunks.isEmpty()
+						? SurvivalProgressLedger.emptySnapshot()
+						: SURVIVAL_PROGRESS_CODEC.decode(ChunkedSavedPayload.join("", survivalProgressChunks))
 		);
 	}
 

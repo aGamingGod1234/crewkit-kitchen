@@ -44,6 +44,10 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyIndexedKillLookup();
 		assertions += verifyVerifierFailureIsolationAndRetry();
 		assertions += verifySurvivalAndOperatorConfirmation();
+		assertions += verifySurvivalProgressAcrossRestart();
+		assertions += verifySurvivalDeathResetAcrossRestart();
+		assertions += verifySurvivalProgressBoundsAndPruning();
+		assertions += verifySurvivalProgressPersistenceCompatibility();
 		assertions += verifyQueuedPromotionAfterEvidence();
 		assertions += verifyQueuedKillActivationBoundary();
 		assertions += verifyRequestedCompletionLifecycle();
@@ -482,6 +486,150 @@ public final class GoalVerificationRuntimeVerification {
 		return 6;
 	}
 
+	private static int verifySurvivalProgressAcrossRestart() {
+		AgentSavedData data = new AgentSavedData();
+		long now = 60_000L;
+		AgentRecord idle = data.registry().create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		GoalPredicate compound = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.SurviveDuration(3L),
+				new GoalPredicate.InventoryContains("minecraft:iron_ingot", 1)
+		));
+		data.registry().start(idle.agentId(), GoalSpec.create("Survive and get iron", compound, 650L), now + 1L);
+		FakeFacts facts = new FakeFacts();
+		long[] tick = { 650L };
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				data.registry(), ignored -> Optional.of(facts), () -> tick[0], () -> now + tick[0],
+				data.killLedger(), data.survivalProgress());
+		assertEquals(false, runtime.evaluate(idle.agentId()).verified(),
+				"the first alive tick starts compound survival progress");
+
+		AgentSavedData restored = roundTripSavedData(data, false);
+		long[] restartTick = { 0L };
+		GoalVerificationRuntime restoredRuntime = new GoalVerificationRuntime(
+				restored.registry(), ignored -> Optional.of(facts), () -> restartTick[0], () -> now + 2_000L,
+				restored.killLedger(), restored.survivalProgress());
+		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"partial survival progress resumes after saved-data restart");
+		restartTick[0]++;
+		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"satisfied survival progress remains while its compound sibling waits");
+
+		AgentSavedData restoredAgain = roundTripSavedData(restored, false);
+		facts.items.put("minecraft:iron_ingot", 1);
+		GoalVerificationRuntime completed = new GoalVerificationRuntime(
+				restoredAgain.registry(), ignored -> Optional.of(facts), () -> 0L, () -> now + 3_000L,
+				restoredAgain.killLedger(), restoredAgain.survivalProgress());
+		assertEquals(true, completed.evaluate(idle.agentId()).verified(),
+				"an already-satisfied survival leaf completes its compound goal after another restart");
+		return 4;
+	}
+
+	private static int verifySurvivalDeathResetAcrossRestart() {
+		AgentSavedData data = new AgentSavedData();
+		long now = 70_000L;
+		AgentRecord idle = data.registry().create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		data.registry().start(idle.agentId(), GoalSpec.create(
+				"Survive after death", new GoalPredicate.SurviveDuration(3L), 700L), now + 1L);
+		FakeFacts facts = new FakeFacts();
+		long[] tick = { 700L };
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				data.registry(), ignored -> Optional.of(facts), () -> tick[0], () -> now + tick[0],
+				data.killLedger(), data.survivalProgress());
+		runtime.evaluate(idle.agentId());
+		tick[0]++;
+		runtime.evaluate(idle.agentId());
+		tick[0]++;
+		facts.alive = false;
+		assertEquals(false, runtime.evaluate(idle.agentId()).verified(),
+				"an authoritative death clears accumulated survival progress");
+
+		AgentSavedData restored = roundTripSavedData(data, false);
+		facts.alive = true;
+		long[] restartTick = { 0L };
+		GoalVerificationRuntime restoredRuntime = new GoalVerificationRuntime(
+				restored.registry(), ignored -> Optional.of(facts), () -> restartTick[0], () -> now + 2_000L,
+				restored.killLedger(), restored.survivalProgress());
+		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"death reset remains authoritative after restart");
+		restartTick[0]++;
+		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"post-death survival must rebuild the full duration");
+		restartTick[0]++;
+		assertEquals(true, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"the full post-death duration eventually satisfies");
+		return 4;
+	}
+
+	private static int verifySurvivalProgressBoundsAndPruning() {
+		AgentId agentId = AgentId.random();
+		SurvivalProgressLedger ledger = new SurvivalProgressLedger();
+		SurvivalProgressLedger.Requirement retained = new SurvivalProgressLedger.Requirement(
+				new UUID(0L, 1L), agentId, "root.0", 5L);
+		SurvivalProgressLedger.Requirement stale = new SurvivalProgressLedger.Requirement(
+				new UUID(0L, 2L), agentId, "root.1", 5L);
+		ledger.synchronizeProgress(List.of(retained, stale));
+		ledger.observe(retained, true, 1L);
+		ledger.observe(stale, true, 1L);
+		ledger.synchronizeProgress(List.of(retained));
+		assertEquals(1, ledger.snapshot().entries().size(),
+				"inactive goal leaves are pruned from durable survival progress");
+		assertEquals(retained.goalId(), ledger.snapshot().entries().getFirst().goalId(),
+				"pruning retains only the current survival requirement");
+
+		ArrayList<SurvivalProgressLedger.Requirement> maximum = new ArrayList<>();
+		for (int index = 0; index < SurvivalProgressLedger.MAX_ENTRIES; index++) {
+			maximum.add(new SurvivalProgressLedger.Requirement(
+					new UUID(1L, index), agentId, "root", 1L));
+		}
+		ledger.synchronizeProgress(maximum);
+		assertEquals(SurvivalProgressLedger.MAX_ENTRIES, ledger.snapshot().entries().size(),
+				"durable survival progress accepts its exact configured bound");
+		maximum.add(new SurvivalProgressLedger.Requirement(
+				new UUID(2L, 0L), agentId, "root", 1L));
+		try {
+			ledger.synchronizeProgress(maximum);
+			throw new AssertionError("survival progress above the configured bound must fail");
+		} catch (IllegalArgumentException expected) {
+			assertEquals("Active survival progress exceeds the bounded limit", expected.getMessage(),
+					"survival progress rejects entries above the configured bound");
+		}
+		return 4;
+	}
+
+	private static int verifySurvivalProgressPersistenceCompatibility() {
+		AgentSavedData data = new AgentSavedData();
+		long now = 80_000L;
+		AgentRecord idle = data.registry().create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		data.registry().start(idle.agentId(), GoalSpec.create(
+				"Survive", new GoalPredicate.SurviveDuration(2L), 800L), now + 1L);
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				data.registry(), ignored -> Optional.of(new FakeFacts()), () -> 800L, () -> now + 2L,
+				data.killLedger(), data.survivalProgress());
+		runtime.evaluate(idle.agentId());
+		AgentSavedData legacy = roundTripSavedData(data, false, true);
+		assertEquals(0, legacy.survivalProgress().snapshot().entries().size(),
+				"saved data without survival progress loads as an empty legacy ledger");
+
+		SurvivalProgressLedgerCodec codec = new SurvivalProgressLedgerCodec();
+		String encoded = codec.encode(data.survivalProgress().snapshot());
+		assertEquals(1, codec.decode(encoded).entries().size(),
+				"survival progress codec preserves a bounded entry");
+		try {
+			codec.decode(encoded.replace("\"schema_version\":1", "\"schema_version\":2"));
+			throw new AssertionError("unsupported survival-progress schema must fail closed");
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+			assertEquals("INVALID_PERSISTED_SURVIVAL_PROGRESS", expected.code(),
+					"unsupported survival-progress versions are rejected explicitly");
+		}
+		return 3;
+	}
+
 	private static int verifyQueuedPromotionAfterEvidence() {
 		Fixture fixture = fixture(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1), 700L);
 		GoalSpec queued = GoalSpec.create("Get a diamond pickaxe",
@@ -570,15 +718,23 @@ public final class GoalVerificationRuntimeVerification {
 
 	@SuppressWarnings("unchecked")
 	private static AgentSavedData roundTripSavedData(AgentSavedData data, boolean removeKillLedger) {
+		return roundTripSavedData(data, removeKillLedger, false);
+	}
+
+	@SuppressWarnings("unchecked")
+	private static AgentSavedData roundTripSavedData(
+			AgentSavedData data, boolean removeKillLedger, boolean removeSurvivalProgress
+	) {
 		try {
 			Field field = AgentSavedData.class.getDeclaredField("CODEC");
 			field.setAccessible(true);
 			Codec<AgentSavedData> codec = (Codec<AgentSavedData>) field.get(null);
 			Tag encoded = codec.encodeStart(NbtOps.INSTANCE, data).getOrThrow();
 			if (removeKillLedger) ((CompoundTag) encoded).remove("kill_ledger_chunks");
+			if (removeSurvivalProgress) ((CompoundTag) encoded).remove("survival_progress_chunks");
 			return codec.parse(NbtOps.INSTANCE, encoded).getOrThrow();
 		} catch (ReflectiveOperationException exception) {
-			throw new AssertionError("could not round-trip kill ledger through Minecraft SavedData", exception);
+			throw new AssertionError("could not round-trip ledgers through Minecraft SavedData", exception);
 		}
 	}
 

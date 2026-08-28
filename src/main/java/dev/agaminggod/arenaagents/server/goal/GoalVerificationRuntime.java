@@ -32,6 +32,7 @@ public final class GoalVerificationRuntime {
 	private final LongSupplier epochMillis;
 	private final GoalCompletionVerifier verifier;
 	private final AgentKillLedger killLedger;
+	private final SurvivalProgressLedger survivalProgress;
 	private final Set<UUID> operatorConfirmed = new HashSet<>();
 	private final Map<AgentId, VerificationFault> faults = new LinkedHashMap<>();
 
@@ -41,7 +42,7 @@ public final class GoalVerificationRuntime {
 			LongSupplier serverTick,
 			LongSupplier epochMillis
 	) {
-		this(registry, facts, serverTick, epochMillis, new GoalCompletionVerifier(), new AgentKillLedger());
+		this(registry, facts, serverTick, epochMillis, new AgentKillLedger(), new SurvivalProgressLedger());
 	}
 
 	public GoalVerificationRuntime(
@@ -51,28 +52,29 @@ public final class GoalVerificationRuntime {
 			LongSupplier epochMillis,
 			AgentKillLedger killLedger
 	) {
-		this(registry, facts, serverTick, epochMillis, new GoalCompletionVerifier(), killLedger);
+		this(registry, facts, serverTick, epochMillis, killLedger, new SurvivalProgressLedger());
 	}
 
-	GoalVerificationRuntime(
+	public GoalVerificationRuntime(
 			AgentRegistry registry,
 			Function<AgentId, Optional<GoalCompletionVerifier.FactSource>> facts,
 			LongSupplier serverTick,
 			LongSupplier epochMillis,
-			GoalCompletionVerifier verifier,
-			AgentKillLedger killLedger
+			AgentKillLedger killLedger,
+			SurvivalProgressLedger survivalProgress
 	) {
 		this.registry = Objects.requireNonNull(registry, "registry must not be null");
 		this.facts = Objects.requireNonNull(facts, "facts must not be null");
 		this.serverTick = Objects.requireNonNull(serverTick, "serverTick must not be null");
 		this.epochMillis = Objects.requireNonNull(epochMillis, "epochMillis must not be null");
-		this.verifier = Objects.requireNonNull(verifier, "verifier must not be null");
 		this.killLedger = Objects.requireNonNull(killLedger, "killLedger must not be null");
-		synchronizeKillProgress();
+		this.survivalProgress = Objects.requireNonNull(survivalProgress, "survivalProgress must not be null");
+		this.verifier = new GoalCompletionVerifier(this.survivalProgress);
+		synchronizeProgress();
 	}
 
 	public List<AgentTransition> tick() {
-		synchronizeKillProgress();
+		synchronizeProgress();
 		long tick = serverTick.getAsLong();
 		long now = epochMillis.getAsLong();
 		if (tick < 0L) throw new IllegalStateException("Server tick must be nonnegative");
@@ -90,7 +92,7 @@ public final class GoalVerificationRuntime {
 			if (!result.verified()) continue;
 			transitions.add(registry.satisfyGoal(record.agentId(), record.goalRevision(), result.evidence(tick), now));
 		}
-		synchronizeKillProgress();
+		synchronizeProgress();
 		Set<UUID> currentGoals = registry.records().stream().flatMap(record -> record.currentGoal().stream())
 				.map(AgentGoal::goalId).collect(java.util.stream.Collectors.toUnmodifiableSet());
 		verifier.retainGoals(currentGoals);
@@ -103,7 +105,7 @@ public final class GoalVerificationRuntime {
 	}
 
 	public GoalCompletionVerifier.VerificationResult evaluate(AgentId agentId) {
-		synchronizeKillProgress();
+		synchronizeProgress();
 		AgentRecord record = registry.require(agentId);
 		long tick = serverTick.getAsLong();
 		return verifySafely(record, tick);
@@ -152,7 +154,7 @@ public final class GoalVerificationRuntime {
 	}
 
 	public void recordKill(AgentId agentId, String entityType) {
-		synchronizeKillProgress();
+		synchronizeProgress();
 		killLedger.record(agentId, entityType, epochMillis.getAsLong());
 	}
 
@@ -170,12 +172,17 @@ public final class GoalVerificationRuntime {
 		return killLedger;
 	}
 
+	public SurvivalProgressLedger survivalProgress() {
+		return survivalProgress;
+	}
+
 	public List<VerificationFault> faults() {
 		return List.copyOf(faults.values());
 	}
 
-	private void synchronizeKillProgress() {
+	private void synchronizeProgress() {
 		ArrayList<AgentKillLedger.KillProgressRequirement> requirements = new ArrayList<>();
+		ArrayList<SurvivalProgressLedger.Requirement> survivalRequirements = new ArrayList<>();
 		for (AgentRecord record : registry.records()) {
 			AgentGoal goal = record.currentGoal().orElse(null);
 			if (goal == null || goal.status() != GoalStatus.ACTIVE && goal.status() != GoalStatus.RECOVERING) continue;
@@ -186,8 +193,31 @@ public final class GoalVerificationRuntime {
 						goal.goalId(), record.agentId(), entry.getKey().entityType(),
 						entry.getKey().afterExclusive(), entry.getValue()));
 			}
+			collectSurvivalRequirements(
+					goal.goalId(), record.agentId(), goal.spec().completion(), "root", survivalRequirements);
 		}
 		killLedger.synchronizeProgress(requirements);
+		survivalProgress.synchronizeProgress(survivalRequirements);
+	}
+
+	private static void collectSurvivalRequirements(
+			UUID goalId,
+			AgentId agentId,
+			GoalPredicate predicate,
+			String path,
+			List<SurvivalProgressLedger.Requirement> requirements
+	) {
+		if (predicate instanceof GoalPredicate.SurviveDuration survive) {
+			requirements.add(new SurvivalProgressLedger.Requirement(goalId, agentId, path, survive.ticks()));
+			return;
+		}
+		List<GoalPredicate> children;
+		if (predicate instanceof GoalPredicate.AllOf all) children = all.predicates();
+		else if (predicate instanceof GoalPredicate.AnyOf any) children = any.predicates();
+		else return;
+		for (int index = 0; index < children.size(); index++) {
+			collectSurvivalRequirements(goalId, agentId, children.get(index), path + "." + index, requirements);
+		}
 	}
 
 	private static void collectKillRequirements(
