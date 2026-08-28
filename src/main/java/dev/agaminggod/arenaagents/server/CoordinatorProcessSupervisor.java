@@ -1277,8 +1277,11 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	@Override
 	public void close() {
 		ArrayList<ChildProcess> cleanup = new ArrayList<>();
+		boolean alreadyStopped;
 		synchronized (this) {
-			if (stopped) return;
+			alreadyStopped = stopped;
+			releaseManagedVoiceEndpoint();
+			if (alreadyStopped) return;
 			stopped = true;
 			state = CoordinatorRecoveryState.STOPPED;
 			nextRetryEpochMs = 0L;
@@ -1287,7 +1290,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			if (active != null) cleanup.add(active);
 			if (pendingTermination != null && !cleanup.contains(pendingTermination)) cleanup.add(pendingTermination);
 			pendingTermination = null;
-			releaseManagedVoiceEndpoint();
 			MaintenanceResult result;
 			while ((result = maintenanceResults.poll()) != null) {
 				if (result instanceof LaunchMaintenanceResult launch && launch.child() != null
