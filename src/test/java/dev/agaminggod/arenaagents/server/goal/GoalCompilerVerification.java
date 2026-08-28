@@ -334,6 +334,11 @@ public final class GoalCompilerVerification {
 				"kill alternatives publish each bounded related entity"
 		);
 		assertEquals(
+				List.of("minecraft:skeleton", "minecraft:wither_skeleton", "minecraft:zombie"),
+				compiler.candidateIdsFor("Kill 3 zombies or 2 skeletons", RegistryAccess.EMPTY),
+				"each counted kill alternative publishes its matching any-of candidates"
+		);
+		assertEquals(
 				List.of("minecraft:iron_pickaxe"),
 				compiler.candidateIdsFor("Get an iron or iron pickaxe", RegistryAccess.EMPTY),
 				"duplicate alternatives publish one candidate identifier"
@@ -373,7 +378,7 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Get stairs or slab", RegistryAccess.EMPTY).size(),
 				"alternative candidate unions retain the draft schema limit"
 		);
-		return 9;
+		return 10;
 	}
 
 	private static int verifyDraftRoundTrip() {

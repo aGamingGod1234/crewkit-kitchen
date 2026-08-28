@@ -17,18 +17,13 @@ import java.util.regex.Pattern;
 import java.util.function.Predicate;
 import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
-import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.EquipmentSlot;
-import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.item.Item;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.equipment.Equippable;
 
 public final class GoalCompiler {
 	private static final int MAX_COMPOUND_LEAVES = 16;
@@ -164,7 +159,7 @@ public final class GoalCompiler {
 			List<String> matches = matchItems(item.group(3), registries);
 			if (matches.size() == 1) {
 				String itemId = matches.getFirst();
-				if (exceedsInventoryCapacity(itemId, count, registries)) return unrepresentableItemCount();
+				if (GoalInventoryCapacity.exceeds(itemId, count, registries)) return unrepresentableItemCount();
 				return accepted(original, new GoalPredicate.InventoryContains(itemId, count), createdAtTick,
 						"Goal set: obtain " + itemId + " x" + count + ".");
 			}
@@ -347,7 +342,7 @@ public final class GoalCompiler {
 						return unrepresentableItemCount();
 					}
 				}
-				if (exceedsInventoryCapacity(itemId, combinedCount, registries)) return unrepresentableItemCount();
+				if (GoalInventoryCapacity.exceeds(itemId, combinedCount, registries)) return unrepresentableItemCount();
 				GoalPredicate combined = new GoalPredicate.InventoryContains(itemId, combinedCount);
 				if (priorIndex == null) {
 					inventoryPredicateIndexes.put(itemId, predicates.size());
@@ -422,6 +417,7 @@ public final class GoalCompiler {
 		TreeSet<String> candidates = new TreeSet<>();
 		for (int index = 0; index < alternatives.size(); index++) {
 			String alternative = alternatives.get(index);
+			if (kind == ClauseKind.KILL) alternative = stripKillCount(alternative);
 			List<String> related;
 			if (kind == ClauseKind.ITEM) {
 				related = index < alternatives.size() - 1 && !sharedNoun.isEmpty() && !alternative.contains(" ")
@@ -469,22 +465,6 @@ public final class GoalCompiler {
 		return GoalCompilation.needsTranslation(
 				"I can verify possession, but not that this item was newly crafted. Clarify whether obtaining it counts."
 		);
-	}
-
-	private static boolean exceedsInventoryCapacity(String itemId, int count, RegistryAccess registries) {
-		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
-		Item item = itemRegistry.getValue(Identifier.parse(itemId));
-		int maxStackSize = item.getDefaultMaxStackSize();
-		int capacity = maxStackSize * Inventory.INVENTORY_SIZE;
-		Equippable equippable = item.components().get(DataComponents.EQUIPPABLE);
-		for (EquipmentSlot slot : Inventory.EQUIPMENT_SLOT_MAPPING.values()) {
-			if (slot == EquipmentSlot.OFFHAND || equippable != null
-					&& equippable.slot() == slot
-					&& equippable.canBeEquippedBy(EntityType.PLAYER.builtInRegistryHolder())) {
-				capacity += slot.limit(new ItemStack(item.builtInRegistryHolder(), maxStackSize)).getCount();
-			}
-		}
-		return count > capacity;
 	}
 
 	private static GoalCompilation unrepresentableItemCount() {

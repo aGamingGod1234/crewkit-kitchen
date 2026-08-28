@@ -37,6 +37,7 @@ import dev.agaminggod.arenaagents.server.conversation.PendingConversationWake;
 import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.goal.GoalPredicateWorldValidator;
+import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
@@ -788,6 +789,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					GOAL_SPEC_WIRE_CODEC.decodePredicate(predicateElement.getAsJsonObject()), draft.dimensionId());
 			GoalPredicateWorldValidator.validateTranslatedProposal(predicate);
 			validateProposalIdentifiers(predicate, Set.copyOf(draft.candidateIds()));
+			GoalInventoryCapacity.validateTranslated(
+					predicate,
+					manager.server() == null ? net.minecraft.core.RegistryAccess.EMPTY : manager.server().registryAccess()
+			);
 			if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
 				GoalPredicateWorldValidator.validate(
 						GoalPredicateWorldValidator.requireLevel(manager.server(), draft.dimensionId()), predicate);

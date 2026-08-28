@@ -21,6 +21,7 @@ import dev.agaminggod.arenaagents.server.conversation.ConversationEvent;
 import dev.agaminggod.arenaagents.server.conversation.ConversationKind;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWakeCodec;
 import dev.agaminggod.arenaagents.server.goal.DraftIntent;
+import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
@@ -135,7 +136,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyStaleGoalDraftIsPrunedBeforeHandshake();
 		verifyCompletionResultFacts();
 		verifyReplacementOperation();
-		return 154;
+		return 160;
 	}
 
 	/**
@@ -433,6 +434,31 @@ public final class MultiplexedServerBridgeVerification {
 				assertEquals("INVALID_GOAL_SPEC_REQUEST_ID", malformedRejected.payload().get("reasonCode").getAsString(),
 						"malformed proposal identity reports its stable reason code");
 
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-million", goalSpecProposal(
+								requestId, new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1_000_000))));
+				BridgeEnvelope millionRejected = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("rejected", millionRejected.payload().get("status").getAsString(),
+						"translated million-item inventory goal is rejected");
+				assertEquals("INVALID_GOAL_PREDICATE", millionRejected.payload().get("reasonCode").getAsString(),
+						"translated inventory overflow reports a correctable predicate error");
+				assertTrue(manager.goalDraft(requestId).orElseThrow().proposedPredicate().isEmpty(),
+						"an impossible translated count is never staged");
+
+				GoalPredicate compoundOverflow = new GoalPredicate.AllOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 20),
+						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 18)
+				));
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-compound-overflow", goalSpecProposal(requestId, compoundOverflow)));
+				BridgeEnvelope compoundRejected = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("rejected", compoundRejected.payload().get("status").getAsString(),
+						"translated duplicate inventory requirements are summed before validation");
+				assertEquals("INVALID_GOAL_PREDICATE", compoundRejected.payload().get("reasonCode").getAsString(),
+						"compound translated capacity overflow reports a correctable predicate error");
+				assertTrue(manager.goalDraft(requestId).orElseThrow().proposedPredicate().isEmpty(),
+						"an impossible compound inventory predicate is never staged");
+
 				JsonObject proposal = goalSpecProposal(requestId, "minecraft:iron_pickaxe");
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-1", proposal));
@@ -480,14 +506,14 @@ public final class MultiplexedServerBridgeVerification {
 	}
 
 	private static JsonObject goalSpecProposal(UUID requestId, String itemId) {
+		return goalSpecProposal(requestId, new GoalPredicate.InventoryContains(itemId, 1));
+	}
+
+	private static JsonObject goalSpecProposal(UUID requestId, GoalPredicate predicate) {
 		JsonObject payload = new JsonObject();
 		payload.addProperty("requestId", requestId.toString());
 		payload.addProperty("summary", "Obtain the selected pickaxe.");
-		JsonObject predicate = new JsonObject();
-		predicate.addProperty("type", "inventory_contains");
-		predicate.addProperty("itemId", itemId);
-		predicate.addProperty("count", 1);
-		payload.add("predicate", predicate);
+		payload.add("predicate", new GoalSpecWireCodec().encodePredicate(predicate));
 		return payload;
 	}
 
