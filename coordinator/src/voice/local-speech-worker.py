@@ -24,18 +24,6 @@ _warmup_started = False
 _warmup_error = None
 _response_lock = threading.Lock()
 
-_LOCAL_VOICE_STYLES = (
-    (0.48, 0.18),
-    (0.56, 0.24),
-    (0.64, 0.30),
-    (0.72, 0.36),
-    (0.80, 0.42),
-    (0.88, 0.48),
-    (0.96, 0.54),
-    (1.04, 0.60),
-)
-
-
 def _load_tts():
     global _tts_model
     with _model_lock:
@@ -123,14 +111,14 @@ def _tts(request):
         raise ValueError("TTS voice ID is invalid")
     if not isinstance(speed, (int, float)) or not math.isfinite(speed) or speed < 0.5 or speed > 2:
         raise ValueError("TTS speed is invalid")
-    exaggeration, cfg_weight = _voice_style(voice_id)
+    conditioning = _voice_conditioning(voice_id)
     with _model_lock:
         model = _load_tts()
         with contextlib.redirect_stdout(sys.stderr):
             import torch
 
             with torch.inference_mode():
-                waveform = model.generate(text, exaggeration=exaggeration, cfg_weight=cfg_weight)
+                waveform = model.generate(text, **conditioning)
                 waveform = _apply_speed(waveform, speed, torch)
             pcm = (waveform.detach().float().cpu().flatten().clamp(-1, 1) * 32767).to(torch.int16).numpy().tobytes()
     if not pcm or len(pcm) % 2 or len(pcm) > MAX_TTS_PCM_BYTES:
@@ -143,16 +131,24 @@ def _tts(request):
     }
 
 
-def _voice_style(voice_id):
+def _voice_conditioning(voice_id):
     digest = hashlib.sha256(voice_id.encode("utf-8")).digest()
-    exaggeration, cfg_weight = _LOCAL_VOICE_STYLES[digest[0] % len(_LOCAL_VOICE_STYLES)]
+    expression = int.from_bytes(digest[:2], "big") / 0xFFFF
+    variation = int.from_bytes(digest[2:4], "big") / 0xFFFF
+    exaggeration = round(0.50 + (0.30 * expression), 4)
+    cfg_weight = round(0.50 - (0.20 * expression), 4)
+    temperature = round(0.78 + (0.04 * variation), 4)
     configured_exaggeration = os.environ.get("ARENA_LOCAL_TTS_EXAGGERATION")
     configured_cfg_weight = os.environ.get("ARENA_LOCAL_TTS_CFG_WEIGHT")
     if configured_exaggeration:
         exaggeration = float(configured_exaggeration)
     if configured_cfg_weight:
         cfg_weight = float(configured_cfg_weight)
-    return exaggeration, cfg_weight
+    return {
+        "exaggeration": exaggeration,
+        "cfg_weight": cfg_weight,
+        "temperature": temperature,
+    }
 
 
 def _local_voice_id(voice_id):

@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import test from 'node:test';
 
+import { builtInVoiceProfiles } from '../src/voice/voice-profile-store.mjs';
+
 const execFileAsync = promisify(execFile);
 
 test('local speech RPC responses use the original stdout outside global redirects', async () => {
@@ -25,6 +27,26 @@ test('local speech worker serializes concurrent TTS, STT, and warmup model work'
 		maximumConcurrentInference: 1,
 		maximumConcurrentWarmupOrInference: 1,
 	});
+});
+
+test('all built-in profiles reach Chatterbox with distinct bounded conditioning', async () => {
+	const python = process.env.ARENA_AGENT_SPEECH_PYTHON
+		?? (process.platform === 'win32' ? 'python' : 'python3');
+	const fixture = fileURLToPath(new URL('../test-support/local-speech-voice-conditioning-check.py', import.meta.url));
+	const voiceIds = builtInVoiceProfiles().map(({ voiceId }) => voiceId);
+	const { stdout } = await execFileAsync(python, [fixture, JSON.stringify(voiceIds)], {
+		timeout: 10_000,
+		windowsHide: true,
+	});
+	const received = JSON.parse(stdout.trim());
+	assert.equal(received.length, 16);
+	assert.equal(new Set(received.map((conditioning) => JSON.stringify(conditioning))).size, 16);
+	for (const conditioning of received) {
+		assert.deepEqual(Object.keys(conditioning).sort(), ['cfg_weight', 'exaggeration', 'temperature']);
+		assert.ok(conditioning.exaggeration >= 0.5 && conditioning.exaggeration <= 0.8);
+		assert.ok(conditioning.cfg_weight >= 0.3 && conditioning.cfg_weight <= 0.5);
+		assert.ok(conditioning.temperature >= 0.78 && conditioning.temperature <= 0.82);
+	}
 });
 
 test('local speech provider keeps one bounded process for TTS and STT', async () => {
