@@ -101,6 +101,7 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVeri
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostconditionVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionProtocolVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerPathPlannerVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.MinecraftNavigationWorldVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.NavigationProgressVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatPolicyVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatNavigationFailureVerification;
@@ -224,6 +225,7 @@ public final class VerificationMain {
 		passedAssertions += MenuCapabilityRegistryVerification.verify();
 		passedAssertions += VoiceSubsystemVerification.verify();
 		passedAssertions += ServerPathPlannerVerification.verify();
+		passedAssertions += MinecraftNavigationWorldVerification.verify();
 		passedAssertions += NavigationProgressVerification.verify();
 		passedAssertions += CombatPolicyVerification.verify();
 		passedAssertions += CombatNavigationFailureVerification.verify();

@@ -66,7 +66,7 @@ public final class ServerActionExecutor {
 	private static final Set<ActionType> ARENA_SCRIPT_PRIMITIVES = Set.of(
 			ActionType.MOVE_TO, ActionType.NAVIGATE_TO, ActionType.LOOK_AT, ActionType.ATTACK,
 			ActionType.SELECT_ITEM, ActionType.USE_ITEM, ActionType.BREAK_BLOCK, ActionType.PLACE_BLOCK,
-			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.DROP_ITEM,
+			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.PICK_UP_ITEM, ActionType.DROP_ITEM,
 			ActionType.TRANSFER_CONTAINER, ActionType.CRAFT_INVENTORY, ActionType.CRAFT_TABLE,
 			ActionType.FURNACE_TRANSACTION, ActionType.EQUIP_ITEM, ActionType.SELECT_TOOL,
 			ActionType.BLOCK_WITH_SHIELD, ActionType.USE_RANGED, ActionType.RESPAWN

@@ -65,6 +65,24 @@ test('native Minecraft tools expose the common fast path plus one validated adva
 	assert.match(NATIVE_AGENT_INSTRUCTIONS, /speech playback is asynchronous/i);
 });
 
+test('advertised native actions exactly match Java model-authored dispatch', async () => {
+	const executor = await readFile(new URL('../../src/main/java/dev/agaminggod/arenaagents/server/runtime/ServerActionExecutor.java', import.meta.url), 'utf8');
+	const allowlist = executor.match(/ARENA_SCRIPT_PRIMITIVES\s*=\s*Set\.of\(([\s\S]*?)\);/)?.[1] ?? '';
+	const javaActions = [...allowlist.matchAll(/ActionType\.([A-Z_]+)/g)]
+		.map(([, name]) => name.toLowerCase())
+		.sort();
+	const advertisedActions = MINECRAFT_DYNAMIC_TOOLS
+		.find(({ name }) => name === 'act')
+		.inputSchema.properties.actionType.enum
+		.toSorted();
+
+	assert.deepEqual(advertisedActions, javaActions);
+	assert.ok(advertisedActions.includes('pick_up_item'), 'working Java pickup controller remains reachable');
+	for (const unsupportedComposite of ['build_sequence', 'fight_target', 'flee_from', 'follow_entity']) {
+		assert.ok(!advertisedActions.includes(unsupportedComposite), `${unsupportedComposite} is not advertised without native dispatch`);
+	}
+});
+
 test('native Minecraft tool calls normalize to exact existing body actions', () => {
 	assert.deepEqual(normalizeMinecraftToolCall('moveTo', { x: 1, y: 64, z: -2 }), {
 		kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: true, timeoutMs: 30_000 },
@@ -97,20 +115,6 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 		kind: 'action', actionType: 'pick_up_item',
 		arguments: { targetSelector: '550e8400-e29b-41d4-a716-446655440000' },
 	});
-	assert.deepEqual(normalizeMinecraftToolCall('act', {
-		actionType: 'fight_target',
-		arguments: { targetSelector: '550e8400-e29b-41d4-a716-446655440000', desiredRange: 2, timeoutMs: 30_000 },
-	}), {
-		kind: 'action', actionType: 'fight_target',
-		arguments: { targetSelector: '550e8400-e29b-41d4-a716-446655440000', desiredRange: 2, timeoutMs: 30_000 },
-	});
-	assert.deepEqual(normalizeMinecraftToolCall('act', {
-		actionType: 'build_sequence',
-		arguments: { placements: [{ x: 1, y: 64, z: 2, face: 'up', itemId: 'minecraft:stone' }], timeoutMs: 30_000 },
-	}), {
-		kind: 'action', actionType: 'build_sequence',
-		arguments: { placements: [{ x: 1, y: 64, z: 2, face: 'up', itemId: 'minecraft:stone' }], timeoutMs: 30_000 },
-	});
 	assert.deepEqual(normalizeMinecraftToolCall('sequence', {
 		actions: [
 			{ actionType: 'navigate_to', arguments: { x: 2, y: 64, z: 1 } },
@@ -136,6 +140,8 @@ test('native Minecraft boundary rejects unknown, oversized, and malformed calls'
 	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'pick_up_item', arguments: { targetSelector: 'nearest_item' } }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'fight_target', arguments: { targetSelector: 'zombie', desiredRange: 20, timeoutMs: 1_000 } }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'build_sequence', arguments: { placements: [], timeoutMs: 1_000 } }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
+	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'flee_from', arguments: { targetSelector: 'target', distance: 8, timeoutMs: 1_000 } }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
+	assert.throws(() => normalizeMinecraftToolCall('act', { actionType: 'follow_entity', arguments: { targetSelector: 'target', distance: 3, timeoutMs: 1_000 } }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('sequence', { actions: [{ actionType: 'wait', arguments: { durationMs: 1 } }] }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('sequence', { actions: Array.from({ length: 9 }, () => ({ actionType: 'wait', arguments: { durationMs: 1 } })) }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 });

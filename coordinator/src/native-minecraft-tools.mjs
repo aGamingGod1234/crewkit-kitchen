@@ -1,10 +1,8 @@
 import {
 	ACTION_FIELDS,
-	MAX_BUILD_SEQUENCE_PLACEMENTS,
 	MAX_CHAT_LENGTH,
 	MAX_DURATION_MS,
 	MAX_IDENTIFIER_LENGTH,
-	MAX_TARGET_SELECTOR_LENGTH,
 	MIN_DURATION_MS,
 } from './constants.mjs';
 import { validateAction } from './schema.mjs';
@@ -12,23 +10,17 @@ import { validateAction } from './schema.mjs';
 const MAX_TOOL_RESULT_BYTES = 16_384;
 const COORDINATE_LIMIT = 30_000_000;
 const MAX_SEQUENCE_ACTIONS = 8;
-const COMPOSITE_ACTION_FIELDS = Object.freeze({
-	build_sequence: Object.freeze(['placements', 'timeoutMs']),
-	fight_target: Object.freeze(['targetSelector', 'desiredRange', 'timeoutMs']),
-	flee_from: Object.freeze(['targetSelector', 'distance', 'timeoutMs']),
-	follow_entity: Object.freeze(['targetSelector', 'distance', 'timeoutMs']),
-});
-const NATIVE_ACTION_TYPES = Object.freeze([...Object.keys(ACTION_FIELDS), ...Object.keys(COMPOSITE_ACTION_FIELDS)]);
+const NATIVE_ACTION_TYPES = Object.freeze(Object.keys(ACTION_FIELDS));
 
 export const NATIVE_AGENT_INSTRUCTIONS = `You control one live Minecraft player. You are the only brain choosing what it does.
 
 Act as soon as it is safe. Do not wait to solve the whole goal and do not narrate a plan. Call the smallest useful Minecraft tool now, inspect its factual result, then choose the next tool. Keep each decision local and brief even when your configured reasoning effort is high.
 
-Use observe only when the latest event and tool results lack needed facts. The goalSpec predicate is Minecraft's immutable completion contract; choose action arguments that satisfy it exactly. Use moveTo, mine, say, and wait for common operations. Use act for another supported player action. Use sequence for a short exact chain you can choose now; it stops on the first failed action. Call finish only to ask Minecraft to verify the immutable active goal. Minecraft decides whether the goal is complete and returns expected and observed facts. If verification fails, use those facts and continue working. Never claim an action happened unless its tool result confirms it. When an event has mode conversation_only, only observe if necessary and reply through say; do not take a physical action or call finish. Plain assistant text is not visible in Minecraft, so communicate through say. For nearby voice, say at most 12 words with audience proximity, then immediately call the first physical tool because speech playback is asynchronous.`;
+Use observe only when the latest event and tool results lack needed facts. The goalSpec predicate is Minecraft's immutable completion contract; choose action arguments that satisfy it exactly. Use moveTo, mine, say, and wait for common operations. moveTo uses bounded loaded waypoints and may time out before a distant destination. Use act for another supported player action. Use sequence for a short exact chain you can choose now; it stops on the first failed action. Call finish only to ask Minecraft to verify the immutable active goal. Minecraft decides whether the goal is complete and returns expected and observed facts. If verification fails, use those facts and continue working. Never claim an action happened unless its tool result confirms it. When an event has mode conversation_only, only observe if necessary and reply through say; do not take a physical action or call finish. Plain assistant text is not visible in Minecraft, so communicate through say. For nearby voice, say at most 12 words with audience proximity, then immediately call the first physical tool because speech playback is asynchronous.`;
 
 export const MINECRAFT_DYNAMIC_TOOLS = Object.freeze([
 	tool('observe', 'Return the latest compact player, inventory, nearby block, entity, goal, and conversation facts.', objectSchema({})),
-	tool('moveTo', 'Navigate the player to one coordinate and wait for the body result.', objectSchema({
+	tool('moveTo', 'Navigate toward one coordinate through bounded loaded safe waypoints and wait for success or a factual failure/timeout.', objectSchema({
 		x: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
 		y: numberSchema(-2_048, 2_048),
 		z: numberSchema(-COORDINATE_LIMIT, COORDINATE_LIMIT),
@@ -119,9 +111,7 @@ export function normalizeMinecraftToolCall(name, value) {
 			if (typeof args.actionType !== 'string' || !NATIVE_ACTION_TYPES.includes(args.actionType)) invalid('actionType is not supported');
 			const actionArguments = requireObject(args.arguments);
 			try {
-				const normalizedArguments = Object.hasOwn(ACTION_FIELDS, args.actionType)
-					? stripActionType(validateAction({ type: args.actionType, ...actionArguments }))
-					: validateCompositeAction(args.actionType, actionArguments);
+				const normalizedArguments = stripActionType(validateAction({ type: args.actionType, ...actionArguments }));
 				return { kind: 'action', actionType: args.actionType, arguments: normalizedArguments };
 			} catch (error) {
 				invalid(error?.message ?? 'invalid action arguments');
@@ -220,34 +210,6 @@ function optionalBoolean(value, fallback, field) {
 	if (value === undefined) return fallback;
 	if (typeof value !== 'boolean') invalid(`${field} must be a boolean`);
 	return value;
-}
-
-function validateCompositeAction(type, value) {
-	requireExactKeys(value, COMPOSITE_ACTION_FIELDS[type]);
-	switch (type) {
-		case 'build_sequence': {
-			if (!Array.isArray(value.placements) || value.placements.length < 1 || value.placements.length > MAX_BUILD_SEQUENCE_PLACEMENTS) {
-				invalid(`placements must contain 1 to ${MAX_BUILD_SEQUENCE_PLACEMENTS} entries`);
-			}
-			const placements = value.placements.map((placement) => stripActionType(validateAction({ type: 'place_block', ...requireObject(placement) })));
-			return { placements, timeoutMs: integer(value.timeoutMs, 'timeoutMs', MIN_DURATION_MS, MAX_DURATION_MS) };
-		}
-		case 'fight_target':
-			return {
-				targetSelector: boundedText(value.targetSelector, 'targetSelector', MAX_TARGET_SELECTOR_LENGTH),
-				desiredRange: finiteNumber(value.desiredRange, 'desiredRange', 1, 6),
-				timeoutMs: integer(value.timeoutMs, 'timeoutMs', MIN_DURATION_MS, MAX_DURATION_MS),
-			};
-		case 'flee_from':
-		case 'follow_entity':
-			return {
-				targetSelector: boundedText(value.targetSelector, 'targetSelector', MAX_TARGET_SELECTOR_LENGTH),
-				distance: finiteNumber(value.distance, 'distance', 1, 64),
-				timeoutMs: integer(value.timeoutMs, 'timeoutMs', MIN_DURATION_MS, MAX_DURATION_MS),
-			};
-		default:
-			invalid('actionType is not supported');
-	}
 }
 
 function stripActionType(action) {

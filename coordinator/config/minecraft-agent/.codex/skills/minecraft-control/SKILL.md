@@ -272,7 +272,7 @@ Bad:
 {"tool":"act","arguments":{"actionType":"attack","arguments":{"targetId":"nearest_zombie","timeoutMs":15000}}}
 ```
 
-## act / fight_target - Approach and fight a target selector until the composite action returns.
+## Unsupported / fight_target - Composite combat is not exposed through native act dispatch.
 
 Formatting:
 
@@ -280,9 +280,9 @@ Formatting:
 {"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetSelector":<required nonblank string 1..256 characters>,"desiredRange":<required finite number 1..6>,"timeoutMs":<required integer 1..600000>}}}
 ```
 
-Good:
+Rejected:
 
-```json executor-call
+```json executor-bad-call
 {"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","desiredRange":2,"timeoutMs":30000}}}
 ```
 
@@ -292,7 +292,7 @@ Bad:
 {"tool":"act","arguments":{"actionType":"fight_target","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","desiredRange":7,"timeoutMs":30000}}}
 ```
 
-## act / flee_from - Move away from an observed target until the requested distance is reached or the action returns.
+## Unsupported / flee_from - Composite retreat is not exposed through native act dispatch.
 
 Formatting:
 
@@ -300,9 +300,9 @@ Formatting:
 {"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetSelector":<required nonblank string 1..256 characters>,"distance":<required finite number 1..64>,"timeoutMs":<required integer 1..600000>}}}
 ```
 
-Good:
+Rejected:
 
-```json executor-call
+```json executor-bad-call
 {"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","distance":12,"timeoutMs":30000}}}
 ```
 
@@ -312,7 +312,7 @@ Bad:
 {"tool":"act","arguments":{"actionType":"flee_from","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","distance":0,"timeoutMs":30000}}}
 ```
 
-## act / follow_entity - Follow an observed target at the requested distance until the action returns.
+## Unsupported / follow_entity - Composite following is not exposed through native act dispatch.
 
 Formatting:
 
@@ -320,9 +320,9 @@ Formatting:
 {"tool":"act","arguments":{"actionType":"follow_entity","arguments":{"targetSelector":<required nonblank string 1..256 characters>,"distance":<required finite number 1..64>,"timeoutMs":<required integer 1..600000>}}}
 ```
 
-Good:
+Rejected:
 
-```json executor-call
+```json executor-bad-call
 {"tool":"act","arguments":{"actionType":"follow_entity","arguments":{"targetSelector":"550e8400-e29b-41d4-a716-446655440000","distance":3,"timeoutMs":30000}}}
 ```
 
@@ -512,7 +512,7 @@ Bad:
 {"tool":"act","arguments":{"actionType":"place_block","arguments":{"x":11,"y":64,"z":10,"face":"top","itemId":"minecraft:cobblestone"}}}
 ```
 
-## act / build_sequence - Place 1 to 32 already-known blocks as one composite build action.
+## Unsupported / build_sequence - Composite building is not exposed through native act dispatch.
 
 Formatting:
 
@@ -520,9 +520,9 @@ Formatting:
 {"tool":"act","arguments":{"actionType":"build_sequence","arguments":{"placements":[<1..32 objects each with x:<32-bit integer>, y:<32-bit integer>, z:<32-bit integer>, face:<"down"|"up"|"north"|"south"|"west"|"east">, itemId:<nonblank string 1..256 characters>, desiredState:<optional null or nonblank string 1..512 characters>>],"timeoutMs":<required integer 1..600000>}}}
 ```
 
-Good:
+Rejected:
 
-```json executor-call
+```json executor-bad-call
 {"tool":"act","arguments":{"actionType":"build_sequence","arguments":{"placements":[{"x":11,"y":64,"z":10,"face":"up","itemId":"minecraft:cobblestone"}],"timeoutMs":30000}}}
 ```
 
