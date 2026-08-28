@@ -834,7 +834,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		try {
 		Set<String> legacyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits");
 		Set<String> latencyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "latencies");
-		if (!payload.keySet().equals(legacyKeys) && !payload.keySet().equals(latencyKeys)) {
+		Set<String> recoveryKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "bridgeSessionEpoch", "runtimeGeneration", "components");
+		Set<String> recoveryLatencyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "latencies", "bridgeSessionEpoch", "runtimeGeneration", "components");
+		boolean extendedRecovery = payload.keySet().equals(recoveryKeys) || payload.keySet().equals(recoveryLatencyKeys);
+		if (!payload.keySet().equals(legacyKeys) && !payload.keySet().equals(latencyKeys) && !extendedRecovery) {
 			throw new BridgeProtocolException("INVALID_FIELD", "coordinator_status");
 		}
 		JsonArray profileValues = requiredArray(payload, "profiles", CoordinatorStatusSnapshot.MAX_PROFILES);
@@ -842,10 +845,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		for (var element : profileValues) {
 			if (!element.isJsonObject()) throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", "profile must be an object");
 			JsonObject profile = element.getAsJsonObject();
-			requireKeys(profile, Set.of("agentId", "provider", "model", "reasoningEffort"), "profile");
+			Set<String> legacyProfileKeys = Set.of("agentId", "provider", "model", "reasoningEffort");
+			Set<String> exactProfileKeys = Set.of("agentId", "provider", "model", "reasoningEffort", "serviceTier");
+			if (!profile.keySet().equals(legacyProfileKeys) && !profile.keySet().equals(exactProfileKeys)) throw new BridgeProtocolException("INVALID_FIELD", "profile");
 			profiles.add(new CoordinatorStatusSnapshot.SupportedProfile(
 					requiredStatusString(profile, "agentId"), requiredStatusString(profile, "provider"),
-					requiredStatusString(profile, "model"), requiredStatusString(profile, "reasoningEffort")
+					requiredStatusString(profile, "model"), requiredStatusString(profile, "reasoningEffort"),
+					profile.has("serviceTier") ? requiredStatusString(profile, "serviceTier") : "priority"
 			));
 		}
 		JsonObject scheduler = requiredObject(payload, "scheduler");
@@ -891,9 +897,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					requiredNonNegativeDouble(latency, "p50Ms"), requiredNonNegativeDouble(latency, "p95Ms")
 			));
 		}
+		long bridgeSessionEpoch = 0L;
+		String runtimeGeneration = null;
+		ArrayList<CoordinatorStatusSnapshot.ComponentRecovery> components = new ArrayList<>();
+		if (extendedRecovery) {
+			bridgeSessionEpoch = requiredLong(payload, "bridgeSessionEpoch");
+			runtimeGeneration = requiredNullableStatusString(payload, "runtimeGeneration");
+			JsonArray componentValues = requiredArray(payload, "components", CoordinatorStatusSnapshot.MAX_COMPONENTS);
+			for (var element : componentValues) {
+				if (!element.isJsonObject()) throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", "component must be an object");
+				JsonObject component = element.getAsJsonObject();
+				requireKeys(component, Set.of(
+						"component", "state", "fallbackMode", "boundary", "failureCode", "consecutiveFailureCount",
+						"nextProbeAtEpochMs", "generation", "lastRecoveryAtEpochMs"
+				), "component");
+				components.add(new CoordinatorStatusSnapshot.ComponentRecovery(
+						requiredStatusString(component, "component"), requiredStatusString(component, "state"),
+						requiredNullableStatusString(component, "fallbackMode"), requiredNullableStatusString(component, "boundary"),
+						requiredNullableStatusString(component, "failureCode"), requiredInt(component, "consecutiveFailureCount"),
+						requiredNullableStatusLong(component, "nextProbeAtEpochMs"), requiredLong(component, "generation"),
+						requiredNullableStatusLong(component, "lastRecoveryAtEpochMs")
+				));
+			}
+		}
 			return new CoordinatorStatusSnapshot(
 					requiredBoolean(payload, "reconciled"), profiles, requiredInt(payload, "supportedProfileCount"),
 					requiredInt(payload, "rosterReadyCount"), requiredInt(payload, "rosterCount"), schedulerStatus, circuits, latencies,
+					bridgeSessionEpoch, runtimeGeneration, components,
 					receivedAtEpochMs
 			);
 		} catch (BridgeProtocolException exception) {
@@ -1906,6 +1936,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", field + " must be nonblank and at most 256 characters");
 		}
 		return value;
+	}
+
+	private static String requiredNullableStatusString(JsonObject object, String field) {
+		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		if (object.get(field).isJsonNull()) return null;
+		return requiredStatusString(object, field);
+	}
+
+	private static Long requiredNullableStatusLong(JsonObject object, String field) {
+		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		return object.get(field).isJsonNull() ? null : requiredLong(object, field);
 	}
 
 	private static String requiredProvenanceString(JsonObject object, String field) {

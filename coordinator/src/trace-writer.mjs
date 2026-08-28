@@ -3,6 +3,8 @@ import { types as nodeTypes } from 'node:util';
 import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
+import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
+
 const REDACTED = '[REDACTED]';
 const UNSAFE = '[UNSAFE_OBJECT]';
 const BOUNDED = '[BOUNDED]';
@@ -24,8 +26,9 @@ export class TraceWriter {
 	#appendFile;
 	#mkdir;
 	#ready;
-	#queue = Promise.resolve();
+	#queue;
 	#closed = false;
+	#closePromise = null;
 
 	constructor(filePath, dependencies = {}) {
 		if (typeof filePath !== 'string' || filePath.trim().length === 0) throw new TypeError('trace file path must be nonblank');
@@ -35,36 +38,56 @@ export class TraceWriter {
 		this.#diagnosticFilePath = privatePath === null ? null : path.resolve(privatePath);
 		this.#appendFile = dependencies.appendFile ?? appendFile;
 		this.#mkdir = dependencies.mkdir ?? mkdir;
+		this.#queue = new BestEffortDiagnosticQueue({
+			maxPending: dependencies.maxPending,
+			operationTimeoutMs: dependencies.operationTimeoutMs,
+			closeTimeoutMs: dependencies.closeTimeoutMs,
+			schedule: dependencies.schedule,
+			cancel: dependencies.cancel,
+			dispatch: dependencies.dispatch,
+			now: dependencies.now,
+		});
 		const directories = [path.dirname(this.#filePath), this.#diagnosticFilePath === null ? null : path.dirname(this.#diagnosticFilePath)].filter(Boolean);
-		this.#ready = Promise.all([...new Set(directories)].map((directory) => this.#mkdir(directory, { recursive: true })));
+		this.#ready = Promise.all([...new Set(directories)].map((directory) => this.#mkdir(directory, { recursive: true }))).then(() => true, () => false);
 	}
 
 	write(eventOrRow, fields = {}) {
-		if (this.#closed) return Promise.reject(new Error('trace writer is closed'));
-		const row = normalizeRow(eventOrRow, fields);
-		return this.#enqueue(this.#filePath, publicTraceRow(row));
+		if (this.#closed) return Promise.resolve();
+		try {
+			const row = normalizeRow(eventOrRow, fields);
+			this.#enqueue(this.#filePath, publicTraceRow(row));
+		} catch { /* invalid diagnostics are dropped at this boundary */ }
+		return Promise.resolve();
 	}
 
 	/** Writes bounded source for the agent-private diagnostic trace only. */
 	writeDiagnostic(eventOrRow, fields = {}) {
-		if (this.#closed) return Promise.reject(new Error('trace writer is closed'));
+		if (this.#closed) return Promise.resolve();
 		if (this.#diagnosticFilePath === null) return Promise.resolve();
-		const row = normalizeRow(eventOrRow, fields);
-		return this.#enqueue(this.#diagnosticFilePath, privateTraceRow(row));
+		try {
+			const row = normalizeRow(eventOrRow, fields);
+			this.#enqueue(this.#diagnosticFilePath, privateTraceRow(row));
+		} catch { /* invalid diagnostics are dropped at this boundary */ }
+		return Promise.resolve();
 	}
 
-	async close() {
+	close() {
+		if (this.#closePromise !== null) return this.#closePromise;
 		this.#closed = true;
-		await this.#queue;
+		this.#closePromise = this.#queue.close();
+		return this.#closePromise;
+	}
+
+	statusSnapshot() {
+		return this.#queue.statusSnapshot('diagnostics');
 	}
 
 	#enqueue(filePath, row) {
 		const encoded = `${JSON.stringify(row)}\n`;
-		this.#queue = this.#queue.then(async () => {
-			await this.#ready;
+		this.#queue.submit(async () => {
+			if (!await this.#ready) throw new Error('trace sink directory is unavailable');
 			await this.#appendFile(filePath, encoded, { encoding: 'utf8', flag: 'a' });
 		});
-		return this.#queue;
 	}
 }
 

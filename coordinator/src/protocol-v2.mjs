@@ -795,16 +795,17 @@ function defaultDeadlineSchedule(callback, delay) {
 
 function normalizeCoordinatorStatus(value) {
 	const requiredKeys = ['reconciled', 'profiles', 'supportedProfileCount', 'rosterReadyCount', 'rosterCount', 'scheduler', 'circuits'];
-	const allowedKeys = [...requiredKeys, 'latencies'];
+	const allowedKeys = [...requiredKeys, 'latencies', 'bridgeSessionEpoch', 'runtimeGeneration', 'components'];
 	exactKeys(value, allowedKeys, requiredKeys, 'coordinator_status');
 	const profiles = boundedArray(value.profiles, 'coordinator_status.profiles', 16).map((profile, index) => {
 		const field = `coordinator_status.profiles[${index}]`;
-		exactKeys(profile, ['agentId', 'provider', 'model', 'reasoningEffort'], ['agentId', 'provider', 'model', 'reasoningEffort'], field);
+		exactKeys(profile, ['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier'], ['agentId', 'provider', 'model', 'reasoningEffort'], field);
 		return {
 			agentId: requireIdentifier(profile.agentId, `${field}.agentId`),
 			provider: requireIdentifier(profile.provider, `${field}.provider`),
 			model: boundedText(profile.model, `${field}.model`, MAX_IDENTIFIER_LENGTH),
 			reasoningEffort: requireIdentifier(profile.reasoningEffort, `${field}.reasoningEffort`),
+			...(profile.serviceTier === undefined ? {} : { serviceTier: requireIdentifier(profile.serviceTier, `${field}.serviceTier`) }),
 		};
 	});
 	const supportedProfileCount = nonnegativeInteger(value.supportedProfileCount, 'coordinator_status.supportedProfileCount');
@@ -890,7 +891,44 @@ function normalizeCoordinatorStatus(value) {
 	if (new Set(latencies.map((latency) => latency.operation)).size !== latencies.length) {
 		throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status latency operations must be unique');
 	}
-	return { reconciled: boolean(value.reconciled, 'coordinator_status.reconciled'), profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits, latencies };
+	const extendedFields = ['bridgeSessionEpoch', 'runtimeGeneration', 'components'];
+	const presentExtendedFields = extendedFields.filter((field) => value[field] !== undefined);
+	if (presentExtendedFields.length !== 0 && presentExtendedFields.length !== extendedFields.length) {
+		throw new ProtocolV2Error('MISSING_FIELD', 'extended coordinator_status recovery fields must be published together');
+	}
+	if (presentExtendedFields.length === 0) {
+		return { reconciled: boolean(value.reconciled, 'coordinator_status.reconciled'), profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits, latencies };
+	}
+	const components = boundedArray(value.components, 'coordinator_status.components', 32).map((component, index) => {
+		const field = `coordinator_status.components[${index}]`;
+		const keys = ['component', 'state', 'fallbackMode', 'boundary', 'failureCode', 'consecutiveFailureCount', 'nextProbeAtEpochMs', 'generation', 'lastRecoveryAtEpochMs'];
+		exactKeys(component, keys, keys, field);
+		const state = requireIdentifier(component.state, `${field}.state`);
+		if (!['ready', 'degraded', 'backoff', 'blocked_retryable', 'unknown'].includes(state)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field}.state is invalid`);
+		return {
+			component: boundedText(component.component, `${field}.component`, 128),
+			state,
+			fallbackMode: nullableBoundedText(component.fallbackMode, `${field}.fallbackMode`, 128),
+			boundary: nullableBoundedText(component.boundary, `${field}.boundary`, 128),
+			failureCode: nullableBoundedText(component.failureCode, `${field}.failureCode`, 128),
+			consecutiveFailureCount: nonnegativeInteger(component.consecutiveFailureCount, `${field}.consecutiveFailureCount`),
+			nextProbeAtEpochMs: nullableNonnegativeInteger(component.nextProbeAtEpochMs, `${field}.nextProbeAtEpochMs`),
+			generation: nonnegativeInteger(component.generation, `${field}.generation`),
+			lastRecoveryAtEpochMs: nullableNonnegativeInteger(component.lastRecoveryAtEpochMs, `${field}.lastRecoveryAtEpochMs`),
+		};
+	});
+	if (new Set(components.map((component) => component.component)).size !== components.length) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status component identities must be unique');
+	const runtimeGeneration = value.runtimeGeneration === null
+		? null
+		: boundedText(value.runtimeGeneration, 'coordinator_status.runtimeGeneration', 64);
+	if (runtimeGeneration !== null && !/^[0-9a-f]{64}$/.test(runtimeGeneration)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'coordinator_status.runtimeGeneration must be a lowercase SHA-256 value');
+	return {
+		reconciled: boolean(value.reconciled, 'coordinator_status.reconciled'), profiles, supportedProfileCount, rosterReadyCount,
+		rosterCount, scheduler, circuits, latencies,
+		bridgeSessionEpoch: nonnegativeInteger(value.bridgeSessionEpoch, 'coordinator_status.bridgeSessionEpoch'),
+		runtimeGeneration,
+		components,
+	};
 }
 
 function normalizeRegisteredAgent(value, field) {
@@ -1551,6 +1589,14 @@ function boolean(value, field) {
 
 function nullableIdentifier(value, field) {
 	return value === null ? null : requireIdentifier(value, field);
+}
+
+function nullableBoundedText(value, field, maximum) {
+	return value === null ? null : boundedText(value, field, maximum);
+}
+
+function nullableNonnegativeInteger(value, field) {
+	return value === null ? null : nonnegativeInteger(value, field);
 }
 
 function nullableBoolean(value, field) {

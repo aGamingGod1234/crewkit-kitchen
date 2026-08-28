@@ -75,7 +75,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyCloseIsIdempotent();
-		return 150;
+		return 151;
 	}
 
 	private static void verifyCandidatePromotionUsesMaintenanceWorker() {
@@ -1111,6 +1111,9 @@ public final class CoordinatorProcessSupervisorVerification {
 					"new coordinator receives an authentication deadline");
 			assertEquals(authenticating.launchId(), launcher.launches.getFirst().environment().get("ARENA_AGENT_COORDINATOR_LAUNCH_ID"),
 					"launch UUID is passed through the child environment");
+			assertEquals(launcher.launches.getFirst().generationId(),
+					launcher.launches.getFirst().environment().get("ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION"),
+					"exact runtime generation is passed through the child environment");
 			UUID.fromString(authenticating.launchId());
 		}
 	}

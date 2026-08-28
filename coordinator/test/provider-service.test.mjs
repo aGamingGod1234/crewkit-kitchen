@@ -524,3 +524,13 @@ test('a stale successful reconciliation cannot mark a degraded provider restored
 	assert.equal(restored, 0);
 	await router.stop();
 });
+
+test('provider recovery status retains the exact failing boundary', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi', 'cursor'].map((provider) => [provider, new FakeService(provider)]));
+	services.codex.createAgent = async () => { throw Object.assign(new Error('create failed'), { code: 'PROVIDER_UNAVAILABLE' }); };
+	const router = new ProviderService(services);
+	await assert.rejects(router.createAgent(profile('codex')));
+
+	assert.equal(router.recoverySnapshot()[0].boundary, 'create');
+	await router.stop();
+});

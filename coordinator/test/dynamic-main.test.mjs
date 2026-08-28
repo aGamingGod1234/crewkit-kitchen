@@ -8,7 +8,7 @@ import test from 'node:test';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
-import { createDynamicCoordinator, normalizeDynamicConfig } from '../src/dynamic-main.mjs';
+import { createDynamicCoordinator, normalizeDynamicConfig, resolveDynamicCliRuntime } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { ProviderService } from '../src/provider-service.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
@@ -3234,6 +3234,46 @@ test('injects coordinator latency telemetry into program reaction timing', async
 		publishStatus();
 		await eventually(() => run.bridge.sent.some((message) => message.type === 'coordinator_status' && message.payload.latencies.some((entry) => entry.operation === 'event_receipt_to_branch')));
 	} finally { await run.coordinator.stop(); }
+});
+
+test('publishes exact profile and recovery identity in extended coordinator status', async () => {
+	let publishStatus = null;
+	const provider = new FakeProvider();
+	provider.recoverySnapshot = () => [{
+		provider: 'codex', state: 'degraded', fallbackMode: 'last_valid', boundary: 'create', failureCode: 'PROVIDER_TIMEOUT',
+		consecutiveFailureCount: 2, nextProbeAtEpochMs: 4_000, generation: 3, lastRecoveryAtEpochMs: null,
+	}];
+	const diagnostics = {
+		write() {},
+		statusSnapshot: () => ({
+			component: 'diagnostics', state: 'degraded', fallbackMode: 'drop', boundary: 'diagnostic_sink',
+			failureCode: 'DIAGNOSTIC_BACKPRESSURE', consecutiveFailureCount: 1, nextProbeAtEpochMs: null,
+			generation: 1, lastRecoveryAtEpochMs: null,
+		}),
+	};
+	const generation = 'b'.repeat(64);
+	const run = await start({
+		codexService: provider,
+		traceWriter: diagnostics,
+		runtimeGeneration: generation,
+		setStatusInterval: (callback) => { publishStatus = callback; return 1; },
+		clearStatusInterval: () => {},
+	});
+	try {
+		publishStatus();
+		await eventually(() => run.bridge.sent.some(({ type }) => type === 'coordinator_status'));
+		const status = run.bridge.sent.filter(({ type }) => type === 'coordinator_status').at(-1).payload;
+		assert.equal(status.profiles[0].serviceTier, 'priority');
+		assert.equal(status.bridgeSessionEpoch, 1);
+		assert.equal(status.runtimeGeneration, generation);
+		assert.equal(status.components.find(({ component }) => component === 'provider:codex').boundary, 'create');
+		assert.equal(status.components.find(({ component }) => component === 'diagnostics').failureCode, 'DIAGNOSTIC_BACKPRESSURE');
+	} finally { await run.coordinator.stop(); }
+});
+
+test('runtime generation environment is optional and never a startup validation failure', () => {
+	assert.equal(resolveDynamicCliRuntime({ ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION: 'c'.repeat(64) }).runtimeGeneration, 'c'.repeat(64));
+	assert.equal(resolveDynamicCliRuntime({ ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION: 'invalid' }).runtimeGeneration, null);
 });
 
 test('steering and death dispose programs so stale action results are rejected', async () => {

@@ -14,6 +14,7 @@ import { AntigravityProviderService } from './antigravity-service.mjs';
 import { CodexService } from './codex-service.mjs';
 import { CursorProviderService } from './cursor-service.mjs';
 import { ControlLatencyRegistry } from './control-latency-registry.mjs';
+import { buildCoordinatorStatus, providerRecoveryComponents } from './coordinator-status.mjs';
 import { ConversationMemory } from './conversation-memory.mjs';
 import { FactLedger } from './fact-ledger.mjs';
 import { ProviderService } from './provider-service.mjs';
@@ -31,6 +32,7 @@ import { advanceContextCursor, buildPlannerInput, createContextCursor } from './
 import { profileFingerprint } from './provider-session.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
 import { classifyRecoveryFailure } from './recovery-policy.mjs';
+import { ReportingTransitionDeduper } from './reporting-transition-deduper.mjs';
 import { NativeToolRuntime } from './native-tool-runtime.mjs';
 import { classifyNativeGoalError } from './native-goal-error-policy.mjs';
 import { ProgramRuntimeManager } from './program-runtime-manager.mjs';
@@ -124,8 +126,10 @@ export class DynamicCoordinator extends EventEmitter {
 	#traceWriter;
 	#providerTurnRecorder;
 	#verboseEnabled = false;
+	#runtimeGeneration;
+	#verboseTransitions = new ReportingTransitionDeduper();
 
-	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout }) {
+	constructor({ registry, scheduler, codexService, planner, bridge, healthRegistry, latencyRegistry, goalSupervisor, codexControlProtocol = 'native_tools', traceWriter = null, providerTurnRecorder = null, runtimeGeneration = null, benchmarkRecorder = null, controlNow = () => performance.now(), epochNow = Date.now, setStatusInterval = defaultStatusInterval, clearStatusInterval = clearInterval, setGoalSpecTimeout = defaultGoalSpecTimeout, clearGoalSpecTimeout = clearTimeout }) {
 		super();
 		this.#registry = requireDependency(registry, 'registry');
 		this.#scheduler = requireDependency(scheduler, 'scheduler');
@@ -139,6 +143,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#traceWriter = traceWriter;
 		if (providerTurnRecorder !== null && typeof providerTurnRecorder.close !== 'function') throw new TypeError('providerTurnRecorder.close must be a function');
 		this.#providerTurnRecorder = providerTurnRecorder;
+		this.#runtimeGeneration = runtimeGeneration;
 		if (!['arena_script', 'native_tools'].includes(codexControlProtocol)) throw new TypeError('codexControlProtocol must be arena_script or native_tools');
 		this.#codexControlProtocol = codexControlProtocol;
 		if (typeof controlNow !== 'function') throw new TypeError('controlNow must be a function');
@@ -343,6 +348,7 @@ export class DynamicCoordinator extends EventEmitter {
 			await this.#nativeRuntime.dispose(message.agentId, 'agent_removed');
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
 			this.#providerWork.delete(message.agentId);
+			this.#verboseTransitions.clear(message.agentId);
 			this.#programRuntimeEpochs.delete(message.agentId);
 			this.#nativeRuntimeEpochs.delete(message.agentId);
 			this.#pendingAttention.delete(message.agentId);
@@ -1337,7 +1343,9 @@ export class DynamicCoordinator extends EventEmitter {
 				const retryAt = safeClockRead(this.#controlNow);
 				if (retryAt !== null) this.#providerRetryAfter.set(record.agentId, retryAt + EMPTY_TURN_RETRY_DELAY_MS);
 			}
-			this.#publishVerbose(record.agentId, record.goalRevision, 'retry', verboseRecoveryMessage(recovery), work.connectionEpoch);
+			this.#publishVerbose(record.agentId, record.goalRevision, 'retry', verboseRecoveryMessage(recovery), work.connectionEpoch, {
+				component: 'provider', boundary: recovery.kind ?? 'planning', code: recovery.code ?? 'PROVIDER_RETRY', state: 'retrying',
+			});
 			try {
 				const latest = this.#registry.get(record.agentId);
 				if (latest?.state === DynamicAgentState.ERROR) this.#registry.setState(record.agentId, DynamicAgentState.STARTING, { goalRevision: record.goalRevision });
@@ -1594,13 +1602,17 @@ export class DynamicCoordinator extends EventEmitter {
 			if (classifyRecoveryFailure(error).quiet) {
 				// App-server transport silence is retried from the next fresh observation.
 				// It is not a world-action failure that the player or agent must repair.
-				if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'retry', 'Provider output was incomplete; retrying from the next fresh observation.');
+				if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'retry', 'Provider output was incomplete; retrying from the next fresh observation.', this.#connectionEpoch, {
+					component: 'provider', boundary: 'planning', code: String(error?.code ?? 'EMPTY_PROVIDER_TURN'), state: 'retrying',
+				});
 				const retryAt = safeClockRead(this.#controlNow);
 				if (retryAt === null) this.#providerRetryAfter.delete(agentId);
 				else this.#providerRetryAfter.set(agentId, retryAt + EMPTY_TURN_RETRY_DELAY_MS);
 				return;
 			}
-			if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'error', verboseErrorMessage(error));
+			if (verboseRecord !== null) this.#publishVerbose(agentId, verboseRecord.goalRevision, 'error', verboseErrorMessage(error), this.#connectionEpoch, {
+				component: 'coordinator', boundary: 'agent_work', code: String(error?.code ?? 'COORDINATOR_ERROR'), state: 'degraded',
+			});
 			this.#emitRuntimeError(error);
 			if (!this.#bridge.ready || !this.#registry.has(agentId)) return;
 			const record = this.#registry.get(agentId);
@@ -1657,13 +1669,16 @@ export class DynamicCoordinator extends EventEmitter {
 	#setVerboseEnabled(enabled) {
 		this.#verboseEnabled = enabled;
 		if (enabled) return;
+		this.#verboseTransitions.clearAll();
 		for (const reporter of this.#verboseReporters) reporter.reset();
 	}
 
-	#publishVerbose(agentId, goalRevision, stage, message, connectionEpoch = this.#connectionEpoch) {
+	#publishVerbose(agentId, goalRevision, stage, message, connectionEpoch = this.#connectionEpoch, transition = {}) {
 		try {
 			const bounded = sanitizeVerboseMessage(stage, message);
 			if (bounded.length === 0) return;
+			const identity = verboseTransitionIdentity(stage, bounded, transition);
+			if (!this.#verboseTransitions.accept({ agentId, goalRevision, ...identity })) return;
 			this.#sendVerbose(agentId, goalRevision, stage, bounded, connectionEpoch);
 		} catch { /* verbose delivery is best effort */ }
 	}
@@ -1708,11 +1723,7 @@ export class DynamicCoordinator extends EventEmitter {
 		if (!this.#isConnectionEpochCurrent(connectionEpoch) || !this.#bridge.ready) return;
 		const records = this.#registry.list();
 		const readyStates = new Set([DynamicAgentState.IDLE, DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING, DynamicAgentState.PAUSED, DynamicAgentState.COMPLETED]);
-		const profiles = records
-			.filter((record) => this.#supportedAgentIds.has(record.agentId))
-			.map((record) => ({ agentId: record.agentId, provider: record.provider, model: record.model, reasoningEffort: record.reasoningEffort }))
-			.sort((left, right) => left.agentId.localeCompare(right.agentId));
-		const rosterReadyCount = records.filter((record) => this.#supportedAgentIds.has(record.agentId) && readyStates.has(record.state)).length;
+		const profiles = records.filter((record) => this.#supportedAgentIds.has(record.agentId));
 		const healthIdentities = [...new Map(profiles.flatMap((profile) => ['create_agent', 'decide'].map((operation) => ({
 			provider: profile.provider,
 			model: profile.model,
@@ -1721,13 +1732,20 @@ export class DynamicCoordinator extends EventEmitter {
 			.sort((left, right) => left.provider.localeCompare(right.provider)
 			|| left.model.localeCompare(right.model) || left.operation.localeCompare(right.operation));
 		const pressure = this.#scheduler.pressureSnapshot;
-		await this.#sendForEpoch(connectionEpoch, 'coordinator_status', 'server', {
+		let providerRecovery = [];
+		try { providerRecovery = this.#codexService.recoverySnapshot?.() ?? []; }
+		catch { /* optional status must not affect coordinator control */ }
+		const components = providerRecoveryComponents(providerRecovery);
+		try {
+			const diagnostics = this.#traceWriter?.statusSnapshot?.();
+			if (diagnostics !== null && diagnostics !== undefined) components.push(diagnostics);
+		} catch { /* optional status must not affect coordinator control */ }
+		await this.#sendForEpoch(connectionEpoch, 'coordinator_status', 'server', buildCoordinatorStatus({
 			reconciled: this.#reconciledStatus,
-			profiles,
-			supportedProfileCount: profiles.length,
-			rosterReadyCount,
-			rosterCount: records.length,
-			scheduler: {
+			records,
+			supportedAgentIds: this.#supportedAgentIds,
+			readyStates,
+			pressure: {
 				active: pressure.active,
 				pending: pressure.pending,
 				maxConcurrent: pressure.maxConcurrent,
@@ -1751,9 +1769,12 @@ export class DynamicCoordinator extends EventEmitter {
 				ordinaryReservationRejections: pressure.ordinaryReservationRejections,
 				urgentReservationRejections: pressure.urgentReservationRejections,
 			},
-			circuits: healthIdentities.slice(0, 32).map((identity) => this.#healthRegistry.snapshot(identity)),
+			healthSnapshots: healthIdentities.slice(0, 32).map((identity) => this.#healthRegistry.snapshot(identity)),
 			latencies: this.#latencyRegistry.snapshot(),
-		});
+			bridgeSessionEpoch: connectionEpoch,
+			runtimeGeneration: this.#runtimeGeneration,
+			components,
+		}));
 	}
 
 	#ledger(agentId) {
@@ -2039,6 +2060,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 		codexControlProtocol: config.codex.controlProtocol,
 		traceWriter: dependencies.traceWriter,
 		providerTurnRecorder,
+		runtimeGeneration: dependencies.runtimeGeneration,
 		controlNow: dependencies.controlNow,
 		epochNow: dependencies.epochNow,
 		setStatusInterval: dependencies.setStatusInterval,
@@ -2074,6 +2096,9 @@ export function resolveDynamicCliRuntime(environment = process.env) {
 		diagnosticTracePath: environment.ARENA_HEADLESS_PRIVATE_TRACE_PATH ?? `${traceDirectory}${separator}coordinator-private.jsonl`,
 		protocolAuditPath: environment.ARENA_PROTOCOL_AUDIT_PATH ?? null,
 		providerTurnsPath: environment.ARENA_PROVIDER_TURNS_PATH ?? null,
+		runtimeGeneration: /^[0-9a-f]{64}$/.test(environment.ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION ?? '')
+			? environment.ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION
+			: null,
 		runId: environment.ARENA_HEADLESS_RUN_ID ?? 'dynamic-run',
 		scenarioId: environment.ARENA_HEADLESS_SCENARIO_ID ?? 'dynamic',
 	};
@@ -2182,7 +2207,7 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 		scenarioId: runtime.scenarioId,
 		privatePath: runtime.providerTurnsPath,
 	});
-	const coordinator = createDynamicCoordinator(config, { traceWriter, protocolAudit, providerTurnRecorder });
+	const coordinator = createDynamicCoordinator(config, { traceWriter, protocolAudit, providerTurnRecorder, runtimeGeneration: runtime.runtimeGeneration });
 	const disposeDiagnostics = wireRuntimeDiagnostics(coordinator, reporter);
 	let voiceWorker = await startVoiceWorker(config, process.env).catch(() => {
 		process.stderr.write('[voice-worker] unavailable; proximity speech will fall back to text\n');
@@ -2414,6 +2439,23 @@ function sanitizeVerboseMessage(stage, message) {
 
 function verboseDecisionSummary(decision) {
 	return sanitizePublicNarrative(decision?.summary) || 'Plan accepted.';
+}
+
+function verboseTransitionIdentity(stage, message, value) {
+	const defaults = {
+		conversation: { component: 'conversation', boundary: 'message', code: 'MESSAGE_RECEIVED', state: 'ready' },
+		decision: { component: 'provider', boundary: 'planning', code: 'PLAN_ACCEPTED', state: 'ready' },
+		error: { component: 'coordinator', boundary: 'agent_work', code: 'COORDINATOR_ERROR', state: 'degraded' },
+		lifecycle: { component: 'lifecycle', boundary: 'goal', code: 'LIFECYCLE_CHANGED', state: 'ready' },
+		retry: { component: 'provider', boundary: 'planning', code: 'PROVIDER_RETRY', state: 'retrying' },
+	}[stage] ?? { component: 'coordinator', boundary: stage, code: 'STATUS_CHANGED', state: 'ready' };
+	return {
+		component: String(value?.component ?? defaults.component).slice(0, 128),
+		boundary: String(value?.boundary ?? defaults.boundary).slice(0, 128),
+		code: String(value?.code ?? defaults.code).slice(0, 128),
+		state: String(value?.state ?? defaults.state).slice(0, 128),
+		detail: message,
+	};
 }
 
 function sanitizePublicAgentMessage(message) {

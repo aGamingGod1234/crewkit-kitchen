@@ -137,3 +137,51 @@ test('reserves truncation-marker bytes at the serialized line boundary', async (
 	assert.equal(row.truncated, '[BOUNDED]');
 	assert.doesNotMatch(lines[0], /\uD800|\uDFFF/);
 });
+
+test('trace writes never reject when mkdir or append sinks fail', async () => {
+	let appendCalls = 0;
+	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {
+		mkdir: async () => { throw new Error('mkdir failed'); },
+		appendFile: async () => { appendCalls += 1; throw new Error('append failed'); },
+	});
+	await assert.doesNotReject(writer.write('first', { token: 'private' }));
+	await assert.doesNotReject(writer.write('second'));
+	await assert.doesNotReject(writer.close());
+	assert.equal(appendCalls, 0, 'a failed readiness sink is observed without attempting append');
+	assert.equal(writer.statusSnapshot().failureCode, 'DIAGNOSTIC_SINK_FAILED');
+	await assert.doesNotReject(writer.write('after-close'));
+});
+
+test('trace writer bounds hung sinks, drops overflow, and closes idempotently', async () => {
+	let appendCalls = 0;
+	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {
+		mkdir: async () => {},
+		appendFile: async () => { appendCalls += 1; return new Promise(() => {}); },
+		maxPending: 2,
+		operationTimeoutMs: 20,
+		closeTimeoutMs: 10,
+	});
+	for (let index = 0; index < 100; index += 1) await assert.doesNotReject(writer.write('event', { index }));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(appendCalls, 1);
+	const closing = writer.close();
+	assert.strictEqual(writer.close(), closing);
+	await closing;
+});
+
+test('trace writer recovers after an asynchronous append rejection', async () => {
+	const rows = [];
+	let calls = 0;
+	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {
+		mkdir: async () => {},
+		appendFile: async (_file, row) => {
+			calls += 1;
+			if (calls === 1) throw new Error('temporary trace failure');
+			rows.push(JSON.parse(row));
+		},
+	});
+	await writer.write('first');
+	await writer.write('second');
+	await writer.close();
+	assert.deepEqual(rows.map(({ event }) => event), ['second']);
+});

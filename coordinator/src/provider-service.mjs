@@ -111,7 +111,7 @@ export class ProviderService extends EventEmitter {
 		return [...this.#services.keys()].map((provider) => {
 			const record = this.#recovery.get(provider);
 			return record === undefined
-				? { provider, state: 'idle', fallbackMode: null, failureCode: null, consecutiveFailureCount: 0, nextProbeAtEpochMs: null, generation: 0, lastRecoveryAtEpochMs: null }
+				? { provider, state: 'idle', fallbackMode: null, boundary: null, failureCode: null, consecutiveFailureCount: 0, nextProbeAtEpochMs: null, generation: 0, lastRecoveryAtEpochMs: null }
 				: { provider, ...record };
 		});
 	}
@@ -365,9 +365,9 @@ export class ProviderService extends EventEmitter {
 		if (failures?.size === 0) this.#failureBoundaries.delete(provider);
 		const remaining = this.#failureBoundaries.get(provider);
 		if (remaining?.size > 0) {
-			const latest = [...remaining.values()].at(-1);
+			const [latestBoundary, latest] = [...remaining.entries()].at(-1);
 			this.#recovery.set(provider, {
-				state: 'degraded', fallbackMode: latest.fallbackMode, failureCode: latest.failureCode,
+				state: 'degraded', fallbackMode: latest.fallbackMode, boundary: latestBoundary, failureCode: latest.failureCode,
 				consecutiveFailureCount: [...remaining.values()].reduce((sum, failure) => Math.min(1_000_000, sum + failure.count), 0),
 				nextProbeAtEpochMs: latest.nextProbeAtEpochMs, generation: previous?.generation ?? 1,
 				lastRecoveryAtEpochMs: previous?.lastRecoveryAtEpochMs ?? null,
@@ -376,7 +376,7 @@ export class ProviderService extends EventEmitter {
 		}
 		const recovered = previous?.state === 'degraded';
 		this.#recovery.set(provider, {
-			state: 'live', fallbackMode: null, failureCode: null, consecutiveFailureCount: 0,
+			state: 'live', fallbackMode: null, boundary: null, failureCode: null, consecutiveFailureCount: 0,
 			nextProbeAtEpochMs: null, generation: previous?.generation ?? 1,
 			lastRecoveryAtEpochMs: recovered ? safeNow(this.#now) : previous?.lastRecoveryAtEpochMs ?? null,
 		});
@@ -399,7 +399,7 @@ export class ProviderService extends EventEmitter {
 		failures.set(boundary, failure);
 		this.#failureBoundaries.set(provider, failures);
 		this.#recovery.set(provider, {
-			state: 'degraded', fallbackMode, failureCode: failure.failureCode,
+			state: 'degraded', fallbackMode, boundary, failureCode: failure.failureCode,
 			consecutiveFailureCount: [...failures.values()].reduce((sum, entry) => Math.min(1_000_000, sum + entry.count), 0),
 			nextProbeAtEpochMs: failure.nextProbeAtEpochMs,
 			generation: (previous?.generation ?? 0) + (previous?.state === 'degraded' ? 0 : 1),

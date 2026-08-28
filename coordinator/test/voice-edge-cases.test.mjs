@@ -127,6 +127,96 @@ test('TTS route aborts synthesis when the client closes before the response', as
 	});
 });
 
+test('client cancellation releases its shared slot even when TTS ignores abort', async () => {
+	let first = true;
+	let releaseLate;
+	const late = new Promise((resolve) => { releaseLate = resolve; });
+	await withWorker({
+		maxConcurrent: 1,
+		provider: { async synthesize() {
+			if (first) { first = false; return late; }
+			return validSynthesis();
+		} },
+	}, async ({ baseUrl }) => {
+		const controller = new AbortController();
+		const cancelled = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'cancel me' }), signal: controller.signal,
+		});
+		await eventuallyActive(baseUrl, 1);
+		controller.abort();
+		await assert.rejects(cancelled, (error) => error?.name === 'AbortError');
+		await eventuallyActive(baseUrl, 0);
+
+		try {
+			const replacement = await fetch(`${baseUrl}/v1/tts`, {
+				method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'replacement' }),
+			});
+			assert.equal(replacement.status, 200);
+		} finally {
+			releaseLate(validSynthesis());
+		}
+	});
+});
+
+test('TTS timeout releases its slot and fences a late synthesis result from cache', async () => {
+	let calls = 0;
+	let releaseLate;
+	const late = new Promise((resolve) => { releaseLate = resolve; });
+	await withWorker({
+		maxConcurrent: 1,
+		requestTimeoutMs: 20,
+		provider: { async synthesize({ text }) {
+			calls += 1;
+			if (text === 'late') return late;
+			return validSynthesis();
+		} },
+	}, async ({ baseUrl }) => {
+		let timedOut;
+		try {
+			timedOut = await Promise.race([
+				fetch(`${baseUrl}/v1/tts`, {
+					method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'late' }),
+				}),
+				new Promise((_, reject) => setTimeout(() => reject(new Error('voice request did not time out')), 250)),
+			]);
+		} finally {
+			releaseLate(validSynthesis());
+		}
+		assert.equal(timedOut.status, 504);
+		await eventuallyActive(baseUrl, 0);
+
+		const healthy = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'healthy' }),
+		});
+		assert.equal(healthy.status, 200);
+		await new Promise((resolve) => setImmediate(resolve));
+		const retried = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'late', conversationSequence: 3 }),
+		});
+		assert.equal(retried.status, 200);
+		assert.equal(calls, 3, 'late timed-out audio was not cached or promoted');
+	});
+});
+
+test('STT provider errors release the shared slot exactly once', async () => {
+	let calls = 0;
+	await withWorker({
+		maxConcurrent: 1,
+		sttProvider: { async transcribe() {
+			calls += 1;
+			if (calls === 1) throw Object.assign(new Error('temporary STT failure'), { code: 'STT_UNAVAILABLE' });
+			return { transcript: 'heard', confidence: 0.9 };
+		} },
+	}, async ({ baseUrl }) => {
+		const failed = await fetch(`${baseUrl}/v1/stt`, { method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2) });
+		assert.equal(failed.status, 503);
+		assert.equal((await health(baseUrl)).active, 0);
+		const recovered = await fetch(`${baseUrl}/v1/stt`, { method: 'POST', headers: sttHeaders({ 'X-Utterance-Sequence': '2' }), body: Buffer.alloc(2) });
+		assert.equal(recovered.status, 200);
+		assert.equal((await health(baseUrl)).active, 0);
+	});
+});
+
 test('voice worker start and close are bounded when called concurrently', async () => {
 	const worker = createVoiceHttpServer({
 		provider: { async synthesize() { return validSynthesis(); } },
@@ -215,6 +305,7 @@ async function withWorker(options, verification) {
 		profileStore: new VoiceProfileStore(),
 		secret: SECRET,
 		maxConcurrent: options.maxConcurrent,
+		requestTimeoutMs: options.requestTimeoutMs,
 		port: 0,
 	});
 	const address = await worker.start();
@@ -223,6 +314,18 @@ async function withWorker(options, verification) {
 	} finally {
 		await worker.close();
 	}
+}
+
+async function health(baseUrl) {
+	return (await fetch(`${baseUrl}/health`)).json();
+}
+
+async function eventuallyActive(baseUrl, expected) {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if ((await health(baseUrl)).active === expected) return;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error(`voice worker active count did not reach ${expected}`);
 }
 
 function validSynthesis() {

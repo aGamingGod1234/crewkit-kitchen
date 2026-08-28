@@ -976,6 +976,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		configureVoiceProviderCredential(prepared.root(), environment);
 		environment.put("ARENA_AGENT_BRIDGE_SECRET", prepared.bridgeSecret());
 		environment.put("ARENA_AGENT_COORDINATOR_LAUNCH_ID", ownedLaunchId);
+		environment.put("ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION", prepared.generationId());
 		Path logs = gameDirectory.resolve("logs");
 		return new LaunchRequest(
 				List.of(

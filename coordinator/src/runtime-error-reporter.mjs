@@ -21,10 +21,13 @@ const CONTEXT_FIELDS = Object.freeze([
 export class RuntimeErrorReporter {
 	#refused = 0;
 	#write;
+	#queue;
+	#incidents = new Map();
 
-	constructor({ write = (line) => process.stderr.write(line) } = {}) {
+	constructor({ write = (line) => process.stderr.write(line), ...queueOptions } = {}) {
 		if (typeof write !== 'function') throw new TypeError('runtime error reporter write must be a function');
 		this.#write = write;
+		this.#queue = new BestEffortDiagnosticQueue(queueOptions);
 	}
 
 	report(error, context = {}) {
@@ -33,18 +36,42 @@ export class RuntimeErrorReporter {
 			if (this.#refused === 1) this.#emit('[dynamic-coordinator] ECONNREFUSED: Minecraft bridge is unavailable; retrying\n');
 			return;
 		}
-		try { this.#emit(formatUnexpectedRuntimeError(error, context)); }
+		try {
+			const line = formatUnexpectedRuntimeError(error, context);
+			const incident = this.#incidents.get(line);
+			if (incident !== undefined) {
+				incident.count = Math.min(1_000_000, incident.count + 1);
+				return;
+			}
+			if (this.#incidents.size >= 16) this.#incidents.delete(this.#incidents.keys().next().value);
+			this.#incidents.set(line, { count: 1 });
+			this.#emit(line);
+		}
 		catch { this.#emit(GENERIC_RUNTIME_ERROR); }
 	}
 
 	recovered() {
-		if (this.#refused === 0) return;
-		this.#emit(`[dynamic-coordinator] BRIDGE_RECONNECTED after ${this.#refused} refused connection attempts\n`);
-		this.#refused = 0;
+		if (this.#refused > 0) {
+			this.#emit(`[dynamic-coordinator] BRIDGE_RECONNECTED after ${this.#refused} refused connection attempts\n`);
+			this.#refused = 0;
+		}
+		this.#emitIncidentRecovery();
+	}
+
+	close() {
+		return this.#queue.close();
 	}
 
 	#emit(line) {
-		try { this.#write(line); } catch { /* diagnostics must not interrupt coordinator work */ }
+		try { this.#queue.submit(() => this.#write(line)); } catch { /* diagnostics must not interrupt coordinator work */ }
+	}
+
+	#emitIncidentRecovery() {
+		if (this.#incidents.size === 0) return;
+		let repeated = 0;
+		for (const incident of this.#incidents.values()) repeated += Math.max(0, incident.count - 1);
+		this.#incidents.clear();
+		this.#emit(`[dynamic-coordinator] RUNTIME_RECOVERED; ${repeated} repeated diagnostics suppressed\n`);
 	}
 }
 
@@ -113,6 +140,10 @@ function diagnosticText(value, limit) {
 		.replace(/(?:Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
 		.replace(/(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*[^\s,;)}\]"']+/gi, '[REDACTED]')
 		.replace(/(?:raw\s+)?prompt\s*[:=]\s*[^\r\n]*/gi, '[REDACTED]')
+		.replace(/(["'])(?:file:\/\/\/)?[A-Za-z]:[\\/][^"'\r\n]+\1/gi, '[location redacted]')
+		.replace(/(["'])\/(?:home|Users|private|var|tmp)\/[^"'\r\n]+\1/g, '[location redacted]')
+		.replace(/(?:file:\/\/\/)?[A-Za-z]:[\\/][^\s,;)}\]"']+/gi, '[location redacted]')
+		.replace(/\/(?:home|Users|private|var|tmp)\/[^\s,;)}\]"']+/g, '[location redacted]')
 		.replace(/[\u0000-\u001f\u007f]+/g, ' ')
 		.trim();
 	return truncate(text, limit);
@@ -122,3 +153,4 @@ function truncate(value, limit) {
 	if (value.length <= limit) return value;
 	return `${value.slice(0, Math.max(0, limit - 3))}...`;
 }
+import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';

@@ -155,6 +155,22 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 		circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 100, p95Ms: 200, failureRate: 0, circuit: 'closed' }],
 	};
 	assert.deepEqual(validateProtocolV2Payload('coordinator_status', payload), { ...payload, latencies: [] });
+	const extended = {
+		...payload,
+		profiles: [{ ...payload.profiles[0], serviceTier: 'priority' }],
+		bridgeSessionEpoch: 3,
+		runtimeGeneration: 'a'.repeat(64),
+		components: [{
+			component: 'provider:codex', state: 'degraded', fallbackMode: 'last_valid', boundary: 'create',
+			failureCode: 'PROVIDER_TIMEOUT', consecutiveFailureCount: 2, nextProbeAtEpochMs: 4_000,
+			generation: 3, lastRecoveryAtEpochMs: null,
+		}],
+	};
+	assert.deepEqual(validateProtocolV2Payload('coordinator_status', extended), { ...extended, latencies: [] });
+	assert.throws(() => validateProtocolV2Payload('coordinator_status', {
+		...extended,
+		components: [{ ...extended.components[0], privatePath: 'C:\\private\\secret.txt' }],
+	}), /field/i);
 	assert.deepEqual(validateProtocolV2Payload('coordinator_status', {
 		...payload,
 		scheduler: { ...payload.scheduler, active: 3, target: 2 },
