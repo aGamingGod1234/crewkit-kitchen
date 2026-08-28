@@ -218,3 +218,52 @@ test('voice bootstrap exposes slow local warmup without delaying the bound worke
 	assert.equal(settled, true);
 	await worker.close();
 });
+
+test('voice bootstrap propagates startup cancellation into provider discovery', async () => {
+	const controller = new AbortController();
+	let observedSignal = null;
+	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+		platform: 'win32',
+		signal: controller.signal,
+		createLocalSpeechProvider: async ({ signal }) => {
+			observedSignal = signal;
+			if (signal === undefined) throw new Error('startup signal was not propagated');
+			return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
+				const error = new Error('provider discovery aborted');
+				error.name = 'AbortError';
+				reject(error);
+			}, { once: true }));
+		},
+	});
+	controller.abort();
+	await assert.rejects(starting, (error) => error.name === 'AbortError');
+	assert.equal(observedSignal, controller.signal);
+});
+
+test('voice bootstrap propagates startup cancellation into HTTP binding', async () => {
+	const controller = new AbortController();
+	let observedSignal = null;
+	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_API_KEY: 'test-key',
+	}, {
+		signal: controller.signal,
+		platform: 'linux',
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => ({ async synthesize() { return {}; } }),
+		createVoiceServer: () => ({
+			start: ({ signal }) => {
+				observedSignal = signal;
+				return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
+					const error = new Error('bind aborted');
+					error.name = 'AbortError';
+					reject(error);
+				}, { once: true }));
+			},
+			async close() {},
+		}),
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	controller.abort();
+	await assert.rejects(starting, (error) => error.name === 'AbortError');
+	assert.equal(observedSignal, controller.signal);
+});

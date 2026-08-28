@@ -2226,7 +2226,7 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 	});
 	const disposeDiagnostics = wireRuntimeDiagnostics(coordinator, reporter);
 	voiceSupervisor = new VoiceSupervisor({
-		startWorker: () => startVoiceWorker(config, process.env),
+		startWorker: ({ signal }) => startVoiceWorker(config, process.env, { signal }),
 	});
 	try {
 		await startCoordinatorControl(coordinator, voiceSupervisor);
@@ -2292,6 +2292,11 @@ export async function startVoiceWorker(config, environment = process.env, depend
 	if (config === null || typeof config !== 'object' || Array.isArray(config)) throw new TypeError('voice worker config must be an object');
 	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) throw new TypeError('voice worker environment must be an object');
 	const voice = config.voice ?? {};
+	const signal = dependencies.signal;
+	if (signal !== undefined && (signal === null || typeof signal !== 'object' || typeof signal.aborted !== 'boolean')) {
+		throw new TypeError('voice startup signal must be an AbortSignal');
+	}
+	throwIfVoiceStartupAborted(signal);
 	const fishApiKey = firstNonBlank(
 		environment[voice.fishApiKeyEnvironmentVariable ?? DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE],
 		environment.FISH_API_KEY,
@@ -2300,15 +2305,18 @@ export async function startVoiceWorker(config, environment = process.env, depend
 	const createLocalSpeechProvider = dependencies.createLocalSpeechProvider
 		?? ((options) => LocalSpeechProvider.createIfAvailable(options));
 	if (typeof createLocalSpeechProvider !== 'function') throw new TypeError('createLocalSpeechProvider must be a function');
-	const localSpeechProvider = await createLocalSpeechProvider({
-		executable: firstNonBlank(environment.ARENA_AGENT_SPEECH_PYTHON, voice.localSpeechPythonPath)
-			?? path.resolve(PROJECT_DIRECTORY, DEFAULT_LOCAL_SPEECH_PYTHON_PATH),
-		scriptPath: path.join(SOURCE_DIRECTORY, 'voice', 'local-speech-worker.py'),
-		timeoutMs: voice.localSpeechTimeoutMs ?? 120_000,
-	});
-	if (localSpeechProvider === null && fishApiKey === null && platform !== 'win32') return null;
+	let localSpeechProvider = null;
 	let worker = null;
 	try {
+		localSpeechProvider = await createLocalSpeechProvider({
+			executable: firstNonBlank(environment.ARENA_AGENT_SPEECH_PYTHON, voice.localSpeechPythonPath)
+				?? path.resolve(PROJECT_DIRECTORY, DEFAULT_LOCAL_SPEECH_PYTHON_PATH),
+			scriptPath: path.join(SOURCE_DIRECTORY, 'voice', 'local-speech-worker.py'),
+			timeoutMs: voice.localSpeechTimeoutMs ?? 120_000,
+			signal,
+		});
+		throwIfVoiceStartupAborted(signal);
+		if (localSpeechProvider === null && fishApiKey === null && platform !== 'win32') return null;
 		const profilePath = dependencies.profilePath
 			?? voice.profileAssignmentsPath
 			?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
@@ -2321,7 +2329,8 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
 		if (typeof createWindowsTtsProvider !== 'function') throw new TypeError('createWindowsTtsProvider must be a function');
 		if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
-		const profiles = await loadProfileStore(profilePath);
+		const profiles = await loadProfileStore(profilePath, { signal });
+		throwIfVoiceStartupAborted(signal);
 		if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
 			throw new TypeError('loadProfileStore must return a profile store');
 		}
@@ -2342,15 +2351,40 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			port: voice.port ?? DEFAULT_VOICE_PORT,
 			maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT,
 		});
+		throwIfVoiceStartupAborted(signal);
 		if (worker === null || typeof worker !== 'object' || typeof worker.start !== 'function' || typeof worker.close !== 'function') {
 			throw new TypeError('createVoiceServer must return a voice worker');
 		}
-		await worker.start();
+		await worker.start({ signal });
+		throwIfVoiceStartupAborted(signal);
 		return localSpeechProvider === null ? worker : voiceWorkerWithOwnedProvider(worker, localSpeechProvider);
 	} catch (error) {
-		await Promise.allSettled([worker?.close(), localSpeechProvider?.close()]);
+		await settleVoiceBootstrapCleanup(
+			[() => worker?.close(), () => localSpeechProvider?.close()],
+			dependencies.cleanupTimeoutMs ?? 1_000,
+		);
 		throw error;
 	}
+}
+
+async function settleVoiceBootstrapCleanup(operations, timeoutMs) {
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new TypeError('voice cleanup timeout must be positive');
+	const cleanup = Promise.allSettled(operations.map((operation) => Promise.resolve().then(operation)));
+	let timer;
+	await Promise.race([
+		cleanup,
+		new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+	]);
+	clearTimeout(timer);
+}
+
+function throwIfVoiceStartupAborted(signal) {
+	if (!signal?.aborted) return;
+	if (signal.reason instanceof Error) throw signal.reason;
+	const error = new Error('Voice startup was cancelled');
+	error.name = 'AbortError';
+	error.code = 'VOICE_OPERATION_CANCELLED';
+	throw error;
 }
 
 function voiceWorkerWithOwnedProvider(worker, provider) {

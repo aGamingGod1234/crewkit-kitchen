@@ -2,6 +2,7 @@ const DEFAULT_INITIAL_RETRY_MS = 1_000;
 const DEFAULT_MAX_RETRY_MS = 30_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 10_000;
 const DEFAULT_WARMUP_TIMEOUT_MS = 30_000;
+const DEFAULT_CLEANUP_TIMEOUT_MS = 1_000;
 
 export class VoiceSupervisor {
 	#startWorker;
@@ -12,19 +13,20 @@ export class VoiceSupervisor {
 	#maxRetryMs;
 	#startupTimeoutMs;
 	#warmupTimeoutMs;
+	#cleanupTimeoutMs;
 	#started = false;
 	#closed = false;
-	#worker = null;
-	#candidate = null;
+	#closePromise = null;
+	#attempt = null;
+	#live = null;
 	#retryTimer = null;
-	#operationEpoch = 0;
+	#epoch = 0;
 	#statusGeneration = 0;
 	#failures = 0;
 	#nextRetryAt = null;
 	#failureCode = 'VOICE_NOT_STARTED';
 	#lastRecoveryAt = null;
-	#controllers = new Set();
-	#closedWorkers = new WeakSet();
+	#workerCloses = new WeakMap();
 
 	constructor({
 		startWorker,
@@ -35,12 +37,15 @@ export class VoiceSupervisor {
 		maxRetryMs = DEFAULT_MAX_RETRY_MS,
 		startupTimeoutMs = DEFAULT_STARTUP_TIMEOUT_MS,
 		warmupTimeoutMs = DEFAULT_WARMUP_TIMEOUT_MS,
+		cleanupTimeoutMs = DEFAULT_CLEANUP_TIMEOUT_MS,
 	} = {}) {
 		if (typeof startWorker !== 'function') throw new TypeError('startWorker must be a function');
 		if (typeof now !== 'function' || typeof schedule !== 'function' || typeof cancelSchedule !== 'function') {
 			throw new TypeError('voice supervisor clock and scheduler must be functions');
 		}
-		for (const [name, value] of Object.entries({ initialRetryMs, maxRetryMs, startupTimeoutMs, warmupTimeoutMs })) {
+		for (const [name, value] of Object.entries({
+			initialRetryMs, maxRetryMs, startupTimeoutMs, warmupTimeoutMs, cleanupTimeoutMs,
+		})) {
 			if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${name} must be positive`);
 		}
 		if (maxRetryMs < initialRetryMs) throw new TypeError('maxRetryMs must not be less than initialRetryMs');
@@ -52,30 +57,30 @@ export class VoiceSupervisor {
 		this.#maxRetryMs = maxRetryMs;
 		this.#startupTimeoutMs = startupTimeoutMs;
 		this.#warmupTimeoutMs = warmupTimeoutMs;
+		this.#cleanupTimeoutMs = cleanupTimeoutMs;
 	}
 
 	start() {
 		if (this.#closed || this.#started) return;
 		this.#started = true;
-		queueMicrotask(() => this.#attempt());
+		queueMicrotask(() => this.#beginAttempt());
 	}
 
 	statusSnapshots() {
-		if (this.#worker !== null) {
+		if (this.#live !== null) {
 			try {
-				const snapshots = this.#worker.statusSnapshots?.();
-				if (Array.isArray(snapshots)) return snapshots.slice(0, 3).map((snapshot) => this.#withStartupHistory(snapshot));
-				const snapshot = this.#worker.statusSnapshot?.();
-				if (snapshot !== null && typeof snapshot === 'object') return [this.#withStartupHistory(snapshot)];
+				const snapshots = this.#live.worker.statusSnapshots?.();
+				if (Array.isArray(snapshots)) return snapshots.slice(0, 3).map((snapshot) => this.#withHistory(snapshot));
+				const snapshot = this.#live.worker.statusSnapshot?.();
+				if (snapshot !== null && typeof snapshot === 'object') return [this.#withHistory(snapshot)];
 			} catch { /* optional voice status is observational */ }
 		}
 		const state = this.#failures === 0 ? 'unknown' : 'degraded';
-		const boundary = state === 'unknown' ? 'voice_start' : 'voice_start';
 		return ['voice', 'voice:tts', 'voice:stt'].map((component) => Object.freeze({
 			component,
 			state,
 			fallbackMode: 'text',
-			boundary,
+			boundary: 'voice_start',
 			failureCode: this.#failureCode,
 			consecutiveFailureCount: this.#failures,
 			nextProbeAtEpochMs: this.#nextRetryAt,
@@ -84,114 +89,202 @@ export class VoiceSupervisor {
 		}));
 	}
 
-	async close() {
-		if (this.#closed) return;
+	close() {
+		if (this.#closePromise !== null) return this.#closePromise;
 		this.#closed = true;
-		this.#operationEpoch += 1;
-		if (this.#retryTimer !== null) {
-			this.#cancelSchedule(this.#retryTimer);
-			this.#retryTimer = null;
-		}
-		for (const controller of this.#controllers) controller.abort();
-		this.#controllers.clear();
-		const workers = [this.#worker, this.#candidate];
-		this.#worker = null;
-		this.#candidate = null;
-		await Promise.allSettled(workers.map((worker) => this.#closeWorker(worker)));
-	}
-
-	async #attempt() {
-		if (this.#closed || this.#worker !== null) return;
-		const epoch = ++this.#operationEpoch;
+		this.#epoch += 1;
+		if (this.#retryTimer !== null) this.#cancelSchedule(this.#retryTimer);
 		this.#retryTimer = null;
-		let startup;
-		try {
-			startup = Promise.resolve().then(() => this.#bounded(
-				(signal) => this.#startWorker({ signal }),
-				this.#startupTimeoutMs,
-				'VOICE_START_TIMEOUT',
-				(worker) => this.#closeWorker(worker),
-			));
-			startup.then((worker) => {
-				if (epoch !== this.#operationEpoch || this.#closed) void this.#closeWorker(worker);
-			}, () => {});
-			const worker = await startup;
-			if (worker === null || typeof worker !== 'object' || typeof worker.close !== 'function') {
-				throw voiceError('VOICE_UNAVAILABLE', 'Voice worker is unavailable');
-			}
-			if (epoch !== this.#operationEpoch || this.#closed) {
-				await this.#closeWorker(worker);
-				return;
-			}
-			this.#candidate = worker;
-			if (typeof worker.warmup === 'function') {
-				await this.#bounded((signal) => worker.warmup({ signal }), this.#warmupTimeoutMs, 'VOICE_WARMUP_TIMEOUT');
-			}
-			if (epoch !== this.#operationEpoch || this.#closed) {
-				await this.#closeWorker(worker);
-				return;
-			}
-			this.#candidate = null;
-			this.#worker = worker;
-			if (this.#failures > 0) this.#lastRecoveryAt = this.#now();
-			this.#failures = 0;
-			this.#nextRetryAt = null;
-			this.#failureCode = null;
-			this.#statusGeneration += 1;
-		} catch (error) {
-			if (epoch !== this.#operationEpoch || this.#closed) return;
-			this.#operationEpoch += 1;
-			const failedCandidate = this.#candidate;
-			this.#candidate = null;
-			await this.#closeWorker(failedCandidate);
-			if (this.#closed) return;
-			this.#failures = Math.min(1_000_000, this.#failures + 1);
-			this.#failureCode = failureCode(error);
-			this.#statusGeneration += 1;
-			const delay = Math.min(this.#maxRetryMs, this.#initialRetryMs * 2 ** Math.min(20, this.#failures - 1));
-			this.#nextRetryAt = this.#now() + delay;
-			const retryEpoch = this.#operationEpoch;
-			this.#retryTimer = this.#schedule(() => {
-				if (this.#closed || retryEpoch !== this.#operationEpoch) return;
-				void this.#attempt();
-			}, delay);
+		this.#nextRetryAt = null;
+		const attempt = this.#attempt;
+		const live = this.#live;
+		attempt?.controller.abort(abortError('Voice supervisor closed'));
+		attempt?.unsubscribe?.();
+		live?.unsubscribe?.();
+		this.#live = null;
+		this.#closePromise = Promise.allSettled([
+			this.#closeWorker(attempt?.candidate),
+			this.#closeWorker(live?.worker),
+		]).then(() => undefined);
+		return this.#closePromise;
+	}
+
+	#beginAttempt() {
+		if (this.#closed || this.#live !== null || this.#attempt !== null) return;
+		this.#retryTimer = null;
+		this.#nextRetryAt = null;
+		const token = {
+			epoch: ++this.#epoch,
+			controller: new AbortController(),
+			phase: 'start',
+			timer: null,
+			candidate: null,
+			unsubscribe: null,
+			failureRecorded: false,
+		};
+		this.#attempt = token;
+		const startup = Promise.resolve().then(() => this.#startWorker({ signal: token.controller.signal }));
+		token.timer = this.#schedule(() => this.#timeoutAttempt(token, 'VOICE_START_TIMEOUT'), this.#startupTimeoutMs);
+		startup.then(
+			(worker) => { void this.#workerStarted(token, worker); },
+			(error) => { void this.#attemptRejected(token, error); },
+		);
+	}
+
+	async #workerStarted(token, worker) {
+		this.#cancelTokenTimer(token);
+		if (!this.#ownsAttempt(token) || token.controller.signal.aborted || this.#closed) {
+			await this.#closeWorker(worker);
+			this.#releaseAttempt(token);
+			return;
 		}
+		if (worker === null || typeof worker !== 'object' || typeof worker.close !== 'function') {
+			await this.#failAttempt(token, voiceError('VOICE_UNAVAILABLE', 'Voice worker is unavailable'));
+			return;
+		}
+		token.candidate = worker;
+		try {
+			token.unsubscribe = this.#subscribeFailure(worker, (error) => this.#workerFailed(token, worker, error));
+		} catch (error) {
+			await this.#failAttempt(token, error);
+			return;
+		}
+		if (typeof worker.warmup !== 'function') {
+			this.#promote(token, worker);
+			return;
+		}
+		token.phase = 'warmup';
+		const warming = Promise.resolve().then(() => worker.warmup({ signal: token.controller.signal }));
+		token.timer = this.#schedule(() => this.#timeoutAttempt(token, 'VOICE_WARMUP_TIMEOUT'), this.#warmupTimeoutMs);
+		warming.then(
+			() => this.#warmupFinished(token, worker),
+			(error) => { void this.#attemptRejected(token, error); },
+		);
 	}
 
-	#bounded(operation, timeoutMs, code, onLateResult = null) {
-		const controller = new AbortController();
-		this.#controllers.add(controller);
-		let timeout;
-		let expired = false;
-		const work = Promise.resolve().then(() => operation(controller.signal));
-		work.then((result) => {
-			if (expired && typeof onLateResult === 'function') void onLateResult(result);
-		}, () => {});
-		let onAbort;
-		const aborted = new Promise((_, reject) => {
-			onAbort = () => {
-				expired = true;
-				const error = voiceError('VOICE_OPERATION_CANCELLED', 'Voice lifecycle operation was cancelled');
-				error.name = 'AbortError';
-				reject(error);
-			};
-			controller.signal.addEventListener('abort', onAbort, { once: true });
-		});
-		const deadline = new Promise((_, reject) => {
-			timeout = this.#schedule(() => {
-				expired = true;
-				reject(voiceError(code, 'Voice lifecycle operation timed out'));
-				controller.abort();
-			}, timeoutMs);
-		});
-		return Promise.race([work, deadline, aborted]).finally(() => {
-			this.#cancelSchedule(timeout);
-			controller.signal.removeEventListener('abort', onAbort);
-			this.#controllers.delete(controller);
-		});
+	#warmupFinished(token, worker) {
+		this.#cancelTokenTimer(token);
+		if (!this.#ownsAttempt(token) || token.controller.signal.aborted || this.#closed) return;
+		this.#promote(token, worker);
 	}
 
-	#withStartupHistory(snapshot) {
+	async #attemptRejected(token, error) {
+		if (!this.#ownsAttempt(token)) return;
+		this.#cancelTokenTimer(token);
+		await this.#failAttempt(token, token.failureRecorded ? null : error);
+	}
+
+	#timeoutAttempt(token, code) {
+		if (!this.#ownsAttempt(token)) return;
+		token.timer = null;
+		const error = voiceError(code, 'Voice lifecycle operation timed out');
+		token.failureRecorded = true;
+		this.#recordFailure(error);
+		token.controller.abort(error);
+		if (token.phase === 'warmup') void this.#failAttempt(token, null);
+		// A start operation retains ownership until it acknowledges cancellation or returns.
+	}
+
+	async #failAttempt(token, error) {
+		if (!this.#ownsAttempt(token)) return;
+		this.#cancelTokenTimer(token);
+		if (error !== null && !token.failureRecorded && !this.#closed) {
+			token.failureRecorded = true;
+			this.#recordFailure(error);
+		}
+		token.controller.abort(error ?? abortError('Voice startup failed'));
+		token.unsubscribe?.();
+		token.unsubscribe = null;
+		await this.#closeWorker(token.candidate);
+		this.#releaseAttempt(token);
+	}
+
+	#promote(token, worker) {
+		if (!this.#ownsAttempt(token) || this.#closed) return;
+		this.#cancelTokenTimer(token);
+		this.#attempt = null;
+		this.#live = { epoch: token.epoch, worker, unsubscribe: token.unsubscribe };
+		token.candidate = null;
+		token.unsubscribe = null;
+		if (this.#failures > 0) this.#lastRecoveryAt = this.#now();
+		this.#failures = 0;
+		this.#failureCode = null;
+		this.#nextRetryAt = null;
+		this.#statusGeneration += 1;
+	}
+
+	#workerFailed(owner, worker, error) {
+		if (this.#attempt === owner && owner.candidate === worker) {
+			void this.#failAttempt(owner, error);
+			return;
+		}
+		const live = this.#live;
+		if (live === null || live.epoch !== owner.epoch || live.worker !== worker || this.#closed) return;
+		this.#live = null;
+		live.unsubscribe?.();
+		this.#recordFailure(error);
+		void this.#closeWorker(worker);
+		this.#scheduleRetry();
+	}
+
+	#releaseAttempt(token) {
+		if (!this.#ownsAttempt(token)) return;
+		this.#attempt = null;
+		token.candidate = null;
+		token.unsubscribe = null;
+		if (!this.#closed && this.#live === null && token.failureRecorded) this.#scheduleRetry();
+	}
+
+	#recordFailure(error) {
+		if (this.#closed) return;
+		this.#failures = Math.min(1_000_000, this.#failures + 1);
+		this.#failureCode = failureCode(error);
+		this.#statusGeneration += 1;
+	}
+
+	#scheduleRetry() {
+		if (this.#closed || this.#live !== null || this.#attempt !== null || this.#retryTimer !== null) return;
+		const delay = Math.min(this.#maxRetryMs, this.#initialRetryMs * 2 ** Math.min(20, this.#failures - 1));
+		this.#nextRetryAt = this.#now() + delay;
+		const epoch = this.#epoch;
+		this.#retryTimer = this.#schedule(() => {
+			if (this.#closed || epoch !== this.#epoch) return;
+			this.#retryTimer = null;
+			this.#beginAttempt();
+		}, delay);
+	}
+
+	#subscribeFailure(worker, listener) {
+		if (typeof worker.onFailure !== 'function') return () => {};
+		const unsubscribe = worker.onFailure(listener);
+		return typeof unsubscribe === 'function' ? once(unsubscribe) : () => {};
+	}
+
+	#closeWorker(worker) {
+		if (worker === null || typeof worker !== 'object' || typeof worker.close !== 'function') return Promise.resolve();
+		const existing = this.#workerCloses.get(worker);
+		if (existing !== undefined) return existing;
+		let timer;
+		const raw = Promise.resolve().then(() => worker.close()).then(() => undefined, () => undefined);
+		const deadline = new Promise((resolve) => {
+			timer = this.#schedule(resolve, this.#cleanupTimeoutMs);
+		});
+		const bounded = Promise.race([raw, deadline]).finally(() => this.#cancelSchedule(timer));
+		this.#workerCloses.set(worker, bounded);
+		return bounded;
+	}
+
+	#cancelTokenTimer(token) {
+		if (token.timer === null) return;
+		this.#cancelSchedule(token.timer);
+		token.timer = null;
+	}
+
+	#ownsAttempt(token) {
+		return this.#attempt === token && token.epoch === this.#epoch;
+	}
+
+	#withHistory(snapshot) {
 		if (snapshot === null || typeof snapshot !== 'object') return snapshot;
 		const workerGeneration = Number.isSafeInteger(snapshot.generation) && snapshot.generation >= 0
 			? snapshot.generation
@@ -207,14 +300,15 @@ export class VoiceSupervisor {
 				: this.#lastRecoveryAt === null ? workerRecovery : Math.max(workerRecovery, this.#lastRecoveryAt),
 		});
 	}
+}
 
-	#closeWorker(worker) {
-		if (worker === null || typeof worker !== 'object' || typeof worker.close !== 'function') return Promise.resolve();
-		if (this.#closedWorkers.has(worker)) return Promise.resolve();
-		this.#closedWorkers.add(worker);
-		try { return Promise.resolve(worker.close()).then(() => undefined, () => undefined); }
-		catch { return Promise.resolve(); }
-	}
+function once(callback) {
+	let called = false;
+	return () => {
+		if (called) return;
+		called = true;
+		try { callback(); } catch { /* lifecycle detachment is best effort */ }
+	};
 }
 
 function defaultSchedule(callback, delay) {
@@ -232,5 +326,11 @@ function failureCode(error) {
 function voiceError(code, message) {
 	const error = new Error(message);
 	error.code = code;
+	return error;
+}
+
+function abortError(message) {
+	const error = voiceError('VOICE_OPERATION_CANCELLED', message);
+	error.name = 'AbortError';
 	return error;
 }

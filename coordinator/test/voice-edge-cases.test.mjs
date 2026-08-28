@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { DeepgramSttProvider } from '../src/voice/deepgram-stt-provider.mjs';
+import { NoSttProvider } from '../src/voice/deepgram-stt-provider.mjs';
 import { FishTtsProvider } from '../src/voice/fish-tts-provider.mjs';
 import { TtsCache } from '../src/voice/tts-cache.mjs';
 import { createVoiceHttpServer } from '../src/voice/voice-http-server.mjs';
@@ -26,6 +27,7 @@ test('TTS lifecycle automatically probes and recovers while STT remains independ
 			error.code = 'TTS_UNAVAILABLE';
 			throw error;
 		}, async probe() { probes += 1; await probeGate; } },
+		sttProvider: { async transcribe() { return { transcript: '', confidence: 1 }; } },
 		initialProbeDelayMs: 10,
 		maxProbeDelayMs: 10,
 	}, async ({ worker, baseUrl }) => {
@@ -82,6 +84,76 @@ test('transient STT failure automatically recovers while idle', async () => {
 		assert.equal(failed.status, 502);
 		await eventually(() => worker.statusSnapshots().find(({ component }) => component === 'voice:stt').state === 'ready');
 		assert.equal(probes, 1);
+	});
+});
+
+test('missing and explicitly unavailable STT begin degraded without retry spam', async () => {
+	for (const sttProvider of [null, new NoSttProvider()]) {
+		const worker = createVoiceHttpServer({
+			provider: { async synthesize() { return validSynthesis(); } },
+			sttProvider,
+			profileStore: new VoiceProfileStore(),
+			secret: SECRET,
+			port: 0,
+		});
+		try {
+			const stt = worker.statusSnapshots().find(({ component }) => component === 'voice:stt');
+			assert.equal(stt.state, 'degraded');
+			assert.equal(stt.failureCode, 'STT_UNAVAILABLE');
+			assert.equal(stt.nextProbeAtEpochMs, null);
+			assert.equal(worker.statusSnapshot().failureCode, 'STT_UNAVAILABLE');
+		} finally {
+			await worker.close();
+		}
+	}
+});
+
+test('missing TTS begins degraded while the STT channel remains independently usable', async () => {
+	const worker = createVoiceHttpServer({
+		provider: null,
+		sttProvider: { async transcribe() { return { transcript: 'heard', confidence: 1 }; } },
+		profileStore: new VoiceProfileStore(),
+		secret: SECRET,
+		port: 0,
+	});
+	try {
+		const snapshots = worker.statusSnapshots();
+		assert.equal(snapshots.find(({ component }) => component === 'voice:tts').failureCode, 'TTS_UNAVAILABLE');
+		assert.equal(snapshots.find(({ component }) => component === 'voice:stt').state, 'ready');
+		const address = await worker.start();
+		const unavailable = await fetch(`http://127.0.0.1:${address.port}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		assert.equal(unavailable.status, 503);
+	} finally {
+		await worker.close();
+	}
+});
+
+test('abort-ignoring provider probe never accumulates a replacement call', async () => {
+	let probes = 0;
+	let aborts = 0;
+	await withWorker({
+		provider: {
+			async synthesize() { throw Object.assign(new Error('TTS offline'), { code: 'TTS_UNAVAILABLE' }); },
+			probe: ({ signal }) => {
+				probes += 1;
+				signal.addEventListener('abort', () => { aborts += 1; }, { once: true });
+				return new Promise(() => {});
+			},
+		},
+		initialProbeDelayMs: 5,
+		maxProbeDelayMs: 5,
+		probeTimeoutMs: 5,
+	}, async ({ worker, baseUrl }) => {
+		const failed = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		assert.equal(failed.status, 502);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(probes, 1, 'one unresolved provider call retains exact probe ownership');
+		assert.equal(aborts, 1, 'probe deadline aborts the underlying provider call');
+		assert.equal(worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state, 'degraded');
 	});
 });
 
@@ -195,7 +267,11 @@ test('TTS route aborts synthesis when the client closes before the response', as
 		await assert.rejects(request, (error) => error?.name === 'AbortError');
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		assert.equal(providerSignal.aborted, true);
-		assert.equal(worker.statusSnapshot().state, 'ready', 'client cancellation is not a provider outage');
+		assert.equal(
+			worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state,
+			'ready',
+			'client cancellation is not a TTS provider outage',
+		);
 	});
 });
 
@@ -380,6 +456,7 @@ async function withWorker(options, verification) {
 		requestTimeoutMs: options.requestTimeoutMs,
 		initialProbeDelayMs: options.initialProbeDelayMs,
 		maxProbeDelayMs: options.maxProbeDelayMs,
+		probeTimeoutMs: options.probeTimeoutMs,
 		port: 0,
 	});
 	const address = await worker.start();
