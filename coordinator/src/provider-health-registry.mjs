@@ -91,6 +91,7 @@ export class ProviderHealthRegistry {
 			p95Ms: percentile(durations, 0.95),
 			failureRate: durations.length === 0 ? 0 : failures / durations.length,
 			circuit: state.circuit,
+			...(state.circuit === 'open' && state.openedAt !== null ? { nextProbeAtEpochMs: state.openedAt + this.#cooldownMs } : {}),
 		});
 	}
 
@@ -100,7 +101,7 @@ export class ProviderHealthRegistry {
 
 	#state(identityValue) {
 		const identity = requireIdentity(identityValue);
-		const key = JSON.stringify([identity.provider, identity.model, identity.operation]);
+		const key = JSON.stringify([identity.profileFingerprint ?? `legacy:${identity.provider}:${identity.model}`, identity.operation]);
 		let state = this.#operations.get(key);
 		if (state === undefined) {
 			state = { samples: [], circuit: 'closed', openedAt: null, probeInFlight: false };
@@ -127,7 +128,13 @@ function requireIdentity(value) {
 		provider: requirePart(value.provider, 'provider'),
 		model: requirePart(value.model, 'model'),
 		operation: requirePart(value.operation, 'operation'),
+		...(value.profileFingerprint === undefined ? {} : { profileFingerprint: requireFingerprint(value.profileFingerprint) }),
 	});
+}
+
+function requireFingerprint(value) {
+	if (typeof value !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(value)) throw new TypeError('profileFingerprint must be a sha256 fingerprint');
+	return value;
 }
 
 function requirePart(value, field) {

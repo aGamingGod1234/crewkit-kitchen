@@ -1383,6 +1383,54 @@ test('a recoverable native provider failure stays active and schedules observati
 	}
 });
 
+test('ArenaScript infrastructure failure replaces the exact session and retries once from fresh facts', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let attempts = 0;
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		attempts += 1;
+		if (attempts === 1) throw Object.assign(new Error('provider planning timed out'), { code: 'PLANNING_TIMEOUT' });
+		return withCompletionContract({ summary: 'Recovered.', directive: 'replace', source: SOURCE }, request.goalRevision);
+	};
+	const provider = new FakeProvider();
+	const session = { sessionGeneration: 3 };
+	const replacements = [];
+	provider.getAgent = () => session;
+	provider.replaceAgent = async (profile, options) => { replacements.push({ profile, options }); return session; };
+	const run = await start({
+		registry,
+		planner,
+		codexService: provider,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: {
+			bridge: { port: 25570, secret: 's'.repeat(32) },
+			codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
+		},
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => attempts === 1 && replacements.length === 1 && timers.pendingCount === 1);
+		assert.equal(replacements[0].profile.agentId, 'agent-a');
+		assert.equal(replacements[0].options.expectedSessionGeneration, 3);
+		assert.equal(run.registry.get('agent-a').state, DynamicAgentState.PLANNING);
+		assert.equal(run.bridge.sent.some(({ type }) => type === 'agent_error'), false);
+		await timers.runNext();
+		assert.equal(run.bridge.sent.filter(({ type }) => type === 'request_observation').length, 1);
+
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, observation: { player: { x: 1, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => attempts === 2 && run.bridge.sent.some(({ type }) => type === 'action_command'));
+		assert.equal(replacements.length, 1);
+		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.PAUSED);
+		assert.notEqual(run.registry.get('agent-a').state, DynamicAgentState.ERROR);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('a replaced native goal fences an already queued recovery callback', async () => {
 	const timers = new ManualTimerQueue();
 	const registry = new AgentRegistry();

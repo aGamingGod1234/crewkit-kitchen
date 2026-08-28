@@ -12,10 +12,36 @@ class FakeService {
 	async start() {}
 	async stop() { this.stopped = true; }
 	async createAgent(profile) { this.created.push(profile); return { agentId: profile.agentId, provider: this.provider }; }
+	async replaceAgent(profile) { this.removed.push(profile.agentId); return this.createAgent(profile); }
 	getAgent(agentId) { return this.created.some((profile) => profile.agentId === agentId) ? { agentId, provider: this.provider } : null; }
 	async removeAgent(agentId) { this.removed.push(agentId); return true; }
 	async reconcile(records) { return { valid: records, invalid: [], removed: [], catalog: { provider: this.provider, models: [] } }; }
 }
+
+test('provider router coalesces one exact-profile replacement and rejects tier mutation', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	services.codex.replaceAgent = async (value) => {
+		services.codex.removed.push(value.agentId);
+		await gate;
+		return services.codex.createAgent(value);
+	};
+	const router = new ProviderService(services);
+	const selected = profile('codex');
+	await router.createAgent(selected);
+	const first = router.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	const second = router.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	await assert.rejects(
+		router.replaceAgent({ ...selected, serviceTier: 'priority' }),
+		(error) => error?.code === 'AGENT_PROFILE_CONFLICT',
+	);
+	release();
+	assert.equal(await first, await second);
+	assert.deepEqual(services.codex.removed, [selected.agentId]);
+	assert.equal(services.codex.created.length, 2);
+	await router.stop();
+});
 
 function profile(provider, overrides = {}) {
 	return {

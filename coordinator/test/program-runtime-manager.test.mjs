@@ -624,21 +624,24 @@ test('wires full watcher provenance and preserves the exact profile on reactive 
 	assert.equal(watcher.provenance.watcherId, 'watcher-0');
 });
 
-test('cancel-send rejection pauses an unmatched urgent wake and fences late results', async () => {
+test('cancel-send rejection keeps an unmatched urgent wake active for recovery and fences late results', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const sent = [];
 	const errors = [];
+	const recoveries = [];
 	const manager = new ProgramRuntimeManager({
 		registry,
 		bridge: { send: async (type, agentId, payload) => { sent.push({ type, agentId, payload }); if (type === 'action_cancel') throw Object.assign(new Error('cancel unavailable'), { code: 'CANCEL_UNAVAILABLE' }); } },
 		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
 		reportError: (_agentId, error) => errors.push(error),
+		requestRecovery: (request) => recoveries.push(request),
 	});
 	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: 'program.onUnhandledAttention("pause_and_notify"); await player.wait(1);' }, { observation: observation(), eventSequence: 1 });
 	const active = sent[0].payload;
 	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage' });
-	for (let attempt = 0; attempt < 5 && registry.get('agent-a').state !== DynamicAgentState.PAUSED; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(registry.get('agent-a').state, DynamicAgentState.PAUSED);
+	for (let attempt = 0; attempt < 5 && recoveries.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	assert.equal(recoveries.length, 1);
 	assert.equal(sent.filter((message) => message.type === 'action_cancel').length, 1);
 	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3 }), false);
 	assert.equal(errors.at(-1)?.code, 'CANCEL_UNAVAILABLE');
@@ -679,6 +682,54 @@ test('replans from bounded failed-action context instead of pausing after a repe
 	assert.match(requests[0].input, /"recipeId":"minecraft:planks"/);
 	assert.equal(actionCommands(sent).length, 3);
 	assert.equal(actionCommands(sent)[2].payload.actionType, 'wait');
+});
+
+test('reactive provider suspension stays active and retries once after fresh authoritative facts', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [];
+	const requests = [];
+	const recoveries = [];
+	const timeout = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async (request) => {
+			requests.push(request);
+			if (requests.length === 1) throw timeout;
+			return withCompletionContract({
+				summary: 'Recover with fresh facts.',
+				directive: 'replace',
+				source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(1);',
+			}, request.goalRevision);
+		} },
+		requestRecovery: (request) => recoveries.push(request),
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace',
+		source: `
+			program.onUnhandledAttention("continue_and_notify");
+			await program.repeatUntil(() => false, { maxIterations: 8 }, async () => {
+				await player.craftInventory({ recipeId: "minecraft:planks", count: 1, timeoutMs: 5000 });
+			});
+		`,
+	}, { observation: observation(), eventSequence: 1 });
+	await manager.onActionResult(registry.get('agent-a'), { actionId: actionCommands(sent)[0].payload.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND' });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	await manager.onActionResult(registry.get('agent-a'), { actionId: actionCommands(sent)[1].payload.actionId, state: 'FAILED', reasonCode: 'RECIPE_NOT_FOUND' });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 3 });
+	for (let attempt = 0; attempt < 10 && recoveries.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 1);
+	assert.equal(recoveries.length, 1);
+	assert.equal(recoveries[0].reason, 'reactive_provider_failure');
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+
+	await manager.onObservation(registry.get('agent-a'), { observation: observation({ player: { health: 19 } }), eventSequence: 4 });
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(recoveries.length, 1, 'one failure schedules only one recovery before fresh facts');
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	for (let attempt = 0; attempt < 10 && actionCommands(sent).at(-1)?.payload.actionType !== 'wait'; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(actionCommands(sent).at(-1).payload.actionType, 'wait');
 });
 
 test('serializes coalesced reactive planner requests for one program', async () => {
@@ -923,21 +974,24 @@ test('bridge send rejection unwedges the active program with a stable failed res
 	assert.equal(snapshot.activeActionId, null, 'failed send is terminally acknowledged instead of wedging the engine');
 });
 
-test('bridge send rejection contains a model execution error without terminating the coordinator', async () => {
+test('bridge send rejection contains a model execution error and schedules active recovery', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const errors = [];
+	const recoveries = [];
 	const manager = new ProgramRuntimeManager({
 		registry,
 		bridge: { send: async () => { throw Object.assign(new Error('stale revision'), { code: 'STALE_GOAL_REVISION' }); } },
 		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
 		reportError: (_id, error) => errors.push(error),
+		requestRecovery: (request) => recoveries.push(request),
 	});
 	await manager.installDecision(registry.get('agent-a'), {
 		directive: 'replace',
 		source: 'program.onUnhandledAttention("continue_and_notify"); const result = await tryResult(player.wait(1)); const invalid = result.yaw; program.finish("done");',
 	}, { observation: observation(), eventSequence: 1 });
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(registry.get('agent-a').state, DynamicAgentState.PAUSED);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	assert.equal(recoveries.length, 1);
 	assert.equal(errors.some((error) => error.code === 'STALE_GOAL_REVISION'), true);
 	assert.equal(errors.some((error) => error.code === 'UNKNOWN_MEMBER'), true);
 });

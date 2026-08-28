@@ -47,7 +47,7 @@ test('provider health uses deterministic percentiles and one half-open probe', (
 	const key = { provider: 'gemini', model: 'pro', operation: 'decide' };
 	assert.deepEqual(registry.snapshot(key), {
 		...key, count: 4, p50Ms: 200, p95Ms: 12_000,
-		failureRate: 0.5, circuit: 'open',
+		failureRate: 0.5, circuit: 'open', nextProbeAtEpochMs: 1_500,
 	});
 	assert.equal(registry.canAttempt(key, now), false);
 	now += 500;
@@ -101,4 +101,23 @@ test('reset clears health carried across Minecraft server instances', () => {
 	assert.equal(registry.snapshot(key).circuit, 'open');
 	registry.reset();
 	assert.deepEqual(registry.snapshot(key), { ...key, count: 0, p50Ms: 0, p95Ms: 0, failureRate: 0, circuit: 'closed' });
+});
+
+test('circuits isolate exact profile fingerprints and expose the next half-open deadline', () => {
+	let now = 10_000;
+	const firstFingerprint = `sha256:${'1'.repeat(64)}`;
+	const secondFingerprint = `sha256:${'2'.repeat(64)}`;
+	const registry = new ProviderHealthRegistry({ minimumSamples: 1, failureRateToOpen: 1, cooldownMs: 500, now: () => now });
+	const first = { provider: 'codex', model: 'sol', operation: 'decide', profileFingerprint: firstFingerprint };
+	const second = { ...first, profileFingerprint: secondFingerprint };
+	registry.record({ ...first, durationMs: 10, errorCode: 'PROVIDER_UNAVAILABLE' });
+	assert.equal(registry.snapshot(first).circuit, 'open');
+	assert.equal(registry.snapshot(first).nextProbeAtEpochMs, 10_500);
+	assert.equal(registry.snapshot(second).circuit, 'closed');
+	assert.equal(registry.canAttempt(second), true);
+	assert.equal(registry.canAttempt(first), false);
+	now = 10_500;
+	assert.equal(registry.canAttempt(first), true);
+	registry.record({ ...first, durationMs: 10, errorCode: 'PROVIDER_UNAVAILABLE' });
+	assert.equal(registry.snapshot(first).nextProbeAtEpochMs, 11_000, 'failed half-open probes own a fresh cooldown');
 });

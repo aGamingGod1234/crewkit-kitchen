@@ -335,6 +335,24 @@ test('Codex session replacement increments generation and reports a reset reason
 	await service.stop();
 });
 
+test('Codex transport loss fences the owning threads and coalesces one exact replacement generation', async () => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	const selected = profile('agent-transport-loss');
+	const stale = await service.createAgent(selected, { controlProtocol: 'arena_script' });
+	transport.emit('exit', Object.assign(new Error('app server exited'), { code: 'PROCESS_EXITED' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(service.getAgent(selected.agentId), null);
+	await assert.rejects(stale.decide('late work', { goalRevision: 0 }), (error) => error?.code === 'SESSION_INVALIDATED');
+	const first = service.replaceAgent(selected, { controlProtocol: 'arena_script', expectedSessionGeneration: 1 });
+	const second = service.replaceAgent(selected, { controlProtocol: 'arena_script', expectedSessionGeneration: 1 });
+	const [replacement, duplicate] = await Promise.all([first, second]);
+	assert.equal(replacement, duplicate);
+	assert.equal(replacement.sessionGeneration, 2);
+	assert.equal(replacement.profileFingerprint, stale.profileFingerprint);
+	await service.stop();
+});
+
 test('Codex service gives concurrent thread creation enough time for a full arena roster', async () => {
 	const transport = new FakeSharedTransport();
 	const service = new CodexService({ cwd: 'C:\\workspace' }, { transport });

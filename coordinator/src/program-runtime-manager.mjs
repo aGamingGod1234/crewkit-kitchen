@@ -28,14 +28,16 @@ export class ProgramRuntimeManager {
 	#completionRetryDelayMs;
 	#setTimeout;
 	#clearTimeout;
+	#requestRecovery;
 
-	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+	constructor({ registry, bridge, planner, reportError = () => {}, trace = () => {}, onCompleted = () => {}, onCompletionRequested = () => {}, requestRecovery = () => {}, plannerContext = () => ({}), compilerCorrectionLimit = 1, latencyRegistry = null, clock = performance.now.bind(performance), recorder = null, benchmarkRecorder = null, completionRetryDelayMs = 1_000, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
 		if (!registry || !bridge || !planner) throw new TypeError('registry, bridge, and planner are required');
 		if (typeof bridge.send !== 'function' || typeof planner.requestPlan !== 'function') throw new TypeError('bridge.send and planner.requestPlan are required');
 		if (typeof reportError !== 'function') throw new TypeError('reportError must be a function');
 		if (typeof trace !== 'function') throw new TypeError('trace must be a function');
 		if (typeof onCompleted !== 'function') throw new TypeError('onCompleted must be a function');
 		if (typeof onCompletionRequested !== 'function') throw new TypeError('onCompletionRequested must be a function');
+		if (typeof requestRecovery !== 'function') throw new TypeError('requestRecovery must be a function');
 		if (typeof plannerContext !== 'function') throw new TypeError('plannerContext must be a function');
 		this.#registry = registry;
 		this.#bridge = bridge;
@@ -44,6 +46,7 @@ export class ProgramRuntimeManager {
 		this.#trace = trace;
 		this.#onCompleted = onCompleted;
 		this.#onCompletionRequested = onCompletionRequested;
+		this.#requestRecovery = requestRecovery;
 		this.#plannerContext = plannerContext;
 		if (!Number.isSafeInteger(compilerCorrectionLimit) || compilerCorrectionLimit < 0) throw new TypeError('compilerCorrectionLimit must be a non-negative safe integer');
 		this.#compilerCorrectionLimit = compilerCorrectionLimit;
@@ -148,6 +151,13 @@ export class ProgramRuntimeManager {
 		});
 		this.#flushDeferredProgramTrace(state);
 		this.#syncState(record, state);
+		if (state.reactiveRecovery !== null) {
+			state.reactiveRecovery = {
+				context: Object.freeze({ ...state.reactiveRecovery.context, observation }),
+				fresh: true,
+			};
+			if (!state.reactiveRequestActive) this.#resumeReactiveRecovery(state);
+		}
 		return state.engine.snapshot();
 	}
 
@@ -317,6 +327,9 @@ export class ProgramRuntimeManager {
 			lastReceiptEpochMs: null,
 			reactiveRequest: null,
 			reactiveRequestActive: false,
+			reactiveRecovery: null,
+			recoveryRequested: false,
+			explicitPause: false,
 			pendingReplacementTrace: null,
 			dispatchTraceRecorded: false,
 			worldActionTraceIds: new Set(),
@@ -455,6 +468,11 @@ export class ProgramRuntimeManager {
 			state.reactiveRequest = null;
 			state.reactiveRequestActive = false;
 			if (pending !== null) void this.#requestReactiveDecision(state, pending);
+			else if (state.reactiveRecovery?.fresh === true) this.#resumeReactiveRecovery(state);
+			else {
+				const record = this.#registry.get(state.agentId);
+				if (!state.disposed && record?.goalRevision === state.goalRevision) this.#syncState(record, state);
+			}
 		}
 	}
 
@@ -520,6 +538,7 @@ export class ProgramRuntimeManager {
 				this.#traceProgramInstall(state, record, decision.source, version, context.eventSequence);
 			} else {
 				const accepted = sameEngineRequest(state.engine.snapshot(), context);
+				state.explicitPause = decision?.directive === 'pause';
 				state.engine.applyDirective({ ...context, directive: decision?.directive, status: decision?.status });
 				if (accepted && decision?.directive === 'finish') {
 					state.terminalStatus = decision.status;
@@ -528,6 +547,12 @@ export class ProgramRuntimeManager {
 			}
 			this.#syncState(record, state);
 		} catch (error) {
+			if (isInfrastructureFailure(error) && context.decisionContext !== 'completion_verification_failed') {
+				state.reactiveRecovery = { context, fresh: false };
+				this.#requestRecoveryLease(record, state, 'reactive_provider_failure', error);
+				this.#syncState(record, state);
+				return;
+			}
 			state.engine.failDirectiveRequest(context);
 			if (context.decisionContext === 'completion_verification_failed') {
 				this.#setTerminalState(record, DynamicAgentState.ERROR);
@@ -824,7 +849,34 @@ export class ProgramRuntimeManager {
 			if (state.terminalStatus === 'impossible') this.#setTerminalState(record, DynamicAgentState.ERROR);
 			else this.#requestCompletion(record, state);
 		}
-		if (snapshot.status === 'PAUSED' || snapshot.status === 'SUSPENDED') this.#setTerminalState(record, DynamicAgentState.PAUSED);
+		if (snapshot.status === 'PAUSED' || (snapshot.status === 'SUSPENDED' && state.explicitPause)) {
+			this.#setTerminalState(record, DynamicAgentState.PAUSED);
+			return;
+		}
+		if (snapshot.status === 'SUSPENDED') {
+			this.#ensureActing(record);
+			if (!state.reactiveRequestActive && state.reactiveRequest === null) this.#requestRecoveryLease(record, state, 'reactive_suspended');
+		}
+	}
+
+	#resumeReactiveRecovery(state) {
+		if (state.reactiveRecovery?.fresh !== true || state.disposed) return;
+		const retry = state.reactiveRecovery.context;
+		state.reactiveRecovery = null;
+		state.recoveryRequested = false;
+		void this.#requestReactiveDecision(state, retry);
+	}
+
+	#requestRecoveryLease(record, state, reason, error = null) {
+		if (state.recoveryRequested || state.disposed) return;
+		state.recoveryRequested = true;
+		const request = Object.freeze({
+			record,
+			reason,
+			...(typeof error?.code === 'string' ? { errorCode: error.code.slice(0, 128) } : {}),
+		});
+		try { void Promise.resolve(this.#requestRecovery(request)).catch(() => undefined); }
+		catch { /* recovery scheduling cannot terminate the program */ }
 	}
 
 	#setTerminalState(record, state) {
@@ -987,6 +1039,14 @@ function stableFailureCode(error) {
 
 function isRetryableCompletionError(error) {
 	return ['BRIDGE_NOT_READY', 'BRIDGE_DISCONNECTED', 'CONNECTION_BACKPRESSURE', 'AGENT_BACKPRESSURE', 'AGENT_NOT_SUPPORTED'].includes(error?.code);
+}
+
+function isInfrastructureFailure(error) {
+	return [
+		'PLANNING_TIMEOUT', 'PLANNING_LEASE_EXPIRED', 'PROVIDER_UNAVAILABLE', 'PROVIDER_CIRCUIT_OPEN',
+		'SPAWN_FAILED', 'SESSION_INVALIDATED', 'TRANSPORT_STOPPED', 'PROVIDER_STOPPED',
+		'MISSING_AGENT_MESSAGE', 'MISSING_FINAL_MESSAGE',
+	].includes(error?.code);
 }
 
 function monotonicTimestamp(value) {

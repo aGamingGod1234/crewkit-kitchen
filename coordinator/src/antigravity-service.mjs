@@ -32,6 +32,7 @@ export class AntigravityProviderService {
 	#workspaceManager;
 	#agents = new Map();
 	#creating = new Map();
+	#replacing = new Map();
 	#sessionGenerations = new Map();
 	#lifecycleGeneration = 0;
 
@@ -60,6 +61,11 @@ export class AntigravityProviderService {
 		await this.catalog.refresh();
 		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
 		const profile = validateProfile(profileValue, this.#config);
+		const replacing = this.#replacing.get(profile.agentId);
+		if (replacing !== undefined) {
+			if (!profilesMatch(replacing.profile, profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+			return replacing.promise;
+		}
 		const existing = this.#agents.get(profile.agentId);
 		if (existing !== undefined) {
 			if (!existing.matchesProfile(profile)) {
@@ -83,6 +89,40 @@ export class AntigravityProviderService {
 		}
 	}
 
+	async replaceAgent(profileValue, { recoverySummary = null, expectedSessionGeneration = null } = {}) {
+		const lifecycleGeneration = this.#lifecycleGeneration;
+		await this.catalog.refresh();
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
+		const profile = validateProfile(profileValue, this.#config);
+		const replacing = this.#replacing.get(profile.agentId);
+		if (replacing !== undefined) {
+			if (!profilesMatch(replacing.profile, profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+			return replacing.promise;
+		}
+		const creating = this.#creating.get(profile.agentId);
+		if (creating !== undefined && !profilesMatch(creating.profile, profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+		const existing = this.#agents.get(profile.agentId);
+		if (existing !== undefined && !existing.matchesProfile(profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+		const currentGeneration = existing?.sessionGeneration ?? this.#sessionGenerations.get(profile.agentId) ?? 0;
+		if (expectedSessionGeneration !== null && expectedSessionGeneration !== currentGeneration) {
+			throw new AcpProtocolError('SESSION_GENERATION_MISMATCH', `Gemini session generation ${currentGeneration} does not match expected ${expectedSessionGeneration}`);
+		}
+		const promise = (async () => {
+			if (creating !== undefined) await creating.promise;
+			const owned = this.#agents.get(profile.agentId);
+			if (owned !== undefined) {
+				this.#agents.delete(profile.agentId);
+				owned.invalidateSession(new AcpProtocolError('SESSION_INVALIDATED', 'Gemini session was replaced'));
+				await owned.dispose();
+			}
+			return this.#createAgentOnce(profile, recoverySummary, lifecycleGeneration);
+		})();
+		this.#replacing.set(profile.agentId, { profile, promise });
+		try { return await promise; } finally {
+			if (this.#replacing.get(profile.agentId)?.promise === promise) this.#replacing.delete(profile.agentId);
+		}
+	}
+
 	async #createAgentOnce(profile, recoverySummary, lifecycleGeneration) {
 		let cwd;
 		try {
@@ -99,12 +139,14 @@ export class AntigravityProviderService {
 		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
 		const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
 		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
-		const agent = new AntigravityAgent(profile, cwd, {
+		let agent;
+		agent = new AntigravityAgent(profile, cwd, {
 			...this.#dependencies,
 			config: this.#config,
 			recoverySummary: normalizeRecoverySummary(recoverySummary),
 			sessionGeneration,
 			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
+			onInvalidated: () => this.#invalidateAgent(agent),
 		});
 		if (lifecycleGeneration !== this.#lifecycleGeneration) {
 			await agent.dispose();
@@ -112,6 +154,10 @@ export class AntigravityProviderService {
 		}
 		this.#agents.set(profile.agentId, agent);
 		return agent;
+	}
+
+	#invalidateAgent(agent) {
+		if (this.#agents.get(agent.agentId) === agent) this.#agents.delete(agent.agentId);
 	}
 
 	async removeAgent(agentId) {
@@ -153,8 +199,12 @@ export class AntigravityProviderService {
 
 	async stop() {
 		this.#lifecycleGeneration += 1;
-		await Promise.allSettled([...this.#creating.values()].map((entry) => entry.promise));
+		await Promise.allSettled([
+			...[...this.#creating.values()].map((entry) => entry.promise),
+			...[...this.#replacing.values()].map((entry) => entry.promise),
+		]);
 		this.#creating.clear();
+		this.#replacing.clear();
 		const agents = [...this.#agents.values()];
 		this.#agents.clear();
 		await Promise.allSettled(agents.map((agent) => agent.dispose()));
@@ -184,8 +234,10 @@ class AntigravityAgent {
 	#sessionState = 'cold';
 	#resetReason;
 	#disposed = false;
+	#invalidationError = null;
+	#onInvalidated;
 
-	constructor(profile, cwd, { config, spawn, terminate, platform, recoverySummary, sessionGeneration = 1, resetReason = null }) {
+	constructor(profile, cwd, { config, spawn, terminate, platform, recoverySummary, sessionGeneration = 1, resetReason = null, onInvalidated = null }) {
 		this.#profile = structuredClone(profile);
 		this.#cwd = cwd;
 		this.#config = config;
@@ -195,6 +247,7 @@ class AntigravityAgent {
 		this.#recoverySummary = recoverySummary;
 		this.#sessionGeneration = sessionGeneration;
 		this.#resetReason = resetReason;
+		this.#onInvalidated = onInvalidated;
 	}
 
 	get agentId() { return this.#profile.agentId; }
@@ -218,7 +271,7 @@ class AntigravityAgent {
 		goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs, onVerbose = null,
 		parseOutput = parseDecision, systemPrompt,
 	} = {}) {
-		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `gemini agent '${this.agentId}' is disposed`);
+		if (this.#disposed) throw this.#invalidationError ?? new AcpProtocolError('AGENT_DISPOSED', `gemini agent '${this.agentId}' is disposed`);
 		if (this.#activeOperation !== null) throw new AcpProtocolError('TURN_IN_PROGRESS', `gemini agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
 		if (typeof parseOutput !== 'function') throw new TypeError('parseOutput must be a function');
@@ -252,6 +305,7 @@ class AntigravityAgent {
 		try {
 			const decisionText = await operation.promise;
 			rawOutput = decisionText;
+			if (this.#disposed) throw this.#invalidationError ?? new AcpProtocolError('SESSION_INVALIDATED', 'Gemini session was invalidated');
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
@@ -285,6 +339,7 @@ class AntigravityAgent {
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal', { cause: error });
 			}
+			if (isSessionFailure(error)) this.invalidateSession(error);
 			throw error;
 		} finally {
 			signal?.removeEventListener('abort', abort);
@@ -299,10 +354,26 @@ class AntigravityAgent {
 	}
 
 	async dispose() {
-		if (this.#disposed) return;
 		this.#disposed = true;
 		await this.interrupt();
 	}
+
+	invalidateSession(cause) {
+		if (this.#invalidationError !== null) return;
+		this.#invalidationError = new AcpProtocolError('SESSION_INVALIDATED', 'Gemini session transport is no longer usable', { cause });
+		this.#disposed = true;
+		this.#hasConversation = false;
+		this.#sessionState = 'cold';
+		this.#onInvalidated?.(this);
+	}
+}
+
+const SESSION_FAILURE_CODES = new Set([
+	'SPAWN_FAILED', 'PROVIDER_UNAVAILABLE', 'PLANNING_TIMEOUT', 'PROCESS_TERMINATION_FAILED', 'OUTPUT_LIMIT_EXCEEDED',
+]);
+
+function isSessionFailure(error) {
+	return SESSION_FAILURE_CODES.has(error?.code);
 }
 
 function providerTiming(durationMs, apiDurationMs, queueWaitMs) {

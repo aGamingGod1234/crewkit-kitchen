@@ -17,6 +17,7 @@ export class ProviderService extends EventEmitter {
 	#services;
 	#assignments = new Map();
 	#creating = new Map();
+	#replacing = new Map();
 	#starting = new Map();
 	#startedProviders = new Set();
 	#inFlight = new Set();
@@ -93,6 +94,7 @@ export class ProviderService extends EventEmitter {
 		)));
 		this.#assignments.clear();
 		this.#creating.clear();
+		this.#replacing.clear();
 		this.#starting.clear();
 		this.#startedProviders.clear();
 		this.#inFlight.clear();
@@ -118,6 +120,11 @@ export class ProviderService extends EventEmitter {
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		this.#assertActive(lifecycleGeneration);
 		const profile = freezeProfile(profileValue);
+		const replacing = this.#replacing.get(profile.agentId);
+		if (replacing !== undefined) {
+			assertSameProfile(replacing.profile, profile);
+			return replacing.promise;
+		}
 		const existing = this.#assignments.get(profile.agentId);
 		if (existing !== undefined) {
 			assertSameProfile(existing, profile);
@@ -142,6 +149,39 @@ export class ProviderService extends EventEmitter {
 		}
 	}
 
+	async replaceAgent(profileValue, options = {}) {
+		const lifecycleGeneration = this.#lifecycleGeneration;
+		this.#assertActive(lifecycleGeneration);
+		const profile = freezeProfile(profileValue);
+		const replacing = this.#replacing.get(profile.agentId);
+		if (replacing !== undefined) {
+			assertSameProfile(replacing.profile, profile);
+			return replacing.promise;
+		}
+		const creating = this.#creating.get(profile.agentId);
+		if (creating !== undefined) {
+			assertSameProfile(creating.profile, profile);
+			try { await creating.promise; } catch { /* replacement recreates a failed attempt */ }
+			this.#assertActive(lifecycleGeneration);
+		}
+		const assigned = this.#assignments.get(profile.agentId);
+		if (assigned !== undefined) assertSameProfile(assigned, profile);
+		const service = this.#services.get(profile.provider);
+		if (service === undefined) throw new TypeError(`${profile.provider} service is unavailable`);
+		const promise = this.#execute(profile.provider, async () => {
+			const agent = typeof service.replaceAgent === 'function'
+				? await service.replaceAgent(profile, this.#creationOptions(options))
+				: (await service.removeAgent(profile.agentId), await service.createAgent(profile, this.#creationOptions(options)));
+			this.#assertActive(lifecycleGeneration);
+			this.#assignments.set(profile.agentId, profile);
+			return agent;
+		}, 'replace');
+		const entry = { profile, promise };
+		this.#replacing.set(profile.agentId, entry);
+		try { return await promise; }
+		finally { if (this.#replacing.get(profile.agentId) === entry) this.#replacing.delete(profile.agentId); }
+	}
+
 	getAgent(agentId) {
 		if (this.#stopped) return null;
 		const assigned = this.#assignments.get(agentId);
@@ -151,6 +191,10 @@ export class ProviderService extends EventEmitter {
 	}
 
 	async removeAgent(agentId) {
+		const replacing = this.#replacing.get(agentId);
+		if (replacing !== undefined) {
+			try { await replacing.promise; } catch { /* failed replacement has no live runtime */ }
+		}
 		const creating = this.#creating.get(agentId);
 		if (creating !== undefined) {
 			try { await creating.promise; } catch { /* failed creation has no runtime to remove */ }

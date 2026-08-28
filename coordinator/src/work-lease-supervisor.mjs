@@ -325,20 +325,27 @@ function publicLease(lease) {
 
 function normalizeKey(value) {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('work lease key must be an object');
-	const { agentId, goalRevision, lifecycleGeneration } = value;
+	const { agentId, goalRevision, lifecycleGeneration, sessionEpoch, profileFingerprint } = value;
 	if (typeof agentId !== 'string' || agentId.length === 0) throw new TypeError('work lease key agentId must be nonblank text');
 	if (!Number.isSafeInteger(goalRevision) || goalRevision < 0) throw new TypeError('work lease key goalRevision must be a nonnegative safe integer');
 	if (!Number.isSafeInteger(lifecycleGeneration) || lifecycleGeneration < 0) throw new TypeError('work lease key lifecycleGeneration must be a nonnegative safe integer');
-	return Object.freeze({ agentId, goalRevision, lifecycleGeneration });
+	if (!Number.isSafeInteger(sessionEpoch) || sessionEpoch < 0) throw new TypeError('work lease key sessionEpoch must be a nonnegative safe integer');
+	if (typeof profileFingerprint !== 'string' || !/^sha256:[a-f0-9]{64}$/i.test(profileFingerprint)) throw new TypeError('work lease key profileFingerprint must be a SHA-256 fingerprint');
+	return Object.freeze({ agentId, goalRevision, lifecycleGeneration, sessionEpoch, profileFingerprint });
 }
 
 function sameKey(left, right) {
-	return left.agentId === right.agentId && left.goalRevision === right.goalRevision && left.lifecycleGeneration === right.lifecycleGeneration;
+	return left.agentId === right.agentId
+		&& left.goalRevision === right.goalRevision
+		&& left.lifecycleGeneration === right.lifecycleGeneration
+		&& left.sessionEpoch === right.sessionEpoch
+		&& left.profileFingerprint === right.profileFingerprint;
 }
 
 function isNewer(next, current) {
 	if (next.goalRevision !== current.goalRevision) return next.goalRevision > current.goalRevision;
-	return next.lifecycleGeneration > current.lifecycleGeneration;
+	if (next.lifecycleGeneration !== current.lifecycleGeneration) return next.lifecycleGeneration > current.lifecycleGeneration;
+	return next.sessionEpoch > current.sessionEpoch;
 }
 
 function safeClone(value) {

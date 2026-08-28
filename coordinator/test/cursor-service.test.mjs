@@ -261,3 +261,40 @@ test('Cursor interruption terminates the active native process', async () => {
 	assert.deepEqual(terminated, [child]);
 	await service.stop();
 });
+
+test('Cursor process death invalidates only its owning generation and exact replacement coalesces', async () => {
+	let attempt = 0;
+	const service = new CursorProviderService(config(), {
+		discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+		spawn: () => {
+			attempt += 1;
+			const child = new FakeChild();
+			queueMicrotask(() => {
+				if (attempt === 1) {
+					child.exitCode = 1;
+					child.emit('close', 1, null);
+					return;
+				}
+				child.stdout.emit('data', Buffer.from(JSON.stringify({
+					type: 'result', subtype: 'success', is_error: false, result: DECISION,
+					session_id: `cursor-session-${attempt}`, duration_ms: 1, duration_api_ms: 1,
+				})));
+				child.exitCode = 0;
+				child.emit('close', 0, null);
+			});
+			return child;
+		},
+	});
+	const selected = profile();
+	const stale = await service.createAgent(selected);
+	await stale.setGoalRevision(1);
+	await assert.rejects(stale.decide('state', { goalRevision: 1 }), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
+	assert.equal(service.getAgent(selected.agentId), null);
+	await assert.rejects(stale.decide('state', { goalRevision: 1 }), (error) => error?.code === 'SESSION_INVALIDATED');
+
+	const first = service.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	const second = service.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	assert.equal(await first, await second);
+	assert.equal((await first).sessionGeneration, 2);
+	await service.stop();
+});

@@ -28,10 +28,12 @@ export class CodexService {
 	#agents = new Map();
 	#sessionGenerations = new Map();
 	#creating = new Map();
+	#replacing = new Map();
 	#started = false;
 	#starting = null;
 	#startupGeneration = 0;
 	#lifecycleGeneration = 0;
+	#transportGeneration = 0;
 	#startupSchedule;
 	#startupCancelSchedule;
 
@@ -45,6 +47,8 @@ export class CodexService {
 			this.#transport.on('diagnostic', (message) => {
 				console.error(`[codex-app-server] ${String(message).slice(0, 4_096)}`);
 			});
+			this.#transport.on('exit', (error) => this.#handleTransportLoss(error));
+			this.#transport.on('protocolError', (error) => this.#handleTransportLoss(error));
 		}
 		if (typeof this.#transport.getMaxListeners === 'function' && typeof this.#transport.setMaxListeners === 'function') {
 			this.#transport.setMaxListeners(Math.max(this.#transport.getMaxListeners(), DEFAULT_AGENT_CAP + 4));
@@ -84,6 +88,11 @@ export class CodexService {
 		this.#assertLifecycleCurrent(lifecycleGeneration);
 		const profile = validateProfile(profileValue, this.#config);
 		const protocol = validateControlProtocol(controlProtocol);
+		const replacing = this.#replacing.get(profile.agentId);
+		if (replacing !== undefined) {
+			if (!profilesMatch(replacing.profile, profile) || replacing.controlProtocol !== protocol) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+			return replacing.promise;
+		}
 		const existing = this.#agents.get(profile.agentId);
 		if (existing !== undefined) {
 			if (!existing.matchesProfile(profile) || !existing.matchesControlProtocol(protocol)) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
@@ -99,6 +108,34 @@ export class CodexService {
 		try { return await promise; } finally { this.#creating.delete(profile.agentId); }
 	}
 
+	async replaceAgent(profileValue, { recoverySummary = null, controlProtocol = 'native_tools', expectedSessionGeneration = null } = {}) {
+		const profile = validateProfile(profileValue, this.#config);
+		const protocol = validateControlProtocol(controlProtocol);
+		const replacing = this.#replacing.get(profile.agentId);
+		if (replacing !== undefined) {
+			if (!profilesMatch(replacing.profile, profile) || replacing.controlProtocol !== protocol) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+			return replacing.promise;
+		}
+		const existing = this.#agents.get(profile.agentId);
+		if (existing !== undefined) {
+			if (!existing.matchesProfile(profile) || !existing.matchesControlProtocol(protocol)) throw new CodexProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+			if (expectedSessionGeneration !== null && existing.sessionGeneration !== expectedSessionGeneration) throw new CodexProtocolError('STALE_SESSION_GENERATION', 'Codex replacement target is no longer current');
+			this.#agents.delete(profile.agentId);
+		}
+		const promise = Promise.resolve()
+			.then(() => existing?.dispose())
+			.then(async () => {
+				const lifecycleGeneration = this.#lifecycleGeneration;
+				await this.start();
+				this.#assertLifecycleCurrent(lifecycleGeneration);
+				return this.#createAgentOnce(profile, recoverySummary, protocol, lifecycleGeneration);
+			});
+		const entry = { profile, controlProtocol: protocol, promise };
+		this.#replacing.set(profile.agentId, entry);
+		try { return await promise; }
+		finally { if (this.#replacing.get(profile.agentId) === entry) this.#replacing.delete(profile.agentId); }
+	}
+
 	async prewarmAgent(profileValue, { goalRevision = 0 } = {}) {
 		const agent = await this.createAgent(profileValue, { controlProtocol: 'native_tools' });
 		await agent.setGoalRevision(goalRevision);
@@ -107,6 +144,7 @@ export class CodexService {
 	}
 
 	async #createAgentOnce(profile, recoverySummary, controlProtocol, lifecycleGeneration) {
+		const transportGeneration = this.#transportGeneration;
 		if (this.#catalog.stale) await this.#catalog.refresh();
 		this.#assertLifecycleCurrent(lifecycleGeneration);
 		this.#catalog.assertSupported(profile.model, profile.reasoningEffort, profile.serviceTier);
@@ -145,6 +183,7 @@ export class CodexService {
 				: controlProtocol === 'goal_spec' ? 'Return only one JSON value matching the supplied output schema. Never call tools.' : recoveryInstructions(recoverySummary),
 		}, { timeoutMs: THREAD_START_TIMEOUT_MS });
 		const threadId = requireNestedId(response, 'thread', 'thread/start');
+		if (transportGeneration !== this.#transportGeneration) throw new CodexProtocolError('SESSION_INVALIDATED', 'Codex transport generation was replaced');
 	const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
 		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
 		const agent = new SharedCodexAgent(profile, threadId, this.#transport, {
@@ -205,11 +244,27 @@ export class CodexService {
 		this.#starting?.controller.abort();
 		await Promise.allSettled([...this.#creating.values()].map((entry) => entry.promise));
 		this.#creating.clear();
+		this.#replacing.clear();
 		const agents = [...this.#agents.values()];
 		this.#agents.clear();
 		await Promise.allSettled(agents.map((agent) => agent.dispose()));
 		if (this.#started || this.#starting !== null) await this.#transport.stop();
 		this.#started = false;
+	}
+
+	#handleTransportLoss(error) {
+		if (!this.#started && this.#agents.size === 0 && this.#creating.size === 0) return;
+		this.#transportGeneration += 1;
+		this.#startupGeneration += 1;
+		this.#starting?.controller.abort(error);
+		this.#started = false;
+		const invalidation = new CodexProtocolError('SESSION_INVALIDATED', 'Codex provider transport was lost', {
+			cause: error instanceof Error ? error : undefined,
+		});
+		const agents = [...this.#agents.values()];
+		this.#agents.clear();
+		for (const agent of agents) agent.invalidateTransport(invalidation);
+		void Promise.resolve(this.#transport.stop()).catch(() => {});
 	}
 
 	async #startOnce(attempt) {
@@ -278,6 +333,7 @@ export class SharedCodexAgent {
 	#prewarmPromise = null;
 	#prewarmTurnPromise = null;
 	#disposed = false;
+	#invalidationError = null;
 
 	constructor(profile, threadId, transport, dependencies = {}) {
 		this.#profile = structuredClone(profile);
@@ -322,7 +378,7 @@ export class SharedCodexAgent {
 		outputSchema = PLANNER_OUTPUT_SCHEMA, parseOutput = parseDecision, systemPrompt,
 	} = {}) {
 		if (this.#controlProtocol === 'native_tools') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'Native tool agents must use act()');
-		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
+		if (this.#disposed) throw this.#invalidationError ?? new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
 		if (typeof parseOutput !== 'function') throw new TypeError('parseOutput must be a function');
@@ -428,7 +484,7 @@ export class SharedCodexAgent {
 
 	prewarm({ goalRevision = this.#goalRevision } = {}) {
 		if (this.#controlProtocol !== 'native_tools') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'ArenaScript agents cannot prewarm native tools');
-		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
+		if (this.#disposed) throw this.#invalidationError ?? new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		requireRevision(goalRevision);
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
 		if (this.#sessionState === 'warm') return Promise.resolve(this);
@@ -455,7 +511,7 @@ export class SharedCodexAgent {
 
 	async act(input, { goalRevision, signal, executeTool, prewarm = false, onVerbose = null } = {}) {
 		if (this.#controlProtocol !== 'native_tools') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'ArenaScript agents must use decide()');
-		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
+		if (this.#disposed) throw this.#invalidationError ?? new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native event input must be nonblank');
 		if (typeof executeTool !== 'function') throw new TypeError('executeTool must be a function');
 		requireRevision(goalRevision);
@@ -547,7 +603,7 @@ export class SharedCodexAgent {
 
 	async steer(input, { goalRevision = this.#goalRevision } = {}) {
 		if (this.#controlProtocol !== 'native_tools') throw new CodexProtocolError('CONTROL_PROTOCOL_MISMATCH', 'ArenaScript agents cannot steer native turns');
-		if (this.#disposed) throw new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
+		if (this.#disposed) throw this.#invalidationError ?? new CodexProtocolError('AGENT_DISPOSED', `Codex agent '${this.agentId}' is disposed`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('native steer input must be nonblank');
 		requireRevision(goalRevision);
 		if (goalRevision !== this.#goalRevision) throw new CodexProtocolError('STALE_GOAL_REVISION', `Goal revision ${goalRevision} does not match ${this.#goalRevision}`);
@@ -612,6 +668,17 @@ export class SharedCodexAgent {
 			this.#active?.collector.dispose();
 			this.#active = null;
 		}
+	}
+
+	invalidateTransport(error) {
+		if (this.#disposed) return;
+		this.#invalidationError = error;
+		this.#disposed = true;
+		this.#threadId = null;
+		const active = this.#active;
+		active?.cancel(error);
+		active?.collector.dispose();
+		this.#active = null;
 	}
 }
 

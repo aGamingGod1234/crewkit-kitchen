@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { AgentRegistryError, DynamicAgentState } from './agent-registry.mjs';
 import { normalizeRetryReason, validateTraceId } from './control-latency-registry.mjs';
 import { ProviderHealthRegistry } from './provider-health-registry.mjs';
+import { profileFingerprint } from './provider-session.mjs';
 import { createProviderTurnTelemetry } from './provider-turn-telemetry.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
 import { parseGoalSpecRequest } from './goal-spec.mjs';
@@ -11,6 +12,7 @@ import { GoalSpecTranslator } from './goal-spec-translator.mjs';
 const DEFAULT_INVALID_DECISION_RETRIES = 1;
 const MAX_RETRY_ERROR_LENGTH = 512;
 const MAX_VERBOSE_MESSAGE_LENGTH = 256;
+const DEFAULT_PLANNING_LEASE_TIMEOUT_MS = 125_000;
 const RETRYABLE_DECISION_ERRORS = new Set([
 	'EMPTY_DECISION',
 	'MALFORMED_DECISION',
@@ -33,6 +35,15 @@ const QUIET_RETRYABLE_PROVIDER_ERRORS = new Set([
 	'MISSING_AGENT_MESSAGE',
 	'MISSING_FINAL_MESSAGE',
 ]);
+const INFRASTRUCTURE_FAILURES = new Set([
+	...RETRYABLE_PROVIDER_ERRORS,
+	'PROVIDER_CIRCUIT_OPEN',
+	'PLANNING_LEASE_EXPIRED',
+	'SESSION_INVALIDATED',
+	'PROCESS_TERMINATION_FAILED',
+	'TRANSPORT_STOPPED',
+	'PROVIDER_STOPPED',
+]);
 
 export class AgentPlanner {
 	#registry;
@@ -45,6 +56,7 @@ export class AgentPlanner {
 	#now;
 	#recorder;
 	#turnRecorder;
+	#planningLeaseTimeoutMs;
 
 	constructor({
 		registry,
@@ -58,6 +70,7 @@ export class AgentPlanner {
 		recorder = null,
 		benchmarkRecorder = null,
 		turnRecorder = null,
+		planningLeaseTimeoutMs = DEFAULT_PLANNING_LEASE_TIMEOUT_MS,
 	}) {
 		if (registry === null || registry === undefined) throw new TypeError('registry is required');
 		if (scheduler === null || scheduler === undefined) throw new TypeError('scheduler is required');
@@ -72,6 +85,7 @@ export class AgentPlanner {
 		const selectedRecorder = recorder ?? benchmarkRecorder;
 		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		if (turnRecorder !== null && (typeof turnRecorder !== 'object' || typeof turnRecorder.record !== 'function')) throw new TypeError('turnRecorder must provide record or be null');
+		if (!Number.isSafeInteger(planningLeaseTimeoutMs) || planningLeaseTimeoutMs <= 0) throw new TypeError('planningLeaseTimeoutMs must be a positive safe integer');
 		this.#registry = registry;
 		this.#scheduler = scheduler;
 		this.#codexService = codexService;
@@ -82,6 +96,7 @@ export class AgentPlanner {
 		this.#now = now;
 		this.#recorder = selectedRecorder;
 		this.#turnRecorder = turnRecorder;
+		this.#planningLeaseTimeoutMs = planningLeaseTimeoutMs;
 	}
 
 	get healthRegistry() { return this.#healthRegistry; }
@@ -191,6 +206,7 @@ export class AgentPlanner {
 		const selectedPriority = planningPriority ?? priority ?? record.planningPriority ?? record.priority ?? 'ordinary';
 		const queuedAt = this.#now();
 		const trace = { retryReason: null, phasesRecorded: false };
+		let leaseAgent = null;
 		safeVerbose(onVerbose, 'planner', `Planning request queued with ${selectedPriority} priority.`);
 		this.#record('planner_requested', record, { operation: 'plan', preserveState, retry: false, lane: record.provider, priority: selectedPriority, traceId });
 		return this.#scheduler.schedule(agentId, async ({ signal }) => {
@@ -215,6 +231,7 @@ export class AgentPlanner {
 						}, async () => {
 							const created = await this.#codexService.createAgent(record, { recoverySummary, controlProtocol: 'arena_script' });
 							await created.setGoalRevision(goalRevision);
+							leaseAgent = created;
 							return created;
 						}, null, onVerbose);
 						break;
@@ -227,6 +244,13 @@ export class AgentPlanner {
 						) {
 							initializationRetryCount += 1;
 							safeVerbose(onVerbose, 'retry', verboseErrorMessage('Retrying provider initialization', error));
+							const replacement = await this.#replaceExactSession(record, leaseAgent, 'arena_script', 'provider_initialization_retry');
+							if (replacement !== null) {
+								agent = replacement;
+								leaseAgent = replacement;
+								await replacement.setGoalRevision(goalRevision);
+								break;
+							}
 							continue;
 						}
 						throw error;
@@ -280,6 +304,12 @@ export class AgentPlanner {
 						) {
 							providerRetryCount += 1;
 							safeVerbose(onVerbose, 'retry', verboseErrorMessage(`Provider retry ${providerRetryCount}`, error));
+							const replacement = await this.#replaceExactSession(record, agent, 'arena_script', 'provider_turn_retry');
+							if (replacement !== null) {
+								agent = replacement;
+								leaseAgent = replacement;
+								await replacement.setGoalRevision(goalRevision);
+							}
 							plannerInput = input;
 							continue;
 						}
@@ -293,6 +323,7 @@ export class AgentPlanner {
 					error?.code !== 'STALE_PLAN'
 					&& error?.code !== 'PLAN_CANCELLED'
 					&& !QUIET_RETRYABLE_PROVIDER_ERRORS.has(error?.code)
+					&& !isInfrastructureFailure(error)
 					&& this.#isCurrent(agentId, goalRevision)
 					&& !preserveState
 				) {
@@ -303,14 +334,21 @@ export class AgentPlanner {
 				}
 				throw error;
 			}
-		}, { lane: record.provider, priority: selectedPriority });
+		}, {
+			lane: record.provider,
+			priority: selectedPriority,
+			leaseTimeoutMs: this.#planningLeaseTimeoutMs,
+			onLeaseExpired: () => this.#replaceExactSession(record, leaseAgent, 'arena_script', 'planning_lease_expired'),
+		});
 	}
 
 	async #providerAttempt(record, fields, operation, sessionAgent = null, onVerbose = null) {
-		const healthIdentity = { provider: record.provider, model: record.model, operation: fields.operation };
+		const healthIdentity = { provider: record.provider, model: record.model, operation: fields.operation, profileFingerprint: profileFingerprint(record) };
 		if (!this.#healthRegistry.canAttempt(healthIdentity)) {
 			const error = new Error(`Provider circuit is open for '${record.provider}/${record.model}/${fields.operation}'`);
 			error.code = 'PROVIDER_CIRCUIT_OPEN';
+			const deadline = this.#healthRegistry.snapshot?.(healthIdentity)?.nextProbeAtEpochMs;
+			if (Number.isFinite(deadline)) error.nextProbeAtEpochMs = deadline;
 			this.#record('provider_attempt_rejected', record, { ...fields, operation: fields.operation, errorCode: error.code });
 			safeVerbose(onVerbose, 'error', `Provider circuit rejected ${fields.operation}.`);
 			throw error;
@@ -354,6 +392,18 @@ export class AgentPlanner {
 			}));
 			throw error;
 		}
+	}
+
+	async #replaceExactSession(record, expectedAgent, controlProtocol, recoverySummary) {
+		if (typeof this.#codexService.replaceAgent !== 'function') return null;
+		const current = typeof this.#codexService.getAgent === 'function' ? this.#codexService.getAgent(record.agentId) : null;
+		if (current !== null && expectedAgent !== null && current !== expectedAgent) return current;
+		const owned = expectedAgent ?? current;
+		return this.#codexService.replaceAgent(record, {
+			recoverySummary,
+			controlProtocol,
+			...(Number.isSafeInteger(owned?.sessionGeneration) ? { expectedSessionGeneration: owned.sessionGeneration } : {}),
+		});
 	}
 
 	#publishTelemetry(telemetry) {
@@ -482,6 +532,10 @@ function parseGoalSpecJson(value) {
 }
 
 function codedError(code, message) { return Object.assign(new Error(message), { code }); }
+
+function isInfrastructureFailure(error) {
+	return INFRASTRUCTURE_FAILURES.has(error?.code);
+}
 
 function elapsed(startedAt, finishedAt) {
 	if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) throw new TypeError('planner clock must return finite values');

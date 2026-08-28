@@ -4,6 +4,7 @@ import test from 'node:test';
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { DynamicAgentState } from '../src/agent-registry.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
+import { profileFingerprint } from '../src/provider-session.mjs';
 
 const AGENT_ID = 'agent-1';
 const GOAL_REVISION = 7;
@@ -335,7 +336,17 @@ test('routes planning through the provider lane and preserves priority and provi
 	const scheduleCalls = [];
 	const createdRecords = [];
 	const transient = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
-	let decideAttempts = 0;
+	let replacements = 0;
+	const replacementAgent = {
+		sessionGeneration: 2,
+		async setGoalRevision() {},
+		async decide() { return VALID_DECISION; },
+	};
+	const staleAgent = {
+		sessionGeneration: 1,
+		async setGoalRevision() {},
+		async decide() { throw transient; },
+	};
 	const planner = new AgentPlanner({
 		registry,
 		scheduler: {
@@ -348,14 +359,13 @@ test('routes planning through the provider lane and preserves priority and provi
 		codexService: {
 			async createAgent(record) {
 				createdRecords.push(record);
-				return {
-					async setGoalRevision() {},
-					async decide() {
-						decideAttempts += 1;
-						if (decideAttempts === 1) throw transient;
-						return VALID_DECISION;
-					},
-				};
+				return staleAgent;
+			},
+			async replaceAgent(record, options) {
+				replacements += 1;
+				assert.deepEqual(record, RECORD);
+				assert.equal(options.expectedSessionGeneration, 1);
+				return replacementAgent;
 			},
 			getAgent() { return null; },
 			async removeAgent() { return false; },
@@ -370,10 +380,15 @@ test('routes planning through the provider lane and preserves priority and provi
 	});
 
 	assert.deepEqual(result, { ...VALID_DECISION, goalRevision: GOAL_REVISION });
-	assert.deepEqual(scheduleCalls, [{ agentId: AGENT_ID, options: { lane: RECORD.provider, priority: 'urgent' } }]);
+	assert.equal(scheduleCalls.length, 1);
+	assert.equal(scheduleCalls[0].agentId, AGENT_ID);
+	assert.equal(scheduleCalls[0].options.lane, RECORD.provider);
+	assert.equal(scheduleCalls[0].options.priority, 'urgent');
+	assert.equal(scheduleCalls[0].options.leaseTimeoutMs, 125_000);
+	assert.equal(typeof scheduleCalls[0].options.onLeaseExpired, 'function');
 	assert.equal(createdRecords.length, 1);
 	assert.deepEqual(createdRecords[0], RECORD, 'urgent provider retry retains the exact selected profile');
-	assert.equal(decideAttempts, 2);
+	assert.equal(replacements, 1, 'provider retry replaces the failed exact session once');
 });
 
 test('retries one empty Codex turn without changing authoritative input', async () => {
@@ -420,7 +435,7 @@ test('exhausted empty Codex turns remain planning for quiet observation retry', 
 	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
 });
 
-test('exhausted retryable provider errors enter error after the retry budget', async () => {
+test('exhausted infrastructure errors remain active for observation-driven recovery', async () => {
 	const registry = new FakeRegistry();
 	const timeout = Object.assign(new Error('provider timed out'), { code: 'PLANNING_TIMEOUT' });
 	const agent = {
@@ -431,13 +446,8 @@ test('exhausted retryable provider errors enter error after the retry budget', a
 	await assert.rejects(planner.requestPlan({
 		agentId: AGENT_ID, input: 'authoritative state', goalRevision: GOAL_REVISION,
 	}), (error) => error === timeout);
-	assert.deepEqual(registry.states.at(-1), {
-		state: DynamicAgentState.ERROR,
-		options: {
-			goalRevision: GOAL_REVISION,
-			error: { code: 'PLANNING_TIMEOUT', message: 'provider timed out' },
-		},
-	});
+	assert.equal(registry.states.at(-1).state, DynamicAgentState.PLANNING);
+	assert.equal(registry.states.some(({ state }) => state === DynamicAgentState.ERROR), false);
 });
 
 test('retries one transient provider initialization failure', async () => {
@@ -599,9 +609,14 @@ test('feeds redacted provider telemetry to the scheduler after health recording'
 test('provider circuit rejects work before allocating a provider session', async () => {
 	const registry = new FakeRegistry();
 	let creates = 0;
+	let identity;
 	const planner = new AgentPlanner({
 		registry,
-		healthRegistry: { canAttempt: () => false, record: () => { throw new Error('must not record'); } },
+		healthRegistry: {
+			canAttempt: (value) => { identity = value; return false; },
+			snapshot: () => ({ nextProbeAtEpochMs: 12_345 }),
+			record: () => { throw new Error('must not record'); },
+		},
 		scheduler: {
 			schedule(_agentId, operation) { return operation({ signal: new AbortController().signal }); },
 			cancel() { return false; },
@@ -618,7 +633,49 @@ test('provider circuit rejects work before allocating a provider session', async
 		(error) => error?.code === 'PROVIDER_CIRCUIT_OPEN',
 	);
 	assert.equal(creates, 0);
-	assert.equal(registry.states.at(-1).options.error.code, 'PROVIDER_CIRCUIT_OPEN');
+	assert.deepEqual(identity, {
+		provider: RECORD.provider,
+		model: RECORD.model,
+		operation: 'create_agent',
+		profileFingerprint: profileFingerprint(RECORD),
+	});
+	assert.equal(registry.states.some(({ state }) => state === DynamicAgentState.ERROR), false);
+});
+
+test('planning lease expiry tears down only the matching exact provider generation', async () => {
+	const registry = new FakeRegistry();
+	let scheduleOptions;
+	const agent = {
+		sessionGeneration: 4,
+		async setGoalRevision() {},
+		async decide() { return VALID_DECISION; },
+	};
+	const replacements = [];
+	const planner = new AgentPlanner({
+		registry,
+		planningLeaseTimeoutMs: 25,
+		scheduler: {
+			schedule(_agentId, operation, options) {
+				scheduleOptions = options;
+				return operation({ signal: new AbortController().signal });
+			},
+			cancel() { return false; },
+		},
+		codexService: {
+			async createAgent() { return agent; },
+			getAgent() { return agent; },
+			async replaceAgent(record, options) { replacements.push({ record, options }); return agent; },
+			async removeAgent() { return false; },
+		},
+	});
+
+	await planner.requestPlan({ agentId: AGENT_ID, input: 'state', goalRevision: GOAL_REVISION });
+	assert.equal(scheduleOptions.leaseTimeoutMs, 25);
+	await scheduleOptions.onLeaseExpired();
+	assert.deepEqual(replacements, [{
+		record: RECORD,
+		options: { recoverySummary: 'planning_lease_expired', controlProtocol: 'arena_script', expectedSessionGeneration: 4 },
+	}]);
 });
 
 test('native turn keeps scheduler and selected Codex profile while delegating body execution', async () => {

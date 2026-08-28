@@ -3,7 +3,13 @@ import test from 'node:test';
 
 import { LEASE_TIMEOUTS_MS, WorkLeaseSupervisor } from '../src/work-lease-supervisor.mjs';
 
-const key = Object.freeze({ agentId: 'luna', goalRevision: 7, lifecycleGeneration: 3 });
+const key = Object.freeze({
+	agentId: 'luna',
+	goalRevision: 7,
+	lifecycleGeneration: 3,
+	sessionEpoch: 11,
+	profileFingerprint: `sha256:${'a'.repeat(64)}`,
+});
 
 class FakeClock {
 	#now = 0;
@@ -133,4 +139,16 @@ test('newer lifecycle keys fence callbacks and suspension cancels every lease', 
 	await clock.runDue();
 	assert.deepEqual(observations, []);
 	assert.equal(clock.pendingCount, 0);
+});
+
+test('recovery lease identity fences stale session epochs and exact-profile mutations', () => {
+	const { supervisor } = fixture();
+	supervisor.activate(key);
+	const stale = supervisor.acquire(key, 'provider');
+	const nextSession = { ...key, sessionEpoch: key.sessionEpoch + 1 };
+	assert.equal(supervisor.activate(nextSession), true);
+	assert.equal(supervisor.release(stale), false, 'an earlier bridge session cannot release replacement work');
+	assert.equal(supervisor.snapshot(key), null);
+	assert.equal(supervisor.snapshot(nextSession)?.key.profileFingerprint, key.profileFingerprint);
+	assert.equal(supervisor.activate({ ...nextSession, profileFingerprint: `sha256:${'b'.repeat(64)}` }), false, 'same-generation profile mutation is not newer work');
 });
