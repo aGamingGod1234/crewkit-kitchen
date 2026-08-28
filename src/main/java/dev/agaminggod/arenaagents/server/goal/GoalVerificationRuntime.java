@@ -42,6 +42,16 @@ public final class GoalVerificationRuntime {
 		this(registry, facts, serverTick, epochMillis, new GoalCompletionVerifier(), new AgentKillLedger());
 	}
 
+	public GoalVerificationRuntime(
+			AgentRegistry registry,
+			Function<AgentId, Optional<GoalCompletionVerifier.FactSource>> facts,
+			LongSupplier serverTick,
+			LongSupplier epochMillis,
+			AgentKillLedger killLedger
+	) {
+		this(registry, facts, serverTick, epochMillis, new GoalCompletionVerifier(), killLedger);
+	}
+
 	GoalVerificationRuntime(
 			AgentRegistry registry,
 			Function<AgentId, Optional<GoalCompletionVerifier.FactSource>> facts,

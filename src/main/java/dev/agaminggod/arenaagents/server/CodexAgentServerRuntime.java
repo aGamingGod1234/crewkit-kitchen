@@ -99,7 +99,8 @@ public final class CodexAgentServerRuntime {
 				manager.registry(),
 				agentId -> manager.findAgentPlayer(agentId).map(dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier::minecraftFacts),
 				server::getTickCount,
-				System::currentTimeMillis
+				System::currentTimeMillis,
+				AgentSavedData.get(server).killLedger()
 		));
 		CoordinatorProcessSupervisor supervisor = null;
 		try {

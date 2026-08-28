@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server.goal;
 
+import com.mojang.serialization.Codec;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
@@ -10,12 +11,17 @@ import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
+import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
 
 public final class GoalVerificationRuntimeVerification {
 	private GoalVerificationRuntimeVerification() { }
@@ -29,6 +35,9 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyAgentSpecificKillAttribution();
 		assertions += verifyDistinctRepeatedKillAttribution();
 		assertions += verifyKillGoalAfterServerTickReset();
+		assertions += verifyPersistedKillProgressAcrossRestart();
+		assertions += verifyPersistedKillActivationFencing();
+		assertions += verifyKillLedgerPersistenceCompatibility();
 		assertions += verifyIndexedKillLookup();
 		assertions += verifyVerifierFailureIsolationAndRetry();
 		assertions += verifySurvivalAndOperatorConfirmation();
@@ -198,6 +207,107 @@ public final class GoalVerificationRuntimeVerification {
 		return 2;
 	}
 
+	private static int verifyPersistedKillProgressAcrossRestart() {
+		AgentSavedData data = new AgentSavedData();
+		AgentRegistry registry = data.registry();
+		long now = 40_000L;
+		AgentRecord idle = registry.create("codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		GoalPredicate compound = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+				new GoalPredicate.InventoryContains("minecraft:iron_ingot", 1)
+		));
+		registry.start(idle.agentId(), GoalSpec.create("Kill a zombie and get iron", compound, 900L), now + 1L);
+		FakeFacts facts = new FakeFacts();
+		long[] tick = { 900L };
+		long[] epoch = { now + 2L };
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				registry, ignored -> Optional.of(facts), () -> tick[0], () -> epoch[0], data.killLedger());
+		runtime.recordKill(idle.agentId(), "minecraft:zombie");
+		assertEquals(true, data.isDirty(), "kill recording dirties saved data before a verification tick");
+
+		AgentSavedData restored = roundTripSavedData(data, false);
+		GoalVerificationRuntime restoredRuntime = new GoalVerificationRuntime(
+				restored.registry(), ignored -> Optional.of(facts), () -> 1L, () -> epoch[0] + 1L, restored.killLedger());
+		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"a restored compound goal still waits for its unfinished non-kill predicate");
+		facts.items.put("minecraft:iron_ingot", 1);
+		assertEquals(true, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"persisted partial kill progress completes the compound goal after restart");
+
+		AgentSavedData singleData = new AgentSavedData();
+		AgentRecord singleIdle = singleData.registry().create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now + 10L);
+		singleData.registry().start(singleIdle.agentId(), GoalSpec.create(
+				"Kill a skeleton", new GoalPredicate.EntityKilledByAgent("minecraft:skeleton", true), 901L), now + 11L);
+		GoalVerificationRuntime singleRuntime = new GoalVerificationRuntime(
+				singleData.registry(), ignored -> Optional.of(new FakeFacts()), () -> 901L, () -> now + 12L,
+				singleData.killLedger());
+		singleRuntime.recordKill(singleIdle.agentId(), "minecraft:skeleton");
+		AgentSavedData restoredSingle = roundTripSavedData(singleData, false);
+		GoalVerificationRuntime restoredSingleRuntime = new GoalVerificationRuntime(
+				restoredSingle.registry(), ignored -> Optional.of(new FakeFacts()), () -> 1L, () -> now + 13L,
+				restoredSingle.killLedger());
+		assertEquals(true, restoredSingleRuntime.evaluate(singleIdle.agentId()).verified(),
+				"a kill saved before the next verification tick survives a crash and restart");
+		return 4;
+	}
+
+	private static int verifyPersistedKillActivationFencing() {
+		AgentSavedData data = new AgentSavedData();
+		long now = 50_000L;
+		AgentRecord idle = data.registry().create("codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		data.registry().start(idle.agentId(), GoalSpec.create("Get iron",
+				new GoalPredicate.InventoryContains("minecraft:iron_ingot", 1), 950L), now + 1L);
+		data.registry().queue(idle.agentId(), GoalSpec.create("Kill a zombie",
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true), 951L), now + 2L);
+		FakeFacts facts = new FakeFacts();
+		long[] tick = { 950L };
+		long[] epoch = { now + 3L };
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				data.registry(), ignored -> Optional.of(facts), () -> tick[0], () -> epoch[0], data.killLedger());
+		runtime.recordKill(idle.agentId(), "minecraft:zombie");
+		facts.items.put("minecraft:iron_ingot", 1);
+		runtime.tick();
+		tick[0]++;
+		epoch[0]++;
+		runtime.tick();
+		long activation = data.registry().require(idle.agentId()).currentGoal().orElseThrow().createdAtEpochMs();
+		data.killLedger().record(idle.agentId(), "minecraft:zombie", activation);
+
+		AgentSavedData restored = roundTripSavedData(data, false);
+		long[] restartEpoch = { activation + 1L };
+		GoalVerificationRuntime restoredRuntime = new GoalVerificationRuntime(
+				restored.registry(), ignored -> Optional.of(facts), () -> 1L, () -> restartEpoch[0], restored.killLedger());
+		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"persisted kills before or exactly at queued-goal activation remain fenced after restart");
+		restoredRuntime.recordKill(idle.agentId(), "minecraft:zombie");
+		assertEquals(true, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"the first persisted kill strictly after activation satisfies the restored queued goal");
+		return 2;
+	}
+
+	private static int verifyKillLedgerPersistenceCompatibility() {
+		AgentSavedData data = new AgentSavedData();
+		AgentId agentId = AgentId.random();
+		data.killLedger().record(agentId, "minecraft:zombie", 1L);
+		AgentSavedData legacy = roundTripSavedData(data, true);
+		assertEquals(0, legacy.killLedger().size(), "saved data without the new optional field loads as an empty legacy ledger");
+
+		AgentKillLedgerCodec codec = new AgentKillLedgerCodec();
+		String unsupported = codec.encode(data.killLedger().snapshot()).replace("\"schema_version\":1", "\"schema_version\":2");
+		try {
+			codec.decode(unsupported);
+			throw new AssertionError("unsupported kill-ledger schema must fail closed");
+		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException expected) {
+			assertEquals("INVALID_PERSISTED_KILL_LEDGER", expected.code(),
+					"unsupported persisted kill-ledger versions are rejected explicitly");
+		}
+		return 2;
+	}
+
 	private static int verifyIndexedKillLookup() {
 		AgentKillLedger ledger = new AgentKillLedger();
 		AgentId agentId = AgentId.random();
@@ -208,7 +318,11 @@ public final class GoalVerificationRuntimeVerification {
 				"indexed kill lookup returns the exact suffix count");
 		assertEquals(true, ledger.lastLookupProbeCount() <= 13,
 				"a full kill ledger lookup uses logarithmic probes instead of rescanning all events");
-		return 2;
+		ledger.record(agentId, "minecraft:zombie", 4_096L);
+		assertEquals(AgentKillLedger.MAX_EVENTS, ledger.size(), "kill history remains bounded after overflow");
+		assertEquals(AgentKillLedger.MAX_EVENTS, ledger.count(agentId, "minecraft:zombie", 0L),
+				"overflow evicts the oldest kill without discarding the bounded recent suffix");
+		return 4;
 	}
 
 	private static int verifyVerifierFailureIsolationAndRetry() {
@@ -360,6 +474,20 @@ public final class GoalVerificationRuntimeVerification {
 
 	private static String goalName(GoalPredicate predicate) {
 		return "Verify " + predicate.getClass().getSimpleName();
+	}
+
+	@SuppressWarnings("unchecked")
+	private static AgentSavedData roundTripSavedData(AgentSavedData data, boolean removeKillLedger) {
+		try {
+			Field field = AgentSavedData.class.getDeclaredField("CODEC");
+			field.setAccessible(true);
+			Codec<AgentSavedData> codec = (Codec<AgentSavedData>) field.get(null);
+			Tag encoded = codec.encodeStart(NbtOps.INSTANCE, data).getOrThrow();
+			if (removeKillLedger) ((CompoundTag) encoded).remove("kill_ledger_chunks");
+			return codec.parse(NbtOps.INSTANCE, encoded).getOrThrow();
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not round-trip kill ledger through Minecraft SavedData", exception);
+		}
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

@@ -5,17 +5,36 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /** Bounded server-owned attribution ledger for kills made by agent players. */
 public final class AgentKillLedger {
-	private static final int MAX_EVENTS = 4_096;
+	static final int SCHEMA_VERSION = 1;
+	static final int MAX_EVENTS = 4_096;
 	private final Deque<Kill> kills = new ArrayDeque<>();
 	private final Map<KillKey, TimestampSeries> killsByAgentAndType = new HashMap<>();
+	private final Runnable mutationListener;
 	private int lastLookupProbeCount;
 
+	public AgentKillLedger() {
+		this(emptySnapshot(), () -> { });
+	}
+
+	public AgentKillLedger(Snapshot snapshot, Runnable mutationListener) {
+		this.mutationListener = Objects.requireNonNull(mutationListener, "mutationListener must not be null");
+		for (KillEvent event : Objects.requireNonNull(snapshot, "snapshot must not be null").events()) {
+			append(event.agentId(), event.entityType(), event.occurredAtEpochMs());
+		}
+	}
+
 	public synchronized void record(AgentId agentId, String entityType, long occurredAt) {
+		append(agentId, entityType, occurredAt);
+		mutationListener.run();
+	}
+
+	private void append(AgentId agentId, String entityType, long occurredAt) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		String type = Objects.requireNonNull(entityType, "entityType must not be null");
 		if (!type.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) throw new IllegalArgumentException("entityType must be namespaced");
@@ -29,6 +48,16 @@ public final class AgentKillLedger {
 			series.remove(removed.occurredAt());
 			if (series.isEmpty()) killsByAgentAndType.remove(removed.key());
 		}
+	}
+
+	public synchronized Snapshot snapshot() {
+		return new Snapshot(SCHEMA_VERSION, kills.stream()
+				.map(kill -> new KillEvent(kill.key().agentId(), kill.key().entityType(), kill.occurredAt()))
+				.toList());
+	}
+
+	public static Snapshot emptySnapshot() {
+		return new Snapshot(SCHEMA_VERSION, List.of());
 	}
 
 	public synchronized int count(AgentId agentId, String entityType, long afterExclusive) {
@@ -54,6 +83,29 @@ public final class AgentKillLedger {
 
 	private record KillKey(AgentId agentId, String entityType) { }
 	private record Kill(KillKey key, long occurredAt) { }
+
+	public record Snapshot(int schemaVersion, List<KillEvent> events) {
+		public Snapshot {
+			if (schemaVersion != SCHEMA_VERSION) {
+				throw new IllegalArgumentException("Unsupported kill ledger schema: " + schemaVersion);
+			}
+			events = List.copyOf(Objects.requireNonNull(events, "events must not be null"));
+			if (events.size() > MAX_EVENTS) {
+				throw new IllegalArgumentException("Kill ledger exceeds the bounded event limit");
+			}
+		}
+	}
+
+	public record KillEvent(AgentId agentId, String entityType, long occurredAtEpochMs) {
+		public KillEvent {
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			Objects.requireNonNull(entityType, "entityType must not be null");
+			if (!entityType.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
+				throw new IllegalArgumentException("entityType must be namespaced");
+			}
+			if (occurredAtEpochMs < 0L) throw new IllegalArgumentException("occurredAtEpochMs must be nonnegative");
+		}
+	}
 
 	private static final class TimestampSeries {
 		private final ArrayList<Long> values = new ArrayList<>();
