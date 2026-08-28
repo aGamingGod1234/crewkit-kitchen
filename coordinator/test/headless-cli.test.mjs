@@ -42,7 +42,7 @@ test('wires provider-turn capture into scenario evidence paths', async () => {
 			close: async () => {},
 		}),
 	});
-	assert.equal(result.report.scenarios[0].evidence.paths.providerTurns, providerTurnsPath);
+	assert.equal(result.report.scenarios[0].evidence.paths.providerTurns, '[location redacted]');
 	assert.equal(result.report.scenarios[0].evidence.providerTurnsRows, 1);
 	assert.deepEqual(result.report.scenarios[0].timings.turns, [{
 		provider: 'codex', model: 'm', reasoningEffort: 'low', attempt: 1, retry: false,

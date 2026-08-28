@@ -25,6 +25,7 @@ export function isSensitiveDiagnosticKey(value) {
 		.toLowerCase();
 	if (/^(?:(?:input|output|prompt|completion|cached|reasoning|total)_tokens?(?:_count)?|tokens?_count|token_(?:bucket|latency_ms|budget|limit|usage|remaining))$/.test(normalized)) return false;
 	return /(?:^|_)(?:authorization|api_key|access_token|refresh_token|client_secret|secret|password|token|credential|oauth)(?:_|$)/.test(normalized)
+		|| normalized === 'tokens'
 		|| normalized === 'launcher_account'
 		|| normalized === 'launcheraccount'
 		|| normalized === 'account_data'
@@ -64,7 +65,7 @@ export function sanitizeDiagnosticValue(value, {
 	const seen = new WeakSet();
 	let nodes = 0;
 	const visit = (input, depth, key = null) => {
-		if (isSensitiveDiagnosticKey(key)) return DIAGNOSTIC_REDACTED;
+		if (isSensitiveDiagnosticKey(key) && !isOperationalTokenMetrics(key, input)) return DIAGNOSTIC_REDACTED;
 		if (typeof input === 'string') return sanitizeDiagnosticText(input, { maxBytes: maxStringBytes, redactPaths });
 		if (input === null || ['boolean', 'number'].includes(typeof input)) return input;
 		if (['undefined', 'bigint', 'function', 'symbol'].includes(typeof input)) return DIAGNOSTIC_UNSAFE;
@@ -88,6 +89,22 @@ export function sanitizeDiagnosticValue(value, {
 		return output;
 	};
 	return visit(value, 0);
+}
+
+function isOperationalTokenMetrics(key, value) {
+	if (key !== 'tokens' || value === null || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value)) return false;
+	let keys;
+	try { keys = Reflect.ownKeys(value); } catch { return false; }
+	const categories = new Set(['input', 'output', 'reasoning', 'cached', 'cacheWrite']);
+	for (const category of keys) {
+		if (typeof category !== 'string' || !categories.has(category)) return false;
+		let descriptor;
+		try { descriptor = Object.getOwnPropertyDescriptor(value, category); } catch { return false; }
+		if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) return false;
+		const count = descriptor.value;
+		if (count !== null && !(Number.isSafeInteger(count) && count >= 0)) return false;
+	}
+	return true;
 }
 
 export function truncateDiagnosticUtf8(value, maxBytes) {

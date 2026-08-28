@@ -73,14 +73,17 @@ test('structured token metrics remain visible but actual token credentials are r
 		inputTokens: 123,
 		output_token_count: 45,
 		tokenCount: 8,
+		tokens: { input: 123, output: 45, reasoning: 8, cached: 3, cacheWrite: null },
 		access_token: 'secret-access-token',
 		github_token: 'secret-github-token',
 	});
 	assert.equal(sanitized.inputTokens, 123);
 	assert.equal(sanitized.output_token_count, 45);
 	assert.equal(sanitized.tokenCount, 8);
+	assert.deepEqual({ ...sanitized.tokens }, { input: 123, output: 45, reasoning: 8, cached: 3, cacheWrite: null });
 	assert.equal(sanitized.access_token, '[REDACTED]');
 	assert.equal(sanitized.github_token, '[REDACTED]');
+	assert.equal(sanitizeDiagnosticValue({ tokens: 'credential-shaped-secret' }).tokens, '[REDACTED]');
 });
 
 test('launcher and account credential aliases redact in text and structured diagnostics', () => {

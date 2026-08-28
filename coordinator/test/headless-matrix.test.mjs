@@ -116,3 +116,47 @@ test('replaces deeply nested report values at the depth bound', () => {
 	assert.equal(bounded, '[TRUNCATED]');
 	assert.ok(JSON.stringify(report).length < 10000);
 });
+
+test('headless reports redact every launcher and account credential alias', () => {
+	const scenario = normalizeHeadlessScenario(validScenario(), 0);
+	const aliases = ['launcherAccount', 'launcher_account', 'launcher-account', 'launcheraccount', 'accountData', 'account_data', 'account-data', 'accountdata'];
+	for (const [index, alias] of aliases.entries()) {
+		const secret = `headless-private-value-${index}`;
+		const report = scenarioReport('FAILED', scenario, { evidence: { [alias]: secret } });
+		assert.equal(report.evidence[alias], '[REDACTED]', `${alias} was not redacted`);
+		assert.doesNotMatch(JSON.stringify(report), new RegExp(secret));
+	}
+});
+
+test('headless diagnostics redact file URIs while preserving operational text', () => {
+	const scenario = normalizeHeadlessScenario(validScenario(), 0);
+	for (const location of [
+		'file:///C:/Users/lucas/Arena%20Agents/secret.json',
+		'file:///var/lib/arena%20agents/secret.json',
+		'file://server/share/Arena%20Agents/secret.json',
+	]) {
+		const report = scenarioReport('FAILED', scenario, { diagnostics: `failure at ${location}` });
+		assert.equal(report.diagnostics.includes(location), false, `${location} leaked`);
+		assert.match(report.diagnostics, /\[location redacted\]/);
+	}
+	const operational = 'https://example.com/file:///docs http://127.0.0.1:8766/v1/tts relative/file.txt inputTokens=4';
+	assert.equal(scenarioReport('FAILED', scenario, { diagnostics: operational }).diagnostics, operational);
+});
+
+test('headless structured reports retain bounded token metrics and sanitize nested text', () => {
+	const scenario = normalizeHeadlessScenario(validScenario(), 0);
+	const metrics = {
+		tokens: { input: 12, output: 3, reasoning: 1, cached: 2, cacheWrite: null },
+		inputTokens: 12,
+		output_token_count: 3,
+		note: `file:///var/lib/private/${'x'.repeat(10_000)}`,
+		detail: 'x'.repeat(10_000),
+	};
+	const report = scenarioReport('PASSED', scenario, { metrics });
+	assert.deepEqual(report.metrics.tokens, metrics.tokens);
+	assert.equal(report.metrics.inputTokens, 12);
+	assert.equal(report.metrics.output_token_count, 3);
+	assert.match(report.metrics.note, /\[location redacted\]/);
+	assert.ok(Buffer.byteLength(report.metrics.detail, 'utf8') <= 4096);
+	assert.ok(Buffer.byteLength(JSON.stringify(report), 'utf8') < 16_384);
+});
