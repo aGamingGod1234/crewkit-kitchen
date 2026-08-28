@@ -30,6 +30,7 @@ import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.net.Proxy;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
@@ -45,6 +46,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
+import net.minecraft.SystemReport;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.permissions.LevelBasedPermissionSet;
+import net.minecraft.server.permissions.PermissionSet;
+import net.minecraft.server.players.PlayerList;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.debugchart.SampleLogger;
 
 public final class MultiplexedServerBridgeVerification {
 	private MultiplexedServerBridgeVerification() {
@@ -186,11 +194,22 @@ public final class MultiplexedServerBridgeVerification {
 				writeHello(socket, codec, secret, null, "hello-removal-race");
 				awaitLatch(snapshotTaken, "handshake captured the pre-removal registry");
 				MultiplexedServerBridge activeBridge = bridge;
-				activeBridge.withinPublicationBoundary(() -> {
-					manager.registry().remove(record.agentId());
-					activeBridge.onRemoved(record.agentId(), 1L);
-					return null;
+				AtomicBoolean managerRemovalBoundaryUsed = new AtomicBoolean();
+				manager.setRuntimeHooks(new AgentRuntimeHooks() {
+					@Override
+					public <T> T withinPublicationBoundary(java.util.function.Supplier<T> publication) {
+						managerRemovalBoundaryUsed.set(true);
+						return activeBridge.withinPublicationBoundary(publication);
+					}
+
+					@Override
+					public void onRemoved(AgentId agentId, long terminalRevision) {
+						activeBridge.onRemoved(agentId, terminalRevision);
+					}
 				});
+				manager.remove(record.agentId().toString());
+				assertTrue(managerRemovalBoundaryUsed.get(),
+						"manager removal enters the bridge publication boundary before onRemoved");
 				releaseSnapshot.countDown();
 				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
 				assertEquals(0, acknowledgement.payload().getAsJsonArray("registry").size(),
@@ -601,14 +620,61 @@ public final class MultiplexedServerBridgeVerification {
 			field.setAccessible(true);
 			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
 			CodexAgentManager manager = (CodexAgentManager) unsafe.allocateInstance(CodexAgentManager.class);
+			TestMinecraftServer server = (TestMinecraftServer) unsafe.allocateInstance(TestMinecraftServer.class);
+			server.playerList = (EmptyPlayerList) unsafe.allocateInstance(EmptyPlayerList.class);
+			putObject(unsafe, manager, "server", server);
 			Field savedData = CodexAgentManager.class.getDeclaredField("savedData");
 			unsafe.putObject(manager, unsafe.objectFieldOffset(savedData), new AgentSavedData());
-			Field pending = CodexAgentManager.class.getDeclaredField("pendingAgentRegistrations");
-			unsafe.putObject(manager, unsafe.objectFieldOffset(pending), java.util.concurrent.ConcurrentHashMap.newKeySet());
+			putObject(unsafe, manager, "chunkTickets", new java.util.LinkedHashMap<>());
+			putObject(unsafe, manager, "chunkTicketReferences", new java.util.LinkedHashMap<>());
+			putObject(unsafe, manager, "pendingPlayerSpawns", new java.util.LinkedHashMap<>());
+			putObject(unsafe, manager, "pendingVerifiedRespawns", new java.util.LinkedHashMap<>());
+			putObject(unsafe, manager, "pendingAgentRegistrations", java.util.concurrent.ConcurrentHashMap.newKeySet());
+			putObject(unsafe, manager, "pendingEntityRecoveries", new java.util.LinkedHashSet<>());
+			putObject(unsafe, manager, "seenPlayers", new java.util.LinkedHashSet<>());
 			return manager;
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not allocate lifecycle-only manager", exception);
 		}
+	}
+
+	private static void putObject(sun.misc.Unsafe unsafe, CodexAgentManager manager, String fieldName, Object value)
+			throws ReflectiveOperationException {
+		Field field = CodexAgentManager.class.getDeclaredField(fieldName);
+		unsafe.putObject(manager, unsafe.objectFieldOffset(field), value);
+	}
+
+	private static final class TestMinecraftServer extends MinecraftServer {
+		private EmptyPlayerList playerList;
+
+		private TestMinecraftServer() {
+			super(null, null, null, null, java.util.Optional.empty(), Proxy.NO_PROXY, null, null, null, false);
+		}
+
+		@Override protected boolean initServer() { return true; }
+		@Override public LevelBasedPermissionSet operatorUserPermissions() { return null; }
+		@Override public PermissionSet getFunctionCompilationPermissions() { return null; }
+		@Override public boolean shouldRconBroadcast() { return false; }
+		@Override protected SampleLogger getTickTimeLogger() { return null; }
+		@Override public boolean isTickTimeLoggingEnabled() { return false; }
+		@Override public SystemReport fillServerSystemReport(SystemReport report) { return report; }
+		@Override public boolean isDedicatedServer() { return false; }
+		@Override public int getRateLimitPacketsPerSecond() { return 0; }
+		@Override public boolean useNativeTransport() { return false; }
+		@Override public boolean isPublished() { return false; }
+		@Override public boolean shouldInformAdmins() { return false; }
+		@Override public boolean isSingleplayerOwner(net.minecraft.server.players.NameAndId profile) { return false; }
+		@Override public int getMaxPlayers() { return 0; }
+		@Override public PlayerList getPlayerList() { return playerList; }
+	}
+
+	private static final class EmptyPlayerList extends PlayerList {
+		private EmptyPlayerList() {
+			super(null, null, null, null);
+		}
+
+		@Override public ServerPlayer getPlayer(UUID uuid) { return null; }
+		@Override public ServerPlayer getPlayerByName(String name) { return null; }
 	}
 
 	@SuppressWarnings("unchecked")
