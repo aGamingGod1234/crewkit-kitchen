@@ -30,7 +30,10 @@ public final class ServerNavigationController implements ServerController {
 	private static final int MAX_SHALLOW_WATER_PATH_BLOCKS = MinecraftNavigationWorld.MAX_SHALLOW_WATER_CROSSING;
 	private static final long STALL_TIMEOUT_MS = 4_000L;
 	private static final int MAX_REPLANS = 3;
-	private static final int MAX_PRODUCTIVE_PLANNING_DEFERRALS = 3;
+	private static final double INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED = 0.36D;
+	private static final double INTERMEDIATE_WAYPOINT_VERTICAL_TOLERANCE = 0.25D;
+	// Plans are rebuilt from current world state; the replan cap and action deadline bound identical retries
+	// without retaining stale edge bans that could reject terrain after it changes.
 
 	private final Vec3 destination;
 	private final double tolerance;
@@ -44,7 +47,6 @@ public final class ServerNavigationController implements ServerController {
 	private double lastProgressValue;
 	private InputLease inputLease;
 	private AgentInputStates.MotorState motorState;
-	private int productivePlanningDeferrals;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -97,7 +99,8 @@ public final class ServerNavigationController implements ServerController {
 		boolean finalWaypoint = waypointIndex == nodes.size() - 1;
 		Vec3 target = targetFor(waypoint, finalWaypoint);
 		boolean reached = reachedTarget(player.position(), waypoint, finalWaypoint);
-		WaypointProgress.Update update = progress.observe(remaining, reached, nowEpochMs);
+		double activeWaypointDistance = player.position().distanceTo(target);
+		WaypointProgress.Update update = progress.observe(activeWaypointDistance, reached, nowEpochMs);
 		lastProgressValue = update.progress();
 		if (reached) {
 			waypointIndex++;
@@ -105,7 +108,9 @@ public final class ServerNavigationController implements ServerController {
 				return replanOrResult(player, nowEpochMs, remaining);
 			}
 			waypoint = nodes.get(waypointIndex);
-			target = targetFor(waypoint, waypointIndex == nodes.size() - 1);
+			finalWaypoint = waypointIndex == nodes.size() - 1;
+			target = targetFor(waypoint, finalWaypoint);
+			progress.waypointAdvanced(player.position().distanceTo(target), nowEpochMs);
 		}
 		if (update.decision() == WaypointProgress.Decision.FAIL) {
 			return fail(player, "PATH_BLOCKED", "Navigation could not recover from repeated stalls", update.progress());
@@ -196,11 +201,9 @@ public final class ServerNavigationController implements ServerController {
 		for (GridPosition goal : goals) {
 			ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
 			if (planning.deferred()) {
-				if (planning.plan().expandedNodes() > 0) productivePlanningDeferrals++;
-				if (productivePlanningDeferrals >= MAX_PRODUCTIVE_PLANNING_DEFERRALS) {
-					return fail(player, "PATH_LIMIT_REACHED", "Path planning repeatedly exhausted its bounded search budget", currentProgress());
-				}
-				return TickResult.running(currentProgress());
+				return shouldRetryPlanning(planning.plan().outcome(), true, nowEpochMs, startedAt, timeoutMs)
+						? TickResult.running(currentProgress())
+						: fail(player, "PATH_LIMIT_REACHED", "Path planning exceeded its navigation deadline", currentProgress());
 			}
 			PathPlan planned = planning.plan();
 			if (planned.outcome() == PathOutcome.FOUND
@@ -212,16 +215,23 @@ public final class ServerNavigationController implements ServerController {
 			pathLimitReached |= planned.outcome() == PathOutcome.NODE_LIMIT || planned.outcome() == PathOutcome.TIME_LIMIT;
 		}
 		if (candidate == null) {
+			if (pathLimitReached && shouldRetryPlanning(PathOutcome.NODE_LIMIT, false, nowEpochMs, startedAt, timeoutMs)) {
+				return TickResult.running(currentProgress());
+			}
 			return fail(player, pathLimitReached ? "PATH_LIMIT_REACHED" : "NO_PATH",
 					"No bounded safe path is currently available", currentProgress());
 		}
-		productivePlanningDeferrals = 0;
 		plan = candidate;
 		waypointIndex = Math.min(1, Math.max(0, candidate.nodes().size() - 1));
+		PathNode activeWaypoint = candidate.nodes().get(waypointIndex);
+		boolean finalWaypoint = waypointIndex == candidate.nodes().size() - 1;
+		double activeWaypointDistance = player.position().distanceTo(targetFor(activeWaypoint, finalWaypoint));
 		if (progress == null) {
-			progress = new WaypointProgress(remaining, nowEpochMs, STALL_TIMEOUT_MS, MAX_REPLANS);
+			progress = new WaypointProgress(activeWaypointDistance, nowEpochMs, STALL_TIMEOUT_MS, MAX_REPLANS);
 		} else if (recovery) {
-			progress.replanned(remaining, nowEpochMs);
+			progress.replanned(activeWaypointDistance, nowEpochMs);
+		} else {
+			progress.waypointAdvanced(activeWaypointDistance, nowEpochMs);
 		}
 		return null;
 	}
@@ -277,7 +287,26 @@ public final class ServerNavigationController implements ServerController {
 	private static boolean reachedWaypoint(Vec3 player, Vec3 waypoint) {
 		double dx = player.x - waypoint.x;
 		double dz = player.z - waypoint.z;
-		return dx * dx + dz * dz <= 0.36D && Math.abs(player.y - waypoint.y) <= 1.25D;
+		return dx * dx + dz * dz <= INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED
+				&& Math.abs(player.y - waypoint.y) <= INTERMEDIATE_WAYPOINT_VERTICAL_TOLERANCE;
+	}
+
+	static boolean shouldRetryPlanning(
+			PathOutcome outcome,
+			boolean deferred,
+			long nowEpochMs,
+			long startedAtEpochMs,
+			long timeoutMs
+	) {
+		Objects.requireNonNull(outcome, "outcome must not be null");
+		if (!deferred && outcome != PathOutcome.NODE_LIMIT && outcome != PathOutcome.TIME_LIMIT) return false;
+		if (timeoutMs <= 0L) return false;
+		if (nowEpochMs <= startedAtEpochMs) return true;
+		try {
+			return Math.subtractExact(nowEpochMs, startedAtEpochMs) < timeoutMs;
+		} catch (ArithmeticException exception) {
+			return false;
+		}
 	}
 
 	private static Vec3 center(GridPosition position) {

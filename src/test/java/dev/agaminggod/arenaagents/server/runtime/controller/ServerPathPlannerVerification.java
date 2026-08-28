@@ -47,7 +47,7 @@ public final class ServerPathPlannerVerification {
 		assertTrue(first.nodes().stream().noneMatch(node -> blocked.contains(node.position())),
 				"server plan does not cross blocked cells");
 		return 3 + verifyElevationAndHoleSafety() + verifyDeferredPlanningIsRetryable() + verifySharedElapsedBudget()
-				+ verifyRoundRobinAdmissionEventuallyServesAll()
+				+ verifyRoundRobinAdmissionEventuallyServesAll() + verifyContentionDeferralWindow()
 				+ verifyTickScopeRestoresPreviousBudget();
 	}
 
@@ -192,6 +192,37 @@ public final class ServerPathPlannerVerification {
 		assertTrue(second.deferred(), "elapsed tick budget defers every later request in the same tick");
 		assertEquals(0, budget.expandedNodes(), "elapsed exhaustion performs no expansion");
 		return 4;
+	}
+
+	private static int verifyContentionDeferralWindow() {
+		ServerPathPlanner planner = new ServerPathPlanner();
+		WalkabilityView view = position -> position.y() == 63
+				? WalkabilityView.Cell.SAFE_SUPPORT
+				: position.y() >= 64 && position.y() <= 65
+						? WalkabilityView.Cell.CLEAR
+						: WalkabilityView.Cell.BLOCKED;
+		for (int tick = 0; tick < 6; tick++) {
+			ServerPathPlanner.TickBudget budget = new ServerPathPlanner.TickBudget(
+					1,
+					LocalPathfinder.MAX_PLANNING_TIME_NANOS,
+					() -> 0L
+			);
+			ServerPathPlanner.PlanningResult admitted = planner.planPath(
+					view,
+					new GridPosition(0, 64, tick),
+					new GridPosition(1, 64, tick),
+					budget
+			);
+			ServerPathPlanner.PlanningResult deferred = planner.planPath(
+					view,
+					new GridPosition(0, 64, tick + 100),
+					new GridPosition(1, 64, tick + 100),
+					budget
+			);
+			assertEquals(PathOutcome.FOUND, admitted.plan().outcome(), "contention admits the first agent");
+			assertTrue(deferred.deferred(), "contention defers the second agent without terminal failure");
+		}
+		return 12;
 	}
 
 	private static int verifyTickScopeRestoresPreviousBudget() {

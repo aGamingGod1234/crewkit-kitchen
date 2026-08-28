@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 
 import dev.agaminggod.arenaagents.client.navigation.GridPosition;
 import dev.agaminggod.arenaagents.client.navigation.PathNode;
+import dev.agaminggod.arenaagents.client.navigation.PathOutcome;
 import dev.agaminggod.arenaagents.client.navigation.TraversalType;
 import net.minecraft.world.phys.Vec3;
 
@@ -38,10 +39,42 @@ public final class NavigationProgressVerification {
 		assertEquals(WaypointProgress.Decision.REPLAN, detour.observe(10.5D, false, 9_200L).decision(),
 				"a reached detour replans only after its new stall deadline");
 
+		WaypointProgress nextWaypoint = new WaypointProgress(2.0D, 1_000L, 4_000L, 3);
+		nextWaypoint.observe(1.0D, true, 1_100L);
+		nextWaypoint.waypointAdvanced(20.0D, 1_100L);
+		assertEquals(WaypointProgress.Decision.CONTINUE, nextWaypoint.observe(20.0D, false, 5_099L).decision(),
+				"a new waypoint gets its own progress baseline after a detour");
+		assertEquals(WaypointProgress.Decision.REPLAN, nextWaypoint.observe(20.0D, false, 5_100L).decision(),
+				"the new waypoint stall deadline is measured from its activation");
+
 		assertTrue(ServerNavigationController.satisfiesDestinationTolerance(1.0D, 1.0D),
 				"the requested tolerance includes its exact boundary");
 		assertTrue(!ServerNavigationController.satisfiesDestinationTolerance(1.01D, 1.0D),
 				"path exhaustion outside the requested tolerance must replan");
+		ServerNavigationController intermediateNavigation = new ServerNavigationController(
+				new Vec3(2.5D, 65.0D, 2.5D), 0.2D, false, 0L, 1_000L);
+		PathNode jumpWaypoint = new PathNode(new GridPosition(2, 65, 2), TraversalType.JUMP_UP);
+		assertTrue(!intermediateNavigation.reachedTarget(new Vec3(2.5D, 64.0D, 2.5D), jumpWaypoint, false),
+				"an intermediate jump cannot complete while the player is one block below");
+		assertTrue(intermediateNavigation.reachedTarget(new Vec3(2.5D, 64.8D, 2.5D), jumpWaypoint, false),
+				"an intermediate jump completes only after the player reaches the landing height");
+		PathNode dropWaypoint = new PathNode(new GridPosition(2, 63, 2), TraversalType.DROP_DOWN);
+		assertTrue(!intermediateNavigation.reachedTarget(new Vec3(2.5D, 64.0D, 2.5D), dropWaypoint, false),
+				"an intermediate drop cannot complete before the lower landing");
+		assertTrue(intermediateNavigation.reachedTarget(new Vec3(2.5D, 63.0D, 2.5D), dropWaypoint, false),
+				"an intermediate drop completes at its landing height");
+		assertTrue(ServerNavigationController.shouldRetryPlanning(
+				PathOutcome.NODE_LIMIT,
+				true, 1_000L, 0L, 10_000L),
+				"scheduler-contended planning remains retryable beyond three ticks");
+		assertTrue(!ServerNavigationController.shouldRetryPlanning(
+				PathOutcome.NODE_LIMIT,
+				true, 10_000L, 0L, 10_000L),
+				"bounded planning retry stops at the navigation deadline");
+		assertTrue(!ServerNavigationController.shouldRetryPlanning(
+				PathOutcome.NO_PATH,
+				false, 1_000L, 0L, 10_000L),
+				"a genuine no-path result remains terminal");
 
 		Vec3 exactDestination = new Vec3(5.1D, 64.0D, 7.9D);
 		ServerNavigationController exactNavigation = new ServerNavigationController(
@@ -86,7 +119,7 @@ public final class NavigationProgressVerification {
 		longWaterPath.add(new PathNode(new GridPosition(5, 64, 0), TraversalType.WALK));
 		assertTrue(!ServerNavigationController.hasBoundedShallowWaterRun(longWaterPath, position -> position.x() > 0),
 				"a five-block swim is rejected instead of silently enabling open-water navigation");
-		return 25;
+		return 34;
 	}
 
 	private static void assertBounded(double value) {
