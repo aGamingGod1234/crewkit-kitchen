@@ -84,6 +84,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private boolean rollbackRequested;
 	private long nextGenerationMutationEpochMs;
 	private long nextTerminationRetryEpochMs;
+	private boolean voiceEndpointExplicitOverride;
+	private String managedVoiceEndpoint;
+	private long voiceConfigurationRevision;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -190,6 +193,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		this.orphanReaper = Objects.requireNonNull(orphanReaper, "orphan reaper must not be null");
 		this.generationController = Objects.requireNonNull(generationController,
 				"generation controller must not be null");
+		this.voiceEndpointExplicitOverride = configuredProperty("arenaagents.voiceUrl") != null;
 		DependencyMonitorScheduler monitorScheduler = Objects.requireNonNull(
 				dependencyMonitorScheduler, "dependency monitor scheduler must not be null"
 		);
@@ -461,6 +465,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	synchronized long bridgeRevision() {
 		return bridgeRevision;
+	}
+
+	synchronized long voiceConfigurationRevision() {
+		return voiceConfigurationRevision;
 	}
 
 	synchronized String runtimeGenerationId() {
@@ -1141,6 +1149,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			if (active != null) cleanup.add(active);
 			if (pendingTermination != null && !cleanup.contains(pendingTermination)) cleanup.add(pendingTermination);
 			pendingTermination = null;
+			releaseManagedVoiceEndpoint();
 			MaintenanceResult result;
 			while ((result = maintenanceResults.poll()) != null) {
 				if (result instanceof LaunchMaintenanceResult launch && launch.child() != null
@@ -1183,14 +1192,37 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	private void configureSharedVoiceEndpoint(Path configPath) {
-		String configured = System.getProperty("arenaagents.voiceUrl");
-		if ((configured != null && !configured.isBlank()) || !Files.isRegularFile(configPath)) return;
+		if (voiceEndpointExplicitOverride || !Files.isRegularFile(configPath)) return;
+		String configured = configuredProperty("arenaagents.voiceUrl");
+		if (!Objects.equals(configured, managedVoiceEndpoint)) {
+			voiceEndpointExplicitOverride = true;
+			managedVoiceEndpoint = null;
+			return;
+		}
 		try {
-			CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
-					.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
+			String endpoint = CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
+					.orElse(null);
+			if (Objects.equals(endpoint, managedVoiceEndpoint)) return;
+			if (endpoint == null) System.clearProperty("arenaagents.voiceUrl");
+			else System.setProperty("arenaagents.voiceUrl", endpoint);
+			managedVoiceEndpoint = endpoint;
+			voiceConfigurationRevision++;
 		} catch (IOException | RuntimeException invalidVoiceConfiguration) {
 			LOGGER.warn("Ignoring unavailable optional voice endpoint", invalidVoiceConfiguration);
 		}
+	}
+
+	private void releaseManagedVoiceEndpoint() {
+		if (managedVoiceEndpoint == null) return;
+		if (Objects.equals(configuredProperty("arenaagents.voiceUrl"), managedVoiceEndpoint)) {
+			System.clearProperty("arenaagents.voiceUrl");
+		}
+		managedVoiceEndpoint = null;
+	}
+
+	private static String configuredProperty(String name) {
+		String value = System.getProperty(name);
+		return value == null || value.isBlank() ? null : value;
 	}
 
 	private static Path findPackageRoot(Path gameDirectory) {
