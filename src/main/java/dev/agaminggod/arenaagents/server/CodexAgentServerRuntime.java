@@ -9,6 +9,7 @@ import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
@@ -168,7 +169,11 @@ public final class CodexAgentServerRuntime {
 			}
 			VoiceStartGate voiceStart = VOICE_STARTS.computeIfAbsent(server, ignored -> new VoiceStartGate());
 			try {
-				voiceStart.startIfPrepared(supervisor, () -> VoiceSubsystemRuntime.start(server));
+				voiceStart.startIfPrepared(supervisor, configuration -> {
+					return VoiceSubsystemRuntime.start(server, new VoiceSubsystemConfiguration(
+							configuration.endpoint(), configuration.secret()
+					));
+				});
 			} catch (RuntimeException exception) {
 				LOGGER.warn("Arena Agents voice startup is degraded; coordinator and Minecraft bridge recovery continue", exception);
 			}
@@ -370,15 +375,42 @@ public final class CodexAgentServerRuntime {
 	}
 
 	static final class VoiceStartGate {
+		private final LongSupplier clock;
+		private final CoordinatorLaunchPolicy.RestartBudget retryBudget =
+				new CoordinatorLaunchPolicy.RestartBudget();
 		private boolean started;
 		private boolean closed;
+		private long nextRetryEpochMs;
 
-		synchronized void startIfPrepared(CoordinatorProcessSupervisor supervisor, Runnable starter) {
+		VoiceStartGate() {
+			this(System::currentTimeMillis);
+		}
+
+		VoiceStartGate(LongSupplier clock) {
+			this.clock = java.util.Objects.requireNonNull(clock, "voice retry clock must not be null");
+		}
+
+		synchronized void startIfPrepared(
+				CoordinatorProcessSupervisor supervisor,
+				Function<CoordinatorProcessSupervisor.VoiceConfiguration, Boolean> starter
+		) {
 			java.util.Objects.requireNonNull(supervisor, "coordinator supervisor must not be null");
 			java.util.Objects.requireNonNull(starter, "voice starter must not be null");
-			if (closed || started || !supervisor.voiceConfigurationPublished()) return;
-			started = true;
-			starter.run();
+			CoordinatorProcessSupervisor.VoiceConfiguration configuration = supervisor.voiceConfiguration();
+			long now = clock.getAsLong();
+			if (closed || started || configuration == null || now < nextRetryEpochMs) return;
+			try {
+				if (Boolean.TRUE.equals(starter.apply(configuration))) {
+					started = true;
+					nextRetryEpochMs = 0L;
+					return;
+				}
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Arena Agents voice startup is degraded; coordinator and Minecraft bridge recovery continue",
+						exception);
+			}
+			retryBudget.recordUnexpectedExit();
+			nextRetryEpochMs = now + retryBudget.nextDelayMs();
 		}
 
 		synchronized void close(Runnable closer) {

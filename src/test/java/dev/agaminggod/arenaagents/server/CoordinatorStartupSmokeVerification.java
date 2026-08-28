@@ -95,8 +95,11 @@ public final class CoordinatorStartupSmokeVerification {
 					Thread.sleep(10L);
 				}
 				assertTrue(supervisor.configured(), "staged package is configured");
-				assertEquals("http://127.0.0.1:" + voicePort + "/v1/tts", System.getProperty("arenaagents.voiceUrl"),
-						"coordinator voice endpoint is shared with the addon before voice startup");
+				assertEquals("http://127.0.0.1:" + voicePort + "/v1/tts",
+						supervisor.voiceConfiguration().endpoint(),
+						"coordinator publishes the prepared voice endpoint directly before voice startup");
+				assertEquals("s".repeat(32), supervisor.voiceConfiguration().secret(),
+						"coordinator publishes the validated in-memory voice secret directly");
 				assertEquals(node.toAbsolutePath().normalize(), NodeRuntimeLocator.locate(packageRoot).executable(),
 						"bundled runtime is selected before the empty PATH");
 

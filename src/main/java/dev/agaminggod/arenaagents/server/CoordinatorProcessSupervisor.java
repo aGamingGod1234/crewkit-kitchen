@@ -18,7 +18,10 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -39,9 +42,12 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private final Supplier<String> launchIds;
 	private final MaintenanceWorker maintenanceWorker;
 	private final OrphanReaper orphanReaper;
+	private final DependencyChangeMonitor dependencyChangeMonitor;
 	private final long createdAtEpochMs;
 	private final CoordinatorLaunchPolicy.RestartBudget restartBudget = new CoordinatorLaunchPolicy.RestartBudget();
 	private final ConcurrentLinkedQueue<MaintenanceResult> maintenanceResults = new ConcurrentLinkedQueue<>();
+	private final AtomicLong dependencyWakeGeneration = new AtomicLong();
+	private final AtomicBoolean dependencyWakeQueued = new AtomicBoolean();
 
 	private PreparedRuntime runtime;
 	private ChildProcess child;
@@ -87,7 +93,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				null,
 				() -> UUID.randomUUID().toString(),
 				new OwnedMaintenanceWorker(),
-				CoordinatorProcessOwnership::reapOrphaned
+				CoordinatorProcessOwnership::reapOrphaned,
+				new OwnedDependencyMonitorScheduler()
 		);
 	}
 
@@ -107,7 +114,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				processLauncher,
 				launchIds,
 				Runnable::run,
-				CoordinatorProcessOwnership::reapOrphaned
+				CoordinatorProcessOwnership::reapOrphaned,
+				task -> { }
 		);
 	}
 
@@ -120,6 +128,23 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			Supplier<String> launchIds,
 			MaintenanceWorker maintenanceWorker,
 			OrphanReaper orphanReaper
+	) {
+		this(
+				gameDirectory, launchEnvironmentOverrides, clock, dependencyResolver, processLauncher, launchIds,
+				maintenanceWorker, orphanReaper, task -> { }
+		);
+	}
+
+	CoordinatorProcessSupervisor(
+			Path gameDirectory,
+			Map<String, String> launchEnvironmentOverrides,
+			LongSupplier clock,
+			DependencyResolver dependencyResolver,
+			ProcessLauncher processLauncher,
+			Supplier<String> launchIds,
+			MaintenanceWorker maintenanceWorker,
+			OrphanReaper orphanReaper,
+			DependencyMonitorScheduler dependencyMonitorScheduler
 	) {
 		this.gameDirectory = Objects.requireNonNull(gameDirectory, "game directory must not be null")
 				.toAbsolutePath().normalize();
@@ -135,15 +160,23 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		this.launchIds = Objects.requireNonNull(launchIds, "launch IDs must not be null");
 		this.maintenanceWorker = Objects.requireNonNull(maintenanceWorker, "maintenance worker must not be null");
 		this.orphanReaper = Objects.requireNonNull(orphanReaper, "orphan reaper must not be null");
+		DependencyMonitorScheduler monitorScheduler = Objects.requireNonNull(
+				dependencyMonitorScheduler, "dependency monitor scheduler must not be null"
+		);
 		this.createdAtEpochMs = now();
 		if (!autoStartEnabled()) {
 			stopped = true;
 			state = CoordinatorRecoveryState.STOPPED;
 			this.maintenanceWorker.close();
+			monitorScheduler.close();
+			this.dependencyChangeMonitor = null;
 			return;
 		}
 		state = CoordinatorRecoveryState.STARTING;
 		nextRetryEpochMs = createdAtEpochMs + CoordinatorLaunchPolicy.STARTUP_GRACE_MS;
+		this.dependencyChangeMonitor = new DependencyChangeMonitor(
+				this::safeFingerprint, this::publishDependencyFingerprintChange, monitorScheduler
+		);
 		submitDependencyMaintenance(createdAtEpochMs, true, true);
 		drainMaintenanceResults(createdAtEpochMs);
 	}
@@ -177,6 +210,15 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	@FunctionalInterface
+	interface DependencyMonitorScheduler extends AutoCloseable {
+		void start(Runnable task);
+
+		@Override
+		default void close() {
+		}
+	}
+
+	@FunctionalInterface
 	interface OrphanReaper {
 		int reap(Path runtimeRoot) throws IOException;
 	}
@@ -190,11 +232,12 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			DependencyResolution resolution,
 			boolean fingerprintChanged,
 			boolean initial,
-			boolean orphanCleanupSucceeded
+			boolean orphanCleanupSucceeded,
+			long submittedWakeGeneration
 	) implements MaintenanceResult {
 	}
 
-	private record DependencyFingerprintChanged() implements MaintenanceResult {
+	private record DependencyFingerprintChanged(long generation) implements MaintenanceResult {
 	}
 
 	private record LaunchMaintenanceResult(
@@ -258,14 +301,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 	}
 
-	record VoiceConfiguration(String endpoint, Path secretPath) {
+	record VoiceConfiguration(String endpoint, String secret) {
 		VoiceConfiguration {
 			endpoint = Objects.requireNonNull(endpoint, "voice endpoint must not be null").strip();
 			if (endpoint.isEmpty() || endpoint.length() > 2_048) {
 				throw new IllegalArgumentException("voice endpoint must be nonblank and bounded");
 			}
-			secretPath = Objects.requireNonNull(secretPath, "voice secret path must not be null")
-					.toAbsolutePath().normalize();
+			secret = Objects.requireNonNull(secret, "voice secret must not be null").strip();
+			if (secret.length() < 16 || secret.length() > 256) {
+				throw new IllegalArgumentException("voice secret is invalid");
+			}
 		}
 	}
 
@@ -348,12 +393,20 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		return voiceConfiguration != null;
 	}
 
+	synchronized VoiceConfiguration voiceConfiguration() {
+		return voiceConfiguration;
+	}
+
 	synchronized long voiceConfigurationRevision() {
 		return voiceConfigurationRevision;
 	}
 
 	void publishDependencyFingerprintChange() {
-		if (!stopped) maintenanceResults.add(new DependencyFingerprintChanged());
+		if (stopped) return;
+		long generation = dependencyWakeGeneration.incrementAndGet();
+		if (dependencyWakeQueued.compareAndSet(false, true)) {
+			maintenanceResults.add(new DependencyFingerprintChanged(generation));
+		}
 	}
 
 	synchronized void tick(boolean bridgeAuthenticated) {
@@ -544,8 +597,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private void publishVoiceConfiguration(VoiceConfiguration preparedVoice) {
 		if (preparedVoice == null || preparedVoice.equals(voiceConfiguration)) return;
-		System.setProperty("arenaagents.voiceUrl", preparedVoice.endpoint());
-		System.setProperty("arenaagents.voiceSecretFile", preparedVoice.secretPath().toString());
 		voiceConfiguration = preparedVoice;
 		voiceConfigurationRevision++;
 	}
@@ -555,14 +606,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		maintenancePending = true;
 		String previousFingerprint = dependencyFingerprint;
 		long scheduledCheck = nextDependencyCheckEpochMs;
+		long submittedWakeGeneration = dependencyWakeGeneration.get();
 		boolean reapRequired = !orphanCleanupComplete;
 		submitMaintenance(() -> {
 			String currentFingerprint = safeFingerprint();
+			dependencyChangeMonitor.observeSubmittedFingerprint(currentFingerprint);
 			boolean changed = !Objects.equals(previousFingerprint, currentFingerprint);
 			long checkedAt = now();
 			if (!force && !reapRequired && !changed && checkedAt < scheduledCheck) {
 				publishMaintenanceResult(new DependencyMaintenanceResult(
-						currentFingerprint, null, false, initial, false
+						currentFingerprint, null, false, initial, false, submittedWakeGeneration
 				));
 				return;
 			}
@@ -583,13 +636,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 							),
 							changed,
 							initial,
-							false
+							false,
+							submittedWakeGeneration
 					));
 					return;
 				}
 			}
 			publishMaintenanceResult(new DependencyMaintenanceResult(
-					currentFingerprint, resolveDependencies(), changed, initial, reaped
+					currentFingerprint, resolveDependencies(), changed, initial, reaped, submittedWakeGeneration
 			));
 		});
 	}
@@ -663,6 +717,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		MaintenanceResult result;
 		while ((result = maintenanceResults.poll()) != null) {
 			if (result instanceof DependencyFingerprintChanged) {
+				dependencyWakeQueued.set(false);
 				nextDependencyCheckEpochMs = 0L;
 				continue;
 			}
@@ -674,6 +729,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 					applyDependencyResolution(
 							dependency.resolution(), now, dependency.initial(), dependency.fingerprintChanged()
 					);
+				}
+				if (dependencyWakeGeneration.get() > dependency.submittedWakeGeneration()) {
+					nextDependencyCheckEpochMs = 0L;
 				}
 			} else if (result instanceof LaunchMaintenanceResult launch) {
 				if (launch.child() == null) {
@@ -820,6 +878,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			}
 		}
 		maintenanceWorker.close();
+		if (dependencyChangeMonitor != null) dependencyChangeMonitor.close();
 	}
 
 	private long now() {
@@ -868,12 +927,11 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	static void configureSharedBridgeSecretPath(Path secretPath) {
 		Path canonical = secretPath.toAbsolutePath().normalize();
 		System.setProperty("arenaagents.bridgeSecretFile", canonical.toString());
-		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
 	}
 
 	static VoiceConfiguration prepareOptionalVoiceConfiguration(
 			Path configPath,
-			Path secretPath,
+			String secret,
 			Map<String, String> launchEnvironmentOverrides,
 			String endpointOverride
 	) {
@@ -881,7 +939,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			String endpoint = endpointOverride != null && !endpointOverride.isBlank()
 					? endpointOverride
 					: CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides).orElse(null);
-			return endpoint == null ? null : new VoiceConfiguration(endpoint, secretPath);
+			return endpoint == null ? null : new VoiceConfiguration(endpoint, secret);
 		} catch (IOException | RuntimeException invalidVoiceConfiguration) {
 			LOGGER.warn("Ignoring invalid optional voice endpoint; coordinator recovery will continue without voice",
 					invalidVoiceConfiguration);
@@ -939,6 +997,92 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		@Override
 		public void close() {
 			executor.shutdown();
+		}
+	}
+
+	private static final class DependencyChangeMonitor implements AutoCloseable {
+		private final Supplier<String> fingerprint;
+		private final Runnable changed;
+		private final DependencyMonitorScheduler scheduler;
+		private final AtomicBoolean closed = new AtomicBoolean();
+		private final Object stateLock = new Object();
+		private String previous;
+		private boolean initialized;
+
+		private DependencyChangeMonitor(
+				Supplier<String> fingerprint,
+				Runnable changed,
+				DependencyMonitorScheduler scheduler
+		) {
+			this.fingerprint = Objects.requireNonNull(fingerprint, "dependency fingerprint must not be null");
+			this.changed = Objects.requireNonNull(changed, "dependency wake callback must not be null");
+			this.scheduler = Objects.requireNonNull(scheduler, "dependency monitor scheduler must not be null");
+			this.scheduler.start(this::poll);
+		}
+
+		private void poll() {
+			if (closed.get()) return;
+			String current = fingerprint.get();
+			if (closed.get()) return;
+			boolean wake = false;
+			synchronized (stateLock) {
+				if (closed.get()) return;
+				if (!initialized) {
+					previous = current;
+					initialized = true;
+					return;
+				}
+				if (!Objects.equals(previous, current)) {
+					previous = current;
+					wake = true;
+				}
+			}
+			if (wake) changed.run();
+		}
+
+		private void observeSubmittedFingerprint(String submitted) {
+			boolean wake = false;
+			synchronized (stateLock) {
+				if (closed.get()) return;
+				if (!initialized) {
+					previous = submitted;
+					initialized = true;
+					return;
+				}
+				wake = !Objects.equals(previous, submitted);
+			}
+			if (wake) changed.run();
+		}
+
+		@Override
+		public void close() {
+			if (!closed.compareAndSet(false, true)) return;
+			scheduler.close();
+		}
+	}
+
+	private static final class OwnedDependencyMonitorScheduler implements DependencyMonitorScheduler {
+		private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+			Thread thread = new Thread(runnable, "arenaagents-coordinator-dependency-monitor");
+			thread.setDaemon(true);
+			return thread;
+		});
+		private final AtomicBoolean started = new AtomicBoolean();
+
+		@Override
+		public void start(Runnable task) {
+			if (!started.compareAndSet(false, true)) return;
+			executor.scheduleWithFixedDelay(
+					Objects.requireNonNull(task, "dependency monitor task must not be null"),
+					0L,
+					250L,
+					TimeUnit.MILLISECONDS
+			);
+		}
+
+		@Override
+		public void close() {
+			executor.shutdownNow();
 		}
 	}
 
@@ -1082,7 +1226,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				String secret = Files.readString(prepared.secret(), StandardCharsets.UTF_8).trim();
 				validateConfig(prepared.config());
 				preparedVoice = prepareOptionalVoiceConfiguration(
-						prepared.config(), prepared.secret(), environmentOverrides, voiceEndpointOverride
+						prepared.config(), secret, environmentOverrides, voiceEndpointOverride
 				);
 				PreparedRuntime partial = prepared(prepared, null, secret);
 				try {

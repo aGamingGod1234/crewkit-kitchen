@@ -6,6 +6,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.voice.VoiceRequest;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -33,6 +34,7 @@ final class VoiceWorkerClientsVerification {
 	static int verify() throws Exception {
 		int assertions = 0;
 		assertions += verifyTtsClientSendsContractAndDecodesPcm();
+		assertions += verifyPreparedSecretDoesNotReadGlobalSecretPath();
 		assertions += verifyTtsClientRejectsMalformedAudioAndHttpFailure();
 		assertions += verifyTtsCancellationStopsTheHttpExchange();
 		assertions += verifySttClientSendsPcmMetadataAndBoundsTranscript();
@@ -40,6 +42,30 @@ final class VoiceWorkerClientsVerification {
 		assertions += verifySttUnavailablePreservesWorkerCode();
 		assertions += verifyClientsRejectWrongResponseMediaTypes();
 		return assertions;
+	}
+
+	private static int verifyPreparedSecretDoesNotReadGlobalSecretPath() throws Exception {
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
+		String oldBridgeSecret = System.getProperty("arenaagents.bridgeSecretFile");
+		try (WorkerServer server = new WorkerServer(exchange -> {
+			assertEquals("Bearer " + SECRET, exchange.getRequestHeaders().getFirst("Authorization"),
+					"prepared in-memory TTS authorization");
+			respondPcm(exchange, pcm(1, 2));
+		})) {
+			System.setProperty("arenaagents.voiceSecretFile", "missing/unreadable/voice-secret.txt");
+			System.setProperty("arenaagents.bridgeSecretFile", "missing/unreadable/bridge-secret.txt");
+			VoiceWorkerClient client = new VoiceWorkerClient(new VoiceSubsystemConfiguration(
+					server.uri("/v1/tts").toString(), SECRET
+			));
+			short[] samples = client.synthesize(request()).join();
+			server.assertHealthy();
+			assertEquals(true, Arrays.equals(new short[] {1, 2}, samples),
+					"voice client starts from worker-prevalidated memory after secret paths become unreadable");
+			return 2;
+		} finally {
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+		}
 	}
 
 	private static int verifyTtsClientSendsContractAndDecodesPcm() throws Exception {
@@ -235,6 +261,11 @@ final class VoiceWorkerClientsVerification {
 		if (!Objects.equals(expected, actual)) {
 			throw new AssertionError(message + ": expected=" + expected + ", actual=" + actual);
 		}
+	}
+
+	private static void restoreProperty(String name, String value) {
+		if (value == null) System.clearProperty(name);
+		else System.setProperty(name, value);
 	}
 
 	@FunctionalInterface

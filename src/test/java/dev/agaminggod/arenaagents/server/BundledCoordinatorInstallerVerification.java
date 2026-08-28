@@ -58,8 +58,9 @@ public final class BundledCoordinatorInstallerVerification {
 			CoordinatorProcessSupervisor.configureSharedBridgeSecretPath(preparedSecret);
 			assertEquals(preparedSecret.toString(), System.getProperty("arenaagents.bridgeSecretFile"),
 					"prepared runtime overrides a stale development bridge secret path");
-			assertEquals(preparedSecret.toString(), System.getProperty("arenaagents.voiceSecretFile"),
-					"prepared runtime overrides a stale development voice secret path");
+			assertEquals("development-runtime/runtime/bridge-secret.txt",
+					System.getProperty("arenaagents.voiceSecretFile"),
+					"prepared runtime never publishes its validated voice secret through a global path property");
 			return 2;
 		} finally {
 			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);

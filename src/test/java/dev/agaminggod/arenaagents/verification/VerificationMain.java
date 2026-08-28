@@ -190,6 +190,7 @@ public final class VerificationMain {
 		passedAssertions += CoordinatorProcessOwnershipVerification.verify();
 		passedAssertions += CoordinatorStartupSmokeVerification.verify();
 		passedAssertions += CoordinatorVoiceEndpointVerification.verify();
+		passedAssertions += dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntimeVerification.verify();
 		passedAssertions += AgentActivityPresentationVerification.verify();
 		passedAssertions += AgentDeathCaptureVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();

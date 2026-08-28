@@ -20,10 +20,16 @@ final class SimpleVoiceChatSubsystem implements VoiceSubsystem {
 	private static final Logger LOGGER = LoggerFactory.getLogger(SimpleVoiceChatSubsystem.class);
 	private final MinecraftServer server;
 	private final VoicePlaybackCoordinator playback;
+	private final Runnable onClose;
 
 	SimpleVoiceChatSubsystem(MinecraftServer server, VoiceWorkerClient worker) {
+		this(server, worker, () -> { });
+	}
+
+	SimpleVoiceChatSubsystem(MinecraftServer server, VoiceWorkerClient worker, Runnable onClose) {
 		this.server = Objects.requireNonNull(server, "server must not be null");
 		Objects.requireNonNull(worker, "worker must not be null");
+		this.onClose = Objects.requireNonNull(onClose, "close callback must not be null");
 		this.playback = new VoicePlaybackCoordinator(
 				worker::synthesize,
 				server::execute,
@@ -72,7 +78,11 @@ final class SimpleVoiceChatSubsystem implements VoiceSubsystem {
 
 	@Override
 	public void close() {
-		playback.close();
+		try {
+			playback.close();
+		} finally {
+			onClose.run();
+		}
 	}
 
 	private final class SimpleVoiceTransport implements VoicePlaybackCoordinator.Transport {

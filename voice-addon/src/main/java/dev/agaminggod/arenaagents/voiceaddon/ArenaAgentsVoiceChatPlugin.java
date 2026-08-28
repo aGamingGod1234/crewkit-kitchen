@@ -6,11 +6,16 @@ import de.maxhenkel.voicechat.api.events.EventRegistration;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStoppedEvent;
 import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import net.minecraft.server.MinecraftServer;
 
 public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 	private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(ArenaAgentsVoiceChatPlugin.class);
 	private static volatile VoicechatServerApi serverApi;
 	private static volatile HumanSpeechCapture speechCapture;
+	private static final Map<MinecraftServer, VoiceSubsystemConfiguration> CONFIGURATIONS = new ConcurrentHashMap<>();
 
 	@Override
 	public String getPluginId() {
@@ -41,7 +46,9 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 				capture = speechCapture;
 				if (capture == null) {
 					try {
-						capture = new HumanSpeechCapture(new SpeechWorkerClient());
+						VoiceSubsystemConfiguration configuration = CONFIGURATIONS.get(player.level().getServer());
+						if (configuration == null) return;
+						capture = new HumanSpeechCapture(new SpeechWorkerClient(configuration));
 						speechCapture = capture;
 					} catch (RuntimeException exception) {
 						LOGGER.error("Arena Agents proximity speech capture could not start", exception);
@@ -55,5 +62,13 @@ public final class ArenaAgentsVoiceChatPlugin implements VoicechatPlugin {
 
 	static VoicechatServerApi serverApi() {
 		return serverApi;
+	}
+
+	static void configure(MinecraftServer server, VoiceSubsystemConfiguration configuration) {
+		CONFIGURATIONS.put(server, configuration);
+	}
+
+	static void clearConfiguration(MinecraftServer server) {
+		CONFIGURATIONS.remove(server);
 	}
 }

@@ -20,22 +20,37 @@ public final class VoiceSubsystemRuntime {
 	private VoiceSubsystemRuntime() {
 	}
 
-	public static synchronized void start(MinecraftServer server) {
-		Objects.requireNonNull(server, "server must not be null");
-		if (INSTANCES.containsKey(server)) return;
-		VoiceSubsystem selected = NoVoiceSubsystem.INSTANCE;
-		for (VoiceSubsystemProvider provider : FabricLoader.getInstance().getEntrypoints(
+	public static synchronized boolean start(MinecraftServer server, VoiceSubsystemConfiguration configuration) {
+		return start(server, configuration, FabricLoader.getInstance().getEntrypoints(
 				ENTRYPOINT, VoiceSubsystemProvider.class
-		)) {
+		));
+	}
+
+	static synchronized boolean start(
+			MinecraftServer server,
+			VoiceSubsystemConfiguration configuration,
+			Iterable<VoiceSubsystemProvider> providers
+	) {
+		Objects.requireNonNull(server, "server must not be null");
+		Objects.requireNonNull(configuration, "voice configuration must not be null");
+		Objects.requireNonNull(providers, "voice providers must not be null");
+		if (INSTANCES.containsKey(server)) return true;
+		boolean foundProvider = false;
+		for (VoiceSubsystemProvider provider : providers) {
+			foundProvider = true;
 			try {
-				VoiceSubsystem candidate = Objects.requireNonNull(provider.create(server), "voice provider returned null");
-				selected = candidate;
-				break;
+				VoiceSubsystem candidate = Objects.requireNonNull(
+						provider.create(server, configuration), "voice provider returned null"
+				);
+				INSTANCES.put(server, new Holder(candidate, new VoiceRegistrationTracker(), new LinkedHashMap<>()));
+				return true;
 			} catch (RuntimeException exception) {
 				LOGGER.warn("Voice addon failed to initialize; proximity speech will use text fallback", exception);
 			}
 		}
-		INSTANCES.put(server, new Holder(selected, new VoiceRegistrationTracker(), new LinkedHashMap<>()));
+		if (foundProvider) return false;
+		INSTANCES.put(server, new Holder(NoVoiceSubsystem.INSTANCE, new VoiceRegistrationTracker(), new LinkedHashMap<>()));
+		return true;
 	}
 
 	public static synchronized void tick(MinecraftServer server) {

@@ -5,5 +5,5 @@ import net.minecraft.server.MinecraftServer;
 /** Fabric entrypoint implemented by optional voice transport addons. */
 @FunctionalInterface
 public interface VoiceSubsystemProvider {
-	VoiceSubsystem create(MinecraftServer server);
+	VoiceSubsystem create(MinecraftServer server, VoiceSubsystemConfiguration configuration);
 }

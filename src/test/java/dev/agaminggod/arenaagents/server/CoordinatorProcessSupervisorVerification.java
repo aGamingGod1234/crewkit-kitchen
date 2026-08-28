@@ -56,14 +56,18 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyHealthyDependencyRevalidation();
 		verifyBlockingMaintenanceNeverBlocksTicks();
 		verifyBlockedMaintenanceWaitsForRetryDeadline();
+		verifyProductionDependencyMonitorWakesOnRelevantFileChange();
+		verifyDependencyWakeSurvivesInflightFailure();
+		verifyDependencyMonitorCloseDoesNotWaitForPoll();
 		verifyOrphanReapRetriesBeforeLaunch();
 		verifyBridgeWaitsForWorkerPreparedSecret();
 		verifyVoiceWaitsForPublishedPreparation();
-		verifyPublishedVoicePropertyDoesNotFreezePreparation();
+		verifyVoiceStartRetriesAndPromotes();
+		verifySupervisorsDoNotSharePublishedVoiceConfiguration();
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyCloseIsIdempotent();
-		return 114;
+		return 144;
 	}
 
 	private static void verifyRecoveryContract() {
@@ -362,6 +366,107 @@ public final class CoordinatorProcessSupervisorVerification {
 		supervisor.close();
 	}
 
+	private static void verifyProductionDependencyMonitorWakesOnRelevantFileChange() {
+		String oldPackageRoot = System.getProperty("arenaagents.packageRoot");
+		Path fixtureRoot = null;
+		CoordinatorProcessSupervisor supervisor = null;
+		try {
+			fixtureRoot = Files.createTempDirectory("arena-dependency-monitor-");
+			Path packageRoot = fixtureRoot.resolve("package");
+			Path config = packageRoot.resolve("coordinator/config/dynamic-agents.json");
+			Files.createDirectories(config.getParent());
+			Files.writeString(config, "{}", StandardCharsets.UTF_8);
+			System.setProperty("arenaagents.packageRoot", packageRoot.toString());
+			FakeClock clock = new FakeClock();
+			QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+			ManualDependencyMonitorScheduler monitor = new ManualDependencyMonitorScheduler();
+			supervisor = new CoordinatorProcessSupervisor(
+					fixtureRoot.resolve("game"), Map.of(), clock, null, new FakeLauncher(),
+					() -> "00000000-0000-0000-0000-000000000454", worker, runtimeRoot -> 0, monitor
+			);
+			monitor.poll();
+			worker.runNext();
+			supervisor.tick(false, null, 0L);
+			assertEquals(1, worker.submissions, "initial production dependency resolution completes once");
+			for (int index = 0; index < 50; index++) {
+				monitor.poll();
+				supervisor.tick(false, null, 0L);
+			}
+			assertEquals(1, worker.submissions, "unchanged production monitor polls never duplicate resolution");
+
+			Files.writeString(config, "{\"voice\":{\"port\":18766}}", StandardCharsets.UTF_8);
+			monitor.poll();
+			supervisor.tick(false, null, 0L);
+			assertEquals(2, worker.submissions,
+					"a real coordinator config stamp change wakes blocked production resolution before five seconds");
+			long closeStarted = System.nanoTime();
+			supervisor.close();
+			supervisor = null;
+			assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closeStarted) < 250L,
+					"dependency monitor close never joins or blocks the server thread");
+			assertTrue(monitor.closed, "supervisor close idempotently stops its production dependency monitor");
+			monitor.poll();
+			assertEquals(2, worker.submissions, "a closed dependency monitor cannot publish later work");
+		} catch (IOException exception) {
+			throw new AssertionError("production dependency monitor verification failed", exception);
+		} finally {
+			if (supervisor != null) supervisor.close();
+			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+			if (fixtureRoot != null) deleteTree(fixtureRoot);
+		}
+	}
+
+	private static void verifyDependencyWakeSurvivesInflightFailure() {
+		FakeClock clock = new FakeClock();
+		BlockingFailureDependencies dependencies = new BlockingFailureDependencies();
+		QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+		ManualDependencyMonitorScheduler monitor = new ManualDependencyMonitorScheduler();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "inflight-dependency-wake-game"), Map.of(), clock, dependencies, new FakeLauncher(),
+				() -> "00000000-0000-0000-0000-000000000455", worker, runtimeRoot -> 0, monitor
+		);
+		Thread resolver = worker.startNext("blocking-failed-dependency-resolution");
+		await(dependencies.started, "in-flight failing dependency resolution started");
+		dependencies.fingerprint = "blocked-inflight-changed";
+		monitor.poll();
+		dependencies.release.countDown();
+		join(resolver, "in-flight failing dependency resolution completes");
+		supervisor.tick(false, null, 0L);
+		assertEquals(2, worker.submissions,
+				"a dependency wake during in-flight failure remains immediately eligible after stale failure publication");
+		assertEquals(1, dependencies.resolveCalls.get(), "the stale blocked result is applied only once before its replacement queues");
+		supervisor.close();
+	}
+
+	private static void verifyDependencyMonitorCloseDoesNotWaitForPoll() {
+		BlockingFingerprintDependencies dependencies = new BlockingFingerprintDependencies();
+		ManualDependencyMonitorScheduler monitor = new ManualDependencyMonitorScheduler();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "blocking-dependency-monitor-close"), Map.of(), new FakeClock(), dependencies,
+				new FakeLauncher(), () -> "00000000-0000-0000-0000-000000000456",
+				new QueuedMaintenanceWorker(), runtimeRoot -> 0, monitor
+		);
+		Thread poller = monitor.startPoll("blocking-dependency-monitor-poll");
+		await(dependencies.fingerprintStarted, "dependency monitor fingerprint poll started");
+		CountDownLatch closeReturned = new CountDownLatch(1);
+		Thread closer = Thread.ofPlatform().daemon().name("nonblocking-dependency-monitor-close").start(() -> {
+			supervisor.close();
+			closeReturned.countDown();
+		});
+		boolean prompt;
+		try {
+			prompt = closeReturned.await(250L, TimeUnit.MILLISECONDS);
+		} catch (InterruptedException interrupted) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError("dependency monitor close wait was interrupted", interrupted);
+		} finally {
+			dependencies.releaseFingerprint.countDown();
+		}
+		join(poller, "blocked dependency fingerprint poll exits after release");
+		join(closer, "dependency monitor close returns after release");
+		assertTrue(prompt, "supervisor close never waits for an in-flight dependency fingerprint poll");
+	}
+
 	private static void verifyOrphanReapRetriesBeforeLaunch() {
 		FakeClock clock = new FakeClock();
 		MutableDependencies dependencies = MutableDependencies.ready();
@@ -523,49 +628,65 @@ public final class CoordinatorProcessSupervisorVerification {
 		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
-			System.clearProperty("arenaagents.voiceUrl");
-			System.clearProperty("arenaagents.voiceSecretFile");
+			System.setProperty("arenaagents.voiceUrl", "http://127.0.0.1:19991/v1/tts");
+			System.setProperty("arenaagents.voiceSecretFile", "user-owned-secret-path");
 			FakeClock clock = new FakeClock();
 			MutableDependencies dependencies = MutableDependencies.ready();
 			String endpoint = "http://127.0.0.1:18766/v1/tts";
-			Path secretPath = dependencies.runtime.secret();
+			String voiceSecret = "v".repeat(32);
 			dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(
 					dependencies.runtime,
-					new CoordinatorProcessSupervisor.VoiceConfiguration(endpoint, secretPath)
+					new CoordinatorProcessSupervisor.VoiceConfiguration(endpoint, voiceSecret)
 			);
 			QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
 			supervisor = new CoordinatorProcessSupervisor(
 					Path.of("build", "deferred-voice-game"), Map.of(), clock, dependencies, new FakeLauncher(),
 					() -> "00000000-0000-0000-0000-000000000353", worker, runtimeRoot -> 0
 			);
-			CodexAgentServerRuntime.VoiceStartGate gate = new CodexAgentServerRuntime.VoiceStartGate();
+			CodexAgentServerRuntime.VoiceStartGate gate = new CodexAgentServerRuntime.VoiceStartGate(clock);
 			AtomicInteger starts = new AtomicInteger();
 			AtomicInteger closes = new AtomicInteger();
-			gate.startIfPrepared(supervisor, starts::incrementAndGet);
+			gate.startIfPrepared(supervisor, configuration -> {
+				starts.incrementAndGet();
+				return true;
+			});
 			assertEquals(0, starts.get(), "voice client is not constructed before dependency preparation begins");
 			worker.runNext();
-			gate.startIfPrepared(supervisor, starts::incrementAndGet);
+			gate.startIfPrepared(supervisor, configuration -> {
+				starts.incrementAndGet();
+				return true;
+			});
 			assertEquals(0, starts.get(), "completed worker preparation is not visible before supervisor publication");
-			assertEquals(null, System.getProperty("arenaagents.voiceUrl"),
-					"background preparation does not mutate voice endpoint before publication");
 
 			supervisor.tick(false, null, 0L);
 			assertTrue(supervisor.voiceConfigurationPublished(), "supervisor publishes worker-prepared voice configuration");
-			assertEquals(endpoint, System.getProperty("arenaagents.voiceUrl"),
-					"published voice endpoint is installed before client construction");
-			assertEquals(secretPath.toAbsolutePath().normalize().toString(),
-					System.getProperty("arenaagents.voiceSecretFile"),
-					"published voice client uses the prepared bridge secret path");
-			gate.startIfPrepared(supervisor, starts::incrementAndGet);
-			gate.startIfPrepared(supervisor, starts::incrementAndGet);
+			assertEquals(new CoordinatorProcessSupervisor.VoiceConfiguration(endpoint, voiceSecret),
+					supervisor.voiceConfiguration(), "supervisor publishes the exact in-memory voice endpoint and secret");
+			assertEquals("http://127.0.0.1:19991/v1/tts", System.getProperty("arenaagents.voiceUrl"),
+					"worker-owned voice endpoint never contaminates the global user override property");
+			assertEquals("user-owned-secret-path", System.getProperty("arenaagents.voiceSecretFile"),
+					"worker-prevalidated voice secret is never placed in a global property");
+			gate.startIfPrepared(supervisor, configuration -> {
+				assertEquals(endpoint, configuration.endpoint(), "voice gate forwards the prepared endpoint directly");
+				assertEquals(voiceSecret, configuration.secret(), "voice gate forwards the prepared secret directly");
+				starts.incrementAndGet();
+				return true;
+			});
+			gate.startIfPrepared(supervisor, configuration -> {
+				starts.incrementAndGet();
+				return true;
+			});
 			assertEquals(1, starts.get(), "voice subsystem initializes exactly once after prepared configuration publication");
 			gate.close(closes::incrementAndGet);
 			gate.close(closes::incrementAndGet);
 			assertEquals(1, closes.get(), "voice deferred state closes exactly once after initialization");
 
-			CodexAgentServerRuntime.VoiceStartGate closedBeforeStart = new CodexAgentServerRuntime.VoiceStartGate();
+			CodexAgentServerRuntime.VoiceStartGate closedBeforeStart = new CodexAgentServerRuntime.VoiceStartGate(clock);
 			closedBeforeStart.close(closes::incrementAndGet);
-			closedBeforeStart.startIfPrepared(supervisor, starts::incrementAndGet);
+			closedBeforeStart.startIfPrepared(supervisor, configuration -> {
+				starts.incrementAndGet();
+				return true;
+			});
 			assertEquals(1, starts.get(), "closed deferred voice state never initializes later");
 			assertEquals(1, closes.get(), "closing before initialization does not close an unconstructed subsystem");
 		} finally {
@@ -575,31 +696,90 @@ public final class CoordinatorProcessSupervisorVerification {
 		}
 	}
 
-	private static void verifyPublishedVoicePropertyDoesNotFreezePreparation() {
-		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
-		Path fixtureRoot = null;
-		try {
-			fixtureRoot = Files.createTempDirectory("arena-deferred-voice-");
-			Path config = fixtureRoot.resolve("dynamic-agents.json");
-			Path secret = fixtureRoot.resolve("bridge-secret.txt");
-			Files.writeString(secret, "s".repeat(32), StandardCharsets.UTF_8);
-			System.setProperty("arenaagents.voiceUrl", "http://127.0.0.1:19999/v1/tts");
-			Files.writeString(config, "{\"voice\":{\"port\":18766}}", StandardCharsets.UTF_8);
-			CoordinatorProcessSupervisor.VoiceConfiguration first =
-					CoordinatorProcessSupervisor.prepareOptionalVoiceConfiguration(config, secret, Map.of(), null);
-			assertEquals("http://127.0.0.1:18766/v1/tts", first.endpoint(),
-					"a previously published voice property is not mistaken for a permanent user override");
+	private static void verifyVoiceStartRetriesAndPromotes() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.ready();
+		String endpoint = "http://127.0.0.1:18768/v1/tts";
+		String secret = "r".repeat(32);
+		dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(
+				dependencies.runtime, new CoordinatorProcessSupervisor.VoiceConfiguration(endpoint, secret)
+		);
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "voice-retry-game"), Map.of(), clock, dependencies, new FakeLauncher(),
+				() -> "00000000-0000-0000-0000-000000000556"
+		);
+		CodexAgentServerRuntime.VoiceStartGate gate = new CodexAgentServerRuntime.VoiceStartGate(clock);
+		AtomicInteger attempts = new AtomicInteger();
+		AtomicInteger closes = new AtomicInteger();
+		CoordinatorRecoveryState coreState = supervisor.snapshot().state();
+		java.util.function.Function<CoordinatorProcessSupervisor.VoiceConfiguration, Boolean> starter = configuration -> {
+			assertEquals(secret, configuration.secret(), "voice retry retains the worker-prevalidated in-memory secret");
+			return attempts.incrementAndGet() > 1;
+		};
+		gate.startIfPrepared(supervisor, starter);
+		assertEquals(1, attempts.get(), "first voice construction failure is attempted once");
+		gate.startIfPrepared(supervisor, starter);
+		clock.advance(999L);
+		gate.startIfPrepared(supervisor, starter);
+		assertEquals(1, attempts.get(), "voice construction failure waits for its one-second retry deadline");
+		clock.advance(1L);
+		gate.startIfPrepared(supervisor, starter);
+		gate.startIfPrepared(supervisor, starter);
+		assertEquals(2, attempts.get(), "later successful voice construction promotes exactly once");
+		assertEquals(coreState, supervisor.snapshot().state(), "voice failure and promotion do not affect coordinator recovery");
+		assertEquals(dependencies.runtime.bridgeSecret(), supervisor.bridgeSecret(),
+				"voice failure and promotion do not affect the prepared Java bridge secret");
+		gate.close(closes::incrementAndGet);
+		gate.close(closes::incrementAndGet);
+		assertEquals(1, closes.get(), "promoted voice subsystem closes exactly once");
+		supervisor.close();
+	}
 
-			Files.writeString(config, "{\"voice\":{\"port\":18767}}", StandardCharsets.UTF_8);
-			CoordinatorProcessSupervisor.VoiceConfiguration second =
-					CoordinatorProcessSupervisor.prepareOptionalVoiceConfiguration(config, secret, Map.of(), null);
-			assertEquals("http://127.0.0.1:18767/v1/tts", second.endpoint(),
-					"later worker preparation can observe a changed runtime voice endpoint for Task 7 promotion");
-		} catch (IOException exception) {
-			throw new AssertionError("voice preparation refresh verification failed", exception);
+	private static void verifySupervisorsDoNotSharePublishedVoiceConfiguration() {
+		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
+		CoordinatorProcessSupervisor first = null;
+		CoordinatorProcessSupervisor second = null;
+		try {
+			System.setProperty("arenaagents.voiceUrl", "http://127.0.0.1:19998/v1/tts");
+			System.setProperty("arenaagents.voiceSecretFile", "user-owned-secret-path");
+			MutableDependencies firstDependencies = MutableDependencies.ready();
+			firstDependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(
+					firstDependencies.runtime,
+					new CoordinatorProcessSupervisor.VoiceConfiguration(
+							"http://127.0.0.1:18769/v1/tts", "a".repeat(32)
+					)
+			);
+			MutableDependencies secondDependencies = MutableDependencies.ready();
+			secondDependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(
+					secondDependencies.runtime,
+					new CoordinatorProcessSupervisor.VoiceConfiguration(
+							"http://127.0.0.1:18770/v1/tts", "b".repeat(32)
+					)
+			);
+			first = new CoordinatorProcessSupervisor(
+					Path.of("build", "first-voice-supervisor"), Map.of(), new FakeClock(), firstDependencies,
+					new FakeLauncher(), () -> "00000000-0000-0000-0000-000000000557"
+			);
+			second = new CoordinatorProcessSupervisor(
+					Path.of("build", "second-voice-supervisor"), Map.of(), new FakeClock(), secondDependencies,
+					new FakeLauncher(), () -> "00000000-0000-0000-0000-000000000558"
+			);
+			assertEquals("http://127.0.0.1:18769/v1/tts", first.voiceConfiguration().endpoint(),
+					"first supervisor retains its own prepared endpoint");
+			assertEquals("http://127.0.0.1:18770/v1/tts", second.voiceConfiguration().endpoint(),
+					"second supervisor cannot inherit the first supervisor endpoint");
+			assertEquals("b".repeat(32), second.voiceConfiguration().secret(),
+					"second supervisor cannot inherit the first supervisor secret");
+			assertEquals("http://127.0.0.1:19998/v1/tts", System.getProperty("arenaagents.voiceUrl"),
+					"runtime endpoint publication never overwrites the user-owned global property");
+			assertEquals("user-owned-secret-path", System.getProperty("arenaagents.voiceSecretFile"),
+					"runtime secret publication never overwrites the user-owned global property");
 		} finally {
+			if (first != null) first.close();
+			if (second != null) second.close();
 			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
-			if (fixtureRoot != null) deleteTree(fixtureRoot);
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
 		}
 	}
 
@@ -838,6 +1018,47 @@ public final class CoordinatorProcessSupervisorVerification {
 		}
 	}
 
+	private static final class BlockingFailureDependencies implements CoordinatorProcessSupervisor.DependencyResolver {
+		private final CountDownLatch started = new CountDownLatch(1);
+		private final CountDownLatch release = new CountDownLatch(1);
+		private final AtomicInteger resolveCalls = new AtomicInteger();
+		private volatile String fingerprint = "blocked-inflight";
+
+		@Override
+		public String fingerprint() {
+			return fingerprint;
+		}
+
+		@Override
+		public CoordinatorProcessSupervisor.DependencyResolution resolve() {
+			resolveCalls.incrementAndGet();
+			started.countDown();
+			await(release, "in-flight failed dependency resolver released");
+			return CoordinatorProcessSupervisor.DependencyResolution.blocked(
+					"NODE_RUNTIME_NOT_FOUND", "Node.js 22+ is unavailable"
+			);
+		}
+	}
+
+	private static final class BlockingFingerprintDependencies implements CoordinatorProcessSupervisor.DependencyResolver {
+		private final CountDownLatch fingerprintStarted = new CountDownLatch(1);
+		private final CountDownLatch releaseFingerprint = new CountDownLatch(1);
+
+		@Override
+		public String fingerprint() {
+			fingerprintStarted.countDown();
+			await(releaseFingerprint, "blocking dependency fingerprint released");
+			return "blocking-fingerprint";
+		}
+
+		@Override
+		public CoordinatorProcessSupervisor.DependencyResolution resolve() {
+			return CoordinatorProcessSupervisor.DependencyResolution.blocked(
+					"NODE_RUNTIME_NOT_FOUND", "Node.js 22+ is unavailable"
+			);
+		}
+	}
+
 	private static final class BlockingLauncher implements CoordinatorProcessSupervisor.ProcessLauncher {
 		private final BlockingChild child = new BlockingChild();
 
@@ -893,6 +1114,33 @@ public final class CoordinatorProcessSupervisorVerification {
 		private Thread startNext(String name) {
 			Thread thread = Thread.ofPlatform().daemon().name(name).start(removeNext());
 			return thread;
+		}
+	}
+
+	private static final class ManualDependencyMonitorScheduler
+			implements CoordinatorProcessSupervisor.DependencyMonitorScheduler {
+		private Runnable poll;
+		private boolean closed;
+
+		@Override
+		public void start(Runnable task) {
+			if (poll != null) throw new AssertionError("dependency monitor was started more than once");
+			poll = task;
+		}
+
+		private void poll() {
+			if (poll == null) throw new AssertionError("dependency monitor was not started");
+			poll.run();
+		}
+
+		private Thread startPoll(String name) {
+			if (poll == null) throw new AssertionError("dependency monitor was not started");
+			return Thread.ofPlatform().daemon().name(name).start(poll);
+		}
+
+		@Override
+		public void close() {
+			closed = true;
 		}
 	}
 
