@@ -157,6 +157,76 @@ test('abort-ignoring provider probe never accumulates a replacement call', async
 	});
 });
 
+test('new real success releases a hung probe token so a later failure can recover', async () => {
+	let synthesisCalls = 0;
+	let probes = 0;
+	let oldProbeAborted = false;
+	let releaseOldProbe;
+	const oldProbe = new Promise((resolve) => { releaseOldProbe = resolve; });
+	await withWorker({
+		provider: {
+			async synthesize() {
+				synthesisCalls += 1;
+				if (synthesisCalls === 1 || synthesisCalls === 3) {
+					throw Object.assign(new Error('temporary TTS failure'), { code: 'TTS_UNAVAILABLE' });
+				}
+				return validSynthesis();
+			},
+			probe: ({ signal }) => {
+				probes += 1;
+				if (probes > 1) return Promise.resolve();
+				signal.addEventListener('abort', () => { oldProbeAborted = true; }, { once: true });
+				return oldProbe;
+			},
+		},
+		initialProbeDelayMs: 5,
+		maxProbeDelayMs: 5,
+		probeTimeoutMs: 500,
+	}, async ({ worker, baseUrl }) => {
+		const first = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'first failure' }),
+		});
+		assert.equal(first.status, 502);
+		await eventually(() => probes === 1);
+		const success = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'real success', conversationSequence: 2 }),
+		});
+		assert.equal(success.status, 200);
+		assert.equal(oldProbeAborted, true);
+		const secondFailure = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'second failure', conversationSequence: 3 }),
+		});
+		assert.equal(secondFailure.status, 502);
+		await eventually(() => probes === 2 && worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state === 'ready');
+		releaseOldProbe();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state, 'ready');
+	});
+});
+
+test('persistent profile discovery aborts a stalled production read seam', async () => {
+	const controller = new AbortController();
+	let entered;
+	const readEntered = new Promise((resolve) => { entered = resolve; });
+	let observedSignal = null;
+	const loading = loadPersistentVoiceProfileStore('stalled-profile-store.json', {
+		signal: controller.signal,
+		readFile: (filePath, options) => {
+			observedSignal = options.signal;
+			entered();
+			return new Promise(() => {});
+		},
+	});
+	const firstBoundary = await Promise.race([
+		readEntered.then(() => 'entered'),
+		loading.then(() => 'settled', () => 'settled'),
+	]);
+	assert.equal(firstBoundary, 'entered', 'production profile loader uses the injected read seam');
+	controller.abort();
+	await assert.rejects(loading, (error) => error.name === 'AbortError');
+	assert.equal(observedSignal, controller.signal);
+});
+
 test('TTS route rejects a non-JSON content type before synthesis', async () => {
 	let calls = 0;
 	await withWorker({

@@ -65,16 +65,27 @@ export class VoiceProfileStore {
 	}
 }
 
-export async function loadPersistentVoiceProfileStore(filePath) {
+export async function loadPersistentVoiceProfileStore(filePath, dependencies = {}) {
 	if (typeof filePath !== 'string' || filePath.trim() === '') throw new TypeError('filePath must not be blank');
+	if (dependencies === null || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
+		throw new TypeError('voice profile dependencies must be an object');
+	}
+	const signal = dependencies.signal;
+	const read = dependencies.readFile ?? readFile;
+	if (typeof read !== 'function') throw new TypeError('readFile must be a function');
+	if (signal?.aborted) throw abortReason(signal);
 	let assignments = {};
 	try {
-		const document = JSON.parse(await readFile(filePath, 'utf8'));
+		const document = JSON.parse(await awaitAbortable(
+			Promise.resolve().then(() => read(filePath, { encoding: 'utf8', signal })),
+			signal,
+		));
 		if (document?.schemaVersion === 1 && document.assignments !== null
 				&& typeof document.assignments === 'object' && !Array.isArray(document.assignments)) {
 			assignments = document.assignments;
 		}
 	} catch (error) {
+		if (signal?.aborted) throw abortReason(signal);
 		if (error?.code !== 'ENOENT') throw error;
 	}
 	let pending = Promise.resolve();
@@ -121,4 +132,31 @@ function stableHash(value) {
 
 function isUuid(value) {
 	return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function awaitAbortable(value, signal) {
+	if (signal === undefined) return value;
+	if (signal.aborted) return Promise.reject(abortReason(signal));
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (operation, result) => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener('abort', onAbort);
+			operation(result);
+		};
+		const onAbort = () => finish(reject, abortReason(signal));
+		signal.addEventListener('abort', onAbort, { once: true });
+		Promise.resolve(value).then(
+			(result) => signal.aborted ? onAbort() : finish(resolve, result),
+			(error) => finish(reject, error),
+		);
+	});
+}
+
+function abortReason(signal) {
+	if (signal?.reason instanceof Error) return signal.reason;
+	const error = new Error('Voice profile discovery was cancelled');
+	error.name = 'AbortError';
+	return error;
 }

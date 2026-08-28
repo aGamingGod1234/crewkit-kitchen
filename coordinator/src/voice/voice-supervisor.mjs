@@ -149,6 +149,12 @@ export class VoiceSupervisor {
 			await this.#failAttempt(token, error);
 			return;
 		}
+		if (!this.#ownsAttempt(token) || token.controller.signal.aborted || token.failureRecorded) {
+			token.unsubscribe?.();
+			token.unsubscribe = null;
+			if (this.#ownsAttempt(token)) await this.#failAttempt(token, null);
+			return;
+		}
 		if (typeof worker.warmup !== 'function') {
 			this.#promote(token, worker);
 			return;

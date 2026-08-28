@@ -85,3 +85,29 @@ test('aborting inference restarts the serial worker so replacement speech is not
 		await firstClose;
 	}
 });
+
+test('default provider discovery aborts promptly through its production access seam', async () => {
+	const { LocalSpeechProvider } = await import('../src/voice/local-speech-provider.mjs');
+	const controller = new AbortController();
+	let entered;
+	const accessEntered = new Promise((resolve) => { entered = resolve; });
+	let observedSignal = null;
+	const discovering = LocalSpeechProvider.createIfAvailable({
+		executable: 'stalled-python',
+		scriptPath: 'stalled-worker.py',
+		signal: controller.signal,
+		accessFile: (filePath, signal) => {
+			observedSignal = signal;
+			entered();
+			return new Promise(() => {});
+		},
+	});
+	const firstBoundary = await Promise.race([
+		accessEntered.then(() => 'entered'),
+		discovering.then(() => 'settled', () => 'settled'),
+	]);
+	assert.equal(firstBoundary, 'entered', 'production provider discovery uses the injected access seam');
+	controller.abort();
+	await assert.rejects(discovering, (error) => error.name === 'AbortError');
+	assert.equal(observedSignal, controller.signal);
+});

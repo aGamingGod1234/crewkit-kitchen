@@ -268,6 +268,80 @@ test('hung candidate close cannot block startup failure retry', async () => {
 	}
 });
 
+test('terminal close and error between bind and subscription replay into exact startup retries', async () => {
+	const workers = [];
+	const supervisor = new VoiceSupervisor({
+		startWorker: async () => {
+			const worker = createVoiceHttpServer({
+				provider: { async synthesize() { return validSynthesis(); } },
+				sttProvider: { async transcribe() { return { transcript: '', confidence: 1 }; } },
+				profileStore: new VoiceProfileStore(),
+				secret: SECRET,
+				port: 0,
+			});
+			await worker.start();
+			workers.push(worker);
+			if (workers.length === 1) {
+				await new Promise((resolve, reject) => worker.server.close((error) => error ? reject(error) : resolve()));
+			} else if (workers.length === 2) {
+				worker.server.emit('error', Object.assign(new Error('failed before subscription'), { code: 'VOICE_EARLY_FAILURE' }));
+			}
+			return worker;
+		},
+		initialRetryMs: 5,
+		maxRetryMs: 5,
+		startupTimeoutMs: 100,
+		warmupTimeoutMs: 100,
+		cleanupTimeoutMs: 20,
+	});
+	try {
+		supervisor.start();
+		await eventually(() => workers.length === 3 && component(supervisor, 'voice').state === 'ready');
+		workers[0].server.emit('error', Object.assign(new Error('stale replay'), { code: 'VOICE_STALE_FAILURE' }));
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(workers.length, 3, 'stale terminal events cannot invalidate the recovered worker');
+	} finally {
+		await supervisor.close();
+	}
+});
+
+test('default local discovery aborts a stalled filesystem generation and retries cleanly', async () => {
+	let accessCalls = 0;
+	let aborts = 0;
+	const lateResolvers = [];
+	const supervisor = new VoiceSupervisor({
+		startWorker: ({ signal }) => startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 0 } }, {
+			FISH_API_KEY: 'test-key',
+		}, {
+			signal,
+			platform: 'linux',
+			localSpeechAccess: (filePath, accessSignal) => {
+				accessCalls += 1;
+				if (accessCalls > 2) throw Object.assign(new Error('not installed'), { code: 'ENOENT' });
+				accessSignal.addEventListener('abort', () => { aborts += 1; }, { once: true });
+				return new Promise((resolve) => { lateResolvers.push(resolve); });
+			},
+			loadProfileStore: async () => ({ store: { resolve: () => probeProfile() } }),
+			createTtsProvider: () => ({ async synthesize() { return validSynthesis(); } }),
+		}),
+		initialRetryMs: 5,
+		maxRetryMs: 5,
+		startupTimeoutMs: 10,
+		warmupTimeoutMs: 100,
+		cleanupTimeoutMs: 20,
+	});
+	try {
+		supervisor.start();
+		await eventually(() => accessCalls >= 3 && component(supervisor, 'voice:tts').state === 'ready');
+		assert.equal(aborts, 2, 'both stalled default access operations observe cancellation');
+		for (const resolve of lateResolvers) resolve();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(component(supervisor, 'voice:tts').state, 'ready', 'late filesystem success cannot replace recovery');
+	} finally {
+		await supervisor.close();
+	}
+});
+
 function component(supervisor, name) {
 	return supervisor.statusSnapshots().find(({ component: candidate }) => candidate === name);
 }

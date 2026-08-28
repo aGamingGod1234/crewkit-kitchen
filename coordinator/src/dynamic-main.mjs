@@ -2314,6 +2314,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			scriptPath: path.join(SOURCE_DIRECTORY, 'voice', 'local-speech-worker.py'),
 			timeoutMs: voice.localSpeechTimeoutMs ?? 120_000,
 			signal,
+			accessFile: dependencies.localSpeechAccess,
 		});
 		throwIfVoiceStartupAborted(signal);
 		if (localSpeechProvider === null && fishApiKey === null && platform !== 'win32') return null;
@@ -2329,7 +2330,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
 		if (typeof createWindowsTtsProvider !== 'function') throw new TypeError('createWindowsTtsProvider must be a function');
 		if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
-		const profiles = await loadProfileStore(profilePath, { signal });
+		const profiles = await loadProfileStore(profilePath, { ...(dependencies.voiceProfileIo ?? {}), signal });
 		throwIfVoiceStartupAborted(signal);
 		if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
 			throw new TypeError('loadProfileStore must return a profile store');

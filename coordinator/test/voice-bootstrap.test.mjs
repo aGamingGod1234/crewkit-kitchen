@@ -243,6 +243,8 @@ test('voice bootstrap propagates startup cancellation into provider discovery', 
 test('voice bootstrap propagates startup cancellation into HTTP binding', async () => {
 	const controller = new AbortController();
 	let observedSignal = null;
+	let markStartEntered;
+	const startEntered = new Promise((resolve) => { markStartEntered = resolve; });
 	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
 		FISH_API_KEY: 'test-key',
 	}, {
@@ -253,6 +255,7 @@ test('voice bootstrap propagates startup cancellation into HTTP binding', async 
 		createVoiceServer: () => ({
 			start: ({ signal }) => {
 				observedSignal = signal;
+				markStartEntered();
 				return new Promise((resolve, reject) => signal.addEventListener('abort', () => {
 					const error = new Error('bind aborted');
 					error.name = 'AbortError';
@@ -262,8 +265,35 @@ test('voice bootstrap propagates startup cancellation into HTTP binding', async 
 			async close() {},
 		}),
 	});
-	await new Promise((resolve) => setImmediate(resolve));
+	await startEntered;
 	controller.abort();
 	await assert.rejects(starting, (error) => error.name === 'AbortError');
 	assert.equal(observedSignal, controller.signal);
+});
+
+test('voice bootstrap keeps supervisor ownership over the production profile read seam', async () => {
+	const controller = new AbortController();
+	const unrelated = new AbortController();
+	let observedSignal = null;
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_API_KEY: 'test-key',
+	}, {
+		signal: controller.signal,
+		platform: 'linux',
+		localSpeechAccess: async () => { throw Object.assign(new Error('not installed'), { code: 'ENOENT' }); },
+		voiceProfileIo: {
+			signal: unrelated.signal,
+			readFile: async (filePath, options) => {
+				observedSignal = options.signal;
+				throw Object.assign(new Error('new store'), { code: 'ENOENT' });
+			},
+		},
+		createTtsProvider: () => ({ async synthesize() { return {}; } }),
+		createVoiceServer: () => ({ async start() {}, async close() {} }),
+	});
+	try {
+		assert.equal(observedSignal, controller.signal);
+	} finally {
+		await worker.close();
+	}
 });

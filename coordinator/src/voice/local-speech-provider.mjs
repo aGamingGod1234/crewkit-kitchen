@@ -28,9 +28,16 @@ export class LocalSpeechProvider {
 	}
 
 	static async createIfAvailable(options = {}) {
+		const signal = options.signal;
+		const accessFile = options.accessFile ?? defaultAccess;
+		if (typeof accessFile !== 'function') throw new TypeError('accessFile must be a function');
+		if (signal?.aborted) throw abortReason(signal);
 		try {
-			await Promise.all([access(options.executable), access(options.scriptPath)]);
+			await awaitAbortable(Promise.all(
+				[options.executable, options.scriptPath].map((filePath) => Promise.resolve().then(() => accessFile(filePath, signal))),
+			), signal);
 		} catch (error) {
+			if (signal?.aborted) throw abortReason(signal);
 			if (error?.code === 'ENOENT') return null;
 			throw error;
 		}
@@ -200,6 +207,35 @@ function abortError() {
 	const error = new Error('Local speech request was cancelled');
 	error.name = 'AbortError';
 	return error;
+}
+
+function abortReason(signal) {
+	if (signal?.reason instanceof Error) return signal.reason;
+	return abortError();
+}
+
+function awaitAbortable(value, signal) {
+	if (signal === undefined) return value;
+	if (signal.aborted) return Promise.reject(abortReason(signal));
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = (operation, result) => {
+			if (settled) return;
+			settled = true;
+			signal.removeEventListener('abort', onAbort);
+			operation(result);
+		};
+		const onAbort = () => finish(reject, abortReason(signal));
+		signal.addEventListener('abort', onAbort, { once: true });
+		Promise.resolve(value).then(
+			(result) => signal.aborted ? onAbort() : finish(resolve, result),
+			(error) => finish(reject, error),
+		);
+	});
+}
+
+function defaultAccess(filePath) {
+	return access(filePath);
 }
 
 function timeoutError() {

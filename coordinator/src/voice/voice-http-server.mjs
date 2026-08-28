@@ -50,6 +50,7 @@ export function createVoiceHttpServer({
 	let closePromise = null;
 	let live = false;
 	let closing = false;
+	let terminalFailure = null;
 	const lifecycleOptions = {
 		now, schedule: scheduleProbe, cancelSchedule: cancelProbe,
 		initialRetryMs: initialProbeDelayMs, maxRetryMs: maxProbeDelayMs, probeTimeoutMs,
@@ -190,30 +191,38 @@ export function createVoiceHttpServer({
 			controllers.delete(controller);
 		}
 	});
-	server.on('error', (error) => {
-		if (live && !closing) notifyFailure(error);
-	});
-	server.on('close', () => {
-		const unexpectedlyClosed = live && !closing;
-		live = false;
-		if (unexpectedlyClosed) notifyFailure(typedError('VOICE_SERVER_CLOSED', 'Voice HTTP server closed unexpectedly'));
-	});
-	server.on('listening', () => {
-		if (closing) {
-			try { server.close(); } catch { /* a canceled late bind must not survive cleanup */ }
-		}
-	});
-
 	const notifyFailure = (error) => {
 		for (const listener of [...failureListeners]) {
 			try { listener(error); } catch { /* optional lifecycle listeners are isolated */ }
 		}
 	};
+	const recordTerminalFailure = (error) => {
+		if (terminalFailure !== null || closing) return;
+		terminalFailure = error;
+		live = false;
+		notifyFailure(error);
+	};
+	server.on('error', (error) => {
+		if (live) recordTerminalFailure(error);
+	});
+	server.on('close', () => {
+		if (live) recordTerminalFailure(typedError('VOICE_SERVER_CLOSED', 'Voice HTTP server closed unexpectedly'));
+		live = false;
+	});
+	server.on('listening', () => {
+		if (closing || terminalFailure !== null) {
+			try { server.close(); } catch { /* a canceled late bind must not survive cleanup */ }
+		}
+	});
 
 	return Object.freeze({
 		server,
 		onFailure(listener) {
 			if (typeof listener !== 'function') throw new TypeError('voice failure listener must be a function');
+			if (terminalFailure !== null) {
+				try { listener(terminalFailure); } catch { /* replay cannot escape lifecycle subscription */ }
+				return () => {};
+			}
 			if (closing) return () => {};
 			failureListeners.add(listener);
 			let subscribed = true;
@@ -233,6 +242,7 @@ export function createVoiceHttpServer({
 		},
 		async start({ signal } = {}) {
 			if (closePromise !== null) throw typedError('VOICE_WORKER_CLOSED', 'Voice worker has been closed');
+			if (terminalFailure !== null) throw terminalFailure;
 			if (signal?.aborted) throw abortReason(signal);
 			if (server.listening) return server.address();
 			if (startPromise !== null) return startPromise;
@@ -351,8 +361,12 @@ class VoiceChannelLifecycle {
 		if (this.#timer !== null) this.#cancelSchedule(this.#timer);
 		this.#timer = null;
 		if (this.#probeToken !== null) {
-			this.#probeToken.invalidated = true;
-			this.#probeToken.controller.abort();
+			const staleProbe = this.#probeToken;
+			staleProbe.invalidated = true;
+			if (staleProbe.timeout !== null) this.#cancelSchedule(staleProbe.timeout);
+			staleProbe.timeout = null;
+			staleProbe.controller.abort();
+			this.#probeToken = null;
 		}
 		this.#state = 'ready';
 		this.#failureCode = null;
