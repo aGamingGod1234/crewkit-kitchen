@@ -90,6 +90,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#conversationMemories = new Map();
 	#contextCursors = new Map();
 	#nativeConversationSequences = new Map();
+	#nativeConversationRecoveries = new Map();
 	#nativeObservationSignatures = new Map();
 	#supervisedObservationRequests = new Map();
 	#conversationWakeTransactions = new Map();
@@ -202,6 +203,12 @@ export class DynamicCoordinator extends EventEmitter {
 		if (this.#stopping || this.#closed || key === null || typeof key !== 'object') return false;
 		const record = this.#registry.get(key.agentId);
 		if (record === null || record.goalRevision !== key.goalRevision) return false;
+		const conversationRecovery = this.#nativeConversationRecoveries.get(key.agentId);
+		if (conversationRecovery !== undefined && sameSupervisionKey(conversationRecovery.supervisionKey, key)) {
+			this.#nativeConversationRecoveries.delete(key.agentId);
+			this.#scheduleNativeTurn(record, conversationRecovery.request);
+			return true;
+		}
 		if (this.#usesNativeTools(record)) {
 			this.#supervisedObservationRequests.set(key.agentId, {
 				goalRevision: key.goalRevision,
@@ -227,6 +234,13 @@ export class DynamicCoordinator extends EventEmitter {
 				&& work.lifecycleGeneration === key.lifecycleGeneration
 				&& work.supervisionToken?.operationId === lease.operationId) {
 				work.expired = true;
+				this.#restoreNativeConversation(work.request);
+				if (work.request.conversationOnly === true) {
+					this.#nativeConversationRecoveries.set(work.agentId, {
+						supervisionKey: work.supervisionKey,
+						request: work.request,
+					});
+				}
 				this.#providerWork.delete(key.agentId);
 			}
 			try {
@@ -303,6 +317,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#conversationMemories.clear();
 		this.#contextCursors.clear();
 		this.#nativeConversationSequences.clear();
+		this.#nativeConversationRecoveries.clear();
 		this.#nativeObservationSignatures.clear();
 		this.#supervisedObservationRequests.clear();
 		this.#conversationWakeTransactions.clear();
@@ -376,6 +391,7 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#conversationMemories.delete(message.agentId);
 			this.#contextCursors.delete(message.agentId);
 			this.#nativeConversationSequences.delete(message.agentId);
+			this.#nativeConversationRecoveries.delete(message.agentId);
 			this.#nativeObservationSignatures.delete(message.agentId);
 			this.#supervisedObservationRequests.delete(message.agentId);
 			this.#forgetConversationWakes(message.agentId);
@@ -725,6 +741,9 @@ export class DynamicCoordinator extends EventEmitter {
 			this.#setVerboseEnabled(false);
 			this.#cancelGoalSpecRequests();
 			for (const record of this.#registry.list()) {
+				const work = this.#providerWork.get(record.agentId);
+				if (work?.kind === 'native') this.#restoreNativeConversation(work.request);
+				this.#nativeConversationRecoveries.delete(record.agentId);
 				this.#goalSupervisor.suspend(this.#supervisionKey(record));
 				this.#advanceLifecycleGeneration(record.agentId);
 			}
@@ -994,6 +1013,7 @@ export class DynamicCoordinator extends EventEmitter {
 			return existing.promise;
 		}
 		const supervisionKey = this.#supervisionKey(record, request.lifecycleGeneration);
+		this.#forgetNativeConversationRecovery(supervisionKey);
 		this.#goalSupervisor.activate(supervisionKey);
 		const work = {
 			agentId: record.agentId,
@@ -1175,7 +1195,6 @@ export class DynamicCoordinator extends EventEmitter {
 			classification = recovery.retryable ? 'recoverable' : classifyNativeGoalError(error);
 		} finally {
 			this.#goalSupervisor.end(work.supervisionToken, { scheduleRecovery: classification !== 'stale' });
-			if (work.request.conversationOnly === true) this.#goalSupervisor.terminate(work.supervisionKey);
 		}
 		if (this.#providerWork.get(work.agentId) !== work) return null;
 		this.#providerWork.delete(work.agentId);
@@ -1184,7 +1203,14 @@ export class DynamicCoordinator extends EventEmitter {
 		const staleLifecycle = record?.goalRevision !== work.goalRevision
 			|| !this.#isConnectionEpochCurrent(work.connectionEpoch)
 			|| !this.#isLifecycleGenerationCurrent(work.agentId, work.lifecycleGeneration);
-		if (staleLifecycle || classification === 'stale' || this.#stopping || this.#closed) {
+		if (staleLifecycle || this.#stopping || this.#closed) {
+			if (work.request.conversationOnly === true) this.#goalSupervisor.terminate(work.supervisionKey);
+			this.#reschedulePendingNativeTurn(pending);
+			return null;
+		}
+		this.#restoreNativeConversation(work.request);
+		if (classification === 'stale') {
+			if (work.request.conversationOnly === true) this.#goalSupervisor.terminate(work.supervisionKey);
 			this.#reschedulePendingNativeTurn(pending);
 			return null;
 		}
@@ -1199,6 +1225,12 @@ export class DynamicCoordinator extends EventEmitter {
 			}
 			await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
 		} else {
+			if (work.request.conversationOnly === true) {
+				this.#nativeConversationRecoveries.set(work.agentId, {
+					supervisionKey: work.supervisionKey,
+					request: work.request,
+				});
+			}
 			this.#goalSupervisor.recover(work.supervisionKey, this.#recoveryDetails(work.agentId, {
 				errorCode: recovery.code,
 				recoveryKind: recovery.kind,
@@ -1588,6 +1620,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#contextCursors.delete(agentId);
 		this.#nativeObservationSignatures.delete(agentId);
 		this.#supervisedObservationRequests.delete(agentId);
+		this.#nativeConversationRecoveries.delete(agentId);
 		this.#providerProbeDeadlines.delete(agentId);
 		this.#deferredProviderRecovery.delete(agentId);
 		this.#advanceLifecycleGeneration(agentId);
@@ -1954,6 +1987,7 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#conversationMemories.clear();
 		this.#contextCursors.clear();
 		this.#nativeConversationSequences.clear();
+		this.#nativeConversationRecoveries.clear();
 		this.#nativeObservationSignatures.clear();
 		this.#supervisedObservationRequests.clear();
 		this.#conversationWakeTransactions.clear();
@@ -2073,6 +2107,13 @@ export class DynamicCoordinator extends EventEmitter {
 		const current = this.#nativeConversationSequences.get(request.agentId) ?? -1;
 		if (current === delivery.nextSequence) this.#nativeConversationSequences.set(request.agentId, delivery.afterSequence);
 		delete request.nativeConversationDelivery;
+	}
+
+	#forgetNativeConversationRecovery(supervisionKey) {
+		const recovery = this.#nativeConversationRecoveries.get(supervisionKey.agentId);
+		if (recovery !== undefined && sameSupervisionKey(recovery.supervisionKey, supervisionKey)) {
+			this.#nativeConversationRecoveries.delete(supervisionKey.agentId);
+		}
 	}
 
 	#rememberConversationWake(transactionId, agentId, fingerprint) {
@@ -2678,6 +2719,14 @@ function mergePlannerRequest(previous, next) {
 	const priority = previous.priority === 'urgent' || next.priority === 'urgent' ? 'urgent' : 'ordinary';
 	const winner = next.priority === priority ? next : previous;
 	return { ...next, priority, trigger: winner.trigger };
+}
+
+function sameSupervisionKey(left, right) {
+	return left?.agentId === right?.agentId
+		&& left?.goalRevision === right?.goalRevision
+		&& left?.lifecycleGeneration === right?.lifecycleGeneration
+		&& left?.sessionEpoch === right?.sessionEpoch
+		&& left?.profileFingerprint === right?.profileFingerprint;
 }
 
 export function buildNativeEventInput(record, { event, trigger, observation = {}, conversation = { mode: 'unread', baseSequence: -1, nextSequence: -1, entries: [] }, conversationOnly = false } = {}) {

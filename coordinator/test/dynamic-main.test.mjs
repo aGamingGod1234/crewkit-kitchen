@@ -2221,6 +2221,116 @@ test('native turns receive each conversation entry exactly once', async () => {
 	} finally { await run.coordinator.stop(); }
 });
 
+test('failed idle native conversation keeps the direct message unread for its recovery turn', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) {
+			throw Object.assign(new Error('provider unavailable'), { code: 'PROVIDER_DOWN' });
+		}
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	try {
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Please answer after you reconnect.', goalRevision: 0, observedAtEpochMs: 1_787_184_000_001,
+		} });
+		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: 'Please answer after you reconnect.', goalRevision: 0, observedAtEpochMs: 1_787_184_000_001,
+		} });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(planner.requests.length, 1, 'replayed delivery cannot bypass the fenced recovery turn');
+		await timers.runNext();
+		await eventually(() => planner.requests.length === 2);
+		assert.match(planner.requests[0].input, /Please answer after you reconnect\./);
+		assert.match(planner.requests[1].input, /Please answer after you reconnect\./);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('expired idle native conversation keeps the proximity message unread for its replacement turn', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (planner.requests.length === 1) return new Promise(() => {});
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	try {
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'proximity',
+			text: 'Reply after the expired provider turn.', goalRevision: 0, observedAtEpochMs: 1_787_184_000_001,
+		} });
+		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+		await timers.runNext();
+		await eventually(() => planner.requests.length === 2);
+		assert.match(planner.requests[0].input, /Reply after the expired provider turn\./);
+		assert.match(planner.requests[1].input, /Reply after the expired provider turn\./);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('failed active native conversation remains unread through fresh-fact recovery', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let failedConversation = false;
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		if (!failedConversation && request.input.includes('Do not forget this steering message.')) {
+			failedConversation = true;
+			throw Object.assign(new Error('provider unavailable'), { code: 'PROVIDER_DOWN' });
+		}
+		return { status: 'completed', toolCalls: 0 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1,
+			observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => planner.requests.length === 1);
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 1, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'proximity',
+			text: 'Do not forget this steering message.', goalRevision: 1, observedAtEpochMs: 1_787_184_000_001,
+		} });
+		await eventually(() => planner.requests.length === 2 && timers.pendingCount === 1);
+		await timers.runNext();
+		const request = run.bridge.sent.findLast(({ type }) => type === 'request_observation');
+		assert.ok(request);
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 2,
+			observation: { player: { x: 1, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await eventually(() => planner.requests.length === 3);
+		assert.match(planner.requests[2].input, /Do not forget this steering message\./);
+	} finally { await run.coordinator.stop(); }
+});
+
 function immutableGoalSpec(originalRequest, predicate = { type: 'operator_confirmed' }, createdAtTick = 1) {
 	const fields = { originalRequest, predicate, createdAtTick };
 	return { ...fields, fingerprint: goalSpecFingerprint(fields) };
