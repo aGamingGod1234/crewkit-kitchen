@@ -83,13 +83,17 @@ test('stale callbacks are fenced before they can request observation or action',
 	assert.notEqual(result.states.at(-1), DynamicAgentState.ERROR);
 });
 
-test('unsupported profile aligns with a terminal state and one factual error', async () => {
+test('temporarily unsupported profile stays active with one bounded recovery owner', async () => {
 	const result = await createNativeGoalHarness({
 		unsupportedProfile: true,
 		turns: [['observe']],
 	}).run();
-	assert.equal(result.finalState, DynamicAgentState.ERROR);
-	assert.equal(result.sent.filter((entry) => entry.type === 'agent_error').length, 1);
+	assert.equal(result.finalState, DynamicAgentState.PLANNING);
+	assert.equal(result.states.includes(DynamicAgentState.ERROR), false);
+	assert.equal(result.states.includes(DynamicAgentState.PAUSED), false);
+	assert.equal(result.sent.filter((entry) => entry.type === 'agent_error').length, 0);
+	assert.ok(result.recoveryDispatches > 0, 'the blocked-retryable profile requests recovery');
+	assert.ok(result.maxRecoveryHandles <= 1, 'profile recovery owns at most one live handle');
 });
 
 test('repeated recoverable provider failures keep one bounded recovery handle', async () => {
