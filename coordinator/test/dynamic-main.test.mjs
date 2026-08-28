@@ -2028,6 +2028,76 @@ test('an expired native provider turn is evicted so a fresh observation can star
 	}
 });
 
+test('native scheduling drops unchanged quiet heartbeats but accepts the supervisor continuation observation', async () => {
+	const timers = new ManualTimerQueue();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		goalClock: () => 0,
+		goalSchedule: timers.schedule,
+		cancelGoalSchedule: timers.cancel,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	const observation = { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } };
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, attention: false, observation } });
+		await eventually(() => planner.requests.length === 1 && timers.pendingCount === 1);
+		for (let sequence = 2; sequence <= 20; sequence += 1) {
+			run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: sequence, attention: false, observation } });
+		}
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(planner.requests.length, 1);
+		await timers.runNext();
+		await eventually(() => run.bridge.sent.some((message) => message.type === 'request_observation'));
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 21, attention: false, observation } });
+		await eventually(() => planner.requests.length === 2);
+		assert.match(planner.requests[1].input, /"trigger":"continuation"/);
+	} finally { await run.coordinator.stop(); }
+});
+
+test('native turns receive each conversation entry exactly once', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	planner.requestNativeTurn = async (request) => {
+		planner.requests.push(request);
+		return { status: 'completed', toolCalls: 1 };
+	};
+	const run = await start({
+		registry,
+		planner,
+		config: { bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'native_tools' } },
+	});
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Listen and keep working.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, attention: false, observation: { player: { x: 0, y: 64, z: 0 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } } } });
+		await eventually(() => planner.requests.length === 1);
+		for (const [sequence, text] of [[1, 'First message'], [2, 'Second message']]) {
+			run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+				sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text,
+				goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 + sequence,
+			} });
+			await eventually(() => planner.requests.length === sequence + 1);
+		}
+		const delivered = planner.requests.slice(1).map(({ input }) => JSON.parse(input.split('\n').at(-1)).conversation);
+		assert.deepEqual(delivered.map(({ mode }) => mode), ['unread', 'unread']);
+		assert.deepEqual(delivered.map(({ entries }) => entries.map(({ sequence }) => sequence)), [[1], [2]]);
+		assert.equal(planner.requests[2].input.includes('First message'), false);
+		run.bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence: 2, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct', text: 'Second message',
+			goalRevision: 1, observedAtEpochMs: 1_787_184_000_002,
+		} });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(planner.requests.length, 3, 'replayed delivery does not schedule another native turn');
+	} finally { await run.coordinator.stop(); }
+});
+
 function immutableGoalSpec(originalRequest, predicate = { type: 'operator_confirmed' }, createdAtTick = 1) {
 	const fields = { originalRequest, predicate, createdAtTick };
 	return { ...fields, fingerprint: goalSpecFingerprint(fields) };

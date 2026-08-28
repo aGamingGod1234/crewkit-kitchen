@@ -48,6 +48,9 @@ export function buildGoalSpecTranslatorPrompt(requestValue) {
 	return [
 		'Translate one Minecraft request into one factual, server-verifiable predicate.',
 		'Use only the predicate schema and candidate identifiers below. Do not invent identifiers.',
+		'Preserve compound factual requests: use all_of for results joined by "and" and any_of only for explicit alternatives joined by "or".',
+		'For each requested item or kill, emit its own inventory_contains or entity_killed_by_agent leaf, including the requested item count.',
+		'Compound predicates may contain at most 16 factual leaves and must use only the bounded candidate list.',
 		'If the outcome is subjective, use operator_confirmed. Keep the summary short and concrete.',
 		'Return exactly one JSON object matching the supplied schema and nothing else.',
 		`Request: ${JSON.stringify(request.originalRequest)}`,

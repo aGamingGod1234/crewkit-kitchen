@@ -527,6 +527,7 @@ export class SharedCodexAgent {
 		}
 		if (this.#active !== null) throw new CodexProtocolError('TURN_IN_PROGRESS', `Codex agent '${this.agentId}' already has an active turn`);
 
+		const silenceDeadline = createProviderSilenceDeadline(this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
 		const collector = createNativeTurnCollector({
 			transport: this.#transport,
 			threadId: this.#threadId,
@@ -534,6 +535,9 @@ export class SharedCodexAgent {
 			goalRevision,
 			executeTool,
 			onVerbose,
+			onProviderActivity: () => silenceDeadline.restart(),
+			onToolExecutionStart: () => silenceDeadline.pause(),
+			onToolExecutionEnd: () => silenceDeadline.resume(),
 		});
 		void collector.promise.catch(() => {});
 		let lifecycleSettled = false;
@@ -586,7 +590,8 @@ export class SharedCodexAgent {
 				try { await this.interrupt(); } catch {}
 				throw new CodexProtocolError('STALE_PLAN', 'Codex native turn started after its goal revision became obsolete');
 			}
-			const result = await withTimeout(Promise.race([collector.promise, lifecyclePromise]), this.#planningTimeoutMs, this.#schedule, this.#cancelSchedule);
+			silenceDeadline.restart();
+			const result = await Promise.race([collector.promise, lifecyclePromise, silenceDeadline.promise]);
 			if (this.#active !== active || this.#goalRevision !== goalRevision || signal?.aborted) throw new CodexProtocolError('STALE_PLAN', 'Codex native turn belongs to an obsolete goal revision');
 			this.#sessionState = 'warm';
 			return result;
@@ -597,6 +602,7 @@ export class SharedCodexAgent {
 			throw error;
 		} finally {
 			signal?.removeEventListener('abort', abort);
+			silenceDeadline.dispose();
 			collector.dispose();
 			if (this.#active === active) this.#active = null;
 		}
@@ -786,7 +792,7 @@ function isRateLimitError(error) {
 		.some((key) => info[key]?.httpStatusCode === 429);
 }
 
-function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose }) {
+function createNativeTurnCollector({ transport, threadId, agentId, goalRevision, executeTool, onVerbose, onProviderActivity = () => {}, onToolExecutionStart = () => {}, onToolExecutionEnd = () => {} }) {
 	let expectedTurnId = null;
 	let bufferedRequests = [];
 	let publishedAgentMessage = false;
@@ -813,8 +819,11 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 		const executor = toolExecutor;
 		const execute = async () => {
 			if (settled || completionStatus?.status === 'failed') return;
+			let executionStarted = false;
 			try {
 				const tool = normalizeMinecraftToolCall(params.tool, params.arguments);
+				onToolExecutionStart(tool);
+				executionStarted = true;
 				const result = await executor({
 					agentId,
 					goalRevision,
@@ -830,6 +839,8 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 					reasonCode: String(error?.code ?? 'TOOL_EXECUTION_FAILED').slice(0, 128),
 					message: String(error?.message ?? error).slice(0, 512),
 				}, false));
+			} finally {
+				if (executionStarted) onToolExecutionEnd();
 			}
 		};
 		const task = executionTail.then(execute, execute);
@@ -842,6 +853,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 	const onServerRequest = (request) => {
 		if (request?.method !== 'item/tool/call' || request.params?.threadId !== threadId) return;
+		onProviderActivity();
 		if (expectedTurnId === null) {
 			if (bufferedRequests.length >= MAX_BUFFERED_TURN_NOTIFICATIONS) {
 				settled = true;
@@ -855,6 +867,7 @@ function createNativeTurnCollector({ transport, threadId, agentId, goalRevision,
 	};
 	const onNotification = ({ method, params }) => {
 		if (params?.threadId !== threadId || expectedTurnId === null || notificationTurnId(params) !== expectedTurnId) return;
+		onProviderActivity();
 		if (method === 'item/completed' && params?.item?.type === 'agentMessage' && typeof params.item.text === 'string') {
 			if (!publishedAgentMessage) {
 				publishedAgentMessage = true;
@@ -908,6 +921,42 @@ function withTimeout(promise, timeoutMs, schedule, cancelSchedule) {
 			(error) => { cancelSchedule(handle); reject(error); },
 		);
 	});
+}
+
+function createProviderSilenceDeadline(timeoutMs, schedule, cancelSchedule) {
+	let handle = null;
+	let generation = 0;
+	let disposed = false;
+	let paused = false;
+	let rejectDeadline;
+	const promise = new Promise((_, reject) => { rejectDeadline = reject; });
+	const clear = () => {
+		generation += 1;
+		if (handle !== null) cancelSchedule(handle);
+		handle = null;
+	};
+	const restart = () => {
+		if (disposed) return;
+		clear();
+		if (paused) return;
+		const expectedGeneration = generation;
+		handle = schedule(() => {
+			if (disposed || generation !== expectedGeneration) return;
+			handle = null;
+			rejectDeadline(new CodexProtocolError('PLANNING_TIMEOUT', `Codex provider was silent for ${timeoutMs} ms`));
+		}, timeoutMs);
+	};
+	return {
+		promise,
+		pause() { paused = true; clear(); },
+		resume() { paused = false; restart(); },
+		restart,
+		dispose() {
+			if (disposed) return;
+			disposed = true;
+			clear();
+		},
+	};
 }
 
 function safeVerbose(callback, stage, message) {

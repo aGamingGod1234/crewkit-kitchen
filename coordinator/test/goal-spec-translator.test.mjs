@@ -57,3 +57,28 @@ test('translator rejects mismatched request identities', async () => {
 	});
 	await assert.rejects(() => translator.translate(REQUEST), error => error?.code === 'GOAL_SPEC_REQUEST_MISMATCH');
 });
+
+test('translator preserves compound item and kill requests as bounded all-of leaves', async () => {
+	const request = {
+		requestId: '00000000-0000-4000-8000-000000000011',
+		originalRequest: 'Get an iron pickaxe and kill a zombie',
+		candidateIds: ['minecraft:iron_pickaxe', 'minecraft:zombie'],
+	};
+	const translator = new GoalSpecTranslator({
+		generate: async ({ prompt }) => {
+			assert.match(prompt, /use all_of/i);
+			assert.match(prompt, /at most 16 factual leaves/i);
+			return {
+				requestId: request.requestId,
+				summary: 'Get the pickaxe and defeat the zombie',
+				predicate: { type: 'all_of', predicates: [
+					{ type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 },
+					{ type: 'entity_killed_by_agent', entityType: 'minecraft:zombie', afterGoalStart: true },
+				] },
+			};
+		},
+	});
+	const proposal = await translator.translate(request);
+	assert.equal(proposal.predicate.type, 'all_of');
+	assert.equal(proposal.predicate.predicates.length, 2);
+});

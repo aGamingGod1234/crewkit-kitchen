@@ -839,6 +839,44 @@ test('native Codex drains an in-flight tool before completing its turn', async (
 	await service.stop();
 });
 
+test('native Codex pauses the provider-silence deadline while Minecraft owns an accepted tool', async (t) => {
+	const transport = new FakeSharedTransport();
+	transport.autoComplete = false;
+	const timers = [];
+	const service = new CodexService({
+		cwd: 'C:\\workspace',
+		planningTimeoutMs: 25,
+		schedule(callback, timeoutMs) {
+			const handle = { callback, timeoutMs, cancelled: false };
+			timers.push(handle);
+			return handle;
+		},
+		cancelSchedule(handle) { handle.cancelled = true; },
+	}, { transport });
+	let releaseTool;
+	const toolGate = new Promise((resolve) => { releaseTool = resolve; });
+	t.after(async () => { releaseTool(); await service.stop(); });
+	const agent = await service.createAgent(profile('agent-native-tool-deadline'), { controlProtocol: 'native_tools' });
+	await agent.setGoalRevision(1);
+	const turn = agent.act('event: perform a long physical action', {
+		goalRevision: 1,
+		executeTool: async () => { await toolGate; return { state: 'SUCCEEDED' }; },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('serverRequest', {
+		id: 106,
+		method: 'item/tool/call',
+		params: { threadId: 'thread-1', turnId: 'turn-1', callId: 'long-tool', tool: 'moveTo', arguments: { x: 50, y: 64, z: 0, timeoutMs: 120_000 } },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } });
+	assert.equal(timers.filter(({ timeoutMs, cancelled }) => timeoutMs === 25 && !cancelled).length, 0, 'provider silence has no live timer during the physical tool');
+	for (const timer of timers.filter(({ timeoutMs }) => timeoutMs === 25)) timer.callback();
+	assert.equal(await Promise.race([turn.then(() => 'settled', () => 'settled'), new Promise((resolve) => setImmediate(() => resolve('pending')))]), 'pending');
+	releaseTool();
+	assert.deepEqual(await turn, { status: 'completed', toolCalls: 1 });
+});
+
 test('native Codex serializes two tool calls within one turn', async (t) => {
 	const transport = new FakeSharedTransport();
 	transport.autoComplete = false;

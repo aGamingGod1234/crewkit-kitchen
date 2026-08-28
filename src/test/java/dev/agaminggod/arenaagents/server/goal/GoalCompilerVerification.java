@@ -21,6 +21,7 @@ public final class GoalCompilerVerification {
 		int assertions = 0;
 		assertions += verifyExactItemAndAmbiguity();
 		assertions += verifyExactPositionEntityAndAdvancement();
+		assertions += verifyCompoundItemsAndKills();
 		assertions += verifyDraftRoundTrip();
 		assertions += verifyDraftRevisionBinding();
 		assertions += verifyDraftAuthorizationAndChoices();
@@ -108,6 +109,40 @@ public final class GoalCompilerVerification {
 				"nonexistent advancement ID requires clarification"
 		);
 		return 6;
+	}
+
+	private static int verifyCompoundItemsAndKills() {
+		GoalCompiler compiler = new GoalCompiler();
+		GoalCompilation mixed = compiler.compile("Get 2 apples and kill a zombie", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, mixed.kind(), "mixed factual item and kill request is accepted");
+		assertEquals(
+				new GoalPredicate.AllOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:apple", 2),
+						new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)
+				)),
+				mixed.acceptedSpec().orElseThrow().completion(),
+				"mixed request freezes one bounded predicate per factual result"
+		);
+		GoalCompilation twoKills = compiler.compile("Kill a zombie and a skeleton", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(
+				new GoalPredicate.AllOf(List.of(
+						new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+						new GoalPredicate.EntityKilledByAgent("minecraft:skeleton", true)
+				)),
+				twoKills.acceptedSpec().orElseThrow().completion(),
+				"a carried kill verb compiles each entity into its own verifier"
+		);
+		assertEquals(
+				List.of(
+						"minecraft:copper_pickaxe", "minecraft:diamond_pickaxe", "minecraft:golden_pickaxe", "minecraft:iron_pickaxe",
+						"minecraft:netherite_pickaxe", "minecraft:stone_pickaxe", "minecraft:wooden_pickaxe", "minecraft:zombie"
+				),
+				compiler.candidateIdsFor("Get a good pickaxe and kill a zombie", RegistryAccess.EMPTY),
+				"compound translation candidates include registered items and entities"
+		);
+		GoalCompilation overBound = compiler.compile("Get apple" + " and apple".repeat(16), RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.REJECTED, overBound.kind(), "compound predicates reject more than sixteen factual leaves");
+		return 5;
 	}
 
 	private static int verifyDraftRoundTrip() {

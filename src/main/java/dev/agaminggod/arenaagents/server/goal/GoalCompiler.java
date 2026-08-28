@@ -5,8 +5,9 @@ import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 import java.util.Locale;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -20,6 +21,7 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.item.Item;
 
 public final class GoalCompiler {
+	private static final int MAX_COMPOUND_LEAVES = 16;
 	private static final Pattern POSITION = Pattern.compile(
 			"^(?:go|move|travel|get)(?: to)?(?: coordinates?)?\\s+"
 					+ "(?:x\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
@@ -28,7 +30,7 @@ public final class GoalCompiler {
 					+ "(?:\\s+and\\s+stop(?:\\s+there)?)?$"
 	);
 	private static final Pattern ADVANCEMENT = Pattern.compile("^(?:complete|get|earn) (?:the )?advancement ([a-z0-9_.-]+:[a-z0-9_./-]+)$");
-	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:the )?(.+)$");
+	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:(?:the|a|an) )?(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
@@ -89,9 +91,6 @@ public final class GoalCompiler {
 				return accepted(original, new GoalPredicate.EntityKilledByAgent(entityId, true), createdAtTick,
 						"Goal set: defeat " + entityId + ".");
 			}
-			return GoalCompilation.needsTranslation(matches.isEmpty()
-					? "I could not identify the exact Minecraft entity to defeat."
-					: "More than one Minecraft entity matches that request.");
 		}
 
 		Matcher item = ITEM.matcher(command);
@@ -114,6 +113,18 @@ public final class GoalCompiler {
 				return accepted(original, new GoalPredicate.InventoryContains(itemId, count), createdAtTick,
 						"Goal set: obtain " + itemId + " x" + count + ".");
 			}
+		}
+
+		GoalCompilation compound = compileCompound(original, command, registries, createdAtTick);
+		if (compound != null) return compound;
+		if (kill.matches()) {
+			List<String> matches = matchEntities(kill.group(1), registries);
+			return GoalCompilation.needsTranslation(matches.isEmpty()
+					? "I could not identify the exact Minecraft entity to defeat."
+					: "More than one Minecraft entity matches that request.");
+		}
+		if (item.matches()) {
+			List<String> matches = matchItems(item.group(2), registries);
 			return GoalCompilation.needsTranslation(matches.isEmpty()
 					? "I could not identify the exact Minecraft item you want."
 					: "More than one Minecraft item matches that request.");
@@ -152,6 +163,16 @@ public final class GoalCompiler {
 		Objects.requireNonNull(registries, "registries must not be null");
 		String command = stripTrailingPunctuation(stripPoliteness(
 				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		List<GoalClause> clauses = compoundClauses(command);
+		if (clauses.size() > 1) {
+			TreeSet<String> candidates = new TreeSet<>();
+			for (GoalClause clause : clauses) {
+				String target = SUBJECTIVE.matcher(clause.target()).replaceAll(" ").replaceAll("\\s+", " ").strip();
+				candidates.addAll(clause.kind() == ClauseKind.ITEM ? relatedItems(target, registries) : relatedEntities(target, registries));
+				if (candidates.size() >= 64) break;
+			}
+			return candidates.stream().limit(64).toList();
+		}
 		Matcher item = ITEM.matcher(command);
 		if (item.matches()) {
 			String target = SUBJECTIVE.matcher(item.group(3)).replaceAll(" ").replaceAll("\\s+", " ").strip();
@@ -166,19 +187,88 @@ public final class GoalCompiler {
 		return List.of();
 	}
 
+	private static GoalCompilation compileCompound(String original, String command, RegistryAccess registries, long createdAtTick) {
+		List<GoalClause> clauses = compoundClauses(command);
+		if (clauses.size() < 2) return null;
+		if (clauses.size() > MAX_COMPOUND_LEAVES) {
+			return GoalCompilation.rejected("A compound goal may contain at most " + MAX_COMPOUND_LEAVES + " factual results.");
+		}
+		ArrayList<GoalPredicate> predicates = new ArrayList<>();
+		for (GoalClause clause : clauses) {
+			if (clause.kind() == ClauseKind.ITEM) {
+				if (clause.count() <= 0) return GoalCompilation.rejected("The requested item count must be positive.");
+				List<String> matches = matchItems(clause.target(), registries);
+				if (matches.size() != 1) return GoalCompilation.needsTranslation(matches.isEmpty()
+						? "I could not identify every Minecraft item in that request."
+						: "More than one Minecraft item matches part of that request.");
+				predicates.add(new GoalPredicate.InventoryContains(matches.getFirst(), clause.count()));
+			} else {
+				List<String> matches = matchEntities(clause.target(), registries);
+				if (matches.size() != 1) return GoalCompilation.needsTranslation(matches.isEmpty()
+						? "I could not identify every Minecraft entity in that request."
+						: "More than one Minecraft entity matches part of that request.");
+				predicates.add(new GoalPredicate.EntityKilledByAgent(matches.getFirst(), true));
+			}
+		}
+		return accepted(original, new GoalPredicate.AllOf(predicates), createdAtTick,
+				"Goal set: complete " + predicates.size() + " factual Minecraft results.");
+	}
+
+	private static List<GoalClause> compoundClauses(String command) {
+		String[] parts = command.split("\\s+and\\s+");
+		if (parts.length < 2) return List.of();
+		ArrayList<GoalClause> clauses = new ArrayList<>();
+		ClauseKind inherited = null;
+		for (String part : parts) {
+			GoalClause clause = parseClause(part.strip(), inherited);
+			if (clause == null) return List.of();
+			clauses.add(clause);
+			inherited = clause.kind();
+		}
+		return List.copyOf(clauses);
+	}
+
+	private static GoalClause parseClause(String value, ClauseKind inherited) {
+		Matcher kill = KILL.matcher(value);
+		if (kill.matches()) return new GoalClause(ClauseKind.KILL, kill.group(1), 1);
+		Matcher item = ITEM.matcher(value);
+		if (item.matches()) {
+			try {
+				return new GoalClause(ClauseKind.ITEM, item.group(2), item.group(1) == null ? 1 : Integer.parseInt(item.group(1)));
+			} catch (NumberFormatException exception) {
+				return new GoalClause(ClauseKind.ITEM, item.group(2), -1);
+			}
+		}
+		if (inherited == null) return null;
+		String target = value.replaceFirst("^(?:the|a|an|some)\\s+", "").strip();
+		if (target.isEmpty()) return null;
+		if (inherited == ClauseKind.KILL) return new GoalClause(ClauseKind.KILL, target, 1);
+		Matcher counted = Pattern.compile("^(?:(\\d+)\\s+)?(?:(?:the|a|an|some)\\s+)?(.+)$").matcher(value);
+		if (!counted.matches()) return null;
+		try {
+			return new GoalClause(ClauseKind.ITEM, counted.group(2), counted.group(1) == null ? 1 : Integer.parseInt(counted.group(1)));
+		} catch (NumberFormatException exception) {
+			return new GoalClause(ClauseKind.ITEM, counted.group(2), -1);
+		}
+	}
+
+	private enum ClauseKind { ITEM, KILL }
+	private record GoalClause(ClauseKind kind, String target, int count) { }
+
 	private static GoalCompilation accepted(String original, GoalPredicate predicate, long createdAtTick, String message) {
 		return GoalCompilation.accepted(GoalSpec.create(original, predicate, createdAtTick), message);
 	}
 
 	private static List<String> matchItems(String target, RegistryAccess registries) {
 		String wanted = normalizedTarget(target);
+		Set<String> forms = singularForms(wanted);
 		ArrayList<String> matches = new ArrayList<>();
 		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
 		for (Identifier id : itemRegistry.keySet()) {
 			Item item = itemRegistry.getValue(id);
 			if (item == null) continue;
 			String descriptionName = descriptionName(item.getDescriptionId());
-			if (wanted.equals(id.toString()) || wanted.equals(pathName(id)) || wanted.equals(descriptionName)) {
+			if (forms.contains(id.toString()) || forms.contains(pathName(id)) || forms.contains(descriptionName)) {
 				matches.add(id.toString());
 			}
 		}
@@ -239,6 +329,13 @@ public final class GoalCompiler {
 
 	private static String normalizedTarget(String value) {
 		return value.strip().replaceAll("\\s+", " ");
+	}
+
+	private static Set<String> singularForms(String value) {
+		if (value.length() > 1 && value.endsWith("s") && !value.endsWith("ss")) {
+			return Set.of(value, value.substring(0, value.length() - 1));
+		}
+		return Set.of(value);
 	}
 
 	private static String stripPoliteness(String request) {

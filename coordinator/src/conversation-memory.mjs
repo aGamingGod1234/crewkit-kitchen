@@ -64,6 +64,29 @@ export class ConversationMemory {
 
 	toPlannerDelta(afterSequence = null) { return this.delta(afterSequence); }
 
+	/** Native turns consume this projection once, advancing their own sequence cursor. */
+	unread(afterSequence = -1) {
+		const delta = this.delta(afterSequence);
+		return Object.freeze({
+			mode: 'unread',
+			baseSequence: delta.baseSequence,
+			nextSequence: delta.nextSequence,
+			entries: Object.freeze(delta.entries),
+		});
+	}
+
+	/** Observation tools may expose recent context only when it is labelled as history. */
+	history(maximumEntries = 4) {
+		if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 0 || maximumEntries > this.#maximumEntries) {
+			throw new TypeError(`maximumEntries must be between 0 and ${this.#maximumEntries}`);
+		}
+		return Object.freeze({
+			mode: 'history',
+			nextSequence: this.#lastSequence,
+			entries: Object.freeze(this.#entries.slice(-maximumEntries).map((entry) => structuredClone(entry))),
+		});
+	}
+
 	reset() {
 		this.#entries = [];
 		this.#lastSequence = -1;
