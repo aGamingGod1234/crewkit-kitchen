@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.agent.goal;
 
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
+import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -32,8 +33,9 @@ public sealed interface GoalPredicate permits
 		public PositionWithin {
 			dimensionId = identifier(dimensionId, "dimensionId");
 			if (!MinecraftCoordinateBounds.isReachable(x, y, z)
-					|| !Double.isFinite(radius) || radius < 0.0D) {
-				throw invalid("Position values must be reachable Minecraft coordinates and radius must be nonnegative");
+					|| !Double.isFinite(radius) || radius < ProtocolConstants.MIN_MOVEMENT_TOLERANCE) {
+				throw invalid("Position values must be reachable Minecraft coordinates and radius must be at least "
+						+ ProtocolConstants.MIN_MOVEMENT_TOLERANCE);
 			}
 			if (stableTicks <= 0) throw invalid("Stable ticks must be positive");
 		}

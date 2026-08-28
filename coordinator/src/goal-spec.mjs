@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 
+import { MIN_MOVEMENT_TOLERANCE } from './constants.mjs';
+
 const IDENTIFIER = /^[a-z0-9_.-]+:[a-z0-9_./-]+$/;
 const FINGERPRINT = /^[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -22,11 +24,11 @@ const predicateVariants = [
 	}),
 	objectSchema(['type', 'x', 'y', 'z', 'radius', 'stableTicks'], {
 		type: { const: 'position_within' }, dimensionId: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' }, z: { type: 'number' },
-		radius: { type: 'number', minimum: 0 }, stableTicks: { type: 'integer', minimum: 1 },
+		radius: { type: 'number', minimum: MIN_MOVEMENT_TOLERANCE }, stableTicks: { type: 'integer', minimum: 1 },
 	}),
 	objectSchema(['type', 'advancementId'], { type: { const: 'advancement_granted' }, advancementId: { type: 'string' } }),
 	objectSchema(['type', 'entityType', 'afterGoalStart'], {
-		type: { const: 'entity_killed_by_agent' }, entityType: { type: 'string' }, afterGoalStart: { type: 'boolean' },
+		type: { const: 'entity_killed_by_agent' }, entityType: { type: 'string' }, afterGoalStart: { const: true },
 	}),
 	objectSchema(['type', 'x', 'y', 'z', 'blockId', 'properties'], {
 		type: { const: 'block_matches' }, dimensionId: { type: 'string' }, x: { type: 'integer' }, y: { type: 'integer' }, z: { type: 'integer' },
@@ -76,10 +78,12 @@ export function parseGoalSpecProposal(value) {
 	requireObject(value, 'goal spec proposal');
 	exactKeys(value, ['requestId', 'summary', 'predicate'], 'goal spec proposal');
 	const budget = { leaves: 0 };
+	const predicate = parsePredicate(value.predicate, 0, budget);
+	requirePostActivationKills(predicate);
 	return deepFreeze({
 		requestId: requestId(value.requestId),
 		summary: text(value.summary, 'summary', 256),
-		predicate: parsePredicate(value.predicate, 0, budget),
+		predicate,
 	});
 }
 
@@ -136,7 +140,7 @@ function parsePredicate(value, depth, budget) {
 			result = {
 				type, ...(value.dimensionId === undefined ? {} : { dimensionId: identifier(value.dimensionId, 'dimensionId') }),
 				x: finiteNumber(value.x, 'x'), y: finiteNumber(value.y, 'y'), z: finiteNumber(value.z, 'z'),
-				radius: nonnegativeNumber(value.radius, 'radius'), stableTicks: positiveInteger(value.stableTicks, 'stableTicks'),
+				radius: positionRadius(value.radius), stableTicks: positiveInteger(value.stableTicks, 'stableTicks'),
 			};
 			break;
 		case 'advancement_granted':
@@ -311,10 +315,21 @@ function finiteNumber(value, field) {
 	return value;
 }
 
-function nonnegativeNumber(value, field) {
+function positionRadius(value) {
+	const field = 'radius';
 	const checked = finiteNumber(value, field);
-	if (checked < 0) fail('INVALID_GOAL_PREDICATE', `${field} must be nonnegative`);
+	if (checked < MIN_MOVEMENT_TOLERANCE) {
+		fail('INVALID_GOAL_PREDICATE', `${field} must be at least ${MIN_MOVEMENT_TOLERANCE}`);
+	}
 	return checked;
+}
+
+function requirePostActivationKills(predicate) {
+	visitPredicate(predicate, value => {
+		if (value.type === 'entity_killed_by_agent' && !value.afterGoalStart) {
+			fail('INVALID_GOAL_PREDICATE', 'afterGoalStart must be true for translated kill goals');
+		}
+	});
 }
 
 function deepFreeze(value) {

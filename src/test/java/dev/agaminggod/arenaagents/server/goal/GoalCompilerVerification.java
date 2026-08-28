@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server.goal;
 
+import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
@@ -37,6 +38,7 @@ public final class GoalCompilerVerification {
 		assertions += verifyExplicitAlternativeCandidates();
 		assertions += verifyDraftRoundTrip();
 		assertions += verifyWorldValidation();
+		assertions += verifyWireBoundaryInvariants();
 		assertions += verifyDraftRevisionBinding();
 		assertions += verifyDraftAuthorizationAndChoices();
 		assertions += verifySpecAwareLifecycleStart();
@@ -405,6 +407,29 @@ public final class GoalCompilerVerification {
 				"minecraft:oak_stairs", Map.of("facing", "upwards")),
 				"unknown block-state values are rejected before staging");
 		return 7;
+	}
+
+	private static int verifyWireBoundaryInvariants() {
+		GoalSpecWireCodec codec = new GoalSpecWireCodec();
+		GoalPredicate.PositionWithin minimumPosition = new GoalPredicate.PositionWithin(12, 64, -8, 0.01, 1);
+		assertEquals(minimumPosition, codec.decodePredicate(codec.encodePredicate(minimumPosition)),
+				"minimum executable position radius survives the Java wire round-trip");
+		GoalPredicate.EntityKilledByAgent attributedKill =
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true);
+		assertEquals(attributedKill, codec.decodePredicate(codec.encodePredicate(attributedKill)),
+				"post-activation kill attribution survives the Java wire round-trip");
+		expectCode("INVALID_GOAL_PREDICATE", () -> codec.decodePredicate(JsonParser.parseString("""
+				{"type":"position_within","x":12,"y":64,"z":-8,"radius":0,"stableTicks":1}
+				""").getAsJsonObject()), "zero-radius wire predicates fail closed");
+		GoalPredicate historicalKill = codec.decodePredicate(JsonParser.parseString("""
+				{"type":"entity_killed_by_agent","entityType":"minecraft:zombie","afterGoalStart":false}
+				""").getAsJsonObject());
+		assertEquals(new GoalPredicate.EntityKilledByAgent("minecraft:zombie", false), historicalKill,
+				"general goal decoding preserves explicit historical attribution semantics");
+		expectCode("INVALID_GOAL_PREDICATE",
+				() -> GoalPredicateWorldValidator.validateTranslatedProposal(historicalKill),
+				"pre-goal kill attribution fails closed at the translated-proposal boundary");
+		return 5;
 	}
 
 	private static int verifySpecAwareLifecycleStart() {

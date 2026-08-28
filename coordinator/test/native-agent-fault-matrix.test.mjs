@@ -148,7 +148,7 @@ test('completion verifies the immutable compound position and block predicates',
 		goalPredicate: {
 			type: 'all_of',
 			predicates: [
-				{ type: 'position_within', x: 1, y: 64, z: 0, radius: 0, stableTicks: 1 },
+				{ type: 'position_within', x: 1, y: 64, z: 0, radius: 0.01, stableTicks: 1 },
 				{ type: 'block_matches', x: 0, y: 64, z: 0, blockId: 'minecraft:oak_log', properties: {} },
 			],
 		},

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+	GOAL_PREDICATE_SCHEMA,
+	GOAL_SPEC_PROPOSAL_SCHEMA,
 	parseGoalSpec,
 	parseGoalSpecProposal,
 	parseGoalSpecRequest,
@@ -9,6 +11,42 @@ import {
 } from '../src/goal-spec.mjs';
 
 const REQUEST_ID = '00000000-0000-4000-8000-000000000001';
+
+test('translated movement and kill predicates enforce executable post-activation invariants', () => {
+	const position = {
+		requestId: REQUEST_ID,
+		summary: 'Reach the position',
+		predicate: { type: 'position_within', x: 12, y: 64, z: -8, radius: 0.01, stableTicks: 1 },
+	};
+	assert.deepEqual(parseGoalSpecProposal(position), position);
+	for (const radius of [0, 0.009, -1]) {
+		assert.throws(
+			() => parseGoalSpecProposal({ ...position, predicate: { ...position.predicate, radius } }),
+			error => error?.code === 'INVALID_GOAL_PREDICATE' && /radius/i.test(error.message),
+		);
+	}
+
+	const kill = {
+		requestId: REQUEST_ID,
+		summary: 'Kill the zombie',
+		predicate: { type: 'entity_killed_by_agent', entityType: 'minecraft:zombie', afterGoalStart: true },
+	};
+	assert.deepEqual(parseGoalSpecProposal(kill), kill);
+	assert.throws(
+		() => parseGoalSpecProposal({ ...kill, predicate: { ...kill.predicate, afterGoalStart: false } }),
+		error => error?.code === 'INVALID_GOAL_PREDICATE' && /afterGoalStart/i.test(error.message),
+	);
+	const killSpecFields = { originalRequest: 'Kill the zombie', predicate: kill.predicate, createdAtTick: 1_200 };
+	const killSpec = { ...killSpecFields, fingerprint: goalSpecFingerprint(killSpecFields) };
+	assert.deepEqual(parseGoalSpec(killSpec), killSpec);
+
+	for (const schema of [GOAL_PREDICATE_SCHEMA, GOAL_SPEC_PROPOSAL_SCHEMA.$defs.predicate]) {
+		const positionSchema = schema.oneOf.find(entry => entry.properties.type.const === 'position_within');
+		const killSchema = schema.oneOf.find(entry => entry.properties.type.const === 'entity_killed_by_agent');
+		assert.equal(positionSchema.properties.radius.minimum, 0.01);
+		assert.equal(killSchema.properties.afterGoalStart.const, true);
+	}
+});
 
 test('goal spec proposal accepts only the closed authoritative predicate schema', () => {
 	const proposal = {

@@ -44,6 +44,24 @@ public final class GoalPredicateWorldValidator {
 		};
 	}
 
+	/** Provider-translated imperative kills can never claim events retained from before activation. */
+	public static void validateTranslatedProposal(GoalPredicate predicate) {
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		switch (predicate) {
+			case GoalPredicate.EntityKilledByAgent value -> {
+				if (!value.afterGoalStart()) {
+					throw invalid("INVALID_GOAL_PREDICATE",
+							"Translated kill goals must require attribution after goal activation");
+				}
+			}
+			case GoalPredicate.AllOf value -> value.predicates().forEach(
+					GoalPredicateWorldValidator::validateTranslatedProposal);
+			case GoalPredicate.AnyOf value -> value.predicates().forEach(
+					GoalPredicateWorldValidator::validateTranslatedProposal);
+			default -> { }
+		}
+	}
+
 	public static ServerLevel requireLevel(MinecraftServer server, String dimensionId) {
 		Objects.requireNonNull(server, "server must not be null");
 		Objects.requireNonNull(dimensionId, "dimensionId must not be null");
