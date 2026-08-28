@@ -135,7 +135,48 @@ public final class GoalVerificationRuntimeVerification {
 				alternativeFixture.agentId, "minecraft:zombie", alternativeStart + 1L);
 		assertEquals(true, alternativeFixture.runtime.evaluate(alternativeFixture.agentId).verified(),
 				"alternative kill branches share the same single-event requirement");
-		return 3;
+
+		GoalPredicate alternativeThenRepeated = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.AnyOf(List.of(
+						new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+						new GoalPredicate.EntityKilledByAgent("minecraft:skeleton", true)
+				)),
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)
+		));
+		Fixture backtrackingFixture = fixture(alternativeThenRepeated, 452L);
+		long backtrackingStart = backtrackingFixture.record().currentGoal().orElseThrow().createdAtEpochMs();
+		backtrackingFixture.runtime.killLedger().record(
+				backtrackingFixture.agentId, "minecraft:zombie", backtrackingStart + 1L);
+		backtrackingFixture.runtime.killLedger().record(
+				backtrackingFixture.agentId, "minecraft:skeleton", backtrackingStart + 2L);
+		assertEquals(true, backtrackingFixture.runtime.evaluate(backtrackingFixture.agentId).verified(),
+				"an enclosing conjunction backtracks to the satisfiable kill alternative");
+
+		Fixture insufficientFixture = fixture(alternativeThenRepeated, 453L);
+		long insufficientStart = insufficientFixture.record().currentGoal().orElseThrow().createdAtEpochMs();
+		insufficientFixture.runtime.killLedger().record(
+				insufficientFixture.agentId, "minecraft:zombie", insufficientStart + 1L);
+		assertEquals(false, insufficientFixture.runtime.evaluate(insufficientFixture.agentId).verified(),
+				"alternative backtracking cannot reuse one kill across a repeated requirement");
+
+		GoalPredicate nestedAlternative = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.AnyOf(List.of(
+						new GoalPredicate.AllOf(List.of(
+								new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+								new GoalPredicate.EntityKilledByAgent("minecraft:skeleton", true)
+						)),
+						new GoalPredicate.EntityKilledByAgent("minecraft:creeper", true)
+				)),
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)
+		));
+		Fixture nestedFixture = fixture(nestedAlternative, 454L);
+		long nestedStart = nestedFixture.record().currentGoal().orElseThrow().createdAtEpochMs();
+		nestedFixture.runtime.killLedger().record(nestedFixture.agentId, "minecraft:zombie", nestedStart + 1L);
+		nestedFixture.runtime.killLedger().record(nestedFixture.agentId, "minecraft:skeleton", nestedStart + 2L);
+		nestedFixture.runtime.killLedger().record(nestedFixture.agentId, "minecraft:creeper", nestedStart + 3L);
+		assertEquals(true, nestedFixture.runtime.evaluate(nestedFixture.agentId).verified(),
+				"nested alternatives backtrack when their first satisfied compound exhausts a later requirement");
+		return 6;
 	}
 
 	private static int verifyKillGoalAfterServerTickReset() {

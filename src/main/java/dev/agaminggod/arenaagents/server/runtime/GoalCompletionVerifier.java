@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
@@ -41,11 +42,20 @@ public final class GoalCompletionVerifier {
 		if (facts == null) return failure(record.goalRevision(), "NO_PLAYER");
 		if (serverTick < 0L) throw new IllegalArgumentException("serverTick must be nonnegative");
 		AgentGoal goal = record.currentGoal().orElseThrow();
+		AgentKillLedger kills = killLedger == null ? new AgentKillLedger() : killLedger;
 		Evaluation evaluation = evaluate(
 				goal.goalId(), goal.spec().completion(), "root", facts,
-				killLedger == null ? new AgentKillLedger() : killLedger,
+				kills,
 				record, serverTick, operatorConfirmed, new Counter(), new KillAllocation()
 		);
+		if (!evaluation.satisfied()) {
+			Optional<List<GoalEvidence.Fact>> recovered = satisfyWithBacktracking(
+					goal.goalId(), goal.spec().completion(), "root", facts,
+					kills,
+					record, serverTick, operatorConfirmed, new KillAllocation(), ignored -> Optional.of(List.of())
+			);
+			if (recovered.isPresent()) evaluation = new Evaluation(true, recovered.orElseThrow());
+		}
 		return new VerificationResult(
 				evaluation.satisfied(), record.goalRevision(),
 				evaluation.satisfied() ? "COMPLETION_VERIFIED" : "PREDICATE_FAILED",
@@ -217,6 +227,83 @@ public final class GoalCompletionVerifier {
 		return new Evaluation(satisfied, List.of(new GoalEvidence.Fact(type, satisfied, expected, observed)));
 	}
 
+	private Optional<List<GoalEvidence.Fact>> satisfyWithBacktracking(
+			UUID goalId,
+			GoalPredicate predicate,
+			String path,
+			FactSource source,
+			AgentKillLedger kills,
+			AgentRecord record,
+			long tick,
+			boolean operatorConfirmed,
+			KillAllocation allocation,
+			AllocationContinuation continuation
+	) {
+		if (predicate instanceof GoalPredicate.AllOf all) {
+			return satisfyAllWithBacktracking(goalId, all.predicates(), 0, path, source, kills, record,
+					tick, operatorConfirmed, allocation, continuation);
+		}
+		if (predicate instanceof GoalPredicate.AnyOf any) {
+			for (int index = 0; index < any.predicates().size(); index++) {
+				Optional<List<GoalEvidence.Fact>> satisfied = satisfyWithBacktracking(
+						goalId, any.predicates().get(index), path + "." + index, source, kills, record,
+						tick, operatorConfirmed, allocation.copy(), continuation);
+				if (satisfied.isPresent()) return satisfied;
+			}
+			return Optional.empty();
+		}
+		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
+			KillAllocation claimed = allocation.copy();
+			long afterTime = killed.afterGoalStart()
+					? record.currentGoal().orElseThrow().createdAtEpochMs()
+					: Long.MIN_VALUE;
+			int required = claimed.claim(new KillRequirement(killed.entityType(), afterTime));
+			int observed = kills.count(record.agentId(), killed.entityType(), afterTime);
+			if (observed < required) return Optional.empty();
+			GoalEvidence.Fact fact = new GoalEvidence.Fact(
+					"entity_killed_by_agent", true,
+					killed.entityType() + " x" + required, killed.entityType() + " x" + observed);
+			return prepend(fact, continuation.apply(claimed));
+		}
+		Evaluation leaf = evaluate(
+				goalId, predicate, path, source, kills, record, tick, operatorConfirmed,
+				new Counter(), allocation.copy());
+		if (!leaf.satisfied()) return Optional.empty();
+		return prepend(leaf.facts().getFirst(), continuation.apply(allocation));
+	}
+
+	private Optional<List<GoalEvidence.Fact>> satisfyAllWithBacktracking(
+			UUID goalId,
+			List<GoalPredicate> predicates,
+			int index,
+			String path,
+			FactSource source,
+			AgentKillLedger kills,
+			AgentRecord record,
+			long tick,
+			boolean operatorConfirmed,
+			KillAllocation allocation,
+			AllocationContinuation continuation
+	) {
+		if (index == predicates.size()) return continuation.apply(allocation);
+		return satisfyWithBacktracking(
+				goalId, predicates.get(index), path + "." + index, source, kills, record,
+				tick, operatorConfirmed, allocation,
+				next -> satisfyAllWithBacktracking(goalId, predicates, index + 1, path, source, kills,
+						record, tick, operatorConfirmed, next, continuation));
+	}
+
+	private static Optional<List<GoalEvidence.Fact>> prepend(
+			GoalEvidence.Fact fact,
+			Optional<List<GoalEvidence.Fact>> continuation
+	) {
+		if (continuation.isEmpty()) return Optional.empty();
+		ArrayList<GoalEvidence.Fact> facts = new ArrayList<>(continuation.orElseThrow().size() + 1);
+		facts.add(fact);
+		facts.addAll(continuation.orElseThrow());
+		return Optional.of(List.copyOf(facts));
+	}
+
 	private static String sortedProperties(Map<String, String> properties) {
 		return properties.entrySet().stream().sorted(Map.Entry.comparingByKey())
 				.map(entry -> entry.getKey() + "=" + entry.getValue())
@@ -290,6 +377,10 @@ public final class GoalCompletionVerifier {
 	private record SurvivalCounter(long ticks, long lastTick) { }
 	private record KillRequirement(String entityType, long afterTime) { }
 	private record Evaluation(boolean satisfied, List<GoalEvidence.Fact> facts) { }
+	@FunctionalInterface
+	private interface AllocationContinuation {
+		Optional<List<GoalEvidence.Fact>> apply(KillAllocation allocation);
+	}
 	private static final class Counter { private int value; int next() { return ++value; } }
 	private static final class KillAllocation {
 		private final Map<KillRequirement, Integer> required = new HashMap<>();
