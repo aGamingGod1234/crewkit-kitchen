@@ -38,6 +38,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyUnavailableSttRecoversAfterBackoff();
 		assertions += verifyCloseCancelsPendingTranscription();
 		assertions += verifyConsentRevocationCancelsOnlyOwnedSpeech();
+		assertions += verifyDisconnectGenerationStateIsBounded();
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		assertions += verifyCloseContinuesAfterDecoderCloseFailure();
 		return assertions;
@@ -483,6 +484,53 @@ final class SpeechCaptureEngineVerification {
 		return 6;
 	}
 
+	private static int verifyDisconnectGenerationStateIsBounded() throws Exception {
+		java.util.Map<UUID, NonCancellableFuture<SpeechWorkerClient.Transcript>> pending =
+				new java.util.LinkedHashMap<>();
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
+			NonCancellableFuture<SpeechWorkerClient.Transcript> future = new NonCancellableFuture<>();
+			pending.put(playerId, future);
+			return future;
+		}, scheduler(), 5_000L, 1);
+
+		for (int index = 0; index < 256; index++) engine.cancel(UUID.randomUUID());
+		assertEquals(0, trackedPlayerGenerationCount(engine),
+				"disconnects without captured speech retain no player generation state");
+
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		NonCancellableFuture<SpeechWorkerClient.Transcript> revoked = pending.get(PLAYER);
+		assertEquals(1, trackedPlayerGenerationCount(engine),
+				"captured speech owns one player generation");
+		engine.cancel(PLAYER);
+		assertEquals(true, revoked.cancellationAttempted,
+				"revocation attempts to cancel its owned transcription");
+		assertEquals(0, trackedPlayerGenerationCount(engine),
+				"revocation releases the disconnected player's generation state");
+
+		engine.accept(PLAYER, false, new byte[] { 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		NonCancellableFuture<SpeechWorkerClient.Transcript> regranted = pending.get(PLAYER);
+		revoked.complete(new SpeechWorkerClient.Transcript("late", 0.9));
+		assertEquals(List.of(), delivered,
+				"late work from a revoked generation stays fenced after consent is granted again");
+		regranted.complete(new SpeechWorkerClient.Transcript("current", 0.9));
+		assertEquals(List.of(new Delivered(PLAYER, "current", false)), delivered,
+				"the replacement generation can deliver while revoked work remains fenced");
+		engine.cancel(PLAYER);
+		assertEquals(0, trackedPlayerGenerationCount(engine),
+				"settled replacement work leaves no generation state after disconnect");
+		engine.close();
+		return 7;
+	}
+
+	private static int trackedPlayerGenerationCount(SpeechCaptureEngine engine) throws Exception {
+		var field = SpeechCaptureEngine.class.getDeclaredField("playerGenerations");
+		field.setAccessible(true);
+		return ((java.util.Map<?, ?>) field.get(engine)).size();
+	}
+
 	private static ScheduledExecutorService scheduler() {
 		return Executors.newSingleThreadScheduledExecutor(
 				runnable -> Thread.ofPlatform().daemon().name("voice-capture-verification").unstarted(runnable)
@@ -538,6 +586,16 @@ final class SpeechCaptureEngineVerification {
 
 		private void fail(long sequence, Throwable failure) {
 			pending.get(sequence).completeExceptionally(failure);
+		}
+	}
+
+	private static final class NonCancellableFuture<T> extends CompletableFuture<T> {
+		private boolean cancellationAttempted;
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			cancellationAttempted = true;
+			return false;
 		}
 	}
 
