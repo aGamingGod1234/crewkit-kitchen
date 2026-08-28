@@ -117,15 +117,29 @@ public final class CodexAgentServerRuntime {
 	private static long explicitBridgeRevision() {
 		String configuredPath = System.getProperty("arenaagents.bridgeSecretFile");
 		if (configuredPath == null || configuredPath.isBlank()) configuredPath = System.getenv("ARENA_AGENT_BRIDGE_SECRET_FILE");
-		Path path = configuredPath == null || configuredPath.isBlank()
-				? Path.of("runtime", "bridge-secret.txt")
-				: Path.of(configuredPath);
 		String port = System.getProperty("arenaagents.bridgePort", Integer.toString(MultiplexedServerBridge.DEFAULT_PORT));
+		return java.util.Objects.hash(port, explicitSecretFileRevision(configuredPath, Path.of("runtime", "bridge-secret.txt")));
+	}
+
+	private static long explicitSecretFileRevision(String configuredPath, Path fallbackPath) {
 		try {
+			Path path = configuredPath == null || configuredPath.isBlank()
+					? fallbackPath
+					: Path.of(configuredPath);
 			Path normalized = path.toAbsolutePath().normalize();
-			return java.util.Objects.hash(port, normalized, Files.size(normalized), Files.getLastModifiedTime(normalized).toMillis());
+			byte[] relevantContent;
+			try (var input = Files.newInputStream(normalized)) {
+				relevantContent = input.readNBytes(257);
+			}
+			return java.util.Objects.hash(
+					normalized, Files.size(normalized), Files.getLastModifiedTime(normalized).toMillis(),
+					java.util.Arrays.hashCode(relevantContent)
+			);
 		} catch (java.io.IOException | RuntimeException unavailable) {
-			return java.util.Objects.hash(port, path.toAbsolutePath().normalize(), unavailable.getClass().getName());
+			return java.util.Objects.hash(
+					configuredPath == null || configuredPath.isBlank() ? fallbackPath.toString() : configuredPath,
+					unavailable.getClass().getName()
+			);
 		}
 	}
 
@@ -326,9 +340,12 @@ public final class CodexAgentServerRuntime {
 	}
 
 	static long voiceConfigurationRevision(CoordinatorProcessSupervisor supervisor) {
+		long explicitSecretRevision = supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
+				? explicitSecretFileRevision(configuredVoiceSecretFile(), Path.of("runtime", "bridge-secret.txt"))
+				: 0L;
 		return java.util.Objects.hash(
 				supervisor.voiceConfigurationRevision(), supervisor.sharedSecretRevision(), supervisor.secretPath(),
-				configuredVoiceSecretFile(), System.getProperty("arenaagents.voiceUrl")
+				configuredVoiceSecretFile(), explicitSecretRevision, System.getProperty("arenaagents.voiceUrl")
 		);
 	}
 

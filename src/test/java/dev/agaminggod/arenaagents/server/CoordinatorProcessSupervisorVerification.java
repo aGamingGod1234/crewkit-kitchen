@@ -84,6 +84,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyDeferredVoiceInitialization();
 		verifyCandidateReadinessRequiresFreshReconciledStatus();
 		verifyAutoStartDisabledStillBindsExplicitBridge();
+		verifyInvalidExplicitSecretPathRetriesSafely();
 		verifyPortOnlyChangeAdvancesBridgeRevision();
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
@@ -92,7 +93,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 237;
+		return 242;
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -1326,6 +1327,40 @@ public final class CoordinatorProcessSupervisorVerification {
 			if (secretFile != null) {
 				try { Files.deleteIfExists(secretFile); } catch (IOException ignored) { }
 			}
+		}
+	}
+
+	private static void verifyInvalidExplicitSecretPathRetriesSafely() {
+		String oldAutoStart = System.getProperty("arenaagents.coordinatorAutoStart");
+		String oldSecret = System.getProperty("arenaagents.bridgeSecretFile");
+		CoordinatorProcessSupervisor supervisor = null;
+		CodexAgentServerRuntime.BridgeSlot slot = null;
+		try {
+			System.setProperty("arenaagents.coordinatorAutoStart", "false");
+			System.setProperty("arenaagents.bridgeSecretFile", "invalid\0secret-path");
+			supervisor = new CoordinatorProcessSupervisor(
+					Path.of("build", "invalid-explicit-secret-game"), Map.of(), new FakeClock(), MutableDependencies.ready(),
+					new FakeLauncher(), () -> "00000000-0000-0000-0000-000000000775"
+			);
+			FakeClock clock = new FakeClock();
+			slot = new CodexAgentServerRuntime.BridgeSlot(clock);
+			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			assertEquals(null, slot.bridge(), "invalid explicit secret path leaves automation safely offline");
+			assertEquals("JAVA_BRIDGE_START_FAILED", slot.retry().failureCode(),
+					"invalid explicit secret path uses the normal retry diagnostic");
+			assertTrue(slot.retry().failureMessage() != null && !slot.retry().failureMessage().isBlank(),
+					"invalid explicit secret path retains the platform parsing diagnostic");
+			long firstRetry = slot.retry().nextRetryEpochMs();
+			assertTrue(firstRetry > clock.getAsLong(), "invalid explicit secret path enters bounded retry backoff");
+			clock.advance(firstRetry - clock.getAsLong());
+			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
+			assertTrue(slot.retry().nextRetryEpochMs() > firstRetry,
+					"invalid explicit secret path retries without escaping the server tick boundary");
+		} finally {
+			if (slot != null) slot.close();
+			if (supervisor != null) supervisor.close();
+			restoreProperty("arenaagents.coordinatorAutoStart", oldAutoStart);
+			restoreProperty("arenaagents.bridgeSecretFile", oldSecret);
 		}
 	}
 

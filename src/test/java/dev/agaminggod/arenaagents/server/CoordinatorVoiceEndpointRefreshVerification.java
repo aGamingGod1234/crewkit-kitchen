@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -14,11 +15,15 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 	public static int verify() throws Exception {
 		String oldAutoStart = System.getProperty("arenaagents.coordinatorAutoStart");
 		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
+		String oldBridgeSecret = System.getProperty("arenaagents.bridgeSecretFile");
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
 		Path config = Files.createTempFile("arena-supervisor-voice-refresh-", ".json");
+		Path manualSecret = Files.createTempFile("arena-manual-voice-secret-", ".txt");
 		AtomicInteger voiceStarts = new AtomicInteger();
 		AtomicInteger voiceCloses = new AtomicInteger();
 		CoordinatorProcessSupervisor managed = null;
 		CoordinatorProcessSupervisor overridden = null;
+		CoordinatorProcessSupervisor manual = null;
 		try {
 			System.setProperty("arenaagents.coordinatorAutoStart", "true");
 			System.clearProperty("arenaagents.voiceUrl");
@@ -98,13 +103,43 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			overridden = null;
 			assertEquals(explicitOverride, System.getProperty("arenaagents.voiceUrl"),
 					"supervisor shutdown leaves an explicit user voice endpoint untouched");
-			return 18;
+
+			System.setProperty("arenaagents.coordinatorAutoStart", "false");
+			System.clearProperty("arenaagents.voiceSecretFile");
+			System.setProperty("arenaagents.bridgeSecretFile", manualSecret.toString());
+			Files.writeString(manualSecret, "m".repeat(32), StandardCharsets.UTF_8);
+			FileTime originalTimestamp = Files.getLastModifiedTime(manualSecret);
+			manual = supervisor(new MutableResolver(config, "unused-manual"),
+					"00000000-0000-0000-0000-000000000803");
+			assertEquals(CoordinatorRecoveryState.STOPPED, manual.snapshot().state(),
+					"manual coordinator mode leaves child-process supervision stopped");
+			long initialManualRevision = CodexAgentServerRuntime.voiceConfigurationRevision(manual);
+			CodexAgentServerRuntime.VoiceInitializationGate manualGate =
+					new CodexAgentServerRuntime.VoiceInitializationGate(
+							voiceStarts::incrementAndGet, voiceCloses::incrementAndGet
+					);
+			assertTrue(manualGate.reconcile(true, initialManualRevision),
+					"manual secret configuration creates the initial worker client");
+			Files.writeString(manualSecret, "n".repeat(32), StandardCharsets.UTF_8);
+			Files.setLastModifiedTime(manualSecret, originalTimestamp);
+			long rotatedManualRevision = CodexAgentServerRuntime.voiceConfigurationRevision(manual);
+			assertFalse(initialManualRevision == rotatedManualRevision,
+					"same-path manual secret content rotation advances the voice gate revision");
+			assertTrue(manualGate.reconcile(true, rotatedManualRevision),
+					"manual secret rotation recreates the worker client without restarting Minecraft");
+			assertEquals(4, voiceStarts.get(), "manual secret rotation starts one replacement worker client");
+			assertEquals(2, voiceCloses.get(), "manual secret rotation closes the stale worker client once");
+			return 24;
 		} finally {
 			if (managed != null) managed.close();
 			if (overridden != null) overridden.close();
+			if (manual != null) manual.close();
 			restoreProperty("arenaagents.coordinatorAutoStart", oldAutoStart);
 			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
+			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
 			Files.deleteIfExists(config);
+			Files.deleteIfExists(manualSecret);
 		}
 	}
 
