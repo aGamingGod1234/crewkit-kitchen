@@ -112,6 +112,32 @@ class FakePlanner {
 	async remove(agentId) { return this.registry.remove(agentId); }
 }
 
+test('coordinator binds the Minecraft bridge without eagerly starting a provider', async () => {
+	const bridge = new FakeBridge();
+	let providerStarts = 0;
+	let releaseProvider;
+	const provider = new FakeProvider();
+	provider.start = async () => {
+		providerStarts += 1;
+		await new Promise((resolve) => { releaseProvider = resolve; });
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, codexService: provider },
+	);
+
+	const starting = coordinator.start();
+	await new Promise((resolve) => setImmediate(resolve));
+	try {
+		assert.equal(bridge.ready, true);
+		assert.equal(providerStarts, 0, 'provider startup is lazy and cannot delay bridge readiness');
+	} finally {
+		releaseProvider?.();
+		await Promise.allSettled([starting]);
+		await coordinator.stop();
+	}
+});
+
 test('goal translation is isolated, coalesced, acknowledged, and does not change lifecycle state', async () => {
 	const run = await start();
 	const request = {
@@ -2207,6 +2233,60 @@ test('a transient reconciliation timeout cannot poison later agent lifecycle tra
 		assert.equal(registry.get('agent-a').state, DynamicAgentState.STARTING);
 		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 1));
 		assert.deepEqual(runtimeErrors, [timeout], 'one provider outage is reported once instead of once per queued agent event');
+	} finally {
+		await coordinator.stop();
+	}
+});
+
+test('a restored roster provider is reconciled and promoted without restarting the coordinator', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	let statusTick;
+	let now = 1_000;
+	const provider = new (class extends EventEmitter {
+		catalog = { stale: false, refresh: async () => ({ refreshedAtEpochMs: 2, models: [] }), assertSupported() {} };
+		async start() {}
+		async stop() {}
+		recoverySnapshot() {
+			return [{ provider: 'codex', state: 'degraded', nextProbeAtEpochMs: 2_000 }];
+		}
+	})();
+	const planner = new FakePlanner(registry);
+	let attempts = 0;
+	planner.beginReconcile = (records, options) => {
+		const reconciledRegistry = registry.reconcile(records, options);
+		attempts += 1;
+		const valid = attempts === 1 ? [] : reconciledRegistry.records;
+		const invalid = attempts === 1
+			? [{ profile: reconciledRegistry.records[0], code: 'PROVIDER_TIMEOUT', message: 'provider timed out' }]
+			: [];
+		return { registry: reconciledRegistry, complete: Promise.resolve({
+			registry: reconciledRegistry,
+			providers: { valid, invalid, catalog: { refreshedAtEpochMs: attempts, models: [] } },
+		}) };
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{
+			bridge, registry, planner, codexService: provider,
+			epochNow: () => now,
+			setStatusInterval: (callback) => { statusTick = callback; return { id: 'status' }; },
+			clearStatusInterval: () => {},
+		},
+	);
+	await coordinator.start();
+	try {
+		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'test', registry: [record()] });
+		await eventually(() => bridge.sent.some(({ type }) => type === 'agent_error'));
+		assert.equal(bridge.sent.some(({ type }) => type === 'agent_ready'), false);
+
+		statusTick();
+		for (let index = 0; index < 3; index += 1) await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(attempts, 1, 'maintenance does not probe before the provider recovery deadline');
+		now = 2_000;
+		statusTick();
+		await eventually(() => bridge.sent.some(({ type }) => type === 'agent_ready'));
+		assert.equal(attempts, 2);
 	} finally {
 		await coordinator.stop();
 	}

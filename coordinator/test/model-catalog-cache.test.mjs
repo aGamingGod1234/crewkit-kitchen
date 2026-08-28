@@ -93,3 +93,43 @@ test('catalog exposes a stable operator sequence and omits hidden provider model
 	assert.deepEqual(cache.find('gpt-5.6-sol').serviceTiers, ['priority', 'fast']);
 	assert.equal(cache.find('gpt-reserve'), null);
 });
+
+test('malformed refresh retains the previous valid catalog as last_valid', async () => {
+	let response = [MODEL];
+	const cache = new ModelCatalogCache(async () => response);
+	const live = await cache.refresh();
+	assert.equal(live.source, 'live');
+	response = [{ ...MODEL }, { ...MODEL }];
+	const retained = await cache.refresh({ force: true });
+	assert.equal(retained.source, 'last_valid');
+	assert.deepEqual(retained.models.map(({ id }) => id), ['gpt-5.6-sol']);
+	assert.equal(cache.stale, true, 'a retained snapshot remains eligible for automatic refresh');
+});
+
+test('catalog uses only its deterministic exact-profile builtin until live discovery recovers', async () => {
+	let available = false;
+	const builtin = {
+		id: 'gpt-5.6-terra', model: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra',
+		supportedReasoningEfforts: ['xhigh'], serviceTiers: ['priority'],
+	};
+	const liveModel = {
+		id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol',
+		supportedReasoningEfforts: ['high'], serviceTiers: ['fast'],
+	};
+	const cache = new ModelCatalogCache(async () => {
+		if (!available) throw Object.assign(new Error('offline'), { code: 'PROVIDER_UNAVAILABLE' });
+		return [liveModel];
+	}, { builtinModels: [builtin] });
+
+	const fallback = await cache.refresh();
+	assert.equal(fallback.source, 'builtin');
+	assert.deepEqual(fallback.models.map(({ id, reasoningEfforts, serviceTiers }) => ({ id, reasoningEfforts, serviceTiers })), [{
+		id: 'gpt-5.6-terra', reasoningEfforts: ['xhigh'], serviceTiers: ['priority'],
+	}]);
+	assert.equal(cache.find('gpt-5.6-sol'), null, 'fallback never invents or substitutes another profile');
+
+	available = true;
+	const live = await cache.refresh({ force: true });
+	assert.equal(live.source, 'live');
+	assert.deepEqual(live.models.map(({ id }) => id), ['gpt-5.6-sol']);
+});

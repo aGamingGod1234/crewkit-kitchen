@@ -29,18 +29,26 @@ export class ModelCatalogCache {
 	#models = [];
 	#refreshedAtEpochMs = 0;
 	#refreshPromise = null;
+	#source = null;
+	#failureCount = 0;
+	#failureCode = null;
 
-	constructor(loader, { ttlMs = DEFAULT_CATALOG_TTL_MS, now = Date.now } = {}) {
+	constructor(loader, { ttlMs = DEFAULT_CATALOG_TTL_MS, now = Date.now, builtinModels = [] } = {}) {
 		if (typeof loader !== 'function') throw new TypeError('model catalog loader must be a function');
 		if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new TypeError('catalog ttlMs must be a positive safe integer');
 		if (typeof now !== 'function') throw new TypeError('catalog now dependency must be a function');
 		this.#loader = loader;
 		this.#ttlMs = ttlMs;
 		this.#now = now;
+		if (!Array.isArray(builtinModels)) throw new TypeError('catalog builtinModels must be an array');
+		if (builtinModels.length > 0) {
+			this.#models = normalizeCatalog(builtinModels);
+			this.#source = 'builtin';
+		}
 	}
 
 	get stale() {
-		return this.#models.length === 0 || this.#now() - this.#refreshedAtEpochMs >= this.#ttlMs;
+		return this.#source !== 'live' || this.#models.length === 0 || this.#now() - this.#refreshedAtEpochMs >= this.#ttlMs;
 	}
 
 	async refresh({ force = false } = {}) {
@@ -49,8 +57,20 @@ export class ModelCatalogCache {
 		this.#refreshPromise = Promise.resolve()
 			.then(() => this.#loader())
 			.then((models) => {
-				this.#models = normalizeCatalog(models);
+				const normalized = normalizeCatalog(models);
+				if (normalized.length === 0) throw new ModelCatalogError('INVALID_CATALOG', 'Model catalog must contain at least one visible model');
+				this.#models = normalized;
 				this.#refreshedAtEpochMs = this.#now();
+				this.#source = 'live';
+				this.#failureCount = 0;
+				this.#failureCode = null;
+				return this.snapshot();
+			})
+			.catch((error) => {
+				this.#failureCount = Math.min(1_000_000, this.#failureCount + 1);
+				this.#failureCode = boundedFailureCode(error);
+				if (this.#models.length === 0) throw error;
+				if (this.#source !== 'builtin') this.#source = 'last_valid';
 				return this.snapshot();
 			})
 			.finally(() => { this.#refreshPromise = null; });
@@ -61,6 +81,12 @@ export class ModelCatalogCache {
 		return {
 			refreshedAtEpochMs: this.#refreshedAtEpochMs,
 			models: structuredClone(this.#models),
+			source: this.#source,
+			recovery: {
+				state: this.#source === 'live' ? 'live' : 'degraded',
+				failureCode: this.#failureCode,
+				consecutiveFailureCount: this.#failureCount,
+			},
 		};
 	}
 
@@ -156,4 +182,9 @@ function requireDisplayName(value, fallback) {
 function requireText(value, field) {
 	if (typeof value !== 'string' || value.trim().length === 0) throw new ModelCatalogError('INVALID_CATALOG', `${field} must be nonblank`);
 	return value;
+}
+
+function boundedFailureCode(error) {
+	const value = typeof error?.code === 'string' && error.code.trim().length > 0 ? error.code : 'CATALOG_REFRESH_FAILED';
+	return value.slice(0, 128);
 }

@@ -9,6 +9,7 @@ import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_DECISION_BYTES = 256 * 1_024;
 const THREAD_START_TIMEOUT_MS = 60_000;
 const MAX_BUFFERED_TURN_NOTIFICATIONS = 4_096;
@@ -52,6 +53,7 @@ export class CodexService {
 		this.#catalog = dependencies.catalog ?? new ModelCatalogCache(() => this.#listModels(), {
 			ttlMs: this.#config.catalogTtlMs,
 			now: dependencies.now ?? Date.now,
+			builtinModels: exactLaunchProfileCatalog(this.#config.launchProfile),
 		});
 	}
 
@@ -188,7 +190,7 @@ export class CodexService {
 	async #startOnce() {
 		await this.#transport.start();
 		try {
-			await this.#transport.request('initialize', { clientInfo: CLIENT_INFO, capabilities: CLIENT_CAPABILITIES });
+			await this.#transport.request('initialize', { clientInfo: CLIENT_INFO, capabilities: CLIENT_CAPABILITIES }, { timeoutMs: this.#config.startupTimeoutMs });
 			this.#transport.notify('initialized', {});
 			this.#started = true;
 			await this.#catalog.refresh({ force: true });
@@ -815,12 +817,15 @@ function validateServiceConfig(value, { requireLaunchProfile }) {
 	if (!Number.isSafeInteger(maxDecisionBytes) || maxDecisionBytes <= 0) throw new TypeError('maxDecisionBytes must be a positive safe integer');
 	const catalogTtlMs = value.catalogTtlMs ?? 60_000;
 	if (!Number.isSafeInteger(catalogTtlMs) || catalogTtlMs <= 0) throw new TypeError('catalogTtlMs must be a positive safe integer');
+	const startupTimeoutMs = value.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS;
+	if (!Number.isSafeInteger(startupTimeoutMs) || startupTimeoutMs <= 0) throw new TypeError('startupTimeoutMs must be a positive safe integer');
 	if (requireLaunchProfile && value.launchProfile === undefined) throw new TypeError('Codex service launchProfile is required when no transport is injected');
 	return {
 		...value,
 		planningTimeoutMs,
 		maxDecisionBytes,
 		catalogTtlMs,
+		startupTimeoutMs,
 		schedule: value.schedule ?? setTimeout,
 		cancelSchedule: value.cancelSchedule ?? clearTimeout,
 	};
@@ -851,6 +856,18 @@ function nativeRecoveryInstructions(summary) {
 	if (summary === null || summary === undefined || summary === '') return 'Use only the Minecraft tools. Act immediately on each compact event.';
 	if (typeof summary !== 'string' || summary.length > 2_048) throw new TypeError('recoverySummary must be at most 2048 characters');
 	return `Use only the Minecraft tools. Act immediately. Prior factual summary: ${JSON.stringify(summary)}`;
+}
+
+function exactLaunchProfileCatalog(profile) {
+	if (profile === null || typeof profile !== 'object' || Array.isArray(profile)) return [];
+	if (![profile.model, profile.reasoningEffort, profile.serviceTier].every((value) => typeof value === 'string' && value.trim().length > 0)) return [];
+	return [{
+		id: profile.model,
+		model: profile.model,
+		displayName: profile.model,
+		supportedReasoningEfforts: [profile.reasoningEffort],
+		serviceTiers: [profile.serviceTier],
+	}];
 }
 
 function goalSpecInstructions() {

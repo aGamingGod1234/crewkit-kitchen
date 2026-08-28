@@ -88,6 +88,41 @@ test('Codex service defaults dynamic profiles to the priority app-server tier', 
 	await service.stop();
 });
 
+test('Codex catalog fallback contains only the configured exact launch profile', async () => {
+	const transport = new FakeSharedTransport();
+	transport.request = async (method, params, options) => {
+		transport.calls.push({ method, params, options });
+		if (method === 'initialize') return { userAgent: 'fake' };
+		if (method === 'model/list') throw Object.assign(new Error('catalog offline'), { code: 'PROVIDER_UNAVAILABLE' });
+		throw new Error(`Unexpected method ${method}`);
+	};
+	const service = new CodexService({
+		cwd: 'C:\\workspace',
+		launchProfile: { model: 'gpt-5.6-terra', reasoningEffort: 'xhigh', serviceTier: 'priority' },
+	}, { transport });
+	await service.start();
+	try {
+		const snapshot = service.catalog.snapshot();
+		assert.equal(snapshot.source, 'builtin');
+		assert.deepEqual(snapshot.models.map(({ id, reasoningEfforts, serviceTiers }) => ({ id, reasoningEfforts, serviceTiers })), [{
+			id: 'gpt-5.6-terra', reasoningEfforts: ['xhigh'], serviceTiers: ['priority'],
+		}]);
+	} finally {
+		await service.stop();
+	}
+});
+
+test('Codex initialization forwards its bounded startup deadline to the transport', async () => {
+	const transport = new FakeSharedTransport();
+	const service = new CodexService({ cwd: 'C:\\workspace', startupTimeoutMs: 321 }, { transport });
+	await service.start();
+	try {
+		assert.deepEqual(transport.calls.find(({ method }) => method === 'initialize').options, { timeoutMs: 321 });
+	} finally {
+		await service.stop();
+	}
+});
+
 test('Codex service forwards app-server diagnostics to the coordinator error log', (t) => {
 	const diagnostics = [];
 	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));

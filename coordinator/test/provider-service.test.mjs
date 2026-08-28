@@ -177,7 +177,7 @@ test('bootstrap catalog is complete before mixed-provider profiles can be accept
 	for (const [provider, service] of Object.entries(services)) {
 		service.catalog.refresh = async () => ({
 			refreshedAtEpochMs: 42,
-			models: [{ id: `${provider}-model`, model: `${provider}-model` }],
+			models: [{ id: `${provider}-model`, model: `${provider}-model`, displayName: `${provider} model`, reasoningEfforts: ['high'], serviceTiers: [] }],
 		});
 	}
 	const router = new ProviderService(services);
@@ -188,4 +188,89 @@ test('bootstrap catalog is complete before mixed-provider profiles can be accept
 		['gemini', 'gemini-model'],
 		['kimi', 'kimi-model'],
 	]);
+});
+
+test('concurrent creation coalesces one lazy startup for the selected provider', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let releaseStart;
+	let startCalls = 0;
+	services.codex.start = async () => {
+		startCalls += 1;
+		await new Promise((resolve) => { releaseStart = resolve; });
+	};
+	const router = new ProviderService(services);
+	const first = router.createAgent(profile('codex', { agentId: 'codex-a' }));
+	const second = router.createAgent(profile('codex', { agentId: 'codex-b' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	try {
+		assert.equal(startCalls, 1);
+		assert.equal(services.codex.created.length, 0, 'agent creation waits for the shared provider startup');
+	} finally {
+		releaseStart?.();
+		await Promise.allSettled([first, second]);
+		await router.stop();
+	}
+});
+
+test('a hung provider is bounded while healthy provider reconciliation remains usable', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let releaseCodex;
+	services.codex.reconcile = async () => new Promise((resolve) => { releaseCodex = () => resolve({ valid: [], invalid: [], removed: [] }); });
+	const router = new ProviderService(services, { operationTimeoutMs: 5 });
+	const reconciling = router.reconcile([
+		profile('codex', { agentId: 'codex-a' }),
+		profile('gemini', { agentId: 'gemini-a' }),
+	]);
+	try {
+		const outcome = await Promise.race([
+			reconciling,
+			new Promise((resolve) => setTimeout(() => resolve('still-pending'), 50)),
+		]);
+		assert.notEqual(outcome, 'still-pending', 'one hung provider cannot hold reconciliation forever');
+		assert.deepEqual(outcome.valid.map(({ agentId }) => agentId), ['gemini-a']);
+		assert.deepEqual(outcome.invalid.map((entry) => entry.profile.agentId), ['codex-a']);
+		assert.equal(outcome.recovery.find(({ provider }) => provider === 'codex').state, 'degraded');
+	} finally {
+		releaseCodex?.();
+		await Promise.allSettled([reconciling]);
+		await router.stop();
+	}
+});
+
+test('provider catalog aggregation settles failures and promotes a restored provider live', async () => {
+	const services = Object.fromEntries(['codex', 'gemini', 'kimi'].map((provider) => [provider, new FakeService(provider)]));
+	let codexAvailable = false;
+	services.codex.catalog.refresh = async () => {
+		if (!codexAvailable) throw Object.assign(new Error('Codex unavailable'), { code: 'PROVIDER_UNAVAILABLE' });
+		return { refreshedAtEpochMs: 2, models: [{ id: 'codex-model', model: 'codex-model', displayName: 'Codex', reasoningEfforts: ['high'], serviceTiers: ['priority'] }] };
+	};
+	services.gemini.catalog.refresh = async () => ({
+		refreshedAtEpochMs: 1,
+		models: [{ id: 'gemini-model', model: 'gemini-model', displayName: 'Gemini', reasoningEfforts: ['high'], serviceTiers: [] }],
+	});
+	services.kimi.catalog.refresh = async () => ({ refreshedAtEpochMs: 1, models: [] });
+	const router = new ProviderService(services, { operationTimeoutMs: 10 });
+
+	const degraded = await router.catalog.refresh({ providers: ['codex', 'gemini'] });
+	assert.deepEqual(degraded.models.map(({ provider, id }) => [provider, id]), [['gemini', 'gemini-model']]);
+	assert.equal(degraded.recovery.find(({ provider }) => provider === 'codex').state, 'degraded');
+
+	codexAvailable = true;
+	const restored = await router.catalog.refresh({ providers: ['codex', 'gemini'], force: true });
+	assert.deepEqual(restored.models.map(({ provider, id }) => [provider, id]), [
+		['codex', 'codex-model'], ['gemini', 'gemini-model'],
+	]);
+	assert.equal(restored.recovery.find(({ provider }) => provider === 'codex').state, 'live');
+
+	services.codex.catalog.refresh = async () => ({
+		refreshedAtEpochMs: 3,
+		models: [{ id: 'codex-model', model: 'codex-model' }],
+	});
+	const retained = await router.catalog.refresh({ providers: ['codex', 'gemini'], force: true });
+	assert.deepEqual(retained.models.map(({ provider, id }) => [provider, id]), [
+		['codex', 'codex-model'], ['gemini', 'gemini-model'],
+	]);
+	assert.equal(retained.source, 'last_valid');
+	assert.equal(retained.recovery.find(({ provider }) => provider === 'codex').state, 'degraded');
+	await router.stop();
 });

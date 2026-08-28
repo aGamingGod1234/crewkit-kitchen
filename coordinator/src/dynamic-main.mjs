@@ -79,6 +79,7 @@ export class DynamicCoordinator extends EventEmitter {
 	#planner;
 	#bridge;
 	#listeners = [];
+	#providerListeners = [];
 	#agentOperations = new Map();
 	#providerWork = new Map();
 	#pendingAttention = new Map();
@@ -116,6 +117,8 @@ export class DynamicCoordinator extends EventEmitter {
 	#serverInstanceId = null;
 	#connectionEpoch = 0;
 	#connected = false;
+	#readyRegistry = [];
+	#providerRecoveryPending = false;
 	#traceWriter;
 	#providerTurnRecorder;
 	#verboseEnabled = false;
@@ -224,12 +227,12 @@ export class DynamicCoordinator extends EventEmitter {
 		if (this.#started) return;
 		if (this.#closed) throw new Error('Dynamic coordinator cannot restart after it has been stopped');
 		this.#stopping = false;
-		await this.#codexService.start();
 		try {
 			this.#bindBridge();
 			this.#bridge.start();
 			this.#statusHandle = this.#setStatusInterval(() => {
 				const connectionEpoch = this.#connectionEpoch;
+				this.#requestProviderRecovery(connectionEpoch);
 				this.#run(() => this.#publishStatus(connectionEpoch), connectionEpoch);
 			}, 1_000);
 			this.#started = true;
@@ -279,6 +282,7 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#bindBridge() {
+		this.#bindProviderRecovery();
 		this.#listen('ready', (connection) => {
 			const connectionEpoch = this.#acceptReadyEpoch(connection);
 			if (connectionEpoch === null) return;
@@ -288,50 +292,10 @@ export class DynamicCoordinator extends EventEmitter {
 				this.#invalidateServerInstance(connectionEpoch);
 			}
 			this.#serverInstanceId = serverInstanceId;
+			this.#readyRegistry = structuredClone(registry);
 			this.#reconciledStatus = false;
 			this.#supportedAgentIds.clear();
-			const startedReconciliation = this.#planner.beginReconcile(registry, { recovery: true });
-			const reconciliation = Promise.resolve().then(async () => {
-			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
-			if (typeof this.#codexService.bootstrapCatalog === 'function') {
-				const catalog = await this.#codexService.bootstrapCatalog();
-				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
-				await this.#publishCatalog(catalog, connectionEpoch);
-			}
-			const reconciliation = await startedReconciliation.complete;
-			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
-			const providers = reconciliation.providers ?? reconciliation.codex;
-			await this.#publishCatalog(providers.catalog, connectionEpoch);
-			for (const profile of providers.valid) {
-				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
-				let record = this.#registry.get(profile.agentId);
-				if (record === null) throw new ProtocolV2Error('UNKNOWN_AGENT', `Reconciled provider profile references unknown agent '${profile.agentId}'`);
-				if (this.#usesNativeTools(record) && record.state === DynamicAgentState.STARTING && record.currentGoal !== null) {
-					this.#goalSupervisor.activate(this.#supervisionKey(record));
-				}
-				await this.#sendForEpoch(connectionEpoch, 'agent_ready', profile.agentId, { goalRevision: record.goalRevision, reconciled: true });
-				this.#supportedAgentIds.add(profile.agentId);
-				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent reconciled and ready.', connectionEpoch);
-				this.#prewarmNativeAgent(record);
-				if (record.state === DynamicAgentState.DEAD) await this.#installDeadStatePlan(record, record.death, connectionEpoch);
-			}
-			for (const invalid of providers.invalid) {
-				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
-				const agentId = invalid.agentId ?? invalid.profile?.agentId;
-				await this.#sendForEpoch(connectionEpoch, 'agent_error', agentId, { goalRevision: this.#registry.get(agentId)?.goalRevision ?? 0, code: invalid.code, message: invalid.message });
-			}
-			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
-			this.#reconciledStatus = true;
-			if (this.#disconnectedAt !== null) this.#disconnectedAt = null;
-			await this.#publishStatus(connectionEpoch);
-			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
-			this.emit('reconciled', reconciliation);
-			return reconciliation;
-			});
-			this.#reconciliation = reconciliation.catch((error) => {
-				if (this.#isConnectionEpochCurrent(connectionEpoch)) this.#emitRuntimeError(error);
-				return null;
-			});
+			this.#beginReconciliation(registry, connectionEpoch);
 		}, { lifecycle: true });
 		this.#listen('verbose_control', (message) => {
 			this.#setVerboseEnabled(message.payload.enabled);
@@ -691,6 +655,94 @@ export class DynamicCoordinator extends EventEmitter {
 		this.#listen('shutdown', () => this.#run(() => this.stop()));
 		this.#listen('protocolError', (error) => this.emit('runtimeError', error), { lifecycle: true });
 		this.#listen('transportError', (error) => this.emit('runtimeError', error), { lifecycle: true });
+	}
+
+	#beginReconciliation(registry, connectionEpoch) {
+		let startedReconciliation;
+		try {
+			startedReconciliation = this.#planner.beginReconcile(registry, { recovery: true });
+		} catch (error) {
+			startedReconciliation = { complete: Promise.reject(error) };
+		}
+		const reconciliation = Promise.resolve().then(async () => {
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+			if (typeof this.#codexService.bootstrapCatalog === 'function') {
+				const catalog = await this.#codexService.bootstrapCatalog(registry);
+				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+				await this.#publishCatalog(catalog, connectionEpoch);
+			}
+			const result = await startedReconciliation.complete;
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+			const providers = result.providers ?? result.codex;
+			await this.#publishCatalog(providers.catalog, connectionEpoch);
+			for (const profile of providers.valid) {
+				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+				const record = this.#registry.get(profile.agentId);
+				if (record === null) throw new ProtocolV2Error('UNKNOWN_AGENT', `Reconciled provider profile references unknown agent '${profile.agentId}'`);
+				if (this.#supportedAgentIds.has(profile.agentId)) continue;
+				if (this.#usesNativeTools(record) && record.state === DynamicAgentState.STARTING && record.currentGoal !== null) {
+					this.#goalSupervisor.activate(this.#supervisionKey(record));
+				}
+				await this.#sendForEpoch(connectionEpoch, 'agent_ready', profile.agentId, { goalRevision: record.goalRevision, reconciled: true });
+				this.#supportedAgentIds.add(profile.agentId);
+				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', 'Agent reconciled and ready.', connectionEpoch);
+				this.#prewarmNativeAgent(record);
+				if (record.state === DynamicAgentState.DEAD) await this.#installDeadStatePlan(record, record.death, connectionEpoch);
+			}
+			for (const invalid of providers.invalid) {
+				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+				const agentId = invalid.agentId ?? invalid.profile?.agentId;
+				await this.#sendForEpoch(connectionEpoch, 'agent_error', agentId, { goalRevision: this.#registry.get(agentId)?.goalRevision ?? 0, code: invalid.code, message: invalid.message });
+			}
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+			this.#reconciledStatus = this.#readyRegistry.every(({ agentId }) => this.#supportedAgentIds.has(agentId));
+			if (this.#disconnectedAt !== null) this.#disconnectedAt = null;
+			await this.#publishStatus(connectionEpoch);
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
+			this.emit('reconciled', result);
+			return result;
+		});
+		this.#reconciliation = reconciliation.catch((error) => {
+			if (this.#isConnectionEpochCurrent(connectionEpoch)) this.#emitRuntimeError(error);
+			return null;
+		});
+	}
+
+	#bindProviderRecovery() {
+		if (typeof this.#codexService.on !== 'function' || typeof this.#codexService.off !== 'function') return;
+		const listener = () => this.#requestProviderRecovery(this.#connectionEpoch, { force: true });
+		this.#codexService.on('providerRestored', listener);
+		this.#providerListeners.push(['providerRestored', listener]);
+	}
+
+	#requestProviderRecovery(connectionEpoch, { force = false } = {}) {
+		if (!this.#isConnectionEpochCurrent(connectionEpoch) || this.#providerRecoveryPending) return;
+		if (!this.#readyRegistry.some(({ agentId }) => !this.#supportedAgentIds.has(agentId))) return;
+		if (!force && !this.#providerProbeDue()) return;
+		this.#providerRecoveryPending = true;
+		void Promise.resolve(this.#reconciliation).finally(() => {
+			this.#providerRecoveryPending = false;
+			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return;
+			if (!this.#readyRegistry.some(({ agentId }) => !this.#supportedAgentIds.has(agentId))) return;
+			this.#beginReconciliation(structuredClone(this.#readyRegistry), connectionEpoch);
+		});
+	}
+
+	#providerProbeDue() {
+		if (typeof this.#codexService.recoverySnapshot !== 'function') return true;
+		let recovery;
+		try { recovery = this.#codexService.recoverySnapshot(); }
+		catch { return true; }
+		if (!Array.isArray(recovery)) return true;
+		const missingProviders = new Set(this.#readyRegistry
+			.filter(({ agentId }) => !this.#supportedAgentIds.has(agentId))
+			.map(({ provider }) => provider ?? 'codex'));
+		const now = safeClockRead(this.#epochNow);
+		for (const provider of missingProviders) {
+			const record = recovery.find((entry) => entry?.provider === provider);
+			if (record?.state !== 'degraded' || record.nextProbeAtEpochMs === null || now === null || now >= record.nextProbeAtEpochMs) return true;
+		}
+		return false;
 	}
 
 	#listen(event, listener, { lifecycle = false } = {}) {
@@ -1288,6 +1340,10 @@ export class DynamicCoordinator extends EventEmitter {
 	#unbindBridge() {
 		for (const [event, listener] of this.#listeners) this.#bridge.off(event, listener);
 		this.#listeners = [];
+		if (typeof this.#codexService.off === 'function') {
+			for (const [event, listener] of this.#providerListeners) this.#codexService.off(event, listener);
+		}
+		this.#providerListeners = [];
 	}
 
 	#beginGoalControlInterruption(message, connectionEpoch) {
@@ -1505,7 +1561,10 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	async #publishCatalog(snapshot, connectionEpoch = this.#connectionEpoch) {
-		await this.#sendForEpoch(connectionEpoch, 'catalog_snapshot', 'server', snapshot);
+		await this.#sendForEpoch(connectionEpoch, 'catalog_snapshot', 'server', {
+			refreshedAtEpochMs: snapshot.refreshedAtEpochMs,
+			models: snapshot.models,
+		});
 	}
 
 	async #publishGoalCompleted({ record, goalFingerprint, traceId }, connectionEpoch = this.#connectionEpoch) {
@@ -1815,7 +1874,7 @@ export function createDynamicCoordinator(configValue, dependencies = {}) {
 			platform: dependencies.platform,
 			workspaceManager,
 		}),
-	}, { turnRecorder: providerTurnRecorder });
+	}, { turnRecorder: providerTurnRecorder, now: dependencies.epochNow ?? Date.now });
 	const healthRegistry = dependencies.healthRegistry ?? dependencies.planner?.healthRegistry ?? new ProviderHealthRegistry({ now: dependencies.healthNow ?? Date.now });
 	const latencyRegistry = dependencies.latencyRegistry ?? new ControlLatencyRegistry();
 	const planner = dependencies.planner ?? new AgentPlanner({
