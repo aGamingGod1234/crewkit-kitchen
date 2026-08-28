@@ -62,6 +62,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyReconnectRecoveryAndExpiry();
 		verifyContinuousStabilityResetsFailures();
 		verifyCandidatePromotionUsesMaintenanceWorker();
+		verifyCandidateReadinessGapRestartsStabilityWindow();
 		verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination();
 		verifyCandidateRollbackWaitsForConfirmedTermination();
 		verifySoleCandidateFailureKeepsRetrying();
@@ -89,7 +90,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 221;
+		return 225;
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -346,6 +347,39 @@ public final class CoordinatorProcessSupervisorVerification {
 				"promotion result credits the matching candidate stability interval");
 		assertEquals(0, supervisor.snapshot().consecutiveFailures(),
 				"successful candidate promotion resets crash-loop history");
+		supervisor.close();
+	}
+
+	private static void verifyCandidateReadinessGapRestartsStabilityWindow() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		FakeLauncher launcher = new FakeLauncher();
+		FakeGenerationController generations = new FakeGenerationController();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-readiness-gap-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(250), Runnable::run, runtimeRoot -> 0, task -> { }, generations
+		);
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L, false);
+		String launchId = supervisor.snapshot().launchId();
+		supervisor.tick(true, launchId, 1L, true);
+
+		clock.advance(STABILITY_INTERVAL_MS - 1L);
+		supervisor.tick(true, launchId, 1L, false);
+		assertEquals(0, generations.promotions,
+				"candidate readiness loss prevents promotion at the old stability boundary");
+		clock.advance(1L);
+		supervisor.tick(true, launchId, 1L, true);
+		assertEquals(0, generations.promotions,
+				"one fresh reconciled status starts a new candidate stability window");
+		clock.advance(STABILITY_INTERVAL_MS - 1L);
+		supervisor.tick(true, launchId, 1L, true);
+		assertEquals(0, generations.promotions,
+				"candidate remains unpromoted before the replacement window completes");
+		clock.advance(1L);
+		supervisor.tick(true, launchId, 1L, true);
+		assertEquals(1, generations.promotions,
+				"candidate promotes after one continuously ready replacement window");
 		supervisor.close();
 	}
 
@@ -1299,10 +1333,11 @@ public final class CoordinatorProcessSupervisorVerification {
 				"close publishes its terminal state before awaiting maintenance");
 		assertTrue(closing.isAlive(), "close waits while the owned launch can still publish a child");
 
+		launcher.child.terminationFailuresRemaining = 1;
 		launcher.release.countDown();
 		join(closing, "close waits for in-flight owned launch cleanup");
-		assertEquals(1, launcher.child.terminationAttempts,
-				"the late owned child receives exactly one shutdown cleanup attempt");
+		assertEquals(2, launcher.child.terminationAttempts,
+				"a transient late-launch cleanup failure receives one bounded retry");
 		assertEquals(1, launcher.child.terminations,
 				"close returns only after the late owned child is confirmed terminated");
 		assertFalse(launcher.child.ownershipPresent,

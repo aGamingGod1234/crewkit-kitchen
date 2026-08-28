@@ -37,6 +37,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
 	private static final long TERMINATION_RETRY_MS = 1_000L;
 	private static final long SHUTDOWN_WAIT_MS = 10_000L;
+	private static final int SHUTDOWN_TERMINATION_ATTEMPTS = 3;
 	private static final long DESCENDANT_TRACK_INTERVAL_MS = 100L;
 	private static final int CANDIDATE_FAILURES_BEFORE_ROLLBACK = 3;
 
@@ -619,6 +620,13 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				stabilityCredited = false;
 			}
 			authenticatedSessionGeneration = sessionGeneration;
+			if (!coordinatorReady) {
+				authenticatedSinceEpochMs = 0L;
+				stabilityCredited = false;
+			} else if (!coordinatorReconciled) {
+				authenticatedSinceEpochMs = now;
+				stabilityCredited = false;
+			}
 			coordinatorReconciled = coordinatorReady;
 			failingBoundary = null;
 			clearDiagnostic();
@@ -904,7 +912,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				maintenanceResults.add(result);
 			}
 		}
-		if (cleanup != null) cleanup.terminate();
+		if (cleanup != null) terminateForShutdown(cleanup);
 	}
 
 	private void drainMaintenanceResults(long now) {
@@ -1140,6 +1148,20 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		pendingTermination = owned;
 	}
 
+	private static void terminateForShutdown(ChildProcess process) {
+		RuntimeException lastFailure = null;
+		for (int attempt = 0; attempt < SHUTDOWN_TERMINATION_ATTEMPTS; attempt++) {
+			try {
+				process.terminate();
+				return;
+			} catch (RuntimeException failure) {
+				lastFailure = failure;
+			}
+		}
+		LOGGER.warn("Could not complete coordinator shutdown cleanup after {} attempts",
+				SHUTDOWN_TERMINATION_ATTEMPTS, lastFailure);
+	}
+
 	static void terminateFailedStart(Process started) {
 		CoordinatorProcessOwnership.terminateTree(started.toHandle());
 	}
@@ -1169,11 +1191,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		if (dependencyChangeMonitor != null) dependencyChangeMonitor.close();
 		try {
 			for (ChildProcess process : cleanup) {
-				try {
-					process.terminate();
-				} catch (RuntimeException failure) {
-					LOGGER.warn("Could not complete coordinator shutdown cleanup", failure);
-				}
+				terminateForShutdown(process);
 			}
 		} finally {
 			// Do not hold the supervisor monitor while waiting. An in-flight launch must
