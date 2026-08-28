@@ -81,6 +81,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private String failingBoundary;
 	private ChildProcess pendingTermination;
 	private long bridgeRevision;
+	private long sharedSecretRevision;
 	private int candidateFailures;
 	private boolean rollbackRequested;
 	private long nextGenerationMutationEpochMs;
@@ -468,6 +469,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		return bridgeRevision;
 	}
 
+	synchronized long sharedSecretRevision() {
+		return sharedSecretRevision;
+	}
+
 	synchronized long voiceConfigurationRevision() {
 		return voiceConfigurationRevision;
 	}
@@ -698,9 +703,11 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 		if (runtime != null) configureSharedBridgeSecretPath(runtime.secret());
 		if (runtime != null) configureSharedVoiceEndpoint(runtime.config());
-		if (runtime != null && (previous == null
+		boolean sharedSecretChanged = runtime != null && (previous == null
 				|| !previous.secret().equals(runtime.secret())
-				|| !previous.bridgeSecret().equals(runtime.bridgeSecret())
+				|| !previous.bridgeSecret().equals(runtime.bridgeSecret()));
+		if (sharedSecretChanged) sharedSecretRevision++;
+		if (runtime != null && (sharedSecretChanged
 				|| previous.bridgePort() != runtime.bridgePort())) {
 			bridgeRevision++;
 		}

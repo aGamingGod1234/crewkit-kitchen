@@ -327,7 +327,7 @@ public final class CodexAgentServerRuntime {
 
 	static long voiceConfigurationRevision(CoordinatorProcessSupervisor supervisor) {
 		return java.util.Objects.hash(
-				supervisor.voiceConfigurationRevision(), supervisor.secretPath(),
+				supervisor.voiceConfigurationRevision(), supervisor.sharedSecretRevision(), supervisor.secretPath(),
 				configuredVoiceSecretFile(), System.getProperty("arenaagents.voiceUrl")
 		);
 	}

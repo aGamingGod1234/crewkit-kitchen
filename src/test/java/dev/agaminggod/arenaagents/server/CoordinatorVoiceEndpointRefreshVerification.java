@@ -4,6 +4,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Verifies ownership and refresh of the voice URL published by coordinator configuration. */
 public final class CoordinatorVoiceEndpointRefreshVerification {
@@ -14,6 +15,8 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 		String oldAutoStart = System.getProperty("arenaagents.coordinatorAutoStart");
 		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
 		Path config = Files.createTempFile("arena-supervisor-voice-refresh-", ".json");
+		AtomicInteger voiceStarts = new AtomicInteger();
+		AtomicInteger voiceCloses = new AtomicInteger();
 		CoordinatorProcessSupervisor managed = null;
 		CoordinatorProcessSupervisor overridden = null;
 		try {
@@ -46,6 +49,30 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			managed.tick(false, null, 0L);
 			assertEquals(refreshedRevision, managed.voiceConfigurationRevision(),
 					"an unchanged resolved endpoint does not recreate the voice client");
+
+			CodexAgentServerRuntime.VoiceInitializationGate voiceGate =
+					new CodexAgentServerRuntime.VoiceInitializationGate(
+							voiceStarts::incrementAndGet, voiceCloses::incrementAndGet
+					);
+			long initialRuntimeRevision = CodexAgentServerRuntime.voiceConfigurationRevision(managed);
+			assertTrue(voiceGate.reconcile(true, initialRuntimeRevision),
+					"prepared voice configuration creates the initial worker client");
+			long endpointRevisionBeforeSecretRotation = managed.voiceConfigurationRevision();
+			long bridgeRevisionBeforeSecretRotation = managed.bridgeRevision();
+			managedResolver.rotateSecret("managed-secret-only-change", "w".repeat(32));
+			managed.publishDependencyFingerprintChange();
+			managed.tick(false, null, 0L);
+			assertEquals(endpointRevisionBeforeSecretRotation, managed.voiceConfigurationRevision(),
+					"secret-only rotation preserves the endpoint-only revision");
+			assertTrue(managed.bridgeRevision() > bridgeRevisionBeforeSecretRotation,
+					"same-path shared-secret rotation advances the bridge content revision");
+			long rotatedRuntimeRevision = CodexAgentServerRuntime.voiceConfigurationRevision(managed);
+			assertFalse(initialRuntimeRevision == rotatedRuntimeRevision,
+					"same-path shared-secret rotation advances the voice initialization gate revision");
+			assertTrue(voiceGate.reconcile(true, rotatedRuntimeRevision),
+					"same-path shared-secret rotation recreates the worker client");
+			assertEquals(2, voiceStarts.get(), "secret rotation starts one replacement worker client");
+			assertEquals(1, voiceCloses.get(), "secret rotation closes the stale worker client once");
 			managed.close();
 			managed = null;
 			assertEquals(null, System.getProperty("arenaagents.voiceUrl"),
@@ -71,7 +98,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			overridden = null;
 			assertEquals(explicitOverride, System.getProperty("arenaagents.voiceUrl"),
 					"supervisor shutdown leaves an explicit user voice endpoint untouched");
-			return 11;
+			return 18;
 		} finally {
 			if (managed != null) managed.close();
 			if (overridden != null) overridden.close();
@@ -90,7 +117,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 	}
 
 	private static final class MutableResolver implements CoordinatorProcessSupervisor.DependencyResolver {
-		private final CoordinatorProcessSupervisor.PreparedRuntime runtime;
+		private CoordinatorProcessSupervisor.PreparedRuntime runtime;
 		private String fingerprint;
 
 		private MutableResolver(Path config, String fingerprint) {
@@ -115,6 +142,16 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 		public CoordinatorProcessSupervisor.DependencyResolution resolve() {
 			return CoordinatorProcessSupervisor.DependencyResolution.ready(runtime);
 		}
+
+		private void rotateSecret(String fingerprint, String secret) {
+			CoordinatorProcessSupervisor.PreparedRuntime current = runtime;
+			runtime = new CoordinatorProcessSupervisor.PreparedRuntime(
+					current.root(), current.coordinatorRoot(), current.main(), current.config(), current.secret(),
+					current.nodeExecutable(), secret, current.bridgePort(), current.generationId(),
+					current.candidate(), current.lastKnownGoodAvailable()
+			);
+			this.fingerprint = fingerprint;
+		}
 	}
 
 	private static void restoreProperty(String name, String value) {
@@ -130,5 +167,9 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 
 	private static void assertTrue(boolean condition, String label) {
 		if (!condition) throw new AssertionError(label);
+	}
+
+	private static void assertFalse(boolean condition, String label) {
+		if (condition) throw new AssertionError(label);
 	}
 }
