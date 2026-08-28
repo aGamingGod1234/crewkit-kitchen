@@ -77,6 +77,7 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import net.minecraft.server.level.ServerPlayer;
@@ -98,8 +99,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_CONVERSATION_SOURCES_PER_AGENT = 16;
-	private static final int CATALOG_DISCOVERY_RETRY_LIMIT = 3;
 	private static final long CATALOG_DISCOVERY_RETRY_BASE_NANOS = 50_000_000L;
+	private static final int CATALOG_DISCOVERY_MAX_BACKOFF_SHIFT = 6;
 	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
 	private static final String COORDINATOR_OFFLINE_MESSAGE =
 			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
@@ -129,6 +130,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final String secret;
 	private final int port;
 	private final ServerSocketFactory serverSockets;
+	private final LongSupplier nanoTime;
 	private final AgentVerboseState verboseState;
 	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(SERVER_TASK_CAP);
 	private final AtomicBoolean running = new AtomicBoolean();
@@ -231,7 +233,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			Path secretPath,
 			ServerSocketFactory serverSockets
 	) {
-		this(manager, port, secretPath, new AgentVerboseState(), defaultGoalVerificationRuntime(manager), serverSockets);
+		this(manager, port, secretPath, new AgentVerboseState(), defaultGoalVerificationRuntime(manager), serverSockets, System::nanoTime);
+	}
+
+	MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime
+	) {
+		this(manager, port, secretPath, new AgentVerboseState(), defaultGoalVerificationRuntime(manager), serverSockets, nanoTime);
 	}
 
 	private MultiplexedServerBridge(
@@ -242,7 +254,19 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			GoalVerificationRuntime goalVerificationRuntime,
 			ServerSocketFactory serverSockets
 	) {
-		this(manager, port, readSecret(secretPath), verboseState, goalVerificationRuntime, serverSockets);
+		this(manager, port, readSecret(secretPath), verboseState, goalVerificationRuntime, serverSockets, System::nanoTime);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime
+	) {
+		this(manager, port, readSecret(secretPath), verboseState, goalVerificationRuntime, serverSockets, nanoTime);
 	}
 
 	private MultiplexedServerBridge(
@@ -253,10 +277,23 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			GoalVerificationRuntime goalVerificationRuntime,
 			ServerSocketFactory serverSockets
 	) {
+		this(manager, port, preparedSecret, verboseState, goalVerificationRuntime, serverSockets, System::nanoTime);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			String preparedSecret,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		this.port = port;
 		this.serverSockets = Objects.requireNonNull(serverSockets, "server socket factory must not be null");
+		this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime must not be null");
 		this.secret = validatePreparedSecret(preparedSecret);
 		this.verboseState = Objects.requireNonNull(verboseState, "verboseState must not be null");
 		this.goalVerificationRuntime = Objects.requireNonNull(goalVerificationRuntime, "goalVerificationRuntime must not be null");
@@ -1156,9 +1193,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				catalogLoaded = false;
 				catalogDiscoveryPending = false;
 				if (catalogDiscoveryAttempts == 0) requestCatalogDiscovery();
-				else if (catalogDiscoveryAttempts < CATALOG_DISCOVERY_RETRY_LIMIT) {
-					catalogDiscoveryRetryAtNanos = System.nanoTime() + catalogRetryDelayNanos(catalogDiscoveryAttempts);
-				}
+				else catalogDiscoveryRetryAtNanos = catalogRetryDeadline(catalogDiscoveryAttempts);
 			}
 			return;
 		}
@@ -1187,25 +1222,32 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void publishCatalogDiscoveryRetry() {
 		synchronized (publicationLock) {
-			if (catalogLoaded || catalogDiscoveryAttempts == 0 || catalogDiscoveryAttempts >= CATALOG_DISCOVERY_RETRY_LIMIT) return;
+			if (catalogLoaded || catalogDiscoveryAttempts == 0) return;
 			if (catalogDiscoveryGeneration != coordinatorLifecycleGeneration || session == null || !session.authenticated.get()) return;
-			if (System.nanoTime() < catalogDiscoveryRetryAtNanos) return;
+			if (nanoTime.getAsLong() < catalogDiscoveryRetryAtNanos) return;
 			catalogDiscoveryPending = false;
 			requestCatalogDiscovery();
 		}
 	}
 
 	private void requestCatalogDiscovery() {
-		if (catalogDiscoveryAttempts >= CATALOG_DISCOVERY_RETRY_LIMIT || catalogLoaded) return;
+		if (catalogLoaded || catalogDiscoveryPending) return;
 		send("catalog_request", "server", new JsonObject());
 		catalogDiscoveryPending = true;
-		catalogDiscoveryAttempts += 1;
+		if (catalogDiscoveryAttempts < Integer.MAX_VALUE) catalogDiscoveryAttempts += 1;
 		catalogDiscoveryGeneration = coordinatorLifecycleGeneration;
-		catalogDiscoveryRetryAtNanos = System.nanoTime() + catalogRetryDelayNanos(catalogDiscoveryAttempts);
+		catalogDiscoveryRetryAtNanos = catalogRetryDeadline(catalogDiscoveryAttempts);
 	}
 
-	private static long catalogRetryDelayNanos(int completedAttempts) {
-		return CATALOG_DISCOVERY_RETRY_BASE_NANOS << Math.min(2, Math.max(0, completedAttempts - 1));
+	static long catalogRetryDelayNanos(int completedAttempts) {
+		return CATALOG_DISCOVERY_RETRY_BASE_NANOS
+				<< Math.min(CATALOG_DISCOVERY_MAX_BACKOFF_SHIFT, Math.max(0, completedAttempts - 1));
+	}
+
+	private long catalogRetryDeadline(int completedAttempts) {
+		long now = nanoTime.getAsLong();
+		long delay = catalogRetryDelayNanos(completedAttempts);
+		return now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
 	}
 
 	private void plannerReady(BridgeEnvelope envelope) {

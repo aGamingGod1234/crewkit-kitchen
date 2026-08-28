@@ -3,27 +3,39 @@ import { types as nodeTypes } from 'node:util';
 export const DIAGNOSTIC_REDACTED = '[REDACTED]';
 export const DIAGNOSTIC_UNSAFE = '[UNSAFE_OBJECT]';
 
-const SENSITIVE_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
-const QUOTED_SECRET_KEY = /(["'])([A-Za-z0-9_-]{0,64}(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]{0,64})\1\s*:\s*(["'])/gi;
-const SECRET_ASSIGNMENT = /((?:[A-Za-z0-9_-]{0,64}(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]{0,64})\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
-const BEARER = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
+const CREDENTIAL_KEY = '[A-Za-z0-9_-]{0,64}(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth|launcherAccount|accountData)[A-Za-z0-9_-]{0,64}';
+const ASSIGNMENT_VALUE = '("(?:\\\\.|[^"\\\\])*"|\'(?:\\\\.|[^\'\\\\])*\'|[^\\s,;)}\\]]+)';
+const QUOTED_ASSIGNMENT = new RegExp(`(["'])(${CREDENTIAL_KEY})\\1(\\s*[:=]\\s*)${ASSIGNMENT_VALUE}`, 'gi');
+const BARE_ASSIGNMENT = new RegExp(`\\b(${CREDENTIAL_KEY})(\\s*[:=]\\s*)${ASSIGNMENT_VALUE}`, 'gi');
+const AUTHORIZATION = /\b(authorization\s*[:=]\s*)(Basic|Bearer)\s+("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z0-9._~+/=-]+)/gi;
+const BEARER = /\b(Bearer)\s+("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z0-9._~+/=-]+)/gi;
 const RAW_PROMPT = /(?:raw\s+)?prompt\s*[:=]\s*[^\r\n]*/gi;
-const QUOTED_ABSOLUTE_PATH = /(["'])(?:(?:file:\/{2,3})?(?:[A-Za-z]:[\\/]|\/{1,2})|\\\\[^\\/\s]+[\\/][^\\/\s]+[\\/])[^"'\r\n]+\1/gi;
-const WINDOWS_PATH = /(?:file:\/{2,3})?[A-Za-z]:[\\/][^\s,;)}\]"']+/gi;
+const QUOTED_ABSOLUTE_PATH = /(["'])((?:[A-Za-z]:[\\/]|\\\\[^\\/\r\n"']+[\\/][^\\/\r\n"']+[\\/]|\/(?!\/))[^"'\r\n]+)\1/g;
+const WINDOWS_PATH = /\b[A-Za-z]:[\\/][^\s,;)}\]"']+/g;
 const UNC_PATH = /\\\\[^\\/\s]+[\\/][^\s,;)}\]"']+/g;
-const POSIX_PATH = /(^|[\s(=:\[])(\/(?:[^\s,;)}\]"'\/]+\/)*[^\s,;)}\]"'\/]+)/g;
+const POSIX_PATH = /(^|[\s(=\[])(\/(?!\/)[^\s,;)}\]"']+)/g;
 
 export function isSensitiveDiagnosticKey(value) {
-	return typeof value === 'string' && SENSITIVE_KEY.test(value);
+	if (typeof value !== 'string') return false;
+	const normalized = value
+		.replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+		.replace(/[\s-]+/g, '_')
+		.toLowerCase();
+	if (/^(?:(?:input|output|prompt|completion|cached|reasoning|total)_tokens?(?:_count)?|tokens?_count|token_(?:bucket|latency_ms|budget|limit|usage|remaining))$/.test(normalized)) return false;
+	return /(?:^|_)(?:authorization|api_key|access_token|refresh_token|client_secret|secret|password|token|credential|oauth)(?:_|$)/.test(normalized)
+		|| normalized === 'launcheraccount'
+		|| normalized === 'accountdata';
 }
 
 export function sanitizeDiagnosticText(value, { maxBytes = 2_048, redactPaths = true } = {}) {
 	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError('maxBytes must be a nonnegative safe integer');
 	let text;
 	try { text = String(value ?? ''); } catch { text = '[unavailable]'; }
-	text = redactQuotedSecrets(text)
-		.replace(BEARER, `Bearer ${DIAGNOSTIC_REDACTED}`)
-		.replace(SECRET_ASSIGNMENT, `$1${DIAGNOSTIC_REDACTED}`)
+	text = text
+		.replace(AUTHORIZATION, (_match, prefix, scheme) => `${prefix}${scheme} ${DIAGNOSTIC_REDACTED}`)
+		.replace(BEARER, (_match, scheme) => `${scheme} ${DIAGNOSTIC_REDACTED}`)
+		.replace(QUOTED_ASSIGNMENT, redactQuotedSensitiveAssignment)
+		.replace(BARE_ASSIGNMENT, redactBareSensitiveAssignment)
 		.replace(RAW_PROMPT, DIAGNOSTIC_REDACTED);
 	if (redactPaths) {
 		text = text
@@ -77,23 +89,14 @@ export function truncateDiagnosticUtf8(value, maxBytes) {
 	return Buffer.from(value, 'utf8').subarray(0, maxBytes).toString('utf8').replace(/\uFFFD$/u, '');
 }
 
-function redactQuotedSecrets(value) {
-	let result = '';
-	let cursor = 0;
-	QUOTED_SECRET_KEY.lastIndex = 0;
-	let match;
-	while ((match = QUOTED_SECRET_KEY.exec(value)) !== null) {
-		const valueStart = QUOTED_SECRET_KEY.lastIndex;
-		let valueEnd = valueStart;
-		while (valueEnd < value.length) {
-			if (value[valueEnd] === '\\') { valueEnd += 2; continue; }
-			if (value[valueEnd] === match[3]) break;
-			valueEnd += 1;
-		}
-		if (valueEnd >= value.length) break;
-		result += value.slice(cursor, valueStart) + DIAGNOSTIC_REDACTED + match[3];
-		cursor = valueEnd + 1;
-		QUOTED_SECRET_KEY.lastIndex = cursor;
-	}
-	return result + value.slice(cursor);
+function redactQuotedSensitiveAssignment(match, quote, key, separator, rawValue) {
+	if (!isSensitiveDiagnosticKey(key)) return match;
+	const valueQuote = rawValue[0] === '"' || rawValue[0] === "'" ? rawValue[0] : '';
+	return `${quote}${key}${quote}${separator}${valueQuote}${DIAGNOSTIC_REDACTED}${valueQuote}`;
+}
+
+function redactBareSensitiveAssignment(match, key, separator, rawValue) {
+	if (!isSensitiveDiagnosticKey(key)) return match;
+	const valueQuote = rawValue[0] === '"' || rawValue[0] === "'" ? rawValue[0] : '';
+	return `${key}${separator}${valueQuote}${DIAGNOSTIC_REDACTED}${valueQuote}`;
 }

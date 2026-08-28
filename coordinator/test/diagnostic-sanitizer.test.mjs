@@ -30,3 +30,55 @@ test('shared diagnostic sanitizer contains proxies and accessors and bounds stri
 	assert.equal(Object.hasOwn(safe, 'hostile'), false);
 	assert.equal(sanitizeDiagnosticValue(new Proxy({}, { ownKeys() { throw new Error('hostile proxy'); } })), '[UNSAFE_OBJECT]');
 });
+
+test('credential grammar redacts quoted assignments and authorization schemes', () => {
+	const cases = [
+		['api_key = "super secret"', 'super secret'],
+		["'client_secret' = 'client secret value'", 'client secret value'],
+		['password: "space rich password"', 'space rich password'],
+		['Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==', 'QWxhZGRpbjpvcGVuIHNlc2FtZQ=='],
+		['authorization = Bearer sk-live_realistic.credential-value', 'sk-live_realistic.credential-value'],
+		['github_token=ghp_0123456789abcdefghijklmnopqrstuvwxyz', 'ghp_0123456789abcdefghijklmnopqrstuvwxyz'],
+		['raw prompt: mine the nearby tree\noperation=decide', 'mine the nearby tree'],
+	];
+	for (const [source, secret] of cases) {
+		const sanitized = sanitizeDiagnosticText(source);
+		assert.equal(sanitized.includes(secret), false, `leaked credential from ${source}`);
+		assert.match(sanitized, /\[REDACTED\]/);
+	}
+});
+
+test('sanitizer preserves URLs and operational token metrics while redacting only absolute filesystem paths', () => {
+	const preserved = [
+		'https://example.com/v1/token?count=2',
+		'http://127.0.0.1:8766/v1/tts',
+		'inputTokens=123 output_token_count=45 tokenCount:8 cached_tokens=9',
+		'token_bucket=4 token_latency_ms=12',
+		'src/token/worker.js',
+	].join(' ');
+	assert.equal(sanitizeDiagnosticText(preserved), preserved);
+	for (const absolutePath of [
+		'C:\\Users\\lucas\\Arena Agents\\secret.json',
+		'/var/lib/arena agents/secret.json',
+		'\\\\server\\share\\Arena Agents\\secret.json',
+	]) {
+		const sanitized = sanitizeDiagnosticText(`failure at "${absolutePath}"`);
+		assert.equal(sanitized.includes(absolutePath), false);
+		assert.match(sanitized, /\[location redacted\]/);
+	}
+});
+
+test('structured token metrics remain visible but actual token credentials are redacted', () => {
+	const sanitized = sanitizeDiagnosticValue({
+		inputTokens: 123,
+		output_token_count: 45,
+		tokenCount: 8,
+		access_token: 'secret-access-token',
+		github_token: 'secret-github-token',
+	});
+	assert.equal(sanitized.inputTokens, 123);
+	assert.equal(sanitized.output_token_count, 45);
+	assert.equal(sanitized.tokenCount, 8);
+	assert.equal(sanitized.access_token, '[REDACTED]');
+	assert.equal(sanitized.github_token, '[REDACTED]');
+});

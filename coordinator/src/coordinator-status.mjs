@@ -40,8 +40,8 @@ export function buildCoordinatorStatus({
 		rosterReadyCount: records.filter((record) => supportedAgentIds.has(record.agentId) && readyStates.has(record.state)).length,
 		rosterCount: records.length,
 		scheduler: { ...pressure },
-		circuits: safeOptionalArray(healthSnapshots, 32),
-		latencies: safeOptionalArray(latencies, 16),
+		circuits: safeOptionalArray(healthSnapshots, 32).map(safeCircuit).filter(Boolean),
+		latencies: safeOptionalArray(latencies, 16).map(safeLatency).filter(Boolean),
 		bridgeSessionEpoch: nonnegativeIntegerOrZero(bridgeSessionEpoch),
 		runtimeGeneration: typeof runtimeGeneration === 'string' && RUNTIME_GENERATION.test(runtimeGeneration) ? runtimeGeneration : null,
 		components: [...recovery.values()].sort((left, right) => left.component.localeCompare(right.component)).slice(0, 32),
@@ -51,20 +51,22 @@ export function buildCoordinatorStatus({
 export function providerRecoveryComponents(value) {
 	const result = [];
 	for (const recovery of safeOptionalArray(value, 16)) {
-		try {
-			if (recovery === null || typeof recovery !== 'object' || typeof recovery.provider !== 'string') continue;
-			result.push({
-				component: `provider:${recovery.provider}`,
-				state: recovery.state === 'live' ? 'ready' : recovery.state === 'idle' ? 'unknown' : recovery.state,
-				fallbackMode: recovery.fallbackMode ?? null,
-				boundary: recovery.boundary ?? null,
-				failureCode: recovery.failureCode ?? null,
-				consecutiveFailureCount: recovery.consecutiveFailureCount ?? 0,
-				nextProbeAtEpochMs: recovery.nextProbeAtEpochMs ?? null,
-				generation: recovery.generation ?? 0,
-				lastRecoveryAtEpochMs: recovery.lastRecoveryAtEpochMs ?? null,
-			});
-		} catch { /* optional provider status is observational */ }
+		const own = safeOwnDataRecord(recovery);
+		if (own === null) continue;
+		const provider = boundedOptionalText(own.provider, false);
+		if (provider === null) continue;
+		const component = safeComponent({
+			component: `provider:${provider}`,
+			state: own.state === 'live' ? 'ready' : own.state === 'idle' ? 'unknown' : own.state,
+			fallbackMode: own.fallbackMode ?? null,
+			boundary: own.boundary ?? null,
+			failureCode: own.failureCode ?? null,
+			consecutiveFailureCount: own.consecutiveFailureCount ?? 0,
+			nextProbeAtEpochMs: own.nextProbeAtEpochMs ?? null,
+			generation: own.generation ?? 0,
+			lastRecoveryAtEpochMs: own.lastRecoveryAtEpochMs ?? null,
+		});
+		if (component !== null) result.push(component);
 	}
 	return result;
 }
@@ -84,25 +86,22 @@ function bridgeComponent(reconciled, generation) {
 }
 
 function safeComponent(value) {
-	try {
-		if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value)) return null;
-		const component = boundedOptionalText(value.component, false);
-		const state = boundedOptionalText(value.state, false);
-		if (component === null || state === null || !COMPONENT_STATES.has(state)) return null;
-		return {
-			component,
-			state,
-			fallbackMode: boundedOptionalText(value.fallbackMode),
-			boundary: boundedOptionalText(value.boundary),
-			failureCode: boundedOptionalText(value.failureCode),
-			consecutiveFailureCount: nonnegativeIntegerOrZero(value.consecutiveFailureCount),
-			nextProbeAtEpochMs: nullableNonnegativeInteger(value.nextProbeAtEpochMs),
-			generation: nonnegativeIntegerOrZero(value.generation),
-			lastRecoveryAtEpochMs: nullableNonnegativeInteger(value.lastRecoveryAtEpochMs),
-		};
-	} catch {
-		return null;
-	}
+	const own = safeOwnDataRecord(value);
+	if (own === null) return null;
+	const component = boundedOptionalText(own.component, false);
+	const state = boundedOptionalText(own.state, false);
+	if (component === null || state === null || !COMPONENT_STATES.has(state)) return null;
+	return {
+		component,
+		state,
+		fallbackMode: boundedOptionalText(own.fallbackMode),
+		boundary: boundedOptionalText(own.boundary),
+		failureCode: boundedOptionalText(own.failureCode),
+		consecutiveFailureCount: nonnegativeIntegerOrZero(own.consecutiveFailureCount),
+		nextProbeAtEpochMs: nullableNonnegativeInteger(own.nextProbeAtEpochMs),
+		generation: nonnegativeIntegerOrZero(own.generation),
+		lastRecoveryAtEpochMs: nullableNonnegativeInteger(own.lastRecoveryAtEpochMs),
+	};
 }
 
 function safeOptionalArray(value, maximum) {
@@ -120,6 +119,50 @@ function safeOptionalArray(value, maximum) {
 	} catch {
 		return [];
 	}
+}
+
+function safeOwnDataRecord(value) {
+	try {
+		if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeTypes.isProxy(value)) return null;
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return null;
+		const keys = Reflect.ownKeys(value);
+		if (keys.some((key) => typeof key !== 'string')) return null;
+		const result = Object.create(null);
+		for (const key of keys) {
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor || !Object.hasOwn(descriptor, 'value')) return null;
+			if (descriptor.enumerable) result[key] = descriptor.value;
+		}
+		return result;
+	} catch {
+		return null;
+	}
+}
+
+function safeCircuit(value) {
+	const own = safeOwnDataRecord(value);
+	if (own === null) return null;
+	const provider = boundedOptionalText(own.provider, false);
+	const model = boundedOptionalText(own.model, false);
+	const operation = boundedOptionalText(own.operation, false);
+	if (provider === null || model === null || operation === null) return null;
+	if (!Number.isSafeInteger(own.count) || own.count < 0
+		|| !Number.isSafeInteger(own.p50Ms) || own.p50Ms < 0
+		|| !Number.isSafeInteger(own.p95Ms) || own.p95Ms < 0
+		|| !Number.isFinite(own.failureRate) || own.failureRate < 0 || own.failureRate > 1
+		|| !['closed', 'open', 'half_open'].includes(own.circuit)) return null;
+	return { provider, model, operation, count: own.count, p50Ms: own.p50Ms, p95Ms: own.p95Ms, failureRate: own.failureRate, circuit: own.circuit };
+}
+
+function safeLatency(value) {
+	const own = safeOwnDataRecord(value);
+	if (own === null) return null;
+	const operation = boundedOptionalText(own.operation, false);
+	if (operation === null || !Number.isSafeInteger(own.count) || own.count < 0
+		|| !Number.isFinite(own.p50Ms) || own.p50Ms < 0
+		|| !Number.isFinite(own.p95Ms) || own.p95Ms < 0) return null;
+	return { operation, count: own.count, p50Ms: own.p50Ms, p95Ms: own.p95Ms };
 }
 
 function boundedOptionalText(value, nullable = true) {

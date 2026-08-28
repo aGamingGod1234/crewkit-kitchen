@@ -50,6 +50,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
@@ -228,10 +229,17 @@ public final class MultiplexedServerBridgeVerification {
 		MultiplexedServerBridge bridge = null;
 		Path secretFile = null;
 		try {
+			assertEquals(50_000_000L, MultiplexedServerBridge.catalogRetryDelayNanos(1),
+					"catalog retry starts at the bounded base interval");
+			assertEquals(3_200_000_000L, MultiplexedServerBridge.catalogRetryDelayNanos(7),
+					"catalog retry reaches its capped interval");
+			assertEquals(3_200_000_000L, MultiplexedServerBridge.catalogRetryDelayNanos(10_000),
+					"catalog retry remains capped across indefinite attempts");
+			AtomicLong nanoTime = new AtomicLong(1_000_000L);
 			String secret = "0123456789abcdef0123456789abcdef";
 			secretFile = Files.createTempFile("arena-agents-catalog-secret-", ".txt");
 			Files.writeString(secretFile, secret);
-			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile, ServerSocket::new, nanoTime::get);
 			bridge.start();
 			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
@@ -246,6 +254,9 @@ public final class MultiplexedServerBridgeVerification {
 				assertEquals("hello_ack", acknowledgement.type(), "empty-catalog fixture authenticates the bridge");
 				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
 						"empty-catalog fixture consumes handshake state before catalog discovery");
+				nanoTime.addAndGet(60_000_000_000L);
+				for (int tick = 0; tick < 8; tick++) bridge.tick();
+				assertTrue(!reader.ready(), "catalog discovery does not start eagerly before an empty snapshot");
 
 				JsonObject catalog = new JsonObject();
 				catalog.addProperty("refreshedAtEpochMs", 0L);
@@ -263,41 +274,57 @@ public final class MultiplexedServerBridgeVerification {
 				}
 				assertTrue(request != null && "catalog_request".equals(request.type()),
 						"an empty bootstrap catalog requests live provider discovery asynchronously");
+				assertTrue(!bridge.catalogModels().isEmpty(),
+						"fallback model choices remain visible while live discovery retries");
 
-				writeEnvelope(socket, codec, new BridgeEnvelope(
-						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-2", catalog
-				));
-				BridgeEnvelope retry = null;
-				deadline = System.currentTimeMillis() + 2_000L;
-				while (retry == null && System.currentTimeMillis() < deadline) {
-					bridge.tick();
-					if (reader.ready()) retry = codec.decode(reader.readLine());
-					else Thread.sleep(10L);
+				for (int attempt = 2; attempt <= 6; attempt++) {
+					writeEnvelope(socket, codec, new BridgeEnvelope(
+							2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-" + attempt, catalog
+					));
+					nanoTime.addAndGet(60_000_000_000L);
+					BridgeEnvelope retry = null;
+					deadline = System.currentTimeMillis() + 2_000L;
+					while (retry == null && System.currentTimeMillis() < deadline) {
+						bridge.tick();
+						if (reader.ready()) retry = codec.decode(reader.readLine());
+						else Thread.sleep(1L);
+					}
+					assertTrue(retry != null && "catalog_request".equals(retry.type()),
+							"empty catalog discovery keeps probing after attempt " + attempt);
+					for (int tick = 0; tick < 8; tick++) bridge.tick();
+					assertTrue(!reader.ready(), "one exact catalog request owns each retry deadline");
 				}
-				assertTrue(retry != null && "catalog_request".equals(retry.type()),
-						"a second empty discovery schedules one bounded retry instead of latching fallback forever");
 
+				JsonObject liveModel = new JsonObject();
+				liveModel.addProperty("provider", "codex");
+				liveModel.addProperty("id", "codex:review-recovered");
+				liveModel.addProperty("model", "gpt-5.6-sol");
+				liveModel.addProperty("displayName", "Recovered Sol");
+				JsonArray efforts = new JsonArray();
+				efforts.add("high");
+				liveModel.add("reasoningEfforts", efforts);
+				JsonArray tiers = new JsonArray();
+				tiers.add("priority");
+				liveModel.add("serviceTiers", tiers);
+				JsonObject recoveredCatalog = new JsonObject();
+				recoveredCatalog.addProperty("refreshedAtEpochMs", 1L);
+				JsonArray liveModels = new JsonArray();
+				liveModels.add(liveModel);
+				recoveredCatalog.add("models", liveModels);
 				writeEnvelope(socket, codec, new BridgeEnvelope(
-						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-3", catalog
+						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "recovered-catalog", recoveredCatalog
 				));
-				BridgeEnvelope finalRetry = null;
 				deadline = System.currentTimeMillis() + 2_000L;
-				while (finalRetry == null && System.currentTimeMillis() < deadline) {
+				while (bridge.catalogModels().stream().noneMatch(model -> "codex:review-recovered".equals(model.model()))
+						&& System.currentTimeMillis() < deadline) {
 					bridge.tick();
-					if (reader.ready()) finalRetry = codec.decode(reader.readLine());
-					else Thread.sleep(10L);
+					Thread.sleep(1L);
 				}
-				assertTrue(finalRetry != null && "catalog_request".equals(finalRetry.type()),
-						"empty discovery retries are capped but include a final recovery probe");
-				writeEnvelope(socket, codec, new BridgeEnvelope(
-						2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-4", catalog
-				));
-				deadline = System.currentTimeMillis() + 300L;
-				while (System.currentTimeMillis() < deadline) {
-					bridge.tick();
-					assertTrue(!reader.ready(), "catalog discovery must not exceed its per-session retry cap");
-					Thread.sleep(10L);
-				}
+				assertTrue(bridge.catalogModels().stream().anyMatch(model -> "codex:review-recovered".equals(model.model())),
+						"eventual provider recovery promotes the live model catalog automatically");
+				nanoTime.addAndGet(60_000_000_000L);
+				for (int tick = 0; tick < 8; tick++) bridge.tick();
+				assertTrue(!reader.ready(), "live catalog promotion cancels the fallback retry timer");
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("empty catalog discovery verification failed", exception);
@@ -920,6 +947,14 @@ public final class MultiplexedServerBridgeVerification {
 				assertEquals(started.after().agentId().toString(),
 						firstAck.payload().getAsJsonArray("registry").get(0).getAsJsonObject().get("agentId").getAsString(),
 						"first session knows the active agent");
+				JsonObject emptyCatalog = new JsonObject();
+				emptyCatalog.addProperty("refreshedAtEpochMs", 0L);
+				emptyCatalog.add("models", new JsonArray());
+				writeEnvelope(first, codec, new BridgeEnvelope(
+						2, firstAck.serverInstanceId(), "server", "catalog_snapshot", "old-session-empty-catalog", emptyCatalog
+				));
+				assertEquals("catalog_request", pollBridgeResponse(bridge, first, firstReader, codec).type(),
+						"old session owns its catalog discovery request");
 			}
 			MultiplexedServerBridge activeBridge = bridge;
 			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
@@ -937,6 +972,13 @@ public final class MultiplexedServerBridgeVerification {
 				bridge.tick();
 				assertEquals(AgentLifecycleState.STARTING, manager.registry().require(active.agentId()).state(),
 						"replacement authentication consumes the old session disconnect without disconnecting the agent");
+				long staleRetryDeadline = System.nanoTime() + 150_000_000L;
+				while (System.nanoTime() < staleRetryDeadline) {
+					bridge.tick();
+					Thread.sleep(1L);
+				}
+				assertEquals(0, replacement.getInputStream().available(),
+						"replacement session never receives the closed session catalog retry");
 
 				JsonObject ready = new JsonObject();
 				ready.addProperty("goalRevision", started.after().goalRevision());
