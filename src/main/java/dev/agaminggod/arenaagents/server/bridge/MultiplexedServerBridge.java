@@ -167,19 +167,37 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	public synchronized void start() {
+		start(ServerSocket::new);
+	}
+
+	synchronized void start(ServerSocketFactory socketFactory) {
+		Objects.requireNonNull(socketFactory, "server socket factory must not be null");
 		if (!running.compareAndSet(false, true)) {
 			return;
 		}
+		ServerSocket socket = null;
 		try {
-			ServerSocket socket = new ServerSocket();
+			socket = socketFactory.open();
 			socket.bind(new InetSocketAddress(InetAddress.getByName(LOOPBACK_HOST), port), 1);
 			serverSocket = socket;
 			manager.setRuntimeHooks(this);
 			Thread.ofPlatform().daemon().name("arenaagents-v2-accept").start(this::acceptLoop);
 		} catch (IOException exception) {
 			running.set(false);
+			if (socket != null) {
+				try {
+					socket.close();
+				} catch (IOException closeException) {
+					exception.addSuppressed(closeException);
+				}
+			}
 			throw new BridgeProtocolException("BRIDGE_BIND_FAILED", "Could not bind " + LOOPBACK_HOST + ":" + port, exception);
 		}
+	}
+
+	@FunctionalInterface
+	interface ServerSocketFactory {
+		ServerSocket open() throws IOException;
 	}
 
 	public void tick() {

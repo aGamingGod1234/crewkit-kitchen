@@ -27,10 +27,13 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
 import java.net.Proxy;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
@@ -113,6 +116,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyConversationAttention(registered.getFirst().agentId());
 		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
+		verifyFailedBindClosesEverySocket();
 		verifyRealBridgeSessionLifecycle();
 		verifyLaunchIdentityAndReconnectGeneration();
 		verifyHandshakeResnapshotsLifecycleRaces();
@@ -122,7 +126,35 @@ public final class MultiplexedServerBridgeVerification {
 		verifyAtomicConversationWakePublication();
 		verifyAtomicPublicationRacesSessionClose();
 		verifyCompletionResultFacts();
-		return 74;
+		return 80;
+	}
+
+	private static void verifyFailedBindClosesEverySocket() {
+		MultiplexedServerBridge bridge = null;
+		try (ServerSocket conflict = new ServerSocket(0, 1, InetAddress.getByName(MultiplexedServerBridge.LOOPBACK_HOST))) {
+			int port = conflict.getLocalPort();
+			bridge = MultiplexedServerBridge.withPreparedSecret(
+					uninitializedManager(), port, "0123456789abcdef0123456789abcdef");
+			List<ServerSocket> candidates = new ArrayList<>();
+			MultiplexedServerBridge.ServerSocketFactory socketFactory = () -> {
+				ServerSocket candidate = new ServerSocket();
+				candidates.add(candidate);
+				return candidate;
+			};
+
+			MultiplexedServerBridge retryingBridge = bridge;
+			for (int attempt = 0; attempt < 4; attempt++) {
+				assertThrows(BridgeProtocolException.class, () -> retryingBridge.start(socketFactory),
+						"occupied bridge port rejects retry " + attempt);
+			}
+			assertEquals(4, candidates.size(), "each occupied-port retry creates one candidate socket");
+			assertTrue(candidates.stream().allMatch(ServerSocket::isClosed),
+					"every candidate socket closes when bind fails before bridge ownership transfer");
+		} catch (IOException exception) {
+			throw new AssertionError("failed-bind socket cleanup verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+		}
 	}
 
 	private static void verifyLaunchIdentityAndReconnectGeneration() {
