@@ -4,6 +4,7 @@ const PROVIDERS = Object.freeze(['codex', 'gemini', 'kimi', 'cursor']);
 const DEFAULT_SERVICE_TIER = 'priority';
 const PROFILE_KEYS = Object.freeze(['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier']);
 const DEFAULT_OPERATION_TIMEOUT_MS = 60_000;
+const AUTOMATIC_RECOVERY_BOUNDARIES = new Set(['startup', 'catalog']);
 
 export class ProviderProfileConflictError extends Error {
 	constructor() {
@@ -22,6 +23,7 @@ export class ProviderService extends EventEmitter {
 	#startedProviders = new Set();
 	#inFlight = new Set();
 	#recovery = new Map();
+	#recoveryTimers = new Map();
 	#failureBoundaries = new Map();
 	#reconciliationGeneration = 0;
 	#activeReconciliations = new Map();
@@ -69,6 +71,8 @@ export class ProviderService extends EventEmitter {
 		this.#stopped = true;
 		this.#lifecycleGeneration += 1;
 		this.#reconciliationGeneration += 1;
+		for (const timer of this.#recoveryTimers.values()) this.#cancelTimeout(timer.handle);
+		this.#recoveryTimers.clear();
 		for (const { controller } of this.#activeReconciliations.values()) controller.abort(providerError('STALE_RECONCILIATION', 'Provider reconciliation was stopped'));
 		this.#starting.clear();
 		this.#stopPromise = this.#stopOnce();
@@ -372,6 +376,7 @@ export class ProviderService extends EventEmitter {
 				nextProbeAtEpochMs: latest.nextProbeAtEpochMs, generation: previous?.generation ?? 1,
 				lastRecoveryAtEpochMs: previous?.lastRecoveryAtEpochMs ?? null,
 			});
+			this.#syncRecoveryTimer(provider);
 			return;
 		}
 		const recovered = previous?.state === 'degraded';
@@ -380,6 +385,7 @@ export class ProviderService extends EventEmitter {
 			nextProbeAtEpochMs: null, generation: previous?.generation ?? 1,
 			lastRecoveryAtEpochMs: recovered ? safeNow(this.#now) : previous?.lastRecoveryAtEpochMs ?? null,
 		});
+		this.#syncRecoveryTimer(provider);
 		if (recovered) this.emit('providerRestored', { provider });
 	}
 
@@ -405,6 +411,51 @@ export class ProviderService extends EventEmitter {
 			generation: (previous?.generation ?? 0) + (previous?.state === 'degraded' ? 0 : 1),
 			lastRecoveryAtEpochMs: previous?.lastRecoveryAtEpochMs ?? null,
 		});
+		this.#syncRecoveryTimer(provider);
+	}
+
+	#syncRecoveryTimer(provider) {
+		const failures = this.#failureBoundaries.get(provider);
+		const candidates = failures === undefined ? [] : [...failures.entries()]
+			.filter(([boundary, failure]) => AUTOMATIC_RECOVERY_BOUNDARIES.has(boundary) && Number.isSafeInteger(failure.nextProbeAtEpochMs))
+			.sort((left, right) => left[1].nextProbeAtEpochMs - right[1].nextProbeAtEpochMs);
+		const next = candidates[0];
+		const existing = this.#recoveryTimers.get(provider);
+		if (next === undefined || this.#stopped) {
+			if (existing !== undefined) this.#cancelTimeout(existing.handle);
+			this.#recoveryTimers.delete(provider);
+			return;
+		}
+		const [boundary, failure] = next;
+		if (existing?.boundary === boundary && existing.deadline === failure.nextProbeAtEpochMs) return;
+		if (existing !== undefined) this.#cancelTimeout(existing.handle);
+		const now = safeNow(this.#now);
+		if (now === null) return;
+		const token = {
+			boundary,
+			deadline: failure.nextProbeAtEpochMs,
+			generation: this.#lifecycleGeneration,
+			handle: null,
+		};
+		token.handle = this.#scheduleTimeout(() => this.#runRecoveryProbe(provider, token), Math.max(0, token.deadline - now));
+		token.handle?.unref?.();
+		this.#recoveryTimers.set(provider, token);
+	}
+
+	async #runRecoveryProbe(provider, token) {
+		if (this.#recoveryTimers.get(provider) !== token) return;
+		this.#recoveryTimers.delete(provider);
+		if (this.#stopped || token.generation !== this.#lifecycleGeneration) return;
+		const now = safeNow(this.#now);
+		if (now !== null && now < token.deadline) {
+			this.#syncRecoveryTimer(provider);
+			return;
+		}
+		try {
+			if (token.boundary === 'startup') await this.#execute(provider, () => undefined, 'startup');
+			else await this.catalog.refresh({ providers: [provider] });
+		} catch { /* the failed operation records and schedules its own next retry */ }
+		finally { this.#syncRecoveryTimer(provider); }
 	}
 }
 

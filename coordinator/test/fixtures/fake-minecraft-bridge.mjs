@@ -262,7 +262,6 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	#actionResults = [];
 	#connectionEpoch = 0;
 	#deferredActionResults = new Map();
-	#replayedActionIds = new Set();
 	#activePhysicalActions = 0;
 
 	sent = [];
@@ -276,6 +275,8 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	completionEvaluations = [];
 	goalControls = [];
 	actionEffects = [];
+	actionAttempts = [];
+	deliveredActionResults = [];
 	staleActionReplays = [];
 	maxConcurrentPhysicalActions = 0;
 
@@ -310,7 +311,6 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	get goalSpec() { return this.#record.goalSpec === undefined ? null : structuredClone(this.#record.goalSpec); }
 	get connectionEpoch() { return this.#connectionEpoch; }
 	get actionDispatches() { return this.sent.filter(({ type }) => type === 'action_command').map((entry) => structuredClone(entry)); }
-	get staleActionEffectCount() { return this.actionEffects.filter(({ actionId }) => this.#replayedActionIds.has(actionId)).length; }
 	get deferredActionCount() { return this.#deferredActionResults.size; }
 
 	start() {
@@ -362,7 +362,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			payload: { operation: 'start', goalRevision: revision, goal, goalSpec: this.#record.goalSpec, updatedAtEpochMs: revision },
 		};
 		this.goalControls.push(structuredClone(control));
-		this.emit('goal_control', control);
+		this.emit('goal_control', { ...control, connectionEpoch: this.#connectionEpoch });
 		return this.publishObservation({ attention: true });
 	}
 
@@ -412,7 +412,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		});
 		validateProtocolV2Envelope(envelope, { direction: 'server_to_coordinator' });
 		this.validatedInbound += 1;
-		if (this.#connected && !this.#stopped) this.emit('observation', { agentId: this.#record.agentId, payload: envelope.payload });
+		if (this.#connected && !this.#stopped) this.emit('observation', { agentId: this.#record.agentId, payload: envelope.payload, connectionEpoch: this.#connectionEpoch });
 		return envelope.payload;
 	}
 
@@ -422,6 +422,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		this.emit('goal_control', {
 			agentId: this.#record.agentId,
 			payload: { operation: 'stop', goalRevision: revision, updatedAtEpochMs: revision },
+			connectionEpoch: this.#connectionEpoch,
 		});
 	}
 
@@ -429,14 +430,13 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		const deferred = [...this.#deferredActionResults.values()];
 		this.#deferredActionResults.clear();
 		for (const entry of deferred) {
-			this.#replayedActionIds.add(entry.result.actionId);
 			this.staleActionReplays.push({
 				actionId: entry.result.actionId,
 				originConnectionEpoch: entry.connectionEpoch,
 				replayConnectionEpoch: this.#connectionEpoch,
 				goalRevision: entry.result.goalRevision,
 			});
-			this.#emitInbound('action_result', entry.result);
+			this.#emitInbound('action_result', entry.result, entry.connectionEpoch);
 		}
 		return deferred.length;
 	}
@@ -448,7 +448,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 			payload: { operation, goalRevision: revision, updatedAtEpochMs: revision, ...extra },
 		};
 		this.goalControls.push(structuredClone(control));
-		this.emit('goal_control', control);
+		this.emit('goal_control', { ...control, connectionEpoch: this.#connectionEpoch });
 	}
 
 	async #executeAction(command, connectionEpoch) {
@@ -458,9 +458,10 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		const actionType = command.actionType;
 		const succeeded = actionFault === 'SUCCEEDED';
 		const disconnectOutstanding = this.#scenario.disconnectWhileActionOutstandingAtAction === this.#actionNumber;
-		if (succeeded && !disconnectOutstanding) {
+		if (succeeded) {
 			this.#activePhysicalActions += 1;
 			this.maxConcurrentPhysicalActions = Math.max(this.maxConcurrentPhysicalActions, this.#activePhysicalActions);
+			this.actionAttempts.push({ actionId: command.actionId, actionType, goalRevision: command.goalRevision, connectionEpoch });
 			try { this.#applySuccessfulAction(command, connectionEpoch); }
 			finally { this.#activePhysicalActions -= 1; }
 		}
@@ -555,34 +556,41 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 	#applySuccessfulAction(command, connectionEpoch) {
 		const actionType = command.actionType;
 		const args = command.arguments ?? {};
+		let changed = false;
 		if (actionType === 'break_block' || actionType === 'mine') {
-			this.#world.blocks.delete(`${args.x},${args.y},${args.z}`);
+			changed = this.#world.blocks.delete(`${args.x},${args.y},${args.z}`);
 			if (this.#world.drop !== null) {
+				const nextX = this.#scenario.moveDropBeforePickup ? 3 : this.#world.drop.x;
+				changed ||= nextX !== this.#world.drop.x;
 				this.#world.drop = {
 					...this.#world.drop,
-					x: this.#scenario.moveDropBeforePickup ? 3 : this.#world.drop.x,
+					x: nextX,
 				};
 			}
 		}
 		if (actionType === 'navigate_to') {
+			changed = this.#world.position.x !== args.x || this.#world.position.y !== args.y || this.#world.position.z !== args.z;
 			this.#world.position = { x: args.x, y: args.y, z: args.z };
 		}
 		if (actionType === 'pick_up_item') {
 			const drop = this.#world.drop;
 			if (drop !== null && args.targetSelector === drop.stableId) {
+				changed = true;
 				this.#world.inventory.set(drop.itemId, (this.#world.inventory.get(drop.itemId) ?? 0) + drop.count);
 				this.#world.drop = null;
 			}
 		}
 		if (actionType === 'craft_inventory') {
+			changed = true;
 			const itemId = args.recipeId ?? 'minecraft:wooden_pickaxe';
 			this.#world.inventory.set(itemId, (this.#world.inventory.get(itemId) ?? 0) + (args.count ?? 1));
 		}
 		if (actionType === 'respawn') {
+			changed = this.#world.dead || this.#world.health !== 20;
 			this.#world.dead = false;
 			this.#world.health = 20;
 		}
-		this.actionEffects.push({ actionId: command.actionId, actionType, goalRevision: command.goalRevision, connectionEpoch });
+		if (changed) this.actionEffects.push({ actionId: command.actionId, actionType, goalRevision: command.goalRevision, connectionEpoch });
 	}
 
 	#evaluateGoalPredicate(predicate) {
@@ -654,7 +662,7 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		});
 	}
 
-	#emitInbound(type, payload) {
+	#emitInbound(type, payload, connectionEpoch = this.#connectionEpoch) {
 		const envelope = createProtocolV2Envelope({
 			serverInstanceId: this.#serverInstanceId,
 			agentId: this.#record.agentId,
@@ -664,7 +672,8 @@ export class FaultInjectingMinecraftBridge extends EventEmitter {
 		});
 		validateProtocolV2Envelope(envelope, { direction: 'server_to_coordinator' });
 		this.validatedInbound += 1;
-		if (this.#connected && !this.#stopped) this.emit(type, { agentId: this.#record.agentId, payload: envelope.payload });
+		if (type === 'action_result') this.deliveredActionResults.push({ actionId: envelope.payload.actionId, connectionEpoch });
+		if (this.#connected && !this.#stopped) this.emit(type, { agentId: this.#record.agentId, payload: envelope.payload, connectionEpoch });
 	}
 }
 

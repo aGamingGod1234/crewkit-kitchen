@@ -20,6 +20,7 @@ const PROFILE_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
 const RESOURCE_NAMES = Object.freeze([
 	'leases', 'sessions', 'actions', 'timers', 'promises', 'childProcesses', 'listeners',
 ]);
+const INSTRUMENTED_VALUES = new WeakSet();
 
 const scenarios = [
 	['provider startup hang', providerStartupHang],
@@ -43,18 +44,22 @@ for (const [name, run] of scenarios) {
 	});
 }
 
-test('recovery matrix evidence contract rejects omitted and unmeasured fields', () => {
+test('recovery matrix evidence contract rejects omitted, null, and fabricated measurements', () => {
 	assert.throws(() => assertCompleteEvidence({}), /recovery evidence is required/);
+	assert.throws(() => observed(null, 'null measurement'), /non-null instrumented value/);
+	assert.throws(() => observed({ pending: 0, maximum: 0 }, 'hardcoded fixture counter'), /instrumented measurement/);
 	const invalid = {
 		recovery: { healthy: true, permanentLatch: false, stateBefore: 'fault', stateAfter: 'ready', nextProbeAtEpochMs: null, attemptTimes: [], probeDeadlines: [], retryDelays: [], attemptCount: 0 },
-		states: observed([], 'test registry'),
+		states: measured([], 'test registry sampler'),
 		profile: notApplicable('No profile is selected in this contract test.'),
-		resources: Object.fromEntries(RESOURCE_NAMES.map((name) => [name, observed(0, `${name} counter`)])),
+		resources: Object.fromEntries(RESOURCE_NAMES.map((name) => [name, notApplicable(`${name} is deliberately absent from this evidence-contract-only fixture.`)])),
 	};
 	delete invalid.resources.timers;
 	assert.throws(() => assertCompleteEvidence(invalid), /timers evidence is required/);
-	invalid.resources.timers = { kind: 'observed', value: 0 };
-	assert.throws(() => assertCompleteEvidence(invalid), /timers evidence source/);
+	invalid.resources.timers = { kind: 'observed', value: null, source: 'malicious all-null fixture' };
+	assert.throws(() => assertCompleteEvidence(invalid), /non-null instrumented value/);
+	invalid.resources.timers = { kind: 'notApplicable' };
+	assert.throws(() => assertCompleteEvidence(invalid), /notApplicable reason/);
 });
 
 async function providerStartupHang() {
@@ -88,6 +93,7 @@ async function providerStartupHang() {
 		cancelTimeout: timers.cancel,
 		now: () => timers.now,
 	});
+	const listeners = new ListenerGauge(router);
 	let session = null;
 	let degraded;
 	let restored;
@@ -104,32 +110,33 @@ async function providerStartupHang() {
 		timers.advanceTo(degraded.nextProbeAtEpochMs - 1);
 		await flush();
 		assert.deepEqual(attemptTimes, [0], 'no startup probe runs before the advertised deadline');
-		timers.advanceTo(degraded.nextProbeAtEpochMs);
-		const retry = await router.start(['codex']);
-		assert.equal(retry[0].status, 'fulfilled');
+		await timers.runNext();
 		restored = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
 		assert.equal(restored.state, 'live');
 		assert.deepEqual(attemptTimes, [0, 1_025], 'one startup probe runs at the deadline');
+		assert.equal(maxPendingStarts, 2, 'the timed-out start remains owned until its underlying promise settles');
+		assert.equal(pendingStarts, 1, 'logical timeout does not fabricate settlement of the old start');
 		session = await router.createAgent(PROFILE);
 		releaseHung();
 		await flush();
 	} finally {
 		releaseHung?.();
 		await router.stop();
+		listeners.sample();
 	}
 	const sessions = services.codex.sessionStats();
 	return evidence({
 		recovery: { healthy: restored?.state === 'live', permanentLatch: false, stateBefore: degraded?.state, stateAfter: restored?.state, nextProbeAtEpochMs: degraded?.nextProbeAtEpochMs, attemptTimes, probeDeadlines: [degraded?.nextProbeAtEpochMs], retryDelays: [1_000], attemptCount: attemptTimes.length },
 		states: notApplicable('Provider startup has no authority to mutate an agent domain lifecycle.'),
-		profile: observed({ before: PROFILE, after: session?.profile }, 'ProviderService exact session snapshot'),
+		profile: measured({ before: PROFILE, after: session?.profile }, 'ProviderService exact session snapshot'),
 		resources: resources({
 			leases: notApplicable('No work lease is allocated during provider-only startup.'),
-			sessions: observed(sessions, 'fake backend current-session counter around ProviderService'),
+			sessions: measured(sessions, 'fake backend current-session counter around ProviderService'),
 			actions: notApplicable('Provider startup cannot dispatch Minecraft actions.'),
-			timers: observed(timers.snapshot(), 'ProviderService injected timeout scheduler'),
-			promises: observed({ pending: pendingStarts, maximum: maxPendingStarts }, 'backend start-promise counter'),
-			childProcesses: observed({ current: 0, maximum: 0 }, 'credential-free provider fixture spawn counter'),
-			listeners: observed({ current: listenerCount(router), maximum: 0 }, 'ProviderService EventEmitter listener count after stop'),
+			timers: measured(timers.snapshot(), 'ProviderService injected timeout and recovery scheduler'),
+			promises: measured({ pending: pendingStarts, maximum: maxPendingStarts }, 'backend start-promise ownership counter'),
+			childProcesses: notApplicable('This in-process provider fixture has no child-process creation capability.'),
+			listeners: measured(listeners.snapshot(), 'ProviderService EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -139,56 +146,64 @@ async function providerOutageAndRestoration() {
 	const services = providerServices();
 	let available = false;
 	const refreshTimes = [];
-	services.codex.catalog.refresh = async () => {
+	let pendingRefreshes = 0;
+	let maxPendingRefreshes = 0;
+	services.codex.catalog.refresh = () => trackedOperation(async () => {
 		refreshTimes.push(timers.now);
 		if (!available) throw Object.assign(new Error('temporary outage'), { code: 'PROVIDER_UNAVAILABLE' });
 		return catalog('codex', PROFILE.model);
-	};
+	}, (delta) => {
+		pendingRefreshes += delta;
+		maxPendingRefreshes = Math.max(maxPendingRefreshes, pendingRefreshes);
+	});
 	const router = new ProviderService(services, {
 		operationTimeoutMs: 100,
 		scheduleTimeout: timers.schedule,
 		cancelTimeout: timers.cancel,
 		now: () => timers.now,
 	});
+	const listeners = new ListenerGauge(router);
 	let session = null;
 	let degraded;
 	let restored;
 	try {
 		const expectedRetryDelays = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000];
 		const probeDeadlines = [];
-		for (const expectedDelay of expectedRetryDelays) {
-			await router.catalog.refresh({ providers: ['codex'] });
+		await router.catalog.refresh({ providers: ['codex'] });
+		for (let index = 0; index < expectedRetryDelays.length; index += 1) {
+			const expectedDelay = expectedRetryDelays[index];
 			degraded = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
 			assert.equal(degraded.state, 'degraded');
 			assert.equal(degraded.nextProbeAtEpochMs - timers.now, expectedDelay);
 			probeDeadlines.push(degraded.nextProbeAtEpochMs);
 			timers.advanceTo(degraded.nextProbeAtEpochMs - 1);
 			await flush();
-			assert.equal(refreshTimes.length, probeDeadlines.length, 'catalog recovery cannot spin before its deadline');
-			timers.advanceTo(degraded.nextProbeAtEpochMs);
+			assert.equal(refreshTimes.length, index + 1, 'catalog recovery cannot spin before its deadline');
+			if (index === expectedRetryDelays.length - 1) available = true;
+			await timers.runNext();
+			assert.equal(refreshTimes.length, index + 2, 'production recovery executes exactly one probe at the deadline');
 		}
-		available = true;
-		const snapshot = await router.catalog.refresh({ providers: ['codex'] });
-		restored = snapshot.recovery.find(({ provider }) => provider === 'codex');
+		restored = router.recoverySnapshot().find(({ provider }) => provider === 'codex');
 		assert.equal(restored.state, 'live');
 		assert.deepEqual(refreshTimes, [0, ...probeDeadlines]);
 		session = await router.createAgent(PROFILE);
 		degraded = { ...degraded, probeDeadlines, retryDelays: expectedRetryDelays };
 	} finally {
 		await router.stop();
+		listeners.sample();
 	}
 	return evidence({
 		recovery: { healthy: restored?.state === 'live', permanentLatch: false, stateBefore: degraded?.state, stateAfter: restored?.state, nextProbeAtEpochMs: degraded?.nextProbeAtEpochMs, attemptTimes: refreshTimes, probeDeadlines: degraded?.probeDeadlines, retryDelays: degraded?.retryDelays, attemptCount: refreshTimes.length },
 		states: notApplicable('Catalog recovery has no authority to mutate an agent domain lifecycle.'),
-		profile: observed({ before: PROFILE, after: session?.profile }, 'restored ProviderService session snapshot'),
+		profile: measured({ before: PROFILE, after: session?.profile }, 'restored ProviderService session snapshot'),
 		resources: resources({
 			leases: notApplicable('Catalog refresh owns bounded operations, not goal work leases.'),
-			sessions: observed(services.codex.sessionStats(), 'backend session counter after router cleanup'),
+			sessions: measured(services.codex.sessionStats(), 'backend session counter after router cleanup'),
 			actions: notApplicable('Catalog refresh cannot dispatch Minecraft actions.'),
-			timers: observed(timers.snapshot(), 'ProviderService injected timeout scheduler'),
-			promises: observed({ pending: 0, maximum: 1 }, 'awaited catalog-operation counter'),
-			childProcesses: observed({ current: 0, maximum: 0 }, 'catalog fixture spawn counter'),
-			listeners: observed({ current: listenerCount(router), maximum: 0 }, 'ProviderService listener count after stop'),
+			timers: measured(timers.snapshot(), 'ProviderService injected timeout and recovery scheduler'),
+			promises: measured({ pending: pendingRefreshes, maximum: maxPendingRefreshes }, 'catalog refresh-promise ownership counter'),
+			childProcesses: notApplicable('This in-process catalog fixture has no child-process creation capability.'),
+			listeners: measured(listeners.snapshot(), 'ProviderService EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -200,6 +215,7 @@ async function ignoredAbortReleasesCapacity() {
 	let activePromises = 0;
 	let maxActivePromises = 0;
 	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1, scheduleTimeout: timers.schedule, cancelTimeout: timers.cancel });
+	const schedulerLeases = new SchedulerLeaseGauge(scheduler);
 	const ignored = scheduler.schedule('fault-agent', async () => {
 		activePromises += 1;
 		maxActivePromises = Math.max(maxActivePromises, activePromises);
@@ -216,27 +232,31 @@ async function ignoredAbortReleasesCapacity() {
 	});
 	const ignoredOutcome = assert.rejects(ignored, (error) => error?.code === 'PLANNING_LEASE_EXPIRED');
 	await flush();
+	schedulerLeases.sample();
 	assert.equal(scheduler.activeCount, 1);
 	assert.equal(timers.snapshot().requestedDelays[0], 20);
 	await timers.runNext();
 	await ignoredOutcome;
 	assert.equal(scheduler.activeCount, 1, 'the replacement owns the released scheduler slot');
+	assert.equal(activePromises, 2, 'the ignored-abort promise remains owned while replacement capacity is released');
+	schedulerLeases.sample();
 	releaseReplacement();
 	assert.equal(await replacement, 'healthy');
 	releaseIgnored();
 	await flush();
 	scheduler.close();
+	schedulerLeases.sample();
 	return evidence({
 		recovery: { healthy: scheduler.activeCount === 0 && scheduler.pendingCount === 0, permanentLatch: false, stateBefore: 'lease_expired', stateAfter: 'capacity_available', nextProbeAtEpochMs: 20, attemptTimes: [0, 20], probeDeadlines: [20], retryDelays: [20], attemptCount: 2 },
 		states: notApplicable('PlanningScheduler does not own agent domain lifecycle state.'),
 		profile: notApplicable('Scheduler capacity is provider-profile agnostic and cannot mutate a profile.'),
 		resources: resources({
-			leases: observed({ maxByKind: { provider: 1 }, pending: scheduler.activeCount }, 'PlanningScheduler active lease count'),
+			leases: measured(schedulerLeases.snapshot(), 'PlanningScheduler active lease sampler'),
 			sessions: notApplicable('The scheduler test deliberately uses no provider session.'),
 			actions: notApplicable('Planning tasks do not invoke the Minecraft action bridge in this scenario.'),
-			timers: observed(timers.snapshot(), 'PlanningScheduler injected lease timer'),
-			promises: observed({ pending: activePromises, maximum: maxActivePromises }, 'underlying abort-ignoring task counter'),
-			childProcesses: observed({ current: 0, maximum: 0 }, 'scheduler fixture spawn counter'),
+			timers: measured(timers.snapshot(), 'PlanningScheduler injected lease timer'),
+			promises: measured({ pending: activePromises, maximum: maxActivePromises }, 'underlying abort-ignoring task ownership counter'),
+			childProcesses: notApplicable('This in-process scheduler fixture has no child-process creation capability.'),
 			listeners: notApplicable('PlanningScheduler exposes no event-listener surface.'),
 		}),
 	});
@@ -261,27 +281,41 @@ async function disconnectFencesOutstandingActionReplay() {
 	const replacementDispatches = result.actionDispatches.filter(({ connectionEpoch }) => connectionEpoch === replacementEpoch);
 	assert.equal(result.staleActionReplays.length, 1);
 	assert.equal(result.staleActionReplays[0].actionId, oldDispatch.payload.actionId);
+	assert.equal(result.staleActionReplays[0].originConnectionEpoch, oldDispatch.connectionEpoch);
 	assert.equal(result.staleActionReplays[0].replayConnectionEpoch, replacementEpoch);
-	assert.equal(result.staleDispatches, 0, 'the replayed old action creates no post-fence physical effect');
 	assert.equal(replacementDispatches.length, 1);
+	assert.equal(result.actionAttempts.length, 2, 'the old command and one replacement each reach the physical boundary');
 	assert.equal(result.actionEffects.length, 1);
-	assert.equal(result.actionEffects[0].actionId, replacementDispatches[0].payload.actionId);
-	assert.equal(new Set(result.actionEffects.map(({ actionId }) => actionId)).size, result.actionEffects.length);
+	assert.equal(result.actionEffects[0].actionId, oldDispatch.payload.actionId, 'the first dispatched command honestly mutates the world before disconnect');
+	assert.deepEqual(result.acceptedActionResults, [{ actionId: replacementDispatches[0].payload.actionId, connectionEpoch: replacementEpoch }], 'the replacement result is accepted exactly once');
+	assert.equal(result.acceptedActionResults.some(({ actionId }) => actionId === oldDispatch.payload.actionId), false, 'the explicitly old-epoch result is rejected by the coordinator fence');
+	assert.equal(result.staleDispatches, 0, 'no old-epoch terminal result crosses the coordinator fence');
+	assert.equal(result.deliveredActionResults.find(({ actionId }) => actionId === oldDispatch.payload.actionId)?.connectionEpoch, oldDispatch.connectionEpoch);
+	const duplicateDispatches = result.actionDispatches.length - new Set(result.actionDispatches.map(({ payload }) => payload.actionId)).size;
+	assert.equal(duplicateDispatches, 0);
 	assert.equal(result.providerSessions.created, 1);
 	assert.equal(result.leaseStats.maxByKind.provider, 1);
 	assert.equal(result.leaseStats.maxByKind.action, 1);
 	return evidence({
 		recovery: { healthy: result.connectionEpoch === 2 && replacementDispatches.length === 1, permanentLatch: false, stateBefore: 'bridge_disconnected', stateAfter: result.finalState, nextProbeAtEpochMs: null, attemptTimes: [1, 2], probeDeadlines: [], retryDelays: [], attemptCount: 2 },
-		states: observed(result.states, 'AgentRegistry snapshots sampled throughout native goal execution'),
-		profile: observed({ before: result.providerSessions.profile, after: result.profile }, 'provider session and final AgentRegistry snapshots'),
+		states: measured(result.states, 'AgentRegistry snapshots sampled throughout native goal execution'),
+		profile: measured({ before: result.providerSessions.profile, after: result.profile }, 'provider session and final AgentRegistry snapshots'),
 		resources: resources({
-			leases: observed(result.leaseStats, 'tracking wrapper around the production ActiveGoalSupervisor'),
-			sessions: observed(result.providerSessions, 'scripted provider exact-session counters'),
-			actions: observed({ maxConcurrent: result.maxConcurrentPhysicalActions, effects: result.actionEffects.length, duplicates: result.actionEffects.length - new Set(result.actionEffects.map(({ actionId }) => actionId)).size, staleEffects: result.staleDispatches, pending: harness.bridge.deferredActionCount }, 'FaultInjectingMinecraftBridge command/epoch effect ledger'),
-			timers: observed(combinedTimerSnapshot(result.goalScheduler, result.stuckScheduler), 'injected work-lease and factual-progress schedulers'),
-			promises: observed({ pending: result.activeWork, maximum: 1 }, 'scripted provider active-turn counter'),
-			childProcesses: observed({ current: 0, maximum: 0 }, 'native provider fixture spawn counter'),
-			listeners: observed({ current: result.listenerResidue, maximum: result.listenerResidue }, 'bridge EventEmitter listeners after coordinator stop'),
+			leases: measured(result.leaseStats, 'tracking wrapper around the production ActiveGoalSupervisor'),
+			sessions: measured(result.providerSessions, 'scripted provider exact-session counters'),
+			actions: measured({
+				maxConcurrent: result.maxConcurrentPhysicalActions,
+				effects: result.actionEffects.length,
+				duplicates: duplicateDispatches,
+				staleEffects: result.acceptedActionResults.filter(({ connectionEpoch }) => connectionEpoch !== replacementEpoch).length,
+				pending: harness.bridge.deferredActionCount,
+				attempts: result.actionAttempts.length,
+				postFenceAccepted: result.acceptedActionResults.length,
+			}, 'FaultInjectingMinecraftBridge physical ledger and coordinator actionResult acceptance events'),
+			timers: measured(combinedTimerSnapshot(result.goalScheduler, result.stuckScheduler), 'injected work-lease and factual-progress schedulers'),
+			promises: measured({ pending: result.activeWork, maximum: result.providerSessions.maxTurnsPending }, 'scripted provider unsettled-turn ownership counter'),
+			childProcesses: notApplicable('This in-process native-provider fixture has no child-process creation capability.'),
+			listeners: measured(result.listenerStats, 'bridge and coordinator EventEmitter listener sampler'),
 		}),
 	});
 }
@@ -293,18 +327,24 @@ async function voiceBindFailureAndRecovery() {
 	let liveWorkers = 0;
 	let maxWorkers = 0;
 	let failureListeners = 0;
+	let maxFailureListeners = 0;
+	let pendingStarts = 0;
+	let maxPendingStarts = 0;
 	const supervisor = new VoiceSupervisor({
-		startWorker: async () => {
+		startWorker: () => trackedOperation(async () => {
 			attemptTimes.push(timers.now);
 			if (attemptTimes.length <= 3) throw Object.assign(new Error('port occupied'), { code: 'EADDRINUSE' });
 			liveWorkers += 1;
 			maxWorkers = Math.max(maxWorkers, liveWorkers);
 			return {
 				statusSnapshots: () => ['voice', 'voice:tts', 'voice:stt'].map((component) => ({ component, state: 'ready', generation: 1, lastRecoveryAtEpochMs: null })),
-				onFailure() { failureListeners += 1; return () => { failureListeners -= 1; }; },
+				onFailure() { failureListeners += 1; maxFailureListeners = Math.max(maxFailureListeners, failureListeners); return () => { failureListeners -= 1; }; },
 				async close() { liveWorkers -= 1; },
 			};
-		},
+		}, (delta) => {
+			pendingStarts += delta;
+			maxPendingStarts = Math.max(maxPendingStarts, pendingStarts);
+		}),
 		now: () => timers.now,
 		schedule: timers.schedule,
 		cancelSchedule: timers.cancel,
@@ -339,10 +379,10 @@ async function voiceBindFailureAndRecovery() {
 			leases: notApplicable('VoiceSupervisor owns retry timers rather than goal work leases.'),
 			sessions: notApplicable('Voice workers are not AI provider sessions.'),
 			actions: notApplicable('Voice recovery cannot dispatch Minecraft actions.'),
-			timers: observed(timers.snapshot(), 'VoiceSupervisor injected startup and retry scheduler'),
-			promises: observed({ pending: liveWorkers, maximum: maxWorkers }, 'voice worker lifecycle counter'),
-			childProcesses: observed({ current: 0, maximum: 0 }, 'in-process voice fixture spawn counter'),
-			listeners: observed({ current: failureListeners, maximum: 1 }, 'voice worker failure-listener counter'),
+			timers: measured(timers.snapshot(), 'VoiceSupervisor injected startup and retry scheduler'),
+			promises: measured({ pending: pendingStarts, maximum: maxPendingStarts }, 'voice startup-promise ownership counter'),
+			childProcesses: notApplicable('This in-process voice fixture has no child-process creation capability.'),
+			listeners: measured({ current: failureListeners, maximum: maxFailureListeners }, 'voice worker failure-listener registration counter'),
 		}),
 	});
 }
@@ -354,13 +394,13 @@ async function diagnosticHangAndRejection() {
 	let maxPendingOperations = 0;
 	const completed = [];
 	const queue = new BestEffortDiagnosticQueue({ maxPending: 4, operationTimeoutMs: 5, closeTimeoutMs: 50, maxDetachedOperations: 2, schedule: timers.schedule, cancel: timers.cancel });
-	queue.submit(() => {
-		pendingOperations += 1;
+	const trackDiagnostic = (operation) => trackedOperation(operation, (delta) => {
+		pendingOperations += delta;
 		maxPendingOperations = Math.max(maxPendingOperations, pendingOperations);
-		return new Promise((resolve) => { releaseHung = () => { pendingOperations -= 1; resolve(); }; });
 	});
-	queue.submit(async () => { throw Object.assign(new Error('disk offline'), { code: 'EIO' }); });
-	queue.submit(() => { completed.push('healthy'); });
+	queue.submit(() => trackDiagnostic(() => new Promise((resolve) => { releaseHung = resolve; })));
+	queue.submit(() => trackDiagnostic(async () => { throw Object.assign(new Error('disk offline'), { code: 'EIO' }); }));
+	queue.submit(() => trackDiagnostic(() => { completed.push('healthy'); }));
 	await flush();
 	assert.equal(queue.statusSnapshot().state, 'ready');
 	await timers.runNext({ flushAfter: false });
@@ -369,6 +409,7 @@ async function diagnosticHangAndRejection() {
 	assert.equal(degradedState, 'degraded');
 	await eventually(() => completed.length === 1);
 	assert.equal(queue.statusSnapshot().state, 'ready');
+	assert.equal(pendingOperations, 1, 'the detached timed-out write remains owned until the sink settles');
 	releaseHung();
 	await flush();
 	await queue.close();
@@ -380,9 +421,9 @@ async function diagnosticHangAndRejection() {
 			leases: notApplicable('DiagnosticQueue owns bounded sink operations rather than goal leases.'),
 			sessions: notApplicable('Diagnostics create no provider sessions.'),
 			actions: notApplicable('Diagnostics cannot dispatch Minecraft actions.'),
-			timers: observed(timers.snapshot(), 'BestEffortDiagnosticQueue injected operation scheduler'),
-			promises: observed({ pending: pendingOperations, maximum: maxPendingOperations }, 'diagnostic sink promise counter'),
-			childProcesses: observed({ current: 0, maximum: 0 }, 'diagnostic fixture spawn counter'),
+			timers: measured(timers.snapshot(), 'BestEffortDiagnosticQueue injected operation scheduler'),
+			promises: measured({ pending: pendingOperations, maximum: maxPendingOperations }, 'diagnostic sink-promise ownership counter'),
+			childProcesses: notApplicable('This in-process diagnostic fixture has no child-process creation capability.'),
 			listeners: notApplicable('BestEffortDiagnosticQueue exposes no listener surface.'),
 		}),
 	});
@@ -391,12 +432,17 @@ async function diagnosticHangAndRejection() {
 async function exactProfileSessionAndLeasePreservation() {
 	const timers = new ManualTimers();
 	const supervisor = new WorkLeaseSupervisor({ clock: () => timers.now, schedule: timers.schedule, cancelSchedule: timers.cancel, stuckSchedule: timers.schedule, cancelStuckSchedule: timers.cancel });
+	const leases = new LeaseSnapshotGauge();
 	const first = leaseKey(1);
 	const second = leaseKey(2);
 	assert.equal(supervisor.activate(first), true);
+	leases.sample(supervisor.snapshot(first));
 	const staleProvider = supervisor.acquire(first, 'provider');
+	leases.sample(supervisor.snapshot(first));
 	assert.equal(supervisor.activate(second), true);
+	leases.sample(supervisor.snapshot(second));
 	const action = supervisor.acquire(second, 'action');
+	leases.sample(supervisor.snapshot(second));
 	assert.equal(supervisor.release(staleProvider), false);
 	assert.equal(supervisor.activate({ ...second, profileFingerprint: `sha256:${'b'.repeat(64)}` }), false);
 	const live = supervisor.snapshot(second);
@@ -406,18 +452,20 @@ async function exactProfileSessionAndLeasePreservation() {
 	const recovered = supervisor.snapshot(second);
 	assert.equal(recovered.leases.length, 1);
 	assert.equal(recovered.leases[0].kind, 'scheduled');
+	leases.sample(recovered);
 	supervisor.close();
+	leases.sample(null);
 	return evidence({
 		recovery: { healthy: recovered.state === 'active', permanentLatch: false, stateBefore: 'session_epoch_1', stateAfter: 'session_epoch_2', nextProbeAtEpochMs: recovered.leases[0].deadline, attemptTimes: [first.sessionEpoch, second.sessionEpoch], probeDeadlines: [recovered.leases[0].deadline], retryDelays: [recovered.leases[0].deadline - timers.now], attemptCount: 2 },
 		states: notApplicable('WorkLeaseSupervisor cannot mutate the AgentRegistry lifecycle.'),
-		profile: observed({ before: { fingerprint: PROFILE_FINGERPRINT }, after: { fingerprint: recovered.key.profileFingerprint } }, 'production WorkLeaseSupervisor key snapshots'),
+		profile: measured({ before: { fingerprint: PROFILE_FINGERPRINT }, after: { fingerprint: recovered.key.profileFingerprint } }, 'production WorkLeaseSupervisor key snapshots'),
 		resources: resources({
-			leases: observed({ maxByKind: { provider: 1, action: 1, scheduled: 1 }, pending: 0 }, 'production WorkLeaseSupervisor snapshots and post-close timer state'),
-			sessions: observed({ maxCurrent: 1, current: 0, created: 1 }, 'two fenced session epochs with one current owner'),
-			actions: observed({ maxConcurrent: 1, effects: 0, duplicates: 0, staleEffects: 0, pending: 0 }, 'one action lease and stale-token rejection'),
-			timers: observed(timers.snapshot(), 'WorkLeaseSupervisor injected lease scheduler'),
-			promises: observed({ pending: 0, maximum: 0 }, 'synchronous lease-operation counter'),
-			childProcesses: observed({ current: 0, maximum: 0 }, 'lease fixture spawn counter'),
+			leases: measured(leases.snapshot(), 'production WorkLeaseSupervisor lifecycle snapshots'),
+			sessions: notApplicable('Lease fencing uses session keys but does not create provider sessions.'),
+			actions: notApplicable('Action lease fencing does not dispatch a physical Minecraft action.'),
+			timers: measured(timers.snapshot(), 'WorkLeaseSupervisor injected lease scheduler'),
+			promises: notApplicable('WorkLeaseSupervisor lease operations are synchronous and own no promises.'),
+			childProcesses: notApplicable('WorkLeaseSupervisor has no child-process creation capability.'),
 			listeners: notApplicable('WorkLeaseSupervisor exposes no event-listener surface.'),
 		}),
 	});
@@ -435,7 +483,15 @@ function resources(value) {
 
 function observed(value, source) {
 	if (typeof source !== 'string' || source.trim().length < 8) throw new TypeError('observed evidence source must be descriptive');
+	if (value === null || value === undefined || (typeof value !== 'object' && typeof value !== 'function')) throw new TypeError('observed evidence requires a non-null instrumented value');
+	if (!INSTRUMENTED_VALUES.has(value)) throw new TypeError('observed evidence requires an instrumented measurement');
 	return Object.freeze({ kind: 'observed', value, source });
+}
+
+function measured(value, source) {
+	if (value === null || value === undefined || (typeof value !== 'object' && typeof value !== 'function')) throw new TypeError('measurement value must be a non-null object');
+	INSTRUMENTED_VALUES.add(value);
+	return observed(value, source);
 }
 
 function notApplicable(reason) {
@@ -459,7 +515,8 @@ function assertCompleteEvidence(result) {
 
 function assertEvidenceEntry(entry, name) {
 	if (entry?.kind === 'observed') {
-		if (!Object.hasOwn(entry, 'value')) throw new TypeError(`${name} evidence value is required`);
+		if (!Object.hasOwn(entry, 'value') || entry.value === null || entry.value === undefined) throw new TypeError(`${name} evidence requires a non-null instrumented value`);
+		if (!INSTRUMENTED_VALUES.has(entry.value)) throw new TypeError(`${name} evidence requires an instrumented measurement`);
 		if (typeof entry.source !== 'string' || entry.source.trim().length < 8) throw new TypeError(`${name} evidence source is required`);
 		return;
 	}
@@ -576,6 +633,63 @@ function combinedTimerSnapshot(...snapshots) {
 		firedDelays: snapshots.flatMap((snapshot) => snapshot.firedDelays),
 		maximum: Math.max(...snapshots.map((snapshot) => snapshot.maxPending)),
 	};
+}
+
+function trackedOperation(operation, update) {
+	update(1);
+	return Promise.resolve().then(operation).finally(() => update(-1));
+}
+
+class ListenerGauge {
+	#emitter;
+	#maximum = 0;
+	#current = 0;
+
+	constructor(emitter) {
+		this.#emitter = emitter;
+		this.sample();
+	}
+
+	sample() {
+		this.#current = listenerCount(this.#emitter);
+		this.#maximum = Math.max(this.#maximum, this.#current);
+	}
+
+	snapshot() { return { current: this.#current, maximum: this.#maximum }; }
+}
+
+class SchedulerLeaseGauge {
+	#scheduler;
+	#maximum = 0;
+	#current = 0;
+
+	constructor(scheduler) {
+		this.#scheduler = scheduler;
+		this.sample();
+	}
+
+	sample() {
+		this.#current = this.#scheduler.activeCount;
+		this.#maximum = Math.max(this.#maximum, this.#current);
+	}
+
+	snapshot() { return { maxByKind: { provider: this.#maximum }, pending: this.#current }; }
+}
+
+class LeaseSnapshotGauge {
+	#maximumByKind = new Map();
+	#pending = 0;
+
+	sample(snapshot) {
+		const leases = snapshot?.leases ?? [];
+		this.#pending = leases.length;
+		for (const { kind } of leases) {
+			const current = leases.filter((lease) => lease.kind === kind).length;
+			this.#maximumByKind.set(kind, Math.max(this.#maximumByKind.get(kind) ?? 0, current));
+		}
+	}
+
+	snapshot() { return { maxByKind: Object.fromEntries(this.#maximumByKind), pending: this.#pending }; }
 }
 
 class ManualTimers {

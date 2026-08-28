@@ -126,8 +126,15 @@ export function createNativeGoalHarness(scenario = {}) {
 		},
 		goalSupervisor,
 	});
-	coordinator.on('runtimeError', (error) => bridge.recoveries.push(error?.code ?? 'RUNTIME_ERROR'));
-	return new NativeGoalHarness({ coordinator, registry, bridge, provider, scenario: normalized, goalScheduler, stuckScheduler, goalSupervisor });
+	const acceptedActionResults = [];
+	const acceptedActionResultListener = (message) => acceptedActionResults.push({
+		actionId: message.payload.actionId,
+		connectionEpoch: message.connectionEpoch,
+	});
+	const runtimeErrorListener = (error) => bridge.recoveries.push(error?.code ?? 'RUNTIME_ERROR');
+	coordinator.on('actionResult', acceptedActionResultListener);
+	coordinator.on('runtimeError', runtimeErrorListener);
+	return new NativeGoalHarness({ coordinator, registry, bridge, provider, scenario: normalized, goalScheduler, stuckScheduler, goalSupervisor, acceptedActionResults, acceptedActionResultListener, runtimeErrorListener });
 }
 
 export class NativeGoalHarness {
@@ -139,9 +146,13 @@ export class NativeGoalHarness {
 	#goalScheduler;
 	#goalSupervisor;
 	#stuckScheduler;
+	#acceptedActionResults;
+	#acceptedActionResultListener;
+	#runtimeErrorListener;
+	#maxListenerCount;
 	#observedStates = [];
 
-	constructor({ coordinator, registry, bridge, provider, scenario, goalScheduler, stuckScheduler, goalSupervisor }) {
+	constructor({ coordinator, registry, bridge, provider, scenario, goalScheduler, stuckScheduler, goalSupervisor, acceptedActionResults, acceptedActionResultListener, runtimeErrorListener }) {
 		this.#coordinator = coordinator;
 		this.#registry = registry;
 		this.#bridge = bridge;
@@ -150,6 +161,10 @@ export class NativeGoalHarness {
 		this.#goalScheduler = goalScheduler;
 		this.#goalSupervisor = goalSupervisor;
 		this.#stuckScheduler = stuckScheduler;
+		this.#acceptedActionResults = acceptedActionResults;
+		this.#acceptedActionResultListener = acceptedActionResultListener;
+		this.#runtimeErrorListener = runtimeErrorListener;
+		this.#maxListenerCount = emitterListenerCount(bridge) + emitterListenerCount(coordinator);
 	}
 
 	get bridge() { return this.#bridge; }
@@ -174,6 +189,8 @@ export class NativeGoalHarness {
 			if (this.#provider.turns >= this.#scenario.turns.length && this.#scenario.stopWhenScriptExhausted) break;
 		}
 		await this.#coordinator.stop();
+		this.#coordinator.off('actionResult', this.#acceptedActionResultListener);
+		this.#coordinator.off('runtimeError', this.#runtimeErrorListener);
 		const result = this.#result();
 		return { ...result, activeWork: this.#provider.activeWork, recoveryHandles: this.#bridge.recoveryHandles };
 	}
@@ -181,6 +198,7 @@ export class NativeGoalHarness {
 	#result() {
 		const record = this.#registry.get(AGENT_ID);
 		const states = [...this.#provider.states, ...this.#observedStates, record?.state].filter(Boolean);
+		const replayedActionIds = new Set(this.#bridge.staleActionReplays.map(({ actionId }) => actionId));
 		return {
 			finalState: record?.state ?? null,
 			states,
@@ -194,16 +212,19 @@ export class NativeGoalHarness {
 			stuckScheduler: this.#stuckScheduler.snapshot(),
 			maxRecoveryHandles: this.#bridge.maxRecoveryHandles,
 			recoveryDispatches: this.#bridge.recoveryDispatches,
-			staleDispatches: this.#bridge.staleActionEffectCount,
+			staleDispatches: this.#acceptedActionResults.filter(({ actionId }) => replayedActionIds.has(actionId)).length,
 			actionDispatches: this.#bridge.actionDispatches,
 			actionEffects: this.#bridge.actionEffects,
+			actionAttempts: this.#bridge.actionAttempts,
+			deliveredActionResults: this.#bridge.deliveredActionResults,
+			acceptedActionResults: [...this.#acceptedActionResults],
 			staleActionReplays: this.#bridge.staleActionReplays,
 			connectionEpoch: this.#bridge.connectionEpoch,
 			maxConcurrentPhysicalActions: this.#bridge.maxConcurrentPhysicalActions,
 			providerSessions: this.#provider.sessionStats(),
 			profile: this.#registry.get(AGENT_ID),
 			leaseStats: this.#goalSupervisor.stats(),
-			listenerResidue: this.#bridge.eventNames().reduce((sum, event) => sum + this.#bridge.listenerCount(event), 0),
+			listenerStats: { current: emitterListenerCount(this.#bridge) + emitterListenerCount(this.#coordinator), maximum: this.#maxListenerCount },
 			recoveryCycles: this.#provider.recoveryCycles,
 			inventory: this.#bridge.inventory,
 			completionEvaluations: this.#bridge.completionEvaluations,
@@ -222,6 +243,7 @@ class ScriptedNativeProvider {
 	turns = 0;
 	recoveryCycles = 0;
 	activeWork = 0;
+	maxActiveWork = 0;
 	maxRecoveryHandles = 0;
 	states = [];
 	recoveries = [];
@@ -237,12 +259,12 @@ class ScriptedNativeProvider {
 
 	constructor(scenario) { this.#scenario = scenario; }
 	async start() {}
-	async stop() { this.#session = null; this.#sessionProfile = null; this.#currentSessions = 0; this.activeWork = 0; }
+	async stop() { this.#session = null; this.#sessionProfile = null; this.#currentSessions = 0; }
 	async bootstrapCatalog() { return this.catalog.refresh(); }
 	async reconcile(records) { return { valid: records, invalid: [], catalog: await this.catalog.refresh() }; }
 	getAgent() { return this.#session; }
 	async remove() { this.#session = null; return true; }
-	async interrupt() { this.activeWork = 0; }
+	async interrupt() {}
 
 	async createAgent(record) {
 		if (this.#scenario.unsupportedProfile) throw codedError('MODEL_UNAVAILABLE', 'fixture profile is unavailable');
@@ -263,6 +285,7 @@ class ScriptedNativeProvider {
 			async act(_input, { executeTool }) {
 				provider.turns += 1;
 				provider.activeWork += 1;
+				provider.maxActiveWork = Math.max(provider.maxActiveWork, provider.activeWork);
 				const script = provider.#scenario.turns[provider.turns - 1];
 				provider.executedScripts.push(script instanceof Error ? script.code : script);
 				try {
@@ -284,7 +307,7 @@ class ScriptedNativeProvider {
 					provider.onTurnEnd?.(provider.turns);
 				}
 			},
-			async interrupt() { provider.activeWork = 0; },
+			async interrupt() {},
 		};
 		return this.#session;
 	}
@@ -297,6 +320,7 @@ class ScriptedNativeProvider {
 			profile: this.#lastSessionProfile === null ? null : { ...this.#lastSessionProfile },
 			turnsStarted: this.turns,
 			turnsPending: this.activeWork,
+			maxTurnsPending: this.maxActiveWork,
 		});
 	}
 }
@@ -346,6 +370,10 @@ function profileSnapshot(value) {
 
 function sameProfile(left, right) {
 	return ['agentId', 'provider', 'model', 'reasoningEffort', 'serviceTier'].every((key) => left?.[key] === right?.[key]);
+}
+
+function emitterListenerCount(emitter) {
+	return emitter.eventNames().reduce((sum, event) => sum + emitter.listenerCount(event), 0);
 }
 
 function nativeRequest(record, goalRevision, turn, call, action) {
