@@ -22,6 +22,7 @@ public final class BundledCoordinatorInstallerVerification {
 		int assertions = 0;
 		assertions += verifyConfiguredSecretPathUsesPreparedRuntime();
 		assertions += verifyVerifiedGenerationCanRollbackCandidate();
+		assertions += verifyCorruptedActiveGenerationRollsBackToVerifiedRuntime();
 		assertions += verifySoleCandidateIsRetainedForRetry();
 		assertions += verifyStaleCoordinatorIsReplacedWithoutTouchingRuntimeState();
 		assertions += verifyIncompleteBundleLeavesExistingCoordinatorIntact();
@@ -29,6 +30,67 @@ public final class BundledCoordinatorInstallerVerification {
 		assertions += verifyInterruptedSwapRecoversPreviousCoordinator();
 		assertions += verifyTransientDirectoryLockIsRetried();
 		return assertions;
+	}
+
+	private static int verifyCorruptedActiveGenerationRollsBackToVerifiedRuntime() throws Exception {
+		Path packageRoot = Files.createTempDirectory("arena-coordinator-corrupt-active");
+		try {
+			byte[] verifiedMain = "verified main".getBytes(StandardCharsets.UTF_8);
+			byte[] config = "{}".getBytes(StandardCharsets.UTF_8);
+			String verifiedManifest = manifest(
+					entry("src/dynamic-main.mjs", verifiedMain),
+					entry("config/dynamic-agents.json", config)
+			);
+			String verifiedGeneration = sha256(verifiedManifest.getBytes(StandardCharsets.UTF_8));
+			BundledCoordinatorInstaller.install(
+					packageRoot,
+					resource(resources(verifiedManifest, verifiedMain, config))
+			);
+			assertTrue(BundledCoordinatorInstaller.promote(packageRoot, verifiedGeneration),
+					"corruption fixture promotes its verified rollback target");
+
+			byte[] candidateMain = "candidate main".getBytes(StandardCharsets.UTF_8);
+			String candidateManifest = manifest(
+					entry("src/dynamic-main.mjs", candidateMain),
+					entry("config/dynamic-agents.json", config)
+			);
+			String candidateGeneration = sha256(candidateManifest.getBytes(StandardCharsets.UTF_8));
+			BundledCoordinatorInstaller.install(
+					packageRoot,
+					resource(resources(candidateManifest, candidateMain, config))
+			);
+			assertEquals("verified main",
+					Files.readString(packageRoot.resolve("coordinator.last-known-good/src/dynamic-main.mjs")),
+					"candidate activation retains the exact verified runtime before corruption");
+
+			Files.writeString(
+					packageRoot.resolve("coordinator/src/dynamic-main.mjs"),
+					"corrupted active main",
+					StandardCharsets.UTF_8
+			);
+			boolean corruptionDetected = false;
+			try {
+				BundledCoordinatorInstaller.validate(packageRoot);
+			} catch (IOException expected) {
+				corruptionDetected = true;
+			}
+			assertTrue(corruptionDetected, "active runtime corruption is detected before launch");
+			assertTrue(BundledCoordinatorInstaller.rollback(packageRoot, candidateGeneration),
+					"corrupted active candidate rolls back to the verified runtime");
+			assertEquals("verified main", Files.readString(packageRoot.resolve("coordinator/src/dynamic-main.mjs")),
+					"rollback replaces corrupted candidate bytes with verified bytes");
+			BundledCoordinatorInstaller.RuntimePackage recovered = BundledCoordinatorInstaller.validate(packageRoot);
+			assertEquals(verifiedGeneration, recovered.generationId(),
+					"recovered runtime publishes the exact verified generation");
+			assertFalse(recovered.candidate(), "recovered runtime is immediately verified");
+			assertFalse(Files.exists(packageRoot.resolve("coordinator.last-known-good")),
+					"recovery consumes the retained copy instead of leaking generations");
+			assertFalse(BundledCoordinatorInstaller.rollback(packageRoot, candidateGeneration),
+					"repeating corruption rollback is idempotent");
+			return 9;
+		} finally {
+			deleteTree(packageRoot);
+		}
 	}
 
 	private static int verifyVerifiedGenerationCanRollbackCandidate() throws Exception {

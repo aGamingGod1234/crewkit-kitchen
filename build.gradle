@@ -160,6 +160,14 @@ tasks.register('verifyCore', JavaExec) {
 	}
 }
 
+tasks.register('verifyCoordinatorRecoveryFaults', JavaExec) {
+	group = 'verification'
+	description = 'Runs the focused deterministic coordinator recovery matrix and bounded real-process smokes.'
+	dependsOn tasks.named('testClasses')
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass.set('dev.agaminggod.arenaagents.server.CoordinatorRecoveryFaultMatrixVerification')
+}
+
 tasks.named('test') {
 	failOnNoDiscoveredTests = false
 }

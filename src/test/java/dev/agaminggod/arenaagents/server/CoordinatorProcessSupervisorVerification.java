@@ -44,6 +44,11 @@ public final class CoordinatorProcessSupervisorVerification {
 	}
 
 	public static int verify() {
+		return verifyFaultMatrix();
+	}
+
+	/** Replays every injected Java supervisor failure as one deterministic recovery matrix. */
+	public static int verifyFaultMatrix() {
 		verifyRecoveryContract();
 		verifyBridgeBindFailureRecovery();
 		verifyEightCrashesStillRecover();
