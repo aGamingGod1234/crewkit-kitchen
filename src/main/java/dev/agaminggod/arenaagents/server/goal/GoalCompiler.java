@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.goal;
 
 import dev.agaminggod.arenaagents.agent.AgentValidators;
+import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import java.util.ArrayList;
@@ -18,6 +19,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.item.Item;
 
 public final class GoalCompiler {
@@ -33,6 +35,7 @@ public final class GoalCompiler {
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:(?:the|a|an) )?(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
+	private static final Pattern BLOCK = Pattern.compile("^(?:build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
 	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
 	private static final Pattern LIVE_STEERING = Pattern.compile(
@@ -40,17 +43,32 @@ public final class GoalCompiler {
 	);
 
 	public GoalCompilation compile(String request, RegistryAccess registries, long createdAtTick) {
-		return compile(request, registries, createdAtTick, ignored -> true);
+		return compile(request, registries, createdAtTick, ignored -> true, GoalPredicate.DEFAULT_DIMENSION);
+	}
+
+	public GoalCompilation compile(String request, RegistryAccess registries, long createdAtTick, String dimensionId) {
+		return compile(request, registries, createdAtTick, ignored -> true, dimensionId);
+	}
+
+	public GoalCompilation compile(
+			String request,
+			RegistryAccess registries,
+		long createdAtTick,
+		Predicate<String> advancementExists
+	) {
+		return compile(request, registries, createdAtTick, advancementExists, GoalPredicate.DEFAULT_DIMENSION);
 	}
 
 	public GoalCompilation compile(
 			String request,
 			RegistryAccess registries,
 			long createdAtTick,
-			Predicate<String> advancementExists
+			Predicate<String> advancementExists,
+			String dimensionId
 	) {
 		Objects.requireNonNull(registries, "registries must not be null");
 		Objects.requireNonNull(advancementExists, "advancementExists must not be null");
+		Objects.requireNonNull(dimensionId, "dimensionId must not be null");
 		String original = AgentValidators.normalizePrompt(request);
 		String command = stripTrailingPunctuation(stripPoliteness(original.toLowerCase(Locale.ROOT)));
 		if (SUBJECTIVE.matcher(command).find()) {
@@ -61,11 +79,12 @@ public final class GoalCompiler {
 		if (position.matches()) {
 			try {
 				GoalPredicate predicate = new GoalPredicate.PositionWithin(
+						dimensionId,
 						Integer.parseInt(position.group(1)), Integer.parseInt(position.group(2)), Integer.parseInt(position.group(3)),
 						1.0D, 20
 				);
 				return accepted(original, predicate, createdAtTick, "Goal set: reach the requested coordinates.");
-			} catch (NumberFormatException exception) {
+			} catch (NumberFormatException | AgentDomainException exception) {
 				return GoalCompilation.rejected("Those coordinates are outside Minecraft's supported range.");
 			}
 		}
@@ -109,6 +128,10 @@ public final class GoalCompiler {
 				return accepted(original, new GoalPredicate.InventoryContains(itemId, count), createdAtTick,
 						"Goal set: obtain " + itemId + " x" + count + ".");
 			}
+		}
+		Matcher block = BLOCK.matcher(command);
+		if (block.matches() && relatedBlocks(block.group(1), registries).isEmpty()) {
+			return GoalCompilation.needsTranslation("I could not identify the exact Minecraft block for that request.");
 		}
 
 		GoalCompilation compound = compileCompound(original, command, registries, createdAtTick);
@@ -180,6 +203,8 @@ public final class GoalCompiler {
 			String target = SUBJECTIVE.matcher(kill.group(1)).replaceAll(" ").replaceAll("\\s+", " ").strip();
 			return relatedEntities(target, registries).stream().limit(64).toList();
 		}
+		Matcher block = BLOCK.matcher(command);
+		if (block.matches()) return relatedBlocks(block.group(1), registries).stream().limit(64).toList();
 		return List.of();
 	}
 
@@ -299,6 +324,23 @@ public final class GoalCompiler {
 							|| tools && path.startsWith(material + " ") && toolKinds.contains(path.substring(material.length() + 1));
 				})
 				.map(Identifier::toString).distinct().sorted().toList();
+	}
+
+	private static List<String> relatedBlocks(String target, RegistryAccess registries) {
+		String wanted = normalizedTarget(target).replaceFirst("^(?:with|using|from|of)\\s+", "");
+		if (wanted.isEmpty()) return List.of();
+		Set<String> forms = singularForms(wanted);
+		Set<String> terms = Set.of(wanted.split("\\s+"));
+		Registry<Block> blockRegistry = registries.lookup(Registries.BLOCK).orElse(BuiltInRegistries.BLOCK);
+		return blockRegistry.keySet().stream().filter(id -> {
+			Block block = blockRegistry.getValue(id);
+			String path = pathName(id);
+			String description = block == null ? "" : descriptionName(block.getDescriptionId());
+			if (forms.contains(id.toString()) || forms.contains(path) || forms.contains(description)
+					|| path.endsWith(" " + wanted) || description.endsWith(" " + wanted)) return true;
+			return terms.stream().filter(term -> term.length() > 1 && !Set.of("block", "blocks", "the", "and").contains(term))
+					.anyMatch(term -> path.equals(term) || path.contains(term) || description.equals(term) || description.contains(term));
+		}).map(Identifier::toString).distinct().sorted().toList();
 	}
 
 	private static List<String> matchEntities(String target, RegistryAccess registries) {

@@ -31,7 +31,7 @@ public final class GoalSpecWireCodec {
 				json.addProperty("type", "inventory_contains"); json.addProperty("itemId", value.itemId()); json.addProperty("count", value.count());
 			}
 			case GoalPredicate.PositionWithin value -> {
-				json.addProperty("type", "position_within"); json.addProperty("x", value.x()); json.addProperty("y", value.y());
+				json.addProperty("type", "position_within"); json.addProperty("dimensionId", value.dimensionId()); json.addProperty("x", value.x()); json.addProperty("y", value.y());
 				json.addProperty("z", value.z()); json.addProperty("radius", value.radius()); json.addProperty("stableTicks", value.stableTicks());
 			}
 			case GoalPredicate.AdvancementGranted value -> {
@@ -42,7 +42,7 @@ public final class GoalSpecWireCodec {
 				json.addProperty("afterGoalStart", value.afterGoalStart());
 			}
 			case GoalPredicate.BlockMatches value -> {
-				json.addProperty("type", "block_matches"); json.addProperty("x", value.x()); json.addProperty("y", value.y());
+				json.addProperty("type", "block_matches"); json.addProperty("dimensionId", value.dimensionId()); json.addProperty("x", value.x()); json.addProperty("y", value.y());
 				json.addProperty("z", value.z()); json.addProperty("blockId", value.blockId());
 				JsonObject properties = new JsonObject(); value.properties().forEach(properties::addProperty); json.add("properties", properties);
 			}
@@ -74,10 +74,10 @@ public final class GoalSpecWireCodec {
 		String type = string(json, "type");
 		return switch (type) {
 			case "inventory_contains" -> { exact(json, Set.of("type", "itemId", "count")); leaves.add(); yield new GoalPredicate.InventoryContains(string(json, "itemId"), integer(json, "count")); }
-			case "position_within" -> { exact(json, Set.of("type", "x", "y", "z", "radius", "stableTicks")); leaves.add(); yield new GoalPredicate.PositionWithin(number(json, "x"), number(json, "y"), number(json, "z"), number(json, "radius"), integer(json, "stableTicks")); }
+			case "position_within" -> { boolean legacy = !json.has("dimensionId"); exact(json, legacy ? Set.of("type", "x", "y", "z", "radius", "stableTicks") : Set.of("type", "dimensionId", "x", "y", "z", "radius", "stableTicks")); leaves.add(); yield new GoalPredicate.PositionWithin(legacy ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimensionId"), number(json, "x"), number(json, "y"), number(json, "z"), number(json, "radius"), integer(json, "stableTicks")); }
 			case "advancement_granted" -> { exact(json, Set.of("type", "advancementId")); leaves.add(); yield new GoalPredicate.AdvancementGranted(string(json, "advancementId")); }
 			case "entity_killed_by_agent" -> { exact(json, Set.of("type", "entityType", "afterGoalStart")); leaves.add(); yield new GoalPredicate.EntityKilledByAgent(string(json, "entityType"), bool(json, "afterGoalStart")); }
-			case "block_matches" -> { exact(json, Set.of("type", "x", "y", "z", "blockId", "properties")); leaves.add(); yield new GoalPredicate.BlockMatches(integer(json, "x"), integer(json, "y"), integer(json, "z"), string(json, "blockId"), properties(json, "properties")); }
+			case "block_matches" -> { boolean legacy = !json.has("dimensionId"); exact(json, legacy ? Set.of("type", "x", "y", "z", "blockId", "properties") : Set.of("type", "dimensionId", "x", "y", "z", "blockId", "properties")); leaves.add(); yield new GoalPredicate.BlockMatches(legacy ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimensionId"), integer(json, "x"), integer(json, "y"), integer(json, "z"), string(json, "blockId"), properties(json, "properties")); }
 			case "survive_duration" -> { exact(json, Set.of("type", "ticks")); leaves.add(); yield new GoalPredicate.SurviveDuration(longInteger(json, "ticks")); }
 			case "operator_confirmed" -> { exact(json, Set.of("type")); leaves.add(); yield new GoalPredicate.OperatorConfirmed(); }
 			case "all_of" -> new GoalPredicate.AllOf(decodeChildren(json, depth, leaves));

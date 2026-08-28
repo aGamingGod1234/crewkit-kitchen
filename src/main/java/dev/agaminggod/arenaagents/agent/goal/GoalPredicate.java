@@ -15,6 +15,8 @@ public sealed interface GoalPredicate permits
 		GoalPredicate.OperatorConfirmed,
 		GoalPredicate.AllOf,
 		GoalPredicate.AnyOf {
+	String DEFAULT_DIMENSION = "minecraft:overworld";
+
 	record InventoryContains(String itemId, int count) implements GoalPredicate {
 		public InventoryContains {
 			itemId = identifier(itemId, "itemId");
@@ -22,11 +24,16 @@ public sealed interface GoalPredicate permits
 		}
 	}
 
-	record PositionWithin(double x, double y, double z, double radius, int stableTicks) implements GoalPredicate {
+	record PositionWithin(String dimensionId, double x, double y, double z, double radius, int stableTicks) implements GoalPredicate {
+		public PositionWithin(double x, double y, double z, double radius, int stableTicks) {
+			this(DEFAULT_DIMENSION, x, y, z, radius, stableTicks);
+		}
+
 		public PositionWithin {
-			if (!Double.isFinite(x) || !Double.isFinite(y) || !Double.isFinite(z)
+			dimensionId = identifier(dimensionId, "dimensionId");
+			if (!MinecraftCoordinateBounds.isReachable(x, y, z)
 					|| !Double.isFinite(radius) || radius < 0.0D) {
-				throw invalid("Position values must be finite and radius must be nonnegative");
+				throw invalid("Position values must be reachable Minecraft coordinates and radius must be nonnegative");
 			}
 			if (stableTicks <= 0) throw invalid("Stable ticks must be positive");
 		}
@@ -44,9 +51,17 @@ public sealed interface GoalPredicate permits
 		}
 	}
 
-	record BlockMatches(int x, int y, int z, String blockId, Map<String, String> properties) implements GoalPredicate {
+	record BlockMatches(String dimensionId, int x, int y, int z, String blockId, Map<String, String> properties) implements GoalPredicate {
+		public BlockMatches(int x, int y, int z, String blockId, Map<String, String> properties) {
+			this(DEFAULT_DIMENSION, x, y, z, blockId, properties);
+		}
+
 		public BlockMatches {
+			dimensionId = identifier(dimensionId, "dimensionId");
 			blockId = identifier(blockId, "blockId");
+			if (!MinecraftCoordinateBounds.isReachable(x, y, z)) {
+				throw invalid("Block coordinates are outside Minecraft's reachable world bounds");
+			}
 			properties = Map.copyOf(Objects.requireNonNull(properties, "properties must not be null"));
 			if (properties.size() > 16) throw invalid("Block property limit exceeded");
 			for (Map.Entry<String, String> entry : properties.entrySet()) {

@@ -190,7 +190,7 @@ public final class AgentLifecycleReducer {
 			);
 			return transition(current, completed, true, true);
 		}
-		AgentGoal promoted = queue.getFirst();
+		AgentGoal promoted = queue.getFirst().activatedAt(nowEpochMs);
 		AgentRecord promotedRecord = current.withLifecycle(
 				AgentLifecycleState.STARTING,
 				Optional.of(promoted),
@@ -242,7 +242,7 @@ public final class AgentLifecycleReducer {
 		}
 		AgentRecord promoted = current.withLifecycle(
 				AgentLifecycleState.STARTING,
-				Optional.of(current.queuedGoals().getFirst()),
+				Optional.of(current.queuedGoals().getFirst().activatedAt(nowEpochMs)),
 				nextRevision(current),
 				current.queuedGoals().subList(1, current.queuedGoals().size()),
 				nowEpochMs,

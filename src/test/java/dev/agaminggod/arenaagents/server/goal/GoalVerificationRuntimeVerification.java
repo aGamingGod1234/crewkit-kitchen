@@ -24,6 +24,7 @@ public final class GoalVerificationRuntimeVerification {
 		int assertions = 0;
 		assertions += verifyExactInventoryAndIdempotence();
 		assertions += verifyStablePositionAndReset();
+		assertions += verifyDimensionBinding();
 		assertions += verifyBlockAdvancementAndCompoundPredicates();
 		assertions += verifyAgentSpecificKillAttribution();
 		assertions += verifyKillGoalAfterServerTickReset();
@@ -31,6 +32,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyVerifierFailureIsolationAndRetry();
 		assertions += verifySurvivalAndOperatorConfirmation();
 		assertions += verifyQueuedPromotionAfterEvidence();
+		assertions += verifyQueuedKillActivationBoundary();
 		assertions += verifyRequestedCompletionLifecycle();
 		return assertions;
 	}
@@ -66,6 +68,15 @@ public final class GoalVerificationRuntimeVerification {
 		fixture.advance();
 		assertEquals(1, fixture.runtime.tick().size(), "consecutive in-radius ticks satisfy the position goal");
 		return 5;
+	}
+
+	private static int verifyDimensionBinding() {
+		Fixture fixture = fixture(new GoalPredicate.PositionWithin("minecraft:the_nether", 0.0, 64.0, 0.0, 1.0, 1), 250L);
+		fixture.facts.dimension = GoalPredicate.DEFAULT_DIMENSION;
+		GoalCompletionVerifier.VerificationResult mismatch = fixture.runtime.evaluate(fixture.agentId);
+		assertEquals(false, mismatch.verified(), "coordinate goal fails closed in the wrong dimension");
+		assertEquals("position_dimension", mismatch.facts().getFirst().type(), "dimension mismatch is explicit evidence");
+		return 2;
 	}
 
 	private static int verifyBlockAdvancementAndCompoundPredicates() {
@@ -211,6 +222,22 @@ public final class GoalVerificationRuntimeVerification {
 		return 5;
 	}
 
+	private static int verifyQueuedKillActivationBoundary() {
+		Fixture fixture = fixture(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1), 750L);
+		GoalSpec queued = GoalSpec.create("Kill a zombie",
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true), 751L);
+		fixture.registry.queue(fixture.agentId, queued, fixture.now + 1L);
+		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:zombie", fixture.epoch[0]);
+		fixture.facts.items.put("minecraft:iron_pickaxe", 1);
+		assertEquals(1, fixture.runtime.tick().size(), "first goal satisfies before queued kill promotion");
+		fixture.advance();
+		assertEquals(1, fixture.runtime.tick().size(), "queued kill goal promotes after prior goal evidence");
+		assertEquals(false, fixture.runtime.evaluate(fixture.agentId).verified(), "queued goal ignores kills recorded before activation");
+		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:zombie", fixture.epoch[0] + 1L);
+		assertEquals(true, fixture.runtime.evaluate(fixture.agentId).verified(), "queued goal accepts a kill recorded after activation");
+		return 4;
+	}
+
 	private static int verifyRequestedCompletionLifecycle() {
 		Fixture fixture = fixture(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1), 800L);
 		long requestedRevision = fixture.record().goalRevision();
@@ -277,6 +304,7 @@ public final class GoalVerificationRuntimeVerification {
 		private final Map<String, Boolean> advancements = new HashMap<>();
 		private GoalCompletionVerifier.Position position = new GoalCompletionVerifier.Position(0.0, 64.0, 0.0);
 		private boolean alive = true;
+		private String dimension = GoalPredicate.DEFAULT_DIMENSION;
 
 		@Override public int inventoryCount(String itemId) { return items.getOrDefault(itemId, 0); }
 		@Override public GoalCompletionVerifier.Position position() { return position; }
@@ -285,6 +313,7 @@ public final class GoalVerificationRuntimeVerification {
 		}
 		@Override public boolean advancementGranted(String advancementId) { return advancements.getOrDefault(advancementId, false); }
 		@Override public boolean alive() { return alive; }
+		@Override public String dimensionId() { return dimension; }
 	}
 
 	private static final class Fixture {

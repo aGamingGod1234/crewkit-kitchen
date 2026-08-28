@@ -96,6 +96,14 @@ public record AgentGoal(
 		return new AgentGoal(goalId, prompt, steeringInstructions, spec, revisedStatus, revisedEvidence, createdAtEpochMs, nowEpochMs);
 	}
 
+	/** Resets the factual start boundary when a queued goal becomes active. */
+	public AgentGoal activatedAt(long nowEpochMs) {
+		if (nowEpochMs <= 0L || nowEpochMs < updatedAtEpochMs) {
+			throw new AgentDomainException("INVALID_GOAL_TIME", "Activation timestamp is invalid");
+		}
+		return new AgentGoal(goalId, prompt, steeringInstructions, spec, status, evidence, nowEpochMs, nowEpochMs);
+	}
+
 	private static GoalSpec legacySpec(String prompt) {
 		String checked = AgentValidators.normalizePrompt(prompt);
 		return GoalSpec.create(checked, new GoalPredicate.OperatorConfirmed(), 0L);

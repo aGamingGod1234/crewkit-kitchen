@@ -46,12 +46,24 @@ public final class GoalSpecCodec {
 
 	public GoalSpec decodeObject(JsonObject root) {
 		requireExactKeys(root, Set.of("original_request", "completion", "created_at_tick", "fingerprint"));
-		return new GoalSpec(
-				string(root, "original_request"),
-				decodePredicate(object(field(root, "completion"), "completion"), 0),
-				exactLong(root, "created_at_tick"),
-				string(root, "fingerprint")
-		);
+		String originalRequest = string(root, "original_request");
+		long createdAtTick = exactLong(root, "created_at_tick");
+		boolean[] migratedLegacyDimensions = { false };
+		GoalPredicate completion = decodePredicate(
+				object(field(root, "completion"), "completion"), 0, migratedLegacyDimensions);
+		String fingerprint = string(root, "fingerprint");
+		if (!migratedLegacyDimensions[0]) {
+			return new GoalSpec(originalRequest, completion, createdAtTick, fingerprint);
+		}
+
+		// Older snapshots had no dimension field. Validate their old fingerprint before
+		// canonicalizing the predicate with the safe overworld compatibility dimension.
+		String legacyFingerprint = legacyFingerprint(originalRequest, completion, createdAtTick);
+		String migratedFingerprint = fingerprint(originalRequest, completion, createdAtTick);
+		if (!fingerprint.equals(legacyFingerprint) && !fingerprint.equals(migratedFingerprint)) {
+			throw failure("GOAL_FINGERPRINT_MISMATCH", "Goal fingerprint does not match its immutable fields");
+		}
+		return GoalSpec.create(originalRequest, completion, createdAtTick);
 	}
 
 	public JsonObject encodePredicateObject(GoalPredicate predicate) {
@@ -60,7 +72,7 @@ public final class GoalSpecCodec {
 	}
 
 	public GoalPredicate decodePredicateObject(JsonObject predicate) {
-		GoalPredicate decoded = decodePredicate(predicate, 0);
+		GoalPredicate decoded = decodePredicate(predicate, 0, new boolean[1]);
 		validatePredicate(decoded);
 		return decoded;
 	}
@@ -71,7 +83,15 @@ public final class GoalSpecCodec {
 
 	static String fingerprint(String request, GoalPredicate predicate, long createdAtTick) {
 		validatePredicate(predicate);
-		byte[] bytes = GSON.toJson(canonicalFields(request, predicate, createdAtTick)).getBytes(StandardCharsets.UTF_8);
+		return digest(canonicalFields(request, predicate, createdAtTick, true));
+	}
+
+	private static String legacyFingerprint(String request, GoalPredicate predicate, long createdAtTick) {
+		return digest(canonicalFields(request, predicate, createdAtTick, false));
+	}
+
+	private static String digest(JsonObject canonical) {
+		byte[] bytes = GSON.toJson(canonical).getBytes(StandardCharsets.UTF_8);
 		try {
 			return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
 		} catch (NoSuchAlgorithmException exception) {
@@ -109,14 +129,22 @@ public final class GoalSpecCodec {
 	}
 
 	private static JsonObject canonicalFields(String request, GoalPredicate predicate, long createdAtTick) {
+		return canonicalFields(request, predicate, createdAtTick, true);
+	}
+
+	private static JsonObject canonicalFields(String request, GoalPredicate predicate, long createdAtTick, boolean includeDimensions) {
 		JsonObject root = new JsonObject();
 		root.addProperty("original_request", request);
-		root.add("completion", encodePredicate(predicate));
+		root.add("completion", encodePredicate(predicate, includeDimensions));
 		root.addProperty("created_at_tick", createdAtTick);
 		return root;
 	}
 
 	private static JsonObject encodePredicate(GoalPredicate predicate) {
+		return encodePredicate(predicate, true);
+	}
+
+	private static JsonObject encodePredicate(GoalPredicate predicate, boolean includeDimensions) {
 		JsonObject json = new JsonObject();
 		switch (predicate) {
 			case GoalPredicate.InventoryContains inventory -> {
@@ -126,6 +154,7 @@ public final class GoalSpecCodec {
 			}
 			case GoalPredicate.PositionWithin position -> {
 				json.addProperty("type", "position_within");
+				if (includeDimensions) json.addProperty("dimension_id", position.dimensionId());
 				json.addProperty("x", position.x());
 				json.addProperty("y", position.y());
 				json.addProperty("z", position.z());
@@ -143,6 +172,7 @@ public final class GoalSpecCodec {
 			}
 			case GoalPredicate.BlockMatches block -> {
 				json.addProperty("type", "block_matches");
+				if (includeDimensions) json.addProperty("dimension_id", block.dimensionId());
 				json.addProperty("x", block.x());
 				json.addProperty("y", block.y());
 				json.addProperty("z", block.z());
@@ -160,23 +190,27 @@ public final class GoalSpecCodec {
 			case GoalPredicate.OperatorConfirmed ignored -> json.addProperty("type", "operator_confirmed");
 			case GoalPredicate.AllOf all -> {
 				json.addProperty("type", "all_of");
-				json.add("predicates", encodeChildren(all.predicates()));
+				json.add("predicates", encodeChildren(all.predicates(), includeDimensions));
 			}
 			case GoalPredicate.AnyOf any -> {
 				json.addProperty("type", "any_of");
-				json.add("predicates", encodeChildren(any.predicates()));
+				json.add("predicates", encodeChildren(any.predicates(), includeDimensions));
 			}
 		}
 		return json;
 	}
 
 	private static JsonArray encodeChildren(List<GoalPredicate> predicates) {
+		return encodeChildren(predicates, true);
+	}
+
+	private static JsonArray encodeChildren(List<GoalPredicate> predicates, boolean includeDimensions) {
 		JsonArray array = new JsonArray();
-		predicates.forEach(predicate -> array.add(encodePredicate(predicate)));
+		predicates.forEach(predicate -> array.add(encodePredicate(predicate, includeDimensions)));
 		return array;
 	}
 
-	private static GoalPredicate decodePredicate(JsonObject json, int depth) {
+	private static GoalPredicate decodePredicate(JsonObject json, int depth, boolean[] migratedLegacyDimensions) {
 		if (depth > MAX_PREDICATE_DEPTH) {
 			throw failure("GOAL_PREDICATE_DEPTH_EXCEEDED", "Goal predicate is nested too deeply");
 		}
@@ -187,8 +221,15 @@ public final class GoalSpecCodec {
 				yield new GoalPredicate.InventoryContains(string(json, "item_id"), exactInt(json, "count"));
 			}
 			case "position_within" -> {
-				requireExactKeys(json, Set.of("type", "x", "y", "z", "radius", "stable_ticks"));
-				yield new GoalPredicate.PositionWithin(finiteDouble(json, "x"), finiteDouble(json, "y"), finiteDouble(json, "z"), finiteDouble(json, "radius"), exactInt(json, "stable_ticks"));
+				boolean legacy = !json.has("dimension_id");
+				requireExactKeys(json, legacy
+						? Set.of("type", "x", "y", "z", "radius", "stable_ticks")
+						: Set.of("type", "dimension_id", "x", "y", "z", "radius", "stable_ticks"));
+				if (legacy) migratedLegacyDimensions[0] = true;
+				yield new GoalPredicate.PositionWithin(
+						legacy ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimension_id"),
+						finiteDouble(json, "x"), finiteDouble(json, "y"), finiteDouble(json, "z"),
+						finiteDouble(json, "radius"), exactInt(json, "stable_ticks"));
 			}
 			case "advancement_granted" -> {
 				requireExactKeys(json, Set.of("type", "advancement_id"));
@@ -199,8 +240,15 @@ public final class GoalSpecCodec {
 				yield new GoalPredicate.EntityKilledByAgent(string(json, "entity_type"), bool(json, "after_goal_start"));
 			}
 			case "block_matches" -> {
-				requireExactKeys(json, Set.of("type", "x", "y", "z", "block_id", "properties"));
-				yield new GoalPredicate.BlockMatches(exactInt(json, "x"), exactInt(json, "y"), exactInt(json, "z"), string(json, "block_id"), stringMap(object(field(json, "properties"), "properties")));
+				boolean legacy = !json.has("dimension_id");
+				requireExactKeys(json, legacy
+						? Set.of("type", "x", "y", "z", "block_id", "properties")
+						: Set.of("type", "dimension_id", "x", "y", "z", "block_id", "properties"));
+				if (legacy) migratedLegacyDimensions[0] = true;
+				yield new GoalPredicate.BlockMatches(
+						legacy ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimension_id"),
+						exactInt(json, "x"), exactInt(json, "y"), exactInt(json, "z"),
+						string(json, "block_id"), stringMap(object(field(json, "properties"), "properties")));
 			}
 			case "survive_duration" -> {
 				requireExactKeys(json, Set.of("type", "ticks"));
@@ -212,19 +260,19 @@ public final class GoalSpecCodec {
 			}
 			case "all_of" -> {
 				requireExactKeys(json, Set.of("type", "predicates"));
-				yield new GoalPredicate.AllOf(decodeChildren(array(json, "predicates"), depth + 1));
+				yield new GoalPredicate.AllOf(decodeChildren(array(json, "predicates"), depth + 1, migratedLegacyDimensions));
 			}
 			case "any_of" -> {
 				requireExactKeys(json, Set.of("type", "predicates"));
-				yield new GoalPredicate.AnyOf(decodeChildren(array(json, "predicates"), depth + 1));
+				yield new GoalPredicate.AnyOf(decodeChildren(array(json, "predicates"), depth + 1, migratedLegacyDimensions));
 			}
 			default -> throw failure("UNKNOWN_GOAL_PREDICATE", "Unknown goal predicate: " + type);
 		};
 	}
 
-	private static List<GoalPredicate> decodeChildren(JsonArray array, int depth) {
+	private static List<GoalPredicate> decodeChildren(JsonArray array, int depth, boolean[] migratedLegacyDimensions) {
 		ArrayList<GoalPredicate> predicates = new ArrayList<>(array.size());
-		for (JsonElement element : array) predicates.add(decodePredicate(object(element, "predicate"), depth));
+		for (JsonElement element : array) predicates.add(decodePredicate(object(element, "predicate"), depth, migratedLegacyDimensions));
 		return predicates;
 	}
 

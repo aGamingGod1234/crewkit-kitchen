@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.agent.AgentGoal;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
+import dev.agaminggod.arenaagents.agent.goal.MinecraftCoordinateBounds;
 import dev.agaminggod.arenaagents.server.goal.AgentKillLedger;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -61,6 +62,20 @@ public final class GoalCompletionVerifier {
 	public static FactSource minecraftFacts(ServerPlayer player) {
 		Objects.requireNonNull(player, "player must not be null");
 		return new FactSource() {
+			@Override public String dimensionId() {
+				return player.level().dimension().identifier().toString();
+			}
+
+			@Override public boolean isCoordinateReachable(double x, double y, double z) {
+				return MinecraftCoordinateBounds.isReachable(x, y, z)
+						&& player.level().isInWorldBounds(BlockPos.containing(x, y, z));
+			}
+
+			@Override public boolean isCoordinateReachable(int x, int y, int z) {
+				return MinecraftCoordinateBounds.isReachable(x, y, z)
+						&& player.level().isInWorldBounds(new BlockPos(x, y, z));
+			}
+
 			@Override public int inventoryCount(String itemId) {
 				int count = 0;
 				for (int index = 0; index < player.getInventory().getContainerSize(); index++) {
@@ -133,6 +148,12 @@ public final class GoalCompletionVerifier {
 			return leaf("inventory_contains", observed >= inventory.count(), inventory.itemId() + " x" + inventory.count(), inventory.itemId() + " x" + observed);
 		}
 		if (predicate instanceof GoalPredicate.PositionWithin position) {
+			if (!position.dimensionId().equals(source.dimensionId())) {
+				return leaf("position_dimension", false, position.dimensionId(), source.dimensionId());
+			}
+			if (!source.isCoordinateReachable(position.x(), position.y(), position.z())) {
+				return leaf("position_reachable", false, formatPosition(position.x(), position.y(), position.z()), "unreachable");
+			}
 			Position observed = source.position();
 			double dx = observed.x() - position.x();
 			double dy = observed.y() - position.y();
@@ -157,6 +178,12 @@ public final class GoalCompletionVerifier {
 			return leaf("entity_killed_by_agent", observed > 0, killed.entityType() + " x1", killed.entityType() + " x" + observed);
 		}
 		if (predicate instanceof GoalPredicate.BlockMatches block) {
+			if (!block.dimensionId().equals(source.dimensionId())) {
+				return leaf("block_dimension", false, block.dimensionId(), source.dimensionId());
+			}
+			if (!source.isCoordinateReachable(block.x(), block.y(), block.z())) {
+				return leaf("block_reachable", false, block.x() + "," + block.y() + "," + block.z(), "unreachable");
+			}
 			BlockFact observed = source.blockAt(block.x(), block.y(), block.z());
 			boolean satisfied = observed.blockId().equals(block.blockId())
 					&& block.properties().entrySet().stream().allMatch(entry -> entry.getValue().equals(observed.properties().get(entry.getKey())));
@@ -200,6 +227,13 @@ public final class GoalCompletionVerifier {
 		BlockFact blockAt(int x, int y, int z);
 		boolean advancementGranted(String advancementId);
 		boolean alive();
+		default String dimensionId() { return GoalPredicate.DEFAULT_DIMENSION; }
+		default boolean isCoordinateReachable(double x, double y, double z) {
+			return MinecraftCoordinateBounds.isReachable(x, y, z);
+		}
+		default boolean isCoordinateReachable(int x, int y, int z) {
+			return MinecraftCoordinateBounds.isReachable(x, y, z);
+		}
 	}
 
 	public record Position(double x, double y, double z) { }

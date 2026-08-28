@@ -108,7 +108,16 @@ public final class GoalCompilerVerification {
 				compiler.compile("Complete advancement minecraft:story/not_real", RegistryAccess.EMPTY, 1_200L, id -> false).kind(),
 				"nonexistent advancement ID requires clarification"
 		);
-		return 6;
+		GoalPredicate.PositionWithin netherPosition = (GoalPredicate.PositionWithin) compiler.compile(
+				"Go to 12 64 -8", RegistryAccess.EMPTY, 1_200L, "minecraft:the_nether"
+		).acceptedSpec().orElseThrow().completion();
+		assertEquals("minecraft:the_nether", netherPosition.dimensionId(), "coordinate goal binds its source dimension");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Go to 30000000 64 0", RegistryAccess.EMPTY, 1_200L).kind(),
+				"out-of-world horizontal coordinates are rejected before a goal is accepted");
+		assertTrue(compiler.candidateIdsFor("Place oak planks", RegistryAccess.EMPTY).contains("minecraft:oak_planks"),
+				"block translation candidates include matching registered block IDs");
+		return 9;
 	}
 
 	private static int verifyCompoundItemsAndKills() {
@@ -277,6 +286,11 @@ public final class GoalCompilerVerification {
 		if (!java.util.Objects.equals(expected, actual)) {
 			throw new AssertionError(label + ": expected=" + expected + ", actual=" + actual);
 		}
+		System.out.println("PASS: " + label);
+	}
+
+	private static void assertTrue(boolean value, String label) {
+		if (!value) throw new AssertionError(label);
 		System.out.println("PASS: " + label);
 	}
 
