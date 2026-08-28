@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelope;
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodec;
+import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusSnapshot;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 
 import java.io.BufferedReader;
@@ -76,6 +77,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyOrphanReapRetriesBeforeLaunch();
 		verifyBridgeWaitsForWorkerPreparedSecret();
 		verifyDeferredVoiceInitialization();
+		verifyCandidateReadinessRequiresFreshReconciledStatus();
 		verifyAutoStartDisabledStillBindsExplicitBridge();
 		verifyPortOnlyChangeAdvancesBridgeRevision();
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
@@ -83,7 +85,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 204;
+		return 209;
 	}
 
 	private static void verifyLaunchMaterialChangeFencesOwnedChild() {
@@ -860,6 +862,7 @@ public final class CoordinatorProcessSupervisorVerification {
 
 			CodexAgentManager manager = uninitializedManager();
 			AgentRecord active = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Keeper"), 1_000L);
+			manager.registry().setAutomaticProgress(active.agentId(), false, 1_000L);
 			manager.registry().start(active.agentId(), "keep gathering stone", 1_001L);
 			var originalProfile = manager.registry().require(active.agentId()).profile();
 			var originalGoal = manager.registry().require(active.agentId()).currentGoal();
@@ -886,6 +889,9 @@ public final class CoordinatorProcessSupervisorVerification {
 					MultiplexedServerBridge.withPreparedSecret(manager, port, ownedSupervisor.bridgeSecret()));
 			MultiplexedServerBridge repairedBridge = slot.bridge();
 			assertFalse(originalBridge == repairedBridge, "secret repair replaces the cached Java bridge instance");
+			assertEquals(dev.agaminggod.arenaagents.agent.AgentLifecycleState.DISCONNECTED,
+					manager.registry().require(active.agentId()).state(),
+					"bridge replacement drains the authenticated session disconnect before dropping the old bridge");
 			repairedConnection = authenticate(port, repairedSecret, supervisor.snapshot().launchId(), "repaired-secret");
 			supervisor.tick(true, repairedBridge.authenticatedLaunchId(), repairedBridge.authenticatedSessionGeneration());
 			assertEquals(CoordinatorRecoveryState.HEALTHY, supervisor.snapshot().state(),
@@ -1010,6 +1016,26 @@ public final class CoordinatorProcessSupervisorVerification {
 		assertEquals(1, closes.get(), "the prior voice runtime is closed exactly once before recreation");
 	}
 
+	private static void verifyCandidateReadinessRequiresFreshReconciledStatus() {
+		long now = 10_000L;
+		CoordinatorStatusSnapshot fresh = coordinatorStatus(true, now - 2_500L);
+		CoordinatorStatusSnapshot stale = coordinatorStatus(true, now - 2_501L);
+		assertTrue(CodexAgentServerRuntime.coordinatorStatusReady(fresh, now),
+				"candidate promotion accepts a reconciled status at the bounded freshness edge");
+		assertFalse(CodexAgentServerRuntime.coordinatorStatusReady(stale, now),
+				"candidate promotion rejects a status that stopped refreshing");
+		assertFalse(CodexAgentServerRuntime.coordinatorStatusReady(coordinatorStatus(false, now), now),
+				"candidate promotion still requires coordinator reconciliation");
+	}
+
+	private static CoordinatorStatusSnapshot coordinatorStatus(boolean reconciled, long receivedAtEpochMs) {
+		return new CoordinatorStatusSnapshot(
+				reconciled, List.of(), 0, 0, 0,
+				new CoordinatorStatusSnapshot.SchedulerStatus(0, 0, 1, 0, false),
+				List.of(), receivedAtEpochMs
+		);
+	}
+
 	private static void verifyPortOnlyChangeAdvancesBridgeRevision() {
 		CodexAgentServerRuntime.BridgeSlot slot = null;
 		Socket reboundConnection = null;
@@ -1062,6 +1088,7 @@ public final class CoordinatorProcessSupervisorVerification {
 	private static void verifyAutoStartDisabledStillBindsExplicitBridge() {
 		String oldAutoStart = System.getProperty("arenaagents.coordinatorAutoStart");
 		String oldSecret = System.getProperty("arenaagents.bridgeSecretFile");
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
 		String oldPort = System.getProperty("arenaagents.bridgePort");
 		Path secretFile = null;
 		CoordinatorProcessSupervisor supervisor = null;
@@ -1072,6 +1099,7 @@ public final class CoordinatorProcessSupervisorVerification {
 			int port = unusedLoopbackPort();
 			System.setProperty("arenaagents.coordinatorAutoStart", "false");
 			System.setProperty("arenaagents.bridgeSecretFile", secretFile.toString());
+			System.clearProperty("arenaagents.voiceSecretFile");
 			System.setProperty("arenaagents.bridgePort", Integer.toString(port));
 			FakeLauncher launcher = new FakeLauncher();
 			supervisor = new CoordinatorProcessSupervisor(
@@ -1082,6 +1110,8 @@ public final class CoordinatorProcessSupervisorVerification {
 					"disabled coordinator autostart stops only child-process supervision");
 			assertEquals(0, launcher.launches.size(),
 					"disabled coordinator autostart never launches a child coordinator");
+			assertTrue(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
+					"bridge-secret-only explicit setup initializes voice through the worker's supported fallback");
 			slot = new CodexAgentServerRuntime.BridgeSlot(System::currentTimeMillis);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
 			assertTrue(slot.bridge() != null, "explicit bridge secret still constructs the Java listener");
@@ -1098,6 +1128,7 @@ public final class CoordinatorProcessSupervisorVerification {
 			if (supervisor != null) supervisor.close();
 			restoreProperty("arenaagents.coordinatorAutoStart", oldAutoStart);
 			restoreProperty("arenaagents.bridgeSecretFile", oldSecret);
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
 			restoreProperty("arenaagents.bridgePort", oldPort);
 			if (secretFile != null) {
 				try { Files.deleteIfExists(secretFile); } catch (IOException ignored) { }

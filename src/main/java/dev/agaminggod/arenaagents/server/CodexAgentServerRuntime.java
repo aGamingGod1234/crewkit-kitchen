@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridge;
 import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
+import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusSnapshot;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusStore;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
@@ -38,6 +39,7 @@ public final class CodexAgentServerRuntime {
 	private static final Map<MinecraftServer, VoiceInitializationGate> VOICE_GATES = new ConcurrentHashMap<>();
 	private static final Map<MinecraftServer, Map<String, Long>> PLANNING_UPDATES = new ConcurrentHashMap<>();
 	private static final long PLANNING_UPDATE_INTERVAL_MS = 30_000L;
+	private static final long COORDINATOR_STATUS_MAXIMUM_AGE_MS = 2_500L;
 	private static boolean registered;
 
 	private CodexAgentServerRuntime() {
@@ -144,7 +146,9 @@ public final class CodexAgentServerRuntime {
 		MultiplexedServerBridge bridge = bridge(server);
 		if (supervisor != null) {
 			boolean coordinatorReady = bridge != null && bridge.authenticated()
-					&& CoordinatorStatusStore.latest(server).map(status -> status.reconciled()).orElse(false);
+					&& CoordinatorStatusStore.latest(server)
+							.map(status -> coordinatorStatusReady(status, System.currentTimeMillis()))
+							.orElse(false);
 			supervisor.tick(
 					bridge != null && bridge.authenticated(),
 					bridge == null ? null : bridge.authenticatedLaunchId(),
@@ -293,14 +297,9 @@ public final class CodexAgentServerRuntime {
 	/** Starts voice only after the supervisor has published the prepared secret/config paths. */
 	private static void reconcileVoice(MinecraftServer server, CoordinatorProcessSupervisor supervisor) {
 		if (supervisor == null) return;
-		boolean prepared = supervisor.configured()
-				|| (supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-						&& propertyPresent("arenaagents.voiceSecretFile"));
+		boolean prepared = voiceConfigurationPrepared(supervisor);
 		if (!prepared) return;
-		long revision = java.util.Objects.hash(
-				supervisor.bridgeRevision(), supervisor.secretPath(),
-				System.getProperty("arenaagents.voiceSecretFile"), System.getProperty("arenaagents.voiceUrl")
-		);
+		long revision = voiceConfigurationRevision(supervisor);
 		VoiceInitializationGate gate = VOICE_GATES.computeIfAbsent(server, ignored ->
 				new VoiceInitializationGate(
 						() -> VoiceSubsystemRuntime.start(server),
@@ -312,6 +311,32 @@ public final class CodexAgentServerRuntime {
 		} catch (RuntimeException failure) {
 			LOGGER.warn("Voice subsystem initialization will retry after coordinator paths are prepared", failure);
 		}
+	}
+
+	static boolean coordinatorStatusReady(CoordinatorStatusSnapshot status, long nowEpochMs) {
+		return status != null && status.reconciled()
+				&& status.fresh(nowEpochMs, COORDINATOR_STATUS_MAXIMUM_AGE_MS);
+	}
+
+	static boolean voiceConfigurationPrepared(CoordinatorProcessSupervisor supervisor) {
+		return supervisor != null && (supervisor.configured()
+				|| (supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
+						&& (propertyPresent("arenaagents.voiceSecretFile")
+								|| propertyPresent("arenaagents.bridgeSecretFile"))));
+	}
+
+	static long voiceConfigurationRevision(CoordinatorProcessSupervisor supervisor) {
+		return java.util.Objects.hash(
+				supervisor.bridgeRevision(), supervisor.secretPath(),
+				configuredVoiceSecretFile(), System.getProperty("arenaagents.voiceUrl")
+		);
+	}
+
+	private static String configuredVoiceSecretFile() {
+		return System.getProperty(
+				"arenaagents.voiceSecretFile",
+				System.getProperty("arenaagents.bridgeSecretFile", "runtime/bridge-secret.txt")
+		);
 	}
 
 	private static boolean propertyPresent(String name) {
@@ -363,7 +388,7 @@ public final class CodexAgentServerRuntime {
 			java.util.Objects.requireNonNull(factory, "bridge factory must not be null");
 			if (closed || bridge != null && activeRevision == desiredRevision) return;
 			if (bridge != null) {
-				bridge.close();
+				bridge.closeAndDrainDisconnect();
 				bridge = null;
 				activeRevision = Long.MIN_VALUE;
 			}

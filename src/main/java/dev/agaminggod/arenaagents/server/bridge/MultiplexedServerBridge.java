@@ -425,6 +425,12 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
+	/** Rebinding runs on the server thread, so finish the old session's state transition before replacement. */
+	public void closeAndDrainDisconnect() {
+		close();
+		publishPendingDisconnects();
+	}
+
 	private void acceptLoop() {
 		while (running.get()) {
 			try {
