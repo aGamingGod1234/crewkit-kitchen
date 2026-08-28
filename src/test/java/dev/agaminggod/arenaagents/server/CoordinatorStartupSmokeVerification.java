@@ -216,7 +216,25 @@ public final class CoordinatorStartupSmokeVerification {
 	private static void deleteTree(Path root) throws IOException {
 		if (!Files.exists(root)) return;
 		try (var paths = Files.walk(root)) {
-			for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+			for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) deleteEventually(path);
+		}
+	}
+
+	private static void deleteEventually(Path path) throws IOException {
+		long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2L);
+		while (true) {
+			try {
+				Files.deleteIfExists(path);
+				return;
+			} catch (java.nio.file.AccessDeniedException exception) {
+				if (!isWindows() || System.nanoTime() >= deadline) throw exception;
+				try {
+					Thread.sleep(25L);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					throw new IOException("Interrupted while waiting for Windows to release " + path, interrupted);
+				}
+			}
 		}
 	}
 
