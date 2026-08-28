@@ -40,6 +40,21 @@ try {
 
 	$first = Install-ArenaCoordinatorRuntime -SourceRoot $sourceA -InstalledPackageRoot $installedRoot
 	if (-not $first.Changed -or -not $first.Candidate) { throw 'First runtime must activate as an unverified candidate.' }
+	$missingGeneration = ('f' * 64)
+	Write-ArenaGenerationState $installedRoot @{
+		Phase = 'activate'; ActiveGeneration = $missingGeneration; VerifiedGeneration = ''
+		CandidateGeneration = $missingGeneration; LastKnownGoodGeneration = ''
+		StagingDirectory = "coordinator.staging-$missingGeneration"; PreviousActiveGeneration = $first.GenerationId
+	}
+	try {
+		Complete-ArenaGenerationJournal $installedRoot
+		throw 'Missing candidate journal unexpectedly recovered.'
+	} catch {
+		if ($_.Exception.Message -notmatch 'no validated runnable generation') { throw }
+	}
+	Assert-Equal 'runtime-a' ([IO.File]::ReadAllText((Join-Path $installedRoot 'coordinator\src\dynamic-main.mjs'))) 'Missing LKG recovery must preserve the sole runnable active generation'
+	Assert-Equal $first.GenerationId (Get-ArenaInstalledGeneration (Join-Path $installedRoot 'coordinator')) 'Sole active generation must remain hash-valid after failed recovery'
+	Write-ArenaGenerationState $installedRoot (Get-ArenaReadyState $first.GenerationId '' $first.GenerationId '')
 	Confirm-ArenaCoordinatorGeneration -InstalledPackageRoot $installedRoot -GenerationId $first.GenerationId | Out-Null
 	$config = Join-Path $installedRoot 'runtime\dynamic-agents.json'
 	Assert-Equal $legacyConfigHash (Get-Hash $config) 'Legacy mutable config must migrate without changing its bytes'

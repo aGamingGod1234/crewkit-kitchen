@@ -3,9 +3,13 @@ package dev.agaminggod.arenaagents.server;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.Writer;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -102,15 +106,11 @@ final class CoordinatorProcessOwnership {
 
 	static int reapOrphaned(Path runtimeRoot, String activeGenerationId) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
-		String expectedGeneration = normalizeGeneration(activeGenerationId);
+		normalizeGeneration(activeGenerationId);
 		Path expectedMain = root.resolve("coordinator/src/dynamic-main.mjs").normalize();
 		Ownership ownership = read(root);
 		if (ownership != null && ownerAlive(ownership.ownerPid())) return 0;
 		if (ownership == null) return 0;
-		if (!expectedGeneration.equals(ownership.generationId())) {
-			Files.deleteIfExists(ownershipFile(root));
-			return 0;
-		}
 
 		int reaped = 0;
 		Optional<ProcessHandle> recorded = ProcessHandle.of(ownership.pid());
@@ -118,7 +118,7 @@ final class CoordinatorProcessOwnership {
 			terminateTree(recorded.get());
 			reaped += 1;
 		}
-		Files.deleteIfExists(ownershipFile(root));
+		clearIfMatching(root, ownership);
 		return reaped;
 	}
 
@@ -161,16 +161,19 @@ final class CoordinatorProcessOwnership {
 	) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
 		Ownership ownership = read(root);
-		if (ownership == null || (ownership.pid() == processPid
+		if (ownership != null && ownership.pid() == processPid
 				&& ownership.startedAtEpochMs() == startedAtEpochMs
 				&& ownership.generationId().equals(generationId)
-				&& ownership.launchId().equals(launchId))) {
-			Files.deleteIfExists(ownershipFile(root));
+				&& ownership.launchId().equals(launchId)) {
+			clearIfMatching(root, ownership);
 		}
 	}
 
 	private static Ownership read(Path runtimeRoot) throws IOException {
-		Path file = ownershipFile(runtimeRoot);
+		return read(runtimeRoot, ownershipFile(runtimeRoot));
+	}
+
+	private static Ownership read(Path runtimeRoot, Path file) throws IOException {
 		if (!Files.isRegularFile(file)) return null;
 		Properties values = new Properties();
 		try (Reader reader = Files.newBufferedReader(file)) {
@@ -262,6 +265,35 @@ final class CoordinatorProcessOwnership {
 		return runtimeRoot.toAbsolutePath().normalize();
 	}
 
+	private static boolean clearIfMatching(Path root, Ownership expected) throws IOException {
+		Path ownership = ownershipFile(root);
+		Path claimed = ownership.resolveSibling(ownership.getFileName() + ".clear-" + UUID.randomUUID());
+		try {
+			moveWithoutReplace(ownership, claimed);
+		} catch (NoSuchFileException missing) {
+			return false;
+		}
+		Ownership claimedOwnership = read(root, claimed);
+		if (expected.equals(claimedOwnership)) {
+			Files.deleteIfExists(claimed);
+			return true;
+		}
+		try {
+			Files.move(claimed, ownership);
+		} catch (FileAlreadyExistsException newerOwnershipPublished) {
+			Files.deleteIfExists(claimed);
+		}
+		return false;
+	}
+
+	private static void moveWithoutReplace(Path source, Path target) throws IOException {
+		try {
+			Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
+		} catch (AtomicMoveNotSupportedException unsupported) {
+			Files.move(source, target);
+		}
+	}
+
 	private static String normalizeGeneration(String generationId) {
 		String normalized = java.util.Objects.requireNonNull(generationId, "generation ID must not be null");
 		if (!normalized.matches("[0-9a-f]{64}")) throw new IllegalArgumentException("coordinator generation ID is invalid");
@@ -273,17 +305,24 @@ final class CoordinatorProcessOwnership {
 	}
 
 	static void terminateTree(ProcessHandle process) {
+		terminateTree(process, EXIT_TIMEOUT_MS);
+	}
+
+	static void terminateTree(ProcessHandle process, long exitTimeoutMs) {
+		if (exitTimeoutMs < 0L) throw new IllegalArgumentException("process exit timeout must not be negative");
 		boolean interrupted = Thread.interrupted();
 		try {
-			List<ProcessHandle> descendants = process.descendants().toList();
+			LinkedHashSet<ProcessHandle> descendants = new LinkedHashSet<>(process.descendants().toList());
 			descendants.forEach(ProcessHandle::destroy);
 			process.destroy();
-			interrupted |= awaitExit(process, descendants, EXIT_TIMEOUT_MS);
-			List<ProcessHandle> remaining = process.descendants().toList();
+			interrupted |= awaitExit(process, List.copyOf(descendants), exitTimeoutMs);
+			descendants.addAll(process.descendants().toList());
 			descendants.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
-			remaining.stream().filter(ProcessHandle::isAlive).forEach(ProcessHandle::destroyForcibly);
 			if (process.isAlive()) process.destroyForcibly();
-			interrupted |= awaitExit(process, remaining, EXIT_TIMEOUT_MS);
+			interrupted |= awaitExit(process, List.copyOf(descendants), exitTimeoutMs);
+			if (process.isAlive() || descendants.stream().anyMatch(ProcessHandle::isAlive)) {
+				throw new IllegalStateException("Owned coordinator process tree is still alive after termination");
+			}
 		} finally {
 			if (interrupted) Thread.currentThread().interrupt();
 		}

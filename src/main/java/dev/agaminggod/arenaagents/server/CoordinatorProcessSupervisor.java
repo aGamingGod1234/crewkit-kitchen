@@ -33,6 +33,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
 	private static final long STABILITY_INTERVAL_MS = 30_000L;
+	private static final long TERMINATION_RETRY_MS = 1_000L;
 	private static final int CANDIDATE_FAILURES_BEFORE_ROLLBACK = 3;
 
 	private final Path gameDirectory;
@@ -79,6 +80,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private int candidateFailures;
 	private boolean rollbackRequested;
 	private long nextGenerationMutationEpochMs;
+	private long nextTerminationRetryEpochMs;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -289,7 +291,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	) implements MaintenanceResult {
 	}
 
-	private record TerminationMaintenanceResult() implements MaintenanceResult {
+	private record TerminationMaintenanceResult(ChildProcess child, String failureMessage) implements MaintenanceResult {
 	}
 
 	private record PromotionMaintenanceResult(GenerationStatus status, String generationId, String failureMessage)
@@ -511,7 +513,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			if (child != null) submitDependencyMaintenance(now, false, false);
 		}
 		if (pendingTermination != null) {
-			submitTerminationMaintenance();
+			if (now >= nextTerminationRetryEpochMs) submitTerminationMaintenance();
 			drainMaintenanceResults(now);
 			if (pendingTermination != null || maintenancePending) return;
 		}
@@ -780,15 +782,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private void submitTerminationMaintenance() {
 		if (maintenancePending || pendingTermination == null || stopped) return;
 		ChildProcess terminating = pendingTermination;
-		pendingTermination = null;
 		maintenancePending = true;
 		submitMaintenance(() -> {
 			try {
 				terminating.terminate();
+				publishMaintenanceResult(new TerminationMaintenanceResult(terminating, null));
 			} catch (RuntimeException failure) {
-				LOGGER.warn("Could not finish coordinator process-tree termination", failure);
+				publishMaintenanceResult(new TerminationMaintenanceResult(
+						terminating, Objects.toString(failure.getMessage(), "Owned process-tree termination failed")
+				));
 			}
-			publishMaintenanceResult(new TerminationMaintenanceResult());
 		});
 	}
 
@@ -891,6 +894,16 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				state = CoordinatorRecoveryState.AUTHENTICATING;
 				failingBoundary = "bridge_authentication";
 				LOGGER.info("Started the Arena Agents coordinator (pid {}, generation {})", child.pid(), generation);
+			} else if (result instanceof TerminationMaintenanceResult termination) {
+				if (pendingTermination != termination.child()) continue;
+				if (termination.failureMessage() != null) {
+					nextTerminationRetryEpochMs = now + TERMINATION_RETRY_MS;
+					state = CoordinatorRecoveryState.BLOCKED_RETRYABLE;
+					setDiagnostic("COORDINATOR_TERMINATION_FAILED", termination.failureMessage(), "process_termination");
+					continue;
+				}
+				pendingTermination = null;
+				nextTerminationRetryEpochMs = 0L;
 			} else if (result instanceof PromotionMaintenanceResult promotion) {
 				if (runtime == null || !promotion.generationId().equals(runtime.generationId())) continue;
 				if (promotion.status() == null) {
@@ -1342,14 +1355,15 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		}
 
 		@Override
-		public void terminate() {
-			if (!terminated.compareAndSet(false, true)) return;
+		public synchronized void terminate() {
+			if (terminated.get()) return;
 			CoordinatorProcessOwnership.terminateTree(process.toHandle());
 			try {
 				CoordinatorProcessOwnership.clear(runtimeRoot, process, generationId, launchId);
 			} catch (IOException exception) {
-				LOGGER.warn("Could not clear the Arena Agents coordinator ownership record", exception);
+				throw new IllegalStateException("Could not safely clear coordinator ownership", exception);
 			}
+			terminated.set(true);
 		}
 	}
 

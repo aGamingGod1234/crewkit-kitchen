@@ -54,6 +54,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyContinuousStabilityResetsFailures();
 		verifyCandidatePromotionUsesMaintenanceWorker();
 		verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination();
+		verifyCandidateRollbackWaitsForConfirmedTermination();
 		verifySoleCandidateFailureKeepsRetrying();
 		verifyConnectionGenerationResetsUnsampledStability();
 		verifyMissingThenRestoredDependency();
@@ -147,6 +148,49 @@ public final class CoordinatorProcessSupervisorVerification {
 		supervisor.close();
 	}
 
+	private static void verifyCandidateRollbackWaitsForConfirmedTermination() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.candidate(true);
+		FakeLauncher launcher = new FakeLauncher();
+		FakeGenerationController generations = new FakeGenerationController();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "candidate-termination-retry-game"), Map.of(), clock, dependencies, launcher,
+				new SequentialLaunchIds(325), Runnable::run, runtimeRoot -> 0, task -> { }, generations
+		);
+		clock.advance(STARTUP_GRACE_MS);
+		supervisor.tick(false, null, 0L);
+		for (long retryDelay : new long[]{1_000L, 2_000L}) {
+			clock.advance(AUTHENTICATION_TIMEOUT_MS);
+			supervisor.tick(false, null, 0L);
+			clock.advance(retryDelay);
+			supervisor.tick(false, null, 0L);
+		}
+		FakeChild failedCandidate = launcher.latest();
+		failedCandidate.terminationFailuresRemaining = 1;
+		clock.advance(AUTHENTICATION_TIMEOUT_MS);
+		supervisor.tick(false, null, 0L);
+		assertEquals(1, failedCandidate.terminationAttempts,
+				"failed candidate termination is attempted before rollback");
+		assertEquals(0, failedCandidate.terminations,
+				"refused termination does not report the owned child dead");
+		assertEquals(true, failedCandidate.ownershipPresent,
+				"refused termination preserves the owned child record");
+		assertEquals(0, generations.rollbacks,
+				"candidate rollback stays blocked while the exact child may live");
+		supervisor.tick(false, null, 0L);
+		assertEquals(1, failedCandidate.terminationAttempts,
+				"termination retry waits for its bounded retry deadline");
+		clock.advance(1_000L);
+		supervisor.tick(false, null, 0L);
+		assertEquals(2, failedCandidate.terminationAttempts,
+				"failed termination is retried through the maintenance boundary");
+		assertEquals(false, failedCandidate.ownershipPresent,
+				"ownership clears only after confirmed process-tree termination");
+		assertEquals(1, generations.rollbacks,
+				"rollback proceeds after the exact owned child is confirmed dead");
+		supervisor.close();
+	}
+
 	private static void verifySoleCandidateFailureKeepsRetrying() {
 		FakeClock clock = new FakeClock();
 		MutableDependencies dependencies = MutableDependencies.candidate(false);
@@ -174,6 +218,7 @@ public final class CoordinatorProcessSupervisorVerification {
 	public static void main(String[] arguments) {
 		verifyCandidatePromotionUsesMaintenanceWorker();
 		verifyRepeatedCandidateAuthenticationFailureRollsBackAfterTermination();
+		verifyCandidateRollbackWaitsForConfirmedTermination();
 		verifySoleCandidateFailureKeepsRetrying();
 		System.out.println("PASS: coordinator generation supervisor assertions");
 	}
@@ -1168,6 +1213,9 @@ public final class CoordinatorProcessSupervisorVerification {
 		private final long pid;
 		private boolean alive = true;
 		private int terminations;
+		private int terminationAttempts;
+		private int terminationFailuresRemaining;
+		private boolean ownershipPresent = true;
 
 		private FakeChild(long pid) {
 			this.pid = pid;
@@ -1189,8 +1237,14 @@ public final class CoordinatorProcessSupervisorVerification {
 
 		@Override
 		public void terminate() {
+			terminationAttempts++;
+			if (terminationFailuresRemaining > 0) {
+				terminationFailuresRemaining--;
+				throw new IllegalStateException("owned process refused termination");
+			}
 			terminations++;
 			alive = false;
+			ownershipPresent = false;
 		}
 	}
 

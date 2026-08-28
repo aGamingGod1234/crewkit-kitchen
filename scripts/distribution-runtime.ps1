@@ -168,7 +168,8 @@ function Complete-ArenaGenerationJournal([string] $InstalledRoot, [string] $Fail
 			return
 		}
 		if ((Get-ArenaInstalledGeneration $staging $state.ActiveGeneration) -ne $state.ActiveGeneration) {
-			if ((Get-ArenaInstalledGeneration $lkg $state.VerifiedGeneration) -eq $state.VerifiedGeneration) {
+			$lkgGeneration = if ($state.VerifiedGeneration -ne '') { Get-ArenaInstalledGeneration $lkg $state.VerifiedGeneration } else { '' }
+			if ($state.VerifiedGeneration -ne '' -and $lkgGeneration -ceq $state.VerifiedGeneration) {
 				if (Test-Path -LiteralPath $active) { Remove-ArenaTree $InstalledRoot $active }
 				Move-Item -LiteralPath $lkg -Destination $active
 				Write-ArenaGenerationState $InstalledRoot (Get-ArenaReadyState $state.VerifiedGeneration $state.VerifiedGeneration '' '')

@@ -64,11 +64,12 @@ public final class CoordinatorProcessOwnershipVerification {
 
 			staleGeneration = startSleeper(main);
 			CoordinatorProcessOwnership.record(root, staleGeneration, main, GENERATION_A, LAUNCH_A, Long.MAX_VALUE);
-			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, GENERATION_B) == 0,
-					"ownership from another runtime generation cannot kill the current generation");
-			assertTrue(staleGeneration.isAlive(), "a process protected by generation fencing survives stale reaping");
+			assertTrue(CoordinatorProcessOwnership.reapOrphaned(root, GENERATION_B) == 1,
+					"a stale-generation record still reaps its exact PID, start time, main, generation, and launch identity");
+			assertTrue(staleGeneration.waitFor(5, TimeUnit.SECONDS),
+					"the stale-generation exact coordinator exits before ownership clears");
 			assertTrue(!Files.exists(CoordinatorProcessOwnership.ownershipFile(root)),
-					"mismatched stale generation ownership is cleared without killing a process");
+					"only the matching stale-generation ownership record is cleared");
 
 			tree = startTreeSleeper(main);
 			CoordinatorProcessOwnership.record(root, tree, main, GENERATION_A, LAUNCH_A, Long.MAX_VALUE);
@@ -86,7 +87,8 @@ public final class CoordinatorProcessOwnershipVerification {
 			assertTrue(Thread.interrupted(), "tree termination preserves interruption status");
 			assertTrue(interruptedDescendants.stream().noneMatch(ProcessHandle::isAlive),
 					"interrupted tree termination still stops every child");
-			return 17 + clearAssertions + verifyStartupOwnershipRecordFailureCleanup(main);
+			return 17 + clearAssertions + verifyStartupOwnershipRecordFailureCleanup(main)
+					+ verifyRefusedProcessTreeTerminationFailsClosed();
 		} finally {
 			if (orphan != null && orphan.isAlive()) orphan.destroyForcibly();
 			if (liveOwned != null && liveOwned.isAlive()) liveOwned.destroyForcibly();
@@ -135,6 +137,25 @@ public final class CoordinatorProcessOwnershipVerification {
 		} finally {
 			if (failedStart.isAlive()) failedStart.destroyForcibly();
 		}
+	}
+
+	private static int verifyRefusedProcessTreeTerminationFailsClosed() {
+		RefusingProcessHandle child = new RefusingProcessHandle(9002L, java.util.List.of());
+		RefusingProcessHandle parent = new RefusingProcessHandle(9001L, java.util.List.of(child));
+		try {
+			CoordinatorProcessOwnership.terminateTree(parent, 1L);
+			throw new AssertionError("a surviving exact process tree must fail termination");
+		} catch (IllegalStateException expected) {
+			assertTrue(expected.getMessage().contains("still alive"),
+					"surviving process-tree failure is explicit");
+		}
+		assertTrue(parent.normalDestroyAttempts == 1 && parent.forcedDestroyAttempts == 1,
+				"the exact parent receives normal and forced termination attempts");
+		assertTrue(child.normalDestroyAttempts == 1 && child.forcedDestroyAttempts == 1,
+				"every captured descendant receives normal and forced termination attempts");
+		assertTrue(parent.isAlive() && child.isAlive(),
+				"refused process handles remain visibly alive to the caller");
+		return 4;
 	}
 
 	private static int verifyClearPreservesNewerRecord(Path root, Process process) throws Exception {
@@ -194,6 +215,30 @@ public final class CoordinatorProcessOwnershipVerification {
 
 	private static boolean isWindows() {
 		return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
+	}
+
+	private static final class RefusingProcessHandle implements ProcessHandle {
+		private final long pid;
+		private final java.util.List<ProcessHandle> descendants;
+		private int normalDestroyAttempts;
+		private int forcedDestroyAttempts;
+
+		private RefusingProcessHandle(long pid, java.util.List<ProcessHandle> descendants) {
+			this.pid = pid;
+			this.descendants = descendants;
+		}
+
+		@Override public long pid() { return pid; }
+		@Override public java.util.Optional<ProcessHandle> parent() { return java.util.Optional.empty(); }
+		@Override public java.util.stream.Stream<ProcessHandle> children() { return descendants.stream(); }
+		@Override public java.util.stream.Stream<ProcessHandle> descendants() { return descendants.stream(); }
+		@Override public Info info() { return ProcessHandle.current().info(); }
+		@Override public java.util.concurrent.CompletableFuture<ProcessHandle> onExit() { return new java.util.concurrent.CompletableFuture<>(); }
+		@Override public boolean supportsNormalTermination() { return true; }
+		@Override public boolean destroy() { normalDestroyAttempts++; return false; }
+		@Override public boolean destroyForcibly() { forcedDestroyAttempts++; return false; }
+		@Override public boolean isAlive() { return true; }
+		@Override public int compareTo(ProcessHandle other) { return Long.compare(pid, other.pid()); }
 	}
 
 	private static void assertTrue(boolean condition, String label) {
