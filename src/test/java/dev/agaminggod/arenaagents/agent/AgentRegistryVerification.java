@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.agent;
 
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
+import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -452,13 +454,37 @@ public final class AgentRegistryVerification {
 		assertEquals(disconnected.goalRevision(), disconnectedRespawn.after().goalRevision(),
 				"disconnected respawn preserves the unfinished goal revision");
 
+		GoalEvidence evidence = new GoalEvidence(4L, "inventory_contains", List.of(
+				new GoalEvidence.Fact("inventory_contains", true, "minecraft:iron_pickaxe x1", "minecraft:iron_pickaxe x1")
+		));
+		AgentRecord satisfied = AgentLifecycleReducer.satisfyGoal(
+				active, active.goalRevision(), evidence, START_TIME + 4L).after();
+		AgentRecord satisfiedDead = AgentLifecycleReducer.die(satisfied, death, START_TIME + 5L).after();
+		assertEquals(GoalStatus.SATISFIED, satisfiedDead.currentGoal().orElseThrow().status(),
+				"death retains factual completion evidence");
+		assertTrue(!satisfiedDead.resumeAfterRespawn(), "completed work has no continuation intent");
+		AgentTransition satisfiedRespawn = AgentLifecycleReducer.respawn(
+				satisfiedDead, UUID.randomUUID(), START_TIME + 6L);
+		assertEquals(AgentLifecycleState.COMPLETED, satisfiedRespawn.after().state(),
+				"respawn preserves the terminal lifecycle of a satisfied goal");
+		assertEquals(satisfied.goalRevision(), satisfiedRespawn.after().goalRevision(),
+				"completed respawn preserves the satisfied goal revision");
+		assertTrue(!satisfiedRespawn.after().acceptsRevision(satisfied.goalRevision()),
+				"completed respawn cannot restart terminal coordinator work");
+		AgentTransition nextGoal = AgentLifecycleReducer.start(
+				satisfiedRespawn.after(), "Get some wood", START_TIME + 7L);
+		assertEquals(AgentLifecycleState.STARTING, nextGoal.after().state(),
+				"a new goal can start normally after completed respawn");
+		assertEquals("Get some wood", nextGoal.after().currentGoal().orElseThrow().prompt(),
+				"new work replaces the retained completed goal");
+
 		String legacyWithoutContinuationIntent = encoded.replaceFirst(",\\\"resume_after_respawn\\\":true", "");
 		AgentRecord legacyDead = codec.decode(legacyWithoutContinuationIntent).records().getFirst();
 		assertTrue(!legacyDead.resumeAfterRespawn(), "legacy dead records fail safe without continuation intent");
 		assertEquals(AgentLifecycleState.PAUSED,
 				AgentLifecycleReducer.respawn(legacyDead, UUID.randomUUID(), START_TIME + 7L).after().state(),
 				"legacy dead records remain paused after respawn");
-		return 28;
+		return 36;
 	}
 
 	private static void expectFailure(Runnable operation, String expectedCode) {

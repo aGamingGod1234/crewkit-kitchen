@@ -7,6 +7,11 @@ public final class ConversationWakePolicy {
 	private ConversationWakePolicy() {
 	}
 
+	public static boolean mayInstallNewGoalFromSpeech(AgentLifecycleState state) {
+		Objects.requireNonNull(state, "state must not be null");
+		return state == AgentLifecycleState.IDLE || state == AgentLifecycleState.COMPLETED;
+	}
+
 	public static boolean shouldStartGoal(AgentLifecycleState state, ConversationKind kind) {
 		Objects.requireNonNull(state, "state must not be null");
 		Objects.requireNonNull(kind, "kind must not be null");

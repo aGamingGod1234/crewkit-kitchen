@@ -275,7 +275,8 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 					"The requester's live dimension changed before the goal could be compiled");
 		}
 		// Replace/queue is an explicit /agent goal choice, not inferred from live speech.
-		if (!GoalCompiler.consumePlayerSpeechAsGoal(target.currentGoal().isPresent(), event.text(), false)) {
+		if (!GoalCompiler.consumePlayerSpeechAsGoal(
+				!ConversationWakePolicy.mayInstallNewGoalFromSpeech(target.state()), event.text(), false)) {
 			return GoalRoute.EVENT_ONLY;
 		}
 

@@ -318,11 +318,14 @@ public final class AgentLifecycleReducer {
 
 	public static AgentTransition respawn(AgentRecord current, UUID entityUuid, long nowEpochMs) {
 		requireState(current, "respawn", AgentLifecycleState.DEAD);
-		AgentLifecycleState nextState = current.currentGoal().isEmpty()
-				? AgentLifecycleState.IDLE
-				: current.resumeAfterRespawn()
-						? AgentLifecycleState.STARTING
-						: AgentLifecycleState.PAUSED;
+		AgentLifecycleState nextState;
+		if (current.currentGoal().isEmpty()) {
+			nextState = AgentLifecycleState.IDLE;
+		} else if (current.currentGoal().orElseThrow().status() == GoalStatus.SATISFIED) {
+			nextState = AgentLifecycleState.COMPLETED;
+		} else {
+			nextState = current.resumeAfterRespawn() ? AgentLifecycleState.STARTING : AgentLifecycleState.PAUSED;
+		}
 		AgentRecord respawned = current.withLifecycle(
 				nextState,
 				current.currentGoal(),

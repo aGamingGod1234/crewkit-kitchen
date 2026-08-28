@@ -47,6 +47,14 @@ public final class AgentConversationRouterVerification {
 	}
 
 	private static int verifyPlayerConversationWakePolicy() {
+		assertEquals(true, ConversationWakePolicy.mayInstallNewGoalFromSpeech(AgentLifecycleState.IDLE),
+				"idle agent can receive a goal from speech");
+		assertEquals(true, ConversationWakePolicy.mayInstallNewGoalFromSpeech(AgentLifecycleState.COMPLETED),
+				"completed goal is inactive even while its evidence remains attached");
+		assertEquals(false, ConversationWakePolicy.mayInstallNewGoalFromSpeech(AgentLifecycleState.PAUSED),
+				"paused goal cannot be silently replaced by speech");
+		assertEquals(false, ConversationWakePolicy.mayInstallNewGoalFromSpeech(AgentLifecycleState.ACTING),
+				"active work cannot be silently replaced by speech");
 		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.IDLE, ConversationKind.PLAYER_MESSAGE
 		), "idle agent wakes for direct player message");
@@ -74,7 +82,7 @@ public final class AgentConversationRouterVerification {
 					state, ConversationKind.PLAYER_MESSAGE
 			), state + " agent is not auto-started by conversation");
 		}
-		return 11;
+		return 15;
 	}
 
 	private static int verifyDirectDeliveryAndOperatorMirror() {
