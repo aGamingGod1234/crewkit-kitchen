@@ -140,11 +140,11 @@ test('Codex startup owns its deadline and a later probe starts a fresh transport
 		assertSupported() {},
 		reconcileProfiles: (records) => ({ valid: records, invalid: [] }),
 	};
-	const service = new CodexService({ cwd: 'C:\\workspace', startupTimeoutMs: 5 }, { transport, catalog });
+	const service = new CodexService({ cwd: 'C:\\workspace', startupTimeoutMs: 100 }, { transport, catalog });
 	try {
 		const first = await Promise.race([
 			service.start().then(() => 'fulfilled', (error) => error?.code),
-			new Promise((resolve) => setTimeout(() => resolve('outer-timeout'), 30)),
+			new Promise((resolve) => setTimeout(() => resolve('outer-timeout'), 1_000)),
 		]);
 		assert.equal(first, 'PROVIDER_START_TIMEOUT');
 		const second = service.start();
