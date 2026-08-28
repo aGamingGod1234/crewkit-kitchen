@@ -4,7 +4,11 @@ import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.server.MinecraftServer;
@@ -121,7 +125,76 @@ public final class VoiceSubsystemRuntimeVerification {
 		assertTrue(VoiceSubsystemRuntime.available(startupRaceServer),
 				"the retry promotes the real voice subsystem without restarting Minecraft");
 		VoiceSubsystemRuntime.close(startupRaceServer);
-		return 26 + verifyOptionalConfigurationFailure() + verifyEndpointValidation();
+		return 26 + verifyOptionalConfigurationFailure() + verifyEndpointValidation()
+				+ verifyConsentCancellationLockOrder();
+	}
+
+	private static int verifyConsentCancellationLockOrder() {
+		MinecraftServer server = uninitializedServer();
+		VoiceSubsystemConfiguration configuration = new VoiceSubsystemConfiguration(
+				"http://127.0.0.1:18774/v1/tts", "l".repeat(32)
+		);
+		UUID playerId = UUID.randomUUID();
+		Object captureMonitor = new Object();
+		CountDownLatch captureMonitorHeld = new CountDownLatch(1);
+		CountDownLatch continueCapture = new CountDownLatch(1);
+		CountDownLatch cancellationStarted = new CountDownLatch(1);
+		AtomicBoolean captureRan = new AtomicBoolean();
+		AtomicReference<Boolean> captureAccepted = new AtomicReference<>();
+		CancellationLockVoiceSubsystem subsystem = new CancellationLockVoiceSubsystem(
+				captureMonitor, cancellationStarted
+		);
+		assertTrue(VoiceSubsystemRuntime.start(server, configuration,
+				List.of((actualServer, actualConfiguration) -> subsystem)),
+				"lock-order verification installs its voice subsystem");
+		VoiceConsentRegistry.grant(server, playerId);
+
+		Thread microphone = Thread.ofPlatform().daemon().name("voice-consent-lock-test-microphone").unstarted(() -> {
+			synchronized (captureMonitor) {
+				captureMonitorHeld.countDown();
+				await(continueCapture, "microphone callback was not released");
+				captureAccepted.set(VoiceConsentRegistry.captureWhileGranted(
+						server, playerId, () -> captureRan.set(true)
+				));
+			}
+		});
+		Thread revoke = Thread.ofPlatform().daemon().name("voice-consent-lock-test-revoke").unstarted(
+				() -> VoiceConsentRegistry.revoke(server, playerId)
+		);
+		microphone.start();
+		await(captureMonitorHeld, "microphone callback did not acquire the capture monitor");
+		revoke.start();
+		await(cancellationStarted, "consent revocation did not reach capture cancellation");
+		continueCapture.countDown();
+		join(microphone, "microphone callback deadlocked with consent revocation");
+		join(revoke, "consent revocation deadlocked with the microphone callback");
+
+		assertEquals(false, captureAccepted.get(),
+				"a callback racing after revocation cannot accept captured speech");
+		assertFalse(captureRan.get(), "revoked capture work remains fenced during the lock-order race");
+		assertEquals(1, subsystem.cancellations.get(),
+				"revocation cancels the exact live capture generation once");
+		VoiceSubsystemRuntime.close(server);
+		return 6;
+	}
+
+	private static void await(CountDownLatch latch, String message) {
+		try {
+			if (!latch.await(2L, TimeUnit.SECONDS)) throw new AssertionError(message);
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError(message, exception);
+		}
+	}
+
+	private static void join(Thread thread, String message) {
+		try {
+			thread.join(2_000L);
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError(message, exception);
+		}
+		if (thread.isAlive()) throw new AssertionError(message);
 	}
 
 	private static int verifyEndpointValidation() {
@@ -296,6 +369,32 @@ public final class VoiceSubsystemRuntimeVerification {
 		public void close() {
 			closes.incrementAndGet();
 		}
+	}
+
+	private static final class CancellationLockVoiceSubsystem implements VoiceSubsystem {
+		private final Object captureMonitor;
+		private final CountDownLatch cancellationStarted;
+		private final AtomicInteger cancellations = new AtomicInteger();
+
+		private CancellationLockVoiceSubsystem(Object captureMonitor, CountDownLatch cancellationStarted) {
+			this.captureMonitor = captureMonitor;
+			this.cancellationStarted = cancellationStarted;
+		}
+
+		@Override public boolean available() { return true; }
+		@Override public void registerAgent(dev.agaminggod.arenaagents.agent.AgentId agentId, UUID entityId) { }
+		@Override public void unregisterAgent(dev.agaminggod.arenaagents.agent.AgentId agentId) { }
+		@Override public java.util.concurrent.CompletionStage<VoiceReceipt> speak(VoiceRequest request) {
+			return CompletableFuture.completedFuture(VoiceReceipt.accepted());
+		}
+		@Override public void stop(dev.agaminggod.arenaagents.agent.AgentId agentId) { }
+		@Override public void cancelHumanSpeech(UUID playerId) {
+			cancellationStarted.countDown();
+			synchronized (captureMonitor) {
+				cancellations.incrementAndGet();
+			}
+		}
+		@Override public void close() { }
 	}
 
 	private static void assertTrue(boolean value, String label) {

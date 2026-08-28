@@ -17,11 +17,13 @@ public final class VoiceConsentRegistry {
 		ENABLED.computeIfAbsent(server, ignored -> new LinkedHashSet<>()).add(playerId);
 	}
 
-	public static synchronized void revoke(MinecraftServer server, UUID playerId) {
-		Set<UUID> players = ENABLED.get(server);
-		if (players != null) {
-			players.remove(playerId);
-			if (players.isEmpty()) ENABLED.remove(server);
+	public static void revoke(MinecraftServer server, UUID playerId) {
+		synchronized (VoiceConsentRegistry.class) {
+			Set<UUID> players = ENABLED.get(server);
+			if (players != null) {
+				players.remove(playerId);
+				if (players.isEmpty()) ENABLED.remove(server);
+			}
 		}
 		VoiceSubsystemRuntime.cancelHumanSpeech(server, playerId);
 	}
@@ -30,7 +32,7 @@ public final class VoiceConsentRegistry {
 	 * Clears a player's opt-in at the server's disconnect boundary. Consent is
 	 * deliberately session-scoped and must be granted again after reconnecting.
 	 */
-	public static synchronized void playerDisconnected(MinecraftServer server, UUID playerId) {
+	public static void playerDisconnected(MinecraftServer server, UUID playerId) {
 		revoke(server, playerId);
 	}
 
