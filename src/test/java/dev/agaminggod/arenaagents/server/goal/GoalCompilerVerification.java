@@ -26,6 +26,7 @@ public final class GoalCompilerVerification {
 		bindItemStackSize(Items.APPLE, 64);
 		bindItemStackSize(Items.COBBLESTONE, 64);
 		bindItemStackSize(Items.DIAMOND_PICKAXE, 1);
+		bindItemStackSize(Items.DIAMOND_SWORD, 1);
 		bindItemStackSize(Items.IRON_AXE, 1);
 		bindItemStackSize(Items.IRON_PICKAXE, 1);
 		int assertions = 0;
@@ -197,7 +198,26 @@ public final class GoalCompilerVerification {
 				!compiler.candidateIdsFor("Place oak planks", RegistryAccess.EMPTY).contains("minecraft:oak_button"),
 				"phrase matching does not expand a block request to unrelated same-material blocks"
 		);
-		return 14;
+		GoalCompilation breakBlock = compiler.compile(
+				"Break stone at 10 64 -10", RegistryAccess.EMPTY, 1_200L, "minecraft:the_nether");
+		assertEquals(GoalCompilation.Kind.ACCEPTED, breakBlock.kind(),
+				"an exact coordinate-bearing destructive request compiles without translation");
+		assertEquals(
+				new GoalPredicate.BlockMatches("minecraft:the_nether", 10, 64, -10, "minecraft:air", Map.of()),
+				breakBlock.acceptedSpec().orElseThrow().completion(),
+				"destructive block completion verifies the achievable post-break state"
+		);
+		assertEquals(
+				List.of("minecraft:air"),
+				compiler.candidateIdsFor("Destroy stone at coordinates x=10, y=64, z=-10", RegistryAccess.EMPTY),
+				"destructive coordinate translation exposes only the post-break state"
+		);
+		assertEquals(
+				List.of("minecraft:stone"),
+				compiler.candidateIdsFor("Place stone at 10 64 -10", RegistryAccess.EMPTY),
+				"placement translation still exposes the requested placed block"
+		);
+		return 18;
 	}
 
 	private static int verifyCompoundItemsAndKills() {
@@ -251,7 +271,23 @@ public final class GoalCompilerVerification {
 				compiler.compile("Get an iron pickaxe and make a shield", RegistryAccess.EMPTY, 1_200L).kind(),
 				"an explicit make clause keeps the entire compound goal verifiable"
 		);
-		return 10;
+		GoalCompilation repeatedItem = compiler.compile(
+				"Get 2 diamond swords and 3 diamond swords", RegistryAccess.EMPTY, 1_200L);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, repeatedItem.kind(),
+				"repeated inventory requirements remain directly compilable");
+		assertEquals(
+				new GoalPredicate.AllOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:diamond_sword", 5)
+				)),
+				repeatedItem.acceptedSpec().orElseThrow().completion(),
+				"repeated inventory requirements sum into one exact minimum count"
+		);
+		assertEquals(
+				GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 20 diamond swords and 18 diamond swords", RegistryAccess.EMPTY, 1_200L).kind(),
+				"summed duplicate requirements are revalidated against inventory capacity"
+		);
+		return 13;
 	}
 
 	private static int verifyExplicitAlternativeCandidates() {

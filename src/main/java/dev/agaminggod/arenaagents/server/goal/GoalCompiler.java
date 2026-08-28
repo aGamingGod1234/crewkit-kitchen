@@ -5,8 +5,10 @@ import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.Objects;
@@ -43,12 +45,12 @@ public final class GoalCompiler {
 	private static final Pattern KILL_COUNT = Pattern.compile("^\\d+\\s+(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
-	private static final Pattern BLOCK = Pattern.compile("^(?:build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
+	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
 			"\\s+(?:at|on)(?: coordinates?)?\\s+"
-					+ "(?:x\\s*=\\s*)?-?\\d+\\s*,?\\s*"
-					+ "(?:y\\s*=\\s*)?-?\\d+\\s*,?\\s*"
-					+ "(?:z\\s*=\\s*)?-?\\d+$"
+					+ "(?:x\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
+					+ "(?:y\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
+					+ "(?:z\\s*=\\s*)?(-?\\d+)$"
 	);
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
 	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
@@ -166,8 +168,27 @@ public final class GoalCompiler {
 			}
 		}
 		Matcher block = BLOCK.matcher(command);
-		if (block.matches() && relatedBlocks(block.group(1), registries).isEmpty()) {
-			return GoalCompilation.needsTranslation("I could not identify the exact Minecraft block for that request.");
+		if (block.matches()) {
+			List<String> sourceBlocks = relatedBlocks(block.group(2), registries);
+			if (sourceBlocks.isEmpty()) {
+				return GoalCompilation.needsTranslation("I could not identify the exact Minecraft block for that request.");
+			}
+			Matcher location = BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(block.group(2)));
+			if (isDestructiveBlockVerb(block.group(1)) && location.find()) {
+				try {
+					GoalPredicate predicate = new GoalPredicate.BlockMatches(
+							dimensionId,
+							Integer.parseInt(location.group(1)),
+							Integer.parseInt(location.group(2)),
+							Integer.parseInt(location.group(3)),
+							"minecraft:air",
+							Map.of()
+					);
+					return accepted(original, predicate, createdAtTick, "Goal set: clear the requested block position.");
+				} catch (NumberFormatException | AgentDomainException exception) {
+					return GoalCompilation.rejected("Those block coordinates are outside Minecraft's supported range.");
+				}
+			}
 		}
 
 		GoalCompilation compound = compileCompound(original, command, registries, createdAtTick);
@@ -238,7 +259,15 @@ public final class GoalCompiler {
 			return relatedCandidates(ClauseKind.KILL, stripKillCount(kill.group(1)), registries);
 		}
 		Matcher block = BLOCK.matcher(command);
-		if (block.matches()) return relatedBlocks(block.group(1), registries).stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
+		if (block.matches()) {
+			List<String> sourceBlocks = relatedBlocks(block.group(2), registries);
+			if (!sourceBlocks.isEmpty()
+					&& isDestructiveBlockVerb(block.group(1))
+					&& BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(block.group(2))).find()) {
+				return List.of("minecraft:air");
+			}
+			return sourceBlocks.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
+		}
 		return List.of();
 	}
 
@@ -249,6 +278,7 @@ public final class GoalCompiler {
 			return GoalCompilation.rejected("A compound goal may contain at most " + MAX_COMPOUND_LEAVES + " factual results.");
 		}
 		ArrayList<GoalPredicate> predicates = new ArrayList<>();
+		HashMap<String, Integer> inventoryPredicateIndexes = new HashMap<>();
 		for (GoalClause clause : clauses) {
 			if (clause.kind() == ClauseKind.ITEM) {
 				if (clause.requiresCreation()) return craftingNeedsTranslation();
@@ -258,8 +288,24 @@ public final class GoalCompiler {
 						? "I could not identify every Minecraft item in that request."
 						: "More than one Minecraft item matches part of that request.");
 				String itemId = matches.getFirst();
-				if (exceedsInventoryCapacity(itemId, clause.count(), registries)) return unrepresentableItemCount();
-				predicates.add(new GoalPredicate.InventoryContains(itemId, clause.count()));
+				Integer priorIndex = inventoryPredicateIndexes.get(itemId);
+				int combinedCount = clause.count();
+				if (priorIndex != null) {
+					try {
+						combinedCount = Math.addExact(
+								((GoalPredicate.InventoryContains) predicates.get(priorIndex)).count(), clause.count());
+					} catch (ArithmeticException exception) {
+						return unrepresentableItemCount();
+					}
+				}
+				if (exceedsInventoryCapacity(itemId, combinedCount, registries)) return unrepresentableItemCount();
+				GoalPredicate combined = new GoalPredicate.InventoryContains(itemId, combinedCount);
+				if (priorIndex == null) {
+					inventoryPredicateIndexes.put(itemId, predicates.size());
+					predicates.add(combined);
+				} else {
+					predicates.set(priorIndex, combined);
+				}
 			} else {
 				List<String> matches = matchEntities(clause.target(), registries);
 				if (matches.size() != 1) return GoalCompilation.needsTranslation(matches.isEmpty()
@@ -364,6 +410,10 @@ public final class GoalCompiler {
 
 	private static boolean isCraftingVerb(String verb) {
 		return verb.equals("craft") || verb.equals("make");
+	}
+
+	private static boolean isDestructiveBlockVerb(String verb) {
+		return verb.equals("mine") || verb.equals("break") || verb.equals("destroy");
 	}
 
 	private static GoalCompilation craftingNeedsTranslation() {
