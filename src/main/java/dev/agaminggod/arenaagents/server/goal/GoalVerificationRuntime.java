@@ -206,11 +206,11 @@ public final class GoalVerificationRuntime {
 			if (goal == null || goal.status() != GoalStatus.ACTIVE && goal.status() != GoalStatus.RECOVERING) continue;
 			activeGoalIds.add(goal.goalId());
 			Map<KillRequirementKey, Integer> requiredByEntity = new HashMap<>();
-			collectKillRequirements(goal.spec().completion(), goal.createdAtEpochMs(), requiredByEntity);
+			collectKillRequirements(goal.spec().completion(), requiredByEntity);
 			for (Map.Entry<KillRequirementKey, Integer> entry : requiredByEntity.entrySet()) {
 				requirements.add(new AgentKillLedger.KillProgressRequirement(
 						goal.goalId(), record.agentId(), entry.getKey().entityType(),
-						entry.getKey().afterExclusive(), entry.getValue()));
+						entry.getKey().afterGoalStart(), entry.getValue()));
 			}
 			collectSurvivalRequirements(
 					goal.goalId(), record.agentId(), goal.spec().completion(), "root", survivalRequirements);
@@ -241,27 +241,27 @@ public final class GoalVerificationRuntime {
 	}
 
 	private static void collectKillRequirements(
-			GoalPredicate predicate, long goalStartedAt, Map<KillRequirementKey, Integer> requiredByEntity
+			GoalPredicate predicate, Map<KillRequirementKey, Integer> requiredByEntity
 	) {
 		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
-			long afterExclusive = killed.afterGoalStart() ? goalStartedAt : Long.MIN_VALUE;
-			requiredByEntity.merge(new KillRequirementKey(killed.entityType(), afterExclusive), 1, Math::addExact);
+			requiredByEntity.merge(
+					new KillRequirementKey(killed.entityType(), killed.afterGoalStart()), 1, Math::addExact);
 			return;
 		}
 		if (predicate instanceof GoalPredicate.AllOf all) {
 			for (GoalPredicate child : all.predicates()) {
-				collectKillRequirements(child, goalStartedAt, requiredByEntity);
+				collectKillRequirements(child, requiredByEntity);
 			}
 			return;
 		}
 		if (predicate instanceof GoalPredicate.AnyOf any) {
 			for (GoalPredicate child : any.predicates()) {
-				collectKillRequirements(child, goalStartedAt, requiredByEntity);
+				collectKillRequirements(child, requiredByEntity);
 			}
 		}
 	}
 
-	private record KillRequirementKey(String entityType, long afterExclusive) { }
+	private record KillRequirementKey(String entityType, boolean afterGoalStart) { }
 
 	private GoalCompletionVerifier.VerificationResult verifySafely(AgentRecord record, long tick) {
 		VerificationFault existing = faults.get(record.agentId());

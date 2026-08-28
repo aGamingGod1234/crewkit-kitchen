@@ -13,14 +13,16 @@ import java.util.UUID;
 
 /** Bounded server-owned attribution ledger for kills made by agent players. */
 public final class AgentKillLedger {
-	static final int SCHEMA_VERSION = 2;
+	static final int SCHEMA_VERSION = 3;
 	static final int MAX_EVENTS = 4_096;
 	static final int MAX_PROGRESS_ENTRIES = 16_384;
 	private final Deque<Kill> kills = new ArrayDeque<>();
-	private final Map<KillKey, TimestampSeries> killsByAgentAndType = new HashMap<>();
+	private final Map<KillKey, OrderedLongSeries> killTimesByAgentAndType = new HashMap<>();
+	private final Map<KillKey, OrderedLongSeries> killSequencesByAgentAndType = new HashMap<>();
 	private final Map<ProgressKey, Progress> progress = new HashMap<>();
 	private final Map<KillKey, List<ProgressKey>> progressByAgentAndType = new HashMap<>();
 	private final Runnable mutationListener;
+	private long lastSequence;
 	private int lastLookupProbeCount;
 
 	public AgentKillLedger() {
@@ -29,12 +31,22 @@ public final class AgentKillLedger {
 
 	public AgentKillLedger(Snapshot snapshot, Runnable mutationListener) {
 		this.mutationListener = Objects.requireNonNull(mutationListener, "mutationListener must not be null");
-		for (KillEvent event : Objects.requireNonNull(snapshot, "snapshot must not be null").events()) {
-			append(event.agentId(), event.entityType(), event.occurredAtEpochMs());
+		Snapshot persisted = Objects.requireNonNull(snapshot, "snapshot must not be null");
+		lastSequence = persisted.lastSequence();
+		long previousSequence = 0L;
+		for (KillEvent event : persisted.events()) {
+			if (event.sequence() <= previousSequence || event.sequence() > lastSequence) {
+				throw new IllegalArgumentException("Kill ledger event sequence is outside persisted ordering");
+			}
+			append(event.agentId(), event.entityType(), event.occurredAtEpochMs(), event.sequence());
+			previousSequence = event.sequence();
 		}
-		for (ProgressEvent event : snapshot.progress()) {
-			ProgressKey key = new ProgressKey(event.goalId(), event.agentId(), event.entityType(), event.afterExclusive());
-			if (progress.putIfAbsent(key, new Progress(event.requiredCount(), event.evictedCount())) != null) {
+		for (ProgressEvent event : persisted.progress()) {
+			ProgressKey key = new ProgressKey(
+					event.goalId(), event.agentId(), event.entityType(), event.afterGoalStart());
+			Progress value = new Progress(
+					event.requiredCount(), event.evictedCount(), event.afterSequenceExclusive());
+			if (progress.putIfAbsent(key, value) != null) {
 				throw new IllegalArgumentException("Kill ledger contains duplicate goal progress");
 			}
 		}
@@ -42,29 +54,39 @@ public final class AgentKillLedger {
 	}
 
 	public synchronized void record(AgentId agentId, String entityType, long occurredAt) {
-		append(agentId, entityType, occurredAt);
+		long sequence = Math.incrementExact(lastSequence);
+		append(agentId, entityType, occurredAt, sequence);
+		lastSequence = sequence;
 		mutationListener.run();
 	}
 
-	private void append(AgentId agentId, String entityType, long occurredAt) {
+	private void append(AgentId agentId, String entityType, long occurredAt, long sequence) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		String type = Objects.requireNonNull(entityType, "entityType must not be null");
 		if (!type.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) throw new IllegalArgumentException("entityType must be namespaced");
 		if (occurredAt < 0L) throw new IllegalArgumentException("occurredAt must be nonnegative");
+		if (sequence <= 0L) throw new IllegalArgumentException("sequence must be positive");
 		KillKey key = new KillKey(agentId, type);
-		kills.addLast(new Kill(key, occurredAt));
-		killsByAgentAndType.computeIfAbsent(key, ignored -> new TimestampSeries()).add(occurredAt);
+		kills.addLast(new Kill(key, occurredAt, sequence));
+		killTimesByAgentAndType.computeIfAbsent(key, ignored -> new OrderedLongSeries()).add(occurredAt);
+		killSequencesByAgentAndType.computeIfAbsent(key, ignored -> new OrderedLongSeries()).add(sequence);
 		while (kills.size() > MAX_EVENTS) {
 			Kill removed = kills.removeFirst();
 			for (ProgressKey progressKey : progressByAgentAndType.getOrDefault(removed.key(), List.of())) {
-				if (removed.occurredAt() > progressKey.afterExclusive()) {
-					progress.computeIfPresent(progressKey, (ignored, value) -> value.creditEvicted());
+				Progress tracked = progress.get(progressKey);
+				if (tracked != null && removed.sequence() > tracked.afterSequenceExclusive()) {
+					progress.put(progressKey, tracked.creditEvicted());
 				}
 			}
-			TimestampSeries series = killsByAgentAndType.get(removed.key());
-			series.remove(removed.occurredAt());
-			if (series.isEmpty()) killsByAgentAndType.remove(removed.key());
+			removeIndexed(killTimesByAgentAndType, removed.key(), removed.occurredAt());
+			removeIndexed(killSequencesByAgentAndType, removed.key(), removed.sequence());
 		}
+	}
+
+	private static void removeIndexed(Map<KillKey, OrderedLongSeries> index, KillKey key, long value) {
+		OrderedLongSeries series = index.get(key);
+		series.remove(value);
+		if (series.isEmpty()) index.remove(key);
 	}
 
 	public synchronized Snapshot snapshot() {
@@ -72,21 +94,23 @@ public final class AgentKillLedger {
 				.sorted(Comparator.comparing((Map.Entry<ProgressKey, Progress> entry) -> entry.getKey().goalId().toString())
 						.thenComparing(entry -> entry.getKey().agentId().toString())
 						.thenComparing(entry -> entry.getKey().entityType())
-						.thenComparingLong(entry -> entry.getKey().afterExclusive()))
+						.thenComparing(entry -> entry.getKey().afterGoalStart()))
 				.map(entry -> new ProgressEvent(
 						entry.getKey().goalId(), entry.getKey().agentId(), entry.getKey().entityType(),
-						entry.getKey().afterExclusive(), entry.getValue().requiredCount(), entry.getValue().evictedCount()))
+						entry.getKey().afterGoalStart(), entry.getValue().afterSequenceExclusive(),
+						entry.getValue().requiredCount(), entry.getValue().evictedCount()))
 				.toList();
 		return new Snapshot(
 				SCHEMA_VERSION,
+				lastSequence,
 				kills.stream().map(kill -> new KillEvent(
-						kill.key().agentId(), kill.key().entityType(), kill.occurredAt())).toList(),
+						kill.key().agentId(), kill.key().entityType(), kill.occurredAt(), kill.sequence())).toList(),
 				persistedProgress
 		);
 	}
 
 	public static Snapshot emptySnapshot() {
-		return new Snapshot(SCHEMA_VERSION, List.of(), List.of());
+		return new Snapshot(SCHEMA_VERSION, 0L, List.of(), List.of());
 	}
 
 	public synchronized void synchronizeProgress(List<KillProgressRequirement> requirements) {
@@ -94,7 +118,7 @@ public final class AgentKillLedger {
 		Map<ProgressKey, Integer> desired = new HashMap<>();
 		for (KillProgressRequirement requirement : requirements) {
 			ProgressKey key = new ProgressKey(
-					requirement.goalId(), requirement.agentId(), requirement.entityType(), requirement.afterExclusive());
+					requirement.goalId(), requirement.agentId(), requirement.entityType(), requirement.afterGoalStart());
 			desired.merge(key, requirement.requiredCount(), Math::max);
 		}
 		if (desired.size() > MAX_PROGRESS_ENTRIES) {
@@ -104,7 +128,10 @@ public final class AgentKillLedger {
 		for (Map.Entry<ProgressKey, Integer> entry : desired.entrySet()) {
 			Progress previous = progress.get(entry.getKey());
 			int credited = previous == null ? 0 : Math.min(previous.evictedCount(), entry.getValue());
-			next.put(entry.getKey(), new Progress(entry.getValue(), credited));
+			long boundary = previous == null
+					? (entry.getKey().afterGoalStart() ? lastSequence : 0L)
+					: previous.afterSequenceExclusive();
+			next.put(entry.getKey(), new Progress(entry.getValue(), credited, boundary));
 		}
 		if (!next.equals(progress)) {
 			progress.clear();
@@ -122,26 +149,38 @@ public final class AgentKillLedger {
 		}
 	}
 
+	/** Timestamp query retained for diagnostics and compatibility. Goal verification uses persisted sequence fences. */
 	public synchronized int count(AgentId agentId, String entityType, long afterExclusive) {
 		Objects.requireNonNull(agentId, "agentId must not be null");
 		Objects.requireNonNull(entityType, "entityType must not be null");
-		TimestampSeries series = killsByAgentAndType.get(new KillKey(agentId, entityType));
+		OrderedLongSeries series = killTimesByAgentAndType.get(new KillKey(agentId, entityType));
+		return countAfter(series, afterExclusive);
+	}
+
+	public synchronized int count(
+			UUID goalId, AgentId agentId, String entityType, boolean afterGoalStart
+	) {
+		Objects.requireNonNull(goalId, "goalId must not be null");
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Objects.requireNonNull(entityType, "entityType must not be null");
+		Progress tracked = progress.get(new ProgressKey(goalId, agentId, entityType, afterGoalStart));
+		if (tracked == null) {
+			lastLookupProbeCount = 0;
+			return 0;
+		}
+		OrderedLongSeries series = killSequencesByAgentAndType.get(new KillKey(agentId, entityType));
+		int recent = countAfter(series, tracked.afterSequenceExclusive());
+		return recent + tracked.evictedCount();
+	}
+
+	private int countAfter(OrderedLongSeries series, long afterExclusive) {
 		if (series == null) {
 			lastLookupProbeCount = 0;
 			return 0;
 		}
-		TimestampSeries.Lookup lookup = series.countAfter(afterExclusive);
+		OrderedLongSeries.Lookup lookup = series.countAfter(afterExclusive);
 		lastLookupProbeCount = lookup.probes();
 		return lookup.count();
-	}
-
-	public synchronized int count(
-			UUID goalId, AgentId agentId, String entityType, long afterExclusive
-	) {
-		Objects.requireNonNull(goalId, "goalId must not be null");
-		int recent = count(agentId, entityType, afterExclusive);
-		Progress preserved = progress.get(new ProgressKey(goalId, agentId, entityType, afterExclusive));
-		return recent + (preserved == null ? 0 : preserved.evictedCount());
 	}
 
 	public synchronized int size() {
@@ -153,19 +192,24 @@ public final class AgentKillLedger {
 	}
 
 	private record KillKey(AgentId agentId, String entityType) { }
-	private record Kill(KillKey key, long occurredAt) { }
-	private record ProgressKey(UUID goalId, AgentId agentId, String entityType, long afterExclusive) { }
-	private record Progress(int requiredCount, int evictedCount) {
+	private record Kill(KillKey key, long occurredAt, long sequence) { }
+	private record ProgressKey(UUID goalId, AgentId agentId, String entityType, boolean afterGoalStart) { }
+	private record Progress(int requiredCount, int evictedCount, long afterSequenceExclusive) {
 		private Progress creditEvicted() {
-			return evictedCount >= requiredCount ? this : new Progress(requiredCount, evictedCount + 1);
+			return evictedCount >= requiredCount
+					? this
+					: new Progress(requiredCount, evictedCount + 1, afterSequenceExclusive);
 		}
 	}
 
-	public record Snapshot(int schemaVersion, List<KillEvent> events, List<ProgressEvent> progress) {
+	public record Snapshot(
+			int schemaVersion, long lastSequence, List<KillEvent> events, List<ProgressEvent> progress
+	) {
 		public Snapshot {
 			if (schemaVersion != SCHEMA_VERSION) {
 				throw new IllegalArgumentException("Unsupported kill ledger schema: " + schemaVersion);
 			}
+			if (lastSequence < 0L) throw new IllegalArgumentException("lastSequence must be nonnegative");
 			events = List.copyOf(Objects.requireNonNull(events, "events must not be null"));
 			progress = List.copyOf(Objects.requireNonNull(progress, "progress must not be null"));
 			if (events.size() > MAX_EVENTS) {
@@ -174,10 +218,14 @@ public final class AgentKillLedger {
 			if (progress.size() > MAX_PROGRESS_ENTRIES) {
 				throw new IllegalArgumentException("Kill ledger exceeds the bounded progress limit");
 			}
+			if (events.stream().anyMatch(event -> event.sequence() > lastSequence)
+					|| progress.stream().anyMatch(entry -> entry.afterSequenceExclusive() > lastSequence)) {
+				throw new IllegalArgumentException("Kill ledger ordering exceeds lastSequence");
+			}
 		}
 	}
 
-	public record KillEvent(AgentId agentId, String entityType, long occurredAtEpochMs) {
+	public record KillEvent(AgentId agentId, String entityType, long occurredAtEpochMs, long sequence) {
 		public KillEvent {
 			Objects.requireNonNull(agentId, "agentId must not be null");
 			Objects.requireNonNull(entityType, "entityType must not be null");
@@ -185,11 +233,12 @@ public final class AgentKillLedger {
 				throw new IllegalArgumentException("entityType must be namespaced");
 			}
 			if (occurredAtEpochMs < 0L) throw new IllegalArgumentException("occurredAtEpochMs must be nonnegative");
+			if (sequence <= 0L) throw new IllegalArgumentException("sequence must be positive");
 		}
 	}
 
 	public record KillProgressRequirement(
-			UUID goalId, AgentId agentId, String entityType, long afterExclusive, int requiredCount
+			UUID goalId, AgentId agentId, String entityType, boolean afterGoalStart, int requiredCount
 	) {
 		public KillProgressRequirement {
 			Objects.requireNonNull(goalId, "goalId must not be null");
@@ -205,18 +254,24 @@ public final class AgentKillLedger {
 	}
 
 	public record ProgressEvent(
-			UUID goalId, AgentId agentId, String entityType, long afterExclusive,
-			int requiredCount, int evictedCount
+			UUID goalId, AgentId agentId, String entityType, boolean afterGoalStart,
+			long afterSequenceExclusive, int requiredCount, int evictedCount
 	) {
 		public ProgressEvent {
-			new KillProgressRequirement(goalId, agentId, entityType, afterExclusive, requiredCount);
+			new KillProgressRequirement(goalId, agentId, entityType, afterGoalStart, requiredCount);
+			if (afterSequenceExclusive < 0L) {
+				throw new IllegalArgumentException("afterSequenceExclusive must be nonnegative");
+			}
+			if (!afterGoalStart && afterSequenceExclusive != 0L) {
+				throw new IllegalArgumentException("unfenced progress must start at sequence zero");
+			}
 			if (evictedCount < 0 || evictedCount > requiredCount) {
 				throw new IllegalArgumentException("evictedCount must be between zero and requiredCount");
 			}
 		}
 	}
 
-	private static final class TimestampSeries {
+	private static final class OrderedLongSeries {
 		private final ArrayList<Long> values = new ArrayList<>();
 
 		private void add(long value) {

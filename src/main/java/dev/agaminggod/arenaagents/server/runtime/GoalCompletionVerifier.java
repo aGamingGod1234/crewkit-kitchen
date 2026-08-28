@@ -203,9 +203,8 @@ public final class GoalCompletionVerifier {
 			return leaf("advancement_granted", granted, advancement.advancementId(), granted ? "granted" : "not granted");
 		}
 		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
-			long afterTime = killed.afterGoalStart() ? record.currentGoal().orElseThrow().createdAtEpochMs() : Long.MIN_VALUE;
-			int required = killAllocation.claim(new KillRequirement(killed.entityType(), afterTime));
-			int observed = kills.count(goalId, record.agentId(), killed.entityType(), afterTime);
+			int required = killAllocation.claim(new KillRequirement(killed.entityType(), killed.afterGoalStart()));
+			int observed = kills.count(goalId, record.agentId(), killed.entityType(), killed.afterGoalStart());
 			return leaf("entity_killed_by_agent", observed >= required,
 					killed.entityType() + " x" + required, killed.entityType() + " x" + observed);
 		}
@@ -263,11 +262,8 @@ public final class GoalCompletionVerifier {
 		}
 		if (predicate instanceof GoalPredicate.EntityKilledByAgent killed) {
 			KillAllocation claimed = allocation.copy();
-			long afterTime = killed.afterGoalStart()
-					? record.currentGoal().orElseThrow().createdAtEpochMs()
-					: Long.MIN_VALUE;
-			int required = claimed.claim(new KillRequirement(killed.entityType(), afterTime));
-			int observed = kills.count(goalId, record.agentId(), killed.entityType(), afterTime);
+			int required = claimed.claim(new KillRequirement(killed.entityType(), killed.afterGoalStart()));
+			int observed = kills.count(goalId, record.agentId(), killed.entityType(), killed.afterGoalStart());
 			if (observed < required) return Optional.empty();
 			GoalEvidence.Fact fact = new GoalEvidence.Fact(
 					"entity_killed_by_agent", true,
@@ -383,7 +379,7 @@ public final class GoalCompletionVerifier {
 
 	private record PredicateKey(UUID goalId, String path) { }
 	private record PositionCounter(int ticks, long lastTick) { }
-	private record KillRequirement(String entityType, long afterTime) { }
+	private record KillRequirement(String entityType, boolean afterGoalStart) { }
 	private record Evaluation(boolean satisfied, List<GoalEvidence.Fact> facts) { }
 	@FunctionalInterface
 	private interface AllocationContinuation {

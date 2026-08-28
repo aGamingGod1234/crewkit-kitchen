@@ -121,10 +121,9 @@ public final class GoalVerificationRuntimeVerification {
 		AgentId other = AgentId.random();
 		long goalCreated = fixture.record().currentGoal().orElseThrow().createdAtEpochMs();
 		fixture.runtime.killLedger().record(other, "minecraft:ender_dragon", goalCreated + 1L);
-		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", goalCreated - 1L);
-		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", goalCreated);
-		assertEquals(false, fixture.runtime.evaluate(fixture.agentId).verified(), "another player and pre-goal kills cannot satisfy attribution");
-		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:ender_dragon", goalCreated + 1L);
+		assertEquals(false, fixture.runtime.evaluate(fixture.agentId).verified(),
+				"another player's kill cannot satisfy attribution");
+		fixture.runtime.recordKill(fixture.agentId, "minecraft:ender_dragon");
 		assertEquals(true, fixture.runtime.evaluate(fixture.agentId).verified(), "responsible agent kill after goal start satisfies attribution");
 		assertEquals(1, fixture.runtime.tick().size(), "attributed kill completes once");
 		return 3;
@@ -315,21 +314,27 @@ public final class GoalVerificationRuntimeVerification {
 		facts.items.put("minecraft:iron_ingot", 1);
 		runtime.tick();
 		tick[0]++;
-		epoch[0]++;
 		runtime.tick();
 		long activation = data.registry().require(idle.agentId()).currentGoal().orElseThrow().createdAtEpochMs();
-		data.killLedger().record(idle.agentId(), "minecraft:zombie", activation);
+		assertEquals(epoch[0], activation,
+				"queued goal activates in the same millisecond as the earlier kill");
 
 		AgentSavedData restored = roundTripSavedData(data, false);
-		long[] restartEpoch = { activation + 1L };
+		long[] restartEpoch = { activation };
 		GoalVerificationRuntime restoredRuntime = new GoalVerificationRuntime(
 				restored.registry(), ignored -> Optional.of(facts), () -> 1L, () -> restartEpoch[0], restored.killLedger());
 		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
-				"persisted kills before or exactly at queued-goal activation remain fenced after restart");
+				"a same-millisecond kill before queued-goal activation remains fenced after restart");
 		restoredRuntime.recordKill(idle.agentId(), "minecraft:zombie");
 		assertEquals(true, restoredRuntime.evaluate(idle.agentId()).verified(),
-				"the first persisted kill strictly after activation satisfies the restored queued goal");
-		return 2;
+				"a kill after activation in that same millisecond satisfies the restored queued goal");
+		AgentSavedData restoredAgain = roundTripSavedData(restored, false);
+		GoalVerificationRuntime secondRestart = new GoalVerificationRuntime(
+				restoredAgain.registry(), ignored -> Optional.of(facts), () -> 2L, () -> restartEpoch[0],
+				restoredAgain.killLedger());
+		assertEquals(true, secondRestart.evaluate(idle.agentId()).verified(),
+				"same-millisecond post-activation attribution survives another restart");
+		return 4;
 	}
 
 	private static int verifyActiveKillProgressSurvivesLedgerEviction() {
@@ -361,7 +366,7 @@ public final class GoalVerificationRuntimeVerification {
 				"global kill history stays bounded while an active goal is tracked");
 		assertEquals(0, data.killLedger().count(idle.agentId(), "minecraft:zombie", activation),
 				"the qualifying kill is no longer present in the bounded event suffix");
-		assertEquals(1, data.killLedger().count(goalId, idle.agentId(), "minecraft:zombie", activation),
+		assertEquals(1, data.killLedger().count(goalId, idle.agentId(), "minecraft:zombie", true),
 				"eviction compacts the qualifying kill into bounded active-goal progress");
 
 		AgentSavedData restored = roundTripSavedData(data, false);
@@ -392,11 +397,25 @@ public final class GoalVerificationRuntimeVerification {
 
 		AgentKillLedgerCodec codec = new AgentKillLedgerCodec();
 		String encoded = codec.encode(data.killLedger().snapshot());
-		String legacyEncoding = encoded.replace("\"schema_version\":2", "\"schema_version\":1")
-				.replace(",\"progress\":[]", "");
+		String legacyEncoding = "{\"schema_version\":1,\"events\":[{\"agent_id\":\""
+				+ agentId + "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":1}]}";
 		assertEquals(1, codec.decode(legacyEncoding).events().size(),
 				"schema-one kill ledgers upgrade with empty compacted progress");
-		String unsupported = encoded.replace("\"schema_version\":2", "\"schema_version\":3");
+		UUID legacyGoalId = UUID.randomUUID();
+		String schemaTwo = "{\"schema_version\":2,\"events\":[{\"agent_id\":\"" + agentId
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":7}],\"progress\":[{"
+				+ "\"goal_id\":\"" + legacyGoalId + "\",\"agent_id\":\"" + agentId
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"after_exclusive\":7,"
+				+ "\"required_count\":1,\"evicted_count\":0}]}";
+		AgentKillLedger migrated = new AgentKillLedger(codec.decode(schemaTwo), () -> { });
+		migrated.synchronizeProgress(List.of(new AgentKillLedger.KillProgressRequirement(
+				legacyGoalId, agentId, "minecraft:zombie", true, 1)));
+		assertEquals(0, migrated.count(legacyGoalId, agentId, "minecraft:zombie", true),
+				"schema-two timestamps migrate to an exclusive sequence boundary");
+		migrated.record(agentId, "minecraft:zombie", 7L);
+		assertEquals(1, migrated.count(legacyGoalId, agentId, "minecraft:zombie", true),
+				"migrated schema accepts a later event with the same timestamp");
+		String unsupported = encoded.replace("\"schema_version\":3", "\"schema_version\":4");
 		try {
 			codec.decode(unsupported);
 			throw new AssertionError("unsupported kill-ledger schema must fail closed");
@@ -404,7 +423,7 @@ public final class GoalVerificationRuntimeVerification {
 			assertEquals("INVALID_PERSISTED_KILL_LEDGER", expected.code(),
 					"unsupported persisted kill-ledger versions are rejected explicitly");
 		}
-		return 3;
+		return 5;
 	}
 
 	private static int verifyIndexedKillLookup() {
