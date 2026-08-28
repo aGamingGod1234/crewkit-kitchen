@@ -13,6 +13,7 @@ public final class VoiceAddonVerificationMain {
 	public static void main(String[] arguments) throws Exception {
 		int assertions = 0;
 		assertions += verifyFabricMetadataLoadsOnIntegratedAndDedicatedServers();
+		assertions += ArenaAgentsVoiceChatPluginVerification.verify();
 		assertions += ServerSpeechCaptureRegistryVerification.verify();
 		assertions += VoicePlaybackCoordinatorVerification.verify();
 		assertions += SpeechCaptureEngineVerification.verify();
