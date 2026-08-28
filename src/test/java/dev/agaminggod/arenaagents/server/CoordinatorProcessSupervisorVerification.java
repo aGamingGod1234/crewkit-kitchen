@@ -82,7 +82,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyLaunchFailureRecovers();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 190;
+		return 198;
 	}
 
 	private static void verifyLaunchMaterialChangeFencesOwnedChild() {
@@ -1010,23 +1010,52 @@ public final class CoordinatorProcessSupervisorVerification {
 	}
 
 	private static void verifyPortOnlyChangeAdvancesBridgeRevision() {
-		Fixture fixture = Fixture.ready();
-		long originalRevision = fixture.supervisor.bridgeRevision();
-		CoordinatorProcessSupervisor.PreparedRuntime current = fixture.dependencies.runtime;
-		fixture.dependencies.runtime = new CoordinatorProcessSupervisor.PreparedRuntime(
-				current.root(), current.coordinatorRoot(), current.main(), current.config(), current.secret(),
-				current.nodeExecutable(), current.bridgeSecret(), 31_771, current.generationId(),
-				current.candidate(), current.lastKnownGoodAvailable()
-		);
-		fixture.dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(fixture.dependencies.runtime);
-		fixture.dependencies.fingerprint = "port-only-change";
-		fixture.supervisor.publishDependencyFingerprintChange();
-		fixture.supervisor.tick(false, null, 0L);
-		assertEquals(31_771, fixture.supervisor.bridgePort(),
-				"dependency publication carries the changed bridge port into Java");
-		assertTrue(fixture.supervisor.bridgeRevision() > originalRevision,
-				"a port-only config change advances the Java bridge rebind revision");
-		fixture.supervisor.close();
+		CodexAgentServerRuntime.BridgeSlot slot = null;
+		Socket reboundConnection = null;
+		Fixture fixture = null;
+		try {
+			int originalPort = unusedLoopbackPort();
+			int changedPort = unusedLoopbackPort();
+			while (changedPort == originalPort) changedPort = unusedLoopbackPort();
+			MutableDependencies dependencies = MutableDependencies.ready();
+			dependencies.setPort(originalPort);
+			fixture = new Fixture(dependencies);
+			CodexAgentManager manager = uninitializedManager();
+			slot = new CodexAgentServerRuntime.BridgeSlot(fixture.clock);
+			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, manager, fixture.supervisor);
+			long originalRevision = fixture.supervisor.bridgeRevision();
+			MultiplexedServerBridge originalBridge = slot.bridge();
+			assertTrue(originalBridge != null, "production bridge binds its initial configured port");
+
+			fixture.dependencies.setPort(changedPort);
+			fixture.dependencies.fingerprint = "port-only-change";
+			fixture.supervisor.publishDependencyFingerprintChange();
+			fixture.supervisor.tick(false, null, 0L);
+			assertEquals(changedPort, fixture.supervisor.bridgePort(),
+					"dependency publication carries the changed bridge port into Java");
+			assertTrue(fixture.supervisor.bridgeRevision() > originalRevision,
+					"a port-only config change advances the Java bridge rebind revision");
+
+			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, manager, fixture.supervisor);
+			MultiplexedServerBridge reboundBridge = slot.bridge();
+			assertTrue(reboundBridge != null && reboundBridge != originalBridge,
+					"production reconciliation replaces the listener after a port-only change");
+			try (ServerSocket released = new ServerSocket(originalPort, 1, InetAddress.getLoopbackAddress())) {
+				assertEquals(originalPort, released.getLocalPort(), "port-only reconciliation releases the old listener");
+			}
+			reboundConnection = authenticate(
+					changedPort, fixture.supervisor.bridgeSecret(),
+					"00000000-0000-0000-0000-000000000774", "port-only-production-rebind"
+			);
+			assertTrue(reboundBridge.authenticated(),
+					"replacement listener accepts authentication on the changed configured port");
+		} catch (Exception exception) {
+			throw new AssertionError("port-only production bridge rebind failed", exception);
+		} finally {
+			closeSocket(reboundConnection);
+			if (slot != null) slot.close();
+			if (fixture != null) fixture.supervisor.close();
+		}
 	}
 
 	private static void verifyAutoStartDisabledStillBindsExplicitBridge() {
@@ -1043,12 +1072,15 @@ public final class CoordinatorProcessSupervisorVerification {
 			System.setProperty("arenaagents.coordinatorAutoStart", "false");
 			System.setProperty("arenaagents.bridgeSecretFile", secretFile.toString());
 			System.setProperty("arenaagents.bridgePort", Integer.toString(port));
+			FakeLauncher launcher = new FakeLauncher();
 			supervisor = new CoordinatorProcessSupervisor(
 					Path.of("build", "explicit-bridge-game"), Map.of(), new FakeClock(), MutableDependencies.ready(),
-					new FakeLauncher(), () -> "00000000-0000-0000-0000-000000000772"
+					launcher, () -> "00000000-0000-0000-0000-000000000772"
 			);
 			assertEquals(CoordinatorRecoveryState.STOPPED, supervisor.snapshot().state(),
 					"disabled coordinator autostart stops only child-process supervision");
+			assertEquals(0, launcher.launches.size(),
+					"disabled coordinator autostart never launches a child coordinator");
 			slot = new CodexAgentServerRuntime.BridgeSlot(System::currentTimeMillis);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
 			assertTrue(slot.bridge() != null, "explicit bridge secret still constructs the Java listener");
@@ -1231,6 +1263,16 @@ public final class CoordinatorProcessSupervisorVerification {
 			this.fingerprint = fingerprint;
 			this.runtime = runtime(secretPath, secret);
 			this.result = CoordinatorProcessSupervisor.DependencyResolution.ready(runtime);
+		}
+
+		private void setPort(int port) {
+			CoordinatorProcessSupervisor.PreparedRuntime current = runtime;
+			runtime = new CoordinatorProcessSupervisor.PreparedRuntime(
+					current.root(), current.coordinatorRoot(), current.main(), current.config(), current.secret(),
+					current.nodeExecutable(), current.bridgeSecret(), port, current.generationId(),
+					current.candidate(), current.lastKnownGoodAvailable()
+			);
+			result = CoordinatorProcessSupervisor.DependencyResolution.ready(runtime);
 		}
 
 		private static CoordinatorProcessSupervisor.PreparedRuntime runtime(Path secretPath, String secret) {
