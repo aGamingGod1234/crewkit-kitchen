@@ -43,6 +43,8 @@ public final class MultiplexedServerBridgeVerification {
 	}
 
 	public static int verify() {
+		assertEquals(true, MultiplexedServerBridge.HANDSHAKE_RETRY_WAIT_MS > 0L,
+				"hello retries wait instead of spinning when the registry snapshot moves");
 		List<AgentRecord> registered = new ArrayList<>();
 		for (int index = 0; index <= AgentConstants.DEFAULT_AGENT_LIMIT; index++) {
 			registered.add(AgentRecord.create(
@@ -98,7 +100,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyRealBridgeSessionLifecycle();
 		verifyAtomicConversationWakePublication();
 		verifyCompletionResultFacts();
-		return 54;
+		return 55;
 	}
 
 	private static void verifyCompletionResultFacts() {
@@ -377,6 +379,8 @@ public final class MultiplexedServerBridgeVerification {
 			CodexAgentManager manager = (CodexAgentManager) unsafe.allocateInstance(CodexAgentManager.class);
 			Field savedData = CodexAgentManager.class.getDeclaredField("savedData");
 			unsafe.putObject(manager, unsafe.objectFieldOffset(savedData), new AgentSavedData());
+			Field pending = CodexAgentManager.class.getDeclaredField("pendingAgentRegistrations");
+			unsafe.putObject(manager, unsafe.objectFieldOffset(pending), java.util.concurrent.ConcurrentHashMap.newKeySet());
 			return manager;
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not allocate lifecycle-only manager", exception);
