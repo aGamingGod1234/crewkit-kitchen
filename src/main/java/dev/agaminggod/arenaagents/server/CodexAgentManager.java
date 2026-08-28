@@ -11,6 +11,7 @@ import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
@@ -38,8 +39,10 @@ import java.util.WeakHashMap;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
+import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -306,11 +309,18 @@ public final class CodexAgentManager {
 		}
 		AgentRecord record = savedData.registry().require(draft.agentId());
 		if (!draft.matches(record)) throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
-		dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate = draft.proposedPredicate().orElseThrow();
+		GoalPredicate predicate = draft.proposedPredicate().orElseThrow();
 		if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
 			GoalPredicateWorldValidator.validate(
 					GoalPredicateWorldValidator.requireLevel(server, draft.dimensionId()), predicate);
 		}
+		validateLiveAdvancementIdentifiers(
+				predicate,
+				id -> {
+					Identifier identifier = Identifier.tryParse(id);
+					return identifier != null && server.getAdvancements().get(identifier) != null;
+				}
+		);
 		GoalSpec spec = GoalSpec.create(
 				draft.originalRequest(), predicate, draft.createdAtTick());
 		long now = System.currentTimeMillis();
@@ -322,6 +332,29 @@ public final class CodexAgentManager {
 		};
 		savedData.removeGoalDraft(draftId);
 		return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.of(transition)));
+	}
+
+	static void validateLiveAdvancementIdentifiers(
+			GoalPredicate predicate,
+			Predicate<String> advancementExists
+	) {
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		Objects.requireNonNull(advancementExists, "advancementExists must not be null");
+		switch (predicate) {
+			case GoalPredicate.AdvancementGranted value -> {
+				if (!advancementExists.test(value.advancementId())) {
+					throw new AgentDomainException(
+							"UNKNOWN_GOAL_IDENTIFIER",
+							"advancement does not exist on this server: " + value.advancementId()
+					);
+				}
+			}
+			case GoalPredicate.AllOf value -> value.predicates().forEach(
+					child -> validateLiveAdvancementIdentifiers(child, advancementExists));
+			case GoalPredicate.AnyOf value -> value.predicates().forEach(
+					child -> validateLiveAdvancementIdentifiers(child, advancementExists));
+			default -> { }
+		}
 	}
 
 	public record GoalDraftResult(
