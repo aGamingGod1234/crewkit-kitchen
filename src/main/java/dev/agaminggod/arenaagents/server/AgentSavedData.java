@@ -231,11 +231,23 @@ public final class AgentSavedData extends SavedData {
 		}
 		goalDrafts.entrySet().removeIf(entry -> entry.getValue().agentId().equals(draft.agentId())
 				&& entry.getValue().requestingPlayerId().equals(draft.requestingPlayerId()));
+		pruneStaleGoalDrafts();
 		if (goalDrafts.size() >= registry.maxAgents() * 2) {
 			throw new AgentDomainException("GOAL_DRAFT_LIMIT_REACHED", "Too many pending goal clarifications");
 		}
 		goalDrafts.put(draft.draftId(), draft);
 		setDirty();
+	}
+
+	private void pruneStaleGoalDrafts() {
+		Map<AgentId, AgentRecord> currentRecords = new LinkedHashMap<>();
+		for (AgentRecord record : registry.records()) currentRecords.put(record.agentId(), record);
+		boolean removed = goalDrafts.entrySet().removeIf(entry -> {
+			PendingGoalDraft pending = entry.getValue();
+			AgentRecord current = currentRecords.get(pending.agentId());
+			return current == null || !pending.matches(current);
+		});
+		if (removed) setDirty();
 	}
 
 	public synchronized List<PendingGoalDraft> goalDrafts() {
