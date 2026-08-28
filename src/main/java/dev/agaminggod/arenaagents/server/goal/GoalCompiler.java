@@ -15,13 +15,18 @@ import java.util.regex.Pattern;
 import java.util.function.Predicate;
 import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.equipment.Equippable;
 
 public final class GoalCompiler {
 	private static final int MAX_COMPOUND_LEAVES = 16;
@@ -38,6 +43,12 @@ public final class GoalCompiler {
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
 	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK = Pattern.compile("^(?:build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
+	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
+			"\\s+(?:at|on)(?: coordinates?)?\\s+"
+					+ "(?:x\\s*=\\s*)?-?\\d+\\s*,?\\s*"
+					+ "(?:y\\s*=\\s*)?-?\\d+\\s*,?\\s*"
+					+ "(?:z\\s*=\\s*)?-?\\d+$"
+	);
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
 	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
 	private static final Pattern LIVE_STEERING = Pattern.compile(
@@ -148,6 +159,7 @@ public final class GoalCompiler {
 			List<String> matches = matchItems(item.group(3), registries);
 			if (matches.size() == 1) {
 				String itemId = matches.getFirst();
+				if (exceedsInventoryCapacity(itemId, count, registries)) return unrepresentableItemCount();
 				return accepted(original, new GoalPredicate.InventoryContains(itemId, count), createdAtTick,
 						"Goal set: obtain " + itemId + " x" + count + ".");
 			}
@@ -246,7 +258,9 @@ public final class GoalCompiler {
 				if (matches.size() != 1) return GoalCompilation.needsTranslation(matches.isEmpty()
 						? "I could not identify every Minecraft item in that request."
 						: "More than one Minecraft item matches part of that request.");
-				predicates.add(new GoalPredicate.InventoryContains(matches.getFirst(), clause.count()));
+				String itemId = matches.getFirst();
+				if (exceedsInventoryCapacity(itemId, clause.count(), registries)) return unrepresentableItemCount();
+				predicates.add(new GoalPredicate.InventoryContains(itemId, clause.count()));
 			} else {
 				List<String> matches = matchEntities(clause.target(), registries);
 				if (matches.size() != 1) return GoalCompilation.needsTranslation(matches.isEmpty()
@@ -310,6 +324,26 @@ public final class GoalCompiler {
 		);
 	}
 
+	private static boolean exceedsInventoryCapacity(String itemId, int count, RegistryAccess registries) {
+		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		Item item = itemRegistry.getValue(Identifier.parse(itemId));
+		int maxStackSize = item.getDefaultMaxStackSize();
+		int capacity = maxStackSize * Inventory.INVENTORY_SIZE;
+		Equippable equippable = item.components().get(DataComponents.EQUIPPABLE);
+		for (EquipmentSlot slot : Inventory.EQUIPMENT_SLOT_MAPPING.values()) {
+			if (slot == EquipmentSlot.OFFHAND || equippable != null
+					&& equippable.slot() == slot
+					&& equippable.canBeEquippedBy(EntityType.PLAYER.builtInRegistryHolder())) {
+				capacity += slot.limit(new ItemStack(item.builtInRegistryHolder(), maxStackSize)).getCount();
+			}
+		}
+		return count > capacity;
+	}
+
+	private static GoalCompilation unrepresentableItemCount() {
+		return GoalCompilation.rejected("The requested item count exceeds the player's inventory capacity for that item.");
+	}
+
 	private static GoalCompilation accepted(String original, GoalPredicate predicate, long createdAtTick, String message) {
 		return GoalCompilation.accepted(GoalSpec.create(original, predicate, createdAtTick), message);
 	}
@@ -350,7 +384,10 @@ public final class GoalCompiler {
 	}
 
 	private static List<String> relatedBlocks(String target, RegistryAccess registries) {
-		String wanted = normalizedTarget(target).replaceFirst("^(?:with|using|from|of)\\s+", "");
+		String wanted = BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(target))
+				.replaceFirst("")
+				.replaceFirst("^(?:with|using|from|of)\\s+", "")
+				.strip();
 		if (wanted.isEmpty()) return List.of();
 		Set<String> wantedForms = blockPhraseForms(wanted);
 		Registry<Block> blockRegistry = registries.lookup(Registries.BLOCK).orElse(BuiltInRegistries.BLOCK);

@@ -11,6 +11,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.component.DataComponentMap;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
 
 public final class GoalCompilerVerification {
 	private GoalCompilerVerification() {
@@ -19,8 +23,14 @@ public final class GoalCompilerVerification {
 	public static int verify() {
 		net.minecraft.SharedConstants.tryDetectVersion();
 		net.minecraft.server.Bootstrap.bootStrap();
+		bindItemStackSize(Items.APPLE, 64);
+		bindItemStackSize(Items.COBBLESTONE, 64);
+		bindItemStackSize(Items.DIAMOND_PICKAXE, 1);
+		bindItemStackSize(Items.IRON_AXE, 1);
+		bindItemStackSize(Items.IRON_PICKAXE, 1);
 		int assertions = 0;
 		assertions += verifyExactItemAndAmbiguity();
+		assertions += verifyInventoryCapacity();
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyCompoundItemsAndKills();
 		assertions += verifyDraftRoundTrip();
@@ -75,6 +85,46 @@ public final class GoalCompilerVerification {
 		assertEquals(GoalCompilation.Kind.NEEDS_TRANSLATION, make.kind(),
 				"make wording cannot be reduced to already-held inventory");
 		return 17;
+	}
+
+	private static int verifyInventoryCapacity() {
+		GoalCompiler compiler = new GoalCompiler();
+		GoalCompilation fullCobblestoneInventory = compiler.compile(
+				"Get 2368 cobblestone", RegistryAccess.EMPTY, 1_200L
+		);
+		assertEquals(GoalCompilation.Kind.ACCEPTED, fullCobblestoneInventory.kind(),
+				"general inventory and offhand stacks are representable");
+		assertEquals(
+				new GoalPredicate.InventoryContains("minecraft:cobblestone", 2_368),
+				fullCobblestoneInventory.acceptedSpec().orElseThrow().completion(),
+				"the stackable-item capacity boundary preserves the exact requested count"
+		);
+		assertEquals(
+				GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 2369 cobblestone", RegistryAccess.EMPTY, 1_200L).kind(),
+				"one item above the stackable-item capacity is rejected"
+		);
+		assertEquals(
+				GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 1000000 cobblestone", RegistryAccess.EMPTY, 1_200L).kind(),
+				"an unrepresentable million-item inventory goal is rejected"
+		);
+		assertEquals(
+				GoalCompilation.Kind.ACCEPTED,
+				compiler.compile("Get 37 iron pickaxes", RegistryAccess.EMPTY, 1_200L).kind(),
+				"unstackable tools can fill general inventory and offhand slots"
+		);
+		assertEquals(
+				GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 38 iron pickaxes", RegistryAccess.EMPTY, 1_200L).kind(),
+				"unstackable items use their resolved one-item stack limit"
+		);
+		assertEquals(
+				GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 2369 cobblestone and kill a zombie", RegistryAccess.EMPTY, 1_200L).kind(),
+				"compound inventory predicates enforce the same carrying capacity"
+		);
+		return 7;
 	}
 
 	private static int verifyExactPositionEntityAndAdvancement() {
@@ -132,11 +182,21 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Build with oak_planks", RegistryAccess.EMPTY),
 				"registry path spelling is normalized as a multiword block name"
 		);
+		assertEquals(
+				List.of("minecraft:crafting_table"),
+				compiler.candidateIdsFor("place a crafting table at 10 64 10", RegistryAccess.EMPTY),
+				"exact coordinates are removed before matching a block translation candidate"
+		);
+		assertEquals(
+				List.of("minecraft:crafting_table"),
+				compiler.candidateIdsFor("Place a crafting table at coordinates x=-10, y=64, z=10", RegistryAccess.EMPTY),
+				"labelled coordinate suffixes preserve the exact block candidate"
+		);
 		assertTrue(
 				!compiler.candidateIdsFor("Place oak planks", RegistryAccess.EMPTY).contains("minecraft:oak_button"),
 				"phrase matching does not expand a block request to unrelated same-material blocks"
 		);
-		return 12;
+		return 14;
 	}
 
 	private static int verifyCompoundItemsAndKills() {
@@ -356,5 +416,11 @@ public final class GoalCompilerVerification {
 		} catch (dev.agaminggod.arenaagents.agent.AgentDomainException exception) {
 			assertEquals(code, exception.code(), label);
 		}
+	}
+
+	private static void bindItemStackSize(Item item, int maxStackSize) {
+		item.builtInRegistryHolder().bindComponents(
+				DataComponentMap.builder().set(DataComponents.MAX_STACK_SIZE, maxStackSize).build()
+		);
 	}
 }
