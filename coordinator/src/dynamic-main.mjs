@@ -1711,15 +1711,23 @@ function createLocalSpeechFailover(localProvider, {
 	};
 	const switchToFallback = async (error, signal) => {
 		if (error?.name === 'AbortError' || signal?.aborted) throw error;
-		if (fallbackTtsFactory() === null) throw error;
+		const hasFallbackTts = fishApiKey !== null || platform === 'win32';
+		const hasFallbackStt = deepgramApiKey !== null;
+		if (!hasFallbackTts && !hasFallbackStt) throw error;
+		await closeLocal();
+		throwIfVoiceStartupAborted(signal);
 		activeTts = fallbackTtsFactory();
 		activeStt = fallbackSttFactory();
 		switched = true;
-		await closeLocal();
 	};
 	return Object.freeze({
 		tts: Object.freeze({
-			synthesize(request) { return activeTts.synthesize(request); },
+			synthesize(request) {
+				if (activeTts !== null) return activeTts.synthesize(request);
+				const error = new Error('Speech synthesis is not configured');
+				error.code = 'TTS_UNAVAILABLE';
+				return Promise.reject(error);
+			},
 		}),
 		stt: Object.freeze({
 			transcribe(request) { return activeStt.transcribe(request); },

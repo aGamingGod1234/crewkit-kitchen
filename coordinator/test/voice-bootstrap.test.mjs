@@ -301,6 +301,50 @@ test('local model warmup failure switches both channels to configured remote pro
 	assert.equal(localCloses, 1);
 });
 
+test('local model warmup failure preserves Deepgram-only STT on non-Windows hosts', async () => {
+	let active;
+	let localCloses = 0;
+	let deepgramProviders = 0;
+	const local = {
+		async warmup() { throw Object.assign(new Error('local models failed'), { code: 'LOCAL_SPEECH_WARMUP_FAILED' }); },
+		async synthesize() { throw new Error('failed local TTS must not receive traffic'); },
+		async transcribe() { throw new Error('failed local STT must not receive traffic'); },
+		async close() { localCloses += 1; },
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		DEEPGRAM_API_KEY: 'deepgram-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: () => { throw new Error('Fish TTS must not be created without a credential'); },
+		createWindowsTtsProvider: () => { throw new Error('Windows TTS must not be created on Linux'); },
+		createSttProvider: ({ apiKey }) => {
+			assert.equal(apiKey, 'deepgram-key');
+			assert.equal(localCloses, 1, 'Deepgram must not overlap the failed local provider');
+			deepgramProviders += 1;
+			return { async transcribe() { return { transcript: 'remote', confidence: 1 }; } };
+		},
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		await worker.warmup();
+		assert.equal(localCloses, 1, 'failed local provider is closed before fallback traffic starts');
+		assert.equal(deepgramProviders, 1);
+		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'remote');
+		await assert.rejects(
+			active.provider.synthesize({ text: 'hi' }),
+			(error) => error?.code === 'TTS_UNAVAILABLE',
+		);
+	} finally {
+		await worker.close();
+	}
+	assert.equal(localCloses, 1);
+});
+
 test('local cleanup failure cannot roll back a successful external fallback switch', async () => {
 	let active;
 	const local = {
