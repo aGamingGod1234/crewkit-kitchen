@@ -18,6 +18,7 @@ import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
 import dev.agaminggod.arenaagents.server.goal.GoalDraftResolution;
 import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
 import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
+import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
 import dev.agaminggod.arenaagents.server.goal.GoalPredicateWorldValidator;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntities;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntity;
@@ -42,6 +43,10 @@ import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -49,6 +54,8 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.FallingBlock;
@@ -314,8 +321,9 @@ public final class CodexAgentManager {
 			GoalPredicateWorldValidator.validate(
 					GoalPredicateWorldValidator.requireLevel(server, draft.dimensionId()), predicate);
 		}
-		validateLiveAdvancementIdentifiers(
+		validateGoalDraftPredicate(
 				predicate,
+				server.registryAccess(),
 				id -> {
 					Identifier identifier = Identifier.tryParse(id);
 					return identifier != null && server.getAdvancements().get(identifier) != null;
@@ -334,26 +342,62 @@ public final class CodexAgentManager {
 		return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.of(transition)));
 	}
 
-	static void validateLiveAdvancementIdentifiers(
+	static void validateGoalDraftPredicate(
 			GoalPredicate predicate,
+			RegistryAccess registries,
+			Predicate<String> advancementExists
+	) {
+		Objects.requireNonNull(registries, "registries must not be null");
+		Registry<Item> items = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		Registry<EntityType<?>> entities = registries.lookup(Registries.ENTITY_TYPE)
+				.orElse(BuiltInRegistries.ENTITY_TYPE);
+		validateLiveGoalIdentifiers(
+				predicate,
+				id -> contains(items, id),
+				id -> contains(entities, id),
+				advancementExists
+		);
+		GoalInventoryCapacity.validateTranslated(predicate, registries);
+	}
+
+	static void validateLiveGoalIdentifiers(
+			GoalPredicate predicate,
+			Predicate<String> itemExists,
+			Predicate<String> entityExists,
 			Predicate<String> advancementExists
 	) {
 		Objects.requireNonNull(predicate, "predicate must not be null");
+		Objects.requireNonNull(itemExists, "itemExists must not be null");
+		Objects.requireNonNull(entityExists, "entityExists must not be null");
 		Objects.requireNonNull(advancementExists, "advancementExists must not be null");
 		switch (predicate) {
+			case GoalPredicate.InventoryContains value -> requireLiveIdentifier(
+					itemExists.test(value.itemId()), "item", value.itemId());
+			case GoalPredicate.EntityKilledByAgent value -> requireLiveIdentifier(
+					entityExists.test(value.entityType()), "entity type", value.entityType());
 			case GoalPredicate.AdvancementGranted value -> {
-				if (!advancementExists.test(value.advancementId())) {
-					throw new AgentDomainException(
-							"UNKNOWN_GOAL_IDENTIFIER",
-							"advancement does not exist on this server: " + value.advancementId()
-					);
-				}
+				requireLiveIdentifier(
+						advancementExists.test(value.advancementId()), "advancement", value.advancementId());
 			}
 			case GoalPredicate.AllOf value -> value.predicates().forEach(
-					child -> validateLiveAdvancementIdentifiers(child, advancementExists));
+					child -> validateLiveGoalIdentifiers(child, itemExists, entityExists, advancementExists));
 			case GoalPredicate.AnyOf value -> value.predicates().forEach(
-					child -> validateLiveAdvancementIdentifiers(child, advancementExists));
+					child -> validateLiveGoalIdentifiers(child, itemExists, entityExists, advancementExists));
 			default -> { }
+		}
+	}
+
+	private static boolean contains(Registry<?> registry, String value) {
+		Identifier identifier = Identifier.tryParse(value);
+		return identifier != null && registry.containsKey(identifier);
+	}
+
+	private static void requireLiveIdentifier(boolean exists, String type, String value) {
+		if (!exists) {
+			throw new AgentDomainException(
+					"UNKNOWN_GOAL_IDENTIFIER",
+					type + " does not exist on this server: " + value
+			);
 		}
 	}
 

@@ -337,7 +337,7 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 				UUID.randomUUID(), target.agentId(), playerId, event.text(),
 				sourceLevel.dimension().identifier().toString(),
 				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess(), liveAdvancementTitles()), proposed, intent,
-				manager.server().getTickCount(), target.goalRevision(), target.currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId)
+				manager.server().getTickCount(), target.goalRevision(), PendingGoalDraft.expectedGoalIdFor(target)
 		);
 	}
 

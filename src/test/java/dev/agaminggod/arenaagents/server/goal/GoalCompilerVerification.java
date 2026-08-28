@@ -5,6 +5,7 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import java.util.LinkedHashMap;
@@ -663,7 +664,43 @@ public final class GoalCompilerVerification {
 				.acceptedSpec().orElseThrow();
 		AgentRecord started = AgentLifecycleReducer.start(idle, spec, 10_001L).after();
 		assertEquals(false, draft.matches(started), "draft becomes stale when the goal revision changes");
-		return 2;
+
+		UUID activeGoalId = started.currentGoal().orElseThrow().goalId();
+		assertEquals(Optional.of(activeGoalId), PendingGoalDraft.expectedGoalIdFor(started),
+				"unfinished work remains the exact expected goal for replace or queue");
+		PendingGoalDraft activeDraft = new PendingGoalDraft(
+				UUID.randomUUID(), started.agentId(), UUID.randomUUID(), "Get a diamond pickaxe",
+				Optional.of(new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 1)),
+				DraftIntent.CONFIRM_TRANSLATION, 101L, started.goalRevision(), Optional.of(activeGoalId)
+		);
+		assertEquals(true, activeDraft.matches(started), "unfinished work keeps its exact replace-or-queue fence");
+
+		GoalEvidence evidence = new GoalEvidence(
+				started.goalRevision(),
+				"inventory_contains",
+				List.of(new GoalEvidence.Fact(
+						"inventory_contains", true,
+						"minecraft:iron_pickaxe x1", "minecraft:iron_pickaxe x1"))
+		);
+		AgentRecord completed = AgentLifecycleReducer.satisfyGoal(
+				started, started.goalRevision(), evidence, 10_002L).after();
+		assertEquals(Optional.empty(), PendingGoalDraft.expectedGoalIdFor(completed),
+				"satisfied retained history is absent from a new draft's expected goal");
+
+		UUID requester = UUID.randomUUID();
+		PendingGoalDraft completedDraft = new PendingGoalDraft(
+				UUID.randomUUID(), completed.agentId(), requester, "Get a diamond pickaxe",
+				Optional.of(new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 1)),
+				DraftIntent.CONFIRM_TRANSLATION, 102L, completed.goalRevision(), Optional.empty()
+		);
+		assertEquals(true, completedDraft.matches(completed),
+				"a draft survives proposal and confirmation while satisfied history remains attached");
+		assertEquals(GoalDraftResolution.Operation.START,
+				GoalDraftResolution.authorize(completedDraft, requester, false, GoalDraftChoice.CONFIRM),
+				"ordinary confirm starts new work after a satisfied retained goal");
+		assertEquals(false, activeDraft.matches(completed),
+				"an unfinished-goal fence cannot match satisfied retained history");
+		return 8;
 	}
 
 	private static void assertEquals(Object expected, Object actual, String label) {

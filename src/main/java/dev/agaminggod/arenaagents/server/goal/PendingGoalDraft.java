@@ -1,8 +1,10 @@
 package dev.agaminggod.arenaagents.server.goal;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentValidators;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
+import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.List;
@@ -72,10 +74,17 @@ public record PendingGoalDraft(
 				createdAtTick, expectedGoalRevision, expectedGoalId);
 	}
 
-	public boolean matches(dev.agaminggod.arenaagents.agent.AgentRecord record) {
+	public boolean matches(AgentRecord record) {
 		Objects.requireNonNull(record, "record must not be null");
 		return record.agentId().equals(agentId)
 				&& record.goalRevision() == expectedGoalRevision
-				&& record.currentGoal().map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId).equals(expectedGoalId);
+				&& expectedGoalIdFor(record).equals(expectedGoalId);
+	}
+
+	public static Optional<UUID> expectedGoalIdFor(AgentRecord record) {
+		Objects.requireNonNull(record, "record must not be null");
+		return record.currentGoal()
+				.filter(goal -> goal.status() != GoalStatus.SATISFIED && goal.status() != GoalStatus.CANCELLED)
+				.map(dev.agaminggod.arenaagents.agent.AgentGoal::goalId);
 	}
 }
