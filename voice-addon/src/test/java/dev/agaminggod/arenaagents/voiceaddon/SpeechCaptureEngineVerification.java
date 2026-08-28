@@ -6,10 +6,14 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Queue;
 import java.util.UUID;
+import java.util.concurrent.AbstractExecutorService;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Delayed;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 final class SpeechCaptureEngineVerification {
@@ -23,6 +27,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyProductionSpeechEndpointFlushesWithinBudget();
 		assertions += verifyInputLatencyReportsOneCompletedUtterance();
 		assertions += verifySilenceFlushesOneOrderedUtterance();
+		assertions += verifyCanceledRunningSilenceTimerCannotFinishNewerAudio();
 		assertions += verifyWhisperChangeSplitsAndSequencesUtterances();
 		assertions += verifyMaximumDurationBoundsDecodedSamples();
 		assertions += verifyMalformedPacketDoesNotWedgeLaterSpeech();
@@ -33,6 +38,36 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		assertions += verifyCloseContinuesAfterDecoderCloseFailure();
 		return assertions;
+	}
+
+	private static int verifyCanceledRunningSilenceTimerCannotFinishNewerAudio() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		ManualScheduledExecutor scheduler = new ManualScheduledExecutor();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler, 20L, 32);
+		RecordingDecoder first = new RecordingDecoder();
+		RecordingDecoder afterClose = new RecordingDecoder();
+		Queue<RecordingDecoder> decoders = new ArrayDeque<>(List.of(first, afterClose));
+
+		engine.accept(PLAYER, false, new byte[] { 1 }, decoders::remove, Runnable::run,
+				(playerId, text, whispering) -> { });
+		engine.accept(PLAYER, false, new byte[] { 2 }, decoders::remove, Runnable::run,
+				(playerId, text, whispering) -> { });
+		assertEquals(true, scheduler.tasks.get(0).isCancelled(), "new packet cancels the prior silence timer");
+		scheduler.runEvenIfCancelled(0);
+		assertEquals(0, transcriber.captured.size(), "canceled running timer cannot finish newer audio");
+		assertEquals(false, first.closed, "canceled running timer cannot close the current decoder");
+
+		scheduler.runEvenIfCancelled(1);
+		assertEquals(1, transcriber.captured.size(), "current silence timer finishes exactly once");
+		assertEquals(true, Arrays.equals(new short[] { 1, 2 }, transcriber.captured.getFirst().samples),
+				"current timer preserves every packet in its epoch");
+
+		engine.accept(PLAYER, false, new byte[] { 3 }, decoders::remove, Runnable::run,
+				(playerId, text, whispering) -> { });
+		engine.close();
+		scheduler.runEvenIfCancelled(2);
+		assertEquals(1, transcriber.captured.size(), "closed generation fences a captured timer");
+		return 6;
 	}
 
 	private static int verifyInputLatencyReportsOneCompletedUtterance() {
@@ -413,6 +448,72 @@ final class SpeechCaptureEngineVerification {
 			if (closeAttempted != null) closeAttempted.countDown();
 			if (closeFailure != null) throw closeFailure;
 		}
+	}
+
+	private static final class ManualScheduledExecutor extends AbstractExecutorService
+			implements ScheduledExecutorService {
+		private final List<ManualFuture> tasks = new ArrayList<>();
+		private boolean shutdown;
+
+		private void runEvenIfCancelled(int index) {
+			tasks.get(index).runEvenIfCancelled();
+		}
+
+		@Override
+		public ScheduledFuture<?> schedule(Runnable command, long delay, TimeUnit unit) {
+			ManualFuture future = new ManualFuture(command);
+			tasks.add(future);
+			return future;
+		}
+
+		@Override
+		public <V> ScheduledFuture<V> schedule(Callable<V> callable, long delay, TimeUnit unit) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public ScheduledFuture<?> scheduleAtFixedRate(
+				Runnable command, long initialDelay, long period, TimeUnit unit
+		) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override
+		public ScheduledFuture<?> scheduleWithFixedDelay(
+				Runnable command, long initialDelay, long delay, TimeUnit unit
+		) {
+			throw new UnsupportedOperationException();
+		}
+
+		@Override public void shutdown() { shutdown = true; }
+		@Override public List<Runnable> shutdownNow() { shutdown = true; return List.of(); }
+		@Override public boolean isShutdown() { return shutdown; }
+		@Override public boolean isTerminated() { return shutdown; }
+		@Override public boolean awaitTermination(long timeout, TimeUnit unit) { return shutdown; }
+		@Override public void execute(Runnable command) { command.run(); }
+	}
+
+	private static final class ManualFuture implements ScheduledFuture<Object> {
+		private final Runnable command;
+		private boolean cancelled;
+		private boolean done;
+
+		private ManualFuture(Runnable command) {
+			this.command = command;
+		}
+
+		private void runEvenIfCancelled() {
+			command.run();
+			done = true;
+		}
+
+		@Override public long getDelay(TimeUnit unit) { return 0L; }
+		@Override public int compareTo(Delayed other) { return 0; }
+		@Override public boolean cancel(boolean mayInterruptIfRunning) { cancelled = true; return true; }
+		@Override public boolean isCancelled() { return cancelled; }
+		@Override public boolean isDone() { return done; }
+		@Override public Object get() { return null; }
+		@Override public Object get(long timeout, TimeUnit unit) { return null; }
 	}
 
 	private record Captured(UUID playerId, long sequence, boolean whispering, short[] samples) {

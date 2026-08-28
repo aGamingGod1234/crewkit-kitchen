@@ -3255,11 +3255,19 @@ test('publishes exact profile and recovery identity in extended coordinator stat
 	const run = await start({
 		codexService: provider,
 		traceWriter: diagnostics,
-		voiceStatusSnapshot: () => ({
+		voiceStatusSnapshot: () => [{
 			component: 'voice', state: 'degraded', fallbackMode: 'text', boundary: 'voice_provider',
 			failureCode: 'STT_TIMEOUT', consecutiveFailureCount: 1, nextProbeAtEpochMs: 5_000,
 			generation: 2, lastRecoveryAtEpochMs: null,
-		}),
+		}, {
+			component: 'voice:tts', state: 'ready', fallbackMode: null, boundary: null,
+			failureCode: null, consecutiveFailureCount: 0, nextProbeAtEpochMs: null,
+			generation: 1, lastRecoveryAtEpochMs: null,
+		}, {
+			component: 'voice:stt', state: 'degraded', fallbackMode: 'text', boundary: 'voice_stt_provider',
+			failureCode: 'STT_TIMEOUT', consecutiveFailureCount: 1, nextProbeAtEpochMs: 5_000,
+			generation: 1, lastRecoveryAtEpochMs: null,
+		}],
 		runtimeGeneration: generation,
 		setStatusInterval: (callback) => { publishStatus = callback; return 1; },
 		clearStatusInterval: () => {},
@@ -3274,6 +3282,8 @@ test('publishes exact profile and recovery identity in extended coordinator stat
 		assert.equal(status.components.find(({ component }) => component === 'provider:codex').boundary, 'create');
 		assert.equal(status.components.find(({ component }) => component === 'diagnostics').failureCode, 'DIAGNOSTIC_BACKPRESSURE');
 		assert.equal(status.components.find(({ component }) => component === 'voice').failureCode, 'STT_TIMEOUT');
+		assert.equal(status.components.find(({ component }) => component === 'voice:tts').state, 'ready');
+		assert.equal(status.components.find(({ component }) => component === 'voice:stt').failureCode, 'STT_TIMEOUT');
 	} finally { await run.coordinator.stop(); }
 });
 

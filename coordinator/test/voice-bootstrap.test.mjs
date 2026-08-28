@@ -141,6 +141,24 @@ test('voice bootstrap closes a worker when binding fails', async () => {
 	assert.equal(closes, 1);
 });
 
+test('voice bootstrap closes a prepared local provider when later setup fails', async () => {
+	let closes = 0;
+	const local = {
+		async synthesize() { return {}; },
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() { closes += 1; },
+	};
+	await assert.rejects(
+		startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+			platform: 'win32',
+			createLocalSpeechProvider: async () => local,
+			loadProfileStore: async () => { throw new Error('profile setup failed'); },
+		}),
+		/profile setup failed/,
+	);
+	assert.equal(closes, 1, 'partially prepared provider is not leaked between retries');
+});
+
 test('voice bootstrap prefers one local speech runtime for both expressive TTS and STT', async () => {
 	const captured = {};
 	let localCloses = 0;
@@ -168,13 +186,15 @@ test('voice bootstrap prefers one local speech runtime for both expressive TTS a
 
 	assert.equal(captured.options.provider, local);
 	assert.equal(captured.options.sttProvider, local);
+	assert.equal(warmups, 0, 'worker bind does not await optional model warmup');
+	await created.warmup();
 	assert.equal(warmups, 1);
 	await created.close();
 	assert.equal(serverCloses, 1);
 	assert.equal(localCloses, 1);
 });
 
-test('voice bootstrap does not report ready before local STT warmup settles', async () => {
+test('voice bootstrap exposes slow local warmup without delaying the bound worker', async () => {
 	let releaseWarmup;
 	const warmupGate = new Promise((resolve) => { releaseWarmup = resolve; });
 	const local = {
@@ -183,17 +203,18 @@ test('voice bootstrap does not report ready before local STT warmup settles', as
 		async transcribe() { return { transcript: '', confidence: 0 }; },
 		async close() {},
 	};
-	let settled = false;
-	const starting = startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {}, {
 		platform: 'win32',
 		loadProfileStore: async () => ({ store: { resolve() {} } }),
 		createLocalSpeechProvider: async () => local,
 		createVoiceServer: () => ({ async start() {}, async close() {} }),
-	}).then((worker) => { settled = true; return worker; });
+	});
+	let settled = false;
+	const warming = worker.warmup().then(() => { settled = true; });
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(settled, false);
 	releaseWarmup();
-	const worker = await starting;
+	await warming;
 	assert.equal(settled, true);
 	await worker.close();
 });

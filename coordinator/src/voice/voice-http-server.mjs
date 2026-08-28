@@ -5,6 +5,10 @@ import { TtsCache } from './tts-cache.mjs';
 
 const MAX_REQUEST_BYTES = 8 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_INITIAL_PROBE_DELAY_MS = 1_000;
+const DEFAULT_MAX_PROBE_DELAY_MS = 30_000;
+const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
+const PROBE_AGENT_ID = '00000000-0000-4000-8000-000000000000';
 
 export function createVoiceHttpServer({
 	provider,
@@ -16,6 +20,12 @@ export function createVoiceHttpServer({
 	port = 8_766,
 	maxConcurrent = 5,
 	requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+	now = Date.now,
+	scheduleProbe = defaultSchedule,
+	cancelProbe = clearTimeout,
+	initialProbeDelayMs = DEFAULT_INITIAL_PROBE_DELAY_MS,
+	maxProbeDelayMs = DEFAULT_MAX_PROBE_DELAY_MS,
+	probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
 } = {}) {
 	if (provider === null || typeof provider?.synthesize !== 'function') throw new TypeError('provider.synthesize is required');
 	if (profileStore === null || typeof profileStore?.resolve !== 'function') throw new TypeError('profileStore.resolve is required');
@@ -24,33 +34,32 @@ export function createVoiceHttpServer({
 	if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new TypeError('port is invalid');
 	if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > 5) throw new TypeError('maxConcurrent must be between 1 and 5');
 	if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > 120_000) throw new TypeError('requestTimeoutMs must be between 1 and 120000');
+	if (typeof now !== 'function' || typeof scheduleProbe !== 'function' || typeof cancelProbe !== 'function') {
+		throw new TypeError('voice probe clock and scheduler must be functions');
+	}
+	for (const [name, value] of Object.entries({ initialProbeDelayMs, maxProbeDelayMs, probeTimeoutMs })) {
+		if (!Number.isSafeInteger(value) || value < 1 || value > 120_000) throw new TypeError(`${name} must be between 1 and 120000`);
+	}
+	if (maxProbeDelayMs < initialProbeDelayMs) throw new TypeError('maxProbeDelayMs must not be less than initialProbeDelayMs');
 
 	let active = 0;
 	const controllers = new Set();
 	let startPromise = null;
 	let closePromise = null;
-	let lifecycleState = 'unknown';
-	let lifecycleBoundary = 'voice_start';
-	let lifecycleCode = 'VOICE_NOT_STARTED';
-	let lifecycleFailures = 0;
-	let lifecycleGeneration = 0;
-	let lastRecoveryAtEpochMs = null;
-	const recordFailure = (error, boundary) => {
-		lifecycleState = 'degraded';
-		lifecycleBoundary = boundary;
-		lifecycleCode = voiceFailureCode(error);
-		lifecycleFailures = Math.min(1_000_000, lifecycleFailures + 1);
-		lifecycleGeneration += 1;
+	const lifecycleOptions = {
+		now, schedule: scheduleProbe, cancelSchedule: cancelProbe,
+		initialRetryMs: initialProbeDelayMs, maxRetryMs: maxProbeDelayMs, probeTimeoutMs,
 	};
-	const recordReady = () => {
-		if (lifecycleState === 'ready') return;
-		if (lifecycleState === 'degraded') lastRecoveryAtEpochMs = Date.now();
-		lifecycleState = 'ready';
-		lifecycleBoundary = null;
-		lifecycleCode = null;
-		lifecycleFailures = 0;
-		lifecycleGeneration += 1;
-	};
+	const ttsLifecycle = new VoiceChannelLifecycle({
+		component: 'voice:tts', boundary: 'voice_tts_provider',
+		probe: (signal) => probeTts(provider, profileStore, signal),
+		...lifecycleOptions,
+	});
+	const sttLifecycle = new VoiceChannelLifecycle({
+		component: 'voice:stt', boundary: 'voice_stt_provider',
+		probe: (signal) => probeStt(sttProvider, signal),
+		...lifecycleOptions,
+	});
 	const server = createServer(async (request, response) => {
 		if (request.method === 'GET' && request.url === '/health') {
 			respondJson(response, 200, { ready: true, active, maxConcurrent });
@@ -90,21 +99,21 @@ export function createVoiceHttpServer({
 			error.name = 'TimeoutError';
 			controller.abort(error);
 		}, requestTimeoutMs);
-		let providerAttempted = false;
+		let attemptedLifecycle = null;
 		try {
 			if (request.url === '/v1/stt') {
 				requireContentType(request.headers['content-type'], 'audio/l16;rate=48000;channels=1');
+				attemptedLifecycle = sttLifecycle;
 				if (sttProvider === null || typeof sttProvider.transcribe !== 'function') {
 					throw typedError('STT_UNAVAILABLE', 'Speech recognition is not configured');
 				}
 				const metadata = validateSttHeaders(request.headers);
 				const pcm = await awaitAbortable(readBytes(request, 48_000 * 2 * 20), controller.signal);
-				providerAttempted = true;
 				const result = validateTranscriptResult(await awaitAbortable(
 					Promise.resolve().then(() => sttProvider.transcribe({ pcm, signal: controller.signal })),
 					controller.signal,
 				));
-				recordReady();
+				sttLifecycle.recordReady();
 				respondJson(response, 200, {
 					playerId: metadata.playerId,
 					utteranceSequence: metadata.utteranceSequence,
@@ -129,7 +138,7 @@ export function createVoiceHttpServer({
 			});
 			let output = cache.get(cacheKey);
 			if (output === null) {
-				providerAttempted = true;
+				attemptedLifecycle = ttsLifecycle;
 				const synthesized = validateSynthesis(await awaitAbortable(
 					Promise.resolve().then(() => provider.synthesize({
 						text: payload.text,
@@ -141,7 +150,7 @@ export function createVoiceHttpServer({
 				));
 				output = resampleS16leMono(synthesized.pcm, synthesized.sampleRateHz, 48_000, 20);
 				if (output.length === 0) throw typedError('TTS_MALFORMED_AUDIO', 'TTS output was empty');
-				recordReady();
+				ttsLifecycle.recordReady();
 				cache.set(cacheKey, output);
 			}
 			response.writeHead(200, {
@@ -154,7 +163,7 @@ export function createVoiceHttpServer({
 			});
 			response.end(output);
 		} catch (error) {
-			if (providerAttempted && error?.name !== 'AbortError') recordFailure(error, 'voice_provider');
+			if (attemptedLifecycle !== null && error?.name !== 'AbortError') attemptedLifecycle.recordFailure(error);
 			if (!response.headersSent) respondJson(response, statusFor(error), {
 				code: String(error?.code ?? 'TTS_ERROR').slice(0, 64),
 				message: String(error?.message ?? error).slice(0, 256),
@@ -172,11 +181,12 @@ export function createVoiceHttpServer({
 	return Object.freeze({
 		server,
 		statusSnapshot() {
-			return Object.freeze({
-				component: 'voice', state: lifecycleState, fallbackMode: lifecycleState === 'ready' ? null : 'text',
-				boundary: lifecycleBoundary, failureCode: lifecycleCode, consecutiveFailureCount: lifecycleFailures,
-				nextProbeAtEpochMs: null, generation: lifecycleGeneration, lastRecoveryAtEpochMs,
-			});
+			return aggregateVoiceStatus(ttsLifecycle.snapshot(), sttLifecycle.snapshot());
+		},
+		statusSnapshots() {
+			const tts = ttsLifecycle.snapshot();
+			const stt = sttLifecycle.snapshot();
+			return Object.freeze([aggregateVoiceStatus(tts, stt), tts, stt]);
 		},
 		async start() {
 			if (closePromise !== null) throw typedError('VOICE_WORKER_CLOSED', 'Voice worker has been closed');
@@ -197,10 +207,8 @@ export function createVoiceHttpServer({
 			});
 			try {
 				const address = await startPromise;
-				recordReady();
 				return address;
 			} catch (error) {
-				recordFailure(error, 'voice_start');
 				throw error;
 			} finally {
 				startPromise = null;
@@ -209,6 +217,8 @@ export function createVoiceHttpServer({
 		async close() {
 			if (closePromise !== null) return closePromise;
 			closePromise = (async () => {
+				ttsLifecycle.close();
+				sttLifecycle.close();
 				if (startPromise !== null) {
 					try { await startPromise; }
 					catch { /* close still flushes assignments after a failed bind */ }
@@ -222,6 +232,193 @@ export function createVoiceHttpServer({
 			return closePromise;
 		},
 	});
+}
+
+class VoiceChannelLifecycle {
+	#component;
+	#boundary;
+	#probe;
+	#now;
+	#schedule;
+	#cancelSchedule;
+	#initialRetryMs;
+	#maxRetryMs;
+	#probeTimeoutMs;
+	#state = 'ready';
+	#failureCode = null;
+	#failures = 0;
+	#nextProbeAt = null;
+	#generation = 1;
+	#lastRecoveryAt = null;
+	#epoch = 0;
+	#timer = null;
+	#probeTimeout = null;
+	#probeController = null;
+	#probeInFlight = false;
+	#closed = false;
+
+	constructor({ component, boundary, probe, now, schedule, cancelSchedule, initialRetryMs, maxRetryMs, probeTimeoutMs }) {
+		this.#component = component;
+		this.#boundary = boundary;
+		this.#probe = probe;
+		this.#now = now;
+		this.#schedule = schedule;
+		this.#cancelSchedule = cancelSchedule;
+		this.#initialRetryMs = initialRetryMs;
+		this.#maxRetryMs = maxRetryMs;
+		this.#probeTimeoutMs = probeTimeoutMs;
+	}
+
+	recordFailure(error) {
+		if (this.#closed) return;
+		this.#state = 'degraded';
+		this.#failureCode = voiceFailureCode(error);
+		this.#failures = Math.min(1_000_000, this.#failures + 1);
+		this.#generation += 1;
+		if (this.#timer === null && !this.#probeInFlight) this.#scheduleRetry();
+	}
+
+	recordReady() {
+		if (this.#closed) return;
+		const recovered = this.#state !== 'ready';
+		this.#epoch += 1;
+		if (this.#timer !== null) this.#cancelSchedule(this.#timer);
+		if (this.#probeTimeout !== null) this.#cancelSchedule(this.#probeTimeout);
+		this.#timer = null;
+		this.#probeTimeout = null;
+		this.#probeController?.abort();
+		this.#probeController = null;
+		this.#probeInFlight = false;
+		this.#state = 'ready';
+		this.#failureCode = null;
+		this.#failures = 0;
+		this.#nextProbeAt = null;
+		if (recovered) {
+			this.#lastRecoveryAt = this.#now();
+			this.#generation += 1;
+		}
+	}
+
+	snapshot() {
+		return Object.freeze({
+			component: this.#component,
+			state: this.#state,
+			fallbackMode: this.#state === 'ready' ? null : 'text',
+			boundary: this.#state === 'ready' ? null : this.#boundary,
+			failureCode: this.#failureCode,
+			consecutiveFailureCount: this.#failures,
+			nextProbeAtEpochMs: this.#nextProbeAt,
+			generation: this.#generation,
+			lastRecoveryAtEpochMs: this.#lastRecoveryAt,
+		});
+	}
+
+	close() {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#epoch += 1;
+		if (this.#timer !== null) this.#cancelSchedule(this.#timer);
+		if (this.#probeTimeout !== null) this.#cancelSchedule(this.#probeTimeout);
+		this.#probeController?.abort();
+		this.#timer = null;
+		this.#probeTimeout = null;
+		this.#probeController = null;
+		this.#probeInFlight = false;
+	}
+
+	#scheduleRetry() {
+		const delay = Math.min(this.#maxRetryMs, this.#initialRetryMs * 2 ** Math.min(20, this.#failures - 1));
+		this.#nextProbeAt = this.#now() + delay;
+		const epoch = ++this.#epoch;
+		this.#timer = this.#schedule(() => {
+			if (this.#closed || epoch !== this.#epoch) return;
+			this.#timer = null;
+			void this.#runProbe(epoch);
+		}, delay);
+	}
+
+	async #runProbe(epoch) {
+		if (this.#closed || epoch !== this.#epoch || this.#probeInFlight) return;
+		this.#probeInFlight = true;
+		const controller = new AbortController();
+		this.#probeController = controller;
+		let failure = null;
+		try {
+			await Promise.race([
+				Promise.resolve().then(() => this.#probe(controller.signal)),
+				new Promise((_, reject) => {
+					this.#probeTimeout = this.#schedule(() => {
+						const error = typedError(`${this.#component === 'voice:stt' ? 'STT' : 'TTS'}_TIMEOUT`, 'Voice health probe timed out');
+						error.name = 'TimeoutError';
+						reject(error);
+						controller.abort();
+					}, this.#probeTimeoutMs);
+				}),
+			]);
+		} catch (error) {
+			failure = error;
+		} finally {
+			if (this.#probeTimeout !== null) this.#cancelSchedule(this.#probeTimeout);
+			if (epoch !== this.#epoch || this.#closed) return;
+			this.#probeTimeout = null;
+			this.#probeController = null;
+			this.#probeInFlight = false;
+		}
+		if (failure === null) this.recordReady();
+		else this.recordFailure(failure);
+	}
+}
+
+function aggregateVoiceStatus(tts, stt) {
+	const failed = [tts, stt].find((snapshot) => snapshot.state !== 'ready');
+	if (failed === undefined) {
+		return Object.freeze({
+			component: 'voice', state: 'ready', fallbackMode: null, boundary: null, failureCode: null,
+			consecutiveFailureCount: 0, nextProbeAtEpochMs: null,
+			generation: tts.generation + stt.generation,
+			lastRecoveryAtEpochMs: latestRecovery(tts, stt),
+		});
+	}
+	return Object.freeze({
+		component: 'voice', state: failed.state, fallbackMode: 'text', boundary: 'voice_provider',
+		failureCode: failed.failureCode,
+		consecutiveFailureCount: Math.max(tts.consecutiveFailureCount, stt.consecutiveFailureCount),
+		nextProbeAtEpochMs: earliestProbe(tts, stt),
+		generation: tts.generation + stt.generation,
+		lastRecoveryAtEpochMs: latestRecovery(tts, stt),
+	});
+}
+
+async function probeTts(provider, profileStore, signal) {
+	if (typeof provider.probe === 'function') return provider.probe({ signal });
+	if (typeof provider.warmup === 'function') return provider.warmup({ signal });
+	const profile = profileStore.resolve(PROBE_AGENT_ID);
+	validateSynthesis(await provider.synthesize({ text: '.', voiceId: profile.voiceId, speed: profile.speed, signal }));
+}
+
+async function probeStt(provider, signal) {
+	if (provider === null || typeof provider?.transcribe !== 'function') {
+		throw typedError('STT_UNAVAILABLE', 'Speech recognition is not configured');
+	}
+	if (typeof provider.probe === 'function') return provider.probe({ signal });
+	if (typeof provider.warmup === 'function') return provider.warmup({ signal });
+	validateTranscriptResult(await provider.transcribe({ pcm: Buffer.alloc(1_920), signal }));
+}
+
+function earliestProbe(...snapshots) {
+	const values = snapshots.map((snapshot) => snapshot.nextProbeAtEpochMs).filter(Number.isSafeInteger);
+	return values.length === 0 ? null : Math.min(...values);
+}
+
+function latestRecovery(...snapshots) {
+	const values = snapshots.map((snapshot) => snapshot.lastRecoveryAtEpochMs).filter(Number.isSafeInteger);
+	return values.length === 0 ? null : Math.max(...values);
+}
+
+function defaultSchedule(callback, delay) {
+	const timer = setTimeout(callback, delay);
+	timer.unref?.();
+	return timer;
 }
 
 function voiceFailureCode(error) {

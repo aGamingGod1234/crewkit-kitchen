@@ -14,33 +14,74 @@ const SECRET = 'voice-edge-verification-secret';
 const AGENT = '00000000-0000-4000-8000-000000000001';
 const PLAYER = '10000000-0000-4000-8000-000000000001';
 
-test('voice lifecycle snapshot reports provider failure and a later recovery', async () => {
+test('TTS lifecycle automatically probes and recovers while STT remains independently ready', async () => {
 	let calls = 0;
+	let probes = 0;
+	let releaseProbe;
+	const probeGate = new Promise((resolve) => { releaseProbe = resolve; });
 	await withWorker({
 		provider: { async synthesize() {
 			calls += 1;
-			if (calls === 1) {
-				const error = new Error('temporary provider failure');
-				error.code = 'TTS_UNAVAILABLE';
-				throw error;
-			}
-			return validSynthesis();
-		} },
+			const error = new Error('temporary provider failure');
+			error.code = 'TTS_UNAVAILABLE';
+			throw error;
+		}, async probe() { probes += 1; await probeGate; } },
+		initialProbeDelayMs: 10,
+		maxProbeDelayMs: 10,
 	}, async ({ worker, baseUrl }) => {
 		assert.equal(worker.statusSnapshot().state, 'ready');
 		const failed = await fetch(`${baseUrl}/v1/tts`, { method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()) });
 		assert.equal(failed.status, 502);
-		assert.deepEqual(worker.statusSnapshot(), {
-			component: 'voice', state: 'degraded', fallbackMode: 'text', boundary: 'voice_provider',
-			failureCode: 'TTS_UNAVAILABLE', consecutiveFailureCount: 1, nextProbeAtEpochMs: null,
-			generation: 2, lastRecoveryAtEpochMs: null,
+		const failedSnapshots = worker.statusSnapshots();
+		assert.equal(failedSnapshots.find(({ component }) => component === 'voice:tts').failureCode, 'TTS_UNAVAILABLE');
+		assert.equal(failedSnapshots.find(({ component }) => component === 'voice:stt').state, 'ready');
+		assert.ok(Number.isSafeInteger(failedSnapshots.find(({ component }) => component === 'voice:tts').nextProbeAtEpochMs));
+		releaseProbe();
+		await eventually(() => worker.statusSnapshots().find(({ component }) => component === 'voice:tts').state === 'ready');
+		assert.equal(probes, 1, 'idle recovery uses one lightweight probe');
+		assert.equal(calls, 1, 'recovery does not need another user TTS request');
+	});
+});
+
+test('permanent STT failure remains degraded after successful TTS traffic', async () => {
+	let sttProbes = 0;
+	await withWorker({
+		provider: { async synthesize() { return validSynthesis(); } },
+		sttProvider: {
+			async transcribe() { throw Object.assign(new Error('STT offline'), { code: 'STT_UNAVAILABLE' }); },
+			async probe() { sttProbes += 1; throw Object.assign(new Error('STT offline'), { code: 'STT_UNAVAILABLE' }); },
+		},
+		initialProbeDelayMs: 10,
+		maxProbeDelayMs: 20,
+	}, async ({ worker, baseUrl }) => {
+		const failed = await fetch(`${baseUrl}/v1/stt`, { method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2) });
+		assert.equal(failed.status, 503);
+		const tts = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
 		});
-		const recovered = await fetch(`${baseUrl}/v1/tts`, { method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'recovery' }) });
-		assert.equal(recovered.status, 200);
-		const snapshot = worker.statusSnapshot();
-		assert.equal(snapshot.state, 'ready');
-		assert.equal(snapshot.generation, 3);
-		assert.ok(Number.isSafeInteger(snapshot.lastRecoveryAtEpochMs));
+		assert.equal(tts.status, 200);
+		await eventually(() => sttProbes >= 1);
+		const snapshots = worker.statusSnapshots();
+		assert.equal(snapshots.find(({ component }) => component === 'voice:tts').state, 'ready');
+		assert.equal(snapshots.find(({ component }) => component === 'voice:stt').state, 'degraded');
+		assert.equal(snapshots.find(({ component }) => component === 'voice').failureCode, 'STT_UNAVAILABLE');
+	});
+});
+
+test('transient STT failure automatically recovers while idle', async () => {
+	let probes = 0;
+	await withWorker({
+		sttProvider: {
+			async transcribe() { throw Object.assign(new Error('temporary STT failure'), { code: 'STT_TIMEOUT' }); },
+			async probe() { probes += 1; },
+		},
+		initialProbeDelayMs: 10,
+		maxProbeDelayMs: 10,
+	}, async ({ worker, baseUrl }) => {
+		const failed = await fetch(`${baseUrl}/v1/stt`, { method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2) });
+		assert.equal(failed.status, 502);
+		await eventually(() => worker.statusSnapshots().find(({ component }) => component === 'voice:stt').state === 'ready');
+		assert.equal(probes, 1);
 	});
 });
 
@@ -337,6 +378,8 @@ async function withWorker(options, verification) {
 		secret: SECRET,
 		maxConcurrent: options.maxConcurrent,
 		requestTimeoutMs: options.requestTimeoutMs,
+		initialProbeDelayMs: options.initialProbeDelayMs,
+		maxProbeDelayMs: options.maxProbeDelayMs,
 		port: 0,
 	});
 	const address = await worker.start();
@@ -357,6 +400,14 @@ async function eventuallyActive(baseUrl, expected) {
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
 	throw new Error(`voice worker active count did not reach ${expected}`);
+}
+
+async function eventually(predicate) {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if (predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error('voice lifecycle did not reach the expected state');
 }
 
 function validSynthesis() {

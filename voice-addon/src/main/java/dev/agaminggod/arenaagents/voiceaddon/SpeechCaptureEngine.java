@@ -124,8 +124,11 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				utterance.lastPacketNanos = System.nanoTime();
 				if (utterance.timeout != null) utterance.timeout.cancel(false);
 				Utterance current = utterance;
+				long timeoutEpoch = ++utterance.timeoutEpoch;
 				utterance.timeout = scheduler.schedule(
-						() -> finishIfCurrent(playerId, current), silenceMilliseconds, TimeUnit.MILLISECONDS
+						() -> finishIfCurrent(playerId, current, timeoutEpoch),
+						silenceMilliseconds,
+						TimeUnit.MILLISECONDS
 				);
 				if (utterance.length >= maxSamples) completed.add(finishLocked(playerId, utterance));
 			}
@@ -140,10 +143,10 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		decoderRetryAfterNanos = now > Long.MAX_VALUE - delay ? Long.MAX_VALUE : now + delay;
 	}
 
-	private void finishIfCurrent(UUID playerId, Utterance expected) {
+	private void finishIfCurrent(UUID playerId, Utterance expected, long timeoutEpoch) {
 		CompletedUtterance completed;
 		synchronized (this) {
-			if (closed || utterances.get(playerId) != expected) return;
+			if (closed || utterances.get(playerId) != expected || expected.timeoutEpoch != timeoutEpoch) return;
 			completed = finishLocked(playerId, expected);
 		}
 		transcribe(completed);
@@ -151,6 +154,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 
 	private CompletedUtterance finishLocked(UUID playerId, Utterance utterance) {
 		utterances.remove(playerId, utterance);
+		utterance.timeoutEpoch++;
 		if (utterance.timeout != null) utterance.timeout.cancel(false);
 		boolean decoderClosed = closeDecoder(utterance.decoder);
 		return new CompletedUtterance(
@@ -167,6 +171,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 
 	private CompletedUtterance discardLocked(UUID playerId, Utterance utterance) {
 		utterances.remove(playerId, utterance);
+		utterance.timeoutEpoch++;
 		if (utterance.timeout != null) utterance.timeout.cancel(false);
 		closeDecoder(utterance.decoder);
 		return new CompletedUtterance(
@@ -311,6 +316,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		if (closed) return;
 		closed = true;
 		for (Utterance utterance : utterances.values()) {
+			utterance.timeoutEpoch++;
 			if (utterance.timeout != null) utterance.timeout.cancel(false);
 			closeDecoder(utterance.decoder);
 		}
@@ -361,6 +367,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		private int length;
 		private long lastPacketNanos;
 		private ScheduledFuture<?> timeout;
+		private long timeoutEpoch;
 
 		private Utterance(
 				UUID playerId,

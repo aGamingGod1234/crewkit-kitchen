@@ -46,6 +46,7 @@ import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
 import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
 import { LocalSpeechProvider } from './voice/local-speech-provider.mjs';
 import { createVoiceHttpServer } from './voice/voice-http-server.mjs';
+import { VoiceSupervisor } from './voice/voice-supervisor.mjs';
 import { loadPersistentVoiceProfileStore } from './voice/voice-profile-store.mjs';
 import { WindowsTtsProvider } from './voice/windows-tts-provider.mjs';
 
@@ -1747,7 +1748,8 @@ export class DynamicCoordinator extends EventEmitter {
 		} catch { /* optional status must not affect coordinator control */ }
 		try {
 			const voice = this.#voiceStatusSnapshot?.();
-			if (voice !== null && voice !== undefined) components.push(voice);
+			if (Array.isArray(voice)) components.push(...voice.slice(0, 3));
+			else if (voice !== null && voice !== undefined) components.push(voice);
 		} catch { /* optional voice status must not affect coordinator control */ }
 		await this.#sendForEpoch(connectionEpoch, 'coordinator_status', 'server', buildCoordinatorStatus({
 			reconciled: this.#reconciledStatus,
@@ -2217,38 +2219,43 @@ async function runCli(reporter = new RuntimeErrorReporter()) {
 		scenarioId: runtime.scenarioId,
 		privatePath: runtime.providerTurnsPath,
 	});
-	let voiceWorker = null;
-	let voiceFailureStatus = null;
+	let voiceSupervisor = null;
 	const coordinator = createDynamicCoordinator(config, {
 		traceWriter, protocolAudit, providerTurnRecorder, runtimeGeneration: runtime.runtimeGeneration,
-		voiceStatusSnapshot: () => voiceWorker?.statusSnapshot?.() ?? voiceFailureStatus,
+		voiceStatusSnapshot: () => voiceSupervisor?.statusSnapshots?.() ?? null,
 	});
 	const disposeDiagnostics = wireRuntimeDiagnostics(coordinator, reporter);
-	voiceWorker = await startVoiceWorker(config, process.env).catch((error) => {
-		voiceFailureStatus = {
-			component: 'voice', state: 'degraded', fallbackMode: 'text', boundary: 'voice_start',
-			failureCode: typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'VOICE_UNAVAILABLE', consecutiveFailureCount: 1,
-			nextProbeAtEpochMs: null, generation: 1, lastRecoveryAtEpochMs: null,
-		};
-		process.stderr.write('[voice-worker] unavailable; proximity speech will fall back to text\n');
-		return null;
+	voiceSupervisor = new VoiceSupervisor({
+		startWorker: () => startVoiceWorker(config, process.env),
 	});
 	try {
-		await coordinator.start();
+		await startCoordinatorControl(coordinator, voiceSupervisor);
 	} catch (error) {
-		await Promise.allSettled([coordinator.stop(), voiceWorker?.close(), protocolAudit?.close()]);
+		await Promise.allSettled([coordinator.stop(), voiceSupervisor.close(), protocolAudit?.close()]);
 		disposeDiagnostics();
 		throw error;
 	}
 	let shutdownPromise = null;
 	const shutdown = async () => {
-		shutdownPromise ??= Promise.allSettled([coordinator.stop(), voiceWorker?.close(), protocolAudit?.close()])
+		shutdownPromise ??= Promise.allSettled([coordinator.stop(), voiceSupervisor.close(), protocolAudit?.close()])
 			.finally(disposeDiagnostics);
 		await shutdownPromise;
 		process.exitCode = 0;
 	};
 	process.once('SIGINT', shutdown);
 	process.once('SIGTERM', shutdown);
+}
+
+export async function startCoordinatorControl(coordinator, voiceSupervisor) {
+	if (coordinator === null || typeof coordinator?.start !== 'function') {
+		throw new TypeError('coordinator.start is required');
+	}
+	if (voiceSupervisor === null || typeof voiceSupervisor?.start !== 'function') {
+		throw new TypeError('voiceSupervisor.start is required');
+	}
+	await coordinator.start();
+	try { Promise.resolve(voiceSupervisor.start()).catch(() => {}); }
+	catch { /* optional voice startup cannot reject coordinator control */ }
 }
 
 export function createJsonlAudit(filePath, metadata, dependencies = {}) {
@@ -2300,51 +2307,48 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		timeoutMs: voice.localSpeechTimeoutMs ?? 120_000,
 	});
 	if (localSpeechProvider === null && fishApiKey === null && platform !== 'win32') return null;
-	const profilePath = dependencies.profilePath
-		?? voice.profileAssignmentsPath
-		?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
-	const loadProfileStore = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
-	const createTtsProvider = dependencies.createTtsProvider ?? ((options) => new FishTtsProvider(options));
-	const createWindowsTtsProvider = dependencies.createWindowsTtsProvider ?? ((options) => new WindowsTtsProvider(options));
-	const createSttProvider = dependencies.createSttProvider ?? ((options) => new DeepgramSttProvider(options));
-	const createServer = dependencies.createVoiceServer ?? createVoiceHttpServer;
-	if (typeof loadProfileStore !== 'function') throw new TypeError('loadProfileStore must be a function');
-	if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
-	if (typeof createWindowsTtsProvider !== 'function') throw new TypeError('createWindowsTtsProvider must be a function');
-	if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
-	const profiles = await loadProfileStore(profilePath);
-	if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
-		throw new TypeError('loadProfileStore must return a profile store');
-	}
-	const deepgramApiKey = firstNonBlank(
-		environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
-	);
-	if (deepgramApiKey !== null && typeof createSttProvider !== 'function') throw new TypeError('createSttProvider must be a function when Deepgram is configured');
-	let provider = localSpeechProvider;
-	if (provider === null) provider = fishApiKey === null ? createWindowsTtsProvider({}) : createTtsProvider({ apiKey: fishApiKey });
-	if (localSpeechProvider === null && fishApiKey !== null && platform === 'win32') {
-		provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}));
-	}
-	const worker = createServer({
-		provider,
-		sttProvider: localSpeechProvider ?? (deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey })),
-		profileStore: typeof profiles.flush === 'function' ? Object.assign(profiles.store, { flush: profiles.flush }) : profiles.store,
-		secret: config.bridge?.secret,
-		port: voice.port ?? DEFAULT_VOICE_PORT,
-		maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT,
-	});
-	if (worker === null || typeof worker !== 'object' || typeof worker.start !== 'function' || typeof worker.close !== 'function') {
-		throw new TypeError('createVoiceServer must return a voice worker');
-	}
+	let worker = null;
 	try {
-		await worker.start();
-		if (typeof localSpeechProvider?.warmup === 'function') {
-			try { await localSpeechProvider.warmup(); }
-			catch { /* warmup is opportunistic; the first real request can retry model loading */ }
+		const profilePath = dependencies.profilePath
+			?? voice.profileAssignmentsPath
+			?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
+		const loadProfileStore = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
+		const createTtsProvider = dependencies.createTtsProvider ?? ((options) => new FishTtsProvider(options));
+		const createWindowsTtsProvider = dependencies.createWindowsTtsProvider ?? ((options) => new WindowsTtsProvider(options));
+		const createSttProvider = dependencies.createSttProvider ?? ((options) => new DeepgramSttProvider(options));
+		const createServer = dependencies.createVoiceServer ?? createVoiceHttpServer;
+		if (typeof loadProfileStore !== 'function') throw new TypeError('loadProfileStore must be a function');
+		if (typeof createTtsProvider !== 'function') throw new TypeError('createTtsProvider must be a function');
+		if (typeof createWindowsTtsProvider !== 'function') throw new TypeError('createWindowsTtsProvider must be a function');
+		if (typeof createServer !== 'function') throw new TypeError('createVoiceServer must be a function');
+		const profiles = await loadProfileStore(profilePath);
+		if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
+			throw new TypeError('loadProfileStore must return a profile store');
 		}
+		const deepgramApiKey = firstNonBlank(
+			environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
+		);
+		if (deepgramApiKey !== null && typeof createSttProvider !== 'function') throw new TypeError('createSttProvider must be a function when Deepgram is configured');
+		let provider = localSpeechProvider;
+		if (provider === null) provider = fishApiKey === null ? createWindowsTtsProvider({}) : createTtsProvider({ apiKey: fishApiKey });
+		if (localSpeechProvider === null && fishApiKey !== null && platform === 'win32') {
+			provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}));
+		}
+		worker = createServer({
+			provider,
+			sttProvider: localSpeechProvider ?? (deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey })),
+			profileStore: typeof profiles.flush === 'function' ? Object.assign(profiles.store, { flush: profiles.flush }) : profiles.store,
+			secret: config.bridge?.secret,
+			port: voice.port ?? DEFAULT_VOICE_PORT,
+			maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT,
+		});
+		if (worker === null || typeof worker !== 'object' || typeof worker.start !== 'function' || typeof worker.close !== 'function') {
+			throw new TypeError('createVoiceServer must return a voice worker');
+		}
+		await worker.start();
 		return localSpeechProvider === null ? worker : voiceWorkerWithOwnedProvider(worker, localSpeechProvider);
 	} catch (error) {
-		await Promise.allSettled([worker.close(), localSpeechProvider?.close()]);
+		await Promise.allSettled([worker?.close(), localSpeechProvider?.close()]);
 		throw error;
 	}
 }
@@ -2354,6 +2358,9 @@ function voiceWorkerWithOwnedProvider(worker, provider) {
 	return Object.freeze({
 		...worker,
 		start: worker.start.bind(worker),
+		warmup: typeof provider.warmup === 'function'
+			? ({ signal } = {}) => provider.warmup({ signal })
+			: undefined,
 		close() {
 			closePromise ??= Promise.allSettled([worker.close(), provider.close()]).then(() => undefined);
 			return closePromise;
