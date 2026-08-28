@@ -144,20 +144,23 @@ public final class GoalCompletionVerifier {
 			return new Evaluation(satisfied, facts);
 		}
 		if (predicate instanceof GoalPredicate.AnyOf any) {
-			boolean satisfied = false;
-			ArrayList<GoalEvidence.Fact> facts = new ArrayList<>();
+			ArrayList<GoalEvidence.Fact> failureFacts = new ArrayList<>();
 			KillAllocation baseAllocation = killAllocation.copy();
 			KillAllocation selectedAllocation = null;
+			Evaluation selected = null;
 			for (int index = 0; index < any.predicates().size(); index++) {
 				KillAllocation branchAllocation = baseAllocation.copy();
 				Evaluation child = evaluate(goalId, any.predicates().get(index), path + "." + index, source, kills,
 						record, tick, operatorConfirmed, counter, branchAllocation);
-				if (!satisfied && child.satisfied()) selectedAllocation = branchAllocation;
-				satisfied |= child.satisfied();
-				facts.addAll(child.facts());
+				if (selected == null && child.satisfied()) {
+					selectedAllocation = branchAllocation;
+					selected = child;
+				}
+				failureFacts.addAll(child.facts());
 			}
-			if (selectedAllocation != null) killAllocation.replaceWith(selectedAllocation);
-			return new Evaluation(satisfied, facts);
+			if (selected == null) return new Evaluation(false, failureFacts);
+			killAllocation.replaceWith(selectedAllocation);
+			return selected;
 		}
 		if (counter.next() > 16) throw new IllegalStateException("Goal predicate leaf limit was not enforced");
 		PredicateKey key = new PredicateKey(goalId, path);

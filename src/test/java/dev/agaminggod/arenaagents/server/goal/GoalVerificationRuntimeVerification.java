@@ -33,6 +33,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyDimensionBinding();
 		assertions += verifyBlockAdvancementAndCompoundPredicates();
 		assertions += verifyAgentSpecificKillAttribution();
+		assertions += verifyAnyOfEvidenceSelection();
 		assertions += verifyDistinctRepeatedKillAttribution();
 		assertions += verifyKillGoalAfterServerTickReset();
 		assertions += verifyPersistedKillProgressAcrossRestart();
@@ -120,6 +121,32 @@ public final class GoalVerificationRuntimeVerification {
 		return 3;
 	}
 
+	private static int verifyAnyOfEvidenceSelection() {
+		GoalPredicate alternatives = new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
+				new GoalPredicate.EntityKilledByAgent("minecraft:skeleton", true)
+		));
+		Fixture fixture = fixture(alternatives, 425L);
+		long goalCreated = fixture.record().currentGoal().orElseThrow().createdAtEpochMs();
+		fixture.runtime.killLedger().record(fixture.agentId, "minecraft:zombie", goalCreated + 1L);
+
+		GoalCompletionVerifier.VerificationResult result = fixture.runtime.evaluate(fixture.agentId);
+		assertEquals(true, result.verified(), "one successful alternative verifies the goal");
+		assertEquals(1, result.facts().size(), "verified alternatives retain only selected branch evidence");
+		assertEquals("minecraft:zombie x1", result.facts().getFirst().expectedValue(),
+				"selected alternative evidence identifies the successful branch");
+		assertEquals(true, result.facts().getFirst().satisfied(),
+				"accepted alternative evidence contains no failed requirement");
+
+		Fixture failedFixture = fixture(alternatives, 426L);
+		GoalCompletionVerifier.VerificationResult failed = failedFixture.runtime.evaluate(failedFixture.agentId);
+		assertEquals(false, failed.verified(), "unsatisfied alternatives fail verification");
+		assertEquals(List.of("minecraft:zombie x1", "minecraft:skeleton x1"),
+				failed.facts().stream().map(fact -> fact.expectedValue()).toList(),
+				"failed alternatives retain bounded evidence from every branch");
+		return 6;
+	}
+
 	private static int verifyDistinctRepeatedKillAttribution() {
 		GoalPredicate repeatedKills = new GoalPredicate.AllOf(List.of(
 				new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true),
@@ -183,9 +210,16 @@ public final class GoalVerificationRuntimeVerification {
 		nestedFixture.runtime.killLedger().record(nestedFixture.agentId, "minecraft:zombie", nestedStart + 1L);
 		nestedFixture.runtime.killLedger().record(nestedFixture.agentId, "minecraft:skeleton", nestedStart + 2L);
 		nestedFixture.runtime.killLedger().record(nestedFixture.agentId, "minecraft:creeper", nestedStart + 3L);
-		assertEquals(true, nestedFixture.runtime.evaluate(nestedFixture.agentId).verified(),
+		GoalCompletionVerifier.VerificationResult nestedResult = nestedFixture.runtime.evaluate(nestedFixture.agentId);
+		assertEquals(true, nestedResult.verified(),
 				"nested alternatives backtrack when their first satisfied compound exhausts a later requirement");
-		return 6;
+		assertEquals(2, nestedResult.facts().size(),
+				"nested backtracking retains only the allocation branch that satisfies the conjunction");
+		assertEquals("minecraft:creeper x1", nestedResult.facts().get(0).expectedValue(),
+				"nested backtracking evidence identifies the selected alternative");
+		assertEquals("minecraft:zombie x1", nestedResult.facts().get(1).expectedValue(),
+				"nested backtracking evidence retains the enclosing requirement");
+		return 9;
 	}
 
 	private static int verifyKillGoalAfterServerTickReset() {
