@@ -97,13 +97,15 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyProductionChildPreservesDescendantsAcrossRootExit();
+		verifyWindowsJobNameCollisionFailsClosed();
+		verifyWindowsJobOwnsLateDetachedDescendant();
 		verifySynchronousInitialCaptureSurvivesFastRootExit();
 		verifyProductionBridgePortValidation();
 		verifyProductionBridgeSecretValidation();
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return 283;
+		return isWindows() ? 293 : 283;
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -139,7 +141,7 @@ public final class CoordinatorProcessSupervisorVerification {
 							"00000000-0000-0000-0000-000000000991"
 					)
 			);
-			owned = new CoordinatorProcessSupervisor.DefaultProcessLauncher().launch(request);
+			owned = new CoordinatorProcessSupervisor.DefaultProcessLauncher(ProcessBuilder::start).launch(request);
 			Properties ownership = new Properties();
 			try (var reader = Files.newBufferedReader(CoordinatorProcessOwnership.ownershipFile(root))) {
 				ownership.load(reader);
@@ -173,6 +175,116 @@ public final class CoordinatorProcessSupervisorVerification {
 				try { owned.terminate(); } catch (RuntimeException ignored) { }
 			}
 			if (provider != null && provider.isAlive()) provider.destroyForcibly();
+			if (root != null) deleteTree(root);
+		}
+	}
+
+	private static void verifyWindowsJobNameCollisionFailsClosed() {
+		if (!isWindows()) return;
+		WindowsCoordinatorJob original = null;
+		try {
+			String launchId = "00000000-0000-0000-0000-000000000997";
+			original = WindowsCoordinatorJob.create(launchId);
+			try {
+				WindowsCoordinatorJob.create(launchId);
+			} catch (IOException expected) {
+				assertTrue(expected.getMessage().contains("already in use"),
+						"Windows job launch identity collisions fail before any process can be attached");
+				return;
+			}
+			throw new AssertionError("duplicate Windows coordinator job name was accepted");
+		} catch (IOException exception) {
+			throw new AssertionError("Windows coordinator job collision verification failed", exception);
+		} finally {
+			if (original != null) {
+				try { original.closeHandle(); } catch (IOException ignored) { }
+			}
+		}
+	}
+
+	private static void verifyWindowsJobOwnsLateDetachedDescendant() {
+		if (!isWindows()) return;
+		Path root = null;
+		CoordinatorProcessSupervisor.ChildProcess owned = null;
+		Process unrelated = null;
+		ProcessHandle provider = null;
+		try {
+			root = Files.createTempDirectory("arena-supervisor-job-gap-");
+			Path runtimeRoot = root;
+			Path main = root.resolve("coordinator/src/dynamic-main.mjs").toAbsolutePath().normalize();
+			Path gate = main.resolveSibling("job-gate.mjs");
+			Path providerPid = root.resolve("runtime/provider.pid");
+			Path spawnProvider = root.resolve("runtime/spawn-provider");
+			Files.createDirectories(main.getParent());
+			Files.createDirectories(providerPid.getParent());
+			Files.copy(Path.of("coordinator/src/job-gate.mjs"), gate);
+			Files.writeString(main, lateProviderScript(), StandardCharsets.UTF_8);
+
+			String java = Path.of(System.getProperty("java.home"), "bin", "java.exe").toString();
+			String providerClass = ProviderFixture.class.getName();
+			unrelated = new ProcessBuilder(
+					java, "-cp", System.getProperty("java.class.path"), providerClass
+			).start();
+			Process exactUnrelated = unrelated;
+			assertTrue(exactUnrelated.isAlive(), "unrelated process is alive before job cleanup");
+
+			Path node = NodeRuntimeLocator.locate(root).executable();
+			CoordinatorProcessSupervisor.LaunchRequest request = new CoordinatorProcessSupervisor.LaunchRequest(
+					List.of(
+							node.toString(), main.toString(), providerPid.toString(), spawnProvider.toString(),
+							java, System.getProperty("java.class.path"), providerClass
+					),
+					root,
+					System.getenv(),
+					root.resolve("logs/coordinator.log"),
+					root.resolve("logs/coordinator-error.log"),
+					root,
+					main,
+					GENERATION_A,
+					"00000000-0000-0000-0000-000000000994",
+					new CoordinatorProcessOwnership.SupervisorIdentity(
+							"00000000-0000-0000-0000-000000000995"
+					)
+			);
+			owned = new CoordinatorProcessSupervisor.DefaultProcessLauncher().launch(request);
+			long rootPid = owned.pid();
+			Thread.sleep(250L);
+			assertTrue(owned.isAlive(), "gated coordinator stays alive beyond the former descendant poll interval");
+			assertEquals("", persistedDescendants(runtimeRoot),
+					"Windows job ownership does not depend on a descendant snapshot");
+
+			Files.writeString(spawnProvider, "spawn", StandardCharsets.UTF_8);
+			awaitCondition(() -> readablePid(providerPid), "coordinator launches a provider after the old poll gap");
+			provider = ProcessHandle.of(Long.parseLong(Files.readString(providerPid).trim())).orElseThrow();
+			ProcessHandle exactProvider = provider;
+			awaitCondition(
+					() -> ProcessHandle.of(rootPid).map(handle -> !handle.isAlive()).orElse(true),
+					"coordinator exits immediately after its late provider spawn"
+			);
+			assertTrue(exactProvider.isAlive(), "late provider survives coordinator reparenting before cleanup");
+			assertEquals("", persistedDescendants(runtimeRoot),
+					"late provider is deliberately absent from persisted polling evidence");
+
+			int reaped = CoordinatorProcessOwnership.reapOrphaned(
+					runtimeRoot,
+					new CoordinatorProcessOwnership.SupervisorIdentity(
+							"00000000-0000-0000-0000-000000000996"
+					)
+			);
+			assertEquals(1, reaped, "a replacement supervisor reopens and terminates the named coordinator job");
+			awaitCondition(() -> !exactProvider.isAlive(),
+					"Windows job cleanup terminates the unsnapshotted reparented provider");
+			assertTrue(exactUnrelated.isAlive(), "Windows job cleanup leaves unrelated processes alive");
+			assertFalse(Files.exists(CoordinatorProcessOwnership.ownershipFile(root)),
+					"Windows job ownership clears after kernel cleanup is accepted");
+		} catch (Exception exception) {
+			throw new AssertionError("Windows coordinator job gap verification failed", exception);
+		} finally {
+			if (owned != null) {
+				try { owned.terminate(); } catch (RuntimeException ignored) { }
+			}
+			if (provider != null && provider.isAlive()) provider.destroyForcibly();
+			if (unrelated != null && unrelated.isAlive()) unrelated.destroyForcibly();
 			if (root != null) deleteTree(root);
 		}
 	}
@@ -2370,6 +2482,31 @@ public final class CoordinatorProcessSupervisorVerification {
 		} catch (IOException | RuntimeException ignored) {
 			return false;
 		}
+	}
+
+	private static String persistedDescendants(Path root) throws IOException {
+		Properties ownership = new Properties();
+		try (var reader = Files.newBufferedReader(CoordinatorProcessOwnership.ownershipFile(root))) {
+			ownership.load(reader);
+		}
+		return ownership.getProperty("descendants", "");
+	}
+
+	private static String lateProviderScript() {
+		return """
+				import { spawn } from 'node:child_process';
+				import { existsSync, writeFileSync } from 'node:fs';
+				import { setTimeout as delay } from 'node:timers/promises';
+				const [pidFile, releaseFile, java, classpath, providerClass] = process.argv.slice(2);
+				while (!existsSync(releaseFile)) await delay(5);
+				const provider = spawn(java, ['-cp', classpath, providerClass], {
+				  detached: true,
+				  stdio: 'ignore',
+				  windowsHide: true,
+				});
+				writeFileSync(pidFile, String(provider.pid));
+				provider.unref();
+				""";
 	}
 
 	private static int productionBridgePort(Path config, String jsonValue) throws IOException {

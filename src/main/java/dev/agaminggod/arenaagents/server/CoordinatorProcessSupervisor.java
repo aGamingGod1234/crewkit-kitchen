@@ -1538,30 +1538,30 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	static final class DefaultProcessLauncher implements ProcessLauncher {
 		private final ProcessStarter processStarter;
+		private final boolean windowsJobOwnership;
 
 		DefaultProcessLauncher() {
-			this(ProcessBuilder::start);
+			this(ProcessBuilder::start, WindowsCoordinatorJob.supported());
 		}
 
 		DefaultProcessLauncher(ProcessStarter processStarter) {
+			this(processStarter, false);
+		}
+
+		private DefaultProcessLauncher(ProcessStarter processStarter, boolean windowsJobOwnership) {
 			this.processStarter = Objects.requireNonNull(processStarter, "process starter must not be null");
+			this.windowsJobOwnership = windowsJobOwnership;
 		}
 
 		@Override
 		public ChildProcess launch(LaunchRequest request) throws IOException {
 			Files.createDirectories(request.standardOutput().getParent());
 			CoordinatorLogRotation.rotate(request.standardOutput().getParent());
-			ProcessBuilder builder = new ProcessBuilder(request.command());
-			builder.directory(request.workingDirectory().toFile());
-			builder.environment().clear();
-			builder.environment().putAll(request.environment());
-			builder.redirectOutput(ProcessBuilder.Redirect.appendTo(request.standardOutput().toFile()));
-			builder.redirectError(ProcessBuilder.Redirect.appendTo(request.standardError().toFile()));
+			if (windowsJobOwnership) return launchInWindowsJob(request);
+			ProcessBuilder builder = processBuilder(request, request.command());
 			Process process = processStarter.start(builder);
 			try {
-				long startedAtEpochMs = process.info().startInstant()
-						.orElseThrow(() -> new IOException("coordinator process start time is unavailable"))
-						.toEpochMilli();
+				long startedAtEpochMs = processStart(process);
 				CoordinatorProcessOwnership.record(
 						request.runtimeRoot(), process, request.main(), request.generationId(), request.launchId(),
 						request.supervisorIdentity()
@@ -1572,6 +1572,143 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			} catch (IOException | RuntimeException ownershipFailure) {
 				terminateFailedStart(process);
 				throw ownershipFailure;
+			}
+		}
+
+		private ChildProcess launchInWindowsJob(LaunchRequest request) throws IOException {
+			List<String> gatedCommand = gatedCommand(request);
+			WindowsCoordinatorJob job = WindowsCoordinatorJob.create(request.launchId());
+			Process process = null;
+			try {
+				process = processStarter.start(processBuilder(request, gatedCommand));
+				job.attach(process.pid());
+				long startedAtEpochMs = processStart(process);
+				CoordinatorProcessOwnership.record(
+						request.runtimeRoot(), process, request.main(), request.generationId(), request.launchId(),
+						request.supervisorIdentity()
+				);
+				WindowsJobChild child = new WindowsJobChild(
+						request.runtimeRoot(), process, startedAtEpochMs, request.generationId(), request.launchId(), job
+				);
+				process.getOutputStream().write(1);
+				process.getOutputStream().flush();
+				process.getOutputStream().close();
+				return child;
+			} catch (IOException | RuntimeException launchFailure) {
+				try {
+					job.terminateAndClose();
+				} catch (IOException cleanupFailure) {
+					launchFailure.addSuppressed(cleanupFailure);
+					try {
+						job.closeHandle();
+					} catch (IOException closeFailure) {
+						launchFailure.addSuppressed(closeFailure);
+					}
+				}
+				if (process != null && process.isAlive()) terminateFailedStart(process);
+				throw launchFailure;
+			}
+		}
+
+		private static ProcessBuilder processBuilder(LaunchRequest request, List<String> command) {
+			ProcessBuilder builder = new ProcessBuilder(command);
+			builder.directory(request.workingDirectory().toFile());
+			builder.environment().clear();
+			builder.environment().putAll(request.environment());
+			builder.redirectOutput(ProcessBuilder.Redirect.appendTo(request.standardOutput().toFile()));
+			builder.redirectError(ProcessBuilder.Redirect.appendTo(request.standardError().toFile()));
+			return builder;
+		}
+
+		private static long processStart(Process process) throws IOException {
+			return process.info().startInstant()
+					.orElseThrow(() -> new IOException("coordinator process start time is unavailable"))
+					.toEpochMilli();
+		}
+
+		private static List<String> gatedCommand(LaunchRequest request) throws IOException {
+			List<String> command = request.command();
+			if (command.size() < 2 || !samePathArgument(command.get(1), request.main())) {
+				throw new IOException("Could not gate coordinator launch: command does not own the configured main module");
+			}
+			Path gate = request.main().resolveSibling("job-gate.mjs").toAbsolutePath().normalize();
+			if (!Files.isRegularFile(gate)) {
+				throw new IOException("Could not gate coordinator launch: job-gate.mjs is missing");
+			}
+			ArrayList<String> gated = new ArrayList<>(command.size() + 1);
+			gated.add(command.getFirst());
+			gated.add(gate.toString());
+			gated.addAll(command.subList(1, command.size()));
+			return List.copyOf(gated);
+		}
+
+		private static boolean samePathArgument(String argument, Path expected) {
+			try {
+				return Path.of(argument).toAbsolutePath().normalize().equals(expected.toAbsolutePath().normalize());
+			} catch (RuntimeException invalid) {
+				return false;
+			}
+		}
+	}
+
+	private static final class WindowsJobChild implements ChildProcess {
+		private final Path runtimeRoot;
+		private final Process process;
+		private final long startedAtEpochMs;
+		private final String generationId;
+		private final String launchId;
+		private final WindowsCoordinatorJob job;
+		private final AtomicBoolean terminated = new AtomicBoolean();
+
+		private WindowsJobChild(
+				Path runtimeRoot,
+				Process process,
+				long startedAtEpochMs,
+				String generationId,
+				String launchId,
+				WindowsCoordinatorJob job
+		) {
+			this.runtimeRoot = runtimeRoot;
+			this.process = process;
+			this.startedAtEpochMs = startedAtEpochMs;
+			this.generationId = generationId;
+			this.launchId = launchId;
+			this.job = job;
+		}
+
+		@Override
+		public boolean isAlive() {
+			return process.isAlive();
+		}
+
+		@Override
+		public long pid() {
+			return process.pid();
+		}
+
+		@Override
+		public synchronized void terminate() {
+			if (terminated.get()) return;
+			try {
+				job.terminateAndClose();
+				awaitExit(process);
+				CoordinatorProcessOwnership.clear(
+						runtimeRoot, process.pid(), startedAtEpochMs, generationId, launchId
+				);
+				terminated.set(true);
+			} catch (IOException exception) {
+				throw new IllegalStateException("Could not terminate the owned coordinator job", exception);
+			}
+		}
+
+		private static void awaitExit(Process process) throws IOException {
+			try {
+				if (!process.waitFor(2L, TimeUnit.SECONDS)) {
+					throw new IOException("coordinator job root stayed alive after termination");
+				}
+			} catch (InterruptedException interrupted) {
+				Thread.currentThread().interrupt();
+				throw new IOException("coordinator job termination was interrupted", interrupted);
 			}
 		}
 	}

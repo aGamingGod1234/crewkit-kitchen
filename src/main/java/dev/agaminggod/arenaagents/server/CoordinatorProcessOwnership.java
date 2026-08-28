@@ -225,6 +225,10 @@ final class CoordinatorProcessOwnership {
 	private static int reapOrphanedRecord(Path root, Ownership ownership) throws IOException {
 		Path expectedMain = root.resolve("coordinator/src/dynamic-main.mjs").normalize();
 		int reaped = 0;
+		if (WindowsCoordinatorJob.terminateExisting(ownership.launchId())) {
+			clearIfMatching(root, ownership);
+			return 1;
+		}
 		Optional<ProcessHandle> recorded = ProcessHandle.of(ownership.pid());
 		if (recorded.isPresent() && matchesIdentity(recorded.get(), expectedMain, ownership.startedAtEpochMs())) {
 			terminateTree(recorded.get(), ownership.descendants());
