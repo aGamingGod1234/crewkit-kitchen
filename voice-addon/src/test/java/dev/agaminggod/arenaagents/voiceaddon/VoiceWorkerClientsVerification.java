@@ -37,6 +37,7 @@ final class VoiceWorkerClientsVerification {
 		assertions += verifyPreparedSecretDoesNotReadGlobalSecretPath();
 		assertions += verifyTtsClientRejectsMalformedAudioAndHttpFailure();
 		assertions += verifyTtsCancellationStopsTheHttpExchange();
+		assertions += verifySttCancellationStopsTheHttpExchange();
 		assertions += verifySttClientSendsPcmMetadataAndBoundsTranscript();
 		assertions += verifySttClientRejectsMalformedInputAndResponse();
 		assertions += verifySttUnavailablePreservesWorkerCode();
@@ -128,6 +129,19 @@ final class VoiceWorkerClientsVerification {
 		CompletableFuture<short[]> synthesis = client.synthesize(request());
 		assertEquals(true, synthesis.cancel(true), "TTS request cancellation is accepted");
 		assertEquals(true, http.response.isCancelled(), "TTS cancellation reaches the HTTP exchange");
+		return 2;
+	}
+
+	private static int verifySttCancellationStopsTheHttpExchange() {
+		PendingHttpClient http = new PendingHttpClient();
+		SpeechWorkerClient client = new SpeechWorkerClient(
+				http, URI.create("http://127.0.0.1:8766/v1/stt"), SECRET
+		);
+		CompletableFuture<SpeechWorkerClient.Transcript> transcription = client.transcribe(
+				PLAYER, 18L, false, new short[] { 1, 2 }
+		);
+		assertEquals(true, transcription.cancel(true), "STT request cancellation is accepted");
+		assertEquals(true, http.response.isCancelled(), "STT cancellation reaches the HTTP exchange");
 		return 2;
 	}
 

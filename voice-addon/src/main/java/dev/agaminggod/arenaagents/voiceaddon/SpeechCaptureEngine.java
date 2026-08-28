@@ -4,9 +4,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Executor;
@@ -27,6 +30,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	private final Map<UUID, Utterance> utterances = new LinkedHashMap<>();
 	private final Map<UUID, Long> sequences = new LinkedHashMap<>();
 	private final Map<UUID, TranscriptQueue> transcriptQueues = new LinkedHashMap<>();
+	private final Set<CompletableFuture<SpeechWorkerClient.Transcript>> transcriptions = new LinkedHashSet<>();
 	private boolean closed;
 	private long sttRetryAfterNanos;
 
@@ -171,20 +175,30 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			return;
 		}
 		long transcriptionStartedNanos = System.nanoTime();
-		CompletionStage<SpeechWorkerClient.Transcript> stage;
+		CompletableFuture<SpeechWorkerClient.Transcript> transcription;
 		try {
-			stage = Objects.requireNonNull(transcriber.transcribe(
+			transcription = Objects.requireNonNull(Objects.requireNonNull(transcriber.transcribe(
 					utterance.playerId,
 					utterance.sequence,
 					utterance.whispering,
 					utterance.samples
-			), "transcriber returned null");
+			), "transcriber returned null").toCompletableFuture(), "transcriber returned a null future");
 		} catch (RuntimeException failure) {
 			reportLatency(utterance, transcriptionStartedNanos, System.nanoTime());
 			completeTranscription(utterance, null, failure);
 			return;
 		}
-		stage.whenComplete((transcript, failure) -> {
+		synchronized (this) {
+			if (closed) {
+				transcription.cancel(true);
+				return;
+			}
+			transcriptions.add(transcription);
+		}
+		transcription.whenComplete((transcript, failure) -> {
+			synchronized (this) {
+				transcriptions.remove(transcription);
+			}
 			reportLatency(utterance, transcriptionStartedNanos, System.nanoTime());
 			completeTranscription(utterance, transcript, failure);
 		});
@@ -281,6 +295,10 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		}
 		utterances.clear();
 		transcriptQueues.clear();
+		for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : List.copyOf(transcriptions)) {
+			transcription.cancel(true);
+		}
+		transcriptions.clear();
 		scheduler.shutdownNow();
 	}
 

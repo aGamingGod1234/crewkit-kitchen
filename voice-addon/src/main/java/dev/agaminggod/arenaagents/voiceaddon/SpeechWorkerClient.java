@@ -54,8 +54,10 @@ final class SpeechWorkerClient {
 				.header("X-Whispering", Boolean.toString(whispering))
 				.POST(HttpRequest.BodyPublishers.ofByteArray(pcm.array()))
 				.build();
-		return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-				.thenApply(response -> {
+		CompletableFuture<HttpResponse<String>> exchange = client.sendAsync(
+				request, HttpResponse.BodyHandlers.ofString()
+		);
+		CompletableFuture<Transcript> result = exchange.thenApply(response -> {
 					if (response.statusCode() != 200) {
 						throw workerHttpFailure(response);
 					}
@@ -88,6 +90,10 @@ final class SpeechWorkerClient {
 						);
 					}
 				});
+		result.whenComplete((transcript, failure) -> {
+			if (result.isCancelled()) exchange.cancel(true);
+		});
+		return result;
 	}
 
 	private static VoiceWorkerClient.VoiceWorkerException workerHttpFailure(HttpResponse<String> response) {

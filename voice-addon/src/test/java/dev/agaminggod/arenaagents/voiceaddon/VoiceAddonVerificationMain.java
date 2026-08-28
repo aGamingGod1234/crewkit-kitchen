@@ -14,6 +14,7 @@ public final class VoiceAddonVerificationMain {
 		int assertions = 0;
 		assertions += verifyFabricMetadataLoadsOnIntegratedAndDedicatedServers();
 		assertions += ArenaAgentsVoiceChatPluginVerification.verify();
+		assertions += VoicechatServerBindingsVerification.verify();
 		assertions += ServerSpeechCaptureRegistryVerification.verify();
 		assertions += VoicePlaybackCoordinatorVerification.verify();
 		assertions += SpeechCaptureEngineVerification.verify();

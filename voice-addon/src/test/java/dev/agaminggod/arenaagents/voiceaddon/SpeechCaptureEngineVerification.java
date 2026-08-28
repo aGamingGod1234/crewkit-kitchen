@@ -28,6 +28,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyMalformedPacketDoesNotWedgeLaterSpeech();
 		assertions += verifyTranscriptsDeliverInUtteranceOrder();
 		assertions += verifyUnavailableSttRecoversAfterBackoff();
+		assertions += verifyCloseCancelsPendingTranscription();
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		return assertions;
 	}
@@ -237,6 +238,27 @@ final class SpeechCaptureEngineVerification {
 		assertEquals(true, decoder.closed, "close closes active decoder");
 		assertEquals(0, transcriber.captured.size(), "close discards partial utterance");
 		return 2;
+	}
+
+	private static int verifyCloseCancelsPendingTranscription() {
+		ControlledTranscriber transcriber = new ControlledTranscriber();
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 5_000L, 1);
+		engine.accept(
+				PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering))
+		);
+		engine.accept(
+				PLAYER, true, new byte[] { 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering))
+		);
+		CompletableFuture<SpeechWorkerClient.Transcript> firstPending = transcriber.pending.get(1L);
+		CompletableFuture<SpeechWorkerClient.Transcript> secondPending = transcriber.pending.get(2L);
+		engine.close();
+		assertEquals(true, firstPending.isCancelled(), "close cancels the first pending STT request");
+		assertEquals(true, secondPending.isCancelled(), "close cancels the replacement STT request");
+		assertEquals(List.of(), delivered, "a late cancelled transcript cannot deliver after close");
+		return 3;
 	}
 
 	private static ScheduledExecutorService scheduler() {

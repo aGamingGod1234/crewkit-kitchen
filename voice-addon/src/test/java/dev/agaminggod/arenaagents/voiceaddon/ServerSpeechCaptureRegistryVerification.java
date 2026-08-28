@@ -79,7 +79,41 @@ public final class ServerSpeechCaptureRegistryVerification {
 		assertEquals(0, captureB.closes, "stopping server A still leaves server B active");
 		registry.clearOwner(voicechatB);
 		assertEquals(1, captureB.closes, "server B closes its remaining capture once");
-		return 16;
+
+		List<RecordingCapture> cleanupCaptures = new ArrayList<>();
+		ServerSpeechCaptureRegistry<Object, Object> cleanupRegistry = new ServerSpeechCaptureRegistry<>(configuration -> {
+			RecordingCapture capture = new RecordingCapture(configuration);
+			cleanupCaptures.add(capture);
+			return capture;
+		});
+		Object cleanupServer = new Object();
+		Object cleanupOwner = new Object();
+		cleanupRegistry.configure(cleanupServer, cleanupOwner, configurationA);
+		cleanupRegistry.accept(cleanupServer, cleanupOwner, null);
+		cleanupCaptures.getFirst().closeFailure = new IllegalStateException("stale capture cleanup failed");
+		cleanupRegistry.configure(cleanupServer, cleanupOwner, configurationB);
+		cleanupRegistry.accept(cleanupServer, cleanupOwner, null);
+		assertEquals(1, cleanupCaptures.getFirst().closes,
+				"failed displaced capture cleanup is attempted exactly once");
+		assertEquals(1, cleanupCaptures.getLast().accepts,
+				"failed displaced cleanup cannot block the replacement capture");
+
+		List<RecordingCapture> liveFailureCaptures = new ArrayList<>();
+		ServerSpeechCaptureRegistry<Object, Object> liveFailureRegistry = new ServerSpeechCaptureRegistry<>(configuration -> {
+			RecordingCapture capture = new RecordingCapture(configuration);
+			if (liveFailureCaptures.isEmpty()) {
+				capture.acceptFailure = new IllegalStateException("speech capture failed live");
+			}
+			liveFailureCaptures.add(capture);
+			return capture;
+		});
+		liveFailureRegistry.configure(cleanupServer, cleanupOwner, configurationA);
+		liveFailureRegistry.accept(cleanupServer, cleanupOwner, null);
+		liveFailureRegistry.accept(cleanupServer, cleanupOwner, null);
+		assertEquals(2, liveFailureCaptures.size(), "live capture failure reconstructs on the next packet");
+		assertEquals(1, liveFailureCaptures.getFirst().closes, "failed live capture closes once");
+		assertEquals(1, liveFailureCaptures.getLast().accepts, "replacement capture receives the next packet");
+		return 21;
 	}
 
 	private static void acceptConcurrently(
@@ -143,6 +177,8 @@ public final class ServerSpeechCaptureRegistryVerification {
 		private final VoiceSubsystemConfiguration configuration;
 		private int accepts;
 		private int closes;
+		private RuntimeException closeFailure;
+		private RuntimeException acceptFailure;
 
 		private RecordingCapture(VoiceSubsystemConfiguration configuration) {
 			this.configuration = configuration;
@@ -150,12 +186,14 @@ public final class ServerSpeechCaptureRegistryVerification {
 
 		@Override
 		public synchronized void accept(MicrophonePacketEvent event) {
+			if (acceptFailure != null) throw acceptFailure;
 			accepts++;
 		}
 
 		@Override
 		public synchronized void close() {
 			closes++;
+			if (closeFailure != null) throw closeFailure;
 		}
 	}
 }

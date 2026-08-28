@@ -19,6 +19,10 @@ final class VoicechatServerBindings<S, O> {
 
 	synchronized void started(O owner) {
 		Objects.requireNonNull(owner, "voice-chat API must not be null");
+		if (current != null && current.live && current.owner == owner) return;
+		for (Association association : associations.values()) {
+			if (association.registration.live && association.registration.owner == owner) return;
+		}
 		long displacedGeneration = 0L;
 		if (current != null && !current.claimed) {
 			current.live = false;
@@ -45,7 +49,21 @@ final class VoicechatServerBindings<S, O> {
 			association = new Association(current);
 			associations.put(server, association);
 		} else if (!association.registration.live) {
-			throw new IllegalStateException("Minecraft server belongs to a stopped Simple Voice Chat registration");
+			if (current == null || !current.live) {
+				throw new IllegalStateException("Simple Voice Chat has no active server registration");
+			}
+			if (current.displacedGeneration != 0L) {
+				throw new IllegalStateException("Simple Voice Chat registration replaced an unclaimed generation");
+			}
+			if (current.claimed) {
+				throw new IllegalStateException("Active Simple Voice Chat registration belongs to another server");
+			}
+			if (current.generation <= association.stoppedAtGeneration) {
+				throw new IllegalStateException("Simple Voice Chat registration predates this server stop");
+			}
+			current.claimed = true;
+			association = new Association(current);
+			associations.put(server, association);
 		}
 
 		captures.configure(server, association.registration.owner, configuration);
@@ -66,7 +84,10 @@ final class VoicechatServerBindings<S, O> {
 	synchronized void stopped(O owner) {
 		if (current != null && current.owner == owner) current = null;
 		for (Association association : associations.values()) {
-			if (association.registration.owner == owner) association.registration.live = false;
+			if (association.registration.owner == owner) {
+				association.registration.live = false;
+				association.stoppedAtGeneration = generation;
+			}
 		}
 		captures.clearOwner(owner);
 	}
@@ -127,6 +148,7 @@ final class VoicechatServerBindings<S, O> {
 	private final class Association {
 		private final Registration registration;
 		private long revision;
+		private long stoppedAtGeneration;
 		private boolean configured;
 
 		private Association(Registration registration) {

@@ -70,6 +70,7 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyBridgeWaitsForWorkerPreparedSecret();
 		verifyVoiceWaitsForPublishedPreparation();
 		verifyVoiceStartRetriesAndPromotes();
+		verifyVoiceLiveFailureAndReconfigurationRecover();
 		verifySupervisorsDoNotSharePublishedVoiceConfiguration();
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
@@ -928,6 +929,63 @@ public final class CoordinatorProcessSupervisorVerification {
 		gate.close(closes::incrementAndGet);
 		gate.close(closes::incrementAndGet);
 		assertEquals(1, closes.get(), "promoted voice subsystem closes exactly once");
+		supervisor.close();
+	}
+
+	private static void verifyVoiceLiveFailureAndReconfigurationRecover() {
+		FakeClock clock = new FakeClock();
+		MutableDependencies dependencies = MutableDependencies.ready();
+		String firstEndpoint = "http://127.0.0.1:18773/v1/tts";
+		String secondEndpoint = "http://127.0.0.1:18774/v1/tts";
+		dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(
+				dependencies.runtime,
+				new CoordinatorProcessSupervisor.VoiceConfiguration(firstEndpoint, "a".repeat(32))
+		);
+		QueuedMaintenanceWorker worker = new QueuedMaintenanceWorker();
+		CoordinatorProcessSupervisor supervisor = new CoordinatorProcessSupervisor(
+				Path.of("build", "voice-live-recovery-game"), Map.of(), clock, dependencies, new FakeLauncher(),
+				() -> "00000000-0000-0000-0000-000000000557", worker, runtimeRoot -> 0
+		);
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		CodexAgentServerRuntime.VoiceStartGate gate = new CodexAgentServerRuntime.VoiceStartGate(clock);
+		AtomicInteger starts = new AtomicInteger();
+		AtomicInteger closes = new AtomicInteger();
+		java.util.concurrent.atomic.AtomicBoolean healthy = new java.util.concurrent.atomic.AtomicBoolean(true);
+		List<String> endpoints = new ArrayList<>();
+		java.util.function.Function<CoordinatorProcessSupervisor.VoiceConfiguration, Boolean> starter = configuration -> {
+			starts.incrementAndGet();
+			endpoints.add(configuration.endpoint());
+			healthy.set(true);
+			return true;
+		};
+
+		gate.startIfPrepared(supervisor, starter, healthy::get, closes::incrementAndGet);
+		gate.startIfPrepared(supervisor, starter, healthy::get, closes::incrementAndGet);
+		assertEquals(1, starts.get(), "healthy voice remains idempotently started");
+		healthy.set(false);
+		gate.startIfPrepared(supervisor, starter, healthy::get, closes::incrementAndGet);
+		assertEquals(1, closes.get(), "a failed live voice generation closes exactly once");
+		assertEquals(1, starts.get(), "live failure observes its retry deadline before reconstruction");
+		clock.advance(1_000L);
+		gate.startIfPrepared(supervisor, starter, healthy::get, closes::incrementAndGet);
+		assertEquals(2, starts.get(), "voice reconstructs automatically after live failure backoff");
+
+		dependencies.result = CoordinatorProcessSupervisor.DependencyResolution.ready(
+				dependencies.runtime,
+				new CoordinatorProcessSupervisor.VoiceConfiguration(secondEndpoint, "b".repeat(32))
+		);
+		clock.advance(5_000L);
+		supervisor.tick(false, null, 0L);
+		worker.runNext();
+		supervisor.tick(false, null, 0L);
+		gate.startIfPrepared(supervisor, starter, healthy::get, closes::incrementAndGet);
+		assertEquals(List.of(firstEndpoint, firstEndpoint, secondEndpoint), endpoints,
+				"voice reconfiguration replaces the runtime with the exact published endpoint");
+		assertEquals(2, closes.get(), "reconfiguration closes the previous live generation once");
+		gate.close(closes::incrementAndGet);
+		gate.close(closes::incrementAndGet);
+		assertEquals(3, closes.get(), "final voice generation closes idempotently");
 		supervisor.close();
 	}
 

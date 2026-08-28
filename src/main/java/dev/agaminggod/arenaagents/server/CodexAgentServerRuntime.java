@@ -173,9 +173,10 @@ public final class CodexAgentServerRuntime {
 					return VoiceSubsystemRuntime.start(server, new VoiceSubsystemConfiguration(
 							configuration.endpoint(), configuration.secret()
 					));
-				});
+				}, () -> VoiceSubsystemRuntime.available(server), () -> VoiceSubsystemRuntime.close(server));
 			} catch (RuntimeException exception) {
-				LOGGER.warn("Arena Agents voice startup is degraded; coordinator and Minecraft bridge recovery continue", exception);
+				LOGGER.warn("Arena Agents voice startup is degraded ({}); coordinator and Minecraft bridge recovery continue",
+						exception.getClass().getSimpleName());
 			}
 		}
 		if (!ScenarioRuntimeService.restorePersistedState(server)) {
@@ -381,6 +382,7 @@ public final class CodexAgentServerRuntime {
 		private boolean started;
 		private boolean closed;
 		private long nextRetryEpochMs;
+		private long activeConfigurationRevision = Long.MIN_VALUE;
 
 		VoiceStartGate() {
 			this(System::currentTimeMillis);
@@ -394,30 +396,80 @@ public final class CodexAgentServerRuntime {
 				CoordinatorProcessSupervisor supervisor,
 				Function<CoordinatorProcessSupervisor.VoiceConfiguration, Boolean> starter
 		) {
+			startIfPrepared(supervisor, starter, () -> true, () -> { });
+		}
+
+		synchronized void startIfPrepared(
+				CoordinatorProcessSupervisor supervisor,
+				Function<CoordinatorProcessSupervisor.VoiceConfiguration, Boolean> starter,
+				java.util.function.BooleanSupplier healthy,
+				Runnable closer
+		) {
 			java.util.Objects.requireNonNull(supervisor, "coordinator supervisor must not be null");
 			java.util.Objects.requireNonNull(starter, "voice starter must not be null");
+			java.util.Objects.requireNonNull(healthy, "voice health probe must not be null");
+			java.util.Objects.requireNonNull(closer, "voice closer must not be null");
 			CoordinatorProcessSupervisor.VoiceConfiguration configuration = supervisor.voiceConfiguration();
+			long configurationRevision = supervisor.voiceConfigurationRevision();
 			long now = clock.getAsLong();
-			if (closed || started || configuration == null || now < nextRetryEpochMs) return;
+			if (closed || configuration == null) return;
+			if (started) {
+				if (activeConfigurationRevision != configurationRevision) {
+					closeActive(closer);
+					retryBudget.resetAfterStability();
+					nextRetryEpochMs = 0L;
+				} else if (safelyHealthy(healthy)) {
+					return;
+				} else {
+					closeActive(closer);
+					retryBudget.recordUnexpectedExit();
+					nextRetryEpochMs = now + retryBudget.nextDelayMs();
+					return;
+				}
+			}
+			if (now < nextRetryEpochMs) return;
 			try {
 				if (Boolean.TRUE.equals(starter.apply(configuration))) {
 					started = true;
+					activeConfigurationRevision = configurationRevision;
+					retryBudget.resetAfterStability();
 					nextRetryEpochMs = 0L;
 					return;
 				}
 			} catch (RuntimeException exception) {
-				LOGGER.warn("Arena Agents voice startup is degraded; coordinator and Minecraft bridge recovery continue",
-						exception);
+				LOGGER.warn("Arena Agents voice startup is degraded ({}); coordinator and Minecraft bridge recovery continue",
+						exception.getClass().getSimpleName());
 			}
 			retryBudget.recordUnexpectedExit();
 			nextRetryEpochMs = now + retryBudget.nextDelayMs();
+		}
+
+		private boolean safelyHealthy(java.util.function.BooleanSupplier healthy) {
+			try {
+				return healthy.getAsBoolean();
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Arena Agents voice health probe failed ({}); recovery will retry",
+						exception.getClass().getSimpleName());
+				return false;
+			}
+		}
+
+		private void closeActive(Runnable closer) {
+			started = false;
+			activeConfigurationRevision = Long.MIN_VALUE;
+			try {
+				closer.run();
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Arena Agents voice cleanup failed ({}); recovery will continue",
+						exception.getClass().getSimpleName());
+			}
 		}
 
 		synchronized void close(Runnable closer) {
 			java.util.Objects.requireNonNull(closer, "voice closer must not be null");
 			if (closed) return;
 			closed = true;
-			if (started) closer.run();
+			if (started) closeActive(closer);
 		}
 	}
 

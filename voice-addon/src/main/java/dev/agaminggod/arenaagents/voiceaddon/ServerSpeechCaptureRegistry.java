@@ -8,6 +8,9 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /** Owns one lazily constructed speech capture for each configured server. */
 final class ServerSpeechCaptureRegistry<S, O> {
+	private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(
+			ServerSpeechCaptureRegistry.class
+	);
 	private final Map<S, Entry> entries = new ConcurrentHashMap<>();
 	private final CaptureFactory factory;
 
@@ -18,7 +21,7 @@ final class ServerSpeechCaptureRegistry<S, O> {
 	void configure(S server, O owner, VoiceSubsystemConfiguration configuration) {
 		Objects.requireNonNull(server, "server must not be null");
 		Entry previous = entries.put(server, new Entry(owner, configuration));
-		if (previous != null) previous.close();
+		if (previous != null) safeClose(previous);
 	}
 
 	void accept(S server, O owner, MicrophonePacketEvent event) {
@@ -28,13 +31,22 @@ final class ServerSpeechCaptureRegistry<S, O> {
 
 	void clear(S server) {
 		Entry removed = entries.remove(server);
-		if (removed != null) removed.close();
+		if (removed != null) safeClose(removed);
 	}
 
 	void clearOwner(O owner) {
 		for (Map.Entry<S, Entry> candidate : entries.entrySet()) {
 			Entry entry = candidate.getValue();
-			if (entry.ownedBy(owner) && entries.remove(candidate.getKey(), entry)) entry.close();
+			if (entry.ownedBy(owner) && entries.remove(candidate.getKey(), entry)) safeClose(entry);
+		}
+	}
+
+	private void safeClose(Entry entry) {
+		try {
+			entry.close();
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Proximity speech capture cleanup failed ({}); voice recovery remains available",
+					exception.getClass().getSimpleName());
 		}
 	}
 
@@ -67,7 +79,19 @@ final class ServerSpeechCaptureRegistry<S, O> {
 			if (capture == null) {
 				capture = Objects.requireNonNull(factory.create(configuration), "capture factory returned null");
 			}
-			capture.accept(event);
+			try {
+				capture.accept(event);
+			} catch (RuntimeException exception) {
+				Capture failed = capture;
+				capture = null;
+				try {
+					failed.close();
+				} catch (RuntimeException cleanupFailure) {
+					exception.addSuppressed(cleanupFailure);
+				}
+				LOGGER.warn("Proximity speech capture failed ({}); the next packet will reconstruct it",
+						exception.getClass().getSimpleName());
+			}
 		}
 
 		private synchronized boolean ownedBy(O candidate) {
