@@ -290,6 +290,26 @@ public final class GoalCompilerVerification {
 				compiler.candidateIdsFor("Get an apple and kill 3 zombies", RegistryAccess.EMPTY),
 				"compound translation strips kill counts without changing item candidates"
 		);
+		String everyPredicateKind = "Place a crafting table at 10 64 10 and get an iron pickaxe"
+				+ " and go to 12 64 12 and complete the Stone Age advancement"
+				+ " and kill a zombie and survive for 20 ticks and explore somewhere nice";
+		assertEquals(
+				List.of(
+						"minecraft:crafting_table", "minecraft:iron_pickaxe",
+						"minecraft:story/mine_stone", "minecraft:zombie"
+				),
+				compiler.candidateIdsFor(
+						everyPredicateKind,
+						RegistryAccess.EMPTY,
+						Map.of("minecraft:story/mine_stone", "Stone Age")
+				),
+				"compound translation retains identifiers while non-identifier predicate kinds add no candidates"
+		);
+		assertEquals(
+				GoalCompilation.Kind.NEEDS_TRANSLATION,
+				compiler.compile(everyPredicateKind, RegistryAccess.EMPTY, 1_200L).kind(),
+				"mixed-schema compound requests reach translation instead of being misparsed as one block"
+		);
 		GoalCompilation overBound = compiler.compile("Get apple" + " and apple".repeat(16), RegistryAccess.EMPTY, 1_200L);
 		assertEquals(GoalCompilation.Kind.REJECTED, overBound.kind(), "compound predicates reject more than sixteen factual leaves");
 		GoalCompilation carriedCraft = compiler.compile("Craft an iron pickaxe and a shield", RegistryAccess.EMPTY, 1_200L);
@@ -318,7 +338,7 @@ public final class GoalCompilerVerification {
 				compiler.compile("Get 20 diamond swords and 18 diamond swords", RegistryAccess.EMPTY, 1_200L).kind(),
 				"summed duplicate requirements are revalidated against inventory capacity"
 		);
-		return 13;
+		return 15;
 	}
 
 	private static int verifyExplicitAlternativeCandidates() {

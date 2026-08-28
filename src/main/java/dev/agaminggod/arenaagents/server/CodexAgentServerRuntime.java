@@ -101,7 +101,8 @@ public final class CodexAgentServerRuntime {
 				server::getTickCount,
 				System::currentTimeMillis,
 				AgentSavedData.get(server).killLedger(),
-				AgentSavedData.get(server).survivalProgress()
+				AgentSavedData.get(server).survivalProgress(),
+				AgentSavedData.get(server).operatorConfirmations()
 		));
 		CoordinatorProcessSupervisor supervisor = null;
 		try {

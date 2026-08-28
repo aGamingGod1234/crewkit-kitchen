@@ -49,6 +49,7 @@ public final class GoalCompiler {
 					+ "(?:y\\s*=\\s*)?(-?\\d+)\\s*,?\\s*"
 					+ "(?:z\\s*=\\s*)?(-?\\d+)$"
 	);
+	private static final Pattern SURVIVE = Pattern.compile("^survive\\b.*$");
 	private static final Pattern SUBJECTIVE = Pattern.compile("\\b(?:good|better|best|strong|stronger|useful|decent|nice|appropriate|some kind of)\\b");
 	private static final Pattern GOAL_LEAD = Pattern.compile("^(?:get|obtain|collect|bring|craft|make|go|move|travel|come|kill|slay|defeat|build|mine|find|gather|chop|break|place|beat|survive|explore|follow|protect|farm|smelt|cook|trade|complete|earn)\\b");
 	private static final Pattern LIVE_STEERING = Pattern.compile(
@@ -245,19 +246,18 @@ public final class GoalCompiler {
 		Objects.requireNonNull(liveAdvancementTitles, "liveAdvancementTitles must not be null");
 		String command = stripTrailingPunctuation(stripPoliteness(
 				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
-		String advancementName = advancementName(command);
-		if (advancementName != null) {
-			return relatedAdvancements(advancementName, liveAdvancementTitles);
-		}
 		List<GoalClause> clauses = compoundClauses(command);
 		if (clauses.size() > 1) {
 			TreeSet<String> candidates = new TreeSet<>();
 			for (GoalClause clause : clauses) {
-				String target = clause.kind() == ClauseKind.KILL ? stripKillCount(clause.target()) : clause.target();
-				candidates.addAll(relatedCandidates(clause.kind(), target, registries));
+				candidates.addAll(candidatesForClause(clause, registries, liveAdvancementTitles));
 				if (candidates.size() >= MAX_TRANSLATION_CANDIDATES) break;
 			}
 			return candidates.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
+		}
+		String advancementName = advancementName(command);
+		if (advancementName != null) {
+			return relatedAdvancements(advancementName, liveAdvancementTitles);
 		}
 		Matcher item = ITEM.matcher(command);
 		if (item.matches()) {
@@ -321,6 +321,9 @@ public final class GoalCompiler {
 		if (clauses.size() > MAX_COMPOUND_LEAVES) {
 			return GoalCompilation.rejected("A compound goal may contain at most " + MAX_COMPOUND_LEAVES + " factual results.");
 		}
+		if (clauses.stream().anyMatch(clause -> clause.kind() != ClauseKind.ITEM && clause.kind() != ClauseKind.KILL)) {
+			return GoalCompilation.needsTranslation("Confirm the exact factual results for this compound goal.");
+		}
 		ArrayList<GoalPredicate> predicates = new ArrayList<>();
 		HashMap<String, Integer> inventoryPredicateIndexes = new HashMap<>();
 		for (GoalClause clause : clauses) {
@@ -378,30 +381,69 @@ public final class GoalCompiler {
 
 	private static GoalClause parseClause(String value, GoalClause inherited) {
 		Matcher kill = KILL.matcher(value);
-		if (kill.matches()) return new GoalClause(ClauseKind.KILL, kill.group(1), 1, false);
+		if (kill.matches()) return new GoalClause(ClauseKind.KILL, kill.group(1), 1, false, false);
 		Matcher item = ITEM.matcher(value);
 		if (item.matches()) {
 			try {
-				return new GoalClause(ClauseKind.ITEM, item.group(3), item.group(2) == null ? 1 : Integer.parseInt(item.group(2)), isCraftingVerb(item.group(1)));
+				return new GoalClause(ClauseKind.ITEM, item.group(3), item.group(2) == null ? 1 : Integer.parseInt(item.group(2)), isCraftingVerb(item.group(1)), false);
 			} catch (NumberFormatException exception) {
-				return new GoalClause(ClauseKind.ITEM, item.group(3), -1, isCraftingVerb(item.group(1)));
+				return new GoalClause(ClauseKind.ITEM, item.group(3), -1, isCraftingVerb(item.group(1)), false);
 			}
 		}
+		Matcher block = BLOCK.matcher(value);
+		if (block.matches()) {
+			return new GoalClause(ClauseKind.BLOCK, block.group(2), 1, false, isDestructiveBlockVerb(block.group(1)));
+		}
+		String advancement = advancementName(value);
+		if (advancement != null) return new GoalClause(ClauseKind.ADVANCEMENT, advancement, 1, false, false);
+		if (POSITION.matcher(value).matches()) return new GoalClause(ClauseKind.POSITION, value, 1, false, false);
+		if (SURVIVE.matcher(value).matches()) return new GoalClause(ClauseKind.SURVIVE, value, 1, false, false);
+		if (SUBJECTIVE.matcher(value).find()) return new GoalClause(ClauseKind.OPERATOR, value, 1, false, false);
 		if (inherited == null) return null;
 		String target = value.replaceFirst("^(?:the|a|an|some)\\s+", "").strip();
 		if (target.isEmpty()) return null;
-		if (inherited.kind() == ClauseKind.KILL) return new GoalClause(ClauseKind.KILL, target, 1, false);
+		if (inherited.kind() == ClauseKind.KILL) return new GoalClause(ClauseKind.KILL, target, 1, false, false);
+		if (inherited.kind() == ClauseKind.BLOCK) {
+			return new GoalClause(ClauseKind.BLOCK, target, 1, false, inherited.destructiveBlock());
+		}
+		if (inherited.kind() == ClauseKind.ADVANCEMENT) {
+			return new GoalClause(ClauseKind.ADVANCEMENT, target.replaceFirst("\\s+advancement$", ""), 1, false, false);
+		}
+		if (inherited.kind() != ClauseKind.ITEM) return null;
 		Matcher counted = Pattern.compile("^(?:(\\d+)\\s+)?(?:(?:the|a|an|some)\\s+)?(.+)$").matcher(value);
 		if (!counted.matches()) return null;
 		try {
-			return new GoalClause(ClauseKind.ITEM, counted.group(2), counted.group(1) == null ? 1 : Integer.parseInt(counted.group(1)), inherited.requiresCreation());
+			return new GoalClause(ClauseKind.ITEM, counted.group(2), counted.group(1) == null ? 1 : Integer.parseInt(counted.group(1)), inherited.requiresCreation(), false);
 		} catch (NumberFormatException exception) {
-			return new GoalClause(ClauseKind.ITEM, counted.group(2), -1, inherited.requiresCreation());
+			return new GoalClause(ClauseKind.ITEM, counted.group(2), -1, inherited.requiresCreation(), false);
 		}
 	}
 
-	private enum ClauseKind { ITEM, KILL }
-	private record GoalClause(ClauseKind kind, String target, int count, boolean requiresCreation) { }
+	private enum ClauseKind { ITEM, KILL, BLOCK, ADVANCEMENT, POSITION, SURVIVE, OPERATOR }
+	private record GoalClause(
+			ClauseKind kind, String target, int count, boolean requiresCreation, boolean destructiveBlock
+	) { }
+
+	private static List<String> candidatesForClause(
+			GoalClause clause,
+			RegistryAccess registries,
+			Map<String, String> liveAdvancementTitles
+	) {
+		return switch (clause.kind()) {
+			case ITEM -> relatedCandidates(ClauseKind.ITEM, clause.target(), registries);
+			case KILL -> relatedCandidates(ClauseKind.KILL, stripKillCount(clause.target()), registries);
+			case BLOCK -> {
+				List<String> blocks = relatedBlocks(clause.target(), registries);
+				if (!blocks.isEmpty() && clause.destructiveBlock()
+						&& BLOCK_LOCATION_SUFFIX.matcher(normalizedTarget(clause.target())).find()) {
+					yield List.of("minecraft:air");
+				}
+				yield blocks.stream().limit(MAX_TRANSLATION_CANDIDATES).toList();
+			}
+			case ADVANCEMENT -> relatedAdvancements(clause.target(), liveAdvancementTitles);
+			case POSITION, SURVIVE, OPERATOR -> List.of();
+		};
+	}
 
 	private static String stripKillCount(String target) {
 		Matcher counted = KILL_COUNT.matcher(target);

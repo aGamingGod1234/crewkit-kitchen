@@ -12,7 +12,6 @@ import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,7 +32,7 @@ public final class GoalVerificationRuntime {
 	private final GoalCompletionVerifier verifier;
 	private final AgentKillLedger killLedger;
 	private final SurvivalProgressLedger survivalProgress;
-	private final Set<UUID> operatorConfirmed = new HashSet<>();
+	private final OperatorConfirmationLedger operatorConfirmations;
 	private final Map<AgentId, VerificationFault> faults = new LinkedHashMap<>();
 
 	public GoalVerificationRuntime(
@@ -63,12 +62,27 @@ public final class GoalVerificationRuntime {
 			AgentKillLedger killLedger,
 			SurvivalProgressLedger survivalProgress
 	) {
+		this(registry, facts, serverTick, epochMillis, killLedger, survivalProgress,
+				new OperatorConfirmationLedger());
+	}
+
+	public GoalVerificationRuntime(
+			AgentRegistry registry,
+			Function<AgentId, Optional<GoalCompletionVerifier.FactSource>> facts,
+			LongSupplier serverTick,
+			LongSupplier epochMillis,
+			AgentKillLedger killLedger,
+			SurvivalProgressLedger survivalProgress,
+			OperatorConfirmationLedger operatorConfirmations
+	) {
 		this.registry = Objects.requireNonNull(registry, "registry must not be null");
 		this.facts = Objects.requireNonNull(facts, "facts must not be null");
 		this.serverTick = Objects.requireNonNull(serverTick, "serverTick must not be null");
 		this.epochMillis = Objects.requireNonNull(epochMillis, "epochMillis must not be null");
 		this.killLedger = Objects.requireNonNull(killLedger, "killLedger must not be null");
 		this.survivalProgress = Objects.requireNonNull(survivalProgress, "survivalProgress must not be null");
+		this.operatorConfirmations = Objects.requireNonNull(
+				operatorConfirmations, "operatorConfirmations must not be null");
 		this.verifier = new GoalCompletionVerifier(this.survivalProgress);
 		synchronizeProgress();
 	}
@@ -96,7 +110,6 @@ public final class GoalVerificationRuntime {
 		Set<UUID> currentGoals = registry.records().stream().flatMap(record -> record.currentGoal().stream())
 				.map(AgentGoal::goalId).collect(java.util.stream.Collectors.toUnmodifiableSet());
 		verifier.retainGoals(currentGoals);
-		operatorConfirmed.retainAll(currentGoals);
 		faults.entrySet().removeIf(entry -> registry.records().stream().noneMatch(record ->
 				record.agentId().equals(entry.getKey())
 						&& record.currentGoal().isPresent()
@@ -165,7 +178,7 @@ public final class GoalVerificationRuntime {
 		if (!currentGoalId.equals(Objects.requireNonNull(goalId, "goalId must not be null"))) {
 			throw new AgentDomainException("STALE_GOAL_CONFIRMATION", "Operator confirmation targets a stale goal");
 		}
-		operatorConfirmed.add(goalId);
+		operatorConfirmations.confirm(goalId);
 	}
 
 	public AgentKillLedger killLedger() {
@@ -176,6 +189,10 @@ public final class GoalVerificationRuntime {
 		return survivalProgress;
 	}
 
+	public OperatorConfirmationLedger operatorConfirmations() {
+		return operatorConfirmations;
+	}
+
 	public List<VerificationFault> faults() {
 		return List.copyOf(faults.values());
 	}
@@ -183,9 +200,11 @@ public final class GoalVerificationRuntime {
 	private void synchronizeProgress() {
 		ArrayList<AgentKillLedger.KillProgressRequirement> requirements = new ArrayList<>();
 		ArrayList<SurvivalProgressLedger.Requirement> survivalRequirements = new ArrayList<>();
+		Set<UUID> activeGoalIds = new java.util.HashSet<>();
 		for (AgentRecord record : registry.records()) {
 			AgentGoal goal = record.currentGoal().orElse(null);
 			if (goal == null || goal.status() != GoalStatus.ACTIVE && goal.status() != GoalStatus.RECOVERING) continue;
+			activeGoalIds.add(goal.goalId());
 			Map<KillRequirementKey, Integer> requiredByEntity = new HashMap<>();
 			collectKillRequirements(goal.spec().completion(), goal.createdAtEpochMs(), requiredByEntity);
 			for (Map.Entry<KillRequirementKey, Integer> entry : requiredByEntity.entrySet()) {
@@ -198,6 +217,7 @@ public final class GoalVerificationRuntime {
 		}
 		killLedger.synchronizeProgress(requirements);
 		survivalProgress.synchronizeProgress(survivalRequirements);
+		operatorConfirmations.retainGoals(activeGoalIds);
 	}
 
 	private static void collectSurvivalRequirements(
@@ -254,7 +274,7 @@ public final class GoalVerificationRuntime {
 					facts.apply(record.agentId()).orElse(null),
 					killLedger,
 					tick,
-					record.currentGoal().map(AgentGoal::goalId).filter(operatorConfirmed::contains).isPresent()
+					record.currentGoal().map(AgentGoal::goalId).filter(operatorConfirmations::isConfirmed).isPresent()
 			);
 			faults.remove(record.agentId());
 			return result;

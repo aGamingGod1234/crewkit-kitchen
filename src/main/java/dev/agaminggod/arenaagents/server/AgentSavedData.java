@@ -15,6 +15,8 @@ import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraftCodec;
 import dev.agaminggod.arenaagents.server.goal.AgentKillLedger;
 import dev.agaminggod.arenaagents.server.goal.AgentKillLedgerCodec;
+import dev.agaminggod.arenaagents.server.goal.OperatorConfirmationLedger;
+import dev.agaminggod.arenaagents.server.goal.OperatorConfirmationLedgerCodec;
 import dev.agaminggod.arenaagents.server.goal.SurvivalProgressLedger;
 import dev.agaminggod.arenaagents.server.goal.SurvivalProgressLedgerCodec;
 import java.util.LinkedHashMap;
@@ -39,18 +41,21 @@ public final class AgentSavedData extends SavedData {
 	private static final String GOAL_DRAFTS_FIELD = "goal_drafts";
 	private static final String KILL_LEDGER_CHUNKS_FIELD = "kill_ledger_chunks";
 	private static final String SURVIVAL_PROGRESS_CHUNKS_FIELD = "survival_progress_chunks";
+	private static final String OPERATOR_CONFIRMATION_CHUNKS_FIELD = "operator_confirmation_chunks";
 	private static final AgentRegistrySnapshotCodec SNAPSHOT_CODEC = new AgentRegistrySnapshotCodec();
 	private static final PendingConversationWakeCodec WAKE_CODEC = new PendingConversationWakeCodec();
 	private static final PendingGoalDraftCodec DRAFT_CODEC = new PendingGoalDraftCodec();
 	private static final AgentKillLedgerCodec KILL_LEDGER_CODEC = new AgentKillLedgerCodec();
 	private static final SurvivalProgressLedgerCodec SURVIVAL_PROGRESS_CODEC = new SurvivalProgressLedgerCodec();
+	private static final OperatorConfirmationLedgerCodec OPERATOR_CONFIRMATION_CODEC = new OperatorConfirmationLedgerCodec();
 	private static final Codec<AgentSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
 			Codec.STRING.optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
 			Codec.STRING.listOf().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload())),
 			Codec.STRING.listOf().optionalFieldOf(CONVERSATION_WAKES_FIELD, List.of()).forGetter(AgentSavedData::encodeConversationWakes),
 			Codec.STRING.listOf().optionalFieldOf(GOAL_DRAFTS_FIELD, List.of()).forGetter(AgentSavedData::encodeGoalDrafts),
 			Codec.STRING.listOf().optionalFieldOf(KILL_LEDGER_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeKillLedger),
-			Codec.STRING.listOf().optionalFieldOf(SURVIVAL_PROGRESS_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeSurvivalProgress)
+			Codec.STRING.listOf().optionalFieldOf(SURVIVAL_PROGRESS_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeSurvivalProgress),
+			Codec.STRING.listOf().optionalFieldOf(OPERATOR_CONFIRMATION_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeOperatorConfirmations)
 	).apply(instance, AgentSavedData::decodePayload));
 	public static final SavedDataType<AgentSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "codex_agents"),
@@ -64,6 +69,7 @@ public final class AgentSavedData extends SavedData {
 	private final Map<UUID, PendingGoalDraft> goalDrafts = new LinkedHashMap<>();
 	private final AgentKillLedger killLedger;
 	private final SurvivalProgressLedger survivalProgress;
+	private final OperatorConfirmationLedger operatorConfirmations;
 	private AgentRuntimeHooks runtimeHooks = AgentRuntimeHooks.NO_OP;
 
 	public AgentSavedData() {
@@ -76,7 +82,8 @@ public final class AgentSavedData extends SavedData {
 	}
 
 	private AgentSavedData(AgentRegistry.Snapshot snapshot) {
-		this(snapshot, List.of(), List.of(), AgentKillLedger.emptySnapshot(), SurvivalProgressLedger.emptySnapshot());
+		this(snapshot, List.of(), List.of(), AgentKillLedger.emptySnapshot(), SurvivalProgressLedger.emptySnapshot(),
+				OperatorConfirmationLedger.emptySnapshot());
 	}
 
 	private AgentSavedData(
@@ -84,10 +91,12 @@ public final class AgentSavedData extends SavedData {
 			List<PendingConversationWake> persistedWakes,
 			List<PendingGoalDraft> persistedDrafts,
 			AgentKillLedger.Snapshot persistedKillLedger,
-			SurvivalProgressLedger.Snapshot persistedSurvivalProgress
+			SurvivalProgressLedger.Snapshot persistedSurvivalProgress,
+			OperatorConfirmationLedger.Snapshot persistedOperatorConfirmations
 	) {
 		this.killLedger = new AgentKillLedger(persistedKillLedger, this::setDirty);
 		this.survivalProgress = new SurvivalProgressLedger(persistedSurvivalProgress, this::setDirty);
+		this.operatorConfirmations = new OperatorConfirmationLedger(persistedOperatorConfirmations, this::setDirty);
 		if (persistedWakes.size() > snapshot.maxAgents()) {
 			throw new AgentDomainException("INVALID_PERSISTED_CONVERSATION_WAKE", "Persisted conversation wake count exceeds the agent limit");
 		}
@@ -147,6 +156,10 @@ public final class AgentSavedData extends SavedData {
 		return survivalProgress;
 	}
 
+	public OperatorConfirmationLedger operatorConfirmations() {
+		return operatorConfirmations;
+	}
+
 	public void setRuntimeHooks(AgentRuntimeHooks runtimeHooks) {
 		this.runtimeHooks = Objects.requireNonNull(runtimeHooks, "runtimeHooks must not be null");
 	}
@@ -171,13 +184,18 @@ public final class AgentSavedData extends SavedData {
 		return ChunkedSavedPayload.split(SURVIVAL_PROGRESS_CODEC.encode(survivalProgress.snapshot()));
 	}
 
+	private List<String> encodeOperatorConfirmations() {
+		return ChunkedSavedPayload.split(OPERATOR_CONFIRMATION_CODEC.encode(operatorConfirmations.snapshot()));
+	}
+
 	private static AgentSavedData decodePayload(
 			String legacyPayload,
 			List<String> chunks,
 			List<String> encodedWakes,
 			List<String> encodedDrafts,
 			List<String> killLedgerChunks,
-			List<String> survivalProgressChunks
+			List<String> survivalProgressChunks,
+			List<String> operatorConfirmationChunks
 	) {
 		return new AgentSavedData(
 				SNAPSHOT_CODEC.decode(ChunkedSavedPayload.join(legacyPayload, chunks)),
@@ -188,7 +206,10 @@ public final class AgentSavedData extends SavedData {
 						: KILL_LEDGER_CODEC.decode(ChunkedSavedPayload.join("", killLedgerChunks)),
 				survivalProgressChunks.isEmpty()
 						? SurvivalProgressLedger.emptySnapshot()
-						: SURVIVAL_PROGRESS_CODEC.decode(ChunkedSavedPayload.join("", survivalProgressChunks))
+						: SURVIVAL_PROGRESS_CODEC.decode(ChunkedSavedPayload.join("", survivalProgressChunks)),
+				operatorConfirmationChunks.isEmpty()
+						? OperatorConfirmationLedger.emptySnapshot()
+						: OPERATOR_CONFIRMATION_CODEC.decode(ChunkedSavedPayload.join("", operatorConfirmationChunks))
 		);
 	}
 

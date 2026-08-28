@@ -44,6 +44,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyIndexedKillLookup();
 		assertions += verifyVerifierFailureIsolationAndRetry();
 		assertions += verifySurvivalAndOperatorConfirmation();
+		assertions += verifyOperatorConfirmationAcrossRestart();
 		assertions += verifySurvivalProgressAcrossRestart();
 		assertions += verifySurvivalDeathResetAcrossRestart();
 		assertions += verifySurvivalProgressBoundsAndPruning();
@@ -486,6 +487,50 @@ public final class GoalVerificationRuntimeVerification {
 		return 6;
 	}
 
+	private static int verifyOperatorConfirmationAcrossRestart() {
+		AgentSavedData data = new AgentSavedData();
+		long now = 65_000L;
+		AgentRecord idle = data.registry().create(
+				"codex", "gpt-5.6-sol", "high", "priority", Optional.empty(),
+				dev.agaminggod.arenaagents.agent.AgentGameMode.SURVIVAL, now);
+		GoalPredicate compound = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.OperatorConfirmed(),
+				new GoalPredicate.InventoryContains("minecraft:iron_ingot", 1)
+		));
+		data.registry().start(idle.agentId(), GoalSpec.create("Confirm and get iron", compound, 675L), now + 1L);
+		FakeFacts facts = new FakeFacts();
+		GoalVerificationRuntime runtime = new GoalVerificationRuntime(
+				data.registry(), ignored -> Optional.of(facts), () -> 675L, () -> now + 2L,
+				data.killLedger(), data.survivalProgress(), data.operatorConfirmations());
+		UUID goalId = data.registry().require(idle.agentId()).currentGoal().orElseThrow().goalId();
+		runtime.confirm(idle.agentId(), goalId);
+		assertEquals(false, runtime.evaluate(idle.agentId()).verified(),
+				"operator confirmation remains partial while a factual sibling is unfinished");
+
+		AgentSavedData restored = roundTripSavedData(data, false);
+		GoalVerificationRuntime restoredRuntime = new GoalVerificationRuntime(
+				restored.registry(), ignored -> Optional.of(facts), () -> 1L, () -> now + 3L,
+				restored.killLedger(), restored.survivalProgress(), restored.operatorConfirmations());
+		assertEquals(false, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"persisted confirmation remains true while the restored factual sibling is unfinished");
+		facts.items.put("minecraft:iron_ingot", 1);
+		assertEquals(true, restoredRuntime.evaluate(idle.agentId()).verified(),
+				"persisted confirmation completes its compound goal after the remaining fact becomes true");
+		assertEquals(1, restoredRuntime.tick().size(),
+				"restored operator confirmation emits one terminal transition");
+		assertEquals(0, restored.operatorConfirmations().snapshot().goalIds().size(),
+				"resolved goals release their durable operator confirmation");
+
+		AgentSavedData legacy = roundTripSavedData(data, false, false, true);
+		assertEquals(0, legacy.operatorConfirmations().snapshot().goalIds().size(),
+				"saved data without confirmations loads as an empty legacy ledger");
+		OperatorConfirmationLedgerCodec codec = new OperatorConfirmationLedgerCodec();
+		String encoded = codec.encode(data.operatorConfirmations().snapshot());
+		assertEquals(1, codec.decode(encoded).goalIds().size(),
+				"operator confirmation codec preserves a bounded goal identity");
+		return 7;
+	}
+
 	private static int verifySurvivalProgressAcrossRestart() {
 		AgentSavedData data = new AgentSavedData();
 		long now = 60_000L;
@@ -725,6 +770,16 @@ public final class GoalVerificationRuntimeVerification {
 	private static AgentSavedData roundTripSavedData(
 			AgentSavedData data, boolean removeKillLedger, boolean removeSurvivalProgress
 	) {
+		return roundTripSavedData(data, removeKillLedger, removeSurvivalProgress, false);
+	}
+
+	@SuppressWarnings("unchecked")
+	private static AgentSavedData roundTripSavedData(
+			AgentSavedData data,
+			boolean removeKillLedger,
+			boolean removeSurvivalProgress,
+			boolean removeOperatorConfirmations
+	) {
 		try {
 			Field field = AgentSavedData.class.getDeclaredField("CODEC");
 			field.setAccessible(true);
@@ -732,6 +787,7 @@ public final class GoalVerificationRuntimeVerification {
 			Tag encoded = codec.encodeStart(NbtOps.INSTANCE, data).getOrThrow();
 			if (removeKillLedger) ((CompoundTag) encoded).remove("kill_ledger_chunks");
 			if (removeSurvivalProgress) ((CompoundTag) encoded).remove("survival_progress_chunks");
+			if (removeOperatorConfirmations) ((CompoundTag) encoded).remove("operator_confirmation_chunks");
 			return codec.parse(NbtOps.INSTANCE, encoded).getOrThrow();
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not round-trip ledgers through Minecraft SavedData", exception);
