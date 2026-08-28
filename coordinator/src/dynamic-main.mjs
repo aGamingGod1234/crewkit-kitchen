@@ -53,7 +53,7 @@ const DEFAULT_VOICE_MAX_CONCURRENT = 5;
 const DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH = path.join('runtime', 'voice-profile-assignments.json');
 const DEFAULT_FISH_API_KEY_ENVIRONMENT_VARIABLE = 'FISH_AUDIO_API_KEY';
 const DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE = 'DEEPGRAM_API_KEY';
-const DEFAULT_LOCAL_SPEECH_PYTHON_PATH = path.join('runtime', 'local-speech', '.venv', 'Scripts', 'python.exe');
+const DEFAULT_LOCAL_SPEECH_PYTHON_DIRECTORY = path.join('runtime', 'local-speech', '.venv');
 const WINDOWS_TTS_FALLBACK_CODES = new Set([
 	'TTS_AUDIO_TOO_LONG',
 	'TTS_MALFORMED_AUDIO',
@@ -1521,9 +1521,10 @@ export async function startVoiceWorker(config, environment = process.env, depend
 	try {
 		localSpeechProvider = await createLocalSpeechProvider({
 			executable: firstNonBlank(environment.ARENA_AGENT_SPEECH_PYTHON, voice.localSpeechPythonPath)
-				?? path.resolve(PROJECT_DIRECTORY, DEFAULT_LOCAL_SPEECH_PYTHON_PATH),
+				?? path.resolve(PROJECT_DIRECTORY, defaultLocalSpeechPythonPath(platform)),
 			scriptPath: path.join(SOURCE_DIRECTORY, 'voice', 'local-speech-worker.py'),
 			timeoutMs: voice.localSpeechTimeoutMs ?? 120_000,
+			environment,
 			signal,
 			accessFile: dependencies.localSpeechAccess,
 		});
@@ -1550,15 +1551,33 @@ export async function startVoiceWorker(config, environment = process.env, depend
 			environment[voice.deepgramApiKeyEnvironmentVariable ?? DEFAULT_DEEPGRAM_API_KEY_ENVIRONMENT_VARIABLE],
 		);
 		if (deepgramApiKey !== null && typeof createSttProvider !== 'function') throw new TypeError('createSttProvider must be a function when Deepgram is configured');
-		let provider = localSpeechProvider;
-		if (provider === null) provider = fishApiKey === null ? createWindowsTtsProvider({}) : createTtsProvider({ apiKey: fishApiKey });
-		if (localSpeechProvider === null && fishApiKey !== null && platform === 'win32') {
-			provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}));
+		let provider;
+		let sttProvider;
+		let ownedSpeechProvider = localSpeechProvider;
+		if (localSpeechProvider !== null) {
+			const fallback = createLocalSpeechFailover(localSpeechProvider, {
+				fishApiKey,
+				deepgramApiKey,
+				platform,
+				createTtsProvider,
+				createWindowsTtsProvider,
+				createSttProvider,
+			});
+			provider = fallback.tts;
+			sttProvider = fallback.stt;
+			ownedSpeechProvider = fallback;
+		} else {
+			provider = fishApiKey === null ? createWindowsTtsProvider({}) : createTtsProvider({ apiKey: fishApiKey });
+			if (fishApiKey !== null && platform === 'win32') provider = ttsProviderWithFallback(provider, createWindowsTtsProvider({}));
+			sttProvider = deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey });
 		}
+		const profileStore = typeof profiles.flush === 'function'
+			? Object.assign(profiles.store, { flush: profiles.flush })
+			: profiles.store;
 		worker = createServer({
 			provider,
-			sttProvider: localSpeechProvider ?? (deepgramApiKey === null ? new NoSttProvider() : createSttProvider({ apiKey: deepgramApiKey })),
-			profileStore: typeof profiles.flush === 'function' ? Object.assign(profiles.store, { flush: profiles.flush }) : profiles.store,
+			sttProvider,
+			profileStore,
 			secret: config.bridge?.secret,
 			port: voice.port ?? DEFAULT_VOICE_PORT,
 			maxConcurrent: voice.maxConcurrent ?? DEFAULT_VOICE_MAX_CONCURRENT,
@@ -1569,7 +1588,7 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		}
 		await worker.start({ signal });
 		throwIfVoiceStartupAborted(signal);
-		return localSpeechProvider === null ? worker : voiceWorkerWithOwnedProvider(worker, localSpeechProvider);
+		return localSpeechProvider === null ? worker : voiceWorkerWithOwnedProvider(worker, ownedSpeechProvider);
 	} catch (error) {
 		await settleVoiceBootstrapCleanup(
 			[() => worker?.close(), () => localSpeechProvider?.close()],
@@ -1610,6 +1629,78 @@ function voiceWorkerWithOwnedProvider(worker, provider) {
 		close() {
 			closePromise ??= Promise.allSettled([worker.close(), provider.close()]).then(() => undefined);
 			return closePromise;
+		},
+	});
+}
+
+function defaultLocalSpeechPythonPath(platform) {
+	return path.join(
+		DEFAULT_LOCAL_SPEECH_PYTHON_DIRECTORY,
+		platform === 'win32' ? 'Scripts' : 'bin',
+		platform === 'win32' ? 'python.exe' : 'python',
+	);
+}
+
+function createLocalSpeechFailover(localProvider, {
+	fishApiKey,
+	deepgramApiKey,
+	platform,
+	createTtsProvider,
+	createWindowsTtsProvider,
+	createSttProvider,
+}) {
+	let activeTts = localProvider;
+	let activeStt = localProvider;
+	let fallbackTts = null;
+	let fallbackStt = null;
+	let switched = false;
+	const fallbackTtsFactory = () => {
+		if (fallbackTts !== null) return fallbackTts;
+		if (fishApiKey !== null) {
+			const fish = createTtsProvider({ apiKey: fishApiKey });
+			fallbackTts = platform === 'win32'
+				? ttsProviderWithFallback(fish, createWindowsTtsProvider({}))
+				: fish;
+			return fallbackTts;
+		}
+		if (platform === 'win32') fallbackTts = createWindowsTtsProvider({});
+		return fallbackTts;
+	};
+	const fallbackSttFactory = () => {
+		if (fallbackStt !== null) return fallbackStt;
+		fallbackStt = deepgramApiKey === null
+			? new NoSttProvider()
+			: createSttProvider({ apiKey: deepgramApiKey });
+		return fallbackStt;
+	};
+	const switchToFallback = async (error, signal) => {
+		if (error?.name === 'AbortError' || signal?.aborted) throw error;
+		if (fallbackTtsFactory() === null) throw error;
+		activeTts = fallbackTtsFactory();
+		activeStt = fallbackSttFactory();
+		switched = true;
+	};
+	return Object.freeze({
+		tts: Object.freeze({
+			synthesize(request) { return activeTts.synthesize(request); },
+		}),
+		stt: Object.freeze({
+			transcribe(request) { return activeStt.transcribe(request); },
+		}),
+		async warmup({ signal } = {}) {
+			if (switched || typeof localProvider.warmup !== 'function') return;
+			try {
+				await localProvider.warmup({ signal });
+			} catch (error) {
+				await switchToFallback(error, signal);
+			}
+		},
+		async close() {
+			await Promise.allSettled([
+				localProvider.close?.(),
+				fallbackTts?.close?.(),
+				fallbackStt?.close?.(),
+			]);
 		},
 	});
 }

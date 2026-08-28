@@ -6,7 +6,7 @@ for await (const line of lines) {
 	const request = JSON.parse(line);
 	if (inferenceBlocked) continue;
 	if (request.op === 'warmup') {
-		process.stdout.write(`${JSON.stringify({ id: request.id, ok: true })}\n`);
+		process.stdout.write(`${JSON.stringify({ id: request.id, ok: true, sttReady: true, ttsReady: true })}\n`);
 		continue;
 	}
 	if (request.op === 'tts') {

@@ -7,6 +7,20 @@ const MAX_TTS_PCM_BYTES = 24_000 * 2 * 20;
 const MAX_STT_PCM_BYTES = 48_000 * 2 * 20;
 const MAX_RESPONSE_LINE_CHARS = 2 * 1024 * 1024;
 
+// Keep credentials and provider-specific secrets out of the local model process.
+// The worker only needs runtime paths, model/cache settings, and the local voice
+// tuning knobs. Unknown variables are intentionally excluded by default.
+const LOCAL_ENVIRONMENT_KEYS = Object.freeze([
+	'PATH', 'Path', 'PATHEXT', 'SystemRoot', 'WINDIR', 'ComSpec',
+	'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA',
+	'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'PYTHONIOENCODING',
+	'PYTHONPATH', 'PYTHONHOME', 'VIRTUAL_ENV', 'CUDA_VISIBLE_DEVICES',
+	'HF_HOME', 'HUGGINGFACE_HUB_CACHE', 'TRANSFORMERS_CACHE', 'TORCH_HOME',
+	'ARENA_LOCAL_TTS_DEVICE', 'ARENA_LOCAL_STT_DEVICE', 'ARENA_LOCAL_STT_MODEL',
+	'ARENA_LOCAL_STT_COMPUTE_TYPE', 'ARENA_LOCAL_TTS_EXAGGERATION',
+	'ARENA_LOCAL_TTS_CFG_WEIGHT',
+]);
+
 export class LocalSpeechProvider {
 	#executable;
 	#scriptPath;
@@ -17,14 +31,19 @@ export class LocalSpeechProvider {
 	#closed = false;
 	#generation = 0;
 	#closePromise = null;
+	#environment;
 
-	constructor({ executable, scriptPath, timeoutMs = 120_000 } = {}) {
+	constructor({ executable, scriptPath, timeoutMs = 120_000, environment = process.env } = {}) {
 		if (typeof executable !== 'string' || executable.trim() === '') throw new TypeError('local speech executable must not be blank');
 		if (typeof scriptPath !== 'string' || scriptPath.trim() === '') throw new TypeError('local speech scriptPath must not be blank');
 		if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new TypeError('timeoutMs must be positive');
+		if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) {
+			throw new TypeError('local speech environment must be an object');
+		}
 		this.#executable = executable;
 		this.#scriptPath = scriptPath;
 		this.#timeoutMs = timeoutMs;
+		this.#environment = createLocalSpeechEnvironment(environment);
 	}
 
 	static async createIfAvailable(options = {}) {
@@ -45,21 +64,33 @@ export class LocalSpeechProvider {
 	}
 
 	async warmup({ signal } = {}) {
-		await this.#request({ op: 'warmup' }, signal);
+		const response = await this.#request({ op: 'warmup' }, signal);
+		if (response.sttReady !== true || response.ttsReady !== true) {
+			throw typedError('LOCAL_SPEECH_WARMUP_FAILED', 'Local speech model warmup did not initialize both STT and TTS');
+		}
 	}
 
-	async synthesize({ text, speed = 1, signal } = {}) {
+	async synthesize({ text, voiceId = 'local.default.v1', speed = 1, signal } = {}) {
 		if (typeof text !== 'string' || text.trim() === '') throw new TypeError('text must not be blank');
 		if ([...text].length > MAX_TTS_TEXT_CODE_POINTS) throw new TypeError('text must be at most 280 Unicode code points');
 		if (!Number.isFinite(speed) || speed < 0.5 || speed > 2) throw new TypeError('speed must be between 0.5 and 2');
-		const response = await this.#request({ op: 'tts', text, speed }, signal);
+		if (typeof voiceId !== 'string' || voiceId.trim() === '') throw new TypeError('voiceId must not be blank');
+		const response = await this.#request({ op: 'tts', text, voiceId, speed }, signal);
 		const sampleRateHz = response.sampleRateHz;
 		const pcm = decodePcm(response.pcmBase64);
 		if (!Number.isSafeInteger(sampleRateHz) || sampleRateHz !== 24_000
 				|| pcm.length === 0 || pcm.length % 2 !== 0 || pcm.length > MAX_TTS_PCM_BYTES) {
 			throw typedError('TTS_MALFORMED_AUDIO', 'Local TTS returned invalid 24 kHz mono signed 16-bit PCM');
 		}
-		return Object.freeze({ sampleRateHz, channels: 1, sampleFormat: 's16le', pcm });
+		return Object.freeze({
+			sampleRateHz,
+			channels: 1,
+			sampleFormat: 's16le',
+			pcm,
+			provider: 'local-chatterbox',
+			model: 'chatterbox-v1',
+			voiceId: typeof response.voiceId === 'string' ? response.voiceId : localVoiceId(voiceId),
+		});
 	}
 
 	async transcribe({ pcm, signal } = {}) {
@@ -107,23 +138,19 @@ export class LocalSpeechProvider {
 			const onAbort = () => {
 				const error = abortError();
 				finish(() => reject(error));
-				this.#failProcess(error, child, generation);
+				this.#failProcess(error, child, generation, true);
 			};
 			const timer = setTimeout(() => {
 				const error = timeoutError();
 				finish(() => reject(error));
-				this.#failProcess(error, child, generation);
+				this.#failProcess(error, child, generation, true);
 			}, this.#timeoutMs);
 			timer.unref?.();
-			this.#pending.set(id, { resolve, reject, timer, onAbort, signal, generation });
+			this.#pending.set(id, {
+				id, payload: { id, ...payload }, resolve, reject, timer, onAbort, signal, generation,
+			});
 			signal?.addEventListener('abort', onAbort, { once: true });
-			try {
-				child.stdin.write(`${JSON.stringify({ id, ...payload })}\n`, (error) => {
-					if (error) this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'), child, generation);
-				});
-			} catch {
-				this.#failProcess(typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'), child, generation);
-			}
+			this.#writeRequest(child, generation, this.#pending.get(id));
 		});
 	}
 
@@ -132,7 +159,7 @@ export class LocalSpeechProvider {
 		const child = spawn(this.#executable, [this.#scriptPath], {
 			stdio: ['pipe', 'pipe', 'pipe'],
 			windowsHide: true,
-			env: { ...process.env, PYTHONUNBUFFERED: '1' },
+			env: this.#environment,
 		});
 		this.#child = child;
 		this.#generation += 1;
@@ -176,18 +203,86 @@ export class LocalSpeechProvider {
 		pending.reject(typedError(workerErrorCode(response.code), workerErrorMessage(response.message)));
 	}
 
-	#failProcess(error, expectedChild = this.#child, expectedGeneration = this.#generation) {
+	#failProcess(error, expectedChild = this.#child, expectedGeneration = this.#generation, preservePending = false) {
 		if (expectedChild !== this.#child || expectedGeneration !== this.#generation) return;
 		const child = this.#child;
 		this.#child = null;
 		if (child !== null && child.exitCode === null && !child.killed) child.kill();
+		const pending = preservePending ? [...this.#pending.values()] : [];
 		for (const [id, pending] of this.#pending) {
+			if (preservePending && pending.generation === expectedGeneration) continue;
 			this.#pending.delete(id);
 			clearTimeout(pending.timer);
 			pending.signal?.removeEventListener('abort', pending.onAbort);
 			pending.reject(error);
 		}
+		if (preservePending && pending.length > 0 && !this.#closed) this.#replayPending(pending);
 	}
+
+	#replayPending(pending) {
+		let child;
+		try { child = this.#ensureProcess(); }
+		catch {
+			for (const request of pending) this.#rejectPending(request, typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker could not restart'));
+			return;
+		}
+		for (const request of pending) {
+			if (!this.#pending.has(request.id)) continue;
+			if (request.signal?.aborted) {
+				this.#rejectPending(request, abortError());
+				continue;
+			}
+			request.generation = this.#generation;
+			this.#writeRequest(child, this.#generation, request);
+		}
+	}
+
+	#writeRequest(child, generation, pending) {
+		if (pending === undefined || !this.#pending.has(pending.id)) return;
+		try {
+			child.stdin.write(`${JSON.stringify(pending.payload)}\n`, (error) => {
+				if (error) this.#failProcess(
+					typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'),
+					child,
+					generation,
+					true,
+				);
+			});
+		} catch {
+			this.#failProcess(
+				typedError('LOCAL_SPEECH_UNAVAILABLE', 'Local speech worker input failed'),
+				child,
+				generation,
+				true,
+			);
+		}
+	}
+
+	#rejectPending(pending, error) {
+		if (!this.#pending.delete(pending.id)) return;
+		clearTimeout(pending.timer);
+		pending.signal?.removeEventListener('abort', pending.onAbort);
+		pending.reject(error);
+	}
+}
+
+export function createLocalSpeechEnvironment(environment = process.env) {
+	if (environment === null || typeof environment !== 'object' || Array.isArray(environment)) {
+		throw new TypeError('local speech environment must be an object');
+	}
+	const childEnvironment = { PYTHONUNBUFFERED: '1' };
+	for (const name of LOCAL_ENVIRONMENT_KEYS) {
+		if (typeof environment[name] === 'string') childEnvironment[name] = environment[name];
+	}
+	return childEnvironment;
+}
+
+export function localVoiceId(sourceVoiceId) {
+	if (typeof sourceVoiceId !== 'string' || sourceVoiceId.trim() === '') return 'local.chatterbox.v1.default';
+	if (/^local\.chatterbox\.v1\.[0-9a-f]{8}$/i.test(sourceVoiceId)) return sourceVoiceId;
+	let hash = 0x811c9dc5;
+	for (const byte of Buffer.from(sourceVoiceId, 'utf8')) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+	return `local.chatterbox.v1.${hash.toString(16).padStart(8, '0')}`;
 }
 
 function decodePcm(value) {

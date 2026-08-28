@@ -185,8 +185,8 @@ test('voice bootstrap prefers one local speech runtime for both expressive TTS a
 		},
 	});
 
-	assert.equal(captured.options.provider, local);
-	assert.equal(captured.options.sttProvider, local);
+	assert.notEqual(captured.options.provider, local, 'local speech is wrapped so a failed warmup can fail over');
+	assert.notEqual(captured.options.sttProvider, local, 'local STT is wrapped so a failed warmup can fail over');
 	assert.equal(warmups, 0, 'worker bind does not await optional model warmup');
 	await created.warmup();
 	assert.equal(warmups, 1);
@@ -218,6 +218,42 @@ test('voice bootstrap exposes slow local warmup without delaying the bound worke
 	await warming;
 	assert.equal(settled, true);
 	await worker.close();
+});
+
+test('local model warmup failure switches both channels to configured remote providers', async () => {
+	let active;
+	let localCloses = 0;
+	const local = {
+		async warmup() { throw Object.assign(new Error('Chatterbox import failed'), { code: 'LOCAL_SPEECH_WARMUP_FAILED' }); },
+		async synthesize() { throw new Error('local TTS must be replaced'); },
+		async transcribe() { throw new Error('local STT must be replaced'); },
+		async close() { localCloses += 1; },
+	};
+	const fish = { async synthesize() { return {}; } };
+	const deepgram = { async transcribe() { return { transcript: 'fallback', confidence: 1 }; } };
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_AUDIO_API_KEY: 'fish-key',
+		DEEPGRAM_API_KEY: 'deepgram-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() { return { profileId: 'voice.test', provider: 'fish', model: 'test', voiceId: 'fish-id', revision: 1, speed: 1 }; } } }),
+		createTtsProvider: () => fish,
+		createSttProvider: () => deepgram,
+		createVoiceServer: (options) => {
+			active = options;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		await worker.warmup();
+		assert.notEqual(active.provider, local);
+		assert.notEqual(active.sttProvider, local);
+		assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'fallback');
+	} finally {
+		await worker.close();
+	}
+	assert.equal(localCloses, 1);
 });
 
 test('voice bootstrap propagates startup cancellation into provider discovery', async () => {

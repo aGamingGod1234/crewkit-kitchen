@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -19,6 +20,19 @@ _tts_lock = threading.Lock()
 _stt_lock = threading.Lock()
 _warmup_lock = threading.Lock()
 _warmup_started = False
+_warmup_error = None
+_response_lock = threading.Lock()
+
+_LOCAL_VOICE_STYLES = (
+    (0.48, 0.18),
+    (0.56, 0.24),
+    (0.64, 0.30),
+    (0.72, 0.36),
+    (0.80, 0.42),
+    (0.88, 0.48),
+    (0.96, 0.54),
+    (1.04, 0.60),
+)
 
 
 def _load_tts():
@@ -83,38 +97,90 @@ def _warmup_model(name, loader):
 
 
 def _warmup():
-    global _warmup_started
+    global _warmup_started, _warmup_error
     with _warmup_lock:
+        if _warmup_error is not None:
+            raise RuntimeError(_warmup_error)
         if _warmup_started:
             return {"sttReady": _stt_model is not None, "ttsReady": _tts_model is not None}
         _warmup_started = True
-    stt_ready = _warmup_model("STT", _load_stt)
-    threading.Thread(target=_warmup_model, args=("TTS", _load_tts), daemon=True).start()
-    return {"sttReady": stt_ready, "ttsReady": _tts_model is not None}
+    results = {}
+
+    def warm(name, loader):
+        results[name] = _warmup_model(name, loader)
+
+    threads = [
+        threading.Thread(target=warm, args=("STT", _load_stt), daemon=True),
+        threading.Thread(target=warm, args=("TTS", _load_tts), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if not results.get("stt", False) or not results.get("tts", False):
+        failed = ", ".join(name for name in ("STT", "TTS") if not results.get(name, False))
+        _warmup_error = f"Local speech model warmup failed for: {failed}"
+        raise RuntimeError(_warmup_error)
+    return {"sttReady": True, "ttsReady": True}
 
 
 def _tts(request):
     text = request.get("text")
+    voice_id = request.get("voiceId", "local.default.v1")
     speed = request.get("speed", 1)
     if not isinstance(text, str) or not text.strip() or len(text) > MAX_TTS_CODE_POINTS:
         raise ValueError("TTS text must contain 1 to 280 code points")
+    if not isinstance(voice_id, str) or not voice_id.strip():
+        raise ValueError("TTS voice ID is invalid")
     if not isinstance(speed, (int, float)) or not math.isfinite(speed) or speed < 0.5 or speed > 2:
         raise ValueError("TTS speed is invalid")
     model = _load_tts()
-    exaggeration = float(os.environ.get("ARENA_LOCAL_TTS_EXAGGERATION", "0.7"))
-    cfg_weight = float(os.environ.get("ARENA_LOCAL_TTS_CFG_WEIGHT", "0.3"))
+    exaggeration, cfg_weight = _voice_style(voice_id)
     with contextlib.redirect_stdout(sys.stderr):
         import torch
 
         with torch.inference_mode():
             waveform = model.generate(text, exaggeration=exaggeration, cfg_weight=cfg_weight)
+            waveform = _apply_speed(waveform, speed, torch)
         pcm = (waveform.detach().float().cpu().flatten().clamp(-1, 1) * 32767).to(torch.int16).numpy().tobytes()
     if not pcm or len(pcm) % 2 or len(pcm) > MAX_TTS_PCM_BYTES:
         raise RuntimeError("Generated speech exceeded the 20 second PCM limit")
     return {
         "sampleRateHz": int(model.sr),
         "pcmBase64": base64.b64encode(pcm).decode("ascii"),
+        "provider": "local-chatterbox",
+        "voiceId": _local_voice_id(voice_id),
     }
+
+
+def _voice_style(voice_id):
+    digest = hashlib.sha256(voice_id.encode("utf-8")).digest()
+    exaggeration, cfg_weight = _LOCAL_VOICE_STYLES[digest[0] % len(_LOCAL_VOICE_STYLES)]
+    configured_exaggeration = os.environ.get("ARENA_LOCAL_TTS_EXAGGERATION")
+    configured_cfg_weight = os.environ.get("ARENA_LOCAL_TTS_CFG_WEIGHT")
+    if configured_exaggeration:
+        exaggeration = float(configured_exaggeration)
+    if configured_cfg_weight:
+        cfg_weight = float(configured_cfg_weight)
+    return exaggeration, cfg_weight
+
+
+def _local_voice_id(voice_id):
+    digest = hashlib.sha256(voice_id.encode("utf-8")).hexdigest()[:8]
+    return f"local.chatterbox.v1.{digest}"
+
+
+def _apply_speed(waveform, speed, torch):
+    if speed == 1:
+        return waveform
+    flattened = waveform.detach().float().flatten()
+    target_length = max(1, round(flattened.shape[0] / speed))
+    if target_length == flattened.shape[0]:
+        return flattened
+    import torch.nn.functional as functional
+    return functional.interpolate(
+        flattened.view(1, 1, -1), size=target_length, mode="linear", align_corners=False,
+    ).flatten()
 
 
 def _stt(request):
@@ -159,32 +225,37 @@ def _error_code(operation, error):
 
 
 def _respond(value):
-    _RPC_STDOUT.write(json.dumps(value, separators=(",", ":")) + "\n")
-    _RPC_STDOUT.flush()
+    with _response_lock:
+        _RPC_STDOUT.write(json.dumps(value, separators=(",", ":")) + "\n")
+        _RPC_STDOUT.flush()
+
+
+def _handle_request(line):
+    operation = "unknown"
+    request_id = None
+    try:
+        request = json.loads(line)
+        request_id = request.get("id")
+        operation = request.get("op")
+        if not isinstance(request_id, int) or request_id < 1:
+            raise ValueError("Request ID is invalid")
+        if operation == "tts":
+            result = _tts(request)
+        elif operation == "stt":
+            result = _stt(request)
+        elif operation == "warmup":
+            result = _warmup()
+        else:
+            raise ValueError("Speech operation is invalid")
+        _respond({"id": request_id, "ok": True, **result})
+    except Exception as error:
+        message = f"{type(error).__name__}: {error}"[:256]
+        _respond({"id": request_id, "ok": False, "code": _error_code(operation, error), "message": message})
 
 
 def main():
     for line in sys.stdin:
-        operation = "unknown"
-        request_id = None
-        try:
-            request = json.loads(line)
-            request_id = request.get("id")
-            operation = request.get("op")
-            if not isinstance(request_id, int) or request_id < 1:
-                raise ValueError("Request ID is invalid")
-            if operation == "tts":
-                result = _tts(request)
-            elif operation == "stt":
-                result = _stt(request)
-            elif operation == "warmup":
-                result = _warmup()
-            else:
-                raise ValueError("Speech operation is invalid")
-            _respond({"id": request_id, "ok": True, **result})
-        except Exception as error:
-            message = f"{type(error).__name__}: {error}"[:256]
-            _respond({"id": request_id, "ok": False, "code": _error_code(operation, error), "message": message})
+        threading.Thread(target=_handle_request, args=(line,), daemon=True).start()
 
 
 if __name__ == "__main__":
