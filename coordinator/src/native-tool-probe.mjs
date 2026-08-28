@@ -4,6 +4,7 @@ import { mkdir } from 'node:fs/promises';
 
 import { CodexService } from './codex-service.mjs';
 import { MinecraftAgentWorkspace } from './minecraft-agent-workspace.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage } from './diagnostic-sanitizer.mjs';
 
 const [model = 'gpt-5.6-luna', reasoningEffort = 'low', serviceTier = 'fast'] = process.argv.slice(2);
 const startedAt = performance.now();
@@ -158,7 +159,7 @@ try {
 		activeSteer,
 	})}\n`);
 } catch (error) {
-	process.stdout.write(`${JSON.stringify({ status: 'FAILED', code: error?.code ?? 'ERROR', message: String(error?.message ?? error).slice(0, 1_024) })}\n`);
+	process.stdout.write(`${JSON.stringify({ status: 'FAILED', code: sanitizeDiagnosticErrorCode(error, { fallback: 'ERROR' }), message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 1_024 }) })}\n`);
 	process.exitCode = 1;
 } finally {
 	await service.stop();

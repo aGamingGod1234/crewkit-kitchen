@@ -4,6 +4,7 @@ import { mkdir } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
 import { AgentWorkspaceManager } from './agent-workspace.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage } from './diagnostic-sanitizer.mjs';
 
 const [serviceModulePath, variant, trialText, model = 'gpt-5.6-luna', reasoningEffort = 'xhigh', serviceTier = 'fast'] = process.argv.slice(2);
 if (!serviceModulePath || !variant || !trialText) throw new TypeError('service module, variant, and trial are required');
@@ -64,7 +65,7 @@ try {
 		coldDm, warmDm, moveMine, craft,
 	})}\n`);
 } catch (error) {
-	process.stdout.write(`${JSON.stringify({ status: 'FAILED', variant, trial, code: error?.code ?? 'ERROR', message: String(error?.message ?? error).slice(0, 1_024) })}\n`);
+	process.stdout.write(`${JSON.stringify({ status: 'FAILED', variant, trial, code: sanitizeDiagnosticErrorCode(error, { fallback: 'ERROR' }), message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 1_024 }) })}\n`);
 	process.exitCode = 1;
 } finally {
 	await service.stop();

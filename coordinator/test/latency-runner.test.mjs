@@ -495,15 +495,17 @@ test('artifact output is staged, bounded, and redacted on provider failure', asy
 	const directory = await mkdtemp(path.join(os.tmpdir(), 'latency-artifacts-'));
 	try {
 		const secret = 'fixture-secret-token-123456';
+		const privatePath = 'C:\\private\\benchmark.json';
 		const result = await runLatencyMatrix({
 			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'redacted', providerAvailabilityRequired: true }] }),
 			scenarioResolver: () => fixtureScenario(),
-			providerFactories: { instant: () => ({ available: true, async start() { throw new Error(`authorization token=${secret}`); }, async stop() {} }) },
+			providerFactories: { instant: () => ({ available: true, async start() { throw new Error(`authorization token=${secret} at ${privatePath}`); }, async stop() {} }) },
 			artifactDirectory: directory,
 		});
 		assert.equal(result.trials[0].status, 'FAILED');
 		const manifest = await readFile(path.join(directory, 'latency-manifest.json'), 'utf8');
 		assert.equal(manifest.includes(secret), false);
+		assert.equal(manifest.includes(privatePath), false);
 		assert.ok(manifest.length < 100_000);
 	} finally {
 		await rm(directory, { recursive: true, force: true });

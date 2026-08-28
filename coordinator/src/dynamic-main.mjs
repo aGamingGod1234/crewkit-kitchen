@@ -41,7 +41,7 @@ import { TraceWriter } from './trace-writer.mjs';
 import { wireRuntimeDiagnostics } from './runtime-diagnostics.mjs';
 import { RuntimeErrorReporter } from './runtime-error-reporter.mjs';
 import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
-import { sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
+import { sanitizeDiagnosticCode, sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
 import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
 import { LocalSpeechProvider } from './voice/local-speech-provider.mjs';
@@ -727,7 +727,11 @@ export class DynamicCoordinator extends EventEmitter {
 			for (const invalid of providers.invalid) {
 				if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 				const agentId = invalid.agentId ?? invalid.profile?.agentId;
-				await this.#sendForEpoch(connectionEpoch, 'agent_error', agentId, { goalRevision: this.#registry.get(agentId)?.goalRevision ?? 0, code: invalid.code, message: invalid.message });
+				await this.#sendForEpoch(connectionEpoch, 'agent_error', agentId, {
+					goalRevision: this.#registry.get(agentId)?.goalRevision ?? 0,
+					code: sanitizeDiagnosticCode(invalid.code, { fallback: 'INVALID_PROFILE' }),
+					message: sanitizeDiagnosticText(invalid.message ?? 'Provider profile is unavailable.', { maxBytes: 2_048 }),
+				});
 			}
 			if (!this.#isConnectionEpochCurrent(connectionEpoch)) return null;
 			this.#reconciledStatus = this.#readyRegistry.every(({ agentId }) => this.#supportedAgentIds.has(agentId));
@@ -1126,7 +1130,7 @@ export class DynamicCoordinator extends EventEmitter {
 			if ([DynamicAgentState.STARTING, DynamicAgentState.PLANNING, DynamicAgentState.ACTING].includes(record.state)) {
 				this.#registry.setState(work.agentId, DynamicAgentState.ERROR, {
 					goalRevision: work.goalRevision,
-					error: { code: String(error?.code ?? 'NATIVE_TURN_FAILED').slice(0, 128), message: String(error?.message ?? error).slice(0, 2_048) },
+					error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'NATIVE_TURN_FAILED' }), message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 2_048 }) },
 				});
 			}
 			await this.#reportAgentError(work.agentId, error, work.connectionEpoch);
@@ -1625,8 +1629,8 @@ export class DynamicCoordinator extends EventEmitter {
 			try {
 				await this.#sendForEpoch(connectionEpoch, 'agent_error', agentId, {
 					goalRevision: record.goalRevision,
-					code: String(error?.code ?? 'COORDINATOR_ERROR').slice(0, 128),
-					message: String(error?.message ?? error).slice(0, 2_048),
+					code: sanitizeDiagnosticErrorCode(error, { fallback: 'COORDINATOR_ERROR' }),
+					message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 2_048 }),
 				});
 			} catch (reportError) {
 				if (!QUIET_LIFECYCLE_ERRORS.has(reportError?.code)) this.#emitRuntimeError(reportError);

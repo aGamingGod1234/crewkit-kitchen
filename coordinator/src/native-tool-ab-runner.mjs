@@ -2,6 +2,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
 
 const [baselineService, currentService, outputPath, repetitionsText = '10'] = process.argv.slice(2);
 if (!baselineService || !currentService || !outputPath) throw new TypeError('baseline service, current service, and output path are required');
@@ -79,10 +80,10 @@ function runTrial(modulePath, variant, trial) {
 			try {
 				const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
 				const row = JSON.parse(lines.at(-1));
-				if (code !== 0 && row.status !== 'FAILED') throw new Error(`trial exited ${code}: ${stderr.slice(-1_024)}`);
+				if (code !== 0 && row.status !== 'FAILED') throw new Error(`trial exited ${code}: ${sanitizeDiagnosticText(stderr, { maxBytes: 1_024 })}`);
 				resolve(row);
 			} catch (error) {
-				reject(new Error(`Could not parse ${variant} trial ${trial}: ${error.message}; stderr=${stderr.slice(-1_024)}`));
+				reject(new Error(`Could not parse ${variant} trial ${trial}: ${sanitizeDiagnosticErrorMessage(error, { maxBytes: 512 })}; stderr=${sanitizeDiagnosticText(stderr, { maxBytes: 1_024 })}`));
 			}
 		});
 	});

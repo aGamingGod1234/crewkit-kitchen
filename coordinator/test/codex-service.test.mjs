@@ -238,6 +238,17 @@ test('Codex service forwards app-server diagnostics to the coordinator error log
 	assert.deepEqual(diagnostics, ['[codex-app-server] failed to spawn required runtime sidecar']);
 });
 
+test('Codex service sanitizes forwarded transport diagnostics at the console boundary', (t) => {
+	const diagnostics = [];
+	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));
+	const transport = new FakeSharedTransport();
+	new CodexService({ cwd: 'C:\\workspace' }, { transport });
+	transport.emit('diagnostic', 'Authorization: Bearer forwarded-secret at C:\\private\\provider.log ' + 'x'.repeat(8_000));
+	assert.equal(diagnostics.length, 1);
+	assert.doesNotMatch(diagnostics[0], /forwarded-secret|private/);
+	assert.ok(Buffer.byteLength(diagnostics[0], 'utf8') <= 4_128);
+});
+
 test('direct Codex callers default to native Minecraft tools when protocol is omitted', async () => {
 	const transport = new FakeSharedTransport();
 	let prepareCalls = 0;

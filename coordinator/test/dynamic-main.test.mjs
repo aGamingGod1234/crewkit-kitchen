@@ -2567,7 +2567,7 @@ test('a restored roster provider is reconciled and promoted without restarting t
 		attempts += 1;
 		const valid = attempts === 1 ? [] : reconciledRegistry.records;
 		const invalid = attempts === 1
-			? [{ profile: reconciledRegistry.records[0], code: 'PROVIDER_TIMEOUT', message: 'provider timed out' }]
+			? [{ profile: reconciledRegistry.records[0], code: 'PROVIDER_TIMEOUT', message: 'provider timed out authorization=profile-secret at C:\\private\\profile.json' }]
 			: [];
 		return { registry: reconciledRegistry, complete: Promise.resolve({
 			registry: reconciledRegistry,
@@ -2587,6 +2587,9 @@ test('a restored roster provider is reconciled and promoted without restarting t
 	try {
 		bridge.emit('ready', { connectionEpoch: 1, serverInstanceId: 'test', registry: [record()] });
 		await eventually(() => bridge.sent.some(({ type }) => type === 'agent_error'));
+		const agentError = bridge.sent.find(({ type }) => type === 'agent_error');
+		assert.equal(agentError.payload.code, 'PROVIDER_TIMEOUT');
+		assert.doesNotMatch(agentError.payload.message, /profile-secret|private/);
 		assert.equal(bridge.sent.some(({ type }) => type === 'agent_ready'), false);
 
 		statusTick();

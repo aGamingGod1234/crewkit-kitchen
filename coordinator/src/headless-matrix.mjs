@@ -2,7 +2,7 @@ import path from 'node:path';
 import { mkdir as defaultMkdir, open as defaultOpen, readFile as defaultReadFile, writeFile as defaultWriteFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { HeadlessRconClient } from './headless-rcon.mjs';
-import { sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
+import { sanitizeDiagnosticErrorStack, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 
 const PROVIDERS = new Set(['codex', 'gemini', 'kimi', 'cursor']);
 const MAX_TIMEOUT_MS = 900_000;
@@ -1274,9 +1274,14 @@ async function runHeadlessCli() {
 	process.exitCode = result.exitCode;
 }
 
+export function writeHeadlessCliFailure(error, write = (line) => process.stderr.write(line)) {
+	if (typeof write !== 'function') throw new TypeError('headless CLI diagnostic writer must be a function');
+	write(`${sanitizeDiagnosticErrorStack(error, { maxBytes: 4_096 })}\n`);
+}
+
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	runHeadlessCli().catch((error) => {
-		process.stderr.write(`${error?.stack ?? error}\n`);
+		writeHeadlessCliFailure(error);
 		process.exitCode = 1;
 	});
 }

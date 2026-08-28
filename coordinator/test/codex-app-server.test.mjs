@@ -262,6 +262,42 @@ test('a stopped child late spawn error cannot orphan its running replacement tra
 	}
 });
 
+test('Codex child stderr crosses the shared bounded diagnostic sanitizer', async () => {
+	const child = new FakeStdioChild();
+	const diagnostics = [];
+	const transport = new CodexStdioTransport(config, { spawn: () => child, stopTimeoutMs: 1 });
+	transport.on('diagnostic', (message) => diagnostics.push(message));
+	const started = transport.start();
+	child.emit('spawn');
+	await started;
+	try {
+		child.stderr.emit('data', Buffer.from('Authorization: Bearer child-secret at C:\\private\\codex.log ' + 'x'.repeat(8_000)));
+		assert.equal(diagnostics.length, 1);
+		assert.doesNotMatch(diagnostics[0], /child-secret|private/);
+		assert.ok(Buffer.byteLength(diagnostics[0], 'utf8') <= 4_096);
+	} finally {
+		await transport.stop();
+	}
+});
+
+test('Codex desktop discovery writes a shared-sanitized bounded failure', (t) => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-secret-path-'));
+	const diagnostics = [];
+	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));
+	try {
+		resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { ProgramFiles: path.join(root, 'Program Files'), LOCALAPPDATA: path.join(root, 'Local') },
+			windowsPackageLocations: [],
+		});
+		assert.equal(diagnostics.length, 1);
+		assert.doesNotMatch(diagnostics[0], /arena-codex-secret-path/i);
+		assert.ok(Buffer.byteLength(diagnostics[0], 'utf8') <= 4_096);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test('initializes before catalog validation and thread start', async () => {
 	const transport = new FakeCodexTransport();
 	const agent = new CodexAgent(config, transport);

@@ -6,12 +6,23 @@ import {
 	normalizeHeadlessScenario,
 	selectHeadlessScenarios,
 	scenarioReport,
+	writeHeadlessCliFailure,
 } from '../src/headless-matrix.mjs';
 
 const validScenario = (overrides = {}) => ({
 	id: 'codex-chat-completion', provider: 'codex', model: 'gpt-5.6-sol',
 	reasoningEffort: 'high', serviceTier: 'fast', task: 'Send HEADLESS_PASS',
 	timeoutMs: 180000, assert: [{ type: 'lifecycle', state: 'COMPLETED' }], ...overrides,
+});
+
+test('headless CLI exception writer redacts and bounds the stack it emits', () => {
+	const writes = [];
+	const error = new Error('Authorization: Bearer cli-secret');
+	error.stack = `Error: Authorization: Bearer cli-secret\n at C:\\private\\headless.mjs:1:2\n${'x'.repeat(8_000)}`;
+	writeHeadlessCliFailure(error, (line) => writes.push(line));
+	assert.equal(writes.length, 1);
+	assert.doesNotMatch(writes[0], /cli-secret|private/);
+	assert.ok(Buffer.byteLength(writes[0], 'utf8') <= 4_097);
 });
 
 test('normalizes one bounded real-provider scenario', () => {
@@ -149,6 +160,8 @@ test('headless structured reports retain bounded token metrics and sanitize nest
 		tokens: { input: 12, output: 3, reasoning: 1, cached: 2, cacheWrite: null },
 		inputTokens: 12,
 		output_token_count: 3,
+		token_budget: 'credential-shaped-budget',
+		token_latency_ms: -1,
 		note: `file:///var/lib/private/${'x'.repeat(10_000)}`,
 		detail: 'x'.repeat(10_000),
 	};
@@ -156,6 +169,8 @@ test('headless structured reports retain bounded token metrics and sanitize nest
 	assert.deepEqual(report.metrics.tokens, metrics.tokens);
 	assert.equal(report.metrics.inputTokens, 12);
 	assert.equal(report.metrics.output_token_count, 3);
+	assert.equal(report.metrics.token_budget, '[REDACTED]');
+	assert.equal(report.metrics.token_latency_ms, '[REDACTED]');
 	assert.match(report.metrics.note, /\[location redacted\]/);
 	assert.ok(Buffer.byteLength(report.metrics.detail, 'utf8') <= 4096);
 	assert.ok(Buffer.byteLength(JSON.stringify(report), 'utf8') < 16_384);

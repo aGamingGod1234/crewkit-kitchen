@@ -7,6 +7,7 @@ import { PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
+import { sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
@@ -45,7 +46,7 @@ export class CodexService {
 		this.#transport = dependencies.transport ?? new CodexStdioTransport(this.#config.launchProfile);
 		if (typeof this.#transport.on === 'function') {
 			this.#transport.on('diagnostic', (message) => {
-				console.error(`[codex-app-server] ${String(message).slice(0, 4_096)}`);
+				try { console.error(`[codex-app-server] ${sanitizeDiagnosticText(message, { maxBytes: 4_096 })}`); } catch { /* diagnostics cannot interrupt provider work */ }
 			});
 			this.#transport.on('exit', (error) => this.#handleTransportLoss(error));
 			this.#transport.on('protocolError', (error) => this.#handleTransportLoss(error));

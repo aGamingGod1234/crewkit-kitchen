@@ -9,6 +9,7 @@ import { reportVisibleOutput } from './verbose-output.mjs';
 import { parseGoalSpecRequest } from './goal-spec.mjs';
 import { GoalSpecTranslator } from './goal-spec-translator.mjs';
 import { classifyRecoveryFailure } from './recovery-policy.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage } from './diagnostic-sanitizer.mjs';
 
 const DEFAULT_INVALID_DECISION_RETRIES = 1;
 const MAX_RETRY_ERROR_LENGTH = 512;
@@ -320,7 +321,7 @@ export class AgentPlanner {
 				) {
 					this.#registry.setState(agentId, DynamicAgentState.ERROR, {
 						goalRevision,
-						error: { code: String(error?.code ?? 'PLANNING_FAILED').slice(0, 128), message: String(error?.message ?? error).slice(0, 2_048) },
+						error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'PLANNING_FAILED' }), message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 2_048 }) },
 					});
 				}
 				throw error;

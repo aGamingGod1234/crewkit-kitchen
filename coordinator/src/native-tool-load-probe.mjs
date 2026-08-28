@@ -5,6 +5,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import { AgentWorkspaceManager } from './agent-workspace.mjs';
 import { CodexService } from './codex-service.mjs';
 import { PlanningScheduler } from './planning-scheduler.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage } from './diagnostic-sanitizer.mjs';
 
 const [model = 'gpt-5.6-luna', reasoningEffort = 'low', serviceTier = 'fast', agentCountValue = '16', includeSamplesValue = 'false'] = process.argv.slice(2);
 const agentCount = Number(agentCountValue);
@@ -118,7 +119,7 @@ try {
 		phases: { firstDm, warmDm, moveThenMine, sequenceMoveThenMine },
 	})}\n`);
 } catch (error) {
-	process.stdout.write(`${JSON.stringify({ status: 'FAILED', code: error?.code ?? 'ERROR', message: String(error?.message ?? error).slice(0, 1_024) })}\n`);
+	process.stdout.write(`${JSON.stringify({ status: 'FAILED', code: sanitizeDiagnosticErrorCode(error, { fallback: 'ERROR' }), message: sanitizeDiagnosticErrorMessage(error, { maxBytes: 1_024 }) })}\n`);
 	process.exitCode = 1;
 } finally {
 	scheduler.close();

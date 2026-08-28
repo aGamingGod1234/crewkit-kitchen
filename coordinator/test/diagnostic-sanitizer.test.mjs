@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { sanitizeDiagnosticText, sanitizeDiagnosticValue } from '../src/diagnostic-sanitizer.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticErrorStack, sanitizeDiagnosticText, sanitizeDiagnosticValue } from '../src/diagnostic-sanitizer.mjs';
 
 test('shared diagnostic sanitizer redacts credentials and absolute paths', () => {
 	const source = [
@@ -84,6 +84,110 @@ test('structured token metrics remain visible but actual token credentials are r
 	assert.equal(sanitized.access_token, '[REDACTED]');
 	assert.equal(sanitized.github_token, '[REDACTED]');
 	assert.equal(sanitizeDiagnosticValue({ tokens: 'credential-shaped-secret' }).tokens, '[REDACTED]');
+});
+
+test('every operational token alias requires a field-appropriate numeric metric', () => {
+	const aliases = [
+		['inputTokens', 12],
+		['output_token_count', 12],
+		['tokenCount', 12],
+		['tokens_count', 12],
+		['cached_tokens', 12],
+		['token_bucket', 12],
+		['token_latency_ms', 12.5],
+		['token_budget', 12],
+		['token_limit', 12],
+		['token_usage', 12],
+		['token_remaining', 12],
+		['Input-Tokens', 12],
+		['TOKEN LATENCY MS', 12.5],
+	];
+	for (const [alias, metric] of aliases) {
+		assert.equal(sanitizeDiagnosticValue({ [alias]: metric })[alias], metric, `${alias} rejected a valid metric`);
+		for (const invalid of ['12', -1, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1, {}, new Proxy({}, {})]) {
+			assert.equal(sanitizeDiagnosticValue({ [alias]: invalid })[alias], '[REDACTED]', `${alias} accepted ${String(invalid)}`);
+		}
+		if (alias.toLowerCase().replace(/[ -]/g, '_') !== 'token_latency_ms') {
+			assert.equal(sanitizeDiagnosticValue({ [alias]: 1.5 })[alias], '[REDACTED]', `${alias} accepted a fractional count`);
+		}
+		if (!alias.includes(' ')) {
+			assert.equal(sanitizeDiagnosticText(`${alias}=${metric}`), `${alias}=${metric}`, `${alias} text rejected a valid metric`);
+			const credential = `${alias}-credential`;
+			const text = sanitizeDiagnosticText(`${alias}=${credential}`);
+			assert.equal(text.includes(credential), false, `${alias} text leaked a credential-shaped value`);
+		}
+	}
+});
+
+test('operational token aliases never execute accessors and preserve only numeric text literals', () => {
+	let getterCalls = 0;
+	const hostile = Object.create(null, {
+		inputTokens: { enumerable: true, get() { getterCalls += 1; return 42; } },
+	});
+	const sanitized = sanitizeDiagnosticValue(hostile);
+	assert.equal(getterCalls, 0);
+	assert.equal(Object.hasOwn(sanitized, 'inputTokens'), false);
+
+	for (const source of ['inputTokens=12', 'token_latency_ms:12.5', 'TOKEN-LIMIT = 0']) {
+		assert.equal(sanitizeDiagnosticText(source), source);
+	}
+	for (const [source, secret] of [
+		['inputTokens="12"', '12'],
+		['output_token_count=-1', '-1'],
+		['tokenCount=1.5', '1.5'],
+		['cached_tokens=provider-secret', 'provider-secret'],
+		['token_latency_ms=Infinity', 'Infinity'],
+		['token_budget=9007199254740992', '9007199254740992'],
+	]) {
+		const output = sanitizeDiagnosticText(source);
+		assert.equal(output.includes(secret), false, `${source} leaked a non-metric value`);
+		assert.match(output, /\[REDACTED\]/);
+	}
+});
+
+test('tokens object requires exact own data metrics and preserves the validated object', () => {
+	const exact = Object.create(null, {
+		input: { enumerable: true, value: 12 },
+		output: { enumerable: true, value: 4 },
+		reasoning: { enumerable: true, value: 2 },
+		cached: { enumerable: true, value: 1 },
+		cacheWrite: { enumerable: true, value: null },
+	});
+	assert.deepEqual({ ...sanitizeDiagnosticValue({ tokens: exact }).tokens }, { input: 12, output: 4, reasoning: 2, cached: 1, cacheWrite: null });
+	for (const invalid of [
+		{ input: '12' },
+		{ input: -1 },
+		{ input: 1.5 },
+		{ input: Number.POSITIVE_INFINITY },
+		{ input: 1, credential: 'secret' },
+		new Proxy({ input: 1 }, {}),
+	]) assert.equal(sanitizeDiagnosticValue({ tokens: invalid }).tokens, '[REDACTED]');
+	let getterCalls = 0;
+	const accessor = Object.create(null, { input: { enumerable: true, get() { getterCalls += 1; return 12; } } });
+	assert.equal(sanitizeDiagnosticValue({ tokens: accessor }).tokens, '[REDACTED]');
+	assert.equal(getterCalls, 0);
+});
+
+test('error helpers read only own data fields and sanitize messages, stacks, and codes', () => {
+	const error = Object.assign(new Error('authorization=secret-message'), { code: 'PROVIDER_FAILED' });
+	error.stack = 'Error: authorization=secret-stack\n at C:\\private\\agent.mjs:1:2';
+	assert.equal(sanitizeDiagnosticErrorCode(error), 'PROVIDER_FAILED');
+	assert.doesNotMatch(sanitizeDiagnosticErrorMessage(error), /secret-message/);
+	assert.doesNotMatch(sanitizeDiagnosticErrorStack(error), /secret-stack|private/);
+
+	let getterCalls = 0;
+	const accessor = Object.create(null, {
+		code: { enumerable: true, get() { getterCalls += 1; return 'LEAKED_CODE'; } },
+		message: { enumerable: true, get() { getterCalls += 1; return 'secret-message'; } },
+		stack: { enumerable: true, get() { getterCalls += 1; return 'secret-stack'; } },
+	});
+	assert.equal(sanitizeDiagnosticErrorCode(accessor), 'UNKNOWN');
+	assert.equal(sanitizeDiagnosticErrorMessage(accessor), 'unknown error');
+	assert.equal(sanitizeDiagnosticErrorStack(accessor), 'unknown error');
+	assert.equal(getterCalls, 0);
+	const proxy = new Proxy({}, { get() { getterCalls += 1; throw new Error('must not read proxy'); } });
+	assert.equal(sanitizeDiagnosticErrorMessage(proxy), 'unknown error');
+	assert.equal(getterCalls, 0);
 });
 
 test('launcher and account credential aliases redact in text and structured diagnostics', () => {

@@ -4,7 +4,7 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
-import { DIAGNOSTIC_REDACTED, isSensitiveDiagnosticKey, sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
+import { DIAGNOSTIC_REDACTED, isOperationalTokenMetric, isSensitiveDiagnosticKey, sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
 
 const REDACTED = DIAGNOSTIC_REDACTED;
 const UNSAFE = '[UNSAFE_OBJECT]';
@@ -188,7 +188,7 @@ function sanitizeValue(value, state, depth = 0, key = null) {
 			try { descriptor = Object.getOwnPropertyDescriptor(input, property); } catch { continue; }
 			if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) continue;
 			entries += 1;
-			if (isSensitiveDiagnosticKey(property)) output[property] = REDACTED;
+			if (isSensitiveDiagnosticKey(property) && !isOperationalTokenMetric(property, descriptor.value)) output[property] = REDACTED;
 			else if (property === 'source' && !state.allowSource) continue;
 			else children.push({ value: descriptor.value, assign: (result) => { Object.defineProperty(output, property, { enumerable: true, configurable: true, writable: true, value: result }); }, depth: task.depth + 1, key: property });
 		}
