@@ -6,6 +6,7 @@ import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, v
 import { completionContractFingerprint } from '../src/goal-contract.mjs';
 
 const SECRET = 's'.repeat(32);
+const LAUNCH_ID = '00000000-0000-0000-0000-000000000123';
 const TRACE_ID = 'trace-wire-1';
 const DESIRED_OAK_STAIRS_STATE = 'minecraft:oak_stairs[facing=north,half=bottom,shape=straight,waterlogged=false]';
 const PROVENANCE = Object.freeze({
@@ -35,6 +36,55 @@ class FakeSocket extends EventEmitter {
 function serverEnvelope(type, agentId, messageId, payload = {}) {
 	return { protocolVersion: 2, serverInstanceId: 'server-instance', agentId, type, messageId, payload };
 }
+
+test('optional launch identity fences supervised coordinator authentication', async () => {
+	assert.deepEqual(validateProtocolV2Payload('hello', { secret: SECRET }), { secret: SECRET });
+	assert.deepEqual(validateProtocolV2Payload('hello', { secret: SECRET, launchId: LAUNCH_ID }), {
+		secret: SECRET,
+		launchId: LAUNCH_ID,
+	});
+
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, launchId: LAUNCH_ID }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	assert.equal(hello.payload.launchId, LAUNCH_ID);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-launch-ack', {
+		replyTo: hello.messageId,
+		authenticated: true,
+		registry: [],
+		launchId: LAUNCH_ID,
+	}))}\n`);
+	assert.equal((await ready)[0].launchId, LAUNCH_ID);
+	bridge.stop();
+
+	const staleSocket = new FakeSocket();
+	const staleBridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, launchId: LAUNCH_ID }, {
+		socketFactory: () => staleSocket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	staleBridge.start();
+	staleSocket.emit('connect');
+	const staleHello = JSON.parse(staleSocket.writes[0]);
+	const rejected = once(staleBridge, 'protocolError');
+	staleSocket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-stale-launch-ack', {
+		replyTo: staleHello.messageId,
+		authenticated: true,
+		registry: [],
+		launchId: '00000000-0000-0000-0000-000000000999',
+	}))}\n`);
+	assert.equal((await rejected)[0].code, 'LAUNCH_ID_MISMATCH');
+	staleBridge.stop();
+});
 
 test('coordinator status is strict, bounded, and excludes private planner data', () => {
 	const payload = {

@@ -9,6 +9,8 @@ import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
+import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.server.AgentRuntimeHooks;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.conversation.ConversationAudience;
@@ -27,14 +29,20 @@ import dev.agaminggod.arenaagents.protocol.ActionType;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
 
@@ -98,9 +106,225 @@ public final class MultiplexedServerBridgeVerification {
 		verifyObservationCadence(candidates);
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyRealBridgeSessionLifecycle();
+		verifyLaunchIdentityAndReconnectGeneration();
+		verifyHandshakeResnapshotsLifecycleRaces();
+		verifyImmediateHandshakeClosePreservesDisconnect();
+		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicConversationWakePublication();
 		verifyCompletionResultFacts();
-		return 55;
+		return 74;
+	}
+
+	private static void verifyLaunchIdentityAndReconnectGeneration() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			String launchId = "00000000-0000-0000-0000-000000000881";
+			secretFile = Files.createTempFile("arena-agents-launch-identity-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			long firstGeneration;
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				BridgeEnvelope acknowledgement = authenticate(socket, reader, codec, secret, launchId, "hello-launch-1");
+				assertEquals(launchId, acknowledgement.payload().get("launchId").getAsString(),
+						"hello acknowledgement echoes the owned launch identity");
+				assertEquals(launchId, bridge.authenticatedLaunchId(),
+						"bridge publishes the exact authenticated launch identity");
+				firstGeneration = bridge.authenticatedSessionGeneration();
+				assertTrue(firstGeneration > 0L, "first authenticated socket receives a positive session generation");
+			}
+			MultiplexedServerBridge activeBridge = bridge;
+			awaitCondition(() -> !activeBridge.authenticated(), "closed authenticated socket releases bridge authentication");
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				authenticate(socket, reader, codec, secret, launchId, "hello-launch-2");
+				assertTrue(bridge.authenticatedSessionGeneration() > firstGeneration,
+						"replacement authentication advances the bridge session generation");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("launch identity bridge verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyHandshakeResnapshotsLifecycleRaces() {
+		verifyRemovalDuringHandshakeResnapshots();
+		verifyTransitionDuringHandshakePublishesOnce();
+	}
+
+	private static void verifyRemovalDuringHandshakeResnapshots() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		CountDownLatch releaseSnapshot = new CountDownLatch(1);
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-removal-handshake-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord record = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Removed"), 1_000L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			AtomicBoolean firstSnapshot = new AtomicBoolean(true);
+			CountDownLatch snapshotTaken = new CountDownLatch(1);
+			bridge.setHandshakeSnapshotHookForVerification(() -> {
+				if (!firstSnapshot.compareAndSet(true, false)) return;
+				snapshotTaken.countDown();
+				awaitLatch(releaseSnapshot, "removal handshake snapshot released");
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				writeHello(socket, codec, secret, null, "hello-removal-race");
+				awaitLatch(snapshotTaken, "handshake captured the pre-removal registry");
+				MultiplexedServerBridge activeBridge = bridge;
+				activeBridge.withinPublicationBoundary(() -> {
+					manager.registry().remove(record.agentId());
+					activeBridge.onRemoved(record.agentId(), 1L);
+					return null;
+				});
+				releaseSnapshot.countDown();
+				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
+				assertEquals(0, acknowledgement.payload().getAsJsonArray("registry").size(),
+						"removal during authentication retries the snapshot without closing the candidate session");
+				assertTrue(bridge.authenticated(), "removal race leaves the resnapshotted session authenticated");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("removal handshake race verification failed", exception);
+		} finally {
+			releaseSnapshot.countDown();
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyTransitionDuringHandshakePublishesOnce() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		CountDownLatch releaseSnapshot = new CountDownLatch(1);
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-transition-handshake-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord record = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Starting"), 1_000L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			AtomicBoolean firstSnapshot = new AtomicBoolean(true);
+			CountDownLatch snapshotTaken = new CountDownLatch(1);
+			bridge.setHandshakeSnapshotHookForVerification(() -> {
+				if (!firstSnapshot.compareAndSet(true, false)) return;
+				snapshotTaken.countDown();
+				awaitLatch(releaseSnapshot, "transition handshake snapshot released");
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				writeHello(socket, codec, secret, null, "hello-transition-race");
+				awaitLatch(snapshotTaken, "handshake captured the pre-transition registry");
+				AgentTransition transition = manager.registry().start(record.agentId(), "publish exactly once", 1_001L);
+				bridge.onTransition(transition);
+				releaseSnapshot.countDown();
+				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
+				JsonObject published = acknowledgement.payload().getAsJsonArray("registry").get(0).getAsJsonObject();
+				assertEquals(AgentLifecycleState.STARTING.name(), published.get("state").getAsString(),
+						"transition during authentication is folded into the retried handshake snapshot");
+				socket.setSoTimeout(150);
+				try {
+					reader.readLine();
+					throw new AssertionError("transition race published a duplicate lifecycle frame");
+				} catch (SocketTimeoutException expected) {
+					assertTrue(true, "transition race emits no duplicate queue or start frame after hello_ack");
+				}
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("transition handshake race verification failed", exception);
+		} finally {
+			releaseSnapshot.countDown();
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyImmediateHandshakeClosePreservesDisconnect() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-immediate-close-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge.setHandshakeCommittedHookForVerification(session -> {
+				try {
+					session.close();
+				} catch (Exception exception) {
+					throw new AssertionError(exception);
+				}
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification())) {
+				writeHello(socket, codec, secret, null, "hello-immediate-close");
+				MultiplexedServerBridge activeBridge = bridge;
+				awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
+						"session close immediately after authentication preserves the pending disconnect");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("immediate handshake close verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyPendingRegistrationMarkerIsFenced() {
+		try {
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord record = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Pending"), 1_000L);
+			Set<AgentId> pending = pendingRegistrations(manager);
+			pending.add(record.agentId());
+			assertTrue(MultiplexedServerBridge.registeredObservationIds(manager.coordinatorVisibleRecords()).isEmpty(),
+					"pending registrations stay out of observation scheduling");
+			AtomicBoolean inBoundary = new AtomicBoolean();
+			AtomicBoolean removedInsideBoundary = new AtomicBoolean();
+			manager.setRuntimeHooks(new AgentRuntimeHooks() {
+				@Override
+				public boolean onCreated(AgentRecord created) {
+					assertTrue(inBoundary.get(), "registration hook runs inside the publication boundary");
+					return true;
+				}
+
+				@Override
+				public <T> T withinPublicationBoundary(java.util.function.Supplier<T> publication) {
+					inBoundary.set(true);
+					try {
+						T result = publication.get();
+						removedInsideBoundary.set(!pending.contains(record.agentId()));
+						return result;
+					} finally {
+						inBoundary.set(false);
+					}
+				}
+			});
+			Method publish = CodexAgentManager.class.getDeclaredMethod("publishPendingRegistration", AgentRecord.class);
+			publish.setAccessible(true);
+			publish.invoke(manager, record);
+			assertTrue(removedInsideBoundary.get(),
+					"pending registration marker clears before the publication boundary opens");
+			assertEquals(List.of(record), manager.coordinatorVisibleRecords(),
+					"published registration becomes observation-eligible after the fenced commit");
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("pending registration fence verification failed", exception);
+		}
 	}
 
 	private static void verifyCompletionResultFacts() {
@@ -384,6 +608,63 @@ public final class MultiplexedServerBridgeVerification {
 			return manager;
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not allocate lifecycle-only manager", exception);
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private static Set<AgentId> pendingRegistrations(CodexAgentManager manager) {
+		try {
+			Field field = CodexAgentManager.class.getDeclaredField("pendingAgentRegistrations");
+			field.setAccessible(true);
+			return (Set<AgentId>) field.get(manager);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not read pending registrations", exception);
+		}
+	}
+
+	private static BridgeEnvelope authenticate(
+			Socket socket,
+			BufferedReader reader,
+			BridgeEnvelopeCodec codec,
+			String secret,
+			String launchId,
+			String messageId
+	) throws Exception {
+		writeHello(socket, codec, secret, launchId, messageId);
+		return codec.decode(reader.readLine());
+	}
+
+	private static void writeHello(
+			Socket socket,
+			BridgeEnvelopeCodec codec,
+			String secret,
+			String launchId,
+			String messageId
+	) throws java.io.IOException {
+		JsonObject payload = new JsonObject();
+		payload.addProperty("secret", secret);
+		if (launchId != null) payload.addProperty("launchId", launchId);
+		socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
+				2, "coordinator", "server", "hello", messageId, payload
+		)).getBytes(StandardCharsets.UTF_8));
+		socket.getOutputStream().flush();
+	}
+
+	private static void awaitLatch(CountDownLatch latch, String label) {
+		try {
+			assertTrue(latch.await(2L, java.util.concurrent.TimeUnit.SECONDS), label);
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError(label + " was interrupted", exception);
+		}
+	}
+
+	private static void deleteIfExists(Path path) {
+		if (path == null) return;
+		try {
+			Files.deleteIfExists(path);
+		} catch (java.io.IOException exception) {
+			throw new AssertionError("could not remove temporary bridge secret", exception);
 		}
 	}
 

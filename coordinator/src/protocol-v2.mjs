@@ -76,6 +76,7 @@ const MAX_REGISTRY_SNAPSHOT_AGENTS = 1_024;
 const MAX_NEARBY_TRANSACTION_TARGETS = 16;
 const MAX_COMPLETION_FACTS = 16;
 const MAX_CHANGED_FACTS = 256;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const FACTUAL_PLAYER_FIELDS = new Set([
 	'health', 'maxHealth', 'armor', 'foodLevel', 'saturation', 'gameMode', 'onGround', 'inWater',
 	'onFire', 'air', 'maxAir', 'suffocating', 'fallDistance', 'lastAttacker', 'effects',
@@ -134,15 +135,19 @@ export function validateProtocolV2Payload(type, value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${type} payload must be an object`);
 	switch (type) {
 		case 'hello':
-			exactKeys(value, ['secret'], ['secret'], type);
-			return { secret: boundedText(value.secret, 'secret', MAX_BRIDGE_SECRET_LENGTH, 32) };
+			exactKeys(value, ['secret', 'launchId'], ['secret'], type);
+			return {
+				secret: boundedText(value.secret, 'secret', MAX_BRIDGE_SECRET_LENGTH, 32),
+				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
+			};
 		case 'hello_ack':
-			exactKeys(value, ['replyTo', 'authenticated', 'registry'], ['replyTo', 'authenticated', 'registry'], type);
+			exactKeys(value, ['replyTo', 'authenticated', 'registry', 'launchId'], ['replyTo', 'authenticated', 'registry'], type);
 			if (value.authenticated !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'hello_ack authenticated must be true');
 			return {
 				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
 				authenticated: true,
 				registry: boundedArray(value.registry, 'registry', MAX_REGISTRY_SNAPSHOT_AGENTS).map((entry) => normalizeRegisteredAgent(entry, 'registry entry')),
+				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
 			};
 		case 'catalog_request':
 			exactKeys(value, [], [], type);
@@ -238,6 +243,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#host;
 	#port;
 	#secret;
+	#launchId;
 	#expectedServerInstanceId;
 	#serverInstanceId;
 	#socketFactory;
@@ -272,6 +278,10 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (this.#host !== LOOPBACK_HOST) throw new ProtocolV2Error('LOOPBACK_REQUIRED', `Multiplexed bridge host must be ${LOOPBACK_HOST}`);
 		this.#port = requirePort(config.port);
 		this.#secret = requireSecret(config.secret);
+		const configuredLaunchId = config.launchId ?? process.env.ARENA_AGENT_COORDINATOR_LAUNCH_ID;
+		this.#launchId = configuredLaunchId === undefined || configuredLaunchId === null || configuredLaunchId === ''
+			? null
+			: launchIdentity(configuredLaunchId);
 		this.#expectedServerInstanceId = config.serverInstanceId === undefined ? null : requireIdentifier(config.serverInstanceId, 'serverInstanceId');
 		this.#serverInstanceId = this.#expectedServerInstanceId ?? PENDING_SERVER_INSTANCE_ID;
 		this.#socketFactory = dependencies.socketFactory ?? (() => net.createConnection({ host: this.#host, port: this.#port }));
@@ -351,7 +361,10 @@ export class MultiplexedServerBridge extends EventEmitter {
 			agentId: 'server',
 			type: 'hello',
 			messageId,
-			payload: { secret: this.#secret },
+			payload: {
+				secret: this.#secret,
+				...(this.#launchId === null ? {} : { launchId: this.#launchId }),
+			},
 		});
 		const encoded = encodeJsonLine(hello);
 		this.#invokeAudit('coordinator_to_server', { ...hello, payload: { secret: '[REDACTED]' } });
@@ -406,6 +419,9 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (envelope.type !== 'hello_ack' || envelope.agentId !== 'server') throw new ProtocolV2Error('HANDSHAKE_REQUIRED', 'hello_ack must be the first server message');
 		if (envelope.payload.replyTo !== this.#helloMessageId) throw new ProtocolV2Error('HANDSHAKE_MISMATCH', 'hello_ack does not match the active hello');
 		if (envelope.payload.authenticated !== true) throw new ProtocolV2Error('AUTHENTICATION_FAILED', 'Server rejected bridge authentication');
+		if (this.#launchId !== null && envelope.payload.launchId !== this.#launchId) {
+			throw new ProtocolV2Error('LAUNCH_ID_MISMATCH', 'Server acknowledgement does not match this coordinator launch');
+		}
 		if (this.#expectedServerInstanceId !== null && envelope.serverInstanceId !== this.#expectedServerInstanceId) throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Connected server instance does not match configuration');
 		const registry = envelope.payload.registry ?? [];
 		if (!Array.isArray(registry)) throw new ProtocolV2Error('INVALID_REGISTRY_SNAPSHOT', 'hello_ack registry must be an array');
@@ -418,7 +434,11 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (this.#knownAgentIds.size !== registry.length) throw new ProtocolV2Error('DUPLICATE_AGENT', 'hello_ack registry contains duplicate agents');
 		this.#ready = true;
 		this.#reconnectDelayMs = this.#initialReconnectDelayMs;
-		this.emit('ready', { serverInstanceId: this.#serverInstanceId, registry: structuredClone(registry) });
+		this.emit('ready', {
+			serverInstanceId: this.#serverInstanceId,
+			registry: structuredClone(registry),
+			...(this.#launchId === null ? {} : { launchId: this.#launchId }),
+		});
 	}
 
 	#assertRevision(envelope, guardedTypes) {
@@ -1386,6 +1406,12 @@ function requirePort(value) {
 
 function requireIdentifier(value, field) {
 	return requireText(value, field, MAX_IDENTIFIER_LENGTH);
+}
+
+function launchIdentity(value) {
+	const launchId = boundedText(value, 'launchId', 36);
+	if (!UUID_PATTERN.test(launchId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'launchId must be a UUID');
+	return launchId.toLowerCase();
 }
 
 function requireText(value, field, maximum) {

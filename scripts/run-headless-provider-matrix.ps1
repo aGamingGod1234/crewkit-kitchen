@@ -133,7 +133,11 @@ function Get-ConfiguredPort([string] $EnvironmentName) {
 
 function ConvertTo-ProcessCreationKey($Value) {
 	if ($null -eq $Value) { return $null }
-	if ($Value -is [DateTime]) { return $Value.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture) }
+	if ($Value -is [DateTime]) {
+		$ticks = $Value.ToUniversalTime().Ticks
+		$millisecondTicks = $ticks - ($ticks % [TimeSpan]::TicksPerMillisecond)
+		return $millisecondTicks.ToString([Globalization.CultureInfo]::InvariantCulture)
+	}
 	$valueText = [string] $Value
 	if ([string]::IsNullOrWhiteSpace($valueText)) { return $null }
 	return $valueText
@@ -235,8 +239,14 @@ function Measure-RunnerResourcesUntilExit(
 	[System.Collections.Generic.List[object]] $ProcessIdentities,
 	[DateTime] $Deadline
 ) {
-	$peakProcessCount = 0
-	[long] $peakRssBytes = 0
+	$initialRoots = [System.Collections.Generic.HashSet[int]]::new()
+	[long] $initialRssBytes = 0
+	foreach ($handle in $TrackedHandles) {
+		if ($null -eq $handle -or $null -eq $handle.Process -or -not $initialRoots.Add([int] $handle.Process.Id)) { continue }
+		if ($null -ne $handle.InitialRssBytes) { $initialRssBytes += [long] $handle.InitialRssBytes }
+	}
+	$peakProcessCount = $initialRoots.Count
+	[long] $peakRssBytes = $initialRssBytes
 	while ($true) {
 		foreach ($handle in $TrackedHandles) {
 			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIdentities $(if ($null -ne $handle.Identity) { $handle.Identity } else { $handle.Process.Id }) }
@@ -317,18 +327,19 @@ function Start-RedirectedProcess(
 	$process = [Diagnostics.Process]::new()
 	$process.StartInfo = $startInfo
 	if (-not $process.Start()) { throw "Could not start process: $FileName" }
-	$processes = Get-ProcessSnapshot
-	if (-not $processes.ContainsKey([int] $process.Id)) {
-		try { $process.Kill() } catch {}
-		throw "Could not capture process identity: $FileName"
+	$process.Refresh()
+	$identity = [pscustomobject]@{
+		ProcessId = [int] $process.Id
+		ParentProcessId = [int] $PID
+		CreationDate = ConvertTo-ProcessCreationKey $process.StartTime
 	}
-	$observed = $processes[[int] $process.Id]
-	$identity = [pscustomobject]@{ ProcessId = [int] $observed.ProcessId; ParentProcessId = [int] $observed.ParentProcessId; CreationDate = [string] $observed.CreationDate }
+	$initialRssBytes = [long] $process.WorkingSet64
 	$stdoutTask = $process.StandardOutput.ReadToEndAsync()
 	$stderrTask = $process.StandardError.ReadToEndAsync()
 	return @{
 		Process = $process
 		Identity = $identity
+		InitialRssBytes = $initialRssBytes
 		StdoutTask = $stdoutTask
 		StderrTask = $stderrTask
 		StdoutPath = $StdoutPath

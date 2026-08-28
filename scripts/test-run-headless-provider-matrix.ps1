@@ -249,6 +249,42 @@ function Test-PortClosed([int] $Port) {
 	return $null -eq (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
 
+function Import-WrapperFunction([string] $Name) {
+	$tokens = $null
+	$errors = $null
+	$ast = [Management.Automation.Language.Parser]::ParseInput($wrapperSource, [ref] $tokens, [ref] $errors)
+	$definition = $ast.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name }, $true) | Select-Object -First 1
+	if ($null -eq $definition) { throw "Could not load wrapper function '$Name'" }
+	$extent = $definition.Extent.Text
+	$body = $definition.Body.Extent.Text
+	$parameterStart = $extent.IndexOf('(')
+	$bodyStart = $extent.IndexOf('{')
+	$parameters = $extent.Substring($parameterStart, $bodyStart - $parameterStart)
+	Set-Item -Path "Function:\script:$Name" -Value ([scriptblock]::Create("param$parameters`n" + $body.Substring(1, $body.Length - 2)))
+}
+
+function Test-FastExitResourceSampling([string] $WorkingDirectory) {
+	foreach ($name in @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit', 'Start-RedirectedProcess')) {
+		Import-WrapperFunction $name
+	}
+	$script:PollMilliseconds = 10
+	$stdout = Join-Path $WorkingDirectory 'fast-runner.stdout.log'
+	$stderr = Join-Path $WorkingDirectory 'fast-runner.stderr.log'
+	$handle = Start-RedirectedProcess powershell.exe '-NoProfile -Command "Start-Sleep -Milliseconds 150"' $WorkingDirectory $stdout $stderr @{}
+	$tracked = [System.Collections.Generic.List[object]]::new()
+	try {
+		Start-Sleep -Milliseconds 250
+		$measurement = Measure-RunnerResourcesUntilExit $handle @($handle) $tracked ([DateTime]::UtcNow.AddSeconds(5))
+		if ([int] $measurement.processCount -lt 1) { throw 'Fast-exit runner was not sampled before completion' }
+	} finally {
+		if (-not $handle.Process.HasExited) { $handle.Process.Kill() }
+		$handle.Process.WaitForExit()
+		$null = $handle.StdoutTask.Wait(1000)
+		$null = $handle.StderrTask.Wait(1000)
+		$handle.Process.Dispose()
+	}
+}
+
 $project = Join-Path ([IO.Path]::GetTempPath()) "arena-headless-wrapper-test-$([Guid]::NewGuid().ToString('N'))"
 $originalAppData = [Environment]::GetEnvironmentVariable('APPDATA')
 $originalLocalAppData = [Environment]::GetEnvironmentVariable('LOCALAPPDATA')
@@ -264,6 +300,8 @@ try {
 
 	$fixture = Join-Path $project 'fixture'
 	New-Fixture $fixture
+	Test-FastExitResourceSampling $fixture
+	Write-Output 'PASS PowerShell wrapper samples a fast-exit tracked runner before completion'
 	Set-TestEnvironment 'APPDATA' (Join-Path $fixture 'fake-appdata')
 	Set-TestEnvironment 'LOCALAPPDATA' (Join-Path $fixture 'fake-localappdata')
 	Set-TestEnvironment 'ARENA_HEADLESS_SKIP_PROVIDER_PREFLIGHT' '1'
@@ -330,6 +368,7 @@ try {
 		return
 	}
 
+	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '5'
 	Enable-FakeServer $fixture
 	Set-TestEnvironment 'ARENA_HEADLESS_FAKE_NO_HELLO_ACK' '1'
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'Coordinator bridge did not become ready'
@@ -344,7 +383,6 @@ try {
 		Remove-Item -LiteralPath (Join-Path $fixture 'fake-appdata\no-catalog') -Force -ErrorAction SilentlyContinue
 	}
 	Write-Output 'PASS authenticated bridge waits for catalog publication before runner startup'
-	Set-TestEnvironment 'ARENA_HEADLESS_STARTUP_TIMEOUT_SECONDS' '5'
 	Assert-Fails { & $scriptPath -ProjectRoot $fixture -MatrixPath (Join-Path $fixture 'matrix.json') -ServerTemplate (Join-Path $fixture 'runtime\server-template') } 'ready|timed out|failed|required'
 	if (-not (Test-PortClosed 39165) -or -not (Test-PortClosed 39166) -or -not (Test-PortClosed 39167)) { throw 'Allocated ports remained open after timeout cleanup' }
 	$runRoot = Join-Path $fixture 'runtime\headless-runs'

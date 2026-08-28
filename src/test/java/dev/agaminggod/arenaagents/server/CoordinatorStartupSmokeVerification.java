@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodec;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
@@ -18,8 +19,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 
 /** Starts one staged coordinator with an isolated, empty PATH and validates its first catalog. */
@@ -55,16 +61,24 @@ public final class CoordinatorStartupSmokeVerification {
 			System.clearProperty("arenaagents.voiceUrl");
 
 			try (ServerSocket bridge = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-				writeSmokeConfig(packageRoot, bridge.getLocalPort());
+				int voicePort = unusedLoopbackPort();
+				writeSmokeConfig(packageRoot, bridge.getLocalPort(), voicePort);
 				Map<String, String> emptyPath = new HashMap<>();
 				emptyPath.put("PATH", "");
 				emptyPath.put("APPDATA", fakeAppData.toString());
 				emptyPath.put("FISH_AUDIO_API_KEY", "");
 				emptyPath.put("FISH_API_KEY", "");
 				supervisor = new CoordinatorProcessSupervisor(packageRoot.resolve("game"), emptyPath);
+				long configurationDeadline = System.currentTimeMillis() + STARTUP_TIMEOUT_MS;
+				while (!supervisor.configured() && System.currentTimeMillis() < configurationDeadline) {
+					supervisor.tick(false);
+					Thread.sleep(10L);
+				}
 				assertTrue(supervisor.configured(), "staged package is configured");
-				assertEquals("http://127.0.0.1:9123/v1/tts", System.getProperty("arenaagents.voiceUrl"),
-						"coordinator voice endpoint is shared with the addon before voice startup");
+				assertEquals(bridge.getLocalPort(), supervisor.bridgePort(),
+						"production supervisor publishes the nondefault coordinator bridge port");
+				assertEquals("http://127.0.0.1:" + voicePort + "/v1/tts", System.getProperty("arenaagents.voiceUrl"),
+						"coordinator shares the existing optional voice endpoint before startup");
 				assertEquals(node.toAbsolutePath().normalize(), NodeRuntimeLocator.locate(packageRoot).executable(),
 						"bundled runtime is selected before the empty PATH");
 
@@ -74,7 +88,7 @@ public final class CoordinatorStartupSmokeVerification {
 					if (bridge.getSoTimeout() == 0) bridge.setSoTimeout(250);
 					try (Socket socket = bridge.accept()) {
 						socket.setSoTimeout(15_000);
-						if (completeHandshakeAndCatalog(socket)) return 7;
+						if (completeHandshakeAndCatalog(socket)) return 10;
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
 					}
@@ -83,13 +97,34 @@ public final class CoordinatorStartupSmokeVerification {
 				throw new AssertionError("staged coordinator did not reach the catalog-ready boundary: " + supervisor.failureCode());
 			}
 		} finally {
-			if (supervisor != null) supervisor.close();
-			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
-			restoreProperty(NodeRuntimeLocator.PROPERTY, oldNodePath);
-			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
-			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
-			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
-			deleteTree(packageRoot);
+			AssertionError ownershipFailure = null;
+			try {
+				if (supervisor != null) {
+					supervisor.close();
+					try {
+						long ownershipDeadline = System.currentTimeMillis() + 5_000L;
+						while (Files.exists(CoordinatorProcessOwnership.ownershipFile(packageRoot))
+								&& System.currentTimeMillis() < ownershipDeadline) {
+							Thread.sleep(25L);
+						}
+						assertTrue(!Files.exists(CoordinatorProcessOwnership.ownershipFile(packageRoot)),
+								"coordinator close clears the ownership record");
+					} catch (AssertionError failure) {
+						ownershipFailure = failure;
+					} catch (InterruptedException interrupted) {
+						Thread.currentThread().interrupt();
+						ownershipFailure = new AssertionError("ownership cleanup wait was interrupted", interrupted);
+					}
+				}
+			} finally {
+				restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+				restoreProperty(NodeRuntimeLocator.PROPERTY, oldNodePath);
+				restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+				restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+				restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
+				deleteTree(packageRoot);
+			}
+			if (ownershipFailure != null) throw ownershipFailure;
 		}
 	}
 
@@ -100,10 +135,13 @@ public final class CoordinatorStartupSmokeVerification {
 			String helloLine = reader.readLine();
 			JsonObject hello = JsonParser.parseString(helloLine).getAsJsonObject();
 			assertEquals("hello", hello.get("type").getAsString(), "coordinator starts with hello");
+			String launchId = hello.getAsJsonObject("payload").get("launchId").getAsString();
+			java.util.UUID.fromString(launchId);
 			JsonObject payload = new JsonObject();
 			payload.addProperty("replyTo", hello.get("messageId").getAsString());
 			payload.addProperty("authenticated", true);
 			payload.add("registry", new JsonArray());
+			payload.addProperty("launchId", launchId);
 			writer.write(codec.encode(new BridgeEnvelope(
 					2,
 					"startup-smoke-server",
@@ -113,20 +151,79 @@ public final class CoordinatorStartupSmokeVerification {
 					payload
 			)));
 			writer.flush();
-			String catalogLine = reader.readLine();
-			JsonObject catalog = JsonParser.parseString(catalogLine).getAsJsonObject();
-			assertEquals("catalog_snapshot", catalog.get("type").getAsString(), "coordinator publishes catalog after handshake");
-			assertTrue(catalog.getAsJsonObject("payload").getAsJsonArray("models").toString().contains("gpt-5.6-luna"),
-				"catalog-ready boundary contains the staged Codex model");
+			boolean discoveryRequested = false;
+			boolean stagedModelReady = false;
+			long deadline = System.currentTimeMillis() + STARTUP_TIMEOUT_MS;
+			while (System.currentTimeMillis() < deadline) {
+				String line = reader.readLine();
+				if (line == null) break;
+				JsonObject message = JsonParser.parseString(line).getAsJsonObject();
+				if (!"catalog_snapshot".equals(message.get("type").getAsString())) continue;
+				JsonArray models = message.getAsJsonObject("payload").getAsJsonArray("models");
+				if (models.toString().contains("gpt-5.6-luna")) {
+					stagedModelReady = true;
+					break;
+				}
+				if (discoveryRequested) continue;
+				discoveryRequested = true;
+				writer.write(codec.encode(new BridgeEnvelope(
+						2,
+						"startup-smoke-server",
+						"server",
+						"catalog_request",
+						"startup-smoke-catalog-request",
+						new JsonObject()
+				)));
+				writer.flush();
+			}
+			assertTrue(stagedModelReady, "catalog-ready boundary contains the staged Codex model");
 			return true;
 		}
 	}
 
 	private static void stageCoordinator(Path source, Path root) throws IOException {
-		copyTree(source.resolve("src"), root.resolve("coordinator/src"));
-		copyTree(source.resolve("node_modules/acorn"), root.resolve("coordinator/node_modules/acorn"));
-		Files.createDirectories(root.resolve("coordinator/config"));
-		Files.copy(source.resolve("package.json"), root.resolve("coordinator/package.json"), StandardCopyOption.REPLACE_EXISTING);
+		String manifest = coordinatorManifest(source);
+		BundledCoordinatorInstaller.install(root, resourcePath -> {
+			String prefix = "arena-agents/coordinator/";
+			if (!resourcePath.startsWith(prefix)) throw new IOException("Unexpected coordinator resource: " + resourcePath);
+			String relative = resourcePath.substring(prefix.length());
+			if (relative.equals("coordinator-manifest.txt")) {
+				return new ByteArrayInputStream(manifest.getBytes(StandardCharsets.UTF_8));
+			}
+			Path file = source.resolve(relative).normalize();
+			if (!file.startsWith(source) || !Files.isRegularFile(file)) {
+				throw new IOException("Missing coordinator fixture resource: " + relative);
+			}
+			return Files.newInputStream(file);
+		});
+	}
+
+	private static String coordinatorManifest(Path source) throws IOException {
+		List<Path> files = new ArrayList<>();
+		for (String fixed : List.of("package.json", "package-lock.json")) {
+			Path file = source.resolve(fixed);
+			if (Files.isRegularFile(file)) files.add(file);
+		}
+		for (String directory : List.of("config", "src", "node_modules/acorn")) {
+			try (var paths = Files.walk(source.resolve(directory))) {
+				paths.filter(Files::isRegularFile).forEach(files::add);
+			}
+		}
+		files.sort(Comparator.comparing(file -> source.relativize(file).toString().replace('\\', '/')));
+		StringBuilder manifest = new StringBuilder();
+		for (Path file : files) {
+			manifest.append(sha256(Files.readAllBytes(file))).append(' ')
+					.append(source.relativize(file).toString().replace('\\', '/')).append('\n');
+		}
+		return manifest.toString();
+	}
+
+	private static String sha256(byte[] bytes) {
+		try {
+			return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+		} catch (NoSuchAlgorithmException impossible) {
+			throw new IllegalStateException(impossible);
+		}
 	}
 
 	private static Path stageBundledNode(Path root) throws IOException {
@@ -162,17 +259,23 @@ public final class CoordinatorStartupSmokeVerification {
 		return root.resolve("fake-appdata");
 	}
 
-	private static void writeSmokeConfig(Path root, int port) throws IOException {
+	private static void writeSmokeConfig(Path root, int port, int voicePort) throws IOException {
 		String config = """
 				{
 				  "bridge": { "host": "127.0.0.1", "port": %d, "secretEnvironmentVariable": "ARENA_AGENT_BRIDGE_SECRET", "reconnectDelayMs": 50, "maxReconnectDelayMs": 100 },
 				  "codex": { "cwd": "%s", "planningTimeoutMs": 1000, "catalogTtlMs": 60000, "serviceTier": "fast", "launchProfile": { "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "serviceTier": "fast" } },
-				  "voice": { "port": 9123, "maxConcurrent": 1 },
+				  "voice": { "port": %d, "maxConcurrent": 1 },
 				  "limits": { "agentCap": 1, "goalQueueCap": 1, "planningConcurrency": 1, "planningMode": "fixed", "urgentReserve": 0, "invalidDecisionRetries": 0 }
 				}
-				""".formatted(port, root.toString().replace("\\", "\\\\"));
-		Files.createDirectories(root.resolve("coordinator/config"));
-		Files.writeString(root.resolve("coordinator/config/dynamic-agents.json"), config, StandardCharsets.UTF_8);
+				""".formatted(port, root.toString().replace("\\", "\\\\"), voicePort);
+		Files.createDirectories(root.resolve("runtime"));
+		Files.writeString(root.resolve("runtime/dynamic-agents.json"), config, StandardCharsets.UTF_8);
+	}
+
+	private static int unusedLoopbackPort() throws IOException {
+		try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+			return socket.getLocalPort();
+		}
 	}
 
 	private static Path findHostNode() throws IOException {
@@ -210,8 +313,19 @@ public final class CoordinatorStartupSmokeVerification {
 
 	private static void deleteTree(Path root) throws IOException {
 		if (!Files.exists(root)) return;
-		try (var paths = Files.walk(root)) {
-			for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+		for (int attempt = 0; attempt < 20; attempt += 1) {
+			try (var paths = Files.walk(root)) {
+				for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
+				return;
+			} catch (java.nio.file.AccessDeniedException busyExecutable) {
+				if (attempt == 19) throw busyExecutable;
+				try {
+					Thread.sleep(50L);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					throw new IOException("Interrupted while cleaning the startup fixture", interrupted);
+				}
+			}
 		}
 	}
 
