@@ -17,8 +17,10 @@ export async function runNativeToolCli(run, { stdout = process.stdout, stderr = 
 		const outcome = await run({
 			progress: (value) => writeRecord(stdout, { type: 'PROGRESS', ...value }),
 		});
-		writeRecord(stdout, outcome);
-		return outcome?.status === 'FAILED' ? NATIVE_TOOL_CLI_FAILURE : 0;
+		let terminal = prepareRecord(outcome);
+		if (!['PASSED', 'FAILED'].includes(terminal.status)) terminal = prepareRecord({ status: 'FAILED', code: 'INVALID_OUTCOME' });
+		stdout.write(terminal.line);
+		return terminal.status === 'FAILED' ? NATIVE_TOOL_CLI_FAILURE : 0;
 	} catch (error) {
 		const failure = {
 			status: 'FAILED',
@@ -37,6 +39,10 @@ export async function runNativeToolCli(run, { stdout = process.stdout, stderr = 
 }
 
 export function serializeNativeToolCliRecord(value, { maxLineBytes = NATIVE_TOOL_CLI_MAX_LINE_BYTES } = {}) {
+	return prepareRecord(value, { maxLineBytes }).line;
+}
+
+function prepareRecord(value, { maxLineBytes = NATIVE_TOOL_CLI_MAX_LINE_BYTES } = {}) {
 	if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 256) throw new TypeError('maxLineBytes must be an integer of at least 256');
 	const source = sanitizeDiagnosticValue(value, {
 		maxDepth: 12,
@@ -53,18 +59,23 @@ export function serializeNativeToolCliRecord(value, { maxLineBytes = NATIVE_TOOL
 		candidate = redactCredentialShapedValues(candidate);
 		if (attempt > 0 && candidate !== null && typeof candidate === 'object' && !Array.isArray(candidate)) candidate.bounded = true;
 		const line = `${JSON.stringify(candidate)}\n`;
-		if (Buffer.byteLength(line, 'utf8') <= maxLineBytes) return line;
+		if (Buffer.byteLength(line, 'utf8') <= maxLineBytes) return { line, status: safeStatus(candidate) };
 		maxStringBytes = Math.max(32, Math.floor(maxStringBytes / 2));
 		maxEntries = Math.max(2, Math.floor(maxEntries / 2));
 		maxNodes = Math.max(16, Math.floor(maxNodes / 2));
 		maxDepth = Math.max(2, maxDepth - 1);
 	}
 	const status = source?.status === 'PASSED' ? 'PASSED' : source?.status === 'FAILED' ? 'FAILED' : undefined;
-	return `${JSON.stringify({ ...(status ? { status } : {}), bounded: true })}\n`;
+	return { line: `${JSON.stringify({ ...(status ? { status } : {}), bounded: true })}\n`, status };
 }
 
 function writeRecord(stream, value) {
 	stream.write(serializeNativeToolCliRecord(value));
+}
+
+function safeStatus(value) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+	return Object.hasOwn(value, 'status') && ['PASSED', 'FAILED'].includes(value.status) ? value.status : undefined;
 }
 
 function redactCredentialShapedValues(value) {

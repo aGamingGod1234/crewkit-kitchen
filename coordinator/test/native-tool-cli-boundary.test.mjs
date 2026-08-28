@@ -6,6 +6,8 @@ import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { runNativeToolCli } from '../src/native-tool-cli-boundary.mjs';
+
 const coordinatorRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const privateMissingModule = 'C:\\private\\api-token-secret.mjs';
 const maximumDiagnosticBytes = 8 * 1_024;
@@ -205,4 +207,42 @@ test('cleanup failure replaces success with exactly one failed terminal outcome'
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test('hostile terminal status access cannot create a second outcome', async (context) => {
+	for (const [name, fixture] of [
+		['accessor', () => {
+			let calls = 0;
+			const value = Object.create(null, {
+				status: { enumerable: true, get() { calls += 1; throw new Error('must not run'); } },
+			});
+			return { value, calls: () => calls };
+		}],
+		['proxy', () => {
+			let calls = 0;
+			const value = new Proxy({}, {
+				get(_target, property) {
+					if (property === 'then') return undefined;
+					calls += 1;
+					throw new Error('must not run');
+				},
+				ownKeys() { calls += 1; throw new Error('must not run'); },
+			});
+			return { value, calls: () => calls };
+		}],
+	]) await context.test(name, async () => {
+		const { value, calls } = fixture();
+		const stdout = [];
+		const stderr = [];
+		const exitCode = await runNativeToolCli(async () => value, {
+			stdout: { write: (line) => stdout.push(String(line)) },
+			stderr: { write: (line) => stderr.push(String(line)) },
+		});
+		assert.equal(exitCode, 1);
+		assert.equal(calls(), 0);
+		assert.equal(stdout.length, 1);
+		assert.equal(stderr.length, 0);
+		assert.ok(Buffer.byteLength(stdout[0], 'utf8') <= maximumDiagnosticBytes);
+		assert.deepEqual(JSON.parse(stdout[0]), { status: 'FAILED', code: 'INVALID_OUTCOME' });
+	});
 });
