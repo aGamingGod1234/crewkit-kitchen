@@ -4,6 +4,27 @@ import { MAX_LINE_BYTES } from './constants.mjs';
 
 const NEWLINE = 0x0a;
 const CARRIAGE_RETURN = 0x0d;
+const EMPTY = Buffer.alloc(0);
+const UTF8 = new TextDecoder('utf-8', { fatal: true });
+const QUOTE = 0x22;
+const COMMA = 0x2c;
+const COLON = 0x3a;
+const OPEN_BRACKET = 0x5b;
+const BACKSLASH = 0x5c;
+const CLOSE_BRACKET = 0x5d;
+const OPEN_BRACE = 0x7b;
+const CLOSE_BRACE = 0x7d;
+
+// The set matched by the /\s/u character class. Only the first four are legal JSON
+// whitespace; the rest keep the scanner from rejecting a frame before JSON.parse does.
+function isWhitespace(code) {
+	if (code === 0x20) return true;
+	if (code >= 0x09 && code <= 0x0d) return true;
+	if (code < 0xa0) return false;
+	return code === 0xa0 || code === 0x1680 || (code >= 0x2000 && code <= 0x200a)
+		|| code === 0x2028 || code === 0x2029 || code === 0x202f || code === 0x205f
+		|| code === 0x3000 || code === 0xfeff;
+}
 
 export class JsonlError extends Error {
 	constructor(code, message, options) {
@@ -29,18 +50,25 @@ export class JsonlDecoder {
 			throw new TypeError('JSONL chunk must be a string or byte view');
 		}
 		const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-		this.#buffer = this.#buffer.length === 0 ? Buffer.from(bytes) : Buffer.concat([this.#buffer, bytes]);
+		// Scan the caller's bytes in place; only an unconsumed tail is copied, and only
+		// when it borrows caller-owned memory that may be reused after this call.
+		const borrowed = this.#buffer.length === 0 && typeof chunk !== 'string';
+		this.#buffer = this.#buffer.length === 0 ? bytes : Buffer.concat([this.#buffer, bytes]);
 		const messages = [];
-		while (true) {
-			const newlineIndex = this.#buffer.indexOf(NEWLINE);
-			if (newlineIndex === -1) break;
-			if (newlineIndex > this.#maxBytes) this.#throwOversized(newlineIndex);
-			let line = this.#buffer.subarray(0, newlineIndex);
-			this.#buffer = this.#buffer.subarray(newlineIndex + 1);
-			if (line.at(-1) === CARRIAGE_RETURN) line = line.subarray(0, -1);
-			messages.push(parseObject(line));
+		try {
+			while (true) {
+				const newlineIndex = this.#buffer.indexOf(NEWLINE);
+				if (newlineIndex === -1) break;
+				if (newlineIndex > this.#maxBytes) this.#throwOversized(newlineIndex);
+				let line = this.#buffer.subarray(0, newlineIndex);
+				this.#buffer = this.#buffer.subarray(newlineIndex + 1);
+				if (line.at(-1) === CARRIAGE_RETURN) line = line.subarray(0, -1);
+				messages.push(parseObject(line));
+			}
+			if (this.#buffer.length > this.#maxBytes) this.#throwOversized(this.#buffer.length);
+		} finally {
+			if (borrowed) this.#buffer = this.#buffer.length === 0 ? EMPTY : Buffer.from(this.#buffer);
 		}
-		if (this.#buffer.length > this.#maxBytes) this.#throwOversized(this.#buffer.length);
 		return messages;
 	}
 
@@ -51,7 +79,7 @@ export class JsonlDecoder {
 	}
 
 	#throwOversized(actualBytes) {
-		this.#buffer = Buffer.alloc(0);
+		this.#buffer = EMPTY;
 		throw new JsonlError('LINE_TOO_LARGE', `JSONL frame is ${actualBytes} UTF-8 bytes and exceeds ${this.#maxBytes} UTF-8 bytes`);
 	}
 }
@@ -74,7 +102,7 @@ function parseObject(bytes) {
 	if (bytes.length === 0) throw new JsonlError('MALFORMED_JSON', 'JSONL frame must not be blank');
 	let text;
 	try {
-		text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+		text = UTF8.decode(bytes);
 	} catch (error) {
 		throw new JsonlError('INVALID_ENCODING', 'JSONL frame must be valid UTF-8', { cause: error });
 	}
@@ -99,55 +127,65 @@ function isPlainObject(value) {
 // bridge treats those as ambiguous identities, so scan the already-valid JSON
 // grammar before materialising the object.
 function assertNoDuplicateKeys(text) {
+	const length = text.length;
 	let index = 0;
-	const whitespace = () => { while (/\s/u.test(text[index] ?? '')) index += 1; };
+	const whitespace = () => { while (isWhitespace(text.charCodeAt(index))) index += 1; };
 	const string = () => {
 		const start = index;
-		if (text[index++] !== '"') throw new SyntaxError('Expected JSON string');
-		let escaped = false;
-		while (index < text.length) {
-			const character = text[index++];
-			if (escaped) { escaped = false; continue; }
-			if (character === '\\') { escaped = true; continue; }
-			if (character === '"') return JSON.parse(text.slice(start, index));
+		if (text.charCodeAt(index++) !== QUOTE) throw new SyntaxError('Expected JSON string');
+		let literalName = true;
+		while (index < length) {
+			const code = text.charCodeAt(index++);
+			if (code === BACKSLASH) { literalName = false; index += 1; continue; }
+			if (code < 0x20) literalName = false;
+			if (code === QUOTE) {
+				const raw = text.slice(start + 1, index - 1);
+				// An unescaped, control-free name already equals its decoded form, so the
+				// escape-decoding parse is only needed for the rest.
+				return literalName ? raw : JSON.parse(text.slice(start, index));
+			}
 		}
 		throw new SyntaxError('Unterminated JSON string');
 	};
 	const literal = () => {
-		while (index < text.length && !/[\s,\]}]/u.test(text[index])) index += 1;
+		while (index < length) {
+			const code = text.charCodeAt(index);
+			if (code === COMMA || code === CLOSE_BRACKET || code === CLOSE_BRACE || isWhitespace(code)) break;
+			index += 1;
+		}
 	};
 	const value = () => {
 		whitespace();
-		if (text[index] === '{') {
+		if (text.charCodeAt(index) === OPEN_BRACE) {
 			index += 1;
 			const names = new Set();
 			whitespace();
-			if (text[index] === '}') { index += 1; return; }
+			if (text.charCodeAt(index) === CLOSE_BRACE) { index += 1; return; }
 			while (true) {
 				whitespace();
 				const name = string();
 				if (names.has(name)) throw new SyntaxError(`Duplicate JSON object key '${name}'`);
 				names.add(name);
 				whitespace();
-				if (text[index++] !== ':') throw new SyntaxError('Expected colon');
+				if (text.charCodeAt(index++) !== COLON) throw new SyntaxError('Expected colon');
 				value();
 				whitespace();
-				if (text[index] === '}') { index += 1; return; }
-				if (text[index++] !== ',') throw new SyntaxError('Expected comma');
+				if (text.charCodeAt(index) === CLOSE_BRACE) { index += 1; return; }
+				if (text.charCodeAt(index++) !== COMMA) throw new SyntaxError('Expected comma');
 			}
 		}
-		if (text[index] === '[') {
+		if (text.charCodeAt(index) === OPEN_BRACKET) {
 			index += 1;
 			whitespace();
-			if (text[index] === ']') { index += 1; return; }
+			if (text.charCodeAt(index) === CLOSE_BRACKET) { index += 1; return; }
 			while (true) {
 				value();
 				whitespace();
-				if (text[index] === ']') { index += 1; return; }
-				if (text[index++] !== ',') throw new SyntaxError('Expected comma');
+				if (text.charCodeAt(index) === CLOSE_BRACKET) { index += 1; return; }
+				if (text.charCodeAt(index++) !== COMMA) throw new SyntaxError('Expected comma');
 			}
 		}
-		if (text[index] === '"') { string(); return; }
+		if (text.charCodeAt(index) === QUOTE) { string(); return; }
 		literal();
 	};
 	value();
