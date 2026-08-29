@@ -9,6 +9,45 @@ test('frames fragmented JSONL objects', () => {
 	assert.deepEqual(decoder.push(':2}\r\n'), [{ b: 2 }]);
 });
 
+test('does not concatenate an accumulated partial tail for every fragment', () => {
+	const decoder = new JsonlDecoder();
+	const frame = `{"payload":"${'x'.repeat(4096)}"}\n`;
+	const originalConcat = Buffer.concat;
+	let concatCalls = 0;
+	Buffer.concat = (...args) => {
+		concatCalls += 1;
+		return originalConcat(...args);
+	};
+	try {
+		for (let index = 0; index < frame.length; index += 1) {
+			const messages = decoder.push(frame.slice(index, index + 1));
+			if (index < frame.length - 1) assert.deepEqual(messages, []);
+			else assert.deepEqual(messages, [{ payload: 'x'.repeat(4096) }]);
+		}
+	} finally {
+		Buffer.concat = originalConcat;
+	}
+	assert.equal(concatCalls, 0);
+});
+
+test('preserves frames split at every UTF-8 byte boundary', () => {
+	const encoded = Buffer.from('{"text":"héllo 💥"}\n', 'utf8');
+	for (let split = 1; split < encoded.length; split += 1) {
+		const decoder = new JsonlDecoder();
+		assert.deepEqual(decoder.push(encoded.subarray(0, split)), [], `split ${split}`);
+		assert.deepEqual(decoder.push(encoded.subarray(split)), [{ text: 'héllo 💥' }], `split ${split}`);
+	}
+});
+
+test('recovers after a malformed fragmented frame without retaining caller bytes', () => {
+	const decoder = new JsonlDecoder();
+	const first = Buffer.from('{"bad":1,}\n{"next"', 'utf8');
+	const malformedFrameBytes = Buffer.byteLength('{"bad":1,}\n', 'utf8');
+	assert.throws(() => decoder.push(first), (error) => error.code === 'MALFORMED_JSON');
+	first.fill(0x20, malformedFrameBytes);
+	assert.deepEqual(decoder.push(Buffer.from(':true}\n', 'utf8')), [{ next: true }]);
+});
+
 test('counts UTF-8 bytes and rejects an oversized frame before a newline', () => {
 	const decoder = new JsonlDecoder({ maxBytes: 8 });
 	assert.throws(() => decoder.push('"💥💥"'), /exceeds 8 UTF-8 bytes/);

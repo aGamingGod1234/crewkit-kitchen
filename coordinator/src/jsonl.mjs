@@ -35,7 +35,14 @@ export class JsonlError extends Error {
 }
 
 export class JsonlDecoder {
-	#buffer = Buffer.alloc(0);
+	#segments = [];
+	#segmentIndex = 0;
+	#segmentOffset = 0;
+	#bufferedBytes = 0;
+	#consumedBytes = 0;
+	#appendedBytes = 0;
+	#newlineOffsets = [];
+	#newlineIndex = 0;
 	#maxBytes;
 
 	constructor({ maxBytes = MAX_LINE_BYTES } = {}) {
@@ -50,37 +57,129 @@ export class JsonlDecoder {
 			throw new TypeError('JSONL chunk must be a string or byte view');
 		}
 		const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-		// Scan the caller's bytes in place; only an unconsumed tail is copied, and only
-		// when it borrows caller-owned memory that may be reused after this call.
-		const borrowed = this.#buffer.length === 0 && typeof chunk !== 'string';
-		this.#buffer = this.#buffer.length === 0 ? bytes : Buffer.concat([this.#buffer, bytes]);
+		this.#append(bytes, typeof chunk !== 'string');
 		const messages = [];
 		try {
 			while (true) {
-				const newlineIndex = this.#buffer.indexOf(NEWLINE);
+				const newlineIndex = this.#nextNewlineOffset();
 				if (newlineIndex === -1) break;
 				if (newlineIndex > this.#maxBytes) this.#throwOversized(newlineIndex);
-				let line = this.#buffer.subarray(0, newlineIndex);
-				this.#buffer = this.#buffer.subarray(newlineIndex + 1);
+				let line = this.#read(newlineIndex);
+				this.#consume(1);
 				if (line.at(-1) === CARRIAGE_RETURN) line = line.subarray(0, -1);
 				messages.push(parseObject(line));
 			}
-			if (this.#buffer.length > this.#maxBytes) this.#throwOversized(this.#buffer.length);
+			if (this.#bufferedBytes > this.#maxBytes) this.#throwOversized(this.#bufferedBytes);
 		} finally {
-			if (borrowed) this.#buffer = this.#buffer.length === 0 ? EMPTY : Buffer.from(this.#buffer);
+			this.#detachBorrowedSegments();
+			this.#compactStorage();
 		}
 		return messages;
 	}
 
 	finish() {
-		if (this.#buffer.length !== 0) {
+		if (this.#bufferedBytes !== 0) {
 			throw new JsonlError('INCOMPLETE_FRAME', 'Incomplete JSONL frame at end of stream');
 		}
 	}
 
 	#throwOversized(actualBytes) {
-		this.#buffer = EMPTY;
+		this.#clear();
 		throw new JsonlError('LINE_TOO_LARGE', `JSONL frame is ${actualBytes} UTF-8 bytes and exceeds ${this.#maxBytes} UTF-8 bytes`);
+	}
+
+	#append(bytes, borrowed) {
+		if (bytes.length === 0) return;
+		const start = this.#appendedBytes;
+		for (let offset = bytes.indexOf(NEWLINE); offset !== -1; offset = bytes.indexOf(NEWLINE, offset + 1)) {
+			this.#newlineOffsets.push(start + offset);
+		}
+		this.#appendedBytes += bytes.length;
+		this.#bufferedBytes += bytes.length;
+		this.#segments.push({ bytes, borrowed });
+	}
+
+	#nextNewlineOffset() {
+		while (this.#newlineIndex < this.#newlineOffsets.length && this.#newlineOffsets[this.#newlineIndex] < this.#consumedBytes) {
+			this.#newlineIndex += 1;
+		}
+		if (this.#newlineIndex === this.#newlineOffsets.length) return -1;
+		return this.#newlineOffsets[this.#newlineIndex] - this.#consumedBytes;
+	}
+
+	#read(length) {
+		if (length === 0) return EMPTY;
+		const current = this.#segments[this.#segmentIndex];
+		const available = current.bytes.length - this.#segmentOffset;
+		if (available >= length) {
+			const line = current.bytes.subarray(this.#segmentOffset, this.#segmentOffset + length);
+			this.#consume(length);
+			return line;
+		}
+
+		const line = Buffer.allocUnsafe(length);
+		let copied = 0;
+		while (copied < length) {
+			const segment = this.#segments[this.#segmentIndex];
+			const segmentAvailable = segment.bytes.length - this.#segmentOffset;
+			const amount = Math.min(segmentAvailable, length - copied);
+			segment.bytes.copy(line, copied, this.#segmentOffset, this.#segmentOffset + amount);
+			this.#consume(amount);
+			copied += amount;
+		}
+		return line;
+	}
+
+	#consume(length) {
+		this.#consumedBytes += length;
+		this.#bufferedBytes -= length;
+		while (length > 0) {
+			const segment = this.#segments[this.#segmentIndex];
+			const available = segment.bytes.length - this.#segmentOffset;
+			const amount = Math.min(available, length);
+			this.#segmentOffset += amount;
+			length -= amount;
+			if (this.#segmentOffset === segment.bytes.length) {
+				this.#segmentIndex += 1;
+				this.#segmentOffset = 0;
+			}
+		}
+	}
+
+	#detachBorrowedSegments() {
+		for (let index = this.#segmentIndex; index < this.#segments.length; index += 1) {
+			const segment = this.#segments[index];
+			if (!segment.borrowed) continue;
+			segment.bytes = Buffer.from(segment.bytes.subarray(index === this.#segmentIndex ? this.#segmentOffset : 0));
+			segment.borrowed = false;
+			if (index === this.#segmentIndex) this.#segmentOffset = 0;
+		}
+	}
+
+	#compactStorage() {
+		if (this.#bufferedBytes === 0) {
+			this.#clear();
+			return;
+		}
+		if (this.#segmentIndex >= 64 && this.#segmentIndex * 2 >= this.#segments.length) {
+			this.#segments = this.#segments.slice(this.#segmentIndex);
+			this.#segmentIndex = 0;
+		}
+		if (this.#newlineIndex >= 64 && this.#newlineIndex * 2 >= this.#newlineOffsets.length) {
+			this.#newlineOffsets = this.#newlineOffsets.slice(this.#newlineIndex);
+			this.#newlineIndex = 0;
+		}
+	}
+
+	#clear() {
+		this.#segments = [];
+		this.#segmentIndex = 0;
+		this.#segmentOffset = 0;
+		this.#bufferedBytes = 0;
+		this.#consumedBytes = 0;
+		this.#appendedBytes = 0;
+		this.#newlineOffsets = [];
+		this.#newlineIndex = 0;
 	}
 }
 
