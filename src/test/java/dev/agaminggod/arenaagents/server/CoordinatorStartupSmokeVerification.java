@@ -46,6 +46,7 @@ public final class CoordinatorStartupSmokeVerification {
 		String oldBridgeSecret = System.getProperty("arenaagents.bridgeSecretFile");
 		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
 		String oldVoiceUrl = System.getProperty("arenaagents.voiceUrl");
+		String oldVoiceRequestTimeout = System.getProperty("arenaagents.voiceRequestTimeoutMs");
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
 			stageCoordinator(sourceCoordinator, packageRoot);
@@ -59,6 +60,7 @@ public final class CoordinatorStartupSmokeVerification {
 			System.clearProperty("arenaagents.bridgeSecretFile");
 			System.clearProperty("arenaagents.voiceSecretFile");
 			System.clearProperty("arenaagents.voiceUrl");
+			System.clearProperty("arenaagents.voiceRequestTimeoutMs");
 
 			try (ServerSocket bridge = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
 				int voicePort = unusedLoopbackPort();
@@ -75,10 +77,17 @@ public final class CoordinatorStartupSmokeVerification {
 					Thread.sleep(10L);
 				}
 				assertTrue(supervisor.configured(), "staged package is configured");
+<<<<<<< HEAD
 				assertEquals(bridge.getLocalPort(), supervisor.bridgePort(),
 						"production supervisor publishes the nondefault coordinator bridge port");
 				assertEquals("http://127.0.0.1:" + voicePort + "/v1/tts", System.getProperty("arenaagents.voiceUrl"),
 						"coordinator shares the existing optional voice endpoint before startup");
+=======
+				assertEquals("http://127.0.0.1:9123/v1/tts", System.getProperty("arenaagents.voiceUrl"),
+						"coordinator voice endpoint is shared with the addon before voice startup");
+				assertEquals("91234", System.getProperty("arenaagents.voiceRequestTimeoutMs"),
+						"coordinator local inference deadline is shared with the addon before voice startup");
+>>>>>>> origin/main
 				assertEquals(node.toAbsolutePath().normalize(), NodeRuntimeLocator.locate(packageRoot).executable(),
 						"bundled runtime is selected before the empty PATH");
 
@@ -88,7 +97,11 @@ public final class CoordinatorStartupSmokeVerification {
 					if (bridge.getSoTimeout() == 0) bridge.setSoTimeout(250);
 					try (Socket socket = bridge.accept()) {
 						socket.setSoTimeout(15_000);
+<<<<<<< HEAD
 						if (completeHandshakeAndCatalog(socket)) return 10;
+=======
+						if (completeHandshakeAndCatalog(socket)) return 8;
+>>>>>>> origin/main
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
 					}
@@ -97,6 +110,7 @@ public final class CoordinatorStartupSmokeVerification {
 				throw new AssertionError("staged coordinator did not reach the catalog-ready boundary: " + supervisor.failureCode());
 			}
 		} finally {
+<<<<<<< HEAD
 			AssertionError ownershipFailure = null;
 			try {
 				if (supervisor != null) {
@@ -125,6 +139,16 @@ public final class CoordinatorStartupSmokeVerification {
 				deleteTree(packageRoot);
 			}
 			if (ownershipFailure != null) throw ownershipFailure;
+=======
+			if (supervisor != null) supervisor.close();
+			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
+			restoreProperty(NodeRuntimeLocator.PROPERTY, oldNodePath);
+			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
+			restoreProperty("arenaagents.voiceRequestTimeoutMs", oldVoiceRequestTimeout);
+			deleteTree(packageRoot);
+>>>>>>> origin/main
 		}
 	}
 
@@ -264,7 +288,11 @@ public final class CoordinatorStartupSmokeVerification {
 				{
 				  "bridge": { "host": "127.0.0.1", "port": %d, "secretEnvironmentVariable": "ARENA_AGENT_BRIDGE_SECRET", "reconnectDelayMs": 50, "maxReconnectDelayMs": 100 },
 				  "codex": { "cwd": "%s", "planningTimeoutMs": 1000, "catalogTtlMs": 60000, "serviceTier": "fast", "launchProfile": { "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "serviceTier": "fast" } },
+<<<<<<< HEAD
 				  "voice": { "port": %d, "maxConcurrent": 1 },
+=======
+				  "voice": { "port": 9123, "maxConcurrent": 1, "localSpeechTimeoutMs": 91234 },
+>>>>>>> origin/main
 				  "limits": { "agentCap": 1, "goalQueueCap": 1, "planningConcurrency": 1, "planningMode": "fixed", "urgentReserve": 0, "invalidDecisionRetries": 0 }
 				}
 				""".formatted(port, root.toString().replace("\\", "\\\\"), voicePort);
@@ -313,6 +341,7 @@ public final class CoordinatorStartupSmokeVerification {
 
 	private static void deleteTree(Path root) throws IOException {
 		if (!Files.exists(root)) return;
+<<<<<<< HEAD
 		for (int attempt = 0; attempt < 20; attempt += 1) {
 			try (var paths = Files.walk(root)) {
 				for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
@@ -324,6 +353,26 @@ public final class CoordinatorStartupSmokeVerification {
 				} catch (InterruptedException interrupted) {
 					Thread.currentThread().interrupt();
 					throw new IOException("Interrupted while cleaning the startup fixture", interrupted);
+=======
+		try (var paths = Files.walk(root)) {
+			for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) deleteEventually(path);
+		}
+	}
+
+	private static void deleteEventually(Path path) throws IOException {
+		long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2L);
+		while (true) {
+			try {
+				Files.deleteIfExists(path);
+				return;
+			} catch (java.nio.file.AccessDeniedException exception) {
+				if (!isWindows() || System.nanoTime() >= deadline) throw exception;
+				try {
+					Thread.sleep(25L);
+				} catch (InterruptedException interrupted) {
+					Thread.currentThread().interrupt();
+					throw new IOException("Interrupted while waiting for Windows to release " + path, interrupted);
+>>>>>>> origin/main
 				}
 			}
 		}

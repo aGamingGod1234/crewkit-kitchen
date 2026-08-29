@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server.voice;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.server.CodexAgentServerRuntime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -15,6 +16,39 @@ public final class VoiceSubsystemVerification {
 
 	public static int verify() {
 		int assertions = 0;
+		UUID humanPlayer = UUID.randomUUID();
+		VoiceConsentRegistry.clear(null);
+		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
+			throw new AssertionError("Human proximity transcription must default to disabled");
+		}
+		assertions++;
+		VoiceConsentRegistry.grant(null, humanPlayer);
+		if (!VoiceConsentRegistry.granted(null, humanPlayer)) {
+			throw new AssertionError("Granted consent must remain active during the current connection");
+		}
+		assertions++;
+		VoiceConsentRegistry.playerDisconnected(null, humanPlayer);
+		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
+			throw new AssertionError("Disconnect must revoke consent before a later connection");
+		}
+		assertions++;
+		if (!CodexAgentServerRuntime.deliverHumanSpeech(null, humanPlayer, "must stay private", false)
+				.deliveredIds().isEmpty()) {
+			throw new AssertionError("Revoked consent must fence buffered or in-flight speech delivery");
+		}
+		assertions++;
+		if (VoiceConsentRegistry.captureWhileGranted(null, humanPlayer, () -> {
+			throw new AssertionError("Revoked consent must fence a racing microphone packet");
+		})) {
+			throw new AssertionError("Revoked consent must reject new capture work");
+		}
+		assertions++;
+		VoiceConsentRegistry.grant(null, humanPlayer);
+		VoiceConsentRegistry.clear(null);
+		if (VoiceConsentRegistry.granted(null, humanPlayer)) {
+			throw new AssertionError("A server shutdown must clear prior consent");
+		}
+		assertions++;
 		AgentId first = AgentId.parse("00000000-0000-0000-0000-000000000001");
 		AgentId second = AgentId.parse("00000000-0000-0000-0000-000000000002");
 		VoiceRequest request = new VoiceRequest(first, "Hello nearby.", "voice.moss.v1", 48, 1L);
@@ -52,7 +86,7 @@ public final class VoiceSubsystemVerification {
 		if (!subsystem.unregistered.equals(List.of(second, first, first))) {
 			throw new AssertionError("Shutdown must unregister the remaining channel");
 		}
-		return assertions + 1;
+		return assertions + 1 + VoiceSubsystemRuntimeVerification.verify();
 	}
 
 	private static final class RecordingSubsystem implements VoiceSubsystem {
@@ -66,6 +100,7 @@ public final class VoiceSubsystemVerification {
 			return CompletableFuture.completedFuture(VoiceReceipt.accepted());
 		}
 		@Override public void stop(AgentId agentId) { }
+		@Override public void cancelHumanSpeech(UUID playerId) { }
 		@Override public void close() { }
 	}
 }

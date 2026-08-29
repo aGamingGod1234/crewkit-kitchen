@@ -31,6 +31,7 @@ import java.util.function.Supplier;
 /** Owns coordinator availability until explicit Minecraft shutdown. */
 final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CoordinatorProcessSupervisor.class);
+<<<<<<< HEAD
 	private static final long DEPENDENCY_RECHECK_MS = 5_000L;
 	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
@@ -41,6 +42,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long DESCENDANT_TRACK_INTERVAL_MS = 100L;
 	private static final int MAX_BRIDGE_SECRET_LENGTH = 512;
 	private static final int CANDIDATE_FAILURES_BEFORE_ROLLBACK = 3;
+=======
+	private static final String VOICE_URL_PROPERTY = "arenaagents.voiceUrl";
+	private static final String VOICE_REQUEST_TIMEOUT_PROPERTY = "arenaagents.voiceRequestTimeoutMs";
+>>>>>>> origin/main
 
 	private final Path gameDirectory;
 	private final Map<String, String> launchEnvironmentOverrides;
@@ -82,6 +87,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private String dependencyFingerprint;
 	private String failureCode;
 	private String failureMessage;
+<<<<<<< HEAD
 	private String failingBoundary;
 	private ChildProcess pendingTermination;
 	private long bridgeRevision;
@@ -95,6 +101,14 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private String managedVoiceEndpoint;
 	private long voiceConfigurationRevision;
 	private boolean initialBridgeListenerObserved;
+=======
+	private String previousVoiceRequestTimeout;
+	private String derivedVoiceRequestTimeout;
+	private boolean ownsVoiceRequestTimeout;
+	private String previousVoiceUrl;
+	private String derivedVoiceUrl;
+	private boolean ownsVoiceUrl;
+>>>>>>> origin/main
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -1275,6 +1289,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	@Override
+<<<<<<< HEAD
 	public void close() {
 		ArrayList<ChildProcess> cleanup = new ArrayList<>();
 		boolean alreadyStopped;
@@ -1319,6 +1334,31 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private static boolean autoStartEnabled() {
 		return !"false".equalsIgnoreCase(System.getProperty("arenaagents.coordinatorAutoStart"));
+=======
+	public synchronized void close() {
+		try {
+			Process owned = process;
+			if (owned == null) return;
+			ProcessHandle handle = owned.toHandle();
+			handle.descendants().forEach(ProcessHandle::destroy);
+			if (owned.isAlive()) owned.destroy();
+			try {
+				if (!owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
+					handle.descendants().forEach(ProcessHandle::destroyForcibly);
+					owned.destroyForcibly();
+					owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
+				}
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+				handle.descendants().forEach(ProcessHandle::destroyForcibly);
+				owned.destroyForcibly();
+			}
+			process = null;
+		} finally {
+			releaseDerivedVoiceUrl();
+			releaseDerivedVoiceRequestTimeout();
+		}
+>>>>>>> origin/main
 	}
 
 	static void configureSharedBridgeSecretPath(Path secretPath) {
@@ -1327,6 +1367,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
 	}
 
+<<<<<<< HEAD
 	private void configureSharedVoiceEndpoint(Path configPath) {
 		if (voiceEndpointExplicitOverride || !Files.isRegularFile(configPath)) return;
 		String configured = configuredProperty("arenaagents.voiceUrl");
@@ -1359,6 +1400,48 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static String configuredProperty(String name) {
 		String value = System.getProperty(name);
 		return value == null || value.isBlank() ? null : value;
+=======
+	void configureSharedVoiceEndpoint(Path configPath) throws IOException {
+		String configured = System.getProperty(VOICE_URL_PROPERTY);
+		if (configured == null || configured.isBlank()) {
+			previousVoiceUrl = configured;
+			CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
+					.ifPresent(endpoint -> {
+						derivedVoiceUrl = endpoint;
+						System.setProperty(VOICE_URL_PROPERTY, endpoint);
+						ownsVoiceUrl = true;
+					});
+		}
+		String configuredTimeout = System.getProperty(VOICE_REQUEST_TIMEOUT_PROPERTY);
+		if (configuredTimeout == null || configuredTimeout.isBlank()) {
+			previousVoiceRequestTimeout = configuredTimeout;
+			derivedVoiceRequestTimeout = Integer.toString(CoordinatorVoiceEndpoint.requestTimeoutMs(configPath));
+			System.setProperty(VOICE_REQUEST_TIMEOUT_PROPERTY, derivedVoiceRequestTimeout);
+			ownsVoiceRequestTimeout = true;
+		}
+	}
+
+	private void releaseDerivedVoiceUrl() {
+		if (!ownsVoiceUrl) return;
+		if (Objects.equals(System.getProperty(VOICE_URL_PROPERTY), derivedVoiceUrl)) {
+			if (previousVoiceUrl == null) System.clearProperty(VOICE_URL_PROPERTY);
+			else System.setProperty(VOICE_URL_PROPERTY, previousVoiceUrl);
+		}
+		previousVoiceUrl = null;
+		derivedVoiceUrl = null;
+		ownsVoiceUrl = false;
+	}
+
+	private void releaseDerivedVoiceRequestTimeout() {
+		if (!ownsVoiceRequestTimeout) return;
+		if (Objects.equals(System.getProperty(VOICE_REQUEST_TIMEOUT_PROPERTY), derivedVoiceRequestTimeout)) {
+			if (previousVoiceRequestTimeout == null) System.clearProperty(VOICE_REQUEST_TIMEOUT_PROPERTY);
+			else System.setProperty(VOICE_REQUEST_TIMEOUT_PROPERTY, previousVoiceRequestTimeout);
+		}
+		previousVoiceRequestTimeout = null;
+		derivedVoiceRequestTimeout = null;
+		ownsVoiceRequestTimeout = false;
+>>>>>>> origin/main
 	}
 
 	private static Path findPackageRoot(Path gameDirectory) {

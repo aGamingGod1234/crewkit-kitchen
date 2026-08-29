@@ -61,7 +61,7 @@ public final class CodexAgentServerRuntime {
 		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::tick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
-				VoiceConsentRegistry.revoke(server, handler.getPlayer().getUUID()));
+				VoiceConsentRegistry.playerDisconnected(server, handler.getPlayer().getUUID()));
 		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) -> {
 			if (!(entity instanceof net.minecraft.server.level.ServerPlayer player)) return true;
 			return AgentDeathCapture.allowVanillaDeath(
@@ -330,6 +330,9 @@ public final class CodexAgentServerRuntime {
 			String transcript,
 			boolean whispering
 	) {
+		if (!VoiceConsentRegistry.granted(server, sourcePlayerId)) {
+			return new DeliveryReceipt(List.of(), List.of());
+		}
 		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge == null || !bridge.authenticated()) return new DeliveryReceipt(List.of(), List.of());
 		ServerPlayer source = server.getPlayerList().getPlayer(sourcePlayerId);
