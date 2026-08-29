@@ -539,6 +539,78 @@ test('cached local speech is not returned after runtime failover to Fish', async
 	}
 });
 
+test('nested runtime fallback caches a successful Fish probe only as Fish audio', async () => {
+	const fishFailure = Object.assign(new Error('Fish is unavailable'), { code: 'TTS_PROVIDER_ERROR' });
+	let now = 0;
+	let fishHealthy = false;
+	let localCalls = 0;
+	let fishCalls = 0;
+	let windowsCalls = 0;
+	const local = {
+		async synthesize() {
+			localCalls += 1;
+			throw Object.assign(new Error('local TTS failed'), { code: 'LOCAL_TTS_ERROR' });
+		},
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() {},
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 0 } }, {
+		FISH_AUDIO_API_KEY: 'fish-key',
+	}, {
+		platform: 'win32',
+		voiceFallbackNow: () => now,
+		voiceFallbackBaseDelayMs: 10,
+		voiceFallbackMaxDelayMs: 10,
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() { return {
+			profileId: 'voice.test', provider: 'fish', model: 's2.1-pro-free', voiceId: 'fish-id', revision: 1, speed: 1,
+		}; } } }),
+		createTtsProvider: () => ({
+			cacheNamespace: () => 'fish/test',
+			async synthesize() {
+				fishCalls += 1;
+				if (!fishHealthy) throw fishFailure;
+				return { sampleRateHz: 48_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.from([1, 0, 1, 0]) };
+			},
+		}),
+		createWindowsTtsProvider: () => ({
+			cacheNamespace: () => 'windows/test',
+			async synthesize() {
+				windowsCalls += 1;
+				return { sampleRateHz: 48_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.from([2, 0, 2, 0]) };
+			},
+		}),
+	});
+	try {
+		const baseUrl = `http://127.0.0.1:${worker.server.address().port}`;
+		let sequence = 0;
+		const request = (text) => fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				agentId: '00000000-0000-4000-8000-000000000001', conversationSequence: ++sequence,
+				profileId: 'voice.auto.v1', radius: 48, text,
+			}),
+		});
+
+		assert.equal((await request('open the circuit')).status, 200);
+		assert.deepEqual([localCalls, fishCalls, windowsCalls], [1, 1, 1]);
+
+		now = 10;
+		fishHealthy = true;
+		assert.equal((await request('repeat me')).status, 200, 'the half-open Fish probe succeeds');
+		assert.equal((await request('repeat me')).status, 200);
+		assert.equal(fishCalls, 2, 'closed-circuit Fish cache lookup reuses the probe result');
+
+		fishHealthy = false;
+		assert.equal((await request('reopen the circuit')).status, 200);
+		assert.equal((await request('repeat me')).status, 200);
+		assert.equal(windowsCalls, 3, 'the reopened circuit cannot return Fish audio from the Windows cache namespace');
+	} finally {
+		await worker.close();
+	}
+});
+
 test('runtime local STT failures switch concurrent requests once to Deepgram while local TTS stays available', async () => {
 	let active;
 	let localSttCalls = 0;

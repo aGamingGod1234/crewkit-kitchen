@@ -8,8 +8,12 @@ export function providerCacheNamespace(provider, fallback) {
 }
 
 export function tagSynthesisCacheNamespace(output, namespace) {
+	const wrapperNamespace = requireNamespace(namespace);
+	const completedNamespace = output?.[CACHE_NAMESPACE];
 	const tagged = { ...output };
-	Object.defineProperty(tagged, CACHE_NAMESPACE, { value: requireNamespace(namespace) });
+	Object.defineProperty(tagged, CACHE_NAMESPACE, {
+		value: validNamespace(completedNamespace) ? completedNamespace : wrapperNamespace,
+	});
 	return Object.freeze(tagged);
 }
 
