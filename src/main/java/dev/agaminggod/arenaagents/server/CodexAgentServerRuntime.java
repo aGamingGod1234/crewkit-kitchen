@@ -14,6 +14,7 @@ import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
+import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
@@ -95,6 +96,8 @@ public final class CodexAgentServerRuntime {
 		ServerLifecycleEvents.SERVER_STARTED.register(CodexAgentServerRuntime::start);
 		ServerTickEvents.END_SERVER_TICK.register(CodexAgentServerRuntime::tick);
 		ServerLifecycleEvents.SERVER_STOPPING.register(CodexAgentServerRuntime::stop);
+		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resourceManager, success) ->
+				ServerObservationCollector.clearTagCache());
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
 				VoiceConsentRegistry.playerDisconnected(server, handler.getPlayer().getUUID()));
 		ServerLivingEntityEvents.ALLOW_DEATH.register((entity, source, damageAmount) -> {
@@ -109,6 +112,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void start(MinecraftServer server) {
+		ServerObservationCollector.clearTagCache();
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		if (supervisor == null) {
@@ -459,6 +463,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void stop(MinecraftServer server) {
+		ServerObservationCollector.clearTagCache();
 		PLANNING_UPDATES.remove(server);
 		GOAL_VERIFIERS.remove(server);
 		VOICE_GATES.remove(server);
