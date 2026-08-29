@@ -966,27 +966,39 @@ function frozenRecord(values) {
 	return Object.freeze(record);
 }
 
-function safePrimitive(value, code, label) {
-	if (value === undefined || value === null || typeof value === 'string' || typeof value === 'boolean') return value;
-	if (typeof value === 'number' && Number.isFinite(value)) return value;
-	throw executionError(code, `ArenaScript ${code}: ${label} must be a safe data value`);
+function isSafePrimitive(value) {
+	if (value === undefined || value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+	return typeof value === 'number' && Number.isFinite(value);
 }
 
 function canonicalize(value, { errorCode, invalidCode, label, maxBytes, requireNullPrototype = false }) {
 	const state = { nodes: 0, keys: 0, bytes: 0, seen: new Set(), containers: [] };
-	const root = createCanonicalNode(value, label, 0, state, { errorCode, invalidCode, maxBytes, requireNullPrototype });
+	const root = createCanonicalNode(value, null, label, 0, state, { errorCode, invalidCode, maxBytes, requireNullPrototype });
 	if (!root.container) return root.value;
 	const stack = [root];
 	while (stack.length > 0) {
 		const current = stack.pop();
 		if (current.depth > CANONICAL_LIMITS.depth) throw limitError(errorCode, 'depth');
-		const entries = current.array ? arrayDataEntries(current.source, current.label, invalidCode) : ownDataEntries(current.source, current.label, { requireNullPrototype, errorCode: invalidCode });
-		for (const [key, childValue] of entries) {
-			if (FORBIDDEN_MEMBER_NAMES.has(key)) throw executionError(invalidCode, `ArenaScript ${invalidCode}: forbidden ${current.label} key`);
+		if (current.array) {
+			const values = arrayDataValues(current, invalidCode);
+			for (let index = 0; index < values.length; index += 1) {
+				state.keys += 1;
+				addCanonicalIndexBytes(index, state, maxBytes, errorCode);
+				if (state.keys > CANONICAL_LIMITS.keys) throw limitError(errorCode, 'keys');
+				const child = createCanonicalNode(values[index], current, index, current.depth + 1, state, { errorCode, invalidCode, maxBytes, requireNullPrototype });
+				current.target[index] = child.value;
+				if (child.container) stack.push(child);
+			}
+			continue;
+		}
+		const record = recordDataValues(current, requireNullPrototype, invalidCode);
+		for (let index = 0; index < record.keys.length; index += 1) {
+			const key = record.keys[index];
+			if (FORBIDDEN_MEMBER_NAMES.has(key)) throw executionError(invalidCode, `ArenaScript ${invalidCode}: forbidden ${canonicalLabel(current)} key`);
 			state.keys += 1;
 			addCanonicalBytes(key, state, maxBytes, errorCode);
 			if (state.keys > CANONICAL_LIMITS.keys) throw limitError(errorCode, 'keys');
-			const child = createCanonicalNode(childValue, `${current.label}.${key}`, current.depth + 1, state, { errorCode, invalidCode, maxBytes, requireNullPrototype });
+			const child = createCanonicalNode(record.values[index], current, key, current.depth + 1, state, { errorCode, invalidCode, maxBytes, requireNullPrototype });
 			current.target[key] = child.value;
 			if (child.container) stack.push(child);
 		}
@@ -995,12 +1007,20 @@ function canonicalize(value, { errorCode, invalidCode, label, maxBytes, requireN
 	return root.value;
 }
 
-function createCanonicalNode(value, label, depth, state, options) {
+// Labels only appear in error messages, so nodes carry their parent and key and the
+// dotted path is materialised on a throwing path instead of once per visited key.
+function canonicalLabel(node, key) {
+	const suffix = key === undefined ? '' : `.${key}`;
+	return node.parent === null ? `${node.key}${suffix}` : `${canonicalLabel(node.parent, node.key)}${suffix}`;
+}
+
+function createCanonicalNode(value, parent, key, depth, state, options) {
 	if (value === null || typeof value !== 'object') {
 		if (typeof value === 'string') addCanonicalBytes(value, state, options.maxBytes, options.errorCode);
-		try { return { value: safePrimitive(value, options.invalidCode, label), container: false }; } catch (error) { if (error instanceof ArenaScriptError) throw error; throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: invalid ${label}`); }
+		if (isSafePrimitive(value)) return { value, container: false };
+		throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: ${nodeLabel(parent, key)} must be a safe data value`);
 	}
-	if (nodeTypes.isProxy(value) || state.seen.has(value)) throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: cyclic or proxy ${label}`);
+	if (nodeTypes.isProxy(value) || state.seen.has(value)) throw executionError(options.invalidCode, `ArenaScript ${options.invalidCode}: cyclic or proxy ${nodeLabel(parent, key)}`);
 	state.seen.add(value);
 	state.nodes += 1;
 	if (state.nodes > CANONICAL_LIMITS.nodes || depth > CANONICAL_LIMITS.depth) throw limitError(options.errorCode, 'nodes');
@@ -1008,24 +1028,50 @@ function createCanonicalNode(value, label, depth, state, options) {
 		if (value.length > CANONICAL_LIMITS.arrayLength) throw limitError(options.errorCode, 'array length');
 		const target = [];
 		state.containers.push(target);
-		return { value: target, source: value, target, label, depth, array: true, container: true };
+		return { value: target, source: value, target, parent, key, depth, array: true, container: true };
 	}
 	const target = Object.create(null);
 	state.containers.push(target);
-	return { value: target, source: value, target, label, depth, array: false, container: true };
+	return { value: target, source: value, target, parent, key, depth, array: false, container: true };
 }
 
-function arrayDataEntries(value, label, errorCode) {
-	if (nodeTypes.isProxy(value) || value.length > CANONICAL_LIMITS.arrayLength) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${label}`);
-	const descriptors = Object.getOwnPropertyDescriptors(value);
-	const entries = [];
-	for (let index = 0; index < value.length; index += 1) {
-		const descriptor = descriptors[String(index)];
-		if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${label}`);
-		entries.push([String(index), descriptor.value]);
+// Mirrors ownDataEntries for the canonicalisation walk, returning parallel key and value
+// arrays so records visited by the walk do not allocate an entry pair per key.
+function recordDataValues(node, requireNullPrototype, errorCode) {
+	const value = node.source;
+	const prototype = Object.getPrototypeOf(value);
+	if (nodeTypes.isProxy(value)) throw executionError(errorCode, `ArenaScript ${errorCode}: ${canonicalLabel(node)} must be a plain record`);
+	if (requireNullPrototype ? prototype !== null : (prototype !== null && prototype !== Object.prototype)) throw executionError(errorCode, `ArenaScript ${errorCode}: ${canonicalLabel(node)} has an unsafe prototype`);
+	const keys = Reflect.ownKeys(value);
+	const values = [];
+	for (const key of keys) {
+		if (typeof key !== 'string') throw executionError(errorCode, `ArenaScript ${errorCode}: ${canonicalLabel(node)} cannot use symbols`);
 	}
-	if (Reflect.ownKeys(value).some((key) => typeof key === 'symbol' || (typeof key === 'string' && key !== 'length' && !/^\d+$/.test(key)))) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${label}`);
-	return entries;
+	for (const key of keys) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor || !descriptor.enumerable || !Object.hasOwn(descriptor, 'value') || descriptor.get || descriptor.set) throw executionError(errorCode, `ArenaScript ${errorCode}: ${canonicalLabel(node)}.${key} must be own data`);
+		values.push(descriptor.value);
+	}
+	return { keys, values };
+}
+
+// Every element is validated before any of them is accounted for, so an unsafe array is
+// still reported as unsafe rather than as whichever limit its earlier elements exhausted.
+function arrayDataValues(node, errorCode) {
+	const value = node.source;
+	if (nodeTypes.isProxy(value) || value.length > CANONICAL_LIMITS.arrayLength) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${canonicalLabel(node)}`);
+	const values = [];
+	for (let index = 0; index < value.length; index += 1) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, index);
+		if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${canonicalLabel(node)}`);
+		values.push(descriptor.value);
+	}
+	const keys = Reflect.ownKeys(value);
+	// Every index below length is already known to be an own data property, so a key count
+	// of length plus `length` itself leaves no room for an extra or symbol key.
+	if (keys.length !== value.length + 1
+		&& keys.some((key) => typeof key === 'symbol' || (typeof key === 'string' && key !== 'length' && !/^\d+$/.test(key)))) throw executionError(errorCode, `ArenaScript ${errorCode}: unsafe ${canonicalLabel(node)}`);
+	return values;
 }
 
 function addCanonicalBytes(value, state, maxBytes, errorCode) {
@@ -1034,6 +1080,15 @@ function addCanonicalBytes(value, state, maxBytes, errorCode) {
 	state.bytes += bytes;
 	if (state.bytes > maxBytes) throw limitError(errorCode, 'bytes');
 }
+
+// An array index key contributes exactly its decimal digits, so accounting for it never
+// has to materialise the key as a string.
+function addCanonicalIndexBytes(index, state, maxBytes, errorCode) {
+	state.bytes += index < 10 ? 1 : index < 100 ? 2 : index < 1000 ? 3 : String(index).length;
+	if (state.bytes > maxBytes) throw limitError(errorCode, 'bytes');
+}
+
+function nodeLabel(parent, key) { return parent === null ? key : canonicalLabel(parent, key); }
 
 function limitError(code, category) { return executionError(code, `ArenaScript ${code}: canonical ${category} limit exceeded`); }
 
