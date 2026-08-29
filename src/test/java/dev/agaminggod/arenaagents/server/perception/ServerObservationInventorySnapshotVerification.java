@@ -17,8 +17,8 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 
 import java.lang.reflect.Field;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.IdentityHashMap;
+import java.util.Map;
 
 /** Exercises the production inventory tracker against mutable Minecraft inventory and menu objects. */
 public final class ServerObservationInventorySnapshotVerification {
@@ -126,7 +126,7 @@ public final class ServerObservationInventorySnapshotVerification {
 	}
 
 	private static final class ComponentBindings implements AutoCloseable {
-		private final List<Holder.Reference<Item>> temporary = new ArrayList<>();
+		private final IdentityHashMap<Holder.Reference<Item>, DataComponentMap> originals = new IdentityHashMap<>();
 
 		private ItemStack stack(Item item, int count) {
 			bind(item, 64, 0);
@@ -140,12 +140,14 @@ public final class ServerObservationInventorySnapshotVerification {
 
 		private void bind(Item item, int maxStackSize, int maxDamage) {
 			Holder.Reference<Item> holder = item.builtInRegistryHolder();
-			if (holder.areComponentsBound()) return;
-			DataComponentMap.Builder components = DataComponentMap.builder()
-					.set(DataComponents.MAX_STACK_SIZE, maxStackSize);
+			if (originals.containsKey(holder)) return;
+			DataComponentMap original = holder.areComponentsBound() ? holder.components() : null;
+			originals.put(holder, original);
+			DataComponentMap.Builder components = DataComponentMap.builder();
+			if (original != null) components.addAll(original);
+			components.set(DataComponents.MAX_STACK_SIZE, maxStackSize);
 			if (maxDamage > 0) components.set(DataComponents.MAX_DAMAGE, maxDamage);
 			holder.bindComponents(components.build());
-			temporary.add(holder);
 		}
 
 		@Override
@@ -153,7 +155,10 @@ public final class ServerObservationInventorySnapshotVerification {
 			try {
 				Field components = Holder.Reference.class.getDeclaredField("components");
 				components.setAccessible(true);
-				for (Holder.Reference<Item> holder : temporary) components.set(holder, null);
+				for (Map.Entry<Holder.Reference<Item>, DataComponentMap> entry : originals.entrySet()) {
+					if (entry.getValue() == null) components.set(entry.getKey(), null);
+					else entry.getKey().bindComponents(entry.getValue());
+				}
 			} catch (ReflectiveOperationException exception) {
 				throw new AssertionError("could not restore temporary item components", exception);
 			}
