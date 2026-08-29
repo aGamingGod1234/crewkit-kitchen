@@ -1541,18 +1541,27 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	static final class DefaultProcessLauncher implements ProcessLauncher {
 		private final ProcessStarter processStarter;
 		private final boolean windowsJobOwnership;
+		private final boolean posixSessionOwnership;
 
 		DefaultProcessLauncher() {
-			this(ProcessBuilder::start, WindowsCoordinatorJob.supported());
+			this(ProcessBuilder::start, WindowsCoordinatorJob.supported(), PosixCoordinatorSession.supported());
 		}
 
 		DefaultProcessLauncher(ProcessStarter processStarter) {
-			this(processStarter, false);
+			this(processStarter, false, false);
 		}
 
-		private DefaultProcessLauncher(ProcessStarter processStarter, boolean windowsJobOwnership) {
+		DefaultProcessLauncher(
+				ProcessStarter processStarter,
+				boolean windowsJobOwnership,
+				boolean posixSessionOwnership
+		) {
 			this.processStarter = Objects.requireNonNull(processStarter, "process starter must not be null");
 			this.windowsJobOwnership = windowsJobOwnership;
+			this.posixSessionOwnership = posixSessionOwnership;
+			if (windowsJobOwnership && posixSessionOwnership) {
+				throw new IllegalArgumentException("coordinator launch cannot use Windows and POSIX ownership together");
+			}
 		}
 
 		@Override
@@ -1560,6 +1569,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			Files.createDirectories(request.standardOutput().getParent());
 			CoordinatorLogRotation.rotate(request.standardOutput().getParent());
 			if (windowsJobOwnership) return launchInWindowsJob(request);
+			if (posixSessionOwnership) return launchInPosixSession(request);
 			ProcessBuilder builder = processBuilder(request, request.command());
 			Process process = processStarter.start(builder);
 			try {
@@ -1574,6 +1584,45 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			} catch (IOException | RuntimeException ownershipFailure) {
 				terminateFailedStart(process);
 				throw ownershipFailure;
+			}
+		}
+
+		private ChildProcess launchInPosixSession(LaunchRequest request) throws IOException {
+			PosixCoordinatorSession.Started started = null;
+			boolean recorded = false;
+			try {
+				started = PosixCoordinatorSession.start(request, processStarter);
+				CoordinatorProcessOwnership.recordPosix(
+						request.runtimeRoot(), request.main(), request.generationId(), request.launchId(),
+						request.supervisorIdentity(), started.sessionIdentity(), started.rootIdentity()
+				);
+				recorded = true;
+				PosixSessionChild child = new PosixSessionChild(
+						request.runtimeRoot(), started, request.generationId(), request.launchId()
+				);
+				started.release();
+				return child;
+			} catch (IOException | RuntimeException launchFailure) {
+				if (started != null) {
+					boolean cleanupComplete = false;
+					try {
+						started.terminate();
+						cleanupComplete = true;
+					} catch (IOException cleanupFailure) {
+						launchFailure.addSuppressed(cleanupFailure);
+					}
+					if (recorded && cleanupComplete) {
+						try {
+							CoordinatorProcessOwnership.clear(
+									request.runtimeRoot(), started.rootIdentity().pid(),
+									started.rootIdentity().startedAtEpochMs(), request.generationId(), request.launchId()
+							);
+						} catch (IOException cleanupFailure) {
+							launchFailure.addSuppressed(cleanupFailure);
+						}
+					}
+				}
+				throw launchFailure;
 			}
 		}
 
@@ -1649,6 +1698,51 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				return Path.of(argument).toAbsolutePath().normalize().equals(expected.toAbsolutePath().normalize());
 			} catch (RuntimeException invalid) {
 				return false;
+			}
+		}
+	}
+
+	private static final class PosixSessionChild implements ChildProcess {
+		private final Path runtimeRoot;
+		private final PosixCoordinatorSession.Started started;
+		private final String generationId;
+		private final String launchId;
+		private final AtomicBoolean terminated = new AtomicBoolean();
+
+		private PosixSessionChild(
+				Path runtimeRoot,
+				PosixCoordinatorSession.Started started,
+				String generationId,
+				String launchId
+		) {
+			this.runtimeRoot = runtimeRoot;
+			this.started = started;
+			this.generationId = generationId;
+			this.launchId = launchId;
+		}
+
+		@Override
+		public boolean isAlive() {
+			return started.rootIdentity().isAlive();
+		}
+
+		@Override
+		public long pid() {
+			return started.rootIdentity().pid();
+		}
+
+		@Override
+		public synchronized void terminate() {
+			if (terminated.get()) return;
+			try {
+				started.terminate();
+				CoordinatorProcessOwnership.clear(
+						runtimeRoot, started.rootIdentity().pid(), started.rootIdentity().startedAtEpochMs(),
+						generationId, launchId
+				);
+				terminated.set(true);
+			} catch (IOException exception) {
+				throw new IllegalStateException("Could not terminate the owned POSIX coordinator session", exception);
 			}
 		}
 	}

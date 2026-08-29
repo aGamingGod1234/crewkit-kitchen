@@ -97,6 +97,8 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifySecretRepairRebindsBridgeAndAuthenticatesReplacement();
 		verifyLaunchFailureRecovers();
 		verifyProductionChildPreservesDescendantsAcrossRootExit();
+		verifyPosixLaunchGateCommand();
+		verifyPosixOwnershipSurvivesUnsampledRootExit();
 		verifyWindowsJobNameCollisionFailsClosed();
 		verifyWindowsJobOwnsLateDetachedDescendant();
 		verifySynchronousInitialCaptureSurvivesFastRootExit();
@@ -105,7 +107,158 @@ public final class CoordinatorProcessSupervisorVerification {
 		verifyCloseWaitsForInflightOwnedLaunchCleanup();
 		verifyCloseTerminatesChildBehindBlockedMaintenance();
 		verifyCloseIsIdempotent();
-		return isWindows() ? 293 : 283;
+		return isWindows() ? 311 : 301;
+	}
+
+	private static void verifyPosixLaunchGateCommand() {
+		Path root = null;
+		try {
+			root = Files.createTempDirectory("arena-posix-command-");
+			Path main = root.resolve("coordinator/src/dynamic-main.mjs").toAbsolutePath().normalize();
+			Path gate = main.resolveSibling("job-gate.mjs");
+			Path wrapper = main.resolveSibling("posix-process-wrapper.mjs");
+			Files.createDirectories(main.getParent());
+			Files.writeString(main, "// main", StandardCharsets.UTF_8);
+			Files.writeString(gate, "// gate", StandardCharsets.UTF_8);
+			Files.writeString(wrapper, "// wrapper", StandardCharsets.UTF_8);
+			String launchId = "00000000-0000-0000-0000-000000000980";
+			CoordinatorProcessSupervisor.LaunchRequest request = new CoordinatorProcessSupervisor.LaunchRequest(
+					List.of("node", main.toString(), "--config", "fixture.json"), root, Map.of(),
+					root.resolve("logs/out.log"), root.resolve("logs/error.log"), root, main,
+					GENERATION_A, launchId, new CoordinatorProcessOwnership.SupervisorIdentity(
+							"00000000-0000-0000-0000-000000000981"
+					)
+			);
+			Path claim = PosixCoordinatorSession.claimFile(root, launchId);
+			List<String> command = PosixCoordinatorSession.wrapperCommand(request, claim);
+			assertEquals(wrapper, Path.of(command.get(1)),
+					"POSIX launch enters the session wrapper before coordinator code");
+			assertEquals(claim, Path.of(command.get(2)),
+					"POSIX launch uses a runtime-scoped exclusive ownership claim");
+			assertEquals(gate, Path.of(command.get(4)),
+					"POSIX session starts the coordinator behind the release gate");
+			assertEquals(List.of(main.toString(), "--config", "fixture.json"), command.subList(5, command.size()),
+					"POSIX gate preserves the exact coordinator command");
+		} catch (IOException exception) {
+			throw new AssertionError("POSIX launch command verification failed", exception);
+		} finally {
+			if (root != null) deleteTree(root);
+		}
+	}
+
+	private static void verifyPosixOwnershipSurvivesUnsampledRootExit() {
+		Path root = null;
+		Process session = null;
+		Process coordinator = null;
+		Process duplicate = null;
+		Process unrelated = null;
+		try {
+			root = Files.createTempDirectory("arena-posix-ownership-");
+			Path main = root.resolve("coordinator/src/dynamic-main.mjs").toAbsolutePath().normalize();
+			Files.createDirectories(main.getParent());
+			Files.writeString(main, "// POSIX ownership seam", StandardCharsets.UTF_8);
+			String java = Path.of(
+					System.getProperty("java.home"), "bin", isWindows() ? "java.exe" : "java"
+			).toString();
+			String classpath = System.getProperty("java.class.path");
+			session = new ProcessBuilder(java, "-cp", classpath, ProviderFixture.class.getName(), "session").start();
+			coordinator = new ProcessBuilder(
+					java, "-cp", classpath, ProviderFixture.class.getName(), main.toString()
+			).start();
+			duplicate = new ProcessBuilder(
+					java, "-cp", classpath, ProviderFixture.class.getName(), main.toString()
+			).start();
+			unrelated = new ProcessBuilder(java, "-cp", classpath, ProviderFixture.class.getName(), "unrelated").start();
+			CoordinatorProcessOwnership.ProcessIdentity sessionIdentity =
+					CoordinatorProcessOwnership.ProcessIdentity.from(session.toHandle()).orElseThrow();
+			CoordinatorProcessOwnership.ProcessIdentity rootIdentity =
+					CoordinatorProcessOwnership.ProcessIdentity.from(coordinator.toHandle()).orElseThrow();
+			String launchId = "00000000-0000-0000-0000-000000000982";
+			CoordinatorProcessOwnership.recordPosix(
+					root, main, GENERATION_A, launchId,
+					new CoordinatorProcessOwnership.SupervisorIdentity("00000000-0000-0000-0000-000000000983"),
+					sessionIdentity, rootIdentity
+			);
+			Properties ownership = new Properties();
+			try (var reader = Files.newBufferedReader(CoordinatorProcessOwnership.ownershipFile(root))) {
+				ownership.load(reader);
+			}
+			assertEquals(Long.toString(session.pid()), ownership.getProperty("posixSessionPid"),
+					"POSIX ownership persists the durable session supervisor identity before release");
+			assertEquals("", ownership.getProperty("descendants", ""),
+					"POSIX ownership does not depend on a descendant snapshot");
+
+			boolean duplicateRejected = false;
+			try {
+				CoordinatorProcessOwnership.recordPosix(
+						root, main, GENERATION_A, "00000000-0000-0000-0000-000000000984",
+						new CoordinatorProcessOwnership.SupervisorIdentity("00000000-0000-0000-0000-000000000985"),
+						CoordinatorProcessOwnership.ProcessIdentity.from(unrelated.toHandle()).orElseThrow(),
+						CoordinatorProcessOwnership.ProcessIdentity.from(duplicate.toHandle()).orElseThrow()
+				);
+			} catch (IOException expected) {
+				duplicateRejected = true;
+			}
+			assertTrue(duplicateRejected, "a second POSIX ownership claim fails closed");
+			assertEquals(launchId, persistedProperty(root, "launchId"),
+					"a rejected duplicate cannot replace the original ownership record");
+
+			coordinator.destroyForcibly();
+			coordinator.waitFor(5L, TimeUnit.SECONDS);
+			assertFalse(coordinator.isAlive(), "the coordinator root exits before replacement cleanup");
+			assertTrue(session.isAlive(), "the durable POSIX session supervisor outlives the coordinator root");
+			Path claim = PosixCoordinatorSession.claimFile(root, launchId);
+			Files.writeString(claim, "session cleanup pending", StandardCharsets.UTF_8);
+			boolean missingSessionRejected = false;
+			try {
+				CoordinatorProcessOwnership.reapOrphaned(
+						root,
+						new CoordinatorProcessOwnership.SupervisorIdentity("00000000-0000-0000-0000-000000000986"),
+						(runtimeRoot, selectedLaunch, expectedSession) -> PosixCoordinatorSession.Termination.ABSENT
+				);
+			} catch (IOException expected) {
+				missingSessionRejected = true;
+			}
+			assertTrue(missingSessionRejected,
+					"replacement cleanup fails closed while a vanished session still has its claim");
+			assertTrue(Files.exists(CoordinatorProcessOwnership.ownershipFile(root)),
+					"failed-closed POSIX cleanup retains durable ownership evidence");
+			assertTrue(session.isAlive(), "failed-closed recovery does not signal an unverified process");
+			Files.delete(claim);
+			Process exactSession = session;
+			Process exactUnrelated = unrelated;
+			AtomicReference<CoordinatorProcessOwnership.ProcessIdentity> selected = new AtomicReference<>();
+			int reaped = CoordinatorProcessOwnership.reapOrphaned(
+					root,
+					new CoordinatorProcessOwnership.SupervisorIdentity("00000000-0000-0000-0000-000000000986"),
+					(runtimeRoot, selectedLaunch, expectedSession) -> {
+						assertEquals(launchId, selectedLaunch,
+								"replacement cleanup selects the original POSIX launch identity");
+						selected.set(expectedSession);
+						exactSession.destroyForcibly();
+						try {
+							exactSession.waitFor(5L, TimeUnit.SECONDS);
+						} catch (InterruptedException interrupted) {
+							Thread.currentThread().interrupt();
+							throw new IOException("replacement cleanup was interrupted", interrupted);
+						}
+						return PosixCoordinatorSession.Termination.TERMINATED;
+					}
+			);
+			assertEquals(sessionIdentity, selected.get(),
+					"replacement cleanup uses the persisted session identity after root reparenting");
+			assertEquals(1, reaped, "replacement cleanup accepts one exact POSIX session termination");
+			assertTrue(exactUnrelated.isAlive(), "POSIX session cleanup leaves an unrelated process alive");
+			assertFalse(Files.exists(CoordinatorProcessOwnership.ownershipFile(root)),
+					"POSIX ownership clears only after exact session cleanup succeeds");
+		} catch (Exception exception) {
+			throw new AssertionError("POSIX durable ownership verification failed", exception);
+		} finally {
+			for (Process process : new Process[] { session, coordinator, duplicate, unrelated }) {
+				if (process != null && process.isAlive()) process.destroyForcibly();
+			}
+			if (root != null) deleteTree(root);
+		}
 	}
 
 	private static void verifyProductionChildPreservesDescendantsAcrossRootExit() {
@@ -2490,6 +2643,14 @@ public final class CoordinatorProcessSupervisorVerification {
 			ownership.load(reader);
 		}
 		return ownership.getProperty("descendants", "");
+	}
+
+	private static String persistedProperty(Path root, String name) throws IOException {
+		Properties ownership = new Properties();
+		try (var reader = Files.newBufferedReader(CoordinatorProcessOwnership.ownershipFile(root))) {
+			ownership.load(reader);
+		}
+		return ownership.getProperty(name);
 	}
 
 	private static String lateProviderScript() {

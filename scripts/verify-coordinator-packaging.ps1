@@ -46,6 +46,7 @@ try {
         'config/dynamic-agents.json',
         'src/dynamic-main.mjs',
 		'src/job-gate.mjs',
+		'src/posix-process-wrapper.mjs',
         'node_modules/acorn/package.json',
         'node_modules/acorn/dist/acorn.mjs'
     )) {

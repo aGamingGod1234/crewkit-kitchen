@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -25,6 +26,15 @@ final class CoordinatorProcessOwnership {
 	static final int MAX_TRACKED_DESCENDANTS = 256;
 
 	private CoordinatorProcessOwnership() {
+	}
+
+	@FunctionalInterface
+	interface PosixSessionTerminator {
+		PosixCoordinatorSession.Termination terminate(
+				Path runtimeRoot,
+				String launchId,
+				ProcessIdentity sessionIdentity
+		) throws IOException;
 	}
 
 	static Path ownershipFile(Path runtimeRoot) {
@@ -109,11 +119,50 @@ final class CoordinatorProcessOwnership {
 				.toEpochMilli();
 		write(root, new Ownership(
 				process.pid(), ownerPid, ownerStartedAtEpochMs, startedAtEpochMs,
-				expectedGeneration, expectedLaunch, Optional.of(expectedSupervisor), List.of()
+				expectedGeneration, expectedLaunch, Optional.of(expectedSupervisor), Optional.empty(), List.of()
 		), expectedMain);
 	}
 
+	static synchronized void recordPosix(
+			Path runtimeRoot,
+			Path main,
+			String generationId,
+			String launchId,
+			SupervisorIdentity supervisorIdentity,
+			ProcessIdentity sessionIdentity,
+			ProcessIdentity rootIdentity
+	) throws IOException {
+		Path root = normalizeRoot(runtimeRoot);
+		Path expectedMain = normalizeMain(root, main);
+		String expectedGeneration = normalizeGeneration(generationId);
+		String expectedLaunch = normalizeLaunchId(launchId);
+		SupervisorIdentity expectedSupervisor = java.util.Objects.requireNonNull(
+				supervisorIdentity, "supervisor identity must not be null"
+		);
+		ProcessIdentity expectedSession = java.util.Objects.requireNonNull(
+				sessionIdentity, "POSIX session identity must not be null"
+		);
+		ProcessIdentity expectedRoot = java.util.Objects.requireNonNull(
+				rootIdentity, "coordinator root identity must not be null"
+		);
+		expectedRoot.resolve().orElseThrow(() -> new IOException("POSIX coordinator root is unavailable"));
+		ProcessHandle owner = ProcessHandle.current();
+		Ownership ownership = new Ownership(
+				expectedRoot.pid(), owner.pid(), ownerStartEpochMs(owner), expectedRoot.startedAtEpochMs(),
+				expectedGeneration, expectedLaunch, Optional.of(expectedSupervisor), Optional.of(expectedSession), List.of()
+		);
+		writeNew(root, ownership, expectedMain);
+	}
+
 	private static void write(Path root, Ownership ownership, Path expectedMain) throws IOException {
+		write(root, ownership, expectedMain, true);
+	}
+
+	private static void writeNew(Path root, Ownership ownership, Path expectedMain) throws IOException {
+		write(root, ownership, expectedMain, false);
+	}
+
+	private static void write(Path root, Ownership ownership, Path expectedMain, boolean replace) throws IOException {
 		Properties values = new Properties();
 		values.setProperty("pid", Long.toString(ownership.pid()));
 		values.setProperty("ownerPid", Long.toString(ownership.ownerPid()));
@@ -124,6 +173,10 @@ final class CoordinatorProcessOwnership {
 		values.setProperty("launchId", ownership.launchId());
 		ownership.supervisorIdentity().ifPresent(identity ->
 				values.setProperty("supervisorId", identity.value()));
+		ownership.posixSessionIdentity().ifPresent(identity -> {
+			values.setProperty("posixSessionPid", Long.toString(identity.pid()));
+			values.setProperty("posixSessionStartedAtEpochMs", Long.toString(identity.startedAtEpochMs()));
+		});
 		if (!ownership.descendants().isEmpty()) {
 			values.setProperty("descendants", ownership.descendants().stream()
 					.map(ProcessIdentity::serialized)
@@ -133,13 +186,19 @@ final class CoordinatorProcessOwnership {
 		Files.createDirectories(ownershipFile.getParent());
 		Path staging = ownershipFile.resolveSibling(ownershipFile.getFileName() + ".staging-" + UUID.randomUUID());
 		try {
-			try (Writer writer = Files.newBufferedWriter(staging)) {
+			try (Writer writer = Files.newBufferedWriter(staging, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
 				values.store(writer, "Arena Agents coordinator ownership");
 			}
-			try {
-				Files.move(staging, ownershipFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-			} catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
-				Files.move(staging, ownershipFile, StandardCopyOption.REPLACE_EXISTING);
+			if (replace) {
+				try {
+					Files.move(staging, ownershipFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+				} catch (java.nio.file.AtomicMoveNotSupportedException unsupported) {
+					Files.move(staging, ownershipFile, StandardCopyOption.REPLACE_EXISTING);
+				}
+			} else {
+				// Linking a fully-written staging inode publishes the claim atomically and
+				// fails if any supervisor already owns this runtime root.
+				Files.createLink(ownershipFile, staging);
 			}
 		} finally {
 			Files.deleteIfExists(staging);
@@ -197,7 +256,7 @@ final class CoordinatorProcessOwnership {
 		// The recorded process identity is sufficient to prove ownership. Requiring the
 		// active bundle to validate here prevents orphan cleanup precisely when a broken
 		// active generation must be moved out of the way for rollback.
-		return reapOrphaned(root, ownership.generationId());
+		return reapOrphanedRecord(root, ownership, PosixCoordinatorSession::terminateExisting);
 	}
 
 	static synchronized int reapOrphaned(Path runtimeRoot, String activeGenerationId) throws IOException {
@@ -206,10 +265,18 @@ final class CoordinatorProcessOwnership {
 		Ownership ownership = read(root);
 		if (ownership != null && ownerAlive(ownership)) return 0;
 		if (ownership == null) return 0;
-		return reapOrphanedRecord(root, ownership);
+		return reapOrphanedRecord(root, ownership, PosixCoordinatorSession::terminateExisting);
 	}
 
 	static synchronized int reapOrphaned(Path runtimeRoot, SupervisorIdentity currentSupervisor) throws IOException {
+		return reapOrphaned(runtimeRoot, currentSupervisor, PosixCoordinatorSession::terminateExisting);
+	}
+
+	static synchronized int reapOrphaned(
+			Path runtimeRoot,
+			SupervisorIdentity currentSupervisor,
+			PosixSessionTerminator posixTerminator
+	) throws IOException {
 		Path root = normalizeRoot(runtimeRoot);
 		Path ownershipFile = ownershipFile(root);
 		if (!Files.isRegularFile(ownershipFile)) return 0;
@@ -219,13 +286,35 @@ final class CoordinatorProcessOwnership {
 			return 0;
 		}
 		if (ownerAlive(ownership, currentSupervisor)) return 0;
-		return reapOrphanedRecord(root, ownership);
+		return reapOrphanedRecord(root, ownership, java.util.Objects.requireNonNull(
+				posixTerminator, "POSIX session terminator must not be null"
+		));
 	}
 
-	private static int reapOrphanedRecord(Path root, Ownership ownership) throws IOException {
+	private static int reapOrphanedRecord(
+			Path root,
+			Ownership ownership,
+			PosixSessionTerminator posixTerminator
+	) throws IOException {
 		Path expectedMain = root.resolve("coordinator/src/dynamic-main.mjs").normalize();
 		int reaped = 0;
 		if (WindowsCoordinatorJob.terminateExisting(ownership.launchId())) {
+			clearIfMatching(root, ownership);
+			return 1;
+		}
+		if (ownership.posixSessionIdentity().isPresent()) {
+			PosixCoordinatorSession.Termination termination = posixTerminator.terminate(
+					root, ownership.launchId(), ownership.posixSessionIdentity().orElseThrow()
+			);
+			if (termination == PosixCoordinatorSession.Termination.TERMINATED) {
+				clearIfMatching(root, ownership);
+				return 1;
+			}
+			if (Files.exists(PosixCoordinatorSession.claimFile(root, ownership.launchId()))) {
+				throw new IOException("Recorded POSIX coordinator session disappeared before proving group cleanup");
+			}
+			// The wrapper removes its exclusive claim only after the process group is
+			// empty. A missing wrapper plus a missing claim is therefore completed cleanup.
 			clearIfMatching(root, ownership);
 			return 1;
 		}
@@ -310,6 +399,18 @@ final class CoordinatorProcessOwnership {
 			String supervisorId = values.getProperty("supervisorId");
 			Optional<SupervisorIdentity> supervisorIdentity = supervisorId == null
 					? Optional.empty() : Optional.of(new SupervisorIdentity(supervisorId));
+			String posixSessionPid = values.getProperty("posixSessionPid");
+			String posixSessionStartedAt = values.getProperty("posixSessionStartedAtEpochMs");
+			Optional<ProcessIdentity> posixSessionIdentity;
+			if (posixSessionPid == null && posixSessionStartedAt == null) {
+				posixSessionIdentity = Optional.empty();
+			} else if (posixSessionPid != null && posixSessionStartedAt != null) {
+				posixSessionIdentity = Optional.of(new ProcessIdentity(
+						Long.parseLong(posixSessionPid), Long.parseLong(posixSessionStartedAt)
+				));
+			} else {
+				return null;
+			}
 			List<ProcessIdentity> descendants = parseDescendants(values.getProperty("descendants", ""));
 			Path main = Path.of(values.getProperty("main", "")).toAbsolutePath().normalize();
 			Path expectedMain = normalizeRoot(runtimeRoot).resolve("coordinator/src/dynamic-main.mjs").normalize();
@@ -318,7 +419,7 @@ final class CoordinatorProcessOwnership {
 					|| !samePath(main, expectedMain)) return null;
 			return new Ownership(
 					pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId,
-					supervisorIdentity, descendants
+					supervisorIdentity, posixSessionIdentity, descendants
 			);
 		} catch (RuntimeException invalid) {
 			return null;
@@ -547,12 +648,13 @@ final class CoordinatorProcessOwnership {
 			String generationId,
 			String launchId,
 			Optional<SupervisorIdentity> supervisorIdentity,
+			Optional<ProcessIdentity> posixSessionIdentity,
 			List<ProcessIdentity> descendants
 	) {
 		private Ownership withDescendants(List<ProcessIdentity> tracked) {
 			return new Ownership(
 					pid, ownerPid, ownerStartedAtEpochMs, startedAtEpochMs, generationId, launchId,
-					supervisorIdentity, List.copyOf(tracked)
+					supervisorIdentity, posixSessionIdentity, List.copyOf(tracked)
 			);
 		}
 	}
