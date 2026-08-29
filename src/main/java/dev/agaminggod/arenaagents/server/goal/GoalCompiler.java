@@ -41,7 +41,8 @@ public final class GoalCompiler {
 	private static final Pattern KILL = Pattern.compile("^(?:kill|slay|defeat) (?:(?:the|a|an) )?(.+)$");
 	private static final Pattern KILL_COUNT = Pattern.compile("^([+-]?\\d+)\\s+(.+)$");
 	private static final Pattern BEAT_GAME = Pattern.compile("^beat (?:the )?game$");
-	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:(\\d+) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
+	private static final Pattern ITEM = Pattern.compile("^(get|obtain|collect|bring|craft|make) (?:me )?(?:([+-]?\\d\\S*) )?(?:(?:a|an|some) )?(.+?)(?: for me)?$");
+	private static final Pattern ITEM_ALTERNATIVE_COUNT = Pattern.compile("^([+-]?\\d\\S*)\\s+(.+)$");
 	private static final Pattern BLOCK = Pattern.compile("^(build|construct|place|put|set|mine|break|destroy) (?:with |using |from )?(?:(?:a|an|some|the) )?(.+?)(?: for me)?$");
 	private static final Pattern BLOCK_LOCATION_SUFFIX = Pattern.compile(
 			"\\s+(?:at|on)(?: coordinates?)?\\s+"
@@ -246,11 +247,18 @@ public final class GoalCompiler {
 		String command = stripTrailingPunctuation(stripPoliteness(
 				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
 		List<GoalClause> clauses = compoundClauses(command);
+		TranslationLeafBudget budget = candidateTranslationBudget(command, clauses);
+		if (!budget.valid()) {
+			throw new AgentDomainException("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", budget.rejection());
+		}
 		ArrayList<GoalTranslationConstraint.KillClause> killClauses = new ArrayList<>();
+		ArrayList<GoalTranslationConstraint.ItemClause> itemClauses = new ArrayList<>();
 		if (clauses.size() > 1) {
 			for (GoalClause clause : clauses) {
 				if (clause.kind() == ClauseKind.KILL) {
 					killClauses.add(killConstraintFor(clause.target(), registries));
+				} else if (clause.kind() == ClauseKind.ITEM) {
+					itemClauses.add(itemConstraintFor(clause.target(), clause.count(), registries));
 				}
 			}
 		} else {
@@ -258,10 +266,15 @@ public final class GoalCompiler {
 			if (kill.matches() && !BEAT_GAME.matcher(command).matches()) {
 				killClauses.add(killConstraintFor(kill.group(1), registries));
 			}
+			Matcher item = ITEM.matcher(command);
+			if (item.matches()) {
+				itemClauses.add(itemConstraintFor(
+						item.group(3), item.group(2) == null ? 1 : Integer.parseInt(item.group(2)), registries));
+			}
 		}
-		return killClauses.isEmpty()
+		return killClauses.isEmpty() && itemClauses.isEmpty()
 				? GoalTranslationConstraint.none()
-				: new GoalTranslationConstraint(killClauses);
+				: new GoalTranslationConstraint(killClauses, itemClauses);
 	}
 
 	public List<String> candidateIdsFor(
@@ -441,7 +454,7 @@ public final class GoalCompiler {
 			return new GoalClause(ClauseKind.ADVANCEMENT, target.replaceFirst("\\s+advancement$", ""), 1, false, false);
 		}
 		if (inherited.kind() != ClauseKind.ITEM) return null;
-		Matcher counted = Pattern.compile("^(?:(\\d+)\\s+)?(?:(?:the|a|an|some)\\s+)?(.+)$").matcher(value);
+		Matcher counted = Pattern.compile("^(?:([+-]?\\d\\S*)\\s+)?(?:(?:the|a|an|some)\\s+)?(.+)$").matcher(value);
 		if (!counted.matches()) return null;
 		try {
 			return new GoalClause(ClauseKind.ITEM, counted.group(2), counted.group(1) == null ? 1 : Integer.parseInt(counted.group(1)), inherited.requiresCreation(), false);
@@ -497,12 +510,37 @@ public final class GoalCompiler {
 		return new GoalTranslationConstraint.KillClause(alternatives);
 	}
 
+	private static GoalTranslationConstraint.ItemClause itemConstraintFor(
+			String target,
+			int defaultCount,
+			RegistryAccess registries
+	) {
+		String factualTarget = SUBJECTIVE.matcher(target).replaceAll(" ").replaceAll("\\s+", " ").strip();
+		List<String> alternatives = explicitAlternatives(factualTarget);
+		String finalTarget = stripItemAlternativeCount(alternatives.getLast());
+		String sharedNoun = alternatives.size() > 1 ? sharedItemNoun(finalTarget) : "";
+		ArrayList<GoalTranslationConstraint.ItemAlternative> constraints = new ArrayList<>();
+		for (int index = 0; index < alternatives.size(); index++) {
+			String alternative = alternatives.get(index);
+			Matcher counted = ITEM_ALTERNATIVE_COUNT.matcher(alternative);
+			int count = counted.matches() ? Integer.parseInt(counted.group(1)) : defaultCount;
+			String itemTarget = counted.matches() ? counted.group(2) : alternative;
+			List<String> candidates = index < alternatives.size() - 1 && !sharedNoun.isEmpty() && !itemTarget.contains(" ")
+					? relatedItems(itemTarget + " " + sharedNoun, registries)
+					: List.of();
+			if (candidates.isEmpty()) candidates = relatedItems(itemTarget, registries);
+			constraints.add(new GoalTranslationConstraint.ItemAlternative(candidates, count));
+		}
+		return new GoalTranslationConstraint.ItemClause(constraints);
+	}
+
 	private static TranslationLeafBudget candidateTranslationBudget(String command, List<GoalClause> clauses) {
 		if (clauses.size() > 1) return compoundTranslationBudget(clauses);
 		Matcher kill = KILL.matcher(command);
-		return kill.matches() && !BEAT_GAME.matcher(command).matches()
-				? killLeafBudget(kill.group(1))
-				: TranslationLeafBudget.valid(0);
+		if (kill.matches() && !BEAT_GAME.matcher(command).matches()) return killLeafBudget(kill.group(1));
+		Matcher item = ITEM.matcher(command);
+		if (!item.matches()) return TranslationLeafBudget.valid(0);
+		return itemLeafBudget(item.group(2) == null ? 1 : parseItemCount(item.group(2)), item.group(3));
 	}
 
 	private static TranslationLeafBudget compoundTranslationBudget(List<GoalClause> clauses) {
@@ -511,7 +549,7 @@ public final class GoalCompiler {
 		for (GoalClause clause : clauses) {
 			TranslationLeafBudget clauseBudget = switch (clause.kind()) {
 				case KILL -> killLeafBudget(clause.target());
-				case ITEM -> alternativeLeafBudget(clause.target());
+				case ITEM -> itemLeafBudget(clause.count(), clause.target());
 				default -> TranslationLeafBudget.valid(1);
 			};
 			if (!clauseBudget.valid()) return clauseBudget;
@@ -528,6 +566,32 @@ public final class GoalCompiler {
 			if (alternative.isBlank()) return TranslationLeafBudget.overBudget();
 		}
 		return TranslationLeafBudget.valid(alternatives.length);
+	}
+
+	private static TranslationLeafBudget itemLeafBudget(int defaultCount, String target) {
+		if (defaultCount <= 0) return TranslationLeafBudget.invalidItemCount();
+		TranslationLeafBudget alternatives = alternativeLeafBudget(target);
+		if (!alternatives.valid()) return alternatives;
+		for (String alternative : explicitAlternatives(target)) {
+			Matcher counted = ITEM_ALTERNATIVE_COUNT.matcher(alternative);
+			if (counted.matches() && parseItemCount(counted.group(1)) <= 0) {
+				return TranslationLeafBudget.invalidItemCount();
+			}
+		}
+		return alternatives;
+	}
+
+	private static int parseItemCount(String value) {
+		try {
+			return Integer.parseInt(value);
+		} catch (NumberFormatException exception) {
+			return -1;
+		}
+	}
+
+	private static String stripItemAlternativeCount(String target) {
+		Matcher counted = ITEM_ALTERNATIVE_COUNT.matcher(target);
+		return counted.matches() ? counted.group(2) : target;
 	}
 
 	private static TranslationLeafBudget killLeafBudget(String target) {
@@ -571,18 +635,23 @@ public final class GoalCompiler {
 			return new TranslationLeafBudget(0,
 					"The requested kills exceed the limit of " + MAX_COMPOUND_LEAVES + " factual results.");
 		}
+
+		private static TranslationLeafBudget invalidItemCount() {
+			return new TranslationLeafBudget(0, "The requested item count must be a positive supported integer.");
+		}
 	}
 
 	private static List<String> relatedCandidates(ClauseKind kind, String rawTarget, RegistryAccess registries) {
 		String target = SUBJECTIVE.matcher(rawTarget).replaceAll(" ").replaceAll("\\s+", " ").strip();
 		List<String> alternatives = explicitAlternatives(target);
 		String sharedNoun = kind == ClauseKind.ITEM && alternatives.size() > 1
-				? sharedItemNoun(alternatives.getLast())
+				? sharedItemNoun(stripItemAlternativeCount(alternatives.getLast()))
 				: "";
 		TreeSet<String> candidates = new TreeSet<>();
 		for (int index = 0; index < alternatives.size(); index++) {
 			String alternative = alternatives.get(index);
 			if (kind == ClauseKind.KILL) alternative = stripKillCount(alternative);
+			if (kind == ClauseKind.ITEM) alternative = stripItemAlternativeCount(alternative);
 			List<String> related;
 			if (kind == ClauseKind.ITEM) {
 				related = index < alternatives.size() - 1 && !sharedNoun.isEmpty() && !alternative.contains(" ")
@@ -659,6 +728,7 @@ public final class GoalCompiler {
 	private static List<String> relatedItems(String target, RegistryAccess registries) {
 		String wanted = normalizedTarget(target);
 		if (wanted.isEmpty()) return List.of();
+		Set<String> forms = singularForms(wanted);
 		Registry<Item> itemRegistry = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
 		boolean tools = wanted.endsWith(" tool") || wanted.endsWith(" tools");
 		String material = tools ? wanted.replaceFirst("\\s+tools?$", "") : "";
@@ -668,8 +738,9 @@ public final class GoalCompiler {
 					Item item = itemRegistry.getValue(id);
 					String description = item == null ? "" : descriptionName(item.getDescriptionId());
 					String path = pathName(id);
-					return id.toString().equals(wanted) || path.equals(wanted) || description.equals(wanted)
-							|| path.endsWith(" " + wanted) || description.endsWith(" " + wanted)
+					return forms.stream().anyMatch(form -> id.toString().equals(form)
+							|| path.equals(form) || description.equals(form)
+							|| path.endsWith(" " + form) || description.endsWith(" " + form))
 							|| tools && path.startsWith(material + " ") && toolKinds.contains(path.substring(material.length() + 1));
 				})
 				.map(Identifier::toString).distinct().sorted().toList();

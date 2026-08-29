@@ -54,6 +54,7 @@ export function buildGoalSpecTranslatorPrompt(requestValue, { correctiveFeedback
 		'Use only the predicate schema and candidate identifiers below. Do not invent identifiers.',
 		'Preserve compound factual requests: use all_of for results joined by "and" and any_of only for explicit alternatives joined by "or".',
 		'For each requested item or kill, emit its own inventory_contains or entity_killed_by_agent leaf. Preserve item counts in count. Preserve kill counts by repeating the kill leaf under all_of so each kill needs distinct evidence.',
+		'Every any_of branch must preserve all factual quantities required by the request. operator_confirmed may accompany subjective factual results, but it cannot replace their item or kill leaves.',
 		'Compound predicates may contain at most 16 factual leaves and must use only the bounded candidate list.',
 		'If the outcome is subjective, use operator_confirmed. Keep the summary short and concrete.',
 		'Return exactly one JSON object matching the supplied schema and nothing else.',

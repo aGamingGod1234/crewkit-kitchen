@@ -40,6 +40,7 @@ public final class GoalCompilerVerification {
 		assertions += verifyCompoundItemsAndKills();
 		assertions += verifyKillCountTranslationBounds();
 		assertions += verifyTranslatedKillConstraints();
+		assertions += verifyTranslatedItemConstraints();
 		assertions += verifyExplicitAlternativeCandidates();
 		assertions += verifyDraftRoundTrip();
 		assertions += verifyWorldValidation();
@@ -606,18 +607,110 @@ public final class GoalCompilerVerification {
 		return 12;
 	}
 
+	private static int verifyTranslatedItemConstraints() {
+		GoalCompiler compiler = new GoalCompiler();
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 0 good iron pickaxes", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a zero subjective item count is rejected before translation");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get -2 good iron pickaxes", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a negative subjective item count is rejected before translation");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 999999999999999999 good iron pickaxes", RegistryAccess.EMPTY, 1_200L).kind(),
+				"an overflowing subjective item count is rejected before translation");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get 3.5 good iron pickaxes", RegistryAccess.EMPTY, 1_200L).kind(),
+				"a non-integral subjective item count is rejected before translation");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get a good pickaxe and 0 diamonds", RegistryAccess.EMPTY, 1_200L).kind(),
+				"an invalid compound item count is rejected before subjective translation");
+
+		GoalTranslationConstraint direct = compiler.translationConstraintFor(
+				"Get 3 good iron pickaxes", RegistryAccess.EMPTY);
+		assertSucceeds(() -> direct.validate(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3)),
+				"a translated item leaf preserves its requested quantity");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> direct.validate(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)),
+				"a translated item leaf cannot lower its requested quantity");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> direct.validate(new GoalPredicate.OperatorConfirmed()),
+				"operator confirmation cannot replace a requested factual item quantity");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> direct.validate(new GoalPredicate.AnyOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3),
+						new GoalPredicate.OperatorConfirmed()))),
+				"an operator-confirmed any-of branch cannot bypass an item quantity");
+
+		GoalTranslationConstraint alternatives = compiler.translationConstraintFor(
+				"Get 3 good iron or diamond pickaxes", RegistryAccess.EMPTY);
+		assertSucceeds(() -> alternatives.validate(new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3),
+				new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 3)
+		))), "every direct item alternative preserves the shared count");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> alternatives.validate(
+				new GoalPredicate.AnyOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3),
+						new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 1)
+				))), "one weakened any-of branch rejects the translated alternative");
+
+		GoalTranslationConstraint perAlternativeCounts = compiler.translationConstraintFor(
+				"Get 3 good iron pickaxes or 2 diamond pickaxes", RegistryAccess.EMPTY);
+		assertEquals(List.of("minecraft:diamond_pickaxe", "minecraft:iron_pickaxe"),
+				compiler.candidateIdsFor("Get 3 good iron pickaxes or 2 diamond pickaxes", RegistryAccess.EMPTY),
+				"per-alternative item counts are removed before publishing candidates");
+		assertSucceeds(() -> perAlternativeCounts.validate(new GoalPredicate.AnyOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3),
+				new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 2)
+		))), "explicit item alternatives may preserve different requested counts");
+
+		GoalTranslationConstraint compound = compiler.translationConstraintFor(
+				"Get 2 good pickaxes and 3 diamonds", RegistryAccess.EMPTY);
+		assertSucceeds(() -> compound.validate(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 2),
+				new GoalPredicate.InventoryContains("minecraft:diamond", 3)
+		))), "compound item translations retain every requested count");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> compound.validate(
+				new GoalPredicate.AnyOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 2),
+						new GoalPredicate.InventoryContains("minecraft:diamond", 3)
+				))), "any-of cannot replace the requested compound conjunction");
+
+		GoalTranslationConstraint repeated = compiler.translationConstraintFor(
+				"Get 2 good iron pickaxes and 3 iron pickaxes", RegistryAccess.EMPTY);
+		assertSucceeds(() -> repeated.validate(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 5)),
+				"one inventory threshold may preserve the summed repeated-item request");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> repeated.validate(
+				new GoalPredicate.AllOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 2),
+						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3)
+				))), "duplicate inventory leaves cannot fake an additive quantity at runtime");
+
+		GoalTranslationConstraint mixed = compiler.translationConstraintFor(
+				"Get 2 good iron pickaxes and kill 3 good zombies", RegistryAccess.EMPTY);
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH", () -> mixed.validate(kills("minecraft:zombie", 3)),
+				"preserving only the kill half cannot omit a compound item quantity");
+		assertSucceeds(() -> mixed.validate(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 2),
+				kills("minecraft:zombie", 3)
+		))), "mixed translations preserve both item and kill quantities");
+		return 19;
+	}
+
 	private static int verifyDraftRoundTrip() {
 		GoalTranslationConstraint constraint = new GoalCompiler().translationConstraintFor(
-				"Kill 3 good zombies", RegistryAccess.EMPTY);
+				"Get 3 good iron pickaxes and kill 2 good zombies", RegistryAccess.EMPTY);
+		GoalPredicate proposed = new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3),
+				kills("minecraft:zombie", 2)));
 		PendingGoalDraft draft = new PendingGoalDraft(
 				UUID.fromString("00000000-0000-0000-0000-000000000101"),
 				new AgentId(UUID.fromString("00000000-0000-0000-0000-000000000102")),
 				UUID.fromString("00000000-0000-0000-0000-000000000103"),
-				"Kill 3 good zombies",
+				"Get 3 good iron pickaxes and kill 2 good zombies",
 				"minecraft:the_nether",
-				List.of("minecraft:zombie"),
+				List.of("minecraft:iron_pickaxe", "minecraft:zombie"),
 				constraint,
-				Optional.of(kills("minecraft:zombie", 3)),
+				Optional.of(proposed),
 				DraftIntent.CONFIRM_TRANSLATION,
 				1_200L,
 				4L,
@@ -626,18 +719,22 @@ public final class GoalCompilerVerification {
 		PendingGoalDraftCodec codec = new PendingGoalDraftCodec();
 		assertEquals(draft, codec.decode(codec.encode(draft)), "pending goal draft round-trip");
 		assertEquals(
-				draft.withProposedPredicate(kills("minecraft:zombie", 3)),
-				codec.decode(codec.encode(draft.withProposedPredicate(kills("minecraft:zombie", 3)))),
+				draft.withProposedPredicate(proposed),
+				codec.decode(codec.encode(draft.withProposedPredicate(proposed))),
 				"atomic proposal replacement retains draft identity and candidate IDs"
 		);
 		var priorJson = JsonParser.parseString(codec.encode(draft)).getAsJsonObject();
+		priorJson.getAsJsonObject("translation_constraint").remove("item_clauses");
+		assertEquals(new GoalTranslationConstraint(constraint.killClauses()),
+				codec.decode(priorJson.toString()).translationConstraint(),
+				"kill-only translation constraints from prior drafts remain readable");
 		priorJson.remove("translation_constraint");
 		assertEquals(GoalTranslationConstraint.none(), codec.decode(priorJson.toString()).translationConstraint(),
 				"drafts persisted before constraints remain readable without invented requirements");
 		priorJson.remove("dimension_id");
 		assertEquals(GoalPredicate.DEFAULT_DIMENSION, codec.decode(priorJson.toString()).dimensionId(),
 				"legacy persisted drafts retain their historical Overworld interpretation");
-		return 4;
+		return 5;
 	}
 
 	private static GoalPredicate kills(String entityType, int count) {

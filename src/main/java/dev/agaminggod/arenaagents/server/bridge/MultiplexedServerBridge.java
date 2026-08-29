@@ -788,7 +788,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			GoalPredicate predicate = GoalPredicateWorldValidator.bindToDimension(
 					GOAL_SPEC_WIRE_CODEC.decodePredicate(predicateElement.getAsJsonObject()), draft.dimensionId());
 			GoalPredicateWorldValidator.validateTranslatedProposal(predicate);
-			draft.translationConstraint().validate(predicate);
+			manager.validateGoalDraftTranslation(draft, predicate);
 			validateProposalIdentifiers(predicate, Set.copyOf(draft.candidateIds()));
 			GoalInventoryCapacity.validateTranslated(
 					predicate,

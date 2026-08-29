@@ -317,7 +317,7 @@ public final class CodexAgentManager {
 		AgentRecord record = savedData.registry().require(draft.agentId());
 		if (!draft.matches(record)) throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
 		GoalPredicate predicate = draft.proposedPredicate().orElseThrow();
-		draft.translationConstraint().validate(predicate);
+		validateGoalDraftTranslation(draft, predicate);
 		if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
 			GoalPredicateWorldValidator.validate(
 					GoalPredicateWorldValidator.requireLevel(server, draft.dimensionId()), predicate);
@@ -334,6 +334,15 @@ public final class CodexAgentManager {
 		};
 		savedData.removeGoalDraft(draftId);
 		return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.of(transition)));
+	}
+
+	public void validateGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
+		Objects.requireNonNull(draft, "draft must not be null");
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		draft.translationConstraint().validate(predicate);
+		RegistryAccess registries = server == null ? RegistryAccess.EMPTY : server.registryAccess();
+		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
+		compiler.translationConstraintFor(draft.originalRequest(), registries).validate(predicate);
 	}
 
 	static void validateGoalDraftPredicate(

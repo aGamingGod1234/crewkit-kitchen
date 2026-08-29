@@ -3,17 +3,20 @@ package dev.agaminggod.arenaagents.server.goal;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /** Server-authored factual requirements that a translated predicate may not weaken. */
-public record GoalTranslationConstraint(List<KillClause> killClauses) {
+public record GoalTranslationConstraint(List<KillClause> killClauses, List<ItemClause> itemClauses) {
 	private static final int MAX_LEAVES = 16;
-	private static final GoalTranslationConstraint NONE = new GoalTranslationConstraint(List.of());
+	private static final GoalTranslationConstraint NONE = new GoalTranslationConstraint(List.of(), List.of());
 
 	public GoalTranslationConstraint {
 		killClauses = List.copyOf(Objects.requireNonNull(killClauses, "killClauses must not be null"));
+		itemClauses = List.copyOf(Objects.requireNonNull(itemClauses, "itemClauses must not be null"));
 		int leaves = 0;
 		for (KillClause clause : killClauses) {
 			Objects.requireNonNull(clause, "kill clause must not be null");
@@ -21,7 +24,16 @@ public record GoalTranslationConstraint(List<KillClause> killClauses) {
 				leaves = Math.addExact(leaves, alternative.count());
 			}
 		}
-		if (leaves > MAX_LEAVES) throw new IllegalArgumentException("kill constraints may require at most 16 leaves");
+		for (ItemClause clause : itemClauses) {
+			Objects.requireNonNull(clause, "item clause must not be null");
+			leaves = Math.addExact(leaves, clause.alternatives().size());
+		}
+		if (leaves > MAX_LEAVES) throw new IllegalArgumentException("translation constraints may require at most 16 leaves");
+	}
+
+	/** Compatibility constructor for constraints persisted before item quantities were captured. */
+	public GoalTranslationConstraint(List<KillClause> killClauses) {
+		this(killClauses, List.of());
 	}
 
 	public static GoalTranslationConstraint none() {
@@ -30,18 +42,19 @@ public record GoalTranslationConstraint(List<KillClause> killClauses) {
 
 	public void validate(GoalPredicate predicate) {
 		Objects.requireNonNull(predicate, "predicate must not be null");
-		if (killClauses.isEmpty()) return;
-		for (List<String> killPath : killPaths(predicate)) {
-			if (!satisfiesClauses(killPath, 0, new boolean[killPath.size()])) {
+		if (killClauses.isEmpty() && itemClauses.isEmpty()) return;
+		for (EvidencePath path : evidencePaths(predicate)) {
+			if (!satisfiesKillClauses(path.kills(), 0, new boolean[path.kills().size()])
+					|| !satisfiesItemClauses(new HashMap<>(path.items()), 0)) {
 				throw new AgentDomainException(
 						"GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
-						"Translated predicate does not preserve every requested kill count"
+						"Translated predicate does not preserve every requested item or kill count"
 				);
 			}
 		}
 	}
 
-	private boolean satisfiesClauses(List<String> kills, int clauseIndex, boolean[] used) {
+	private boolean satisfiesKillClauses(List<String> kills, int clauseIndex, boolean[] used) {
 		if (clauseIndex == killClauses.size()) return true;
 		for (KillAlternative alternative : killClauses.get(clauseIndex).alternatives()) {
 			if (claimAlternative(kills, used, alternative, 0, 0, clauseIndex)) return true;
@@ -57,7 +70,7 @@ public record GoalTranslationConstraint(List<KillClause> killClauses) {
 			int claimed,
 			int clauseIndex
 	) {
-		if (claimed == alternative.count()) return satisfiesClauses(kills, clauseIndex + 1, used);
+		if (claimed == alternative.count()) return satisfiesKillClauses(kills, clauseIndex + 1, used);
 		for (int index = searchFrom; index < kills.size(); index++) {
 			if (used[index] || !alternative.entityTypes().contains(kills.get(index))) continue;
 			used[index] = true;
@@ -67,32 +80,54 @@ public record GoalTranslationConstraint(List<KillClause> killClauses) {
 		return false;
 	}
 
-	private static List<List<String>> killPaths(GoalPredicate predicate) {
+	private boolean satisfiesItemClauses(Map<String, Integer> available, int clauseIndex) {
+		if (clauseIndex == itemClauses.size()) return true;
+		for (ItemAlternative alternative : itemClauses.get(clauseIndex).alternatives()) {
+			for (String itemId : alternative.itemIds()) {
+				int prior = available.getOrDefault(itemId, 0);
+				if (prior < alternative.count()) continue;
+				available.put(itemId, prior - alternative.count());
+				if (satisfiesItemClauses(available, clauseIndex + 1)) return true;
+				available.put(itemId, prior);
+			}
+		}
+		return false;
+	}
+
+	private static List<EvidencePath> evidencePaths(GoalPredicate predicate) {
 		return switch (predicate) {
-			case GoalPredicate.EntityKilledByAgent value -> List.of(List.of(value.entityType()));
+			case GoalPredicate.EntityKilledByAgent value -> List.of(
+					new EvidencePath(List.of(value.entityType()), Map.of()));
+			case GoalPredicate.InventoryContains value -> List.of(
+					new EvidencePath(List.of(), Map.of(value.itemId(), value.count())));
 			case GoalPredicate.AllOf value -> allOfPaths(value.predicates());
 			case GoalPredicate.AnyOf value -> value.predicates().stream()
-					.flatMap(child -> killPaths(child).stream())
+					.flatMap(child -> evidencePaths(child).stream())
 					.toList();
-			default -> List.of(List.of());
+			default -> List.of(new EvidencePath(List.of(), Map.of()));
 		};
 	}
 
-	private static List<List<String>> allOfPaths(List<GoalPredicate> predicates) {
-		List<List<String>> paths = List.of(List.of());
+	private static List<EvidencePath> allOfPaths(List<GoalPredicate> predicates) {
+		List<EvidencePath> paths = List.of(new EvidencePath(List.of(), Map.of()));
 		for (GoalPredicate predicate : predicates) {
-			ArrayList<List<String>> combined = new ArrayList<>();
-			for (List<String> left : paths) {
-				for (List<String> right : killPaths(predicate)) {
-					ArrayList<String> path = new ArrayList<>(left.size() + right.size());
-					path.addAll(left);
-					path.addAll(right);
-					combined.add(List.copyOf(path));
+			ArrayList<EvidencePath> combined = new ArrayList<>();
+			for (EvidencePath left : paths) {
+				for (EvidencePath right : evidencePaths(predicate)) {
+					ArrayList<String> kills = new ArrayList<>(left.kills().size() + right.kills().size());
+					kills.addAll(left.kills());
+					kills.addAll(right.kills());
+					HashMap<String, Integer> items = new HashMap<>(left.items());
+					right.items().forEach((itemId, count) -> items.merge(itemId, count, Math::max));
+					combined.add(new EvidencePath(List.copyOf(kills), Map.copyOf(items)));
 				}
 			}
 			paths = List.copyOf(combined);
 		}
 		return paths;
+	}
+
+	private record EvidencePath(List<String> kills, Map<String, Integer> items) {
 	}
 
 	public record KillClause(List<KillAlternative> alternatives) {
@@ -117,6 +152,29 @@ public record GoalTranslationConstraint(List<KillClause> killClauses) {
 			if (count <= 0 || count > MAX_LEAVES) {
 				throw new IllegalArgumentException("kill alternative count must be between 1 and 16");
 			}
+		}
+	}
+
+	public record ItemClause(List<ItemAlternative> alternatives) {
+		public ItemClause {
+			alternatives = List.copyOf(Objects.requireNonNull(alternatives, "alternatives must not be null"));
+			if (alternatives.isEmpty()) throw new IllegalArgumentException("item clause alternatives must not be empty");
+			alternatives.forEach(value -> Objects.requireNonNull(value, "item alternative must not be null"));
+		}
+	}
+
+	public record ItemAlternative(List<String> itemIds, int count) {
+		public ItemAlternative {
+			itemIds = List.copyOf(Objects.requireNonNull(itemIds, "itemIds must not be null"));
+			if (itemIds.size() > 64 || new HashSet<>(itemIds).size() != itemIds.size()) {
+				throw new IllegalArgumentException("itemIds must contain at most 64 unique identifiers");
+			}
+			for (String itemId : itemIds) {
+				if (itemId == null || !itemId.matches("[a-z0-9_.-]+:[a-z0-9_./-]+")) {
+					throw new IllegalArgumentException("itemIds must contain namespaced identifiers");
+				}
+			}
+			if (count <= 0) throw new IllegalArgumentException("item alternative count must be positive");
 		}
 	}
 }

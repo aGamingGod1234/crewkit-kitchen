@@ -547,6 +547,61 @@ public final class MultiplexedServerBridgeVerification {
 						() -> manager.resolveGoalDraft(
 								confirmationBypassId, countedKillRequester, false, GoalDraftChoice.CONFIRM),
 						"GOAL_TRANSLATION_CONSTRAINT_MISMATCH");
+
+				UUID countedItemId = UUID.fromString("00000000-0000-0000-0000-000000000308");
+				UUID countedItemRequester = UUID.fromString("00000000-0000-0000-0000-000000000309");
+				var countedItemConstraint = new GoalCompiler().translationConstraintFor(
+						"Get 3 good iron pickaxes", net.minecraft.core.RegistryAccess.EMPTY);
+				manager.stageGoalDraft(new PendingGoalDraft(
+						countedItemId, idle.agentId(), countedItemRequester, "Get 3 good iron pickaxes",
+						dev.agaminggod.arenaagents.agent.goal.GoalPredicate.DEFAULT_DIMENSION,
+						List.of("minecraft:iron_pickaxe"), countedItemConstraint, Optional.empty(),
+						DraftIntent.CONFIRM_TRANSLATION, 1_005L, idle.goalRevision(), Optional.empty()
+				));
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-item-undercount",
+						goalSpecProposal(countedItemId,
+								new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1))));
+				BridgeEnvelope itemUndercount = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+						itemUndercount.payload().get("reasonCode").getAsString(),
+						"one translated item cannot satisfy a server-authored count of three");
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-item-operator-bypass",
+						goalSpecProposal(countedItemId, new GoalPredicate.OperatorConfirmed())));
+				BridgeEnvelope itemOperatorBypass = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+						itemOperatorBypass.payload().get("reasonCode").getAsString(),
+						"operator confirmation cannot bypass a server-authored item count");
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-item-anyof-bypass",
+						goalSpecProposal(countedItemId, new GoalPredicate.AnyOf(List.of(
+								new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3),
+								new GoalPredicate.OperatorConfirmed())))));
+				BridgeEnvelope itemAnyOfBypass = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+						itemAnyOfBypass.payload().get("reasonCode").getAsString(),
+						"an operator-confirmed any-of branch cannot bypass a server-authored item count");
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-item-valid",
+						goalSpecProposal(countedItemId,
+								new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3))));
+				assertEquals("accepted", pollBridgeResponse(bridge, socket, reader, codec)
+						.payload().get("status").getAsString(),
+						"the bridge accepts a translated item predicate that preserves the requested count");
+
+				UUID legacyItemBypassId = UUID.fromString("00000000-0000-0000-0000-000000000310");
+				manager.stageGoalDraft(new PendingGoalDraft(
+						legacyItemBypassId, idle.agentId(), countedItemRequester, "Get 3 good iron pickaxes",
+						dev.agaminggod.arenaagents.agent.goal.GoalPredicate.DEFAULT_DIMENSION,
+						List.of("minecraft:iron_pickaxe"), dev.agaminggod.arenaagents.server.goal.GoalTranslationConstraint.none(),
+						Optional.of(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)),
+						DraftIntent.CONFIRM_TRANSLATION, 1_006L, idle.goalRevision(), Optional.empty()
+				));
+				assertThrowsDomain(
+						() -> manager.resolveGoalDraft(
+								legacyItemBypassId, countedItemRequester, false, GoalDraftChoice.CONFIRM),
+						"GOAL_TRANSLATION_CONSTRAINT_MISMATCH");
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("goal specification proposal lifecycle failed", exception);

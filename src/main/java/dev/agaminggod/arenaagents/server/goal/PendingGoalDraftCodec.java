@@ -107,11 +107,26 @@ public final class PendingGoalDraftCodec {
 			clauses.add(clauseJson);
 		}
 		json.add("kill_clauses", clauses);
+		JsonArray itemClauses = new JsonArray();
+		for (GoalTranslationConstraint.ItemClause clause : constraint.itemClauses()) {
+			JsonObject clauseJson = new JsonObject();
+			JsonArray alternatives = new JsonArray();
+			for (GoalTranslationConstraint.ItemAlternative alternative : clause.alternatives()) {
+				JsonObject alternativeJson = new JsonObject();
+				alternativeJson.add("item_ids", GSON.toJsonTree(alternative.itemIds()));
+				alternativeJson.addProperty("count", alternative.count());
+				alternatives.add(alternativeJson);
+			}
+			clauseJson.add("alternatives", alternatives);
+			itemClauses.add(clauseJson);
+		}
+		json.add("item_clauses", itemClauses);
 		return json;
 	}
 
 	private static GoalTranslationConstraint decodeConstraint(JsonObject json) {
-		if (!json.keySet().equals(Set.of("kill_clauses"))) {
+		boolean legacyItemConstraints = json.keySet().equals(Set.of("kill_clauses"));
+		if (!legacyItemConstraints && !json.keySet().equals(Set.of("kill_clauses", "item_clauses"))) {
 			throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Translation constraint fields differ from the closed schema");
 		}
 		JsonElement clausesValue = field(json, "kill_clauses");
@@ -139,7 +154,41 @@ public final class PendingGoalDraftCodec {
 			}
 			clauses.add(new GoalTranslationConstraint.KillClause(alternatives));
 		}
-		return clauses.isEmpty() ? GoalTranslationConstraint.none() : new GoalTranslationConstraint(clauses);
+		ArrayList<GoalTranslationConstraint.ItemClause> itemClauses = legacyItemConstraints
+				? new ArrayList<>()
+				: decodeItemClauses(json);
+		return clauses.isEmpty() && itemClauses.isEmpty()
+				? GoalTranslationConstraint.none()
+				: new GoalTranslationConstraint(clauses, itemClauses);
+	}
+
+	private static ArrayList<GoalTranslationConstraint.ItemClause> decodeItemClauses(JsonObject json) {
+		JsonElement clausesValue = field(json, "item_clauses");
+		if (!clausesValue.isJsonArray()) throw failure("INVALID_GOAL_DRAFT", "item_clauses must be an array");
+		ArrayList<GoalTranslationConstraint.ItemClause> clauses = new ArrayList<>();
+		for (JsonElement clauseValue : clausesValue.getAsJsonArray()) {
+			JsonObject clause = object(clauseValue, "item_clause");
+			if (!clause.keySet().equals(Set.of("alternatives"))) {
+				throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Item clause fields differ from the closed schema");
+			}
+			JsonElement alternativesValue = field(clause, "alternatives");
+			if (!alternativesValue.isJsonArray()) throw failure("INVALID_GOAL_DRAFT", "alternatives must be an array");
+			ArrayList<GoalTranslationConstraint.ItemAlternative> alternatives = new ArrayList<>();
+			for (JsonElement alternativeValue : alternativesValue.getAsJsonArray()) {
+				JsonObject alternative = object(alternativeValue, "item_alternative");
+				if (!alternative.keySet().equals(Set.of("item_ids", "count"))) {
+					throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Item alternative fields differ from the closed schema");
+				}
+				long count = exactLong(alternative, "count");
+				if (count < Integer.MIN_VALUE || count > Integer.MAX_VALUE) {
+					throw failure("INVALID_GOAL_DRAFT", "item alternative count is out of range");
+				}
+				alternatives.add(new GoalTranslationConstraint.ItemAlternative(
+						strings(alternative, "item_ids"), (int) count));
+			}
+			clauses.add(new GoalTranslationConstraint.ItemClause(alternatives));
+		}
+		return clauses;
 	}
 
 	private static List<String> strings(JsonObject object, String field) {

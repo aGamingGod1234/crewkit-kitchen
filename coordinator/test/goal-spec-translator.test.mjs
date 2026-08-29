@@ -93,6 +93,8 @@ test('translator preserves compound item and kill requests as bounded all-of lea
 			assert.match(prompt, /use all_of/i);
 			assert.match(prompt, /at most 16 factual leaves/i);
 			assert.match(prompt, /kill counts by repeating the kill leaf/i);
+			assert.match(prompt, /every any_of branch must preserve all factual quantities/i);
+			assert.match(prompt, /operator_confirmed.*cannot replace/i);
 			return {
 				requestId: request.requestId,
 				summary: 'Get the pickaxe and defeat the zombie',
