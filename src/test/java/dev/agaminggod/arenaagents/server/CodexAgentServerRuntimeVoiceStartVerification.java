@@ -9,7 +9,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Verifies voice starts from the supported default secret when coordinator autostart is disabled. */
+/** Verifies fail-closed runtime ticks and manual-secret voice lifecycle transitions. */
 public final class CodexAgentServerRuntimeVoiceStartVerification {
 	private CodexAgentServerRuntimeVoiceStartVerification() {
 	}
@@ -42,22 +42,55 @@ public final class CodexAgentServerRuntimeVoiceStartVerification {
 			slot = new CodexAgentServerRuntime.BridgeSlot(System::currentTimeMillis);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
 			assertTrue(slot.bridge() != null, "the Java bridge starts from the same default runtime secret");
+			MultiplexedServerBridge adoptionListener = slot.bridge();
+			AtomicInteger boundRuntimeTicks = new AtomicInteger();
+			assertFalse(CodexAgentServerRuntime.runRestoredStateTick(false, boundRuntimeTicks::incrementAndGet),
+					"failed persisted-state restoration fences the bound runtime tick");
+			assertEquals(0, boundRuntimeTicks.get(),
+					"failed restoration does not drain commands or mutate stale-bound agents");
+			assertEquals(adoptionListener, slot.bridge(),
+					"failed restoration leaves the bridge listener available for coordinator adoption");
+			assertTrue(CodexAgentServerRuntime.runRestoredStateTick(true, boundRuntimeTicks::incrementAndGet),
+					"a later successful restoration resumes the bound runtime tick");
+			assertEquals(1, boundRuntimeTicks.get(), "successful restoration resumes bound work exactly once");
 
 			AtomicInteger voiceStarts = new AtomicInteger();
+			AtomicInteger voiceCloses = new AtomicInteger();
 			CodexAgentServerRuntime.VoiceInitializationGate gate =
-					new CodexAgentServerRuntime.VoiceInitializationGate(voiceStarts::incrementAndGet, () -> { });
+					new CodexAgentServerRuntime.VoiceInitializationGate(
+							voiceStarts::incrementAndGet, voiceCloses::incrementAndGet
+					);
 			assertTrue(gate.reconcile(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
 					CodexAgentServerRuntime.voiceConfigurationRevision(supervisor)),
 					"prepared default runtime secret starts the voice subsystem");
 			assertEquals(1, voiceStarts.get(), "voice starts once for the prepared default runtime secret");
 
 			Files.writeString(defaultSecret, "invalid", StandardCharsets.UTF_8);
-			assertFalse(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
-					"invalid default runtime secret keeps voice fail-closed");
+			boolean invalidPrepared = CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor);
+			assertFalse(invalidPrepared, "invalid default runtime secret keeps voice fail-closed");
+			assertTrue(gate.reconcile(invalidPrepared, CodexAgentServerRuntime.voiceConfigurationRevision(supervisor)),
+					"invalidating the effective manual secret fences the active voice subsystem");
+			assertEquals(1, voiceCloses.get(), "invalid secret transition closes the active voice subsystem once");
+
+			Files.writeString(defaultSecret, "r".repeat(32), StandardCharsets.UTF_8);
+			assertTrue(gate.reconcile(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
+					CodexAgentServerRuntime.voiceConfigurationRevision(supervisor)),
+					"repairing the effective manual secret restarts voice without restarting Minecraft");
+			assertEquals(2, voiceStarts.get(), "valid secret recovery starts one replacement voice subsystem");
+
 			Files.delete(defaultSecret);
-			assertFalse(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
-					"missing default runtime secret keeps voice fail-closed");
-			return 6;
+			boolean missingPrepared = CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor);
+			assertFalse(missingPrepared, "missing default runtime secret keeps voice fail-closed");
+			assertTrue(gate.reconcile(missingPrepared, CodexAgentServerRuntime.voiceConfigurationRevision(supervisor)),
+					"removing the effective manual secret fences the recovered voice subsystem");
+			assertEquals(2, voiceCloses.get(), "missing secret transition closes the recovered voice subsystem once");
+
+			Files.writeString(defaultSecret, "s".repeat(32), StandardCharsets.UTF_8);
+			assertTrue(gate.reconcile(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
+					CodexAgentServerRuntime.voiceConfigurationRevision(supervisor)),
+					"recreating the missing manual secret recovers voice on a later tick");
+			assertEquals(3, voiceStarts.get(), "missing secret recovery starts one replacement voice subsystem");
+			return 19;
 		} finally {
 			if (slot != null) slot.close();
 			if (supervisor != null) supervisor.close();

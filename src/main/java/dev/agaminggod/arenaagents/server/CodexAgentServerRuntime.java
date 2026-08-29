@@ -224,19 +224,22 @@ public final class CodexAgentServerRuntime {
 			bridge = bridge(server);
 			reconcileVoice(server, supervisor);
 		}
-		if (!ScenarioRuntimeService.restorePersistedState(server)) {
+		MultiplexedServerBridge activeBridge = bridge;
+		runRestoredStateTick(ScenarioRuntimeService.restorePersistedState(server), () -> {
+			manager.reconcileDeaths();
+			manager.maintainChunkTickets();
 			VoiceSubsystemRuntime.tick(server);
-			if (bridge != null) bridge.tick();
-			return;
-		}
-		manager.reconcileDeaths();
-		manager.maintainChunkTickets();
-		VoiceSubsystemRuntime.tick(server);
-		maintainPlanningProgress(manager);
-		if (bridge != null) {
-			bridge.tick();
-		}
-		ScenarioRuntimeService.tick(server);
+			maintainPlanningProgress(manager);
+			if (activeBridge != null) activeBridge.tick();
+			ScenarioRuntimeService.tick(server);
+		});
+	}
+
+	static boolean runRestoredStateTick(boolean restored, Runnable activeRuntimeTick) {
+		java.util.Objects.requireNonNull(activeRuntimeTick, "active runtime tick must not be null");
+		if (!restored) return false;
+		activeRuntimeTick.run();
+		return true;
 	}
 
 	private static void maintainPlanningProgress(CodexAgentManager manager) {
@@ -359,22 +362,24 @@ public final class CodexAgentServerRuntime {
 		}
 	}
 
-	/** Starts voice only after the supervisor has published the prepared secret/config paths. */
+	/** Keeps voice fenced unless the effective secret and configuration are prepared. */
 	private static void reconcileVoice(MinecraftServer server, CoordinatorProcessSupervisor supervisor) {
 		if (supervisor == null) return;
 		boolean prepared = voiceConfigurationPrepared(supervisor);
-		if (!prepared) return;
-		long revision = voiceConfigurationRevision(supervisor);
-		VoiceInitializationGate gate = VOICE_GATES.computeIfAbsent(server, ignored ->
-				new VoiceInitializationGate(
-						() -> VoiceSubsystemRuntime.start(server),
-						() -> VoiceSubsystemRuntime.close(server)
-				)
-		);
+		VoiceInitializationGate gate = VOICE_GATES.get(server);
+		if (gate == null) {
+			if (!prepared) return;
+			gate = VOICE_GATES.computeIfAbsent(server, ignored ->
+					new VoiceInitializationGate(
+							() -> VoiceSubsystemRuntime.start(server),
+							() -> VoiceSubsystemRuntime.close(server)
+					)
+			);
+		}
 		try {
-			gate.reconcile(true, revision);
+			gate.reconcile(prepared, prepared ? voiceConfigurationRevision(supervisor) : 0L);
 		} catch (RuntimeException failure) {
-			LOGGER.warn("Voice subsystem initialization will retry after coordinator paths are prepared", failure);
+			LOGGER.warn("Voice subsystem reconciliation will retry after coordinator paths are prepared", failure);
 		}
 	}
 
@@ -430,7 +435,13 @@ public final class CodexAgentServerRuntime {
 		}
 
 		synchronized boolean reconcile(boolean prepared, long desiredRevision) {
-			if (!prepared || activeRevision == desiredRevision) return false;
+			if (!prepared) {
+				if (activeRevision == UNINITIALIZED) return false;
+				activeRevision = UNINITIALIZED;
+				closer.run();
+				return true;
+			}
+			if (activeRevision == desiredRevision) return false;
 			if (activeRevision != UNINITIALIZED) {
 				activeRevision = UNINITIALIZED;
 				closer.run();
