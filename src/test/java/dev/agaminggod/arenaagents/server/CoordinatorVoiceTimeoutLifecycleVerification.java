@@ -23,33 +23,46 @@ public final class CoordinatorVoiceTimeoutLifecycleVerification {
 		Path directory = Files.createTempDirectory("arena-voice-timeout-lifecycle");
 		try {
 			System.setProperty(AUTO_START_PROPERTY, "false");
-			System.setProperty(VOICE_URL_PROPERTY, "http://127.0.0.1:9123/v1/tts");
-			Path firstConfig = writeConfig(directory.resolve("first.json"), 12_345);
-			Path secondConfig = writeConfig(directory.resolve("second.json"), 54_321);
+			Path firstConfig = writeConfig(directory.resolve("first.json"), 18_101, 12_345);
+			Path secondConfig = writeConfig(directory.resolve("second.json"), 18_102, 54_321);
 
+			System.clearProperty(VOICE_URL_PROPERTY);
 			System.clearProperty(TIMEOUT_PROPERTY);
 			try (CoordinatorProcessSupervisor first = supervisor(directory.resolve("first-game"))) {
 				first.configureSharedVoiceEndpoint(firstConfig);
+				assertEquals("http://127.0.0.1:18101/v1/tts", System.getProperty(VOICE_URL_PROPERTY),
+						"first server derives its configured voice endpoint");
 				assertEquals("12345", System.getProperty(TIMEOUT_PROPERTY),
 						"first server derives its configured timeout");
 			}
+			assertEquals(null, System.getProperty(VOICE_URL_PROPERTY),
+					"first server releases its derived voice endpoint");
 			assertEquals(null, System.getProperty(TIMEOUT_PROPERTY),
 					"first server releases its derived timeout");
 
 			try (CoordinatorProcessSupervisor second = supervisor(directory.resolve("second-game"))) {
 				second.configureSharedVoiceEndpoint(secondConfig);
+				assertEquals("http://127.0.0.1:18102/v1/tts", System.getProperty(VOICE_URL_PROPERTY),
+						"second server refreshes its configured voice endpoint");
 				assertEquals("54321", System.getProperty(TIMEOUT_PROPERTY),
 						"second server derives the updated timeout");
 			}
+			assertEquals(null, System.getProperty(VOICE_URL_PROPERTY),
+					"second server releases its derived voice endpoint");
 			assertEquals(null, System.getProperty(TIMEOUT_PROPERTY),
 					"second server releases its derived timeout");
 
+			System.setProperty(VOICE_URL_PROPERTY, "http://127.0.0.1:19123/v1/tts");
 			System.setProperty(TIMEOUT_PROPERTY, "77777");
 			try (CoordinatorProcessSupervisor explicit = supervisor(directory.resolve("explicit-game"))) {
 				explicit.configureSharedVoiceEndpoint(firstConfig);
+				assertEquals("http://127.0.0.1:19123/v1/tts", System.getProperty(VOICE_URL_PROPERTY),
+						"an explicit voice endpoint overrides the derived configuration");
 				assertEquals("77777", System.getProperty(TIMEOUT_PROPERTY),
 						"an explicit timeout overrides the derived configuration");
 			}
+			assertEquals("http://127.0.0.1:19123/v1/tts", System.getProperty(VOICE_URL_PROPERTY),
+					"closing a supervisor preserves an explicit voice endpoint");
 			assertEquals("77777", System.getProperty(TIMEOUT_PROPERTY),
 					"closing a supervisor preserves an explicit timeout");
 
@@ -71,7 +84,7 @@ public final class CoordinatorVoiceTimeoutLifecycleVerification {
 			}
 			assertEquals("88888", System.getProperty(TIMEOUT_PROPERTY),
 					"closing does not clobber an override installed during the server session");
-			return 10;
+			return 16;
 		} finally {
 			restoreProperty(AUTO_START_PROPERTY, oldAutoStart);
 			restoreProperty(VOICE_URL_PROPERTY, oldVoiceUrl);
@@ -84,8 +97,9 @@ public final class CoordinatorVoiceTimeoutLifecycleVerification {
 		return new CoordinatorProcessSupervisor(gameDirectory, Map.of());
 	}
 
-	private static Path writeConfig(Path path, int timeoutMs) throws Exception {
-		Files.writeString(path, "{\"voice\":{\"localSpeechTimeoutMs\":" + timeoutMs + "}}", StandardCharsets.UTF_8);
+	private static Path writeConfig(Path path, int port, int timeoutMs) throws Exception {
+		Files.writeString(path, "{\"voice\":{\"port\":" + port
+				+ ",\"localSpeechTimeoutMs\":" + timeoutMs + "}}", StandardCharsets.UTF_8);
 		return path;
 	}
 

@@ -117,10 +117,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 					capture = legacySpeechCapture;
 					if (capture == null) {
 						LegacyConfiguration configuration = legacyConfiguration();
-						URI speechEndpoint = URI.create(System.getProperty(
-								"arenaagents.sttUrl",
-								configuration.endpoint().toString().replace("/v1/tts", "/v1/stt")
-						));
+						URI speechEndpoint = legacySpeechEndpoint(configuration.endpoint());
 						capture = new HumanSpeechCapture(new SpeechWorkerClient(
 								defaultHttpClient(), speechEndpoint, configuration.secret(),
 								configuration.requestTimeout()
@@ -146,10 +143,17 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 		return HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(3)).build();
 	}
 
+	static URI legacySpeechEndpoint(URI voiceEndpoint) {
+		return validateEndpoint(System.getProperty(
+				"arenaagents.sttUrl",
+				voiceEndpoint.toString().replace("/v1/tts", "/v1/stt")
+		), "/v1/stt");
+	}
+
 	private static LegacyConfiguration legacyConfiguration() {
 		URI endpoint = validateEndpoint(System.getProperty(
 				"arenaagents.voiceUrl", "http://127.0.0.1:8766/v1/tts"
-		));
+		), "/v1/tts");
 		int requestTimeoutMs = parseRequestTimeout(System.getProperty(
 				"arenaagents.voiceRequestTimeoutMs", Integer.toString(DEFAULT_REQUEST_TIMEOUT_MS)
 		));
@@ -168,7 +172,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 		}
 	}
 
-	private static URI validateEndpoint(String endpoint) {
+	private static URI validateEndpoint(String endpoint, String requiredPath) {
 		String normalized = Objects.requireNonNull(endpoint, "voice endpoint must not be null").strip();
 		if (normalized.isEmpty() || normalized.length() > 2_048) {
 			throw new IllegalArgumentException("voice endpoint must be nonblank and bounded");
@@ -184,10 +188,12 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 					|| uri.getPort() < 1
 					|| uri.getPort() > 65_535
 					|| uri.getRawUserInfo() != null
-					|| !"/v1/tts".equals(uri.getRawPath())
+					|| !requiredPath.equals(uri.getRawPath())
 					|| uri.getRawQuery() != null
 					|| uri.getRawFragment() != null) {
-				throw new IllegalArgumentException("voice endpoint must be a loopback worker /v1/tts URI");
+				throw new IllegalArgumentException(
+						"voice endpoint must be a loopback worker " + requiredPath + " URI"
+				);
 			}
 			return uri;
 		} catch (URISyntaxException exception) {

@@ -18,12 +18,14 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 final class VoicePlaybackCoordinator implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(VoicePlaybackCoordinator.class);
 	private static final int MAX_DIAGNOSTIC_AGENTS = 64;
+	private static final Supplier<VoiceReceipt> CANCELLED_RECEIPT = resolveCancelledReceipt();
 	private final Synthesizer synthesizer;
 	private final Executor playbackExecutor;
 	private final Transport transport;
@@ -315,7 +317,7 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 			future = pending.remove(agentId);
 			synthesis = syntheses.remove(agentId);
 		}
-		if (future != null) future.complete(VoiceReceipt.cancelled());
+		if (future != null) future.complete(CANCELLED_RECEIPT.get());
 		if (synthesis != null) synthesis.cancel(true);
 		if (player != null) {
 			try {
@@ -325,6 +327,15 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 						"VOICE_PLAYBACK_CLEANUP_FAILED", "Voice playback cleanup failed"
 				));
 			}
+		}
+	}
+
+	private static Supplier<VoiceReceipt> resolveCancelledReceipt() {
+		try {
+			VoiceReceipt.class.getMethod("cancelled");
+			return ModernCancelledReceipt.INSTANCE;
+		} catch (NoSuchMethodException legacyCore) {
+			return () -> VoiceReceipt.degraded("[VOICE_CANCELLED] Speech cancelled");
 		}
 	}
 
@@ -468,6 +479,15 @@ final class VoicePlaybackCoordinator implements AutoCloseable {
 	static final class UnavailableException extends RuntimeException {
 		UnavailableException(String message) {
 			super(message);
+		}
+	}
+
+	private static final class ModernCancelledReceipt implements Supplier<VoiceReceipt> {
+		private static final ModernCancelledReceipt INSTANCE = new ModernCancelledReceipt();
+
+		@Override
+		public VoiceReceipt get() {
+			return VoiceReceipt.cancelled();
 		}
 	}
 }

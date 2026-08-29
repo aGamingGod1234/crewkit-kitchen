@@ -6,13 +6,20 @@ import de.maxhenkel.voicechat.api.events.EventRegistration;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystem;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemProvider;
+import dev.agaminggod.arenaagents.agent.AgentId;
+import dev.agaminggod.arenaagents.server.voice.VoiceReceipt;
+import dev.agaminggod.arenaagents.server.voice.VoiceRequest;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.dedicated.DedicatedServer;
@@ -29,10 +36,12 @@ public final class LegacyVoiceProviderClasspathScenario {
 		Path secretFile = Files.createTempFile("arena-agents-legacy-provider", ".secret");
 		Files.writeString(secretFile, "legacy-provider-secret-0123456789\n", StandardCharsets.UTF_8);
 		String previousUrl = System.getProperty("arenaagents.voiceUrl");
+		String previousSttUrl = System.getProperty("arenaagents.sttUrl");
 		String previousSecretFile = System.getProperty("arenaagents.voiceSecretFile");
 		String previousTimeout = System.getProperty("arenaagents.voiceRequestTimeoutMs");
 		try {
 			System.setProperty("arenaagents.voiceUrl", "http://127.0.0.1:18765/v1/tts");
+			System.setProperty("arenaagents.sttUrl", "http://127.0.0.1:18765/v1/stt");
 			System.setProperty("arenaagents.voiceSecretFile", secretFile.toString());
 			System.setProperty("arenaagents.voiceRequestTimeoutMs", "12345");
 			RecordingEventRegistration events = new RecordingEventRegistration();
@@ -45,13 +54,70 @@ public final class LegacyVoiceProviderClasspathScenario {
 			if (subsystem == null) throw new AssertionError("Legacy provider returned null");
 			if (!subsystem.available()) throw new AssertionError("Legacy voice-chat registration was not retained");
 			subsystem.close();
-			return 3;
+
+			verifyLegacySttEndpointValidation();
+			verifyLegacyConsentCapture(testServer());
+			verifyLegacyPlaybackCancellation();
+			return 7;
 		} finally {
 			restoreProperty("arenaagents.voiceUrl", previousUrl);
+			restoreProperty("arenaagents.sttUrl", previousSttUrl);
 			restoreProperty("arenaagents.voiceSecretFile", previousSecretFile);
 			restoreProperty("arenaagents.voiceRequestTimeoutMs", previousTimeout);
 			Files.deleteIfExists(secretFile);
 		}
+	}
+
+	private static void verifyLegacySttEndpointValidation() {
+		System.setProperty("arenaagents.sttUrl", "https://example.com:443/v1/stt");
+		try {
+			ArenaAgentsVoiceProvider.legacySpeechEndpoint(URI.create("http://127.0.0.1:18765/v1/tts"));
+			throw new AssertionError("Legacy STT endpoint accepted a non-loopback host");
+		} catch (IllegalArgumentException expected) {
+			// The legacy override must follow the same endpoint boundary as TTS.
+		} finally {
+			System.setProperty("arenaagents.sttUrl", "http://127.0.0.1:18765/v1/stt");
+		}
+	}
+
+	private static void verifyLegacyConsentCapture(MinecraftServer server) {
+		AtomicBoolean captured = new AtomicBoolean();
+		if (!HumanSpeechCapture.captureWhileGranted(server, UUID.randomUUID(), () -> captured.set(true))) {
+			throw new AssertionError("Granted legacy speech capture was rejected");
+		}
+		if (!captured.get()) throw new AssertionError("Granted legacy speech was not captured");
+	}
+
+	private static void verifyLegacyPlaybackCancellation() {
+		AgentId agentId = AgentId.parse("00000000-0000-4000-8000-000000000099");
+		CompletableFuture<short[]> synthesis = new CompletableFuture<>();
+		VoicePlaybackCoordinator coordinator = new VoicePlaybackCoordinator(
+				request -> synthesis,
+				Runnable::run,
+				new VoicePlaybackCoordinator.Transport() {
+					@Override public boolean available() { return true; }
+
+					@Override
+					public VoicePlaybackCoordinator.Playback create(
+							AgentId ignoredAgent,
+							UUID ignoredEntity,
+							int ignoredRadius,
+							short[] ignoredSamples,
+							Runnable ignoredStopped
+					) {
+						throw new AssertionError("Pending synthesis must not reach playback");
+					}
+				}
+		);
+		coordinator.registerAgent(agentId, UUID.randomUUID());
+		CompletableFuture<VoiceReceipt> receipt = coordinator.speak(new VoiceRequest(
+				agentId, "Legacy cancellation", "voice.auto.v1", 48, 1L
+		)).toCompletableFuture();
+		coordinator.stop(agentId);
+		if (receipt.join().status() != VoiceReceipt.Status.DEGRADED_TO_TEXT) {
+			throw new AssertionError("Legacy cancellation did not settle with an old-core receipt");
+		}
+		coordinator.close();
 	}
 
 	private static MinecraftServer testServer() throws Exception {

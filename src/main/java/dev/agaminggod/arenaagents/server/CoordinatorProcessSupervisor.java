@@ -15,6 +15,7 @@ import java.util.Objects;
 /** Starts the bundled localhost coordinator with one prepared runtime context. */
 final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CoordinatorProcessSupervisor.class);
+	private static final String VOICE_URL_PROPERTY = "arenaagents.voiceUrl";
 	private static final String VOICE_REQUEST_TIMEOUT_PROPERTY = "arenaagents.voiceRequestTimeoutMs";
 
 	private final Path gameDirectory;
@@ -31,6 +32,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private String previousVoiceRequestTimeout;
 	private String derivedVoiceRequestTimeout;
 	private boolean ownsVoiceRequestTimeout;
+	private String previousVoiceUrl;
+	private String derivedVoiceUrl;
+	private boolean ownsVoiceUrl;
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -192,6 +196,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			}
 			process = null;
 		} finally {
+			releaseDerivedVoiceUrl();
 			releaseDerivedVoiceRequestTimeout();
 		}
 	}
@@ -203,10 +208,15 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	}
 
 	void configureSharedVoiceEndpoint(Path configPath) throws IOException {
-		String configured = System.getProperty("arenaagents.voiceUrl");
+		String configured = System.getProperty(VOICE_URL_PROPERTY);
 		if (configured == null || configured.isBlank()) {
+			previousVoiceUrl = configured;
 			CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
-					.ifPresent(endpoint -> System.setProperty("arenaagents.voiceUrl", endpoint));
+					.ifPresent(endpoint -> {
+						derivedVoiceUrl = endpoint;
+						System.setProperty(VOICE_URL_PROPERTY, endpoint);
+						ownsVoiceUrl = true;
+					});
 		}
 		String configuredTimeout = System.getProperty(VOICE_REQUEST_TIMEOUT_PROPERTY);
 		if (configuredTimeout == null || configuredTimeout.isBlank()) {
@@ -215,6 +225,17 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 			System.setProperty(VOICE_REQUEST_TIMEOUT_PROPERTY, derivedVoiceRequestTimeout);
 			ownsVoiceRequestTimeout = true;
 		}
+	}
+
+	private void releaseDerivedVoiceUrl() {
+		if (!ownsVoiceUrl) return;
+		if (Objects.equals(System.getProperty(VOICE_URL_PROPERTY), derivedVoiceUrl)) {
+			if (previousVoiceUrl == null) System.clearProperty(VOICE_URL_PROPERTY);
+			else System.setProperty(VOICE_URL_PROPERTY, previousVoiceUrl);
+		}
+		previousVoiceUrl = null;
+		derivedVoiceUrl = null;
+		ownsVoiceUrl = false;
 	}
 
 	private void releaseDerivedVoiceRequestTimeout() {
