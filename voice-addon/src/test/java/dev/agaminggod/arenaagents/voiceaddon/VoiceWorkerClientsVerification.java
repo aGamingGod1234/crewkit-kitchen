@@ -6,6 +6,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.voice.VoiceRequest;
+import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -17,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,12 +34,68 @@ final class VoiceWorkerClientsVerification {
 	static int verify() throws Exception {
 		int assertions = 0;
 		assertions += verifyTtsClientSendsContractAndDecodesPcm();
+		assertions += verifyPreparedSecretDoesNotReadGlobalSecretPath();
 		assertions += verifyTtsClientRejectsMalformedAudioAndHttpFailure();
+		assertions += verifyTtsCancellationStopsTheHttpExchange();
+		assertions += verifySttCancellationStopsTheHttpExchange();
 		assertions += verifySttClientSendsPcmMetadataAndBoundsTranscript();
 		assertions += verifySttClientRejectsMalformedInputAndResponse();
 		assertions += verifySttUnavailablePreservesWorkerCode();
 		assertions += verifyClientsRejectWrongResponseMediaTypes();
+		assertions += verifyConfiguredDeadlineReachesBothHttpClients();
 		return assertions;
+	}
+
+	private static int verifyConfiguredDeadlineReachesBothHttpClients() {
+		VoiceSubsystemConfiguration configuration = new VoiceSubsystemConfiguration(
+				"http://127.0.0.1:8766/v1/tts", SECRET, 91_234
+		);
+		PendingHttpClient ttsHttp = new PendingHttpClient();
+		CompletableFuture<short[]> synthesis = new VoiceWorkerClient(
+				ttsHttp,
+				URI.create(configuration.endpoint()),
+				configuration.secret(),
+				java.time.Duration.ofMillis(configuration.requestTimeoutMs())
+		).synthesize(request());
+		assertEquals(91_234L, ttsHttp.request.get().timeout().orElseThrow().toMillis(),
+				"configured TTS HTTP deadline");
+		synthesis.cancel(true);
+
+		PendingHttpClient sttHttp = new PendingHttpClient();
+		CompletableFuture<SpeechWorkerClient.Transcript> transcription = new SpeechWorkerClient(
+				sttHttp,
+				URI.create("http://127.0.0.1:8766/v1/stt"),
+				configuration.secret(),
+				java.time.Duration.ofMillis(configuration.requestTimeoutMs())
+		).transcribe(PLAYER, 1L, false, new short[] { 1 });
+		assertEquals(91_234L, sttHttp.request.get().timeout().orElseThrow().toMillis(),
+				"configured STT HTTP deadline");
+		transcription.cancel(true);
+		return 2;
+	}
+
+	private static int verifyPreparedSecretDoesNotReadGlobalSecretPath() throws Exception {
+		String oldVoiceSecret = System.getProperty("arenaagents.voiceSecretFile");
+		String oldBridgeSecret = System.getProperty("arenaagents.bridgeSecretFile");
+		try (WorkerServer server = new WorkerServer(exchange -> {
+			assertEquals("Bearer " + SECRET, exchange.getRequestHeaders().getFirst("Authorization"),
+					"prepared in-memory TTS authorization");
+			respondPcm(exchange, pcm(1, 2));
+		})) {
+			System.setProperty("arenaagents.voiceSecretFile", "missing/unreadable/voice-secret.txt");
+			System.setProperty("arenaagents.bridgeSecretFile", "missing/unreadable/bridge-secret.txt");
+			VoiceWorkerClient client = new VoiceWorkerClient(new VoiceSubsystemConfiguration(
+					server.uri("/v1/tts").toString(), SECRET
+			));
+			short[] samples = client.synthesize(request()).join();
+			server.assertHealthy();
+			assertEquals(true, Arrays.equals(new short[] {1, 2}, samples),
+					"voice client starts from worker-prevalidated memory after secret paths become unreadable");
+			return 2;
+		} finally {
+			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
+			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
+		}
 	}
 
 	private static int verifyTtsClientSendsContractAndDecodesPcm() throws Exception {
@@ -77,6 +135,42 @@ final class VoiceWorkerClientsVerification {
 			assertWorkerFailure("VOICE_WORKER_HTTP", () -> client.synthesize(request()).join(), "TTS HTTP failure");
 			unavailable.assertHealthy();
 		}
+		try (WorkerServer providerUnavailable = new WorkerServer(exchange -> respond(
+				exchange,
+				502,
+				"{\"code\":\"TTS_UNAVAILABLE\",\"message\":\"secret must-not-reach-logs\"}"
+						.getBytes(StandardCharsets.UTF_8),
+				"application/json"
+		))) {
+			VoiceWorkerClient client = new VoiceWorkerClient(
+					HttpClient.newHttpClient(), providerUnavailable.uri("/v1/tts"), SECRET
+			);
+			assertWorkerFailure("TTS_UNAVAILABLE", () -> client.synthesize(request()).join(),
+					"TTS provider error code");
+			providerUnavailable.assertHealthy();
+		}
+		return 3;
+	}
+
+	private static int verifyTtsCancellationStopsTheHttpExchange() {
+		PendingHttpClient http = new PendingHttpClient();
+		VoiceWorkerClient client = new VoiceWorkerClient(http, URI.create("http://127.0.0.1:8766/v1/tts"), SECRET);
+		CompletableFuture<short[]> synthesis = client.synthesize(request());
+		assertEquals(true, synthesis.cancel(true), "TTS request cancellation is accepted");
+		assertEquals(true, http.response.isCancelled(), "TTS cancellation reaches the HTTP exchange");
+		return 2;
+	}
+
+	private static int verifySttCancellationStopsTheHttpExchange() {
+		PendingHttpClient http = new PendingHttpClient();
+		SpeechWorkerClient client = new SpeechWorkerClient(
+				http, URI.create("http://127.0.0.1:8766/v1/stt"), SECRET
+		);
+		CompletableFuture<SpeechWorkerClient.Transcript> transcription = client.transcribe(
+				PLAYER, 18L, false, new short[] { 1, 2 }
+		);
+		assertEquals(true, transcription.cancel(true), "STT request cancellation is accepted");
+		assertEquals(true, http.response.isCancelled(), "STT cancellation reaches the HTTP exchange");
 		return 2;
 	}
 
@@ -212,6 +306,11 @@ final class VoiceWorkerClientsVerification {
 		}
 	}
 
+	private static void restoreProperty(String name, String value) {
+		if (value == null) System.clearProperty(name);
+		else System.setProperty(name, value);
+	}
+
 	@FunctionalInterface
 	private interface Handler {
 		void handle(HttpExchange exchange) throws Exception;
@@ -250,5 +349,34 @@ final class VoiceWorkerClientsVerification {
 		public void close() {
 			server.stop(0);
 		}
+	}
+
+	private static final class PendingHttpClient extends HttpClient {
+		private final CompletableFuture<java.net.http.HttpResponse<byte[]>> response = new CompletableFuture<>();
+		private final AtomicReference<java.net.http.HttpRequest> request = new AtomicReference<>();
+
+		@Override public java.util.Optional<java.net.CookieHandler> cookieHandler() { return java.util.Optional.empty(); }
+		@Override public java.util.Optional<java.time.Duration> connectTimeout() { return java.util.Optional.empty(); }
+		@Override public Redirect followRedirects() { return Redirect.NEVER; }
+		@Override public java.util.Optional<java.net.ProxySelector> proxy() { return java.util.Optional.empty(); }
+		@Override public javax.net.ssl.SSLContext sslContext() { return null; }
+		@Override public javax.net.ssl.SSLParameters sslParameters() { return new javax.net.ssl.SSLParameters(); }
+		@Override public java.util.Optional<java.net.Authenticator> authenticator() { return java.util.Optional.empty(); }
+		@Override public Version version() { return Version.HTTP_1_1; }
+		@Override public java.util.Optional<java.util.concurrent.Executor> executor() { return java.util.Optional.empty(); }
+		@Override public <T> java.net.http.HttpResponse<T> send(
+				java.net.http.HttpRequest request, java.net.http.HttpResponse.BodyHandler<T> handler
+		) { throw new UnsupportedOperationException(); }
+		@Override @SuppressWarnings("unchecked") public <T> CompletableFuture<java.net.http.HttpResponse<T>> sendAsync(
+				java.net.http.HttpRequest request, java.net.http.HttpResponse.BodyHandler<T> handler
+		) {
+			this.request.set(request);
+			return (CompletableFuture<java.net.http.HttpResponse<T>>) (CompletableFuture<?>) response;
+		}
+		@Override public <T> CompletableFuture<java.net.http.HttpResponse<T>> sendAsync(
+				java.net.http.HttpRequest request,
+				java.net.http.HttpResponse.BodyHandler<T> handler,
+				java.net.http.HttpResponse.PushPromiseHandler<T> pushPromiseHandler
+		) { return sendAsync(request, handler); }
 	}
 }

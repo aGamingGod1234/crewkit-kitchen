@@ -13,6 +13,11 @@ public final class VoiceAddonVerificationMain {
 	public static void main(String[] arguments) throws Exception {
 		int assertions = 0;
 		assertions += verifyFabricMetadataLoadsOnIntegratedAndDedicatedServers();
+		assertions += LegacyVoiceProviderClasspathVerification.verify();
+		assertions += ArenaAgentsVoiceProviderVerification.verify();
+		assertions += ArenaAgentsVoiceChatPluginVerification.verify();
+		assertions += VoicechatServerBindingsVerification.verify();
+		assertions += ServerSpeechCaptureRegistryVerification.verify();
 		assertions += VoicePlaybackCoordinatorVerification.verify();
 		assertions += SpeechCaptureEngineVerification.verify();
 		assertions += VoiceWorkerClientsVerification.verify();
@@ -29,7 +34,16 @@ public final class VoiceAddonVerificationMain {
 			if (!"*".equals(metadata.get("environment").getAsString())) {
 				throw new AssertionError("Voice addon must load in an integrated server client JVM");
 			}
-			return 1;
+			if (!">=0.1.0".equals(metadata.getAsJsonObject("depends")
+					.get("arenaagents").getAsString())) {
+				throw new AssertionError("Voice addon must retain the compatible arenaagents dependency range");
+			}
+			String voicechatEntrypoint = metadata.getAsJsonObject("entrypoints")
+					.getAsJsonArray("voicechat").get(0).getAsString();
+			if (!ArenaAgentsVoiceProvider.class.getName().equals(voicechatEntrypoint)) {
+				throw new AssertionError("Voice addon entrypoints must share the compatibility provider");
+			}
+			return 3;
 		} catch (java.io.IOException exception) {
 			throw new AssertionError("Could not read voice addon metadata", exception);
 		}

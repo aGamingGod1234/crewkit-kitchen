@@ -20,6 +20,10 @@ export class FishTtsProvider {
 		this.#timeoutMs = timeoutMs;
 	}
 
+	cacheNamespace() {
+		return 'fish/s2.1-pro-free';
+	}
+
 	async synthesize({ text, voiceId, speed = 1, signal } = {}) {
 		requireText(text, 'text');
 		requireText(voiceId, 'voiceId');
@@ -27,24 +31,30 @@ export class FishTtsProvider {
 		if (!Number.isFinite(speed) || speed < 0.5 || speed > 2) throw new TypeError('speed must be between 0.5 and 2');
 		const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
 		const combinedSignal = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
-		const response = await this.#fetch(this.#endpoint, {
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${this.#apiKey}`,
-				'Content-Type': 'application/json',
-				model: DEFAULT_MODEL,
-			},
-			body: JSON.stringify({
-				text,
-				reference_id: voiceId,
-				format: 'pcm',
-				sample_rate: 44_100,
-				latency: 'balanced',
-				prosody: { speed, volume: 0, normalize_loudness: true },
-				normalize: true,
-			}),
-			signal: combinedSignal,
-		});
+		let response;
+		try {
+			response = await this.#fetch(this.#endpoint, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${this.#apiKey}`,
+					'Content-Type': 'application/json',
+					model: DEFAULT_MODEL,
+				},
+				body: JSON.stringify({
+					text,
+					reference_id: voiceId,
+					format: 'pcm',
+					sample_rate: 44_100,
+					latency: 'balanced',
+					prosody: { speed, volume: 0, normalize_loudness: true },
+					normalize: true,
+				}),
+				signal: combinedSignal,
+			});
+		} catch (error) {
+			if (!(error instanceof TypeError)) throw error;
+			throw typedError('TTS_PROVIDER_ERROR', 'Fish TTS transport failed');
+		}
 		if (!response.ok) {
 			const retryAfter = response.headers?.get?.('retry-after');
 			const error = new Error(`Fish TTS failed with HTTP ${response.status}`);

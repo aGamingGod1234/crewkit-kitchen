@@ -11,7 +11,7 @@
 			"dev.agaminggod.arenaagents.voiceaddon.ArenaAgentsVoiceProvider"
 		],
 		"voicechat": [
-			"dev.agaminggod.arenaagents.voiceaddon.ArenaAgentsVoiceChatPlugin"
+			"dev.agaminggod.arenaagents.voiceaddon.ArenaAgentsVoiceProvider"
 		]
 	},
 	"depends": {

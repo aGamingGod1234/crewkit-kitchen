@@ -1118,6 +1118,9 @@ public final class ServerActionExecutor {
 		String recipientId = nullableString(arguments, "recipientId");
 		String message = string(arguments, "message");
 		if (audience != ConversationAudience.PROXIMITY || !VoiceSubsystemRuntime.available(manager.server())) {
+			if (audience == ConversationAudience.PROXIMITY) {
+				VoiceSubsystemRuntime.reportAvailabilityFallback(manager.server(), request.agentId());
+			}
 			conversationRouter.deliverAgentMessage(request.agentId(), audience, recipientId, message);
 			return;
 		}
@@ -1131,14 +1134,12 @@ public final class ServerActionExecutor {
 				sequence
 		);
 		VoiceSubsystemRuntime.speak(manager.server(), voiceRequest).whenComplete((receipt, failure) -> {
-			boolean fallback = failure != null || receipt == null
-					|| receipt.status() == VoiceReceipt.Status.DEGRADED_TO_TEXT
-					|| receipt.status() == VoiceReceipt.Status.FAILED;
+			boolean fallback = failure != null || receipt == null || receipt.requiresTextFallback();
 			if (!fallback) return;
 			manager.server().execute(() -> {
 				try {
 					conversationRouter.deliverAgentMessageToPlayers(
-							request.agentId(), audience, recipientId, message
+							request.agentId(), ConversationAudience.PROXIMITY, recipientId, message
 					);
 				} catch (RuntimeException ignored) {
 					// The speaker may have despawned before an asynchronous provider failure.

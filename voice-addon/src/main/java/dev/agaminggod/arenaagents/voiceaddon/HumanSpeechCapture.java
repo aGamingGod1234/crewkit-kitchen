@@ -5,11 +5,16 @@ import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
 import de.maxhenkel.voicechat.api.opus.OpusDecoder;
 import dev.agaminggod.arenaagents.server.CodexAgentServerRuntime;
 import java.util.UUID;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-final class HumanSpeechCapture implements AutoCloseable {
+final class HumanSpeechCapture implements ServerSpeechCaptureRegistry.Capture {
+	private static final Logger LOGGER = LoggerFactory.getLogger(HumanSpeechCapture.class);
 	private static final int MAX_SAMPLES = 48_000 * 20;
-	private static final long SILENCE_MILLISECONDS = 650L;
+	private static final long SILENCE_MILLISECONDS = 300L;
+	private static final ConsentCapture CONSENT_CAPTURE = resolveConsentCapture();
 	private final SpeechCaptureEngine engine;
 
 	HumanSpeechCapture(SpeechWorkerClient worker) {
@@ -19,33 +24,69 @@ final class HumanSpeechCapture implements AutoCloseable {
 						runnable -> Thread.ofPlatform().daemon().name("arenaagents-stt").unstarted(runnable)
 				),
 				SILENCE_MILLISECONDS,
-				MAX_SAMPLES
-		);
-	}
-
-	void accept(MicrophonePacketEvent event) {
-		if (event.getSenderConnection() == null) return;
-		Object rawPlayer = event.getSenderConnection().getPlayer().getPlayer();
-		if (!(rawPlayer instanceof ServerPlayer player)) return;
-		byte[] opus = event.getPacket().getOpusEncodedData().clone();
-		if (opus.length == 0 || opus.length > 8_192) return;
-		VoicechatServerApi api = event.getVoicechat();
-		var server = player.level().getServer();
-		engine.accept(
-				player.getUUID(),
-				event.getPacket().isWhispering(),
-				opus,
-				() -> decoder(api.createDecoder()),
-				server::execute,
-				(playerId, transcript, whispering) -> CodexAgentServerRuntime.deliverHumanSpeech(
-						server, playerId, transcript, whispering
+				MAX_SAMPLES,
+				latency -> LOGGER.info(
+						"Voice input latency player={} sequence={} endpointMs={} transcriptionMs={} totalMs={}",
+						latency.playerId(), latency.utteranceSequence(), latency.endpointMilliseconds(),
+						latency.transcriptionMilliseconds(), latency.totalMilliseconds()
 				)
 		);
 	}
 
 	@Override
+	public void accept(MicrophonePacketEvent event) {
+		if (event.getSenderConnection() == null) return;
+		Object rawPlayer = event.getSenderConnection().getPlayer().getPlayer();
+		if (!(rawPlayer instanceof ServerPlayer player)) return;
+		var server = player.level().getServer();
+		captureWhileGranted(
+				server, player.getUUID(), () -> {
+					byte[] opus = event.getPacket().getOpusEncodedData().clone();
+					if (opus.length == 0 || opus.length > 8_192) return;
+					VoicechatServerApi api = event.getVoicechat();
+					engine.accept(
+							player.getUUID(),
+							event.getPacket().isWhispering(),
+							opus,
+							() -> decoder(api.createDecoder()),
+							server::execute,
+							(playerId, transcript, whispering) -> CodexAgentServerRuntime.deliverHumanSpeech(
+									server, playerId, transcript, whispering
+							)
+					);
+				}
+		);
+	}
+
+	static boolean captureWhileGranted(MinecraftServer server, UUID playerId, Runnable capture) {
+		return CONSENT_CAPTURE.capture(server, playerId, capture);
+	}
+
+	private static ConsentCapture resolveConsentCapture() {
+		try {
+			dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry.class.getMethod(
+					"captureWhileGranted", MinecraftServer.class, UUID.class, Runnable.class
+			);
+			return ModernConsentCapture.INSTANCE;
+		} catch (NoSuchMethodException legacyCore) {
+			return (server, playerId, capture) -> {
+				if (!dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry.granted(server, playerId)) {
+					return false;
+				}
+				capture.run();
+				return true;
+			};
+		}
+	}
+
+	@Override
 	public void close() {
 		engine.close();
+	}
+
+	@Override
+	public void cancel(UUID playerId) {
+		engine.cancel(playerId);
 	}
 
 	private static SpeechCaptureEngine.Decoder decoder(OpusDecoder decoder) {
@@ -54,5 +95,21 @@ final class HumanSpeechCapture implements AutoCloseable {
 			@Override public short[] decode(byte[] opus) { return decoder.decode(opus); }
 			@Override public void close() { decoder.close(); }
 		};
+	}
+
+	@FunctionalInterface
+	private interface ConsentCapture {
+		boolean capture(MinecraftServer server, UUID playerId, Runnable capture);
+	}
+
+	private static final class ModernConsentCapture implements ConsentCapture {
+		private static final ModernConsentCapture INSTANCE = new ModernConsentCapture();
+
+		@Override
+		public boolean capture(MinecraftServer server, UUID playerId, Runnable capture) {
+			return dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry.captureWhileGranted(
+					server, playerId, capture
+			);
+		}
 	}
 }
