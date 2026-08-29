@@ -197,6 +197,9 @@ public final class AgentVerboseVerification {
 			}
 			MultiplexedServerBridge activeBridge = bridge;
 			awaitCondition(() -> !activeBridge.authenticated(), "first verbose session closes");
+			awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
+					"first verbose session schedules coordinator cleanup");
+			bridge.tick();
 			try (Socket second = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(second.getInputStream(), StandardCharsets.UTF_8))) {
 				second.setSoTimeout(1_000);
