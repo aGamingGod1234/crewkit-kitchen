@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { NoSttProvider } from './deepgram-stt-provider.mjs';
 import { resampleS16leMono } from './pcm-audio.mjs';
 import { TtsCache } from './tts-cache.mjs';
+import { providerCacheNamespace, synthesisCacheNamespace } from './tts-cache-identity.mjs';
 import { builtInVoiceProfiles } from './voice-profile-store.mjs';
 
 const MAX_REQUEST_BYTES = 8 * 1024;
@@ -144,16 +145,8 @@ export function createVoiceHttpServer({
 				throw error;
 			}
 			const profile = profileStore.resolve(payload.agentId);
-			const cacheKey = TtsCache.key({
-				provider: profile.provider,
-				model: profile.model,
-				voiceId: profile.voiceId,
-				profileRevision: profile.revision,
-				text: payload.text.normalize('NFC').trim(),
-				speed: profile.speed,
-				format: 's16le',
-				sampleRate: 48_000,
-			});
+			const profileNamespace = `${profile.provider}/${profile.model}`;
+			const cacheKey = synthesisCacheKey(profile, payload, providerCacheNamespace(provider, profileNamespace));
 			let output = cache.get(cacheKey);
 			if (output === null) {
 				attemptedLifecycle = ttsLifecycle;
@@ -167,7 +160,14 @@ export function createVoiceHttpServer({
 				output = resampleS16leMono(synthesized.pcm, synthesized.sampleRateHz, 48_000, 20);
 				if (output.length === 0) throw typedError('TTS_MALFORMED_AUDIO', 'TTS output was empty');
 				ttsLifecycle.recordReady();
-				if (synthesized.cacheable !== false) cache.set(cacheKey, output);
+				if (synthesized.cacheable !== false) {
+					const completedKey = synthesisCacheKey(
+						profile,
+						payload,
+						synthesisCacheNamespace(synthesized, provider, profileNamespace),
+					);
+					cache.set(completedKey, output);
+				}
 			}
 			response.writeHead(200, {
 				'Content-Type': 'audio/L16',
@@ -301,6 +301,20 @@ export function createVoiceHttpServer({
 			})();
 			return closePromise;
 		},
+	});
+}
+
+function synthesisCacheKey(profile, payload, synthesizer) {
+	return TtsCache.key({
+		synthesizer,
+		provider: profile.provider,
+		model: profile.model,
+		voiceId: profile.voiceId,
+		profileRevision: profile.revision,
+		text: payload.text.normalize('NFC').trim(),
+		speed: profile.speed,
+		format: 's16le',
+		sampleRate: 48_000,
 	});
 }
 

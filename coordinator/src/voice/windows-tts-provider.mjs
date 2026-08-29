@@ -54,6 +54,10 @@ export class WindowsTtsProvider {
 		this.#timeoutMs = timeoutMs;
 	}
 
+	cacheNamespace() {
+		return 'windows/system-speech';
+	}
+
 	async synthesize({ text, speed = 1, signal } = {}) {
 		requireText(text);
 		if ([...text].length > 280) throw new TypeError('text must be at most 280 Unicode code points');

@@ -49,6 +49,16 @@ test('all built-in profiles reach Chatterbox with distinct bounded conditioning'
 	}
 });
 
+test('invalid local TTS tuning fails its warmup channel before serving requests', async () => {
+	const python = process.env.ARENA_AGENT_SPEECH_PYTHON
+		?? (process.platform === 'win32' ? 'python' : 'python3');
+	const fixture = fileURLToPath(new URL('../test-support/local-speech-tuning-warmup-check.py', import.meta.url));
+	for (const variable of ['ARENA_LOCAL_TTS_EXAGGERATION', 'ARENA_LOCAL_TTS_CFG_WEIGHT']) {
+		const { stdout } = await execFileAsync(python, [fixture, variable], { timeout: 10_000, windowsHide: true });
+		assert.deepEqual(JSON.parse(stdout.trim()), { sttReady: true, ttsReady: false });
+	}
+});
+
 test('local speech provider keeps one bounded process for TTS and STT', async () => {
 	let providerModule = null;
 	try { providerModule = await import('../src/voice/local-speech-provider.mjs'); }

@@ -26,6 +26,7 @@ _response_lock = threading.Lock()
 def _load_tts():
     global _tts_model
     with _model_lock:
+        _configured_tts_tuning()
         if _tts_model is not None:
             return _tts_model
         with contextlib.redirect_stdout(sys.stderr):
@@ -131,17 +132,30 @@ def _voice_conditioning(voice_id):
     exaggeration = round(0.50 + (0.30 * expression), 4)
     cfg_weight = round(0.50 - (0.20 * expression), 4)
     temperature = round(0.78 + (0.04 * variation), 4)
-    configured_exaggeration = os.environ.get("ARENA_LOCAL_TTS_EXAGGERATION")
-    configured_cfg_weight = os.environ.get("ARENA_LOCAL_TTS_CFG_WEIGHT")
-    if configured_exaggeration:
-        exaggeration = float(configured_exaggeration)
-    if configured_cfg_weight:
-        cfg_weight = float(configured_cfg_weight)
+    configured = _configured_tts_tuning()
+    exaggeration = configured.get("exaggeration", exaggeration)
+    cfg_weight = configured.get("cfg_weight", cfg_weight)
     return {
         "exaggeration": exaggeration,
         "cfg_weight": cfg_weight,
         "temperature": temperature,
     }
+
+
+def _configured_tts_tuning():
+    configured = {}
+    for variable, option in (
+        ("ARENA_LOCAL_TTS_EXAGGERATION", "exaggeration"),
+        ("ARENA_LOCAL_TTS_CFG_WEIGHT", "cfg_weight"),
+    ):
+        value = os.environ.get(variable)
+        if not value:
+            continue
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"{variable} must be finite")
+        configured[option] = parsed
+    return configured
 
 
 def _local_voice_id(voice_id):

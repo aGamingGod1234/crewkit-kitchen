@@ -46,6 +46,10 @@ export class LocalSpeechProvider {
 		this.#environment = createLocalSpeechEnvironment(environment);
 	}
 
+	cacheNamespace() {
+		return 'local-chatterbox/chatterbox-v1';
+	}
+
 	static async createIfAvailable(options = {}) {
 		const signal = options.signal;
 		const accessFile = options.accessFile ?? defaultAccess;

@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { startVoiceWorker } from '../src/dynamic-main.mjs';
+import { FishTtsProvider } from '../src/voice/fish-tts-provider.mjs';
 
 const SECRET = 'voice-bootstrap-test-secret';
 const PLAYER = '10000000-0000-4000-8000-000000000001';
@@ -303,6 +304,52 @@ test('Windows Fish fallback opens a bounded circuit and recovers through one hal
 	await worker.close();
 });
 
+test('Fish fetch failures open the Windows circuit without treating invalid requests as outages', async () => {
+	let fetchCalls = 0;
+	let windowsCalls = 0;
+	let provider;
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+		FISH_AUDIO_API_KEY: 'configured-fish-credential',
+	}, {
+		platform: 'win32',
+		voiceFallbackNow: () => 0,
+		voiceFallbackBaseDelayMs: 100,
+		voiceFallbackMaxDelayMs: 100,
+		loadProfileStore: async () => ({ store: { resolve() {} } }),
+		createTtsProvider: ({ apiKey }) => new FishTtsProvider({
+			apiKey,
+			fetchImpl: async () => {
+				fetchCalls += 1;
+				throw new TypeError('fetch failed');
+			},
+		}),
+		createWindowsTtsProvider: () => ({
+			async synthesize() {
+				windowsCalls += 1;
+				return { sampleRateHz: 16_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.alloc(2) };
+			},
+		}),
+		createVoiceServer: (options) => {
+			provider = options.provider;
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		await assert.rejects(
+			provider.synthesize({ text: '', voiceId: 'voice-id', speed: 1 }),
+			(error) => error instanceof TypeError,
+		);
+		assert.equal(fetchCalls, 0, 'invalid requests fail before the Fish transport');
+		assert.equal(windowsCalls, 0, 'invalid requests do not use Windows speech');
+		await provider.synthesize({ text: 'network failure', voiceId: 'voice-id', speed: 1 });
+		await provider.synthesize({ text: 'open circuit', voiceId: 'voice-id', speed: 1 });
+		assert.equal(fetchCalls, 1, 'the network failure opens the Fish circuit');
+		assert.equal(windowsCalls, 2);
+	} finally {
+		await worker.close();
+	}
+});
+
 test('voice bootstrap closes a worker when binding fails', async () => {
 	let closes = 0;
 	await assert.rejects(
@@ -435,6 +482,61 @@ test('runtime local TTS failures switch concurrent requests once to Fish while l
 	assert.equal(localCloses, 1);
 	assert.equal(fishCloses, 1);
 	assert.equal(profileCloses, 1);
+});
+
+test('cached local speech is not returned after runtime failover to Fish', async () => {
+	let localCalls = 0;
+	let fishCalls = 0;
+	const local = {
+		async synthesize({ text }) {
+			localCalls += 1;
+			if (text === 'switch provider') {
+				throw Object.assign(new Error('local TTS failed'), { code: 'LOCAL_TTS_ERROR' });
+			}
+			return {
+				sampleRateHz: 24_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.from([1, 0, 1, 0]),
+				provider: 'local-chatterbox', model: 'chatterbox-v1', voiceId: 'local.voice',
+			};
+		},
+		async transcribe() { return { transcript: '', confidence: 0 }; },
+		async close() {},
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 0 } }, {
+		FISH_AUDIO_API_KEY: 'fish-key',
+	}, {
+		platform: 'linux',
+		createLocalSpeechProvider: async () => local,
+		loadProfileStore: async () => ({ store: { resolve() { return {
+			profileId: 'voice.test', provider: 'fish', model: 's2.1-pro-free', voiceId: 'fish-id', revision: 1, speed: 1,
+		}; } } }),
+		createTtsProvider: () => ({
+			async synthesize() {
+				fishCalls += 1;
+				return {
+					sampleRateHz: 24_000, channels: 1, sampleFormat: 's16le', pcm: Buffer.from([2, 0, 2, 0]),
+					provider: 'fish', model: 's2.1-pro-free', voiceId: 'fish-id',
+				};
+			},
+		}),
+	});
+	try {
+		const baseUrl = `http://127.0.0.1:${worker.server.address().port}`;
+		const request = async (text, conversationSequence) => fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				agentId: '00000000-0000-4000-8000-000000000001', conversationSequence,
+				profileId: 'voice.auto.v1', radius: 48, text,
+			}),
+		});
+		assert.equal((await request('repeat me', 1)).status, 200);
+		assert.equal((await request('switch provider', 2)).status, 200);
+		assert.equal((await request('repeat me', 3)).status, 200);
+		assert.equal(localCalls, 2);
+		assert.equal(fishCalls, 2, 'the repeated utterance is synthesized by Fish after failover');
+	} finally {
+		await worker.close();
+	}
 });
 
 test('runtime local STT failures switch concurrent requests once to Deepgram while local TTS stays available', async () => {
@@ -823,6 +925,41 @@ test('local model warmup failure preserves Deepgram-only STT on non-Windows host
 		await worker.close();
 	}
 	assert.equal(localCloses, 1);
+});
+
+test('malformed TTS profile state cannot block Deepgram after local warmup fails', async () => {
+	const root = await mkdtemp(path.join(tmpdir(), 'arena-unproven-local-profile-'));
+	const profilePath = path.join(root, 'voice-profile-assignments.json');
+	await writeFile(profilePath, '{ malformed assignments', 'utf8');
+	let active;
+	const local = {
+		async warmup() { return { sttReady: false, ttsReady: false }; },
+		async synthesize() { throw new Error('failed local TTS must not receive traffic'); },
+		async transcribe() { throw new Error('failed local STT must not receive traffic'); },
+		async close() {},
+	};
+	try {
+		const worker = await startVoiceWorker({ bridge: { secret: SECRET }, voice: { port: 8_766 } }, {
+			DEEPGRAM_API_KEY: 'deepgram-key',
+		}, {
+			platform: 'linux',
+			profilePath,
+			createLocalSpeechProvider: async () => local,
+			createSttProvider: () => ({ async transcribe() { return { transcript: 'remote hearing', confidence: 1 }; } }),
+			createVoiceServer: (options) => {
+				active = options;
+				return { async start() {}, async close() {} };
+			},
+		});
+		try {
+			await worker.warmup();
+			assert.equal((await active.sttProvider.transcribe({ pcm: Buffer.alloc(2) })).transcript, 'remote hearing');
+		} finally {
+			await worker.close();
+		}
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test('local cleanup failure cannot roll back a successful external fallback switch', async () => {

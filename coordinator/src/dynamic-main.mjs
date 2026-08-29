@@ -34,9 +34,10 @@ import { TraceWriter } from './trace-writer.mjs';
 import { FishTtsProvider } from './voice/fish-tts-provider.mjs';
 import { DeepgramSttProvider, NoSttProvider } from './voice/deepgram-stt-provider.mjs';
 import { LocalSpeechProvider } from './voice/local-speech-provider.mjs';
+import { providerCacheNamespace, tagSynthesisCacheNamespace } from './voice/tts-cache-identity.mjs';
 import { createVoiceHttpServer } from './voice/voice-http-server.mjs';
 import { VoiceSupervisor } from './voice/voice-supervisor.mjs';
-import { loadPersistentVoiceProfileStore } from './voice/voice-profile-store.mjs';
+import { loadPersistentVoiceProfileStore, VoiceProfileStore } from './voice/voice-profile-store.mjs';
 import { WindowsTtsProvider } from './voice/windows-tts-provider.mjs';
 
 const SOURCE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
@@ -1587,7 +1588,12 @@ export async function startVoiceWorker(config, environment = process.env, depend
 				?? path.resolve(PROJECT_DIRECTORY, DEFAULT_VOICE_PROFILE_ASSIGNMENTS_PATH);
 			const loadProfileStore = dependencies.loadProfileStore ?? loadPersistentVoiceProfileStore;
 			if (typeof loadProfileStore !== 'function') throw new TypeError('loadProfileStore must be a function');
-			profiles = await loadProfileStore(profilePath, { ...(dependencies.voiceProfileIo ?? {}), signal });
+			try {
+				profiles = await loadProfileStore(profilePath, { ...(dependencies.voiceProfileIo ?? {}), signal });
+			} catch (error) {
+				if (!canUseVolatileLocalProfiles({ error, localSpeechProvider, fishApiKey, deepgramApiKey, platform })) throw error;
+				profiles = { store: new VoiceProfileStore() };
+			}
 			throwIfVoiceStartupAborted(signal);
 			if (profiles === null || typeof profiles !== 'object' || profiles.store === null || typeof profiles.store?.resolve !== 'function') {
 				throw new TypeError('loadProfileStore must return a profile store');
@@ -1649,6 +1655,12 @@ export async function startVoiceWorker(config, environment = process.env, depend
 		);
 		throw error;
 	}
+}
+
+function canUseVolatileLocalProfiles({ error, localSpeechProvider, fishApiKey, deepgramApiKey, platform }) {
+	if (localSpeechProvider === null || fishApiKey !== null || deepgramApiKey === null || platform === 'win32') return false;
+	if (error instanceof SyntaxError) return true;
+	return ['EACCES', 'EPERM', 'EISDIR', 'ENOTDIR'].includes(error?.code);
 }
 
 function voiceProfileStoreWithLifecycle(profiles) {
@@ -1816,15 +1828,33 @@ function createLocalSpeechFailover(localProvider, {
 	};
 	return Object.freeze({
 		tts: Object.freeze({
+			cacheNamespace() {
+				if (activeTts === localProvider) return 'local-chatterbox/chatterbox-v1';
+				if (activeTts === null) return 'tts/unavailable';
+				return providerCacheNamespace(
+					activeTts,
+					fishApiKey !== null ? 'fish/s2.1-pro-free' : 'windows/system-speech',
+				);
+			},
 			async synthesize(request) {
 				if (activeTts !== null) {
 					const attemptedProvider = activeTts;
+					const attemptedNamespace = attemptedProvider === localProvider
+						? 'local-chatterbox/chatterbox-v1'
+						: providerCacheNamespace(
+							attemptedProvider,
+							fishApiKey !== null ? 'fish/s2.1-pro-free' : 'windows/system-speech',
+						);
 					try {
-						return await attemptedProvider.synthesize(request);
+						return tagSynthesisCacheNamespace(await attemptedProvider.synthesize(request), attemptedNamespace);
 					} catch (error) {
 						if (attemptedProvider !== localProvider) throw error;
 						await switchTtsToFallback(error, request?.signal);
-						return activeTts.synthesize(request);
+						const fallbackNamespace = providerCacheNamespace(
+							activeTts,
+							fishApiKey !== null ? 'fish/s2.1-pro-free' : 'windows/system-speech',
+						);
+						return tagSynthesisCacheNamespace(await activeTts.synthesize(request), fallbackNamespace);
 					}
 				}
 				const error = new Error('Speech synthesis is not configured');
@@ -1924,14 +1954,17 @@ function ttsProviderWithFallback(primary, fallback, {
 	};
 	const synthesizeFallback = async (request) => {
 		const output = await fallback.synthesize(request);
-		return Object.freeze({ ...output, cacheable: false });
+		return tagSynthesisCacheNamespace(
+			{ ...output, cacheable: false },
+			providerCacheNamespace(fallback, 'windows/system-speech'),
+		);
 	};
 	const attemptPrimary = async (request) => {
 		try {
 			const output = await primary.synthesize(request);
 			consecutiveFailures = 0;
 			nextProbeAt = null;
-			return output;
+			return tagSynthesisCacheNamespace(output, providerCacheNamespace(primary, 'fish/s2.1-pro-free'));
 		} catch (error) {
 			if (!shouldUseWindowsTtsFallback(error)) throw error;
 			recordFailure();
@@ -1939,6 +1972,11 @@ function ttsProviderWithFallback(primary, fallback, {
 		}
 	};
 	return Object.freeze({
+		cacheNamespace() {
+			return nextProbeAt === null
+				? providerCacheNamespace(primary, 'fish/s2.1-pro-free')
+				: providerCacheNamespace(fallback, 'windows/system-speech');
+		},
 		async synthesize(request) {
 			if (nextProbeAt === null) return attemptPrimary(request);
 			if (probePromise !== null || readNow() < nextProbeAt) return synthesizeFallback(request);
