@@ -10,6 +10,7 @@
 		"start:dynamic": "node src/dynamic-main.mjs",
 		"headless:matrix": "node src/headless-matrix.mjs",
 		"task9:simulator": "node src/benchmark/task9-harness-cli.mjs",
+		"benchmark:jsonl-fragmentation": "node src/benchmark/jsonl-fragmentation-benchmark.mjs",
 		"test": "node --test"
 	},
 	"dependencies": {
