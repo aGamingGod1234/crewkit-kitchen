@@ -45,7 +45,7 @@ function harness(options = {}) {
 	const completionRequests = [];
 	manager = new ProgramRuntimeManager({
 		registry,
-		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		bridge: { send: options.bridgeSend ?? (async (type, agentId, payload) => sent.push({ type, agentId, payload })) },
 		planner: { requestPlan: async (request) => { requests.push(request); return withCompletionContract({ summary: 'Continue.', directive: 'continue' }, request.goalRevision); } },
 		reportError: (agentId, error) => errors.push({ agentId, error }),
 		onCompleted: options.onCompleted,
@@ -1203,6 +1203,75 @@ test('bridge send rejection unwedges the active program with a stable failed res
 	assert.equal(errors.at(-1).code, 'AGENT_BACKPRESSURE');
 	const snapshot = await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: false });
 	assert.equal(snapshot.activeActionId, null, 'failed send is terminally acknowledged instead of wedging the engine');
+});
+
+test('ArenaScript action is not sent or reported when the registry advances during dispatch bookkeeping', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [];
+	const errors = [];
+	let advanced = false;
+	const replacementFields = { originalRequest: 'wait somewhere else', predicate: { type: 'operator_confirmed' }, createdAtTick: 2 };
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
+		reportError: (_agentId, error) => errors.push(error),
+		benchmarkRecorder: {
+			record: (stage) => {
+				if (stage !== 'action_dispatch_started' || advanced) return;
+				advanced = true;
+				registry.applyGoalControl('agent-a', {
+					operation: 'steer',
+					goalRevision: 2,
+					goal: replacementFields.originalRequest,
+					goalSpec: { ...replacementFields, fingerprint: goalSpecFingerprint(replacementFields) },
+					updatedAtEpochMs: 2,
+				});
+			},
+		},
+	});
+
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(registry.get('agent-a').goalRevision, 2);
+	assert.equal(actionCommands(sent).length, 0, 'the final registry fence prevents the stale bridge call');
+	assert.equal(errors.length, 0, 'local staleness is lifecycle control, not a provider failure');
+});
+
+test('ArenaScript action is not sent or reported when its runtime is disposed during dispatch bookkeeping', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [];
+	const errors = [];
+	let manager;
+	let disposed = false;
+	manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async () => ({ directive: 'continue', summary: 'continue' }) },
+		reportError: (_agentId, error) => errors.push(error),
+		benchmarkRecorder: {
+			record: (stage) => {
+				if (stage !== 'action_dispatch_started' || disposed) return;
+				disposed = true;
+				manager.dispose('agent-a');
+			},
+		},
+	});
+
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(actionCommands(sent).length, 0, 'a disposed runtime cannot enqueue its captured action');
+	assert.equal(errors.length, 0, 'disposal is not published as a provider failure');
+});
+
+test('bridge.send STALE_PLAN is reported because it is not local stale detection', async () => {
+	const run = harness({
+		bridgeSend: async () => { throw Object.assign(new Error('bridge rejected the action'), { code: 'STALE_PLAN' }); },
+	});
+	await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(run.errors.at(-1)?.error.code, 'STALE_PLAN');
+	assert.equal(actionCommands(run.sent).length, 0);
 });
 
 test('bridge send rejection contains a model execution error and schedules active recovery', async () => {

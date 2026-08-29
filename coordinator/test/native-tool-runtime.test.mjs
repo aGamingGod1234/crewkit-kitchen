@@ -16,9 +16,25 @@ function record(overrides = {}) {
 	};
 }
 
+const testRegistry = { get: (agentId) => record({ agentId }) };
+
+test('native action is rejected before bridge enqueue when the registry has advanced', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({
+		registry: { get: (agentId) => record({ agentId, goalRevision: 4 }) },
+		bridge: { send: async (...args) => sent.push(args) },
+	});
+
+	await assert.rejects(runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-stale', callId: 'call-stale',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1 } },
+	}, record()), (error) => error?.code === 'STALE_PLAN');
+	assert.equal(sent.some(([type]) => type === 'action_command'), false);
+});
+
 test('native body dispatches one correlated action and resolves only its matching result', async () => {
 	const sent = [];
-	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
 	runtime.updateObservation(record(), { player: { position: { x: 0, y: 64, z: 0 } }, inventory: [] }, { eventSequence: 8 });
 
 	const result = runtime.execute({
@@ -41,7 +57,7 @@ test('native body dispatches one correlated action and resolves only its matchin
 
 test('native observe returns latest compact facts without sending a body command', async () => {
 	const sent = [];
-	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
 	runtime.updateObservation(record(), { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] }, { eventSequence: 4 });
 	const result = await runtime.execute({ agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'observe-1', tool: { kind: 'observe' } }, record());
 	assert.deepEqual(result, {
@@ -55,7 +71,7 @@ test('native observe returns latest compact facts without sending a body command
 
 test('native lifecycle disposal cancels an outstanding body action and rejects the tool', async () => {
 	const sent = [];
-	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async (...args) => sent.push(args) } });
 	const pending = runtime.execute({
 		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'call-1',
 		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1_000 } },
@@ -100,7 +116,7 @@ test('native finish asks Minecraft to verify the immutable server goal before re
 });
 
 test('native observe ignores a stale observation event sequence', async () => {
-	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} } });
+	const runtime = new NativeToolRuntime({ registry: testRegistry, bridge: { send: async () => {} } });
 	const current = record();
 	runtime.updateObservation(current, { player: { health: 20 } }, { eventSequence: 8 });
 	runtime.updateObservation(current, { player: { health: 10 } }, { eventSequence: 7 });

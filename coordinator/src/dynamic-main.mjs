@@ -197,6 +197,7 @@ export class DynamicCoordinator extends EventEmitter {
 		});
 		this.#nativeRuntime = new NativeToolRuntime({
 			bridge: nativeBridge,
+			registry: this.#registry,
 			trace: (event, fields) => this.#writeTrace(event, fields),
 			onFinish: async ({ record, result, lifecycleGeneration }) => {
 				const connectionEpoch = this.#nativeRuntimeEpochs.get(record.agentId);

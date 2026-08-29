@@ -2,6 +2,7 @@ import { validateTraceId } from './control-latency-registry.mjs';
 
 export class NativeToolRuntime {
 	#bridge;
+	#registry;
 	#onFinish;
 	#trace;
 	#observations = new Map();
@@ -10,11 +11,13 @@ export class NativeToolRuntime {
 	#staleActions = new Map();
 	#sequence = 0;
 
-	constructor({ bridge, onFinish = async () => ({ state: 'FINISH_REQUESTED' }), trace = () => {} } = {}) {
+	constructor({ bridge, registry = null, onFinish = async () => ({ state: 'FINISH_REQUESTED' }), trace = () => {} } = {}) {
 		if (typeof bridge?.send !== 'function') throw new TypeError('bridge.send must be a function');
+		if (registry !== null && typeof registry?.get !== 'function') throw new TypeError('registry.get must be a function');
 		if (typeof onFinish !== 'function') throw new TypeError('onFinish must be a function');
 		if (typeof trace !== 'function') throw new TypeError('trace must be a function');
 		this.#bridge = bridge;
+		this.#registry = registry;
 		this.#onFinish = onFinish;
 		this.#trace = trace;
 	}
@@ -105,6 +108,12 @@ export class NativeToolRuntime {
 		this.#actions.set(record.agentId, { actionId, goalRevision: record.goalRevision, resolve: resolveAction, reject: rejectAction });
 		this.#trace('native_tool_dispatch_started', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
 		try {
+			const current = this.#registry?.get(record.agentId);
+			if (this.#registry !== null && (current === null || current === undefined || current.goalRevision !== record.goalRevision)) {
+				this.#actions.delete(record.agentId);
+				rejectAction(codedError('STALE_PLAN', 'Native action became stale before bridge send'));
+				return result;
+			}
 			await this.#bridge.send('action_command', record.agentId, payload);
 			this.#trace('native_tool_command_sent', { agentId: record.agentId, goalRevision: record.goalRevision, traceId, actionId, actionType: payload.actionType });
 		} catch (error) {

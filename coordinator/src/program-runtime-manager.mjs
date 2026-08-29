@@ -580,6 +580,7 @@ export class ProgramRuntimeManager {
 		const record = this.#registry.get(state.agentId);
 		if (record === null || record.goalRevision !== state.goalRevision) return;
 		let actionId = null;
+		let locallyStale = false;
 		try {
 			const branchSelectedAt = this.#safeNow();
 			this.#ensureActing(record);
@@ -604,6 +605,11 @@ export class ProgramRuntimeManager {
 					bridgeSendToCompletionMs: null,
 				},
 			});
+			const current = this.#registry.get(state.agentId);
+			if (state.disposed || current === null || current === undefined || current.goalRevision !== record.goalRevision) {
+				locallyStale = true;
+				throw codedError('STALE_PLAN', 'Program action became stale before bridge send');
+			}
 			await this.#bridge.send('action_command', state.agentId, wireActionCommand(record, actionId, command, state.traceId));
 			const bridgeSentAt = this.#safeNow();
 			this.#record('action_command_sent', record, { actionId, actionType: command.action.type, eventSequence: command.provenance.eventSequence, durationMs: elapsedOrNull(branchSelectedAt, bridgeSentAt), traceId: state.traceId });
@@ -622,7 +628,7 @@ export class ProgramRuntimeManager {
 			}
 		} catch (error) {
 			if (actionId !== null) this.#rejectDispatchedAction(state, record, actionId, command.actionId, error);
-			this.#reportError(state.agentId, error);
+			if (!locallyStale) this.#reportError(state.agentId, error);
 		}
 	}
 
