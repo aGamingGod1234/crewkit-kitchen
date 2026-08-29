@@ -138,7 +138,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyStaleGoalDraftIsPrunedBeforeHandshake();
 		verifyCompletionResultFacts();
 		verifyReplacementOperation();
-		return 160;
+		return 163;
 	}
 
 	/**
@@ -254,7 +254,19 @@ public final class MultiplexedServerBridgeVerification {
 		GoalEvidence evidence = new GoalEvidence(3L, "COMPLETION_VERIFIED",
 				List.of(new GoalEvidence.Fact("inventory_contains", true, "minecraft:dirt x1", "minecraft:dirt x1")));
 		registry.satisfyGoal(idle.agentId(), registry.require(idle.agentId()).goalRevision(), evidence, now + 4L);
-		AgentTransition promoted = registry.promoteSatisfied(idle.agentId(), now + 5L);
+		AgentTransition rejected = registry.rejectQueuedGoal(
+				idle.agentId(), registry.require(idle.agentId()).queuedGoals().getFirst().goalId(),
+				"Removed block", now + 5L);
+		assertEquals("dequeue", invokeGoalOperation(rejected),
+				"queued rejection publishes a distinct bridge operation before later promotion");
+		JsonObject rejectedPayload = invokeGoalControlPayload(rejected, invokeGoalOperation(rejected));
+		assertEquals("Get stone", rejectedPayload.get("goal").getAsString(),
+				"queued rejection fences the exact removed head");
+		assertEquals(first.fingerprint(), rejectedPayload.getAsJsonObject("goalSpec").get("fingerprint").getAsString(),
+				"queued rejection serializes the immutable removed goal spec");
+
+		registry.queue(idle.agentId(), first, now + 6L);
+		AgentTransition promoted = registry.promoteSatisfied(idle.agentId(), now + 7L);
 		assertEquals("start", invokeGoalOperation(promoted), "queued promotion remains a start operation");
 	}
 	private static void verifyEmptyCatalogRequestsLiveDiscovery() {

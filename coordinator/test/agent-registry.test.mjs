@@ -95,6 +95,45 @@ test('server promotion after coordinator completion consumes the queued head', (
 	assert.deepEqual(promoted.queue.map((entry) => entry.goal), ['C']);
 });
 
+test('server queue rejections synchronize each exact head before promoting later work', () => {
+	const registry = new AgentRegistry({ queueCap: 2 });
+	const removedFields = { originalRequest: 'Removed block goal', predicate: { type: 'operator_confirmed' }, createdAtTick: 2 };
+	const removedSpec = { ...removedFields, fingerprint: goalSpecFingerprint(removedFields) };
+	const laterFields = { originalRequest: 'C', predicate: { type: 'operator_confirmed' }, createdAtTick: 3 };
+	const laterSpec = { ...laterFields, fingerprint: goalSpecFingerprint(laterFields) };
+	registry.register(record('agent-a'));
+	registry.applyGoalControl('agent-a', { operation: 'start', goalRevision: 1, goal: 'A' });
+	registry.applyGoalControl('agent-a', { operation: 'queue', goalRevision: 1, goal: 'Removed block goal', goalSpec: removedSpec });
+	registry.applyGoalControl('agent-a', { operation: 'queue', goalRevision: 1, goal: 'C', goalSpec: laterSpec });
+	registry.setState('agent-a', DynamicAgentState.COMPLETED, { goalRevision: 1 });
+
+	assert.throws(
+		() => registry.applyGoalControl('agent-a', {
+			operation: 'dequeue', goalRevision: 1, goal: 'C', goalSpec: laterSpec, updatedAtEpochMs: 4,
+		}),
+		(error) => error instanceof AgentRegistryError && error.code === 'QUEUED_GOAL_MISMATCH',
+	);
+	assert.throws(
+		() => registry.applyGoalControl('agent-a', {
+			operation: 'dequeue', goalRevision: 1, goal: 'Removed block goal', goalSpec: laterSpec, updatedAtEpochMs: 4,
+		}),
+		(error) => error instanceof AgentRegistryError && error.code === 'QUEUED_GOAL_MISMATCH',
+	);
+	const rejected = registry.applyGoalControl('agent-a', {
+		operation: 'dequeue', goalRevision: 1, goal: 'Removed block goal', goalSpec: removedSpec, updatedAtEpochMs: 5,
+	});
+	assert.equal(rejected.currentGoal, 'A');
+	assert.equal(rejected.state, DynamicAgentState.COMPLETED);
+	assert.equal(rejected.goalRevision, 1);
+	assert.deepEqual(rejected.queue.map((entry) => entry.goal), ['C']);
+
+	const promoted = registry.applyGoalControl('agent-a', {
+		operation: 'start', goalRevision: 2, goal: 'C', updatedAtEpochMs: 6,
+	});
+	assert.equal(promoted.currentGoal, 'C');
+	assert.deepEqual(promoted.queue, []);
+});
+
 test('replace installs a new authoritative goal without consuming queued work', () => {
 	const registry = new AgentRegistry({ queueCap: 2 });
 	registry.register(record('agent-a'));

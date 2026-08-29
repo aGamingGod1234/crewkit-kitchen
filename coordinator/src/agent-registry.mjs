@@ -31,7 +31,7 @@ const PROMOTION_SOURCE_STATES = new Set([
 	DynamicAgentState.PLANNING,
 	DynamicAgentState.ACTING,
 ]);
-const GOAL_OPERATIONS = new Set(['start', 'replace', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn']);
+const GOAL_OPERATIONS = new Set(['start', 'replace', 'stop', 'queue', 'dequeue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn']);
 const ALLOWED_STATE_TRANSITIONS = Object.freeze({
 	[DynamicAgentState.IDLE]: new Set([DynamicAgentState.STARTING, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
 	[DynamicAgentState.STARTING]: new Set([DynamicAgentState.PLANNING, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
@@ -248,6 +248,23 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 		return {
 			...record,
 			queue: [...record.queue, normalizeQueuedGoal({ goal: controlValue.goal, goalRevision: revision, goalSpec: controlValue.goalSpec }, record.queue.length)],
+			updatedAtEpochMs: nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs'),
+		};
+	}
+	if (operation === 'dequeue') {
+		if (revision !== record.goalRevision) throw new AgentRegistryError('STALE_GOAL_REVISION', `Dequeued goal revision ${revision} does not match current revision ${record.goalRevision}`);
+		if (record.state !== DynamicAgentState.COMPLETED) throw new AgentRegistryError('INVALID_GOAL_CONTROL', `Cannot dequeue rejected work while agent is '${record.state}'`);
+		const rejectedGoal = requireGoal(controlValue.goal);
+		const rejectedSpec = parseGoalSpec(controlValue.goalSpec);
+		const queuedHead = record.queue[0];
+		if (queuedHead === undefined
+				|| queuedHead.goal !== rejectedGoal
+				|| queuedHead.goalSpec?.fingerprint !== rejectedSpec.fingerprint) {
+			throw new AgentRegistryError('QUEUED_GOAL_MISMATCH', `Rejected goal '${rejectedGoal}' does not match the queued head`);
+		}
+		return {
+			...record,
+			queue: record.queue.slice(1),
 			updatedAtEpochMs: nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs'),
 		};
 	}

@@ -1752,6 +1752,50 @@ test('a replace control starts the new goal without consuming the queued head', 
 	}
 });
 
+test('bridge queue rejection reaches the registry before a later queued goal starts', async () => {
+	const removedFields = { originalRequest: 'Removed block goal', predicate: { type: 'operator_confirmed' }, createdAtTick: 2 };
+	const removedSpec = { ...removedFields, fingerprint: goalSpecFingerprint(removedFields) };
+	const laterFields = { originalRequest: 'Valid later goal', predicate: { type: 'operator_confirmed' }, createdAtTick: 3 };
+	const laterSpec = { ...laterFields, fingerprint: goalSpecFingerprint(laterFields) };
+	const run = await start();
+	try {
+		run.bridge.sent.length = 0;
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'start', goalRevision: 1, goal: 'Current goal', updatedAtEpochMs: 1,
+		} });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'queue', goalRevision: 1, goal: removedFields.originalRequest,
+			goalSpec: removedSpec, updatedAtEpochMs: 2,
+		} });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'queue', goalRevision: 1, goal: laterFields.originalRequest,
+			goalSpec: laterSpec, updatedAtEpochMs: 3,
+		} });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'complete', goalRevision: 2, updatedAtEpochMs: 4,
+		} });
+		await eventually(() => run.registry.get('agent-a').state === DynamicAgentState.COMPLETED);
+
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'dequeue', goalRevision: 2, goal: removedFields.originalRequest,
+			goalSpec: removedSpec, updatedAtEpochMs: 5,
+		} });
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: {
+			operation: 'start', goalRevision: 3, goal: laterFields.originalRequest,
+			goalSpec: laterSpec, updatedAtEpochMs: 6,
+		} });
+
+		await eventually(() => run.registry.get('agent-a').goalRevision === 3);
+		const promoted = run.registry.get('agent-a');
+		assert.equal(promoted.currentGoal, laterFields.originalRequest);
+		assert.deepEqual(promoted.currentGoalSpec, laterSpec);
+		assert.deepEqual(promoted.queue, []);
+		assert.equal(run.bridge.sent.some(({ type }) => type === 'agent_error'), false);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('back-to-back accepted controls do not publish stale lifecycle side effects', async () => {
 	const run = await start();
 	try {

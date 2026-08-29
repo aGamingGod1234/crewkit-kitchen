@@ -564,16 +564,16 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const next = control.goalRevision;
 		const current = this.#trackedRevision(envelope.agentId);
 		if (current !== null && current !== undefined) {
-			if (control.operation === 'queue' && next !== current) {
+			if (['queue', 'dequeue'].includes(control.operation) && next !== current) {
 				throw new ProtocolV2Error('STALE_GOAL_REVISION', `Queued goal revision ${next} does not match current revision ${current}`);
 			}
-			if (control.operation !== 'queue' && next < current) {
+			if (!['queue', 'dequeue'].includes(control.operation) && next < current) {
 				throw new ProtocolV2Error('STALE_GOAL_REVISION', `Goal revision ${next} moved backwards from ${current}`);
 			}
 		}
 		this.#observedRevisions.set(envelope.agentId, next);
 		this.#ensureTerminalGoal(envelope.agentId, next);
-		if (control.operation !== 'queue' && (current === null || current === undefined || next > current)) {
+		if (!['queue', 'dequeue'].includes(control.operation) && (current === null || current === undefined || next > current)) {
 			this.#dropSupersededQueuedMessages(envelope.agentId, next);
 		}
 	}
@@ -1056,14 +1056,15 @@ function normalizeProvider(value, field) {
 function normalizeGoalControl(value) {
 	exactKeys(value, ['operation', 'goalRevision', 'updatedAtEpochMs', 'goal', 'goalSpec', 'death', 'resumeGoal'], ['operation', 'goalRevision', 'updatedAtEpochMs'], 'goal_control');
 	const operation = boundedText(value.operation, 'operation', MAX_REASON_CODE_LENGTH);
-	if (!['start', 'replace', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
+	if (!['start', 'replace', 'stop', 'queue', 'dequeue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn'].includes(operation)) throw new ProtocolV2Error('INVALID_PAYLOAD', `Unsupported goal operation '${operation}'`);
 	const normalized = { operation, goalRevision: revision(value.goalRevision, 'goalRevision'), updatedAtEpochMs: nonnegativeInteger(value.updatedAtEpochMs, 'updatedAtEpochMs') };
 	if (value.goal !== undefined) normalized.goal = boundedText(value.goal, 'goal', MAX_GOAL_LENGTH);
 	if (value.goalSpec !== undefined) normalized.goalSpec = parseGoalSpec(value.goalSpec);
 	if (value.death !== undefined) normalized.death = normalizeDeath(value.death);
-	if (['start', 'replace', 'steer', 'queue'].includes(operation) && normalized.goal === undefined) throw new ProtocolV2Error('MISSING_FIELD', `goal_control ${operation} requires goal`);
-	if (!['start', 'replace', 'steer', 'queue'].includes(operation) && normalized.goal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goal`);
-	if (!['start', 'replace', 'steer', 'queue'].includes(operation) && normalized.goalSpec !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goalSpec`);
+	if (['start', 'replace', 'steer', 'queue', 'dequeue'].includes(operation) && normalized.goal === undefined) throw new ProtocolV2Error('MISSING_FIELD', `goal_control ${operation} requires goal`);
+	if (!['start', 'replace', 'steer', 'queue', 'dequeue'].includes(operation) && normalized.goal !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goal`);
+	if (!['start', 'replace', 'steer', 'queue', 'dequeue'].includes(operation) && normalized.goalSpec !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include goalSpec`);
+	if (operation === 'dequeue' && normalized.goalSpec === undefined) throw new ProtocolV2Error('MISSING_FIELD', 'goal_control dequeue requires goalSpec');
 	if (operation === 'dead' && normalized.death === undefined) throw new ProtocolV2Error('MISSING_FIELD', 'goal_control dead requires death facts');
 	if (operation !== 'dead' && normalized.death !== undefined) throw new ProtocolV2Error('INVALID_PAYLOAD', `goal_control ${operation} must not include death facts`);
 	if (operation === 'respawn') normalized.resumeGoal = value.resumeGoal === undefined ? false : boolean(value.resumeGoal, 'resumeGoal');

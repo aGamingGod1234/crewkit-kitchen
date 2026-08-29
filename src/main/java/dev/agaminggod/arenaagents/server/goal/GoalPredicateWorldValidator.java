@@ -81,6 +81,19 @@ public final class GoalPredicateWorldValidator {
 		validateLiveBounds(level, predicate);
 	}
 
+	/** Revalidates every bound spatial leaf against its currently loaded server dimension. */
+	public static void validate(MinecraftServer server, GoalPredicate predicate) {
+		Objects.requireNonNull(server, "server must not be null");
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		switch (predicate) {
+			case GoalPredicate.PositionWithin value -> validate(requireLevel(server, value.dimensionId()), value);
+			case GoalPredicate.BlockMatches value -> validate(requireLevel(server, value.dimensionId()), value);
+			case GoalPredicate.AllOf value -> value.predicates().forEach(child -> validate(server, child));
+			case GoalPredicate.AnyOf value -> value.predicates().forEach(child -> validate(server, child));
+			default -> { }
+		}
+	}
+
 	static void validate(String dimensionId, IntPredicate validBuildHeight, GoalPredicate predicate) {
 		Objects.requireNonNull(dimensionId, "dimensionId must not be null");
 		Objects.requireNonNull(validBuildHeight, "validBuildHeight must not be null");
@@ -109,7 +122,7 @@ public final class GoalPredicateWorldValidator {
 		}
 	}
 
-	static void validateBlockProperties(String blockId, Map<String, String> properties) {
+	public static void validateBlockProperties(String blockId, Map<String, String> properties) {
 		Identifier identifier = Identifier.tryParse(blockId);
 		if (identifier == null || !BuiltInRegistries.BLOCK.containsKey(identifier)) {
 			throw invalid("UNKNOWN_GOAL_IDENTIFIER", "block does not exist on this server");

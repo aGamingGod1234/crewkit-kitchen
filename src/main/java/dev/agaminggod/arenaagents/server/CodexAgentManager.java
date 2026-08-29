@@ -356,8 +356,12 @@ public final class CodexAgentManager {
 
 	public void validateGoalForActivation(GoalSpec spec) {
 		Objects.requireNonNull(spec, "spec must not be null");
+		GoalPredicate predicate = spec.completion();
+		if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
+			GoalPredicateWorldValidator.validate(server, predicate);
+		}
 		validateGoalDraftPredicate(
-				spec.completion(),
+				predicate,
 				server.registryAccess(),
 				id -> {
 					Identifier identifier = Identifier.tryParse(id);
@@ -385,6 +389,8 @@ public final class CodexAgentManager {
 				requireLiveIdentifier(
 						advancementExists.test(value.advancementId()), "advancement", value.advancementId());
 			}
+			case GoalPredicate.BlockMatches value -> GoalPredicateWorldValidator.validateBlockProperties(
+					value.blockId(), value.properties());
 			case GoalPredicate.AllOf value -> value.predicates().forEach(
 					child -> validateLiveGoalIdentifiers(child, itemExists, entityExists, advancementExists));
 			case GoalPredicate.AnyOf value -> value.predicates().forEach(

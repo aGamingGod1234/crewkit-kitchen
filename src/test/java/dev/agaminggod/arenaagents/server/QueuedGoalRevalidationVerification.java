@@ -1,6 +1,7 @@
 package dev.agaminggod.arenaagents.server;
 
 import dev.agaminggod.arenaagents.agent.AgentConstants;
+import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
@@ -13,6 +14,7 @@ import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import net.minecraft.core.RegistryAccess;
@@ -36,6 +38,7 @@ public final class QueuedGoalRevalidationVerification {
 			int assertions = verifyRestartDropsInvalidHeadsBeforeValidPromotion();
 			assertions += verifyAllInvalidQueueSettlesTerminal();
 			assertions += verifyUnchangedQueuePromotesNormally();
+			assertions += verifySpatialActivationValidation();
 			return assertions;
 		} finally {
 			bindItemStackSize(Items.APPLE, 64);
@@ -165,6 +168,16 @@ public final class QueuedGoalRevalidationVerification {
 		return 4;
 	}
 
+	private static int verifySpatialActivationValidation() {
+		expectCode("UNKNOWN_GOAL_IDENTIFIER", () -> CodexAgentManager.validateGoalDraftPredicate(
+				new GoalPredicate.BlockMatches(
+						"minecraft:overworld", 0, 64, 0, "missing:block", Map.of()),
+				RegistryAccess.EMPTY,
+				ignored -> true
+		), "queued activation rejects a block removed after confirmation");
+		return 1;
+	}
+
 	private static void validate(
 			GoalSpec spec,
 			Set<String> liveItems,
@@ -191,5 +204,14 @@ public final class QueuedGoalRevalidationVerification {
 	private static void assertTrue(boolean condition, String label) {
 		if (!condition) throw new AssertionError(label);
 		System.out.println("PASS: " + label);
+	}
+
+	private static void expectCode(String code, Runnable action, String label) {
+		try {
+			action.run();
+			throw new AssertionError(label + ": expected " + code);
+		} catch (AgentDomainException exception) {
+			assertEquals(code, exception.code(), label);
+		}
 	}
 }

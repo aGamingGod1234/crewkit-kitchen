@@ -1689,6 +1689,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			AgentGoal goal = queue.get(queue.size() - 1);
 			payload.addProperty("goal", goal.prompt());
 			payload.add("goalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec()));
+		} else if ("dequeue".equals(operation)) {
+			AgentGoal goal = transition.before().queuedGoals().getFirst();
+			payload.addProperty("goal", goal.prompt());
+			payload.add("goalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec()));
 		} else if ("start".equals(operation) || "replace".equals(operation) || "steer".equals(operation)) {
 			transition.after().currentGoal().ifPresent(goal -> {
 				payload.addProperty("goal", plannerGoal(goal));
@@ -1938,6 +1942,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private static String operation(AgentTransition transition) {
 		if (transition.after().queuedGoals().size() > transition.before().queuedGoals().size()) return "queue";
+		if (transition.after().queuedGoals().size() + 1 == transition.before().queuedGoals().size()
+				&& transition.after().goalRevision() == transition.before().goalRevision()) return "dequeue";
 		if (transition.before().state() == AgentLifecycleState.DEAD
 				&& transition.after().state() != AgentLifecycleState.DEAD) return "respawn";
 		if (transition.after().state() == AgentLifecycleState.DEAD

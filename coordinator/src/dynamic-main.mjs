@@ -461,7 +461,7 @@ export class DynamicCoordinator extends EventEmitter {
 				void this.#reportAgentError(message.agentId, error, connectionEpoch);
 				return;
 			}
-			const lifecycleChanged = previous !== null && message.payload.operation !== 'queue'
+			const lifecycleChanged = previous !== null && !['queue', 'dequeue'].includes(message.payload.operation)
 				&& (record.goalRevision > previous.goalRevision
 					|| (record.goalRevision === previous.goalRevision && ['dead', 'respawn'].includes(message.payload.operation)));
 			let nativeDisposal = Promise.resolve();
@@ -484,7 +484,7 @@ export class DynamicCoordinator extends EventEmitter {
 				};
 				if (!acceptedStillCurrent()) return;
 				this.#publishVerbose(record.agentId, record.goalRevision, 'lifecycle', `Goal lifecycle operation '${message.payload.operation}' accepted.`, connectionEpoch);
-				if (message.payload.operation !== 'queue') {
+				if (!['queue', 'dequeue'].includes(message.payload.operation)) {
 					this.#providerRetryAfter.delete(message.agentId);
 				}
 				if (message.payload.operation === 'dead') {
@@ -1609,7 +1609,7 @@ export class DynamicCoordinator extends EventEmitter {
 	}
 
 	#invalidateLifecycleWork(message) {
-		if (message.payload.operation === 'queue') return;
+		if (['queue', 'dequeue'].includes(message.payload.operation)) return;
 		const current = this.#registry.get(message.agentId);
 		if (current !== null && message.payload.goalRevision <= current.goalRevision) return;
 		this.#invalidateAcceptedLifecycle(message.agentId);

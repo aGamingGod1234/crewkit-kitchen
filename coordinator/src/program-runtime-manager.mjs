@@ -259,7 +259,7 @@ export class ProgramRuntimeManager {
 	}
 
 	onGoalControl(record, operation) {
-		if (operation === 'queue') return;
+		if (operation === 'queue' || operation === 'dequeue') return;
 		const state = this.#states.get(record.agentId);
 		if (!state) return;
 		state.disposed = true;
