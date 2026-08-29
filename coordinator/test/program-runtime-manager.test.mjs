@@ -45,7 +45,7 @@ function harness(options = {}) {
 	const completionRequests = [];
 	manager = new ProgramRuntimeManager({
 		registry,
-		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		bridge: { send: options.bridgeSend ?? (async (type, agentId, payload) => sent.push({ type, agentId, payload })) },
 		planner: { requestPlan: async (request) => { requests.push(request); return withCompletionContract({ summary: 'Continue.', directive: 'continue' }, request.goalRevision); } },
 		reportError: (agentId, error) => errors.push({ agentId, error }),
 		onCompleted: options.onCompleted,
@@ -1203,6 +1203,16 @@ test('bridge send rejection unwedges the active program with a stable failed res
 	assert.equal(errors.at(-1).code, 'AGENT_BACKPRESSURE');
 	const snapshot = await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: false });
 	assert.equal(snapshot.activeActionId, null, 'failed send is terminally acknowledged instead of wedging the engine');
+});
+
+test('bridge.send STALE_PLAN is reported because it is not local stale detection', async () => {
+	const run = harness({
+		bridgeSend: async () => { throw Object.assign(new Error('bridge rejected the action'), { code: 'STALE_PLAN' }); },
+	});
+	await run.manager.installDecision(run.registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(run.errors.at(-1)?.error.code, 'STALE_PLAN');
+	assert.equal(actionCommands(run.sent).length, 0);
 });
 
 test('bridge send rejection contains a model execution error and schedules active recovery', async () => {
