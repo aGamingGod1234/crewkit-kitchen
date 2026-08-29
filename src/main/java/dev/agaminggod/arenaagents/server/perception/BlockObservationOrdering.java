@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Predicate;
 
 public final class BlockObservationOrdering {
 	private static final Comparator<Candidate> ORDER = Comparator
@@ -20,7 +21,17 @@ public final class BlockObservationOrdering {
 	}
 
 	public static List<Candidate> select(List<Candidate> candidates, int maximumEntries, int maximumPerBlockType) {
+		return select(candidates, maximumEntries, maximumPerBlockType, candidate -> true);
+	}
+
+	public static List<Candidate> select(
+			List<Candidate> candidates,
+			int maximumEntries,
+			int maximumPerBlockType,
+			Predicate<Candidate> admissible
+	) {
 		Objects.requireNonNull(candidates, "candidates must not be null");
+		Objects.requireNonNull(admissible, "admissible must not be null");
 		if (maximumEntries <= 0 || maximumPerBlockType <= 0) {
 			throw new IllegalArgumentException("observation limits must be positive");
 		}
@@ -31,6 +42,7 @@ public final class BlockObservationOrdering {
 		for (Candidate candidate : ordered) {
 			int count = counts.getOrDefault(candidate.blockId(), 0);
 			if (count >= maximumPerBlockType) continue;
+			if (!admissible.test(candidate)) continue;
 			selected.add(candidate);
 			counts.put(candidate.blockId(), count + 1);
 			if (selected.size() >= maximumEntries) break;
