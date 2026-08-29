@@ -12,7 +12,6 @@ const DECISION = JSON.stringify({
 	summary: 'Wait safely.',
 	directive: 'replace',
 	source: 'program.onUnhandledAttention("continue_and_notify"); await player.wait(25);',
-	completionContract: { goalRevision: 1, predicates: [{ type: 'position_within', x: 0, y: 64, z: 0, radius: 16 }] },
 });
 
 const MODELS_OUTPUT = `Available models
@@ -149,6 +148,60 @@ test('Cursor parses one JSON result, records provider/API timing, and resumes th
 	await service.stop();
 });
 
+test('Cursor structured turns use an isolated prompt and caller-supplied parser', async () => {
+	const children = [];
+	const spawn = () => {
+		const child = new FakeChild();
+		children.push(child);
+		queueMicrotask(() => {
+			child.stdout.emit('data', Buffer.from(JSON.stringify({
+				type: 'result', subtype: 'success', is_error: false, result: '{"requestId":"draft-1"}',
+				session_id: 'cursor-structured', duration_ms: 1, duration_api_ms: 1,
+			})));
+			child.exitCode = 0;
+			child.emit('close', 0, null);
+		});
+		return child;
+	};
+	const service = new CursorProviderService(config(), {
+		spawn,
+		discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+	});
+	const agent = await service.createAgent(profile({ agentId: 'cursor-structured' }));
+	const result = await agent.decide('translate exactly', { goalRevision: 0, systemPrompt: '', parseOutput: JSON.parse });
+	assert.deepEqual(result, { requestId: 'draft-1' });
+	assert.equal(children[0].stdin.chunks.join(''), 'translate exactly');
+	await service.stop();
+});
+
+test('Cursor reports only its bounded visible result through the verbose adapter contract', async () => {
+	const spawn = () => {
+		const child = new FakeChild();
+		queueMicrotask(() => {
+			child.stdout.emit('data', Buffer.from(JSON.stringify({
+				type: 'result', subtype: 'success', is_error: false, result: DECISION,
+				session_id: 'cursor-session-visible', duration_ms: 12, duration_api_ms: 9,
+			})));
+			child.exitCode = 0;
+			child.emit('close', 0, null);
+		});
+		return child;
+	};
+	const service = new CursorProviderService(config(), {
+		spawn, discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+	});
+	const agent = await service.createAgent(profile({ agentId: 'cursor-verbose' }));
+	await agent.setGoalRevision(1);
+	const events = [];
+	await agent.decide('authoritative state', {
+		goalRevision: 1,
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
+	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.equal(events.map(({ message }) => message).join(''), DECISION);
+	await service.stop();
+});
+
 test('Cursor parse failures record only a generic structured error', async () => {
 	const secret = 'ARBITRARY_CURSOR_MODEL_SECRET';
 	const spawn = () => {
@@ -206,5 +259,42 @@ test('Cursor interruption terminates the active native process', async () => {
 	await agent.interrupt();
 	await assert.rejects(turn, (error) => error?.code === 'PLAN_CANCELLED');
 	assert.deepEqual(terminated, [child]);
+	await service.stop();
+});
+
+test('Cursor process death invalidates only its owning generation and exact replacement coalesces', async () => {
+	let attempt = 0;
+	const service = new CursorProviderService(config(), {
+		discoverCatalog: async () => parseCursorModelList(MODELS_OUTPUT),
+		spawn: () => {
+			attempt += 1;
+			const child = new FakeChild();
+			queueMicrotask(() => {
+				if (attempt === 1) {
+					child.exitCode = 1;
+					child.emit('close', 1, null);
+					return;
+				}
+				child.stdout.emit('data', Buffer.from(JSON.stringify({
+					type: 'result', subtype: 'success', is_error: false, result: DECISION,
+					session_id: `cursor-session-${attempt}`, duration_ms: 1, duration_api_ms: 1,
+				})));
+				child.exitCode = 0;
+				child.emit('close', 0, null);
+			});
+			return child;
+		},
+	});
+	const selected = profile();
+	const stale = await service.createAgent(selected);
+	await stale.setGoalRevision(1);
+	await assert.rejects(stale.decide('state', { goalRevision: 1 }), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
+	assert.equal(service.getAgent(selected.agentId), null);
+	await assert.rejects(stale.decide('state', { goalRevision: 1 }), (error) => error?.code === 'SESSION_INVALIDATED');
+
+	const first = service.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	const second = service.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	assert.equal(await first, await second);
+	assert.equal((await first).sessionGeneration, 2);
 	await service.stop();
 });

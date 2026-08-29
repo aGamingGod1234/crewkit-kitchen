@@ -2,10 +2,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdir } from 'node:fs/promises';
 
-import { AgentWorkspaceManager } from './agent-workspace.mjs';
-import { CodexService } from './codex-service.mjs';
+import { runNativeToolCli } from './native-tool-cli-boundary.mjs';
 
+async function main() {
 const [model = 'gpt-5.6-luna', reasoningEffort = 'low', serviceTier = 'fast'] = process.argv.slice(2);
+const [{ CodexService }, { MinecraftAgentWorkspace }] = await Promise.all([
+	import('./codex-service.mjs'),
+	import('./minecraft-agent-workspace.mjs'),
+]);
 const startedAt = performance.now();
 const probeRoot = path.join(os.tmpdir(), 'arena-native-probe');
 await mkdir(probeRoot, { recursive: true });
@@ -15,7 +19,10 @@ const service = new CodexService({
 	serviceTier,
 	launchProfile: { model, reasoningEffort, serviceTier, cwd: probeRoot },
 }, {
-	workspaceManager: new AgentWorkspaceManager(path.join(os.tmpdir(), 'arena-native-probe-workspaces')),
+	minecraftWorkspace: new MinecraftAgentWorkspace({
+		root: path.join(probeRoot, 'minecraft-agent'),
+		templateRoot: path.resolve('config', 'minecraft-agent'),
+	}),
 });
 
 try {
@@ -142,7 +149,7 @@ try {
 		calls: activeSteerCalls,
 		result: activeSteerResult,
 	};
-	process.stdout.write(`${JSON.stringify({
+	return {
 		status: 'PASSED',
 		profile: { model, reasoningEffort, serviceTier },
 		initializationMs: Math.round(readyAt - startedAt),
@@ -153,10 +160,10 @@ try {
 		chainTurn,
 		advancedTurn,
 		activeSteer,
-	})}\n`);
-} catch (error) {
-	process.stdout.write(`${JSON.stringify({ status: 'FAILED', code: error?.code ?? 'ERROR', message: String(error?.message ?? error).slice(0, 1_024) })}\n`);
-	process.exitCode = 1;
+	};
 } finally {
 	await service.stop();
 }
+}
+
+process.exitCode = await runNativeToolCli(main);

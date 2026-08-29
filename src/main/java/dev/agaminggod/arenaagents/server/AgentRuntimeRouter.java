@@ -6,6 +6,7 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -35,6 +36,10 @@ public final class AgentRuntimeRouter {
 
 	public AgentTransition goalCompleted(AgentId agentId, long goalRevision) {
 		return registry.completeGoal(agentId, goalRevision, System.currentTimeMillis());
+	}
+
+	public AgentTransition goalSatisfied(AgentId agentId, long goalRevision, GoalEvidence evidence) {
+		return registry.satisfyGoal(agentId, goalRevision, evidence, System.currentTimeMillis());
 	}
 
 	public AgentRecord coordinatorCompleted(AgentId agentId, long goalRevision) {

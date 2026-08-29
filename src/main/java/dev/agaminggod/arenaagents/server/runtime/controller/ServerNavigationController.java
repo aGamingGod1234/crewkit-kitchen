@@ -18,12 +18,22 @@ import net.minecraft.world.InteractionHand;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Objects;
+import java.util.function.Predicate;
 
 public final class ServerNavigationController implements ServerController {
 	public static final int DEFAULT_MAX_PATH_LENGTH = 256;
+	public static final double MAX_LOCAL_PLANNING_DISTANCE = 32.0D;
+	private static final double INTERMEDIATE_GOAL_TOLERANCE = 6.0D;
+	private static final int MAX_SHALLOW_WATER_PATH_BLOCKS = MinecraftNavigationWorld.MAX_SHALLOW_WATER_CROSSING;
 	private static final long STALL_TIMEOUT_MS = 4_000L;
 	private static final int MAX_REPLANS = 3;
+	private static final double INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED = 0.36D;
+	private static final double INTERMEDIATE_WAYPOINT_VERTICAL_TOLERANCE = 0.25D;
+	// Plans are rebuilt from current world state; the replan cap and action deadline bound identical retries
+	// without retaining stale edge bans that could reject terrain after it changes.
 
 	private final Vec3 destination;
 	private final double tolerance;
@@ -67,8 +77,9 @@ public final class ServerNavigationController implements ServerController {
 		if (Math.max(0L, nowEpochMs - startedAt) >= timeoutMs) {
 			return fail(player, "ACTION_TIMEOUT", "Navigation timed out", currentProgress());
 		}
-		double remaining = player.position().distanceTo(destination);
-		if (remaining <= tolerance) {
+		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
+		double remaining = player.position().distanceTo(destinationTarget(world));
+		if (satisfiesDestinationTolerance(remaining, tolerance)) {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
 		if (plan == null) {
@@ -80,9 +91,17 @@ public final class ServerNavigationController implements ServerController {
 			return replanOrResult(player, nowEpochMs, remaining);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
-		Vec3 target = center(waypoint.position());
-		boolean reached = reachedWaypoint(player.position(), target);
-		WaypointProgress.Update update = progress.observe(remaining, reached, nowEpochMs);
+		if (!world.isStandable(waypoint.position())) {
+			TickResult replanned = replan(player, nowEpochMs, remaining, true);
+			if (replanned != null) return replanned;
+			nodes = plan.nodes();
+			waypoint = nodes.get(waypointIndex);
+		}
+		boolean finalWaypoint = waypointIndex == nodes.size() - 1;
+		Vec3 target = targetFor(world, waypoint, finalWaypoint);
+		boolean reached = reachedTarget(world, player.position(), waypoint, finalWaypoint);
+		double activeWaypointDistance = player.position().distanceTo(target);
+		WaypointProgress.Update update = progress.observe(activeWaypointDistance, reached, nowEpochMs);
 		lastProgressValue = update.progress();
 		if (reached) {
 			waypointIndex++;
@@ -90,7 +109,9 @@ public final class ServerNavigationController implements ServerController {
 				return replanOrResult(player, nowEpochMs, remaining);
 			}
 			waypoint = nodes.get(waypointIndex);
-			target = center(waypoint.position());
+			finalWaypoint = waypointIndex == nodes.size() - 1;
+			target = targetFor(world, waypoint, finalWaypoint);
+			progress.waypointAdvanced(player.position().distanceTo(target), nowEpochMs);
 		}
 		if (update.decision() == WaypointProgress.Decision.FAIL) {
 			return fail(player, "PATH_BLOCKED", "Navigation could not recover from repeated stalls", update.progress());
@@ -99,7 +120,7 @@ public final class ServerNavigationController implements ServerController {
 			TickResult replanned = replan(player, nowEpochMs, remaining, true);
 			if (replanned != null) return replanned;
 			waypoint = plan.nodes().get(waypointIndex);
-			target = center(waypoint.position());
+			target = targetFor(world, waypoint, waypointIndex == plan.nodes().size() - 1);
 		}
 		drive(player, waypoint, target, nowEpochMs);
 		return TickResult.running(update.progress());
@@ -122,11 +143,82 @@ public final class ServerNavigationController implements ServerController {
 	}
 
 	private TickResult replanOrResult(ServerPlayer player, long nowEpochMs, double remaining) {
-		if (remaining <= tolerance + 0.5D) {
+		if (satisfiesDestinationTolerance(remaining, tolerance)) {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
-		TickResult replanned = replan(player, nowEpochMs, remaining, true);
+		TickResult replanned = replan(player, nowEpochMs, remaining, false);
 		return replanned == null ? TickResult.running(currentProgress()) : replanned;
+	}
+
+	static boolean satisfiesDestinationTolerance(double remaining, double tolerance) {
+		return remaining <= tolerance;
+	}
+
+	Vec3 targetFor(PathNode waypoint, boolean finalWaypoint) {
+		Objects.requireNonNull(waypoint, "waypoint must not be null");
+		return targetFor(waypoint, finalWaypoint, waypoint.position().y());
+	}
+
+	boolean reachedTarget(Vec3 playerPosition, PathNode waypoint, boolean finalWaypoint) {
+		return reachedTarget(playerPosition, waypoint, finalWaypoint, waypoint.position().y());
+	}
+
+	boolean reachedTarget(Vec3 playerPosition, PathNode waypoint, boolean finalWaypoint, double supportHeight) {
+		Objects.requireNonNull(playerPosition, "playerPosition must not be null");
+		if (!Double.isFinite(supportHeight)) return false;
+		Vec3 target = targetFor(waypoint, finalWaypoint, supportHeight);
+		return targetsExactDestination(waypoint, finalWaypoint)
+				? satisfiesDestinationTolerance(playerPosition.distanceTo(target), tolerance)
+				: reachedWaypoint(playerPosition, target);
+	}
+
+	private Vec3 targetFor(MinecraftNavigationWorld world, PathNode waypoint, boolean finalWaypoint) {
+		Vec3 horizontalTarget = targetFor(waypoint, finalWaypoint);
+		double supportHeight = world.supportHeight(
+				waypoint.position(), horizontalTarget.x, horizontalTarget.z);
+		return Double.isFinite(supportHeight)
+				? targetFor(waypoint, finalWaypoint, supportHeight)
+				: horizontalTarget;
+	}
+
+	private Vec3 targetFor(PathNode waypoint, boolean finalWaypoint, double supportHeight) {
+		boolean exactDestination = targetsExactDestination(waypoint, finalWaypoint);
+		Vec3 horizontalTarget = exactDestination ? destination : center(waypoint.position());
+		double targetY = exactDestination && hasFullBlockSupportHeight(waypoint.position(), supportHeight)
+				? destination.y
+				: supportHeight;
+		return new Vec3(horizontalTarget.x, targetY, horizontalTarget.z);
+	}
+
+	private boolean reachedTarget(
+			MinecraftNavigationWorld world,
+			Vec3 playerPosition,
+			PathNode waypoint,
+			boolean finalWaypoint
+	) {
+		return reachedTarget(
+				playerPosition,
+				waypoint,
+				finalWaypoint,
+				world.supportHeight(waypoint.position(), playerPosition.x, playerPosition.z)
+		);
+	}
+
+	private Vec3 destinationTarget(MinecraftNavigationWorld world) {
+		GridPosition destinationPosition = grid(destination);
+		if (!world.isStandable(destinationPosition)) return destination;
+		double supportHeight = world.supportHeight(destinationPosition, destination.x, destination.z);
+		return Double.isFinite(supportHeight) && !hasFullBlockSupportHeight(destinationPosition, supportHeight)
+				? new Vec3(destination.x, supportHeight, destination.z)
+				: destination;
+	}
+
+	private static boolean hasFullBlockSupportHeight(GridPosition position, double supportHeight) {
+		return Math.abs(supportHeight - position.y()) < 1.0E-7D;
+	}
+
+	private boolean targetsExactDestination(PathNode waypoint, boolean finalWaypoint) {
+		return finalWaypoint && waypoint.position().equals(grid(destination));
 	}
 
 	private TickResult replan(
@@ -141,35 +233,64 @@ public final class ServerNavigationController implements ServerController {
 				player.blockPosition().getY(),
 				player.blockPosition().getZ()
 		), 1, 2);
-		GridPosition goal = nearestStandable(world, grid(destination), 4, 3);
-		if (start == null || goal == null) {
-			return fail(player, "NO_STANDABLE_PATH", "Start or destination has no safe standing position", currentProgress());
+		if (start == null) {
+			return fail(player, "NO_STANDABLE_PATH", "Start has no safe standing position", currentProgress());
 		}
-		ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
-		if (planning.deferred()) {
-			// Shared server-tick exhaustion is transient. Keep the action alive so the
-			// fair executor rotation can admit it on a later tick.
-			return TickResult.running(currentProgress());
+		Vec3 localDestination = localPlanningDestination(center(start), destination);
+		boolean finalSegment = localDestination.equals(destination);
+		List<GridPosition> goals = standableGoalsWithinTolerance(
+				world,
+				localDestination,
+				finalSegment ? tolerance : INTERMEDIATE_GOAL_TOLERANCE,
+				4,
+				finalSegment ? 3 : 6
+		);
+		if (goals.isEmpty()) {
+			return fail(player, "NO_STANDABLE_PATH", "Destination has no safe standing position", currentProgress());
 		}
-		PathPlan candidate = planning.plan();
-		if (candidate.outcome() != PathOutcome.FOUND || candidate.nodes().size() > DEFAULT_MAX_PATH_LENGTH) {
-			String reason = candidate.outcome() == PathOutcome.NODE_LIMIT
-					|| candidate.outcome() == PathOutcome.TIME_LIMIT
-					? "PATH_LIMIT_REACHED" : "NO_PATH";
-			return fail(player, reason, "No bounded safe path is currently available", currentProgress());
+		PathPlan candidate = null;
+		boolean pathLimitReached = false;
+		for (GridPosition goal : goals) {
+			ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
+			if (planning.deferred()) {
+				return shouldRetryPlanning(planning.plan().outcome(), true, nowEpochMs, startedAt, timeoutMs)
+						? TickResult.running(currentProgress())
+						: fail(player, "PATH_LIMIT_REACHED", "Path planning exceeded its navigation deadline", currentProgress());
+			}
+			PathPlan planned = planning.plan();
+			if (planned.outcome() == PathOutcome.FOUND
+					&& planned.nodes().size() <= DEFAULT_MAX_PATH_LENGTH
+					&& hasBoundedShallowWaterRun(planned.nodes(), world::isShallowWater)) {
+				candidate = planned;
+				break;
+			}
+			pathLimitReached |= planned.outcome() == PathOutcome.NODE_LIMIT || planned.outcome() == PathOutcome.TIME_LIMIT;
+		}
+		if (candidate == null) {
+			if (pathLimitReached && shouldRetryPlanning(PathOutcome.NODE_LIMIT, false, nowEpochMs, startedAt, timeoutMs)) {
+				return TickResult.running(currentProgress());
+			}
+			return fail(player, pathLimitReached ? "PATH_LIMIT_REACHED" : "NO_PATH",
+					"No bounded safe path is currently available", currentProgress());
 		}
 		plan = candidate;
 		waypointIndex = Math.min(1, Math.max(0, candidate.nodes().size() - 1));
+		PathNode activeWaypoint = candidate.nodes().get(waypointIndex);
+		boolean finalWaypoint = waypointIndex == candidate.nodes().size() - 1;
+		double activeWaypointDistance = player.position().distanceTo(targetFor(world, activeWaypoint, finalWaypoint));
 		if (progress == null) {
-			progress = new WaypointProgress(remaining, nowEpochMs, STALL_TIMEOUT_MS, MAX_REPLANS);
+			progress = new WaypointProgress(activeWaypointDistance, nowEpochMs, STALL_TIMEOUT_MS, MAX_REPLANS);
 		} else if (recovery) {
-			progress.replanned(remaining, nowEpochMs);
+			progress.replanned(activeWaypointDistance, nowEpochMs);
+		} else {
+			progress.waypointAdvanced(activeWaypointDistance, nowEpochMs);
 		}
 		return null;
 	}
 
 	private void drive(ServerPlayer player, PathNode waypoint, Vec3 target, long nowEpochMs) {
 		boolean gapJump = waypoint.traversal() == TraversalType.JUMP_GAP;
+		boolean shallowWater = new MinecraftNavigationWorld(player.level()).isShallowWater(waypoint.position());
 		LeasedServerInputController controller = AgentInputRuntime.controller(player);
 		if (inputLease == null) {
 			inputLease = controller.acquire(AgentInputRuntime.requireAgentId(player), InputOwner.NAVIGATION, 100);
@@ -188,8 +309,8 @@ public final class ServerNavigationController implements ServerController {
 						targetYaw,
 						targetPitch,
 						true,
-						waypoint.traversal() == TraversalType.JUMP_UP || gapJump,
-						(sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
+						waypoint.traversal() == TraversalType.JUMP_UP || gapJump || shallowWater,
+						!shallowWater && (sprint || gapJump) && player.getFoodData().getFoodLevel() > 6
 				),
 				nowEpochMs
 		);
@@ -218,7 +339,26 @@ public final class ServerNavigationController implements ServerController {
 	private static boolean reachedWaypoint(Vec3 player, Vec3 waypoint) {
 		double dx = player.x - waypoint.x;
 		double dz = player.z - waypoint.z;
-		return dx * dx + dz * dz <= 0.36D && Math.abs(player.y - waypoint.y) <= 1.25D;
+		return dx * dx + dz * dz <= INTERMEDIATE_WAYPOINT_HORIZONTAL_TOLERANCE_SQUARED
+				&& Math.abs(player.y - waypoint.y) <= INTERMEDIATE_WAYPOINT_VERTICAL_TOLERANCE;
+	}
+
+	static boolean shouldRetryPlanning(
+			PathOutcome outcome,
+			boolean deferred,
+			long nowEpochMs,
+			long startedAtEpochMs,
+			long timeoutMs
+	) {
+		Objects.requireNonNull(outcome, "outcome must not be null");
+		if (!deferred && outcome != PathOutcome.NODE_LIMIT && outcome != PathOutcome.TIME_LIMIT) return false;
+		if (timeoutMs <= 0L) return false;
+		if (nowEpochMs <= startedAtEpochMs) return true;
+		try {
+			return Math.subtractExact(nowEpochMs, startedAtEpochMs) < timeoutMs;
+		} catch (ArithmeticException exception) {
+			return false;
+		}
 	}
 
 	private static Vec3 center(GridPosition position) {
@@ -263,5 +403,54 @@ public final class ServerNavigationController implements ServerController {
 			}
 		}
 		return null;
+	}
+
+	private static List<GridPosition> standableGoalsWithinTolerance(
+			MinecraftNavigationWorld world,
+			Vec3 destination,
+			double tolerance,
+			int horizontalRadius,
+			int verticalRadius
+	) {
+		GridPosition origin = grid(destination);
+		ArrayList<GridPosition> candidates = new ArrayList<>();
+		for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
+			for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
+				for (int dy = -verticalRadius; dy <= verticalRadius; dy++) {
+					GridPosition candidate = new GridPosition(origin.x() + dx, origin.y() + dy, origin.z() + dz);
+					if (world.isStandable(candidate) && candidateSatisfiesTolerance(candidate, destination, tolerance)) {
+						candidates.add(candidate);
+					}
+				}
+			}
+		}
+		candidates.sort(Comparator.comparingDouble(value -> center(value).distanceToSqr(destination)));
+		return List.copyOf(candidates);
+	}
+
+	static boolean candidateSatisfiesTolerance(GridPosition candidate, Vec3 destination, double tolerance) {
+		return candidate.equals(grid(destination)) || center(candidate).distanceTo(destination) <= tolerance;
+	}
+
+	static Vec3 localPlanningDestination(Vec3 start, Vec3 destination) {
+		Objects.requireNonNull(start, "start must not be null");
+		Objects.requireNonNull(destination, "destination must not be null");
+		double distance = start.distanceTo(destination);
+		if (distance <= MAX_LOCAL_PLANNING_DISTANCE) return destination;
+		return start.add(destination.subtract(start).scale(MAX_LOCAL_PLANNING_DISTANCE / distance));
+	}
+
+	static boolean hasBoundedShallowWaterRun(
+			List<PathNode> nodes,
+			Predicate<GridPosition> shallowWater
+	) {
+		Objects.requireNonNull(nodes, "nodes must not be null");
+		Objects.requireNonNull(shallowWater, "shallowWater must not be null");
+		int run = 0;
+		for (PathNode node : nodes) {
+			run = shallowWater.test(node.position()) ? run + 1 : 0;
+			if (run > MAX_SHALLOW_WATER_PATH_BLOCKS) return false;
+		}
+		return true;
 	}
 }

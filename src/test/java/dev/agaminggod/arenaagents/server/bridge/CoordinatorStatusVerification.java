@@ -9,6 +9,10 @@ public final class CoordinatorStatusVerification {
 	private CoordinatorStatusVerification() {
 	}
 
+	public static void main(String[] args) {
+		System.out.println("CoordinatorStatusVerification assertions=" + verify());
+	}
+
 	public static int verify() {
 		JsonObject payload = payload();
 		CoordinatorStatusSnapshot snapshot = MultiplexedServerBridge.decodeCoordinatorStatus(payload, 1_000L);
@@ -16,6 +20,12 @@ public final class CoordinatorStatusVerification {
 		assertTrue(snapshot.supports("agent-a", "codex", "gpt-5.6-sol", "high"), "supported identity decoded");
 		assertTrue(snapshot.fresh(3_500L, 2_500L), "freshness boundary inclusive");
 		assertTrue(snapshot.latencies().size() == 1, "latency health decoded");
+		JsonObject recovery = extendedRecoveryPayload();
+		CoordinatorStatusSnapshot recovered = MultiplexedServerBridge.decodeCoordinatorStatus(recovery, 1_000L);
+		assertTrue(recovered.bridgeSessionEpoch() == 7L, "bridge session epoch decoded");
+		assertTrue(recovered.runtimeGeneration().equals("a".repeat(64)), "runtime generation decoded");
+		assertTrue(recovered.profiles().getFirst().serviceTier().equals("priority"), "exact service tier decoded");
+		assertTrue(recovered.components().getFirst().boundary().equals("create"), "failing component boundary decoded");
 		JsonObject fractionalLatency = payload();
 		fractionalLatency.getAsJsonArray("latencies").get(0).getAsJsonObject().addProperty("p50Ms", 25.25D);
 		assertTrue(MultiplexedServerBridge.decodeCoordinatorStatus(fractionalLatency, 1_000L).latencies().getFirst().p50Ms() == 25.25D,
@@ -68,7 +78,28 @@ public final class CoordinatorStatusVerification {
 				"catalog speed tiers preserved");
 		catalog.addProperty("privatePrompt", "must never cross this seam");
 		assertThrows(() -> MultiplexedServerBridge.decodeCatalog(catalog), "unknown catalog field rejected");
-		return 16;
+		return 20;
+	}
+
+	private static JsonObject extendedRecoveryPayload() {
+		JsonObject payload = payload();
+		payload.getAsJsonArray("profiles").get(0).getAsJsonObject().addProperty("serviceTier", "priority");
+		payload.addProperty("bridgeSessionEpoch", 7L);
+		payload.addProperty("runtimeGeneration", "a".repeat(64));
+		JsonArray components = new JsonArray();
+		JsonObject component = new JsonObject();
+		component.addProperty("component", "provider:codex");
+		component.addProperty("state", "degraded");
+		component.addProperty("fallbackMode", "last_valid");
+		component.addProperty("boundary", "create");
+		component.addProperty("failureCode", "PROVIDER_TIMEOUT");
+		component.addProperty("consecutiveFailureCount", 2);
+		component.addProperty("nextProbeAtEpochMs", 4_000L);
+		component.addProperty("generation", 3L);
+		component.add("lastRecoveryAtEpochMs", com.google.gson.JsonNull.INSTANCE);
+		components.add(component);
+		payload.add("components", components);
+		return payload;
 	}
 
 	private static JsonObject catalogPayload() {

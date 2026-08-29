@@ -1,6 +1,6 @@
 export const SCRIPT_PRIMITIVES = Object.freeze(new Set([
 	'move_to', 'navigate_to', 'look_at', 'attack', 'select_item', 'use_item',
-	'break_block', 'place_block', 'chat', 'wait', 'set_door', 'drop_item',
+	'break_block', 'pick_up_item', 'place_block', 'chat', 'wait', 'set_door', 'drop_item',
 	'transfer_container', 'craft_inventory', 'craft_table', 'furnace_transaction',
 	'equip_item', 'select_tool', 'block_with_shield', 'use_ranged',
 	'interact_block', 'interact_entity', 'dismount', 'start_fall_flying',
@@ -9,8 +9,8 @@ export const SCRIPT_PRIMITIVES = Object.freeze(new Set([
 ]));
 
 export const PLAYER_MEMBER_PRIMITIVES = Object.freeze({
-	moveTo: 'move_to', navigateTo: 'navigate_to', lookAt: 'look_at', attack: 'attack',
-	selectItem: 'select_item', useItem: 'use_item', mine: 'break_block', place: 'place_block',
+	navigateTo: 'navigate_to', lookAt: 'look_at', attack: 'attack',
+	selectItem: 'select_item', useItem: 'use_item', mine: 'break_block', pickUpItem: 'pick_up_item', place: 'place_block',
 	chat: 'chat', wait: 'wait', setDoor: 'set_door', dropItem: 'drop_item',
 	transferContainer: 'transfer_container', craftInventory: 'craft_inventory', craftTable: 'craft_table',
 	furnaceTransaction: 'furnace_transaction', equipItem: 'equip_item', selectTool: 'select_tool',
@@ -23,6 +23,7 @@ export const PLAYER_MEMBER_PRIMITIVES = Object.freeze({
 
 export const EXACT_TARGET_ACTIONS = Object.freeze({
 	attack: Object.freeze(['targetId', 'timeoutMs']),
+	pickUpItem: Object.freeze(['targetSelector']),
 	useRanged: Object.freeze(['targetId', 'drawDurationMs', 'timeoutMs']),
 	interactEntity: Object.freeze(['targetId', 'hand', 'expectedItemId']),
 });

@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
-import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, resolveCodexLaunch } from '../src/codex-app-server.mjs';
+import { buildCodexArgs, checkCodexModelProfile, CodexAgent, CodexProtocolError, CodexStdioTransport, resolveCodexLaunch } from '../src/codex-app-server.mjs';
 import { finishDecisionJson } from './provider-decision-fixtures.mjs';
 
 const model = {
@@ -39,6 +42,24 @@ class FakeCodexTransport extends EventEmitter {
 	}
 }
 
+class FakeStdioChild extends EventEmitter {
+	constructor() {
+		super();
+		this.stdout = new EventEmitter();
+		this.stderr = new EventEmitter();
+		this.writes = [];
+		this.stdin = { write: (line) => this.writes.push(JSON.parse(String(line).trim())) };
+		this.killed = false;
+		this.exitCode = null;
+		this.signalCode = null;
+	}
+
+	kill() {
+		this.killed = true;
+		return true;
+	}
+}
+
 const config = {
 	agentId: 'agent-55',
 	model: 'gpt-5.5',
@@ -47,6 +68,18 @@ const config = {
 	planningTimeoutMs: 2_000,
 	cwd: 'C:\\arena-runtime',
 };
+
+const desktopRuntimeFiles = [
+	'codex.exe',
+	'codex-code-mode-host.exe',
+	'codex-command-runner.exe',
+	'codex-windows-sandbox-setup.exe',
+];
+
+function writeDesktopRuntime(resources, prefix) {
+	mkdirSync(resources, { recursive: true });
+	for (const name of desktopRuntimeFiles) writeFileSync(path.join(resources, name), `${prefix}-${name}`);
+}
 
 test('builds an isolated app-server process command with exact model profile', () => {
 	assert.deepEqual(buildCodexArgs(config), [
@@ -78,6 +111,112 @@ test('launches the npm Codex JavaScript entrypoint directly on Windows', () => {
 	assert.deepEqual(launch.args.slice(1), buildCodexArgs(config));
 });
 
+test('copies the complete installed Codex desktop runtime to a runnable private cache on Windows', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-desktop-'));
+	try {
+		const programFiles = path.join(root, 'Program Files');
+		const packageName = 'OpenAI.Codex_26.818.8289.0_x64__2p2nqsd0c76g0';
+		const resources = path.join(programFiles, 'WindowsApps', packageName, 'app', 'resources');
+		const localAppData = path.join(root, 'Local');
+		writeDesktopRuntime(resources, 'desktop-codex-fixture');
+
+		const launch = resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: {
+				appdata: path.join(root, 'Roaming'),
+				systemdrive: root,
+			},
+			windowsPackageLocations: [],
+			execPath: 'C:\\node.exe',
+		});
+
+		const cachedCli = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0', 'codex.exe');
+		assert.equal(launch.command, cachedCli);
+		assert.deepEqual(launch.args, buildCodexArgs(config));
+		for (const name of desktopRuntimeFiles) {
+			assert.equal(readFileSync(path.join(path.dirname(cachedCli), name), 'utf8'), `desktop-codex-fixture-${name}`);
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('uses the registered Codex Appx location when WindowsApps cannot be enumerated', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-appx-'));
+	try {
+		const packageRoot = path.join(root, 'OpenAI.Codex_26.818.8289.0_x64__2p2nqsd0c76g0');
+		const resources = path.join(packageRoot, 'app', 'resources');
+		const localAppData = path.join(root, 'Local');
+		writeDesktopRuntime(resources, 'registered-appx-codex-fixture');
+
+		const launch = resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { LOCALAPPDATA: localAppData },
+			windowsPackageLocations: [packageRoot],
+		});
+
+		const cachedCli = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0', 'codex.exe');
+		assert.equal(launch.command, cachedCli);
+		for (const name of desktopRuntimeFiles) {
+			assert.equal(readFileSync(path.join(path.dirname(cachedCli), name), 'utf8'), `registered-appx-codex-fixture-${name}`);
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('reuses a complete private desktop runtime before any Windows package discovery', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-cache-'));
+	try {
+		const localAppData = path.join(root, 'Local');
+		const cachedRuntime = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0');
+		writeDesktopRuntime(cachedRuntime, 'cached-desktop-runtime');
+		let discoveryCalls = 0;
+
+		const launch = resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { LOCALAPPDATA: localAppData },
+			spawnSync: () => {
+				discoveryCalls += 1;
+				throw new Error('package discovery must not run when the complete cache is ready');
+			},
+		});
+
+		assert.equal(launch.command, path.join(cachedRuntime, 'codex.exe'));
+		assert.equal(discoveryCalls, 0);
+		assert.deepEqual(launch.args, buildCodexArgs(config));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('reuses the user profile cache when a packaged launcher redirects LOCALAPPDATA', () => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-packaged-env-'));
+	try {
+		const userProfile = path.join(root, 'Users', 'lucas');
+		const localAppData = path.join(userProfile, 'AppData', 'Local');
+		const redirectedLocalAppData = path.join(localAppData, 'Packages', 'Minecraft', 'LocalCache', 'Local');
+		const cachedRuntime = path.join(localAppData, 'ArenaAgents', 'codex-runtime', '26.818.8289.0');
+		writeDesktopRuntime(cachedRuntime, 'user-profile-desktop-runtime');
+		let discoveryCalls = 0;
+
+		const launch = resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { LOCALAPPDATA: redirectedLocalAppData, USERPROFILE: userProfile },
+			spawnSync: () => {
+				discoveryCalls += 1;
+				throw new Error('package discovery must not run when the user profile cache is ready');
+			},
+		});
+
+		assert.equal(launch.command, path.join(cachedRuntime, 'codex.exe'));
+		assert.equal(discoveryCalls, 0);
+		assert.deepEqual(launch.args, buildCodexArgs(config));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test('Codex launch retains provider configuration but strips bridge credentials', () => {
 	const launch = resolveCodexLaunch(config, {
 		platform: 'win32',
@@ -95,6 +234,70 @@ test('Codex launch retains provider configuration but strips bridge credentials'
 	assert.equal(launch.environment.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined);
 });
 
+test('a stopped child late spawn error cannot orphan its running replacement transport', async () => {
+	const first = new FakeStdioChild();
+	const replacement = new FakeStdioChild();
+	let spawnCalls = 0;
+	const transport = new CodexStdioTransport(config, {
+		spawn: () => {
+			spawnCalls += 1;
+			if (spawnCalls === 1) return first;
+			queueMicrotask(() => replacement.emit('spawn'));
+			return replacement;
+		},
+		stopTimeoutMs: 1,
+	});
+	const obsoleteStart = transport.start();
+	const obsoleteFailure = assert.rejects(obsoleteStart, (error) => error?.code === 'SPAWN_FAILED');
+	try {
+		await transport.stop();
+		await transport.start();
+
+		first.emit('error', new Error('old child failed after replacement started'));
+		await obsoleteFailure;
+		assert.doesNotThrow(() => transport.notify('replacement/alive'));
+		assert.deepEqual(replacement.writes, [{ method: 'replacement/alive', params: {} }]);
+	} finally {
+		await transport.stop();
+	}
+});
+
+test('Codex child stderr crosses the shared bounded diagnostic sanitizer', async () => {
+	const child = new FakeStdioChild();
+	const diagnostics = [];
+	const transport = new CodexStdioTransport(config, { spawn: () => child, stopTimeoutMs: 1 });
+	transport.on('diagnostic', (message) => diagnostics.push(message));
+	const started = transport.start();
+	child.emit('spawn');
+	await started;
+	try {
+		child.stderr.emit('data', Buffer.from('Authorization: Bearer child-secret at C:\\private\\codex.log ' + 'x'.repeat(8_000)));
+		assert.equal(diagnostics.length, 1);
+		assert.doesNotMatch(diagnostics[0], /child-secret|private/);
+		assert.ok(Buffer.byteLength(diagnostics[0], 'utf8') <= 4_096);
+	} finally {
+		await transport.stop();
+	}
+});
+
+test('Codex desktop discovery writes a shared-sanitized bounded failure', (t) => {
+	const root = mkdtempSync(path.join(tmpdir(), 'arena-codex-secret-path-'));
+	const diagnostics = [];
+	t.mock.method(console, 'error', (...values) => diagnostics.push(values.join(' ')));
+	try {
+		resolveCodexLaunch(config, {
+			platform: 'win32',
+			env: { ProgramFiles: path.join(root, 'Program Files'), LOCALAPPDATA: path.join(root, 'Local') },
+			windowsPackageLocations: [],
+		});
+		assert.equal(diagnostics.length, 1);
+		assert.doesNotMatch(diagnostics[0], /arena-codex-secret-path/i);
+		assert.ok(Buffer.byteLength(diagnostics[0], 'utf8') <= 4_096);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test('initializes before catalog validation and thread start', async () => {
 	const transport = new FakeCodexTransport();
 	const agent = new CodexAgent(config, transport);
@@ -102,6 +305,7 @@ test('initializes before catalog validation and thread start', async () => {
 	assert.deepEqual(transport.methods(), ['initialize', 'initialized', 'model/list', 'thread/start']);
 	const initialize = transport.calls.find((call) => call.method === 'initialize').params;
 	assert.deepEqual(initialize.capabilities, { experimentalApi: true, requestAttestation: false });
+	assert.equal(transport.calls.find((call) => call.method === 'model/list').params.includeHidden, false);
 	const thread = transport.calls.find((call) => call.method === 'thread/start').params;
 	assert.deepEqual({ model: thread.model, serviceTier: thread.serviceTier, approvalPolicy: thread.approvalPolicy, sandbox: thread.sandbox, dynamicTools: thread.dynamicTools, environments: thread.environments }, {
 		model: 'gpt-5.5', serviceTier: 'fast', approvalPolicy: 'never', sandbox: 'read-only', dynamicTools: [], environments: [],
@@ -134,7 +338,7 @@ test('uses streamed agent-message deltas when a completed message item is absent
 	const text = finishDecisionJson();
 	transport.emit('notification', { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: text } });
 	transport.emit('notification', { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [], error: null } } });
-	assert.equal((await decisionPromise).status, 'completed');
+	assert.equal((await decisionPromise).directive, 'finish');
 	await agent.stop();
 });
 
@@ -168,6 +372,7 @@ test('checks a live catalog profile without starting a planner thread', async ()
 	const checked = await checkCodexModelProfile(config, transport);
 	assert.equal(checked.model, 'gpt-5.5');
 	assert.deepEqual(transport.methods(), ['initialize', 'initialized', 'model/list']);
+	assert.equal(transport.calls.find((call) => call.method === 'model/list').params.includeHidden, false);
 });
 
 test('restarts a failed app-server into a fresh persistent thread', async () => {

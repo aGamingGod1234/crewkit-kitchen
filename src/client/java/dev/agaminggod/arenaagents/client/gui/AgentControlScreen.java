@@ -18,6 +18,7 @@ import dev.agaminggod.arenaagents.control.AgentControlCommandBuilder;
 import dev.agaminggod.arenaagents.control.AgentControlGroup;
 import dev.agaminggod.arenaagents.control.AgentControlGroupSelection;
 import dev.agaminggod.arenaagents.control.AgentControlPresentation;
+import dev.agaminggod.arenaagents.control.AgentControlSelectionState;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.control.AgentRosterEntry;
 import dev.agaminggod.arenaagents.control.AgentRosterFilter;
@@ -64,6 +65,7 @@ public final class AgentControlScreen extends Screen {
 
 	private AgentControlSnapshot snapshot;
 	private final Screen parent;
+	private final AgentControlSelectionState managementSelection = new AgentControlSelectionState();
 	private final AgentRosterViewState rosterState = new AgentRosterViewState();
 	private AgentRosterFilter rosterFilter = AgentRosterFilter.all();
 	private List<AgentRosterEntry> rosterEntries = List.of();
@@ -131,6 +133,7 @@ public final class AgentControlScreen extends Screen {
 		AgentControlSnapshot checkedSnapshot = Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
 		List<AgentRosterEntry> candidateEntries = rosterEntries(checkedSnapshot);
 		Map<String, AgentVisualIdentity.Resolved> candidateVisuals = rosterVisuals(checkedSnapshot);
+		managementSelection.reconcile(checkedSnapshot.agents());
 		rosterState.reconcile(candidateEntries);
 		snapshot = checkedSnapshot;
 		rosterEntries = candidateEntries;
@@ -145,7 +148,7 @@ public final class AgentControlScreen extends Screen {
 				boolean existed = previous != null && previous.agents().stream()
 						.anyMatch(item -> item.agentId().equals(agent.agentId()));
 				if (!existed) {
-					rosterState.focus(agent.agentId());
+					selectAgent(agent.agentId());
 					selectNewlySummonedAgent = false;
 					page = Page.OVERVIEW;
 					feedback = "";
@@ -158,6 +161,7 @@ public final class AgentControlScreen extends Screen {
 		} else {
 			normalizeRosterFilterOptions();
 		}
+		rosterState.focus(managementSelection.selectedAgentId());
 		if (page == Page.GROUP && snapshot.agents().size() < 2) {
 			page = Page.OVERVIEW;
 			compactGroupComposer = false;
@@ -169,7 +173,9 @@ public final class AgentControlScreen extends Screen {
 	private void replaceSnapshot(AgentControlSnapshot nextSnapshot) {
 		List<AgentRosterEntry> candidateEntries = rosterEntries(nextSnapshot);
 		Map<String, AgentVisualIdentity.Resolved> candidateVisuals = rosterVisuals(nextSnapshot);
+		managementSelection.reconcile(nextSnapshot.agents());
 		rosterState.reconcile(candidateEntries);
+		rosterState.focus(managementSelection.selectedAgentId());
 		snapshot = nextSnapshot;
 		rosterEntries = candidateEntries;
 		rosterVisuals = candidateVisuals;
@@ -356,7 +362,7 @@ public final class AgentControlScreen extends Screen {
 
 	private void addNavigation() {
 		AgentControlLayout layout = layout();
-		boolean groupAvailable = snapshot == null || snapshot.groupAvailable();
+		boolean groupAvailable = snapshot != null && snapshot.groupAvailable();
 		boolean agentWorkflow = page == Page.OVERVIEW || page == Page.CREATE || page == Page.TASK
 				|| page == Page.MANAGE || page == Page.REMOVE_CONFIRM;
 		if (layout.sideNavigation()) {
@@ -662,13 +668,13 @@ public final class AgentControlScreen extends Screen {
 				new AgentRosterGrid.Actions() {
 					@Override
 					public void focus(String id) {
-						rosterState.focus(id);
+						selectAgent(id);
 						focusRosterWidget(id);
 					}
 
 					@Override
 					public void open(String id) {
-						rosterState.focus(id);
+						selectAgent(id);
 						if (mode == AgentRosterGrid.Mode.FOCUS_ONLY) show(Page.MANAGE);
 					}
 
@@ -1386,9 +1392,15 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private AgentControlAgent selectedAgent() {
-		if (snapshot == null || rosterState.focusedId().isBlank()) return null;
+		if (snapshot == null || managementSelection.selectedAgentId().isBlank()) return null;
 		return snapshot.agents().stream()
-				.filter(agent -> agent.agentId().equals(rosterState.focusedId())).findFirst().orElse(null);
+				.filter(agent -> agent.agentId().equals(managementSelection.selectedAgentId())).findFirst().orElse(null);
+	}
+
+	private void selectAgent(String agentId) {
+		if (snapshot == null) return;
+		managementSelection.select(agentId, snapshot.agents());
+		rosterState.focus(managementSelection.selectedAgentId());
 	}
 
 	private List<AgentControlAgent> selectedGroupAgents() {
@@ -1426,6 +1438,7 @@ public final class AgentControlScreen extends Screen {
 
 	private void applyRosterFilter(AgentRosterFilter filter) {
 		setRosterFilterWithoutRebuild(filter);
+		selectAgent(rosterState.focusedId());
 		rebuildWidgets();
 	}
 

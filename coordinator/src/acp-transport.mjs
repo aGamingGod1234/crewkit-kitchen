@@ -6,6 +6,7 @@ import path from 'node:path';
 import { DEFAULT_CHILD_STOP_TIMEOUT_MS, terminateChildProcess } from './child-process-lifecycle.mjs';
 import { JsonlDecoder, encodeJsonLine } from './jsonl.mjs';
 import { createProviderChildEnvironment } from './provider-environment.mjs';
+import { sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from './diagnostic-sanitizer.mjs';
 
 const MAX_LINE_BYTES = 4 * 1_024 * 1_024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -79,16 +80,18 @@ export class AcpStdioTransport extends EventEmitter {
 		try {
 			child = this.#spawn(launch.command, launch.args, launch.options);
 		} catch (error) {
-			throw new AcpProtocolError('SPAWN_FAILED', `Could not start ${this.#config.provider} ACP: ${error.message}`, { cause: error });
+			throw new AcpProtocolError('SPAWN_FAILED', `Could not start ${this.#config.provider} ACP: ${sanitizeDiagnosticErrorMessage(error)}`, { cause: error });
 		}
 		this.#child = child;
 		child.stdout.on('data', (chunk) => this.#onStdout(child, chunk));
-		child.stderr.on('data', (chunk) => this.emit('diagnostic', String(chunk).slice(0, 4_096)));
+		child.stderr.on('data', (chunk) => {
+			try { this.emit('diagnostic', sanitizeDiagnosticText(chunk, { maxBytes: 4_096 })); } catch { /* diagnostics cannot interrupt provider IO */ }
+		});
 		child.on('exit', (code, signal) => this.#onExit(child, code, signal));
 		await new Promise((resolve, reject) => {
 			const cleanup = () => { child.off('spawn', onSpawn); child.off('error', onError); };
 			const onSpawn = () => { cleanup(); resolve(); };
-			const onError = (error) => { cleanup(); this.#child = null; reject(new AcpProtocolError('SPAWN_FAILED', `Could not start ${this.#config.provider} ACP: ${error.message}`, { cause: error })); };
+			const onError = (error) => { cleanup(); this.#child = null; reject(new AcpProtocolError('SPAWN_FAILED', `Could not start ${this.#config.provider} ACP: ${sanitizeDiagnosticErrorMessage(error)}`, { cause: error })); };
 			child.once('spawn', onSpawn);
 			child.once('error', onError);
 			if (Number.isInteger(child.pid) && child.pid > 0) onSpawn();

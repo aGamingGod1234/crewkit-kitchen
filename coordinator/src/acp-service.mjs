@@ -4,6 +4,7 @@ import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { discoverKimiCatalog } from './provider-catalog-discovery.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
+import { reportVisibleOutput } from './verbose-output.mjs';
 
 const DEFAULT_PLANNING_TIMEOUT_MS = 45_000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15_000;
@@ -21,7 +22,9 @@ export class AcpProviderService {
 	#workspaceManager;
 	#agents = new Map();
 	#creating = new Map();
+	#replacing = new Map();
 	#sessionGenerations = new Map();
+	#lifecycleGeneration = 0;
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
@@ -41,8 +44,15 @@ export class AcpProviderService {
 	getAgent(agentId) { return this.#agents.get(agentId) ?? null; }
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
+		const lifecycleGeneration = this.#lifecycleGeneration;
 		await this.catalog.refresh();
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration, this.#config.provider);
 		const requested = profileIdentity(profileValue, this.#config);
+		const replacing = this.#replacing.get(requested.agentId);
+		if (replacing !== undefined) {
+			if (!profilesMatch(replacing.profile, requested)) throw profileConflict();
+			return replacing.promise;
+		}
 		const existing = this.#agents.get(requested.agentId);
 		if (existing !== undefined) {
 			if (!existing.matchesProfile(requested)) throw profileConflict();
@@ -54,27 +64,55 @@ export class AcpProviderService {
 			return creating.promise;
 		}
 		const profile = validateProfile(profileValue, this.#config);
-		const promise = this.#createAgentOnce(profile, recoverySummary);
+		const promise = this.#createAgentOnce(profile, recoverySummary, lifecycleGeneration);
 		this.#creating.set(profile.agentId, { profile, promise });
 		try { return await promise; } finally { this.#creating.delete(profile.agentId); }
 	}
 
-	async #createAgentOnce(profile, recoverySummary) {
+	async replaceAgent(profileValue, { recoverySummary = null, expectedSessionGeneration = null } = {}) {
+		const profile = validateProfile(profileValue, this.#config);
+		const replacing = this.#replacing.get(profile.agentId);
+		if (replacing !== undefined) {
+			if (!profilesMatch(replacing.profile, profile)) throw profileConflict();
+			return replacing.promise;
+		}
+		const existing = this.#agents.get(profile.agentId);
+		if (existing !== undefined) {
+			if (!existing.matchesProfile(profile)) throw profileConflict();
+			if (expectedSessionGeneration !== null && existing.sessionGeneration !== expectedSessionGeneration) throw new AcpProtocolError('STALE_SESSION_GENERATION', `${profile.provider} replacement target is no longer current`);
+			this.#agents.delete(profile.agentId);
+		}
+		const lifecycleGeneration = this.#lifecycleGeneration;
+		const promise = Promise.resolve().then(() => existing?.dispose()).then(() => this.#createAgentOnce(profile, recoverySummary, lifecycleGeneration));
+		const entry = { profile, promise };
+		this.#replacing.set(profile.agentId, entry);
+		try { return await promise; }
+		finally { if (this.#replacing.get(profile.agentId) === entry) this.#replacing.delete(profile.agentId); }
+	}
+
+	async #createAgentOnce(profile, recoverySummary, lifecycleGeneration) {
 		const cwd = this.#workspaceManager === null
 			? this.#config.cwd
 			: await this.#workspaceManager.prepare(profile.provider, profile.agentId);
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration, this.#config.provider);
 		const transport = this.#transportFactory({ ...profile, cwd });
 		const sessionGeneration = (this.#sessionGenerations.get(profile.agentId) ?? 0) + 1;
 		this.#sessionGenerations.set(profile.agentId, sessionGeneration);
-		const agent = new AcpAgent(profile, transport, {
+		let agent;
+		agent = new AcpAgent(profile, transport, {
 			planningTimeoutMs: this.#config.planningTimeoutMs,
 			maxDecisionBytes: this.#config.maxDecisionBytes,
 			recoverySummary: normalizeRecoverySummary(recoverySummary),
 			sessionGeneration,
 			resetReason: sessionGeneration > 1 ? 'session_replaced' : null,
+			onInvalidated: (error) => this.#invalidateAgent(profile.agentId, agent, error),
 		});
-		try { await agent.start(cwd); } catch (error) {
+		try {
+			await agent.start(cwd);
+			assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration, this.#config.provider);
+		} catch (error) {
 			await transport.stop();
+			if (error?.code === 'PROVIDER_STOPPED') throw error;
 			if (error instanceof AcpProtocolError && ['UNSUPPORTED_MODEL', 'UNSUPPORTED_THINKING'].includes(error.code)) throw error;
 			throw new AcpProtocolError('PROVIDER_UNAVAILABLE', `${profile.provider} CLI could not create an ACP session: ${error.message}`, { cause: error });
 		}
@@ -90,27 +128,51 @@ export class AcpProviderService {
 		return true;
 	}
 
-	async reconcile(records) {
+	async reconcile(records, { signal } = {}) {
 		if (!Array.isArray(records)) throw new TypeError(`${this.#config.provider} reconciliation records must be an array`);
+		assertReconciliationActive(signal, this.#config.provider);
 		await this.catalog.refresh();
+		assertReconciliationActive(signal, this.#config.provider);
 		const desiredIds = new Set(records.map((record) => record.agentId));
 		const removed = [];
-		for (const agentId of this.#agents.keys()) if (!desiredIds.has(agentId)) { await this.removeAgent(agentId); removed.push(agentId); }
+		for (const agentId of this.#agents.keys()) if (!desiredIds.has(agentId)) {
+			assertReconciliationActive(signal, this.#config.provider);
+			await this.removeAgent(agentId);
+			assertReconciliationActive(signal, this.#config.provider);
+			removed.push(agentId);
+		}
 		const valid = [];
 		const invalid = [];
 		for (const record of records) {
 			try { valid.push(validateProfile(record, this.#config)); } catch (error) { invalid.push({ profile: record, code: error.code ?? 'INVALID_PROFILE', message: error.message }); }
 		}
-		return { valid, invalid, removed, catalog: await this.catalog.refresh() };
+		const catalog = await this.catalog.refresh();
+		assertReconciliationActive(signal, this.#config.provider);
+		return { valid, invalid, removed, catalog };
 	}
 
 	async stop() {
+		this.#lifecycleGeneration += 1;
 		await Promise.allSettled([...this.#creating.values()].map((entry) => entry.promise));
 		this.#creating.clear();
+		this.#replacing.clear();
 		const agents = [...this.#agents.values()];
 		this.#agents.clear();
 		await Promise.allSettled(agents.map((agent) => agent.dispose()));
 	}
+
+	#invalidateAgent(agentId, agent, error) {
+		if (this.#agents.get(agentId) === agent) this.#agents.delete(agentId);
+		agent.invalidateTransport(error);
+	}
+}
+
+function assertReconciliationActive(signal, provider) {
+	if (signal?.aborted) throw new AcpProtocolError('STALE_RECONCILIATION', `${provider} reconciliation was superseded`);
+}
+
+function assertLifecycleActive(expected, current, provider) {
+	if (expected !== current) throw new AcpProtocolError('PROVIDER_STOPPED', `${provider} service lifecycle was stopped`);
 }
 
 class AcpAgent {
@@ -126,8 +188,10 @@ class AcpAgent {
 	#goalRevision = 0;
 	#active = false;
 	#disposed = false;
+	#invalidationError = null;
+	#onInvalidated;
 
-	constructor(profile, transport, { planningTimeoutMs, maxDecisionBytes, recoverySummary, sessionGeneration = 1, resetReason = null }) {
+	constructor(profile, transport, { planningTimeoutMs, maxDecisionBytes, recoverySummary, sessionGeneration = 1, resetReason = null, onInvalidated = () => {} }) {
 		this.#profile = structuredClone(profile);
 		this.#transport = transport;
 		this.#planningTimeoutMs = planningTimeoutMs;
@@ -135,6 +199,9 @@ class AcpAgent {
 		this.#recoverySummary = recoverySummary;
 		this.#sessionGeneration = sessionGeneration;
 		this.#resetReason = resetReason ?? null;
+		this.#onInvalidated = onInvalidated;
+		this.#transport.on?.('exit', (error) => this.#onInvalidated(sessionInvalidated(error, this.provider)));
+		this.#transport.on?.('protocolError', (error) => this.#onInvalidated(sessionInvalidated(error, this.provider)));
 	}
 
 	get agentId() { return this.#profile.agentId; }
@@ -190,10 +257,15 @@ class AcpAgent {
 		this.#goalRevision = revision;
 	}
 
-	async decide(input, { goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs } = {}) {
-		if (this.#disposed) throw new AcpProtocolError('AGENT_DISPOSED', `${this.provider} agent '${this.agentId}' is disposed`);
+	async decide(input, {
+		goalRevision, signal, turnRecorder = null, attempt = 1, retry = false, queueWaitMs, onVerbose = null,
+		parseOutput = parseDecision, systemPrompt,
+	} = {}) {
+		if (this.#disposed) throw this.#invalidationError ?? new AcpProtocolError('AGENT_DISPOSED', `${this.provider} agent '${this.agentId}' is disposed`);
 		if (this.#active) throw new AcpProtocolError('TURN_IN_PROGRESS', `${this.provider} agent '${this.agentId}' already has an active turn`);
 		if (typeof input !== 'string' || input.trim().length === 0) throw new TypeError('planner input must be nonblank');
+		if (typeof parseOutput !== 'function') throw new TypeError('parseOutput must be a function');
+		if (systemPrompt !== undefined && typeof systemPrompt !== 'string') throw new TypeError('systemPrompt must be a string');
 		if (goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_GOAL_REVISION', `Goal revision ${String(goalRevision)} does not match ${this.#goalRevision}`);
 		if (signal?.aborted) throw signal.reason ?? new AcpProtocolError('PLAN_CANCELLED', 'Planning was cancelled');
 		const turnStartedAt = performance.now();
@@ -217,6 +289,7 @@ class AcpAgent {
 			}
 			decisionBytes += chunkBytes;
 			chunks.push(chunk);
+			reportVisibleOutput(onVerbose, chunk);
 		};
 		const abort = () => this.interrupt();
 		this.#active = true;
@@ -224,12 +297,15 @@ class AcpAgent {
 		signal?.addEventListener('abort', abort, { once: true });
 		let rawOutput = '';
 		let outputHandled = false;
-		const prompt = `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`;
+		const prompt = systemPrompt === undefined
+			? `${PLANNER_SYSTEM_PROMPT}${recoveryPrompt(this.#recoverySummary)}\n\n${input}`
+			: `${systemPrompt}${systemPrompt.length === 0 ? '' : '\n\n'}${input}`;
 		try {
 			const response = await withTimeout(Promise.race([this.#transport.request('session/prompt', {
 				sessionId: this.#sessionId,
 				prompt: [{ type: 'text', text: prompt }],
 			}, { timeoutMs: this.#planningTimeoutMs }), outputLimit]), this.#planningTimeoutMs);
+			if (this.#disposed) throw this.#invalidationError ?? new AcpProtocolError('SESSION_INVALIDATED', `${this.provider} session was invalidated`);
 			if (signal?.aborted || goalRevision !== this.#goalRevision) throw new AcpProtocolError('STALE_PLAN', `${this.provider} result belongs to an obsolete goal`);
 			if (response?.stopReason !== 'end_turn') throw new AcpProtocolError('INCOMPLETE_TURN', `${this.provider} ACP stopped with '${String(response?.stopReason)}'`);
 			const decisionText = chunks.join('');
@@ -242,7 +318,7 @@ class AcpAgent {
 			}
 			let decision;
 			let parseError = null;
-			try { decision = parseDecision(decisionText); }
+			try { decision = parseOutput(decisionText); }
 			catch (error) {
 				parseError = new AcpProtocolError(
 					error?.code ?? 'INVALID_DECISION',
@@ -253,7 +329,7 @@ class AcpAgent {
 			}
 			outputHandled = true;
 			const tokens = acpTokenUsage(response?.usage) ?? (this.provider === 'gemini' ? geminiQuotaTokenUsage(response?._meta) : null);
-			await recordProviderTurn(turnRecorder, {
+			recordProviderTurn(turnRecorder, {
 				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: parseError === null ? decisionText : '', error: structuredProviderError(parseError),
@@ -264,7 +340,7 @@ class AcpAgent {
 			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
-			if (!outputHandled) await recordProviderTurn(turnRecorder, {
+			if (!outputHandled) recordProviderTurn(turnRecorder, {
 				agentId: this.agentId,
 				provider: this.provider, model: this.#profile.model, reasoningEffort: this.#profile.reasoningEffort,
 				goalRevision, attempt, retry, input: prompt, output: rawOutput, error,
@@ -281,6 +357,18 @@ class AcpAgent {
 
 	interrupt() { if (this.#sessionId !== null) this.#transport.notify('session/cancel', { sessionId: this.#sessionId }); }
 	async dispose() { if (this.#disposed) return; this.#disposed = true; if (this.#active) this.interrupt(); await this.#transport.stop(); }
+	invalidateTransport(error) {
+		if (this.#invalidationError !== null) return;
+		this.#invalidationError = error;
+		this.#disposed = true;
+		this.#sessionId = null;
+		this.#active = false;
+		void Promise.resolve(this.#transport.stop()).catch(() => {});
+	}
+}
+
+function sessionInvalidated(error, provider) {
+	return new AcpProtocolError('SESSION_INVALIDATED', `${provider} provider transport was lost`, { cause: error instanceof Error ? error : undefined });
 }
 
 function resolveKimiApiKeyModel(provider, requestedModel, modelOption) {

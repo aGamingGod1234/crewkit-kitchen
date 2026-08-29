@@ -209,6 +209,8 @@ export class PlanningScheduler {
 	#urgentReserve;
 	#ordinaryReservationRejections = 0;
 	#urgentReservationRejections = 0;
+	#scheduleTimeout;
+	#cancelTimeout;
 
 	constructor({
 		maxConcurrent = DEFAULT_MAX_CONCURRENT,
@@ -223,6 +225,8 @@ export class PlanningScheduler {
 		onPressure = () => {},
 		recorder = null,
 		benchmarkRecorder = null,
+		scheduleTimeout = defaultScheduleTimeout,
+		cancelTimeout = clearTimeout,
 	} = {}) {
 		if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) throw new TypeError('maxConcurrent must be a positive safe integer');
 		if (maxConcurrent > MAX_ADAPTIVE_CONCURRENCY) throw new TypeError(`maxConcurrent must not exceed ${MAX_ADAPTIVE_CONCURRENCY}`);
@@ -230,6 +234,8 @@ export class PlanningScheduler {
 		if (maxConcurrent + maxPending > DEFAULT_AGENT_CAP) throw new TypeError(`planning capacity must not exceed ${DEFAULT_AGENT_CAP}`);
 		if (!Number.isSafeInteger(urgentBurstLimit) || urgentBurstLimit <= 0) throw new TypeError('urgentBurstLimit must be a positive safe integer');
 		if (typeof onPressure !== 'function') throw new TypeError('onPressure must be a function');
+		if (typeof scheduleTimeout !== 'function') throw new TypeError('scheduleTimeout must be a function');
+		if (typeof cancelTimeout !== 'function') throw new TypeError('cancelTimeout must be a function');
 		const selectedRecorder = recorder ?? benchmarkRecorder;
 		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		this.#maxConcurrent = maxConcurrent;
@@ -237,6 +243,8 @@ export class PlanningScheduler {
 		this.#maxUrgentBurst = urgentBurstLimit;
 		this.#onPressure = onPressure;
 		this.#recorder = selectedRecorder;
+		this.#scheduleTimeout = scheduleTimeout;
+		this.#cancelTimeout = cancelTimeout;
 		const selectedMode = planningMode ?? 'fixed';
 		const selectedReserve = urgentReserve ?? ((mode !== undefined || planningMode !== undefined) && maxConcurrent >= MIN_ADAPTIVE_CONCURRENCY ? DEFAULT_URGENT_RESERVE : 0);
 		const selectedMinConcurrency = selectedMode === 'adaptive' ? minConcurrency : Math.min(minConcurrency, maxConcurrency);
@@ -316,7 +324,7 @@ export class PlanningScheduler {
 	schedule(agentIdValue, task, options = {}) {
 		const agentId = requireAgentId(agentIdValue);
 		if (typeof task !== 'function') throw new TypeError('planning task must be a function');
-		const { lane, priority } = normalizeScheduleOptions(options);
+		const { lane, priority, leaseTimeoutMs, onLeaseExpired } = normalizeScheduleOptions(options);
 		this.#record('scheduler_admission_requested', agentId, { lane, priority, ...this.#snapshot() });
 		if (this.#closed) return this.#reject('SCHEDULER_CLOSED', 'Planning scheduler is closed', agentId, lane, priority);
 		if (this.#pending.has(agentId)) return this.#reject('PLAN_ALREADY_QUEUED', `Agent '${agentId}' already has a queued planning turn`, agentId, lane, priority);
@@ -328,7 +336,7 @@ export class PlanningScheduler {
 		}
 
 		const promise = new Promise((resolve, reject) => {
-			const entry = { agentId, task, lane, priority, resolve, reject };
+			const entry = { agentId, task, lane, priority, leaseTimeoutMs, onLeaseExpired, resolve, reject };
 			this.#pending.set(agentId, entry);
 			this.#lane(lane)[priority].push(entry);
 		});
@@ -377,7 +385,11 @@ export class PlanningScheduler {
 			if (entry === null) break;
 			this.#pending.delete(entry.agentId);
 			const controller = new AbortController();
-			this.#active.set(entry.agentId, { ...entry, controller });
+			const active = { ...entry, controller, timeoutHandle: null };
+			this.#active.set(entry.agentId, active);
+			if (entry.leaseTimeoutMs !== null) {
+				active.timeoutHandle = this.#scheduleTimeout(() => this.#expire(entry.agentId, controller), entry.leaseTimeoutMs);
+			}
 			this.#record('scheduler_admitted', entry.agentId, {
 				lane: entry.lane,
 				priority: entry.priority,
@@ -433,12 +445,34 @@ export class PlanningScheduler {
 	#release(agentId, controller) {
 		const active = this.#active.get(agentId);
 		if (active?.controller !== controller) return;
+		if (active.timeoutHandle !== null) this.#cancelTimeout(active.timeoutHandle);
 		this.#active.delete(agentId);
 		this.#record('scheduler_released', agentId, {
 			lane: active.lane,
 			priority: active.priority,
 			...this.#snapshot(),
 		});
+		this.#drain();
+	}
+
+	#expire(agentId, controller) {
+		const active = this.#active.get(agentId);
+		if (active?.controller !== controller) return;
+		const error = new PlanningSchedulerError('PLANNING_LEASE_EXPIRED', `Planning lease for '${agentId}' expired after ${active.leaseTimeoutMs} ms`);
+		controller.abort(error);
+		if (active.timeoutHandle !== null) this.#cancelTimeout(active.timeoutHandle);
+		this.#active.delete(agentId);
+		active.reject(error);
+		try {
+			void Promise.resolve(active.onLeaseExpired?.({
+				agentId,
+				lane: active.lane,
+				priority: active.priority,
+				signal: controller.signal,
+				error,
+			})).catch(() => undefined);
+		} catch { /* recovery cannot retain scheduler capacity */ }
+		this.#record('scheduler_lease_expired', agentId, { lane: active.lane, priority: active.priority, ...this.#snapshot() });
 		this.#drain();
 	}
 
@@ -529,10 +563,21 @@ export class PlanningScheduler {
 
 function normalizeScheduleOptions(options) {
 	if (options === null || typeof options !== 'object' || Array.isArray(options)) throw new TypeError('planning schedule options must be an object');
+	const leaseTimeoutMs = options.leaseTimeoutMs ?? null;
+	if (leaseTimeoutMs !== null && (!Number.isSafeInteger(leaseTimeoutMs) || leaseTimeoutMs <= 0)) throw new TypeError('planning leaseTimeoutMs must be a positive safe integer');
+	if (options.onLeaseExpired !== undefined && typeof options.onLeaseExpired !== 'function') throw new TypeError('planning onLeaseExpired must be a function');
 	return {
 		lane: requireLane(options.lane ?? DEFAULT_LANE),
 		priority: requirePriority(options.priority ?? ORDINARY_PRIORITY),
+		leaseTimeoutMs,
+		onLeaseExpired: options.onLeaseExpired ?? null,
 	};
+}
+
+function defaultScheduleTimeout(callback, delay) {
+	const handle = setTimeout(callback, delay);
+	handle.unref?.();
+	return handle;
 }
 
 function requireLane(value) {

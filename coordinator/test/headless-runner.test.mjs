@@ -36,17 +36,53 @@ $required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-Proce
 $definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name }, $true))
 foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Text }
 $script:PollMilliseconds = 10
-$runner = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Milliseconds 150' -PassThru
-$ids = [System.Collections.Generic.List[int]]::new()
-Add-ProcessTreeSnapshot $ids $runner.Id
-$peak = Measure-RunnerResourcesUntilExit @{ Process = $runner } @(@{ Process = $runner }) $ids ([DateTime]::UtcNow.AddSeconds(5))
-$peak | ConvertTo-Json -Compress
+function Get-CimInstance {
+	return @([pscustomobject]@{ ProcessId = 10; ParentProcessId = 1; CreationDate = '100'; WorkingSetSize = 4096 })
+}
+$process = [pscustomobject]@{ Id = 10; HasExited = $false; WorkingSet64 = 4096 }
+$process | Add-Member -MemberType ScriptMethod -Name Refresh -Value {}
+$process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($milliseconds) $this.HasExited = $true; return $true }
+$identity = [pscustomobject]@{ ProcessId = 10; ParentProcessId = 1; CreationDate = '100' }
+$tracked = [System.Collections.Generic.List[object]]::new()
+$runner = @{ Process = $process; Identity = $identity }
+$peak = Measure-RunnerResourcesUntilExit $runner @($runner) $tracked ([DateTime]::UtcNow.AddSeconds(1))
+[pscustomobject]@{ processCount = $peak.processCount; peakRssBytes = $peak.peakRssBytes; exited = $process.HasExited } | ConvertTo-Json -Compress
 `;
 	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
 	assert.equal(result.status, 0, result.stderr || result.stdout);
 	const peak = JSON.parse(result.stdout.trim());
 	assert.ok(peak.processCount >= 1, result.stdout);
 	assert.ok(peak.peakRssBytes > 0, result.stdout);
+	assert.equal(peak.exited, true);
+});
+
+test('PowerShell resource sampling reuses one process snapshot per sampling phase', () => {
+	const wrapper = path.resolve('../scripts/run-headless-provider-matrix.ps1').replaceAll("'", "''");
+	const script = `
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('${wrapper}', [ref] $tokens, [ref] $errors)
+if ($errors.Count -gt 0) { throw $errors[0].Message }
+$required = @('ConvertTo-ProcessCreationKey', 'Get-ProcessSnapshot', 'Test-ProcessIdentityMatch', 'Test-ChildCreationAfterParent', 'Add-ProcessTreeSnapshot', 'Get-TrackedResourceSnapshot', 'Measure-RunnerResourcesUntilExit')
+$definitions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name }, $true))
+foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Text }
+$script:PollMilliseconds = 1
+$script:snapshots = 0
+function Get-CimInstance {
+	$script:snapshots += 1
+	return @([pscustomobject]@{ ProcessId = 10; ParentProcessId = 1; CreationDate = '100'; WorkingSetSize = 4096 })
+}
+$process = [pscustomobject]@{ Id = 10; HasExited = $true }
+$process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($milliseconds) return $true }
+$identity = [pscustomobject]@{ ProcessId = 10; ParentProcessId = 1; CreationDate = '100' }
+$tracked = [System.Collections.Generic.List[object]]::new()
+$runner = @{ Process = $process; Identity = $identity }
+$peak = Measure-RunnerResourcesUntilExit $runner @($runner) $tracked ([DateTime]::UtcNow.AddSeconds(1))
+[pscustomobject]@{ snapshots = $script:snapshots; count = $peak.processCount; rss = $peak.peakRssBytes } | ConvertTo-Json -Compress
+`;
+	const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8', timeout: 10_000 });
+	assert.equal(result.status, 0, result.stderr || result.stdout);
+	assert.deepEqual(JSON.parse(result.stdout.trim()), { snapshots: 1, count: 1, rss: 4096 });
 });
 
 test('PowerShell process tracking rejects a reused PID before sampling or cleanup', () => {

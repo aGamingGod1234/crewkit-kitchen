@@ -12,11 +12,15 @@ public record CoordinatorStatusSnapshot(
 		SchedulerStatus scheduler,
 		List<CircuitHealth> circuits,
 		List<LatencyHealth> latencies,
+		long bridgeSessionEpoch,
+		String runtimeGeneration,
+		List<ComponentRecovery> components,
 		long receivedAtEpochMs
 ) {
 	public static final int MAX_PROFILES = 16;
 	public static final int MAX_CIRCUITS = 32;
 	public static final int MAX_LATENCIES = 16;
+	public static final int MAX_COMPONENTS = 32;
 
 	public CoordinatorStatusSnapshot(
 			boolean reconciled,
@@ -28,15 +32,30 @@ public record CoordinatorStatusSnapshot(
 			List<CircuitHealth> circuits,
 			long receivedAtEpochMs
 	) {
-		this(reconciled, profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits, List.of(), receivedAtEpochMs);
+		this(reconciled, profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits, List.of(), 0L, null, List.of(), receivedAtEpochMs);
+	}
+
+	public CoordinatorStatusSnapshot(
+			boolean reconciled,
+			List<SupportedProfile> profiles,
+			int supportedProfileCount,
+			int rosterReadyCount,
+			int rosterCount,
+			SchedulerStatus scheduler,
+			List<CircuitHealth> circuits,
+			List<LatencyHealth> latencies,
+			long receivedAtEpochMs
+	) {
+		this(reconciled, profiles, supportedProfileCount, rosterReadyCount, rosterCount, scheduler, circuits, latencies, 0L, null, List.of(), receivedAtEpochMs);
 	}
 
 	public CoordinatorStatusSnapshot {
 		profiles = List.copyOf(Objects.requireNonNull(profiles, "profiles must not be null"));
 		circuits = List.copyOf(Objects.requireNonNull(circuits, "circuits must not be null"));
 		latencies = List.copyOf(Objects.requireNonNull(latencies, "latencies must not be null"));
+		components = List.copyOf(Objects.requireNonNull(components, "components must not be null"));
 		scheduler = Objects.requireNonNull(scheduler, "scheduler must not be null");
-		if (profiles.size() > MAX_PROFILES || circuits.size() > MAX_CIRCUITS || latencies.size() > MAX_LATENCIES) throw new IllegalArgumentException("coordinator status exceeds bounded entries");
+		if (profiles.size() > MAX_PROFILES || circuits.size() > MAX_CIRCUITS || latencies.size() > MAX_LATENCIES || components.size() > MAX_COMPONENTS) throw new IllegalArgumentException("coordinator status exceeds bounded entries");
 		if (supportedProfileCount != profiles.size()) throw new IllegalArgumentException("supported profile count does not match profiles");
 		if (profiles.stream().map(SupportedProfile::agentId).distinct().count() != profiles.size()) throw new IllegalArgumentException("supported profile identities must be unique");
 		if (circuits.stream().map(health -> health.provider() + "\u0000" + health.model() + "\u0000" + health.operation()).distinct().count() != circuits.size()) {
@@ -45,8 +64,12 @@ public record CoordinatorStatusSnapshot(
 		if (latencies.stream().map(LatencyHealth::operation).distinct().count() != latencies.size()) {
 			throw new IllegalArgumentException("latency operations must be unique");
 		}
+		if (components.stream().map(ComponentRecovery::component).distinct().count() != components.size()) {
+			throw new IllegalArgumentException("component identities must be unique");
+		}
 		if (rosterReadyCount < 0 || rosterCount < 0 || rosterReadyCount > rosterCount || rosterCount > MAX_PROFILES) throw new IllegalArgumentException("invalid roster counts");
-		if (receivedAtEpochMs < 0L) throw new IllegalArgumentException("receivedAtEpochMs must be non-negative");
+		if (bridgeSessionEpoch < 0L || receivedAtEpochMs < 0L) throw new IllegalArgumentException("status epochs must be non-negative");
+		if (runtimeGeneration != null && !runtimeGeneration.matches("[0-9a-f]{64}")) throw new IllegalArgumentException("runtimeGeneration must be a lowercase SHA-256 value");
 	}
 
 	public boolean fresh(long nowEpochMs, long maximumAgeMs) {
@@ -60,12 +83,48 @@ public record CoordinatorStatusSnapshot(
 				&& profile.reasoningEffort().equals(reasoningEffort));
 	}
 
-	public record SupportedProfile(String agentId, String provider, String model, String reasoningEffort) {
+	public record SupportedProfile(String agentId, String provider, String model, String reasoningEffort, String serviceTier) {
+		public SupportedProfile(String agentId, String provider, String model, String reasoningEffort) {
+			this(agentId, provider, model, reasoningEffort, "priority");
+		}
+
 		public SupportedProfile {
 			agentId = nonblank(agentId, "agentId");
 			provider = nonblank(provider, "provider");
 			model = nonblank(model, "model");
 			reasoningEffort = nonblank(reasoningEffort, "reasoningEffort");
+			serviceTier = nonblank(serviceTier, "serviceTier");
+		}
+	}
+
+	public boolean supports(String agentId, String provider, String model, String reasoningEffort, String serviceTier) {
+		return profiles.stream().anyMatch(profile -> profile.agentId().equals(agentId)
+				&& profile.provider().equals(provider)
+				&& profile.model().equals(model)
+				&& profile.reasoningEffort().equals(reasoningEffort)
+				&& profile.serviceTier().equals(serviceTier));
+	}
+
+	public record ComponentRecovery(
+			String component,
+			String state,
+			String fallbackMode,
+			String boundary,
+			String failureCode,
+			int consecutiveFailureCount,
+			Long nextProbeAtEpochMs,
+			long generation,
+			Long lastRecoveryAtEpochMs
+	) {
+		public ComponentRecovery {
+			component = nonblank(component, "component");
+			state = nonblank(state, "state");
+			if (!List.of("ready", "degraded", "backoff", "blocked_retryable", "unknown").contains(state)) throw new IllegalArgumentException("invalid component state");
+			fallbackMode = nullableBounded(fallbackMode, "fallbackMode");
+			boundary = nullableBounded(boundary, "boundary");
+			failureCode = nullableBounded(failureCode, "failureCode");
+			if (consecutiveFailureCount < 0 || generation < 0L || nextProbeAtEpochMs != null && nextProbeAtEpochMs < 0L
+					|| lastRecoveryAtEpochMs != null && lastRecoveryAtEpochMs < 0L) throw new IllegalArgumentException("invalid component recovery counters");
 		}
 	}
 
@@ -113,5 +172,9 @@ public record CoordinatorStatusSnapshot(
 		Objects.requireNonNull(value, field + " must not be null");
 		if (value.isBlank() || value.length() > 256) throw new IllegalArgumentException(field + " must be 1-256 characters");
 		return value;
+	}
+
+	private static String nullableBounded(String value, String field) {
+		return value == null ? null : nonblank(value, field);
 	}
 }

@@ -146,6 +146,36 @@ test('Antigravity parses planner output and uses the stable per-agent workspace'
 	await service.stop();
 });
 
+test('Antigravity structured turns use an isolated prompt and caller-supplied parser', async () => {
+	const spawnCalls = [];
+	const service = new AntigravityProviderService(config(), {
+		platform: 'win32',
+		spawn: successfulSpawner(spawnCalls, '{"requestId":"draft-1"}'),
+	});
+	const agent = await service.createAgent(profile({ agentId: 'gemini-structured' }));
+	const result = await agent.decide('translate exactly', { goalRevision: 0, systemPrompt: '', parseOutput: JSON.parse });
+	assert.deepEqual(result, { requestId: 'draft-1' });
+	assert.equal(spawnCalls[0].args[1], 'translate exactly');
+	await service.stop();
+});
+
+test('Antigravity reports its bounded visible result through the verbose adapter contract', async () => {
+	const service = new AntigravityProviderService(config(), {
+		platform: 'win32',
+		spawn: successfulSpawner([]),
+	});
+	const agent = await service.createAgent(profile({ agentId: 'gemini-verbose' }));
+	await agent.setGoalRevision(1);
+	const events = [];
+	await agent.decide('authoritative state', {
+		goalRevision: 1,
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
+	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.equal(events.map(({ message }) => message).join(''), DECISION);
+	await service.stop();
+});
+
 test('Antigravity malformed output records one final error row for the attempt', async () => {
 	const spawnCalls = [];
 	const service = new AntigravityProviderService(config(), { platform: 'win32', spawn: successfulSpawner(spawnCalls, 'not-json') });
@@ -251,7 +281,7 @@ test('Antigravity does not warm a session when decision parsing fails', async ()
 			attempt += 1;
 			queueMicrotask(() => {
 				const output = attempt === 1
-					? '{"summary":"Wait safely.","directive":"replace","source":"program.onUnhandledAttention(\\"continue_and_notify\\"); await player.wait(25);"}'
+					? '{"summary":"Wait safely.","directive":"replace","source":null}'
 					: DECISION;
 				child.stdout.emit('data', Buffer.from(output));
 				child.exitCode = 0;
@@ -287,7 +317,7 @@ test('Antigravity interruption terminates the active process and rejects the tur
 	await service.stop();
 });
 
-test('Antigravity does not continue a session after its first turn fails or is interrupted', async () => {
+test('Antigravity starts a fresh replacement after first-turn process failure or interruption', async () => {
 	const failedCalls = [];
 	let failedAttempt = 0;
 	const failedService = new AntigravityProviderService(config(), {
@@ -305,7 +335,9 @@ test('Antigravity does not continue a session after its first turn fails or is i
 	const failedAgent = await failedService.createAgent(profile());
 	await failedAgent.setGoalRevision(1);
 	await assert.rejects(failedAgent.decide('state', { goalRevision: 1 }), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
-	await failedAgent.decide('state', { goalRevision: 1 });
+	const failedReplacement = await failedService.replaceAgent(profile(), { expectedSessionGeneration: 1 });
+	await failedReplacement.setGoalRevision(1);
+	await failedReplacement.decide('state', { goalRevision: 1 });
 	assert.equal(failedCalls[1].args.includes('--continue'), false);
 	await failedService.stop();
 
@@ -333,7 +365,7 @@ test('Antigravity does not continue a session after its first turn fails or is i
 	await interruptedService.stop();
 });
 
-test('Antigravity never falls back to a fresh turn after a continued turn fails', async () => {
+test('Antigravity replaces a dead continued session instead of reusing its continuation', async () => {
 	const calls = [];
 	let attempt = 0;
 	const service = new AntigravityProviderService(config(), {
@@ -352,9 +384,12 @@ test('Antigravity never falls back to a fresh turn after a continued turn fails'
 	await agent.setGoalRevision(1);
 	await agent.decide('state', { goalRevision: 1 });
 	await assert.rejects(agent.decide('state', { goalRevision: 1 }), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
-	await agent.decide('state', { goalRevision: 1 });
+	await assert.rejects(agent.decide('state', { goalRevision: 1 }), (error) => error?.code === 'SESSION_INVALIDATED');
+	const replacement = await service.replaceAgent(profile(), { expectedSessionGeneration: 1 });
+	await replacement.setGoalRevision(1);
+	await replacement.decide('state', { goalRevision: 1 });
 	assert.equal(calls[1].args.includes('--continue'), true);
-	assert.equal(calls[2].args.includes('--continue'), true, 'a failed continuation must not restart in a fresh session');
+	assert.equal(calls[2].args.includes('--continue'), false, 'a replacement must not reuse the dead continuation');
 	await service.stop();
 });
 
@@ -422,6 +457,32 @@ test('Antigravity nonzero exit preserves bounded diagnostics without returning a
 		(error) => error?.code === 'PROVIDER_UNAVAILABLE' && error.message.includes('authentication required'),
 	);
 	await service.stop();
+});
+
+test('Antigravity process death invalidates only its owning generation and exact replacement coalesces', async () => {
+	let attempt = 0;
+	const selected = profile({ serviceTier: 'priority' });
+	const originalSpawn = successfulSpawner([], DECISION);
+	const recoverable = new AntigravityProviderService(config(), {
+		spawn: (command, args, options) => {
+			attempt += 1;
+			if (attempt > 1) return originalSpawn(command, args, options);
+			const child = new FakeChild();
+			queueMicrotask(() => { child.exitCode = 1; child.emit('close', 1, null); });
+			return child;
+		},
+	});
+	const stale = await recoverable.createAgent(selected);
+	await stale.setGoalRevision(1);
+	await assert.rejects(stale.decide('state', { goalRevision: 1 }), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
+	assert.equal(recoverable.getAgent(selected.agentId), null);
+	await assert.rejects(stale.decide('state', { goalRevision: 1 }), (error) => error?.code === 'SESSION_INVALIDATED');
+
+	const first = recoverable.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	const second = recoverable.replaceAgent(selected, { expectedSessionGeneration: 1 });
+	assert.equal(await first, await second);
+	assert.equal((await first).sessionGeneration, 2);
+	await recoverable.stop();
 });
 
 test('Antigravity fails closed before spawn when a Windows prompt is not safely representable', async () => {

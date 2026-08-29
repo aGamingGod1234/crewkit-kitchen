@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.agent;
 
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
+import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -18,8 +20,10 @@ public final class AgentRegistryVerification {
 		assertions += verifyLifecycleAndRevisions();
 		assertions += verifyAtomicStartPublication();
 		assertions += verifyPendingConversationWakeRecovery();
+		assertions += verifyCoordinatorRecoveryRearm();
 		assertions += verifyCoordinatorCompletion();
 		assertions += verifyCoordinatorCompletionPromotesQueue();
+		assertions += verifyTerminalGoalControls();
 		assertions += verifyQueueAndSteeringBounds();
 		assertions += verifyIdentityResolution();
 		assertions += verifyPersistenceRecovery();
@@ -87,6 +91,31 @@ public final class AgentRegistryVerification {
 				"durable conversation wake recovery preserves its exact goal identity");
 		assertEquals("", rearmed.lastError(), "durable conversation wake recovery does not report a false reload pause");
 		return 4;
+	}
+
+	private static int verifyCoordinatorRecoveryRearm() {
+		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transition -> { });
+		AgentRecord created = registry.create(
+				"kimi", "kimi-code/k3", "max", "priority", Optional.of("Recovery"), AgentGameMode.CREATIVE, START_TIME
+		);
+		AgentRecord active = registry.start(created.agentId(), "Keep the exact profile", START_TIME + 1L).after();
+		AgentRecord disconnected = registry.disconnect(created.agentId(), START_TIME + 2L).after();
+
+		AgentRecord rearmed = registry.rearmAfterCoordinatorRecovery(
+				created.agentId().value(), disconnected.goalRevision(), START_TIME + 3L
+		);
+		assertEquals(AgentLifecycleState.STARTING, rearmed.state(), "coordinator recovery re-arms disconnected work");
+		assertEquals(disconnected.goalRevision(), rearmed.goalRevision(), "coordinator recovery preserves the goal revision");
+		assertEquals(active.currentGoal(), rearmed.currentGoal(), "coordinator recovery preserves the exact unfinished goal");
+		assertEquals(created.profile(), rearmed.profile(), "coordinator recovery preserves the exact selected profile");
+		assertEquals(rearmed, registry.rearmAfterCoordinatorRecovery(
+				created.agentId().value(), disconnected.goalRevision(), START_TIME + 4L
+		), "duplicate coordinator recovery is idempotent");
+		expectFailure(
+				() -> registry.rearmAfterCoordinatorRecovery(created.agentId().value(), disconnected.goalRevision() - 1L, START_TIME + 5L),
+				"STALE_REVISION"
+		);
+		return 6;
 	}
 
 	private static int verifyLifecycleAndRevisions() {
@@ -181,6 +210,30 @@ public final class AgentRegistryVerification {
 		return 7;
 	}
 
+	private static int verifyTerminalGoalControls() {
+		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transition -> { });
+		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("Completed"), START_TIME);
+		AgentRecord active = registry.start(created.agentId(), "Get an iron pickaxe", START_TIME + 1L).after();
+		GoalEvidence evidence = new GoalEvidence(2L, "inventory_contains", List.of(
+				new GoalEvidence.Fact("inventory_contains", true, "minecraft:iron_pickaxe x1", "minecraft:iron_pickaxe x1")
+		));
+		AgentRecord completed = registry.satisfyGoal(
+				created.agentId(), active.goalRevision(), evidence, START_TIME + 2L).after();
+
+		expectFailure(() -> registry.stop(created.agentId(), START_TIME + 3L), "TERMINAL_GOAL");
+		assertEquals(completed, registry.require(created.agentId()), "rejected stop preserves the completed record exactly");
+		expectFailure(() -> registry.steer(created.agentId(), "Continue", START_TIME + 4L), "TERMINAL_GOAL");
+		assertEquals(completed, registry.require(created.agentId()), "rejected steering cannot resurrect satisfied work");
+		expectFailure(
+				() -> completed.currentGoal().orElseThrow().steer("Continue", START_TIME + 4L),
+				"TERMINAL_GOAL"
+		);
+		AgentTransition disconnected = registry.disconnect(created.agentId(), START_TIME + 5L);
+		assertEquals(completed, disconnected.after(), "coordinator disconnect leaves completed work immutable");
+		assertEquals(completed, registry.require(created.agentId()), "disconnect cannot create a resumable terminal record");
+		return 7;
+	}
+
 	private static int verifyQueueAndSteeringBounds() {
 		AgentRegistry registry = new AgentRegistry(2, 1, () -> { }, transition -> { });
 		AgentRecord created = registry.create("gpt-5.6-sol", "xhigh", Optional.empty(), START_TIME);
@@ -222,16 +275,25 @@ public final class AgentRegistryVerification {
 		AgentRecord created = registry.create("gpt-5.6-sol", "high", Optional.of("Miner"), START_TIME);
 		registry.start(created.agentId(), "Mine iron", START_TIME + 1L);
 		registry.beginPlanning(created.agentId(), START_TIME + 2L);
+		AgentRecord paused = registry.create("gpt-5.6-sol", "high", Optional.of("Paused Miner"), START_TIME + 2L);
+		registry.start(paused.agentId(), "Wait for the operator", START_TIME + 3L);
+		paused = registry.stop(paused.agentId(), START_TIME + 4L).after();
 
 		AgentRegistrySnapshotCodec codec = new AgentRegistrySnapshotCodec();
 		String encoded = codec.encode(registry.snapshot());
 		AgentRegistry.Snapshot decoded = codec.decode(encoded);
-		AgentRegistry recovered = AgentRegistry.restore(decoded, () -> { }, transition -> { }, START_TIME + 3L);
+		AgentRegistry recovered = AgentRegistry.restore(decoded, () -> { }, transition -> { }, START_TIME + 5L);
 		AgentRecord restored = recovered.require(created.agentId());
-		assertEquals(AgentLifecycleState.PAUSED, restored.state(), "active reload state");
-		assertEquals(2L, restored.goalRevision(), "reload revision");
+		assertEquals(AgentLifecycleState.STARTING, restored.state(), "active reload re-arms unfinished work");
+		assertEquals(1L, restored.goalRevision(), "reload preserves the active goal revision");
 		assertEquals("Mine iron", restored.currentGoal().orElseThrow().prompt(), "reload goal");
-		return 3;
+		assertEquals(registry.require(created.agentId()).profile(), restored.profile(), "reload preserves the exact selected profile");
+		AgentRecord restoredPaused = recovered.require(paused.agentId());
+		assertEquals(AgentLifecycleState.PAUSED, restoredPaused.state(), "explicit pause survives reload");
+		assertEquals(paused.goalRevision(), restoredPaused.goalRevision(), "explicit pause revision survives reload");
+		assertEquals(paused.currentGoal().orElseThrow().prompt(), restoredPaused.currentGoal().orElseThrow().prompt(),
+				"explicit pause goal survives reload");
+		return 7;
 	}
 
 	private static int verifyProviderPersistenceAndMigration() {
@@ -352,6 +414,7 @@ public final class AgentRegistryVerification {
 		AgentTransition died = AgentLifecycleReducer.die(active, death, START_TIME + 3L);
 		assertEquals(AgentLifecycleState.DEAD, died.after().state(), "death enters persistent dead state");
 		assertEquals(active.currentGoal(), died.after().currentGoal(), "death retains current goal");
+		assertEquals(active.goalRevision(), died.after().goalRevision(), "death preserves the unfinished goal revision");
 		assertEquals(active.queuedGoals(), died.after().queuedGoals(), "death retains queued goals");
 		assertEquals(active.profile(), died.after().profile(), "death retains selected model profile");
 		assertEquals(Optional.of(death), died.after().deathSnapshot(), "death retains exact factual snapshot");
@@ -374,7 +437,7 @@ public final class AgentRegistryVerification {
 		String legacy = encoded.replaceFirst(",\\\"death_snapshot\\\":\\{[^}]*\\}", "");
 		assertEquals(Optional.empty(), codec.decode(legacy).records().getFirst().deathSnapshot(), "legacy saves default death snapshot absent");
 
-		AgentRegistry registry = AgentRegistry.restore(snapshot, () -> { }, transition -> { }, START_TIME + 4L);
+		AgentRegistry registry = AgentRegistry.restore(codec.decode(encoded), () -> { }, transition -> { }, START_TIME + 4L);
 		AgentRecord exactDead = registry.require(active.agentId());
 		try {
 			registry.respawnAtomically(active.agentId(), UUID.randomUUID(), START_TIME + 5L, (transition, commit) -> {
@@ -396,8 +459,57 @@ public final class AgentRegistryVerification {
 		}
 		assertEquals(exactDead, registry.require(active.agentId()), "post-commit barrier failure restores the exact DEAD record");
 		AgentTransition respawned = registry.respawnAtomically(active.agentId(), UUID.randomUUID(), START_TIME + 6L, (transition, commit) -> commit.run());
+		assertEquals(AgentLifecycleState.STARTING, respawned.after().state(), "respawn restarts a goal that death interrupted");
+		assertEquals(exactDead.goalRevision(), respawned.after().goalRevision(), "respawn preserves the interrupted goal revision");
+		assertTrue(registry.isCurrentActiveRevision(active.agentId(), exactDead.goalRevision()), "respawn accepts the same unfinished goal revision");
 		assertEquals(Optional.empty(), respawned.after().deathSnapshot(), "only successful respawn clears death snapshot");
-		return 17;
+
+		AgentRecord explicitlyPaused = AgentLifecycleReducer.stop(active, START_TIME + 4L).after();
+		AgentRecord pausedDead = AgentLifecycleReducer.die(explicitlyPaused, death, START_TIME + 5L).after();
+		AgentTransition pausedRespawn = AgentLifecycleReducer.respawn(pausedDead, UUID.randomUUID(), START_TIME + 6L);
+		assertEquals(AgentLifecycleState.PAUSED, pausedRespawn.after().state(), "respawn preserves an explicit user pause");
+		assertTrue(!pausedRespawn.after().acceptsRevision(pausedRespawn.after().goalRevision()), "paused respawn does not accept coordinator work");
+
+		AgentRecord disconnected = AgentLifecycleReducer.disconnect(active, START_TIME + 4L).after();
+		AgentRecord disconnectedDead = AgentLifecycleReducer.die(disconnected, death, START_TIME + 5L).after();
+		assertTrue(disconnectedDead.resumeAfterRespawn(), "death while disconnected retains automatic continuation intent");
+		AgentTransition disconnectedRespawn = AgentLifecycleReducer.respawn(disconnectedDead, UUID.randomUUID(), START_TIME + 6L);
+		assertEquals(AgentLifecycleState.STARTING, disconnectedRespawn.after().state(),
+				"respawn restarts a goal interrupted while the coordinator was disconnected");
+		assertEquals(disconnected.goalRevision(), disconnectedRespawn.after().goalRevision(),
+				"disconnected respawn preserves the unfinished goal revision");
+
+		GoalEvidence evidence = new GoalEvidence(4L, "inventory_contains", List.of(
+				new GoalEvidence.Fact("inventory_contains", true, "minecraft:iron_pickaxe x1", "minecraft:iron_pickaxe x1")
+		));
+		AgentRecord satisfied = AgentLifecycleReducer.satisfyGoal(
+				active, active.goalRevision(), evidence, START_TIME + 4L).after();
+		AgentRecord satisfiedDead = AgentLifecycleReducer.die(satisfied, death, START_TIME + 5L).after();
+		assertEquals(GoalStatus.SATISFIED, satisfiedDead.currentGoal().orElseThrow().status(),
+				"death retains factual completion evidence");
+		assertTrue(!satisfiedDead.resumeAfterRespawn(), "completed work has no continuation intent");
+		AgentTransition satisfiedRespawn = AgentLifecycleReducer.respawn(
+				satisfiedDead, UUID.randomUUID(), START_TIME + 6L);
+		assertEquals(AgentLifecycleState.COMPLETED, satisfiedRespawn.after().state(),
+				"respawn preserves the terminal lifecycle of a satisfied goal");
+		assertEquals(satisfied.goalRevision(), satisfiedRespawn.after().goalRevision(),
+				"completed respawn preserves the satisfied goal revision");
+		assertTrue(!satisfiedRespawn.after().acceptsRevision(satisfied.goalRevision()),
+				"completed respawn cannot restart terminal coordinator work");
+		AgentTransition nextGoal = AgentLifecycleReducer.start(
+				satisfiedRespawn.after(), "Get some wood", START_TIME + 7L);
+		assertEquals(AgentLifecycleState.STARTING, nextGoal.after().state(),
+				"a new goal can start normally after completed respawn");
+		assertEquals("Get some wood", nextGoal.after().currentGoal().orElseThrow().prompt(),
+				"new work replaces the retained completed goal");
+
+		String legacyWithoutContinuationIntent = encoded.replaceFirst(",\\\"resume_after_respawn\\\":true", "");
+		AgentRecord legacyDead = codec.decode(legacyWithoutContinuationIntent).records().getFirst();
+		assertTrue(!legacyDead.resumeAfterRespawn(), "legacy dead records fail safe without continuation intent");
+		assertEquals(AgentLifecycleState.PAUSED,
+				AgentLifecycleReducer.respawn(legacyDead, UUID.randomUUID(), START_TIME + 7L).after().state(),
+				"legacy dead records remain paused after respawn");
+		return 36;
 	}
 
 	private static void expectFailure(Runnable operation, String expectedCode) {

@@ -1,6 +1,6 @@
 import { types as nodeTypes } from 'node:util';
 
-import { MAX_BLOCKS, MAX_ENTITIES, MAX_INVENTORY_SUMMARIES, MAX_OBSERVATION_TAGS, MAX_TAG_COUNT_ENTRIES } from './constants.mjs';
+import { MAX_BLOCKS, MAX_EFFECTS, MAX_ENTITIES, MAX_INVENTORY_SUMMARIES, MAX_OBSERVATION_TAGS, MAX_TAG_COUNT_ENTRIES } from './constants.mjs';
 
 const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 const COORDINATE_FIELDS = ['x', 'y', 'z'];
@@ -8,7 +8,7 @@ const COORDINATE_FIELDS = ['x', 'y', 'z'];
 /** Converts one validated protocol-v2 observation into the narrow ArenaScript fact shape. */
 export function adaptObservation(value) {
 	const source = ownDataRecord(value, 'wire observation');
-	if (source.ready === false) return emptyFacts(source.status === 'PLAYER_DEAD');
+	if (source.ready === false) return { ...emptyFacts(source.status === 'PLAYER_DEAD'), ready: false, status: optionalIdentifier(source.status, 'wire observation.status') ?? 'unavailable' };
 	if (source.ready !== true) throw new TypeError('wire observation.ready must be boolean');
 
 	const position = vector(source.position, 'wire observation.position');
@@ -23,10 +23,21 @@ export function adaptObservation(value) {
 		dead: false,
 	};
 	copyNumber(playerSource, player, 'health');
+	copyNumber(playerSource, player, 'maxHealth');
 	copyNumber(playerSource, player, 'foodLevel', 'hunger');
+	copyNumber(playerSource, player, 'foodLevel');
+	copyNumber(playerSource, player, 'armor');
+	copyNumber(playerSource, player, 'saturation');
 	copyNumber(playerSource, player, 'air');
+	copyNumber(playerSource, player, 'maxAir');
 	copyBoolean(playerSource, player, 'onFire', 'fire');
+	copyBoolean(playerSource, player, 'onFire');
+	copyBoolean(playerSource, player, 'onGround');
+	copyBoolean(playerSource, player, 'inWater');
+	copyBoolean(playerSource, player, 'suffocating');
 	copyNumber(playerSource, player, 'fallDistance');
+	if (Object.hasOwn(playerSource, 'gameMode')) player.gameMode = identifier(playerSource.gameMode, 'player.gameMode');
+	if (Object.hasOwn(playerSource, 'effects')) player.effects = effectFacts(playerSource.effects);
 	if (Object.hasOwn(playerSource, 'lastAttacker')) player.lastAttacker = attackerFacts(playerSource.lastAttacker);
 
 	const entities = boundedDataArray(source.entities, 'entities', MAX_ENTITIES)
@@ -54,11 +65,23 @@ export function adaptObservation(value) {
 
 	const tagCounts = tagCountsFacts(inventorySource.tagCounts);
 	return {
+		ready: true,
+		...(Object.hasOwn(source, 'status') ? { status: identifier(source.status, 'wire observation.status') } : {}),
+		...(Object.hasOwn(source, 'velocity') ? { velocity: vector(source.velocity, 'wire observation.velocity') } : {}),
 		player,
 		items,
 		entities,
 		blocks,
-		inventory: { items: inventoryItems, ...(tagCounts === undefined ? {} : { tagCounts }) },
+		inventory: {
+			items: inventoryItems,
+			...(Object.hasOwn(inventorySource, 'selectedItem') ? { selectedItem: identifier(inventorySource.selectedItem, 'inventory.selectedItem') } : {}),
+			...(tagCounts === undefined ? {} : { tagCounts }),
+		},
+		...(Object.hasOwn(source, 'nearbyContainers') ? { nearbyContainers: nearbyContainerFacts(source.nearbyContainers) } : {}),
+		...(Object.hasOwn(source, 'world') ? { world: worldFacts(source.world) } : {}),
+		...(Object.hasOwn(source, 'currentAction') ? { currentAction: currentActionFacts(source.currentAction) } : {}),
+		...(Object.hasOwn(source, 'lastResult') ? { lastResult: lastResultFacts(source.lastResult) } : {}),
+		...(Object.hasOwn(source, 'interaction') ? { interaction: interactionFacts(source.interaction) } : {}),
 	};
 }
 
@@ -75,6 +98,8 @@ function entityFacts(value, index) {
 	const point = coordinateSource(source, `entities[${index}]`);
 	const type = identifier(source.type, `entities[${index}].type`);
 	const result = { stableId, type, x: point.x, y: point.y, z: point.z };
+	if (Object.hasOwn(source, 'name')) result.name = boundedText(source.name, `entities[${index}].name`, 256, true);
+	if (Object.hasOwn(source, 'isPlayer')) result.isPlayer = boolean(source.isPlayer, `entities[${index}].isPlayer`);
 	if (Object.hasOwn(source, 'distance')) result.distance = finiteNumber(source.distance, `entities[${index}].distance`);
 	if (Object.hasOwn(source, 'tags')) result.tags = tags(source.tags, `entities[${index}].tags`);
 	if (type === 'minecraft:item') {
@@ -88,18 +113,131 @@ function blockFacts(value, index) {
 	const source = ownDataRecord(value, `blocks[${index}]`);
 	const point = coordinateSource(source, `blocks[${index}]`);
 	const stableId = `${point.x},${point.y},${point.z}`;
-	return { stableId, blockId: identifier(source.blockId, `blocks[${index}].blockId`), ...(Object.hasOwn(source, 'tags') ? { tags: tags(source.tags, `blocks[${index}].tags`) } : {}), x: point.x, y: point.y, z: point.z };
+	return {
+		stableId,
+		blockId: identifier(source.blockId, `blocks[${index}].blockId`),
+		...(Object.hasOwn(source, 'placeableFaces') ? { placeableFaces: identifierList(source.placeableFaces, `blocks[${index}].placeableFaces`, 6) } : {}),
+		...(Object.hasOwn(source, 'tags') ? { tags: tags(source.tags, `blocks[${index}].tags`) } : {}),
+		x: point.x, y: point.y, z: point.z,
+	};
 }
 
 function inventoryFacts(value, index) {
 	const source = ownDataRecord(value, `inventory.items[${index}]`);
 	const slot = source.slot;
 	if (!(Number.isSafeInteger(slot) && slot >= 0) && typeof slot !== 'string') throw new TypeError(`inventory.items[${index}].slot must be a slot identifier`);
-	return {
+	const result = {
 		itemId: identifier(source.itemId, `inventory.items[${index}].itemId`),
 		count: nonNegativeInteger(source.count, `inventory.items[${index}].count`),
 		slot,
 		...(Object.hasOwn(source, 'tags') ? { tags: tags(source.tags, `inventory.items[${index}].tags`) } : {}),
+	};
+	if (Object.hasOwn(source, 'damage')) result.damage = nonNegativeInteger(source.damage, `inventory.items[${index}].damage`);
+	if (Object.hasOwn(source, 'maxDamage')) result.maxDamage = nonNegativeInteger(source.maxDamage, `inventory.items[${index}].maxDamage`);
+	if (Object.hasOwn(source, 'hotbar')) result.hotbar = boolean(source.hotbar, `inventory.items[${index}].hotbar`);
+	return result;
+}
+
+function effectFacts(value) {
+	return boundedDataArray(value, 'player.effects', MAX_EFFECTS).map((entry, index) => {
+		const source = ownDataRecord(entry, `player.effects[${index}]`);
+		return {
+			effectId: identifier(source.effectId, `player.effects[${index}].effectId`),
+			amplifier: nonNegativeInteger(source.amplifier, `player.effects[${index}].amplifier`),
+			duration: nonNegativeInteger(source.duration, `player.effects[${index}].duration`),
+		};
+	});
+}
+
+function nearbyContainerFacts(value) {
+	return boundedDataArray(value, 'nearbyContainers', 16).map((entry, index) => {
+		const source = ownDataRecord(entry, `nearbyContainers[${index}]`);
+		return {
+			x: integer(source.x, `nearbyContainers[${index}].x`),
+			y: integer(source.y, `nearbyContainers[${index}].y`),
+			z: integer(source.z, `nearbyContainers[${index}].z`),
+			blockId: identifier(source.blockId, `nearbyContainers[${index}].blockId`),
+			distance: finiteNumber(source.distance, `nearbyContainers[${index}].distance`),
+			withinInteractionRange: boolean(source.withinInteractionRange, `nearbyContainers[${index}].withinInteractionRange`),
+			capabilities: identifierList(source.capabilities, `nearbyContainers[${index}].capabilities`, 32),
+		};
+	});
+}
+
+function worldFacts(value) {
+	const source = ownDataRecord(value, 'wire observation.world');
+	return {
+		dimension: identifier(source.dimension, 'world.dimension'),
+		gameTime: nonNegativeInteger(source.gameTime, 'world.gameTime'),
+		dayTime: nonNegativeInteger(source.dayTime, 'world.dayTime'),
+		raining: boolean(source.raining, 'world.raining'),
+		thundering: boolean(source.thundering, 'world.thundering'),
+	};
+}
+
+function currentActionFacts(value) {
+	const source = ownDataRecord(value, 'wire observation.currentAction');
+	const active = boolean(source.active, 'currentAction.active');
+	return active ? {
+		active,
+		actionId: identifier(source.actionId, 'currentAction.actionId'),
+		actionType: identifier(source.actionType, 'currentAction.actionType'),
+	} : { active };
+}
+
+function lastResultFacts(value) {
+	const source = ownDataRecord(value, 'wire observation.lastResult');
+	const present = boolean(source.present, 'lastResult.present');
+	return present ? {
+		present,
+		actionId: identifier(source.actionId, 'lastResult.actionId'),
+		actionType: identifier(source.actionType, 'lastResult.actionType'),
+		state: identifier(source.state, 'lastResult.state'),
+		reasonCode: identifier(source.reasonCode, 'lastResult.reasonCode'),
+		message: boundedText(source.message, 'lastResult.message', 2_048, true),
+	} : { present };
+}
+
+function interactionFacts(value) {
+	const source = ownDataRecord(value, 'wire observation.interaction');
+	const input = ownDataRecord(source.input, 'interaction.input');
+	const menu = ownDataRecord(source.menu, 'interaction.menu');
+	const cursor = ownDataRecord(menu.cursor, 'interaction.menu.cursor');
+	const ray = ownDataRecord(source.rayTarget, 'interaction.rayTarget');
+	return {
+		mainHandItemId: identifier(source.mainHandItemId, 'interaction.mainHandItemId'),
+		offHandItemId: identifier(source.offHandItemId, 'interaction.offHandItemId'),
+		usingItem: boolean(source.usingItem, 'interaction.usingItem'),
+		activeHand: identifier(source.activeHand, 'interaction.activeHand'),
+		useRemainingTicks: nonNegativeInteger(source.useRemainingTicks, 'interaction.useRemainingTicks'),
+		attackCooldown: finiteNumber(source.attackCooldown, 'interaction.attackCooldown'),
+		input: {
+			active: boolean(input.active, 'interaction.input.active'),
+			forward: finiteNumber(input.forward, 'interaction.input.forward'),
+			strafe: finiteNumber(input.strafe, 'interaction.input.strafe'),
+			jump: boolean(input.jump, 'interaction.input.jump'),
+			sneak: boolean(input.sneak, 'interaction.input.sneak'),
+			sprint: boolean(input.sprint, 'interaction.input.sprint'),
+			attack: boolean(input.attack, 'interaction.input.attack'),
+			use: boolean(input.use, 'interaction.input.use'),
+			yaw: finiteNumber(input.yaw, 'interaction.input.yaw'),
+			pitch: finiteNumber(input.pitch, 'interaction.input.pitch'),
+			selectedSlot: nonNegativeInteger(input.selectedSlot, 'interaction.input.selectedSlot'),
+			hand: identifier(input.hand, 'interaction.input.hand'),
+		},
+		menu: {
+			type: identifier(menu.type, 'interaction.menu.type'),
+			cursor: { itemId: identifier(cursor.itemId, 'interaction.menu.cursor.itemId'), count: nonNegativeInteger(cursor.count, 'interaction.menu.cursor.count') },
+			slots: boundedDataArray(menu.slots, 'interaction.menu.slots', 64).map((entry, index) => {
+				const slot = ownDataRecord(entry, `interaction.menu.slots[${index}]`);
+				return { slot: nonNegativeInteger(slot.slot, `interaction.menu.slots[${index}].slot`), itemId: identifier(slot.itemId, `interaction.menu.slots[${index}].itemId`), count: nonNegativeInteger(slot.count, `interaction.menu.slots[${index}].count`) };
+			}),
+			capabilities: identifierList(menu.capabilities, 'interaction.menu.capabilities', 8),
+		},
+		rayTarget: ray.type === 'block' ? {
+			type: 'block', x: integer(ray.x, 'interaction.rayTarget.x'), y: integer(ray.y, 'interaction.rayTarget.y'), z: integer(ray.z, 'interaction.rayTarget.z'),
+			face: identifier(ray.face, 'interaction.rayTarget.face'), blockId: identifier(ray.blockId, 'interaction.rayTarget.blockId'),
+		} : { type: identifier(ray.type, 'interaction.rayTarget.type') },
 	};
 }
 
@@ -108,6 +246,12 @@ function tags(value, label) {
 		if (typeof tag !== 'string' || !tag.startsWith('#') || tag.length < 2 || tag.length > 256) throw new TypeError(`${label}[${index}] must be a tag identifier`);
 		return tag;
 	});
+	if (new Set(values).size !== values.length) throw new TypeError(`${label} must be unique`);
+	return values;
+}
+
+function identifierList(value, label, maximum) {
+	const values = boundedDataArray(value, label, maximum).map((entry, index) => identifier(entry, `${label}[${index}]`));
 	if (new Set(values).size !== values.length) throw new TypeError(`${label} must be unique`);
 	return values;
 }
@@ -173,6 +317,22 @@ function identifier(value, label) {
 	return value;
 }
 
+function optionalIdentifier(value, label) {
+	return value === undefined ? undefined : identifier(value, label);
+}
+
+function boundedText(value, label, maximumCodePoints, allowEmpty = false) {
+	if (typeof value !== 'string' || (!allowEmpty && value.length === 0) || [...value].length > maximumCodePoints) {
+		throw new TypeError(`${label} must be bounded text`);
+	}
+	return value;
+}
+
+function boolean(value, label) {
+	if (typeof value !== 'boolean') throw new TypeError(`${label} must be boolean`);
+	return value;
+}
+
 function finiteNumber(value, label) {
 	if (typeof value !== 'number' || !Number.isFinite(value)) throw new TypeError(`${label} must be a finite number`);
 	return value;
@@ -180,6 +340,11 @@ function finiteNumber(value, label) {
 
 function positiveInteger(value, label) {
 	if (!Number.isSafeInteger(value) || value < 1) throw new TypeError(`${label} must be a positive integer`);
+	return value;
+}
+
+function integer(value, label) {
+	if (!Number.isSafeInteger(value)) throw new TypeError(`${label} must be a safe integer`);
 	return value;
 }
 

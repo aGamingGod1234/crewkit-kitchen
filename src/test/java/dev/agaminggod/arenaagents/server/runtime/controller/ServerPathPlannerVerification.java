@@ -46,9 +46,41 @@ public final class ServerPathPlannerVerification {
 		assertEquals(first.nodes(), second.nodes(), "server planning is deterministic");
 		assertTrue(first.nodes().stream().noneMatch(node -> blocked.contains(node.position())),
 				"server plan does not cross blocked cells");
-		return 3 + verifyDeferredPlanningIsRetryable() + verifySharedElapsedBudget()
-				+ verifyRoundRobinAdmissionEventuallyServesAll()
+		return 3 + verifyElevationAndHoleSafety() + verifyDeferredPlanningIsRetryable() + verifySharedElapsedBudget()
+				+ verifyRoundRobinAdmissionEventuallyServesAll() + verifyContentionDeferralWindow()
 				+ verifyTickScopeRestoresPreviousBudget();
+	}
+
+	private static int verifyElevationAndHoleSafety() {
+		ServerPathPlanner planner = new ServerPathPlanner();
+		GridPosition hole = new GridPosition(1, 64, 0);
+		GridPosition lava = new GridPosition(1, 64, 1);
+		WalkabilityView detour = position -> {
+			if (position.equals(lava)) return WalkabilityView.Cell.HAZARD;
+			if (position.y() == 63 && position.x() == hole.x() && position.z() == hole.z()) return WalkabilityView.Cell.CLEAR;
+			if (position.y() == 63) return WalkabilityView.Cell.SAFE_SUPPORT;
+			return position.y() == 64 || position.y() == 65
+					? WalkabilityView.Cell.CLEAR
+					: WalkabilityView.Cell.BLOCKED;
+		};
+		PathPlan aroundHole = planner.findPath(detour, new GridPosition(0, 64, 0), new GridPosition(2, 64, 0));
+		assertEquals(PathOutcome.FOUND, aroundHole.outcome(), "planner deterministically routes around a hole and lava");
+		assertTrue(aroundHole.nodes().stream().noneMatch(node -> node.position().equals(hole) || node.position().equals(lava)),
+				"hole and lava cells never enter the route");
+
+		WalkabilityView elevation = position -> {
+			if (position.equals(new GridPosition(1, 64, 0))) return WalkabilityView.Cell.SAFE_SUPPORT;
+			if (position.y() == 63) return WalkabilityView.Cell.SAFE_SUPPORT;
+			return position.y() >= 64 && position.y() <= 66
+					? WalkabilityView.Cell.CLEAR
+					: WalkabilityView.Cell.BLOCKED;
+		};
+		PathPlan stepUp = planner.findPath(elevation, new GridPosition(0, 64, 0), new GridPosition(1, 65, 0));
+		assertEquals(PathOutcome.FOUND, stepUp.outcome(), "one-block elevation has a bounded route");
+		assertEquals(dev.agaminggod.arenaagents.client.navigation.TraversalType.JUMP_UP,
+				stepUp.nodes().get(stepUp.nodes().size() - 1).traversal(),
+				"one-block elevation requires the safe jump-up traversal");
+		return 5;
 	}
 
 	private static int verifyDeferredPlanningIsRetryable() {
@@ -160,6 +192,37 @@ public final class ServerPathPlannerVerification {
 		assertTrue(second.deferred(), "elapsed tick budget defers every later request in the same tick");
 		assertEquals(0, budget.expandedNodes(), "elapsed exhaustion performs no expansion");
 		return 4;
+	}
+
+	private static int verifyContentionDeferralWindow() {
+		ServerPathPlanner planner = new ServerPathPlanner();
+		WalkabilityView view = position -> position.y() == 63
+				? WalkabilityView.Cell.SAFE_SUPPORT
+				: position.y() >= 64 && position.y() <= 65
+						? WalkabilityView.Cell.CLEAR
+						: WalkabilityView.Cell.BLOCKED;
+		for (int tick = 0; tick < 6; tick++) {
+			ServerPathPlanner.TickBudget budget = new ServerPathPlanner.TickBudget(
+					1,
+					LocalPathfinder.MAX_PLANNING_TIME_NANOS,
+					() -> 0L
+			);
+			ServerPathPlanner.PlanningResult admitted = planner.planPath(
+					view,
+					new GridPosition(0, 64, tick),
+					new GridPosition(1, 64, tick),
+					budget
+			);
+			ServerPathPlanner.PlanningResult deferred = planner.planPath(
+					view,
+					new GridPosition(0, 64, tick + 100),
+					new GridPosition(1, 64, tick + 100),
+					budget
+			);
+			assertEquals(PathOutcome.FOUND, admitted.plan().outcome(), "contention admits the first agent");
+			assertTrue(deferred.deferred(), "contention defers the second agent without terminal failure");
+		}
+		return 12;
 	}
 
 	private static int verifyTickScopeRestoresPreviousBudget() {

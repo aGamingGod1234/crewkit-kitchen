@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import { MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { completionContractFingerprint } from '../src/goal-contract.mjs';
+import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 
 const SECRET = 's'.repeat(32);
 const LAUNCH_ID = '00000000-0000-0000-0000-000000000123';
@@ -13,6 +14,11 @@ const PROVENANCE = Object.freeze({
 	provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority',
 	programId: 'program-1-1', programVersion: 1, sourceStepId: 'step-80-126', eventSequence: 4,
 });
+
+const VERBOSE_STAGES = Object.freeze([
+	'conversation', 'lifecycle', 'planner', 'provider', 'output', 'decision',
+	'action', 'progress', 'result', 'retry', 'error',
+]);
 
 class FakeSocket extends EventEmitter {
 	writes = [];
@@ -33,16 +39,35 @@ class FakeSocket extends EventEmitter {
 	}
 }
 
-function serverEnvelope(type, agentId, messageId, payload = {}) {
-	return { protocolVersion: 2, serverInstanceId: 'server-instance', agentId, type, messageId, payload };
+class ManualTimerQueue {
+	#nextId = 0;
+	#timers = new Map();
+
+	schedule = (callback, delay) => {
+		const handle = { id: ++this.#nextId };
+		this.#timers.set(handle.id, { handle, callback, delay });
+		return handle;
+	};
+
+	cancel = (handle) => this.#timers.delete(handle?.id);
+
+	async runDelay(delay) {
+		const timer = [...this.#timers.values()].find((candidate) => candidate.delay === delay);
+		if (timer === undefined) throw new Error(`no ${delay}ms timer is pending`);
+		this.#timers.delete(timer.handle.id);
+		await timer.callback();
+	}
 }
 
-test('optional launch identity fences supervised coordinator authentication', async () => {
+test('optional launch identity is authenticated without weakening manual coordinators', async () => {
 	assert.deepEqual(validateProtocolV2Payload('hello', { secret: SECRET }), { secret: SECRET });
 	assert.deepEqual(validateProtocolV2Payload('hello', { secret: SECRET, launchId: LAUNCH_ID }), {
 		secret: SECRET,
 		launchId: LAUNCH_ID,
 	});
+	assert.deepEqual(validateProtocolV2Payload('hello_ack', {
+		replyTo: 'coordinator-v2-1', authenticated: true, registry: [], launchId: LAUNCH_ID,
+	}), { replyTo: 'coordinator-v2-1', authenticated: true, registry: [], launchId: LAUNCH_ID });
 
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, launchId: LAUNCH_ID }, {
@@ -62,7 +87,8 @@ test('optional launch identity fences supervised coordinator authentication', as
 		registry: [],
 		launchId: LAUNCH_ID,
 	}))}\n`);
-	assert.equal((await ready)[0].launchId, LAUNCH_ID);
+	const [connection] = await ready;
+	assert.equal(connection.launchId, LAUNCH_ID);
 	bridge.stop();
 
 	const staleSocket = new FakeSocket();
@@ -82,8 +108,40 @@ test('optional launch identity fences supervised coordinator authentication', as
 		registry: [],
 		launchId: '00000000-0000-0000-0000-000000000999',
 	}))}\n`);
-	assert.equal((await rejected)[0].code, 'LAUNCH_ID_MISMATCH');
+	const [error] = await rejected;
+	assert.equal(error.code, 'LAUNCH_ID_MISMATCH');
 	staleBridge.stop();
+});
+
+function serverEnvelope(type, agentId, messageId, payload = {}) {
+	return { protocolVersion: 2, serverInstanceId: 'server-instance', agentId, type, messageId, payload };
+}
+
+test('verbose control and events use strict authenticated scopes, stages, revisions, and message bounds', () => {
+	assert.deepEqual(validateProtocolV2Payload('verbose_control', { enabled: true }), { enabled: true });
+	assert.throws(() => validateProtocolV2Payload('verbose_control', { enabled: true, agentId: 'agent-a' }), /field/i);
+	assert.throws(() => validateProtocolV2Payload('verbose_control', { enabled: 'true' }), /boolean/i);
+	assert.deepEqual(
+		validateProtocolV2Envelope(serverEnvelope('verbose_control', 'server', 'verbose-on', { enabled: true }), { direction: 'server_to_coordinator' }).payload,
+		{ enabled: true },
+	);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('verbose_control', 'agent-a', 'verbose-agent', { enabled: true }), { direction: 'server_to_coordinator' }),
+		/agentId 'server'/i,
+	);
+
+	for (const stage of VERBOSE_STAGES) {
+		assert.deepEqual(validateProtocolV2Payload('verbose_event', { goalRevision: 4, stage, message: 'Visible progress.' }), {
+			goalRevision: 4, stage, message: 'Visible progress.',
+		});
+	}
+	assert.throws(() => validateProtocolV2Payload('verbose_event', { goalRevision: 4, stage: 'reasoning', message: 'hidden' }), /stage/i);
+	assert.throws(() => validateProtocolV2Payload('verbose_event', { goalRevision: 4, stage: 'planner', message: 'x'.repeat(257) }), /message/i);
+	assert.throws(() => validateProtocolV2Payload('verbose_event', { goalRevision: 4, stage: 'planner', message: 'ok', detail: 'private' }), /field/i);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('verbose_event', 'server', 'verbose-server', { goalRevision: 4, stage: 'planner', message: 'ok' }), { direction: 'coordinator_to_server' }),
+		/agent id|agent scope/i,
+	);
 });
 
 test('coordinator status is strict, bounded, and excludes private planner data', () => {
@@ -97,6 +155,22 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 		circuits: [{ provider: 'codex', model: 'gpt-5.6-sol', operation: 'decide', count: 2, p50Ms: 100, p95Ms: 200, failureRate: 0, circuit: 'closed' }],
 	};
 	assert.deepEqual(validateProtocolV2Payload('coordinator_status', payload), { ...payload, latencies: [] });
+	const extended = {
+		...payload,
+		profiles: [{ ...payload.profiles[0], serviceTier: 'priority' }],
+		bridgeSessionEpoch: 3,
+		runtimeGeneration: 'a'.repeat(64),
+		components: [{
+			component: 'provider:codex', state: 'degraded', fallbackMode: 'last_valid', boundary: 'create',
+			failureCode: 'PROVIDER_TIMEOUT', consecutiveFailureCount: 2, nextProbeAtEpochMs: 4_000,
+			generation: 3, lastRecoveryAtEpochMs: null,
+		}],
+	};
+	assert.deepEqual(validateProtocolV2Payload('coordinator_status', extended), { ...extended, latencies: [] });
+	assert.throws(() => validateProtocolV2Payload('coordinator_status', {
+		...extended,
+		components: [{ ...extended.components[0], privatePath: 'C:\\private\\secret.txt' }],
+	}), /field/i);
 	assert.deepEqual(validateProtocolV2Payload('coordinator_status', {
 		...payload,
 		scheduler: { ...payload.scheduler, active: 3, target: 2 },
@@ -131,27 +205,26 @@ test('coordinator status is strict, bounded, and excludes private planner data',
 	}), /field/i);
 });
 
-test('protocol v2 carries a revision/profile/trace-bound factual goal completion request', () => {
-	const completionContract = { goalRevision: 4, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
+test('protocol v2 carries a revision/profile/trace-bound server goal verification request', () => {
+	const goalFingerprint = 'a'.repeat(64);
 	const payload = {
 		goalRevision: 4,
-		completionContract,
+		goalFingerprint,
 		traceId: TRACE_ID,
 		profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' },
-		contractHash: completionContractFingerprint(completionContract),
 	};
 	assert.deepEqual(validateProtocolV2Payload('goal_completed', payload), payload);
 	assert.throws(
 		() => validateProtocolV2Payload('goal_completed', { goalRevision: 4 }),
-		error => error.code === 'CONTRACT_REQUIRED',
-		'goal completion cannot fall back to a revision-only proof',
+		/required/i,
+		'goal verification requires the immutable server fingerprint and provenance',
 	);
-	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, contractHash: 'sha256:wrong' }), /contractHash/i);
+	assert.throws(() => validateProtocolV2Payload('goal_completed', { ...payload, goalFingerprint: 'wrong' }), /goalFingerprint/i);
 	const completionResult = {
-		goalRevision: 4, traceId: TRACE_ID, contractHash: payload.contractHash, verified: false, reasonCode: 'PREDICATE_FAILED',
+		goalRevision: 4, traceId: TRACE_ID, goalFingerprint, verified: false, reasonCode: 'PREDICATE_FAILED',
 		facts: [
-			{ predicateIndex: 0, type: 'inventory_min', satisfied: false, observedValue: '0' },
-			{ predicateIndex: 1, type: 'position_within', satisfied: true, observedValue: '1.25' },
+			{ type: 'inventory_contains', satisfied: false, expectedValue: 'minecraft:wooden_pickaxe x1', observedValue: 'minecraft:wooden_pickaxe x0' },
+			{ type: 'position_within', satisfied: true, expectedValue: '0.0,64.0,0.0 radius=2.0', observedValue: '0.0,64.0,1.25 stableTicks=2' },
 		],
 	};
 	assert.deepEqual(validateProtocolV2Payload('goal_completion_result', completionResult), completionResult);
@@ -184,6 +257,87 @@ test('protocol v2 carries one acknowledged conversation wake transaction', () =>
 		'the nested conversation recipient must match the envelope agent',
 	);
 });
+
+test('protocol v2 carries bounded goal translation requests, proposals, and results', () => {
+	const request = {
+		requestId: '00000000-0000-0000-0000-000000000201',
+		originalRequest: 'Get a good pickaxe',
+		candidateIds: ['minecraft:iron_pickaxe', 'minecraft:diamond_pickaxe'],
+	};
+	const proposal = {
+		requestId: request.requestId,
+		summary: 'Obtain an iron or diamond pickaxe',
+		predicate: {
+			type: 'any_of',
+			predicates: request.candidateIds.map(itemId => ({ type: 'inventory_contains', itemId, count: 1 })),
+		},
+	};
+	assert.deepEqual(validateProtocolV2Payload('goal_spec_request', request), request);
+	assert.deepEqual(validateProtocolV2Payload('goal_spec_proposal', proposal), proposal);
+	assert.deepEqual(validateProtocolV2Payload('goal_spec_result', {
+		requestId: request.requestId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED',
+	}), { requestId: request.requestId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' });
+	assert.throws(() => validateProtocolV2Payload('goal_spec_request', { ...request, extra: true }), /field/i);
+	assert.throws(() => validateProtocolV2Payload('goal_spec_proposal', {
+		...proposal, predicate: { type: 'action_success_count', count: 1 },
+	}), error => error?.code === 'UNKNOWN_GOAL_PREDICATE');
+	assert.throws(() => validateProtocolV2Payload('goal_spec_result', {
+		requestId: request.requestId, status: 'maybe', reasonCode: 'UNKNOWN',
+	}), /status/i);
+	assert.equal(validateProtocolV2Envelope(serverEnvelope(
+		'goal_spec_request', 'agent-a', 'goal-spec-request-1', request,
+	), { direction: 'server_to_coordinator' }).type, 'goal_spec_request');
+	assert.throws(() => validateProtocolV2Envelope(serverEnvelope(
+		'goal_spec_proposal', 'agent-a', 'goal-spec-proposal-wrong-way', proposal,
+	), { direction: 'server_to_coordinator' }), /message type/i);
+});
+
+test('goal lifecycle messages retain the full immutable server-authored goal specification', () => {
+	const goalSpec = goalSpecFixture({
+		originalRequest: 'Get an iron pickaxe',
+		predicate: { type: 'inventory_contains', itemId: 'minecraft:iron_pickaxe', count: 1 },
+		createdAtTick: 1200,
+	});
+	const queuedSpec = goalSpecFixture({
+		originalRequest: 'Get a diamond pickaxe',
+		predicate: { type: 'inventory_contains', itemId: 'minecraft:diamond_pickaxe', count: 1 },
+		createdAtTick: 1200,
+	});
+	const control = validateProtocolV2Payload('goal_control', {
+		operation: 'start', goalRevision: 1, updatedAtEpochMs: 2, goal: goalSpec.originalRequest, goalSpec,
+	});
+	assert.deepEqual(control.goalSpec, goalSpec);
+	assert.throws(() => { control.goalSpec.predicate.count = 2; }, TypeError);
+	const replacement = validateProtocolV2Payload('goal_control', {
+		operation: 'replace', goalRevision: 2, updatedAtEpochMs: 3, goal: goalSpec.originalRequest, goalSpec,
+	});
+	assert.equal(replacement.operation, 'replace');
+	assert.deepEqual(replacement.goalSpec, goalSpec);
+	const dequeued = validateProtocolV2Payload('goal_control', {
+		operation: 'dequeue', goalRevision: 2, updatedAtEpochMs: 4, goal: queuedSpec.originalRequest, goalSpec: queuedSpec,
+	});
+	assert.equal(dequeued.operation, 'dequeue');
+	assert.deepEqual(dequeued.goalSpec, queuedSpec);
+	assert.throws(() => validateProtocolV2Payload('goal_control', {
+		operation: 'replace', goalRevision: 2, updatedAtEpochMs: 3,
+	}), /requires goal/i);
+	assert.throws(() => validateProtocolV2Payload('goal_control', {
+		operation: 'dequeue', goalRevision: 2, updatedAtEpochMs: 4,
+	}), /requires goal/i);
+	const registered = validateProtocolV2Payload('hello_ack', {
+		replyTo: 'coordinator-1', authenticated: true,
+		registry: [{
+			...registeredRecord(), state: 'PAUSED', currentGoal: goalSpec.originalRequest, currentGoalSpec: goalSpec,
+			queue: ['Get a diamond pickaxe'], queueGoalSpecs: [queuedSpec],
+		}],
+	}).registry[0];
+	assert.deepEqual(registered.currentGoalSpec, goalSpec);
+	assert.equal(registered.queue[0].goalSpec.predicate.itemId, 'minecraft:diamond_pickaxe');
+});
+
+function goalSpecFixture(fields) {
+	return { ...fields, fingerprint: goalSpecFingerprint(fields) };
+}
 
 test('protocol v2 requires immutable provenance on every action command form', () => {
 	const payload = {
@@ -272,6 +426,49 @@ test('traced action commands, progress, and results round-trip one bounded trace
 	}), /traceId/i);
 });
 
+test('terminal result acknowledgements are strict and make replay idempotent', async (t) => {
+	assert.deepEqual(
+		validateProtocolV2Payload('action_result_ack', { goalRevision: 4, actionId: 'action-ack-1' }),
+		{ goalRevision: 4, actionId: 'action-ack-1' },
+	);
+	assert.throws(
+		() => validateProtocolV2Envelope(serverEnvelope('action_result_ack', 'server', 'ack-server', { goalRevision: 4, actionId: 'action-ack-1' }), { direction: 'coordinator_to_server' }),
+		(error) => error.code === 'INVALID_AGENT_SCOPE',
+	);
+
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-ack-ready', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+	const payload = actionResult('action-ack-1');
+	const delivered = [];
+	const errors = [];
+	bridge.on('action_result', (event) => delivered.push(event));
+	bridge.on('protocolError', (error) => errors.push(error));
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-ack-1', payload))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(delivered.length, 1);
+	await bridge.acknowledgeActionResult('agent-a', payload, { connectionEpoch: 1 });
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'action_result_ack');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-ack-replay', payload))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(delivered.length, 1, 'acknowledged replay is not emitted twice');
+	assert.deepEqual(errors, [], 'acknowledged replay does not tear down the bridge');
+	assert.equal(socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length, 2, 'replay is re-acknowledged');
+});
+
 test('protocol v2 accepts only coordinate-free respawn arguments', () => {
 	const payload = {
 		traceId: TRACE_ID, goalRevision: 7, actionId: 'respawn-1', actionType: 'respawn', arguments: {}, provenance: PROVENANCE,
@@ -327,6 +524,21 @@ test('protocol v2 accepts exact death facts only on dead lifecycle control', () 
 	assert.throws(
 		() => validateProtocolV2Payload('goal_control', { operation: 'start', goalRevision: 8, updatedAtEpochMs: 18, goal: 'run', death }),
 		/must not include death/,
+	);
+});
+
+test('goal respawn control accepts only an optional strict resumeGoal flag and defaults it off', () => {
+	const control = { operation: 'respawn', goalRevision: 9, updatedAtEpochMs: 20 };
+	assert.deepEqual(validateProtocolV2Payload('goal_control', control), { ...control, resumeGoal: false });
+	assert.deepEqual(validateProtocolV2Payload('goal_control', { ...control, resumeGoal: true }), { ...control, resumeGoal: true });
+	assert.deepEqual(validateProtocolV2Payload('goal_control', { ...control, resumeGoal: false }), { ...control, resumeGoal: false });
+	assert.throws(
+		() => validateProtocolV2Payload('goal_control', { ...control, resumeGoal: 'true' }),
+		/boolean/i,
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('goal_control', { operation: 'resume', goalRevision: 9, updatedAtEpochMs: 20, resumeGoal: true }),
+		/resumeGoal|respawn/i,
 	);
 });
 
@@ -596,6 +808,157 @@ test('audit callback failures never interrupt bridge delivery', async () => {
 	bridge.stop();
 });
 
+test('bridge preserves ready and disconnected events while exposing authenticated recovery', async (t) => {
+	const sockets = [];
+	let scheduledReconnect = null;
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, reconnectDelayMs: 1 }, {
+		socketFactory: () => {
+			const socket = new FakeSocket();
+			sockets.push(socket);
+			return socket;
+		},
+		schedule: (callback) => { scheduledReconnect = callback; return 1; },
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	const readyEvents = [];
+	const deliveredResults = [];
+	const activeRecord = { ...registeredRecord(), goalRevision: 4 };
+	const disconnected = once(bridge, 'disconnected');
+	bridge.on('ready', (event) => readyEvents.push(event));
+	bridge.on('action_result', (event) => deliveredResults.push(event));
+	const recovered = once(bridge, 'recovered');
+
+	bridge.start();
+	sockets[0].emit('connect');
+	const firstHello = JSON.parse(sockets[0].writes[0]);
+	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: firstHello.messageId, authenticated: true, registry: [activeRecord],
+	}))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-before-reconnect', actionResult('action-before-reconnect')))}\n`);
+	sockets[0].destroy();
+	const [disconnectedEvent] = await disconnected;
+	assert.equal(disconnectedEvent.connectionEpoch, 1);
+	assert.equal(typeof scheduledReconnect, 'function');
+
+	scheduledReconnect();
+	sockets[1].emit('connect');
+	const secondHello = JSON.parse(sockets[1].writes[0]);
+	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-2', {
+		replyTo: secondHello.messageId, authenticated: true, registry: [activeRecord],
+	}))}\n`);
+	const [recovery] = await recovered;
+
+	assert.equal(readyEvents.length, 2);
+	assert.deepEqual(readyEvents.map(({ connectionEpoch }) => connectionEpoch), [1, 2]);
+	assert.equal(recovery.connectionEpoch, 2);
+	assert.equal(recovery.serverInstanceId, 'server-instance');
+	assert.equal(recovery.registry.length, 1);
+	assert.equal(recovery.registry[0].agentId, 'agent-a');
+	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replayed', actionResult('action-before-reconnect')))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(deliveredResults.length, 1, 'socket-drop replay must not be emitted twice');
+	await bridge.acknowledgeActionResult('agent-a', actionResult('action-before-reconnect'), { connectionEpoch: 2 });
+	assert.equal(JSON.parse(sockets[1].writes.at(-1)).type, 'action_result_ack');
+});
+
+test('bridge destroys and reconnects a connected peer that misses the handshake deadline', async (t) => {
+	const socket = new FakeSocket();
+	const deadlines = new ManualTimerQueue();
+	let reconnect = null;
+	const bridge = new MultiplexedServerBridge({
+		port: 25570,
+		secret: SECRET,
+		reconnectDelayMs: 7,
+		handshakeTimeoutMs: 11,
+		heartbeatIntervalMs: 13,
+		heartbeatTimeoutMs: 29,
+	}, {
+		socketFactory: () => socket,
+		schedule: (callback) => { reconnect = callback; return 1; },
+		cancelSchedule: () => {},
+		scheduleDeadline: deadlines.schedule,
+		cancelDeadline: deadlines.cancel,
+		currentRevision: () => 0,
+	});
+	t.after(() => bridge.stop());
+	const errors = [];
+	bridge.on('protocolError', (error) => errors.push(error));
+	bridge.start();
+	socket.emit('connect');
+
+	await deadlines.runDelay(11);
+	assert.equal(socket.destroyed, true);
+	assert.equal(errors.at(-1)?.code, 'HANDSHAKE_TIMEOUT');
+	assert.equal(typeof reconnect, 'function');
+});
+
+test('bridge probes an authenticated peer and reconnects when heartbeat silence reaches its deadline', async (t) => {
+	const socket = new FakeSocket();
+	const deadlines = new ManualTimerQueue();
+	let reconnect = null;
+	const bridge = new MultiplexedServerBridge({
+		port: 25570,
+		secret: SECRET,
+		reconnectDelayMs: 7,
+		handshakeTimeoutMs: 11,
+		heartbeatIntervalMs: 13,
+		heartbeatTimeoutMs: 29,
+	}, {
+		socketFactory: () => socket,
+		schedule: (callback) => { reconnect = callback; return 1; },
+		cancelSchedule: () => {},
+		scheduleDeadline: deadlines.schedule,
+		cancelDeadline: deadlines.cancel,
+		currentRevision: () => 0,
+	});
+	t.after(() => bridge.stop());
+	const errors = [];
+	bridge.on('protocolError', (error) => errors.push(error));
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await deadlines.runDelay(13);
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'heartbeat');
+
+	await deadlines.runDelay(29);
+	assert.equal(socket.destroyed, true);
+	assert.equal(errors.at(-1)?.code, 'HEARTBEAT_TIMEOUT');
+	assert.equal(typeof reconnect, 'function');
+});
+
+test('terminal action replay stays rejected after bounded diagnostic history rolls over', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 0,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	for (let index = 0; index <= 4_096; index += 1) {
+		const actionId = `action-${index}`;
+		socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', `server-result-${index}`, actionResult(actionId, 0)))}\n`);
+	}
+	const errors = [];
+	bridge.on('protocolError', (error) => errors.push(error));
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replay', actionResult('action-0', 0)))}\n`);
+
+	assert.equal(socket.destroyed, true);
+	assert.equal(errors.at(-1)?.code, 'DUPLICATE_TERMINAL_RESULT');
+});
+
 test('multiplexed bridge rejects stale revisions before writing', async () => {
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
@@ -618,6 +981,10 @@ test('multiplexed bridge rejects stale revisions before writing', async () => {
 		arguments: { durationMs: 25 },
 		provenance: PROVENANCE,
 	}), (error) => error.code === 'STALE_GOAL_REVISION');
+	await assert.rejects(
+		bridge.send('verbose_event', 'agent-a', { goalRevision: 8, stage: 'planner', message: 'Stale planner event.' }),
+		(error) => error.code === 'STALE_GOAL_REVISION',
+	);
 	assert.equal(socket.writes.length, 1);
 	bridge.stop();
 });
@@ -677,6 +1044,47 @@ test('multiplexed bridge bounds queued messages per agent while socket is backpr
 	socket.emit('drain');
 	await queued;
 	bridge.stop();
+});
+
+test('lossy verbose traffic cannot consume control capacity while the socket is backpressured', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, connectionQueueCap: 1, agentQueueCap: 1 }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 1,
+	});
+	bridge.start();
+	t.after(() => bridge.stop());
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+
+	socket.writable = false;
+	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	const verboseResults = Array.from({ length: 8 }, (_, index) => bridge.send('verbose_event', 'agent-a', {
+		goalRevision: 1, stage: 'output', message: `visible-${index}`,
+	}).catch((error) => error));
+	const actionResult = bridge.send('action_command', 'agent-a', {
+		traceId: TRACE_ID,
+		goalRevision: 1,
+		actionId: 'action-after-verbose',
+		actionType: 'wait',
+		arguments: { durationMs: 25 },
+		provenance: PROVENANCE,
+	}).catch((error) => error);
+
+	socket.writable = true;
+	socket.emit('drain');
+	assert.equal((await Promise.all(verboseResults)).some((value) => value instanceof Error), false);
+	assert.equal(await actionResult instanceof Error, false);
+	const wires = socket.writes.map((wire) => JSON.parse(wire));
+	assert.equal(wires.some(({ type }) => type === 'verbose_event'), false, 'blocked verbose events are dropped');
+	assert.equal(wires.some(({ type }) => type === 'action_command'), true, 'control traffic keeps the reserved queue slot');
 });
 
 test('a newer lifecycle revision removes queued stale action commands under backpressure', async (t) => {
@@ -751,7 +1159,7 @@ test('a newer lifecycle revision removes queued stale agent readiness under back
 
 test('strict payload validators accept every current wire shape and reject unknown fields', () => {
 	const catalog = { refreshedAtEpochMs: 1, models: [{ id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT 5.6 Sol', reasoningEfforts: ['high'], serviceTiers: ['fast'] }] };
-	const completionContract = { goalRevision: 1, predicates: [{ type: 'inventory_min', itemId: 'minecraft:wooden_pickaxe', count: 1 }] };
+	const goalFingerprint = 'a'.repeat(64);
 	const messages = [
 		['hello', { secret: SECRET }],
 		['hello_ack', { replyTo: 'coordinator-1', authenticated: true, registry: [registeredRecord()] }],
@@ -765,8 +1173,8 @@ test('strict payload validators accept every current wire shape and reject unkno
 		['action_result', actionResult('action-1', 1)],
 		['agent_ready', { goalRevision: 1, reconciled: true }],
 		['planning_state', { goalRevision: 1, state: 'PLANNING' }],
-		['goal_completed', { goalRevision: 1, completionContract, traceId: TRACE_ID, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' }, contractHash: completionContractFingerprint(completionContract) }],
-		['goal_completion_result', { goalRevision: 1, traceId: TRACE_ID, contractHash: completionContractFingerprint(completionContract), verified: false, reasonCode: 'PREDICATE_FAILED', facts: [] }],
+		['goal_completed', { goalRevision: 1, goalFingerprint, traceId: TRACE_ID, profile: { provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'priority' } }],
+		['goal_completion_result', { goalRevision: 1, traceId: TRACE_ID, goalFingerprint, verified: false, reasonCode: 'PREDICATE_FAILED', facts: [] }],
 		['action_command', { traceId: TRACE_ID, goalRevision: 1, actionId: 'action-1', actionType: 'wait', arguments: { durationMs: 25 }, provenance: PROVENANCE }],
 		['action_cancel', { goalRevision: 1, actionId: 'action-1' }],
 		['agent_error', { goalRevision: 1, code: 'FAILED', message: 'Planner failed.' }],
@@ -790,6 +1198,17 @@ test('action cancellation requires an exact goal revision and action identity', 
 	);
 	assert.throws(
 		() => validateProtocolV2Payload('action_cancel', { goalRevision: 4, actionId: 'action-9', reason: 'danger' }),
+		(error) => error.code === 'INVALID_PAYLOAD_FIELD',
+	);
+});
+
+test('post-action observation requests carry only the active goal revision', () => {
+	assert.deepEqual(
+		validateProtocolV2Payload('request_observation', { goalRevision: 4 }),
+		{ goalRevision: 4 },
+	);
+	assert.throws(
+		() => validateProtocolV2Payload('request_observation', { goalRevision: 4, actionId: 'action-9' }),
 		(error) => error.code === 'INVALID_PAYLOAD_FIELD',
 	);
 });
@@ -865,7 +1284,7 @@ test('protocol v2 preserves nullable desired block state and defers block-id mat
 });
 
 test('protocol v2 rejects retired high-level controller action types', () => {
-	for (const actionType of ['build_sequence', 'pick_up_item', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
+	for (const actionType of ['build_sequence', 'fight_target', 'flee_from', 'follow_entity', 'complete_goal']) {
 		assert.throws(
 			() => validateProtocolV2Payload('action_command', {
 				traceId: TRACE_ID,
@@ -874,6 +1293,25 @@ test('protocol v2 rejects retired high-level controller action types', () => {
 			(error) => error.code === 'INVALID_ACTION' && /Unsupported action/.test(error.message),
 		);
 	}
+});
+
+test('protocol v2 carries an exact observed dropped-item identity to Minecraft', () => {
+	const targetSelector = '550e8400-e29b-41d4-a716-446655440000';
+	assert.deepEqual(validateProtocolV2Payload('action_command', {
+		traceId: TRACE_ID,
+		goalRevision: 1,
+		actionId: 'pickup-1',
+		actionType: 'pick_up_item',
+		arguments: { targetSelector },
+		provenance: PROVENANCE,
+	}), {
+		traceId: TRACE_ID,
+		goalRevision: 1,
+		actionId: 'pickup-1',
+		actionType: 'pick_up_item',
+		arguments: { targetSelector },
+		provenance: PROVENANCE,
+	});
 });
 
 test('accepts the exact rich ready observation emitted by ServerObservationCollector', () => {

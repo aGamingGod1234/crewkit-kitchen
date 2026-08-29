@@ -10,7 +10,7 @@ const DEFAULT_ATTENTION_TRIGGER = 'attention';
 export class ArenaScriptEngine {
 	#callbacks; #vm = null; #program = null; #facts = null; #eventSequence = -1; #factsSequence = -1; #generation = 0; #lifecycleEpoch = 0; #continuationEpoch = 0;
 	#active = null; #pendingResult = null; #boundary = []; #boundaryByWatcher = new Map(); #watcherTruth = new Map(); #cancelling = null;
-	#transition = null; #pendingRequest = null; #coalescedRequest = null; #pendingReplacement = null; #suspendedResult = null; #resumableUnhandled = false; #requestUpdate = null; #completed = new Map(); #deferredBase = null; #status = 'IDLE';
+	#transition = null; #pendingRequest = null; #coalescedRequest = null; #pendingReplacement = null; #suspendedResult = null; #resumableUnhandled = false; #requestUpdate = null; #completed = new Map(); #deferredBase = null; #continuationRequired = false; #status = 'IDLE';
 
 	constructor({ dispatch, cancel, requestModel, trace = () => {} } = {}) {
 		if (typeof dispatch !== 'function' || typeof cancel !== 'function' || typeof requestModel !== 'function') throw new TypeError('ArenaScriptEngine callbacks dispatch, cancel, and requestModel are required');
@@ -46,6 +46,7 @@ export class ArenaScriptEngine {
 		if (this.#pendingResult && !this.#cancelling && eventSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
 		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
 		if (attention && edges === 0) this.#requestModel(null, { priority, trigger });
+		this.#requestExhaustedContinuation();
 		return this.snapshot();
 	}
 
@@ -150,6 +151,7 @@ export class ArenaScriptEngine {
 				return this.snapshot();
 			} catch { return this.snapshot(); }
 		} else if (directive.directive === 'pause' || directive.directive === 'finish') {
+			this.#continuationRequired = false;
 			this.#transition = { kind: 'terminal', status: directive.directive === 'pause' ? 'SUSPENDED' : 'FINISHED' };
 		} else return this.snapshot();
 		if (this.#active) this.#cancelActive(`directive:${directive.directive}`);
@@ -185,6 +187,15 @@ export class ArenaScriptEngine {
 		this.#clear();
 	}
 
+	/** Promotes the latest coalesced request for a recovery retry without issuing another model call. */
+	refreshDirectiveRequest() {
+		if (this.#pendingRequest === null) return null;
+		const latest = this.#coalescedRequest ?? this.#pendingRequest;
+		this.#pendingRequest = latest;
+		this.#coalescedRequest = latest;
+		return latest;
+	}
+
 	snapshot() { const pending = this.#coalescedRequest ?? this.#pendingRequest; return Object.freeze({ status: this.#status, eventSequence: this.#eventSequence, factsSequence: this.#factsSequence, generation: this.#generation, lifecycleEpoch: this.#lifecycleEpoch, continuationEpoch: this.#continuationEpoch, activeActionId: this.#active?.actionId ?? null, programId: this.#program?.programId ?? null, version: this.#program?.version ?? null, pendingRequestPriority: pending?.priority ?? null, pendingRequestTrigger: pending?.trigger ?? null }); }
 
 	#activate(target) {
@@ -206,7 +217,7 @@ export class ArenaScriptEngine {
 
 	#clear(resetGeneration = true) {
 		this.#vm = null; this.#program = null; this.#facts = null; this.#eventSequence = -1; this.#factsSequence = -1; this.#active = null; this.#pendingResult = null;
-		this.#boundary = []; this.#boundaryByWatcher.clear(); this.#watcherTruth.clear(); this.#cancelling = null; this.#transition = null; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#requestUpdate = null; this.#completed.clear(); this.#deferredBase = null; this.#status = 'IDLE';
+		this.#boundary = []; this.#boundaryByWatcher.clear(); this.#watcherTruth.clear(); this.#cancelling = null; this.#transition = null; this.#pendingRequest = null; this.#coalescedRequest = null; this.#pendingReplacement = null; this.#suspendedResult = null; this.#resumableUnhandled = false; this.#requestUpdate = null; this.#completed.clear(); this.#deferredBase = null; this.#continuationRequired = false; this.#status = 'IDLE';
 		if (resetGeneration) this.#generation += 1;
 	}
 
@@ -335,6 +346,7 @@ export class ArenaScriptEngine {
 		this.#updateWatchers();
 		if (this.#pendingResult && !this.#cancelling && this.#factsSequence >= this.#pendingResult.eventSequence) this.#resumeOrRunBoundary();
 		else if (!this.#active && !this.#cancelling && this.#boundary.length > 0) this.#runBoundary();
+		this.#requestExhaustedContinuation();
 		return this.snapshot();
 	}
 	#beginReplacement(replacement) {
@@ -389,7 +401,17 @@ export class ArenaScriptEngine {
 			if (this.#boundary.length > 0) return this.#runBoundary();
 			const deferred = this.#deferredBase; this.#deferredBase = null;
 			this.#handleYield(this.#vm.resumeDeferredCommand(deferred.result, this.#facts), 'step');
+			return;
 		}
+		if (yielded.kind === 'idle' && source === 'step') {
+			this.#continuationRequired = true;
+			this.#requestExhaustedContinuation();
+		}
+	}
+
+	#requestExhaustedContinuation() {
+		if (!this.#continuationRequired || this.#pendingRequest || !this.#isLive() || this.#facts === null) return;
+		this.#requestModel(null, { priority: URGENT_PRIORITY, trigger: 'program_exhausted' });
 	}
 
 	#emitTrace(event, fields) {

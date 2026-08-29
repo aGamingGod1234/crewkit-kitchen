@@ -1,11 +1,9 @@
 package dev.agaminggod.arenaagents.server.runtime;
 
 import carpet.helpers.EntityPlayerActionPack;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
-import dev.agaminggod.arenaagents.agent.AgentLifecycleReducer;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.AgentIdentity;
@@ -68,7 +66,7 @@ public final class ServerActionExecutor {
 	private static final Set<ActionType> ARENA_SCRIPT_PRIMITIVES = Set.of(
 			ActionType.MOVE_TO, ActionType.NAVIGATE_TO, ActionType.LOOK_AT, ActionType.ATTACK,
 			ActionType.SELECT_ITEM, ActionType.USE_ITEM, ActionType.BREAK_BLOCK, ActionType.PLACE_BLOCK,
-			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.DROP_ITEM,
+			ActionType.CHAT, ActionType.WAIT, ActionType.SET_DOOR, ActionType.PICK_UP_ITEM, ActionType.DROP_ITEM,
 			ActionType.TRANSFER_CONTAINER, ActionType.CRAFT_INVENTORY, ActionType.CRAFT_TABLE,
 			ActionType.FURNACE_TRANSACTION, ActionType.EQUIP_ITEM, ActionType.SELECT_TOOL,
 			ActionType.BLOCK_WITH_SHIELD, ActionType.USE_RANGED, ActionType.RESPAWN
@@ -185,25 +183,8 @@ public final class ServerActionExecutor {
 			throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 		}
 		if (request.type() == ActionType.COMPLETE_GOAL) {
-			var record = manager.registry().require(request.agentId());
-			try {
-				JsonElement contractElement = request.arguments().get("completionContract");
-				if (contractElement == null || contractElement.isJsonNull()) throw new AgentDomainException("CONTRACT_REQUIRED", "complete_goal requires a factual completionContract");
-				GoalCompletionContract contract = GoalCompletionContract.parse(contractElement.getAsJsonObject());
-				GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier().verify(
-						record, manager.findAgentPlayer(request.agentId()).orElse(null), contract, actionSuccessLedger);
-				if (!verification.verified()) {
-					emit(request, ServerActionState.FAILED, verification.reasonCode(), "Factual completion verification failed", 0L, false, false);
-					return;
-				}
-				AgentLifecycleReducer.completeGoal(record, request.goalRevision(), System.currentTimeMillis());
-				AgentChatReporter.completed(manager, record, string(request.arguments(), "summary"));
-				emit(request, ServerActionState.SUCCEEDED, "GOAL_COMPLETED", string(request.arguments(), "summary"), 0L, false, false);
-				router.goalCompleted(request.agentId(), request.goalRevision());
-			} catch (RuntimeException exception) {
-				String reason = exception instanceof AgentDomainException domain ? domain.code() : "MALFORMED_CONTRACT";
-				emit(request, ServerActionState.FAILED, reason, "Factual completion contract was rejected", 0L, false, false);
-			}
+			emit(request, ServerActionState.FAILED, "SERVER_VERIFICATION_REQUIRED",
+					"Goal completion must use the server-owned verification request", 0L, false, false);
 			return;
 		}
 
@@ -230,14 +211,18 @@ public final class ServerActionExecutor {
 	}
 
 	private void submitVanillaRespawn(ServerActionRequest request) {
+		CodexAgentManager.VanillaRespawnAttempt attempt = null;
 		try {
 			if (active.containsKey(request.agentId()) || pendingCompletions.containsKey(request.agentId()) || pendingRespawns.containsKey(request.agentId())) {
 				throw new AgentDomainException("ACTION_ALREADY_ACTIVE", "Agent already has an active action");
 			}
+			attempt = manager.beginVanillaRespawn(request.agentId());
+			AgentChatReporter.acting(manager, attempt.deadRecord(), request);
 			pendingRespawns.put(request.agentId(), new PendingRespawn(
-					request, manager.beginVanillaRespawn(request.agentId()), System.currentTimeMillis(), coordinatorGeneration
+					request, attempt, System.currentTimeMillis(), coordinatorGeneration
 			));
 		} catch (RuntimeException exception) {
+			if (attempt != null) manager.rollbackVanillaRespawn(attempt);
 			String reason = exception instanceof AgentDomainException domain ? domain.code() : "RESPAWN_REJECTED";
 			emit(request, ServerActionState.FAILED, reason, safeMessage(exception), 0L, false, false);
 		}
@@ -298,9 +283,30 @@ public final class ServerActionExecutor {
 	public synchronized void coordinatorDisconnected() {
 		coordinatorGeneration++;
 		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) {
-			pendingRespawns.remove(pending.request().agentId(), pending);
-			manager.rollbackVanillaRespawn(pending.attempt());
+			finishDisconnectedRespawn(
+					pendingRespawns,
+					pending.request().agentId(),
+					pending,
+					() -> manager.rollbackVanillaRespawn(pending.attempt()),
+					() -> AgentChatReporter.respawnDisconnected(manager, pending.attempt().deadRecord())
+			);
 		}
+	}
+
+	static boolean finishDisconnectedRespawn(
+			Map<AgentId, ?> pendingRespawns,
+			AgentId agentId,
+			Object pending,
+			Runnable rollback,
+			Runnable terminalReport
+	) {
+		if (!pendingRespawns.remove(agentId, pending)) return false;
+		try {
+			rollback.run();
+		} finally {
+			terminalReport.run();
+		}
+		return true;
 	}
 
 	private void tickRespawn(PendingRespawn pending, long now) {

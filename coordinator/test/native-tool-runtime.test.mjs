@@ -1,12 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { NativeToolRuntime } from '../src/native-tool-runtime.mjs';
+import { goalSpecFingerprint } from '../src/goal-spec.mjs';
+import { constrainGoalBoundNavigation, NativeToolRuntime } from '../src/native-tool-runtime.mjs';
 
 function record(overrides = {}) {
+	const fields = {
+		originalRequest: 'get one stone',
+		predicate: { type: 'inventory_contains', itemId: 'minecraft:stone', count: 1 },
+		createdAtTick: 10,
+	};
 	return {
 		agentId: 'agent-a', provider: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'xhigh', serviceTier: 'fast',
-		goalRevision: 3, currentGoal: 'get one stone', ...overrides,
+		goalRevision: 3, currentGoal: 'get one stone', currentGoalSpec: { ...fields, fingerprint: goalSpecFingerprint(fields) }, ...overrides,
 	};
 }
 
@@ -38,7 +44,12 @@ test('native observe returns latest compact facts without sending a body command
 	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
 	runtime.updateObservation(record(), { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] }, { eventSequence: 4 });
 	const result = await runtime.execute({ agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'observe-1', tool: { kind: 'observe' } }, record());
-	assert.deepEqual(result, { eventSequence: 4, goal: 'get one stone', observation: { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] } });
+	assert.deepEqual(result, {
+		eventSequence: 4,
+		goal: 'get one stone',
+		goalSpec: record().currentGoalSpec,
+		observation: { player: { health: 18 }, blocks: [{ blockId: 'minecraft:stone', x: 1, y: 63, z: 1 }] },
+	});
 	assert.deepEqual(sent, []);
 });
 
@@ -53,9 +64,11 @@ test('native lifecycle disposal cancels an outstanding body action and rejects t
 	await runtime.dispose('agent-a', 'goal_steered');
 	await assert.rejects(pending, (error) => error?.code === 'NATIVE_ACTION_CANCELLED');
 	assert.equal(sent.at(-1)[0], 'action_cancel');
+	assert.equal(runtime.isActionResultStale(record(), { goalRevision: 3, actionId: sent[0][2].actionId }), true);
+	assert.equal(runtime.isActionResultStale(record(), { goalRevision: 3, actionId: 'unknown' }), false);
 });
 
-test('native finish uses the existing factual completion verifier before reporting success', async () => {
+test('native finish asks Minecraft to verify the immutable server goal before reporting success', async () => {
 	const sent = [];
 	const finished = [];
 	const runtime = new NativeToolRuntime({
@@ -64,24 +77,196 @@ test('native finish uses the existing factual completion verifier before reporti
 	});
 	const pending = runtime.execute({
 		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'finish-1',
-		tool: {
-			kind: 'finish', status: 'completed', summary: 'Stone acquired.',
-			completionContract: { goalRevision: 3, predicates: [{ type: 'inventory_min', itemId: 'minecraft:stone', count: 1 }] },
-		},
-	}, record());
+		tool: { kind: 'finish', summary: 'Stone acquired.' },
+	}, record(), { lifecycleGeneration: 7 });
 	await Promise.resolve();
 	assert.equal(sent[0][0], 'goal_completed');
-	assert.equal(sent[0][2].completionContract.predicates[0].itemId, 'minecraft:stone');
-	assert.match(sent[0][2].contractHash, /^sha256:/);
+	assert.equal(sent[0][2].goalFingerprint, record().currentGoalSpec.fingerprint);
+	assert.equal(Object.hasOwn(sent[0][2], 'completionContract'), false);
 	assert.equal(runtime.onCompletionResult(record(), {
 		goalRevision: 3,
 		traceId: sent[0][2].traceId,
-		contractHash: sent[0][2].contractHash,
+		goalFingerprint: sent[0][2].goalFingerprint,
 		verified: true,
 		reasonCode: 'COMPLETION_VERIFIED',
+		facts: [{ type: 'inventory_contains', satisfied: true, expectedValue: 'minecraft:stone x1', observedValue: 'minecraft:stone x1' }],
 	}), true);
-	assert.deepEqual(await pending, { state: 'COMPLETED', verified: true, reasonCode: 'COMPLETION_VERIFIED' });
+	assert.deepEqual(await pending, {
+		state: 'COMPLETED', verified: true, reasonCode: 'COMPLETION_VERIFIED',
+		facts: [{ type: 'inventory_contains', satisfied: true, expectedValue: 'minecraft:stone x1', observedValue: 'minecraft:stone x1' }],
+	});
 	assert.equal(finished.length, 1);
+	assert.equal(finished[0].lifecycleGeneration, 7);
+});
+
+test('native observe ignores a stale observation event sequence', async () => {
+	const runtime = new NativeToolRuntime({ bridge: { send: async () => {} } });
+	const current = record();
+	runtime.updateObservation(current, { player: { health: 20 } }, { eventSequence: 8 });
+	runtime.updateObservation(current, { player: { health: 10 } }, { eventSequence: 7 });
+	const result = await runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'observe-stale', tool: { kind: 'observe' },
+	}, current);
+	assert.deepEqual(result, {
+		eventSequence: 8,
+		goal: 'get one stone',
+		goalSpec: record().currentGoalSpec,
+		observation: { player: { health: 20 } },
+	});
+});
+
+test('goal-bound navigation cannot succeed outside the immutable position radius', async () => {
+	const sent = [];
+	const fields = {
+		originalRequest: 'Move to 12 64 12',
+		predicate: { type: 'position_within', x: 12, y: 64, z: 12, radius: 1, stableTicks: 20 },
+		createdAtTick: 10,
+	};
+	const positioned = record({
+		currentGoal: fields.originalRequest,
+		currentGoalSpec: { ...fields, fingerprint: goalSpecFingerprint(fields) },
+	});
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-position', callId: 'move-position',
+		tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 12, y: 64, z: 12, tolerance: 4, sprint: true, timeoutMs: 30_000 } },
+	}, positioned);
+	await Promise.resolve();
+	assert.equal(sent[0][2].arguments.tolerance, 1);
+	runtime.onActionResult(positioned, {
+		goalRevision: 3,
+		actionId: sent[0][2].actionId,
+		state: 'FAILED',
+		reasonCode: 'PATH_BLOCKED',
+		message: 'Navigation could not recover from repeated stalls',
+		executionStarted: true,
+	});
+	assert.deepEqual(await pending, {
+		state: 'FAILED', reasonCode: 'PATH_BLOCKED',
+		message: 'Navigation could not recover from repeated stalls', executionStarted: true,
+	});
+});
+
+test('goal-bound navigation honors a matching position nested in a compound goal', async () => {
+	const sent = [];
+	const fields = {
+		originalRequest: 'Move to 12 64 12 and survive for a minute',
+		predicate: {
+			type: 'all_of',
+			predicates: [
+				{ type: 'survive_duration', ticks: 1_200 },
+				{ type: 'position_within', x: 12, y: 64, z: 12, radius: 0.01, stableTicks: 20 },
+			],
+		},
+		createdAtTick: 10,
+	};
+	const positioned = record({
+		currentGoal: fields.originalRequest,
+		currentGoalSpec: { ...fields, fingerprint: goalSpecFingerprint(fields) },
+	});
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-position', callId: 'move-position',
+		tool: { kind: 'action', actionType: 'navigate_to', arguments: { x: 12, y: 64, z: 12, tolerance: 1, sprint: true, timeoutMs: 30_000 } },
+	}, positioned);
+	await Promise.resolve();
+	assert.equal(sent[0][2].arguments.tolerance, 0.01);
+	runtime.onActionResult(positioned, {
+		goalRevision: 3,
+		actionId: sent[0][2].actionId,
+		state: 'FAILED',
+		reasonCode: 'PATH_BLOCKED',
+		executionStarted: true,
+	});
+	await pending;
+});
+
+test('nested position constraints do not clamp navigation to unrelated coordinates', () => {
+	const goalSpec = {
+		predicate: {
+			type: 'any_of',
+			predicates: [
+				{ type: 'position_within', x: 12, y: 64, z: 12, radius: 0.5, stableTicks: 20 },
+				{
+					type: 'all_of',
+					predicates: [
+						{ type: 'position_within', x: 99, y: 70, z: -4, radius: 0.01, stableTicks: 20 },
+						{ type: 'survive_duration', ticks: 1_200 },
+					],
+				},
+			],
+		},
+	};
+	const matching = constrainGoalBoundNavigation({
+		kind: 'action', actionType: 'navigate_to',
+		arguments: { x: 12, y: 64, z: 12, tolerance: 1, sprint: true, timeoutMs: 30_000 },
+	}, goalSpec);
+	const unrelated = constrainGoalBoundNavigation({
+		kind: 'action', actionType: 'navigate_to',
+		arguments: { x: 20, y: 64, z: 20, tolerance: 1, sprint: true, timeoutMs: 30_000 },
+	}, goalSpec);
+	assert.equal(matching.arguments.tolerance, 0.5);
+	assert.equal(unrelated.arguments.tolerance, 1);
+});
+
+test('a false finish stays active and returns Minecraft evidence to the same turn', async () => {
+	const finished = [];
+	const sent = [];
+	const runtime = new NativeToolRuntime({
+		bridge: { send: async (...args) => sent.push(args) },
+		onFinish: async (request) => finished.push(request),
+	});
+	const pending = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'finish-false',
+		tool: { kind: 'finish', summary: 'I made the pickaxe.' },
+	}, record());
+	await Promise.resolve();
+	assert.equal(runtime.onCompletionResult(record(), {
+		goalRevision: 3, traceId: sent[0][2].traceId, goalFingerprint: sent[0][2].goalFingerprint,
+		verified: false, reasonCode: 'PREDICATE_FAILED',
+		facts: [{ type: 'inventory_contains', satisfied: false, expectedValue: 'minecraft:iron_pickaxe x1', observedValue: 'minecraft:stone_pickaxe x1' }],
+	}), true);
+	assert.deepEqual(await pending, {
+		state: 'ACTIVE', verified: false, reasonCode: 'PREDICATE_FAILED',
+		facts: [{ type: 'inventory_contains', satisfied: false, expectedValue: 'minecraft:iron_pickaxe x1', observedValue: 'minecraft:stone_pickaxe x1' }],
+	});
+	assert.deepEqual(finished, []);
+});
+
+test('native completion cannot overlap an active physical action', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const action = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'action-1',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1_000 } },
+	}, record());
+	await Promise.resolve();
+	await assert.rejects(runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'finish-1',
+		tool: { kind: 'finish', summary: 'Done.' },
+	}, record()), (error) => error?.code === 'NATIVE_ACTION_IN_PROGRESS');
+	assert.deepEqual(sent.map(([type]) => type), ['action_command']);
+	runtime.onActionResult(record(), { goalRevision: 3, actionId: sent[0][2].actionId, state: 'SUCCEEDED', reasonCode: '' });
+	await action;
+});
+
+test('a physical action cannot overlap native completion verification', async () => {
+	const sent = [];
+	const runtime = new NativeToolRuntime({ bridge: { send: async (...args) => sent.push(args) } });
+	const completion = runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'finish-1',
+		tool: { kind: 'finish', summary: 'Done.' },
+	}, record());
+	await Promise.resolve();
+	await assert.rejects(runtime.execute({
+		agentId: 'agent-a', goalRevision: 3, turnId: 'turn-1', callId: 'action-1',
+		tool: { kind: 'action', actionType: 'wait', arguments: { durationMs: 1_000 } },
+	}, record()), (error) => error?.code === 'NATIVE_COMPLETION_IN_PROGRESS');
+	assert.deepEqual(sent.map(([type]) => type), ['goal_completed']);
+	runtime.onCompletionResult(record(), {
+		goalRevision: 3, traceId: sent[0][2].traceId, goalFingerprint: sent[0][2].goalFingerprint, verified: true, reasonCode: 'COMPLETION_VERIFIED', facts: [],
+	});
+	await completion;
 });
 
 test('native body isolates sixteen concurrent agents and their action results', async () => {

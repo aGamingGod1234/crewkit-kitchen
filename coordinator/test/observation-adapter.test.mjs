@@ -21,13 +21,52 @@ function wireObservation(overrides = {}) {
 
 test('adapts protocol entities and blocks into bounded factual candidate records', () => {
 	const adapted = adaptObservation(wireObservation());
-	assert.deepEqual(adapted.player, { x: 0, y: 64, z: 0, yaw: 10, pitch: -2, dead: false, health: 20, hunger: 18, air: 300, fire: false, fallDistance: 0 });
+	assert.deepEqual(adapted.player, { x: 0, y: 64, z: 0, yaw: 10, pitch: -2, dead: false, health: 20, hunger: 18, foodLevel: 18, air: 300, fire: false, onFire: false, fallDistance: 0 });
 	assert.deepEqual(adapted.items, [{ stableId: '00000000-0000-0000-0000-000000000001', itemId: 'minecraft:oak_log', count: 1, distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0 }]);
 	assert.deepEqual(adapted.entities, [{ stableId: '00000000-0000-0000-0000-000000000001', type: 'minecraft:item', distance: 2, tags: ['#minecraft:item'], x: 2, y: 64, z: 0, itemId: 'minecraft:oak_log', count: 1 }]);
 	assert.deepEqual(adapted.blocks, [{ stableId: '4,64,0', blockId: 'minecraft:oak_log', tags: ['#minecraft:logs'], x: 4, y: 64, z: 0 }]);
 	assert.deepEqual(adapted.inventory, { items: [{ itemId: 'minecraft:oak_log', count: 2, slot: 0, tags: ['#minecraft:logs'] }], tagCounts: { '#minecraft:logs': 2 } });
 	assert.equal(Object.hasOwn(adapted.items[0], 'reachable'), false);
 	assert.deepEqual(adapted.items[0].tags, ['#minecraft:item']);
+});
+
+test('preserves every protocol-v2 fact needed by native observe and action tools', () => {
+	const adapted = adaptObservation(wireObservation({
+		velocity: { x: 0.25, y: -0.1, z: 0 },
+		player: {
+			health: 18, maxHealth: 20, armor: 7, foodLevel: 16, saturation: 3.5, gameMode: 'survival',
+			onGround: false, inWater: true, onFire: false, air: 250, maxAir: 300, suffocating: false,
+			fallDistance: 1.5, effects: [{ effectId: 'minecraft:speed', amplifier: 1, duration: 40 }],
+		},
+		inventory: {
+			selectedItem: 'minecraft:iron_pickaxe', tagCounts: { '#minecraft:tools': 1 },
+			items: [{ itemId: 'minecraft:iron_pickaxe', count: 1, damage: 12, maxDamage: 250, slot: 2, hotbar: true, tags: ['#minecraft:tools'] }],
+		},
+		entities: [{ uuid: 'mob-1', type: 'minecraft:zombie', name: 'Zombie', distance: 3, position: { x: 3, y: 64, z: 0 }, isPlayer: false }],
+		blocks: [{ x: 1, y: 64, z: 0, blockId: 'minecraft:chest', placeableFaces: ['up', 'north'] }],
+		nearbyContainers: [{ x: 1, y: 64, z: 0, blockId: 'minecraft:chest', distance: 1, withinInteractionRange: true, capabilities: ['transfer'] }],
+		world: { dimension: 'minecraft:overworld', gameTime: 10, dayTime: 10, raining: true, thundering: false },
+		currentAction: { active: true, actionId: 'action-1', actionType: 'navigate_to' },
+		lastResult: { present: true, actionId: 'action-0', actionType: 'break_block', state: 'SUCCEEDED', reasonCode: 'DONE', message: 'Mined' },
+		interaction: {
+			mainHandItemId: 'minecraft:iron_pickaxe', offHandItemId: 'minecraft:shield', usingItem: false,
+			activeHand: 'none', useRemainingTicks: 0, attackCooldown: 1,
+			input: { active: true, forward: 1, strafe: 0, jump: false, sneak: false, sprint: true, attack: false, use: false, yaw: 10, pitch: -2, selectedSlot: 2, hand: 'main_hand' },
+			menu: { type: 'none', cursor: { itemId: 'minecraft:air', count: 0 }, slots: [], capabilities: [] },
+			rayTarget: { type: 'block', x: 1, y: 64, z: 0, face: 'north', blockId: 'minecraft:chest' },
+		},
+	}));
+
+	assert.deepEqual(adapted.velocity, { x: 0.25, y: -0.1, z: 0 });
+	assert.equal(adapted.player.effects[0].effectId, 'minecraft:speed');
+	assert.deepEqual(adapted.inventory.items[0], { itemId: 'minecraft:iron_pickaxe', count: 1, slot: 2, tags: ['#minecraft:tools'], damage: 12, maxDamage: 250, hotbar: true });
+	assert.equal(adapted.entities[0].name, 'Zombie');
+	assert.deepEqual(adapted.blocks[0].placeableFaces, ['up', 'north']);
+	assert.equal(adapted.nearbyContainers[0].withinInteractionRange, true);
+	assert.equal(adapted.world.dimension, 'minecraft:overworld');
+	assert.equal(adapted.currentAction.actionId, 'action-1');
+	assert.equal(adapted.lastResult.reasonCode, 'DONE');
+	assert.equal(adapted.interaction.rayTarget.blockId, 'minecraft:chest');
 });
 
 test('preserves the authoritative last attacker for damage watchers', () => {

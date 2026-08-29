@@ -6,7 +6,7 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 public final class WaypointProgress {
 	private static final double MATERIAL_PROGRESS = 0.1D;
 
-	private final double initialDistance;
+	private double segmentStartDistance;
 	private final long stallTimeoutMs;
 	private final int maximumReplans;
 	private double bestRemainingDistance;
@@ -25,36 +25,50 @@ public final class WaypointProgress {
 		if (stallTimeoutMs <= 0L || maximumReplans < 0) {
 			throw new IllegalArgumentException("stall timeout must be positive and replans non-negative");
 		}
-		this.initialDistance = Math.max(MATERIAL_PROGRESS, initialDistance);
+		this.segmentStartDistance = Math.max(MATERIAL_PROGRESS, initialDistance);
 		this.bestRemainingDistance = initialDistance;
 		this.lastProgressAt = startedAtEpochMs;
 		this.stallTimeoutMs = stallTimeoutMs;
 		this.maximumReplans = maximumReplans;
 	}
 
-	public Update observe(double remainingDistance, boolean waypointReached, long nowEpochMs) {
-		if (!Double.isFinite(remainingDistance) || remainingDistance < 0.0D) {
-			throw new IllegalArgumentException("remainingDistance must be finite and non-negative");
+	public Update observe(double activeDistance, boolean waypointReached, long nowEpochMs) {
+		if (!Double.isFinite(activeDistance) || activeDistance < 0.0D) {
+			throw new IllegalArgumentException("activeDistance must be finite and non-negative");
 		}
-		if (remainingDistance + MATERIAL_PROGRESS < bestRemainingDistance) {
-			bestRemainingDistance = remainingDistance;
+		if (activeDistance + MATERIAL_PROGRESS < bestRemainingDistance) {
+			bestRemainingDistance = activeDistance;
+			lastProgressAt = nowEpochMs;
+		}
+		if (waypointReached) {
 			lastProgressAt = nowEpochMs;
 		}
 		long idleMs = Math.max(0L, nowEpochMs - lastProgressAt);
 		Decision decision = idleMs < stallTimeoutMs
 				? Decision.CONTINUE
 				: replans >= maximumReplans ? Decision.FAIL : Decision.REPLAN;
-		double completed = 1.0D - (remainingDistance / initialDistance);
+		double completed = 1.0D - (activeDistance / segmentStartDistance);
 		double bounded = Math.max(0.0D, Math.min(1.0D, completed));
 		return new Update(decision, waypointReached, bounded);
 	}
 
-	public void replanned(double remainingDistance, long nowEpochMs) {
-		if (!Double.isFinite(remainingDistance) || remainingDistance < 0.0D) {
-			throw new IllegalArgumentException("remainingDistance must be finite and non-negative");
+	/** Starts a fresh stall window for the next active waypoint without consuming a replan. */
+	public void waypointAdvanced(double activeDistance, long nowEpochMs) {
+		if (!Double.isFinite(activeDistance) || activeDistance < 0.0D) {
+			throw new IllegalArgumentException("activeDistance must be finite and non-negative");
+		}
+		segmentStartDistance = Math.max(MATERIAL_PROGRESS, activeDistance);
+		bestRemainingDistance = activeDistance;
+		lastProgressAt = nowEpochMs;
+	}
+
+	public void replanned(double activeDistance, long nowEpochMs) {
+		if (!Double.isFinite(activeDistance) || activeDistance < 0.0D) {
+			throw new IllegalArgumentException("activeDistance must be finite and non-negative");
 		}
 		replans++;
-		bestRemainingDistance = remainingDistance;
+		segmentStartDistance = Math.max(MATERIAL_PROGRESS, activeDistance);
+		bestRemainingDistance = activeDistance;
 		lastProgressAt = nowEpochMs;
 	}
 

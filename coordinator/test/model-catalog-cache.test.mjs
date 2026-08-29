@@ -62,3 +62,103 @@ test('catalog cache does not retain decision-like provider output fields', async
 		serviceTiers: ['priority'],
 	});
 });
+
+test('catalog exposes a stable operator sequence and omits hidden provider models', async () => {
+	const cache = new ModelCatalogCache(async () => [
+		{
+			id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', hidden: false,
+			supportedReasoningEfforts: ['ultra', 'low', 'xhigh', 'medium', 'high', 'max'],
+			serviceTiers: ['fast', 'priority'],
+		},
+		{
+			id: 'gpt-reserve', model: 'gpt-reserve', hidden: true,
+			supportedReasoningEfforts: ['high'], serviceTiers: ['priority'],
+		},
+		{
+			id: 'gpt-5.6-luna', model: 'gpt-5.6-luna', hidden: false,
+			supportedReasoningEfforts: ['max', 'xhigh', 'high', 'medium', 'low'],
+			serviceTiers: ['fast', 'priority'],
+		},
+		{
+			id: 'gpt-5.6-terra', model: 'gpt-5.6-terra', hidden: false,
+			supportedReasoningEfforts: ['high', 'low', 'max', 'medium', 'xhigh', 'ultra'],
+			serviceTiers: ['priority', 'fast'],
+		},
+	]);
+	const snapshot = await cache.refresh();
+	assert.deepEqual(snapshot.models.map((model) => model.id), [
+		'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol',
+	]);
+	assert.deepEqual(cache.find('gpt-5.6-luna').reasoningEfforts, ['low', 'medium', 'high', 'xhigh', 'max']);
+	assert.deepEqual(cache.find('gpt-5.6-sol').serviceTiers, ['priority', 'fast']);
+	assert.equal(cache.find('gpt-reserve'), null);
+});
+
+test('malformed refresh retains the previous valid catalog as last_valid', async () => {
+	let response = [MODEL];
+	const cache = new ModelCatalogCache(async () => response);
+	const live = await cache.refresh();
+	assert.equal(live.source, 'live');
+	response = [{ ...MODEL }, { ...MODEL }];
+	const retained = await cache.refresh({ force: true });
+	assert.equal(retained.source, 'last_valid');
+	assert.deepEqual(retained.models.map(({ id }) => id), ['gpt-5.6-sol']);
+	assert.equal(cache.stale, true, 'a retained snapshot remains eligible for automatic refresh');
+});
+
+test('catalog uses only its deterministic exact-profile builtin until live discovery recovers', async () => {
+	let available = false;
+	const builtin = {
+		id: 'gpt-5.6-terra', model: 'gpt-5.6-terra', displayName: 'GPT-5.6 Terra',
+		supportedReasoningEfforts: ['xhigh'], serviceTiers: ['priority'],
+	};
+	const liveModel = {
+		id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol',
+		supportedReasoningEfforts: ['high'], serviceTiers: ['fast'],
+	};
+	const cache = new ModelCatalogCache(async () => {
+		if (!available) throw Object.assign(new Error('offline'), { code: 'PROVIDER_UNAVAILABLE' });
+		return [liveModel];
+	}, { builtinModels: [builtin] });
+
+	const fallback = await cache.refresh();
+	assert.equal(fallback.source, 'builtin');
+	assert.deepEqual(fallback.models.map(({ id, reasoningEfforts, serviceTiers }) => ({ id, reasoningEfforts, serviceTiers })), [{
+		id: 'gpt-5.6-terra', reasoningEfforts: ['xhigh'], serviceTiers: ['priority'],
+	}]);
+	assert.equal(cache.find('gpt-5.6-sol'), null, 'fallback never invents or substitutes another profile');
+
+	available = true;
+	const live = await cache.refresh({ force: true });
+	assert.equal(live.source, 'live');
+	assert.deepEqual(live.models.map(({ id }) => id), ['gpt-5.6-sol']);
+});
+
+test('a timed-out catalog attempt is evicted and its late result cannot replace a fresh generation', async () => {
+	const releases = [];
+	let loaderCalls = 0;
+	const cache = new ModelCatalogCache(({ signal } = {}) => new Promise((resolve) => {
+		loaderCalls += 1;
+		const call = loaderCalls;
+		releases.push(() => resolve([{ ...MODEL, displayName: `attempt-${call}`, aborted: signal?.aborted === true }]));
+	}), { builtinModels: [MODEL], refreshTimeoutMs: 5 });
+	try {
+		const first = await Promise.race([
+			cache.refresh({ force: true }),
+			new Promise((resolve) => setTimeout(() => resolve('outer-timeout'), 30)),
+		]);
+		assert.notEqual(first, 'outer-timeout', 'the cache owns its refresh deadline');
+		assert.equal(first.source, 'builtin');
+
+		const secondAttempt = cache.refresh({ force: true });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(loaderCalls, 2, 'a timed-out loader promise is not cached into the next probe');
+		releases[0]();
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(cache.snapshot().source, 'builtin', 'the obsolete loader cannot promote its late result live');
+		releases[1]();
+		assert.equal((await secondAttempt).source, 'live');
+	} finally {
+		for (const release of releases) release();
+	}
+});

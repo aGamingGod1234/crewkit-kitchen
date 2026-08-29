@@ -176,8 +176,8 @@ function Test-ChildCreationAfterParent($Parent, $Child) {
 	return $childTicks -ge $parentTicks
 }
 
-function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities, $ProcessIdentity) {
-	$processes = Get-ProcessSnapshot
+function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities, $ProcessIdentity, $Processes = $null) {
+	$processes = if ($null -eq $Processes) { Get-ProcessSnapshot } else { $Processes }
 	$rootId = if ($ProcessIdentity -is [int]) { [int] $ProcessIdentity } else { [int] $ProcessIdentity.ProcessId }
 	if ($rootId -le 0) { return }
 	$expectedRoot = if ($ProcessIdentity -is [int]) { $null } else { $ProcessIdentity }
@@ -220,8 +220,8 @@ function Add-ProcessTreeSnapshot([System.Collections.Generic.List[object]] $Proc
 	}
 }
 
-function Get-TrackedResourceSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities) {
-	$processes = Get-ProcessSnapshot
+function Get-TrackedResourceSnapshot([System.Collections.Generic.List[object]] $ProcessIdentities, $Processes = $null) {
+	$processes = if ($null -eq $Processes) { Get-ProcessSnapshot } else { $Processes }
 	$liveCount = 0
 	[long] $rssBytes = 0
 	foreach ($identity in @($ProcessIdentities.ToArray())) {
@@ -266,21 +266,40 @@ function Measure-RunnerResourcesUntilExit(
 	$peakProcessCount = $initialRoots.Count
 	[long] $peakRssBytes = $initialRssBytes
 	while ($true) {
+		$directProcessCount = 0
+		[long] $directRssBytes = 0
 		foreach ($handle in $TrackedHandles) {
-			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIdentities $(if ($null -ne $handle.Identity) { $handle.Identity } else { $handle.Process.Id }) }
+			if ($null -eq $handle -or $null -eq $handle.Process) { continue }
+			try {
+				$handle.Process.Refresh()
+				if (-not $handle.Process.HasExited) {
+					$directProcessCount += 1
+					$directRssBytes += [long] $handle.Process.WorkingSet64
+				}
+			} catch {}
 		}
-		$sample = Get-TrackedResourceSnapshot $ProcessIdentities
+		$peakProcessCount = [Math]::Max($peakProcessCount, $directProcessCount)
+		$peakRssBytes = [Math]::Max($peakRssBytes, $directRssBytes)
+		$runnerExitedBeforeSample = $RunnerHandle.Process.HasExited
+		$processes = Get-ProcessSnapshot
+		foreach ($handle in $TrackedHandles) {
+			if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIdentities $(if ($null -ne $handle.Identity) { $handle.Identity } else { $handle.Process.Id }) $processes }
+		}
+		$sample = Get-TrackedResourceSnapshot $ProcessIdentities $processes
 		$peakProcessCount = [Math]::Max($peakProcessCount, [int] $sample.processCount)
 		$peakRssBytes = [Math]::Max($peakRssBytes, [long] $sample.rssBytes)
-		$runnerExited = $RunnerHandle.Process.HasExited
+		$runnerExited = $runnerExitedBeforeSample
 		if (-not $runnerExited) { $runnerExited = $RunnerHandle.Process.WaitForExit($PollMilliseconds) }
 		if ($runnerExited) {
-			foreach ($handle in $TrackedHandles) {
-				if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIdentities $(if ($null -ne $handle.Identity) { $handle.Identity } else { $handle.Process.Id }) }
+			if (-not $runnerExitedBeforeSample) {
+				$finalProcesses = Get-ProcessSnapshot
+				foreach ($handle in $TrackedHandles) {
+					if ($null -ne $handle -and $null -ne $handle.Process) { Add-ProcessTreeSnapshot $ProcessIdentities $(if ($null -ne $handle.Identity) { $handle.Identity } else { $handle.Process.Id }) $finalProcesses }
+				}
+				$finalSample = Get-TrackedResourceSnapshot $ProcessIdentities $finalProcesses
+				$peakProcessCount = [Math]::Max($peakProcessCount, [int] $finalSample.processCount)
+				$peakRssBytes = [Math]::Max($peakRssBytes, [long] $finalSample.rssBytes)
 			}
-			$finalSample = Get-TrackedResourceSnapshot $ProcessIdentities
-			$peakProcessCount = [Math]::Max($peakProcessCount, [int] $finalSample.processCount)
-			$peakRssBytes = [Math]::Max($peakRssBytes, [long] $finalSample.rssBytes)
 			break
 		}
 		if ([DateTime]::UtcNow -ge $Deadline) { throw 'Scenario runner timed out' }

@@ -16,7 +16,9 @@ class FakeAcpTransport extends EventEmitter {
 		this.calls = [];
 		this.started = false;
 		this.message = DECISION;
+		this.hiddenMessage = null;
 		this.promptResponse = { stopReason: 'end_turn' };
+		this.promptGate = null;
 	}
 
 	async start() { this.started = true; }
@@ -33,10 +35,15 @@ class FakeAcpTransport extends EventEmitter {
 			return { configOptions: this.configOptions };
 		}
 		if (method === 'session/prompt') {
+			if (this.hiddenMessage !== null) queueMicrotask(() => this.emit('notification', {
+				method: 'session/update',
+				params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: this.hiddenMessage } } },
+			}));
 			queueMicrotask(() => this.emit('notification', {
 				method: 'session/update',
 				params: { sessionId: 'session-1', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: this.message } } },
 			}));
+			if (this.promptGate !== null) await this.promptGate;
 			await new Promise((resolve) => setImmediate(resolve));
 			return this.promptResponse;
 		}
@@ -72,6 +79,36 @@ test('Gemini ACP sessions apply the exact model and thinking level and parse pla
 	await service.stop();
 });
 
+test('ACP structured turns use an isolated prompt and caller-supplied parser', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.message = '{"requestId":"draft-1"}';
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-structured', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	const result = await agent.decide('translate exactly', { goalRevision: 0, systemPrompt: '', parseOutput: JSON.parse });
+	assert.deepEqual(result, { requestId: 'draft-1' });
+	const prompt = transport.calls.find((call) => call.method === 'session/prompt').params.prompt[0].text;
+	assert.equal(prompt, 'translate exactly');
+	assert.doesNotMatch(prompt, /strategic author/i);
+	await service.stop();
+});
+
+test('ACP reports only bounded visible agent-message chunks through the verbose adapter contract', async () => {
+	const transport = new FakeAcpTransport(options());
+	transport.hiddenMessage = 'hidden ACP thought';
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'gemini-verbose', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' });
+	await agent.setGoalRevision(1);
+	const events = [];
+	await agent.decide('authoritative state', {
+		goalRevision: 1,
+		onVerbose(stage, message) { events.push({ stage, message }); },
+	});
+	assert.equal(events.every(({ stage, message }) => stage === 'output' && message.length <= 256), true);
+	assert.equal(events.map(({ message }) => message).join(''), DECISION);
+	assert.doesNotMatch(JSON.stringify(events), /hidden ACP thought/);
+	await service.stop();
+});
+
 test('ACP keeps the exact service profile for recovery and rejects profile mutation', async () => {
 	const transport = new FakeAcpTransport(options());
 	const service = new AcpProviderService(
@@ -96,6 +133,49 @@ test('ACP keeps the exact service profile for recovery and rejects profile mutat
 		);
 	}
 	assert.equal(transport.calls.filter((call) => call.method === 'session/new').length, 1);
+	await service.stop();
+});
+
+test('ACP transport loss clears the owning session and coalesces one exact replacement', async () => {
+	const transports = [];
+	const service = new AcpProviderService(
+		{ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] },
+		{ transportFactory: () => {
+			const transport = new FakeAcpTransport(options());
+			transports.push(transport);
+			return transport;
+		} },
+	);
+	const selected = { agentId: 'gemini-lost', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'fast' };
+	const stale = await service.createAgent(selected);
+	transports[0].emit('exit', Object.assign(new Error('ACP exited'), { code: 'PROCESS_EXITED' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(service.getAgent(selected.agentId), null);
+	await assert.rejects(stale.decide('late work', { goalRevision: 0 }), (error) => error?.code === 'SESSION_INVALIDATED');
+	const [replacement, duplicate] = await Promise.all([
+		service.replaceAgent(selected, { expectedSessionGeneration: 1 }),
+		service.replaceAgent(selected, { expectedSessionGeneration: 1 }),
+	]);
+	assert.equal(replacement, duplicate);
+	assert.equal(replacement.sessionGeneration, 2);
+	assert.equal(transports.length, 2);
+	await service.stop();
+});
+
+test('ACP transport loss rejects an in-flight response that arrives after invalidation', async () => {
+	let releasePrompt;
+	const transport = new FakeAcpTransport(options());
+	transport.promptGate = new Promise((resolve) => { releasePrompt = resolve; });
+	const service = new AcpProviderService(
+		{ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] },
+		{ transportFactory: () => transport },
+	);
+	const agent = await service.createAgent({ agentId: 'gemini-late', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high', serviceTier: 'fast' });
+	const decision = agent.decide('late in-flight work', { goalRevision: 0 });
+	await new Promise((resolve) => setImmediate(resolve));
+	transport.emit('protocolError', Object.assign(new Error('ACP protocol lost'), { code: 'PROTOCOL_LOST' }));
+	releasePrompt();
+	await assert.rejects(decision, (error) => error?.code === 'SESSION_INVALIDATED');
 	await service.stop();
 });
 

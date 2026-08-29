@@ -81,3 +81,15 @@ test('conversation memory falls back to a full baseline after ring eviction or r
 	assert.equal(reset.fullBaseline, true);
 	assert.deepEqual(reset.entries, []);
 });
+
+test('native unread and history projections state their delivery semantics', () => {
+	const memory = new ConversationMemory();
+	memory.ingest(event(1));
+	memory.ingest(event(2));
+	assert.deepEqual(memory.unread(1), {
+		mode: 'unread', baseSequence: 1, nextSequence: 2, entries: [event(2)],
+	});
+	assert.deepEqual(memory.history(1), {
+		mode: 'history', nextSequence: 2, entries: [event(2)],
+	});
+});

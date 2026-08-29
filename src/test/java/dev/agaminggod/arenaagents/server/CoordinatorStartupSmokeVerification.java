@@ -50,12 +50,23 @@ public final class CoordinatorStartupSmokeVerification {
 		CoordinatorProcessSupervisor supervisor = null;
 		try {
 			stageCoordinator(sourceCoordinator, packageRoot);
+			System.setProperty("arenaagents.packageRoot", packageRoot.toString());
+			assertEquals(2, CoordinatorProcessSupervisor.ownershipRoots(packageRoot.resolve("game")).size(),
+					"startup checks default and configured ownership roots");
+			assertEquals(packageRoot.toAbsolutePath().normalize(),
+					CoordinatorProcessSupervisor.ownershipRoots(packageRoot.resolve("game")).getFirst(),
+					"custom package ownership is reaped before launch");
+			int credentialAssertions = verifyOptionalVoiceCredential(packageRoot.resolve("credential-test"));
 			Path node = stageBundledNode(packageRoot);
 			Path fakeAppData = stageFakeCodex(packageRoot);
 			Path secret = packageRoot.resolve("runtime/bridge-secret.txt");
 			Files.createDirectories(secret.getParent());
 			Files.writeString(secret, "s".repeat(32), StandardCharsets.UTF_8);
-			System.setProperty("arenaagents.packageRoot", packageRoot.toString());
+			Files.writeString(
+					packageRoot.resolve("runtime/fish-api-key.txt"),
+					"test-fish-api-key",
+					StandardCharsets.UTF_8
+			);
 			System.clearProperty(NodeRuntimeLocator.PROPERTY);
 			System.clearProperty("arenaagents.bridgeSecretFile");
 			System.clearProperty("arenaagents.voiceSecretFile");
@@ -77,17 +88,12 @@ public final class CoordinatorStartupSmokeVerification {
 					Thread.sleep(10L);
 				}
 				assertTrue(supervisor.configured(), "staged package is configured");
-<<<<<<< HEAD
 				assertEquals(bridge.getLocalPort(), supervisor.bridgePort(),
-						"production supervisor publishes the nondefault coordinator bridge port");
+					"production supervisor publishes the nondefault coordinator bridge port");
 				assertEquals("http://127.0.0.1:" + voicePort + "/v1/tts", System.getProperty("arenaagents.voiceUrl"),
-						"coordinator shares the existing optional voice endpoint before startup");
-=======
-				assertEquals("http://127.0.0.1:9123/v1/tts", System.getProperty("arenaagents.voiceUrl"),
-						"coordinator voice endpoint is shared with the addon before voice startup");
+					"coordinator shares the existing optional voice endpoint before startup");
 				assertEquals("91234", System.getProperty("arenaagents.voiceRequestTimeoutMs"),
-						"coordinator local inference deadline is shared with the addon before voice startup");
->>>>>>> origin/main
+					"coordinator local inference deadline is shared with the addon before voice startup");
 				assertEquals(node.toAbsolutePath().normalize(), NodeRuntimeLocator.locate(packageRoot).executable(),
 						"bundled runtime is selected before the empty PATH");
 
@@ -97,11 +103,11 @@ public final class CoordinatorStartupSmokeVerification {
 					if (bridge.getSoTimeout() == 0) bridge.setSoTimeout(250);
 					try (Socket socket = bridge.accept()) {
 						socket.setSoTimeout(15_000);
-<<<<<<< HEAD
-						if (completeHandshakeAndCatalog(socket)) return 10;
-=======
-						if (completeHandshakeAndCatalog(socket)) return 8;
->>>>>>> origin/main
+						if (completeHandshakeAndCatalog(socket)) {
+							assertTrue(awaitLoopbackListener(voicePort, 5_000L),
+								"runtime Fish credential starts the loopback voice worker");
+							return 12 + credentialAssertions;
+						}
 					} catch (java.net.SocketTimeoutException ignored) {
 						// The supervisor's startup grace is intentionally polled without shell state.
 					}
@@ -110,7 +116,6 @@ public final class CoordinatorStartupSmokeVerification {
 				throw new AssertionError("staged coordinator did not reach the catalog-ready boundary: " + supervisor.failureCode());
 			}
 		} finally {
-<<<<<<< HEAD
 			AssertionError ownershipFailure = null;
 			try {
 				if (supervisor != null) {
@@ -122,7 +127,7 @@ public final class CoordinatorStartupSmokeVerification {
 							Thread.sleep(25L);
 						}
 						assertTrue(!Files.exists(CoordinatorProcessOwnership.ownershipFile(packageRoot)),
-								"coordinator close clears the ownership record");
+							"coordinator close clears the ownership record");
 					} catch (AssertionError failure) {
 						ownershipFailure = failure;
 					} catch (InterruptedException interrupted) {
@@ -136,19 +141,10 @@ public final class CoordinatorStartupSmokeVerification {
 				restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
 				restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
 				restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
+				restoreProperty("arenaagents.voiceRequestTimeoutMs", oldVoiceRequestTimeout);
 				deleteTree(packageRoot);
 			}
 			if (ownershipFailure != null) throw ownershipFailure;
-=======
-			if (supervisor != null) supervisor.close();
-			restoreProperty("arenaagents.packageRoot", oldPackageRoot);
-			restoreProperty(NodeRuntimeLocator.PROPERTY, oldNodePath);
-			restoreProperty("arenaagents.bridgeSecretFile", oldBridgeSecret);
-			restoreProperty("arenaagents.voiceSecretFile", oldVoiceSecret);
-			restoreProperty("arenaagents.voiceUrl", oldVoiceUrl);
-			restoreProperty("arenaagents.voiceRequestTimeoutMs", oldVoiceRequestTimeout);
-			deleteTree(packageRoot);
->>>>>>> origin/main
 		}
 	}
 
@@ -288,11 +284,7 @@ public final class CoordinatorStartupSmokeVerification {
 				{
 				  "bridge": { "host": "127.0.0.1", "port": %d, "secretEnvironmentVariable": "ARENA_AGENT_BRIDGE_SECRET", "reconnectDelayMs": 50, "maxReconnectDelayMs": 100 },
 				  "codex": { "cwd": "%s", "planningTimeoutMs": 1000, "catalogTtlMs": 60000, "serviceTier": "fast", "launchProfile": { "model": "gpt-5.6-luna", "reasoningEffort": "xhigh", "serviceTier": "fast" } },
-<<<<<<< HEAD
-				  "voice": { "port": %d, "maxConcurrent": 1 },
-=======
-				  "voice": { "port": 9123, "maxConcurrent": 1, "localSpeechTimeoutMs": 91234 },
->>>>>>> origin/main
+				  "voice": { "port": %d, "maxConcurrent": 1, "localSpeechTimeoutMs": 91234 },
 				  "limits": { "agentCap": 1, "goalQueueCap": 1, "planningConcurrency": 1, "planningMode": "fixed", "urgentReserve": 0, "invalidDecisionRetries": 0 }
 				}
 				""".formatted(port, root.toString().replace("\\", "\\\\"), voicePort);
@@ -300,10 +292,37 @@ public final class CoordinatorStartupSmokeVerification {
 		Files.writeString(root.resolve("runtime/dynamic-agents.json"), config, StandardCharsets.UTF_8);
 	}
 
+	private static int verifyOptionalVoiceCredential(Path runtimeRoot) throws IOException {
+		Path credential = runtimeRoot.resolve("runtime/fish-api-key.txt");
+		Files.createDirectories(credential.getParent());
+		Files.writeString(credential, "bad", StandardCharsets.UTF_8);
+		Map<String, String> environment = new HashMap<>();
+		CoordinatorProcessSupervisor.configureVoiceProviderCredential(runtimeRoot, environment);
+		assertTrue(!environment.containsKey("FISH_AUDIO_API_KEY"),
+				"malformed optional TTS credential is ignored");
+		Files.writeString(credential, "valid-test-fish-key", StandardCharsets.UTF_8);
+		CoordinatorProcessSupervisor.configureVoiceProviderCredential(runtimeRoot, environment);
+		assertEquals("valid-test-fish-key", environment.get("FISH_AUDIO_API_KEY"),
+				"valid optional TTS credential is injected");
+		return 2;
+	}
+
 	private static int unusedLoopbackPort() throws IOException {
 		try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
 			return socket.getLocalPort();
 		}
+	}
+
+	private static boolean awaitLoopbackListener(int port, long timeoutMs) throws InterruptedException {
+		long deadline = System.currentTimeMillis() + timeoutMs;
+		while (System.currentTimeMillis() < deadline) {
+			try (Socket ignored = new Socket(InetAddress.getLoopbackAddress(), port)) {
+				return true;
+			} catch (IOException unavailable) {
+				Thread.sleep(25L);
+			}
+		}
+		return false;
 	}
 
 	private static Path findHostNode() throws IOException {
@@ -341,19 +360,6 @@ public final class CoordinatorStartupSmokeVerification {
 
 	private static void deleteTree(Path root) throws IOException {
 		if (!Files.exists(root)) return;
-<<<<<<< HEAD
-		for (int attempt = 0; attempt < 20; attempt += 1) {
-			try (var paths = Files.walk(root)) {
-				for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
-				return;
-			} catch (java.nio.file.AccessDeniedException busyExecutable) {
-				if (attempt == 19) throw busyExecutable;
-				try {
-					Thread.sleep(50L);
-				} catch (InterruptedException interrupted) {
-					Thread.currentThread().interrupt();
-					throw new IOException("Interrupted while cleaning the startup fixture", interrupted);
-=======
 		try (var paths = Files.walk(root)) {
 			for (Path path : paths.sorted(Comparator.reverseOrder()).toList()) deleteEventually(path);
 		}
@@ -366,13 +372,12 @@ public final class CoordinatorStartupSmokeVerification {
 				Files.deleteIfExists(path);
 				return;
 			} catch (java.nio.file.AccessDeniedException exception) {
-				if (!isWindows() || System.nanoTime() >= deadline) throw exception;
+				if (System.nanoTime() >= deadline) throw exception;
 				try {
 					Thread.sleep(25L);
 				} catch (InterruptedException interrupted) {
 					Thread.currentThread().interrupt();
-					throw new IOException("Interrupted while waiting for Windows to release " + path, interrupted);
->>>>>>> origin/main
+					throw new IOException("Interrupted while waiting for the fixture to release " + path, interrupted);
 				}
 			}
 		}

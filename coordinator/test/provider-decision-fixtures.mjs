@@ -13,7 +13,6 @@ export function replaceDecision({ summary = 'Wait safely.', source = 'program.on
 		summary,
 		directive: 'replace',
 		source,
-		completionContract: factualCompletionContract(goalRevision),
 	};
 }
 
@@ -21,12 +20,11 @@ export function replaceDecisionJson(options) {
 	return JSON.stringify(replaceDecision(options));
 }
 
-export function finishDecision({ summary = 'Done', status = 'completed', goalRevision = 1 } = {}) {
+export function finishDecision({ summary = 'Done' } = {}) {
 	return {
 		summary,
 		directive: 'finish',
-		status,
-		completionContract: factualCompletionContract(goalRevision),
+		source: null,
 	};
 }
 

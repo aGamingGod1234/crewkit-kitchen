@@ -12,14 +12,17 @@ import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
 import dev.agaminggod.arenaagents.server.group.AgentGroupSpawnCoordinator;
+import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.phys.Vec3;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
@@ -37,6 +40,7 @@ public final class CodexAgentCommands {
 	private static final String PROVIDER_CURSOR = "cursor";
 	private static final String ARGUMENT_AGENT = "agent";
 	private static final String ARGUMENT_GAME_MODE = "game_mode";
+	private static final String ARGUMENT_DRAFT = "draft_id";
 	private static final String ARGUMENT_GROUP = "group";
 	private static final String ARGUMENT_GROUP_MEMBERS = "members";
 	private static final String ARGUMENT_MODEL = "model";
@@ -58,6 +62,13 @@ public final class CodexAgentCommands {
 	}
 
 	static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
+		dispatcher.register(Commands.literal("agent").then(goalDraftCommands()));
+		dispatcher.register(
+				Commands.literal("verbose")
+						.requires(GoalControl::mayControl)
+						.then(Commands.literal("on").executes(context -> verbose(context, true)))
+						.then(Commands.literal("off").executes(context -> verbose(context, false)))
+		);
 		dispatcher.register(
 				Commands.literal("codex")
 						.then(Commands.literal("summon")
@@ -103,6 +114,7 @@ public final class CodexAgentCommands {
 								.then(Commands.literal("on").executes(context -> voiceConsent(context, true)))
 								.then(Commands.literal("off").executes(context -> voiceConsent(context, false)))
 								.then(Commands.literal("status").executes(CodexAgentCommands::voiceConsentStatus)))
+						.then(goalDraftCommands())
 						.then(promptCommand("start", CodexAgentManager::start))
 						.then(agentCommand("stop", CodexAgentManager::stop))
 						.then(agentCommand("resume", CodexAgentManager::resume))
@@ -110,7 +122,7 @@ public final class CodexAgentCommands {
 								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::respawn)))
 						.then(promptCommand("queue", CodexAgentManager::queue))
-						.then(promptCommand("steer", CodexAgentManager::steer))
+						.then(promptCommand("steer", (manager, selector, prompt, ignored) -> manager.steer(selector, prompt)))
 						.then(Commands.literal("status")
 								.requires(GoalControl::mayControl)
 								.executes(CodexAgentCommands::statusAll)
@@ -123,6 +135,95 @@ public final class CodexAgentCommands {
 								.requires(GoalControl::mayControl)
 								.then(agentArgument().executes(CodexAgentCommands::toggleAutomatic)))
 		);
+	}
+
+	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> goalDraftCommands() {
+		return Commands.literal("goal")
+				.then(goalDraftChoice("confirm", GoalDraftChoice.CONFIRM))
+				.then(goalDraftChoice("replace", GoalDraftChoice.REPLACE))
+				.then(goalDraftChoice("queue", GoalDraftChoice.QUEUE))
+				.then(goalDraftChoice("cancel", GoalDraftChoice.CANCEL))
+				.then(Commands.literal("complete")
+						.requires(GoalControl::mayControl)
+						.then(agentArgument().executes(CodexAgentCommands::confirmCompletion)));
+	}
+
+	private static int confirmCompletion(CommandContext<CommandSourceStack> context) throws CommandSyntaxException {
+		try {
+			AgentRecord record = manager(context).resolve(StringArgumentType.getString(context, ARGUMENT_AGENT));
+			CodexAgentServerRuntime.confirmCurrentGoal(context.getSource().getServer(), record.agentId());
+			context.getSource().sendSuccess(
+					() -> Component.literal("Confirmed completion for " + manager(context).displayName(record) + "."),
+					false
+			);
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("goal completion confirmation", exception);
+		}
+	}
+
+	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> goalDraftChoice(
+			String literal,
+			GoalDraftChoice choice
+	) {
+		return Commands.literal(literal).then(
+				Commands.argument(ARGUMENT_DRAFT, StringArgumentType.word())
+						.executes(context -> resolveGoalDraft(context, choice))
+		);
+	}
+
+	private static int resolveGoalDraft(
+			CommandContext<CommandSourceStack> context,
+			GoalDraftChoice choice
+	) throws CommandSyntaxException {
+		try {
+			if (choice != GoalDraftChoice.CANCEL) {
+				CodexAgentServerRuntime.requireAutomation(context.getSource().getServer());
+			}
+			UUID draftId = UUID.fromString(StringArgumentType.getString(context, ARGUMENT_DRAFT));
+			UUID actorId = context.getSource().getEntity() instanceof ServerPlayer player
+					? player.getUUID()
+					: new UUID(0L, 0L);
+			Optional<CodexAgentManager.GoalDraftResult> resolved = manager(context).resolveGoalDraft(
+					draftId, actorId, GoalControl.mayControl(context.getSource()), choice);
+			if (resolved.isEmpty()) {
+				context.getSource().sendSuccess(() -> Component.literal("Goal draft was already resolved."), false);
+				return 0;
+			}
+			CodexAgentManager.GoalDraftResult result = resolved.orElseThrow();
+			result.transition().ifPresent(transition -> reportTransition(
+					context,
+					switch (result.operation()) {
+						case START -> "start";
+						case REPLACE -> "replace";
+						case QUEUE -> "queue";
+						case CANCEL -> "cancel";
+					},
+					transition
+			));
+			if (result.operation() == dev.agaminggod.arenaagents.server.goal.GoalDraftResolution.Operation.CANCEL) {
+				context.getSource().sendSuccess(() -> Component.literal("Cancelled goal draft " + draftId + "."), false);
+			}
+			return 1;
+		} catch (AgentDomainException exception) {
+			throw commandFailure(exception);
+		} catch (IllegalArgumentException exception) {
+			throw COMMAND_FAILURE.create("INVALID_GOAL_DRAFT_ID: Draft ID must be a UUID");
+		} catch (RuntimeException exception) {
+			throw unexpectedFailure("goal draft", exception);
+		}
+	}
+
+	private static int verbose(CommandContext<CommandSourceStack> context, boolean enabled) {
+		CodexAgentServerRuntime.setVerbose(context.getSource().getServer(), enabled);
+		context.getSource().sendSuccess(
+				() -> Component.literal("Verbose agent activity " + (enabled ? "enabled" : "disabled")
+						+ " for operators for this server session."),
+				false
+		);
+		return 1;
 	}
 
 	private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> configuredSummon() {
@@ -277,7 +378,7 @@ public final class CodexAgentCommands {
 			CodexAgentServerRuntime.requireAutomation(context.getSource().getServer());
 			String selector = StringArgumentType.getString(context, ARGUMENT_AGENT);
 			String prompt = StringArgumentType.getString(context, ARGUMENT_PROMPT);
-			AgentTransition transition = operation.apply(manager(context), selector, prompt);
+			AgentTransition transition = operation.apply(manager(context), selector, prompt, context.getSource().getLevel());
 			reportTransition(context, operationName, transition);
 			return 1;
 		} catch (AgentDomainException exception) {
@@ -504,6 +605,7 @@ public final class CodexAgentCommands {
 		String message = switch (operation) {
 			case "start" -> "Starting a task for " + name + "...";
 			case "queue" -> "Added a task to " + name + "'s queue.";
+			case "replace" -> "Replacing " + name + "'s current task...";
 			case "steer" -> "Updating " + name + "'s current task...";
 			case "stop" -> "Paused " + name + ".";
 			case "resume" -> "Resuming " + name + "...";
@@ -538,7 +640,7 @@ public final class CodexAgentCommands {
 
 	@FunctionalInterface
 	private interface PromptOperation {
-		AgentTransition apply(CodexAgentManager manager, String selector, String prompt);
+		AgentTransition apply(CodexAgentManager manager, String selector, String prompt, ServerLevel sourceLevel);
 	}
 
 	@FunctionalInterface

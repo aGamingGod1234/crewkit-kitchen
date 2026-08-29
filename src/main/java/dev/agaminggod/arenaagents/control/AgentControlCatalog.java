@@ -101,16 +101,15 @@ public final class AgentControlCatalog {
 	private static List<AgentControlModelOption> buildFallbackOptions() {
 		ArrayList<AgentControlModelOption> values = new ArrayList<>();
 		add(values, CODEX, "gpt-5.6-luna", "GPT 5.6 Luna", List.of("low", "medium", "high", "xhigh", "max"), true);
+		add(values, CODEX, "gpt-5.6-terra", "GPT 5.6 Terra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		add(values, CODEX, "gpt-5.6-sol", "GPT 5.6 Sol", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		add(values, CODEX, "gpt-5.6-sol-wm", "GPT 5.6 Sol WM", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
-		add(values, CODEX, "gpt-5.6-terra", "GPT 5.6 Terra", List.of("low", "medium", "high", "xhigh", "max", "ultra"), true);
 		for (String model : List.of("gpt-5.5", "gpt-5.4")) {
 			add(values, CODEX, model, readable(model), List.of("low", "medium", "high", "xhigh"), true);
 		}
 		for (String model : List.of("gpt-5.4-mini", "gpt-5.3-codex-spark")) {
 			add(values, CODEX, model, readable(model), List.of("low", "medium", "high", "xhigh"), false);
 		}
-		add(values, CODEX, "codex-auto-review", "Codex Auto Review", List.of("low", "medium", "high", "xhigh", "max"), true);
 		add(values, "gemini", "gemini-3.1-pro", "Gemini 3.1 Pro", List.of("high", "low"), false);
 		for (String model : List.of("gemini-3.6-flash", "gemini-3.5-flash")) {
 			add(values, "gemini", model, readable(model), List.of("high", "medium", "low"), false);

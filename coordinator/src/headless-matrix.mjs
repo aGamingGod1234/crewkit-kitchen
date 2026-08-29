@@ -2,7 +2,7 @@ import path from 'node:path';
 import { mkdir as defaultMkdir, open as defaultOpen, readFile as defaultReadFile, writeFile as defaultWriteFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { HeadlessRconClient } from './headless-rcon.mjs';
-import { redact as redactTrace } from './trace-writer.mjs';
+import { sanitizeDiagnosticErrorStack, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 
 const PROVIDERS = new Set(['codex', 'gemini', 'kimi', 'cursor']);
 const MAX_TIMEOUT_MS = 900_000;
@@ -14,10 +14,6 @@ const MAX_EVIDENCE_TAIL_BYTES = 262_144;
 const MAX_SCENARIOS = 24;
 const MAX_MATRIX_REPORT_BYTES = 262_144;
 const POLL_INTERVAL_MS = 50;
-const SENSITIVE_REPORT_KEY = /(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|launcherAccount|accountData|token|credential|oauth)/i;
-const REPORT_SECRET_TEXT = /((?:bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)\s*[:=]\s*)([^\s,;)}\]"']+)/gi;
-const REPORT_BEARER_TEXT = /Bearer\s+[A-Za-z0-9._~+/=-]+/gi;
-const REPORT_QUOTED_SECRET_KEY = /(["'])(?:[A-Za-z0-9_-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|secret|password|token|credential|oauth)[A-Za-z0-9_-]*)\1\s*:\s*(["'])/gi;
 const SCENARIO_KEYS = new Set(['id', 'provider', 'model', 'reasoningEffort', 'serviceTier', 'task', 'timeoutMs', 'rosterSize', 'assert', 'assertions', 'repetitions', 'planningTimeoutMs', 'scenarioTimeoutMs', 'requireFactualSuccess']);
 const ASSERTION_KEYS = {
 	lifecycle: new Set(['type', 'state']),
@@ -138,11 +134,22 @@ export function scenarioReport(status, scenario, fields = {}) {
 	return freeze(report);
 }
 
-function boundReportValue(value, depth = 0) {
+function boundReportValue(value) {
+	const sanitized = sanitizeDiagnosticValue(value, {
+		maxDepth: 6,
+		maxEntries: 64,
+		maxNodes: 512,
+		maxStringBytes: MAX_DIAGNOSTICS,
+		redactPaths: true,
+	});
+	return boundSanitizedReportValue(sanitized);
+}
+
+function boundSanitizedReportValue(value, depth = 0) {
 	if (depth > 6) return '[TRUNCATED]';
-	if (value === null || typeof value !== 'object') return typeof value === 'string' ? redactReportText(value, MAX_DIAGNOSTICS) : value;
-	if (Array.isArray(value)) return value.slice(0, 64).map((entry) => boundReportValue(entry, depth + 1));
-	return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, entry]) => [key.slice(0, 128), SENSITIVE_REPORT_KEY.test(key) && !safeTokenCounts(key, entry) ? '[REDACTED]' : boundReportValue(entry, depth + 1)]));
+	if (value === null || typeof value !== 'object') return value;
+	if (Array.isArray(value)) return value.slice(0, 64).map((entry) => boundSanitizedReportValue(entry, depth + 1));
+	return Object.fromEntries(Object.entries(value).slice(0, 64).map(([key, entry]) => [key.slice(0, 128), boundSanitizedReportValue(entry, depth + 1)]));
 }
 
 function publicCommandRecords(value) {
@@ -161,12 +168,6 @@ function publicCommandRecords(value) {
 		else if (isReadOnlyRcon(source)) operation = 'read_only_assertion';
 		return { operation };
 	});
-}
-
-function safeTokenCounts(key, value) {
-	if (key !== 'tokens' || !value || typeof value !== 'object' || Array.isArray(value)) return false;
-	const categories = new Set(['input', 'output', 'reasoning', 'cached', 'cacheWrite']);
-	return Object.entries(value).every(([category, count]) => categories.has(category) && (count === null || Number.isSafeInteger(count) && count >= 0));
 }
 
 /** Evaluate only evidence that was observed from the server/protocol path. */
@@ -1218,36 +1219,8 @@ function boundedTailText(value, limit) {
 }
 
 function redactReportText(value, limit) {
-	let textValue = Buffer.isBuffer(value) ? value.toString('utf8') : String(value ?? '');
-	try {
-		const redacted = redactTrace(textValue);
-		if (typeof redacted === 'string') textValue = redacted;
-	} catch { /* fall through to the local bounded redactor */ }
-	textValue = redactQuotedJsonSecrets(textValue)
-		.replace(REPORT_BEARER_TEXT, 'Bearer [REDACTED]')
-		.replace(REPORT_SECRET_TEXT, '$1[REDACTED]');
-	return boundedText(textValue, limit);
-}
-
-function redactQuotedJsonSecrets(value) {
-	let result = '';
-	let cursor = 0;
-	REPORT_QUOTED_SECRET_KEY.lastIndex = 0;
-	let match;
-	while ((match = REPORT_QUOTED_SECRET_KEY.exec(value)) !== null) {
-		const valueStart = REPORT_QUOTED_SECRET_KEY.lastIndex;
-		let valueEnd = valueStart;
-		while (valueEnd < value.length) {
-			if (value[valueEnd] === '\\') { valueEnd += 2; continue; }
-			if (value[valueEnd] === match[2]) break;
-			valueEnd += 1;
-		}
-		if (valueEnd >= value.length) break;
-		result += value.slice(cursor, valueStart) + '[REDACTED]' + match[2];
-		cursor = valueEnd + 1;
-		REPORT_QUOTED_SECRET_KEY.lastIndex = cursor;
-	}
-	return result + value.slice(cursor);
+	const textValue = Buffer.isBuffer(value) ? value.toString('utf8') : value;
+	return sanitizeDiagnosticText(textValue, { maxBytes: limit, redactPaths: true });
 }
 
 function logicalNow(now, startedAt, attempt) {
@@ -1301,9 +1274,14 @@ async function runHeadlessCli() {
 	process.exitCode = result.exitCode;
 }
 
+export function writeHeadlessCliFailure(error, write = (line) => process.stderr.write(line)) {
+	if (typeof write !== 'function') throw new TypeError('headless CLI diagnostic writer must be a function');
+	write(`${sanitizeDiagnosticErrorStack(error, { maxBytes: 4_096 })}\n`);
+}
+
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	runHeadlessCli().catch((error) => {
-		process.stderr.write(`${error?.stack ?? error}\n`);
+		writeHeadlessCliFailure(error);
 		process.exitCode = 1;
 	});
 }

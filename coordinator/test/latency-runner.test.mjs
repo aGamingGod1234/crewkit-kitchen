@@ -53,12 +53,13 @@ function movementScenario() {
 	return {
 		id: 'fixture-movement', seed: 42, agentId: 'agent-a', goal: 'Move.',
 		world: { seed: 42, agents: { 'agent-a': { position: { x: 0, y: 1, z: 0 }, onGround: true } }, blocks: [{ x: 0, y: 0, z: 0, blockId: 'minecraft:stone' }] },
-		commands: [{ actionId: 'move-1', actionType: 'move_to', arguments: { x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false } }], events: [], expected: {},
+		commands: [{ actionId: 'move-1', actionType: 'navigate_to', arguments: { x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false, timeoutMs: 5_000 } }], events: [], expected: {},
 	};
 }
 
 function fixtureDecision({ summary = 'done', source = SOURCE, scenario = fixtureScenario() } = {}) {
-	return { summary, directive: 'replace', source, completionContract: compileScenarioDecision(scenario).completionContract };
+	void scenario;
+	return { summary, directive: 'replace', source };
 }
 
 function movementProvider() {
@@ -67,7 +68,7 @@ function movementProvider() {
 		async start() {},
 		async stop() {},
 		async createAgent() {
-			return { async setGoalRevision() {}, async decide() { return fixtureDecision({ summary: 'move', source: 'program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false }); program.finish("done");', scenario: movementScenario() }); } };
+			return { async setGoalRevision() {}, async decide() { return fixtureDecision({ summary: 'move', source: 'program.onUnhandledAttention("continue_and_notify"); await player.navigateTo({ x: 1, y: 1, z: 0, tolerance: 0.2, sprint: false, timeoutMs: 5_000 }); program.finish("done");', scenario: movementScenario() }); } };
 		},
 	};
 }
@@ -494,15 +495,17 @@ test('artifact output is staged, bounded, and redacted on provider failure', asy
 	const directory = await mkdtemp(path.join(os.tmpdir(), 'latency-artifacts-'));
 	try {
 		const secret = 'fixture-secret-token-123456';
+		const privatePath = 'C:\\private\\benchmark.json';
 		const result = await runLatencyMatrix({
 			matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'redacted', providerAvailabilityRequired: true }] }),
 			scenarioResolver: () => fixtureScenario(),
-			providerFactories: { instant: () => ({ available: true, async start() { throw new Error(`authorization token=${secret}`); }, async stop() {} }) },
+			providerFactories: { instant: () => ({ available: true, async start() { throw new Error(`authorization token=${secret} at ${privatePath}`); }, async stop() {} }) },
 			artifactDirectory: directory,
 		});
 		assert.equal(result.trials[0].status, 'FAILED');
 		const manifest = await readFile(path.join(directory, 'latency-manifest.json'), 'utf8');
 		assert.equal(manifest.includes(secret), false);
+		assert.equal(manifest.includes(privatePath), false);
 		assert.ok(manifest.length < 100_000);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
@@ -558,6 +561,36 @@ test('replay mode uses the same full coordinator path and rejects prompt drift',
 		providerFactories: { codex: () => createReplayProvider({ recording, trialId: 'replay-path', prompt: `${prompt}-drift`, providerProfile: profile, scenario, protocolVersion: 2 }) }, artifactDirectory: null,
 	});
 	assert.equal(drift.trials[0].error.code, 'REPLAY_IDENTITY_MISMATCH');
+});
+
+test('Codex benchmark sessions receive the explicit ArenaScript protocol', async () => {
+	const profile = { provider: 'codex', model: 'fixture-model', reasoningEffort: 'high', serviceTier: 'fast' };
+	const optionsSeen = [];
+	const scenario = fixtureScenario();
+	const trial = { ...matrix().trials[0], id: 'codex-arena-script', mode: 'live', providerProfile: profile, scenarioId: scenario.id };
+	const providerFactory = () => ({
+		available: true,
+		provider: 'codex',
+		model: profile.model,
+		reasoningEffort: profile.reasoningEffort,
+		serviceTier: profile.serviceTier,
+		providerProfile: profile,
+		async createAgent(_record, options) {
+			optionsSeen.push(options);
+			return { async setGoalRevision() {}, async decide() { return fixtureDecision({ scenario }); } };
+		},
+		async stop() {},
+	});
+
+	const result = await runLatencyMatrix({
+		matrix: matrix({ trials: [trial] }),
+		scenarioResolver: () => scenario,
+		providerFactories: { codex: providerFactory },
+		artifactDirectory: null,
+	});
+
+	assert.equal(result.trials[0].status, 'PASSED');
+	assert.equal(optionsSeen[0].controlProtocol, 'arena_script');
 });
 
 test('paces delayed replay ticks against wall time instead of racing virtual time ahead', async () => {

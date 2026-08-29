@@ -1,5 +1,7 @@
+import { EventEmitter } from 'node:events';
 import { createProtocolV2Envelope, validateProtocolV2Envelope, validateProtocolV2Payload } from '../../src/protocol-v2.mjs';
 import { adaptObservation } from '../../src/observation-adapter.mjs';
+import { goalSpecFingerprint } from '../../src/goal-spec.mjs';
 
 export const SELECTED_PROFILE = Object.freeze({
 	agentId: 'task10-agent',
@@ -239,4 +241,472 @@ export function assertCommandProvenance(commands, profile = SELECTED_PROFILE, ex
 		if (!/^step-/.test(provenance.sourceStepId)) throw new Error(`invalid source step ${provenance.sourceStepId}`);
 		if (!Number.isSafeInteger(provenance.eventSequence)) throw new Error('command event sequence is not a safe integer');
 	}
+}
+
+/**
+ * Event-emitting bridge for coordinator-level native-turn tests. It is the
+ * external socket/world boundary: tests inject failures here, never into
+ * coordinator private state or supervisor timers.
+ */
+export class FaultInjectingMinecraftBridge extends EventEmitter {
+	#scenario;
+	#record;
+	#serverInstanceId = 'native-fault-fixture-1';
+	#eventSequence = 1;
+	#actionNumber = 0;
+	#completionNumber = 0;
+	#connected = false;
+	#stopped = false;
+	#world;
+	#reconnectTimer = null;
+	#actionResults = [];
+	#connectionEpoch = 0;
+	#deferredActionResults = new Map();
+	#activePhysicalActions = 0;
+
+	sent = [];
+	states = [];
+	recoveries = [];
+	maxRecoveryHandles = 0;
+	validatedOutbound = 0;
+	validatedInbound = 0;
+	recoveryHandles = 0;
+	recoveryDispatches = 0;
+	completionEvaluations = [];
+	goalControls = [];
+	actionEffects = [];
+	actionAttempts = [];
+	deliveredActionResults = [];
+	staleActionReplays = [];
+	maxConcurrentPhysicalActions = 0;
+
+	constructor(scenario = {}) {
+		super();
+		this.#scenario = scenario;
+		this.#record = {
+			agentId: 'native-fault-agent',
+			provider: 'codex',
+			model: 'gpt-5.6-luna',
+			reasoningEffort: 'xhigh',
+			serviceTier: 'fast',
+			goalRevision: 0,
+		};
+		this.#world = {
+			position: { x: 0, y: 64, z: 0 },
+			dead: false,
+			health: 20,
+			inventory: new Map(Object.entries(scenario.initialInventory ?? {})),
+			blocks: new Map([['0,64,0', 'minecraft:oak_log']]),
+			entities: new Map(),
+			drop: { stableId: '00000000-0000-4000-8000-000000000001', itemId: 'minecraft:oak_log', count: 1, x: 1, y: 64, z: 0 },
+		};
+	}
+
+	get record() { return { ...this.#record }; }
+	get connected() { return this.#connected; }
+	get actionCount() { return this.#actionNumber; }
+	get completionCount() { return this.#completionNumber; }
+	get inventory() { return new Map(this.#world.inventory); }
+	get world() { return structuredClone({ ...this.#world, inventory: Object.fromEntries(this.#world.inventory) }); }
+	get goalSpec() { return this.#record.goalSpec === undefined ? null : structuredClone(this.#record.goalSpec); }
+	get connectionEpoch() { return this.#connectionEpoch; }
+	get actionDispatches() { return this.sent.filter(({ type }) => type === 'action_command').map((entry) => structuredClone(entry)); }
+	get deferredActionCount() { return this.#deferredActionResults.size; }
+
+	start() {
+		this.#stopped = false;
+		this.#connected = true;
+	}
+
+	stop() {
+		this.#stopped = true;
+		this.#connected = false;
+		if (this.#reconnectTimer !== null) this.#reconnectTimer.cancelled = true;
+		this.#reconnectTimer = null;
+	}
+
+	ready({ revision = this.#record.goalRevision, state = 'IDLE' } = {}) {
+		this.#connected = true;
+		this.#connectionEpoch += 1;
+		this.#record.goalRevision = revision;
+		const profile = {
+			schemaVersion: 1,
+			agentId: this.#record.agentId,
+			provider: this.#record.provider,
+			model: this.#record.model,
+			reasoningEffort: this.#record.reasoningEffort,
+			serviceTier: this.#record.serviceTier,
+			skinVariant: 'default',
+			state,
+			goalRevision: revision,
+			currentGoal: this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe',
+			currentGoalSpec: this.#record.goalSpec ?? null,
+			queue: [],
+			createdAtEpochMs: 1,
+			updatedAtEpochMs: 1,
+		};
+		this.emit('ready', { connectionEpoch: this.#connectionEpoch, serverInstanceId: this.#serverInstanceId, registry: [profile] });
+	}
+
+	startGoal(goal = this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe', revision = 1) {
+		this.#record.goalRevision = revision;
+		this.#record.goal = goal;
+		const fields = {
+			originalRequest: goal,
+			predicate: this.#scenario.goalPredicate ?? { type: 'inventory_contains', itemId: 'minecraft:wooden_pickaxe', count: 1 },
+			createdAtTick: revision,
+		};
+		this.#record.goalSpec = { ...fields, fingerprint: goalSpecFingerprint(fields) };
+		const control = {
+			agentId: this.#record.agentId,
+			payload: { operation: 'start', goalRevision: revision, goal, goalSpec: this.#record.goalSpec, updatedAtEpochMs: revision },
+		};
+		this.goalControls.push(structuredClone(control));
+		this.emit('goal_control', { ...control, connectionEpoch: this.#connectionEpoch });
+		return this.publishObservation({ attention: true });
+	}
+
+	async send(type, agentId, payload) {
+		const envelope = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId,
+			type,
+			messageId: `native-fault-out-${this.sent.length + 1}`,
+			payload,
+		});
+		validateProtocolV2Envelope(envelope, { direction: 'coordinator_to_server' });
+		this.validatedOutbound += 1;
+		this.sent.push({ type, agentId, payload: envelope.payload, connectionEpoch: this.#connectionEpoch });
+		if (type === 'planning_state') this.states.push(envelope.payload.state);
+		if (type === 'agent_error') this.recoveries.push(envelope.payload.code);
+		if (type === 'agent_error' && this.#scenario.unsupportedProfile) {
+			queueMicrotask(() => this.#emitGoalControl('fail', this.#record.goalRevision + 1));
+		}
+		if (type === 'request_observation') {
+			this.recoveries.push('REQUEST_OBSERVATION');
+			this.recoveryHandles += 1;
+			this.maxRecoveryHandles = Math.max(this.maxRecoveryHandles, this.recoveryHandles);
+			this.recoveryDispatches += 1;
+			queueMicrotask(() => {
+				try { this.publishObservation({ attention: true }); }
+				finally { this.recoveryHandles = Math.max(0, this.recoveryHandles - 1); }
+			});
+		}
+		if (type === 'action_command') {
+			const dispatchEpoch = this.#connectionEpoch;
+			queueMicrotask(() => { void this.#executeAction(envelope.payload, dispatchEpoch); });
+		}
+		if (type === 'goal_completed') queueMicrotask(() => { void this.#completeGoal(envelope.payload); });
+		if (type === 'action_cancel') this.recoveries.push('ACTION_CANCELLED');
+	}
+
+	publishObservation({ attention = true, revision = this.#record.goalRevision, stale = false } = {}) {
+		const observedRevision = stale ? Math.max(0, revision - 1) : revision;
+		const payload = wireObservation(this.#world, observedRevision, ++this.#eventSequence, attention);
+		const envelope = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId: this.#record.agentId,
+			type: 'observation',
+			messageId: `native-fault-in-${this.#eventSequence}`,
+			payload,
+		});
+		validateProtocolV2Envelope(envelope, { direction: 'server_to_coordinator' });
+		this.validatedInbound += 1;
+		if (this.#connected && !this.#stopped) this.emit('observation', { agentId: this.#record.agentId, payload: envelope.payload, connectionEpoch: this.#connectionEpoch });
+		return envelope.payload;
+	}
+
+	pause() {
+		const revision = this.#record.goalRevision + 1;
+		this.#record.goalRevision = revision;
+		this.emit('goal_control', {
+			agentId: this.#record.agentId,
+			payload: { operation: 'stop', goalRevision: revision, updatedAtEpochMs: revision },
+			connectionEpoch: this.#connectionEpoch,
+		});
+	}
+
+	releaseDeferredActionResults() {
+		const deferred = [...this.#deferredActionResults.values()];
+		this.#deferredActionResults.clear();
+		for (const entry of deferred) {
+			this.staleActionReplays.push({
+				actionId: entry.result.actionId,
+				originConnectionEpoch: entry.connectionEpoch,
+				replayConnectionEpoch: this.#connectionEpoch,
+				goalRevision: entry.result.goalRevision,
+			});
+			this.#emitInbound('action_result', entry.result, entry.connectionEpoch);
+		}
+		return deferred.length;
+	}
+
+	#emitGoalControl(operation, revision, extra = {}) {
+		this.#record.goalRevision = revision;
+		const control = {
+			agentId: this.#record.agentId,
+			payload: { operation, goalRevision: revision, updatedAtEpochMs: revision, ...extra },
+		};
+		this.goalControls.push(structuredClone(control));
+		this.emit('goal_control', { ...control, connectionEpoch: this.#connectionEpoch });
+	}
+
+	async #executeAction(command, connectionEpoch) {
+		if (!this.#connected || this.#stopped) return;
+		this.#actionNumber += 1;
+		const actionFault = this.#scenario.actionResults?.[this.#actionNumber - 1] ?? 'SUCCEEDED';
+		const actionType = command.actionType;
+		const succeeded = actionFault === 'SUCCEEDED';
+		const disconnectOutstanding = this.#scenario.disconnectWhileActionOutstandingAtAction === this.#actionNumber;
+		if (succeeded) {
+			this.#activePhysicalActions += 1;
+			this.maxConcurrentPhysicalActions = Math.max(this.maxConcurrentPhysicalActions, this.#activePhysicalActions);
+			this.actionAttempts.push({ actionId: command.actionId, actionType, goalRevision: command.goalRevision, connectionEpoch });
+			try { this.#applySuccessfulAction(command, connectionEpoch); }
+			finally { this.#activePhysicalActions -= 1; }
+		}
+		const respawned = succeeded && actionType === 'respawn';
+		const died = this.#scenario.dieAtAction === this.#actionNumber;
+		if (died) {
+			this.#world.dead = true;
+			this.#world.health = 0;
+		}
+		const state = succeeded ? 'SUCCEEDED' : 'FAILED';
+		const result = {
+			traceId: command.traceId,
+			goalRevision: command.goalRevision,
+			actionId: command.actionId,
+			commandId: command.actionId,
+			actionType,
+			state,
+			reasonCode: actionFault,
+			message: actionFault,
+			elapsedMs: 1,
+			observedAtEpochMs: this.#eventSequence,
+			executionStarted: true,
+			physicalAttempted: true,
+		};
+		this.#actionResults.push(result);
+		this.recoveries.push(actionFault);
+		this.#emitInbound('action_progress', {
+			traceId: command.traceId,
+			goalRevision: command.goalRevision,
+			actionId: command.actionId,
+			commandId: command.actionId,
+			actionType,
+			state: 'RUNNING',
+			message: 'fixture progress',
+			progress: 0.5,
+			elapsedMs: 1,
+			observedAtEpochMs: this.#eventSequence,
+		});
+		if (disconnectOutstanding) {
+			this.#deferredActionResults.set(command.actionId, { command, result, connectionEpoch });
+			this.#disconnectAndResume();
+			return;
+		}
+		this.#emitInbound('action_result', result);
+		if (respawned) this.#emitGoalControl('respawn', this.#record.goalRevision, { resumeGoal: true });
+		if (died) this.#emitGoalControl('dead', this.#record.goalRevision, { death: {
+			cause: 'fixture',
+			dimensionId: 'minecraft:overworld',
+			x: this.#world.position.x,
+			y: this.#world.position.y,
+			z: this.#world.position.z,
+			respawnDimensionId: 'minecraft:overworld',
+			respawnX: this.#world.position.x,
+			respawnY: this.#world.position.y,
+			respawnZ: this.#world.position.z,
+			respawnYaw: 0,
+			respawnPitch: 0,
+			respawnForced: false,
+			gameMode: 'survival',
+			diedAtEpochMs: this.#eventSequence,
+		} });
+		if (this.#scenario.disconnectAtAction === this.#actionNumber) this.#disconnectAndResume();
+		if (this.#scenario.staleCallbackAfterRevision && this.#actionNumber === 1) {
+			queueMicrotask(() => { this.publishObservation({ revision: command.goalRevision, stale: true }); });
+		}
+		if (!this.#world.dead && this.#connected) this.publishObservation({ attention: actionFault !== 'SUCCEEDED' });
+	}
+
+	async #completeGoal(request) {
+		this.#completionNumber += 1;
+		const scriptedResult = this.#scenario.completionResults?.[this.#completionNumber - 1];
+		const evaluation = this.#evaluateGoalPredicate(this.#record.goalSpec?.predicate);
+		const verified = request.goalFingerprint === this.#record.goalSpec?.fingerprint && evaluation.satisfied
+			&& (scriptedResult === undefined || scriptedResult === true);
+		this.completionEvaluations.push({
+			goalRevision: request.goalRevision,
+			goalFingerprint: request.goalFingerprint,
+			verified,
+			facts: structuredClone(evaluation.facts),
+		});
+		if (!verified) this.recoveries.push('COMPLETION_REJECTED');
+		this.#emitInbound('goal_completion_result', {
+			goalRevision: request.goalRevision,
+			traceId: request.traceId,
+			goalFingerprint: request.goalFingerprint,
+			verified,
+			reasonCode: verified ? 'COMPLETION_VERIFIED' : 'COMPLETION_REJECTED',
+			facts: evaluation.facts,
+		});
+	}
+
+	#applySuccessfulAction(command, connectionEpoch) {
+		const actionType = command.actionType;
+		const args = command.arguments ?? {};
+		let changed = false;
+		if (actionType === 'break_block' || actionType === 'mine') {
+			changed = this.#world.blocks.delete(`${args.x},${args.y},${args.z}`);
+			if (this.#world.drop !== null) {
+				const nextX = this.#scenario.moveDropBeforePickup ? 3 : this.#world.drop.x;
+				changed ||= nextX !== this.#world.drop.x;
+				this.#world.drop = {
+					...this.#world.drop,
+					x: nextX,
+				};
+			}
+		}
+		if (actionType === 'navigate_to') {
+			changed = this.#world.position.x !== args.x || this.#world.position.y !== args.y || this.#world.position.z !== args.z;
+			this.#world.position = { x: args.x, y: args.y, z: args.z };
+		}
+		if (actionType === 'pick_up_item') {
+			const drop = this.#world.drop;
+			if (drop !== null && args.targetSelector === drop.stableId) {
+				changed = true;
+				this.#world.inventory.set(drop.itemId, (this.#world.inventory.get(drop.itemId) ?? 0) + drop.count);
+				this.#world.drop = null;
+			}
+		}
+		if (actionType === 'craft_inventory') {
+			changed = true;
+			const itemId = args.recipeId ?? 'minecraft:wooden_pickaxe';
+			this.#world.inventory.set(itemId, (this.#world.inventory.get(itemId) ?? 0) + (args.count ?? 1));
+		}
+		if (actionType === 'respawn') {
+			changed = this.#world.dead || this.#world.health !== 20;
+			this.#world.dead = false;
+			this.#world.health = 20;
+		}
+		if (changed) this.actionEffects.push({ actionId: command.actionId, actionType, goalRevision: command.goalRevision, connectionEpoch });
+	}
+
+	#evaluateGoalPredicate(predicate) {
+		if (predicate === null || typeof predicate !== 'object') return { satisfied: false, facts: [] };
+		if (predicate.type === 'all_of' || predicate.type === 'any_of') {
+			const children = predicate.predicates.map((child) => this.#evaluateGoalPredicate(child));
+			return {
+				satisfied: predicate.type === 'all_of' ? children.every((child) => child.satisfied) : children.some((child) => child.satisfied),
+				facts: children.flatMap((child) => child.facts),
+			};
+		}
+		let satisfied = false;
+		let expectedValue = predicate.type;
+		let observedValue = 'unsupported';
+		switch (predicate.type) {
+			case 'inventory_contains': {
+				const count = this.#world.inventory.get(predicate.itemId) ?? 0;
+				satisfied = count >= predicate.count;
+				expectedValue = `${predicate.itemId} x${predicate.count}`;
+				observedValue = `${predicate.itemId} x${count}`;
+				break;
+			}
+			case 'position_within': {
+				const distance = Math.hypot(this.#world.position.x - predicate.x, this.#world.position.y - predicate.y, this.#world.position.z - predicate.z);
+				satisfied = distance <= predicate.radius;
+				expectedValue = `${predicate.x},${predicate.y},${predicate.z} radius=${predicate.radius}`;
+				observedValue = `${this.#world.position.x},${this.#world.position.y},${this.#world.position.z}`;
+				break;
+			}
+			case 'block_matches': {
+				const observed = this.#world.blocks.get(`${predicate.x},${predicate.y},${predicate.z}`) ?? 'minecraft:air';
+				satisfied = observed === predicate.blockId;
+				expectedValue = predicate.blockId;
+				observedValue = observed;
+				break;
+			}
+			case 'operator_confirmed':
+				expectedValue = 'operator confirmation';
+				observedValue = this.#scenario.operatorConfirmed === true ? 'confirmed' : 'not confirmed';
+				satisfied = this.#scenario.operatorConfirmed === true;
+				break;
+			default:
+				break;
+		}
+		return { satisfied, facts: [{ type: predicate.type, satisfied, expectedValue, observedValue }] };
+	}
+
+	#entityState(entityId) {
+		if (this.#world.drop?.stableId?.toLowerCase() === entityId.toLowerCase()) return 'alive';
+		return this.#world.entities.get(entityId.toLowerCase()) ?? null;
+	}
+
+	#disconnectAndResume() {
+		this.#connected = false;
+		this.recoveries.push('BRIDGE_DISCONNECTED');
+		this.emit('disconnected', { connectionEpoch: this.#connectionEpoch });
+		if (this.#stopped) return;
+		const reconnect = { cancelled: false };
+		this.#reconnectTimer = reconnect;
+		queueMicrotask(() => {
+			if (reconnect.cancelled || this.#reconnectTimer !== reconnect) return;
+			this.#reconnectTimer = null;
+			if (this.#stopped) return;
+			const nextRevision = this.#record.goalRevision + 1;
+			this.#serverInstanceId = `native-fault-fixture-${nextRevision}`;
+			this.ready({ revision: nextRevision, state: 'DISCONNECTED' });
+			this.#emitGoalControl('resume', nextRevision + 1, { goal: this.#record.goal ?? this.#scenario.goal ?? 'gather wood and craft a wooden pickaxe' });
+			this.publishObservation({ attention: true, revision: this.#record.goalRevision });
+		});
+	}
+
+	#emitInbound(type, payload, connectionEpoch = this.#connectionEpoch) {
+		const envelope = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId: this.#record.agentId,
+			type,
+			messageId: `native-fault-in-${++this.#eventSequence}`,
+			payload,
+		});
+		validateProtocolV2Envelope(envelope, { direction: 'server_to_coordinator' });
+		this.validatedInbound += 1;
+		if (type === 'action_result') this.deliveredActionResults.push({ actionId: envelope.payload.actionId, connectionEpoch });
+		if (this.#connected && !this.#stopped) this.emit(type, { agentId: this.#record.agentId, payload: envelope.payload, connectionEpoch });
+	}
+}
+
+function wireObservation(world, goalRevision, eventSequence, attention) {
+	const item = world.drop;
+	return {
+		goalRevision,
+		observedAtEpochMs: eventSequence,
+		ready: true,
+		status: 'ready',
+		eventSequence,
+		attention,
+		changedFacts: attention ? ['inventory', 'entities'] : [],
+		position: { ...world.position },
+		velocity: { x: 0, y: 0, z: 0 },
+		view: { yaw: 0, pitch: 0 },
+		player: {
+			health: world.health, maxHealth: 20, armor: 0, foodLevel: 20, saturation: 5,
+			gameMode: 'survival', onGround: true, inWater: false, onFire: false,
+			air: 300, maxAir: 300, suffocating: false, fallDistance: 0, effects: [],
+		},
+		inventory: {
+			items: [...world.inventory].map(([itemId, count], slot) => ({ itemId, count, damage: 0, maxDamage: 0, slot })),
+			selectedItem: 'minecraft:air',
+		},
+		entities: item === null ? [] : [{ uuid: item.stableId, type: 'minecraft:item', name: 'drop', distance: 1, position: { x: item.x, y: item.y, z: item.z }, itemId: item.itemId, count: item.count }],
+		blocks: [...world.blocks].map(([key, blockId]) => {
+			const [x, y, z] = key.split(',').map(Number);
+			return { x, y, z, blockId, placeableFaces: ['up', 'down', 'north', 'south', 'east', 'west'] };
+		}),
+		nearbyContainers: [],
+		world: { dimension: 'minecraft:overworld', gameTime: eventSequence, dayTime: eventSequence, raining: false, thundering: false },
+		currentAction: { active: false },
+		lastResult: { present: false },
+	};
 }

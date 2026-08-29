@@ -5,6 +5,8 @@ const OBSERVED_SETS = new WeakSet();
 const CANDIDATE_ORIGINS = new WeakMap();
 const PLAYER_FIELDS = ['x', 'y', 'z', 'health', 'hunger', 'air', 'fire', 'fallDistance', 'dead', 'yaw', 'pitch'];
 const CANDIDATE_FIELDS = ['stableId', 'entityId', 'type', 'itemId', 'blockId', 'count', 'x', 'y', 'z', 'distance', 'tags'];
+const ADAPTED_CANDIDATE_FIELDS = new Set([...CANDIDATE_FIELDS, 'name', 'isPlayer', 'placeableFaces']);
+const ADAPTED_INVENTORY_FIELDS = new Set(['itemId', 'count', 'slot', 'tags', 'damage', 'maxDamage', 'hotbar']);
 
 /** Builds an immutable, observation-only fact view. */
 export function createFactView(observation) {
@@ -83,7 +85,7 @@ function copyCandidates(values, kind) {
 function copyCandidate(value, kind) {
 	const source = ownDataRecord(value, `observation ${kind}`);
 	const required = kind === 'item' ? ['stableId', 'itemId', 'count', 'x', 'y', 'z'] : kind === 'entity' ? ['stableId', 'type', 'x', 'y', 'z'] : ['stableId', 'blockId', 'x', 'y', 'z'];
-	if (Reflect.ownKeys(source).some((key) => typeof key !== 'string' || !CANDIDATE_FIELDS.includes(key)) || required.some((key) => !Object.hasOwn(source, key))) throw new TypeError(`observation ${kind} has an invalid schema`);
+	if (Reflect.ownKeys(source).some((key) => typeof key !== 'string' || !ADAPTED_CANDIDATE_FIELDS.has(key)) || required.some((key) => !Object.hasOwn(source, key))) throw new TypeError(`observation ${kind} has an invalid schema`);
 	if (!Number.isFinite(source.x) || !Number.isFinite(source.y) || !Number.isFinite(source.z)) return null;
 	if (typeof source.stableId !== 'string' || source.stableId.length === 0) throw new TypeError(`observation ${kind} has invalid identity`);
 	if (kind === 'item' && (typeof source.itemId !== 'string' || !nonNegativeInteger(source.count))) throw new TypeError('observation item has invalid item fields');
@@ -103,7 +105,7 @@ function copyInventory(values) {
 	if (values === undefined) return Object.freeze([]);
 	return Object.freeze(denseDataArray(values, 'observation inventory items').map((value) => {
 		const source = ownDataRecord(value, 'observation inventory item');
-		if (Reflect.ownKeys(source).some((key) => !['itemId', 'count', 'slot', 'tags'].includes(key)) || typeof source.itemId !== 'string' || !nonNegativeInteger(source.count)) throw new TypeError('observation inventory item has an invalid schema');
+		if (Reflect.ownKeys(source).some((key) => !ADAPTED_INVENTORY_FIELDS.has(key)) || typeof source.itemId !== 'string' || !nonNegativeInteger(source.count)) throw new TypeError('observation inventory item has an invalid schema');
 		const copied = copyRecord(source, ['itemId', 'count', 'slot'], 'observation inventory item');
 		if (Object.hasOwn(source, 'tags')) {
 			const tags = denseDataArray(source.tags, 'observation inventory item tags');

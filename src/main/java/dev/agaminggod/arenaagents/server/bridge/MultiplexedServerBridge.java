@@ -12,6 +12,8 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
 import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.protocol.ActionType;
@@ -22,7 +24,10 @@ import dev.agaminggod.arenaagents.scenario.ScenarioAgentEvent;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import dev.agaminggod.arenaagents.server.AgentRuntimeHooks;
 import dev.agaminggod.arenaagents.server.AgentRuntimeRouter;
+import dev.agaminggod.arenaagents.server.AgentActivityPresentation;
 import dev.agaminggod.arenaagents.server.AgentChatReporter;
+import dev.agaminggod.arenaagents.server.AgentVerboseChat;
+import dev.agaminggod.arenaagents.server.AgentVerboseState;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.conversation.ConversationAudience;
 import dev.agaminggod.arenaagents.server.conversation.ConversationEvent;
@@ -30,6 +35,11 @@ import dev.agaminggod.arenaagents.server.conversation.ConversationKind;
 import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWake;
 import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
+import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
+import dev.agaminggod.arenaagents.server.goal.GoalPredicateWorldValidator;
+import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
+import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
+import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
 import dev.agaminggod.arenaagents.server.perception.AttentionFactDelta;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
@@ -39,7 +49,6 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionProgress;
 import dev.agaminggod.arenaagents.server.runtime.ActionProvenance;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionRequest;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionResult;
-import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContract;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
@@ -71,9 +80,12 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
 
 public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoCloseable {
 	public static final String LOOPBACK_HOST = "127.0.0.1";
@@ -91,10 +103,14 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int OBSERVATION_HISTORY_CAPACITY = 4_096;
 	private static final int MAX_TARGET_IDS_PER_OBSERVATION = 64;
 	private static final int MAX_CONVERSATION_SOURCES_PER_AGENT = 16;
+	private static final long CATALOG_DISCOVERY_RETRY_BASE_NANOS = 50_000_000L;
+	private static final int CATALOG_DISCOVERY_MAX_BACKOFF_SHIFT = 6;
 	private static final String MAX_OBSERVATION_MESSAGE_ID = "m".repeat(128);
+	private static final String COORDINATOR_OFFLINE_MESSAGE =
+			"AI agent coordinator is offline; check logs/arena-agents-coordinator-error.log for the startup cause";
 	private static final Logger LOGGER = LoggerFactory.getLogger(MultiplexedServerBridge.class);
 	private static final Set<String> INBOUND_TYPES = Set.of(
-			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "action_command", "action_cancel", "agent_error", "heartbeat"
+			"hello", "catalog_snapshot", "coordinator_status", "agent_ready", "planning_state", "goal_completed", "conversation_wake_ack", "goal_spec_proposal", "request_observation", "action_command", "action_cancel", "action_result_ack", "agent_error", "verbose_event", "heartbeat"
 	);
 
 	private final CodexAgentManager manager;
@@ -102,7 +118,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final ServerActionExecutor actionExecutor;
 	private final ServerAgentConversationRouter conversationRouter;
 	private final ServerObservationCollector observations;
+	private final GoalVerificationRuntime goalVerificationRuntime;
 	private final BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+	private static final GoalSpecWireCodec GOAL_SPEC_WIRE_CODEC = new GoalSpecWireCodec();
 	private final String serverInstanceId = UUID.randomUUID().toString();
 	private final ObservationPublication observationPublication = new ObservationPublication(
 			AgentConstants.DEFAULT_AGENT_LIMIT,
@@ -115,6 +133,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	);
 	private final String secret;
 	private final int port;
+	private final ServerSocketFactory serverSockets;
+	private final LongSupplier nanoTime;
+	private final AgentVerboseState verboseState;
 	private final BoundedServerTaskQueue serverTasks = new BoundedServerTaskQueue(SERVER_TASK_CAP);
 	private final AtomicBoolean running = new AtomicBoolean();
 	private final AtomicBoolean coordinatorDisconnectPending = new AtomicBoolean();
@@ -123,36 +144,144 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private final AtomicLong registryPublicationRevision = new AtomicLong();
 	private final AtomicLong sessionGenerations = new AtomicLong();
 	private final ProgramActionLedger programActions = new ProgramActionLedger();
+	private final TerminalResultLedger terminalResults = new TerminalResultLedger();
 	private final Object publicationLock = new Object();
+	private final Object verboseControlLock = new Object();
 	private final Set<AgentId> protocolKnownAgentIds = new HashSet<>();
+	private final Set<AgentId> coordinatorReadyAgentIds = new HashSet<>();
+	private final Map<AgentId, RecoveryObservationIdentity> recoveryObservationIdentities = new HashMap<>();
 	private volatile Runnable handshakeSnapshotHook = () -> { };
 	private volatile java.util.function.Consumer<AutoCloseable> handshakeCommittedHook = ignored -> { };
 	private boolean disconnectInProgress;
+	private long coordinatorLifecycleGeneration;
+	private long verboseControlRevision;
+	private long publishedVerboseControlRevision;
 	private volatile Session session;
 	private volatile ServerSocket serverSocket;
 	private volatile Set<String> catalogProfiles = Set.of();
 	private volatile List<AgentControlModelOption> catalogModels = AgentControlCatalog.fallbackOptions();
 	private volatile boolean catalogLoaded;
+	private boolean catalogDiscoveryPending;
+	private int catalogDiscoveryAttempts;
+	private long catalogDiscoveryRetryAtNanos;
+	private long catalogDiscoveryGeneration;
+	private String catalogDiscoveryFailureCode;
 
 	public MultiplexedServerBridge(CodexAgentManager manager) {
-		this(manager, configuredPort(), configuredSecretPath());
+		this(manager, configuredPort(), configuredSecretPath(), new AgentVerboseState());
+	}
+
+	public MultiplexedServerBridge(CodexAgentManager manager, AgentVerboseState verboseState) {
+		this(manager, configuredPort(), configuredSecretPath(), verboseState);
+	}
+
+	public MultiplexedServerBridge(
+			CodexAgentManager manager,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime
+	) {
+		this(manager, configuredPort(), configuredSecretPath(), verboseState, goalVerificationRuntime);
 	}
 
 	public MultiplexedServerBridge(CodexAgentManager manager, Path secretPath) {
-		this(manager, DEFAULT_PORT, secretPath);
+		this(manager, DEFAULT_PORT, secretPath, new AgentVerboseState());
+	}
+
+	public MultiplexedServerBridge(CodexAgentManager manager, Path secretPath, AgentVerboseState verboseState) {
+		this(manager, DEFAULT_PORT, secretPath, verboseState);
 	}
 
 	public MultiplexedServerBridge(CodexAgentManager manager, int port, Path secretPath) {
-		this(manager, port, readSecret(secretPath));
+		this(manager, port, secretPath, new AgentVerboseState());
 	}
 
-	private MultiplexedServerBridge(CodexAgentManager manager, int port, String preparedSecret) {
+	public MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState
+	) {
+		this(manager, port, secretPath, verboseState, defaultGoalVerificationRuntime(manager));
+	}
+
+	public MultiplexedServerBridge(
+			CodexAgentManager manager,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime
+	) {
+		this(manager, DEFAULT_PORT, secretPath, verboseState, goalVerificationRuntime);
+	}
+
+	public MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime
+	) {
+		this(manager, port, secretPath, verboseState, goalVerificationRuntime, ServerSocket::new, System::nanoTime);
+	}
+
+	MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime
+	) {
+		this(
+				manager, port, secretPath, new AgentVerboseState(), defaultGoalVerificationRuntime(manager),
+				serverSockets, nanoTime
+		);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets
+	) {
+		this(manager, port, secretPath, verboseState, goalVerificationRuntime, serverSockets, System::nanoTime);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			Path secretPath,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime
+	) {
+		this(
+				manager, port, readSecret(secretPath), verboseState, goalVerificationRuntime,
+				serverSockets, nanoTime
+		);
+	}
+
+	private MultiplexedServerBridge(
+			CodexAgentManager manager,
+			int port,
+			String preparedSecret,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime,
+			ServerSocketFactory serverSockets,
+			LongSupplier nanoTime
+	) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
 		this.router = new AgentRuntimeRouter(manager);
 		if (port < 0 || port > 65_535) throw new IllegalArgumentException("bridge port must be between 0 and 65535");
 		this.port = port;
+		this.serverSockets = Objects.requireNonNull(serverSockets, "server socket factory must not be null");
+		this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime must not be null");
 		this.secret = validatePreparedSecret(preparedSecret);
-		this.conversationRouter = new ServerAgentConversationRouter(manager, this::publishConversationEvent);
+		this.verboseState = Objects.requireNonNull(verboseState, "verboseState must not be null");
+		this.goalVerificationRuntime = Objects.requireNonNull(goalVerificationRuntime, "goalVerificationRuntime must not be null");
+		this.conversationRouter = new ServerAgentConversationRouter(
+				manager, this::publishConversationEvent, this::publishGoalSpecRequest);
 		this.actionExecutor = new ServerActionExecutor(
 				manager, this::sendActionResult, this::sendActionProgress,
 				dev.agaminggod.arenaagents.server.runtime.ServerProtectionPolicy.TRUSTED_LOCAL_OPERATOR,
@@ -163,11 +292,32 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	public static MultiplexedServerBridge withPreparedSecret(CodexAgentManager manager, int port, String secret) {
-		return new MultiplexedServerBridge(manager, port, secret);
+		return withPreparedSecret(manager, port, secret, new AgentVerboseState(), defaultGoalVerificationRuntime(manager));
+	}
+
+	public static MultiplexedServerBridge withPreparedSecret(
+			CodexAgentManager manager,
+			int port,
+			String secret,
+			AgentVerboseState verboseState
+	) {
+		return withPreparedSecret(manager, port, secret, verboseState, defaultGoalVerificationRuntime(manager));
+	}
+
+	public static MultiplexedServerBridge withPreparedSecret(
+			CodexAgentManager manager,
+			int port,
+			String secret,
+			AgentVerboseState verboseState,
+			GoalVerificationRuntime goalVerificationRuntime
+	) {
+		return new MultiplexedServerBridge(
+				manager, port, secret, verboseState, goalVerificationRuntime, ServerSocket::new, System::nanoTime
+		);
 	}
 
 	public synchronized void start() {
-		start(ServerSocket::new);
+		start(serverSockets);
 	}
 
 	synchronized void start(ServerSocketFactory socketFactory) {
@@ -202,6 +352,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	public void tick() {
 		publishPendingDisconnects();
+		publishPendingVerboseControl();
+		publishCatalogDiscoveryRetry();
 		serverTasks.drain(SERVER_TASKS_PER_TICK, task -> {
 			try {
 				task.run();
@@ -209,6 +361,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				LOGGER.error("Codex bridge server task failed", exception);
 			}
 		});
+		replayPendingTerminalResults();
 		actionExecutor.tick();
 		List<AgentId> observationAgents = registeredObservationIds(manager.coordinatorVisibleRecords());
 		for (AgentId agentId : observations.changedActiveAgents()) {
@@ -234,6 +387,52 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return active != null && active.open.get() && active.authenticated.get();
 	}
 
+	TerminalResultLedger terminalResultsForVerification() {
+		return terminalResults;
+	}
+
+	public void setVerbose(boolean enabled) {
+		synchronized (verboseControlLock) {
+			verboseState.setEnabled(enabled);
+			verboseControlRevision += 1L;
+		}
+		publishPendingVerboseControl();
+	}
+
+	private void publishPendingVerboseControl() {
+		VerboseControlSnapshot control = verboseControlSnapshot();
+		if (control.revision() <= publishedVerboseControlRevision()) return;
+		Session active = session;
+		if (active == null || !active.authenticated.get()) return;
+		try {
+			active.enqueue(verboseControlEnvelope(control.enabled()));
+			markVerboseControlPublished(control);
+		} catch (BridgeProtocolException exception) {
+			LOGGER.debug("Verbose control will retry on the next server tick: {}", exception.getMessage());
+		}
+	}
+
+	private VerboseControlSnapshot verboseControlSnapshot() {
+		synchronized (verboseControlLock) {
+			return new VerboseControlSnapshot(verboseControlRevision, verboseState.enabled());
+		}
+	}
+
+	private long publishedVerboseControlRevision() {
+		synchronized (verboseControlLock) {
+			return publishedVerboseControlRevision;
+		}
+	}
+
+	private void markVerboseControlPublished(VerboseControlSnapshot control) {
+		synchronized (verboseControlLock) {
+			if (verboseControlRevision == control.revision() && verboseState.enabled() == control.enabled()) {
+				publishedVerboseControlRevision = Math.max(publishedVerboseControlRevision, control.revision());
+			}
+		}
+	}
+
+
 	public String authenticatedLaunchId() {
 		Session active = session;
 		return active == null || !active.open.get() || !active.authenticated.get()
@@ -250,6 +449,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	ObservationPublication observationPublicationForVerification() {
 		return observationPublication;
+	}
+
+	boolean coordinatorReadyForVerification(AgentId agentId) {
+		return coordinatorReadyAgentIds.contains(agentId);
 	}
 
 	/** Server ticks serialize input leases with observation publication at this boundary. */
@@ -286,21 +489,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	public DeliveryReceipt sendPlayerDirectMessage(ServerPlayer source, AgentId recipientAgentId, String text) {
 		if (!authenticated()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		return conversationRouter.deliverPlayerMessage(source, recipientAgentId, text);
 	}
 
 	public DeliveryReceipt sendNativePlayerDirectMessage(ServerPlayer source, AgentId recipientAgentId, String text) {
 		if (!authenticated()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		return conversationRouter.deliverPlayerMessageFromNativeWhisper(source, recipientAgentId, text);
 	}
 
 	public DeliveryReceipt sendPlayerProximitySpeech(ServerPlayer source, String text, boolean whispering) {
 		if (!authenticated()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		return conversationRouter.deliverPlayerProximitySpeech(source, text, whispering ? 16.0D : 48.0D);
 	}
@@ -308,7 +511,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	@Override
 	public void validateProfile(AgentProfile profile) {
 		if (!authenticated()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
 		}
 		if (!catalogLoaded) {
 			throw new AgentDomainException("MODEL_CATALOG_UNAVAILABLE", "AI provider model catalog has not loaded yet");
@@ -329,6 +532,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public boolean onCreated(AgentRecord record) {
+		registryPublicationRevision.incrementAndGet();
+		programActions.beginGoal(record.agentId(), record.goalRevision());
+		terminalResults.beginGoal(record.agentId(), record.goalRevision(), logicalGoalId(record));
 		synchronized (publicationLock) {
 			if (protocolKnownAgentIds.contains(record.agentId())) return true;
 			Session active = session;
@@ -344,6 +550,9 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public void onTransition(AgentTransition transition) {
+		registryPublicationRevision.incrementAndGet();
+		programActions.beginGoal(transition.after().agentId(), transition.after().goalRevision());
+		terminalResults.beginGoal(transition.after().agentId(), transition.after().goalRevision(), logicalGoalId(transition.after()));
 		withinPublicationBoundary(() -> {
 			ScenarioRuntimeService.onAgentState(
 					manager.server(),
@@ -383,13 +592,18 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	@Override
 	public void onRemoved(AgentId agentId, long terminalRevision) {
+		registryPublicationRevision.incrementAndGet();
 		actionExecutor.cancel(agentId, "Agent removed");
 		programActions.remove(agentId);
+		terminalResults.remove(agentId);
 		observationPublication.remove(agentId);
 		synchronized (publicationLock) {
+			coordinatorReadyAgentIds.remove(agentId);
+			recoveryObservationIdentities.remove(agentId);
 			if (!protocolKnownAgentIds.contains(agentId)) return;
 			Session active = session;
 			if (active == null || !active.open.get() || !active.authenticated.get()) {
+				if (active != null) active.close();
 				return;
 			}
 			JsonObject payload = new JsonObject();
@@ -431,6 +645,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	public synchronized void close() {
 		synchronized (publicationLock) {
 			running.set(false);
+			verboseState.clearActivity();
 			CoordinatorStatusStore.clear(manager.server());
 			Session active = session;
 			if (active != null) {
@@ -537,6 +752,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			handshake.add(new BridgeEnvelope(
 					2, serverInstanceId, "server", "hello_ack", "server-" + messageIds.incrementAndGet(), payload
 			));
+			VerboseControlSnapshot verboseControl = verboseControlSnapshot();
+			handshake.add(verboseControlEnvelope(verboseControl.enabled()));
 			for (PendingConversationWake wake : pendingWakes) {
 				handshake.add(conversationWakeEnvelope(wake));
 			}
@@ -553,21 +770,74 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Bridge session closed during authentication");
 				}
 				resetObservationPublication();
+				verboseState.clearActivity();
 				catalogProfiles = Set.of();
 				catalogModels = AgentControlCatalog.fallbackOptions();
 				catalogLoaded = false;
+				catalogDiscoveryPending = false;
+				catalogDiscoveryAttempts = 0;
+				catalogDiscoveryRetryAtNanos = 0L;
+				catalogDiscoveryGeneration = 0L;
+				catalogDiscoveryFailureCode = null;
 				protocolKnownAgentIds.clear();
 				protocolKnownAgentIds.addAll(handshakeKnownAgentIds);
+				coordinatorReadyAgentIds.clear();
+				Map<AgentId, AgentRecord> allRecordsById = new HashMap<>();
+				for (AgentRecord record : manager.records()) allRecordsById.put(record.agentId(), record);
+				for (PendingGoalDraft draft : manager.goalDrafts()) {
+					AgentRecord record = allRecordsById.get(draft.agentId());
+					if (record == null) {
+						manager.removeGoalDraft(draft.draftId());
+						continue;
+					}
+					if (!draft.matches(record)) {
+						manager.removeGoalDraft(draft.draftId());
+						continue;
+					}
+					if (draft.proposedPredicate().isEmpty() && handshakeKnownAgentIds.contains(draft.agentId())) {
+						handshake.add(goalSpecRequestEnvelope(draft));
+					}
+				}
+				for (AgentRecord record : visibleRecords) terminalResults.beginGoal(record.agentId(), record.goalRevision(), logicalGoalId(record));
+				List<ServerActionResult> terminalReplay = terminalResults.pending();
+				int replayCapacity = Math.max(0, CONNECTION_QUEUE_CAP - handshake.size());
+				Map<String, Integer> handshakeQueuedByAgent = new HashMap<>();
+				for (BridgeEnvelope queued : handshake) handshakeQueuedByAgent.merge(queued.agentId(), 1, Integer::sum);
+				List<ServerActionResult> claimedReplay = new ArrayList<>();
+				for (ServerActionResult result : terminalReplay) {
+					if (claimedReplay.size() >= replayCapacity) break;
+					if (!handshakeKnownAgentIds.contains(result.agentId())) continue;
+					if (handshakeQueuedByAgent.getOrDefault(result.agentId().toString(), 0) >= AGENT_QUEUE_CAP) continue;
+					if (!terminalResults.claim(result, source)) continue;
+					claimedReplay.add(result);
+					handshake.add(actionResultEnvelope(result));
+					handshakeQueuedByAgent.merge(result.agentId().toString(), 1, Integer::sum);
+				}
 				try {
+					for (AgentRecord record : visibleRecords) programActions.beginGoal(record.agentId(), record.goalRevision());
 					source.completeHandshake(handshake, suppliedLaunchId, sessionGenerations.incrementAndGet());
 					handshakeCommittedHook.accept(source);
+					coordinatorLifecycleGeneration++;
+					markVerboseControlPublished(verboseControl);
+					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
+					for (ServerActionResult result : claimedReplay) terminalResults.release(result, source);
 					protocolKnownAgentIds.clear();
+					coordinatorReadyAgentIds.clear();
 					throw exception;
 				}
 				return;
 			}
 		}
+	}
+
+	private BridgeEnvelope verboseControlEnvelope(boolean enabled) {
+		JsonObject payload = new JsonObject();
+		payload.addProperty("enabled", enabled);
+		return new BridgeEnvelope(
+				2, serverInstanceId, "server", "verbose_control",
+				"server-" + messageIds.incrementAndGet(), payload
+		);
 	}
 
 	private void routeAuthenticated(BridgeEnvelope envelope) {
@@ -577,12 +847,126 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			case "agent_ready", "planning_state" -> plannerReady(envelope);
 			case "goal_completed" -> acceptGoalCompleted(envelope);
 			case "conversation_wake_ack" -> acceptConversationWakeAck(envelope);
+			case "goal_spec_proposal" -> acceptGoalSpecProposal(envelope);
+			case "request_observation" -> acceptObservationRequest(envelope);
 			case "action_command" -> acceptAction(envelope);
 			case "action_cancel" -> acceptActionCancel(envelope);
+			case "action_result_ack" -> acceptActionResultAck(envelope);
 			case "agent_error" -> acceptAgentError(envelope);
+			case "verbose_event" -> acceptVerboseEvent(envelope);
 			case "heartbeat" -> send("heartbeat", "server", new JsonObject());
 			default -> throw new BridgeProtocolException("UNKNOWN_MESSAGE_TYPE", envelope.type());
 		}
+	}
+
+	private void acceptActionResultAck(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("goalRevision", "actionId"), "action_result_ack");
+		terminalResults.acknowledge(agentId, requiredLong(payload, "goalRevision"), requiredString(payload, "actionId"));
+	}
+
+	private void acceptGoalSpecProposal(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("requestId", "summary", "predicate"), "goal_spec_proposal");
+		String requestIdValue = requiredString(payload, "requestId");
+		UUID requestId;
+		try {
+			requestId = UUID.fromString(requestIdValue);
+		} catch (IllegalArgumentException exception) {
+			sendGoalSpecResult(agentId, requestIdValue, "rejected", "INVALID_GOAL_SPEC_REQUEST_ID");
+			return;
+		}
+		String summary = requiredString(payload, "summary").strip();
+		if (summary.isEmpty() || summary.length() > 512) {
+			sendGoalSpecResult(agentId, requestIdValue, "rejected", "INVALID_GOAL_SPEC_SUMMARY");
+			return;
+		}
+		try {
+			JsonElement predicateElement = payload.get("predicate");
+			if (predicateElement == null || !predicateElement.isJsonObject()) {
+				throw new BridgeProtocolException("INVALID_GOAL_PREDICATE", "goal_spec_proposal.predicate must be an object");
+			}
+			PendingGoalDraft draft = manager.goalDraft(requestId)
+					.orElseThrow(() -> new AgentDomainException("UNKNOWN_GOAL_DRAFT", "Goal draft does not exist"));
+			if (!draft.agentId().equals(agentId)) {
+				throw new AgentDomainException("GOAL_DRAFT_AGENT_MISMATCH", "Goal draft belongs to another agent");
+			}
+			if (!draft.matches(manager.registry().require(agentId))) {
+				throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
+			}
+			GoalPredicate predicate = GoalPredicateWorldValidator.bindToDimension(
+					GOAL_SPEC_WIRE_CODEC.decodePredicate(predicateElement.getAsJsonObject()), draft.dimensionId());
+			GoalPredicateWorldValidator.validateTranslatedProposal(predicate);
+			manager.validateGoalDraftTranslation(draft, predicate);
+			validateProposalIdentifiers(predicate, Set.copyOf(draft.candidateIds()));
+			GoalInventoryCapacity.validateTranslated(
+					predicate,
+					manager.server() == null ? net.minecraft.core.RegistryAccess.EMPTY : manager.server().registryAccess()
+			);
+			if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
+				GoalPredicateWorldValidator.validate(
+						GoalPredicateWorldValidator.requireLevel(manager.server(), draft.dimensionId()), predicate);
+			}
+			boolean duplicate = draft.proposedPredicate().isPresent();
+			PendingGoalDraft updated = manager.updateGoalDraftProposal(requestId, agentId, predicate);
+			ServerPlayer player = manager.server() == null ? null : manager.server().getPlayerList().getPlayer(updated.requestingPlayerId());
+			if (player != null && !duplicate) {
+				player.sendSystemMessage(net.minecraft.network.chat.Component.literal(
+						"Proposed goal for \"" + updated.originalRequest() + "\": " + summary
+								+ " Predicate: " + GOAL_SPEC_WIRE_CODEC.encodePredicate(predicate) + ". Confirm or cancel draft " + updated.draftId() + "."));
+			}
+			sendGoalSpecResult(agentId, requestIdValue, "accepted", duplicate ? "PROPOSAL_ALREADY_STAGED" : "PROPOSAL_STAGED");
+		} catch (AgentDomainException | BridgeProtocolException exception) {
+			String code = exception instanceof AgentDomainException domain ? domain.code() : ((BridgeProtocolException) exception).code();
+			sendGoalSpecResult(agentId, requestIdValue, "rejected", code);
+		}
+	}
+
+	private void validateProposalIdentifiers(GoalPredicate predicate, Set<String> candidates) {
+		switch (predicate) {
+			case GoalPredicate.InventoryContains value -> validateIdentifier(value.itemId(), candidates,
+					id -> BuiltInRegistries.ITEM.containsKey(id), "item");
+			case GoalPredicate.AdvancementGranted value -> validateIdentifier(value.advancementId(), candidates,
+					id -> manager.server().getAdvancements().get(id) != null, "advancement");
+			case GoalPredicate.EntityKilledByAgent value -> validateIdentifier(value.entityType(), candidates,
+					id -> BuiltInRegistries.ENTITY_TYPE.containsKey(id), "entity type");
+			case GoalPredicate.BlockMatches value -> validateIdentifier(value.blockId(), candidates,
+					id -> BuiltInRegistries.BLOCK.containsKey(id), "block");
+			case GoalPredicate.AllOf value -> value.predicates().forEach(child -> validateProposalIdentifiers(child, candidates));
+			case GoalPredicate.AnyOf value -> value.predicates().forEach(child -> validateProposalIdentifiers(child, candidates));
+			default -> { }
+		}
+	}
+
+	private static void validateIdentifier(
+			String value, Set<String> candidates, java.util.function.Predicate<Identifier> exists, String type
+	) {
+		if (!candidates.contains(value)) throw new AgentDomainException("GOAL_IDENTIFIER_NOT_CANDIDATE", type + " was not offered by the server");
+		Identifier id = Identifier.tryParse(value);
+		if (id == null || !exists.test(id)) throw new AgentDomainException("UNKNOWN_GOAL_IDENTIFIER", type + " does not exist on this server");
+	}
+
+	private void sendGoalSpecResult(AgentId agentId, String requestId, String status, String reasonCode) {
+		JsonObject result = new JsonObject();
+		result.addProperty("requestId", requestId);
+		result.addProperty("status", status);
+		result.addProperty("reasonCode", reasonCode);
+		send("goal_spec_result", agentId.toString(), result);
+	}
+
+	private void acceptObservationRequest(BridgeEnvelope envelope) {
+		AgentId id = AgentId.parse(envelope.agentId());
+		AgentRecord record = manager.registry().require(id);
+		JsonObject payload = envelope.payload();
+		requireKeys(payload, Set.of("goalRevision"), "request_observation");
+		if (requiredLong(payload, "goalRevision") != record.goalRevision()) {
+			throw new AgentDomainException("STALE_REVISION", "Coordinator observation request revision is stale");
+		}
+		observations.invalidate(id);
+		observationPublication.markAttention(id);
+		queueUrgentObservation(id);
 	}
 
 	private void acceptCoordinatorStatus(JsonObject payload) {
@@ -593,7 +977,10 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		try {
 		Set<String> legacyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits");
 		Set<String> latencyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "latencies");
-		if (!payload.keySet().equals(legacyKeys) && !payload.keySet().equals(latencyKeys)) {
+		Set<String> recoveryKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "bridgeSessionEpoch", "runtimeGeneration", "components");
+		Set<String> recoveryLatencyKeys = Set.of("reconciled", "profiles", "supportedProfileCount", "rosterReadyCount", "rosterCount", "scheduler", "circuits", "latencies", "bridgeSessionEpoch", "runtimeGeneration", "components");
+		boolean extendedRecovery = payload.keySet().equals(recoveryKeys) || payload.keySet().equals(recoveryLatencyKeys);
+		if (!payload.keySet().equals(legacyKeys) && !payload.keySet().equals(latencyKeys) && !extendedRecovery) {
 			throw new BridgeProtocolException("INVALID_FIELD", "coordinator_status");
 		}
 		JsonArray profileValues = requiredArray(payload, "profiles", CoordinatorStatusSnapshot.MAX_PROFILES);
@@ -601,10 +988,13 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		for (var element : profileValues) {
 			if (!element.isJsonObject()) throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", "profile must be an object");
 			JsonObject profile = element.getAsJsonObject();
-			requireKeys(profile, Set.of("agentId", "provider", "model", "reasoningEffort"), "profile");
+			Set<String> legacyProfileKeys = Set.of("agentId", "provider", "model", "reasoningEffort");
+			Set<String> exactProfileKeys = Set.of("agentId", "provider", "model", "reasoningEffort", "serviceTier");
+			if (!profile.keySet().equals(legacyProfileKeys) && !profile.keySet().equals(exactProfileKeys)) throw new BridgeProtocolException("INVALID_FIELD", "profile");
 			profiles.add(new CoordinatorStatusSnapshot.SupportedProfile(
 					requiredStatusString(profile, "agentId"), requiredStatusString(profile, "provider"),
-					requiredStatusString(profile, "model"), requiredStatusString(profile, "reasoningEffort")
+					requiredStatusString(profile, "model"), requiredStatusString(profile, "reasoningEffort"),
+					profile.has("serviceTier") ? requiredStatusString(profile, "serviceTier") : "priority"
 			));
 		}
 		JsonObject scheduler = requiredObject(payload, "scheduler");
@@ -650,9 +1040,33 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					requiredNonNegativeDouble(latency, "p50Ms"), requiredNonNegativeDouble(latency, "p95Ms")
 			));
 		}
+		long bridgeSessionEpoch = 0L;
+		String runtimeGeneration = null;
+		ArrayList<CoordinatorStatusSnapshot.ComponentRecovery> components = new ArrayList<>();
+		if (extendedRecovery) {
+			bridgeSessionEpoch = requiredLong(payload, "bridgeSessionEpoch");
+			runtimeGeneration = requiredNullableStatusString(payload, "runtimeGeneration");
+			JsonArray componentValues = requiredArray(payload, "components", CoordinatorStatusSnapshot.MAX_COMPONENTS);
+			for (var element : componentValues) {
+				if (!element.isJsonObject()) throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", "component must be an object");
+				JsonObject component = element.getAsJsonObject();
+				requireKeys(component, Set.of(
+						"component", "state", "fallbackMode", "boundary", "failureCode", "consecutiveFailureCount",
+						"nextProbeAtEpochMs", "generation", "lastRecoveryAtEpochMs"
+				), "component");
+				components.add(new CoordinatorStatusSnapshot.ComponentRecovery(
+						requiredStatusString(component, "component"), requiredStatusString(component, "state"),
+						requiredNullableStatusString(component, "fallbackMode"), requiredNullableStatusString(component, "boundary"),
+						requiredNullableStatusString(component, "failureCode"), requiredInt(component, "consecutiveFailureCount"),
+						requiredNullableStatusLong(component, "nextProbeAtEpochMs"), requiredLong(component, "generation"),
+						requiredNullableStatusLong(component, "lastRecoveryAtEpochMs")
+				));
+			}
+		}
 			return new CoordinatorStatusSnapshot(
 					requiredBoolean(payload, "reconciled"), profiles, requiredInt(payload, "supportedProfileCount"),
 					requiredInt(payload, "rosterReadyCount"), requiredInt(payload, "rosterCount"), schedulerStatus, circuits, latencies,
+					bridgeSessionEpoch, runtimeGeneration, components,
 					receivedAtEpochMs
 			);
 		} catch (BridgeProtocolException exception) {
@@ -671,18 +1085,52 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		String code = requiredString(envelope.payload(), "code");
 		String message = requiredString(envelope.payload(), "message");
 		AgentTransition transition = router.plannerFailed(agentId, goalRevision, message);
-		AgentChatReporter.failed(manager, transition.after(), code, message);
+		reportRawAgentError(verboseState,
+				() -> AgentChatReporter.failed(manager, transition.after(), code, message));
 	}
+
+	static void reportRawAgentError(AgentVerboseState verboseState, Runnable reporter) {
+		if (verboseState.standardActivityEnabled()) reporter.run();
+	}
+
+	private void acceptVerboseEvent(BridgeEnvelope envelope) {
+		AgentId agentId = AgentId.parse(envelope.agentId());
+		VerboseEvent event = decodeVerboseEvent(envelope.payload());
+		AgentRecord record = manager.registry().require(agentId);
+		if (event.goalRevision() != record.goalRevision()) return;
+		AgentVerboseChat.report(manager, verboseState, record, event.stage(), event.message());
+	}
+
+	static VerboseEvent decodeVerboseEvent(JsonObject payload) {
+		requireKeys(payload, Set.of("goalRevision", "stage", "message"), "verbose_event");
+		long goalRevision = requiredLong(payload, "goalRevision");
+		String stage = requiredString(payload, "stage");
+		if (!AgentVerboseChat.allowedStage(stage)) {
+			throw new BridgeProtocolException("INVALID_VERBOSE_EVENT", "verbose_event.stage is not supported");
+		}
+		String message = requiredString(payload, "message");
+		if (message.length() > AgentVerboseChat.MAX_MESSAGE_LENGTH
+				|| message.codePoints().anyMatch(codePoint -> codePoint < 0x20 || codePoint == 0x7f)) {
+			throw new BridgeProtocolException(
+					"INVALID_VERBOSE_EVENT", "verbose_event.message must be plain text with at most 256 characters"
+			);
+		}
+		return new VerboseEvent(goalRevision, stage, message);
+	}
+
+	static record VerboseEvent(long goalRevision, String stage, String message) { }
 
 	private void acceptGoalCompleted(BridgeEnvelope envelope) {
 		AgentId agentId = AgentId.parse(envelope.agentId());
 		JsonObject payload = envelope.payload();
-		if (!payload.has("completionContract")) throw new BridgeProtocolException("CONTRACT_REQUIRED", "goal_completed requires a factual completionContract");
-		requireKeys(payload, Set.of("goalRevision", "completionContract", "traceId", "profile", "contractHash"), "goal_completed");
+		requireKeys(payload, Set.of("goalRevision", "goalFingerprint", "traceId", "profile"), "goal_completed");
 		long goalRevision = requiredLong(payload, "goalRevision");
 		AgentRecord record = manager.registry().require(agentId);
 		String traceId = requiredTraceId(payload, "traceId");
-		String contractHash = requiredString(payload, "contractHash");
+		String goalFingerprint = requiredString(payload, "goalFingerprint");
+		if (!goalFingerprint.matches("[0-9a-f]{64}")) {
+			throw new BridgeProtocolException("INVALID_GOAL_FINGERPRINT", "goalFingerprint must be lowercase SHA-256");
+		}
 		JsonObject profile = requiredObject(payload, "profile");
 		requireKeys(profile, Set.of("provider", "model", "reasoningEffort", "serviceTier"), "goal_completed.profile");
 		if (!record.profile().provider().equals(requiredString(profile, "provider"))
@@ -691,29 +1139,49 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				|| !record.profile().serviceTier().equals(requiredString(profile, "serviceTier"))) {
 			throw new AgentDomainException("STALE_PROVENANCE", "Completion profile does not match the selected model profile");
 		}
-		JsonElement contractElement = payload.get("completionContract");
-		if (!contractElement.isJsonObject()) throw new BridgeProtocolException("MALFORMED_CONTRACT", "completionContract must be an object");
-		GoalCompletionContract contract = GoalCompletionContract.parse(contractElement.getAsJsonObject());
-		if (contract.goalRevision() != goalRevision || !contractHash.equals(hashContract(contract))) {
-			throw new BridgeProtocolException("STALE_CONTRACT", "Completion contract revision or hash does not match");
+		GoalCompletionVerifier.VerificationResult verification = goalVerificationRuntime.evaluateRequest(
+				agentId, goalRevision, goalFingerprint);
+		VerboseEvent feedback = completionVerboseEvent(goalRevision, verification);
+		boolean changed = verboseState.goalVerificationChanged(
+				agentId, goalRevision, verification.verified(), verification.facts());
+		if (!verification.verified() && changed) {
+			AgentChatReporter.goalNotComplete(manager, record, verification.facts());
+			AgentVerboseChat.report(manager, verboseState, record, feedback.stage(), feedback.message());
 		}
-		GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier().verify(
-				record, manager.findAgentPlayer(agentId).orElse(null), contract, actionExecutor.actionSuccessLedger());
-		JsonObject result = completionResultPayload(goalRevision, traceId, contractHash, verification);
+		JsonObject result = completionResultPayload(goalRevision, traceId, goalFingerprint, verification);
 		send("goal_completion_result", agentId.toString(), result);
-		if (verification.verified()) router.coordinatorCompleted(agentId, goalRevision);
+		if (verification.verified()) {
+			goalVerificationRuntime.acceptVerified(agentId, goalRevision, goalFingerprint, verification);
+			AgentRecord completed = manager.registry().require(agentId);
+			if (changed) {
+				AgentChatReporter.goalVerified(manager, completed, verification.facts());
+				AgentVerboseChat.report(manager, verboseState, completed, feedback.stage(), feedback.message());
+			}
+		}
 	}
 
-	static JsonObject completionResultPayload(long goalRevision, String traceId, String contractHash, GoalCompletionVerifier.VerificationResult verification) {
+	static VerboseEvent completionVerboseEvent(
+			long goalRevision,
+			GoalCompletionVerifier.VerificationResult verification
+	) {
+		Objects.requireNonNull(verification, "verification must not be null");
+		GoalEvidence.Fact fact = verification.facts().stream().filter(item -> !item.satisfied()).findFirst()
+				.orElse(verification.facts().isEmpty() ? null : verification.facts().getFirst());
+		if (verification.verified()) {
+			return new VerboseEvent(goalRevision, "result",
+					fact == null ? "Goal verified." : "Goal verified: " + fact.expectedValue() + ".");
+		}
+		return new VerboseEvent(goalRevision, "retry", fact == null
+				? "Goal not complete. Continuing."
+				: "Goal not complete: expected " + fact.expectedValue() + ", observed " + fact.observedValue() + ". Continuing.");
+	}
+
+	static JsonObject completionResultPayload(long goalRevision, String traceId, String goalFingerprint, GoalCompletionVerifier.VerificationResult verification) {
 		JsonObject result = verification.toJson();
 		result.addProperty("goalRevision", goalRevision);
 		result.addProperty("traceId", traceId);
-		result.addProperty("contractHash", contractHash);
+		result.addProperty("goalFingerprint", goalFingerprint);
 		return result;
-	}
-
-	private static String hashContract(GoalCompletionContract contract) {
-		return contract.fingerprint();
 	}
 
 	private void acceptConversationWakeAck(BridgeEnvelope envelope) {
@@ -821,7 +1289,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			requireKeys(payload, Set.of("refreshedAtEpochMs", "models"), "catalog_snapshot");
 			requiredLong(payload, "refreshedAtEpochMs");
 			JsonArray models = requiredArray(payload, "models", AgentControlModelOption.MAX_OPTIONS);
-			if (models.isEmpty()) throw new BridgeProtocolException("INVALID_MODEL_CATALOG", "models must not be empty");
 			ArrayList<AgentControlModelOption> decoded = new ArrayList<>(models.size());
 			for (var element : models) {
 				if (!element.isJsonObject()) {
@@ -848,6 +1315,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private void acceptCatalog(JsonObject payload) {
 		List<AgentControlModelOption> decoded = decodeCatalog(payload);
+		if (decoded.isEmpty()) {
+			synchronized (publicationLock) {
+				catalogProfiles = Set.of();
+				catalogModels = AgentControlCatalog.fallbackOptions();
+				catalogLoaded = false;
+				catalogDiscoveryPending = false;
+				if (catalogDiscoveryAttempts == 0) requestCatalogDiscovery();
+				else catalogDiscoveryRetryAtNanos = catalogRetryDeadline(catalogDiscoveryAttempts);
+			}
+			return;
+		}
 		JsonArray models = payload.getAsJsonArray("models");
 		HashSet<String> profiles = new HashSet<>();
 		for (var element : models) {
@@ -865,22 +1343,102 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		catalogProfiles = Set.copyOf(profiles);
 		catalogModels = decoded;
 		catalogLoaded = true;
+		catalogDiscoveryPending = false;
+		catalogDiscoveryAttempts = 0;
+		catalogDiscoveryRetryAtNanos = 0L;
+		catalogDiscoveryGeneration = 0L;
+		catalogDiscoveryFailureCode = null;
+	}
+
+	private void publishCatalogDiscoveryRetry() {
+		synchronized (publicationLock) {
+			if (catalogLoaded || catalogDiscoveryAttempts == 0) return;
+			if (catalogDiscoveryGeneration != coordinatorLifecycleGeneration || session == null || !session.authenticated.get()) return;
+			if (!catalogRetryDue(nanoTime.getAsLong(), catalogDiscoveryRetryAtNanos)) return;
+			catalogDiscoveryPending = false;
+			requestCatalogDiscovery();
+		}
+	}
+
+	private void requestCatalogDiscovery() {
+		if (catalogLoaded || catalogDiscoveryPending) return;
+		if (catalogDiscoveryAttempts < Integer.MAX_VALUE) catalogDiscoveryAttempts += 1;
+		catalogDiscoveryGeneration = coordinatorLifecycleGeneration;
+		catalogDiscoveryRetryAtNanos = catalogRetryDeadline(catalogDiscoveryAttempts);
+		try {
+			send("catalog_request", "server", new JsonObject());
+			catalogDiscoveryPending = true;
+			if (catalogDiscoveryFailureCode != null) {
+				LOGGER.debug("Catalog discovery publication recovered after {}", catalogDiscoveryFailureCode);
+				catalogDiscoveryFailureCode = null;
+			}
+		} catch (RuntimeException exception) {
+			catalogDiscoveryPending = false;
+			String failureCode = catalogPublicationFailureCode(exception);
+			if (!failureCode.equals(catalogDiscoveryFailureCode)) {
+				LOGGER.debug("Catalog discovery publication unavailable ({}); retry remains scheduled", failureCode);
+				catalogDiscoveryFailureCode = failureCode;
+			}
+		}
+	}
+
+	static long catalogRetryDelayNanos(int completedAttempts) {
+		return CATALOG_DISCOVERY_RETRY_BASE_NANOS
+				<< Math.min(CATALOG_DISCOVERY_MAX_BACKOFF_SHIFT, Math.max(0, completedAttempts - 1));
+	}
+
+	private long catalogRetryDeadline(int completedAttempts) {
+		return nanoTime.getAsLong() + catalogRetryDelayNanos(completedAttempts);
+	}
+
+	static boolean catalogRetryDue(long now, long deadline) {
+		return now - deadline >= 0L;
+	}
+
+	private static String catalogPublicationFailureCode(RuntimeException exception) {
+		String code = exception instanceof BridgeProtocolException protocol ? protocol.code() : exception.getClass().getSimpleName();
+		if (code == null || code.isBlank()) return "RUNTIME_FAILURE";
+		return code.length() <= 64 ? code : code.substring(0, 64);
 	}
 
 	private void plannerReady(BridgeEnvelope envelope) {
 		AgentId id = AgentId.parse(envelope.agentId());
-		AgentRecord record = manager.registry().require(id);
 		long revision = requiredLong(envelope.payload(), "goalRevision");
+		AgentRecord record;
+		try {
+			record = manager.registry().require(id);
+		} catch (AgentDomainException exception) {
+			if ("AGENT_NOT_FOUND".equals(exception.code())) return;
+			throw exception;
+		}
 		if (revision != record.goalRevision()) {
+			if (revision < record.goalRevision()) return;
 			throw new AgentDomainException("STALE_REVISION", "Coordinator planning revision is stale");
 		}
-		if (record.state() == AgentLifecycleState.STARTING) {
+		boolean agentReady = "agent_ready".equals(envelope.type());
+		if (agentReady) coordinatorReadyAgentIds.add(id);
+		boolean recoveryReady = agentReady
+				&& envelope.payload().has("reconciled")
+				&& requiredBoolean(envelope.payload(), "reconciled");
+		if (recoveryReady && record.state() == AgentLifecycleState.DISCONNECTED
+				&& record.currentGoal().isPresent()) {
+			manager.registry().rearmAfterCoordinatorRecovery(id.value(), revision, System.currentTimeMillis());
+		}
+		if (!recoveryReady && record.state() == AgentLifecycleState.STARTING) {
 			router.plannerStarted(id);
 		}
-		if ("agent_ready".equals(envelope.type())) {
+		if (agentReady && shouldRequestReadyObservation(id, revision, recoveryReady)) {
 			observationPublication.markAttention(id);
 			queueUrgentObservation(id);
 		}
+	}
+
+	private boolean shouldRequestReadyObservation(AgentId agentId, long goalRevision, boolean recoveryReady) {
+		if (!recoveryReady) return true;
+		RecoveryObservationIdentity identity = new RecoveryObservationIdentity(
+				coordinatorLifecycleGeneration, goalRevision
+		);
+		return !identity.equals(recoveryObservationIdentities.put(agentId, identity));
 	}
 
 	private void acceptAction(BridgeEnvelope envelope) {
@@ -956,6 +1514,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		result.addProperty("executionStarted", false);
 		result.addProperty("physicalAttempted", false);
 		send("action_result", identity.agentId(), result);
+		reportVerbose(AgentId.parse(identity.agentId()), "error",
+				"Action rejected: " + boundedRejectionMessage(exception.getMessage()));
 		return true;
 	}
 
@@ -970,6 +1530,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private record RejectionIdentity(String agentId, long goalRevision, String actionId, String actionType, String traceId) { }
+	private record RecoveryObservationIdentity(long coordinatorLifecycleGeneration, long goalRevision) { }
 
 	static String boundedRejectionMessage(String message) {
 		String fallback = "Action rejected";
@@ -1053,25 +1614,40 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				result.state() == dev.agaminggod.arenaagents.server.runtime.ServerActionState.SUCCEEDED
 						&& !"TARGET_ALREADY_SATISFIED".equals(result.reasonCode())
 		);
-		send("action_result", result.agentId().toString(), actionResultPayload(result));
+		synchronized (publicationLock) {
+			terminalResults.retain(result);
+			Session active = session;
+			if (active != null && active.open.get() && active.authenticated.get()) {
+				enqueueTerminalResult(active, result);
+			}
+		}
+		reportVerbose(result.agentId(), AgentActivityPresentation.verboseResultStage(result), verboseResult(result));
+		verboseState.finishAction(result);
 		observationPublication.markAttention(result.agentId());
 		queueUrgentObservation(result.agentId());
 	}
 
-	void publishConversationEvent(ConversationEvent event, Optional<String> wakeGoal) {
+	void publishConversationEvent(ConversationEvent event, Optional<dev.agaminggod.arenaagents.agent.goal.GoalSpec> wakeGoal) {
 		Objects.requireNonNull(event, "event must not be null");
-		Optional<String> checkedWakeGoal = Objects.requireNonNull(wakeGoal, "wakeGoal must not be null");
-		Session active = requireConversationSession();
+		Optional<dev.agaminggod.arenaagents.agent.goal.GoalSpec> checkedWakeGoal = Objects.requireNonNull(wakeGoal, "wakeGoal must not be null");
 		try {
 			if (checkedWakeGoal.isEmpty()) {
-				active.enqueue(new BridgeEnvelope(
-						2, serverInstanceId, event.agentId().toString(), "conversation_event",
-						"server-" + messageIds.incrementAndGet(), conversationEventPayload(event)
-				));
+				synchronized (publicationLock) {
+					Session active = requireConversationSession(event.agentId());
+					active.enqueue(new BridgeEnvelope(
+							2, serverInstanceId, event.agentId().toString(), "conversation_event",
+							"server-" + messageIds.incrementAndGet(), conversationEventPayload(event)
+					));
+				}
 			} else {
 				AgentTransition transition = manager.startConversationWakeAtomically(
 						event, checkedWakeGoal.orElseThrow(),
-						(wake, commit) -> active.enqueueAtomically(conversationWakeEnvelope(wake), commit)
+						(wake, commit) -> {
+							synchronized (publicationLock) {
+								Session active = requireConversationSession(event.agentId());
+								active.enqueueAtomically(conversationWakeEnvelope(wake), commit);
+							}
+						}
 				);
 				publishConversationWakeScenarioState(transition);
 			}
@@ -1081,10 +1657,46 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		conversationPublished(event);
 	}
 
-	private Session requireConversationSession() {
+	private void publishGoalSpecRequest(PendingGoalDraft draft) {
+		Objects.requireNonNull(draft, "draft must not be null");
+		synchronized (publicationLock) {
+			Session active = session;
+			if (active == null || !active.open.get() || !active.authenticated.get()
+					|| !protocolKnownAgentIds.contains(draft.agentId())) return;
+			active.enqueue(goalSpecRequestEnvelope(draft));
+		}
+	}
+
+	private BridgeEnvelope goalSpecRequestEnvelope(PendingGoalDraft draft) {
+		JsonObject payload = new JsonObject();
+		payload.addProperty("requestId", draft.draftId().toString());
+		payload.addProperty("originalRequest", draft.originalRequest());
+		JsonArray candidates = new JsonArray();
+		draft.candidateIds().forEach(candidates::add);
+		payload.add("candidateIds", candidates);
+		return new BridgeEnvelope(
+				2, serverInstanceId, draft.agentId().toString(), "goal_spec_request",
+				"server-" + messageIds.incrementAndGet(), payload
+		);
+	}
+
+	private record VerboseControlSnapshot(long revision, boolean enabled) {
+	}
+
+	private Session requireConversationSession(AgentId agentId) {
 		Session active = session;
-		if (active == null || !active.authenticated.get()) {
-			throw new AgentDomainException("COORDINATOR_DISCONNECTED", "AI agent coordinator is not authenticated");
+		if (active == null || !active.open.get() || !active.authenticated.get()) {
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
+		}
+		if (!protocolKnownAgentIds.contains(agentId)) {
+			throw new AgentDomainException(
+					"AGENT_NOT_READY", "AI agent is still registering with the coordinator; retry shortly"
+			);
+		}
+		if (!coordinatorReadyAgentIds.contains(agentId)) {
+			throw new AgentDomainException(
+					"AGENT_NOT_READY", "AI agent is waiting for coordinator readiness; retry shortly"
+			);
 		}
 		return active;
 	}
@@ -1118,6 +1730,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		control.addProperty("goalRevision", wake.goalRevision());
 		control.addProperty("updatedAtEpochMs", wake.updatedAtEpochMs());
 		control.addProperty("goal", plannerGoal(wake.goal()));
+		control.add("goalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(wake.goal().spec()));
 		payload.add("control", control);
 		return payload;
 	}
@@ -1141,19 +1754,32 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	}
 
 	private void sendRespawnResultBeforeControl(ServerActionResult result, AgentTransition transition, Runnable commit) {
-		Session active = session;
-		if (active == null || !active.authenticated.get()) throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Respawn result has no authenticated coordinator");
-		BridgeEnvelope resultEnvelope = new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
-				"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
-		BridgeEnvelope controlEnvelope = new BridgeEnvelope(2, serverInstanceId, transition.after().agentId().toString(), "goal_control",
-				"server-" + messageIds.incrementAndGet(), goalControlPayload(transition, "respawn"));
-		publishRespawnScenarioEvents(
-				() -> active.enqueuePair(resultEnvelope, controlEnvelope, commit),
-				() -> ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true),
-				() -> ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()))
-		);
+		synchronized (publicationLock) {
+			Session active = session;
+			if (active == null || !active.open.get() || !active.authenticated.get()) {
+				throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Respawn result has no authenticated coordinator");
+			}
+			BridgeEnvelope resultEnvelope = new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
+					"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
+			BridgeEnvelope controlEnvelope = new BridgeEnvelope(2, serverInstanceId, transition.after().agentId().toString(), "goal_control",
+					"server-" + messageIds.incrementAndGet(), goalControlPayload(transition, "respawn"));
+			terminalResults.retain(result);
+			try {
+				if (!terminalResults.claim(result, active)) throw new BridgeProtocolException("ACTION_RESULT_REPLAY_CONFLICT", "Respawn result is already queued");
+				publishRespawnScenarioEvents(
+						() -> active.enqueuePair(resultEnvelope, controlEnvelope, commit),
+						() -> ScenarioRuntimeService.onAgentAction(manager.server(), result.agentId().toString(), result.actionType().wireName(), true),
+						() -> ScenarioRuntimeService.onAgentState(manager.server(), transition.after().agentId().toString(), publicState(transition.after().state()))
+				);
+			} catch (RuntimeException exception) {
+				terminalResults.discard(result, active);
+				throw exception;
+			}
+		}
 		programActions.terminal(result);
 		observations.invalidate(result.agentId());
+		reportVerbose(result.agentId(), AgentActivityPresentation.verboseResultStage(result), verboseResult(result));
+		verboseState.finishAction(result);
 		observationPublication.markAttention(result.agentId());
 		queueUrgentObservation(result.agentId());
 	}
@@ -1189,6 +1815,15 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return payload;
 	}
 
+	private BridgeEnvelope actionResultEnvelope(ServerActionResult result) {
+		return new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
+				"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
+	}
+
+	private static String verboseResult(ServerActionResult result) {
+		return AgentVerboseChat.sanitizeMessage(AgentActivityPresentation.verboseResult(result));
+	}
+
 	private static JsonObject goalControlPayload(AgentTransition transition, String operation) {
 		JsonObject payload = new JsonObject();
 		payload.addProperty("operation", operation);
@@ -1196,9 +1831,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("updatedAtEpochMs", transition.after().updatedAtEpochMs());
 		if ("queue".equals(operation)) {
 			List<AgentGoal> queue = transition.after().queuedGoals();
-			payload.addProperty("goal", queue.get(queue.size() - 1).prompt());
-		} else if ("start".equals(operation) || "steer".equals(operation)) {
-			transition.after().currentGoal().ifPresent(goal -> payload.addProperty("goal", plannerGoal(goal)));
+			AgentGoal goal = queue.get(queue.size() - 1);
+			payload.addProperty("goal", goal.prompt());
+			payload.add("goalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec()));
+		} else if ("dequeue".equals(operation)) {
+			AgentGoal goal = transition.before().queuedGoals().getFirst();
+			payload.addProperty("goal", goal.prompt());
+			payload.add("goalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec()));
+		} else if ("start".equals(operation) || "replace".equals(operation) || "steer".equals(operation)) {
+			transition.after().currentGoal().ifPresent(goal -> {
+				payload.addProperty("goal", plannerGoal(goal));
+				payload.add("goalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec()));
+			});
+		}
+		if ("respawn".equals(operation) && transition.after().state() == AgentLifecycleState.STARTING) {
+			payload.addProperty("resumeGoal", true);
 		}
 		if ("dead".equals(operation)) transition.after().deathSnapshot().ifPresent(death -> payload.add("death", deathFacts(death)));
 		return payload;
@@ -1256,22 +1903,37 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("elapsedMs", progress.elapsedMs());
 		payload.addProperty("observedAtEpochMs", progress.observedAtEpochMs());
 		send("action_progress", progress.agentId().toString(), payload);
+		verboseState.progressMilestone(progress).ifPresent(milestone ->
+				reportVerbose(progress.agentId(), "progress",
+						AgentActivityPresentation.progress(progress.actionType(), milestone)));
 		queueObservation(progress.agentId());
 	}
 
+	private void reportVerbose(AgentId agentId, String stage, String message) {
+		try {
+			AgentRecord record = manager.registry().require(agentId);
+			AgentVerboseChat.report(manager, verboseState, record, stage, message);
+		} catch (RuntimeException exception) {
+			LOGGER.debug("Verbose {} event was unavailable for {}: {}", stage, agentId, exception.getMessage());
+		}
+	}
+
 	private void queueObservation(AgentId agentId) {
+		if (!manager.isCoordinatorVisible(agentId)) return;
 		if (!observationPublication.offer(agentId)) {
 			LOGGER.debug("Observation request coalesced or deferred for {}", agentId);
 		}
 	}
 
 	private void queueUrgentObservation(AgentId agentId) {
+		if (!manager.isCoordinatorVisible(agentId)) return;
 		if (!observationPublication.offerUrgent(agentId)) {
 			LOGGER.debug("Urgent observation request deferred for {}", agentId);
 		}
 	}
 
 	private void sendObservation(AgentId agentId) {
+		if (!manager.isCoordinatorVisible(agentId)) return;
 		if (manager.server() == null) return;
 		Session source = session;
 		if (source == null || !source.authenticated.get()) {
@@ -1341,6 +2003,29 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		};
 	}
 
+	/** Replays retained terminal results without ever re-entering physical action execution. */
+	private void replayPendingTerminalResults() {
+		synchronized (publicationLock) {
+			Session active = session;
+			if (active == null || !active.open.get() || !active.authenticated.get()) return;
+			for (ServerActionResult result : terminalResults.pending()) {
+				if (!enqueueTerminalResult(active, result)) break;
+			}
+		}
+	}
+
+	private boolean enqueueTerminalResult(Session target, ServerActionResult result) {
+		if (!terminalResults.claim(result, target)) return true;
+		try {
+			target.enqueue(actionResultEnvelope(result));
+			return true;
+		} catch (RuntimeException exception) {
+			terminalResults.release(result, target);
+			LOGGER.debug("Terminal action result will retry after coordinator reconnect: {}", exception.getMessage());
+			return false;
+		}
+	}
+
 	private void send(String type, String agentId, JsonObject payload) {
 		Session active = session;
 		if (active == null || !active.authenticated.get()) {
@@ -1375,12 +2060,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("skinVariant", "variant-" + record.profile().skinVariant());
 		payload.addProperty("state", record.state().name());
 		record.currentGoal().ifPresent(goal -> payload.addProperty("currentGoal", plannerGoal(goal)));
+		record.currentGoal().ifPresent(goal -> payload.add("currentGoalSpec", GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec())));
 		payload.addProperty("goalRevision", record.goalRevision());
 		JsonArray queue = new JsonArray();
+		JsonArray queueGoalSpecs = new JsonArray();
 		for (AgentGoal goal : record.queuedGoals()) {
 			queue.add(goal.prompt());
+			queueGoalSpecs.add(GOAL_SPEC_WIRE_CODEC.encodeSpec(goal.spec()));
 		}
 		payload.add("queue", queue);
+		payload.add("queueGoalSpecs", queueGoalSpecs);
 		if (!record.lastSummary().isBlank()) {
 			payload.addProperty("lastSummary", record.lastSummary());
 		}
@@ -1398,25 +2087,39 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 
 	private static String operation(AgentTransition transition) {
 		if (transition.after().queuedGoals().size() > transition.before().queuedGoals().size()) return "queue";
-		if (transition.after().goalRevision() <= transition.before().goalRevision()) return null;
+		if (transition.after().queuedGoals().size() + 1 == transition.before().queuedGoals().size()
+				&& transition.after().goalRevision() == transition.before().goalRevision()) return "dequeue";
 		if (transition.before().state() == AgentLifecycleState.DEAD
 				&& transition.after().state() != AgentLifecycleState.DEAD) return "respawn";
+		if (transition.after().state() == AgentLifecycleState.DEAD
+				&& transition.before().state() != AgentLifecycleState.DEAD) return "dead";
+		if (transition.after().goalRevision() <= transition.before().goalRevision()) return null;
 		if (transition.before().currentGoal().isPresent()
 				&& transition.after().state() == AgentLifecycleState.IDLE
 				&& transition.after().currentGoal().isEmpty()) return "complete";
 		if (transition.after().state() == AgentLifecycleState.PAUSED) return "stop";
 		if (transition.after().state() == AgentLifecycleState.COMPLETED) return "complete";
 		if (transition.after().state() == AgentLifecycleState.ERROR) return "fail";
-		if (transition.after().state() == AgentLifecycleState.DEAD) return "dead";
 		if (transition.after().state() == AgentLifecycleState.DISCONNECTED) return "disconnect";
-		if (transition.before().state() == AgentLifecycleState.PAUSED
+		if ((transition.before().state() == AgentLifecycleState.PAUSED
+				|| transition.before().state() == AgentLifecycleState.DISCONNECTED)
 				&& transition.after().state() == AgentLifecycleState.STARTING) return "resume";
 		if (transition.after().state() != AgentLifecycleState.STARTING) return null;
 		if (transition.before().currentGoal().isPresent() && transition.after().currentGoal().isPresent()
 				&& transition.before().currentGoal().get().goalId().equals(transition.after().currentGoal().get().goalId())) {
 			return "steer";
 		}
+		if (transition.before().currentGoal().isPresent()
+				&& transition.after().currentGoal().isPresent()
+				&& transition.cancelAction()
+				&& transition.interruptPlanner()) {
+			return "replace";
+		}
 		return "start";
+	}
+
+	private static UUID logicalGoalId(AgentRecord record) {
+		return record.currentGoal().map(AgentGoal::goalId).orElse(null);
 	}
 
 	private static String plannerGoal(AgentGoal goal) {
@@ -1431,6 +2134,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		int promptLimit = AgentConstants.MAX_PROMPT_LENGTH - steering.length();
 		String prompt = goal.prompt().length() <= promptLimit ? goal.prompt() : goal.prompt().substring(0, promptLimit);
 		return prompt + steering;
+	}
+
+	private static GoalVerificationRuntime defaultGoalVerificationRuntime(CodexAgentManager manager) {
+		Objects.requireNonNull(manager, "manager must not be null");
+		return new GoalVerificationRuntime(
+				manager.registry(),
+				agentId -> manager.findAgentPlayer(agentId).map(GoalCompletionVerifier::minecraftFacts),
+				() -> manager.server() == null ? 0L : manager.server().getTickCount(),
+				System::currentTimeMillis,
+				manager::validateGoalForActivation
+		);
 	}
 
 	private static Path configuredSecretPath() {
@@ -1544,6 +2258,17 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 			throw new BridgeProtocolException("INVALID_COORDINATOR_STATUS", field + " must be nonblank and at most 256 characters");
 		}
 		return value;
+	}
+
+	private static String requiredNullableStatusString(JsonObject object, String field) {
+		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		if (object.get(field).isJsonNull()) return null;
+		return requiredStatusString(object, field);
+	}
+
+	private static Long requiredNullableStatusLong(JsonObject object, String field) {
+		if (!object.has(field)) throw new BridgeProtocolException("MISSING_FIELD", field);
+		return object.get(field).isJsonNull() ? null : requiredLong(object, field);
 	}
 
 	private static String requiredProvenanceString(JsonObject object, String field) {
@@ -2201,13 +2926,21 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					if (!open.compareAndSet(true, false)) return;
 					wasAuthenticated = authenticated.get();
 				}
+				terminalResults.sessionClosed(this);
 				if (session == this) {
+					verboseState.clearActivity();
 					MultiplexedServerBridge.onSessionClosed(observationPublication, this);
 					session = null;
 					protocolKnownAgentIds.clear();
+					coordinatorReadyAgentIds.clear();
 					catalogProfiles = Set.of();
 					catalogModels = AgentControlCatalog.fallbackOptions();
 					catalogLoaded = false;
+					catalogDiscoveryPending = false;
+					catalogDiscoveryAttempts = 0;
+					catalogDiscoveryRetryAtNanos = 0L;
+					catalogDiscoveryGeneration = 0L;
+					catalogDiscoveryFailureCode = null;
 					CoordinatorStatusStore.clear(manager.server());
 				}
 				if (wasAuthenticated) coordinatorDisconnectPending.set(true);

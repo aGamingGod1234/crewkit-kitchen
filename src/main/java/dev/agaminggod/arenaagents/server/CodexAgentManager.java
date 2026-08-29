@@ -11,6 +11,15 @@ import dev.agaminggod.arenaagents.agent.AgentProfile;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
+import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
+import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
+import dev.agaminggod.arenaagents.server.goal.GoalDraftResolution;
+import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
+import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
+import dev.agaminggod.arenaagents.server.goal.GoalInventoryCapacity;
+import dev.agaminggod.arenaagents.server.goal.GoalPredicateWorldValidator;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntities;
 import dev.agaminggod.arenaagents.agent.CodexAgentEntity;
 import dev.agaminggod.arenaagents.server.group.AgentGroup;
@@ -31,14 +40,22 @@ import java.util.WeakHashMap;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
+import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.damagesource.DamageSource;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.FallingBlock;
@@ -54,6 +71,7 @@ public final class CodexAgentManager {
 	private static final Map<MinecraftServer, CodexAgentManager> INSTANCES = new WeakHashMap<>();
 	private static final int AGENT_TICKET_RADIUS = 2;
 	private static final long PLAYER_SPAWN_TIMEOUT_MS = 10_000L;
+	private static final long VANILLA_DEATH_REMOVAL_GRACE_MS = 1_000L;
 	private static final long RECOVERY_RETRY_DELAY_MS = 30_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
 	private static final String HIDDEN_AGENT_TEAM = "arenaagents_hidden";
@@ -64,6 +82,7 @@ public final class CodexAgentManager {
 
 	private final MinecraftServer server;
 	private final AgentSavedData savedData;
+	private final GoalCompiler goalCompiler = new GoalCompiler();
 	private final AgentGroupSavedData groupSavedData;
 	private final Map<AgentId, AgentChunkTicket> chunkTickets = new LinkedHashMap<>();
 	private final Map<AgentChunkTicket, Integer> chunkTicketReferences = new LinkedHashMap<>();
@@ -197,7 +216,12 @@ public final class CodexAgentManager {
 		}
 	}
 
-	public AgentTransition start(String selector, String prompt) {
+	public AgentTransition start(String selector, String prompt, ServerLevel sourceLevel) {
+		AgentRecord record = resolve(selector);
+		return savedData.registry().start(record.agentId(), compileGoal(prompt, sourceLevel), System.currentTimeMillis());
+	}
+
+	public AgentTransition startSubjective(String selector, String prompt) {
 		AgentRecord record = resolve(selector);
 		return savedData.registry().start(record.agentId(), prompt, System.currentTimeMillis());
 	}
@@ -205,11 +229,12 @@ public final class CodexAgentManager {
 	public AgentTransition startAtomically(
 			AgentId agentId,
 			String prompt,
+			ServerLevel sourceLevel,
 			BiConsumer<AgentTransition, Runnable> publicationBarrier
 	) {
 		return savedData.registry().startAtomically(
 				Objects.requireNonNull(agentId, "agentId must not be null"),
-				prompt,
+				compileGoal(prompt, sourceLevel),
 				System.currentTimeMillis(),
 				Objects.requireNonNull(publicationBarrier, "publicationBarrier must not be null")
 		);
@@ -217,7 +242,7 @@ public final class CodexAgentManager {
 
 	public AgentTransition startConversationWakeAtomically(
 			ConversationEvent event,
-			String prompt,
+			GoalSpec spec,
 			BiConsumer<PendingConversationWake, Runnable> publicationBarrier
 	) {
 		Objects.requireNonNull(event, "event must not be null");
@@ -225,7 +250,7 @@ public final class CodexAgentManager {
 		PendingConversationWake[] staged = { null };
 		try {
 			return savedData.registry().startAtomically(
-					event.agentId(), prompt, System.currentTimeMillis(),
+					event.agentId(), spec, System.currentTimeMillis(),
 					(transition, commit) -> {
 						PendingConversationWake wake = PendingConversationWake.create(event, transition);
 						savedData.stageConversationWake(wake);
@@ -251,6 +276,164 @@ public final class CodexAgentManager {
 		return savedData.conversationWake(agentId);
 	}
 
+	public void stageGoalDraft(PendingGoalDraft draft) {
+		savedData.stageGoalDraft(draft);
+	}
+
+	public List<PendingGoalDraft> goalDrafts() {
+		return savedData.goalDrafts();
+	}
+
+	public Optional<PendingGoalDraft> goalDraft(UUID draftId) {
+		return savedData.goalDraft(draftId);
+	}
+
+	public PendingGoalDraft updateGoalDraftProposal(
+			UUID draftId,
+			AgentId agentId,
+			dev.agaminggod.arenaagents.agent.goal.GoalPredicate predicate
+	) {
+		return savedData.updateGoalDraftProposal(draftId, agentId, predicate);
+	}
+
+	public boolean removeGoalDraft(UUID draftId) {
+		return savedData.removeGoalDraft(draftId);
+	}
+
+	public Optional<GoalDraftResult> resolveGoalDraft(
+			UUID draftId,
+			UUID actorId,
+			boolean operator,
+			GoalDraftChoice choice
+	) {
+		Objects.requireNonNull(draftId, "draftId must not be null");
+		PendingGoalDraft draft = savedData.goalDraft(draftId).orElse(null);
+		if (draft == null) return Optional.empty();
+		GoalDraftResolution.Operation operation = GoalDraftResolution.authorize(draft, actorId, operator, choice);
+		if (operation == GoalDraftResolution.Operation.CANCEL) {
+			savedData.removeGoalDraft(draftId);
+			return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.empty()));
+		}
+		AgentRecord record = savedData.registry().require(draft.agentId());
+		if (!draft.matches(record)) throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
+		GoalPredicate predicate = draft.proposedPredicate().orElseThrow();
+		validateGoalDraftTranslation(draft, predicate);
+		if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
+			GoalPredicateWorldValidator.validate(
+					GoalPredicateWorldValidator.requireLevel(server, draft.dimensionId()), predicate);
+		}
+		GoalSpec spec = GoalSpec.create(
+				draft.originalRequest(), predicate, draft.createdAtTick());
+		validateGoalForActivation(spec);
+		long now = System.currentTimeMillis();
+		AgentTransition transition = switch (operation) {
+			case START -> savedData.registry().start(draft.agentId(), spec, now);
+			case REPLACE -> savedData.registry().replace(draft.agentId(), spec, now);
+			case QUEUE -> savedData.registry().queue(draft.agentId(), spec, now);
+			case CANCEL -> throw new AssertionError("cancel handled above");
+		};
+		savedData.removeGoalDraft(draftId);
+		return Optional.of(new GoalDraftResult(operation, draft.agentId(), Optional.of(transition)));
+	}
+
+	public void validateGoalDraftTranslation(PendingGoalDraft draft, GoalPredicate predicate) {
+		Objects.requireNonNull(draft, "draft must not be null");
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		draft.translationConstraint().validate(predicate);
+		RegistryAccess registries = server == null ? RegistryAccess.EMPTY : server.registryAccess();
+		GoalCompiler compiler = goalCompiler == null ? new GoalCompiler() : goalCompiler;
+		compiler.translationConstraintFor(draft.originalRequest(), registries).validate(predicate);
+	}
+
+	static void validateGoalDraftPredicate(
+			GoalPredicate predicate,
+			RegistryAccess registries,
+			Predicate<String> advancementExists
+	) {
+		Objects.requireNonNull(registries, "registries must not be null");
+		Registry<Item> items = registries.lookup(Registries.ITEM).orElse(BuiltInRegistries.ITEM);
+		Registry<EntityType<?>> entities = registries.lookup(Registries.ENTITY_TYPE)
+				.orElse(BuiltInRegistries.ENTITY_TYPE);
+		validateLiveGoalIdentifiers(
+				predicate,
+				id -> contains(items, id),
+				id -> contains(entities, id),
+				advancementExists
+		);
+		GoalInventoryCapacity.validateTranslated(predicate, registries);
+	}
+
+	public void validateGoalForActivation(GoalSpec spec) {
+		Objects.requireNonNull(spec, "spec must not be null");
+		GoalPredicate predicate = spec.completion();
+		if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
+			GoalPredicateWorldValidator.validate(server, predicate);
+		}
+		validateGoalDraftPredicate(
+				predicate,
+				server.registryAccess(),
+				id -> {
+					Identifier identifier = Identifier.tryParse(id);
+					return identifier != null && server.getAdvancements().get(identifier) != null;
+				}
+		);
+	}
+
+	static void validateLiveGoalIdentifiers(
+			GoalPredicate predicate,
+			Predicate<String> itemExists,
+			Predicate<String> entityExists,
+			Predicate<String> advancementExists
+	) {
+		Objects.requireNonNull(predicate, "predicate must not be null");
+		Objects.requireNonNull(itemExists, "itemExists must not be null");
+		Objects.requireNonNull(entityExists, "entityExists must not be null");
+		Objects.requireNonNull(advancementExists, "advancementExists must not be null");
+		switch (predicate) {
+			case GoalPredicate.InventoryContains value -> requireLiveIdentifier(
+					itemExists.test(value.itemId()), "item", value.itemId());
+			case GoalPredicate.EntityKilledByAgent value -> requireLiveIdentifier(
+					entityExists.test(value.entityType()), "entity type", value.entityType());
+			case GoalPredicate.AdvancementGranted value -> {
+				requireLiveIdentifier(
+						advancementExists.test(value.advancementId()), "advancement", value.advancementId());
+			}
+			case GoalPredicate.BlockMatches value -> GoalPredicateWorldValidator.validateBlockProperties(
+					value.blockId(), value.properties());
+			case GoalPredicate.AllOf value -> value.predicates().forEach(
+					child -> validateLiveGoalIdentifiers(child, itemExists, entityExists, advancementExists));
+			case GoalPredicate.AnyOf value -> value.predicates().forEach(
+					child -> validateLiveGoalIdentifiers(child, itemExists, entityExists, advancementExists));
+			default -> { }
+		}
+	}
+
+	private static boolean contains(Registry<?> registry, String value) {
+		Identifier identifier = Identifier.tryParse(value);
+		return identifier != null && registry.containsKey(identifier);
+	}
+
+	private static void requireLiveIdentifier(boolean exists, String type, String value) {
+		if (!exists) {
+			throw new AgentDomainException(
+					"UNKNOWN_GOAL_IDENTIFIER",
+					type + " does not exist on this server: " + value
+			);
+		}
+	}
+
+	public record GoalDraftResult(
+			GoalDraftResolution.Operation operation,
+			AgentId agentId,
+			Optional<AgentTransition> transition
+	) {
+		public GoalDraftResult {
+			Objects.requireNonNull(operation, "operation must not be null");
+			Objects.requireNonNull(agentId, "agentId must not be null");
+			transition = Objects.requireNonNull(transition, "transition must not be null");
+		}
+	}
+
 	public AgentTransition rearmConversationWake(PendingConversationWake wake) {
 		Objects.requireNonNull(wake, "wake must not be null");
 		return savedData.registry().rearmConversationWake(
@@ -268,9 +451,23 @@ public final class CodexAgentManager {
 		return savedData.registry().resume(record.agentId(), System.currentTimeMillis());
 	}
 
-	public AgentTransition queue(String selector, String prompt) {
+	public AgentTransition queue(String selector, String prompt, ServerLevel sourceLevel) {
 		AgentRecord record = resolve(selector);
-		return savedData.registry().queue(record.agentId(), prompt, System.currentTimeMillis());
+		return savedData.registry().queue(record.agentId(), compileGoal(prompt, sourceLevel), System.currentTimeMillis());
+	}
+
+	private GoalSpec compileGoal(String prompt, ServerLevel sourceLevel) {
+		GoalCompilation compilation = goalCompiler.compile(
+				prompt,
+				server.registryAccess(),
+				server.getTickCount(),
+				id -> server.getAdvancements().get(net.minecraft.resources.Identifier.parse(id)) != null,
+				Objects.requireNonNull(sourceLevel, "sourceLevel must not be null")
+		);
+		return compilation.acceptedSpec().orElseThrow(() -> new AgentDomainException(
+				"GOAL_REQUIRES_CLARIFICATION",
+				compilation.playerMessage()
+		));
 	}
 
 	public AgentTransition steer(String selector, String prompt) {
@@ -290,15 +487,11 @@ public final class CodexAgentManager {
 			);
 			OfflineAgentPlayers.VanillaRespawnTarget target = OfflineAgentPlayers.resolveVanillaRespawn(server, death);
 			long now = System.currentTimeMillis();
-			VanillaRespawnAttempt attempt = new VanillaRespawnAttempt(record, target, now + PLAYER_SPAWN_TIMEOUT_MS);
+			VanillaRespawnAttempt attempt = new VanillaRespawnAttempt(
+					record, target, now + VANILLA_DEATH_REMOVAL_GRACE_MS, now + PLAYER_SPAWN_TIMEOUT_MS);
 			Optional<ServerPlayer> existing = findAgentPlayer(record.agentId());
 			if (existing.isPresent()) {
 				AgentInputRuntime.clear(server, record.agentId());
-				ServerPlayer existingPlayer = existing.orElseThrow();
-				if (AgentRespawnSpawnPolicy.existingPlayerAction(existingPlayer.isAlive())
-						== AgentRespawnSpawnPolicy.ExistingPlayerAction.REMOVE_STALE_PLAYER) {
-					OfflineAgentPlayers.remove(existingPlayer);
-				}
 				pendingPlayerSpawns.put(record.agentId(), attempt.deadlineEpochMs());
 			} else {
 				requestVanillaRespawnPlayer(attempt, now);
@@ -316,6 +509,11 @@ public final class CodexAgentManager {
 			throw new AgentDomainException("STALE_RESPAWN_ATTEMPT", "Dead lifecycle changed during respawn");
 		}
 		Optional<ServerPlayer> found = findAgentPlayer(attempt.deadRecord().agentId());
+		if (!attempt.spawnRequested && found.isPresent() && nowEpochMs >= attempt.removalGraceDeadlineEpochMs) {
+			OfflineAgentPlayers.remove(found.orElseThrow());
+			attempt.deadlineEpochMs = nowEpochMs + PLAYER_SPAWN_TIMEOUT_MS;
+			return false;
+		}
 		AgentRespawnSpawnPolicy.Decision decision = AgentRespawnSpawnPolicy.decide(
 				attempt.spawnRequested, found.isPresent(), nowEpochMs, attempt.deadlineEpochMs()
 		);
@@ -415,13 +613,20 @@ public final class CodexAgentManager {
 	public static final class VanillaRespawnAttempt {
 		private final AgentRecord deadRecord;
 		private final OfflineAgentPlayers.VanillaRespawnTarget target;
+		private final long removalGraceDeadlineEpochMs;
 		private long deadlineEpochMs;
 		private boolean spawnRequested;
 		private ServerPlayer verifiedPlayer;
 
-		private VanillaRespawnAttempt(AgentRecord deadRecord, OfflineAgentPlayers.VanillaRespawnTarget target, long deadlineEpochMs) {
+		private VanillaRespawnAttempt(
+				AgentRecord deadRecord,
+				OfflineAgentPlayers.VanillaRespawnTarget target,
+				long removalGraceDeadlineEpochMs,
+				long deadlineEpochMs
+		) {
 			this.deadRecord = deadRecord;
 			this.target = target;
+			this.removalGraceDeadlineEpochMs = removalGraceDeadlineEpochMs;
 			this.deadlineEpochMs = deadlineEpochMs;
 		}
 
@@ -867,6 +1072,7 @@ public final class CodexAgentManager {
 				failure -> LOGGER.warn("Post-delete cleanup failed for agent {}", record.agentId(), failure)
 		));
 		savedData.clearConversationWake(record.agentId());
+		savedData.clearGoalDrafts(record.agentId());
 		return removed;
 	}
 
@@ -903,6 +1109,12 @@ public final class CodexAgentManager {
 			if (pending.isEmpty()) return records;
 			return records.stream().filter(record -> !pending.contains(record.agentId())).toList();
 		}
+	}
+
+	public boolean isCoordinatorVisible(AgentId agentId) {
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		return !pendingAgentRegistrations.contains(agentId)
+				&& records().stream().anyMatch(record -> record.agentId().equals(agentId));
 	}
 
 	private void publishPendingRegistration(AgentRecord record) {

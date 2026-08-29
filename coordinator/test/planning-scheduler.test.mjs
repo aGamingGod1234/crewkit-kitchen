@@ -141,6 +141,41 @@ test('cancelling a pending turn releases capacity for another agent', async () =
 	assert.equal(await replacement, 'replacement');
 });
 
+test('hard planning lease releases capacity and fences a late ignored-abort completion', async () => {
+	let timeoutCallback;
+	const cancelled = [];
+	const expired = [];
+	const scheduler = new PlanningScheduler({
+		maxConcurrent: 1,
+		maxPending: 0,
+		scheduleTimeout: (callback, delay) => { timeoutCallback = callback; assert.equal(delay, 25); return 1; },
+		cancelTimeout: (handle) => cancelled.push(handle),
+	});
+	const ignoredAbort = deferred();
+	const run = scheduler.schedule('agent-a', () => ignoredAbort.promise, {
+		leaseTimeoutMs: 25,
+		onLeaseExpired: (event) => expired.push(event),
+	});
+	await Promise.resolve();
+	assert.equal(scheduler.activeCount, 1);
+	timeoutCallback();
+	await assert.rejects(run, (error) => error?.code === 'PLANNING_LEASE_EXPIRED');
+	assert.equal(scheduler.activeCount, 0);
+	assert.equal(expired.length, 1);
+	assert.equal(expired[0].signal.aborted, true);
+
+	const replacementGate = deferred();
+	const replacement = scheduler.schedule('agent-a', () => replacementGate.promise);
+	await Promise.resolve();
+	assert.equal(scheduler.activeCount, 1);
+	ignoredAbort.resolve('late');
+	await Promise.resolve();
+	assert.equal(scheduler.activeCount, 1, 'late completion cannot release the replacement generation');
+	replacementGate.resolve('replacement');
+	assert.equal(await replacement, 'replacement');
+	assert.deepEqual(cancelled, [1]);
+});
+
 test('a failed provider turn releases its slot without affecting another lane', async () => {
 	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 2 });
 	const failure = Object.assign(new Error('gemini unavailable'), { code: 'PROVIDER_UNAVAILABLE' });

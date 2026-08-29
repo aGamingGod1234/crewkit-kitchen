@@ -313,7 +313,7 @@ public final class ScenarioSetupScreen extends Screen {
 	}
 
 	private boolean groupAvailable() {
-		return AgentControlClient.snapshot().map(AgentControlSnapshot::groupAvailable).orElse(true);
+		return AgentControlClient.snapshot().map(AgentControlSnapshot::groupAvailable).orElse(false);
 	}
 
 	private void initArena(ScenarioSetupLayout layout) {

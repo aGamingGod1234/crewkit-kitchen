@@ -3,8 +3,12 @@ package dev.agaminggod.arenaagents.server.conversation;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
+import dev.agaminggod.arenaagents.server.goal.GoalCompilation;
+import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+import net.minecraft.core.RegistryAccess;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.OutgoingChatMessage;
 import net.minecraft.network.chat.PlayerChatMessage;
@@ -25,6 +29,7 @@ public final class AgentConversationRouterVerification {
 		assertions += verifyPublicDelivery();
 		assertions += verifyUnicodeSafeTextBound();
 		assertions += verifyPlayerConversationWakePolicy();
+		assertions += verifySpeechGoalCompilationRouting();
 		assertions += verifyNativeWhisperPayload();
 		assertions += verifyNativeWhisperContentSelection();
 		return assertions;
@@ -47,29 +52,79 @@ public final class AgentConversationRouterVerification {
 	}
 
 	private static int verifyPlayerConversationWakePolicy() {
-		assertEquals(true, ConversationWakePolicy.goalFor(
+		assertEquals(true, ConversationWakePolicy.mayInstallNewGoalFromSpeech(AgentLifecycleState.IDLE),
+				"idle agent can receive a goal from speech");
+		assertEquals(true, ConversationWakePolicy.mayInstallNewGoalFromSpeech(AgentLifecycleState.COMPLETED),
+				"completed goal is inactive even while its evidence remains attached");
+		assertEquals(false, ConversationWakePolicy.mayInstallNewGoalFromSpeech(AgentLifecycleState.PAUSED),
+				"paused goal cannot be silently replaced by speech");
+		assertEquals(false, ConversationWakePolicy.mayInstallNewGoalFromSpeech(AgentLifecycleState.ACTING),
+				"active work cannot be silently replaced by speech");
+		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.IDLE, ConversationKind.PLAYER_MESSAGE
-		).isPresent(), "idle agent wakes for direct player message");
-		assertEquals(true, ConversationWakePolicy.goalFor(
+		), "idle agent wakes for direct player message");
+		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.COMPLETED, ConversationKind.PROXIMITY_SPEECH
-		).isPresent(), "completed agent wakes for nearby player speech");
-		assertEquals(false, ConversationWakePolicy.goalFor(
+		), "completed agent wakes for nearby player speech");
+		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
+				AgentLifecycleState.PAUSED, ConversationKind.PLAYER_MESSAGE
+		), "paused agent wakes for direct player message");
+		assertEquals(true, ConversationWakePolicy.shouldStartGoal(
+				AgentLifecycleState.PAUSED, ConversationKind.PROXIMITY_SPEECH
+		), "paused agent wakes for nearby player speech");
+		assertEquals(false, ConversationWakePolicy.shouldStartGoal(
 				AgentLifecycleState.IDLE, ConversationKind.AGENT_MESSAGE
-		).isPresent(), "agent chatter does not wake idle agent");
+		), "agent chatter does not wake idle agent");
 		for (AgentLifecycleState state : List.of(
 				AgentLifecycleState.STARTING,
 				AgentLifecycleState.PLANNING,
 				AgentLifecycleState.ACTING,
-				AgentLifecycleState.PAUSED,
 				AgentLifecycleState.ERROR,
 				AgentLifecycleState.DEAD,
 				AgentLifecycleState.DISCONNECTED
 		)) {
-			assertEquals(false, ConversationWakePolicy.goalFor(
+			assertEquals(false, ConversationWakePolicy.shouldStartGoal(
 					state, ConversationKind.PLAYER_MESSAGE
-			).isPresent(), state + " agent is not auto-started by conversation");
+			), state + " agent is not auto-started by conversation");
 		}
-		return 10;
+		return 15;
+	}
+
+	private static int verifySpeechGoalCompilationRouting() {
+		String rejectionMessage = "That advancement ID does not exist on this server.";
+		GoalCompilation rejected = new GoalCompiler().compile(
+				"Earn advancement mod:removed", RegistryAccess.EMPTY, 1_200L, ignored -> false
+		);
+		assertEquals(GoalCompilation.Kind.REJECTED, rejected.kind(),
+				"exact missing advancement IDs reach the rejected speech route");
+		for (AgentLifecycleState state : List.of(AgentLifecycleState.IDLE, AgentLifecycleState.COMPLETED)) {
+			AtomicInteger coordinatorDrafts = new AtomicInteger();
+			java.util.ArrayList<String> playerMessages = new java.util.ArrayList<>();
+			var route = ServerAgentConversationRouter.routeCompiledSpeechGoal(
+					state, state == AgentLifecycleState.IDLE
+							? ConversationKind.PLAYER_MESSAGE : ConversationKind.PROXIMITY_SPEECH,
+					rejected,
+					coordinatorDrafts::incrementAndGet, playerMessages::add
+			);
+			assertEquals(false, route.publish(), state + " rejected speech is consumed without waking a goal");
+			assertEquals(true, route.wakeSpec().isEmpty(), state + " rejected speech cannot install a fallback goal");
+			assertEquals(List.of(rejectionMessage), playerMessages,
+					state + " rejected speech reports the compiler player message verbatim");
+			assertEquals(0, coordinatorDrafts.get(),
+					state + " rejected speech cannot publish a translation draft or operator-confirmed bypass");
+		}
+
+		AtomicInteger translationDrafts = new AtomicInteger();
+		var translation = ServerAgentConversationRouter.routeCompiledSpeechGoal(
+				AgentLifecycleState.IDLE,
+				ConversationKind.PLAYER_MESSAGE,
+				GoalCompilation.needsTranslation("Choose an exact result."),
+				translationDrafts::incrementAndGet,
+				message -> { throw new AssertionError("translation must not report a rejection"); }
+		);
+		assertEquals(false, translation.publish(), "translation speech is consumed while its draft is staged");
+		assertEquals(1, translationDrafts.get(), "only NEEDS_TRANSLATION stages one coordinator draft");
+		return 11;
 	}
 
 	private static int verifyDirectDeliveryAndOperatorMirror() {

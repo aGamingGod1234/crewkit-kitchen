@@ -6,7 +6,7 @@ import { parseArenaScript } from '../src/arena-script/parser.mjs';
 
 const ACTION_BINDINGS = Object.freeze(Object.assign(Object.create(null), {
 	player: Object.freeze(Object.assign(Object.create(null), {
-		moveTo: Object.freeze(Object.assign(Object.create(null), { primitive: 'move_to' })),
+		navigateTo: Object.freeze(Object.assign(Object.create(null), { primitive: 'navigate_to' })),
 		wait: Object.freeze(Object.assign(Object.create(null), { primitive: 'wait' })),
 		attack: Object.freeze(Object.assign(Object.create(null), { primitive: 'attack' })),
 		useRanged: Object.freeze(Object.assign(Object.create(null), { primitive: 'use_ranged' })),
@@ -42,14 +42,14 @@ function boundedCounterSource() {
 test('yields a command and resumes from its typed result', () => {
 	const vm = interpreter(`
 		program.onUnhandledAttention("continue_and_notify");
-		const moved = await tryResult(player.moveTo({ x: 4, y: 64, z: 2 }));
+		const moved = await tryResult(player.navigateTo({ x: 4, y: 64, z: 2, tolerance: 1, sprint: false, timeoutMs: 5_000 }));
 		if (!moved.succeeded) program.checkpoint(moved.reason);
 		program.finish("arrived");
 	`);
 	const first = vm.start(facts());
 	assert.equal(first.kind, 'command');
-	assert.equal(first.call.primitive, 'move_to');
-	assert.deepEqual(Object.fromEntries(Object.entries(first.call.arguments)), { x: 4, y: 64, z: 2 });
+	assert.equal(first.call.primitive, 'navigate_to');
+	assert.deepEqual(Object.fromEntries(Object.entries(first.call.arguments)), { x: 4, y: 64, z: 2, tolerance: 1, sprint: false, timeoutMs: 5_000 });
 	assert.equal(typeof first.stateToken, 'string');
 	const second = vm.resume(actionResult(first, 'SUCCEEDED', 'ARRIVED'), facts({ player: { x: 4 } }));
 	assert.equal(second.kind, 'finish');
@@ -80,7 +80,7 @@ test('emits exact stable target ids and rejects selector fallbacks', () => {
 test('failed typed action results checkpoint with their stable reason', () => {
 	const vm = interpreter(`
 		program.onUnhandledAttention("continue_and_notify");
-		const moved = await tryResult(player.moveTo({ x: 4, y: 64, z: 2 }));
+		const moved = await tryResult(player.navigateTo({ x: 4, y: 64, z: 2, tolerance: 1, sprint: false, timeoutMs: 5_000 }));
 		if (!moved.succeeded) program.checkpoint(moved.reason);
 		program.finish("unreachable");
 	`);
@@ -188,7 +188,7 @@ test('rejects stale, duplicate, and out-of-order state tokens without losing the
 });
 
 test('yields deeply frozen null-prototype command records and rejects forbidden command keys', () => {
-	const vm = interpreter('program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 1, nested: { y: 2 } });');
+	const vm = interpreter('program.onUnhandledAttention("continue_and_notify"); await player.navigateTo({ x: 1, nested: { y: 2 } });');
 	const command = vm.start(facts());
 	assert.equal(Object.getPrototypeOf(command), null);
 	assert.equal(Object.getPrototypeOf(command.call), null);
@@ -200,7 +200,7 @@ test('yields deeply frozen null-prototype command records and rejects forbidden 
 	assert.throws(() => { command.call.primitive = 'escaped'; }, TypeError);
 	assert.throws(() => { command.call.arguments.nested.y = 9; }, TypeError);
 	for (const key of ['__proto__', 'constructor', 'prototype']) {
-		assert.throws(() => interpreter(`program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ ${key}: 1 });`), (error) => error.code === 'UNSAFE_MEMBER_ACCESS');
+		assert.throws(() => interpreter(`program.onUnhandledAttention("continue_and_notify"); await player.navigateTo({ ${key}: 1 });`), (error) => error.code === 'UNSAFE_MEMBER_ACCESS');
 	}
 });
 
@@ -358,7 +358,7 @@ test('bounds canonical facts, results, and command output without native stack o
 	const command = resultVm.start(facts());
 	assert.throws(() => resultVm.resume({ stateToken: command.stateToken, state: 'SUCCEEDED', reasonCode: 'x'.repeat(4_097) }, facts()), (error) => error.code === 'RESULT_LIMIT');
 
-	const outputVm = interpreter('program.onUnhandledAttention("continue_and_notify"); await player.moveTo(player.state());');
+	const outputVm = interpreter('program.onUnhandledAttention("continue_and_notify"); await player.navigateTo(player.state());');
 	assert.throws(() => outputVm.start(facts({ player: { blob: 'x'.repeat(8_193) } })), (error) => error.code === 'OUTPUT_LIMIT');
 });
 
@@ -390,7 +390,7 @@ test('pauses execution errors and blocks watcher activation afterward', () => {
 
 test('requires exact player binding primitive mappings', () => {
 	const compiled = parseArenaScript('program.onUnhandledAttention("continue_and_notify");');
-	for (const [member, primitive] of [['moveTo', 'fight_target'], ['wait', 'move_to']]) {
+	for (const [member, primitive] of [['navigateTo', 'fight_target'], ['wait', 'move_to']]) {
 		const bindings = Object.freeze(Object.assign(Object.create(null), {
 			player: Object.freeze(Object.assign(Object.create(null), {
 				[member]: Object.freeze(Object.assign(Object.create(null), { primitive })),

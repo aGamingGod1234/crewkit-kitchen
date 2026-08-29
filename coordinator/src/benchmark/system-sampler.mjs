@@ -1,4 +1,5 @@
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { sanitizeDiagnosticErrorMessage } from '../diagnostic-sanitizer.mjs';
 
 const DEFAULT_INTERVAL_MS = 50;
 export const MAX_SUMMARY_SAMPLES = 10_000;
@@ -253,7 +254,7 @@ function positiveInteger(value, field) { if (!Number.isSafeInteger(value) || val
 function boundedPositiveInteger(value, field, maximum) { const result = positiveInteger(value, field); if (result > maximum) throw new RangeError(`${field} must be at most ${maximum}`); return result; }
 function positiveFinite(value, field) { if (!Number.isFinite(value) || value <= 0) throw new TypeError(`${field} must be a positive finite number`); return value; }
 function nonNegativeInteger(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
-function boundedError(error) { return String(error?.message ?? error ?? 'unknown error').slice(0, 256); }
+function boundedError(error) { return sanitizeDiagnosticErrorMessage(error, { maxBytes: 256 }); }
 
 function deepFreeze(value, seen = new WeakSet()) {
 	if (value === null || typeof value !== 'object' || seen.has(value)) return value;

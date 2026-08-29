@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { AgentRegistry, DynamicAgentState } from '../../src/agent-registry.mjs';
 import { parseDecision } from '../../src/decision-parser.mjs';
 import { createDynamicCoordinator } from '../../src/dynamic-main.mjs';
+import { goalSpecFingerprint } from '../../src/goal-spec.mjs';
 import { validateProtocolV2Envelope } from '../../src/protocol-v2.mjs';
 import { withCompletionContract } from './completion-contract.mjs';
 
@@ -18,7 +19,7 @@ export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) 
 	const provider = new FixtureProvider({ malformedFirstAgent });
 	const trace = { rows: [], privateRows: [], async write(event, fields) { this.rows.push({ event, ...fields }); }, async writeDiagnostic(event, fields) { this.privateRows.push({ event, ...fields }); } };
 	const coordinator = createDynamicCoordinator(
-		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' }, serviceTier: 'fast' }, limits: { agentCap: 2, planningConcurrency: 2 } },
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' }, serviceTier: 'fast' }, limits: { agentCap: 2, planningConcurrency: 2 } },
 		{ bridge, registry, codexService: provider, traceWriter: trace },
 	);
 	await coordinator.start();
@@ -28,8 +29,9 @@ export async function startTwoAgentFixture({ malformedFirstAgent = null } = {}) 
 	let stopped = false;
 	return {
 		async goalBoth(goal) {
+			const goalSpec = fixtureGoalSpec(goal);
 			for (const profile of PROFILES) {
-				bridge.emit('goal_control', { agentId: profile.agentId, payload: { operation: 'start', goalRevision: 1, goal, updatedAtEpochMs: 1 } });
+				bridge.emit('goal_control', { agentId: profile.agentId, payload: { operation: 'start', goalRevision: 1, goal, goalSpec, updatedAtEpochMs: 1 } });
 				bridge.emit('observation', observation(profile.agentId, 1, 1));
 			}
 		},
@@ -97,7 +99,7 @@ class FakeBridge extends EventEmitter {
 				payload: {
 					goalRevision: payload.goalRevision,
 					traceId: payload.traceId,
-					contractHash: payload.contractHash,
+					goalFingerprint: payload.goalFingerprint,
 					verified: true,
 					reasonCode: 'COMPLETION_VERIFIED',
 					facts: [],
@@ -114,6 +116,11 @@ class FakeBridge extends EventEmitter {
 			});
 		}
 	}
+}
+
+function fixtureGoalSpec(originalRequest) {
+	const fields = { originalRequest, predicate: { type: 'operator_confirmed' }, createdAtTick: 1 };
+	return Object.freeze({ ...fields, fingerprint: goalSpecFingerprint(fields) });
 }
 
 class FixtureProvider {

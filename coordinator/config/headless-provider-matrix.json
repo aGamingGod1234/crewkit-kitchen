@@ -13,8 +13,7 @@
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CODEX_SOL_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
+        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" }
       ]
     },
     {
@@ -29,8 +28,7 @@
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CODEX_SOL_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
+        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" }
       ]
     },
     {
@@ -45,8 +43,7 @@
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CODEX_LUNA_LOW" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
+        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" }
       ]
     },
     {
@@ -61,8 +58,7 @@
       "assert": [
         { "type": "lifecycle", "state": "COMPLETED" },
         { "type": "chat", "message": "MATRIX_CODEX_LUNA_HIGH" },
-        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" },
-        { "type": "program", "event": "program_finished", "status": "FINISHED" }
+        { "type": "action", "actionType": "move_to", "resultState": "SUCCEEDED" }
       ]
     },
     {

@@ -15,14 +15,16 @@ if (-not (Test-Path -LiteralPath (Join-Path $Coordinator 'package.json') -PathTy
 $env:JAVA_HOME = $JavaHome
 Push-Location $Project
 try {
-    & .\gradlew.bat clean check build verifyCore --no-build-cache --rerun-tasks --no-daemon --console=plain
-    if ($LASTEXITCODE -ne 0) { throw "Gradle verification failed with code $LASTEXITCODE" }
+    $gradle = Start-Process -FilePath (Join-Path $Project 'gradlew.bat') `
+        -ArgumentList @('clean', 'check', 'build', 'verifyCore', '--no-build-cache', '--rerun-tasks', '--no-daemon', '--console=plain') `
+        -NoNewWindow -Wait -PassThru
+    if ($gradle.ExitCode -ne 0) { throw "Gradle verification failed with code $($gradle.ExitCode)" }
 } finally { Pop-Location }
 
 Push-Location $Coordinator
 try {
-    & npm test
-    if ($LASTEXITCODE -ne 0) { throw "Coordinator tests failed with code $LASTEXITCODE" }
+    $npm = Start-Process -FilePath 'npm.cmd' -ArgumentList @('test') -NoNewWindow -Wait -PassThru
+    if ($npm.ExitCode -ne 0) { throw "Coordinator tests failed with code $($npm.ExitCode)" }
 } finally { Pop-Location }
 
 $launcherInstaller = Get-Content -LiteralPath (Join-Path $Project 'scripts\install-launcher-profiles.ps1') -Raw

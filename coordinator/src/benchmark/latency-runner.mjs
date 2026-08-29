@@ -17,6 +17,8 @@ import { ControlLatencyRegistry } from '../control-latency-registry.mjs';
 import { SystemSampler } from './system-sampler.mjs';
 import { createLiveProviderFactory } from './live-provider-factories.mjs';
 import { buildAuthoritativeScenarioOutcome, captureScenarioInitialSnapshot, compileScenarioDecision, runAuthoritativeScenarioSuccess } from './scenario-program.mjs';
+import { goalSpecFingerprint } from '../goal-spec.mjs';
+import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from '../diagnostic-sanitizer.mjs';
 
 const LOADS = Object.freeze([1, 4, 8, 16]);
 const MODES = new Set(['instant', 'replay', 'live']);
@@ -173,8 +175,10 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			catch (error) { await stopProviderAfterTimeout(); throw error; }
 		}
 
-		records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, goalRevision: 0, queue: [] }));
-		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: scenario.goal ?? `Complete ${trial.scenarioId}`, goalRevision: 1 }));
+		const goal = scenario.goal ?? `Complete ${trial.scenarioId}`;
+		const goalSpec = benchmarkGoalSpec(goal);
+		records = scenario.agentIds.map((agentId) => ({ agentId, provider: internalProvider(trial.providerProfile.provider), model: trial.providerProfile.model, reasoningEffort: trial.providerProfile.reasoningEffort, serviceTier: trial.providerProfile.serviceTier, state: DynamicAgentState.IDLE, currentGoal: null, currentGoalSpec: null, goalRevision: 0, queue: [] }));
+		const virtualRecords = records.map((record) => ({ ...record, state: DynamicAgentState.STARTING, currentGoal: goal, currentGoalSpec: goalSpec, goalRevision: 1 }));
 		world = new VirtualWorld(scenario.world, { scheduler: manualScheduler() });
 		metrics.attachWorld(world, scenario, scenario.agentIds);
 		initialSnapshots = new Map(scenario.agentIds.map((agentId) => [agentId, captureScenarioInitialSnapshot({ manifest: scenario.agentManifests?.[agentId] ?? rawScenario, world, agentId })]));
@@ -205,7 +209,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 			plannerNow: () => world.timeMs,
 			epochNow: () => world.timeMs,
 		});
-		const runtimeListener = (error) => { if (runtimeErrors.length < 64) runtimeErrors.push({ code: error?.code, message: boundedError(error?.message) }); };
+		const runtimeListener = (error) => { if (runtimeErrors.length < 64) runtimeErrors.push({ code: sanitizeDiagnosticErrorCode(error), message: boundedError(error) }); };
 		coordinator.on('runtimeError', runtimeListener);
 		cleanup.push(() => coordinator?.off?.('runtimeError', runtimeListener));
 		cleanup.push(() => coordinator?.stop());
@@ -221,7 +225,7 @@ async function runTrial({ matrix, trial, repetition, scenarioResolver, providerF
 		await runWithDeadline(() => reconciled, deadline);
 		for (const agentId of scenario.agentIds) {
 			trialRecorder.record('goal_received', { agentId, goalRevision: 1 });
-			bridge.startAgent(agentId, scenario.goal ?? `Complete ${trial.scenarioId}`);
+			bridge.startAgent(agentId, goal, goalSpec);
 		}
 		await Promise.resolve();
 		for (const agentId of scenario.agentIds) await runWithDeadline(() => bridge.publish(agentId), deadline);
@@ -421,7 +425,7 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 				payload: {
 					goalRevision: payload.goalRevision,
 					traceId: payload.traceId,
-					contractHash: payload.contractHash,
+					goalFingerprint: payload.goalFingerprint,
 					verified,
 					reasonCode,
 					facts: [],
@@ -431,8 +435,13 @@ class VirtualMinecraftBridgeAdapter extends EventEmitter {
 	}
 	publish(agentId, options) { return this.#virtual.publish(agentId, options); }
 	flush() { return this.#virtual.flush(); }
-	startAgent(agentId, goal) { this.emit('goal_control', { agentId, payload: { operation: 'start', goalRevision: 1, goal, updatedAtEpochMs: 0 } }); }
+	startAgent(agentId, goal, goalSpec) { this.emit('goal_control', { agentId, payload: { operation: 'start', goalRevision: 1, goal, goalSpec, updatedAtEpochMs: 0 } }); }
 	get activeActionIds() { return this.#virtual.activeActionIds; }
+}
+
+function benchmarkGoalSpec(originalRequest) {
+	const fields = { originalRequest, predicate: { type: 'operator_confirmed' }, createdAtTick: 1 };
+	return Object.freeze({ ...fields, fingerprint: goalSpecFingerprint(fields) });
 }
 
 /**
@@ -901,10 +910,10 @@ function createInjectedProviderService(provider, trial, budget, deadline, increm
 		catalog: { stale: false, async refresh() { return { models: [] }; }, assertSupported() {} },
 		async start() {}, async stop() { await stopProvider(); sessions.clear(); },
 		async bootstrapCatalog() { return { models: [] }; },
-		async createAgent(record) {
+		async createAgent(record, options) {
 			const profile = { ...record, ...trial.providerProfile, provider: trial.providerProfile.provider };
 			let session;
-			try { session = await runWithDeadline(() => provider.createAgent(profile), deadline); }
+			try { session = await runWithDeadline(() => provider.createAgent(profile, options), deadline); }
 			catch (error) { if (error?.code === 'TRIAL_TIMEOUT') await stopProviderAfterTimeout(); throw error; }
 			if (!session || typeof session.decide !== 'function') throw coded('PROVIDER_EXIT', 'provider returned no decision session');
 			const wrapped = { ...session, async decide(input, options = {}) {
@@ -953,7 +962,7 @@ async function defaultReplayFactory(profile, context = {}) {
 
 function benchmarkCoordinatorConfig(agentCap, planningConcurrency = agentCap) {
 	const effectiveConcurrency = Math.max(1, Math.min(agentCap, planningConcurrency));
-	return { bridge: { secret: 'latency-fixture' }, codex: { cwd: process.cwd() }, limits: { agentCap, goalQueueCap: 8, planningConcurrency: effectiveConcurrency, invalidDecisionRetries: 0 }, workspaceRoot: path.join(os.tmpdir(), 'arena-latency-workspaces') };
+	return { bridge: { secret: 'latency-fixture' }, codex: { cwd: process.cwd(), controlProtocol: 'arena_script' }, limits: { agentCap, goalQueueCap: 8, planningConcurrency: effectiveConcurrency, invalidDecisionRetries: 0 }, workspaceRoot: path.join(os.tmpdir(), 'arena-latency-workspaces') };
 }
 
 function cloneScenarioForLoad(source, load, seed) {
@@ -1211,7 +1220,7 @@ function cleanupSnapshot(bridge, sampler, cleanupErrors = []) {
 	const samplerErrors = sampler?.errors?.length ?? 0;
 	return { ok: activeActions === 0 && listeners === 0 && relays === 0 && pendingObservations === 0 && !samplerActive && cleanupErrors.length === 0, activeActions, listeners, relays, pendingObservations, samplerActive, samplerErrors, errors: cleanupErrors.slice(0, 16) };
 }
-function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}) { return { ...context, trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' }, ...(outcomeHash ? { outcomeHash } : {}), ...(error ? { error: { code: error.code, message: boundedError(error.message) } } : {}), cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 }, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) }; }
+function trialResult(trial, repetition, status, error, startedAt, outcomeHash, cleanup, context = {}) { return { ...context, trialId: trial.id, repetition, status, scenarioId: trial.scenarioId, seed: trial.seed, agentLoad: trial.agentLoad, mode: trial.mode, providerProfile: trial.providerProfile, providerIdentity: { provider: trial.providerProfile.provider, synthetic: trial.mode !== 'live' }, ...(outcomeHash ? { outcomeHash } : {}), ...(error ? { error: { code: sanitizeDiagnosticErrorCode(error, { fallback: 'TRIAL_FAILED' }), message: boundedError(error) } } : {}), cleanup: cleanup ?? { ok: true, activeActions: 0, listeners: 0 }, durationMs: Math.max(0, Math.round(performance.now() - startedAt)) }; }
 function cleanupError() { return null; }
 async function writeArtifacts(directory, output, recorder, artifactFs = {}) {
 	const fs = { mkdir, rename, rm, writeFile, ...artifactFs };
@@ -1244,12 +1253,16 @@ async function writeArtifacts(directory, output, recorder, artifactFs = {}) {
 }
 function redactOutput(output) { return { ...output, trials: output.trials.map((trial) => ({ ...trial, error: trial.error ? { code: trial.error.code, message: boundedError(trial.error.message) } : undefined })) }; }
 function normalizeTrialError(error) {
-	if (error?.code) return coded(error.code, boundedError(error.message));
+	const code = sanitizeDiagnosticErrorCode(error);
+	if (code !== 'UNKNOWN') return coded(code, boundedError(error));
 	const message = boundedError(error);
 	if (/provider|process|spawn|exit|transport/i.test(message)) return coded('PROVIDER_EXIT', message);
 	return coded('TRIAL_FAILED', message);
 }
-function boundedError(value) { return String(value ?? 'unknown error').replace(/(?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+/gi, '$1=[REDACTED]').slice(0, 512); }
+function boundedError(value) {
+	if (value !== null && typeof value === 'object') return sanitizeDiagnosticErrorMessage(value, { maxBytes: 512 });
+	return sanitizeDiagnosticText(value ?? 'unknown error', { maxBytes: 512 });
+}
 function withTimeout(promise, milliseconds, code) {
 	let handle;
 	const timeout = new Promise((_, reject) => { handle = setTimeout(() => reject(coded(code, `${code.toLowerCase()} after ${milliseconds}ms`)), milliseconds); });

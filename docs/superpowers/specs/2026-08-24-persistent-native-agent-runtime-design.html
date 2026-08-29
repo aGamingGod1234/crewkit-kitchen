@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Persistent Native Minecraft Agent Runtime</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0c1015;
+      --surface: #151b23;
+      --surface-2: #1c2430;
+      --border: #2b3645;
+      --text: #edf2f7;
+      --muted: #a7b1c0;
+      --accent: #6ee7b7;
+      --accent-soft: rgba(110, 231, 183, .1);
+      --warning: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(940px, calc(100% - 32px)); margin: 0 auto; padding: 64px 0 96px; }
+    header { margin-bottom: 48px; }
+    .eyebrow { margin: 0 0 10px; color: var(--accent); font-size: .78rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    h1 { max-width: 760px; margin: 0; font-size: clamp(2.25rem, 7vw, 4.7rem); line-height: 1.02; letter-spacing: -.055em; }
+    .lead { max-width: 720px; margin: 24px 0 0; color: var(--muted); font-size: 1.12rem; }
+    .status { display: inline-flex; align-items: center; gap: 9px; margin-top: 24px; padding: 7px 11px; border: 1px solid rgba(110, 231, 183, .25); border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: .86rem; font-weight: 650; }
+    .status::before { width: 8px; height: 8px; border-radius: 50%; background: currentColor; content: ""; }
+    section { padding: 30px 0; border-top: 1px solid var(--border); }
+    h2 { margin: 0 0 18px; font-size: 1.35rem; letter-spacing: -.025em; }
+    h3 { margin: 25px 0 8px; font-size: 1rem; }
+    p { margin: 0 0 16px; }
+    ul, ol { margin: 12px 0 0; padding-left: 1.35rem; }
+    li + li { margin-top: 7px; }
+    .muted { color: var(--muted); }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .card { padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+    .card h3 { margin-top: 0; }
+    .metric { color: var(--accent); font-size: 1.65rem; font-weight: 750; letter-spacing: -.04em; }
+    .flow { counter-reset: step; display: grid; gap: 10px; margin-top: 18px; }
+    .flow div { display: grid; grid-template-columns: 32px 1fr; gap: 12px; align-items: start; padding: 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+    .flow div::before { counter-increment: step; content: counter(step); display: grid; width: 28px; height: 28px; place-items: center; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: .8rem; font-weight: 750; }
+    code { padding: .12em .34em; border-radius: 5px; background: var(--surface-2); color: #d5f9ec; font-size: .9em; }
+    pre { overflow-x: auto; margin: 16px 0 0; padding: 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: #d5f9ec; }
+    .decision { padding: 20px; border-left: 3px solid var(--accent); background: var(--accent-soft); }
+    .risk { color: var(--warning); }
+    footer { padding-top: 28px; border-top: 1px solid var(--border); color: var(--muted); font-size: .85rem; }
+    @media (max-width: 650px) {
+      main { width: min(100% - 24px, 940px); padding: 38px 0 64px; }
+      header { margin-bottom: 34px; }
+      .grid { grid-template-columns: 1fr; }
+      section { padding: 25px 0; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Approved runtime design</p>
+      <h1>Persistent native Minecraft agents</h1>
+      <p class="lead">Make every active goal keep moving until Minecraft verifies completion or a real terminal event occurs. Recoverable provider, bridge, action, and coordinator failures must never silently strand an agent.</p>
+      <div class="status">Ready for implementation planning</div>
+    </header>
+
+    <section>
+      <h2>What the investigation proved</h2>
+      <div class="grid">
+        <div class="card"><div class="metric">489</div><div class="muted">unhandled attention events in the Desktop trace</div></div>
+        <div class="card"><div class="metric">438 MB</div><div class="muted">coordinator error log caused by repeated bridge refusal stacks</div></div>
+        <div class="card"><div class="metric">ArenaScript</div><div class="muted">still selected when a preserved legacy config omits the control protocol</div></div>
+        <div class="card"><div class="metric">ERROR / PAUSED</div><div class="muted">incorrect terminal transitions after recoverable provider failures and reconciliation</div></div>
+      </div>
+      <p class="muted" style="margin-top:18px">The shared root cause is architectural: no module owns the invariant that unfinished active work must always be live or scheduled to continue.</p>
+    </section>
+
+    <section>
+      <h2>Core decision</h2>
+      <div class="decision">
+        Add one event-driven active-goal supervisor at the coordinator lifecycle seam. It owns continuation and recovery scheduling. A small lease timer catches missed events without turning normal operation into polling.
+      </div>
+      <p class="muted" style="margin-top:16px">Retries scattered through individual catch blocks and a continuously polling watchdog were rejected because both duplicate lifecycle policy and leave more race conditions.</p>
+    </section>
+
+    <section>
+      <h2>The active-goal invariant</h2>
+      <p>For every current goal revision in <code>STARTING</code>, <code>PLANNING</code>, or <code>ACTING</code>, at least one continuation must exist:</p>
+      <ul>
+        <li>a provider turn is queued or running;</li>
+        <li>a physical action is running;</li>
+        <li>completion verification is running;</li>
+        <li>a fresh observation is pending;</li>
+        <li>a recovery attempt is scheduled.</li>
+      </ul>
+      <p class="muted" style="margin-top:16px">Every callback is fenced by agent ID, goal revision, and lifecycle generation. Recovery work is coalesced so one agent revision cannot create duplicate retries.</p>
+    </section>
+
+    <section>
+      <h2>Native control and shared instructions</h2>
+      <p>Codex agents use native Minecraft tools by default, including installations with preserved legacy configuration. Every agent gets the same static, read-only job and tool guidance while its conversation, goal, observations, provider state, and tools remain isolated.</p>
+      <pre>runtime/minecraft-agent/
+|-- AGENTS.md
+`-- .codex/
+    `-- skills/
+        `-- minecraft-control/
+            `-- SKILL.md</pre>
+      <p class="muted" style="margin-top:16px">The existing dynamic tools remain direct Codex tools. No CLI or MCP translation layer is added.</p>
+    </section>
+
+    <section>
+      <h2>Continuation flow</h2>
+      <div class="flow">
+        <div>An observation starts or steers a native provider turn.</div>
+        <div>The model calls the smallest useful Minecraft action and receives its structured result.</div>
+        <div>If the turn ends while the goal is unfinished, the supervisor requests a fresh observation.</div>
+        <div>The next turn continues from current world state, including recovery from timeouts, blocked paths, missing drops, or changed terrain.</div>
+        <div>Only Minecraft's verifier may complete the goal.</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Recovery policy</h2>
+      <ul>
+        <li>Recover provider disconnects, timeouts, rate limits, bridge loss, action timeouts, and blocked paths without producing terminal <code>ERROR</code> or <code>PAUSED</code>.</li>
+        <li>Retry from 250 ms with exponential backoff capped at 5 seconds.</li>
+        <li>Reset failure state after useful progress, a fresh observation, reconnection, or a successful provider turn.</li>
+        <li>Preserve explicit pause. Automatically resume interrupted active work after authenticated reconciliation.</li>
+        <li>End only on verified completion, explicit stop/removal/cancellation/replacement, unrecoverable death, a factually supported impossible result, or shutdown.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Logging and diagnostics</h2>
+      <p>Expected bridge refusal is logged once, counted, and summarized on recovery. Unexpected errors retain structured diagnostics such as agent ID, goal revision, lifecycle generation, provider, active-work kind, stable error code, and stack.</p>
+      <p>Coordinator stdout and stderr rotate at a fixed size with bounded retained generations, preventing another hundreds-of-megabytes failure log.</p>
+    </section>
+
+    <section>
+      <h2>Verification</h2>
+      <p>The fault matrix covers legacy config migration, shared read-only instructions, zero-tool and one-action turns, provider failures, bridge reconnects, explicit pause, revision fencing, death and respawn, moved item drops, completion retries, terminal state alignment, orphan cleanup, and bounded logs.</p>
+      <p>The full coordinator, Java protocol, voice addon, and headless suites remain required. The final scenario must prove several sequential actions continue across multiple native turns while recoverable faults are injected between actions.</p>
+    </section>
+
+    <section>
+      <h2>Scope and risks</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>Included</h3>
+          <p class="muted">Codex Minecraft control, goal liveness, reconnect handling, process logging, and the shared instruction workspace.</p>
+        </div>
+        <div class="card">
+          <h3 class="risk">Deliberately excluded</h3>
+          <p class="muted">Agent-selection UI redesign, MCP, a shell CLI, non-Codex protocol redesign, and hidden chain-of-thought exposure.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer>Persistent native Minecraft agent runtime design · 24 August 2026</footer>
+  </main>
+</body>
+</html>

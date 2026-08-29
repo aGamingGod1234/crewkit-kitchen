@@ -43,10 +43,26 @@ public final class AgentInputStates {
 		);
 	}
 
+	public static AgentInputState safetyReflex(
+			ServerPlayer player,
+			Vec3 target,
+			float forward,
+			boolean jump,
+			boolean sprint,
+			boolean use,
+			InteractionHand hand
+	) {
+		AgentInputState movement = lookingAt(
+				player, target, forward, 0.0F, jump, false, sprint, false, use, hand);
+		return new AgentInputState(
+				movement.forward(), movement.strafe(), movement.jump(), movement.sneak(), movement.sprint(),
+				false, movement.use(), movement.yaw(), movement.pitch(), movement.selectedSlot(), movement.hand());
+	}
+
 	/**
 	 * Advances a small player-like movement motor toward a target view and movement direction.
-	 * The target's jump flag is treated as a held request and the returned jump flag is an edge
-	 * pulse, which keeps action-pack jump starts from being retriggered every server tick.
+	 * The target's jump flag is a held request. Carpet converts the first true edge into its
+	 * continuous jump action, so the state must remain true until navigation releases it.
 	 */
 	public static MotorStep stepMotor(MotorState state, MotorTarget target, long nowEpochMs) {
 		Objects.requireNonNull(state, "state must not be null");
@@ -67,7 +83,7 @@ public final class AgentInputStates {
 		if (target.moving()) {
 			// Move mostly forward while turning, then bleed into a lateral component. This avoids
 			// the stop-and-reverse oscillation that a hard yaw snap causes around corners.
-			float relativeRadians = (float) Math.toRadians(yawDelta);
+			float relativeRadians = (float) Math.toRadians(shortestAngleDelta(yaw, target.yaw()));
 			desiredForward = Math.max(0.0F, (float) Math.cos(relativeRadians));
 			desiredStrafe = (float) Math.sin(relativeRadians);
 			if (Math.abs(desiredForward) + Math.abs(desiredStrafe) < MOVEMENT_EPSILON) {
@@ -78,7 +94,7 @@ public final class AgentInputStates {
 				desiredForward == 0.0F ? MOVE_DECELERATION : MOVE_ACCELERATION);
 		float strafe = approach(state.strafe(), desiredStrafe,
 				desiredStrafe == 0.0F ? MOVE_DECELERATION : MOVE_ACCELERATION);
-		boolean jump = target.jumpRequested() && !state.jumpHeld();
+		boolean jump = target.jumpRequested();
 		MotorState next = new MotorState(yaw, pitch, forward, strafe, target.jumpRequested());
 		return new MotorStep(next, forward, strafe, jump, target.sprint());
 	}

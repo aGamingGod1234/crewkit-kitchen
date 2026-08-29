@@ -3,8 +3,10 @@ package dev.agaminggod.arenaagents.verification;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.agaminggod.arenaagents.agent.AgentRegistryVerification;
+import dev.agaminggod.arenaagents.agent.GoalSpecVerification;
 import dev.agaminggod.arenaagents.agent.AgentIdentityVerification;
 import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
+import dev.agaminggod.arenaagents.server.AgentVerbosePresentationVerification;
 import dev.agaminggod.arenaagents.server.AgentDeathCaptureVerification;
 import dev.agaminggod.arenaagents.server.VoiceConsentCommandVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
@@ -42,6 +44,7 @@ import dev.agaminggod.arenaagents.client.navigation.NavigationMovementVerificati
 import dev.agaminggod.arenaagents.client.navigation.MinecraftWalkabilityViewVerification;
 import dev.agaminggod.arenaagents.client.network.GoalReceiverVerification;
 import dev.agaminggod.arenaagents.control.AgentControlVerification;
+import dev.agaminggod.arenaagents.control.AgentControlSelectionStateVerification;
 import dev.agaminggod.arenaagents.control.AgentRosterViewStateVerification;
 import dev.agaminggod.arenaagents.protocol.ActionCommand;
 import dev.agaminggod.arenaagents.protocol.ActionResult;
@@ -51,6 +54,10 @@ import dev.agaminggod.arenaagents.protocol.ProtocolCodec;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.GoalControlVerification;
+import dev.agaminggod.arenaagents.server.GoalDraftAdvancementRevalidationVerification;
+import dev.agaminggod.arenaagents.server.QueuedGoalRevalidationVerification;
+import dev.agaminggod.arenaagents.server.AgentSavedDataGoalDraftVerification;
+import dev.agaminggod.arenaagents.server.goal.GoalCompilerVerification;
 import dev.agaminggod.arenaagents.server.conversation.AgentConversationRouterVerification;
 import dev.agaminggod.arenaagents.server.conversation.NativeAgentWhisperTargetsVerification;
 import dev.agaminggod.arenaagents.server.group.AgentGroupRegistryVerification;
@@ -62,13 +69,9 @@ import dev.agaminggod.arenaagents.server.CoordinatorStartupSmokeVerification;
 import dev.agaminggod.arenaagents.server.CoordinatorLogRotationVerification;
 import dev.agaminggod.arenaagents.server.NodeRuntimeLocatorVerification;
 import dev.agaminggod.arenaagents.server.CoordinatorLaunchPolicyVerification;
-<<<<<<< HEAD
-=======
-import dev.agaminggod.arenaagents.server.CoordinatorStartupSmokeVerification;
-import dev.agaminggod.arenaagents.server.CoordinatorVoiceTimeoutLifecycleVerification;
->>>>>>> origin/main
 import dev.agaminggod.arenaagents.server.CoordinatorVoiceEndpointVerification;
 import dev.agaminggod.arenaagents.server.CoordinatorVoiceEndpointRefreshVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorVoiceTimeoutLifecycleVerification;
 import dev.agaminggod.arenaagents.server.CodexAgentServerRuntimeVoiceStartVerification;
 import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayersVerification;
@@ -76,8 +79,10 @@ import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerificat
 import dev.agaminggod.arenaagents.server.bridge.BridgeEnvelopeCodecVerification;
 import dev.agaminggod.arenaagents.server.bridge.BoundedServerTaskQueueVerification;
 import dev.agaminggod.arenaagents.server.bridge.ProgramActionLedgerVerification;
+import dev.agaminggod.arenaagents.server.bridge.TerminalResultLedgerVerification;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusVerification;
 import dev.agaminggod.arenaagents.server.bridge.MultiplexedServerBridgeVerification;
+import dev.agaminggod.arenaagents.server.bridge.AgentVerboseVerification;
 import dev.agaminggod.arenaagents.server.bridge.SingleBrainBoundaryVerification;
 import dev.agaminggod.arenaagents.server.AgentRecoverySpawnPolicyVerification;
 import dev.agaminggod.arenaagents.server.AgentRespawnSpawnPolicyVerification;
@@ -94,6 +99,8 @@ import dev.agaminggod.arenaagents.server.runtime.ResourceLeaseManagerVerificatio
 import dev.agaminggod.arenaagents.server.runtime.RecipeActionVerification;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutorVerification;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionContractVerification;
+import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntimeVerification;
+import dev.agaminggod.arenaagents.server.goal.GoalSafetyControllerVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionSuccessLedgerVerification;
 import dev.agaminggod.arenaagents.server.runtime.input.InputStateVerification;
 import dev.agaminggod.arenaagents.server.perception.AttentionHazardVerification;
@@ -103,6 +110,7 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.EquipmentAndUseVeri
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionPostconditionVerification;
 import dev.agaminggod.arenaagents.server.runtime.transaction.TransactionProtocolVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerPathPlannerVerification;
+import dev.agaminggod.arenaagents.server.runtime.controller.MinecraftNavigationWorldVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.NavigationProgressVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatPolicyVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.CombatNavigationFailureVerification;
@@ -155,6 +163,7 @@ public final class VerificationMain {
 	public static void main(String[] args) throws Exception {
 		ProtocolCodec codec = new ProtocolCodec();
 
+		passedAssertions += AgentVerbosePresentationVerification.verify();
 		verifyProtocolConstants();
 		verifyActionWireNames();
 		verifyValidActionUnion(codec);
@@ -177,6 +186,10 @@ public final class VerificationMain {
 		passedAssertions += NavigationMovementVerification.verify();
 		passedAssertions += MinecraftWalkabilityViewVerification.verify();
 		passedAssertions += GoalControlVerification.verify();
+		passedAssertions += GoalDraftAdvancementRevalidationVerification.verify();
+		passedAssertions += QueuedGoalRevalidationVerification.verify();
+		passedAssertions += AgentSavedDataGoalDraftVerification.verify();
+		passedAssertions += GoalCompilerVerification.verify();
 		passedAssertions += AgentConversationRouterVerification.verify();
 		passedAssertions += NativeAgentWhisperTargetsVerification.verify();
 		passedAssertions += AgentGroupRegistryVerification.verify();
@@ -199,8 +212,10 @@ public final class VerificationMain {
 		passedAssertions += OfflineAgentPlayersVerification.verify();
 		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();
 		passedAssertions += AgentRegistryVerification.verify();
+		passedAssertions += GoalSpecVerification.verify();
 		passedAssertions += AgentIdentityVerification.verify();
 		passedAssertions += AgentControlVerification.verify();
+		passedAssertions += AgentControlSelectionStateVerification.verify();
 		passedAssertions += AgentRosterViewStateVerification.verify();
 		passedAssertions += AgentControlLayoutVerification.verify();
 		passedAssertions += BlockObservationOrderingVerification.verify();
@@ -219,12 +234,15 @@ public final class VerificationMain {
 		passedAssertions += EquipmentAndUseVerification.verify();
 		passedAssertions += ServerActionExecutorVerification.verify();
 		passedAssertions += GoalCompletionContractVerification.verify();
+		passedAssertions += GoalVerificationRuntimeVerification.verify();
+		passedAssertions += GoalSafetyControllerVerification.verify();
 		passedAssertions += ActionSuccessLedgerVerification.verify();
 		passedAssertions += InputStateVerification.verify();
 		passedAssertions += AttentionHazardVerification.verify();
 		passedAssertions += MenuCapabilityRegistryVerification.verify();
 		passedAssertions += VoiceSubsystemVerification.verify();
 		passedAssertions += ServerPathPlannerVerification.verify();
+		passedAssertions += MinecraftNavigationWorldVerification.verify();
 		passedAssertions += NavigationProgressVerification.verify();
 		passedAssertions += CombatPolicyVerification.verify();
 		passedAssertions += CombatNavigationFailureVerification.verify();
@@ -251,10 +269,12 @@ public final class VerificationMain {
 		passedAssertions += BridgeEnvelopeCodecVerification.verify();
 		passedAssertions += BoundedServerTaskQueueVerification.verify();
 		passedAssertions += ProgramActionLedgerVerification.verify();
+		passedAssertions += TerminalResultLedgerVerification.verify();
 		passedAssertions += CoordinatorStatusVerification.verify();
 		passedAssertions += AgentRecoverySpawnPolicyVerification.verify();
 		passedAssertions += AgentRespawnSpawnPolicyVerification.verify();
 		passedAssertions += MultiplexedServerBridgeVerification.verify();
+		passedAssertions += AgentVerboseVerification.verify();
 		passedAssertions += SingleBrainBoundaryVerification.verify();
 		passedAssertions += GoalReceiverVerification.verify();
 		verifyObservationContracts(codec);

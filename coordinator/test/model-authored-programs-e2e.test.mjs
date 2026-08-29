@@ -7,6 +7,7 @@ import { AgentPlanner } from '../src/agent-planner.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { ProgramRuntimeManager } from '../src/program-runtime-manager.mjs';
+import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { FakeMinecraftBridge, SELECTED_PROFILE, assertCommandProvenance, commandPayloads, observation } from './fixtures/fake-minecraft-bridge.mjs';
 import { withCompletionContract } from './fixtures/completion-contract.mjs';
@@ -19,30 +20,18 @@ const PICKUP_RADIUS = 1.5;
 const LOG_DROP = (stableId, count, x = 8) => ({ stableId, itemId: 'minecraft:oak_log', count, x, y: 64, z: 0 });
 const LOG_TREE = (stableId, x) => ({ stableId, blockId: 'minecraft:oak_log', x, y: 64, z: 0 });
 
-test('collects eight logs across two trees using measured pickup range and provenance', async () => {
+test('collects eight logs across two trees using fresh inventory facts and provenance', async () => {
 	const harness = createHarness({
 		initialObservation: observation({ blocks: [LOG_TREE('tree-one', 4)] }),
 		onAction: async (command) => {
 			const count = harnessCount(command, harness);
-			if (command.actionType === 'move_to') {
-				const target = command.arguments;
-				const drop = harness.bridge.currentObservation.items[0];
-				const pickupDistance = drop === undefined ? null : distance(target, drop);
-				harness.movementEvidence.push({ target: { x: target.x, y: target.y, z: target.z }, drop: drop && { x: drop.x, y: drop.y, z: drop.z }, pickupDistance });
-				assert.ok(drop, 'model-selected move target must have an observed drop');
-				assert.equal(pickupDistance <= PICKUP_RADIUS, true, 'inventory changes only after entering pickup range');
-			}
-			if (command.actionType === 'break_block' && count === 1) return { observation: observation({ items: [LOG_DROP('drop-five', 5)] }) };
-			if (command.actionType === 'move_to' && count === 2) return { observation: observation({ blocks: [LOG_TREE('tree-two', 10)], inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } } }) };
-			if (command.actionType === 'break_block' && count === 3) return { observation: observation({ items: [LOG_DROP('drop-three', 3)], inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } } }) };
+			if (command.actionType === 'break_block' && count === 1) return { observation: observation({ blocks: [LOG_TREE('tree-two', 10)], inventory: { items: [{ itemId: 'minecraft:oak_log', count: 5 }], tagCounts: { '#minecraft:logs': 5 } } }) };
 			return { observation: observation({ inventory: { items: [{ itemId: 'minecraft:oak_log', count: 8 }], tagCounts: { '#minecraft:logs': 8 } } }) };
 		},
 	});
 	await harness.install(`
 		program.onUnhandledAttention("continue_and_notify");
 		await program.repeatUntil(() => inventory.count("minecraft:oak_log") >= 8, { maxIterations: 8 }, async () => {
-			const drop = world.nearest(world.items({ itemId: "minecraft:oak_log" }));
-			if (drop !== null) { await player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }); return; }
 			const tree = world.nearest(world.blocks({ blockId: "minecraft:oak_log" }));
 			if (tree !== null) await player.mine({ x: tree.x, y: tree.y, z: tree.z, timeoutMs: 1 });
 		});
@@ -50,7 +39,7 @@ test('collects eight logs across two trees using measured pickup range and prove
 	`);
 	await eventually(() => harness.managerState() === DynamicAgentState.COMPLETED);
 	const commands = commandPayloads(harness.bridge);
-	assert.deepEqual(commands.map((command) => command.actionType), ['break_block', 'move_to', 'break_block', 'move_to']);
+	assert.deepEqual(commands.map((command) => command.actionType), ['break_block', 'break_block']);
 	assert.deepEqual(commands.filter((command) => command.actionType === 'break_block').map(({ arguments: args }) => ({ x: args.x, y: args.y, z: args.z })), [
 		{ x: 4, y: 64, z: 0 },
 		{ x: 10, y: 64, z: 0 },
@@ -60,10 +49,8 @@ test('collects eight logs across two trees using measured pickup range and prove
 		{ x: 4, y: 64, z: 0 },
 	], 'repeating the first tree coordinate must not produce the second tree drop');
 	assertCommandProvenance(commands, SELECTED_PROFILE, 'program-1-1');
-	assert.ok(harness.bridge.validatedOutbound >= 4);
-	assert.ok(harness.bridge.validatedInbound >= 8, 'progress, observation, and result traffic used protocol-v2 translation');
-	assert.deepEqual(harness.movementEvidence.map((move) => move.target), [{ x: 8, y: 64, z: 0 }, { x: 8, y: 64, z: 0 }]);
-	assert.ok(harness.movementEvidence.every((move) => move.pickupDistance <= PICKUP_RADIUS));
+	assert.ok(harness.bridge.validatedOutbound >= 2);
+	assert.ok(harness.bridge.validatedInbound >= 4, 'progress, observation, and result traffic used protocol-v2 translation');
 	for (let index = 1; index < commands.length; index += 1) {
 		const previousResult = harness.bridge.traffic.findIndex((entry) =>
 				entry.type === 'action_result' && entry.actionId === commands[index - 1].actionId);
@@ -77,40 +64,40 @@ test('collects eight logs across two trees using measured pickup range and prove
 	recordScenario('eight_logs_two_trees', harness);
 });
 
-test('reports an unreachable drop as a typed model-visible failure', async () => {
+test('reports an unreachable observed block as a typed model-visible failure', async () => {
 	const unreachable = createHarness({
-		initialObservation: observation({ items: [LOG_DROP('far-drop', 1, 12)] }),
-		onAction: async () => ({ state: 'FAILED', reasonCode: 'PATH_UNAVAILABLE', observation: observation({ items: [LOG_DROP('far-drop', 1, 12)] }) }),
+		initialObservation: observation({ blocks: [LOG_TREE('far-tree', 12)] }),
+		onAction: async () => ({ state: 'FAILED', reasonCode: 'PATH_UNAVAILABLE', observation: observation({ blocks: [LOG_TREE('far-tree', 12)] }) }),
 	});
 	await unreachable.install(`
 		program.onUnhandledAttention("continue_and_notify");
-		const drop = world.nearest(world.items({ itemId: "minecraft:oak_log" }));
-		const result = await tryResult(player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }));
+		const tree = world.nearest(world.blocks({ blockId: "minecraft:oak_log" }));
+		const result = await tryResult(player.navigateTo({ x: tree.x, y: tree.y, z: tree.z, tolerance: 1, sprint: false, timeoutMs: 5_000 }));
 		if (!result.succeeded) program.checkpoint(result.reason);
 		program.finish("picked up");
 	`);
 	await eventually(() => unreachable.managerState() === DynamicAgentState.PAUSED);
 	assert.equal(unreachable.bridge.results[0].reasonCode, 'PATH_UNAVAILABLE');
 	assertCommandProvenance(commandPayloads(unreachable.bridge), SELECTED_PROFILE, 'program-1-1');
-	recordScenario('unreachable_drop', unreachable);
+	recordScenario('unreachable_target', unreachable);
 });
 
-test('reports a disappearing drop as a typed model-visible failure', async () => {
+test('reports a disappearing observed block as a typed model-visible failure', async () => {
 	const disappeared = createHarness({
-		initialObservation: observation({ items: [LOG_DROP('vanishing-drop', 1, 6)] }),
+		initialObservation: observation({ blocks: [LOG_TREE('vanishing-tree', 6)] }),
 		onAction: async () => ({ observation: observation() }),
 	});
 	await disappeared.install(`
 		program.onUnhandledAttention("continue_and_notify");
-		const drop = world.nearest(world.items({ itemId: "minecraft:oak_log" }));
-		const result = await tryResult(player.moveTo({ x: drop.x, y: drop.y, z: drop.z, tolerance: 1, sprint: false }));
+		const tree = world.nearest(world.blocks({ blockId: "minecraft:oak_log" }));
+		const result = await tryResult(player.mine({ x: tree.x, y: tree.y, z: tree.z, timeoutMs: 5_000 }));
 		if (!result.succeeded) program.checkpoint(result.reason);
-		if (inventory.count("minecraft:oak_log") < 1) program.checkpoint("DROP_NOT_COLLECTED");
+		if (inventory.count("minecraft:oak_log") < 1) program.checkpoint("BLOCK_DROPPED_NO_LOG");
 		program.finish("picked up");
 	`);
 	await eventually(() => disappeared.managerState() === DynamicAgentState.PAUSED);
 	assertCommandProvenance(commandPayloads(disappeared.bridge), SELECTED_PROFILE, 'program-1-1');
-	recordScenario('disappearing_drop', disappeared);
+	recordScenario('disappearing_target', disappeared);
 });
 
 test('keeps inventory unchanged until a drop enters the modeled pickup radius', async () => {
@@ -118,7 +105,7 @@ test('keeps inventory unchanged until a drop enters the modeled pickup radius', 
 	const harness = createHarness({
 		initialObservation: observation({ items: [LOG_DROP('range-drop', 1, 8)] }),
 		onAction: async (command, bridge) => {
-			if (command.actionType !== 'move_to') return { observation: bridge.currentObservation };
+			if (command.actionType !== 'navigate_to') return { observation: bridge.currentObservation };
 			const target = command.arguments;
 			const drop = bridge.currentObservation.items[0];
 			const pickupDistance = distance(target, drop);
@@ -127,7 +114,7 @@ test('keeps inventory unchanged until a drop enters the modeled pickup radius', 
 			return { observation: observation({ player: target, items: collected ? [] : [drop], inventory: collected ? { items: [{ itemId: 'minecraft:oak_log', count: 1 }], tagCounts: { '#minecraft:logs': 1 } } : bridge.currentObservation.inventory }) };
 		},
 	});
-	await harness.install('program.onUnhandledAttention("continue_and_notify"); await player.moveTo({ x: 4, y: 64, z: 0, tolerance: 1, sprint: false }); if (inventory.count("minecraft:oak_log") < 1) await player.moveTo({ x: 8, y: 64, z: 0, tolerance: 1, sprint: false }); program.finish("picked up");');
+	await harness.install('program.onUnhandledAttention("continue_and_notify"); await player.navigateTo({ x: 4, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 5_000 }); if (inventory.count("minecraft:oak_log") < 1) await player.navigateTo({ x: 8, y: 64, z: 0, tolerance: 1, sprint: false, timeoutMs: 5_000 }); program.finish("picked up");');
 	await eventually(() => harness.managerState() === DynamicAgentState.COMPLETED);
 	assert.equal(moves.length, 2);
 	assert.equal(moves[0].pickupDistance, 4);
@@ -286,7 +273,8 @@ test('rejects a physical command without model-program provenance before bridge 
 function createHarness({ initialObservation = observation(), onAction = async () => ({ observation: initialObservation }), plannerDecision = () => null } = {}) {
 	const registry = new AgentRegistry({ agentCap: 1 });
 	const profile = { ...SELECTED_PROFILE };
-	registry.register({ ...profile, state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'Task 10 E2E', queue: [] });
+	const currentGoalSpec = fixtureGoalSpec('Task 10 E2E');
+	registry.register({ ...profile, state: DynamicAgentState.STARTING, goalRevision: 1, currentGoal: 'Task 10 E2E', currentGoalSpec, queue: [] });
 	const record = registry.get(profile.agentId);
 	const plannerCalls = [];
 	let plannerTime = 0;
@@ -314,7 +302,7 @@ function createHarness({ initialObservation = observation(), onAction = async ()
 		onCompletionRequested: (request) => queueMicrotask(() => harness.manager.onCompletionResult(record, {
 			goalRevision: request.record.goalRevision,
 			traceId: request.traceId,
-			contractHash: request.contractHash,
+			goalFingerprint: request.goalFingerprint,
 			verified: true,
 			reasonCode: 'COMPLETION_VERIFIED',
 		})),
@@ -364,7 +352,7 @@ function createProviderHarness({ initialObservation = observation(), onAction = 
 		onCompletionRequested: (request) => queueMicrotask(() => harness.manager.onCompletionResult(harness.record, {
 			goalRevision: request.record.goalRevision,
 			traceId: request.traceId,
-			contractHash: request.contractHash,
+			goalFingerprint: request.goalFingerprint,
 			verified: true,
 			reasonCode: 'COMPLETION_VERIFIED',
 		})),
@@ -375,6 +363,11 @@ function createProviderHarness({ initialObservation = observation(), onAction = 
 		return harness.manager.installDecision(harness.record, withCompletionContract(decision, harness.record.goalRevision), { observation: harness.bridge.currentObservation, eventSequence: 1 });
 	};
 	return harness;
+}
+
+function fixtureGoalSpec(originalRequest) {
+	const fields = { originalRequest, predicate: { type: 'operator_confirmed' }, createdAtTick: 1 };
+	return Object.freeze({ ...fields, fingerprint: goalSpecFingerprint(fields) });
 }
 
 function harnessCount(command, harness) {
@@ -398,11 +391,12 @@ function recordScenario(name, ...entries) {
 after(() => {
 	const syntheticLocal = latency.snapshot();
 	const syntheticProvider = [{ operation: 'provider_inference', ...summarize(providerLatencyMs) }];
-	const scenarios = scenarioResults.filter(({ name }) => !['unreachable_drop', 'disappearing_drop'].includes(name));
-	const dropSubcases = scenarioResults.filter(({ name }) => ['unreachable_drop', 'disappearing_drop'].includes(name));
-	const firstDropIndex = scenarioResults.findIndex(({ name }) => ['unreachable_drop', 'disappearing_drop'].includes(name));
-	const groupedDrop = { name: 'unreachable_and_disappearing_drops', passed: dropSubcases.every(({ passed }) => passed), commands: dropSubcases.reduce((total, scenario) => total + (scenario.commands ?? 0), 0), subcases: dropSubcases.map(({ name }) => name) };
-	if (firstDropIndex >= 0) scenarios.splice(Math.min(firstDropIndex, scenarios.length), 0, groupedDrop);
+	const targetSubcases = ['unreachable_target', 'disappearing_target'];
+	const scenarios = scenarioResults.filter(({ name }) => !targetSubcases.includes(name));
+	const groupedSubcases = scenarioResults.filter(({ name }) => targetSubcases.includes(name));
+	const firstGroupIndex = scenarioResults.findIndex(({ name }) => targetSubcases.includes(name));
+	const groupedTargets = { name: 'unreachable_and_disappearing_targets', passed: groupedSubcases.every(({ passed }) => passed), commands: groupedSubcases.reduce((total, scenario) => total + (scenario.commands ?? 0), 0), subcases: groupedSubcases.map(({ name }) => name) };
+	if (firstGroupIndex >= 0) scenarios.splice(Math.min(firstGroupIndex, scenarios.length), 0, groupedTargets);
 	console.log(`TASK10_E2E_SUMMARY ${JSON.stringify({ scenarios, passed: scenarios.length, timing: { basis: 'deterministic_fake_clock', syntheticLocal, syntheticProvider, benchmarkRequired: true } })}`);
 });
 

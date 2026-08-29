@@ -20,7 +20,7 @@ export const DynamicAgentState = Object.freeze({
 });
 
 const DYNAMIC_AGENT_STATES = new Set(Object.values(DynamicAgentState));
-const ACTIVE_ON_RELOAD = new Set([
+const DISCONNECT_ON_RELOAD = new Set([
 	DynamicAgentState.STARTING,
 	DynamicAgentState.PLANNING,
 	DynamicAgentState.ACTING,
@@ -31,7 +31,7 @@ const PROMOTION_SOURCE_STATES = new Set([
 	DynamicAgentState.PLANNING,
 	DynamicAgentState.ACTING,
 ]);
-const GOAL_OPERATIONS = new Set(['start', 'stop', 'queue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn']);
+const GOAL_OPERATIONS = new Set(['start', 'replace', 'stop', 'queue', 'dequeue', 'steer', 'resume', 'complete', 'fail', 'disconnect', 'dead', 'respawn']);
 const ALLOWED_STATE_TRANSITIONS = Object.freeze({
 	[DynamicAgentState.IDLE]: new Set([DynamicAgentState.STARTING, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
 	[DynamicAgentState.STARTING]: new Set([DynamicAgentState.PLANNING, DynamicAgentState.COMPLETED, DynamicAgentState.PAUSED, DynamicAgentState.ERROR, DynamicAgentState.DEAD, DynamicAgentState.DISCONNECTED]),
@@ -173,12 +173,13 @@ export class AgentRegistry {
 		return clone(current);
 	}
 
-	reconcile(snapshot) {
+	reconcile(snapshot, { recovery = false } = {}) {
 		if (!Array.isArray(snapshot)) throw new TypeError('registry snapshot must be an array');
+		if (typeof recovery !== 'boolean') throw new TypeError('registry recovery option must be a boolean');
 		if (snapshot.length > this.#agentCap) throw new AgentRegistryError('AGENT_CAP_REACHED', `Registry snapshot exceeds agent cap of ${this.#agentCap}`);
 		const next = new Map();
 		for (const value of snapshot) {
-			const record = normalizeAgentRecord(value, { queueCap: this.#queueCap, reload: true });
+			const record = normalizeAgentRecord(value, { queueCap: this.#queueCap, reload: true, recovery });
 			if (next.has(record.agentId)) throw new AgentRegistryError('DUPLICATE_AGENT', `Duplicate agent '${record.agentId}' in registry snapshot`);
 			next.set(record.agentId, record);
 		}
@@ -194,10 +195,12 @@ export class AgentRegistry {
 	}
 }
 
-export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP, reload = false } = {}) {
+export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP, reload = false, recovery = false } = {}) {
 	if (!isPlainObject(value)) throw new TypeError('agent record must be an object');
 	const state = requireState(value.state ?? DynamicAgentState.IDLE);
-	const normalizedState = reload && ACTIVE_ON_RELOAD.has(state) ? DynamicAgentState.PAUSED : state;
+	const normalizedState = reload && DISCONNECT_ON_RELOAD.has(state)
+		? (recovery ? DynamicAgentState.STARTING : DynamicAgentState.DISCONNECTED)
+		: state;
 	const goalRevision = nonnegativeInteger(value.goalRevision ?? 0, 'goalRevision');
 	const queue = value.queue ?? [];
 	if (!Array.isArray(queue)) throw new TypeError('agent queue must be an array');
@@ -207,13 +210,14 @@ export function normalizeAgentRecord(value, { queueCap = DEFAULT_GOAL_QUEUE_CAP,
 		agentId: requireIdentifier(value.agentId, 'agentId'),
 		entityUuid: optionalIdentifier(value.entityUuid, 'entityUuid'),
 		name: optionalText(value.name, 'name', MAX_IDENTIFIER_LENGTH),
-		provider: requireProvider(value.provider ?? 'codex'),
+		provider: requireProvider(recovery ? value.provider : value.provider ?? 'codex'),
 		model: requireIdentifier(value.model, 'model'),
 		reasoningEffort: requireIdentifier(value.reasoningEffort, 'reasoningEffort'),
-		serviceTier: requireIdentifier(value.serviceTier ?? 'priority', 'serviceTier'),
+		serviceTier: requireIdentifier(recovery ? value.serviceTier : value.serviceTier ?? 'priority', 'serviceTier'),
 		skinVariant: requireIdentifier(value.skinVariant ?? 'default', 'skinVariant'),
 		state: normalizedState,
 		currentGoal: optionalGoal(value.currentGoal),
+		currentGoalSpec: value.currentGoalSpec === null || value.currentGoalSpec === undefined ? null : parseGoalSpec(value.currentGoalSpec),
 		goalRevision,
 		queue: queue.map((entry, index) => normalizeQueuedGoal(entry, index)),
 		lastSummary: optionalText(value.lastSummary, 'lastSummary', MAX_RESULT_MESSAGE_LENGTH),
@@ -236,22 +240,48 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 	if (!isPlainObject(controlValue)) throw new TypeError('goal control must be an object');
 	const operation = controlValue.operation;
 	if (!GOAL_OPERATIONS.has(operation)) throw new AgentRegistryError('INVALID_GOAL_OPERATION', `Unsupported goal operation '${String(operation)}'`);
+	if (operation !== 'respawn' && controlValue.resumeGoal !== undefined) throw new AgentRegistryError('INVALID_GOAL_CONTROL', `Goal operation '${operation}' must not include resumeGoal`);
 	const revision = nonnegativeInteger(controlValue.goalRevision, 'goalRevision');
 	if (operation === 'queue') {
 		if (revision !== record.goalRevision) throw new AgentRegistryError('STALE_GOAL_REVISION', `Queued goal revision ${revision} does not match current revision ${record.goalRevision}`);
 		if (record.queue.length >= queueCap) throw new AgentRegistryError('GOAL_QUEUE_FULL', `Agent goal queue is limited to ${queueCap} entries`);
 		return {
 			...record,
-			queue: [...record.queue, normalizeQueuedGoal({ goal: controlValue.goal, goalRevision: revision }, record.queue.length)],
+			queue: [...record.queue, normalizeQueuedGoal({ goal: controlValue.goal, goalRevision: revision, goalSpec: controlValue.goalSpec }, record.queue.length)],
+			updatedAtEpochMs: nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs'),
+		};
+	}
+	if (operation === 'dequeue') {
+		if (revision !== record.goalRevision) throw new AgentRegistryError('STALE_GOAL_REVISION', `Dequeued goal revision ${revision} does not match current revision ${record.goalRevision}`);
+		if (record.state !== DynamicAgentState.COMPLETED) throw new AgentRegistryError('INVALID_GOAL_CONTROL', `Cannot dequeue rejected work while agent is '${record.state}'`);
+		const rejectedGoal = requireGoal(controlValue.goal);
+		const rejectedSpec = parseGoalSpec(controlValue.goalSpec);
+		const queuedHead = record.queue[0];
+		if (queuedHead === undefined
+				|| queuedHead.goal !== rejectedGoal
+				|| queuedHead.goalSpec?.fingerprint !== rejectedSpec.fingerprint) {
+			throw new AgentRegistryError('QUEUED_GOAL_MISMATCH', `Rejected goal '${rejectedGoal}' does not match the queued head`);
+		}
+		return {
+			...record,
+			queue: record.queue.slice(1),
 			updatedAtEpochMs: nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs'),
 		};
 	}
 	if ((operation === 'stop' && record.state === DynamicAgentState.PAUSED && revision === record.goalRevision)
 		|| (operation === 'disconnect' && record.state === DynamicAgentState.DISCONNECTED && revision === record.goalRevision)) return record;
-	if (revision <= record.goalRevision) throw new AgentRegistryError('STALE_GOAL_REVISION', `Goal revision ${revision} is not newer than ${record.goalRevision}`);
+	if (operation === 'respawn' && record.state !== DynamicAgentState.DEAD) {
+		throw new AgentRegistryError('INVALID_GOAL_CONTROL', `Cannot respawn an agent from state '${record.state}'`);
+	}
+	const preservesGoalRevision = operation === 'dead' || operation === 'respawn';
+	if (preservesGoalRevision ? revision !== record.goalRevision : revision <= record.goalRevision) {
+		throw new AgentRegistryError('STALE_GOAL_REVISION', preservesGoalRevision
+			? `Goal revision ${revision} does not match current revision ${record.goalRevision}`
+			: `Goal revision ${revision} is not newer than ${record.goalRevision}`);
+	}
 	const now = nonnegativeInteger(controlValue.updatedAtEpochMs ?? Date.now(), 'updatedAtEpochMs');
 	const next = { ...record, goalRevision: revision, updatedAtEpochMs: now, lastError: null };
-	if (operation === 'start' || operation === 'steer') {
+	if (operation === 'start' || operation === 'replace' || operation === 'steer') {
 		const nextGoal = requireGoal(controlValue.goal);
 		const promotesQueuedGoal = PROMOTION_SOURCE_STATES.has(record.state)
 			|| (record.state === DynamicAgentState.COMPLETED && record.queue.length > 0);
@@ -266,6 +296,7 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 			next.queue = record.queue.slice(1);
 		}
 		next.currentGoal = nextGoal;
+		next.currentGoalSpec = controlValue.goalSpec === undefined ? promotedGoalSpec(record, operation) : parseGoalSpec(controlValue.goalSpec);
 		next.state = DynamicAgentState.STARTING;
 		return next;
 	}
@@ -288,7 +319,10 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 		return next;
 	}
 	if (operation === 'respawn') {
-		next.state = next.currentGoal === null ? DynamicAgentState.IDLE : DynamicAgentState.PAUSED;
+		if (controlValue.resumeGoal !== undefined && typeof controlValue.resumeGoal !== 'boolean') throw new TypeError('resumeGoal must be a boolean');
+		next.state = next.currentGoal === null
+			? DynamicAgentState.IDLE
+			: controlValue.resumeGoal === true ? DynamicAgentState.STARTING : DynamicAgentState.PAUSED;
 		next.death = null;
 		return next;
 	}
@@ -297,13 +331,19 @@ export function reduceGoalControl(recordValue, controlValue, { queueCap = DEFAUL
 		next.lastError = normalizeError(controlValue.error ?? { code: 'AGENT_ERROR', message: 'Agent goal failed' });
 		return next;
 	}
+	if (operation === 'complete') {
+		next.state = DynamicAgentState.COMPLETED;
+		return next;
+	}
 	if (next.queue.length > 0) {
 		const [promoted, ...remaining] = next.queue;
 		next.currentGoal = promoted.goal;
+		next.currentGoalSpec = promoted.goalSpec;
 		next.queue = remaining;
 		next.state = DynamicAgentState.STARTING;
 	} else {
 		next.currentGoal = null;
+		next.currentGoalSpec = null;
 		next.state = DynamicAgentState.IDLE;
 	}
 	return next;
@@ -336,12 +376,19 @@ function assertCurrentGoalRevision(record, revisionValue) {
 }
 
 function normalizeQueuedGoal(value, index) {
-	if (typeof value === 'string') return { goal: requireGoal(value), goalRevision: index + 1 };
+	if (typeof value === 'string') return { goal: requireGoal(value), goalRevision: index + 1, goalSpec: null };
 	if (!isPlainObject(value)) throw new TypeError('queued goal must be an object');
 	return {
 		goal: requireGoal(value.goal),
 		goalRevision: nonnegativeInteger(value.goalRevision ?? index + 1, 'queued goalRevision'),
+		goalSpec: value.goalSpec === null || value.goalSpec === undefined ? null : parseGoalSpec(value.goalSpec),
 	};
+}
+
+function promotedGoalSpec(record, operation) {
+	if (operation === 'steer') return record.currentGoalSpec;
+	if (operation === 'replace') return null;
+	return record.queue[0]?.goalSpec ?? null;
 }
 
 function normalizeError(value) {
@@ -450,3 +497,4 @@ function isPlainObject(value) {
 function clone(value) {
 	return structuredClone(value);
 }
+import { parseGoalSpec } from './goal-spec.mjs';

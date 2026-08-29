@@ -13,6 +13,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
+import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 
 public final class AgentRegistry {
 	private final int maxAgents;
@@ -240,6 +242,14 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.start(require(id), prompt, nowEpochMs));
 	}
 
+	public synchronized AgentTransition start(AgentId id, GoalSpec spec, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.start(require(id), spec, nowEpochMs));
+	}
+
+	public synchronized AgentTransition replace(AgentId id, GoalSpec spec, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.replace(require(id), spec, nowEpochMs));
+	}
+
 	/** Commits a prepared start only after its publication barrier succeeds. */
 	public synchronized AgentTransition startAtomically(
 			AgentId id,
@@ -252,8 +262,23 @@ public final class AgentRegistry {
 		return applyAtomically(transition, barrier, "start");
 	}
 
+	public synchronized AgentTransition startAtomically(
+			AgentId id,
+			GoalSpec spec,
+			long nowEpochMs,
+			BiConsumer<AgentTransition, Runnable> barrier
+	) {
+		Objects.requireNonNull(barrier, "barrier must not be null");
+		AgentTransition transition = AgentLifecycleReducer.start(require(id), spec, nowEpochMs);
+		return applyAtomically(transition, barrier, "start");
+	}
+
 	public synchronized AgentTransition queue(AgentId id, String prompt, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.queue(require(id), prompt, queueLimit, nowEpochMs));
+	}
+
+	public synchronized AgentTransition queue(AgentId id, GoalSpec spec, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.queue(require(id), spec, queueLimit, nowEpochMs));
 	}
 
 	public synchronized AgentTransition stop(AgentId id, long nowEpochMs) {
@@ -282,6 +307,23 @@ public final class AgentRegistry {
 
 	public synchronized AgentTransition completeGoal(AgentId id, long revision, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.completeGoal(require(id), revision, nowEpochMs));
+	}
+
+	public synchronized AgentTransition satisfyGoal(AgentId id, long revision, GoalEvidence evidence, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.satisfyGoal(require(id), revision, evidence, nowEpochMs));
+	}
+
+	public synchronized AgentTransition promoteSatisfied(AgentId id, long nowEpochMs) {
+		return apply(AgentLifecycleReducer.promoteSatisfied(require(id), nowEpochMs));
+	}
+
+	public synchronized AgentTransition rejectQueuedGoal(
+			AgentId id,
+			UUID expectedGoalId,
+			String reason,
+			long nowEpochMs
+	) {
+		return apply(AgentLifecycleReducer.rejectQueuedGoal(require(id), expectedGoalId, reason, nowEpochMs));
 	}
 
 	/** Applies a coordinator-owned terminal state, promoting queued work when present. */
@@ -314,6 +356,19 @@ public final class AgentRegistry {
 
 	public synchronized AgentTransition disconnect(AgentId id, long nowEpochMs) {
 		return apply(AgentLifecycleReducer.disconnect(require(id), nowEpochMs));
+	}
+
+	public synchronized AgentRecord rearmAfterCoordinatorRecovery(
+			UUID agentId,
+			long expectedGoalRevision,
+			long nowEpochMs
+	) {
+		AgentTransition transition = AgentLifecycleReducer.rearmAfterCoordinatorRecovery(
+				require(new AgentId(Objects.requireNonNull(agentId, "agentId must not be null"))),
+				expectedGoalRevision,
+				nowEpochMs
+		);
+		return apply(transition).after();
 	}
 
 	/** Re-arms a durable wake after transport loss without manufacturing a new goal revision. */

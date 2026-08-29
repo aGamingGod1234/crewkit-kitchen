@@ -31,7 +31,7 @@ import java.util.function.Supplier;
 /** Owns coordinator availability until explicit Minecraft shutdown. */
 final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final Logger LOGGER = LoggerFactory.getLogger(CoordinatorProcessSupervisor.class);
-<<<<<<< HEAD
+	private static final String FISH_API_KEY_FILE = "runtime/fish-api-key.txt";
 	private static final long DEPENDENCY_RECHECK_MS = 5_000L;
 	private static final long AUTHENTICATION_TIMEOUT_MS = 15_000L;
 	private static final long RECONNECT_TIMEOUT_MS = 10_000L;
@@ -42,10 +42,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static final long DESCENDANT_TRACK_INTERVAL_MS = 100L;
 	private static final int MAX_BRIDGE_SECRET_LENGTH = 512;
 	private static final int CANDIDATE_FAILURES_BEFORE_ROLLBACK = 3;
-=======
-	private static final String VOICE_URL_PROPERTY = "arenaagents.voiceUrl";
 	private static final String VOICE_REQUEST_TIMEOUT_PROPERTY = "arenaagents.voiceRequestTimeoutMs";
->>>>>>> origin/main
 
 	private final Path gameDirectory;
 	private final Map<String, String> launchEnvironmentOverrides;
@@ -87,7 +84,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private String dependencyFingerprint;
 	private String failureCode;
 	private String failureMessage;
-<<<<<<< HEAD
 	private String failingBoundary;
 	private ChildProcess pendingTermination;
 	private long bridgeRevision;
@@ -101,14 +97,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private String managedVoiceEndpoint;
 	private long voiceConfigurationRevision;
 	private boolean initialBridgeListenerObserved;
-=======
 	private String previousVoiceRequestTimeout;
 	private String derivedVoiceRequestTimeout;
 	private boolean ownsVoiceRequestTimeout;
-	private String previousVoiceUrl;
-	private String derivedVoiceUrl;
-	private boolean ownsVoiceUrl;
->>>>>>> origin/main
 
 	CoordinatorProcessSupervisor() {
 		this(FabricLoader.getInstance().getGameDir());
@@ -1152,6 +1143,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	 * broadening cleanup beyond known roots.
 	 */
 	private synchronized List<Path> orphanRuntimeRoots() {
+		return ownershipRoots(gameDirectory);
+	}
+
+	static List<Path> ownershipRoots(Path gameDirectory) {
 		LinkedHashSet<Path> roots = new LinkedHashSet<>();
 		String configured = System.getProperty("arenaagents.packageRoot");
 		if (configured != null && !configured.isBlank()) {
@@ -1181,6 +1176,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		for (Map.Entry<String, String> override : launchEnvironmentOverrides.entrySet()) {
 			environment.put(override.getKey(), override.getValue());
 		}
+		configureVoiceProviderCredential(prepared.root(), environment);
 		environment.put("ARENA_AGENT_BRIDGE_SECRET", prepared.bridgeSecret());
 		environment.put("ARENA_AGENT_COORDINATOR_LAUNCH_ID", ownedLaunchId);
 		environment.put("ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION", prepared.generationId());
@@ -1288,14 +1284,47 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		CoordinatorProcessOwnership.terminateTree(started.toHandle());
 	}
 
+	static void configureVoiceProviderCredential(Path runtimeRoot, Map<String, String> environment) {
+		if (nonBlankEnvironmentValue(environment, "FISH_AUDIO_API_KEY")
+				|| nonBlankEnvironmentValue(environment, "FISH_API_KEY")) return;
+		Path credentialFile = Objects.requireNonNull(runtimeRoot, "runtime root must not be null")
+				.resolve(FISH_API_KEY_FILE).normalize();
+		if (!Files.isRegularFile(credentialFile)) return;
+		String credential;
+		try {
+			credential = Files.readString(credentialFile, StandardCharsets.UTF_8).trim();
+		} catch (IOException exception) {
+			LOGGER.warn("Ignoring unreadable optional Fish TTS credential; proximity speech will use its fallback");
+			return;
+		}
+		if (credential.length() < 8 || credential.length() > 512) {
+			LOGGER.warn("Ignoring malformed optional Fish TTS credential; proximity speech will use its fallback");
+			return;
+		}
+		for (String existing : List.copyOf(environment.keySet())) {
+			if (existing.equalsIgnoreCase("FISH_AUDIO_API_KEY")) environment.remove(existing);
+		}
+		environment.put("FISH_AUDIO_API_KEY", credential);
+		LOGGER.info("Configured the Arena Agents TTS provider from the runtime credential file");
+	}
+
+	private static boolean nonBlankEnvironmentValue(Map<String, String> environment, String name) {
+		for (Map.Entry<String, String> entry : environment.entrySet()) {
+			if (entry.getKey().equalsIgnoreCase(name) && entry.getValue() != null && !entry.getValue().isBlank()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	@Override
-<<<<<<< HEAD
 	public void close() {
 		ArrayList<ChildProcess> cleanup = new ArrayList<>();
 		boolean alreadyStopped;
 		synchronized (this) {
 			alreadyStopped = stopped;
 			releaseManagedVoiceEndpoint();
+			releaseDerivedVoiceRequestTimeout();
 			if (alreadyStopped) return;
 			stopped = true;
 			state = CoordinatorRecoveryState.STOPPED;
@@ -1334,31 +1363,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	private static boolean autoStartEnabled() {
 		return !"false".equalsIgnoreCase(System.getProperty("arenaagents.coordinatorAutoStart"));
-=======
-	public synchronized void close() {
-		try {
-			Process owned = process;
-			if (owned == null) return;
-			ProcessHandle handle = owned.toHandle();
-			handle.descendants().forEach(ProcessHandle::destroy);
-			if (owned.isAlive()) owned.destroy();
-			try {
-				if (!owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) {
-					handle.descendants().forEach(ProcessHandle::destroyForcibly);
-					owned.destroyForcibly();
-					owned.waitFor(2, java.util.concurrent.TimeUnit.SECONDS);
-				}
-			} catch (InterruptedException exception) {
-				Thread.currentThread().interrupt();
-				handle.descendants().forEach(ProcessHandle::destroyForcibly);
-				owned.destroyForcibly();
-			}
-			process = null;
-		} finally {
-			releaseDerivedVoiceUrl();
-			releaseDerivedVoiceRequestTimeout();
-		}
->>>>>>> origin/main
 	}
 
 	static void configureSharedBridgeSecretPath(Path secretPath) {
@@ -1367,8 +1371,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		System.setProperty("arenaagents.voiceSecretFile", canonical.toString());
 	}
 
-<<<<<<< HEAD
-	private void configureSharedVoiceEndpoint(Path configPath) {
+	void configureSharedVoiceEndpoint(Path configPath) {
+		configureDerivedVoiceRequestTimeout(configPath);
 		if (voiceEndpointExplicitOverride || !Files.isRegularFile(configPath)) return;
 		String configured = configuredProperty("arenaagents.voiceUrl");
 		if (!Objects.equals(configured, managedVoiceEndpoint)) {
@@ -1400,36 +1404,21 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	private static String configuredProperty(String name) {
 		String value = System.getProperty(name);
 		return value == null || value.isBlank() ? null : value;
-=======
-	void configureSharedVoiceEndpoint(Path configPath) throws IOException {
-		String configured = System.getProperty(VOICE_URL_PROPERTY);
-		if (configured == null || configured.isBlank()) {
-			previousVoiceUrl = configured;
-			CoordinatorVoiceEndpoint.resolve(configPath, System.getenv(), launchEnvironmentOverrides)
-					.ifPresent(endpoint -> {
-						derivedVoiceUrl = endpoint;
-						System.setProperty(VOICE_URL_PROPERTY, endpoint);
-						ownsVoiceUrl = true;
-					});
-		}
-		String configuredTimeout = System.getProperty(VOICE_REQUEST_TIMEOUT_PROPERTY);
-		if (configuredTimeout == null || configuredTimeout.isBlank()) {
-			previousVoiceRequestTimeout = configuredTimeout;
-			derivedVoiceRequestTimeout = Integer.toString(CoordinatorVoiceEndpoint.requestTimeoutMs(configPath));
-			System.setProperty(VOICE_REQUEST_TIMEOUT_PROPERTY, derivedVoiceRequestTimeout);
-			ownsVoiceRequestTimeout = true;
-		}
 	}
 
-	private void releaseDerivedVoiceUrl() {
-		if (!ownsVoiceUrl) return;
-		if (Objects.equals(System.getProperty(VOICE_URL_PROPERTY), derivedVoiceUrl)) {
-			if (previousVoiceUrl == null) System.clearProperty(VOICE_URL_PROPERTY);
-			else System.setProperty(VOICE_URL_PROPERTY, previousVoiceUrl);
+	private void configureDerivedVoiceRequestTimeout(Path configPath) {
+		if (ownsVoiceRequestTimeout) return;
+		String configured = System.getProperty(VOICE_REQUEST_TIMEOUT_PROPERTY);
+		if (configured != null && !configured.isBlank()) return;
+		try {
+			derivedVoiceRequestTimeout = Integer.toString(CoordinatorVoiceEndpoint.requestTimeoutMs(configPath));
+		} catch (IOException | RuntimeException invalidVoiceConfiguration) {
+			LOGGER.warn("Ignoring unavailable optional voice request timeout", invalidVoiceConfiguration);
+			return;
 		}
-		previousVoiceUrl = null;
-		derivedVoiceUrl = null;
-		ownsVoiceUrl = false;
+		previousVoiceRequestTimeout = configured;
+		System.setProperty(VOICE_REQUEST_TIMEOUT_PROPERTY, derivedVoiceRequestTimeout);
+		ownsVoiceRequestTimeout = true;
 	}
 
 	private void releaseDerivedVoiceRequestTimeout() {
@@ -1441,7 +1430,6 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		previousVoiceRequestTimeout = null;
 		derivedVoiceRequestTimeout = null;
 		ownsVoiceRequestTimeout = false;
->>>>>>> origin/main
 	}
 
 	private static Path findPackageRoot(Path gameDirectory) {
