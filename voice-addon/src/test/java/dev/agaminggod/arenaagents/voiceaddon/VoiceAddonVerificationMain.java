@@ -13,6 +13,7 @@ public final class VoiceAddonVerificationMain {
 	public static void main(String[] arguments) throws Exception {
 		int assertions = 0;
 		assertions += verifyFabricMetadataLoadsOnIntegratedAndDedicatedServers();
+		assertions += ArenaAgentsVoiceProviderVerification.verify();
 		assertions += ArenaAgentsVoiceChatPluginVerification.verify();
 		assertions += VoicechatServerBindingsVerification.verify();
 		assertions += ServerSpeechCaptureRegistryVerification.verify();
@@ -32,7 +33,11 @@ public final class VoiceAddonVerificationMain {
 			if (!"*".equals(metadata.get("environment").getAsString())) {
 				throw new AssertionError("Voice addon must load in an integrated server client JVM");
 			}
-			return 1;
+			if (!">=0.1.0".equals(metadata.getAsJsonObject("depends")
+					.get("arenaagents").getAsString())) {
+				throw new AssertionError("Voice addon must retain the compatible arenaagents dependency range");
+			}
+			return 2;
 		} catch (java.io.IOException exception) {
 			throw new AssertionError("Could not read voice addon metadata", exception);
 		}
