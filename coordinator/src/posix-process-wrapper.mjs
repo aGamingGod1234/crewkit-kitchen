@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { closeSync, openSync, unlinkSync, writeSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
+import { processGroupIsRunning } from "./posix-process-group.mjs";
 
 const GRACEFUL_STOP_MS = 2_000;
 const [claimPath, launchId, gate, target, ...arguments_] = process.argv.slice(2);
@@ -44,13 +45,7 @@ const signalGroup = (signal) => {
 };
 
 const groupAlive = () => {
-  try {
-    process.kill(-child.pid, 0);
-    return true;
-  } catch (error) {
-    if (error?.code === "ESRCH") return false;
-    throw error;
-  }
+  return processGroupIsRunning(child.pid);
 };
 
 const waitForGroup = async (timeoutMs) => {

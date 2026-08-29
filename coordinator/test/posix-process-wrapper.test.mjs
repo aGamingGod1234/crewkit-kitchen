@@ -6,10 +6,32 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { processGroupIsRunning } from "../src/posix-process-group.mjs";
 
 const coordinatorRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const wrapper = path.join(coordinatorRoot, "src", "posix-process-wrapper.mjs");
 const gate = path.join(coordinatorRoot, "src", "job-gate.mjs");
+
+test("zombie-only POSIX groups are stopped when PID 1 does not reap adopted grandchildren", () => {
+  const groupId = 41_273;
+  const signal = (pid, signalNumber) => {
+    assert.equal(pid, -groupId);
+    assert.equal(signalNumber, 0);
+  };
+
+  assert.equal(processGroupIsRunning(groupId, {
+    signal,
+    readProcessTable: () => `  ${groupId} Z\n  ${groupId} Z+\n`,
+  }), false, "zombies do not keep cleanup waiting");
+  assert.equal(processGroupIsRunning(groupId, {
+    signal,
+    readProcessTable: () => `  ${groupId} Z\n  ${groupId} S\n`,
+  }), true, "one running member keeps the group owned");
+  assert.equal(processGroupIsRunning(groupId, {
+    signal,
+    readProcessTable: () => undefined,
+  }), true, "an unreadable process table fails closed");
+});
 
 test("POSIX wrapper owns a child spawned in the former snapshot gap", {
   skip: process.platform === "win32" ? "POSIX process groups are unavailable on Windows" : false,
