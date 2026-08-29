@@ -1622,12 +1622,6 @@ function boundedText(value, field, maximum, minimum = 1) {
 	return value;
 }
 
-function launchIdentity(value) {
-	const launchId = boundedText(value, 'launchId', 36);
-	if (!UUID_PATTERN.test(launchId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'launchId must be a UUID');
-	return launchId.toLowerCase();
-}
-
 function boundedCodePointText(value, field, maximum) {
 	if (typeof value !== 'string') throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must be a string`);
 	if (value.trim().length === 0) throw new ProtocolV2Error('INVALID_PAYLOAD', `${field} must not be blank`);
@@ -1718,6 +1712,12 @@ function requirePort(value) {
 
 function requireIdentifier(value, field) {
 	return requireText(value, field, MAX_IDENTIFIER_LENGTH);
+}
+
+function launchIdentity(value) {
+	const launchId = boundedText(value, 'launchId', 36);
+	if (!UUID_PATTERN.test(launchId)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'launchId must be a UUID');
+	return launchId.toLowerCase();
 }
 
 function requireText(value, field, maximum) {

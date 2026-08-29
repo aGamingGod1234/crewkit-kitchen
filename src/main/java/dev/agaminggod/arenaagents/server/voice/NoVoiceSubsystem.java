@@ -34,6 +34,10 @@ public final class NoVoiceSubsystem implements VoiceSubsystem {
 	}
 
 	@Override
+	public void cancelHumanSpeech(UUID playerId) {
+	}
+
+	@Override
 	public void close() {
 	}
 }

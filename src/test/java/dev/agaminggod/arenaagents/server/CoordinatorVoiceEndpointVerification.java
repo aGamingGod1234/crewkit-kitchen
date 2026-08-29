@@ -13,7 +13,7 @@ public final class CoordinatorVoiceEndpointVerification {
 	public static int verify() throws Exception {
 		Path config = Files.createTempFile("arena-voice-endpoint", ".json");
 		try {
-			Files.writeString(config, "{\"voice\":{\"port\":9123}}", StandardCharsets.UTF_8);
+			Files.writeString(config, "{\"voice\":{\"port\":9123,\"localSpeechTimeoutMs\":91234}}", StandardCharsets.UTF_8);
 			assertEquals(
 					Optional.of("http://127.0.0.1:9123/v1/tts"),
 					CoordinatorVoiceEndpoint.resolve(config, Map.of(), Map.of()),
@@ -33,7 +33,12 @@ public final class CoordinatorVoiceEndpointVerification {
 							config, Map.of(), Map.of("ARENA_AGENT_VOICE_PORT", "0")),
 					"ephemeral voice port is rejected because the addon cannot discover it"
 			);
-			return 3;
+			assertEquals(91_234, CoordinatorVoiceEndpoint.requestTimeoutMs(config),
+					"configured local inference timeout reaches the voice clients");
+			Files.writeString(config, "{\"voice\":{\"localSpeechTimeoutMs\":600001}}", StandardCharsets.UTF_8);
+			expectIllegalArgument(() -> CoordinatorVoiceEndpoint.requestTimeoutMs(config),
+					"unsupported voice request timeout is rejected before startup");
+			return 5;
 		} finally {
 			Files.deleteIfExists(config);
 		}

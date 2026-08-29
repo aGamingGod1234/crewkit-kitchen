@@ -40,6 +40,7 @@ dependencies {
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+	compileOnly "net.java.dev.jna:jna:5.17.0"
 	compileOnly files("libs/fabric-carpet-26.1+v260402.jar")
 }
 
@@ -149,6 +150,7 @@ tasks.register('verifyCore', JavaExec) {
 	dependsOn tasks.named('testClasses')
 	classpath = sourceSets.test.runtimeClasspath
 	mainClass.set(coreVerificationMainClass)
+	jvmArgs '--enable-native-access=ALL-UNNAMED'
 
 	doFirst {
 		def verificationMain = coreVerificationClassFile.get().asFile

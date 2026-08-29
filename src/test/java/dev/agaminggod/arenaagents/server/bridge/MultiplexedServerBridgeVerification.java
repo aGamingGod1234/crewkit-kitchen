@@ -13,6 +13,8 @@ import dev.agaminggod.arenaagents.agent.AgentTransition;
 import dev.agaminggod.arenaagents.agent.goal.GoalEvidence;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
 import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
+import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.server.AgentRuntimeHooks;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.AgentVerboseState;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
@@ -35,10 +37,16 @@ import dev.agaminggod.arenaagents.server.runtime.ServerActionState;
 import dev.agaminggod.arenaagents.server.runtime.ServerActionExecutor;
 import dev.agaminggod.arenaagents.protocol.ActionType;
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
 import java.net.ServerSocket;
+import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.net.Proxy;
+import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -51,11 +59,23 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
+import net.minecraft.SystemReport;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.permissions.LevelBasedPermissionSet;
+import net.minecraft.server.permissions.PermissionSet;
+import net.minecraft.server.players.PlayerList;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.debugchart.SampleLogger;
 
 public final class MultiplexedServerBridgeVerification {
 	private MultiplexedServerBridgeVerification() {
@@ -79,6 +99,8 @@ public final class MultiplexedServerBridgeVerification {
 		verifyRespawnContinuationPayload();
 		verifyVerboseControlRetriesAfterBackpressure();
 		verifyVerboseTelemetryCannotSuppressProgress();
+		assertEquals(true, MultiplexedServerBridge.HANDSHAKE_RETRY_WAIT_MS > 0L,
+				"hello retries wait instead of spinning when the registry snapshot moves");
 		List<AgentRecord> registered = new ArrayList<>();
 		for (int index = 0; index <= AgentConstants.DEFAULT_AGENT_LIMIT; index++) {
 			registered.add(AgentRecord.create(
@@ -138,7 +160,16 @@ public final class MultiplexedServerBridgeVerification {
 		verifyStaleGoalDraftIsPrunedBeforeHandshake();
 		verifyCompletionResultFacts();
 		verifyReplacementOperation();
-		return 163;
+		verifyFailedBindClosesEverySocket();
+		verifyShutdownRejectsAcceptedSocketBeforePublication();
+		verifyLaunchIdentityAndReconnectGeneration();
+		verifyReplacementHandshakeDrainsPreviousDisconnect();
+		verifyHandshakeResnapshotsLifecycleRaces();
+		verifyHandshakeSnapshotDeadline();
+		verifyImmediateHandshakeClosePreservesDisconnect();
+		verifyPendingRegistrationMarkerIsFenced();
+		verifyAtomicPublicationRacesSessionClose();
+		return 251;
 	}
 
 	/**
@@ -1428,6 +1459,412 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
+	private static void verifyShutdownRejectsAcceptedSocketBeforePublication() {
+		MultiplexedServerBridge bridge = null;
+		ShutdownRaceServerSocket listener = null;
+		try {
+			long baselineBridgeThreads = bridgeThreadCount();
+			bridge = MultiplexedServerBridge.withPreparedSecret(
+					uninitializedManager(), 0, "0123456789abcdef0123456789abcdef");
+			listener = new ShutdownRaceServerSocket();
+			MultiplexedServerBridge activeBridge = bridge;
+			ShutdownRaceServerSocket activeListener = listener;
+			bridge.start(() -> activeListener);
+			activeListener.releaseAccept();
+			awaitLatch(activeListener.acceptedSocket.addressLookupStarted,
+					"accept returns before bridge shutdown");
+			Thread closer = Thread.ofPlatform().daemon().start(activeBridge::close);
+			closer.join(2_000L);
+			assertTrue(!closer.isAlive(), "bridge close completes after the publication boundary opens");
+			assertTrue(activeListener.isClosed(), "bridge close releases the obsolete listener");
+			activeListener.acceptedSocket.releaseAddressLookup();
+			awaitCondition(activeListener.acceptedSocket.closed::get,
+					"socket accepted by the obsolete listener closes instead of becoming a session");
+			assertTrue(readPrivateField(bridge, "session") == null,
+					"shutdown leaves no obsolete session published");
+			assertTrue(!bridge.observationPublicationForVerification().hasActiveSession(),
+					"shutdown leaves no obsolete observation publisher active");
+			BoundedServerTaskQueue tasks = (BoundedServerTaskQueue) readPrivateField(bridge, "serverTasks");
+			assertEquals(0, tasks.pendingCount(), "shutdown queues no inbound work from the rejected socket");
+			awaitCondition(() -> bridgeThreadCount() <= baselineBridgeThreads,
+					"shutdown leaves no accept, reader, or writer thread behind");
+		} catch (Exception exception) {
+			throw new AssertionError("accepted socket shutdown race verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			if (listener != null) {
+				listener.acceptedSocket.releaseAddressLookup();
+				listener.acceptedSocket.close();
+				listener.close();
+			}
+		}
+	}
+
+	private static void verifyFailedBindClosesEverySocket() {
+		MultiplexedServerBridge bridge = null;
+		try (ServerSocket conflict = new ServerSocket(0, 1, InetAddress.getByName(MultiplexedServerBridge.LOOPBACK_HOST))) {
+			int port = conflict.getLocalPort();
+			bridge = MultiplexedServerBridge.withPreparedSecret(
+					uninitializedManager(), port, "0123456789abcdef0123456789abcdef");
+			List<ServerSocket> candidates = new ArrayList<>();
+			MultiplexedServerBridge.ServerSocketFactory socketFactory = () -> {
+				ServerSocket candidate = new ServerSocket();
+				candidates.add(candidate);
+				return candidate;
+			};
+
+			MultiplexedServerBridge retryingBridge = bridge;
+			for (int attempt = 0; attempt < 4; attempt++) {
+				assertThrows(BridgeProtocolException.class, () -> retryingBridge.start(socketFactory),
+						"occupied bridge port rejects retry " + attempt);
+			}
+			assertEquals(4, candidates.size(), "each occupied-port retry creates one candidate socket");
+			assertTrue(candidates.stream().allMatch(ServerSocket::isClosed),
+					"every candidate socket closes when bind fails before bridge ownership transfer");
+		} catch (IOException exception) {
+			throw new AssertionError("failed-bind socket cleanup verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+		}
+	}
+
+	private static void verifyLaunchIdentityAndReconnectGeneration() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			String launchId = "00000000-0000-0000-0000-000000000881";
+			secretFile = Files.createTempFile("arena-agents-launch-identity-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			long firstGeneration;
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				BridgeEnvelope acknowledgement = authenticate(socket, reader, codec, secret, launchId, "hello-launch-1");
+				assertEquals(launchId, acknowledgement.payload().get("launchId").getAsString(),
+						"hello acknowledgement echoes the owned launch identity");
+				assertEquals(launchId, bridge.authenticatedLaunchId(),
+						"bridge publishes the exact authenticated launch identity");
+				firstGeneration = bridge.authenticatedSessionGeneration();
+				assertTrue(firstGeneration > 0L, "first authenticated socket receives a positive session generation");
+			}
+			MultiplexedServerBridge activeBridge = bridge;
+			awaitCondition(() -> !activeBridge.authenticated(), "closed authenticated socket releases bridge authentication");
+			awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
+					"closed authenticated socket schedules coordinator cleanup");
+			bridge.tick();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				authenticate(socket, reader, codec, secret, launchId, "hello-launch-2");
+				assertTrue(bridge.authenticatedSessionGeneration() > firstGeneration,
+						"replacement authentication advances the bridge session generation");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("launch identity bridge verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyReplacementHandshakeDrainsPreviousDisconnect() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-replacement-disconnect-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord record = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Disconnect"), 1_000L);
+			manager.registry().setAutomaticProgress(record.agentId(), false, 1_001L);
+			manager.registry().start(record.agentId(), "remain owned until cleanup", 1_002L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				authenticate(socket, reader, codec, secret, null, "hello-before-replacement");
+			}
+
+			MultiplexedServerBridge activeBridge = bridge;
+			awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
+					"previous authenticated session schedules coordinator cleanup");
+			assertEquals(AgentLifecycleState.STARTING, manager.registry().require(record.agentId()).state(),
+					"pending cleanup leaves the previous lifecycle active");
+			assertEquals(0L, coordinatorGeneration(bridge),
+					"pending cleanup has not fenced coordinator-owned actions early");
+
+			CountDownLatch replacementSnapshot = new CountDownLatch(1);
+			CountDownLatch replacementCommitted = new CountDownLatch(1);
+			AtomicBoolean cleanupVisibleAtCommit = new AtomicBoolean();
+			AtomicInteger commitCount = new AtomicInteger();
+			bridge.setHandshakeSnapshotHookForVerification(replacementSnapshot::countDown);
+			bridge.setHandshakeCommittedHookForVerification(ignored -> {
+				commitCount.incrementAndGet();
+				cleanupVisibleAtCommit.set(
+						manager.registry().require(record.agentId()).state() == AgentLifecycleState.DISCONNECTED
+								&& coordinatorGeneration(activeBridge) == 1L
+				);
+				replacementCommitted.countDown();
+			});
+
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				writeHello(socket, codec, secret, null, "hello-replacement-disconnect-race");
+				awaitLatch(replacementSnapshot, "replacement handshake captures its registry snapshot");
+				assertTrue(!replacementCommitted.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS),
+						"replacement handshake waits for the previous disconnect cleanup");
+				assertTrue(activeBridge.coordinatorDisconnectPendingForVerification(),
+						"replacement handshake preserves the previous disconnect marker");
+
+				bridge.tick();
+				awaitLatch(replacementCommitted, "replacement handshake commits after disconnect cleanup");
+				assertEquals("hello_ack", codec.decode(reader.readLine()).type(),
+						"replacement handshake acknowledges after cleanup");
+				assertTrue(cleanupVisibleAtCommit.get(),
+						"lifecycle and action cleanup complete before replacement commit");
+				assertEquals(1, commitCount.get(), "replacement handshake commits once");
+				assertEquals(AgentLifecycleState.DISCONNECTED, manager.registry().require(record.agentId()).state(),
+						"previous active lifecycle disconnects exactly once");
+				assertEquals(1L, coordinatorGeneration(bridge),
+						"previous coordinator action ownership is fenced exactly once");
+
+				bridge.tick();
+				assertEquals(1, commitCount.get(), "later ticks do not recommit the replacement handshake");
+				assertEquals(1L, coordinatorGeneration(bridge),
+						"later ticks do not repeat previous coordinator cleanup");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("replacement handshake disconnect cleanup verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyHandshakeResnapshotsLifecycleRaces() {
+		verifyRemovalDuringHandshakeResnapshots();
+		verifyTransitionDuringHandshakePublishesOnce();
+	}
+
+	private static void verifyHandshakeSnapshotDeadline() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-handshake-deadline-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			MultiplexedServerBridge activeBridge = bridge;
+			AtomicBoolean churn = new AtomicBoolean(true);
+			java.util.concurrent.atomic.AtomicInteger snapshots = new java.util.concurrent.atomic.AtomicInteger();
+			bridge.setHandshakeSnapshotHookForVerification(() -> {
+				if (!churn.get()) return;
+				snapshots.incrementAndGet();
+				activeBridge.withinPublicationBoundary(() -> null);
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(8_000);
+				writeHello(socket, codec, secret, null, "hello-deadline-churn");
+				assertTrue(reader.readLine() == null, "snapshot churn closes the session at the handshake deadline");
+				assertTrue(snapshots.get() > 1, "snapshot churn retried before the handshake deadline");
+			}
+			awaitCondition(() -> !activeBridge.authenticated(), "expired handshake releases the bridge session");
+		} catch (Exception exception) {
+			throw new AssertionError("handshake snapshot deadline verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyRemovalDuringHandshakeResnapshots() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		CountDownLatch releaseSnapshot = new CountDownLatch(1);
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-removal-handshake-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord record = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Removed"), 1_000L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			AtomicBoolean firstSnapshot = new AtomicBoolean(true);
+			CountDownLatch snapshotTaken = new CountDownLatch(1);
+			bridge.setHandshakeSnapshotHookForVerification(() -> {
+				if (!firstSnapshot.compareAndSet(true, false)) return;
+				snapshotTaken.countDown();
+				awaitLatch(releaseSnapshot, "removal handshake snapshot released");
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				writeHello(socket, codec, secret, null, "hello-removal-race");
+				awaitLatch(snapshotTaken, "handshake captured the pre-removal registry");
+				MultiplexedServerBridge activeBridge = bridge;
+				AtomicBoolean managerRemovalBoundaryUsed = new AtomicBoolean();
+				manager.setRuntimeHooks(new AgentRuntimeHooks() {
+					@Override
+					public <T> T withinPublicationBoundary(java.util.function.Supplier<T> publication) {
+						managerRemovalBoundaryUsed.set(true);
+						return activeBridge.withinPublicationBoundary(publication);
+					}
+
+					@Override
+					public void onRemoved(AgentId agentId, long terminalRevision) {
+						activeBridge.onRemoved(agentId, terminalRevision);
+					}
+				});
+				manager.remove(record.agentId().toString());
+				assertTrue(managerRemovalBoundaryUsed.get(),
+						"manager removal enters the bridge publication boundary before onRemoved");
+				releaseSnapshot.countDown();
+				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
+				assertEquals(0, acknowledgement.payload().getAsJsonArray("registry").size(),
+						"removal during authentication retries the snapshot without closing the candidate session");
+				assertTrue(bridge.authenticated(), "removal race leaves the resnapshotted session authenticated");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("removal handshake race verification failed", exception);
+		} finally {
+			releaseSnapshot.countDown();
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyTransitionDuringHandshakePublishesOnce() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		CountDownLatch releaseSnapshot = new CountDownLatch(1);
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-transition-handshake-", ".txt");
+			Files.writeString(secretFile, secret);
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord record = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Starting"), 1_000L);
+			bridge = new MultiplexedServerBridge(manager, 0, secretFile);
+			AtomicBoolean firstSnapshot = new AtomicBoolean(true);
+			CountDownLatch snapshotTaken = new CountDownLatch(1);
+			bridge.setHandshakeSnapshotHookForVerification(() -> {
+				if (!firstSnapshot.compareAndSet(true, false)) return;
+				snapshotTaken.countDown();
+				awaitLatch(releaseSnapshot, "transition handshake snapshot released");
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				writeHello(socket, codec, secret, null, "hello-transition-race");
+				awaitLatch(snapshotTaken, "handshake captured the pre-transition registry");
+				AgentTransition transition = manager.registry().start(record.agentId(), "publish exactly once", 1_001L);
+				bridge.onTransition(transition);
+				releaseSnapshot.countDown();
+				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
+				JsonObject published = acknowledgement.payload().getAsJsonArray("registry").get(0).getAsJsonObject();
+				assertEquals(AgentLifecycleState.STARTING.name(), published.get("state").getAsString(),
+						"transition during authentication is folded into the retried handshake snapshot");
+				socket.setSoTimeout(150);
+				try {
+					reader.readLine();
+					throw new AssertionError("transition race published a duplicate lifecycle frame");
+				} catch (SocketTimeoutException expected) {
+					assertTrue(true, "transition race emits no duplicate queue or start frame after hello_ack");
+				}
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("transition handshake race verification failed", exception);
+		} finally {
+			releaseSnapshot.countDown();
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyImmediateHandshakeClosePreservesDisconnect() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-immediate-close-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge.setHandshakeCommittedHookForVerification(session -> {
+				try {
+					session.close();
+				} catch (Exception exception) {
+					throw new AssertionError(exception);
+				}
+			});
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification())) {
+				writeHello(socket, codec, secret, null, "hello-immediate-close");
+				MultiplexedServerBridge activeBridge = bridge;
+				awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
+						"session close immediately after authentication preserves the pending disconnect");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("immediate handshake close verification failed", exception);
+		} finally {
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void verifyPendingRegistrationMarkerIsFenced() {
+		try {
+			CodexAgentManager manager = uninitializedManager();
+			AgentRecord record = manager.registry().create("gpt-5.6-sol", "high", Optional.of("Pending"), 1_000L);
+			Set<AgentId> pending = pendingRegistrations(manager);
+			pending.add(record.agentId());
+			assertTrue(MultiplexedServerBridge.registeredObservationIds(manager.coordinatorVisibleRecords()).isEmpty(),
+					"pending registrations stay out of observation scheduling");
+			AtomicBoolean inBoundary = new AtomicBoolean();
+			AtomicBoolean removedInsideBoundary = new AtomicBoolean();
+			manager.setRuntimeHooks(new AgentRuntimeHooks() {
+				@Override
+				public boolean onCreated(AgentRecord created) {
+					assertTrue(inBoundary.get(), "registration hook runs inside the publication boundary");
+					return true;
+				}
+
+				@Override
+				public <T> T withinPublicationBoundary(java.util.function.Supplier<T> publication) {
+					inBoundary.set(true);
+					try {
+						T result = publication.get();
+						removedInsideBoundary.set(!pending.contains(record.agentId()));
+						return result;
+					} finally {
+						inBoundary.set(false);
+					}
+				}
+			});
+			Method publish = CodexAgentManager.class.getDeclaredMethod("publishPendingRegistration", AgentRecord.class);
+			publish.setAccessible(true);
+			publish.invoke(manager, record);
+			assertTrue(removedInsideBoundary.get(),
+					"pending registration marker clears before the publication boundary opens");
+			assertEquals(List.of(record), manager.coordinatorVisibleRecords(),
+					"published registration becomes observation-eligible after the fenced commit");
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("pending registration fence verification failed", exception);
+		}
+	}
+
 	private static void verifyCompletionResultFacts() {
 		GoalCompletionVerifier.VerificationResult verification = new GoalCompletionVerifier.VerificationResult(
 				false,
@@ -1669,6 +2106,94 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
+	private static void verifyAtomicPublicationRacesSessionClose() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-publication-close-race-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			MultiplexedServerBridge activeBridge = bridge;
+			bridge.start();
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				socket.setSoTimeout(2_000);
+				authenticate(socket, reader, codec, secret, null, "hello-publication-close-race");
+				Object session = readPrivateField(bridge, "session");
+				Object publicationLock = readPrivateField(bridge, "publicationLock");
+				Method enqueueAtomically = session.getClass().getDeclaredMethod("enqueueAtomically", BridgeEnvelope.class, Runnable.class);
+				enqueueAtomically.setAccessible(true);
+				BridgeEnvelope envelope = new BridgeEnvelope(2, "server-instance", "server", "heartbeat", "publication-close-race", new JsonObject());
+				CountDownLatch callbackEntered = new CountDownLatch(1);
+				java.util.concurrent.atomic.AtomicReference<Throwable> enqueueFailure = new java.util.concurrent.atomic.AtomicReference<>();
+				Thread enqueuer;
+				Thread closer;
+				synchronized (publicationLock) {
+					enqueuer = Thread.ofPlatform().daemon().start(() -> {
+						try {
+							enqueueAtomically.invoke(session, envelope, (Runnable) () -> {
+								callbackEntered.countDown();
+								activeBridge.withinPublicationBoundary(() -> null);
+							});
+						} catch (java.lang.reflect.InvocationTargetException exception) {
+							enqueueFailure.set(exception.getCause());
+						} catch (ReflectiveOperationException exception) {
+							enqueueFailure.set(exception);
+						}
+					});
+					closer = Thread.ofPlatform().daemon().start(() -> sessionClose(session, enqueueFailure));
+					assertTrue(!callbackEntered.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS),
+							"atomic enqueue acquires publicationLock before entering its transition callback");
+				}
+				enqueuer.join(2_000L);
+				closer.join(2_000L);
+				assertTrue(!enqueuer.isAlive() && !closer.isAlive(),
+						"atomic publication and session close complete without lock-order deadlock");
+				Throwable failure = enqueueFailure.get();
+				if (failure != null && !(failure instanceof BridgeProtocolException)) {
+					throw new AssertionError("atomic publication failed with an unexpected exception", failure);
+				}
+			} finally {
+				if (bridge != null) bridge.close();
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("atomic publication/session close race verification failed", exception);
+		} finally {
+			deleteIfExists(secretFile);
+		}
+	}
+
+	private static void sessionClose(Object session, java.util.concurrent.atomic.AtomicReference<Throwable> failure) {
+		try {
+			Method close = session.getClass().getDeclaredMethod("close");
+			close.setAccessible(true);
+			close.invoke(session);
+		} catch (java.lang.reflect.InvocationTargetException exception) {
+			failure.compareAndSet(null, exception.getCause());
+		} catch (ReflectiveOperationException exception) {
+			failure.compareAndSet(null, exception);
+		}
+	}
+
+	private static Object readPrivateField(Object owner, String fieldName) throws ReflectiveOperationException {
+		Field field = owner.getClass().getDeclaredField(fieldName);
+		field.setAccessible(true);
+		return field.get(owner);
+	}
+
+	private static long coordinatorGeneration(MultiplexedServerBridge bridge) {
+		try {
+			Object actionExecutor = readPrivateField(bridge, "actionExecutor");
+			Field field = actionExecutor.getClass().getDeclaredField("coordinatorGeneration");
+			field.setAccessible(true);
+			return field.getLong(actionExecutor);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not read coordinator action generation", exception);
+		}
+	}
+
 	private static void verifyConversationAttention(AgentId agentId) {
 		MultiplexedServerBridge.PublishedObservationState state =
 				new MultiplexedServerBridge.PublishedObservationState(AgentConstants.DEFAULT_AGENT_LIMIT);
@@ -1753,10 +2278,18 @@ public final class MultiplexedServerBridgeVerification {
 			field.setAccessible(true);
 			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
 			CodexAgentManager manager = (CodexAgentManager) unsafe.allocateInstance(CodexAgentManager.class);
+			TestMinecraftServer server = (TestMinecraftServer) unsafe.allocateInstance(TestMinecraftServer.class);
+			server.playerList = (EmptyPlayerList) unsafe.allocateInstance(EmptyPlayerList.class);
+			putObject(unsafe, manager, "server", server);
 			Field savedData = CodexAgentManager.class.getDeclaredField("savedData");
 			unsafe.putObject(manager, unsafe.objectFieldOffset(savedData), new AgentSavedData());
-			Field pendingRegistrations = CodexAgentManager.class.getDeclaredField("pendingAgentRegistrations");
-			unsafe.putObject(manager, unsafe.objectFieldOffset(pendingRegistrations), new LinkedHashSet<AgentId>());
+			putObject(unsafe, manager, "chunkTickets", new java.util.LinkedHashMap<>());
+			putObject(unsafe, manager, "chunkTicketReferences", new java.util.LinkedHashMap<>());
+			putObject(unsafe, manager, "pendingPlayerSpawns", new java.util.LinkedHashMap<>());
+			putObject(unsafe, manager, "pendingVerifiedRespawns", new java.util.LinkedHashMap<>());
+			putObject(unsafe, manager, "pendingAgentRegistrations", java.util.concurrent.ConcurrentHashMap.newKeySet());
+			putObject(unsafe, manager, "pendingEntityRecoveries", new java.util.LinkedHashSet<>());
+			putObject(unsafe, manager, "seenPlayers", new java.util.LinkedHashSet<>());
 			return manager;
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not allocate lifecycle-only manager", exception);
@@ -1883,6 +2416,199 @@ public final class MultiplexedServerBridgeVerification {
 		}
 	}
 
+	private static void putObject(sun.misc.Unsafe unsafe, CodexAgentManager manager, String fieldName, Object value)
+			throws ReflectiveOperationException {
+		Field field = CodexAgentManager.class.getDeclaredField(fieldName);
+		unsafe.putObject(manager, unsafe.objectFieldOffset(field), value);
+	}
+
+	private static final class TestMinecraftServer extends MinecraftServer {
+		private EmptyPlayerList playerList;
+
+		private TestMinecraftServer() {
+			super(null, null, null, null, java.util.Optional.empty(), Proxy.NO_PROXY, null, null, null, false);
+		}
+
+		@Override protected boolean initServer() { return true; }
+		@Override public LevelBasedPermissionSet operatorUserPermissions() { return null; }
+		@Override public PermissionSet getFunctionCompilationPermissions() { return null; }
+		@Override public boolean shouldRconBroadcast() { return false; }
+		@Override protected SampleLogger getTickTimeLogger() { return null; }
+		@Override public boolean isTickTimeLoggingEnabled() { return false; }
+		@Override public SystemReport fillServerSystemReport(SystemReport report) { return report; }
+		@Override public boolean isDedicatedServer() { return false; }
+		@Override public int getRateLimitPacketsPerSecond() { return 0; }
+		@Override public boolean useNativeTransport() { return false; }
+		@Override public boolean isPublished() { return false; }
+		@Override public boolean shouldInformAdmins() { return false; }
+		@Override public boolean isSingleplayerOwner(net.minecraft.server.players.NameAndId profile) { return false; }
+		@Override public int getMaxPlayers() { return 0; }
+		@Override public PlayerList getPlayerList() { return playerList; }
+	}
+
+	private static final class EmptyPlayerList extends PlayerList {
+		private EmptyPlayerList() {
+			super(null, null, null, null);
+		}
+
+		@Override public ServerPlayer getPlayer(UUID uuid) { return null; }
+		@Override public ServerPlayer getPlayerByName(String name) { return null; }
+	}
+
+	private static final class ShutdownRaceServerSocket extends ServerSocket {
+		private final CountDownLatch releaseAccept = new CountDownLatch(1);
+		private final ShutdownRaceSocket acceptedSocket = new ShutdownRaceSocket();
+		private final AtomicBoolean closed = new AtomicBoolean();
+
+		private ShutdownRaceServerSocket() throws IOException {
+			super();
+		}
+
+		@Override
+		public void bind(java.net.SocketAddress endpoint, int backlog) {
+		}
+
+		@Override
+		public Socket accept() throws IOException {
+			try {
+				releaseAccept.await();
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+				throw new IOException("accept interrupted", exception);
+			}
+			return acceptedSocket;
+		}
+
+		@Override
+		public synchronized void close() {
+			closed.set(true);
+			releaseAccept.countDown();
+		}
+
+		@Override
+		public boolean isClosed() {
+			return closed.get();
+		}
+
+		@Override
+		public int getLocalPort() {
+			return 25_570;
+		}
+
+		private void releaseAccept() {
+			releaseAccept.countDown();
+		}
+	}
+
+	private static final class ShutdownRaceSocket extends Socket {
+		private final CountDownLatch addressLookupStarted = new CountDownLatch(1);
+		private final CountDownLatch allowAddressLookup = new CountDownLatch(1);
+		private final CountDownLatch closedLatch = new CountDownLatch(1);
+		private final AtomicBoolean closed = new AtomicBoolean();
+		private final java.io.InputStream input = new java.io.InputStream() {
+			@Override
+			public int read() throws IOException {
+				try {
+					closedLatch.await();
+					return -1;
+				} catch (InterruptedException exception) {
+					Thread.currentThread().interrupt();
+					throw new IOException("socket read interrupted", exception);
+				}
+			}
+		};
+
+		@Override
+		public InetAddress getInetAddress() {
+			addressLookupStarted.countDown();
+			try {
+				allowAddressLookup.await();
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+			}
+			return InetAddress.getLoopbackAddress();
+		}
+
+		private void releaseAddressLookup() {
+			allowAddressLookup.countDown();
+		}
+
+		@Override
+		public void setTcpNoDelay(boolean on) {
+		}
+
+		@Override
+		public void setSoTimeout(int timeout) {
+		}
+
+		@Override
+		public java.io.InputStream getInputStream() {
+			return input;
+		}
+
+		@Override
+		public java.io.OutputStream getOutputStream() {
+			return java.io.OutputStream.nullOutputStream();
+		}
+
+		@Override
+		public synchronized void close() {
+			if (closed.compareAndSet(false, true)) closedLatch.countDown();
+		}
+
+		@Override
+		public boolean isClosed() {
+			return closed.get();
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private static BridgeEnvelope authenticate(
+			Socket socket,
+			BufferedReader reader,
+			BridgeEnvelopeCodec codec,
+			String secret,
+			String launchId,
+			String messageId
+	) throws Exception {
+		writeHello(socket, codec, secret, launchId, messageId);
+		return codec.decode(reader.readLine());
+	}
+
+	private static void writeHello(
+			Socket socket,
+			BridgeEnvelopeCodec codec,
+			String secret,
+			String launchId,
+			String messageId
+	) throws java.io.IOException {
+		JsonObject payload = new JsonObject();
+		payload.addProperty("secret", secret);
+		if (launchId != null) payload.addProperty("launchId", launchId);
+		socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
+				2, "coordinator", "server", "hello", messageId, payload
+		)).getBytes(StandardCharsets.UTF_8));
+		socket.getOutputStream().flush();
+	}
+
+	private static void awaitLatch(CountDownLatch latch, String label) {
+		try {
+			assertTrue(latch.await(2L, java.util.concurrent.TimeUnit.SECONDS), label);
+		} catch (InterruptedException exception) {
+			Thread.currentThread().interrupt();
+			throw new AssertionError(label + " was interrupted", exception);
+		}
+	}
+
+	private static void deleteIfExists(Path path) {
+		if (path == null) return;
+		try {
+			Files.deleteIfExists(path);
+		} catch (java.io.IOException exception) {
+			throw new AssertionError("could not remove temporary bridge secret", exception);
+		}
+	}
+
 	private static void awaitCondition(java.util.function.BooleanSupplier condition, String label) {
 		long deadline = System.nanoTime() + 2_000_000_000L;
 		while (!condition.getAsBoolean() && System.nanoTime() < deadline) {
@@ -1891,13 +2617,11 @@ public final class MultiplexedServerBridgeVerification {
 		assertTrue(condition.getAsBoolean(), label);
 	}
 
-	private static void awaitLatch(CountDownLatch latch, String label) {
-		try {
-			assertTrue(latch.await(2L, TimeUnit.SECONDS), label);
-		} catch (InterruptedException exception) {
-			Thread.currentThread().interrupt();
-			throw new AssertionError(label + " interrupted", exception);
-		}
+	private static long bridgeThreadCount() {
+		return Thread.getAllStackTraces().keySet().stream()
+				.filter(Thread::isAlive)
+				.filter(thread -> thread.getName().startsWith("arenaagents-v2-"))
+				.count();
 	}
 
 	private static BridgeEnvelope pollBridgeResponse(

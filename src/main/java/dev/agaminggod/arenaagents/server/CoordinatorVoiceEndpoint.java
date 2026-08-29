@@ -12,6 +12,8 @@ import java.util.Optional;
 
 final class CoordinatorVoiceEndpoint {
 	private static final int DEFAULT_PORT = 8_766;
+	private static final int DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+	private static final int MAX_REQUEST_TIMEOUT_MS = 600_000;
 	private static final String PORT_ENVIRONMENT_VARIABLE = "ARENA_AGENT_VOICE_PORT";
 
 	private CoordinatorVoiceEndpoint() {
@@ -35,8 +37,35 @@ final class CoordinatorVoiceEndpoint {
 		return Optional.of("http://127.0.0.1:" + port + "/v1/tts");
 	}
 
+	static int requestTimeoutMs(Path configPath) throws IOException {
+		Objects.requireNonNull(configPath, "configPath must not be null");
+		JsonObject root = readConfig(configPath);
+		if (!root.has("voice") || root.get("voice").isJsonNull()) return DEFAULT_REQUEST_TIMEOUT_MS;
+		JsonObject voice = root.getAsJsonObject("voice");
+		if (!voice.has("localSpeechTimeoutMs") || voice.get("localSpeechTimeoutMs").isJsonNull()) {
+			return DEFAULT_REQUEST_TIMEOUT_MS;
+		}
+		try {
+			var value = voice.get("localSpeechTimeoutMs");
+			if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isNumber()) {
+				throw new IllegalArgumentException("voice.localSpeechTimeoutMs must be numeric");
+			}
+			double numeric = value.getAsDouble();
+			if (!Double.isFinite(numeric) || numeric != Math.rint(numeric)
+					|| numeric < 1 || numeric > MAX_REQUEST_TIMEOUT_MS) {
+				throw new IllegalArgumentException("voice.localSpeechTimeoutMs is outside the supported range");
+			}
+			return (int) numeric;
+		} catch (RuntimeException exception) {
+			throw new IllegalArgumentException(
+					"voice.localSpeechTimeoutMs must be an integer between 1 and 600000",
+					exception
+			);
+		}
+	}
+
 	private static int configuredPort(Path configPath) throws IOException {
-		JsonObject root = JsonParser.parseString(Files.readString(configPath, StandardCharsets.UTF_8)).getAsJsonObject();
+		JsonObject root = readConfig(configPath);
 		if (!root.has("voice") || root.get("voice").isJsonNull()) return DEFAULT_PORT;
 		JsonObject voice = root.getAsJsonObject("voice");
 		if (!voice.has("port") || voice.get("port").isJsonNull()) return DEFAULT_PORT;
@@ -53,6 +82,10 @@ final class CoordinatorVoiceEndpoint {
 		} catch (RuntimeException exception) {
 			throw new IllegalArgumentException("voice.port must be an integer between 0 and 65535", exception);
 		}
+	}
+
+	private static JsonObject readConfig(Path configPath) throws IOException {
+		return JsonParser.parseString(Files.readString(configPath, StandardCharsets.UTF_8)).getAsJsonObject();
 	}
 
 	private static int parsePort(String value) {

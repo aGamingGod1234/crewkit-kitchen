@@ -1053,7 +1053,7 @@ public final class CodexAgentManager {
 		long terminalRevision = record.goalRevision() == Long.MAX_VALUE
 				? Long.MAX_VALUE
 				: record.goalRevision() + 1L;
-		AgentRecord removed = AgentRemovalCoordinator.removeRegistryFirst(
+		AgentRecord removed = runtimeHooks.withinPublicationBoundary(() -> AgentRemovalCoordinator.removeRegistryFirst(
 				savedData.registry(),
 				record.agentId(),
 				() -> {
@@ -1070,7 +1070,7 @@ public final class CodexAgentManager {
 				},
 				() -> runtimeHooks.onRemoved(record.agentId(), terminalRevision),
 				failure -> LOGGER.warn("Post-delete cleanup failed for agent {}", record.agentId(), failure)
-		);
+		));
 		savedData.clearConversationWake(record.agentId());
 		savedData.clearGoalDrafts(record.agentId());
 		return removed;
@@ -1118,9 +1118,13 @@ public final class CodexAgentManager {
 	}
 
 	private void publishPendingRegistration(AgentRecord record) {
-		if (!pendingAgentRegistrations.contains(record.agentId())) return;
 		try {
-			if (runtimeHooks.onCreated(record)) pendingAgentRegistrations.remove(record.agentId());
+			runtimeHooks.withinPublicationBoundary(() -> {
+				if (pendingAgentRegistrations.contains(record.agentId()) && runtimeHooks.onCreated(record)) {
+					pendingAgentRegistrations.remove(record.agentId());
+				}
+				return null;
+			});
 		} catch (RuntimeException exception) {
 			LOGGER.warn("Could not publish verified agent registration for {}", record.agentId(), exception);
 		}

@@ -15,6 +15,9 @@ public interface VoiceSubsystem extends AutoCloseable {
 
 	void stop(AgentId agentId);
 
+	default void cancelHumanSpeech(UUID playerId) {
+	}
+
 	@Override
 	void close();
 }
