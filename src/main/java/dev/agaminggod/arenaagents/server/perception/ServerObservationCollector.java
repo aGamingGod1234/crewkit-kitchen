@@ -16,6 +16,7 @@ import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -47,6 +48,7 @@ public final class ServerObservationCollector {
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
 	/** Spatial block/container scans are expensive; movement and view changes still invalidate the key immediately. */
 	private static final long SPATIAL_CACHE_TICKS = 10L;
+	private static final EquipmentSlot[] EQUIPMENT_SLOTS = EquipmentSlot.values();
 
 	private final CodexAgentManager manager;
 	private final ServerActionExecutor actionExecutor;
@@ -54,6 +56,8 @@ public final class ServerObservationCollector {
 			new ObservationSectionCache<>(SPATIAL_CACHE_CAPACITY, SPATIAL_CACHE_TICKS, value -> value);
 	private final Map<AgentId, RawSpatialObservation.Key> spatialKeys = new HashMap<>();
 	private final Map<AgentId, RawPlayerState> lastRawStates = new HashMap<>();
+	private final Map<AgentId, InventorySnapshot> lastInventories = new HashMap<>();
+	private static final IdentityHashMap<Holder<?>, List<String>> TAG_VALUES = new IdentityHashMap<>();
 
 	public ServerObservationCollector(CodexAgentManager manager, ServerActionExecutor actionExecutor) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
@@ -132,6 +136,7 @@ public final class ServerObservationCollector {
 		spatialCache.invalidateMatching(key -> key.agentId().equals(agentId));
 		synchronized (lastRawStates) {
 			lastRawStates.remove(agentId);
+			lastInventories.remove(agentId);
 		}
 	}
 
@@ -141,6 +146,7 @@ public final class ServerObservationCollector {
 		if (manager.server() == null) {
 			synchronized (lastRawStates) {
 				lastRawStates.clear();
+				lastInventories.clear();
 			}
 			return List.of();
 		}
@@ -152,17 +158,20 @@ public final class ServerObservationCollector {
 			if (agent == null || !agent.isAlive()) {
 				synchronized (lastRawStates) {
 					lastRawStates.remove(agentId);
+					lastInventories.remove(agentId);
 				}
 				continue;
 			}
 			RawPlayerState current = rawPlayerState(agent);
 			synchronized (lastRawStates) {
 				RawPlayerState previous = lastRawStates.put(agentId, current);
-				if (previous != null && !current.equals(previous)) changed.add(agentId);
+				boolean inventoryChanged = updateInventory(agentId, agent);
+				if (previous != null && (!current.equals(previous) || inventoryChanged)) changed.add(agentId);
 			}
 		}
 		synchronized (lastRawStates) {
 			lastRawStates.keySet().removeIf(agentId -> !tracked.contains(agentId));
+			lastInventories.keySet().removeIf(agentId -> !tracked.contains(agentId));
 		}
 		return List.copyOf(changed);
 	}
@@ -364,10 +373,26 @@ public final class ServerObservationCollector {
 		tags(stack.typeHolder()).forEach(tag -> counts.merge(tag.getAsString(), stack.getCount(), Integer::sum));
 	}
 
-	private static JsonArray tags(Holder<?> holder) {
+	static JsonArray tags(Holder<?> holder) {
+		List<String> cached;
+		synchronized (TAG_VALUES) {
+			cached = TAG_VALUES.get(holder);
+			if (cached == null) {
+				cached = holder.tags().map(tag -> "#" + tag.location().toString())
+						.sorted().limit(MAX_OBSERVATION_TAGS).toList();
+				TAG_VALUES.put(holder, cached);
+			}
+		}
 		JsonArray values = new JsonArray();
-		holder.tags().map(tag -> "#" + tag.location().toString()).sorted().limit(MAX_OBSERVATION_TAGS).forEach(values::add);
+		cached.forEach(values::add);
 		return values;
+	}
+
+	/** Clears holder-derived tag values after datapack tags are reloaded. */
+	public static void clearTagCache() {
+		synchronized (TAG_VALUES) {
+			TAG_VALUES.clear();
+		}
 	}
 
 	private static JsonArray entities(ServerLevel level, ServerPlayer agent) {
@@ -539,32 +564,17 @@ public final class ServerObservationCollector {
 				agent.isInWall(),
 				agent.onGround(),
 				finite(agent.fallDistance),
-				attacker != null && attacker.isAlive() ? attacker.getUUID() : null,
-				inventorySignature(agent)
+				attacker != null && attacker.isAlive() ? attacker.getUUID() : null
 			);
 	}
 
-	private static String inventorySignature(ServerPlayer agent) {
-		StringBuilder signature = new StringBuilder(512);
-		Inventory inventory = agent.getInventory();
-		signature.append("selected=").append(inventory.getSelectedSlot()).append(';');
-		for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
-			appendItemSignature(signature, inventory.getItem(slot));
+	private boolean updateInventory(AgentId agentId, ServerPlayer agent) {
+		InventorySnapshot previous = lastInventories.get(agentId);
+		if (previous == null || !previous.hasSameShape(agent)) {
+			lastInventories.put(agentId, InventorySnapshot.capture(agent));
+			return previous != null;
 		}
-		for (EquipmentSlot slot : EquipmentSlot.values()) appendItemSignature(signature, agent.getItemBySlot(slot));
-		if (agent.containerMenu != null) {
-			appendItemSignature(signature, agent.containerMenu.getCarried());
-			for (int slot = 0; slot < agent.containerMenu.slots.size() && slot < 64; slot++) {
-				appendItemSignature(signature, agent.containerMenu.getSlot(slot).getItem());
-			}
-		}
-		return signature.toString();
-	}
-
-	private static void appendItemSignature(StringBuilder signature, ItemStack stack) {
-		signature.append(itemId(stack)).append(':')
-				.append(stack.isEmpty() ? 0 : stack.getCount()).append(':')
-				.append(stack.isEmpty() ? 0 : stack.getDamageValue()).append(';');
+		return previous.matchesAndUpdate(agent);
 	}
 
 	private record RawPlayerState(
@@ -577,8 +587,123 @@ public final class ServerObservationCollector {
 		boolean suffocating,
 		boolean onGround,
 		double fallDistance,
-		java.util.UUID lastAttacker,
-		String inventorySignature
+		java.util.UUID lastAttacker
 	) {
+	}
+
+	/** Exact, allocation-free comparison of the fields used by inventorySignature while shapes are stable. */
+	private static final class InventorySnapshot {
+		private static final int MAX_MENU_SLOTS = 64;
+		private final int[] inventoryItemIds;
+		private final int[] inventoryCounts;
+		private final int[] inventoryDamages;
+		private final int[] equipmentItemIds;
+		private final int[] equipmentCounts;
+		private final int[] equipmentDamages;
+		private final boolean hasMenu;
+		private final int menuSize;
+		private final int[] menuItemIds;
+		private final int[] menuCounts;
+		private final int[] menuDamages;
+		private int selectedSlot;
+		private int carriedItemId;
+		private int carriedCount;
+		private int carriedDamage;
+
+		private InventorySnapshot(ServerPlayer agent) {
+			Inventory inventory = agent.getInventory();
+			this.inventoryItemIds = new int[inventory.getContainerSize()];
+			this.inventoryCounts = new int[inventoryItemIds.length];
+			this.inventoryDamages = new int[inventoryItemIds.length];
+			this.equipmentItemIds = new int[EQUIPMENT_SLOTS.length];
+			this.equipmentCounts = new int[equipmentItemIds.length];
+			this.equipmentDamages = new int[equipmentItemIds.length];
+			this.hasMenu = agent.containerMenu != null;
+			this.menuSize = hasMenu ? Math.min(agent.containerMenu.slots.size(), MAX_MENU_SLOTS) : 0;
+			this.menuItemIds = new int[menuSize];
+			this.menuCounts = new int[menuSize];
+			this.menuDamages = new int[menuSize];
+			captureValues(agent);
+		}
+
+		private static InventorySnapshot capture(ServerPlayer agent) {
+			return new InventorySnapshot(agent);
+		}
+
+		private boolean hasSameShape(ServerPlayer agent) {
+			Inventory inventory = agent.getInventory();
+			boolean currentHasMenu = agent.containerMenu != null;
+			int currentMenuSize = currentHasMenu
+					? Math.min(agent.containerMenu.slots.size(), MAX_MENU_SLOTS) : 0;
+			return inventoryItemIds.length == inventory.getContainerSize()
+					&& hasMenu == currentHasMenu
+					&& menuSize == currentMenuSize;
+		}
+
+		private boolean matchesAndUpdate(ServerPlayer agent) {
+			boolean changed = false;
+			Inventory inventory = agent.getInventory();
+			changed |= selectedSlot != inventory.getSelectedSlot();
+			selectedSlot = inventory.getSelectedSlot();
+			for (int slot = 0; slot < inventoryItemIds.length; slot++) {
+				changed |= update(inventoryItemIds, inventoryCounts, inventoryDamages, slot, inventory.getItem(slot));
+			}
+			for (int slot = 0; slot < EQUIPMENT_SLOTS.length; slot++) {
+				changed |= update(equipmentItemIds, equipmentCounts, equipmentDamages, slot,
+						agent.getItemBySlot(EQUIPMENT_SLOTS[slot]));
+			}
+			if (hasMenu) {
+				changed |= updateCarried(agent.containerMenu.getCarried());
+				for (int slot = 0; slot < menuSize; slot++) {
+					changed |= update(menuItemIds, menuCounts, menuDamages, slot,
+							agent.containerMenu.getSlot(slot).getItem());
+				}
+			}
+			return changed;
+		}
+
+		private void captureValues(ServerPlayer agent) {
+			Inventory inventory = agent.getInventory();
+			selectedSlot = inventory.getSelectedSlot();
+			for (int slot = 0; slot < inventoryItemIds.length; slot++) {
+				update(inventoryItemIds, inventoryCounts, inventoryDamages, slot, inventory.getItem(slot));
+			}
+			for (int slot = 0; slot < EQUIPMENT_SLOTS.length; slot++) {
+				update(equipmentItemIds, equipmentCounts, equipmentDamages, slot,
+						agent.getItemBySlot(EQUIPMENT_SLOTS[slot]));
+			}
+			if (hasMenu) {
+				updateCarried(agent.containerMenu.getCarried());
+				for (int slot = 0; slot < menuSize; slot++) {
+					update(menuItemIds, menuCounts, menuDamages, slot, agent.containerMenu.getSlot(slot).getItem());
+				}
+			}
+		}
+
+		private boolean updateCarried(ItemStack stack) {
+			int itemId = normalizedItemId(stack);
+			int count = stack.isEmpty() ? 0 : stack.getCount();
+			int damage = stack.isEmpty() ? 0 : stack.getDamageValue();
+			boolean changed = carriedItemId != itemId || carriedCount != count || carriedDamage != damage;
+			carriedItemId = itemId;
+			carriedCount = count;
+			carriedDamage = damage;
+			return changed;
+		}
+
+		private static boolean update(int[] itemIds, int[] counts, int[] damages, int slot, ItemStack stack) {
+			int itemId = normalizedItemId(stack);
+			int count = stack.isEmpty() ? 0 : stack.getCount();
+			int damage = stack.isEmpty() ? 0 : stack.getDamageValue();
+			boolean changed = itemIds[slot] != itemId || counts[slot] != count || damages[slot] != damage;
+			itemIds[slot] = itemId;
+			counts[slot] = count;
+			damages[slot] = damage;
+			return changed;
+		}
+
+		private static int normalizedItemId(ItemStack stack) {
+			return stack.isEmpty() ? -1 : BuiltInRegistries.ITEM.getId(stack.getItem());
+		}
 	}
 }

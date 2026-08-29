@@ -91,6 +91,7 @@ import dev.agaminggod.arenaagents.server.perception.BlockObservationOrderingVeri
 import dev.agaminggod.arenaagents.server.perception.InventoryObservationSlotsVerification;
 import dev.agaminggod.arenaagents.server.perception.ObservationBudgetVerification;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationRayTargetVerification;
+import dev.agaminggod.arenaagents.server.perception.ServerObservationTagCacheVerification;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudgetVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
@@ -222,6 +223,7 @@ public final class VerificationMain {
 		passedAssertions += BlockObservationOrderingVerification.verify();
 		passedAssertions += BlockObservationLazyVisibilityVerification.verify();
 		passedAssertions += InventoryObservationSlotsVerification.verify();
+		passedAssertions += ServerObservationTagCacheVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
 		passedAssertions += ServerObservationRayTargetVerification.verify();
 		passedAssertions += ServerObservationWireBudgetVerification.verify();
