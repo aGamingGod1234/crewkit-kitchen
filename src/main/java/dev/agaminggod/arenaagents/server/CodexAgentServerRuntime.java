@@ -384,10 +384,10 @@ public final class CodexAgentServerRuntime {
 	}
 
 	static boolean voiceConfigurationPrepared(CoordinatorProcessSupervisor supervisor) {
-		return supervisor != null && (supervisor.configured()
-				|| (supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-						&& (propertyPresent("arenaagents.voiceSecretFile")
-								|| propertyPresent("arenaagents.bridgeSecretFile"))));
+		if (supervisor == null) return false;
+		if (supervisor.configured()) return true;
+		return supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
+				&& acceptedSecretFile(configuredVoiceSecretFile(), Path.of("runtime", "bridge-secret.txt"));
 	}
 
 	static long voiceConfigurationRevision(CoordinatorProcessSupervisor supervisor) {
@@ -407,9 +407,14 @@ public final class CodexAgentServerRuntime {
 		);
 	}
 
-	private static boolean propertyPresent(String name) {
-		String value = System.getProperty(name);
-		return value != null && !value.isBlank();
+	private static boolean acceptedSecretFile(String configuredPath, Path fallbackPath) {
+		try {
+			Path path = configuredPath == null ? fallbackPath : Path.of(configuredPath);
+			readAcceptedExplicitSecret(path);
+			return true;
+		} catch (IOException | RuntimeException unavailable) {
+			return false;
+		}
 	}
 
 	/** Small lifecycle seam that keeps unprepared startup from permanently selecting NoVoice. */
