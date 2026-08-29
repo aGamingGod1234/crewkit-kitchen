@@ -317,6 +317,7 @@ public final class CodexAgentManager {
 		AgentRecord record = savedData.registry().require(draft.agentId());
 		if (!draft.matches(record)) throw new AgentDomainException("STALE_GOAL_DRAFT", "Goal draft no longer matches the target goal revision");
 		GoalPredicate predicate = draft.proposedPredicate().orElseThrow();
+		draft.translationConstraint().validate(predicate);
 		if (GoalPredicateWorldValidator.requiresLiveLevel(predicate)) {
 			GoalPredicateWorldValidator.validate(
 					GoalPredicateWorldValidator.requireLevel(server, draft.dimensionId()), predicate);

@@ -39,6 +39,7 @@ public final class GoalCompilerVerification {
 		assertions += verifyExactPositionEntityAndAdvancement();
 		assertions += verifyCompoundItemsAndKills();
 		assertions += verifyKillCountTranslationBounds();
+		assertions += verifyTranslatedKillConstraints();
 		assertions += verifyExplicitAlternativeCandidates();
 		assertions += verifyDraftRoundTrip();
 		assertions += verifyWorldValidation();
@@ -543,18 +544,80 @@ public final class GoalCompilerVerification {
 		return 15;
 	}
 
+	private static int verifyTranslatedKillConstraints() {
+		GoalCompiler compiler = new GoalCompiler();
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Kill 0 good zombies", RegistryAccess.EMPTY, 1_200L).kind(),
+				"an invalid subjective kill count is rejected before translation");
+		assertEquals(GoalCompilation.Kind.REJECTED,
+				compiler.compile("Get a good pickaxe and kill 0 zombies", RegistryAccess.EMPTY, 1_200L).kind(),
+				"an invalid compound kill count is rejected before subjective translation");
+
+		GoalTranslationConstraint direct = compiler.translationConstraintFor(
+				"Kill 3 zombies", RegistryAccess.EMPTY);
+		assertSucceeds(() -> direct.validate(kills("minecraft:zombie", 3)),
+				"three translated kill leaves preserve a requested count of three");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> direct.validate(new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true)),
+				"one translated kill cannot satisfy a requested count of three");
+
+		GoalTranslationConstraint alternatives = compiler.translationConstraintFor(
+				"Kill 3 good zombies or 2 skeletons", RegistryAccess.EMPTY);
+		assertSucceeds(() -> alternatives.validate(new GoalPredicate.AnyOf(List.of(
+				kills("minecraft:zombie", 3),
+				kills("minecraft:skeleton", 2)
+		))), "each translated kill alternative preserves its own count");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> alternatives.validate(new GoalPredicate.AnyOf(List.of(
+						kills("minecraft:zombie", 3), new GoalPredicate.OperatorConfirmed()))),
+				"an operator-confirmed alternative cannot bypass a counted kill branch");
+
+		GoalTranslationConstraint compound = compiler.translationConstraintFor(
+				"Get a good pickaxe and kill 2 good zombies and 3 skeletons", RegistryAccess.EMPTY);
+		assertSucceeds(() -> compound.validate(new GoalPredicate.AllOf(List.of(
+				new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1),
+				kills("minecraft:zombie", 2),
+				kills("minecraft:skeleton", 3)
+		))), "compound translations retain every requested kill count");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> compound.validate(new GoalPredicate.AllOf(List.of(
+						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1),
+						kills("minecraft:zombie", 2),
+						kills("minecraft:skeleton", 2)
+				))),
+				"compound translated kill counts each retain distinct evidence");
+
+		GoalTranslationConstraint subjective = compiler.translationConstraintFor(
+				"Kill 3 good zombies", RegistryAccess.EMPTY);
+		assertSucceeds(() -> subjective.validate(new GoalPredicate.AllOf(List.of(
+				kills("minecraft:zombie", 3), new GoalPredicate.OperatorConfirmed()))),
+				"subjective confirmation may accompany the required factual kills");
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> subjective.validate(new GoalPredicate.OperatorConfirmed()),
+				"operator confirmation alone cannot bypass a subjective counted kill request");
+
+		GoalTranslationConstraint repeatedCompound = compiler.translationConstraintFor(
+				"Kill 2 good zombies and 3 zombies", RegistryAccess.EMPTY);
+		expectCode("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+				() -> repeatedCompound.validate(kills("minecraft:zombie", 3)),
+				"one translated kill leaf cannot satisfy two compound kill clauses");
+		assertSucceeds(() -> repeatedCompound.validate(kills("minecraft:zombie", 5)),
+				"five distinct kill leaves satisfy compound counts of two and three");
+		return 12;
+	}
+
 	private static int verifyDraftRoundTrip() {
+		GoalTranslationConstraint constraint = new GoalCompiler().translationConstraintFor(
+				"Kill 3 good zombies", RegistryAccess.EMPTY);
 		PendingGoalDraft draft = new PendingGoalDraft(
 				UUID.fromString("00000000-0000-0000-0000-000000000101"),
 				new AgentId(UUID.fromString("00000000-0000-0000-0000-000000000102")),
 				UUID.fromString("00000000-0000-0000-0000-000000000103"),
-				"Get a good pickaxe",
+				"Kill 3 good zombies",
 				"minecraft:the_nether",
-				List.of("minecraft:diamond_pickaxe", "minecraft:iron_pickaxe"),
-				Optional.of(new GoalPredicate.AnyOf(java.util.List.of(
-						new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1),
-						new GoalPredicate.InventoryContains("minecraft:diamond_pickaxe", 1)
-				))),
+				List.of("minecraft:zombie"),
+				constraint,
+				Optional.of(kills("minecraft:zombie", 3)),
 				DraftIntent.CONFIRM_TRANSLATION,
 				1_200L,
 				4L,
@@ -563,14 +626,24 @@ public final class GoalCompilerVerification {
 		PendingGoalDraftCodec codec = new PendingGoalDraftCodec();
 		assertEquals(draft, codec.decode(codec.encode(draft)), "pending goal draft round-trip");
 		assertEquals(
-				draft.withProposedPredicate(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)),
-				codec.decode(codec.encode(draft.withProposedPredicate(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1)))),
+				draft.withProposedPredicate(kills("minecraft:zombie", 3)),
+				codec.decode(codec.encode(draft.withProposedPredicate(kills("minecraft:zombie", 3)))),
 				"atomic proposal replacement retains draft identity and candidate IDs"
 		);
-		String legacy = codec.encode(draft).replace("\"dimension_id\":\"minecraft:the_nether\",", "");
-		assertEquals(GoalPredicate.DEFAULT_DIMENSION, codec.decode(legacy).dimensionId(),
+		var priorJson = JsonParser.parseString(codec.encode(draft)).getAsJsonObject();
+		priorJson.remove("translation_constraint");
+		assertEquals(GoalTranslationConstraint.none(), codec.decode(priorJson.toString()).translationConstraint(),
+				"drafts persisted before constraints remain readable without invented requirements");
+		priorJson.remove("dimension_id");
+		assertEquals(GoalPredicate.DEFAULT_DIMENSION, codec.decode(priorJson.toString()).dimensionId(),
 				"legacy persisted drafts retain their historical Overworld interpretation");
-		return 3;
+		return 4;
+	}
+
+	private static GoalPredicate kills(String entityType, int count) {
+		return new GoalPredicate.AllOf(java.util.stream.IntStream.range(0, count)
+				.mapToObj(ignored -> (GoalPredicate) new GoalPredicate.EntityKilledByAgent(entityType, true))
+				.toList());
 	}
 
 	private static int verifyWorldValidation() {

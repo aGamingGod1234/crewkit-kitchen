@@ -106,6 +106,8 @@ public final class GoalCompiler {
 		Objects.requireNonNull(dimensionId, "dimensionId must not be null");
 		String original = AgentValidators.normalizePrompt(request);
 		String command = stripTrailingPunctuation(stripPoliteness(original.toLowerCase(Locale.ROOT)));
+		TranslationLeafBudget translationBudget = candidateTranslationBudget(command, compoundClauses(command));
+		if (!translationBudget.valid()) return GoalCompilation.rejected(translationBudget.rejection());
 		if (SUBJECTIVE.matcher(command).find()) {
 			return GoalCompilation.needsTranslation("I need you to clarify the exact Minecraft result you want.");
 		}
@@ -237,6 +239,29 @@ public final class GoalCompiler {
 
 	public List<String> candidateIdsFor(String request, RegistryAccess registries) {
 		return candidateIdsFor(request, registries, Map.of());
+	}
+
+	public GoalTranslationConstraint translationConstraintFor(String request, RegistryAccess registries) {
+		Objects.requireNonNull(registries, "registries must not be null");
+		String command = stripTrailingPunctuation(stripPoliteness(
+				AgentValidators.normalizePrompt(request).toLowerCase(Locale.ROOT)));
+		List<GoalClause> clauses = compoundClauses(command);
+		ArrayList<GoalTranslationConstraint.KillClause> killClauses = new ArrayList<>();
+		if (clauses.size() > 1) {
+			for (GoalClause clause : clauses) {
+				if (clause.kind() == ClauseKind.KILL) {
+					killClauses.add(killConstraintFor(clause.target(), registries));
+				}
+			}
+		} else {
+			Matcher kill = KILL.matcher(command);
+			if (kill.matches() && !BEAT_GAME.matcher(command).matches()) {
+				killClauses.add(killConstraintFor(kill.group(1), registries));
+			}
+		}
+		return killClauses.isEmpty()
+				? GoalTranslationConstraint.none()
+				: new GoalTranslationConstraint(killClauses);
 	}
 
 	public List<String> candidateIdsFor(
@@ -454,6 +479,22 @@ public final class GoalCompiler {
 	private static String stripKillCount(String target) {
 		Matcher counted = KILL_COUNT.matcher(target);
 		return counted.matches() ? counted.group(2) : target;
+	}
+
+	private static GoalTranslationConstraint.KillClause killConstraintFor(
+			String target,
+			RegistryAccess registries
+	) {
+		ArrayList<GoalTranslationConstraint.KillAlternative> alternatives = new ArrayList<>();
+		for (String rawAlternative : target.split("\\s+or\\s+", -1)) {
+			String alternative = rawAlternative.strip();
+			Matcher counted = KILL_COUNT.matcher(alternative);
+			int count = counted.matches() ? Integer.parseInt(counted.group(1)) : 1;
+			String entityTarget = counted.matches() ? counted.group(2) : alternative;
+			alternatives.add(new GoalTranslationConstraint.KillAlternative(
+					relatedCandidates(ClauseKind.KILL, entityTarget, registries), count));
+		}
+		return new GoalTranslationConstraint.KillClause(alternatives);
 	}
 
 	private static TranslationLeafBudget candidateTranslationBudget(String command, List<GoalClause> clauses) {

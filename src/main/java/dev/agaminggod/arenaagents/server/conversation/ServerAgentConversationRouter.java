@@ -336,7 +336,8 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		return new PendingGoalDraft(
 				UUID.randomUUID(), target.agentId(), playerId, event.text(),
 				sourceLevel.dimension().identifier().toString(),
-				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess(), liveAdvancementTitles()), proposed, intent,
+				goalCompiler.candidateIdsFor(event.text(), manager.server().registryAccess(), liveAdvancementTitles()),
+				goalCompiler.translationConstraintFor(event.text(), manager.server().registryAccess()), proposed, intent,
 				manager.server().getTickCount(), target.goalRevision(), PendingGoalDraft.expectedGoalIdFor(target)
 		);
 	}

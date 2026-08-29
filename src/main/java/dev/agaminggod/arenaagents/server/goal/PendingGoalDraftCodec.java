@@ -2,6 +2,7 @@ package dev.agaminggod.arenaagents.server.goal;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParseException;
@@ -22,9 +23,13 @@ public final class PendingGoalDraftCodec {
 			"draft_id", "agent_id", "requesting_player_id", "original_request", "candidate_ids", "proposed_predicate", "intent", "created_at_tick",
 			"expected_goal_revision", "expected_goal_id"
 	);
-	private static final Set<String> FIELDS = Set.of(
+	private static final Set<String> DIMENSION_FIELDS = Set.of(
 			"draft_id", "agent_id", "requesting_player_id", "original_request", "dimension_id", "candidate_ids", "proposed_predicate", "intent",
 			"created_at_tick", "expected_goal_revision", "expected_goal_id"
+	);
+	private static final Set<String> FIELDS = Set.of(
+			"draft_id", "agent_id", "requesting_player_id", "original_request", "dimension_id", "candidate_ids", "translation_constraint",
+			"proposed_predicate", "intent", "created_at_tick", "expected_goal_revision", "expected_goal_id"
 	);
 	private final GoalSpecCodec goalCodec = new GoalSpecCodec();
 
@@ -36,6 +41,7 @@ public final class PendingGoalDraftCodec {
 		json.addProperty("original_request", draft.originalRequest());
 		json.addProperty("dimension_id", draft.dimensionId());
 		json.add("candidate_ids", GSON.toJsonTree(draft.candidateIds()));
+		json.add("translation_constraint", encodeConstraint(draft.translationConstraint()));
 		draft.proposedPredicate().ifPresentOrElse(
 				predicate -> json.add("proposed_predicate", goalCodec.encodePredicateObject(predicate)),
 				() -> json.add("proposed_predicate", null)
@@ -53,8 +59,9 @@ public final class PendingGoalDraftCodec {
 	public PendingGoalDraft decode(String encoded) {
 		try {
 			JsonObject json = object(JsonParser.parseString(encoded), "draft");
-			boolean legacy = json.keySet().equals(LEGACY_FIELDS);
-			if (!legacy && !json.keySet().equals(FIELDS)) throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Draft fields differ from the closed schema");
+			boolean legacyDimension = json.keySet().equals(LEGACY_FIELDS);
+			boolean legacyConstraint = legacyDimension || json.keySet().equals(DIMENSION_FIELDS);
+			if (!legacyConstraint && !json.keySet().equals(FIELDS)) throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Draft fields differ from the closed schema");
 			JsonElement proposed = field(json, "proposed_predicate");
 			Optional<GoalPredicate> predicate = proposed.isJsonNull()
 					? Optional.empty()
@@ -65,8 +72,10 @@ public final class PendingGoalDraftCodec {
 					AgentId.parse(string(json, "agent_id")),
 					uuid(string(json, "requesting_player_id"), "requesting_player_id"),
 					string(json, "original_request"),
-					legacy ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimension_id"),
+					legacyDimension ? GoalPredicate.DEFAULT_DIMENSION : string(json, "dimension_id"),
 					strings(json, "candidate_ids"),
+					legacyConstraint ? GoalTranslationConstraint.none() : decodeConstraint(
+							object(field(json, "translation_constraint"), "translation_constraint")),
 					predicate,
 					enumeration(DraftIntent.class, string(json, "intent"), "intent"),
 					exactLong(json, "created_at_tick"),
@@ -77,9 +86,60 @@ public final class PendingGoalDraftCodec {
 			);
 		} catch (AgentDomainException exception) {
 			throw exception;
-		} catch (JsonParseException | IllegalStateException | NumberFormatException exception) {
+		} catch (JsonParseException | IllegalStateException | IllegalArgumentException exception) {
 			throw failure("INVALID_GOAL_DRAFT", "Invalid persisted goal draft: " + exception.getMessage());
 		}
+	}
+
+	private static JsonObject encodeConstraint(GoalTranslationConstraint constraint) {
+		JsonObject json = new JsonObject();
+		JsonArray clauses = new JsonArray();
+		for (GoalTranslationConstraint.KillClause clause : constraint.killClauses()) {
+			JsonObject clauseJson = new JsonObject();
+			JsonArray alternatives = new JsonArray();
+			for (GoalTranslationConstraint.KillAlternative alternative : clause.alternatives()) {
+				JsonObject alternativeJson = new JsonObject();
+				alternativeJson.add("entity_types", GSON.toJsonTree(alternative.entityTypes()));
+				alternativeJson.addProperty("count", alternative.count());
+				alternatives.add(alternativeJson);
+			}
+			clauseJson.add("alternatives", alternatives);
+			clauses.add(clauseJson);
+		}
+		json.add("kill_clauses", clauses);
+		return json;
+	}
+
+	private static GoalTranslationConstraint decodeConstraint(JsonObject json) {
+		if (!json.keySet().equals(Set.of("kill_clauses"))) {
+			throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Translation constraint fields differ from the closed schema");
+		}
+		JsonElement clausesValue = field(json, "kill_clauses");
+		if (!clausesValue.isJsonArray()) throw failure("INVALID_GOAL_DRAFT", "kill_clauses must be an array");
+		ArrayList<GoalTranslationConstraint.KillClause> clauses = new ArrayList<>();
+		for (JsonElement clauseValue : clausesValue.getAsJsonArray()) {
+			JsonObject clause = object(clauseValue, "kill_clause");
+			if (!clause.keySet().equals(Set.of("alternatives"))) {
+				throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Kill clause fields differ from the closed schema");
+			}
+			JsonElement alternativesValue = field(clause, "alternatives");
+			if (!alternativesValue.isJsonArray()) throw failure("INVALID_GOAL_DRAFT", "alternatives must be an array");
+			ArrayList<GoalTranslationConstraint.KillAlternative> alternatives = new ArrayList<>();
+			for (JsonElement alternativeValue : alternativesValue.getAsJsonArray()) {
+				JsonObject alternative = object(alternativeValue, "kill_alternative");
+				if (!alternative.keySet().equals(Set.of("entity_types", "count"))) {
+					throw failure("UNKNOWN_GOAL_DRAFT_FIELD", "Kill alternative fields differ from the closed schema");
+				}
+				long count = exactLong(alternative, "count");
+				if (count < Integer.MIN_VALUE || count > Integer.MAX_VALUE) {
+					throw failure("INVALID_GOAL_DRAFT", "kill alternative count is out of range");
+				}
+				alternatives.add(new GoalTranslationConstraint.KillAlternative(
+						strings(alternative, "entity_types"), (int) count));
+			}
+			clauses.add(new GoalTranslationConstraint.KillClause(alternatives));
+		}
+		return clauses.isEmpty() ? GoalTranslationConstraint.none() : new GoalTranslationConstraint(clauses);
 	}
 
 	private static List<String> strings(JsonObject object, String field) {

@@ -18,6 +18,7 @@ public record PendingGoalDraft(
 		String originalRequest,
 		String dimensionId,
 		List<String> candidateIds,
+		GoalTranslationConstraint translationConstraint,
 		Optional<GoalPredicate> proposedPredicate,
 		DraftIntent intent,
 		long createdAtTick,
@@ -42,6 +43,7 @@ public record PendingGoalDraft(
 				throw new IllegalArgumentException("candidateIds must contain namespaced identifiers");
 			}
 		}
+		Objects.requireNonNull(translationConstraint, "translationConstraint must not be null");
 		proposedPredicate = Objects.requireNonNull(proposedPredicate, "proposedPredicate must not be null");
 		Objects.requireNonNull(intent, "intent must not be null");
 		if (createdAtTick < 0L) throw new IllegalArgumentException("createdAtTick must be nonnegative");
@@ -51,11 +53,22 @@ public record PendingGoalDraft(
 
 	public PendingGoalDraft(
 			UUID draftId, AgentId agentId, UUID requestingPlayerId, String originalRequest,
+			String dimensionId, List<String> candidateIds, Optional<GoalPredicate> proposedPredicate,
+			DraftIntent intent, long createdAtTick, long expectedGoalRevision, Optional<UUID> expectedGoalId
+	) {
+		this(draftId, agentId, requestingPlayerId, originalRequest, dimensionId, candidateIds,
+				GoalTranslationConstraint.none(), proposedPredicate, intent,
+				createdAtTick, expectedGoalRevision, expectedGoalId);
+	}
+
+	public PendingGoalDraft(
+			UUID draftId, AgentId agentId, UUID requestingPlayerId, String originalRequest,
 			List<String> candidateIds, Optional<GoalPredicate> proposedPredicate, DraftIntent intent,
 			long createdAtTick, long expectedGoalRevision, Optional<UUID> expectedGoalId
 	) {
 		this(draftId, agentId, requestingPlayerId, originalRequest, GoalPredicate.DEFAULT_DIMENSION,
-				candidateIds, proposedPredicate, intent, createdAtTick, expectedGoalRevision, expectedGoalId);
+				candidateIds, GoalTranslationConstraint.none(), proposedPredicate, intent,
+				createdAtTick, expectedGoalRevision, expectedGoalId);
 	}
 
 	public PendingGoalDraft(
@@ -64,13 +77,13 @@ public record PendingGoalDraft(
 			long expectedGoalRevision, Optional<UUID> expectedGoalId
 	) {
 		this(draftId, agentId, requestingPlayerId, originalRequest, GoalPredicate.DEFAULT_DIMENSION,
-				List.of(), proposedPredicate, intent,
+				List.of(), GoalTranslationConstraint.none(), proposedPredicate, intent,
 				createdAtTick, expectedGoalRevision, expectedGoalId);
 	}
 
 	public PendingGoalDraft withProposedPredicate(GoalPredicate predicate) {
 		return new PendingGoalDraft(draftId, agentId, requestingPlayerId, originalRequest, dimensionId, candidateIds,
-				Optional.of(Objects.requireNonNull(predicate, "predicate must not be null")), intent,
+				translationConstraint, Optional.of(Objects.requireNonNull(predicate, "predicate must not be null")), intent,
 				createdAtTick, expectedGoalRevision, expectedGoalId);
 	}
 

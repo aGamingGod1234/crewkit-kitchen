@@ -21,6 +21,8 @@ import dev.agaminggod.arenaagents.server.conversation.ConversationEvent;
 import dev.agaminggod.arenaagents.server.conversation.ConversationKind;
 import dev.agaminggod.arenaagents.server.conversation.PendingConversationWakeCodec;
 import dev.agaminggod.arenaagents.server.goal.DraftIntent;
+import dev.agaminggod.arenaagents.server.goal.GoalCompiler;
+import dev.agaminggod.arenaagents.server.goal.GoalDraftChoice;
 import dev.agaminggod.arenaagents.server.goal.GoalSpecWireCodec;
 import dev.agaminggod.arenaagents.server.goal.PendingGoalDraft;
 import dev.agaminggod.arenaagents.server.perception.ObservationDispatchQueue;
@@ -494,6 +496,45 @@ public final class MultiplexedServerBridgeVerification {
 				BridgeEnvelope intentRejected = pollBridgeResponse(bridge, socket, reader, codec);
 				assertEquals("GOAL_DRAFT_INTENT_MISMATCH", intentRejected.payload().get("reasonCode").getAsString(),
 						"coordinator proposals cannot populate non-translation drafts");
+
+				UUID countedKillId = UUID.fromString("00000000-0000-0000-0000-000000000305");
+				UUID countedKillRequester = UUID.fromString("00000000-0000-0000-0000-000000000306");
+				var countedKillConstraint = new GoalCompiler().translationConstraintFor(
+						"Kill 3 good zombies", net.minecraft.core.RegistryAccess.EMPTY);
+				manager.stageGoalDraft(new PendingGoalDraft(
+						countedKillId, idle.agentId(), countedKillRequester, "Kill 3 good zombies",
+						dev.agaminggod.arenaagents.agent.goal.GoalPredicate.DEFAULT_DIMENSION,
+						List.of("minecraft:zombie"), countedKillConstraint, Optional.empty(),
+						DraftIntent.CONFIRM_TRANSLATION, 1_003L, idle.goalRevision(), Optional.empty()
+				));
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-kill-operator-bypass",
+						goalSpecProposal(countedKillId, new GoalPredicate.OperatorConfirmed())));
+				BridgeEnvelope operatorBypass = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+						operatorBypass.payload().get("reasonCode").getAsString(),
+						"operator confirmation cannot bypass a server-authored kill count");
+				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
+						"goal_spec_proposal", "proposal-kill-undercount",
+						goalSpecProposal(countedKillId,
+								new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true))));
+				BridgeEnvelope undercounted = pollBridgeResponse(bridge, socket, reader, codec);
+				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
+						undercounted.payload().get("reasonCode").getAsString(),
+						"one translated kill cannot satisfy a server-authored count of three");
+
+				UUID confirmationBypassId = UUID.fromString("00000000-0000-0000-0000-000000000307");
+				manager.stageGoalDraft(new PendingGoalDraft(
+						confirmationBypassId, idle.agentId(), countedKillRequester, "Kill 3 good zombies",
+						dev.agaminggod.arenaagents.agent.goal.GoalPredicate.DEFAULT_DIMENSION,
+						List.of("minecraft:zombie"), countedKillConstraint,
+						Optional.of(new GoalPredicate.OperatorConfirmed()), DraftIntent.CONFIRM_TRANSLATION,
+						1_004L, idle.goalRevision(), Optional.empty()
+				));
+				assertThrowsDomain(
+						() -> manager.resolveGoalDraft(
+								confirmationBypassId, countedKillRequester, false, GoalDraftChoice.CONFIRM),
+						"GOAL_TRANSLATION_CONSTRAINT_MISMATCH");
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("goal specification proposal lifecycle failed", exception);
