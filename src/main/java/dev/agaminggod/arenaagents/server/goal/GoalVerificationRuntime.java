@@ -1,5 +1,6 @@
 package dev.agaminggod.arenaagents.server.goal;
 
+import dev.agaminggod.arenaagents.agent.AgentConstants;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.agent.AgentGoal;
 import dev.agaminggod.arenaagents.agent.AgentId;
@@ -7,7 +8,9 @@ import dev.agaminggod.arenaagents.agent.AgentLifecycleState;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.agent.AgentRegistry;
 import dev.agaminggod.arenaagents.agent.AgentTransition;
+import dev.agaminggod.arenaagents.agent.AgentValidators;
 import dev.agaminggod.arenaagents.agent.goal.GoalPredicate;
+import dev.agaminggod.arenaagents.agent.goal.GoalSpec;
 import dev.agaminggod.arenaagents.agent.goal.GoalStatus;
 import dev.agaminggod.arenaagents.server.runtime.GoalCompletionVerifier;
 import java.util.ArrayList;
@@ -19,6 +22,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 
@@ -33,6 +37,7 @@ public final class GoalVerificationRuntime {
 	private final AgentKillLedger killLedger;
 	private final SurvivalProgressLedger survivalProgress;
 	private final OperatorConfirmationLedger operatorConfirmations;
+	private final Consumer<GoalSpec> queuedGoalValidator;
 	private final Map<AgentId, VerificationFault> faults = new LinkedHashMap<>();
 
 	public GoalVerificationRuntime(
@@ -42,6 +47,17 @@ public final class GoalVerificationRuntime {
 			LongSupplier epochMillis
 	) {
 		this(registry, facts, serverTick, epochMillis, new AgentKillLedger(), new SurvivalProgressLedger());
+	}
+
+	public GoalVerificationRuntime(
+			AgentRegistry registry,
+			Function<AgentId, Optional<GoalCompletionVerifier.FactSource>> facts,
+			LongSupplier serverTick,
+			LongSupplier epochMillis,
+			Consumer<GoalSpec> queuedGoalValidator
+	) {
+		this(registry, facts, serverTick, epochMillis, new AgentKillLedger(), new SurvivalProgressLedger(),
+				new OperatorConfirmationLedger(), queuedGoalValidator);
 	}
 
 	public GoalVerificationRuntime(
@@ -63,7 +79,7 @@ public final class GoalVerificationRuntime {
 			SurvivalProgressLedger survivalProgress
 	) {
 		this(registry, facts, serverTick, epochMillis, killLedger, survivalProgress,
-				new OperatorConfirmationLedger());
+				new OperatorConfirmationLedger(), ignored -> { });
 	}
 
 	public GoalVerificationRuntime(
@@ -75,6 +91,20 @@ public final class GoalVerificationRuntime {
 			SurvivalProgressLedger survivalProgress,
 			OperatorConfirmationLedger operatorConfirmations
 	) {
+		this(registry, facts, serverTick, epochMillis, killLedger, survivalProgress, operatorConfirmations,
+				ignored -> { });
+	}
+
+	public GoalVerificationRuntime(
+			AgentRegistry registry,
+			Function<AgentId, Optional<GoalCompletionVerifier.FactSource>> facts,
+			LongSupplier serverTick,
+			LongSupplier epochMillis,
+			AgentKillLedger killLedger,
+			SurvivalProgressLedger survivalProgress,
+			OperatorConfirmationLedger operatorConfirmations,
+			Consumer<GoalSpec> queuedGoalValidator
+	) {
 		this.registry = Objects.requireNonNull(registry, "registry must not be null");
 		this.facts = Objects.requireNonNull(facts, "facts must not be null");
 		this.serverTick = Objects.requireNonNull(serverTick, "serverTick must not be null");
@@ -83,6 +113,8 @@ public final class GoalVerificationRuntime {
 		this.survivalProgress = Objects.requireNonNull(survivalProgress, "survivalProgress must not be null");
 		this.operatorConfirmations = Objects.requireNonNull(
 				operatorConfirmations, "operatorConfirmations must not be null");
+		this.queuedGoalValidator = Objects.requireNonNull(
+				queuedGoalValidator, "queuedGoalValidator must not be null");
 		this.verifier = new GoalCompletionVerifier(this.survivalProgress);
 		synchronizeProgress();
 	}
@@ -96,7 +128,7 @@ public final class GoalVerificationRuntime {
 		for (AgentRecord snapshot : registry.records()) {
 			AgentRecord record = registry.require(snapshot.agentId());
 			if (readyToPromote(record)) {
-				transitions.add(registry.promoteSatisfied(record.agentId(), now));
+				promoteFirstValidQueuedGoal(record, now, transitions);
 				continue;
 			}
 			if (!record.state().isActive() || record.currentGoal().isEmpty()) continue;
@@ -115,6 +147,39 @@ public final class GoalVerificationRuntime {
 						&& record.currentGoal().isPresent()
 						&& record.goalRevision() == entry.getValue().goalRevision()));
 		return List.copyOf(transitions);
+	}
+
+	private void promoteFirstValidQueuedGoal(
+			AgentRecord record,
+			long now,
+			List<AgentTransition> transitions
+	) {
+		while (readyToPromote(record)) {
+			AgentGoal queued = record.queuedGoals().getFirst();
+			try {
+				queuedGoalValidator.accept(queued.spec());
+			} catch (AgentDomainException exception) {
+				AgentTransition rejected = registry.rejectQueuedGoal(
+						record.agentId(), queued.goalId(), rejectionReason(record.lastError(), queued, exception), now);
+				transitions.add(rejected);
+				record = rejected.after();
+				continue;
+			}
+			transitions.add(registry.promoteSatisfied(record.agentId(), now));
+			return;
+		}
+	}
+
+	private static String rejectionReason(
+			String previous,
+			AgentGoal queued,
+			AgentDomainException exception
+	) {
+		String detail = exception.getMessage();
+		if (detail == null || detail.isBlank()) detail = exception.code();
+		String notice = "Skipped queued goal '" + queued.prompt() + "' [" + exception.code() + "]: " + detail;
+		String combined = previous.isBlank() ? notice : previous + " | " + notice;
+		return AgentValidators.boundedText(combined, "error", AgentConstants.MAX_ERROR_LENGTH);
 	}
 
 	public GoalCompletionVerifier.VerificationResult evaluate(AgentId agentId) {

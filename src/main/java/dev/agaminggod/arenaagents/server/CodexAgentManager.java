@@ -322,16 +322,9 @@ public final class CodexAgentManager {
 			GoalPredicateWorldValidator.validate(
 					GoalPredicateWorldValidator.requireLevel(server, draft.dimensionId()), predicate);
 		}
-		validateGoalDraftPredicate(
-				predicate,
-				server.registryAccess(),
-				id -> {
-					Identifier identifier = Identifier.tryParse(id);
-					return identifier != null && server.getAdvancements().get(identifier) != null;
-				}
-		);
 		GoalSpec spec = GoalSpec.create(
 				draft.originalRequest(), predicate, draft.createdAtTick());
+		validateGoalForActivation(spec);
 		long now = System.currentTimeMillis();
 		AgentTransition transition = switch (operation) {
 			case START -> savedData.registry().start(draft.agentId(), spec, now);
@@ -359,6 +352,18 @@ public final class CodexAgentManager {
 				advancementExists
 		);
 		GoalInventoryCapacity.validateTranslated(predicate, registries);
+	}
+
+	public void validateGoalForActivation(GoalSpec spec) {
+		Objects.requireNonNull(spec, "spec must not be null");
+		validateGoalDraftPredicate(
+				spec.completion(),
+				server.registryAccess(),
+				id -> {
+					Identifier identifier = Identifier.tryParse(id);
+					return identifier != null && server.getAdvancements().get(identifier) != null;
+				}
+		);
 	}
 
 	static void validateLiveGoalIdentifiers(

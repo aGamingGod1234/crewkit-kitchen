@@ -317,6 +317,15 @@ public final class AgentRegistry {
 		return apply(AgentLifecycleReducer.promoteSatisfied(require(id), nowEpochMs));
 	}
 
+	public synchronized AgentTransition rejectQueuedGoal(
+			AgentId id,
+			UUID expectedGoalId,
+			String reason,
+			long nowEpochMs
+	) {
+		return apply(AgentLifecycleReducer.rejectQueuedGoal(require(id), expectedGoalId, reason, nowEpochMs));
+	}
+
 	/** Applies a coordinator-owned terminal state, promoting queued work when present. */
 	public synchronized AgentRecord coordinatorCompleted(AgentId id, long revision, long nowEpochMs) {
 		AgentRecord current = require(id);

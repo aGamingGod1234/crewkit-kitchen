@@ -227,13 +227,7 @@ public final class AgentLifecycleReducer {
 	}
 
 	public static AgentTransition promoteSatisfied(AgentRecord current, long nowEpochMs) {
-		requireState(current, "promote satisfied goal", AgentLifecycleState.COMPLETED);
-		AgentGoal completed = current.currentGoal().orElseThrow(
-				() -> new AgentDomainException("NO_CURRENT_GOAL", "Completed agent has no satisfied goal")
-		);
-		if (completed.status() != GoalStatus.SATISFIED) {
-			throw new AgentDomainException("GOAL_NOT_SATISFIED", "Queued work can be promoted only after factual satisfaction");
-		}
+		requireSatisfiedPromotionSource(current);
 		if (current.queuedGoals().isEmpty()) {
 			throw new AgentDomainException("NO_QUEUED_GOAL", "Agent has no queued goal to promote");
 		}
@@ -243,9 +237,34 @@ public final class AgentLifecycleReducer {
 				nextRevision(current),
 				current.queuedGoals().subList(1, current.queuedGoals().size()),
 				nowEpochMs,
-				""
+				current.lastError()
 		);
 		return transition(current, promoted, false, false);
+	}
+
+	public static AgentTransition rejectQueuedGoal(
+			AgentRecord current,
+			UUID expectedGoalId,
+			String reason,
+			long nowEpochMs
+	) {
+		requireSatisfiedPromotionSource(current);
+		if (current.queuedGoals().isEmpty()) {
+			throw new AgentDomainException("NO_QUEUED_GOAL", "Agent has no queued goal to reject");
+		}
+		AgentGoal queued = current.queuedGoals().getFirst();
+		if (!queued.goalId().equals(Objects.requireNonNull(expectedGoalId, "expectedGoalId must not be null"))) {
+			throw new AgentDomainException("STALE_QUEUED_GOAL", "Queued goal head changed before rejection");
+		}
+		AgentRecord rejected = current.withLifecycle(
+				AgentLifecycleState.COMPLETED,
+				current.currentGoal(),
+				current.goalRevision(),
+				current.queuedGoals().subList(1, current.queuedGoals().size()),
+				nowEpochMs,
+				AgentValidators.boundedText(reason, "error", AgentConstants.MAX_ERROR_LENGTH)
+		);
+		return transition(current, rejected, false, false);
 	}
 
 	public static AgentTransition fail(AgentRecord current, String message, long nowEpochMs) {
@@ -363,6 +382,17 @@ public final class AgentLifecycleReducer {
 
 	private static boolean isTerminal(AgentGoal goal) {
 		return goal.status() == GoalStatus.SATISFIED || goal.status() == GoalStatus.CANCELLED;
+	}
+
+	private static void requireSatisfiedPromotionSource(AgentRecord current) {
+		requireState(current, "promote satisfied goal", AgentLifecycleState.COMPLETED);
+		AgentGoal completed = current.currentGoal().orElseThrow(
+				() -> new AgentDomainException("NO_CURRENT_GOAL", "Completed agent has no satisfied goal")
+		);
+		if (completed.status() != GoalStatus.SATISFIED) {
+			throw new AgentDomainException(
+					"GOAL_NOT_SATISFIED", "Queued work can be promoted only after factual satisfaction");
+		}
 	}
 
 	private static long nextRevision(AgentRecord current) {

@@ -54,6 +54,7 @@ import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
 import dev.agaminggod.arenaagents.protocol.ProtocolException;
 import dev.agaminggod.arenaagents.server.GoalControlVerification;
 import dev.agaminggod.arenaagents.server.GoalDraftAdvancementRevalidationVerification;
+import dev.agaminggod.arenaagents.server.QueuedGoalRevalidationVerification;
 import dev.agaminggod.arenaagents.server.AgentSavedDataGoalDraftVerification;
 import dev.agaminggod.arenaagents.server.goal.GoalCompilerVerification;
 import dev.agaminggod.arenaagents.server.conversation.AgentConversationRouterVerification;
@@ -181,6 +182,7 @@ public final class VerificationMain {
 		passedAssertions += MinecraftWalkabilityViewVerification.verify();
 		passedAssertions += GoalControlVerification.verify();
 		passedAssertions += GoalDraftAdvancementRevalidationVerification.verify();
+		passedAssertions += QueuedGoalRevalidationVerification.verify();
 		passedAssertions += AgentSavedDataGoalDraftVerification.verify();
 		passedAssertions += GoalCompilerVerification.verify();
 		passedAssertions += AgentConversationRouterVerification.verify();

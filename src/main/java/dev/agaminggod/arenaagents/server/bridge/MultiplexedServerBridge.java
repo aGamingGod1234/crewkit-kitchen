@@ -1991,7 +1991,8 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				manager.registry(),
 				agentId -> manager.findAgentPlayer(agentId).map(GoalCompletionVerifier::minecraftFacts),
 				() -> manager.server() == null ? 0L : manager.server().getTickCount(),
-				System::currentTimeMillis
+				System::currentTimeMillis,
+				manager::validateGoalForActivation
 		);
 	}
 
