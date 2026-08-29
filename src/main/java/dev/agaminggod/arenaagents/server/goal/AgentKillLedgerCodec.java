@@ -127,14 +127,22 @@ public final class AgentKillLedgerCodec {
 						exactFields(entry, PROGRESS_FIELDS_V2, "kill progress");
 						long afterExclusive = exactLong(entry, "after_exclusive");
 						boolean afterGoalStart = afterExclusive != Long.MIN_VALUE;
+						AgentId agentId = AgentId.parse(string(entry, "agent_id"));
+						String entityType = string(entry, "entity_type");
+						int requiredCount = exactInt(entry, "required_count");
+						int evictedCount = exactInt(entry, "evicted_count");
+						long boundary = afterGoalStart ? lastSequence : 0L;
+						int migratedCount = afterGoalStart
+								? migratedCount(decoded, agentId, entityType, afterExclusive, requiredCount, evictedCount)
+								: evictedCount;
 						decodedProgress.add(new AgentKillLedger.ProgressEvent(
 								UUID.fromString(string(entry, "goal_id")),
-								AgentId.parse(string(entry, "agent_id")),
-								string(entry, "entity_type"),
+								agentId,
+								entityType,
 								afterGoalStart,
-								afterGoalStart ? migratedBoundary(decoded, afterExclusive) : 0L,
-								exactInt(entry, "required_count"),
-								exactInt(entry, "evicted_count")
+								boundary,
+								requiredCount,
+								migratedCount
 						));
 					}
 				}
@@ -148,12 +156,24 @@ public final class AgentKillLedgerCodec {
 		}
 	}
 
-	private static long migratedBoundary(List<AgentKillLedger.KillEvent> events, long afterExclusive) {
-		long boundary = 0L;
+	private static int migratedCount(
+			List<AgentKillLedger.KillEvent> events,
+			AgentId agentId,
+			String entityType,
+			long afterExclusive,
+			int requiredCount,
+			int evictedCount
+	) {
+		int count = evictedCount;
 		for (AgentKillLedger.KillEvent event : events) {
-			if (event.occurredAtEpochMs() <= afterExclusive) boundary = Math.max(boundary, event.sequence());
+			if (count >= requiredCount) break;
+			if (event.agentId().equals(agentId)
+					&& event.entityType().equals(entityType)
+					&& event.occurredAtEpochMs() > afterExclusive) {
+				count++;
+			}
 		}
-		return boundary;
+		return count;
 	}
 
 	private static void exactFields(JsonObject object, Set<String> fields, String label) {

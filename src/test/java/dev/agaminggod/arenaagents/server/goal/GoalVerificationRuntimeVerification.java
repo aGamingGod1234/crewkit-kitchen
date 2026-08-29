@@ -41,6 +41,7 @@ public final class GoalVerificationRuntimeVerification {
 		assertions += verifyKillGoalAfterServerTickReset();
 		assertions += verifyPersistedKillProgressAcrossRestart();
 		assertions += verifyLegacySchemaOneActiveKillProgressMigration();
+		assertions += verifyLegacyKillMigrationAcrossClockRollback();
 		assertions += verifyActiveKillProgressSurvivesLedgerEviction();
 		assertions += verifyPersistedKillActivationFencing();
 		assertions += verifyKillLedgerPersistenceCompatibility();
@@ -343,6 +344,47 @@ public final class GoalVerificationRuntimeVerification {
 		return 6;
 	}
 
+	private static int verifyLegacyKillMigrationAcrossClockRollback() {
+		long goalStartedAt = 42_000L;
+		AgentId agentId = AgentId.random();
+		UUID goalId = UUID.randomUUID();
+		String schemaOne = "{\"schema_version\":1,\"events\":["
+				+ "{\"agent_id\":\"" + agentId
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":41999},"
+				+ "{\"agent_id\":\"" + agentId
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":42001},"
+				+ "{\"agent_id\":\"" + agentId
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":41998},"
+				+ "{\"agent_id\":\"" + agentId
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":42000}]}";
+		AgentKillLedgerCodec codec = new AgentKillLedgerCodec();
+		AgentKillLedger.Snapshot pendingMigration = codec.decode(schemaOne);
+		String savedBeforeSync = codec.encode(pendingMigration);
+		assertEquals(1, JsonParser.parseString(savedBeforeSync).getAsJsonObject()
+				.get("schema_version").getAsInt(),
+				"saving before synchronization retains exact legacy timestamps");
+
+		AgentKillLedger migrated = new AgentKillLedger(codec.decode(savedBeforeSync), () -> { });
+		migrated.synchronizeProgress(List.of(new AgentKillLedger.KillProgressRequirement(
+				goalId, agentId, "minecraft:zombie", true, goalStartedAt, 2)));
+		assertEquals(1, migrated.count(goalId, agentId, "minecraft:zombie", true),
+				"clock rollback cannot fence an earlier qualifying legacy kill");
+		migrated.record(agentId, "minecraft:zombie", goalStartedAt - 100L);
+		assertEquals(2, migrated.count(goalId, agentId, "minecraft:zombie", true),
+				"new sequence-fenced kills remain eligible after a later clock rollback");
+
+		AgentId noisyAgent = AgentId.random();
+		for (int index = 0; index < AgentKillLedger.MAX_EVENTS; index++) {
+			migrated.record(noisyAgent, "minecraft:skeleton", goalStartedAt + index);
+		}
+		AgentKillLedger restarted = new AgentKillLedger(codec.decode(codec.encode(migrated.snapshot())), () -> { });
+		restarted.synchronizeProgress(List.of(new AgentKillLedger.KillProgressRequirement(
+				goalId, agentId, "minecraft:zombie", true, goalStartedAt, 2)));
+		assertEquals(2, restarted.count(goalId, agentId, "minecraft:zombie", true),
+				"migrated qualifying progress survives compaction and restart");
+		return 4;
+	}
+
 	private static int verifyPersistedKillActivationFencing() {
 		AgentSavedData data = new AgentSavedData();
 		long now = 50_000L;
@@ -450,18 +492,20 @@ public final class GoalVerificationRuntimeVerification {
 				"schema-one kill ledgers upgrade with empty compacted progress");
 		UUID legacyGoalId = UUID.randomUUID();
 		String schemaTwo = "{\"schema_version\":2,\"events\":[{\"agent_id\":\"" + agentId
-				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":7}],\"progress\":[{"
+				+ "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":7},{\"agent_id\":\""
+				+ agentId + "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":8},{\"agent_id\":\""
+				+ agentId + "\",\"entity_type\":\"minecraft:zombie\",\"occurred_at_epoch_ms\":6}],\"progress\":[{"
 				+ "\"goal_id\":\"" + legacyGoalId + "\",\"agent_id\":\"" + agentId
 				+ "\",\"entity_type\":\"minecraft:zombie\",\"after_exclusive\":7,"
-				+ "\"required_count\":1,\"evicted_count\":0}]}";
+				+ "\"required_count\":2,\"evicted_count\":0}]}";
 		AgentKillLedger migrated = new AgentKillLedger(codec.decode(schemaTwo), () -> { });
 		migrated.synchronizeProgress(List.of(new AgentKillLedger.KillProgressRequirement(
-				legacyGoalId, agentId, "minecraft:zombie", true, 7L, 1)));
-		assertEquals(0, migrated.count(legacyGoalId, agentId, "minecraft:zombie", true),
-				"schema-two timestamps migrate to an exclusive sequence boundary");
-		migrated.record(agentId, "minecraft:zombie", 7L);
+				legacyGoalId, agentId, "minecraft:zombie", true, 7L, 2)));
 		assertEquals(1, migrated.count(legacyGoalId, agentId, "minecraft:zombie", true),
-				"migrated schema accepts a later event with the same timestamp");
+				"schema-two migration preserves qualifying progress across clock rollback");
+		migrated.record(agentId, "minecraft:zombie", 6L);
+		assertEquals(2, migrated.count(legacyGoalId, agentId, "minecraft:zombie", true),
+				"migrated schema uses sequence order after clock rollback");
 		String unsupported = encoded.replace("\"schema_version\":3", "\"schema_version\":4");
 		try {
 			codec.decode(unsupported);

@@ -130,12 +130,15 @@ public final class AgentKillLedger {
 		Map<ProgressKey, Progress> next = new HashMap<>();
 		for (Map.Entry<ProgressKey, KillProgressRequirement> entry : desired.entrySet()) {
 			Progress previous = progress.get(entry.getKey());
+			if (previous == null) {
+				next.put(entry.getKey(), initialProgress(entry.getKey(), entry.getValue()));
+				continue;
+			}
 			int requiredCount = entry.getValue().requiredCount();
-			int credited = previous == null ? 0 : Math.min(previous.evictedCount(), requiredCount);
-			long boundary = previous == null
-					? initialBoundary(entry.getKey(), entry.getValue())
-					: previous.afterSequenceExclusive();
-			next.put(entry.getKey(), new Progress(requiredCount, credited, boundary));
+			next.put(entry.getKey(), new Progress(
+					requiredCount,
+					Math.min(previous.evictedCount(), requiredCount),
+					previous.afterSequenceExclusive()));
 		}
 		boolean completedLegacyMigration = legacyTimestampProgressMigration;
 		legacyTimestampProgressMigration = false;
@@ -147,16 +150,16 @@ public final class AgentKillLedger {
 		}
 	}
 
-	private long initialBoundary(ProgressKey key, KillProgressRequirement requirement) {
-		if (!key.afterGoalStart()) return 0L;
-		if (!legacyTimestampProgressMigration) return lastSequence;
-		long boundary = 0L;
-		for (Kill kill : kills) {
-			if (kill.occurredAt() <= requirement.goalStartedAtEpochMs()) {
-				boundary = Math.max(boundary, kill.sequence());
-			}
-		}
-		return boundary;
+	private Progress initialProgress(ProgressKey key, KillProgressRequirement requirement) {
+		int requiredCount = requirement.requiredCount();
+		if (!key.afterGoalStart()) return new Progress(requiredCount, 0, 0L);
+		if (!legacyTimestampProgressMigration) return new Progress(requiredCount, 0, lastSequence);
+		OrderedLongSeries legacyTimes = killTimesByAgentAndType.get(
+				new KillKey(key.agentId(), key.entityType()));
+		int qualifying = legacyTimes == null
+				? 0
+				: legacyTimes.countAfter(requirement.goalStartedAtEpochMs()).count();
+		return new Progress(requiredCount, Math.min(qualifying, requiredCount), lastSequence);
 	}
 
 	private void rebuildProgressIndex() {
