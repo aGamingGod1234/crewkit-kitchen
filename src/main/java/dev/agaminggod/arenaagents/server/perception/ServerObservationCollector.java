@@ -438,30 +438,32 @@ public final class ServerObservationCollector {
 			ServerPlayer agent,
 			List<RawSpatialObservation.BlockCandidate> candidates
 	) {
-		ArrayList<BlockObservationOrdering.Candidate> visible = new ArrayList<>();
+		ArrayList<BlockObservationOrdering.Candidate> relative = new ArrayList<>(candidates.size());
 		BlockPos center = agent.blockPosition();
 		for (RawSpatialObservation.BlockCandidate candidate : candidates) {
-			BlockPos position = new BlockPos(candidate.x(), candidate.y(), candidate.z());
-			if (ObservationVisibility.canSeeBlock(level, agent, position)) {
-				visible.add(new BlockObservationOrdering.Candidate(
-						candidate.x() - center.getX(), candidate.y() - center.getY(), candidate.z() - center.getZ(),
-						candidate.blockId()));
-			}
+			relative.add(new BlockObservationOrdering.Candidate(
+					candidate.x() - center.getX(), candidate.y() - center.getY(), candidate.z() - center.getZ(),
+					candidate.blockId()));
 		}
 		JsonArray values = new JsonArray();
-		for (BlockObservationOrdering.Candidate candidate :
-				BlockObservationOrdering.select(visible, MAX_BLOCKS, MAX_BLOCKS_PER_TYPE)) {
+		for (BlockObservationOrdering.Candidate candidate : BlockObservationOrdering.select(
+				relative,
+				MAX_BLOCKS,
+				MAX_BLOCKS_PER_TYPE,
+				selectable -> ObservationVisibility.canSeeBlock(
+						level, agent, center.offset(selectable.x(), selectable.y(), selectable.z()))
+		)) {
 			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());
+			BlockState state = level.getBlockState(position);
 			JsonObject json = new JsonObject();
 			json.addProperty("x", position.getX());
 			json.addProperty("y", position.getY());
 			json.addProperty("z", position.getZ());
 			json.addProperty("blockId", candidate.blockId());
-			json.add("tags", tags(level.getBlockState(position).typeHolder()));
+			json.add("tags", tags(state.typeHolder()));
 			JsonArray placeableFaces = new JsonArray();
-			BlockState supportState = level.getBlockState(position);
 			BlockPlacementAttemptPolicy.supportedFaces(face ->
-					supportState.isFaceSturdy(level, position, face)
+					state.isFaceSturdy(level, position, face)
 							&& level.getBlockState(position.relative(face)).canBeReplaced()
 							&& agent.isWithinBlockInteractionRange(position, 1.0D)
 			).forEach(face -> placeableFaces.add(face.getSerializedName()));
