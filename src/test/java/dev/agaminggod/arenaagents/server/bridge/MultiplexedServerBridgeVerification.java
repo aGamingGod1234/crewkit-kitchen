@@ -249,7 +249,10 @@ public final class MultiplexedServerBridgeVerification {
 					return ledger.pendingCount() == 0;
 				}, "replacement acknowledgement removes the replayed result");
 				bridge.tick();
-				assertTrue(!replacementReader.ready(), "acknowledged terminal result is not replayed again");
+				while (replacementReader.ready()) {
+					assertTrue(!"action_result".equals(codec.decode(replacementReader.readLine()).type()),
+							"acknowledged terminal result is not replayed again");
+				}
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("terminal replay disconnect revision verification failed", exception);
@@ -473,7 +476,8 @@ public final class MultiplexedServerBridgeVerification {
 				malformedId.addProperty("requestId", "not-a-uuid");
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-invalid-id", malformedId));
-				BridgeEnvelope malformedRejected = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope malformedRejected = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("rejected", malformedRejected.payload().get("status").getAsString(),
 						"malformed proposal identity receives an explicit rejection");
 				assertEquals("INVALID_GOAL_SPEC_REQUEST_ID", malformedRejected.payload().get("reasonCode").getAsString(),
@@ -482,7 +486,8 @@ public final class MultiplexedServerBridgeVerification {
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-million", goalSpecProposal(
 								requestId, new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1_000_000))));
-				BridgeEnvelope millionRejected = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope millionRejected = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("rejected", millionRejected.payload().get("status").getAsString(),
 						"translated million-item inventory goal is rejected");
 				assertEquals("INVALID_GOAL_PREDICATE", millionRejected.payload().get("reasonCode").getAsString(),
@@ -496,7 +501,8 @@ public final class MultiplexedServerBridgeVerification {
 				));
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-compound-overflow", goalSpecProposal(requestId, compoundOverflow)));
-				BridgeEnvelope compoundRejected = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope compoundRejected = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("rejected", compoundRejected.payload().get("status").getAsString(),
 						"translated duplicate inventory requirements are summed before validation");
 				assertEquals("INVALID_GOAL_PREDICATE", compoundRejected.payload().get("reasonCode").getAsString(),
@@ -507,7 +513,8 @@ public final class MultiplexedServerBridgeVerification {
 				JsonObject proposal = goalSpecProposal(requestId, "minecraft:iron_pickaxe");
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-1", proposal));
-				BridgeEnvelope accepted = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope accepted = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("goal_spec_result", accepted.type(), "valid proposal receives an explicit acknowledgement");
 				assertEquals("accepted", accepted.payload().get("status").getAsString(), "valid proposal is staged");
 				assertEquals(new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1),
@@ -518,12 +525,14 @@ public final class MultiplexedServerBridgeVerification {
 
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-2", proposal));
-				assertEquals("accepted", pollBridgeResponse(bridge, socket, reader, codec).payload().get("status").getAsString(),
+				assertEquals("accepted", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null).payload().get("status").getAsString(),
 						"identical proposal replay is idempotent");
 
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-3", goalSpecProposal(requestId, "minecraft:diamond_pickaxe")));
-				BridgeEnvelope rejected = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope rejected = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("rejected", rejected.payload().get("status").getAsString(), "changed proposal replay is rejected");
 				assertEquals("GOAL_DRAFT_PROPOSAL_CONFLICT", rejected.payload().get("reasonCode").getAsString(),
 						"changed proposal replay reports the stable conflict code");
@@ -536,7 +545,8 @@ public final class MultiplexedServerBridgeVerification {
 				));
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-wrong-intent", goalSpecProposal(nonTranslationId, "minecraft:iron_pickaxe")));
-				BridgeEnvelope intentRejected = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope intentRejected = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("GOAL_DRAFT_INTENT_MISMATCH", intentRejected.payload().get("reasonCode").getAsString(),
 						"coordinator proposals cannot populate non-translation drafts");
 
@@ -553,7 +563,8 @@ public final class MultiplexedServerBridgeVerification {
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-kill-operator-bypass",
 						goalSpecProposal(countedKillId, new GoalPredicate.OperatorConfirmed())));
-				BridgeEnvelope operatorBypass = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope operatorBypass = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
 						operatorBypass.payload().get("reasonCode").getAsString(),
 						"operator confirmation cannot bypass a server-authored kill count");
@@ -561,7 +572,8 @@ public final class MultiplexedServerBridgeVerification {
 						"goal_spec_proposal", "proposal-kill-undercount",
 						goalSpecProposal(countedKillId,
 								new GoalPredicate.EntityKilledByAgent("minecraft:zombie", true))));
-				BridgeEnvelope undercounted = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope undercounted = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
 						undercounted.payload().get("reasonCode").getAsString(),
 						"one translated kill cannot satisfy a server-authored count of three");
@@ -593,14 +605,16 @@ public final class MultiplexedServerBridgeVerification {
 						"goal_spec_proposal", "proposal-item-undercount",
 						goalSpecProposal(countedItemId,
 								new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 1))));
-				BridgeEnvelope itemUndercount = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope itemUndercount = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
 						itemUndercount.payload().get("reasonCode").getAsString(),
 						"one translated item cannot satisfy a server-authored count of three");
 				writeEnvelope(socket, codec, new BridgeEnvelope(2, hello.serverInstanceId(), idle.agentId().toString(),
 						"goal_spec_proposal", "proposal-item-operator-bypass",
 						goalSpecProposal(countedItemId, new GoalPredicate.OperatorConfirmed())));
-				BridgeEnvelope itemOperatorBypass = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope itemOperatorBypass = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
 						itemOperatorBypass.payload().get("reasonCode").getAsString(),
 						"operator confirmation cannot bypass a server-authored item count");
@@ -609,7 +623,8 @@ public final class MultiplexedServerBridgeVerification {
 						goalSpecProposal(countedItemId, new GoalPredicate.AnyOf(List.of(
 								new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3),
 								new GoalPredicate.OperatorConfirmed())))));
-				BridgeEnvelope itemAnyOfBypass = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope itemAnyOfBypass = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null);
 				assertEquals("GOAL_TRANSLATION_CONSTRAINT_MISMATCH",
 						itemAnyOfBypass.payload().get("reasonCode").getAsString(),
 						"an operator-confirmed any-of branch cannot bypass a server-authored item count");
@@ -617,7 +632,8 @@ public final class MultiplexedServerBridgeVerification {
 						"goal_spec_proposal", "proposal-item-valid",
 						goalSpecProposal(countedItemId,
 								new GoalPredicate.InventoryContains("minecraft:iron_pickaxe", 3))));
-				assertEquals("accepted", pollBridgeResponse(bridge, socket, reader, codec)
+				assertEquals("accepted", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_spec_result", null)
 						.payload().get("status").getAsString(),
 						"the bridge accepts a translated item predicate that preserves the requested count");
 
@@ -1022,11 +1038,20 @@ public final class MultiplexedServerBridgeVerification {
 				invokeUrgentObservation(bridge, pending.agentId());
 				assertEquals(0, bridge.observationPublicationForVerification().pendingCount(),
 						"pending registration cannot enter the urgent observation queue");
-				bridge.tick();
-				bridge.tick();
-				assertTrue(bridge.observationPublicationForVerification().takeHeartbeat(registered.agentId()),
-						"registered agent remains eligible for heartbeat publication");
-				assertTrue(!bridge.observationPublicationForVerification().takeHeartbeat(pending.agentId()),
+				MultiplexedServerBridge.ObservationPublication publication =
+						bridge.observationPublicationForVerification();
+				publication.scheduleIdleHeartbeat(
+						MultiplexedServerBridge.registeredObservationIds(manager.coordinatorVisibleRecords())
+				);
+				AtomicReference<AgentId> heartbeatAgent = new AtomicReference<>();
+				publication.drain(agentId -> {
+					heartbeatAgent.set(agentId);
+					assertTrue(publication.takeHeartbeat(agentId),
+							"registered agent remains eligible for heartbeat publication");
+				});
+				assertEquals(registered.agentId(), heartbeatAgent.get(),
+						"heartbeat scheduling selects the registered agent");
+				assertTrue(!publication.takeHeartbeat(pending.agentId()),
 						"pending registration cannot enter the heartbeat queue");
 				AgentRecord beforeConversation = manager.registry().require(pending.agentId());
 				ConversationEvent pendingMessage = new ConversationEvent(
@@ -1050,7 +1075,8 @@ public final class MultiplexedServerBridgeVerification {
 						2, helloAck.serverInstanceId(), "server", "heartbeat",
 						"heartbeat-after-pending-conversation", new JsonObject()
 				));
-				assertEquals("heartbeat", pollBridgeResponse(bridge, socket, reader, codec).type(),
+				assertEquals("heartbeat", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "heartbeat", pending.agentId()).type(),
 						"pending direct message emits neither conversation_event nor conversation_wake");
 
 				AgentTransition pendingStart = manager.registry().start(
@@ -1061,7 +1087,8 @@ public final class MultiplexedServerBridgeVerification {
 						2, helloAck.serverInstanceId(), "server", "heartbeat",
 						"heartbeat-after-pending-transition", new JsonObject()
 				));
-				assertEquals("heartbeat", pollBridgeResponse(bridge, socket, reader, codec).type(),
+				assertEquals("heartbeat", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "heartbeat", pending.agentId()).type(),
 						"a pending agent cannot publish lifecycle frames before agent_registered");
 
 				bridge.onRemoved(pending.agentId(), pendingStart.after().goalRevision() + 1L);
@@ -1069,11 +1096,13 @@ public final class MultiplexedServerBridgeVerification {
 						2, helloAck.serverInstanceId(), "server", "heartbeat",
 						"heartbeat-after-pending-removal", new JsonObject()
 				));
-				assertEquals("heartbeat", pollBridgeResponse(bridge, socket, reader, codec).type(),
+				assertEquals("heartbeat", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "heartbeat", pending.agentId()).type(),
 						"removing a never-registered pending agent emits no unknown agent_removed frame");
 
 				invokePendingRegistrationPublication(manager, pendingStart.after());
-				BridgeEnvelope registration = codec.decode(reader.readLine());
+				BridgeEnvelope registration = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "agent_registered", pending.agentId());
 				assertEquals("agent_registered", registration.type(),
 						"verified registration is the first frame published for the new agent");
 				assertEquals(pending.agentId().toString(), registration.agentId(),
@@ -1093,7 +1122,8 @@ public final class MultiplexedServerBridgeVerification {
 						2, helloAck.serverInstanceId(), "server", "heartbeat",
 						"heartbeat-before-agent-ready", new JsonObject()
 				));
-				assertEquals("heartbeat", pollBridgeResponse(bridge, socket, reader, codec).type(),
+				assertEquals("heartbeat", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "heartbeat", null).type(),
 						"queued registration does not accept conversation frames before coordinator readiness");
 
 				JsonObject ready = new JsonObject();
@@ -1107,10 +1137,12 @@ public final class MultiplexedServerBridgeVerification {
 					return manager.registry().require(pending.agentId()).state() == AgentLifecycleState.PLANNING;
 				}, "coordinator readiness completes the pending registration boundary");
 				activeBridge.publishConversationEvent(awaitingCoordinatorReady, Optional.empty());
-				assertEquals("conversation_event", codec.decode(reader.readLine()).type(),
+				assertEquals("conversation_event", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "conversation_event", null).type(),
 						"conversation publication begins after coordinator readiness is acknowledged");
 				bridge.onTransition(pendingStart);
-				BridgeEnvelope lifecycle = codec.decode(reader.readLine());
+				BridgeEnvelope lifecycle = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_control", null);
 				assertEquals("goal_control", lifecycle.type(),
 						"lifecycle publication follows the successful agent_registered frame");
 				assertEquals(List.of(registered, manager.registry().require(pending.agentId())), manager.coordinatorVisibleRecords(),
@@ -1159,6 +1191,9 @@ public final class MultiplexedServerBridgeVerification {
 				awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
 						"agent_removed backpressure closes the stale coordinator session");
 			}
+			awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
+					"agent_removed backpressure schedules coordinator reconciliation");
+			bridge.tick();
 
 			try (Socket replacement = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(replacement.getInputStream(), StandardCharsets.UTF_8))) {
@@ -1210,7 +1245,8 @@ public final class MultiplexedServerBridgeVerification {
 				writeEnvelope(first, codec, new BridgeEnvelope(
 						2, firstAck.serverInstanceId(), "server", "catalog_snapshot", "old-session-empty-catalog", emptyCatalog
 				));
-				assertEquals("catalog_request", pollBridgeResponse(bridge, first, firstReader, codec).type(),
+				assertEquals("catalog_request", pollBridgeResponseOfType(
+						bridge, first, firstReader, codec, "catalog_request", null).type(),
 						"old session owns its catalog discovery request");
 			}
 			MultiplexedServerBridge activeBridge = bridge;
@@ -1220,25 +1256,33 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket replacement = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader replacementReader = new BufferedReader(new InputStreamReader(replacement.getInputStream(), StandardCharsets.UTF_8))) {
 				replacement.setSoTimeout(2_000);
-				BridgeEnvelope replacementAck = authenticate(
-						replacement, replacementReader, codec, secret, "hello-fast-replacement"
+				BridgeEnvelope replacementAck = authenticateWithTicks(
+						bridge, replacement, replacementReader, codec, secret, "hello-fast-replacement"
 				);
-				assertEquals(started.after().goalRevision(),
+				AgentRecord reconciled = manager.registry().require(active.agentId());
+				assertEquals(reconciled.goalRevision(),
 						replacementAck.payload().getAsJsonArray("registry").get(0).getAsJsonObject().get("goalRevision").getAsLong(),
-						"replacement handshake snapshots the still-active authoritative revision");
-				bridge.tick();
-				assertEquals(AgentLifecycleState.STARTING, manager.registry().require(active.agentId()).state(),
-						"replacement authentication consumes the old session disconnect without disconnecting the agent");
+						"replacement handshake snapshots the reconciled authoritative revision");
+				assertEquals(AgentLifecycleState.DISCONNECTED, reconciled.state(),
+						"replacement authentication waits for old-session disconnect reconciliation");
 				long staleRetryDeadline = System.nanoTime() + 150_000_000L;
 				while (System.nanoTime() < staleRetryDeadline) {
 					bridge.tick();
 					Thread.sleep(1L);
 				}
-				assertEquals(0, replacement.getInputStream().available(),
-						"replacement session never receives the closed session catalog retry");
+				while (replacement.getInputStream().available() > 0) {
+					BridgeEnvelope response = codec.decode(replacementReader.readLine());
+					assertTrue(!"catalog_request".equals(response.type()),
+							"replacement session never receives the closed session catalog retry");
+				}
 
+				AgentTransition resumed = manager.registry().resume(active.agentId(), 1_502L);
+				bridge.onTransition(resumed);
+				assertEquals("goal_control", pollBridgeResponseOfType(
+						bridge, replacement, replacementReader, codec, "goal_control", null).type(),
+						"replacement session receives the resumed authoritative goal");
 				JsonObject ready = new JsonObject();
-				ready.addProperty("goalRevision", started.after().goalRevision());
+				ready.addProperty("goalRevision", resumed.after().goalRevision());
 				writeEnvelope(replacement, codec, new BridgeEnvelope(
 						2, replacementAck.serverInstanceId(), active.agentId().toString(), "agent_ready",
 						"ready-after-fast-replacement", ready
@@ -1246,7 +1290,7 @@ public final class MultiplexedServerBridgeVerification {
 				awaitCondition(() -> {
 					activeBridge.tick();
 					return manager.registry().require(active.agentId()).state() == AgentLifecycleState.PLANNING;
-				}, "replacement agent_ready for the snapshotted revision remains current");
+				}, "replacement agent_ready for the resumed authoritative revision remains current");
 			}
 		} catch (Exception exception) {
 			throw new AssertionError("replacement handshake disconnect ordering verification failed", exception);
@@ -1316,7 +1360,8 @@ public final class MultiplexedServerBridgeVerification {
 				writeEnvelope(socket, codec, new BridgeEnvelope(
 						2, helloAck.serverInstanceId(), "server", "heartbeat", "heartbeat-after-recovery", new JsonObject()
 				));
-				BridgeEnvelope heartbeat = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope heartbeat = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "heartbeat", null);
 				assertEquals("heartbeat", heartbeat.type(),
 						"infrastructure recovery emits no player resume command");
 				assertEquals(AgentLifecycleState.STARTING, manager.registry().require(disconnected.agentId()).state(),
@@ -1351,7 +1396,8 @@ public final class MultiplexedServerBridgeVerification {
 				writeEnvelope(socket, codec, new BridgeEnvelope(
 						2, helloAck.serverInstanceId(), "server", "heartbeat", "heartbeat-after-paused-ready", new JsonObject()
 				));
-				assertEquals("heartbeat", pollBridgeResponse(bridge, socket, reader, codec).type(),
+				assertEquals("heartbeat", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "heartbeat", null).type(),
 						"explicitly paused reconciliation emits no automatic resume control");
 				assertEquals(AgentLifecycleState.PAUSED, manager.registry().require(paused.agentId()).state(),
 						"explicitly paused agent remains paused after authenticated reconciliation");
@@ -1409,7 +1455,8 @@ public final class MultiplexedServerBridgeVerification {
 						2, helloAck.serverInstanceId(), "server", "heartbeat",
 						"heartbeat-after-stale-agent-error", new JsonObject()
 				));
-				assertEquals("heartbeat", pollBridgeResponse(bridge, socket, reader, codec).type(),
+				assertEquals("heartbeat", pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "heartbeat", null).type(),
 						"stale agent_error leaves the authenticated bridge usable");
 
 				AgentRecord afterStale = manager.registry().require(active.agentId());
@@ -1429,7 +1476,8 @@ public final class MultiplexedServerBridgeVerification {
 						"agent-error-current", currentError
 				));
 
-				BridgeEnvelope failure = pollBridgeResponse(bridge, socket, reader, codec);
+				BridgeEnvelope failure = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "goal_control", null);
 				assertEquals("goal_control", failure.type(),
 						"current agent_error publishes a lifecycle failure control");
 				assertEquals("fail", failure.payload().get("operation").getAsString(),
@@ -1776,6 +1824,8 @@ public final class MultiplexedServerBridgeVerification {
 				JsonObject published = acknowledgement.payload().getAsJsonArray("registry").get(0).getAsJsonObject();
 				assertEquals(AgentLifecycleState.STARTING.name(), published.get("state").getAsString(),
 						"transition during authentication is folded into the retried handshake snapshot");
+				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
+						"transition fixture consumes the handshake verbose-control frame");
 				socket.setSoTimeout(150);
 				try {
 					reader.readLine();
@@ -2001,7 +2051,8 @@ public final class MultiplexedServerBridgeVerification {
 				}, "conversation fixture acknowledges coordinator readiness before publishing a wake");
 
 				bridge.publishConversationEvent(event, Optional.of(testGoal("Respond to the player message.")));
-				BridgeEnvelope wake = codec.decode(reader.readLine());
+				BridgeEnvelope wake = pollBridgeResponseOfType(
+						bridge, socket, reader, codec, "conversation_wake", null);
 				assertEquals("conversation_wake", wake.type(), "conversation and lifecycle start cross the wire as one transaction");
 				transactionId = wake.payload().get("transactionId").getAsString();
 				assertEquals(
@@ -2444,6 +2495,9 @@ public final class MultiplexedServerBridgeVerification {
 		@Override public boolean isSingleplayerOwner(net.minecraft.server.players.NameAndId profile) { return false; }
 		@Override public int getMaxPlayers() { return 0; }
 		@Override public PlayerList getPlayerList() { return playerList; }
+		@Override public net.minecraft.core.RegistryAccess.Frozen registryAccess() {
+			return net.minecraft.core.RegistryAccess.EMPTY;
+		}
 	}
 
 	private static final class EmptyPlayerList extends PlayerList {
@@ -2453,6 +2507,7 @@ public final class MultiplexedServerBridgeVerification {
 
 		@Override public ServerPlayer getPlayer(UUID uuid) { return null; }
 		@Override public ServerPlayer getPlayerByName(String name) { return null; }
+		@Override public void broadcastSystemMessage(net.minecraft.network.chat.Component message, boolean overlay) { }
 	}
 
 	private static final class ShutdownRaceServerSocket extends ServerSocket {
@@ -2572,7 +2627,11 @@ public final class MultiplexedServerBridgeVerification {
 			String messageId
 	) throws Exception {
 		writeHello(socket, codec, secret, launchId, messageId);
-		return codec.decode(reader.readLine());
+		BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
+		assertEquals("hello_ack", acknowledgement.type(), "launch fixture authenticates the session");
+		assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
+				"launch fixture consumes verbose control");
+		return acknowledgement;
 	}
 
 	private static void writeHello(
@@ -2639,6 +2698,30 @@ public final class MultiplexedServerBridgeVerification {
 		throw new AssertionError("bridge did not publish a response");
 	}
 
+	private static BridgeEnvelope pollBridgeResponseOfType(
+			MultiplexedServerBridge bridge,
+			Socket socket,
+			BufferedReader reader,
+			BridgeEnvelopeCodec codec,
+			String expectedType,
+			AgentId excludedAgent
+	) throws Exception {
+		long deadline = System.nanoTime() + 2_000_000_000L;
+		while (System.nanoTime() < deadline) {
+			BridgeEnvelope response = pollBridgeResponse(bridge, socket, reader, codec);
+			if (expectedType.equals(response.type())) return response;
+			if ((excludedAgent != null && excludedAgent.toString().equals(response.agentId()))
+					|| "conversation_event".equals(response.type())
+					|| "conversation_wake".equals(response.type())) {
+				throw new AssertionError("pending agent leaked a bridge publication: " + response.type());
+			}
+			if (!"observation".equals(response.type()) && !"catalog_discovery_request".equals(response.type())) {
+				throw new AssertionError("unexpected bridge response before " + expectedType + ": " + response.type());
+			}
+		}
+		throw new AssertionError("bridge did not publish " + expectedType + " within the bounded response window");
+	}
+
 	private static BridgeEnvelope authenticate(
 			Socket socket,
 			BufferedReader reader,
@@ -2654,6 +2737,27 @@ public final class MultiplexedServerBridgeVerification {
 		BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
 		assertEquals("hello_ack", acknowledgement.type(), "replacement fixture authenticates the session");
 		assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
+				"replacement fixture consumes verbose control");
+		return acknowledgement;
+	}
+
+	private static BridgeEnvelope authenticateWithTicks(
+			MultiplexedServerBridge bridge,
+			Socket socket,
+			BufferedReader reader,
+			BridgeEnvelopeCodec codec,
+			String secret,
+			String messageId
+	) throws Exception {
+		JsonObject hello = new JsonObject();
+		hello.addProperty("secret", secret);
+		writeEnvelope(socket, codec, new BridgeEnvelope(
+				2, "coordinator", "server", "hello", messageId, hello
+		));
+		BridgeEnvelope acknowledgement = pollBridgeResponseOfType(
+				bridge, socket, reader, codec, "hello_ack", null);
+		assertEquals("verbose_control", pollBridgeResponseOfType(
+				bridge, socket, reader, codec, "verbose_control", null).type(),
 				"replacement fixture consumes verbose control");
 		return acknowledgement;
 	}
