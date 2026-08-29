@@ -86,6 +86,7 @@ import dev.agaminggod.arenaagents.server.bridge.AgentVerboseVerification;
 import dev.agaminggod.arenaagents.server.bridge.SingleBrainBoundaryVerification;
 import dev.agaminggod.arenaagents.server.AgentRecoverySpawnPolicyVerification;
 import dev.agaminggod.arenaagents.server.AgentRespawnSpawnPolicyVerification;
+import dev.agaminggod.arenaagents.server.perception.BlockObservationLazyVisibilityVerification;
 import dev.agaminggod.arenaagents.server.perception.BlockObservationOrderingVerification;
 import dev.agaminggod.arenaagents.server.perception.InventoryObservationSlotsVerification;
 import dev.agaminggod.arenaagents.server.perception.ObservationBudgetVerification;
@@ -219,6 +220,7 @@ public final class VerificationMain {
 		passedAssertions += AgentRosterViewStateVerification.verify();
 		passedAssertions += AgentControlLayoutVerification.verify();
 		passedAssertions += BlockObservationOrderingVerification.verify();
+		passedAssertions += BlockObservationLazyVisibilityVerification.verify();
 		passedAssertions += InventoryObservationSlotsVerification.verify();
 		passedAssertions += ObservationBudgetVerification.verify();
 		passedAssertions += ServerObservationRayTargetVerification.verify();
