@@ -5,7 +5,6 @@ import de.maxhenkel.voicechat.api.events.Event;
 import de.maxhenkel.voicechat.api.events.EventRegistration;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystem;
-import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemConfiguration;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemProvider;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
@@ -18,39 +17,35 @@ import java.util.function.Consumer;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.dedicated.DedicatedServer;
 
-/** Verifies both provider startup contracts across core upgrade directions. */
-final class ArenaAgentsVoiceProviderVerification {
-	private ArenaAgentsVoiceProviderVerification() {
+/** Executes inside the isolated legacy-core classloader. */
+public final class LegacyVoiceProviderClasspathScenario {
+	private LegacyVoiceProviderClasspathScenario() {
 	}
 
-	static int verify() throws Exception {
-		Path secretFile = Files.createTempFile("arena-agents-voice-provider", ".secret");
+	public static int verify() throws Exception {
+		if (VoiceSubsystemProvider.class.getDeclaredMethods().length != 1) {
+			throw new AssertionError("Legacy core provider fixture must expose only create(server)");
+		}
+		Path secretFile = Files.createTempFile("arena-agents-legacy-provider", ".secret");
 		Files.writeString(secretFile, "legacy-provider-secret-0123456789\n", StandardCharsets.UTF_8);
 		String previousUrl = System.getProperty("arenaagents.voiceUrl");
 		String previousSecretFile = System.getProperty("arenaagents.voiceSecretFile");
 		String previousTimeout = System.getProperty("arenaagents.voiceRequestTimeoutMs");
-		MinecraftServer server = testServer();
 		try {
 			System.setProperty("arenaagents.voiceUrl", "http://127.0.0.1:18765/v1/tts");
 			System.setProperty("arenaagents.voiceSecretFile", secretFile.toString());
 			System.setProperty("arenaagents.voiceRequestTimeoutMs", "12345");
 			RecordingEventRegistration events = new RecordingEventRegistration();
-			ArenaAgentsVoiceProvider addonEntrypoint = new ArenaAgentsVoiceProvider();
-			addonEntrypoint.registerEvents(events);
+			ArenaAgentsVoiceProvider provider = new ArenaAgentsVoiceProvider();
+			provider.registerEvents(events);
 			events.fire(VoicechatServerStartedEvent.class, startedEvent());
 
-			VoiceSubsystemProvider provider = addonEntrypoint;
-			VoiceSubsystem legacy = provider.create(server);
-			assertTrue(legacy != null, "legacy one-argument provider startup returns a subsystem");
-			legacy.close();
-
-			VoiceSubsystemConfiguration explicit = new VoiceSubsystemConfiguration(
-					"http://127.0.0.1:18766/v1/tts", "explicit-provider-secret-0123456789", 23456
-			);
-			VoiceSubsystem configured = provider.create(server, explicit);
-			assertTrue(configured != null, "configuration-aware provider startup returns a subsystem");
-			configured.close();
-			return 2;
+			VoiceSubsystemProvider legacyProvider = provider;
+			VoiceSubsystem subsystem = legacyProvider.create(testServer());
+			if (subsystem == null) throw new AssertionError("Legacy provider returned null");
+			if (!subsystem.available()) throw new AssertionError("Legacy voice-chat registration was not retained");
+			subsystem.close();
+			return 3;
 		} finally {
 			restoreProperty("arenaagents.voiceUrl", previousUrl);
 			restoreProperty("arenaagents.voiceSecretFile", previousSecretFile);
@@ -71,16 +66,12 @@ final class ArenaAgentsVoiceProviderVerification {
 	private static VoicechatServerStartedEvent startedEvent() {
 		VoicechatServerApi api = proxy(VoicechatServerApi.class, (proxy, method, arguments) ->
 				defaultValue(method.getReturnType()));
-		return eventProxy(VoicechatServerStartedEvent.class, (proxy, method, arguments) ->
+		return proxy(VoicechatServerStartedEvent.class, (proxy, method, arguments) ->
 				method.getName().equals("getVoicechat") ? api : defaultValue(method.getReturnType()));
 	}
 
 	private static <T> T proxy(Class<T> type, InvocationHandler handler) {
 		return type.cast(Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] { type }, handler));
-	}
-
-	private static <T extends Event> T eventProxy(Class<T> type, InvocationHandler handler) {
-		return proxy(type, handler);
 	}
 
 	private static Object defaultValue(Class<?> type) {
@@ -93,10 +84,6 @@ final class ArenaAgentsVoiceProviderVerification {
 	private static void restoreProperty(String key, String value) {
 		if (value == null) System.clearProperty(key);
 		else System.setProperty(key, value);
-	}
-
-	private static void assertTrue(boolean value, String label) {
-		if (!value) throw new AssertionError(label);
 	}
 
 	private static final class RecordingEventRegistration implements EventRegistration {

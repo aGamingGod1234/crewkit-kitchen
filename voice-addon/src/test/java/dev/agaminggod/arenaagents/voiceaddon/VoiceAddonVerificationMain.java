@@ -13,6 +13,7 @@ public final class VoiceAddonVerificationMain {
 	public static void main(String[] arguments) throws Exception {
 		int assertions = 0;
 		assertions += verifyFabricMetadataLoadsOnIntegratedAndDedicatedServers();
+		assertions += LegacyVoiceProviderClasspathVerification.verify();
 		assertions += ArenaAgentsVoiceProviderVerification.verify();
 		assertions += ArenaAgentsVoiceChatPluginVerification.verify();
 		assertions += VoicechatServerBindingsVerification.verify();
@@ -37,7 +38,12 @@ public final class VoiceAddonVerificationMain {
 					.get("arenaagents").getAsString())) {
 				throw new AssertionError("Voice addon must retain the compatible arenaagents dependency range");
 			}
-			return 2;
+			String voicechatEntrypoint = metadata.getAsJsonObject("entrypoints")
+					.getAsJsonArray("voicechat").get(0).getAsString();
+			if (!ArenaAgentsVoiceProvider.class.getName().equals(voicechatEntrypoint)) {
+				throw new AssertionError("Voice addon entrypoints must share the compatibility provider");
+			}
+			return 3;
 		} catch (java.io.IOException exception) {
 			throw new AssertionError("Could not read voice addon metadata", exception);
 		}
