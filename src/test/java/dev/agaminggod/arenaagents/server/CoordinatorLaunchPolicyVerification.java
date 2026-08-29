@@ -11,17 +11,16 @@ public final class CoordinatorLaunchPolicyVerification {
 		assertFalse(CoordinatorLaunchPolicy.shouldStart(false, true, createdAt, createdAt + 5_000L), "live owned coordinator is retained");
 		assertTrue(CoordinatorLaunchPolicy.shouldStart(false, false, createdAt, createdAt + CoordinatorLaunchPolicy.STARTUP_GRACE_MS), "missing coordinator starts after grace");
 		CoordinatorLaunchPolicy.RestartBudget budget = new CoordinatorLaunchPolicy.RestartBudget();
-		assertTrue(budget.recordUnexpectedExit(), "first coordinator crash is restartable");
-		assertEquals(2_000L, budget.nextDelayMs(), "first restart delay is bounded");
-		assertTrue(budget.recordUnexpectedExit(), "second coordinator crash is restartable");
-		assertEquals(5_000L, budget.nextDelayMs(), "second restart delay is bounded");
-		assertTrue(budget.recordUnexpectedExit(), "third coordinator crash is restartable");
-		assertEquals(15_000L, budget.nextDelayMs(), "third restart delay is bounded");
-		assertFalse(budget.recordUnexpectedExit(), "restart budget is exhausted after three crashes");
-		budget.resetAfterAuthentication();
-		assertTrue(budget.recordUnexpectedExit(), "authentication resets the restart budget");
-		assertEquals(2_000L, budget.nextDelayMs(), "reset budget uses the first delay");
-		return 12;
+		long[] expectedDelays = {1_000L, 2_000L, 5_000L, 15_000L, 30_000L, 30_000L, 30_000L, 30_000L};
+		for (int crash = 0; crash < expectedDelays.length; crash++) {
+			assertTrue(budget.recordUnexpectedExit(), "coordinator crash " + (crash + 1) + " remains restartable");
+			assertEquals(expectedDelays[crash], budget.nextDelayMs(),
+					"coordinator crash " + (crash + 1) + " uses the capped retry delay");
+		}
+		budget.resetAfterStability();
+		assertTrue(budget.recordUnexpectedExit(), "authenticated stability resets crash-loop history");
+		assertEquals(1_000L, budget.nextDelayMs(), "stable reset uses the first delay");
+		return 24;
 	}
 
 	private static void assertEquals(long expected, long actual, String label) {

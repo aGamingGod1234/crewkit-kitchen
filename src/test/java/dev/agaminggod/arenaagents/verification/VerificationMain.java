@@ -55,12 +55,21 @@ import dev.agaminggod.arenaagents.server.conversation.AgentConversationRouterVer
 import dev.agaminggod.arenaagents.server.conversation.NativeAgentWhisperTargetsVerification;
 import dev.agaminggod.arenaagents.server.group.AgentGroupRegistryVerification;
 import dev.agaminggod.arenaagents.server.AgentModelArgumentVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorRecoveryFaultMatrixVerification;
 import dev.agaminggod.arenaagents.server.BundledCoordinatorInstallerVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorProcessOwnershipVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorStartupSmokeVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorLogRotationVerification;
 import dev.agaminggod.arenaagents.server.NodeRuntimeLocatorVerification;
 import dev.agaminggod.arenaagents.server.CoordinatorLaunchPolicyVerification;
+<<<<<<< HEAD
+=======
 import dev.agaminggod.arenaagents.server.CoordinatorStartupSmokeVerification;
 import dev.agaminggod.arenaagents.server.CoordinatorVoiceTimeoutLifecycleVerification;
+>>>>>>> origin/main
 import dev.agaminggod.arenaagents.server.CoordinatorVoiceEndpointVerification;
+import dev.agaminggod.arenaagents.server.CoordinatorVoiceEndpointRefreshVerification;
+import dev.agaminggod.arenaagents.server.CodexAgentServerRuntimeVoiceStartVerification;
 import dev.agaminggod.arenaagents.server.AgentSpawnPlacementVerification;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayersVerification;
 import dev.agaminggod.arenaagents.server.PendingSpawnCancellationLedgerVerification;
@@ -173,11 +182,16 @@ public final class VerificationMain {
 		passedAssertions += AgentGroupRegistryVerification.verify();
 		passedAssertions += AgentModelArgumentVerification.verify();
 		passedAssertions += BundledCoordinatorInstallerVerification.verify();
+		passedAssertions += CoordinatorRecoveryFaultMatrixVerification.verify();
+		passedAssertions += CoordinatorLogRotationVerification.verify();
 		passedAssertions += NodeRuntimeLocatorVerification.verify();
 		passedAssertions += CoordinatorLaunchPolicyVerification.verify();
+		passedAssertions += CoordinatorProcessOwnershipVerification.verify();
 		passedAssertions += CoordinatorStartupSmokeVerification.verify();
 		passedAssertions += CoordinatorVoiceTimeoutLifecycleVerification.verify();
 		passedAssertions += CoordinatorVoiceEndpointVerification.verify();
+		passedAssertions += CoordinatorVoiceEndpointRefreshVerification.verify();
+		passedAssertions += CodexAgentServerRuntimeVoiceStartVerification.verify();
 		passedAssertions += AgentActivityPresentationVerification.verify();
 		passedAssertions += AgentDeathCaptureVerification.verify();
 		passedAssertions += VoiceConsentCommandVerification.verify();

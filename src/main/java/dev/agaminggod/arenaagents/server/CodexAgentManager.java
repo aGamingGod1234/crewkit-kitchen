@@ -29,6 +29,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.WeakHashMap;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -68,7 +69,7 @@ public final class CodexAgentManager {
 	private final Map<AgentChunkTicket, Integer> chunkTicketReferences = new LinkedHashMap<>();
 	private final Map<AgentId, Long> pendingPlayerSpawns = new LinkedHashMap<>();
 	private final Map<AgentId, VanillaRespawnAttempt> pendingVerifiedRespawns = new LinkedHashMap<>();
-	private final Set<AgentId> pendingAgentRegistrations = new LinkedHashSet<>();
+	private final Set<AgentId> pendingAgentRegistrations = ConcurrentHashMap.newKeySet();
 	private final Set<AgentId> pendingEntityRecoveries = new LinkedHashSet<>();
 	private final PendingSpawnCancellationLedger cancelledPlayerSpawns =
 			new PendingSpawnCancellationLedger(CANCELLED_SPAWN_RETENTION_MS);
@@ -151,7 +152,14 @@ public final class CodexAgentManager {
 		Objects.requireNonNull(position, "position must not be null");
 		long now = System.currentTimeMillis();
 		AgentRegistry registry = savedData.registry();
-		AgentRecord created = registry.create(provider, model, reasoning, serviceTier, userName, gameMode, now);
+		AgentRecord created;
+		synchronized (registry) {
+			created = runtimeHooks.withinPublicationBoundary(() -> {
+				AgentRecord record = registry.create(provider, model, reasoning, serviceTier, userName, gameMode, now);
+				pendingAgentRegistrations.add(record.agentId());
+				return record;
+			});
+		}
 		try {
 			runtimeHooks.validateProfile(created.profile());
 			OfflineAgentPlayers.spawn(
@@ -165,20 +173,25 @@ public final class CodexAgentManager {
 					gameMode
 			);
 			pendingPlayerSpawns.put(created.agentId(), now + PLAYER_SPAWN_TIMEOUT_MS);
-			pendingAgentRegistrations.add(created.agentId());
 			return created;
 		} catch (RuntimeException exception) {
 			releaseChunkTicket(created.agentId());
-			pendingAgentRegistrations.remove(created.agentId());
 			pendingEntityRecoveries.remove(created.agentId());
 			OfflineAgentPlayers.find(server, created.agentId(), created.profile()).ifPresent(OfflineAgentPlayers::remove);
 			if (pendingPlayerSpawns.remove(created.agentId()) != null) {
 				cancelledPlayerSpawns.record(created.agentId(), System.currentTimeMillis());
 			}
-			try {
-				registry.remove(created.agentId());
-			} catch (AgentDomainException ignored) {
-				// The record may already have been removed by a failing integration hook.
+			synchronized (registry) {
+				runtimeHooks.withinPublicationBoundary(() -> {
+					try {
+						registry.remove(created.agentId());
+					} catch (AgentDomainException ignored) {
+						// The record may already have been removed by a failing integration hook.
+					} finally {
+						pendingAgentRegistrations.remove(created.agentId());
+					}
+					return null;
+				});
 			}
 			throw exception;
 		}
@@ -464,14 +477,7 @@ public final class CodexAgentManager {
 				player.get().setCustomNameVisible(false);
 				hideWorldName(player.get());
 				trackChunkTicket(record.agentId(), player.get());
-				if (pendingAgentRegistrations.contains(record.agentId())) {
-					try {
-						runtimeHooks.onCreated(attached);
-						pendingAgentRegistrations.remove(record.agentId());
-					} catch (RuntimeException exception) {
-						LOGGER.warn("Could not publish verified agent registration for {}", record.agentId(), exception);
-					}
-				}
+				publishPendingRegistration(attached);
 				if (pendingEntityRecoveries.remove(record.agentId())
 						&& attached.state() == dev.agaminggod.arenaagents.agent.AgentLifecycleState.DISCONNECTED) {
 					savedData.registry().resume(record.agentId(), now);
@@ -842,7 +848,7 @@ public final class CodexAgentManager {
 		long terminalRevision = record.goalRevision() == Long.MAX_VALUE
 				? Long.MAX_VALUE
 				: record.goalRevision() + 1L;
-		AgentRecord removed = AgentRemovalCoordinator.removeRegistryFirst(
+		AgentRecord removed = runtimeHooks.withinPublicationBoundary(() -> AgentRemovalCoordinator.removeRegistryFirst(
 				savedData.registry(),
 				record.agentId(),
 				() -> {
@@ -859,7 +865,7 @@ public final class CodexAgentManager {
 				},
 				() -> runtimeHooks.onRemoved(record.agentId(), terminalRevision),
 				failure -> LOGGER.warn("Post-delete cleanup failed for agent {}", record.agentId(), failure)
-		);
+		));
 		savedData.clearConversationWake(record.agentId());
 		return removed;
 	}
@@ -886,6 +892,30 @@ public final class CodexAgentManager {
 
 	public List<AgentRecord> records() {
 		return savedData.registry().records();
+	}
+
+	/** Records already published, or restored through the coordinator handshake, and safe to reference on the wire. */
+	public List<AgentRecord> coordinatorVisibleRecords() {
+		AgentRegistry registry = savedData.registry();
+		synchronized (registry) {
+			Set<AgentId> pending = Set.copyOf(pendingAgentRegistrations);
+			List<AgentRecord> records = registry.records();
+			if (pending.isEmpty()) return records;
+			return records.stream().filter(record -> !pending.contains(record.agentId())).toList();
+		}
+	}
+
+	private void publishPendingRegistration(AgentRecord record) {
+		try {
+			runtimeHooks.withinPublicationBoundary(() -> {
+				if (pendingAgentRegistrations.contains(record.agentId()) && runtimeHooks.onCreated(record)) {
+					pendingAgentRegistrations.remove(record.agentId());
+				}
+				return null;
+			});
+		} catch (RuntimeException exception) {
+			LOGGER.warn("Could not publish verified agent registration for {}", record.agentId(), exception);
+		}
 	}
 
 	public List<String> selectors() {
