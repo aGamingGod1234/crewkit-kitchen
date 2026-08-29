@@ -57,6 +57,7 @@ export class JsonlDecoder {
 			throw new TypeError('JSONL chunk must be a string or byte view');
 		}
 		const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+		const appendedSegmentIndex = this.#segments.length;
 		this.#append(bytes, typeof chunk !== 'string');
 		const messages = [];
 		try {
@@ -71,7 +72,7 @@ export class JsonlDecoder {
 			}
 			if (this.#bufferedBytes > this.#maxBytes) this.#throwOversized(this.#bufferedBytes);
 		} finally {
-			this.#detachBorrowedSegments();
+			this.#detachBorrowedSegments(appendedSegmentIndex);
 			this.#compactStorage();
 		}
 		return messages;
@@ -146,8 +147,8 @@ export class JsonlDecoder {
 		}
 	}
 
-	#detachBorrowedSegments() {
-		for (let index = this.#segmentIndex; index < this.#segments.length; index += 1) {
+	#detachBorrowedSegments(appendedSegmentIndex) {
+		for (let index = Math.max(this.#segmentIndex, appendedSegmentIndex); index < this.#segments.length; index += 1) {
 			const segment = this.#segments[index];
 			if (!segment.borrowed) continue;
 			segment.bytes = Buffer.from(segment.bytes.subarray(index === this.#segmentIndex ? this.#segmentOffset : 0));
