@@ -3,16 +3,22 @@ package dev.agaminggod.arenaagents.server.perception;
 import com.google.gson.JsonArray;
 import net.minecraft.world.item.Items;
 
+import java.lang.reflect.Field;
+import java.util.Map;
+
 /** Verifies that tag caching preserves values while isolating each JSON consumer. */
 public final class ServerObservationTagCacheVerification {
 	private ServerObservationTagCacheVerification() {
 	}
 
 	public static int verify() {
+		net.minecraft.SharedConstants.tryDetectVersion();
+		net.minecraft.server.Bootstrap.bootStrap();
 		ServerObservationCollector.clearTagCache();
 		var holder = Items.DIAMOND.builtInRegistryHolder();
 
 		JsonArray first = ServerObservationCollector.tags(holder);
+		assertEquals(1, cacheSize(), "holder is cached after first use");
 		JsonArray expected = new JsonArray();
 		holder.tags().map(tag -> "#" + tag.location().toString()).sorted()
 				.limit(ServerObservationCollector.MAX_OBSERVATION_TAGS).forEach(expected::add);
@@ -24,9 +30,10 @@ public final class ServerObservationTagCacheVerification {
 		assertTrue(first != second, "each tags call returns a fresh JsonArray");
 
 		ServerObservationCollector.clearTagCache();
+		assertEquals(0, cacheSize(), "cache invalidation releases retained holders");
 		JsonArray afterReload = ServerObservationCollector.tags(holder);
 		assertEquals(expected.toString(), afterReload.toString(), "cache invalidation preserves recomputed values");
-		return 4;
+		return 6;
 	}
 
 	public static void main(String[] args) {
@@ -41,5 +48,18 @@ public final class ServerObservationTagCacheVerification {
 
 	private static void assertTrue(boolean condition, String label) {
 		if (!condition) throw new AssertionError(label);
+	}
+
+	private static int cacheSize() {
+		try {
+			Field field = ServerObservationCollector.class.getDeclaredField("TAG_VALUES");
+			field.setAccessible(true);
+			Map<?, ?> values = (Map<?, ?>) field.get(null);
+			synchronized (values) {
+				return values.size();
+			}
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not inspect tag cache", exception);
+		}
 	}
 }

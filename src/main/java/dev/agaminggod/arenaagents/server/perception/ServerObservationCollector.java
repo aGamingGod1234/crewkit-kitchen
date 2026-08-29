@@ -592,7 +592,7 @@ public final class ServerObservationCollector {
 	}
 
 	/** Exact, allocation-free comparison of the fields used by inventorySignature while shapes are stable. */
-	private static final class InventorySnapshot {
+	static final class InventorySnapshot {
 		private static final int MAX_MENU_SLOTS = 64;
 		private final int[] inventoryItemIds;
 		private final int[] inventoryCounts;
@@ -626,11 +626,11 @@ public final class ServerObservationCollector {
 			captureValues(agent);
 		}
 
-		private static InventorySnapshot capture(ServerPlayer agent) {
+		static InventorySnapshot capture(ServerPlayer agent) {
 			return new InventorySnapshot(agent);
 		}
 
-		private boolean hasSameShape(ServerPlayer agent) {
+		boolean hasSameShape(ServerPlayer agent) {
 			Inventory inventory = agent.getInventory();
 			boolean currentHasMenu = agent.containerMenu != null;
 			int currentMenuSize = currentHasMenu
@@ -640,7 +640,7 @@ public final class ServerObservationCollector {
 					&& menuSize == currentMenuSize;
 		}
 
-		private boolean matchesAndUpdate(ServerPlayer agent) {
+		boolean matchesAndUpdate(ServerPlayer agent) {
 			boolean changed = false;
 			Inventory inventory = agent.getInventory();
 			changed |= selectedSlot != inventory.getSelectedSlot();

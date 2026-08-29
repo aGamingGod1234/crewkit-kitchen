@@ -112,6 +112,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void start(MinecraftServer server) {
+		ServerObservationCollector.clearTagCache();
 		CodexAgentManager manager = CodexAgentManager.get(server);
 		CoordinatorProcessSupervisor supervisor = COORDINATORS.get(server);
 		if (supervisor == null) {
@@ -462,6 +463,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static void stop(MinecraftServer server) {
+		ServerObservationCollector.clearTagCache();
 		PLANNING_UPDATES.remove(server);
 		GOAL_VERIFIERS.remove(server);
 		VOICE_GATES.remove(server);
