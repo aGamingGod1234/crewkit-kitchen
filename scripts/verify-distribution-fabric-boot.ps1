@@ -36,6 +36,13 @@ function New-RandomSecret {
 	return [Convert]::ToBase64String($bytes)
 }
 
+function Send-ProcessInput([Diagnostics.Process] $Process, [string] $Command) {
+	$bytes = [Text.UTF8Encoding]::new($false).GetBytes($Command + "`n")
+	$stream = $Process.StandardInput.BaseStream
+	$stream.Write($bytes, 0, $bytes.Length)
+	$stream.Flush()
+}
+
 function Receive-ProcessOutput(
 	[Diagnostics.Process] $Process,
 	[ref] $StandardOutputTask,
@@ -152,8 +159,7 @@ try {
 	}
 	if (-not $ready) { throw "Fabric server did not reach the Done marker within $StartupTimeoutSeconds seconds." }
 
-	$process.StandardInput.WriteLine('codex status')
-	$process.StandardInput.Flush()
+	Send-ProcessInput $process 'codex status'
 	$statusDeadline = [DateTime]::UtcNow.AddSeconds(15)
 	$statusObserved = $false
 	while ([DateTime]::UtcNow -lt $statusDeadline) {
@@ -182,8 +188,7 @@ try {
 	}
 	if (-not $coordinatorStarted) { throw 'The packaged coordinator did not start within 20 seconds.' }
 
-	$process.StandardInput.WriteLine('stop')
-	$process.StandardInput.Flush()
+	Send-ProcessInput $process 'stop'
 	if (-not $process.WaitForExit($ShutdownTimeoutSeconds * 1000)) { throw "Fabric server did not stop within $ShutdownTimeoutSeconds seconds." }
 	$process.WaitForExit()
 	Receive-ProcessOutput $process ([ref]$standardOutputTask) ([ref]$standardErrorTask) $lines
@@ -201,7 +206,7 @@ try {
 } finally {
 	if ($null -ne $process) {
 		if ($processStarted -and -not $process.HasExited) {
-			try { $process.StandardInput.WriteLine('stop'); $process.StandardInput.Flush() } catch { }
+			try { Send-ProcessInput $process 'stop' } catch { }
 			if (-not $process.WaitForExit(5000)) {
 				try {
 					& taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null
