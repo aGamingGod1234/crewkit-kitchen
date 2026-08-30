@@ -24,6 +24,7 @@ export class CodexService {
 	#config;
 	#transport;
 	#catalog;
+	#exactLaunchProfile;
 	#workspaceManager;
 	#minecraftWorkspace;
 	#agents = new Map();
@@ -62,10 +63,14 @@ export class CodexService {
 		if (this.#minecraftWorkspace !== null && typeof this.#minecraftWorkspace.prepare !== 'function') {
 			throw new TypeError('minecraftWorkspace must expose prepare()');
 		}
+		const builtinModels = exactLaunchProfileCatalog(this.#config.launchProfile);
+		this.#exactLaunchProfile = builtinModels.length === 1
+			? { provider: 'codex', ...this.#config.launchProfile }
+			: null;
 		this.#catalog = dependencies.catalog ?? new ModelCatalogCache(() => this.#listModels(), {
 			ttlMs: this.#config.catalogTtlMs,
 			now: dependencies.now ?? Date.now,
-			builtinModels: exactLaunchProfileCatalog(this.#config.launchProfile),
+			builtinModels,
 			refreshTimeoutMs: this.#config.startupTimeoutMs,
 		});
 	}
@@ -146,7 +151,7 @@ export class CodexService {
 
 	async #createAgentOnce(profile, recoverySummary, controlProtocol, lifecycleGeneration) {
 		const transportGeneration = this.#transportGeneration;
-		if (this.#catalog.stale) await this.#catalog.refresh();
+		if (this.#catalog.stale && !profilesMatch(this.#exactLaunchProfile, profile)) await this.#catalog.refresh();
 		this.#assertLifecycleCurrent(lifecycleGeneration);
 		this.#catalog.assertSupported(profile.model, profile.reasoningEffort, profile.serviceTier);
 		let cwd;
@@ -233,7 +238,11 @@ export class CodexService {
 				removed.push(agentId);
 			}
 		}
-		const catalog = await this.#catalog.refresh();
+		const requiresLiveCatalog = this.#exactLaunchProfile === null
+			|| records.some((record) => !profilesMatch(this.#exactLaunchProfile, { provider: 'codex', ...record }));
+		const catalog = this.#catalog.stale && requiresLiveCatalog
+			? await this.#catalog.refresh()
+			: this.#catalog.snapshot();
 		assertReconciliationActive(signal);
 		const profiles = this.#catalog.reconcileProfiles(records);
 		return { ...profiles, removed, catalog };
@@ -276,7 +285,7 @@ export class CodexService {
 			await this.#transport.request('initialize', { clientInfo: CLIENT_INFO, capabilities: CLIENT_CAPABILITIES }, { timeoutMs: this.#config.startupTimeoutMs });
 			this.#assertStartupCurrent(attempt);
 			this.#transport.notify('initialized', {});
-			await this.#catalog.refresh({ force: true });
+			if (this.#exactLaunchProfile === null) await this.#catalog.refresh({ force: true });
 			this.#assertStartupCurrent(attempt);
 			this.#started = true;
 		} catch (error) {
@@ -1007,6 +1016,7 @@ function validateProfile(value, config) {
 }
 
 function profilesMatch(left, right) {
+	if (left === null || right === null) return false;
 	return left.provider === right.provider && left.model === right.model && left.reasoningEffort === right.reasoningEffort && left.serviceTier === right.serviceTier;
 }
 

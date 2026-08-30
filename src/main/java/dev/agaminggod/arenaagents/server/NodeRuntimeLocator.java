@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -19,17 +20,44 @@ final class NodeRuntimeLocator {
 	private static final int MAX_VERSION_OUTPUT_BYTES = 512;
 	private static final Duration VERSION_PROBE_TIMEOUT = Duration.ofSeconds(2);
 	private static final Pattern VERSION = Pattern.compile("^v?(\\d+)(?:\\..*)?\\s*$");
+	private static CacheEntry productionCache;
 
 	private NodeRuntimeLocator() {
 	}
 
-	static LocatedNode locate(Path packageRoot) {
-		return locate(
-				packageRoot,
-				System.getProperty(PROPERTY),
-				System.getenv("PATH"),
-				NodeRuntimeLocator::probeVersion
-		);
+	static synchronized LocatedNode locate(Path packageRoot) {
+		Path root = requireRoot(packageRoot);
+		String explicit = System.getProperty(PROPERTY);
+		String path = System.getenv("PATH");
+		CacheKey key = cacheKey(root, explicit, path);
+		if (productionCache != null && productionCache.key().equals(key)) return productionCache.node();
+		LocatedNode located = locate(root, explicit, path, NodeRuntimeLocator::probeVersion);
+		productionCache = new CacheEntry(key, located);
+		return located;
+	}
+
+	private static CacheKey cacheKey(Path root, String explicitPath, String path) {
+		String configured = explicitPath == null ? "" : explicitPath.trim();
+		Path candidate = null;
+		if (!configured.isEmpty()) {
+			try { candidate = Path.of(configured).toAbsolutePath().normalize(); }
+			catch (RuntimeException ignored) { }
+		} else {
+			Path bundled = bundledCandidate(root);
+			candidate = Files.exists(bundled) ? bundled : firstPathCandidate(path);
+		}
+		return new CacheKey(root, configured, path == null ? "" : path, fileIdentity(candidate));
+	}
+
+	private static String fileIdentity(Path candidate) {
+		if (candidate == null) return "missing";
+		try {
+			BasicFileAttributes attributes = Files.readAttributes(candidate, BasicFileAttributes.class);
+			return candidate + ":" + attributes.size() + ":" + attributes.lastModifiedTime().toMillis()
+					+ ":" + String.valueOf(attributes.fileKey());
+		} catch (IOException | RuntimeException failure) {
+			return candidate + ":unreadable";
+		}
 	}
 
 	static LocatedNode locate(Path packageRoot, String explicitPath, String path, Probe probe) {
@@ -189,6 +217,12 @@ final class NodeRuntimeLocator {
 			executable = executable.toAbsolutePath().normalize();
 			if (majorVersion < MIN_MAJOR_VERSION) throw new IllegalArgumentException("Node version is unsupported");
 		}
+	}
+
+	private record CacheKey(Path root, String explicitPath, String path, String executableIdentity) {
+	}
+
+	private record CacheEntry(CacheKey key, LocatedNode node) {
 	}
 
 	@FunctionalInterface

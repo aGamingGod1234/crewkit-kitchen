@@ -24,6 +24,7 @@ const DESKTOP_RUNTIME_EXECUTABLES = Object.freeze([
 ]);
 const CLIENT_INFO = Object.freeze({ name: 'arena-agents-coordinator', title: 'Minecraft Arena Agents', version: '1.0.0' });
 const CLIENT_CAPABILITIES = Object.freeze({ experimentalApi: true, requestAttestation: false });
+let cachedProductionCommand = null;
 
 export class CodexProtocolError extends Error {
 	constructor(code, message, options) {
@@ -60,6 +61,7 @@ export function buildCodexArgs(config) {
 }
 
 export function resolveCodexLaunch(config, dependencies = {}) {
+	const useProductionCache = Object.keys(dependencies).length === 0;
 	const platform = dependencies.platform ?? process.platform;
 	const environment = createProviderChildEnvironment(
 		dependencies.env ?? config.environment ?? process.env,
@@ -73,10 +75,29 @@ export function resolveCodexLaunch(config, dependencies = {}) {
 		if (pathExists(entrypoint)) return { command: nodeExecutable, args: [entrypoint, ...buildCodexArgs(config)], environment };
 	}
 	if (platform === 'win32') {
+		const cacheKey = productionCommandCacheKey(platform, environment, nodeExecutable);
+		if (useProductionCache && cachedProductionCommand?.key === cacheKey
+				&& pathExists(cachedProductionCommand.command)) {
+			return { command: cachedProductionCommand.command, args: buildCodexArgs(config), environment };
+		}
 		const desktopCli = cacheInstalledCodexDesktopCli(environment, dependencies);
-		if (desktopCli !== null) return { command: desktopCli, args: buildCodexArgs(config), environment };
+		if (desktopCli !== null) {
+			if (useProductionCache) cachedProductionCommand = { key: cacheKey, command: desktopCli };
+			return { command: desktopCli, args: buildCodexArgs(config), environment };
+		}
 	}
 	return { command: 'codex', args: buildCodexArgs(config), environment };
+}
+
+function productionCommandCacheKey(platform, environment, nodeExecutable) {
+	return JSON.stringify([
+		platform,
+		nodeExecutable,
+		windowsEnvironmentValue(environment, 'ProgramFiles'),
+		windowsEnvironmentValue(environment, 'ProgramW6432'),
+		windowsEnvironmentValue(environment, 'LOCALAPPDATA'),
+		windowsEnvironmentValue(environment, 'USERPROFILE'),
+	]);
 }
 
 function cacheInstalledCodexDesktopCli(environment, dependencies = {}) {

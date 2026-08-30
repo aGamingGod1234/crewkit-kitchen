@@ -252,6 +252,10 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		String fingerprint();
 
 		DependencyResolution resolve();
+
+		default DependencyResolution resolve(String fingerprint) {
+			return resolve();
+		}
 	}
 
 	interface GenerationController {
@@ -548,8 +552,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 	/**
 	 * Production startup also reports whether the prepared bridge is listening.
-	 * The initial adoption window cannot elapse before an external coordinator has
-	 * a real endpoint on which to authenticate.
+	 * Owned launch begins as soon as that endpoint exists. Operators that own an
+	 * external coordinator disable auto-start explicitly.
 	 */
 	synchronized void tickWithBridgeListener(
 			boolean bridgeAuthenticated,
@@ -629,10 +633,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		if (requireInitialBridgeListener && !initialBridgeListenerObserved) {
 			if (!bridgeListenerAvailable && !bridgeAuthenticated) return;
 			initialBridgeListenerObserved = true;
-			nextRetryEpochMs = Math.max(
-					nextRetryEpochMs,
-					now + CoordinatorLaunchPolicy.STARTUP_GRACE_MS
-			);
+			nextRetryEpochMs = Math.max(nextRetryEpochMs, now);
 		}
 
 		if (bridgeAuthenticated && authenticatedLaunchId == null) {
@@ -902,7 +903,7 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 				}
 			}
 			publishMaintenanceResult(new DependencyMaintenanceResult(
-				currentFingerprint, resolveDependencies(), changed, initial, reaped,
+				currentFingerprint, resolveDependencies(currentFingerprint), changed, initial, reaped,
 				reaped ? List.copyOf(cleanupRoots) : List.of(), submittedWakeGeneration
 			));
 		});
@@ -1124,9 +1125,9 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 		);
 	}
 
-	private DependencyResolution resolveDependencies() {
+	private DependencyResolution resolveDependencies(String fingerprint) {
 		try {
-			DependencyResolution resolution = dependencyResolver.resolve();
+			DependencyResolution resolution = dependencyResolver.resolve(fingerprint);
 			return Objects.requireNonNull(resolution, "dependency resolution must not be null");
 		} catch (RuntimeException exception) {
 			return DependencyResolution.blocked(
@@ -1973,6 +1974,8 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 	static final class DefaultDependencyResolver implements DependencyResolver {
 		private final Path gameDirectory;
 		private final Map<String, String> environmentOverrides;
+		private String cachedFingerprint;
+		private DependencyResolution cachedReadyResolution;
 
 		private DefaultDependencyResolver(Path gameDirectory, Map<String, String> environmentOverrides) {
 			this.gameDirectory = gameDirectory;
@@ -2026,6 +2029,26 @@ final class CoordinatorProcessSupervisor implements AutoCloseable {
 
 		@Override
 		public DependencyResolution resolve() {
+			return resolve(fingerprint());
+		}
+
+		@Override
+		public synchronized DependencyResolution resolve(String fingerprint) {
+			if (cachedReadyResolution != null && Objects.equals(cachedFingerprint, fingerprint)) {
+				return cachedReadyResolution;
+			}
+			DependencyResolution resolution = resolveUncached();
+			if (resolution.ready()) {
+				cachedFingerprint = fingerprint;
+				cachedReadyResolution = resolution;
+			} else {
+				cachedFingerprint = null;
+				cachedReadyResolution = null;
+			}
+			return resolution;
+		}
+
+		private DependencyResolution resolveUncached() {
 			BundledCoordinatorInstaller.RuntimePackage prepared = null;
 			try {
 				Path installedRoot = gameDirectory.resolve("arena-agents-runtime");

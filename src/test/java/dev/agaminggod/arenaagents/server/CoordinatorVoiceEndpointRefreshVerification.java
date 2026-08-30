@@ -43,7 +43,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			Files.writeString(config, "{\"voice\":{\"port\":18767}}", StandardCharsets.UTF_8);
 			managedResolver.fingerprint = "managed-config-only-change";
 			managed.publishDependencyFingerprintChange();
-			managed.tick(false, null, 0L);
+			managed.tick(true, null, 1L);
 			assertEquals("http://127.0.0.1:18767/v1/tts", System.getProperty("arenaagents.voiceUrl"),
 					"config-only dependency changes replace the supervisor-managed voice endpoint");
 			assertTrue(managed.voiceConfigurationRevision() > initialVoiceRevision,
@@ -53,7 +53,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 
 			long refreshedRevision = managed.voiceConfigurationRevision();
 			managed.publishDependencyFingerprintChange();
-			managed.tick(false, null, 0L);
+			managed.tick(true, null, 1L);
 			assertEquals(refreshedRevision, managed.voiceConfigurationRevision(),
 					"an unchanged resolved endpoint does not recreate the voice client");
 
@@ -68,7 +68,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			long bridgeRevisionBeforeSecretRotation = managed.bridgeRevision();
 			managedResolver.rotateSecret("managed-secret-only-change", "w".repeat(32));
 			managed.publishDependencyFingerprintChange();
-			managed.tick(false, null, 0L);
+			managed.tick(true, null, 1L);
 			assertEquals(endpointRevisionBeforeSecretRotation, managed.voiceConfigurationRevision(),
 					"secret-only rotation preserves the endpoint-only revision");
 			assertTrue(managed.bridgeRevision() > bridgeRevisionBeforeSecretRotation,
@@ -96,7 +96,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 			Files.writeString(config, "{\"voice\":{\"port\":18768}}", StandardCharsets.UTF_8);
 			overrideResolver.fingerprint = "explicit-override-config-change";
 			overridden.publishDependencyFingerprintChange();
-			overridden.tick(false, null, 0L);
+			overridden.tick(true, null, 1L);
 			assertEquals(explicitOverride, System.getProperty("arenaagents.voiceUrl"),
 					"config changes never replace an explicit user voice endpoint override");
 			assertEquals(overrideRevision, overridden.voiceConfigurationRevision(),

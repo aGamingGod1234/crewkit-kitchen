@@ -102,11 +102,41 @@ test('Codex catalog fallback contains only the configured exact launch profile',
 	}, { transport });
 	await service.start();
 	try {
+		assert.equal(transport.calls.some(({ method }) => method === 'model/list'), false);
 		const snapshot = service.catalog.snapshot();
 		assert.equal(snapshot.source, 'builtin');
 		assert.deepEqual(snapshot.models.map(({ id, reasoningEfforts, serviceTiers }) => ({ id, reasoningEfforts, serviceTiers })), [{
 			id: 'gpt-5.6-terra', reasoningEfforts: ['xhigh'], serviceTiers: ['priority'],
 		}]);
+	} finally {
+		await service.stop();
+	}
+});
+
+test('configured Codex profile creates a thread without waiting for live catalog discovery', async () => {
+	const transport = new FakeSharedTransport();
+	let catalogRequested = false;
+	transport.request = async (method, params, options) => {
+		transport.calls.push({ method, params, options });
+		if (method === 'initialize') return { userAgent: 'fake' };
+		if (method === 'model/list') {
+			catalogRequested = true;
+			return new Promise(() => {});
+		}
+		if (method === 'thread/start') return { thread: { id: 'thread-fast-start' } };
+		throw new Error(`Unexpected method ${method}`);
+	};
+	const service = new CodexService({
+		cwd: 'C:\\workspace',
+		launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' },
+	}, { transport });
+	try {
+		const agent = await service.createAgent(profile('configured-fast-start'));
+		const reconciled = await service.reconcile([profile('configured-fast-start')]);
+		assert.equal(agent.agentId, 'configured-fast-start');
+		assert.deepEqual(reconciled.valid.map(({ agentId }) => agentId), ['configured-fast-start']);
+		assert.equal(catalogRequested, false);
+		assert.equal(transport.calls.some(({ method }) => method === 'thread/start'), true);
 	} finally {
 		await service.stop();
 	}

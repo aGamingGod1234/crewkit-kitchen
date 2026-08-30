@@ -1289,12 +1289,7 @@ public final class CoordinatorProcessSupervisorVerification {
 			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, false);
 			assertEquals(0, launchLauncher.launches.size(), "normal auto-start waits until the bridge listener exists");
 			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
-			launchClock.advance(STARTUP_GRACE_MS - 1L);
-			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
-			assertEquals(0, launchLauncher.launches.size(), "normal auto-start honors the listener adoption window in full");
-			launchClock.advance(1L);
-			launchSupervisor.tickWithBridgeListener(false, null, 0L, false, true);
-			assertEquals(1, launchLauncher.launches.size(), "normal auto-start launches after the listener adoption window");
+			assertEquals(1, launchLauncher.launches.size(), "normal auto-start launches as soon as its bridge can accept authentication");
 			assertEquals(CoordinatorRecoveryState.AUTHENTICATING, launchSupervisor.snapshot().state(),
 					"normal auto-start still enters coordinator authentication");
 		} finally {
@@ -2072,10 +2067,13 @@ public final class CoordinatorProcessSupervisorVerification {
 				new CoordinatorProcessSupervisor.OwnedMaintenanceWorker(), runtimeRoot -> 0, task -> { }
 		);
 		await(dependenciesResolved, "production maintenance worker resolves startup dependencies");
-		supervisor.tick(false, null, 0L);
+		long configuredDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+		while (!supervisor.configured() && System.nanoTime() < configuredDeadline) {
+			supervisor.tick(false, null, 0L);
+			Thread.onSpinWait();
+		}
 		assertTrue(supervisor.configured(), "startup dependencies publish before the launch race");
 
-		clock.advance(STARTUP_GRACE_MS);
 		long launchDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
 		while (launcher.started.getCount() > 0L && System.nanoTime() < launchDeadline) {
 			supervisor.tick(false, null, 0L);

@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.server;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -41,22 +43,27 @@ final class AgentRecoverySpawnPolicy {
 		if (width > MAX_SEARCH_SPAN || depth > MAX_SEARCH_SPAN) {
 			throw new IllegalArgumentException("recovery search bounds exceed the supported span");
 		}
-		Position selected = null;
-		long selectedDistance = Long.MAX_VALUE;
+		ArrayList<Position> candidates = new ArrayList<>((int) (width * depth));
 		for (int x = minX; x <= maxX; x++) {
 			for (int z = minZ; z <= maxZ; z++) {
-				Column column = Objects.requireNonNull(columns.sample(x, z), "column must not be null");
-				if (!column.safe()) continue;
-				long dx = (long) x - centerX;
-				long dz = (long) z - centerZ;
-				long distance = dx * dx + dz * dz;
-				if (distance < selectedDistance) {
-					selected = new Position(x, column.feetY(), z);
-					selectedDistance = distance;
-				}
+				candidates.add(new Position(x, 0, z));
 			}
 		}
-		return Optional.ofNullable(selected);
+		candidates.sort(Comparator
+				.comparingLong((Position position) -> squaredDistance(position.x(), position.z(), centerX, centerZ))
+				.thenComparingInt(Position::x)
+				.thenComparingInt(Position::z));
+		for (Position candidate : candidates) {
+			Column column = Objects.requireNonNull(columns.sample(candidate.x(), candidate.z()), "column must not be null");
+			if (column.safe()) return Optional.of(new Position(candidate.x(), column.feetY(), candidate.z()));
+		}
+		return Optional.empty();
+	}
+
+	private static long squaredDistance(int x, int z, int centerX, int centerZ) {
+		long dx = (long) x - centerX;
+		long dz = (long) z - centerZ;
+		return dx * dx + dz * dz;
 	}
 
 	static OptionalInt selectNearestSafeY(int preferredY, int minY, int maxY, IntPredicate safe) {
