@@ -8,6 +8,7 @@ import dev.agaminggod.arenaagents.server.bridge.BridgeProtocolException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class ServerObservationWireBudgetVerification {
 	private static final String MAX_MESSAGE_ID = "m".repeat(128);
@@ -24,12 +25,15 @@ public final class ServerObservationWireBudgetVerification {
 				codec.encodedBytes(utf8Envelope), "encoded byte count includes UTF-8 and newline");
 
 		JsonObject source = observation();
-		ServerObservationWireBudget.Fitted reduced = ServerObservationWireBudget.fit(source, candidate ->
-				!hasCandidateTags(candidate)
+		AtomicInteger stagedFitChecks = new AtomicInteger();
+		ServerObservationWireBudget.Fitted reduced = ServerObservationWireBudget.fit(source, candidate -> {
+			stagedFitChecks.incrementAndGet();
+			return !hasCandidateTags(candidate)
 						&& candidate.getAsJsonArray("blocks").size() == 1
 						&& candidate.getAsJsonArray("nearbyContainers").size() == 1
 						&& candidate.getAsJsonArray("entities").size() == 1
-						&& candidate.getAsJsonObject("player").getAsJsonArray("effects").size() == 1);
+						&& candidate.getAsJsonObject("player").getAsJsonArray("effects").size() == 1;
+		});
 		JsonObject fitted = reduced.observation();
 		assertEquals(List.of("candidateTags", "blocks", "nearbyContainers", "entities", "player.effects"),
 				reduced.reductions(), "deterministic reduction order");
@@ -52,6 +56,8 @@ public final class ServerObservationWireBudgetVerification {
 				"reduction report is immutable");
 		fitted.remove("player");
 		assertTrue(reduced.observation().has("player"), "fitted observation accessor is detached");
+		assertEquals(6, stagedFitChecks.get(),
+				"each staged reduction performs one complete-envelope check without duplicate fitting");
 
 		JsonObject oversized = observation();
 		for (int index = 0; index < 64; index++) {
@@ -71,7 +77,7 @@ public final class ServerObservationWireBudgetVerification {
 		assertThrowsCode(() -> ServerObservationWireBudget.fit(impossible,
 				candidate -> codec.encodedBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES),
 				"OBSERVATION_TOO_LARGE", "protected essentials fail closed when they cannot fit");
-		return 19;
+		return 20;
 	}
 
 	private static BridgeEnvelope envelope(JsonObject payload) {

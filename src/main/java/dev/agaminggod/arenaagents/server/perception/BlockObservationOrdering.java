@@ -30,13 +30,20 @@ public final class BlockObservationOrdering {
 			int maximumPerBlockType,
 			Predicate<Candidate> admissible
 	) {
-		Objects.requireNonNull(candidates, "candidates must not be null");
+		return selectOrdered(ordered(candidates), maximumEntries, maximumPerBlockType, admissible);
+	}
+
+	static List<Candidate> selectOrdered(
+			List<Candidate> ordered,
+			int maximumEntries,
+			int maximumPerBlockType,
+			Predicate<Candidate> admissible
+	) {
+		Objects.requireNonNull(ordered, "ordered must not be null");
 		Objects.requireNonNull(admissible, "admissible must not be null");
 		if (maximumEntries <= 0 || maximumPerBlockType <= 0) {
 			throw new IllegalArgumentException("observation limits must be positive");
 		}
-		ArrayList<Candidate> ordered = new ArrayList<>(candidates);
-		ordered.sort(ORDER);
 		ArrayList<Candidate> selected = new ArrayList<>(Math.min(maximumEntries, ordered.size()));
 		Map<String, Integer> counts = new HashMap<>();
 		for (Candidate candidate : ordered) {
@@ -48,6 +55,13 @@ public final class BlockObservationOrdering {
 			if (selected.size() >= maximumEntries) break;
 		}
 		return List.copyOf(selected);
+	}
+
+	public static List<Candidate> ordered(List<Candidate> candidates) {
+		Objects.requireNonNull(candidates, "candidates must not be null");
+		ArrayList<Candidate> ordered = new ArrayList<>(candidates);
+		ordered.sort(ORDER);
+		return List.copyOf(ordered);
 	}
 
 	public record Candidate(int x, int y, int z, String blockId) {
