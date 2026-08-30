@@ -3,6 +3,7 @@ import { parseDecision } from './decision-parser.mjs';
 import { recordProviderTurn } from './provider-turn-recorder.mjs';
 import { discoverKimiCatalog } from './provider-catalog-discovery.mjs';
 import { PLANNER_SYSTEM_PROMPT } from './prompts.mjs';
+import { createProviderChildEnvironment } from './provider-environment.mjs';
 import { createSessionMetadata, profileFingerprint } from './provider-session.mjs';
 import { reportVisibleOutput } from './verbose-output.mjs';
 
@@ -28,6 +29,11 @@ export class AcpProviderService {
 
 	constructor(config, dependencies = {}) {
 		this.#config = validateServiceConfig(config);
+		const catalogEnvironment = createProviderChildEnvironment(
+			this.#config.provider,
+			this.#config.environment ?? process.env,
+			this.#config.bridgeSecretEnvironmentVariable,
+		);
 		this.#transportFactory = dependencies.transportFactory ?? ((profile) => new AcpStdioTransport({ ...this.#config, ...profile }));
 		this.#workspaceManager = dependencies.workspaceManager ?? null;
 		if (this.#workspaceManager !== null && typeof this.#workspaceManager.prepare !== 'function') {
@@ -36,6 +42,7 @@ export class AcpProviderService {
 		this.catalog = new AcpCatalog(this.#config, {
 			discover: dependencies.discoverCatalog ?? discoverKimiCatalog,
 			execFile: dependencies.execFile,
+			environment: catalogEnvironment,
 		});
 	}
 
@@ -433,6 +440,7 @@ class AcpCatalog {
 				models = await this.#dependencies.discover({
 					executable: this.#config.executable ?? 'kimi',
 					execFile: this.#dependencies.execFile,
+					environment: this.#dependencies.environment,
 					timeoutMs: this.#config.catalogDiscoveryTimeoutMs,
 				});
 			} catch {

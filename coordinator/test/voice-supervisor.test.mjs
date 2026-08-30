@@ -3,12 +3,44 @@ import { EventEmitter } from 'node:events';
 import { createServer } from 'node:http';
 import test from 'node:test';
 
-import { createVoiceSupervisor, startCoordinatorControl, startVoiceWorker } from '../src/dynamic-main.mjs';
-import { createVoiceHttpServer } from '../src/voice/voice-http-server.mjs';
+import {
+	createVoiceSupervisor,
+	startCoordinatorControl,
+	startVoiceWorker as startVoiceWorkerRuntime,
+} from '../src/dynamic-main.mjs';
+import { createVoiceHttpServer, createVoiceRequestHeaders } from '../src/voice/voice-http-server.mjs';
+
+function fetch(input, init = {}) {
+	const headers = new Headers(init.headers);
+	const url = new URL(typeof input === 'string' ? input : input.url);
+	if (init.method === 'POST' && ['/v1/tts', '/v1/stt'].includes(url.pathname)
+			&& headers.has('X-Voice-Signature')) {
+		const signed = createVoiceRequestHeaders({
+			secret: SECRET,
+			path: url.pathname,
+			contentType: headers.get('Content-Type') ?? '',
+			identityHeaders: headers,
+			body: init.body == null ? Buffer.alloc(0) : Buffer.from(init.body),
+			timestamp: Number(headers.get('X-Voice-Timestamp')),
+			nonce: headers.get('X-Voice-Nonce'),
+		});
+		for (const [name, value] of Object.entries(signed)) headers.set(name, value);
+		return globalThis.fetch(input, { ...init, headers });
+	}
+	return globalThis.fetch(input, init);
+}
 import { VoiceProfileStore } from '../src/voice/voice-profile-store.mjs';
 import { VoiceSupervisor } from '../src/voice/voice-supervisor.mjs';
 
 const SECRET = 'voice-supervisor-test-secret';
+
+function startVoiceWorker(config, environment = {}, dependencies = {}) {
+	return startVoiceWorkerRuntime(
+		{ ...config, voice: { ...config.voice, secret: config.voice?.secret ?? SECRET } },
+		environment,
+		dependencies,
+	);
+}
 
 test('coordinator control starts before optional voice and never awaits its warmup', async () => {
 	const order = [];
@@ -322,7 +354,10 @@ test('a stalled channel probe replaces the exact worker and recovers without ove
 		const first = workers[0];
 		const request = (text, sequence) => fetch(`${first.baseUrl}/v1/tts`, {
 			method: 'POST',
-			headers: { Authorization: `Bearer ${SECRET}`, 'Content-Type': 'application/json' },
+			headers: {
+				...createVoiceRequestHeaders({ secret: SECRET, path: '/v1/tts' }),
+				'Content-Type': 'application/json',
+			},
 			body: JSON.stringify({
 				agentId: '00000000-0000-4000-8000-000000000001', text,
 				profileId: 'voice.auto.v1', radius: 48, conversationSequence: sequence,

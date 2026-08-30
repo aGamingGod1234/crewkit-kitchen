@@ -184,6 +184,10 @@ public final class ServerAgentConversationRouter implements AgentConversationRou
 		return new DeliveryReceipt(List.copyOf(delivered), List.of());
 	}
 
+	public void removeAgent(AgentId agentId) {
+		sequences.remove(Objects.requireNonNull(agentId, "agentId must not be null"));
+	}
+
 	@Override
 	public DeliveryReceipt deliver(ConversationEvent event) {
 		Objects.requireNonNull(event, "event must not be null");

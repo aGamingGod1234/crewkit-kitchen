@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import net from 'node:net';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+
+import { createBridgeAuthenticationProof } from '../src/protocol-v2.mjs';
 
 const coordinatorRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const fixture = path.join(coordinatorRoot, 'test-support', 'recovery-coordinator-process.mjs');
@@ -20,23 +23,47 @@ test('real coordinator process reconnects to a restored loopback bridge without 
 		maxOpenSockets = Math.max(maxOpenSockets, sockets.size);
 		socket.on('close', () => sockets.delete(socket));
 		let buffered = '';
-		let acknowledged = false;
+		let serverNonce = null;
 		socket.on('data', (chunk) => {
-			if (acknowledged) return;
 			buffered += chunk.toString('utf8');
-			const boundary = buffered.indexOf('\n');
-			if (boundary < 0) return;
-			const hello = JSON.parse(buffered.slice(0, boundary));
-			buffered = buffered.slice(boundary + 1);
-			acknowledged = true;
-			socket.write(`${JSON.stringify({
-				protocolVersion: 2,
-				serverInstanceId: 'recovery-smoke-server',
-				agentId: 'server',
-				type: 'hello_ack',
-				messageId: `smoke-ack-${connections}`,
-				payload: { replyTo: hello.messageId, authenticated: true, registry: [] },
-			})}\n`);
+			while (true) {
+				const boundary = buffered.indexOf('\n');
+				if (boundary < 0) return;
+				const message = JSON.parse(buffered.slice(0, boundary));
+				buffered = buffered.slice(boundary + 1);
+				if (message.type === 'auth_challenge') {
+					serverNonce = randomBytes(32).toString('base64url');
+					socket.write(`${JSON.stringify({
+						protocolVersion: 2,
+						serverInstanceId: 'recovery-smoke-server',
+						agentId: 'server',
+						type: 'auth_response',
+						messageId: `smoke-auth-${connections}`,
+						payload: {
+							replyTo: message.messageId,
+							clientNonce: message.payload.clientNonce,
+							serverNonce,
+							proof: createBridgeAuthenticationProof(secret, 'server', {
+								clientNonce: message.payload.clientNonce,
+								serverNonce,
+								serverInstanceId: 'recovery-smoke-server',
+							}),
+						},
+					})}\n`);
+					continue;
+				}
+				if (message.type === 'hello') {
+					assert.equal(message.payload.serverNonce, serverNonce);
+					socket.write(`${JSON.stringify({
+						protocolVersion: 2,
+						serverInstanceId: 'recovery-smoke-server',
+						agentId: 'server',
+						type: 'hello_ack',
+						messageId: `smoke-ack-${connections}`,
+						payload: { replyTo: message.messageId, authenticated: true, registry: [] },
+					})}\n`);
+				}
+			}
 		});
 	});
 	await new Promise((resolve, reject) => {

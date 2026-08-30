@@ -14,6 +14,7 @@ import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -60,12 +61,17 @@ public final class AgentControlSync {
 		boolean scenarioReceiverRegistered = ServerPlayNetworking.registerGlobalReceiver(
 				ScenarioLaunchPayload.TYPE,
 				(payload, context) -> context.server().execute(() -> {
-					try {
-						ScenarioRuntimeService.launch(context.player(), payload.request());
-						sendCurrentBuildProgress(context.player());
-					} catch (RuntimeException exception) {
-						publishRejectedBuild(context.player(), payload, exception);
-					}
+					executeAuthorizedControlAction(
+							GoalControl.mayControl(context.player().createCommandSourceStack()),
+							() -> {
+								try {
+									ScenarioRuntimeService.launch(context.player(), payload.request());
+									sendCurrentBuildProgress(context.player());
+								} catch (RuntimeException exception) {
+									publishRejectedBuild(context.player(), payload, exception);
+								}
+							}
+					);
 				})
 		);
 		if (!scenarioReceiverRegistered) {
@@ -190,27 +196,36 @@ public final class AgentControlSync {
 	public static void sendSnapshot(ServerPlayer player) {
 		try {
 			boolean canControl = GoalControl.mayControl(player.createCommandSourceStack());
-			CodexAgentManager manager = CodexAgentManager.get(player.level().getServer());
-			AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(
-					canControl,
-					CodexAgentServerRuntime.automationAvailable(player.level().getServer()),
-					CodexAgentServerRuntime.automationStatus(player.level().getServer()),
-					System.currentTimeMillis(),
-					manager.records(),
-					manager.groups().stream()
-							.map(group -> new AgentControlGroup(
-									group.name(),
-									group.memberIds().stream().map(Object::toString).toList()
-							))
-							.toList(),
-					CodexAgentServerRuntime.modelCatalog(player.level().getServer())
-			);
-			if (ServerPlayNetworking.canSend(player, AgentControlSnapshotPayload.TYPE)) {
-				ServerPlayNetworking.send(player, AgentControlSnapshotPayload.fromSnapshot(snapshot));
-			}
+			executeAuthorizedControlAction(canControl, () -> {
+				CodexAgentManager manager = CodexAgentManager.get(player.level().getServer());
+				AgentControlSnapshot snapshot = AgentControlSnapshot.fromRecords(
+						true,
+						CodexAgentServerRuntime.automationAvailable(player.level().getServer()),
+						CodexAgentServerRuntime.automationStatus(player.level().getServer()),
+						System.currentTimeMillis(),
+						manager.records(),
+						manager.groups().stream()
+								.map(group -> new AgentControlGroup(
+										group.name(),
+										group.memberIds().stream().map(Object::toString).toList()
+								))
+								.toList(),
+						CodexAgentServerRuntime.modelCatalog(player.level().getServer())
+				);
+				if (ServerPlayNetworking.canSend(player, AgentControlSnapshotPayload.TYPE)) {
+					ServerPlayNetworking.send(player, AgentControlSnapshotPayload.fromSnapshot(snapshot));
+				}
+			});
 		} catch (RuntimeException exception) {
 			LOGGER.warn("Could not send Arena Agents control snapshot to {}", player.getScoreboardName(), exception);
 		}
+	}
+
+	static boolean executeAuthorizedControlAction(boolean canControl, Runnable action) {
+		Objects.requireNonNull(action, "action must not be null");
+		if (!canControl) return false;
+		action.run();
+		return true;
 	}
 
 	private static final class SpectatorPublication {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { AntigravityProviderService } from '../src/antigravity-service.mjs';
+import { ANTIGRAVITY_INTERNAL_TEST_MODE, AntigravityProviderService } from '../src/antigravity-service.mjs';
 import { ProviderService } from '../src/provider-service.mjs';
 
 class FakeService {
@@ -132,6 +132,7 @@ test('provider reconciliation retains a Gemini fast profile and rejects a tier m
 		cwd: 'C:\\workspace',
 		models: ['gemini-3.1-pro'],
 		modelReasoningEfforts: { 'gemini-3.1-pro': ['high', 'low'] },
+		testOnlyMode: ANTIGRAVITY_INTERNAL_TEST_MODE,
 	});
 	const router = new ProviderService({
 		codex: new FakeService('codex'),

@@ -159,7 +159,7 @@ public final class ArenaAgentsVoiceProvider implements VoiceSubsystemProvider, V
 		));
 		String secretPath = System.getProperty(
 				"arenaagents.voiceSecretFile",
-				System.getProperty("arenaagents.bridgeSecretFile", "runtime/bridge-secret.txt")
+				"runtime/voice-secret.txt"
 		);
 		try {
 			String secret = Files.readString(Path.of(secretPath), StandardCharsets.UTF_8).trim();

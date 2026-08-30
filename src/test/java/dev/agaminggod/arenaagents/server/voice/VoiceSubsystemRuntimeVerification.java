@@ -96,6 +96,13 @@ public final class VoiceSubsystemRuntimeVerification {
 		assertTrue(VoiceSubsystemRuntime.availabilityFallbackTransition(
 				server, agentId, "VOICE_TRANSPORT_UNAVAILABLE"
 		), "a later fallback is visible after recovery");
+		assertEquals(1L, VoiceSubsystemRuntime.nextConversationSequence(server, agentId),
+				"first voice conversation uses the first per-agent sequence");
+		assertEquals(2L, VoiceSubsystemRuntime.nextConversationSequence(server, agentId),
+				"voice conversations advance the per-agent sequence");
+		VoiceSubsystemRuntime.removeAgent(server, agentId);
+		assertEquals(1L, VoiceSubsystemRuntime.nextConversationSequence(server, agentId),
+				"agent removal evicts voice sequence and diagnostic state");
 		VoiceRequest request = new VoiceRequest(agentId, "Recovered voice.", "voice.auto.v1", 48, 1L);
 		assertEquals(VoiceReceipt.Status.ACCEPTED,
 				VoiceSubsystemRuntime.speak(server, request).toCompletableFuture().join().status(),
@@ -128,7 +135,7 @@ public final class VoiceSubsystemRuntimeVerification {
 		assertTrue(VoiceSubsystemRuntime.available(startupRaceServer),
 				"the retry promotes the real voice subsystem without restarting Minecraft");
 		VoiceSubsystemRuntime.close(startupRaceServer);
-		return 27 + verifyLegacyProviderCompatibility(configuration)
+		return 30 + verifyLegacyProviderCompatibility(configuration)
 				+ verifyLinkageFailureFallback(configuration)
 				+ verifyOptionalConfigurationFailure() + verifyEndpointValidation()
 				+ verifyConsentCancellationLockOrder();

@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import { BestEffortDiagnosticQueue } from './best-effort-diagnostic-queue.mjs';
 import { DIAGNOSTIC_REDACTED, isOperationalTokenMetric, isSensitiveDiagnosticKey, sanitizeDiagnosticText, truncateDiagnosticUtf8 } from './diagnostic-sanitizer.mjs';
+import { preparePrivateArtifact } from './private-artifact-permissions.mjs';
 
 const REDACTED = DIAGNOSTIC_REDACTED;
 const UNSAFE = '[UNSAFE_OBJECT]';
@@ -24,6 +25,7 @@ export class TraceWriter {
 	#diagnosticFilePath;
 	#appendFile;
 	#mkdir;
+	#preparePrivateArtifact;
 	#ready;
 	#queue;
 	#closed = false;
@@ -37,6 +39,9 @@ export class TraceWriter {
 		this.#diagnosticFilePath = privatePath === null ? null : path.resolve(privatePath);
 		this.#appendFile = dependencies.appendFile ?? appendFile;
 		this.#mkdir = dependencies.mkdir ?? mkdir;
+		this.#preparePrivateArtifact = dependencies.preparePrivateArtifact
+			?? (dependencies.appendFile === undefined && dependencies.mkdir === undefined
+				? preparePrivateArtifact : async () => {});
 		this.#queue = new BestEffortDiagnosticQueue({
 			maxPending: dependencies.maxPending,
 			operationTimeoutMs: dependencies.operationTimeoutMs,
@@ -47,7 +52,9 @@ export class TraceWriter {
 			now: dependencies.now,
 		});
 		const directories = [path.dirname(this.#filePath), this.#diagnosticFilePath === null ? null : path.dirname(this.#diagnosticFilePath)].filter(Boolean);
-		this.#ready = Promise.all([...new Set(directories)].map((directory) => this.#mkdir(directory, { recursive: true }))).then(() => true, () => false);
+		this.#ready = Promise.all([...new Set(directories)].map((directory) => this.#mkdir(directory, { recursive: true, mode: 0o700 })))
+			.then(() => Promise.all([this.#filePath, this.#diagnosticFilePath].filter(Boolean).map((filePath) => this.#preparePrivateArtifact(filePath))))
+			.then(() => true, () => false);
 	}
 
 	write(eventOrRow, fields = {}) {
@@ -85,7 +92,7 @@ export class TraceWriter {
 		const encoded = `${JSON.stringify(row)}\n`;
 		this.#queue.submit(async () => {
 			if (!await this.#ready) throw new Error('trace sink directory is unavailable');
-			await this.#appendFile(filePath, encoded, { encoding: 'utf8', flag: 'a' });
+			await this.#appendFile(filePath, encoded, { encoding: 'utf8', flag: 'a', mode: 0o600 });
 		});
 	}
 }

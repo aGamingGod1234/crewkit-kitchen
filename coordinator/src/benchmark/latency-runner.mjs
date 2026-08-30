@@ -52,7 +52,7 @@ export function normalizeLatencyMatrix(value) {
 		if (!LOADS.includes(agentLoad) || !agentLoads.includes(agentLoad)) throw new TypeError(`${id}.agentLoad must be one of 1, 4, 8, 16`);
 		const providerProfile = normalizeProfile(trial.providerProfile, id);
 		if (mode === 'instant' && providerProfile.provider !== 'instant') throw new TypeError(`${id}.instant trials require providerProfile.provider instant`);
-		if (mode === 'live' && !['codex', 'gemini', 'kimi'].includes(providerProfile.provider)) throw new TypeError(`${id}.live trials require a Codex, Gemini, or Kimi provider`);
+		if (mode === 'live' && !['codex', 'kimi'].includes(providerProfile.provider)) throw new TypeError(`${id}.live trials require a Codex or Kimi provider`);
 		const repetitions = positiveInt(trial.repetitions, `${id}.repetitions`);
 		if (repetitions > MAX_REPETITIONS) throw new TypeError(`${id}.repetitions is too large`);
 		return Object.freeze({

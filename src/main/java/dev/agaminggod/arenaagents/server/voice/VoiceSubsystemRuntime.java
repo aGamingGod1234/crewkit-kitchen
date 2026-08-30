@@ -56,7 +56,7 @@ public final class VoiceSubsystemRuntime {
 		));
 		String secretPath = System.getProperty(
 				"arenaagents.voiceSecretFile",
-				System.getProperty("arenaagents.bridgeSecretFile", "runtime/bridge-secret.txt")
+				"runtime/voice-secret.txt"
 		);
 		try {
 			String secret = Files.readString(Path.of(secretPath), StandardCharsets.UTF_8).trim();
@@ -228,6 +228,14 @@ public final class VoiceSubsystemRuntime {
 		Holder holder = INSTANCES.get(server);
 		if (holder == null) return 1L;
 		return holder.sequences().merge(agentId, 1L, Long::sum);
+	}
+
+	public static synchronized void removeAgent(MinecraftServer server, AgentId agentId) {
+		Objects.requireNonNull(server, "server must not be null");
+		Objects.requireNonNull(agentId, "agentId must not be null");
+		Holder holder = INSTANCES.get(server);
+		if (holder != null) holder.sequences().remove(agentId);
+		clearAvailabilityFallback(server, agentId);
 	}
 
 	public static synchronized void stopSpeaking(MinecraftServer server, AgentId agentId) {

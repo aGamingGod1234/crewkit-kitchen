@@ -24,17 +24,6 @@
 			"serviceTier": "fast"
 		}
 	},
-	"gemini": {
-		"executable": "agy",
-		"models": ["gemini-3.7-flash", "gemini-3.1-pro", "gemini-3.6-flash", "gemini-3.5-flash"],
-		"modelReasoningEfforts": {
-			"gemini-3.7-flash": ["high", "medium", "low"],
-			"gemini-3.1-pro": ["high", "low"],
-			"gemini-3.6-flash": ["high", "medium", "low"],
-			"gemini-3.5-flash": ["high", "medium", "low"]
-		},
-		"planningTimeoutMs": 120000
-	},
 	"kimi": {
 		"models": ["kimi-code/k3", "kimi-code/k3-256k", "kimi-code/kimi-for-coding", "kimi-code/kimi-for-coding-highspeed"],
 		"reasoningEfforts": ["low", "high", "max"],

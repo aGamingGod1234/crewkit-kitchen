@@ -22,7 +22,8 @@ public final class ObservationWireBudgetVerification {
 				worstCaseText(ProtocolConstants.MAX_COMMAND_ID_LENGTH),
 				AgentConfig.DEFAULT_BRIDGE_PORT,
 				AgentConfig.MAX_OBSERVATION_RADIUS,
-				true
+				false,
+				AgentConfig.DEFAULT_BRIDGE_SECRET
 		);
 		BridgeServer server = new BridgeServer(config, codec, Runnable::run, command -> { });
 		Observation source = worstCaseObservation();
