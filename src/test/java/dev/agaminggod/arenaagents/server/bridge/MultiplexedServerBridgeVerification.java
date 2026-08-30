@@ -88,7 +88,7 @@ public final class MultiplexedServerBridgeVerification {
 		net.minecraft.server.Bootstrap.bootStrap();
 		if (args.length == 1 && "preauth-overflow".equals(args[0])) {
 			verifyPreauthOverflowPreservesIncumbentHandshake();
-			System.out.println("MultiplexedServerBridgeVerification preauth-overflow assertions=8");
+			System.out.println("MultiplexedServerBridgeVerification preauth-overflow assertions=14");
 			return;
 		}
 		System.out.println("MultiplexedServerBridgeVerification assertions=" + verify());
@@ -2292,7 +2292,7 @@ public final class MultiplexedServerBridgeVerification {
 					"bridge starts without an accepted session");
 			try (Socket unauthenticated = new Socket(
 					MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification())) {
-				awaitCondition(() -> preauthSessionCount(activeBridge) == 1,
+				awaitPreauthSessionCount(activeBridge, 1,
 						"silent candidate is admitted before the authenticated connection starts");
 				assertTrue(!activeBridge.observationPublicationForVerification().hasActiveSession(),
 						"an unauthenticated socket cannot claim the primary publication session");
@@ -2347,9 +2347,9 @@ public final class MultiplexedServerBridgeVerification {
 					fillers.add(new Socket(
 							MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification()
 					));
+					awaitPreauthSessionCount(activeBridge, index + 1,
+							"pre-authentication filler " + index + " is admitted before the next connection");
 				}
-				awaitCondition(() -> preauthSessionCount(activeBridge) == 8,
-						"pre-authentication pool reaches its bounded capacity");
 
 				try (Socket overflow = new Socket(
 						MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification())) {
@@ -2624,6 +2624,23 @@ public final class MultiplexedServerBridgeVerification {
 		private void releaseAccept() {
 			releaseAccept.countDown();
 		}
+	}
+
+	private static void awaitPreauthSessionCount(
+			MultiplexedServerBridge bridge,
+			int expected,
+			String label
+	) {
+		long deadline = System.nanoTime() + 2_000_000_000L;
+		while (preauthSessionCount(bridge) != expected && System.nanoTime() < deadline) {
+			try {
+				Thread.sleep(1L);
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+				throw new AssertionError(label + " was interrupted", exception);
+			}
+		}
+		assertEquals(expected, preauthSessionCount(bridge), label);
 	}
 
 	private static boolean catalogDiscoveryPending(MultiplexedServerBridge bridge) {
