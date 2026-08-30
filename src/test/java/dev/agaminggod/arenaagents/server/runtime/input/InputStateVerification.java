@@ -18,7 +18,7 @@ public final class InputStateVerification {
 		assertions += verifyLeasePreemptionAndRestoration();
 		assertions += verifyClearReleasesEveryPressedInput();
 		assertions += verifyLeaseDeadman();
-		assertions += verifyUseHandTransitions();
+		assertions += verifyExactHandUseDriver();
 		assertions += verifyBoundedMotor();
 		return assertions;
 	}
@@ -81,6 +81,9 @@ public final class InputStateVerification {
 		controller.apply(lease, state(1.0F, true, true));
 		for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
 		assertEquals(true, controller.currentState(AGENT).isPresent(), "lease remains active inside its renewal window");
+		assertEquals(39, sink.ticked.size(), "held input reaches the physical tick sink throughout its lease");
+		assertEquals(state(1.0F, true, true), sink.ticked.getLast(),
+				"physical tick sink receives the winning held state");
 		controller.tick();
 		assertEquals(true, controller.currentState(AGENT).isEmpty(), "silent lease expires at the deadman deadline");
 		assertEquals(List.of(AGENT), sink.cleared, "deadman neutralizes held physical input once");
@@ -92,23 +95,68 @@ public final class InputStateVerification {
 			for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
 		}
 		assertEquals(true, controller.currentState(AGENT).isPresent(), "regular input application renews the lease");
-		return 5;
+		return 7;
 	}
 
-	private static int verifyUseHandTransitions() {
-		AgentInputState mainUse = state(0.0F, false, true);
-		AgentInputState offhandUse = withHand(mainUse, InteractionHand.OFF_HAND);
-		assertEquals(true, CarpetInputStateSink.shouldStopUsing(mainUse, offhandUse),
-				"changing hand releases the previous held use");
-		assertEquals(true, CarpetInputStateSink.shouldStartUsing(mainUse, offhandUse, true),
-				"changing hand starts use with the requested hand");
-		assertEquals(false, CarpetInputStateSink.shouldStopUsing(offhandUse, offhandUse),
-				"stable offhand use remains held");
-		assertEquals(false, CarpetInputStateSink.shouldStartUsing(offhandUse, offhandUse, false),
-				"stable offhand use is not restarted");
-		assertEquals(true, CarpetInputStateSink.shouldStopUsing(offhandUse, state(0.0F, false, false)),
-				"releasing use neutralizes the selected hand");
-		return 5;
+	private static int verifyExactHandUseDriver() {
+		ExactHandUseDriver driver = new ExactHandUseDriver();
+		RecordingUseAccess block = RecordingUseAccess.target(ExactHandUseDriver.TargetKind.BLOCK, true, true);
+		driver.start(AGENT, InteractionHand.MAIN_HAND, block);
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, block);
+		assertEquals(List.of(InteractionHand.MAIN_HAND), block.targetHands,
+				"block use receives only the requested main hand");
+		assertEquals(List.of(), block.itemHands, "consumed block use does not fall through to item use");
+		assertEquals(List.of(InteractionHand.MAIN_HAND), block.swingHands,
+				"server-authoritative block success swings the requested hand");
+		for (int tick = 0; tick < ExactHandUseDriver.REPEAT_COOLDOWN_TICKS; tick++) {
+			driver.tick(AGENT, InteractionHand.MAIN_HAND, block);
+		}
+		assertEquals(1, block.targetHands.size(), "block use waits for Carpet's pinned repeat cooldown");
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, block);
+		assertEquals(2, block.targetHands.size(), "held block use repeats after the pinned cooldown");
+		driver.stop(AGENT, block);
+
+		RecordingUseAccess entity = RecordingUseAccess.target(ExactHandUseDriver.TargetKind.ENTITY, true, false);
+		driver.start(AGENT, InteractionHand.OFF_HAND, entity);
+		driver.tick(AGENT, InteractionHand.OFF_HAND, entity);
+		assertEquals(List.of(InteractionHand.OFF_HAND), entity.targetHands,
+				"entity use receives only the requested offhand");
+		assertEquals(List.of(), entity.itemHands, "consumed entity use does not fall through to item use");
+		driver.stop(AGENT, entity);
+
+		RecordingUseAccess heldItem = RecordingUseAccess.item();
+		driver.start(AGENT, InteractionHand.OFF_HAND, heldItem);
+		driver.tick(AGENT, InteractionHand.OFF_HAND, heldItem);
+		assertEquals(List.of(), heldItem.targetHands,
+				"missed target does not fabricate a target interaction");
+		assertEquals(List.of(InteractionHand.OFF_HAND), heldItem.itemHands,
+				"item use starts with the requested offhand");
+		assertEquals(InteractionHand.OFF_HAND, heldItem.usedHand(), "held item reports the requested active hand");
+		for (int tick = 0; tick <= ExactHandUseDriver.REPEAT_COOLDOWN_TICKS; tick++) {
+			driver.tick(AGENT, InteractionHand.OFF_HAND, heldItem);
+		}
+		assertEquals(1, heldItem.itemHands.size(), "active held item is not restarted while its key remains down");
+		driver.stop(AGENT, heldItem);
+		assertEquals(1, heldItem.releaseCalls, "releasing use releases the active item once");
+		assertEquals(false, heldItem.isUsingItem(), "releasing use clears the physical using state");
+
+		RecordingUseAccess switchHands = RecordingUseAccess.item();
+		switchHands.usingItem = true;
+		switchHands.usedHand = InteractionHand.OFF_HAND;
+		driver.start(AGENT, InteractionHand.MAIN_HAND, switchHands);
+		assertEquals(1, switchHands.releaseCalls, "starting main-hand use releases an existing offhand use");
+		driver.tick(AGENT, InteractionHand.MAIN_HAND, switchHands);
+		assertEquals(List.of(InteractionHand.MAIN_HAND), switchHands.itemHands,
+				"main-hand selection cannot fall back to the offhand");
+		assertEquals(InteractionHand.MAIN_HAND, switchHands.usedHand(), "main hand becomes the observed active hand");
+		driver.start(AGENT, InteractionHand.OFF_HAND, switchHands);
+		assertEquals(2, switchHands.releaseCalls, "switching hands releases the previous held use");
+		driver.tick(AGENT, InteractionHand.OFF_HAND, switchHands);
+		assertEquals(List.of(InteractionHand.MAIN_HAND, InteractionHand.OFF_HAND), switchHands.itemHands,
+				"hand switch starts the newly requested hand");
+		assertEquals(InteractionHand.OFF_HAND, switchHands.usedHand(), "offhand becomes the observed active hand");
+		driver.stop(AGENT, switchHands);
+		return 19;
 	}
 
 	private static int verifyBoundedMotor() {
@@ -183,15 +231,9 @@ public final class InputStateVerification {
 		);
 	}
 
-	private static AgentInputState withHand(AgentInputState state, InteractionHand hand) {
-		return new AgentInputState(
-				state.forward(), state.strafe(), state.jump(), state.sneak(), state.sprint(), state.attack(), state.use(),
-				state.yaw(), state.pitch(), state.selectedSlot(), hand
-		);
-	}
-
 	private static final class RecordingSink implements InputStateSink {
 		private final List<AgentInputState> applied = new ArrayList<>();
+		private final List<AgentInputState> ticked = new ArrayList<>();
 		private final List<AgentId> cleared = new ArrayList<>();
 
 		@Override
@@ -200,8 +242,102 @@ public final class InputStateVerification {
 		}
 
 		@Override
+		public void tick(AgentId agentId, AgentInputState state) {
+			ticked.add(state);
+		}
+
+		@Override
 		public void clear(AgentId agentId, AgentInputState previous) {
 			cleared.add(agentId);
+		}
+	}
+
+	private static final class RecordingUseAccess implements ExactHandUseDriver.PlayerUseAccess {
+		private final ExactHandUseDriver.TargetKind targetKind;
+		private final boolean targetConsumes;
+		private final boolean targetSwings;
+		private final boolean itemConsumes;
+		private final List<InteractionHand> targetHands = new ArrayList<>();
+		private final List<InteractionHand> itemHands = new ArrayList<>();
+		private final List<InteractionHand> swingHands = new ArrayList<>();
+		private boolean usingItem;
+		private InteractionHand usedHand = InteractionHand.MAIN_HAND;
+		private int releaseCalls;
+
+		private RecordingUseAccess(
+				ExactHandUseDriver.TargetKind targetKind,
+				boolean targetConsumes,
+				boolean targetSwings,
+				boolean itemConsumes
+		) {
+			this.targetKind = targetKind;
+			this.targetConsumes = targetConsumes;
+			this.targetSwings = targetSwings;
+			this.itemConsumes = itemConsumes;
+		}
+
+		private static RecordingUseAccess target(
+				ExactHandUseDriver.TargetKind kind,
+				boolean consumes,
+				boolean swings
+		) {
+			return new RecordingUseAccess(kind, consumes, swings, false);
+		}
+
+		private static RecordingUseAccess item() {
+			return new RecordingUseAccess(ExactHandUseDriver.TargetKind.MISS, false, false, true);
+		}
+
+		@Override
+		public boolean isUsingItem() {
+			return usingItem;
+		}
+
+		@Override
+		public InteractionHand usedHand() {
+			return usedHand;
+		}
+
+		@Override
+		public void releaseUsingItem() {
+			releaseCalls++;
+			usingItem = false;
+		}
+
+		@Override
+		public ExactHandUseDriver.TargetKind target() {
+			return targetKind;
+		}
+
+		@Override
+		public ExactHandUseDriver.TargetAttempt useBlock(InteractionHand hand) {
+			targetHands.add(hand);
+			return !targetConsumes
+					? ExactHandUseDriver.TargetAttempt.pass()
+					: ExactHandUseDriver.TargetAttempt.consumed(targetSwings);
+		}
+
+		@Override
+		public ExactHandUseDriver.TargetAttempt useEntity(InteractionHand hand) {
+			targetHands.add(hand);
+			return !targetConsumes
+					? ExactHandUseDriver.TargetAttempt.pass()
+					: ExactHandUseDriver.TargetAttempt.consumed(targetSwings);
+		}
+
+		@Override
+		public boolean useItem(InteractionHand hand) {
+			itemHands.add(hand);
+			if (itemConsumes) {
+				usingItem = true;
+				usedHand = hand;
+			}
+			return itemConsumes;
+		}
+
+		@Override
+		public void swing(InteractionHand hand) {
+			swingHands.add(hand);
 		}
 	}
 

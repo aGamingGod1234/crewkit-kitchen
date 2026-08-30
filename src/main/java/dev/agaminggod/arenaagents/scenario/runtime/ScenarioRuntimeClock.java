@@ -39,12 +39,18 @@ public final class ScenarioRuntimeClock {
 		if (snapshot.nextEventIndex() > schedule.size()) {
 			throw new IllegalArgumentException("INVALID_SCENARIO_SNAPSHOT: clock event index exceeds schedule");
 		}
-		this.elapsedTick = snapshot.elapsedTick();
+		long durationTicks = session.config().durationTicks();
+		this.elapsedTick = Math.min(snapshot.elapsedTick(), durationTicks);
 		this.nextEventIndex = snapshot.nextEventIndex();
 		this.activePhaseId = snapshot.activePhaseId().orElse(null);
 		this.finished = snapshot.finished();
 		if (finished && !session.state().terminal()) {
 			throw new IllegalArgumentException("INVALID_SCENARIO_SNAPSHOT: active session cannot have a finished clock");
+		}
+		if (!finished && snapshot.elapsedTick() >= durationTicks) {
+			long finishTick = Math.max(session.lastElapsedTick(), Math.max(0L, durationTicks - 1L));
+			session.finish(finishTick, "Configured scenario duration elapsed");
+			finished = true;
 		}
 	}
 

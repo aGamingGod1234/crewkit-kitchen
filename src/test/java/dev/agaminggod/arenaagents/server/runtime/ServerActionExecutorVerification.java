@@ -7,6 +7,11 @@ import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
+import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
+import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
+import dev.agaminggod.arenaagents.server.runtime.input.InputStateSink;
+import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.protocol.ActionType;
@@ -21,6 +26,7 @@ import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAd
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.phys.Vec3;
 
 public final class ServerActionExecutorVerification {
@@ -177,6 +183,7 @@ public final class ServerActionExecutorVerification {
 		assertFalse(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 5L),
 				"respawn completion from a disconnected coordinator generation is ignored");
 		verifyDisconnectedRespawnFinishesOnce();
+		verifyDisconnectedControlNeutralizesLease();
 		assertThrows(IllegalArgumentException.class, () -> new ServerActionProgress(
 				progressAgent, 7L, "action-7", ActionType.NAVIGATE_TO, 1.1D, 250L, 1_750_000_000_250L
 		), "progress rejects fractions above one");
@@ -241,7 +248,46 @@ public final class ServerActionExecutorVerification {
 			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
 			admitted[start] = true;
 		}
-		return 51;
+		return 58;
+	}
+
+	private static void verifyDisconnectedControlNeutralizesLease() {
+		AgentId agentId = AgentId.random();
+		List<AgentId> cleared = new ArrayList<>();
+		InputStateSink sink = new InputStateSink() {
+			@Override
+			public void apply(AgentId ignored, AgentInputState previous, AgentInputState state) {
+			}
+
+			@Override
+			public void clear(AgentId clearedAgent, AgentInputState previous) {
+				cleared.add(clearedAgent);
+			}
+		};
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease lease = controller.acquire(agentId, InputOwner.DIRECT_CONTROL, 250);
+		controller.apply(lease, new AgentInputState(
+				1.0F, -1.0F, true, true, true, true, true,
+				90.0F, 15.0F, 4, InteractionHand.OFF_HAND
+		));
+		Object action = new Object();
+		Map<AgentId, Object> active = new LinkedHashMap<>();
+		active.put(agentId, action);
+		AtomicInteger lifecycleFinishes = new AtomicInteger();
+		assertTrue(ServerActionExecutor.finishDisconnectedControl(
+				active, agentId, action, () -> controller.clear(agentId), lifecycleFinishes::incrementAndGet
+		), "coordinator disconnect fences the active control action");
+		assertTrue(active.isEmpty(), "disconnected control cannot tick again");
+		assertTrue(controller.currentState(agentId).isEmpty(), "disconnect removes the active control lease immediately");
+		assertEquals(List.of(agentId), cleared, "disconnect neutralizes the physical input sink once");
+		assertThrows(IllegalStateException.class, () -> controller.apply(lease, new AgentInputState(
+				1.0F, 0.0F, false, false, true, false, false,
+				0.0F, 0.0F, 0, InteractionHand.MAIN_HAND
+		)), "disconnected control lease cannot renew");
+		assertEquals(1, lifecycleFinishes.get(), "disconnect finishes the control lifecycle once");
+		assertFalse(ServerActionExecutor.finishDisconnectedControl(
+				active, agentId, action, () -> controller.clear(agentId), lifecycleFinishes::incrementAndGet
+		), "duplicate disconnect cannot neutralize the same control twice");
 	}
 
 	private static void verifyDisconnectedRespawnFinishesOnce() {

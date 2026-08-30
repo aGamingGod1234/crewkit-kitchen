@@ -279,9 +279,33 @@ public final class ServerActionExecutor {
 		}
 	}
 
-	/** Fences and rolls back physical respawns when the coordinator session disappears. */
+	/** Fences coordinator-owned physical work when the authenticated session disappears. */
 	public synchronized void coordinatorDisconnected() {
 		coordinatorGeneration++;
+		for (ActiveAction action : new ArrayList<>(active.values())) {
+			if (!action.isControl()) continue;
+			try {
+				finishDisconnectedControl(
+						active,
+						action.request().agentId(),
+						action,
+						() -> {
+							ServerTransactionAdapter.runBestEffort(
+									() -> pendingCompletions.remove(action.request().agentId()),
+									action::neutralizeDisconnectedControl,
+									() -> releaseResourceLease(action)
+							);
+						},
+						() -> {
+							try {
+								router.actionFinished(action.request().agentId(), action.request().goalRevision());
+							} catch (AgentDomainException stale) { }
+						}
+				);
+			} catch (RuntimeException ignored) {
+				// Every neutralization step is best effort and the action has already been fenced from later ticks.
+			}
+		}
 		for (PendingRespawn pending : new ArrayList<>(pendingRespawns.values())) {
 			finishDisconnectedRespawn(
 					pendingRespawns,
@@ -291,6 +315,22 @@ public final class ServerActionExecutor {
 					() -> AgentChatReporter.respawnDisconnected(manager, pending.attempt().deadRecord())
 			);
 		}
+	}
+
+	static boolean finishDisconnectedControl(
+			Map<AgentId, ?> activeActions,
+			AgentId agentId,
+			Object action,
+			Runnable neutralize,
+			Runnable lifecycleFinish
+	) {
+		if (!activeActions.remove(agentId, action)) return false;
+		try {
+			neutralize.run();
+		} finally {
+			lifecycleFinish.run();
+		}
+		return true;
 	}
 
 	static boolean finishDisconnectedRespawn(
@@ -1772,6 +1812,19 @@ public final class ServerActionExecutor {
 					0.0F, 0.0F, false, player.isShiftKeyDown(), player.isSprinting(), attack, use,
 					player.getYRot(), player.getXRot(), player.getInventory().getSelectedSlot(), InteractionHand.MAIN_HAND
 			));
+		}
+
+		boolean isControl() {
+			return mode == Mode.CONTROL;
+		}
+
+		void neutralizeDisconnectedControl() {
+			ServerTransactionAdapter.runBestEffort(
+					this::releaseInput,
+					() -> AgentInputRuntime.clear(player),
+					() -> OfflineAgentPlayers.actions(player).stopAll(),
+					player::stopUsingItem
+			);
 		}
 
 		private void applyControlInput() {

@@ -406,6 +406,21 @@ public final class ScenarioRuntimeService {
 		ScenarioRuntimeClock clock = ScenarioRuntimeClock.restore(session, snapshot.clock());
 		state.publicEvents.clear();
 		state.publicEvents.addAll(snapshot.publicEvents());
+		if (session.state().terminal()) {
+			ScenarioRunSnapshot migrated = ScenarioRunSnapshot.capture(
+					session,
+					clock,
+					snapshot.dimensionId(),
+					snapshot.operatorId(),
+					snapshot.boundAgentIds(),
+					snapshot.parkourCheckpoints(),
+					snapshot.origin(),
+					snapshot.reset(),
+					snapshot.publicEvents()
+			);
+			state.cleanup = new CleanupJob(migrated, snapshot.boundAgentIds(), 0);
+			return retryFailedRecoveryCleanup(state, server);
+		}
 		state.recovery = new RecoveryJob(snapshot, session, clock, savedLevel, 0L);
 		return true;
 	}

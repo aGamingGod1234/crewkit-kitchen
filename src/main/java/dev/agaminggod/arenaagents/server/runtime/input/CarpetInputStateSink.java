@@ -1,15 +1,28 @@
 package dev.agaminggod.arenaagents.server.runtime.input;
 
 import carpet.helpers.EntityPlayerActionPack;
+import carpet.script.utils.Tracer;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
 import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import java.util.Objects;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.decoration.ItemFrame;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 
 public final class CarpetInputStateSink implements InputStateSink {
 	private final CodexAgentManager manager;
+	private final ExactHandUseDriver useDriver = new ExactHandUseDriver();
 
 	public CarpetInputStateSink(CodexAgentManager manager) {
 		this.manager = Objects.requireNonNull(manager, "manager must not be null");
@@ -23,10 +36,12 @@ public final class CarpetInputStateSink implements InputStateSink {
 		boolean resetActions = previous != null && (
 				(previous.jump() && !state.jump())
 						|| (previous.attack() && !state.attack())
-						|| shouldStopUsing(previous, state)
 		);
 		if (resetActions) actions.stopAll();
-		if (shouldStopUsing(previous, state)) player.stopUsingItem();
+		MinecraftPlayerUseAccess useAccess = new MinecraftPlayerUseAccess(player);
+		if (previous != null && previous.use() && (!state.use() || previous.hand() != state.hand())) {
+			useDriver.stop(agentId, useAccess);
+		}
 		actions.look(state.yaw(), state.pitch())
 				.setForward(state.forward())
 				.setStrafing(state.strafe())
@@ -39,29 +54,116 @@ public final class CarpetInputStateSink implements InputStateSink {
 		if (state.attack() && (resetActions || previous == null || !previous.attack())) {
 			actions.start(EntityPlayerActionPack.ActionType.ATTACK, EntityPlayerActionPack.Action.continuous());
 		}
-		if (shouldStartUsing(previous, state, resetActions)) {
-			if (state.hand() == InteractionHand.MAIN_HAND) {
-				actions.start(EntityPlayerActionPack.ActionType.USE, EntityPlayerActionPack.Action.continuous());
-			} else {
-				player.gameMode.useItem(player, player.level(), player.getItemInHand(state.hand()), state.hand());
-			}
+		if (state.use()) useDriver.start(agentId, state.hand(), useAccess);
+	}
+
+	@Override
+	public void tick(AgentId agentId, AgentInputState state) {
+		if (!state.use()) return;
+		ServerPlayer player = manager.findAgentPlayer(agentId).orElse(null);
+		if (player == null) {
+			useDriver.discard(agentId);
+			return;
 		}
-	}
-
-	static boolean shouldStopUsing(AgentInputState previous, AgentInputState state) {
-		return previous != null && previous.use()
-				&& (!state.use() || previous.hand() != state.hand());
-	}
-
-	static boolean shouldStartUsing(AgentInputState previous, AgentInputState state, boolean resetActions) {
-		return state.use() && (resetActions || previous == null || !previous.use() || previous.hand() != state.hand());
+		useDriver.tick(agentId, state.hand(), new MinecraftPlayerUseAccess(player));
 	}
 
 	@Override
 	public void clear(AgentId agentId, AgentInputState previous) {
-		manager.findAgentPlayer(agentId).ifPresent(player -> {
+		ServerPlayer player = manager.findAgentPlayer(agentId).orElse(null);
+		if (player == null) {
+			useDriver.discard(agentId);
+		} else {
 			OfflineAgentPlayers.actions(player).stopAll();
-			player.stopUsingItem();
-		});
+			useDriver.stop(agentId, new MinecraftPlayerUseAccess(player));
+		}
+	}
+
+	private static final class MinecraftPlayerUseAccess implements ExactHandUseDriver.PlayerUseAccess {
+		private final ServerPlayer player;
+		private HitResult target;
+
+		private MinecraftPlayerUseAccess(ServerPlayer player) {
+			this.player = player;
+		}
+
+		@Override
+		public boolean isUsingItem() {
+			return player.isUsingItem();
+		}
+
+		@Override
+		public InteractionHand usedHand() {
+			return player.getUsedItemHand();
+		}
+
+		@Override
+		public void releaseUsingItem() {
+			player.releaseUsingItem();
+		}
+
+		@Override
+		public ExactHandUseDriver.TargetKind target() {
+			double reach = player.gameMode.isCreative() ? 5.0D : 4.5D;
+			target = Tracer.rayTrace(player, 1.0F, reach, false);
+			return switch (target.getType()) {
+				case BLOCK -> ExactHandUseDriver.TargetKind.BLOCK;
+				case ENTITY -> ExactHandUseDriver.TargetKind.ENTITY;
+				case MISS -> ExactHandUseDriver.TargetKind.MISS;
+			};
+		}
+
+		@Override
+		public ExactHandUseDriver.TargetAttempt useBlock(InteractionHand hand) {
+			BlockHitResult hit = (BlockHitResult) target;
+			player.resetLastActionTime();
+			ServerLevel level = player.level();
+			BlockPos position = hit.getBlockPos();
+			Direction direction = hit.getDirection();
+			if (position.getY() >= level.getMaxY() - (direction == Direction.UP ? 1 : 0)
+					|| !level.mayInteract(player, position)) {
+				return ExactHandUseDriver.TargetAttempt.pass();
+			}
+			InteractionResult result = player.gameMode.useItemOn(
+					player, level, player.getItemInHand(hand), hand, hit
+			);
+			if (result instanceof InteractionResult.Success success) {
+				return ExactHandUseDriver.TargetAttempt.consumed(
+						success.swingSource() == InteractionResult.SwingSource.SERVER
+				);
+			}
+			return ExactHandUseDriver.TargetAttempt.pass();
+		}
+
+		@Override
+		public ExactHandUseDriver.TargetAttempt useEntity(InteractionHand hand) {
+			EntityHitResult hit = (EntityHitResult) target;
+			player.resetLastActionTime();
+			Entity target = hit.getEntity();
+			ItemStack held = player.getItemInHand(hand);
+			boolean itemWasEmpty = held.isEmpty();
+			boolean emptyItemFrame = target instanceof ItemFrame frame && frame.getItem().isEmpty();
+			Vec3 relativeHit = hit.getLocation().subtract(target.getX(), target.getY(), target.getZ());
+			if (target.interact(player, hand, relativeHit).consumesAction()) {
+				return ExactHandUseDriver.TargetAttempt.consumed(false);
+			}
+			if (player.interactOn(target, hand, relativeHit).consumesAction()
+					&& (!itemWasEmpty || !emptyItemFrame)) {
+				return ExactHandUseDriver.TargetAttempt.consumed(false);
+			}
+			return ExactHandUseDriver.TargetAttempt.pass();
+		}
+
+		@Override
+		public boolean useItem(InteractionHand hand) {
+			return player.gameMode.useItem(
+					player, player.level(), player.getItemInHand(hand), hand
+			).consumesAction();
+		}
+
+		@Override
+		public void swing(InteractionHand hand) {
+			player.swing(hand);
+		}
 	}
 }

@@ -99,6 +99,9 @@ public final class LeasedServerInputController implements ServerInputController 
 			if (current == null) sink.clear(agentId, previous);
 			else sink.apply(agentId, previous, current);
 		}
+		for (Map.Entry<AgentId, LinkedHashMap<InputLease, LeaseState>> entry : states.entrySet()) {
+			winningState(entry.getValue()).ifPresent(state -> sink.tick(entry.getKey(), state));
+		}
 	}
 
 	private long deadline() {
