@@ -127,6 +127,30 @@ test('cancelling an active turn aborts its dependency-injected signal', async ()
 	assert.equal(signal.aborted, true);
 });
 
+test('cancelling ignored-abort work releases global capacity but fences its agent until settlement', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });
+	const ignoredAbort = deferred();
+	const cancelled = scheduler.schedule('agent-a', () => ignoredAbort.promise);
+	await Promise.resolve();
+	assert.equal(scheduler.cancel('agent-a', 'superseded'), true);
+	assert.equal(scheduler.activeCount, 0);
+	assert.equal(scheduler.hasScheduled('agent-a'), true);
+	await assert.rejects(scheduler.schedule('agent-a', async () => 'overlap'), (error) => error.code === 'PLAN_CANCELLING');
+	assert.equal(await scheduler.schedule('agent-b', async () => 'available'), 'available');
+	ignoredAbort.resolve('late result');
+	await assert.rejects(cancelled, (error) => error.code === 'PLAN_CANCELLED');
+	assert.equal(scheduler.hasScheduled('agent-a'), false);
+});
+
+test('cancelling an admitted task before its microtask starts never invokes provider work', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 0 });
+	let invoked = false;
+	const cancelled = scheduler.schedule('agent-a', async () => { invoked = true; });
+	assert.equal(scheduler.cancel('agent-a', 'superseded'), true);
+	await assert.rejects(cancelled, (error) => error.code === 'PLAN_CANCELLED');
+	assert.equal(invoked, false);
+});
+
 test('cancelling a pending turn releases capacity for another agent', async () => {
 	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1 });
 	const gate = deferred();
@@ -285,6 +309,52 @@ test('ordinary work leaves one active reservation for urgent work', async () => 
 	for (const gate of gates) gate.resolve();
 	urgentGate.resolve();
 	await Promise.all([...ordinaryRuns, urgent]);
+});
+
+test('reserved urgent admission bypasses a fairness-selected ordinary turn that cannot start', async () => {
+	const scheduler = new PlanningScheduler({ planningMode: 'adaptive', maxConcurrent: 4, maxPending: 12, urgentReserve: 1, maxUrgentBurst: 1 });
+	const gates = Array.from({ length: 3 }, () => deferred());
+	const active = gates.map((gate, index) => scheduler.schedule(`ordinary-${index}`, () => gate.promise));
+	await Promise.resolve();
+	const ordinary = scheduler.schedule('ordinary-pending', async () => 'ordinary');
+	const urgent = scheduler.schedule('urgent-pending', async () => 'urgent', { priority: 'urgent' });
+	await Promise.resolve();
+	assert.equal(await urgent, 'urgent');
+	assert.equal(scheduler.pendingAgentIds.includes('ordinary-pending'), true);
+	for (const gate of gates) gate.resolve();
+	await Promise.all([...active, ordinary]);
+});
+
+test('auxiliary work has bounded pending capacity beyond sixteen scheduled agent turns', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 16, maxPending: 0, maxAuxiliaryPending: 2 });
+	const gates = Array.from({ length: 16 }, () => deferred());
+	const active = gates.map((gate, index) => scheduler.schedule(`agent-${index}`, () => gate.promise));
+	await Promise.resolve();
+	const auxiliaryA = scheduler.schedule('goal-spec-a', async () => 'a', { capacityClass: 'auxiliary' });
+	const auxiliaryB = scheduler.schedule('goal-spec-b', async () => 'b', { capacityClass: 'auxiliary' });
+	await assert.rejects(
+		scheduler.schedule('goal-spec-c', async () => 'c', { capacityClass: 'auxiliary' }),
+		(error) => error.code === 'SCHEDULER_CAPACITY',
+	);
+	assert.equal(scheduler.pendingAuxiliaryCount, 2);
+	gates[0].resolve();
+	gates[1].resolve();
+	assert.deepEqual(await Promise.all([auxiliaryA, auxiliaryB]), ['a', 'b']);
+	for (const gate of gates.slice(2)) gate.resolve();
+	await Promise.all(active);
+});
+
+test('auxiliary backlog does not consume default pending admission capacity', async () => {
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1, maxAuxiliaryPending: 2 });
+	const gate = deferred();
+	const active = scheduler.schedule('active', () => gate.promise);
+	await Promise.resolve();
+	const auxiliary = scheduler.schedule('goal-spec', async () => 'auxiliary', { capacityClass: 'auxiliary' });
+	const ordinary = scheduler.schedule('ordinary', async () => 'ordinary');
+	assert.equal(scheduler.pendingAuxiliaryCount, 1);
+	assert.equal(scheduler.pendingAgentIds.includes('ordinary'), true);
+	gate.resolve();
+	assert.deepEqual(await Promise.all([active, auxiliary, ordinary]), [undefined, 'auxiliary', 'ordinary']);
 });
 
 test('ordinary queue capacity preserves the reserved urgent entry at the global boundary', async () => {

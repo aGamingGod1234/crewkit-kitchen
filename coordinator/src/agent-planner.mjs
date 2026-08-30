@@ -108,7 +108,7 @@ export class AgentPlanner {
 				} finally {
 					try { await this.#codexService.removeAgent(translatorId); } catch { /* transient cleanup is best effort */ }
 				}
-			}, { lane: record.provider, priority: 'ordinary' }),
+			}, { lane: record.provider, priority: 'ordinary', capacityClass: 'auxiliary' }),
 		});
 		return translator.translate(checkedRequest, { correctiveFeedback });
 	}

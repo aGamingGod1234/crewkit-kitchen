@@ -3134,7 +3134,7 @@ test('does not submit a duplicate initial plan while the agent already has a sch
 	const blocker = new Promise((resolve) => { release = resolve; });
 	const run = await start({ scheduler });
 	try {
-		scheduler.schedule('agent-a', async () => blocker);
+		void scheduler.schedule('agent-a', async () => blocker).catch(() => {});
 		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Wait.' } });
 		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
 		await new Promise((resolve) => setImmediate(resolve));
@@ -3724,6 +3724,103 @@ test('reconciliation skips death planning when the dead agent has no current goa
 	} finally { await coordinator.stop(); }
 });
 
+test('urgent observation preempts an active ordinary provider turn and installs only the replacement', async () => {
+	let attempts = 0;
+	const provider = realPlannerProvider(async (input, options) => {
+		attempts += 1;
+		if (attempts === 1) {
+			return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }));
+		}
+		assert.match(input, /damage|health/i);
+		return { summary: 'Respond to damage.', directive: 'replace', source: SOURCE };
+	});
+	const registry = new AgentRegistry();
+	const scheduler = new PlanningScheduler({ maxConcurrent: 1, maxPending: 1 });
+	const planner = new AgentPlanner({ registry, scheduler, codexService: provider });
+	const run = await start({ registry, scheduler, planner, codexService: provider });
+	try {
+		run.bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'start', goalRevision: 1, goal: 'Respond.' } });
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 1, observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
+		await eventually(() => attempts === 1 && scheduler.activeAgentIds.includes('agent-a'));
+		run.bridge.emit('observation', { agentId: 'agent-a', payload: { goalRevision: 1, eventSequence: 2, attention: true, changedFacts: ['player.health'], observation: { player: { x: 0, y: 64, z: 0, health: 18 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: [] } } } });
+		await eventually(() => attempts === 2 && run.bridge.sent.some((message) => message.type === 'action_command'));
+		assert.equal(run.bridge.sent.filter((message) => message.type === 'action_command').length, 1);
+		assert.equal(run.bridge.sent.some((message) => message.type === 'agent_error'), false);
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('per-agent event intake rejects non-coalescible overflow at its configured bound', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	let releaseReconciliation;
+	const reconciliationGate = new Promise((resolve) => { releaseReconciliation = resolve; });
+	const planner = new FakePlanner(registry);
+	planner.beginReconcile = (records, options = undefined) => {
+		const reconciled = registry.reconcile(records, options);
+		return {
+			registry: reconciled,
+			complete: reconciliationGate.then(() => ({ registry: reconciled, providers: { valid: reconciled.records, invalid: [], catalog: { models: [] } } })),
+		};
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, registry, planner, codexService: new FakeProvider(), maxPendingAgentOperations: 1 },
+	);
+	const errors = [];
+	coordinator.on('runtimeError', (error) => errors.push(error));
+	await coordinator.start();
+	try {
+		bridge.emit('ready', { serverInstanceId: 'test', registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'Wait.', goalRevision: 1 }] });
+		await new Promise((resolve) => setImmediate(resolve));
+		const payload = (eventSequence) => ({
+			goalRevision: 1, eventSequence, attention: true,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		});
+		bridge.emit('observation', { agentId: 'agent-a', payload: payload(1) });
+		await new Promise((resolve) => setImmediate(resolve));
+		bridge.emit('observation', { agentId: 'agent-a', payload: payload(2) });
+		bridge.emit('observation', { agentId: 'agent-a', payload: payload(3) });
+		await eventually(() => errors.some((error) => error?.code === 'AGENT_EVENT_BACKPRESSURE'));
+	} finally {
+		releaseReconciliation?.();
+		await coordinator.stop();
+	}
+});
+
+test('dead-agent recovery does not delay readiness for later reconciled agents', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	let releaseDeathPlan;
+	planner.requestPlan = async (request) => {
+		planner.requests.push(request);
+		await new Promise((resolve) => { releaseDeathPlan = resolve; });
+		return withCompletionContract({ summary: 'Respawn.', directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); await player.respawn();' }, request.goalRevision);
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script', launchProfile: { agentId: 'coordinator', model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } } },
+		{ bridge, registry, planner, codexService: new FakeProvider() },
+	);
+	await coordinator.start();
+	try {
+		bridge.emit('ready', {
+			serverInstanceId: 'first',
+			registry: [
+				{ ...record('agent-a'), state: DynamicAgentState.DEAD, currentGoal: 'Survive.', goalRevision: 4, death: DEATH },
+				{ ...record('agent-b'), state: DynamicAgentState.STARTING, currentGoal: 'Wait.', goalRevision: 1 },
+			],
+		});
+		await eventually(() => planner.requests.length === 1);
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.agentId === 'agent-b'));
+		assert.equal(bridge.sent.some((message) => message.type === 'action_command'), false);
+	} finally {
+		releaseDeathPlan?.();
+		await coordinator.stop();
+	}
+});
+
 test('reconciliation reissues one dead-state turn to the selected session and preserves DEAD across disconnect', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
@@ -4139,7 +4236,7 @@ test('bridge protocol shutdown is re-emitted for owned worker cleanup', async ()
 	assert.equal(shutdowns, 1);
 });
 
-test('accepts two hundred quiet wire observations without another provider turn', async () => {
+test('coalesces a burst of two hundred quiet wire observations without losing the newest facts', async () => {
 	const run = await start();
 	try {
 		run.planner.requestPlan = async (request) => {
@@ -4161,8 +4258,8 @@ test('accepts two hundred quiet wire observations without another provider turn'
 				goalRevision: 1, eventSequence: index + 1, attention: false,
 				observation: { player: { x: index, y: 64, z: index / 2, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
 			} });
-			await new Promise((resolve) => setImmediate(resolve));
 		}
+		await new Promise((resolve) => setImmediate(resolve));
 		assert.equal(run.planner.requests.length, 1, 'only the initial planning turn reaches the selected provider');
 		run.bridge.emit('action_result', { agentId: 'agent-a', payload: {
 			goalRevision: 1, actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'DONE', eventSequence: 202,

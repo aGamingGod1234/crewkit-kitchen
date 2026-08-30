@@ -962,6 +962,38 @@ test('passes urgent trigger metadata through a coalesced reactive planner turn',
 	assert.match(requests[1].input, /"attentionTrigger":"damage"/);
 });
 
+test('urgent attention interrupts stale ordinary reactive planning before installing its result', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const requests = [];
+	let rejectOrdinary;
+	const planner = {
+		requestPlan: (request) => {
+			requests.push(request);
+			if (requests.length === 1) return new Promise((_resolve, reject) => { rejectOrdinary = reject; });
+			return Promise.resolve(withCompletionContract({ directive: 'continue', summary: 'Handle damage now.' }, request.goalRevision));
+		},
+		interrupt: async () => rejectOrdinary(Object.assign(new Error('superseded'), { code: 'PLAN_CANCELLED' })),
+	};
+	const errors = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async () => {} },
+		planner,
+		reportError: (_agentId, error) => errors.push(error),
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await manager.onObservation(registry.get('agent-a'), { observation: observation(), eventSequence: 2, attention: true, priority: 'ordinary', trigger: 'observation' });
+	await new Promise((resolve) => setImmediate(resolve));
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation({ player: { health: 18 } }), eventSequence: 3, attention: true, priority: 'urgent', trigger: 'damage',
+	});
+	for (let attempt = 0; attempt < 10 && requests.length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(requests.length, 2);
+	assert.equal(requests[1].priority, 'urgent');
+	assert.match(requests[1].input, /"attentionTrigger":"damage"/);
+	assert.equal(errors.length, 0);
+});
+
 test('measures one thousand watcher branches with the real monotonic clock', async () => {
 	const registry = new AgentRegistry();
 	for (const agentId of ['agent-a', 'agent-b', 'agent-c', 'agent-d']) registry.register(record(agentId));

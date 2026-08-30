@@ -6,6 +6,7 @@ const DEFAULT_URGENT_BURST = 3;
 const MIN_ADAPTIVE_CONCURRENCY = 4;
 const MAX_ADAPTIVE_CONCURRENCY = 16;
 const DEFAULT_URGENT_RESERVE = 1;
+const DEFAULT_MAX_AUXILIARY_PENDING = DEFAULT_AGENT_CAP;
 const HEALTHY_WINDOW = 4;
 const TICK_PRESSURE_WINDOW = 3;
 const DEFAULT_LANE = 'default';
@@ -13,6 +14,7 @@ const ORDINARY_PRIORITY = 'ordinary';
 const URGENT_PRIORITY = 'urgent';
 const PRIORITIES = new Set([ORDINARY_PRIORITY, URGENT_PRIORITY]);
 const PLANNING_MODES = new Set(['fixed', 'adaptive']);
+const CAPACITY_CLASSES = new Set(['default', 'auxiliary']);
 const PRESSURE_REASONS = new Map([
 	['RATE_LIMITED', 'provider_rate_limit'],
 	['TOO_MANY_REQUESTS', 'provider_rate_limit'],
@@ -203,6 +205,7 @@ export class PlanningScheduler {
 	#lastLane = null;
 	#urgentStreak = 0;
 	#active = new Map();
+	#settling = new Map();
 	#closed = false;
 	#recorder;
 	#controller;
@@ -211,10 +214,12 @@ export class PlanningScheduler {
 	#urgentReservationRejections = 0;
 	#scheduleTimeout;
 	#cancelTimeout;
+	#maxAuxiliaryPending;
 
 	constructor({
 		maxConcurrent = DEFAULT_MAX_CONCURRENT,
 		maxPending = Math.max(0, DEFAULT_AGENT_CAP - maxConcurrent),
+		maxAuxiliaryPending = DEFAULT_MAX_AUXILIARY_PENDING,
 		maxUrgentBurst = DEFAULT_URGENT_BURST,
 		urgentBurstLimit = maxUrgentBurst,
 		mode,
@@ -231,6 +236,7 @@ export class PlanningScheduler {
 		if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) throw new TypeError('maxConcurrent must be a positive safe integer');
 		if (maxConcurrent > MAX_ADAPTIVE_CONCURRENCY) throw new TypeError(`maxConcurrent must not exceed ${MAX_ADAPTIVE_CONCURRENCY}`);
 		if (!Number.isSafeInteger(maxPending) || maxPending < 0) throw new TypeError('maxPending must be a non-negative safe integer');
+		if (!Number.isSafeInteger(maxAuxiliaryPending) || maxAuxiliaryPending < 0 || maxAuxiliaryPending > DEFAULT_AGENT_CAP) throw new TypeError(`maxAuxiliaryPending must be in [0, ${DEFAULT_AGENT_CAP}]`);
 		if (maxConcurrent + maxPending > DEFAULT_AGENT_CAP) throw new TypeError(`planning capacity must not exceed ${DEFAULT_AGENT_CAP}`);
 		if (!Number.isSafeInteger(urgentBurstLimit) || urgentBurstLimit <= 0) throw new TypeError('urgentBurstLimit must be a positive safe integer');
 		if (typeof onPressure !== 'function') throw new TypeError('onPressure must be a function');
@@ -240,6 +246,7 @@ export class PlanningScheduler {
 		if (selectedRecorder !== null && typeof selectedRecorder.record !== 'function') throw new TypeError('recorder.record must be a function');
 		this.#maxConcurrent = maxConcurrent;
 		this.#maxPending = maxPending;
+		this.#maxAuxiliaryPending = maxAuxiliaryPending;
 		this.#maxUrgentBurst = urgentBurstLimit;
 		this.#onPressure = onPressure;
 		this.#recorder = selectedRecorder;
@@ -288,6 +295,7 @@ export class PlanningScheduler {
 	get maxConcurrency() { return this.#controller.maxConcurrency; }
 	get urgentReserve() { return this.#urgentReserve; }
 	get maxPending() { return this.#maxPending; }
+	get maxAuxiliaryPending() { return this.#maxAuxiliaryPending; }
 	get maxUrgentBurst() { return this.#maxUrgentBurst; }
 	get urgentBurstLimit() { return this.#maxUrgentBurst; }
 	get totalCapacity() { return this.#maxConcurrent + this.#maxPending; }
@@ -297,6 +305,7 @@ export class PlanningScheduler {
 	get activeUrgentCount() { return this.#countActivePriority(URGENT_PRIORITY); }
 	get pendingOrdinaryCount() { return this.#countPendingPriority(ORDINARY_PRIORITY); }
 	get pendingUrgentCount() { return this.#countPendingPriority(URGENT_PRIORITY); }
+	get pendingAuxiliaryCount() { return this.#countPendingCapacityClass('auxiliary'); }
 	get growthCount() { return this.#controller.growthCount; }
 	get backoffCount() { return this.#controller.backoffCount; }
 	get lastChangeReason() { return this.#controller.lastChangeReason; }
@@ -318,25 +327,26 @@ export class PlanningScheduler {
 	}
 	hasScheduled(agentIdValue) {
 		const agentId = requireAgentId(agentIdValue);
-		return this.#pending.has(agentId) || this.#active.has(agentId);
+		return this.#pending.has(agentId) || this.#active.has(agentId) || this.#settling.has(agentId);
 	}
 
 	schedule(agentIdValue, task, options = {}) {
 		const agentId = requireAgentId(agentIdValue);
 		if (typeof task !== 'function') throw new TypeError('planning task must be a function');
-		const { lane, priority, leaseTimeoutMs, onLeaseExpired } = normalizeScheduleOptions(options);
+		const { lane, priority, capacityClass, leaseTimeoutMs, onLeaseExpired } = normalizeScheduleOptions(options);
 		this.#record('scheduler_admission_requested', agentId, { lane, priority, ...this.#snapshot() });
 		if (this.#closed) return this.#reject('SCHEDULER_CLOSED', 'Planning scheduler is closed', agentId, lane, priority);
 		if (this.#pending.has(agentId)) return this.#reject('PLAN_ALREADY_QUEUED', `Agent '${agentId}' already has a queued planning turn`, agentId, lane, priority);
 		if (this.#active.has(agentId)) return this.#reject('PLAN_ALREADY_ACTIVE', `Agent '${agentId}' already has an active planning turn`, agentId, lane, priority);
-		if (this.#wouldExceedCapacity(priority)) {
+		if (this.#settling.has(agentId)) return this.#reject('PLAN_CANCELLING', `Agent '${agentId}' is still settling a cancelled planning turn`, agentId, lane, priority);
+		if (this.#wouldExceedCapacity(priority, capacityClass)) {
 			if (priority === ORDINARY_PRIORITY) this.#ordinaryReservationRejections += 1;
 			else this.#urgentReservationRejections += 1;
 			return this.#reject('SCHEDULER_CAPACITY', `Planning scheduler capacity ${this.totalCapacity} is full`, agentId, lane, priority);
 		}
 
 		const promise = new Promise((resolve, reject) => {
-			const entry = { agentId, task, lane, priority, leaseTimeoutMs, onLeaseExpired, resolve, reject };
+			const entry = { agentId, task, lane, priority, capacityClass, leaseTimeoutMs, onLeaseExpired, resolve, reject };
 			this.#pending.set(agentId, entry);
 			this.#lane(lane)[priority].push(entry);
 		});
@@ -357,7 +367,15 @@ export class PlanningScheduler {
 			pending.reject(new PlanningSchedulerError('PLAN_CANCELLED', reason));
 		}
 		const active = this.#active.get(agentId);
-		if (active !== undefined) active.controller.abort(new PlanningSchedulerError('PLAN_CANCELLED', reason));
+		if (active !== undefined) {
+			const error = new PlanningSchedulerError('PLAN_CANCELLED', reason);
+			active.cancelError = error;
+			active.controller.abort(error);
+			if (active.timeoutHandle !== null) this.#cancelTimeout(active.timeoutHandle);
+			this.#active.delete(agentId);
+			this.#settling.set(agentId, active);
+			this.#record('scheduler_cancelled', agentId, { lane: active.lane, priority: active.priority, ...this.#snapshot() });
+		}
 		this.#drain();
 		this.#notifyPressure();
 		return pending !== undefined || active !== undefined;
@@ -385,7 +403,7 @@ export class PlanningScheduler {
 			if (entry === null) break;
 			this.#pending.delete(entry.agentId);
 			const controller = new AbortController();
-			const active = { ...entry, controller, timeoutHandle: null };
+			const active = { ...entry, controller, timeoutHandle: null, cancelError: null };
 			this.#active.set(entry.agentId, active);
 			if (entry.leaseTimeoutMs !== null) {
 				active.timeoutHandle = this.#scheduleTimeout(() => this.#expire(entry.agentId, controller), entry.leaseTimeoutMs);
@@ -396,20 +414,26 @@ export class PlanningScheduler {
 				...this.#snapshot(),
 			});
 			Promise.resolve()
-				.then(() => entry.task({ agentId: entry.agentId, signal: controller.signal, lane: entry.lane, priority: entry.priority }))
+				.then(() => {
+					if (controller.signal.aborted) throw controller.signal.reason;
+					return entry.task({ agentId: entry.agentId, signal: controller.signal, lane: entry.lane, priority: entry.priority });
+				})
 				.then(
-					(value) => { this.#release(entry.agentId, controller); entry.resolve(value); },
-					(error) => { this.#release(entry.agentId, controller); entry.reject(error); },
+					(value) => this.#settle(entry.agentId, controller, null, value),
+					(error) => this.#settle(entry.agentId, controller, error),
 				);
 		}
 		this.#notifyPressure();
 	}
 
 	#nextEntry() {
-		const priority = this.#nextPriority();
+		let priority = this.#nextPriority();
+		if (priority === ORDINARY_PRIORITY && this.activeOrdinaryCount >= this.#ordinaryActiveLimit()) {
+			if (!this.#hasPendingPriority(URGENT_PRIORITY)) return null;
+			priority = URGENT_PRIORITY;
+		}
 		const lane = this.#nextLane(priority);
 		if (lane === null) return null;
-		if (priority === ORDINARY_PRIORITY && this.activeOrdinaryCount >= this.#ordinaryActiveLimit()) return null;
 		const entry = this.#lanes.get(lane)[priority].shift() ?? null;
 		if (entry !== null) {
 			this.#lastLane = lane;
@@ -442,17 +466,23 @@ export class PlanningScheduler {
 		return null;
 	}
 
-	#release(agentId, controller) {
+	#settle(agentId, controller, error, value = undefined) {
 		const active = this.#active.get(agentId);
-		if (active?.controller !== controller) return;
-		if (active.timeoutHandle !== null) this.#cancelTimeout(active.timeoutHandle);
-		this.#active.delete(agentId);
+		const settling = this.#settling.get(agentId);
+		const entry = active?.controller === controller ? active : (settling?.controller === controller ? settling : null);
+		if (entry === null) return;
+		if (entry.timeoutHandle !== null) this.#cancelTimeout(entry.timeoutHandle);
+		if (active === entry) this.#active.delete(agentId);
+		if (settling === entry) this.#settling.delete(agentId);
 		this.#record('scheduler_released', agentId, {
-			lane: active.lane,
-			priority: active.priority,
+			lane: entry.lane,
+			priority: entry.priority,
 			...this.#snapshot(),
 		});
 		this.#drain();
+		if (entry.cancelError !== null) entry.reject(entry.cancelError);
+		else if (error !== null) entry.reject(error);
+		else entry.resolve(value);
 	}
 
 	#expire(agentId, controller) {
@@ -490,7 +520,9 @@ export class PlanningScheduler {
 			used,
 			maxConcurrent: this.#maxConcurrent,
 			maxPending: this.#maxPending,
+			maxAuxiliaryPending: this.#maxAuxiliaryPending,
 			totalCapacity: this.totalCapacity,
+			settling: this.#settling.size,
 			mode: controller.mode,
 			planningMode: controller.mode,
 			configuredTarget: controller.configuredTarget,
@@ -504,6 +536,7 @@ export class PlanningScheduler {
 			activeUrgent: this.activeUrgentCount,
 			pendingOrdinary: this.pendingOrdinaryCount,
 			pendingUrgent: this.pendingUrgentCount,
+			pendingAuxiliary: this.pendingAuxiliaryCount,
 			growthCount: controller.growthCount,
 			backoffCount: controller.backoffCount,
 			lastChangeReason: controller.lastChangeReason,
@@ -521,9 +554,17 @@ export class PlanningScheduler {
 		return count;
 	}
 
-	#countPendingPriority(priority) {
+	#countPendingPriority(priority, capacityClass = null) {
 		let count = 0;
-		for (const entry of this.#pending.values()) if (entry.priority === priority) count += 1;
+		for (const entry of this.#pending.values()) {
+			if (entry.priority === priority && (capacityClass === null || entry.capacityClass === capacityClass)) count += 1;
+		}
+		return count;
+	}
+
+	#countPendingCapacityClass(capacityClass) {
+		let count = 0;
+		for (const entry of this.#pending.values()) if (entry.capacityClass === capacityClass) count += 1;
 		return count;
 	}
 
@@ -531,11 +572,12 @@ export class PlanningScheduler {
 		return Math.max(0, this.#controller.target - this.#urgentReserve);
 	}
 
-	#wouldExceedCapacity(priority) {
-		const used = this.#active.size + this.#pending.size;
+	#wouldExceedCapacity(priority, capacityClass) {
+		if (capacityClass === 'auxiliary') return this.pendingAuxiliaryCount >= this.#maxAuxiliaryPending;
+		const used = this.#active.size + this.#pending.size - this.pendingAuxiliaryCount;
 		if (used >= this.totalCapacity) return true;
 		if (priority !== ORDINARY_PRIORITY || this.#urgentReserve === 0) return false;
-		const ordinaryUsed = this.activeOrdinaryCount + this.pendingOrdinaryCount;
+		const ordinaryUsed = this.activeOrdinaryCount + this.#countPendingPriority(ORDINARY_PRIORITY, 'default');
 		const urgentUsed = this.activeUrgentCount + this.pendingUrgentCount;
 		const ordinaryLimit = this.totalCapacity - Math.max(this.#urgentReserve, urgentUsed);
 		return ordinaryUsed >= ordinaryLimit;
@@ -569,9 +611,15 @@ function normalizeScheduleOptions(options) {
 	return {
 		lane: requireLane(options.lane ?? DEFAULT_LANE),
 		priority: requirePriority(options.priority ?? ORDINARY_PRIORITY),
+		capacityClass: requireCapacityClass(options.capacityClass ?? 'default'),
 		leaseTimeoutMs,
 		onLeaseExpired: options.onLeaseExpired ?? null,
 	};
+}
+
+function requireCapacityClass(value) {
+	if (typeof value !== 'string' || !CAPACITY_CLASSES.has(value)) throw new TypeError("planning capacityClass must be 'default' or 'auxiliary'");
+	return value;
 }
 
 function defaultScheduleTimeout(callback, delay) {
