@@ -56,7 +56,9 @@ export function createVoiceHttpServer({
 	if (maxProbeDelayMs < initialProbeDelayMs) throw new TypeError('maxProbeDelayMs must not be less than initialProbeDelayMs');
 
 	let active = 0;
+	let pendingAuthentication = 0;
 	const controllers = new Set();
+	const preauthenticationRequests = new Set();
 	const failureListeners = new Set();
 	let startPromise = null;
 	let closePromise = null;
@@ -87,32 +89,51 @@ export function createVoiceHttpServer({
 	});
 	const server = createServer(async (request, response) => {
 		if (request.method === 'GET' && request.url === '/health') {
-			respondJson(response, 200, { ready: true, active, maxConcurrent });
+			respondJson(response, 200, { ready: true, active, pendingAuthentication, maxConcurrent });
 			return;
 		}
 		if (request.method !== 'POST' || !['/v1/tts', '/v1/stt'].includes(request.url)) {
-			respondJson(response, 404, { code: 'NOT_FOUND' });
+			respondJsonAndClose(request, response, 404, { code: 'NOT_FOUND' });
 			return;
 		}
 		const preparedAuthentication = prepareRequestAuthentication(request, authenticatedNonces, Date.now());
 		if (preparedAuthentication === null) {
-			respondJson(response, 401, { code: 'UNAUTHORIZED' });
+			respondJsonAndClose(request, response, 401, { code: 'UNAUTHORIZED' });
 			return;
 		}
-		let requestBody;
+		const maximumBytes = request.url === '/v1/stt' ? 48_000 * 2 * 20 : MAX_REQUEST_BYTES;
 		try {
-			const maximumBytes = request.url === '/v1/stt' ? 48_000 * 2 * 20 : MAX_REQUEST_BYTES;
+			validateDeclaredContentLength(request.headers['content-length'], maximumBytes);
+		} catch (error) {
+			respondJsonAndClose(request, response, statusFor(error), {
+				code: String(error?.code ?? 'INVALID_REQUEST').slice(0, 64),
+				message: String(error?.message ?? error).slice(0, 256),
+			});
+			return;
+		}
+		if (pendingAuthentication >= maxConcurrent) {
+			respondJsonAndClose(request, response, 429, { code: 'VOICE_AUTH_CAPACITY' });
+			return;
+		}
+		pendingAuthentication += 1;
+		preauthenticationRequests.add(request);
+		let requestBody;
+		let authentication = null;
+		try {
 			requestBody = await readRequestBody(request, maximumBytes, requestTimeoutMs);
+			authentication = authenticateRequest(
+				request, secret, authenticatedNonces, preparedAuthentication, requestBody,
+			);
 		} catch (error) {
 			if (!response.headersSent && !response.destroyed) respondJson(response, statusFor(error), {
 				code: String(error?.code ?? 'INVALID_REQUEST').slice(0, 64),
 				message: String(error?.message ?? error).slice(0, 256),
 			});
 			return;
+		} finally {
+			pendingAuthentication = Math.max(0, pendingAuthentication - 1);
+			preauthenticationRequests.delete(request);
 		}
-		const authentication = authenticateRequest(
-			request, secret, authenticatedNonces, preparedAuthentication, requestBody,
-		);
 		if (authentication === null) {
 			respondJson(response, 401, { code: 'UNAUTHORIZED' });
 			return;
@@ -339,6 +360,8 @@ export function createVoiceHttpServer({
 					catch { /* close still flushes assignments after a failed bind */ }
 				}
 				for (const controller of controllers) controller.abort();
+				for (const request of preauthenticationRequests) request.destroy(typedError('VOICE_WORKER_CLOSED', 'Voice worker has been closed'));
+				preauthenticationRequests.clear();
 				authenticatedNonces.clear();
 				activeSttPlayers.clear();
 				sttNextAllowedAt.clear();
@@ -627,6 +650,22 @@ async function readRequestBody(request, maximum, deadlineMs) {
 	}
 }
 
+function validateDeclaredContentLength(value, maximum) {
+	if (value === undefined) return;
+	if (typeof value !== 'string' || !/^\d{1,16}$/.test(value)) {
+		throw typedError('INVALID_CONTENT_LENGTH', 'Content-Length is invalid');
+	}
+	const length = Number(value);
+	if (!Number.isSafeInteger(length)) throw typedError('INVALID_CONTENT_LENGTH', 'Content-Length is invalid');
+	if (length > maximum) throw typedError('REQUEST_TOO_LARGE', 'Voice request exceeds its byte limit');
+}
+
+function respondJsonAndClose(request, response, status, payload) {
+	response.setHeader('Connection', 'close');
+	response.once('finish', () => request.destroy());
+	respondJson(response, status, payload);
+}
+
 function validatePcmBody(body) {
 	if (body.length === 0 || body.length % 2 !== 0) throw typedError('STT_MALFORMED_AUDIO', 'STT audio is invalid');
 	return body;
@@ -695,7 +734,7 @@ function statusFor(error) {
 	if (error?.code === 'STT_RATE_LIMITED' || error?.code === 'STT_PLAYER_BUSY') return 429;
 	if (error?.code === 'STT_UNAVAILABLE') return 503;
 	if (error?.code === 'REQUEST_TIMEOUT') return 408;
-	if (['INVALID_REQUEST', 'INVALID_JSON', 'REQUEST_TOO_LARGE'].includes(error?.code)) return 400;
+	if (['INVALID_REQUEST', 'INVALID_JSON', 'INVALID_CONTENT_LENGTH', 'REQUEST_TOO_LARGE'].includes(error?.code)) return 400;
 	return 502;
 }
 

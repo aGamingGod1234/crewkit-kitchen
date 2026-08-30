@@ -177,7 +177,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 259;
+		return 260;
 	}
 
 	/**
@@ -213,7 +213,16 @@ public final class MultiplexedServerBridgeVerification {
 				assertTrue(ledger.retain(result), "terminal result is retained before the coordinator closes");
 				assertTrue(ledger.claim(result, session(bridge)), "first session owns the initial result delivery");
 				bridge.tick();
-				assertTrue(!firstReader.ready(), "claimed terminal result is not replayed twice on the first session");
+				first.setSoTimeout(100);
+				try {
+					while (true) {
+						BridgeEnvelope published = codec.decode(firstReader.readLine());
+						assertTrue(!"action_result".equals(published.type()),
+								"claimed terminal result is not replayed twice on the first session");
+					}
+				} catch (SocketTimeoutException expected) {
+					// Other queued control messages do not make the claimed terminal result a duplicate.
+				}
 			}
 
 			MultiplexedServerBridge activeBridge = bridge;
@@ -233,14 +242,26 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket replacement = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader replacementReader = new BufferedReader(new InputStreamReader(replacement.getInputStream(), StandardCharsets.UTF_8))) {
 				replacement.setSoTimeout(2_000);
-				BridgeEnvelope replacementAck = authenticate(
+				AuthenticationExchange replacementExchange = beginAuthentication(
 						replacement, replacementReader, codec, secret, "hello-terminal-replay-replacement"
 				);
+				writeAuthenticatedHello(
+						replacement, codec, secret, null, "hello-terminal-replay-replacement", replacementExchange
+				);
+				BridgeEnvelope replacementAck = codec.decode(replacementReader.readLine());
+				assertEquals("hello_ack", replacementAck.type(), "replacement authenticates before terminal replay");
+				assertEquals("verbose_control", codec.decode(replacementReader.readLine()).type(),
+						"replacement consumes verbose control before terminal replay");
 				BridgeEnvelope replay = codec.decode(replacementReader.readLine());
 				assertEquals("action_result", replay.type(),
 						"replacement handshake replays a terminal result after the disconnect revision");
 				assertEquals("terminal-after-close", replay.payload().get("actionId").getAsString(),
 						"replacement handshake replays the original action exactly once");
+				assertEquals(MultiplexedServerBridge.actionResultReplayProof(
+						secret, replacementExchange.clientNonce(), replacementExchange.serverNonce(),
+						replacementAck.serverInstanceId(), result.agentId().toString(), result.goalRevision(), result.actionId()
+				), replay.payload().get("replayProof").getAsString(),
+						"retained result provenance is bound to the replacement authenticated session");
 				assertEquals(2L, replacementAck.payload().getAsJsonArray("registry").get(0)
 						.getAsJsonObject().get("goalRevision").getAsLong(),
 						"replacement handshake reports the reconciled lifecycle revision");

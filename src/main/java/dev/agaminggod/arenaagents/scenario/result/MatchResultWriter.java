@@ -77,34 +77,19 @@ public final class MatchResultWriter {
 
 		enforceJournalBudget(journal, previous);
 
-		long journalBytes = Files.exists(journal) ? Files.size(journal) : 0L;
-		int lineCount = 0;
-		boolean invalidJournal = false;
-		if (journalBytes > 0L) {
-			try (BufferedReader reader = Files.newBufferedReader(journal, StandardCharsets.UTF_8)) {
-				String line;
-				while ((line = reader.readLine()) != null) {
-					lineCount++;
-					if (lineCount > MAX_JOURNAL_LINES) {
-						invalidJournal = true;
-						break;
-					}
-					if (line.getBytes(StandardCharsets.UTF_8).length > MAX_JOURNAL_LINE_BYTES) {
-						invalidJournal = true;
-						break;
-					}
-					if (line.isBlank()) continue;
-					try {
-						if (matchesExisting(line, matchId, hash, canonical)) return;
-					} catch (InvalidJournalException exception) {
-						invalidJournal = true;
-						break;
-					}
-				}
-			}
-		}
+		JournalScan archiveScan = scanJournal(previous, matchId, hash, canonical);
+		if (archiveScan.invalid()) Files.deleteIfExists(previous);
 
-		if (invalidJournal || lineCount >= MAX_JOURNAL_LINES
+		long journalBytes = Files.exists(journal) ? Files.size(journal) : 0L;
+		JournalScan activeScan = scanJournal(journal, matchId, hash, canonical);
+		if (activeScan.invalid()) {
+			if (Files.exists(previous)) Files.deleteIfExists(journal);
+			else rotateJournal(journal, previous);
+			journalBytes = 0L;
+		}
+		if (archiveScan.matchFound() || activeScan.matchFound()) return;
+
+		if (activeScan.lineCount() >= MAX_JOURNAL_LINES
 				|| journalBytes + entry.length > MAX_ACTIVE_JOURNAL_BYTES) {
 			rotateJournal(journal, previous);
 		}
@@ -116,6 +101,28 @@ public final class MatchResultWriter {
 			channel.force(true);
 		}
 		enforceJournalBudget(journal, previous);
+	}
+
+	private static JournalScan scanJournal(Path path, String matchId, String hash, String canonical) throws IOException {
+		if (!Files.exists(path) || Files.size(path) == 0L) return new JournalScan(false, false, 0);
+		int lineCount = 0;
+		boolean matchFound = false;
+		try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+			String line;
+			while ((line = reader.readLine()) != null) {
+				lineCount++;
+				if (lineCount > MAX_JOURNAL_LINES || line.getBytes(StandardCharsets.UTF_8).length > MAX_JOURNAL_LINE_BYTES) {
+					return new JournalScan(false, true, lineCount);
+				}
+				if (line.isBlank()) continue;
+				try {
+					if (matchesExisting(line, matchId, hash, canonical)) matchFound = true;
+				} catch (InvalidJournalException exception) {
+					return new JournalScan(false, true, lineCount);
+				}
+			}
+		}
+		return new JournalScan(matchFound, false, lineCount);
 	}
 
 	private static boolean matchesExisting(String line, String matchId, String hash, String canonical) throws IOException {
@@ -173,6 +180,8 @@ public final class MatchResultWriter {
 			super("MATCH_RESULT_JOURNAL_INVALID: " + message, cause);
 		}
 	}
+
+	private record JournalScan(boolean matchFound, boolean invalid, int lineCount) { }
 
 	private static void writeAtomic(Path target, String value) throws IOException {
 		Path parent = target.getParent();

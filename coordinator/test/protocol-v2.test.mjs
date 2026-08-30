@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import test from 'node:test';
 
-import { createBridgeAuthenticationProof, MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
+import { createActionResultReplayProof, createBridgeAuthenticationProof, MultiplexedServerBridge, ProtocolV2Error, validateProtocolV2Envelope, validateProtocolV2Payload } from '../src/protocol-v2.mjs';
 import { completionContractFingerprint } from '../src/goal-contract.mjs';
 import { goalSpecFingerprint } from '../src/goal-spec.mjs';
 
@@ -552,6 +552,42 @@ test('terminal results for actions not issued by the coordinator fail closed', a
 	assert.equal(error.code, 'UNISSUED_ACTION_RESULT');
 	assert.equal(delivered, false);
 	assert.equal(socket.destroyed, true);
+});
+
+test('a replacement coordinator accepts only session-proven retained terminal results', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket, schedule: () => 1, cancelSchedule: () => {}, currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const challenge = JSON.parse(socket.authenticationWrites[0]);
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-ready-retained', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+
+	const actionId = 'action-before-process-restart';
+	const payload = {
+		...actionResult(actionId),
+		replayProof: createActionResultReplayProof(SECRET, {
+			clientNonce: challenge.payload.clientNonce,
+			serverNonce: Buffer.alloc(32, 7).toString('base64url'),
+			serverInstanceId: 'server-instance',
+			agentId: 'agent-a',
+			goalRevision: 4,
+			actionId,
+		}),
+	};
+	const delivered = once(bridge, 'action_result');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-retained-result', payload))}\n`);
+	const [message] = await delivered;
+	assert.deepEqual(message.payload, payload);
+	await bridge.acknowledgeActionResult('agent-a', payload, { connectionEpoch: 1 });
+	assert.equal(JSON.parse(socket.writes.at(-1)).type, 'action_result_ack');
 });
 
 test('protocol v2 accepts only coordinate-free respawn arguments', () => {

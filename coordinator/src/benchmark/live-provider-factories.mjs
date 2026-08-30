@@ -2,16 +2,14 @@ import path from 'node:path';
 
 import { AcpProviderService } from '../acp-service.mjs';
 import { AgentWorkspaceManager } from '../agent-workspace.mjs';
-import { AntigravityProviderService } from '../antigravity-service.mjs';
 import { CodexService } from '../codex-service.mjs';
 import { createProviderChildEnvironment } from '../provider-environment.mjs';
 import { sanitizeDiagnosticErrorCode, sanitizeDiagnosticErrorMessage, sanitizeDiagnosticText } from '../diagnostic-sanitizer.mjs';
 
-const PROVIDERS = new Set(['codex', 'gemini', 'kimi']);
+const PROVIDERS = new Set(['codex', 'kimi']);
 const DEFAULT_BRIDGE_SECRET_ENVIRONMENT_VARIABLE = 'ARENA_AGENT_BRIDGE_SECRET';
 const DEFAULT_PREFLIGHT_TIMEOUT_MS = 15_000;
 const PREFLIGHT_AGENT_ID = '__latency_preflight__';
-const GEMINI_PROBE_INPUT = 'Return exactly one valid JSON decision with directive "finish" and status "completed". Do not call tools.';
 
 /**
  * Build an exact-provider factory for a live latency trial.
@@ -74,11 +72,9 @@ export function createLiveProviderFactory(providerValue, options = {}) {
 			agent = await runBounded((signal) => service.createAgent({ ...profile, agentId, provider }, { signal, controlProtocol: 'arena_script' }), context.signal, timeoutMs);
 			if (agent === null || typeof agent !== 'object') throw coded('INVALID_SESSION', 'provider returned no live agent session');
 
-			phase = provider === 'gemini' || typeof options.probe === 'function' ? 'first_turn' : 'session';
+			phase = typeof options.probe === 'function' ? 'first_turn' : 'session';
 			if (typeof options.probe === 'function') {
 				await runBounded((signal) => options.probe({ provider, profile: { ...profile, agentId, provider }, agent, signal, timeoutMs, context }), context.signal, timeoutMs);
-			} else if (provider === 'gemini') {
-				await runBounded((signal) => defaultGeminiProbe(agent, signal), context.signal, timeoutMs);
 			}
 
 			await removeAgent(service, agentId, agent);
@@ -145,18 +141,10 @@ function createDefaultService(provider, { config, environment, workspaceManager 
 			bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable,
 		}, dependencies);
 	}
-	if (provider === 'kimi') {
-		if (options.kimiTransportFactory !== undefined) dependencies.transportFactory = options.kimiTransportFactory;
-		if (options.kimiDiscoverCatalog !== undefined) dependencies.discoverCatalog = options.kimiDiscoverCatalog;
-		if (options.execFile !== undefined) dependencies.execFile = options.execFile;
-		return new (options.AcpProviderService ?? AcpProviderService)({ ...config, provider, environment, bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable }, dependencies);
-	}
-	if (options.antigravitySpawn !== undefined) dependencies.spawn = options.antigravitySpawn;
-	if (options.terminateProviderProcess !== undefined) dependencies.terminate = options.terminateProviderProcess;
-	if (options.antigravityDiscoverCatalog !== undefined) dependencies.discoverCatalog = options.antigravityDiscoverCatalog;
+	if (options.kimiTransportFactory !== undefined) dependencies.transportFactory = options.kimiTransportFactory;
+	if (options.kimiDiscoverCatalog !== undefined) dependencies.discoverCatalog = options.kimiDiscoverCatalog;
 	if (options.execFile !== undefined) dependencies.execFile = options.execFile;
-	if (options.platform !== undefined) dependencies.platform = options.platform;
-	return new (options.AntigravityProviderService ?? AntigravityProviderService)({ ...config, provider, environment, bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable }, dependencies);
+	return new (options.AcpProviderService ?? AcpProviderService)({ ...config, provider, environment, bridgeSecretEnvironmentVariable: config.bridgeSecretEnvironmentVariable }, dependencies);
 }
 
 function providerConfig(provider, rootValue, options) {
@@ -191,12 +179,6 @@ function validateService(service, provider) {
 	if (!isRecord(service)) throw new TypeError(`${provider} live provider service must be an object`);
 	for (const method of ['start', 'stop', 'createAgent']) if (typeof service[method] !== 'function') throw new TypeError(`${provider} service must expose ${method}()`);
 	if (service.provider !== undefined && service.provider !== provider) throw coded('PROVIDER_MISMATCH', `Service provider '${String(service.provider)}' does not match ${provider}`);
-}
-
-async function defaultGeminiProbe(agent, signal) {
-	if (typeof agent.setGoalRevision === 'function') await agent.setGoalRevision(0);
-	if (typeof agent.decide !== 'function') throw coded('INVALID_SESSION', 'gemini session cannot perform a bounded first-turn probe');
-	await agent.decide(GEMINI_PROBE_INPUT, { goalRevision: 0, signal });
 }
 
 async function removeAgent(service, agentId, agent) {

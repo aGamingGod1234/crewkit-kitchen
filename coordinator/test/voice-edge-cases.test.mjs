@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { request as httpRequest } from 'node:http';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -444,6 +445,91 @@ test('voice request authentication rejects tampered bodies, content types, and p
 	});
 });
 
+test('voice request authentication bounds unauthenticated body readers and releases aborted slots', async () => {
+	await withWorker({ maxConcurrent: 1 }, async ({ baseUrl }) => {
+		const slow = openSlowVoiceRequest(baseUrl);
+		slow.on('error', () => {});
+		slow.write(Buffer.alloc(1));
+		await eventuallyPendingAuthentication(baseUrl, 1);
+		const rejectedSlow = openSlowVoiceRequest(baseUrl);
+		rejectedSlow.on('error', () => {});
+		const rejectedResponse = readClientResponse(rejectedSlow);
+		rejectedSlow.write(Buffer.alloc(1));
+		const rejected = await rejectedResponse;
+		assert.equal(rejected.status, 429);
+		assert.equal(rejected.body.code, 'VOICE_AUTH_CAPACITY');
+		await waitForCondition(() => rejectedSlow.destroyed, 'capacity-rejected slow request retained its socket');
+		assert.equal((await health(baseUrl)).pendingAuthentication, 1, 'rejected reader never enters bounded body admission');
+		slow.destroy();
+		await eventuallyPendingAuthentication(baseUrl, 0);
+		const valid = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		assert.equal(valid.status, 200, 'an aborted unauthenticated reader releases its slot');
+	});
+});
+
+test('voice request authentication rejects oversized declared bodies before admission', async () => {
+	await withWorker({ maxConcurrent: 1 }, async ({ baseUrl }) => {
+		const oversized = openSlowVoiceRequest(baseUrl, { contentLength: 48_000 * 2 * 20 + 1 });
+		oversized.on('error', () => {});
+		const response = await readClientResponse(oversized);
+		assert.equal(response.status, 400);
+		assert.equal(response.body.code, 'REQUEST_TOO_LARGE');
+		assert.equal((await health(baseUrl)).pendingAuthentication, 0, 'declared oversized body never reserves admission');
+		await waitForCondition(() => oversized.destroyed, 'declared oversized body retained its socket');
+		const valid = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		assert.equal(valid.status, 200);
+	});
+});
+
+test('voice request authentication closes unfinished bodies rejected before admission', async () => {
+	await withWorker({ maxConcurrent: 1 }, async ({ baseUrl }) => {
+		const unauthenticated = openSlowVoiceRequest(baseUrl, { authenticated: false });
+		unauthenticated.on('error', () => {});
+		const rejectedResponse = readClientResponse(unauthenticated);
+		unauthenticated.write(Buffer.alloc(1));
+		const rejected = await rejectedResponse;
+		assert.equal(rejected.status, 401);
+		assert.equal(rejected.body.code, 'UNAUTHORIZED');
+		await waitForCondition(() => unauthenticated.destroyed, 'early authentication rejection retained its socket');
+		assert.equal((await health(baseUrl)).pendingAuthentication, 0);
+	});
+});
+
+test('voice request body timeout releases its unauthenticated admission slot', async () => {
+	await withWorker({ maxConcurrent: 1, requestTimeoutMs: 25 }, async ({ baseUrl }) => {
+		const slow = openSlowVoiceRequest(baseUrl);
+		const failed = new Promise((resolve) => slow.once('error', resolve));
+		slow.write(Buffer.alloc(1));
+		await eventuallyPendingAuthentication(baseUrl, 1);
+		await failed;
+		await eventuallyPendingAuthentication(baseUrl, 0);
+		const valid = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		assert.equal(valid.status, 200, 'a timed-out body reader releases its slot');
+	});
+});
+
+test('closing the voice worker destroys pending unauthenticated body readers', async () => {
+	await withWorker({ maxConcurrent: 1, requestTimeoutMs: 10_000 }, async ({ worker, baseUrl }) => {
+		const slow = openSlowVoiceRequest(baseUrl);
+		slow.on('error', () => {});
+		const clientClosed = new Promise((resolve) => slow.once('close', resolve));
+		slow.write(Buffer.alloc(1));
+		await eventuallyPendingAuthentication(baseUrl, 1);
+		await Promise.race([
+			worker.close(),
+			new Promise((_, reject) => setTimeout(() => reject(new Error('voice worker close retained a pending body reader')), 500)),
+		]);
+		await clientClosed;
+		assert.equal(slow.destroyed, true);
+	});
+});
+
 test('invalid STT client input does not degrade or probe the provider lifecycle', async () => {
 	let calls = 0;
 	let probes = 0;
@@ -463,10 +549,14 @@ test('invalid STT client input does not degrade or probe the provider lifecycle'
 			{ headers: sttHeaders(), body: Buffer.alloc(48_000 * 2 * 20 + 2) },
 		];
 		for (const invalid of invalidRequests) {
-			const response = await fetch(`${baseUrl}/v1/stt`, {
-				method: 'POST', headers: invalid.headers, body: invalid.body,
-			});
-			assert.equal(response.ok, false);
+			try {
+				const response = await fetch(`${baseUrl}/v1/stt`, {
+					method: 'POST', headers: invalid.headers, body: invalid.body,
+				});
+				assert.equal(response.ok, false);
+			} catch (error) {
+				assert.match(String(error?.cause?.code ?? error?.message), /ECONNRESET|fetch failed/);
+			}
 			const stt = worker.statusSnapshots().find(({ component }) => component === 'voice:stt');
 			assert.equal(stt.state, 'ready');
 			assert.equal(stt.consecutiveFailureCount, 0);
@@ -1279,6 +1369,14 @@ function ttsHeaders(overrides = {}) {
 	};
 }
 
+async function eventuallyPendingAuthentication(baseUrl, expected) {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		if ((await health(baseUrl)).pendingAuthentication === expected) return;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error(`voice worker pending authentication count did not reach ${expected}`);
+}
+
 function sttHeaders(overrides = {}) {
 	return {
 		...createVoiceRequestHeaders({ secret: SECRET, path: '/v1/stt' }),
@@ -1288,6 +1386,48 @@ function sttHeaders(overrides = {}) {
 		'X-Whispering': 'false',
 		...overrides,
 	};
+}
+
+function openSlowVoiceRequest(baseUrl, { contentLength = 1024, authenticated = true } = {}) {
+	const url = new URL('/v1/stt', baseUrl);
+	const request = httpRequest(url, {
+		method: 'POST',
+		headers: {
+			...(authenticated ? createVoiceRequestHeaders({
+				secret: SECRET,
+				path: '/v1/stt',
+				contentType: 'audio/l16;rate=48000;channels=1',
+				identityHeaders: {
+					'x-player-id': PLAYER,
+					'x-utterance-sequence': '1',
+					'x-whispering': 'false',
+				},
+				body: Buffer.alloc(0),
+			}) : {}),
+			'Content-Type': 'audio/l16;rate=48000;channels=1',
+			'Content-Length': String(contentLength),
+			'X-Player-Id': PLAYER,
+			'X-Utterance-Sequence': '1',
+			'X-Whispering': 'false',
+		},
+	});
+	request.on('response', (response) => response.resume());
+	return request;
+}
+
+function readClientResponse(request) {
+	return new Promise((resolve, reject) => {
+		request.once('response', (response) => {
+			const chunks = [];
+			response.on('data', (chunk) => chunks.push(chunk));
+			response.once('end', () => resolve({
+				status: response.statusCode,
+				body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+			}));
+		});
+		request.once('error', reject);
+		request.flushHeaders();
+	});
 }
 
 function agentUuid(value) {

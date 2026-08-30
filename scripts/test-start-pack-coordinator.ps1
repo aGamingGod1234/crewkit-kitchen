@@ -38,8 +38,11 @@ try {
     Copy-Item -LiteralPath $systemNode -Destination $pathDecoyNode
 
     $secret = 'verified-test-secret-0123456789abcdef'
+    $voiceSecret = 'verified-voice-secret-0123456789abcdef'
     [IO.File]::WriteAllText((Join-Path $runtimeDirectory 'bridge-secret.txt'), $secret, $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $runtimeDirectory 'voice-secret.txt'), $voiceSecret, $utf8NoBom)
     [IO.File]::WriteAllText((Join-Path $coordinatorConfigDirectory 'dynamic-agents.json'), '{}', $utf8NoBom)
+    $env:ARENA_AGENT_VOICE_SECRET = 'inherited-plaintext-override'
     $testCoordinator = @'
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -48,6 +51,8 @@ const resultPath = fileURLToPath(new URL('../../runtime/launch-result.json', imp
 writeFileSync(resultPath, JSON.stringify({
   executable: process.execPath,
   secretMatches: process.env.ARENA_AGENT_BRIDGE_SECRET === 'verified-test-secret-0123456789abcdef',
+  voiceSecretFileMatches: process.env.ARENA_AGENT_VOICE_SECRET_FILE === fileURLToPath(new URL('../../runtime/voice-secret.txt', import.meta.url)),
+  plaintextVoiceSecretAbsent: process.env.ARENA_AGENT_VOICE_SECRET === undefined,
   configFlag: process.argv.at(-2),
   configPath: process.argv.at(-1),
 }));
@@ -61,6 +66,10 @@ writeFileSync(resultPath, JSON.stringify({
         throw "Pack launcher used an unexpected Node.js executable: $($result.executable)"
     }
     if (-not $result.secretMatches) { throw 'Pack launcher did not pass the bridge secret to the trusted Node.js process.' }
+    if (-not $result.voiceSecretFileMatches -or -not $result.plaintextVoiceSecretAbsent) {
+        throw 'Pack launcher did not pass only the dedicated voice-secret file to the trusted Node.js process.'
+    }
+    if (Test-Path Env:\ARENA_AGENT_VOICE_SECRET) { throw 'Pack launcher retained an inherited plaintext voice secret.' }
     if ($result.configFlag -ne '--config' -or [IO.Path]::GetFullPath($result.configPath) -ne [IO.Path]::GetFullPath((Join-Path $coordinatorConfigDirectory 'dynamic-agents.json'))) {
         throw 'Pack launcher did not pass the expected coordinator configuration path.'
     }
@@ -80,7 +89,25 @@ writeFileSync(resultPath, JSON.stringify({
     }
     if (-not $relativeOverrideRejected) { throw 'Pack launcher accepted a relative trusted Node.js override.' }
 
+    $voiceSecretPath = Join-Path $runtimeDirectory 'voice-secret.txt'
     Remove-Item -LiteralPath $resultPath
+    Remove-Item -LiteralPath $voiceSecretPath
+    $env:ARENA_AGENT_VOICE_SECRET = 'inherited-before-readiness-failure'
+    $missingVoiceSecretRejected = $false
+    try { & $scriptPath -NodePath $pathDecoyNode } catch { $missingVoiceSecretRejected = $_.Exception.Message -match 'voice-secret.txt' }
+    if (-not $missingVoiceSecretRejected) { throw 'Pack launcher accepted a missing dedicated voice secret.' }
+    if (Test-Path Env:\ARENA_AGENT_VOICE_SECRET) { throw 'Pack launcher retained plaintext voice credentials after readiness failure.' }
+    [IO.File]::WriteAllText($voiceSecretPath, 'short', $utf8NoBom)
+    $shortVoiceSecretRejected = $false
+    try { & $scriptPath -NodePath $pathDecoyNode } catch { $shortVoiceSecretRejected = $_.Exception.Message -match 'voice secret is missing or invalid' }
+    if (-not $shortVoiceSecretRejected) { throw 'Pack launcher accepted a short dedicated voice secret.' }
+    [IO.File]::WriteAllText($voiceSecretPath, $secret, $utf8NoBom)
+    $sharedVoiceSecretRejected = $false
+    try { & $scriptPath -NodePath $pathDecoyNode } catch { $sharedVoiceSecretRejected = $_.Exception.Message -match 'must be distinct' }
+    if (-not $sharedVoiceSecretRejected) { throw 'Pack launcher accepted a shared bridge and voice secret.' }
+    [IO.File]::WriteAllText($voiceSecretPath, $voiceSecret, $utf8NoBom)
+
+    Remove-Item -LiteralPath $resultPath -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $bundledNode
     [IO.File]::WriteAllText((Join-Path $runtimeDirectory 'bridge-secret.txt'), 'short-secret', $utf8NoBom)
     $pathFallbackRejectedBeforeSecretRead = $false

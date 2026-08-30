@@ -92,6 +92,7 @@ const MAX_CHANGED_FACTS = 256;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const AUTHENTICATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const AUTHENTICATION_CONTEXT = 'arena-agents-v2';
+const ACTION_RESULT_REPLAY_CONTEXT = 'arena-agents-v2-action-result-replay';
 export const MAX_VERBOSE_MESSAGE_LENGTH = 256;
 export const VERBOSE_STAGES = Object.freeze([
 	'conversation', 'lifecycle', 'planner', 'provider', 'output', 'decision',
@@ -805,9 +806,23 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
 		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
 		if (!this.#issuedActionIds.has(key)) {
-			throw new ProtocolV2Error('UNISSUED_ACTION_RESULT', `Action '${actionId}' was not issued by this coordinator`);
+			const expectedProof = this.#clientNonce === null || this.#serverNonce === null
+				? null
+				: createActionResultReplayProof(this.#secret, {
+					clientNonce: this.#clientNonce,
+					serverNonce: this.#serverNonce,
+					serverInstanceId: this.#serverInstanceId,
+					agentId: envelope.agentId,
+					goalRevision: envelope.payload.goalRevision,
+					actionId,
+				});
+			if (expectedProof === null || envelope.payload.replayProof === undefined
+					|| !secretsEqual(envelope.payload.replayProof, expectedProof)) {
+				throw new ProtocolV2Error('UNISSUED_ACTION_RESULT', `Action '${actionId}' was not issued by this coordinator`);
+			}
+			this.#rememberIssuedActionKey(key);
 		}
-		const fingerprint = JSON.stringify(envelope.payload);
+		const fingerprint = terminalResultFingerprint(envelope.payload);
 		const previous = this.#terminalResultsByKey.get(key);
 		if (previous !== undefined) {
 			if (previous !== fingerprint) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Action '${actionId}' changed its terminal result`);
@@ -828,7 +843,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const actionId = requireIdentifier(payload?.actionId ?? payload?.commandId, 'actionId');
 		const key = `${agentId}:${goalRevision}:${actionId}`;
 		const tracked = this.#terminalResultsByKey.get(key);
-		if (tracked === undefined || tracked !== JSON.stringify(payload)) {
+		if (tracked === undefined || tracked !== terminalResultFingerprint(payload)) {
 			return Promise.reject(new ProtocolV2Error('UNTRACKED_ACTION_RESULT', `Action '${actionId}' has no matching delivered terminal result`));
 		}
 		rememberBounded(this.#acknowledgedTerminalActionIds, key, this.#trackedTerminalActionIdCap);
@@ -888,6 +903,10 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const actionId = requireIdentifier(envelope.payload.actionId, 'actionId');
 		this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
 		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
+		this.#rememberIssuedActionKey(key);
+	}
+
+	#rememberIssuedActionKey(key) {
 		const evicted = rememberBounded(this.#issuedActionIds, key, this.#trackedTerminalActionIdCap);
 		if (evicted === undefined) return;
 		this.#terminalResultsByKey.delete(evicted);
@@ -1073,6 +1092,26 @@ export function createBridgeAuthenticationProof(secret, role, {
 	];
 	if (role === 'coordinator') fields.push(launchId === null ? '' : launchIdentity(launchId));
 	return createHmac('sha256', key).update(fields.join('\0'), 'utf8').digest('base64url');
+}
+
+export function createActionResultReplayProof(secret, {
+	clientNonce,
+	serverNonce,
+	serverInstanceId,
+	agentId,
+	goalRevision,
+	actionId,
+}) {
+	const fields = [
+		ACTION_RESULT_REPLAY_CONTEXT,
+		authenticationToken(clientNonce, 'clientNonce'),
+		authenticationToken(serverNonce, 'serverNonce'),
+		requireIdentifier(serverInstanceId, 'serverInstanceId'),
+		requireIdentifier(agentId, 'agentId'),
+		String(revision(goalRevision, 'goalRevision')),
+		requireIdentifier(actionId, 'actionId'),
+	];
+	return createHmac('sha256', requireSecret(secret)).update(fields.join('\0'), 'utf8').digest('base64url');
 }
 
 function defaultDeadlineSchedule(callback, delay) {
@@ -1537,7 +1576,7 @@ function normalizeActionProgress(value) {
 }
 
 function normalizeActionResult(value) {
-	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted'];
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted', 'replayProof'];
 	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'], 'action_result');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
@@ -1563,8 +1602,14 @@ function normalizeActionResult(value) {
 		if (typeof value.physicalAttempted !== 'boolean') throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted must be a boolean');
 		normalized.physicalAttempted = value.physicalAttempted;
 	}
+	if (value.replayProof !== undefined) normalized.replayProof = authenticationToken(value.replayProof, 'replayProof');
 	if (normalized.physicalAttempted === true && normalized.executionStarted !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted requires executionStarted');
 	return normalized;
+}
+
+function terminalResultFingerprint(payload) {
+	const { replayProof: _replayProof, ...result } = payload;
+	return JSON.stringify(result);
 }
 
 function normalizeGoalCompletionRequest(value) {

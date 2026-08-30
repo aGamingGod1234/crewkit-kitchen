@@ -106,6 +106,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private static final int AUTHENTICATION_NONCE_BYTES = 32;
 	private static final int AUTHENTICATION_TOKEN_LENGTH = 43;
 	private static final String AUTHENTICATION_CONTEXT = "arena-agents-v2";
+	private static final String ACTION_RESULT_REPLAY_CONTEXT = "arena-agents-v2-action-result-replay";
 	static final long HANDSHAKE_RETRY_WAIT_MS = 25L;
 	private static final int MIN_SECRET_LENGTH = 32;
 	private static final int MAX_SECRET_LENGTH = 512;
@@ -886,7 +887,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					if (handshakeQueuedByAgent.getOrDefault(result.agentId().toString(), 0) >= AGENT_QUEUE_CAP) continue;
 					if (!terminalResults.claim(result, source)) continue;
 					claimedReplay.add(result);
-					handshake.add(actionResultEnvelope(result));
+					handshake.add(actionResultEnvelope(result, source));
 					handshakeQueuedByAgent.merge(result.agentId().toString(), 1, Integer::sum);
 				}
 				try {
@@ -1840,7 +1841,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 				throw new BridgeProtocolException("COORDINATOR_DISCONNECTED", "Respawn result has no authenticated coordinator");
 			}
 			BridgeEnvelope resultEnvelope = new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
-					"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
+					"server-" + messageIds.incrementAndGet(), actionResultPayload(result, active));
 			BridgeEnvelope controlEnvelope = new BridgeEnvelope(2, serverInstanceId, transition.after().agentId().toString(), "goal_control",
 					"server-" + messageIds.incrementAndGet(), goalControlPayload(transition, "respawn"));
 			terminalResults.retain(result);
@@ -1878,7 +1879,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		}
 	}
 
-	private static JsonObject actionResultPayload(ServerActionResult result) {
+	private JsonObject actionResultPayload(ServerActionResult result, Session target) {
 		JsonObject payload = new JsonObject();
 		payload.addProperty("goalRevision", result.goalRevision());
 		payload.addProperty("actionId", result.actionId());
@@ -1892,12 +1893,16 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		payload.addProperty("observedAtEpochMs", result.observedAtEpochMs());
 		payload.addProperty("executionStarted", result.executionStarted());
 		payload.addProperty("physicalAttempted", result.physicalAttempted());
+		payload.addProperty("replayProof", actionResultReplayProof(
+				secret, target.clientNonce, target.serverNonce, serverInstanceId,
+				result.agentId().toString(), result.goalRevision(), result.actionId()
+		));
 		return payload;
 	}
 
-	private BridgeEnvelope actionResultEnvelope(ServerActionResult result) {
+	private BridgeEnvelope actionResultEnvelope(ServerActionResult result, Session target) {
 		return new BridgeEnvelope(2, serverInstanceId, result.agentId().toString(), "action_result",
-				"server-" + messageIds.incrementAndGet(), actionResultPayload(result));
+				"server-" + messageIds.incrementAndGet(), actionResultPayload(result, target));
 	}
 
 	private static String verboseResult(ServerActionResult result) {
@@ -2097,7 +2102,7 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 	private boolean enqueueTerminalResult(Session target, ServerActionResult result) {
 		if (!terminalResults.claim(result, target)) return true;
 		try {
-			target.enqueue(actionResultEnvelope(result));
+			target.enqueue(actionResultEnvelope(result, target));
 			return true;
 		} catch (RuntimeException exception) {
 			terminalResults.release(result, target);
@@ -2317,6 +2322,26 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		if (!Set.of("server", "coordinator").contains(role)) throw new IllegalArgumentException("authentication role is invalid");
 		String context = String.join("\0", AUTHENTICATION_CONTEXT, role, clientNonce, serverNonce, instanceId)
 				+ ("coordinator".equals(role) ? "\0" + Objects.toString(launchId, "") : "");
+		try {
+			Mac mac = Mac.getInstance("HmacSHA256");
+			mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+			return Base64.getUrlEncoder().withoutPadding().encodeToString(mac.doFinal(context.getBytes(StandardCharsets.UTF_8)));
+		} catch (GeneralSecurityException exception) {
+			throw new IllegalStateException("HmacSHA256 is unavailable", exception);
+		}
+	}
+
+	static String actionResultReplayProof(
+			String secret,
+			String clientNonce,
+			String serverNonce,
+			String instanceId,
+			String agentId,
+			long goalRevision,
+			String actionId
+	) {
+		String context = String.join("\0", ACTION_RESULT_REPLAY_CONTEXT, clientNonce, serverNonce, instanceId,
+				agentId, Long.toString(goalRevision), actionId);
 		try {
 			Mac mac = Mac.getInstance("HmacSHA256");
 			mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));

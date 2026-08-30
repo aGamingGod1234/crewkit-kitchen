@@ -88,11 +88,11 @@ test('routes an exact provider to only the selected injected service', async () 
 
 test('rejects a mismatched profile without fallback or service construction', async () => {
 	let constructed = false;
-	const factory = createLiveProviderFactory('gemini', {
-		serviceFactory() { constructed = true; return fakeService({ provider: 'gemini' }); },
+	const factory = createLiveProviderFactory('codex', {
+		serviceFactory() { constructed = true; return fakeService({ provider: 'codex' }); },
 	});
 
-	await assert.rejects(() => factory({ ...PROFILE, provider: 'kimi' }), (error) => error.code === 'PROVIDER_MISMATCH');
+	await assert.rejects(() => factory(PROFILE), (error) => error.code === 'PROVIDER_MISMATCH');
 	assert.equal(constructed, false);
 });
 
@@ -109,24 +109,12 @@ test('reports configured catalog fallback separately from a successful live sess
 	await provider.stop();
 });
 
-test('uses the bounded default first-turn probe for Gemini after session creation', async () => {
-	const service = fakeService({ provider: 'gemini' });
-	let prompt;
-	service.createAgent = async (profile) => {
-		service.calls.push(['createAgent', profile]);
-		return {
-			async setGoalRevision(revision) { assert.equal(revision, 0); },
-			async decide(input, options) { prompt = input; assert.equal(options.goalRevision, 0); assert.equal(options.signal.aborted, false); },
-		};
-	};
-	const factory = createLiveProviderFactory('gemini', { service });
-
-	const provider = await factory({ provider: 'gemini', model: 'gemini-3.7-flash', reasoningEffort: 'high', serviceTier: 'fast' });
-
-	assert.equal(provider.available, true);
-	assert.equal(provider.preflight.phase, 'first_turn');
-	assert.match(prompt, /exactly one valid JSON decision/i);
-	await provider.stop();
+test('rejects production-disabled Gemini before constructing a live service', () => {
+	let constructed = false;
+	assert.throws(() => createLiveProviderFactory('gemini', {
+		serviceFactory() { constructed = true; return fakeService({ provider: 'gemini' }); },
+	}), /codex, kimi/i);
+	assert.equal(constructed, false);
 });
 
 test('classifies startup failures through shared diagnostic redaction and cleans up', async () => {
