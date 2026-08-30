@@ -158,7 +158,30 @@ public final class BlockObservationLazyVisibilityVerification {
 		assertEquals(ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
 				diverseOccludedChecks.get(),
 				"diverse occlusion cannot exceed the global raycast budget");
-		assertions += 5;
+
+		ArrayList<BlockObservationOrdering.Candidate> coneFiltered = new ArrayList<>();
+		for (int index = 0; index < 40; index++) {
+			coneFiltered.add(new BlockObservationOrdering.Candidate(
+					index + 1, 0, 0, "minecraft:stone"));
+		}
+		AtomicInteger raycastsAfterCone = new AtomicInteger();
+		List<BlockObservationOrdering.Candidate> selectedAfterCone =
+				BlockObservationOrdering.selectOrderedWithVisibilityBudget(
+						BlockObservationOrdering.ordered(coneFiltered),
+						ServerObservationCollector.MAX_BLOCKS,
+						ServerObservationCollector.MAX_BLOCKS_PER_TYPE,
+						ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS,
+						ServerObservationCollector.MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
+						candidate -> candidate.x() > 32,
+						candidate -> {
+							raycastsAfterCone.incrementAndGet();
+							return true;
+						});
+		assertEquals(8, selectedAfterCone.size(),
+				"cheap cone rejects do not hide later visible blocks of the same type");
+		assertEquals(8, raycastsAfterCone.get(),
+				"only cone-eligible candidates consume the raycast budget");
+		assertions += 7;
 
 		return assertions;
 	}

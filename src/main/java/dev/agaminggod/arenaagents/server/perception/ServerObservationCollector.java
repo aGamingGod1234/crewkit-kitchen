@@ -524,7 +524,9 @@ public final class ServerObservationCollector {
 				MAX_BLOCKS_PER_TYPE,
 				MAX_BLOCK_VISIBILITY_CHECKS,
 				MAX_BLOCK_VISIBILITY_CHECKS_PER_TYPE,
-				selectable -> visibility.canSeeBlock(
+				selectable -> visibility.isBlockWithinView(
+						center.offset(selectable.x(), selectable.y(), selectable.z())),
+				selectable -> visibility.hasLineOfSight(
 						center.offset(selectable.x(), selectable.y(), selectable.z()))
 		)) {
 			BlockPos position = center.offset(candidate.x(), candidate.y(), candidate.z());

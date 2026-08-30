@@ -52,7 +52,23 @@ public final class BlockObservationOrdering {
 			int maximumVisibilityChecksPerBlockType,
 			Predicate<Candidate> admissible
 	) {
+		return selectOrderedWithVisibilityBudget(
+				ordered, maximumEntries, maximumPerBlockType,
+				maximumVisibilityChecks, maximumVisibilityChecksPerBlockType,
+				candidate -> true, admissible);
+	}
+
+	static List<Candidate> selectOrderedWithVisibilityBudget(
+			List<Candidate> ordered,
+			int maximumEntries,
+			int maximumPerBlockType,
+			int maximumVisibilityChecks,
+			int maximumVisibilityChecksPerBlockType,
+			Predicate<Candidate> eligibleWithoutVisibilityCheck,
+			Predicate<Candidate> admissible
+	) {
 		Objects.requireNonNull(ordered, "ordered must not be null");
+		Objects.requireNonNull(eligibleWithoutVisibilityCheck, "eligibleWithoutVisibilityCheck must not be null");
 		Objects.requireNonNull(admissible, "admissible must not be null");
 		if (maximumEntries <= 0 || maximumPerBlockType <= 0
 				|| maximumVisibilityChecks <= 0 || maximumVisibilityChecksPerBlockType <= 0) {
@@ -65,6 +81,7 @@ public final class BlockObservationOrdering {
 		for (Candidate candidate : ordered) {
 			int count = counts.getOrDefault(candidate.blockId(), 0);
 			if (count >= maximumPerBlockType) continue;
+			if (!eligibleWithoutVisibilityCheck.test(candidate)) continue;
 			if (visibilityChecks >= maximumVisibilityChecks) break;
 			int typeChecks = visibilityChecksByType.getOrDefault(candidate.blockId(), 0);
 			if (typeChecks >= maximumVisibilityChecksPerBlockType) continue;

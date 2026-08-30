@@ -19,20 +19,20 @@ public final class ServerObservationWireBudget {
 		Objects.requireNonNull(fitsCompleteEnvelope, "fitsCompleteEnvelope must not be null");
 		JsonObject candidate = source.deepCopy();
 		ArrayList<String> reductions = new ArrayList<>();
-		if (fitsCompleteEnvelope.test(candidate)) return Fitted.trusted(candidate, reductions);
+		if (fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
 
 		if (removeCandidateTags(candidate)) reductions.add("candidateTags");
-		if (fitsCompleteEnvelope.test(candidate)) return Fitted.trusted(candidate, reductions);
+		if (fitsCompleteEnvelope.test(candidate)) return fitted(candidate, reductions);
 
 		if (trimTail(candidate, candidate.get("blocks"), fitsCompleteEnvelope, "blocks", reductions)) {
-			return Fitted.trusted(candidate, reductions);
+			return fitted(candidate, reductions);
 		}
 		if (trimTail(candidate, candidate.get("nearbyContainers"), fitsCompleteEnvelope,
 				"nearbyContainers", reductions)) {
-			return Fitted.trusted(candidate, reductions);
+			return fitted(candidate, reductions);
 		}
 		if (trimTail(candidate, candidate.get("entities"), fitsCompleteEnvelope, "entities", reductions)) {
-			return Fitted.trusted(candidate, reductions);
+			return fitted(candidate, reductions);
 		}
 
 		JsonObject player = object(candidate, "player");
@@ -41,7 +41,12 @@ public final class ServerObservationWireBudget {
 			throw new BridgeProtocolException("OBSERVATION_TOO_LARGE",
 					"Protected observation facts exceed the complete bridge envelope limit");
 		}
-		return Fitted.trusted(candidate, reductions);
+		return fitted(candidate, reductions);
+	}
+
+	private static Fitted fitted(JsonObject candidate, List<String> reductions) {
+		// The predicate has observed candidate, so establish sole ownership before taking the trusted path.
+		return Fitted.trusted(candidate.deepCopy(), reductions);
 	}
 
 	private static boolean removeCandidateTags(JsonObject observation) {

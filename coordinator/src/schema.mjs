@@ -41,7 +41,7 @@ export class ValidationError extends Error {
 
 export function validateAction(value) {
 	if (value !== null && typeof value === 'object' && TRUSTED_ACTIONS.has(value)) return value;
-	const action = requireObject(value, 'action');
+	const action = structuredClone(requireObject(value, 'action'));
 	const type = requireText(action.type, 'action.type', MAX_REASON_CODE_LENGTH);
 	if (!ACTION_TYPES.has(type)) throw invalid('UNKNOWN_ACTION', `Unsupported action '${type}'`);
 	const requiredFields = type === 'place_block'
@@ -193,7 +193,7 @@ export function validateAction(value) {
 			if (action.count < 1 || action.count > 64) throw invalid('INVALID_FIELD', 'action.count must be between 1 and 64');
 			break;
 	}
-	const normalized = deepFreeze(structuredClone(action));
+	const normalized = deepFreeze(action);
 	TRUSTED_ACTIONS.add(normalized);
 	return normalized;
 }

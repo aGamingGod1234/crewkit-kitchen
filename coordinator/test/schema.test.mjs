@@ -75,6 +75,27 @@ test('accepts every exact action shape and returns a detached value', () => {
 	}
 });
 
+test('validates the detached action values before assigning the trusted brand', () => {
+	let reads = 0;
+	const action = { type: 'wait' };
+	Object.defineProperty(action, 'durationMs', {
+		enumerable: true,
+		get() {
+			reads += 1;
+			return reads === 1 ? 100 : -1;
+		},
+	});
+	const normalized = validateAction(action);
+	assert.equal(reads, 1);
+	assert.equal(normalized.durationMs, 100);
+	assert.strictEqual(validateAction(normalized), normalized);
+	assert.equal(createActionCommand(normalized, { commandId: 'command-accessor', issuedAtEpochMs: 1 }).durationMs, 100);
+
+	const invalid = { type: 'wait' };
+	Object.defineProperty(invalid, 'durationMs', { enumerable: true, get: () => -1 });
+	assert.throws(() => validateAction(invalid), /between 1 and 600000/);
+});
+
 test('rejects unknown fields, unsupported actions, and unsafe numeric/text values', () => {
 	assert.throws(() => validateAction({ type: 'wait', durationMs: 1, surprise: true }), /Unknown field/);
 	assert.throws(() => validateAction({ type: 'teleport', x: 0 }), /Unsupported action/);

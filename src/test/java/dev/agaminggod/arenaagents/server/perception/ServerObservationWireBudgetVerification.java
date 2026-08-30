@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class ServerObservationWireBudgetVerification {
 	private static final String MAX_MESSAGE_ID = "m".repeat(128);
@@ -59,6 +60,15 @@ public final class ServerObservationWireBudgetVerification {
 		assertEquals(6, stagedFitChecks.get(),
 				"each staged reduction performs one complete-envelope check without duplicate fitting");
 
+		AtomicReference<JsonObject> exposedCandidate = new AtomicReference<>();
+		ServerObservationWireBudget.Fitted isolated = ServerObservationWireBudget.fit(source, candidate -> {
+			exposedCandidate.set(candidate);
+			return true;
+		});
+		exposedCandidate.get().remove("player");
+		assertTrue(isolated.observation().has("player"),
+				"a fitting predicate cannot retain a mutable alias to the fitted observation");
+
 		JsonObject oversized = observation();
 		for (int index = 0; index < 64; index++) {
 			JsonObject entity = candidate("entity-" + index, "x".repeat(2_000));
@@ -77,7 +87,7 @@ public final class ServerObservationWireBudgetVerification {
 		assertThrowsCode(() -> ServerObservationWireBudget.fit(impossible,
 				candidate -> codec.encodedLineBytes(envelope(candidate)) <= BridgeEnvelopeCodec.MAX_LINE_BYTES),
 				"OBSERVATION_TOO_LARGE", "protected essentials fail closed when they cannot fit");
-		return 20;
+		return 21;
 	}
 
 	private static BridgeEnvelope envelope(JsonObject payload) {

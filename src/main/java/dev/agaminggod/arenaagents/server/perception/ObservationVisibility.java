@@ -88,15 +88,23 @@ public final class ObservationVisibility {
 
 		public boolean canSeeBlock(BlockPos position) {
 			Objects.requireNonNull(position, "position must not be null");
+			return isBlockWithinView(position) && hasLineOfSight(position);
+		}
+
+		public boolean isBlockWithinView(BlockPos position) {
+			return isWithinNormalizedViewCone(
+					eye, normalizedView, Vec3.atCenterOf(Objects.requireNonNull(position, "position must not be null")));
+		}
+
+		public boolean hasLineOfSight(BlockPos position) {
+			Objects.requireNonNull(position, "position must not be null");
 			return memoizedBlockVisibility(visibleBlocks, position, this::traceBlock);
 		}
 
 		private boolean traceBlock(BlockPos position) {
-			Vec3 target = Vec3.atCenterOf(position);
-			if (!isWithinNormalizedViewCone(eye, normalizedView, target)) return false;
 			BlockHitResult hit = level.clip(new ClipContext(
 					eye,
-					target,
+					Vec3.atCenterOf(position),
 					ClipContext.Block.VISUAL,
 					ClipContext.Fluid.NONE,
 					observer
