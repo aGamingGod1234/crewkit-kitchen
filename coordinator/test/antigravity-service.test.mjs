@@ -12,6 +12,7 @@ import { replaceDecisionJson } from './provider-decision-fixtures.mjs';
 
 test('Antigravity catalog retains the last discovered aliases when a later CLI refresh fails', async () => {
 	let fail = false;
+	let discoveryCalls = 0;
 	const discovered = [{
 		id: 'gemini-3.6-flash',
 		model: 'gemini-3.6-flash',
@@ -21,14 +22,41 @@ test('Antigravity catalog retains the last discovered aliases when a later CLI r
 	}];
 	const service = new AntigravityProviderService(
 		{ cwd: 'C:\\workspace', catalogDiscovery: true },
-		{ discoverCatalog: async () => { if (fail) throw new Error('offline'); return discovered; } },
+		{ discoverCatalog: async () => { discoveryCalls += 1; if (fail) throw new Error('offline'); return discovered; } },
 	);
 	const first = await service.catalog.refresh({ force: true });
+	const selected = { agentId: 'gemini-warm', provider: 'gemini', model: 'gemini-3.6-flash', reasoningEffort: 'high' };
+	const agent = await service.createAgent(selected);
 	fail = true;
 	const retained = await service.catalog.refresh({ force: true });
 	assert.deepEqual(retained, first);
 	assert.equal(retained.models[0].displayName, 'Gemini 3.6 Flash');
 	assert.equal(service.catalog.stale, true);
+	const callsBeforeReuse = discoveryCalls;
+	assert.equal(await service.createAgent(selected), agent);
+	assert.equal(discoveryCalls, callsBeforeReuse, 'exact warm reuse must not wait for degraded discovery');
+	await service.stop();
+});
+
+test('Antigravity coalesces concurrent stale catalog refreshes', async () => {
+	let discoveryCalls = 0;
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	const discovered = [{
+		id: 'gemini-3.6-flash', model: 'gemini-3.6-flash', displayName: 'Gemini 3.6 Flash',
+		reasoningEfforts: ['high', 'medium', 'low'], serviceTiers: [],
+	}];
+	const service = new AntigravityProviderService(
+		{ cwd: 'C:\\workspace', catalogDiscovery: true },
+		{ discoverCatalog: async () => { discoveryCalls += 1; await gate; return discovered; } },
+	);
+	const refreshes = [service.catalog.refresh({ force: true }), service.catalog.refresh({ force: true }), service.catalog.refresh()];
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(discoveryCalls, 1);
+	release();
+	const snapshots = await Promise.all(refreshes);
+	assert.deepEqual(snapshots[1], snapshots[0]);
+	assert.deepEqual(snapshots[2], snapshots[0]);
 });
 
 test('Antigravity fallback configuration accepts the installed Gemini 3.7 Flash model', async () => {
@@ -271,7 +299,7 @@ test('Antigravity exposes explicit best-effort continuation status without claim
 	await service.stop();
 });
 
-test('Antigravity does not warm a session when decision parsing fails', async () => {
+test('Antigravity parse correction continues the provider-owned conversation after malformed output', async () => {
 	const spawnCalls = [];
 	let attempt = 0;
 	const service = new AntigravityProviderService(config(), {
@@ -293,9 +321,10 @@ test('Antigravity does not warm a session when decision parsing fails', async ()
 	const agent = await service.createAgent(profile());
 	await agent.setGoalRevision(1);
 	await assert.rejects(agent.decide('state', { goalRevision: 1 }), (error) => error?.code === 'DECISION_FIELD_MISMATCH');
-	assert.equal(agent.sessionMetadata().sessionState, 'cold');
+	assert.equal(agent.sessionMetadata().sessionState, 'warm');
 	await agent.decide('state', { goalRevision: 1 });
-	assert.equal(spawnCalls[1].args.includes('--continue'), false);
+	assert.equal(spawnCalls[1].args.includes('--continue'), true);
+	assert.match(spawnCalls[1].args[spawnCalls[1].args.indexOf('--continue') + 1], /strategic author for one Minecraft player/i);
 	assert.equal(agent.sessionMetadata().sessionState, 'warm');
 	await service.stop();
 });

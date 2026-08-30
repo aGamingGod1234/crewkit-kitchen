@@ -3,7 +3,13 @@ import test from 'node:test';
 
 import { parseDecision } from '../src/decision-parser.mjs';
 import { SCRIPT_PRIMITIVES } from '../src/arena-script/minecraft-api.mjs';
-import { buildPlannerInput, PLANNER_OUTPUT_SCHEMA, PLANNER_SYSTEM_PROMPT } from '../src/prompts.mjs';
+import {
+	buildPlannerInput,
+	buildProviderPlannerPrompt,
+	PLANNER_CONTINUATION_PROMPT,
+	PLANNER_OUTPUT_SCHEMA,
+	PLANNER_SYSTEM_PROMPT,
+} from '../src/prompts.mjs';
 
 test('parses a replace envelope containing ArenaScript source', () => {
 	const source = 'program.onUnhandledAttention("continue_and_notify");';
@@ -114,6 +120,20 @@ test('uses one selected-model ArenaScript contract and envelope schema', () => {
 	});
 	assert.deepEqual(PLANNER_OUTPUT_SCHEMA.properties.source, { type: ['string', 'null'], minLength: 1, maxLength: 65_536 });
 	assert.equal(Object.hasOwn(PLANNER_OUTPUT_SCHEMA.properties, 'completionContract'), false);
+});
+
+test('provider continuation prompt preserves directive discrimination at a fraction of the cold contract bytes', () => {
+	const input = 'Minecraft planner state (authoritative JSON):\n{"goal":"collect logs"}';
+	const cold = buildProviderPlannerPrompt(input, { recoverySummary: 'Recovered after transport loss.' });
+	const warm = buildProviderPlannerPrompt(input, { instructionsInstalled: true, recoverySummary: 'must not repeat' });
+	assert.match(cold, /strategic author for one Minecraft player/i);
+	assert.match(cold, /Recovered after transport loss/);
+	assert.doesNotMatch(warm, /strategic author for one Minecraft player/i);
+	assert.doesNotMatch(warm, /must not repeat/);
+	assert.match(warm, /replace requires nonblank ArenaScript source/i);
+	assert.match(warm, /every other directive requires source:null/i);
+	assert.equal(warm.startsWith(PLANNER_CONTINUATION_PROMPT), true);
+	assert.ok(Buffer.byteLength(warm) < Buffer.byteLength(cold) / 4);
 });
 
 test('planner instructions keep physical work in the same program as its acknowledgement', () => {

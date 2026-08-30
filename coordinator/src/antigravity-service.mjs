@@ -58,28 +58,29 @@ export class AntigravityProviderService {
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
 		const lifecycleGeneration = this.#lifecycleGeneration;
-		await this.catalog.refresh();
-		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
-		const profile = validateProfile(profileValue, this.#config);
-		const replacing = this.#replacing.get(profile.agentId);
+		const requested = profileIdentity(profileValue, this.#config);
+		const replacing = this.#replacing.get(requested.agentId);
 		if (replacing !== undefined) {
-			if (!profilesMatch(replacing.profile, profile)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
+			if (!profilesMatch(replacing.profile, requested)) throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			return replacing.promise;
 		}
-		const existing = this.#agents.get(profile.agentId);
+		const existing = this.#agents.get(requested.agentId);
 		if (existing !== undefined) {
-			if (!existing.matchesProfile(profile)) {
+			if (!existing.matchesProfile(requested)) {
 				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			}
 			return existing;
 		}
-		const creating = this.#creating.get(profile.agentId);
+		const creating = this.#creating.get(requested.agentId);
 		if (creating !== undefined) {
-			if (!profilesMatch(creating.profile, profile)) {
+			if (!profilesMatch(creating.profile, requested)) {
 				throw new AcpProtocolError('AGENT_PROFILE_CONFLICT', PROFILE_CONFLICT_MESSAGE);
 			}
 			return creating.promise;
 		}
+		await this.catalog.refresh();
+		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
+		const profile = validateProfile(profileValue, this.#config);
 		const promise = this.#createAgentOnce(profile, recoverySummary, lifecycleGeneration);
 		this.#creating.set(profile.agentId, { profile, promise });
 		try {
@@ -309,6 +310,8 @@ class AntigravityAgent {
 			if (signal?.aborted || goalRevision !== this.#goalRevision) {
 				throw new AcpProtocolError('STALE_PLAN', 'gemini result belongs to an obsolete goal');
 			}
+			this.#hasConversation = true;
+			this.#sessionState = 'warm';
 			reportVisibleOutput(onVerbose, decisionText);
 			let decision;
 			let parseError = null;
@@ -327,8 +330,6 @@ class AntigravityAgent {
 				timing: providerTiming(Math.max(0, performance.now() - turnStartedAt), null, queueWaitMs),
 			});
 			if (parseError !== null) throw parseError;
-			this.#hasConversation = true;
-			this.#sessionState = 'warm';
 			return decision;
 		} catch (error) {
 			if (!outputHandled) recordProviderTurn(turnRecorder, {
@@ -524,6 +525,7 @@ class AntigravityCatalog {
 	#config;
 	#dependencies;
 	#snapshot = null;
+	#refreshPromise = null;
 
 	constructor(config, dependencies) {
 		this.#config = config;
@@ -533,6 +535,14 @@ class AntigravityCatalog {
 
 	async refresh({ force = false } = {}) {
 		if (!force && !this.stale && this.#snapshot !== null) return structuredClone(this.#snapshot);
+		if (this.#refreshPromise !== null) return structuredClone(await this.#refreshPromise);
+		const refreshPromise = this.#refreshOnce();
+		this.#refreshPromise = refreshPromise;
+		try { return structuredClone(await refreshPromise); }
+		finally { if (this.#refreshPromise === refreshPromise) this.#refreshPromise = null; }
+	}
+
+	async #refreshOnce() {
 		let models = null;
 		let discoveryFailed = false;
 		if (this.#config.catalogDiscovery === true) {
@@ -546,7 +556,7 @@ class AntigravityCatalog {
 				discoveryFailed = true;
 				if (this.#snapshot !== null) {
 					this.stale = true;
-					return structuredClone(this.#snapshot);
+					return this.#snapshot;
 				}
 			}
 		}
@@ -559,7 +569,7 @@ class AntigravityCatalog {
 			models: models.map((model) => ({ ...model, reasoningEfforts: [...model.reasoningEfforts], serviceTiers: [...(model.serviceTiers ?? [])] })),
 		};
 		this.stale = discoveryFailed;
-		return structuredClone(this.#snapshot);
+		return this.#snapshot;
 	}
 
 	assertSupported(model, reasoningEffort) {
@@ -606,20 +616,24 @@ function validateServiceConfig(config) {
 }
 
 function validateProfile(value, config) {
-	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('agent profile must be an object');
-	const profile = {
-		agentId: requireText(value.agentId, 'agentId'),
-		provider: value.provider ?? 'codex',
-		model: requireText(value.model, 'model'),
-		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
-		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
-	};
+	const profile = profileIdentity(value, config);
 	if (profile.provider !== 'gemini') throw new AcpProtocolError('PROVIDER_MISMATCH', `Expected gemini profile, received ${profile.provider}`);
 	if (!config.models.includes(profile.model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `gemini model '${profile.model}' is not configured`);
 	if (!config.modelReasoningEfforts[profile.model]?.includes(profile.reasoningEffort)) {
 		throw new AcpProtocolError('UNSUPPORTED_THINKING', `gemini model '${profile.model}' does not support thinking '${profile.reasoningEffort}'`);
 	}
 	return profile;
+}
+
+function profileIdentity(value, config) {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('agent profile must be an object');
+	return {
+		agentId: requireText(value.agentId, 'agentId'),
+		provider: value.provider ?? 'codex',
+		model: requireText(value.model, 'model'),
+		reasoningEffort: requireText(value.reasoningEffort, 'reasoningEffort'),
+		serviceTier: requireText(value.serviceTier ?? config.serviceTier ?? DEFAULT_SERVICE_TIER, 'serviceTier'),
+	};
 }
 
 function profilesMatch(left, right) {
