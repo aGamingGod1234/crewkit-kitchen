@@ -36,6 +36,8 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	private final Map<UUID, DecoderRetry> decoderRetries = new LinkedHashMap<>();
 	private final Map<CompletableFuture<SpeechWorkerClient.Transcript>, CompletedUtterance> transcriptions =
 			new LinkedHashMap<>();
+	private final java.util.Set<UUID> activeTranscriptionPlayers = new java.util.LinkedHashSet<>();
+	private final Map<UUID, CompletedUtterance> pendingTranscriptions = new LinkedHashMap<>();
 	private boolean closed;
 	private long sttRetryAfterNanos;
 
@@ -251,6 +253,18 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			completeTranscription(utterance, null, null);
 			return;
 		}
+		if (monotonicNanos.getAsLong() < sttRetryAfterNanos) {
+			completeTranscription(utterance, null, new RuntimeException("STT retry backoff is active"));
+			return;
+		}
+		if (activeTranscriptionPlayers.contains(utterance.playerId)) {
+			CompletedUtterance replaced = pendingTranscriptions.put(utterance.playerId, utterance);
+			if (replaced != null) {
+				completeTranscription(replaced, null, new RuntimeException("Utterance was coalesced"));
+			}
+			return;
+		}
+		activeTranscriptionPlayers.add(utterance.playerId);
 		long transcriptionStartedNanos = System.nanoTime();
 		CompletableFuture<SpeechWorkerClient.Transcript> transcription;
 		try {
@@ -263,9 +277,11 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		} catch (RuntimeException failure) {
 			reportLatency(utterance, transcriptionStartedNanos, System.nanoTime());
 			completeTranscription(utterance, null, failure);
+			finishActiveAndSubmitPending(utterance.playerId);
 			return;
 		}
 		if (closed || !ownsPlayerGeneration(utterance)) {
+			activeTranscriptionPlayers.remove(utterance.playerId);
 			transcription.cancel(true);
 			return;
 		}
@@ -276,7 +292,14 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			}
 			reportLatency(utterance, transcriptionStartedNanos, System.nanoTime());
 			completeTranscription(utterance, transcript, failure);
+			finishActiveAndSubmitPending(utterance.playerId);
 		});
+	}
+
+	private synchronized void finishActiveAndSubmitPending(UUID playerId) {
+		activeTranscriptionPlayers.remove(playerId);
+		CompletedUtterance pending = pendingTranscriptions.remove(playerId);
+		if (pending != null) transcribe(pending);
 	}
 
 	private void reportLatency(CompletedUtterance utterance, long transcriptionStartedNanos, long completedNanos) {
@@ -372,6 +395,8 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			sequences.remove(playerId);
 			transcriptQueues.remove(playerId);
 			decoderRetries.remove(playerId);
+			activeTranscriptionPlayers.remove(playerId);
+			pendingTranscriptions.remove(playerId);
 			for (Map.Entry<CompletableFuture<SpeechWorkerClient.Transcript>, CompletedUtterance> entry
 					: transcriptions.entrySet()) {
 				if (entry.getValue().playerId.equals(playerId)) ownedTranscriptions.add(entry.getKey());
@@ -409,6 +434,8 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		playerGenerations.clear();
 		transcriptQueues.clear();
 		decoderRetries.clear();
+		activeTranscriptionPlayers.clear();
+		pendingTranscriptions.clear();
 		for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : List.copyOf(transcriptions.keySet())) {
 			transcription.cancel(true);
 		}

@@ -208,6 +208,83 @@ test('goal translation is isolated, coalesced, acknowledged, and does not change
 	}
 });
 
+test('goal translation stays charged against lifecycle capacity until a terminal result', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const run = await start({
+		registry,
+		planner,
+		connectionOperationCap: 2,
+		agentOperationCap: 1,
+		goalSpecRequestCap: 3,
+		initialRegistry: [record('agent-a'), record('agent-b'), record('agent-c')],
+	});
+	const completions = [];
+	const request = (agentId, requestId) => ({
+		agentId,
+		payload: { requestId, originalRequest: 'Get a good pickaxe', candidateIds: ['minecraft:iron_pickaxe'] },
+		waitUntil: (operation) => completions.push(Promise.resolve(operation)),
+	});
+	const firstId = '00000000-0000-4000-8000-000000000111';
+	const secondId = '00000000-0000-4000-8000-000000000112';
+	const thirdId = '00000000-0000-4000-8000-000000000113';
+	try {
+		run.bridge.emit('goal_spec_request', request('agent-a', firstId));
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'goal_spec_proposal' && payload.requestId === firstId));
+		let firstSettled = false;
+		void completions[0].then(() => { firstSettled = true; });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(firstSettled, false, 'initial processing remains attached until the request is terminal');
+		assert.throws(
+			() => run.bridge.emit('goal_spec_request', request('agent-a', '00000000-0000-4000-8000-000000000114')),
+			(error) => error.code === 'AGENT_INBOUND_BACKPRESSURE',
+		);
+		run.bridge.emit('goal_spec_request', request('agent-b', secondId));
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'goal_spec_proposal' && payload.requestId === secondId));
+		assert.throws(
+			() => run.bridge.emit('goal_spec_request', request('agent-c', thirdId)),
+			(error) => error.code === 'CONNECTION_INBOUND_BACKPRESSURE',
+		);
+		run.bridge.emit('goal_spec_result', { agentId: 'agent-a', payload: { requestId: firstId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' } });
+		run.bridge.emit('goal_spec_result', { agentId: 'agent-b', payload: { requestId: secondId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' } });
+		await eventually(() => firstSettled);
+		run.bridge.emit('goal_spec_request', request('agent-c', thirdId));
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'goal_spec_proposal' && payload.requestId === thirdId));
+		run.bridge.emit('goal_spec_result', { agentId: 'agent-c', payload: { requestId: thirdId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' } });
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
+test('goal translation request retention has an independent hard cap', async () => {
+	const registry = new AgentRegistry();
+	const planner = new FakePlanner(registry);
+	const run = await start({
+		registry,
+		planner,
+		connectionOperationCap: 3,
+		agentOperationCap: 3,
+		goalSpecRequestCap: 1,
+		initialRegistry: [record('agent-a'), record('agent-b')],
+	});
+	const firstId = '00000000-0000-4000-8000-000000000115';
+	try {
+		run.bridge.emit('goal_spec_request', {
+			agentId: 'agent-a', payload: { requestId: firstId, originalRequest: 'Get iron', candidateIds: ['minecraft:iron_ingot'] },
+		});
+		await eventually(() => run.bridge.sent.some(({ type, payload }) => type === 'goal_spec_proposal' && payload.requestId === firstId));
+		assert.throws(
+			() => run.bridge.emit('goal_spec_request', {
+				agentId: 'agent-b', payload: { requestId: '00000000-0000-4000-8000-000000000116', originalRequest: 'Get gold', candidateIds: ['minecraft:gold_ingot'] },
+			}),
+			(error) => error.code === 'GOAL_SPEC_REQUEST_BACKPRESSURE',
+		);
+		run.bridge.emit('goal_spec_result', { agentId: 'agent-a', payload: { requestId: firstId, status: 'accepted', reasonCode: 'PROPOSAL_STAGED' } });
+	} finally {
+		await run.coordinator.stop();
+	}
+});
+
 test('goal translation retries provider failure and retransmits until Minecraft acknowledges it', async () => {
 	const timers = new ManualTimerQueue();
 	const registry = new AgentRegistry();

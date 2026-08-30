@@ -49,14 +49,22 @@ public final class AgentSavedData extends SavedData {
 	private static final AgentKillLedgerCodec KILL_LEDGER_CODEC = new AgentKillLedgerCodec();
 	private static final SurvivalProgressLedgerCodec SURVIVAL_PROGRESS_CODEC = new SurvivalProgressLedgerCodec();
 	private static final OperatorConfirmationLedgerCodec OPERATOR_CONFIRMATION_CODEC = new OperatorConfirmationLedgerCodec();
+	private static final Codec<List<String>> WAKE_LIST_CODEC = ChunkedSavedPayload.boundedStringListCodec(
+			AgentConstants.MAX_CONFIGURED_AGENTS, 256 * 1_024, 16 * 1_024 * 1_024,
+			"Persisted conversation wakes"
+	);
+	private static final Codec<List<String>> DRAFT_LIST_CODEC = ChunkedSavedPayload.boundedStringListCodec(
+			AgentConstants.MAX_CONFIGURED_AGENTS * 2, 256 * 1_024, 16 * 1_024 * 1_024,
+			"Persisted goal drafts"
+	);
 	private static final Codec<AgentSavedData> CODEC = RecordCodecBuilder.create(instance -> instance.group(
-			Codec.STRING.optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
-			Codec.STRING.listOf().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload())),
-			Codec.STRING.listOf().optionalFieldOf(CONVERSATION_WAKES_FIELD, List.of()).forGetter(AgentSavedData::encodeConversationWakes),
-			Codec.STRING.listOf().optionalFieldOf(GOAL_DRAFTS_FIELD, List.of()).forGetter(AgentSavedData::encodeGoalDrafts),
-			Codec.STRING.listOf().optionalFieldOf(KILL_LEDGER_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeKillLedger),
-			Codec.STRING.listOf().optionalFieldOf(SURVIVAL_PROGRESS_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeSurvivalProgress),
-			Codec.STRING.listOf().optionalFieldOf(OPERATOR_CONFIRMATION_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeOperatorConfirmations)
+			ChunkedSavedPayload.legacyCodec().optionalFieldOf(PAYLOAD_FIELD, "").forGetter(data -> ""),
+			ChunkedSavedPayload.chunksCodec().optionalFieldOf(PAYLOAD_CHUNKS_FIELD, List.of()).forGetter(data -> ChunkedSavedPayload.split(data.encodePayload())),
+			WAKE_LIST_CODEC.optionalFieldOf(CONVERSATION_WAKES_FIELD, List.of()).forGetter(AgentSavedData::encodeConversationWakes),
+			DRAFT_LIST_CODEC.optionalFieldOf(GOAL_DRAFTS_FIELD, List.of()).forGetter(AgentSavedData::encodeGoalDrafts),
+			ChunkedSavedPayload.chunksCodec().optionalFieldOf(KILL_LEDGER_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeKillLedger),
+			ChunkedSavedPayload.chunksCodec().optionalFieldOf(SURVIVAL_PROGRESS_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeSurvivalProgress),
+			ChunkedSavedPayload.chunksCodec().optionalFieldOf(OPERATOR_CONFIRMATION_CHUNKS_FIELD, List.of()).forGetter(AgentSavedData::encodeOperatorConfirmations)
 	).apply(instance, AgentSavedData::decodePayload));
 	public static final SavedDataType<AgentSavedData> TYPE = new SavedDataType<>(
 			Identifier.fromNamespaceAndPath("arenaagents", "codex_agents"),

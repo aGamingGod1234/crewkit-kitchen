@@ -240,6 +240,8 @@ test('Kimi launches one effort-isolated process and applies the exact ACP thinki
 	const launch = buildAcpLaunch('kimi', { reasoningEffort: 'max' }, {
 		env: {
 			PATH: 'test',
+			KIMI_API_KEY: 'kimi-key',
+			FISH_AUDIO_API_KEY: 'voice-key',
 			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
 			ARENA_AGENT_BRIDGE_SECRET_FILE: 'C:\\runtime\\bridge.secret',
 		},
@@ -248,6 +250,8 @@ test('Kimi launches one effort-isolated process and applies the exact ACP thinki
 	assert.deepEqual(launch.args, ['acp']);
 	assert.equal(launch.options.env.KIMI_MODEL_THINKING_EFFORT, 'max');
 	assert.equal(launch.options.env.PATH, 'test');
+	assert.equal(launch.options.env.KIMI_API_KEY, 'kimi-key');
+	assert.equal(launch.options.env.FISH_AUDIO_API_KEY, undefined);
 	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET, undefined, 'provider child cannot inherit the bridge secret');
 	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET_FILE, undefined, 'provider child cannot inherit the bridge secret file path');
 
@@ -453,6 +457,33 @@ test('ACP parse correction retains the accepted session and compact planner cont
 	assert.match(prompts[0].params.prompt[0].text, /strategic author/i);
 	assert.doesNotMatch(prompts[1].params.prompt[0].text, /strategic author/i);
 	await service.stop();
+});
+
+test('Kimi catalog discovery receives only the Kimi provider environment', async () => {
+	let discoveryOptions;
+	const service = new AcpProviderService({
+		provider: 'kimi',
+		cwd: 'C:\\workspace',
+		catalogDiscovery: true,
+		environment: {
+			PATH: 'test',
+			KIMI_API_KEY: 'kimi-key',
+			OPENAI_API_KEY: 'openai-key',
+			FISH_AUDIO_API_KEY: 'voice-key',
+			DEEPGRAM_API_KEY: 'speech-key',
+		},
+	}, {
+		execFile(_command, _args, options, callback) {
+			discoveryOptions = options;
+			callback(null, JSON.stringify({ models: { 'kimi-code/k3': { supportEfforts: ['high'] } } }));
+		},
+	});
+	await service.catalog.refresh({ force: true });
+	assert.equal(discoveryOptions.env.PATH, 'test');
+	assert.equal(discoveryOptions.env.KIMI_API_KEY, 'kimi-key');
+	assert.equal(discoveryOptions.env.OPENAI_API_KEY, undefined);
+	assert.equal(discoveryOptions.env.FISH_AUDIO_API_KEY, undefined);
+	assert.equal(discoveryOptions.env.DEEPGRAM_API_KEY, undefined);
 });
 
 test('ACP malformed output records one final error row for the attempt', async () => {

@@ -76,7 +76,7 @@ test('Cursor catalog normalizes native Composer and Cursor Grok variants into th
 test('Cursor launch uses native Windows CLI in read-only JSON mode without the unsupported Windows sandbox', () => {
 	const launch = buildCursorLaunch(profile(), config(), {
 		cwd: 'C:\\agents\\cursor\\cursor-a',
-		env: { PATH: 'test', ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret' },
+		env: { PATH: 'test', CURSOR_API_KEY: 'cursor-key', FISH_AUDIO_API_KEY: 'voice-key', ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret' },
 		platform: 'win32',
 	});
 	assert.equal(launch.command, 'powershell.exe');
@@ -87,6 +87,8 @@ test('Cursor launch uses native Windows CLI in read-only JSON mode without the u
 	]);
 	assert.equal(launch.options.cwd, 'C:\\agents\\cursor\\cursor-a');
 	assert.equal(launch.options.env.PATH, 'test');
+	assert.equal(launch.options.env.CURSOR_API_KEY, 'cursor-key');
+	assert.equal(launch.options.env.FISH_AUDIO_API_KEY, undefined);
 	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET, undefined);
 	assert.deepEqual(launch.options.stdio, ['pipe', 'pipe', 'pipe']);
 });

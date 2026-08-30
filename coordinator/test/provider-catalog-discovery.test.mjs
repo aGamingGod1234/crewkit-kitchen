@@ -31,21 +31,24 @@ test('Kimi parser uses local aliases and configured support_efforts without expo
 	]);
 });
 
-test('CLI discovery adapters pass only the catalog command and parse stdout', async () => {
+test('CLI discovery adapters pass only the catalog command, explicit environment, and parse stdout', async () => {
 	const calls = [];
+	const environment = { PATH: 'test', KIMI_API_KEY: 'provider-key' };
 	const execFile = (command, args, options, callback) => {
 		calls.push({ command, args, options });
 		callback(null, 'gemini-3.1-pro-low\tGemini 3.1 Pro (Low)\n', '');
 	};
-	assert.deepEqual(await discoverAntigravityCatalog({ execFile }), [
+	assert.deepEqual(await discoverAntigravityCatalog({ execFile, environment }), [
 		{ id: 'gemini-3.1-pro', model: 'gemini-3.1-pro', displayName: 'Gemini 3.1 Pro', reasoningEfforts: ['low'], serviceTiers: [] },
 	]);
 	assert.deepEqual(calls[0].args, ['models']);
+	assert.equal(calls[0].options.env, environment);
 
 	const kimi = await discoverKimiCatalog({ execFile: (command, args, options, callback) => {
 		calls.push({ command, args, options });
 		callback(null, JSON.stringify({ providers: {}, models: { 'kimi-code/k3': { supportEfforts: ['high'] } } }), '');
-	} });
+	}, environment });
 	assert.equal(kimi[0].id, 'kimi-code/k3');
 	assert.deepEqual(calls.at(-1).args, ['provider', 'list', '--json']);
+	assert.equal(calls.at(-1).options.env, environment);
 });

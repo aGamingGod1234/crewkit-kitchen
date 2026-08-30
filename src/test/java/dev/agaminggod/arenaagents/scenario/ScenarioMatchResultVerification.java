@@ -7,14 +7,22 @@ import dev.agaminggod.arenaagents.scenario.result.ScenarioPublicEvent;
 import dev.agaminggod.arenaagents.scenario.result.ScenarioPublicFormatter;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioResetReceipt;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class ScenarioMatchResultVerification {
 	private ScenarioMatchResultVerification() {
+	}
+
+	public static void main(String[] arguments) throws IOException {
+		System.out.println("PASS: " + verify() + " scenario match result assertions");
 	}
 
 	public static int verify() throws IOException {
@@ -90,6 +98,56 @@ public final class ScenarioMatchResultVerification {
 			List<String> journal = Files.readAllLines(directory.resolve("match-results.jsonl"));
 			assertEquals(1, journal.size(), "idempotent retry does not duplicate journal entry");
 			assertEquals(first.canonicalJson(), journal.getFirst(), "journal stores canonical result");
+			Path archiveRetryDirectory = directory.resolve("archive-retry");
+			MatchResultWriter archiveWriter = new MatchResultWriter(archiveRetryDirectory);
+			archiveWriter.write(first);
+			Files.move(archiveRetryDirectory.resolve("match-results.jsonl"),
+					archiveRetryDirectory.resolve("match-results.previous.jsonl"));
+			MatchResultV1 second = new MatchResultV1(
+					"match-002", "last-valley", "1.0.0", 99L, 101L,
+					first.standings(), first.events(), reset, ""
+			);
+			archiveWriter.write(second);
+			archiveWriter.write(first);
+			assertEquals(List.of(second.canonicalJson()),
+					Files.readAllLines(archiveRetryDirectory.resolve("match-results.jsonl")),
+					"retry finds a matching result in the retained archive without duplicating it");
+			String conflictingFirst = first.canonicalJson().replace("last-valley", "changed-scenario");
+			Files.writeString(archiveRetryDirectory.resolve("match-results.previous.jsonl"),
+					conflictingFirst + "\n", StandardCharsets.UTF_8, StandardOpenOption.APPEND);
+			assertThrowsIOException(() -> archiveWriter.write(first), "MATCH_RESULT_CONFLICT",
+					"matching archived row does not hide a later archived conflict");
+			Files.writeString(archiveRetryDirectory.resolve("match-results.previous.jsonl"),
+					first.canonicalJson() + "\n", StandardCharsets.UTF_8);
+			Files.writeString(archiveRetryDirectory.resolve("match-results.jsonl"),
+					conflictingFirst + "\n", StandardCharsets.UTF_8, StandardOpenOption.APPEND);
+			assertThrowsIOException(() -> archiveWriter.write(first), "MATCH_RESULT_CONFLICT",
+					"matching archived row does not hide an active conflict");
+			Files.writeString(archiveRetryDirectory.resolve("match-results.jsonl"),
+					second.canonicalJson() + "\n", StandardCharsets.UTF_8);
+			Files.writeString(archiveRetryDirectory.resolve("match-results.previous.jsonl"),
+					conflictingFirst + "\n", StandardCharsets.UTF_8);
+			assertThrowsIOException(() -> archiveWriter.write(first), "MATCH_RESULT_CONFLICT",
+					"conflicting archived result fails closed");
+			setSparseLength(directory.resolve("match-results.jsonl"), 8L * 1_024L * 1_024L);
+			writer.write(first);
+			assertTrue(Files.size(directory.resolve("match-results.previous.jsonl")) <= 8L * 1_024L * 1_024L,
+					"normal rotation retains only a bounded archive");
+			assertEquals(List.of(first.canonicalJson()), Files.readAllLines(directory.resolve("match-results.jsonl")),
+					"rotation starts a bounded active journal with the current result");
+			assertTrue(journalBytes(directory) <= 16L * 1_024L * 1_024L,
+					"active and archived journals remain within their combined budget");
+
+			setSparseLength(directory.resolve("match-results.previous.jsonl"), 16L * 1_024L * 1_024L + 1L);
+			setSparseLength(directory.resolve("match-results.jsonl"), 16L * 1_024L * 1_024L + 1L);
+			writer.write(first);
+			assertFalse(Files.exists(directory.resolve("match-results.previous.jsonl")),
+					"upgrade discards an oversized historical archive");
+			assertEquals(List.of(first.canonicalJson()), Files.readAllLines(directory.resolve("match-results.jsonl")),
+					"upgrade rebuilds the active journal from the authoritative match artifact");
+			assertTrue(Files.isRegularFile(artifact), "journal upgrade preserves the authoritative per-match artifact");
+			assertTrue(journalBytes(directory) <= 16L * 1_024L * 1_024L,
+					"legacy upgrade enforces the combined journal byte budget");
 
 			AtomicInteger attempts = new AtomicInteger();
 			Path durableArtifact = artifact;
@@ -108,7 +166,25 @@ public final class ScenarioMatchResultVerification {
 		} finally {
 			deleteTree(directory);
 		}
-		return 24;
+		return 35;
+	}
+
+	private static void setSparseLength(Path path, long length) throws IOException {
+		try (FileChannel channel = FileChannel.open(
+				path, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING
+		)) {
+			if (length == 0L) return;
+			channel.position(length - 1L);
+			channel.write(ByteBuffer.wrap(new byte[] { 0 }));
+		}
+	}
+
+	private static long journalBytes(Path directory) throws IOException {
+		long active = Files.exists(directory.resolve("match-results.jsonl"))
+				? Files.size(directory.resolve("match-results.jsonl")) : 0L;
+		long previous = Files.exists(directory.resolve("match-results.previous.jsonl"))
+				? Files.size(directory.resolve("match-results.previous.jsonl")) : 0L;
+		return active + previous;
 	}
 
 	private static void deleteTree(Path root) throws IOException {
@@ -132,5 +208,19 @@ public final class ScenarioMatchResultVerification {
 		if (!expected.equals(actual)) {
 			throw new AssertionError(label + ": expected <" + expected + "> but was <" + actual + ">");
 		}
+	}
+
+	private static void assertThrowsIOException(IoOperation operation, String expectedMessage, String label) {
+		try {
+			operation.run();
+			throw new AssertionError(label + ": expected IOException");
+		} catch (IOException expected) {
+			assertTrue(expected.getMessage().contains(expectedMessage), label + " names the conflict");
+		}
+	}
+
+	@FunctionalInterface
+	private interface IoOperation {
+		void run() throws IOException;
 	}
 }

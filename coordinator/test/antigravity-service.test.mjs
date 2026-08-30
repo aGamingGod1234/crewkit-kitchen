@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import test from 'node:test';
 
 import {
+	ANTIGRAVITY_INTERNAL_TEST_MODE,
 	AntigravityProviderService,
 	buildAntigravityLaunch,
 } from '../src/antigravity-service.mjs';
@@ -21,7 +22,7 @@ test('Antigravity catalog retains the last discovered aliases when a later CLI r
 		serviceTiers: [],
 	}];
 	const service = new AntigravityProviderService(
-		{ cwd: 'C:\\workspace', catalogDiscovery: true },
+		{ cwd: 'C:\\workspace', catalogDiscovery: true, testOnlyMode: ANTIGRAVITY_INTERNAL_TEST_MODE },
 		{ discoverCatalog: async () => { discoveryCalls += 1; if (fail) throw new Error('offline'); return discovered; } },
 	);
 	const first = await service.catalog.refresh({ force: true });
@@ -47,7 +48,7 @@ test('Antigravity coalesces concurrent stale catalog refreshes', async () => {
 		reasoningEfforts: ['high', 'medium', 'low'], serviceTiers: [],
 	}];
 	const service = new AntigravityProviderService(
-		{ cwd: 'C:\\workspace', catalogDiscovery: true },
+		{ cwd: 'C:\\workspace', catalogDiscovery: true, testOnlyMode: ANTIGRAVITY_INTERNAL_TEST_MODE },
 		{ discoverCatalog: async () => { discoveryCalls += 1; await gate; return discovered; } },
 	);
 	const refreshes = [service.catalog.refresh({ force: true }), service.catalog.refresh({ force: true }), service.catalog.refresh()];
@@ -60,7 +61,7 @@ test('Antigravity coalesces concurrent stale catalog refreshes', async () => {
 });
 
 test('Antigravity fallback configuration accepts the installed Gemini 3.7 Flash model', async () => {
-	const service = new AntigravityProviderService({ cwd: 'C:\\workspace' });
+	const service = new AntigravityProviderService({ cwd: 'C:\\workspace', testOnlyMode: ANTIGRAVITY_INTERNAL_TEST_MODE });
 	const agent = await service.createAgent({
 		agentId: 'gemini-current', provider: 'gemini', model: 'gemini-3.7-flash', reasoningEffort: 'high',
 	});
@@ -112,8 +113,13 @@ function config(overrides = {}) {
 			'gemini-3.6-flash': ['high', 'medium', 'low'],
 		},
 		planningTimeoutMs: 1_000,
+		testOnlyMode: ANTIGRAVITY_INTERNAL_TEST_MODE,
 		...overrides,
 	};
+}
+
+function productionConfig(overrides = {}) {
+	return { ...config(overrides), testOnlyMode: undefined };
 }
 
 function profile(overrides = {}) {
@@ -129,7 +135,12 @@ function profile(overrides = {}) {
 test('Antigravity launch maps the visible Gemini model and thinking to one exact CLI model', () => {
 	const launch = buildAntigravityLaunch(profile(), config(), {
 		cwd: 'C:\\agents\\gemini\\gemini-a',
-		env: { PATH: 'test', ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret' },
+		env: {
+			PATH: 'test',
+			GEMINI_API_KEY: 'gemini-key',
+			FISH_AUDIO_API_KEY: 'voice-key',
+			ARENA_AGENT_BRIDGE_SECRET: 'bridge-secret',
+		},
 		platform: 'win32',
 	});
 	assert.equal(launch.command, 'agy');
@@ -141,8 +152,54 @@ test('Antigravity launch maps the visible Gemini model and thinking to one exact
 	]);
 	assert.equal(launch.options.cwd, 'C:\\agents\\gemini\\gemini-a');
 	assert.equal(launch.options.env.PATH, 'test');
+	assert.equal(launch.options.env.GEMINI_API_KEY, 'gemini-key');
+	assert.equal(launch.options.env.FISH_AUDIO_API_KEY, undefined, 'Gemini child cannot inherit voice credentials');
 	assert.equal(launch.options.env.ARENA_AGENT_BRIDGE_SECRET, undefined, 'Gemini child cannot inherit the bridge secret');
 	assert.deepEqual(launch.options.stdio, ['ignore', 'pipe', 'pipe']);
+});
+
+test('Antigravity catalog discovery receives only the Gemini environment allowlist', async () => {
+	let options;
+	const service = new AntigravityProviderService(config({ catalogDiscovery: true }), {
+		env: {
+			PATH: 'test',
+			GEMINI_API_KEY: 'gemini-key',
+			FISH_AUDIO_API_KEY: 'voice-key',
+			DEEPGRAM_API_KEY: 'speech-key',
+		},
+		execFile(_command, _args, receivedOptions, callback) {
+			options = receivedOptions;
+			callback(null, 'gemini-3.6-flash-high Gemini 3.6 Flash (High)\n');
+		},
+	});
+	await service.catalog.refresh({ force: true });
+	assert.equal(options.env.PATH, 'test');
+	assert.equal(options.env.GEMINI_API_KEY, 'gemini-key');
+	assert.equal(options.env.FISH_AUDIO_API_KEY, undefined);
+	assert.equal(options.env.DEEPGRAM_API_KEY, undefined);
+	await service.stop();
+});
+
+test('Antigravity production mode neither advertises nor creates planner sessions', async () => {
+	let discovered = false;
+	let spawned = false;
+	const service = new AntigravityProviderService(productionConfig({ catalogDiscovery: true }), {
+		discoverCatalog: async () => { discovered = true; return []; },
+		spawn: () => { spawned = true; return new FakeChild(); },
+	});
+	const catalog = await service.catalog.refresh({ force: true });
+	assert.deepEqual(catalog.models, []);
+	assert.equal(discovered, false);
+	await assert.rejects(
+		service.createAgent(profile({ agentId: 'gemini-boundary' })),
+		(error) => error?.code === 'PROVIDER_UNAVAILABLE' && error.message.includes('no-tool'),
+	);
+	assert.throws(() => service.catalog.assertSupported('gemini-3.1-pro', 'high'), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
+	assert.equal(spawned, false);
+	const reconciliation = await service.reconcile([profile({ agentId: 'gemini-reconcile' })]);
+	assert.deepEqual(reconciliation.valid, []);
+	assert.equal(reconciliation.invalid[0].code, 'PROVIDER_UNAVAILABLE');
+	await service.stop();
 });
 
 test('Antigravity parses planner output and uses the stable per-agent workspace', async () => {

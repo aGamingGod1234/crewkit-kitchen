@@ -28,29 +28,28 @@ final class NodeRuntimeLocator {
 	static synchronized LocatedNode locate(Path packageRoot) {
 		Path root = requireRoot(packageRoot);
 		String explicit = System.getProperty(PROPERTY);
-		String path = System.getenv("PATH");
-		CacheKey key = cacheKey(root, explicit, path);
+		CacheKey key = cacheKey(root, explicit);
 		if (productionCache != null && productionCache.key().equals(key)) return productionCache.node();
-		LocatedNode located = locate(root, explicit, path, NodeRuntimeLocator::probeVersion);
+		LocatedNode located = locate(root, explicit, NodeRuntimeLocator::probeVersion);
 		productionCache = new CacheEntry(key, located);
 		return located;
 	}
 
-	private static CacheKey cacheKey(Path root, String explicitPath, String path) {
+	private static CacheKey cacheKey(Path root, String explicitPath) {
 		String configured = explicitPath == null ? "" : explicitPath.trim();
-		Path candidate = null;
+		Path candidate = bundledCandidate(root);
 		if (!configured.isEmpty()) {
-			try { candidate = Path.of(configured).toAbsolutePath().normalize(); }
-			catch (RuntimeException ignored) { }
-		} else {
-			Path bundled = bundledCandidate(root);
-			candidate = Files.exists(bundled) ? bundled : firstPathCandidate(path);
+			try {
+				candidate = Path.of(configured).toAbsolutePath().normalize();
+			} catch (RuntimeException ignored) {
+				candidate = null;
+			}
 		}
-		return new CacheKey(root, configured, path == null ? "" : path, fileIdentity(candidate));
+		return new CacheKey(root, configured, fileIdentity(candidate));
 	}
 
 	private static String fileIdentity(Path candidate) {
-		if (candidate == null) return "missing";
+		if (candidate == null) return "invalid";
 		try {
 			BasicFileAttributes attributes = Files.readAttributes(candidate, BasicFileAttributes.class);
 			return candidate + ":" + attributes.size() + ":" + attributes.lastModifiedTime().toMillis()
@@ -60,7 +59,7 @@ final class NodeRuntimeLocator {
 		}
 	}
 
-	static LocatedNode locate(Path packageRoot, String explicitPath, String path, Probe probe) {
+	static LocatedNode locate(Path packageRoot, String explicitPath, Probe probe) {
 		Path root = requireRoot(packageRoot);
 		String configured = explicitPath == null ? "" : explicitPath.trim();
 		if (!configured.isEmpty()) {
@@ -82,14 +81,9 @@ final class NodeRuntimeLocator {
 		if (Files.exists(bundled)) {
 			return inspect(bundled, Source.BUNDLED_PROFILE, probe);
 		}
-
-		Path pathCandidate = firstPathCandidate(path);
-		if (pathCandidate == null) {
-			throw failure("NODE_RUNTIME_NOT_FOUND",
-					"Node.js 22+ was not found; set -Darenaagents.nodePath to an absolute executable "
-							+ "or install/ship the bundled profile runtime");
-		}
-		return inspect(pathCandidate, Source.PATH, probe);
+		throw failure("NODE_RUNTIME_NOT_FOUND",
+				"Node.js 22+ was not found; set -Darenaagents.nodePath to an absolute executable "
+						+ "or install/ship the bundled profile runtime");
 	}
 
 	private static Path requireRoot(Path packageRoot) {
@@ -104,28 +98,11 @@ final class NodeRuntimeLocator {
 				: packageRoot.resolve("runtime/toolchains/node/bin/node");
 	}
 
-	private static Path firstPathCandidate(String path) {
-		if (path == null || path.isBlank()) return null;
-		String executableName = isWindows() ? "node.exe" : "node";
-		for (String entry : path.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator), -1)) {
-			if (entry.isBlank()) continue;
-			Path directory;
-			try {
-				directory = Path.of(entry);
-			} catch (RuntimeException ignored) {
-				continue;
-			}
-			Path candidate = directory.resolve(executableName).toAbsolutePath().normalize();
-			if (Files.exists(candidate)) return candidate;
-		}
-		return null;
-	}
-
 	private static LocatedNode inspect(Path candidate, Source source, Probe probe) {
 		if (!Files.isRegularFile(candidate) || !Files.isExecutable(candidate)) {
 			String code = source == Source.EXPLICIT_PROPERTY
 					? "NODE_RUNTIME_EXPLICIT_INVALID"
-					: source == Source.BUNDLED_PROFILE ? "NODE_RUNTIME_BUNDLED_INVALID" : "NODE_RUNTIME_NOT_FOUND";
+					: "NODE_RUNTIME_BUNDLED_INVALID";
 			throw failure(code, remediation(source) + ": " + candidate);
 		}
 		String version;
@@ -134,7 +111,7 @@ final class NodeRuntimeLocator {
 		} catch (Exception exception) {
 			String code = source == Source.EXPLICIT_PROPERTY
 					? "NODE_RUNTIME_EXPLICIT_INVALID"
-					: source == Source.BUNDLED_PROFILE ? "NODE_RUNTIME_BUNDLED_INVALID" : "NODE_RUNTIME_NOT_FOUND";
+					: "NODE_RUNTIME_BUNDLED_INVALID";
 			throw failure(code, "Could not run Node.js --version for " + candidate, exception);
 		}
 		Matcher matcher = VERSION.matcher(version == null ? "" : version.trim());
@@ -158,12 +135,7 @@ final class NodeRuntimeLocator {
 		return switch (source) {
 			case EXPLICIT_PROPERTY -> "Configured Node executable is missing or not executable";
 			case BUNDLED_PROFILE -> "Bundled profile Node executable is missing or not executable";
-			case PATH -> "PATH Node executable is missing or not executable";
 		};
-	}
-
-	private static boolean isWindows() {
-		return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
 	}
 
 	private static String probeVersion(Path executable) throws IOException {
@@ -208,8 +180,7 @@ final class NodeRuntimeLocator {
 
 	enum Source {
 		EXPLICIT_PROPERTY,
-		BUNDLED_PROFILE,
-		PATH
+		BUNDLED_PROFILE
 	}
 
 	record LocatedNode(Path executable, Source source, int majorVersion) {
@@ -219,7 +190,7 @@ final class NodeRuntimeLocator {
 		}
 	}
 
-	private record CacheKey(Path root, String explicitPath, String path, String executableIdentity) {
+	private record CacheKey(Path root, String explicitPath, String executableIdentity) {
 	}
 
 	private record CacheEntry(CacheKey key, LocatedNode node) {

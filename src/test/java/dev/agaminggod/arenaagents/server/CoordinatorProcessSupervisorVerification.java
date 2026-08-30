@@ -19,9 +19,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Deque;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -34,6 +36,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 /** Fault-injection verification for coordinator recovery ownership and deadlines. */
 public final class CoordinatorProcessSupervisorVerification {
@@ -533,6 +537,18 @@ public final class CoordinatorProcessSupervisorVerification {
 		CoordinatorProcessSupervisor.PreparedRuntime runtime = preparedRuntime(maximumSecret);
 		assertEquals(maximumSecret, runtime.bridgeSecret(),
 				"production supervisor accepts the protocol bridge-secret upper bound");
+		assertTrue(!runtime.bridgeSecret().equals(runtime.voiceSecret()),
+				"compatibility construction derives a distinct voice credential");
+		try {
+			new CoordinatorProcessSupervisor.PreparedRuntime(
+					runtime.root(), runtime.coordinatorRoot(), runtime.main(), runtime.config(), runtime.secret(),
+					runtime.voiceSecretPath(), runtime.nodeExecutable(), runtime.bridgeSecret(), runtime.bridgeSecret(),
+					runtime.bridgePort(), runtime.generationId(), runtime.candidate(), runtime.lastKnownGoodAvailable()
+			);
+			throw new AssertionError("canonical runtime must reject shared bridge and voice credentials");
+		} catch (IllegalArgumentException expected) {
+			assertTrue(expected.getMessage().contains("distinct"), "shared-secret rejection names the invariant");
+		}
 		try {
 			preparedRuntime("s".repeat(513));
 		} catch (IllegalArgumentException expected) {
@@ -1944,8 +1960,8 @@ public final class CoordinatorProcessSupervisorVerification {
 					"disabled coordinator autostart stops only child-process supervision");
 			assertEquals(0, launcher.launches.size(),
 					"disabled coordinator autostart never launches a child coordinator");
-			assertTrue(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
-					"bridge-secret-only explicit setup initializes voice through the worker's supported fallback");
+			assertFalse(CodexAgentServerRuntime.voiceConfigurationPrepared(supervisor),
+					"bridge-secret-only explicit setup leaves voice disabled without its dedicated secret");
 			slot = new CodexAgentServerRuntime.BridgeSlot(System::currentTimeMillis);
 			CodexAgentServerRuntime.reconcileBridgeConfiguration(slot, uninitializedManager(), supervisor);
 			assertTrue(slot.bridge() != null, "explicit bridge secret still constructs the Java listener");
@@ -2157,6 +2173,10 @@ public final class CoordinatorProcessSupervisorVerification {
 			assertEquals(launcher.launches.getFirst().generationId(),
 					launcher.launches.getFirst().environment().get("ARENA_AGENT_COORDINATOR_RUNTIME_GENERATION"),
 					"exact runtime generation is passed through the child environment");
+			assertEquals("s".repeat(32), launcher.launches.getFirst().environment().get("ARENA_AGENT_BRIDGE_SECRET"),
+					"control bridge receives only its credential");
+			assertEquals("v".repeat(32), launcher.launches.getFirst().environment().get("ARENA_AGENT_VOICE_SECRET"),
+					"voice worker receives its distinct least-privilege credential");
 			UUID.fromString(authenticating.launchId());
 		}
 	}
@@ -2181,8 +2201,14 @@ public final class CoordinatorProcessSupervisorVerification {
 				Path.of("build", "supervisor-runtime", "coordinator", "src", "dynamic-main.mjs"),
 				Path.of("build", "supervisor-runtime", "coordinator", "config", "dynamic-agents.json"),
 				Path.of("build", "supervisor-runtime", "runtime", "bridge-secret.txt"),
+				Path.of("build", "supervisor-runtime", "runtime", "voice-secret.txt"),
 				Path.of("build", "supervisor-runtime", "runtime", "toolchains", "node", "node.exe"),
-				"s".repeat(32)
+				"s".repeat(32),
+				"v".repeat(32),
+				25_570,
+				GENERATION_A,
+				false,
+				true
 		);
 		private String fingerprint;
 		private CoordinatorProcessSupervisor.DependencyResolution result;
@@ -2597,19 +2623,59 @@ public final class CoordinatorProcessSupervisorVerification {
 		try {
 			BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
 			socket.setSoTimeout(2_000);
+			String clientNonce = Base64.getUrlEncoder().withoutPadding().encodeToString(
+					MessageDigest.getInstance("SHA-256").digest(messageId.getBytes(StandardCharsets.UTF_8))
+			);
+			JsonObject challenge = new JsonObject();
+			challenge.addProperty("clientNonce", clientNonce);
+			socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
+					2, "pending", "server", "auth_challenge", messageId + "-challenge", challenge
+			)).getBytes(StandardCharsets.UTF_8));
+			socket.getOutputStream().flush();
+			BridgeEnvelope response = codec.decode(reader.readLine());
+			assertEquals("auth_response", response.type(), "matching child proves the server identity first");
+			String serverNonce = response.payload().get("serverNonce").getAsString();
+			assertEquals(
+					authenticationProof(secret, "server", clientNonce, serverNonce, response.serverInstanceId(), null),
+					response.payload().get("proof").getAsString(),
+					"matching child proves possession of the prepared secret"
+			);
 			JsonObject hello = new JsonObject();
-			hello.addProperty("secret", secret);
+			hello.addProperty("replyTo", response.messageId());
+			hello.addProperty("clientNonce", clientNonce);
+			hello.addProperty("serverNonce", serverNonce);
+			hello.addProperty("proof", authenticationProof(
+					secret, "coordinator", clientNonce, serverNonce, response.serverInstanceId(), launchId
+			));
 			hello.addProperty("launchId", launchId);
 			socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-					2, "coordinator", "server", "hello", messageId, hello
+					2, response.serverInstanceId(), "server", "hello", messageId, hello
 			)).getBytes(StandardCharsets.UTF_8));
 			socket.getOutputStream().flush();
 			assertEquals("hello_ack", codec.decode(reader.readLine()).type(), "matching child receives hello acknowledgement");
+			assertEquals("verbose_control", codec.decode(reader.readLine()).type(), "matching child receives verbose control");
 			return socket;
 		} catch (Exception failure) {
 			closeSocket(socket);
 			throw failure;
 		}
+	}
+
+	private static String authenticationProof(
+			String secret,
+			String role,
+			String clientNonce,
+			String serverNonce,
+			String serverInstanceId,
+			String launchId
+	) throws Exception {
+		String context = String.join("\0", "arena-agents-v2", role, clientNonce, serverNonce, serverInstanceId)
+				+ ("coordinator".equals(role) ? "\0" + (launchId == null ? "" : launchId) : "");
+		Mac mac = Mac.getInstance("HmacSHA256");
+		mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+		return Base64.getUrlEncoder().withoutPadding().encodeToString(
+				mac.doFinal(context.getBytes(StandardCharsets.UTF_8))
+		);
 	}
 
 	private static void closeSocket(Socket socket) {

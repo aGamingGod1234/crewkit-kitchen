@@ -45,7 +45,13 @@ public final class ArenaAgentsClientBootstrapVerification {
 	}
 
 	private static int verifySuccessfulConfigurationIsPreserved() {
-		AgentConfig expected = new AgentConfig("bootstrap-test", 25_571, 8, true);
+		AgentConfig expected = new AgentConfig(
+				"bootstrap-test",
+				25_571,
+				8,
+				true,
+				"bootstrap-verification-secret-0123456789"
+		);
 		AtomicReference<RuntimeException> reported = new AtomicReference<>();
 		AgentConfig actual = ArenaAgentsClient.loadConfigOrDisabled(() -> expected, reported::set);
 		assertSame(expected, actual, "valid configuration is preserved");

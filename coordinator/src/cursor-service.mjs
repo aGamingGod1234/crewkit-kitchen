@@ -381,7 +381,7 @@ export function buildCursorLaunch(profile, configValue = {}, dependencies = {}) 
 		],
 		options: {
 			cwd: dependencies.cwd ?? config.cwd,
-			env: createProviderChildEnvironment(dependencies.env ?? config.environment ?? process.env, config.bridgeSecretEnvironmentVariable),
+			env: createProviderChildEnvironment('cursor', dependencies.env ?? config.environment ?? process.env, config.bridgeSecretEnvironmentVariable),
 			stdio: ['pipe', 'pipe', 'pipe'],
 			windowsHide: true,
 		},
@@ -589,7 +589,7 @@ function buildCursorCommand(config, platform, cliArgs) {
 		],
 		options: {
 			cwd: config.cwd,
-			env: createProviderChildEnvironment(config.environment ?? process.env, config.bridgeSecretEnvironmentVariable),
+			env: createProviderChildEnvironment('cursor', config.environment ?? process.env, config.bridgeSecretEnvironmentVariable),
 			stdio: ['ignore', 'pipe', 'pipe'],
 			windowsHide: true,
 		},

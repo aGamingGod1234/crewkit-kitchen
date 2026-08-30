@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { HeadlessRconClient } from './headless-rcon.mjs';
 import { sanitizeDiagnosticErrorStack, sanitizeDiagnosticText, sanitizeDiagnosticValue } from './diagnostic-sanitizer.mjs';
 
-const PROVIDERS = new Set(['codex', 'gemini', 'kimi', 'cursor']);
+const PROVIDERS = new Set(['codex', 'kimi', 'cursor']);
 const MAX_TIMEOUT_MS = 900_000;
 const MAX_DIAGNOSTICS = 4096;
 const MAX_TEXT = 4096;

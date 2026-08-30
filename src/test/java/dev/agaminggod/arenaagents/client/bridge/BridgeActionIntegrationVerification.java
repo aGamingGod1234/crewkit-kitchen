@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public final class BridgeActionIntegrationVerification {
 	private static final String AGENT_ID = "action-integration-agent";
+	private static final String BRIDGE_SECRET = "action-integration-secret-0123456789";
 	private static final int SOCKET_TIMEOUT_MS = 2_000;
 	private static final long ASYNC_TIMEOUT_MS = 3_000L;
 
@@ -54,7 +55,13 @@ public final class BridgeActionIntegrationVerification {
 		};
 
 		int port = findAvailablePort();
-		AgentConfig config = new AgentConfig(AGENT_ID, port, AgentConfig.DEFAULT_OBSERVATION_RADIUS, true);
+		AgentConfig config = new AgentConfig(
+				AGENT_ID,
+				port,
+				AgentConfig.DEFAULT_OBSERVATION_RADIUS,
+				true,
+				BRIDGE_SECRET
+		);
 		try (BridgeServer server = new BridgeServer(config, codec, callbackExecutor, bridgeSink)) {
 			ActionEventPublisher publisher = new ActionEventPublisher(server, publishFailures::add);
 			ActionFactory actionFactory = new ActionFactory();
@@ -68,7 +75,7 @@ public final class BridgeActionIntegrationVerification {
 			executorReference.set(actionExecutor);
 			server.start();
 
-			try (Socket client = connectAuthenticated(codec, port)) {
+			try (Socket client = connectAuthenticated(codec, config, port)) {
 				write(codec, client, actionEnvelope("message-wait", waitCommand("bridge-wait", 100L)));
 				awaitPending(callbackExecutor, 1);
 				assertEquals(0, publishFailures.size(), "action callback has no publish failure before dispatch");
@@ -206,18 +213,41 @@ public final class BridgeActionIntegrationVerification {
 		}
 	}
 
-	private static Socket connectAuthenticated(ProtocolCodec codec, int port) throws IOException {
+	private static Socket connectAuthenticated(ProtocolCodec codec, AgentConfig config, int port) throws IOException {
 		Socket socket = new Socket();
 		socket.connect(new InetSocketAddress("127.0.0.1", port), SOCKET_TIMEOUT_MS);
 		socket.setSoTimeout(SOCKET_TIMEOUT_MS);
+		JsonObject challenge = read(codec, socket);
+		assertEquals("hello_challenge", challenge.get("type").getAsString(), "action integration receives challenge");
+		String challengeId = challenge.get("messageId").getAsString();
+		String bridgeNonce = challenge.get("nonce").getAsString();
+		String responseId = "message-response";
+		String coordinatorNonce = BridgeAuthentication.newNonce();
 		write(
 				codec,
 				socket,
 				"{\"protocolVersion\":1,\"agentId\":\"" + AGENT_ID
-						+ "\",\"type\":\"hello\",\"messageId\":\"message-hello\"}"
+						+ "\",\"type\":\"hello_response\",\"messageId\":\"" + responseId
+						+ "\",\"challenge\":\"" + bridgeNonce + "\",\"nonce\":\"" + coordinatorNonce
+						+ "\",\"proof\":\"" + BridgeAuthentication.coordinatorProof(
+								config.bridgeSecret(),
+								config.agentId(),
+								challengeId,
+								responseId,
+								bridgeNonce,
+								coordinatorNonce
+						) + "\"}"
 		);
 		JsonObject acknowledgement = read(codec, socket);
 		assertEquals("hello_ack", acknowledgement.get("type").getAsString(), "action integration authenticated");
+		assertEquals(responseId, acknowledgement.get("replyTo").getAsString(), "acknowledgement binds response");
+		assertEquals(
+				BridgeAuthentication.bridgeProof(
+						config.bridgeSecret(), config.agentId(), challengeId, responseId, bridgeNonce, coordinatorNonce
+				),
+				acknowledgement.get("proof").getAsString(),
+				"action integration verifies bridge proof"
+		);
 		return socket;
 	}
 

@@ -3,6 +3,22 @@ import test from 'node:test';
 
 import { observationHash, redact, TraceWriter } from '../src/trace-writer.mjs';
 
+test('prepares both trace artifacts privately before appending', async () => {
+	const prepared = [];
+	const writes = [];
+	const writer = new TraceWriter('trace.jsonl', {
+		diagnosticFilePath: 'private.jsonl',
+		mkdir: async () => {},
+		preparePrivateArtifact: async (filePath) => { prepared.push(filePath); },
+		appendFile: async (_filePath, _text, options) => { writes.push(options); },
+	});
+	await writer.write('public');
+	await writer.writeDiagnostic('private');
+	await writer.close();
+	assert.deepEqual(prepared.map((filePath) => filePath.split(/[\\/]/).at(-1)).sort(), ['private.jsonl', 'trace.jsonl']);
+	assert.ok(writes.every((options) => options.mode === 0o600));
+});
+
 test('appends redacted JSONL rows in order', async () => {
 	const chunks = [];
 	const writer = new TraceWriter('C:\\runtime\\trace.jsonl', {

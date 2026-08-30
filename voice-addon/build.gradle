@@ -10,7 +10,11 @@ base {
 }
 
 repositories {
-	maven { url = 'https://maven.maxhenkel.de/repository/public' }
+	maven {
+		url = 'https://maven.maxhenkel.de/repository/public'
+		mavenContent { releasesOnly() }
+		content { includeGroup 'de.maxhenkel.voicechat' }
+	}
 	maven {
 		name = 'Modrinth'
 		url = 'https://api.modrinth.com/maven'

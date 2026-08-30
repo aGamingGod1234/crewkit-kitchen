@@ -22,6 +22,7 @@ export class AcpProtocolError extends Error {
 export function buildAcpLaunch(provider, profile = {}, dependencies = {}) {
 	const normalizedProvider = requireProvider(provider);
 	const environment = createProviderChildEnvironment(
+		normalizedProvider,
 		dependencies.env ?? profile.environment ?? process.env,
 		profile.bridgeSecretEnvironmentVariable,
 	);

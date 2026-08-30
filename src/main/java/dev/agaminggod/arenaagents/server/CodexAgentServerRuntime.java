@@ -15,6 +15,7 @@ import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
 import dev.agaminggod.arenaagents.server.goal.GoalSafetyController;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationCollector;
+import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
@@ -321,6 +322,7 @@ public final class CodexAgentServerRuntime {
 			VoiceSubsystemRuntime.tick(server);
 			maintainPlanningProgress(manager);
 			if (activeBridge != null) activeBridge.endTick();
+			AgentInputRuntime.tick(server);
 			ScenarioRuntimeService.tick(server);
 		});
 	}
@@ -524,12 +526,12 @@ public final class CodexAgentServerRuntime {
 		if (supervisor == null) return false;
 		if (supervisor.configured()) return true;
 		return supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-				&& acceptedSecretFile(configuredVoiceSecretFile(), Path.of("runtime", "bridge-secret.txt"));
+				&& acceptedSecretFile(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"));
 	}
 
 	static long voiceConfigurationRevision(CoordinatorProcessSupervisor supervisor) {
 		long explicitSecretRevision = supervisor.snapshot().state() == CoordinatorRecoveryState.STOPPED
-				? explicitSecretFileRevision(configuredVoiceSecretFile(), Path.of("runtime", "bridge-secret.txt"))
+				? explicitSecretFileRevision(configuredVoiceSecretFile(), Path.of("runtime", "voice-secret.txt"))
 				: 0L;
 		return java.util.Objects.hash(
 				supervisor.voiceConfigurationRevision(), supervisor.sharedSecretRevision(), supervisor.secretPath(),
@@ -538,10 +540,7 @@ public final class CodexAgentServerRuntime {
 	}
 
 	private static String configuredVoiceSecretFile() {
-		return System.getProperty(
-				"arenaagents.voiceSecretFile",
-				System.getProperty("arenaagents.bridgeSecretFile", "runtime/bridge-secret.txt")
-		);
+		return System.getProperty("arenaagents.voiceSecretFile", "runtime/voice-secret.txt");
 	}
 
 	private static boolean acceptedSecretFile(String configuredPath, Path fallbackPath) {

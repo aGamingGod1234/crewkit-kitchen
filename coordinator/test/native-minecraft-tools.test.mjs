@@ -57,7 +57,7 @@ test('Minecraft control reference covers every executor tool and action with acc
 
 test('native Minecraft tools expose the common fast path plus one validated advanced body operation', () => {
 	assert.deepEqual(MINECRAFT_DYNAMIC_TOOLS.map((tool) => tool.name), [
-		'observe', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
+		'observe', 'control', 'moveTo', 'mine', 'say', 'wait', 'act', 'sequence', 'finish',
 	]);
 	assert.ok(MINECRAFT_DYNAMIC_TOOLS.every((tool) => tool.type === 'function'));
 	assert.ok(NATIVE_AGENT_INSTRUCTIONS.length < 1_500);
@@ -84,6 +84,13 @@ test('advertised native actions exactly match Java model-authored dispatch', asy
 });
 
 test('native Minecraft tool calls normalize to exact existing body actions', () => {
+	assert.deepEqual(normalizeMinecraftToolCall('control', {
+		forward: 1, strafe: -0.5, jump: true, sneak: false, sprint: true,
+		attack: false, use: true, yaw: 90, pitch: -15, selectedSlot: 2, hand: 'off', ticks: 20,
+	}), {
+		kind: 'action', actionType: 'control',
+		arguments: { forward: 1, strafe: -0.5, jump: true, sneak: false, sprint: true, attack: false, use: true, yaw: 90, pitch: -15, selectedSlot: 2, hand: 'off', ticks: 20 },
+	});
 	assert.deepEqual(normalizeMinecraftToolCall('moveTo', { x: 1, y: 64, z: -2 }), {
 		kind: 'action', actionType: 'navigate_to', arguments: { x: 1, y: 64, z: -2, tolerance: 1, sprint: true, timeoutMs: 30_000 },
 	});
@@ -132,6 +139,7 @@ test('native Minecraft tool calls normalize to exact existing body actions', () 
 test('native Minecraft boundary rejects unknown, oversized, and malformed calls', () => {
 	assert.throws(() => normalizeMinecraftToolCall('attack', {}), (error) => error?.code === 'UNKNOWN_MINECRAFT_TOOL');
 	assert.throws(() => normalizeMinecraftToolCall('moveTo', { x: '1', y: 2, z: 3 }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
+	assert.throws(() => normalizeMinecraftToolCall('control', { forward: 1 }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'x'.repeat(257) }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'hi', audience: 'direct' }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');
 	assert.throws(() => normalizeMinecraftToolCall('say', { message: 'hi', audience: 'proximity', recipientId: 'agent-b' }), (error) => error?.code === 'INVALID_MINECRAFT_TOOL_ARGUMENTS');

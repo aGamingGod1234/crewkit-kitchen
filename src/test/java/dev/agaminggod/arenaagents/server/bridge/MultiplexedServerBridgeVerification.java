@@ -50,7 +50,9 @@ import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -84,6 +86,11 @@ public final class MultiplexedServerBridgeVerification {
 	public static void main(String[] args) {
 		net.minecraft.SharedConstants.tryDetectVersion();
 		net.minecraft.server.Bootstrap.bootStrap();
+		if (args.length == 1 && "preauth-overflow".equals(args[0])) {
+			verifyPreauthOverflowPreservesIncumbentHandshake();
+			System.out.println("MultiplexedServerBridgeVerification preauth-overflow assertions=8");
+			return;
+		}
 		System.out.println("MultiplexedServerBridgeVerification assertions=" + verify());
 	}
 
@@ -155,6 +162,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyObservationPublicationLifecycle(registered.getFirst().agentId());
 		verifyEmptyCatalogRequestsLiveDiscovery();
 		verifyRealBridgeSessionLifecycle();
+		verifyPreauthOverflowPreservesIncumbentHandshake();
 		verifyAtomicConversationWakePublication();
 		verifyGoalSpecProposalLifecycle();
 		verifyStaleGoalDraftIsPrunedBeforeHandshake();
@@ -169,7 +177,7 @@ public final class MultiplexedServerBridgeVerification {
 		verifyImmediateHandshakeClosePreservesDisconnect();
 		verifyPendingRegistrationMarkerIsFenced();
 		verifyAtomicPublicationRacesSessionClose();
-		return 251;
+		return 260;
 	}
 
 	/**
@@ -205,7 +213,16 @@ public final class MultiplexedServerBridgeVerification {
 				assertTrue(ledger.retain(result), "terminal result is retained before the coordinator closes");
 				assertTrue(ledger.claim(result, session(bridge)), "first session owns the initial result delivery");
 				bridge.tick();
-				assertTrue(!firstReader.ready(), "claimed terminal result is not replayed twice on the first session");
+				first.setSoTimeout(100);
+				try {
+					while (true) {
+						BridgeEnvelope published = codec.decode(firstReader.readLine());
+						assertTrue(!"action_result".equals(published.type()),
+								"claimed terminal result is not replayed twice on the first session");
+					}
+				} catch (SocketTimeoutException expected) {
+					// Other queued control messages do not make the claimed terminal result a duplicate.
+				}
 			}
 
 			MultiplexedServerBridge activeBridge = bridge;
@@ -225,14 +242,26 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket replacement = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader replacementReader = new BufferedReader(new InputStreamReader(replacement.getInputStream(), StandardCharsets.UTF_8))) {
 				replacement.setSoTimeout(2_000);
-				BridgeEnvelope replacementAck = authenticate(
+				AuthenticationExchange replacementExchange = beginAuthentication(
 						replacement, replacementReader, codec, secret, "hello-terminal-replay-replacement"
 				);
+				writeAuthenticatedHello(
+						replacement, codec, secret, null, "hello-terminal-replay-replacement", replacementExchange
+				);
+				BridgeEnvelope replacementAck = codec.decode(replacementReader.readLine());
+				assertEquals("hello_ack", replacementAck.type(), "replacement authenticates before terminal replay");
+				assertEquals("verbose_control", codec.decode(replacementReader.readLine()).type(),
+						"replacement consumes verbose control before terminal replay");
 				BridgeEnvelope replay = codec.decode(replacementReader.readLine());
 				assertEquals("action_result", replay.type(),
 						"replacement handshake replays a terminal result after the disconnect revision");
 				assertEquals("terminal-after-close", replay.payload().get("actionId").getAsString(),
 						"replacement handshake replays the original action exactly once");
+				assertEquals(MultiplexedServerBridge.actionResultReplayProof(
+						secret, replacementExchange.clientNonce(), replacementExchange.serverNonce(),
+						replacementAck.serverInstanceId(), result.agentId().toString(), result.goalRevision(), result.actionId()
+				), replay.payload().get("replayProof").getAsString(),
+						"retained result provenance is bound to the replacement authenticated session");
 				assertEquals(2L, replacementAck.payload().getAsJsonArray("registry").get(0)
 						.getAsJsonObject().get("goalRevision").getAsLong(),
 						"replacement handshake reports the reconciled lifecycle revision");
@@ -323,15 +352,10 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				JsonObject hello = new JsonObject();
-				hello.addProperty("secret", secret);
-				writeEnvelope(socket, codec, new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-empty-catalog", hello
-				));
-				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
+				BridgeEnvelope acknowledgement = authenticate(
+						socket, reader, codec, secret, "hello-empty-catalog"
+				);
 				assertEquals("hello_ack", acknowledgement.type(), "empty-catalog fixture authenticates the bridge");
-				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
-						"empty-catalog fixture consumes handshake state before catalog discovery");
 				nanoTime.addAndGet(1_000_000L);
 				for (int tick = 0; tick < 8; tick++) bridge.tick();
 				assertTrue(!reader.ready(), "catalog discovery does not start eagerly before an empty snapshot");
@@ -793,6 +817,7 @@ public final class MultiplexedServerBridgeVerification {
 		Path secretFile = null;
 		Thread creator = null;
 		CountDownLatch releaseCreation = new CountDownLatch(1);
+		AtomicReference<AgentRecord> created = new AtomicReference<>();
 		try {
 			String secret = "0123456789abcdef0123456789abcdef";
 			secretFile = Files.createTempFile("arena-agents-atomic-pending-secret-", ".txt");
@@ -803,32 +828,28 @@ public final class MultiplexedServerBridgeVerification {
 			manager.setRuntimeHooks(bridge);
 			bridge.start();
 			MultiplexedServerBridge activeBridge = bridge;
-			CountDownLatch recordVisible = new CountDownLatch(1);
-			AtomicReference<AgentRecord> created = new AtomicReference<>();
-			creator = Thread.ofPlatform().start(() -> activeBridge.withinPublicationBoundary(() -> {
-				AgentRecord record = manager.registry().create(
-						"gpt-5.6-sol", "high", Optional.of("AtomicSpawn"), 1_250L
-				);
-				created.set(record);
-				recordVisible.countDown();
-				awaitLatch(releaseCreation, "pending marker release");
-				pending.add(record.agentId());
-				return null;
-			}));
-			awaitLatch(recordVisible, "logical record creation");
-
 			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				JsonObject hello = new JsonObject();
-				hello.addProperty("secret", secret);
-				writeEnvelope(socket, codec, new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-during-pending-marker", hello
-				));
+				String messageId = "hello-during-pending-marker";
+				AuthenticationExchange exchange = beginAuthentication(socket, reader, codec, secret, messageId);
+				CountDownLatch recordVisible = new CountDownLatch(1);
+				creator = Thread.ofPlatform().start(() -> activeBridge.withinPublicationBoundary(() -> {
+					AgentRecord record = manager.registry().create(
+							"gpt-5.6-sol", "high", Optional.of("AtomicSpawn"), 1_250L
+					);
+					created.set(record);
+					recordVisible.countDown();
+					awaitLatch(releaseCreation, "pending marker release");
+					pending.add(record.agentId());
+					return null;
+				}));
+				awaitLatch(recordVisible, "logical record creation");
+				writeAuthenticatedHello(socket, codec, secret, null, messageId, exchange);
 				Thread.sleep(50L);
-				assertEquals(0, socket.getInputStream().available(),
-						"handshake cannot snapshot a logical record before its pending marker is installed");
+				assertTrue(!activeBridge.authenticated(),
+						"handshake cannot authenticate before the pending marker is installed");
 				releaseCreation.countDown();
 				BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
 				assertEquals(0, acknowledgement.payload().getAsJsonArray("registry").size(),
@@ -916,15 +937,11 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				JsonObject helloPayload = new JsonObject();
-				helloPayload.addProperty("secret", secret);
-				writeEnvelope(socket, codec, new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-observational-verbose", helloPayload
-				));
-				assertEquals("hello_ack", codec.decode(reader.readLine()).type(),
+				BridgeEnvelope verboseHandshake = authenticate(
+						socket, reader, codec, secret, "hello-observational-verbose"
+				);
+				assertEquals("hello_ack", verboseHandshake.type(),
 						"observational verbose fixture authenticates the bridge");
-				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
-						"observational verbose fixture consumes enabled control");
 				AgentId removedAgent = AgentId.parse("00000000-0000-0000-0000-000000000401");
 				invokeActionProgress(bridge, new ServerActionProgress(
 						removedAgent, 1L, "action-progress-1", ActionType.WAIT, "trace-progress-1",
@@ -1019,22 +1036,14 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				JsonObject helloPayload = new JsonObject();
-				helloPayload.addProperty("secret", secret);
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-pending-registration", helloPayload
-				)).getBytes(StandardCharsets.UTF_8));
-				socket.getOutputStream().flush();
-
-				BridgeEnvelope helloAck = codec.decode(reader.readLine());
+				BridgeEnvelope helloAck = authenticate(
+						socket, reader, codec, secret, "hello-pending-registration"
+				);
 				assertEquals("hello_ack", helloAck.type(), "pending-registration fixture authenticates the bridge");
 				JsonArray registry = helloAck.payload().getAsJsonArray("registry");
 				assertEquals(1, registry.size(), "handshake excludes the unregistered logical record");
 				assertEquals(registered.agentId().toString(), registry.get(0).getAsJsonObject().get("agentId").getAsString(),
 						"handshake retains the previously registered agent");
-				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
-						"verbose control follows the authenticated handshake");
-
 				invokeUrgentObservation(bridge, pending.agentId());
 				assertEquals(0, bridge.observationPublicationForVerification().pendingCount(),
 						"pending registration cannot enter the urgent observation queue");
@@ -1339,15 +1348,10 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				JsonObject helloPayload = new JsonObject();
-				helloPayload.addProperty("secret", secret);
-				writeEnvelope(socket, codec, new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-reconnect", helloPayload
-				));
-				BridgeEnvelope helloAck = codec.decode(reader.readLine());
+				BridgeEnvelope helloAck = authenticate(
+						socket, reader, codec, secret, "hello-reconnect"
+				);
 				assertEquals("hello_ack", helloAck.type(), "reconnect fixture authenticates the bridge");
-				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
-						"reconnect fixture consumes verbose control");
 				assertThrowsCode(() -> programActions.accept(replayProtected), "ACTION_REPLAY");
 
 				JsonObject reconnectReady = new JsonObject();
@@ -1664,7 +1668,7 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				writeHello(socket, codec, secret, null, "hello-replacement-disconnect-race");
+				writeHello(socket, reader, codec, secret, null, "hello-replacement-disconnect-race");
 				awaitLatch(replacementSnapshot, "replacement handshake captures its registry snapshot");
 				assertTrue(!replacementCommitted.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS),
 						"replacement handshake waits for the previous disconnect cleanup");
@@ -1722,7 +1726,7 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(8_000);
-				writeHello(socket, codec, secret, null, "hello-deadline-churn");
+				writeHello(socket, reader, codec, secret, null, "hello-deadline-churn");
 				assertTrue(reader.readLine() == null, "snapshot churn closes the session at the handshake deadline");
 				assertTrue(snapshots.get() > 1, "snapshot churn retried before the handshake deadline");
 			}
@@ -1758,7 +1762,7 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				writeHello(socket, codec, secret, null, "hello-removal-race");
+				writeHello(socket, reader, codec, secret, null, "hello-removal-race");
 				awaitLatch(snapshotTaken, "handshake captured the pre-removal registry");
 				MultiplexedServerBridge activeBridge = bridge;
 				AtomicBoolean managerRemovalBoundaryUsed = new AtomicBoolean();
@@ -1815,7 +1819,7 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				writeHello(socket, codec, secret, null, "hello-transition-race");
+				writeHello(socket, reader, codec, secret, null, "hello-transition-race");
 				awaitLatch(snapshotTaken, "handshake captured the pre-transition registry");
 				AgentTransition transition = manager.registry().start(record.agentId(), "publish exactly once", 1_001L);
 				bridge.onTransition(transition);
@@ -1860,8 +1864,9 @@ public final class MultiplexedServerBridgeVerification {
 			});
 			bridge.start();
 			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
-			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification())) {
-				writeHello(socket, codec, secret, null, "hello-immediate-close");
+			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+				writeHello(socket, reader, codec, secret, null, "hello-immediate-close");
 				MultiplexedServerBridge activeBridge = bridge;
 				awaitCondition(activeBridge::coordinatorDisconnectPendingForVerification,
 						"session close immediately after authentication preserves the pending disconnect");
@@ -2030,16 +2035,7 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				JsonObject helloPayload = new JsonObject();
-				helloPayload.addProperty("secret", secret);
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-atomic-wake", helloPayload
-				)).getBytes(StandardCharsets.UTF_8));
-				socket.getOutputStream().flush();
-				BridgeEnvelope helloAck = codec.decode(reader.readLine());
-				assertEquals("hello_ack", helloAck.type(), "conversation fixture authenticates the bridge");
-				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
-						"conversation fixture consumes handshake verbose control before wake replay");
+				BridgeEnvelope helloAck = authenticate(socket, reader, codec, secret, null, "hello-atomic-wake");
 				JsonObject ready = new JsonObject();
 				ready.addProperty("goalRevision", idle.goalRevision());
 				writeEnvelope(socket, codec, new BridgeEnvelope(
@@ -2108,16 +2104,7 @@ public final class MultiplexedServerBridgeVerification {
 			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
 				 BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
 				socket.setSoTimeout(2_000);
-				JsonObject helloPayload = new JsonObject();
-				helloPayload.addProperty("secret", secret);
-				socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-						2, "coordinator", "server", "hello", "hello-replay-wake", helloPayload
-				)).getBytes(StandardCharsets.UTF_8));
-				socket.getOutputStream().flush();
-				BridgeEnvelope helloAck = codec.decode(reader.readLine());
-				assertEquals("hello_ack", helloAck.type(), "replay fixture authenticates the bridge");
-				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
-						"replay fixture consumes handshake verbose control before wake replay");
+				BridgeEnvelope helloAck = authenticate(socket, reader, codec, secret, null, "hello-replay-wake");
 				BridgeEnvelope replay = codec.decode(reader.readLine());
 				assertEquals("conversation_wake", replay.type(), "unacknowledged conversation wake is replayed after reconnect");
 				assertEquals(transactionId, replay.payload().get("transactionId").getAsString(),
@@ -2296,16 +2283,22 @@ public final class MultiplexedServerBridgeVerification {
 		MultiplexedServerBridge bridge = null;
 		Path secretFile = null;
 		try {
+			String secret = "0123456789abcdef0123456789abcdef";
 			secretFile = Files.createTempFile("arena-agents-bridge-secret-", ".txt");
-			Files.writeString(secretFile, "0123456789abcdef0123456789abcdef");
+			Files.writeString(secretFile, secret);
 			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
 			bridge.start();
 			MultiplexedServerBridge activeBridge = bridge;
 			assertTrue(!activeBridge.observationPublicationForVerification().hasActiveSession(),
 					"bridge starts without an accepted session");
-			try (Socket socket = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification())) {
+			try (Socket unauthenticated = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification());
+				 Socket authenticated = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(authenticated.getInputStream(), StandardCharsets.UTF_8))) {
+				assertTrue(!activeBridge.observationPublicationForVerification().hasActiveSession(),
+						"an unauthenticated socket cannot claim the primary publication session");
+				authenticate(authenticated, reader, new BridgeEnvelopeCodec(), secret, null, "hello-after-silent-candidate");
 				awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
-						"accept loop activates publication for a connected session");
+						"a valid coordinator authenticates while a silent candidate remains connected");
 			}
 			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
 					"session close deactivates publication and clears lifecycle ownership");
@@ -2320,6 +2313,75 @@ public final class MultiplexedServerBridgeVerification {
 					throw new AssertionError("could not remove temporary bridge secret", exception);
 				}
 			}
+		}
+	}
+
+	private static void verifyPreauthOverflowPreservesIncumbentHandshake() {
+		MultiplexedServerBridge bridge = null;
+		Path secretFile = null;
+		List<Socket> fillers = new ArrayList<>();
+		try {
+			String secret = "0123456789abcdef0123456789abcdef";
+			secretFile = Files.createTempFile("arena-agents-preauth-overflow-secret-", ".txt");
+			Files.writeString(secretFile, secret);
+			bridge = new MultiplexedServerBridge(uninitializedManager(), 0, secretFile);
+			bridge.start();
+			MultiplexedServerBridge activeBridge = bridge;
+			BridgeEnvelopeCodec codec = new BridgeEnvelopeCodec();
+			try (Socket incumbent = new Socket(
+					MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification());
+				 BufferedReader reader = new BufferedReader(new InputStreamReader(
+						 incumbent.getInputStream(), StandardCharsets.UTF_8))) {
+				incumbent.setSoTimeout(2_000);
+				String messageId = "hello-preauth-incumbent";
+				AuthenticationExchange exchange = beginAuthentication(
+						incumbent, reader, codec, secret, messageId
+				);
+				for (int index = 1; index < 8; index++) {
+					fillers.add(new Socket(
+							MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification()
+					));
+				}
+				awaitCondition(() -> preauthSessionCount(activeBridge) == 8,
+						"pre-authentication pool reaches its bounded capacity");
+
+				try (Socket overflow = new Socket(
+						MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification())) {
+					overflow.setSoTimeout(2_000);
+					assertEquals(-1, overflow.getInputStream().read(),
+							"overflow arrival is closed instead of evicting an incumbent handshake");
+				}
+				assertEquals(8, preauthSessionCount(activeBridge),
+						"overflow rejection leaves every incumbent pre-authentication session registered");
+
+				writeAuthenticatedHello(incumbent, codec, secret, null, messageId, exchange);
+				assertEquals("hello_ack", codec.decode(reader.readLine()).type(),
+						"oldest incumbent completes authentication after overflow rejection");
+				assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
+						"incumbent handshake replay remains intact after pool saturation");
+				awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
+						"incumbent becomes the active coordinator after saturation");
+			}
+		} catch (Exception exception) {
+			throw new AssertionError("pre-authentication overflow verification failed", exception);
+		} finally {
+			for (Socket filler : fillers) {
+				try {
+					filler.close();
+				} catch (IOException ignored) {
+				}
+			}
+			if (bridge != null) bridge.close();
+			deleteIfExists(secretFile);
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private static int preauthSessionCount(MultiplexedServerBridge bridge) {
+		try {
+			return ((Set<Object>) readPrivateField(bridge, "preauthSessions")).size();
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not inspect bounded pre-authentication sessions", exception);
 		}
 	}
 
@@ -2626,7 +2688,7 @@ public final class MultiplexedServerBridgeVerification {
 			String launchId,
 			String messageId
 	) throws Exception {
-		writeHello(socket, codec, secret, launchId, messageId);
+		writeHello(socket, reader, codec, secret, launchId, messageId);
 		BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
 		assertEquals("hello_ack", acknowledgement.type(), "launch fixture authenticates the session");
 		assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
@@ -2636,18 +2698,68 @@ public final class MultiplexedServerBridgeVerification {
 
 	private static void writeHello(
 			Socket socket,
+			BufferedReader reader,
 			BridgeEnvelopeCodec codec,
 			String secret,
 			String launchId,
 			String messageId
-	) throws java.io.IOException {
+	) throws Exception {
+		AuthenticationExchange exchange = beginAuthentication(socket, reader, codec, secret, messageId);
+		writeAuthenticatedHello(socket, codec, secret, launchId, messageId, exchange);
+	}
+
+	private static AuthenticationExchange beginAuthentication(
+			Socket socket,
+			BufferedReader reader,
+			BridgeEnvelopeCodec codec,
+			String secret,
+			String messageId
+	) throws Exception {
+		String clientNonce = Base64.getUrlEncoder().withoutPadding().encodeToString(
+				MessageDigest.getInstance("SHA-256").digest(messageId.getBytes(StandardCharsets.UTF_8))
+		);
+		JsonObject challenge = new JsonObject();
+		challenge.addProperty("clientNonce", clientNonce);
+		writeEnvelope(socket, codec, new BridgeEnvelope(
+				2, "pending", "server", "auth_challenge", messageId + "-challenge", challenge
+		));
+		BridgeEnvelope response = codec.decode(reader.readLine());
+		assertEquals("auth_response", response.type(), "server proves its identity before coordinator authentication");
+		String serverNonce = response.payload().get("serverNonce").getAsString();
+		assertEquals(
+				MultiplexedServerBridge.authenticationProof(secret, "server", clientNonce, serverNonce, response.serverInstanceId(), null),
+				response.payload().get("proof").getAsString(),
+				"server response is bound to the fresh coordinator challenge"
+		);
+		return new AuthenticationExchange(clientNonce, response.payload().get("serverNonce").getAsString(), response);
+	}
+
+	private static void writeAuthenticatedHello(
+			Socket socket,
+			BridgeEnvelopeCodec codec,
+			String secret,
+			String launchId,
+			String messageId,
+			AuthenticationExchange exchange
+	) throws Exception {
+		String clientNonce = exchange.clientNonce();
+		String serverNonce = exchange.serverNonce();
+		BridgeEnvelope response = exchange.response();
 		JsonObject payload = new JsonObject();
-		payload.addProperty("secret", secret);
+		payload.addProperty("replyTo", response.messageId());
+		payload.addProperty("clientNonce", clientNonce);
+		payload.addProperty("serverNonce", serverNonce);
+		payload.addProperty("proof", MultiplexedServerBridge.authenticationProof(
+				secret, "coordinator", clientNonce, serverNonce, response.serverInstanceId(), launchId
+		));
 		if (launchId != null) payload.addProperty("launchId", launchId);
 		socket.getOutputStream().write(codec.encode(new BridgeEnvelope(
-				2, "coordinator", "server", "hello", messageId, payload
+				2, response.serverInstanceId(), "server", "hello", messageId, payload
 		)).getBytes(StandardCharsets.UTF_8));
 		socket.getOutputStream().flush();
+	}
+
+	private record AuthenticationExchange(String clientNonce, String serverNonce, BridgeEnvelope response) {
 	}
 
 	private static void awaitLatch(CountDownLatch latch, String label) {
@@ -2729,11 +2841,7 @@ public final class MultiplexedServerBridgeVerification {
 			String secret,
 			String messageId
 	) throws Exception {
-		JsonObject hello = new JsonObject();
-		hello.addProperty("secret", secret);
-		writeEnvelope(socket, codec, new BridgeEnvelope(
-				2, "coordinator", "server", "hello", messageId, hello
-		));
+		writeHello(socket, reader, codec, secret, null, messageId);
 		BridgeEnvelope acknowledgement = codec.decode(reader.readLine());
 		assertEquals("hello_ack", acknowledgement.type(), "replacement fixture authenticates the session");
 		assertEquals("verbose_control", codec.decode(reader.readLine()).type(),
@@ -2749,11 +2857,7 @@ public final class MultiplexedServerBridgeVerification {
 			String secret,
 			String messageId
 	) throws Exception {
-		JsonObject hello = new JsonObject();
-		hello.addProperty("secret", secret);
-		writeEnvelope(socket, codec, new BridgeEnvelope(
-				2, "coordinator", "server", "hello", messageId, hello
-		));
+		writeHello(socket, reader, codec, secret, null, messageId);
 		BridgeEnvelope acknowledgement = pollBridgeResponseOfType(
 				bridge, socket, reader, codec, "hello_ack", null);
 		assertEquals("verbose_control", pollBridgeResponseOfType(

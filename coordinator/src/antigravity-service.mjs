@@ -1,4 +1,4 @@
-import { spawn as nodeSpawn } from 'node:child_process';
+import { execFile as nodeExecFile, spawn as nodeSpawn } from 'node:child_process';
 
 import { AcpProtocolError } from './acp-transport.mjs';
 import { terminateChildProcess } from './child-process-lifecycle.mjs';
@@ -26,6 +26,9 @@ const GEMINI_MODEL_REASONING = Object.freeze({
 	'gemini-3.5-flash': Object.freeze(['high', 'medium', 'low']),
 });
 
+// A non-serializable token keeps the unsafe planner path out of production configuration.
+export const ANTIGRAVITY_INTERNAL_TEST_MODE = Symbol('ANTIGRAVITY_INTERNAL_TEST_MODE');
+
 export class AntigravityProviderService {
 	#config;
 	#dependencies;
@@ -35,15 +38,24 @@ export class AntigravityProviderService {
 	#replacing = new Map();
 	#sessionGenerations = new Map();
 	#lifecycleGeneration = 0;
+	#plannerEnabled;
 
 	constructor(config, dependencies = {}) {
+		this.#plannerEnabled = config?.testOnlyMode === ANTIGRAVITY_INTERNAL_TEST_MODE;
 		this.#config = validateServiceConfig(config);
+		const environment = createProviderChildEnvironment(
+			'gemini',
+			dependencies.env ?? this.#config.environment ?? process.env,
+			this.#config.bridgeSecretEnvironmentVariable,
+		);
 		this.#dependencies = {
 			spawn: dependencies.spawn ?? nodeSpawn,
 			discoverCatalog: dependencies.discoverCatalog ?? discoverAntigravityCatalog,
-			execFile: dependencies.execFile,
+			execFile: dependencies.execFile ?? nodeExecFile,
+			environment,
 			terminate: dependencies.terminate ?? terminateChildProcess,
 			platform: dependencies.platform ?? process.platform,
+			plannerEnabled: this.#plannerEnabled,
 		};
 		this.#workspaceManager = dependencies.workspaceManager ?? null;
 		if (this.#workspaceManager !== null && typeof this.#workspaceManager.prepare !== 'function') {
@@ -57,6 +69,7 @@ export class AntigravityProviderService {
 	getAgent(agentId) { return this.#agents.get(agentId) ?? null; }
 
 	async createAgent(profileValue, { recoverySummary = null } = {}) {
+		this.#assertPlannerAvailable();
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		const requested = profileIdentity(profileValue, this.#config);
 		const replacing = this.#replacing.get(requested.agentId);
@@ -91,6 +104,7 @@ export class AntigravityProviderService {
 	}
 
 	async replaceAgent(profileValue, { recoverySummary = null, expectedSessionGeneration = null } = {}) {
+		this.#assertPlannerAvailable();
 		const lifecycleGeneration = this.#lifecycleGeneration;
 		await this.catalog.refresh();
 		assertLifecycleActive(lifecycleGeneration, this.#lifecycleGeneration);
@@ -171,6 +185,18 @@ export class AntigravityProviderService {
 
 	async reconcile(records, { signal } = {}) {
 		if (!Array.isArray(records)) throw new TypeError('gemini reconciliation records must be an array');
+		if (!this.#plannerEnabled) {
+			return {
+				valid: [],
+				invalid: records.map((profile) => ({
+					profile,
+					code: 'PROVIDER_UNAVAILABLE',
+					message: unavailablePlannerMessage(),
+				})),
+				removed: [],
+				catalog: await this.catalog.refresh(),
+			};
+		}
 		assertReconciliationActive(signal);
 		await this.catalog.refresh();
 		assertReconciliationActive(signal);
@@ -210,6 +236,14 @@ export class AntigravityProviderService {
 		this.#agents.clear();
 		await Promise.allSettled(agents.map((agent) => agent.dispose()));
 	}
+
+	#assertPlannerAvailable() {
+		if (!this.#plannerEnabled) throw new AcpProtocolError('PROVIDER_UNAVAILABLE', unavailablePlannerMessage());
+	}
+}
+
+function unavailablePlannerMessage() {
+	return 'Gemini planning is disabled because Antigravity CLI does not provide an enforceable no-tool execution boundary';
 }
 
 function assertReconciliationActive(signal) {
@@ -403,7 +437,8 @@ export function buildAntigravityLaunch(profile, configValue = {}, dependencies =
 		],
 		options: {
 			cwd: dependencies.cwd ?? config.cwd,
-			env: createProviderChildEnvironment(
+		env: createProviderChildEnvironment(
+				'gemini',
 				dependencies.env ?? config.environment ?? process.env,
 				config.bridgeSecretEnvironmentVariable,
 			),
@@ -530,10 +565,14 @@ class AntigravityCatalog {
 	constructor(config, dependencies) {
 		this.#config = config;
 		this.#dependencies = dependencies;
-		this.stale = config.catalogDiscovery === true;
+		this.stale = dependencies.plannerEnabled && config.catalogDiscovery === true;
 	}
 
 	async refresh({ force = false } = {}) {
+		if (!this.#dependencies.plannerEnabled) {
+			this.stale = false;
+			return { provider: 'gemini', refreshedAtEpochMs: Date.now(), models: [] };
+		}
 		if (!force && !this.stale && this.#snapshot !== null) return structuredClone(this.#snapshot);
 		if (this.#refreshPromise !== null) return structuredClone(await this.#refreshPromise);
 		const refreshPromise = this.#refreshOnce();
@@ -550,6 +589,7 @@ class AntigravityCatalog {
 				models = await this.#dependencies.discoverCatalog({
 					executable: this.#config.executable,
 					execFile: this.#dependencies.execFile,
+					environment: this.#dependencies.environment,
 					timeoutMs: this.#config.catalogDiscoveryTimeoutMs,
 				});
 			} catch {
@@ -573,6 +613,7 @@ class AntigravityCatalog {
 	}
 
 	assertSupported(model, reasoningEffort) {
+		if (!this.#dependencies.plannerEnabled) throw new AcpProtocolError('PROVIDER_UNAVAILABLE', unavailablePlannerMessage());
 		if (!this.#config.models.includes(model)) throw new AcpProtocolError('UNSUPPORTED_MODEL', `gemini model '${model}' is not configured`);
 		if (!this.#config.modelReasoningEfforts[model]?.includes(reasoningEffort)) {
 			throw new AcpProtocolError('UNSUPPORTED_THINKING', `gemini model '${model}' does not support thinking '${reasoningEffort}'`);
@@ -595,10 +636,11 @@ function validateServiceConfig(config) {
 		throw new TypeError('Antigravity service config must be an object');
 	}
 	if ((config.provider ?? 'gemini') !== 'gemini') throw new TypeError('Antigravity provider must be gemini');
+	const { testOnlyMode: _testOnlyMode, ...configValue } = config;
 	const models = requireStringArray(config.models ?? Object.keys(GEMINI_MODEL_REASONING), 'models');
 	const configuredEfforts = config.modelReasoningEfforts ?? GEMINI_MODEL_REASONING;
 	return {
-		...config,
+		...configValue,
 		provider: 'gemini',
 		cwd: requireText(config.cwd, 'cwd'),
 		executable: requireText(config.executable ?? DEFAULT_EXECUTABLE, 'executable'),

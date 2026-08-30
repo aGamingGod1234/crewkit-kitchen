@@ -88,11 +88,42 @@ public final class OfflineAgentPlayers {
 	}
 
 	public static Optional<ServerPlayer> find(MinecraftServer server, AgentId agentId, AgentProfile profile) {
-		ServerPlayer byUuid = server.getPlayerList().getPlayer(offlineUuid(agentId, profile));
-		return Optional.ofNullable(byUuid != null ? byUuid : server.getPlayerList().getPlayerByName(playerName(agentId, profile)));
+		UUID expectedUuid = offlineUuid(agentId, profile);
+		String expectedName = playerName(agentId, profile);
+		ServerPlayer byUuid = server.getPlayerList().getPlayer(expectedUuid);
+		if (isManagedFakePlayer(byUuid, expectedUuid, expectedName)) return Optional.of(byUuid);
+		ServerPlayer byName = server.getPlayerList().getPlayerByName(expectedName);
+		return isManagedFakePlayer(byName, expectedUuid, expectedName) ? Optional.of(byName) : Optional.empty();
+	}
+
+	static boolean isManagedFakePlayer(ServerPlayer player, AgentId agentId, AgentProfile profile) {
+		return isManagedFakePlayer(player, offlineUuid(agentId, profile), playerName(agentId, profile));
+	}
+
+	private static boolean isManagedFakePlayer(ServerPlayer player, UUID expectedUuid, String expectedName) {
+		return player != null && matchesManagedIdentity(
+				player instanceof EntityPlayerMPFake,
+				player.getUUID(),
+				player.getGameProfile().name(),
+				expectedUuid,
+				expectedName
+		);
+	}
+
+	static boolean matchesManagedIdentity(
+			boolean fakePlayer,
+			UUID actualUuid,
+			String actualName,
+			UUID expectedUuid,
+			String expectedName
+	) {
+		return fakePlayer
+				&& expectedUuid.equals(actualUuid)
+				&& expectedName.equals(actualName);
 	}
 
 	public static EntityPlayerActionPack actions(ServerPlayer player) {
+		requireFakePlayer(player);
 		return ((ServerPlayerInterface) player).getActionPack();
 	}
 
@@ -103,12 +134,14 @@ public final class OfflineAgentPlayers {
 	}
 
 	public static void remove(ServerPlayer player) {
-		stop(player);
-		if (player instanceof EntityPlayerMPFake fake) {
-			fake.kill(Component.literal("Arena agent removed"));
-		} else {
-			player.connection.disconnect(Component.literal("Arena agent removed"));
-		}
+		EntityPlayerMPFake fake = requireFakePlayer(player);
+		stop(fake);
+		fake.kill(Component.literal("Arena agent removed"));
+	}
+
+	private static EntityPlayerMPFake requireFakePlayer(ServerPlayer player) {
+		if (player instanceof EntityPlayerMPFake fake) return fake;
+		throw new AgentDomainException("INVALID_AGENT_PLAYER", "Arena agent control requires a Carpet fake player");
 	}
 
 	/** Revalidates persisted vanilla respawn configuration without requiring the transient dead player. */

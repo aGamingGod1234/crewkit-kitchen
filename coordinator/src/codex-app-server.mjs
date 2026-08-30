@@ -62,6 +62,7 @@ export function buildCodexArgs(config) {
 export function resolveCodexLaunch(config, dependencies = {}) {
 	const platform = dependencies.platform ?? process.platform;
 	const environment = createProviderChildEnvironment(
+		'codex',
 		dependencies.env ?? config.environment ?? process.env,
 		config.bridgeSecretEnvironmentVariable,
 	);

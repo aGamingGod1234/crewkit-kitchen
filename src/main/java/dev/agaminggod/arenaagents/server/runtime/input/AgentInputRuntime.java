@@ -54,6 +54,13 @@ public final class AgentInputRuntime {
 		if (controller != null) controller.clear(java.util.Objects.requireNonNull(agentId, "agentId must not be null"));
 	}
 
+	public static synchronized void tick(MinecraftServer server) {
+		LeasedServerInputController controller = CONTROLLERS.get(
+				java.util.Objects.requireNonNull(server, "server must not be null")
+		);
+		if (controller != null) controller.tick();
+	}
+
 	public static synchronized void release(MinecraftServer server) {
 		CONTROLLERS.remove(server);
 	}

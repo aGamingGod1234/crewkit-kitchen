@@ -1,4 +1,4 @@
-import { timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import net from 'node:net';
 
@@ -33,6 +33,7 @@ import { parseGoalSpec, parseGoalSpecProposal, parseGoalSpecRequest } from './go
 const MAX_COORDINATOR_CIRCUITS = 32;
 
 export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
+	'auth_challenge',
 	'hello',
 	'catalog_snapshot',
 	'coordinator_status',
@@ -51,6 +52,7 @@ export const COORDINATOR_TO_SERVER_TYPES = Object.freeze([
 ]);
 
 export const SERVER_TO_COORDINATOR_TYPES = Object.freeze([
+	'auth_response',
 	'hello_ack',
 	'catalog_request',
 	'agent_registered',
@@ -76,6 +78,7 @@ const REVISION_GUARDED_OUTBOUND_TYPES = new Set(['agent_ready', 'planning_state'
 const TERMINAL_ACTION_STATES = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT']);
 const MAX_TRACKED_MESSAGE_IDS = 4_096;
 const MAX_TRACKED_TERMINAL_ACTION_IDS = 4_096;
+const DEFAULT_INBOUND_DISPATCH_BATCH = 32;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 5_000;
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 15_000;
@@ -87,6 +90,9 @@ const MAX_NEARBY_TRANSACTION_TARGETS = 16;
 const MAX_COMPLETION_FACTS = 16;
 const MAX_CHANGED_FACTS = 256;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const AUTHENTICATION_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const AUTHENTICATION_CONTEXT = 'arena-agents-v2';
+const ACTION_RESULT_REPLAY_CONTEXT = 'arena-agents-v2-action-result-replay';
 export const MAX_VERBOSE_MESSAGE_LENGTH = 256;
 export const VERBOSE_STAGES = Object.freeze([
 	'conversation', 'lifecycle', 'planner', 'provider', 'output', 'decision',
@@ -139,7 +145,7 @@ export function validateProtocolV2Envelope(value, { direction } = {}) {
 	const messageId = requireText(value.messageId, 'messageId', MAX_COMMAND_ID_LENGTH);
 	if (!isPlainObject(value.payload)) throw new ProtocolV2Error('INVALID_PAYLOAD', 'Protocol v2 payload must be an object');
 	validateDirection(type, direction);
-	if ((type === 'hello' || type === 'hello_ack' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'verbose_control' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
+	if ((type === 'auth_challenge' || type === 'auth_response' || type === 'hello' || type === 'hello_ack' || type === 'catalog_request' || type === 'catalog_snapshot' || type === 'coordinator_status' || type === 'verbose_control' || type === 'heartbeat' || type === 'shutdown') && agentId !== 'server') {
 		throw new ProtocolV2Error('INVALID_AGENT_SCOPE', `Message type '${type}' must use agentId 'server'`);
 	}
 	if ((type === 'verbose_event' || type === 'action_result_ack') && agentId === 'server') {
@@ -167,10 +173,24 @@ export function validateProtocolV2Payload(type, value) {
 function normalizeProtocolV2Payload(type, value) {
 	if (!isPlainObject(value)) throw new ProtocolV2Error('INVALID_PAYLOAD', `${type} payload must be an object`);
 	switch (type) {
-		case 'hello':
-			exactKeys(value, ['secret', 'launchId'], ['secret'], type);
+		case 'auth_challenge':
+			exactKeys(value, ['clientNonce'], ['clientNonce'], type);
+			return { clientNonce: authenticationToken(value.clientNonce, 'clientNonce') };
+		case 'auth_response':
+			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
 			return {
-				secret: boundedText(value.secret, 'secret', MAX_BRIDGE_SECRET_LENGTH, 32),
+				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
+				clientNonce: authenticationToken(value.clientNonce, 'clientNonce'),
+				serverNonce: authenticationToken(value.serverNonce, 'serverNonce'),
+				proof: authenticationToken(value.proof, 'proof'),
+			};
+		case 'hello':
+			exactKeys(value, ['replyTo', 'clientNonce', 'serverNonce', 'proof', 'launchId'], ['replyTo', 'clientNonce', 'serverNonce', 'proof'], type);
+			return {
+				replyTo: boundedText(value.replyTo, 'replyTo', MAX_COMMAND_ID_LENGTH),
+				clientNonce: authenticationToken(value.clientNonce, 'clientNonce'),
+				serverNonce: authenticationToken(value.serverNonce, 'serverNonce'),
+				proof: authenticationToken(value.proof, 'proof'),
 				...(value.launchId === undefined ? {} : { launchId: launchIdentity(value.launchId) }),
 			};
 		case 'hello_ack':
@@ -332,14 +352,23 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#reconnectDelayMs;
 	#connectionQueueCap;
 	#agentQueueCap;
+	#inboundConnectionQueueCap;
+	#inboundAgentQueueCap;
+	#inboundDispatchBatch;
+	#trackedTerminalActionIdCap;
 	#messageIds;
 	#audit;
+	#randomNonce;
+	#scheduleInbound;
 	#socket = null;
 	#decoder = null;
 	#running = false;
 	#ready = false;
 	#recovering = false;
+	#challengeMessageId = null;
 	#helloMessageId = null;
+	#clientNonce = null;
+	#serverNonce = null;
 	#reconnectHandle = null;
 	#handshakeDeadlineHandle = null;
 	#handshakeDeadlineToken = 0;
@@ -351,8 +380,15 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#outboundQueue = [];
 	#queuedByAgent = new Map();
 	#writeBlocked = false;
+	#inboundQueue = [];
+	#inboundEntries = new Set();
+	#inboundQueuedByAgent = new Map();
+	#inboundDispatchScheduled = false;
+	#inboundReadPaused = false;
+	#receivingData = false;
 	#inboundMessageIds = new Set();
 	#terminalActionIds = new Set();
+	#issuedActionIds = new Set();
 	#terminalActionsByGoal = new Map();
 	#terminalResultsByKey = new Map();
 	#acknowledgedTerminalActionIds = new Set();
@@ -388,7 +424,13 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#reconnectDelayMs = this.#initialReconnectDelayMs;
 		this.#connectionQueueCap = positiveInteger(config.connectionQueueCap ?? DEFAULT_CONNECTION_QUEUE_CAP, 'connectionQueueCap');
 		this.#agentQueueCap = positiveInteger(config.agentQueueCap ?? DEFAULT_AGENT_MESSAGE_QUEUE_CAP, 'agentQueueCap');
+		this.#inboundConnectionQueueCap = positiveInteger(config.inboundConnectionQueueCap ?? DEFAULT_CONNECTION_QUEUE_CAP, 'inboundConnectionQueueCap');
+		this.#inboundAgentQueueCap = positiveInteger(config.inboundAgentQueueCap ?? DEFAULT_AGENT_MESSAGE_QUEUE_CAP, 'inboundAgentQueueCap');
+		this.#inboundDispatchBatch = positiveInteger(config.inboundDispatchBatch ?? DEFAULT_INBOUND_DISPATCH_BATCH, 'inboundDispatchBatch');
+		this.#trackedTerminalActionIdCap = positiveInteger(config.trackedTerminalActionIdCap ?? MAX_TRACKED_TERMINAL_ACTION_IDS, 'trackedTerminalActionIdCap');
 		this.#messageIds = dependencies.messageIds ?? new MessageIdGenerator('coordinator-v2');
+		this.#randomNonce = dependencies.randomNonce ?? (() => randomBytes(32).toString('base64url'));
+		this.#scheduleInbound = dependencies.scheduleInbound ?? queueMicrotask;
 		if (audit !== null && typeof audit !== 'function') throw new TypeError('audit must be a function or null');
 		this.#audit = audit;
 	}
@@ -415,6 +457,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 			this.#reconnectHandle = null;
 		}
 		this.#clearOutboundQueue(new ProtocolV2Error('BRIDGE_STOPPED', 'Multiplexed bridge stopped'));
+		this.#clearInboundQueue();
 		this.#socket?.destroy();
 		this.#socket = null;
 	}
@@ -456,20 +499,21 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (!this.#isCurrentConnection(socket, connectionEpoch)) return;
 		this.#inboundMessageIds.clear();
 		this.#observedRevisions.clear();
+		this.#clearInboundQueue();
+		this.#clientNonce = authenticationToken(this.#randomNonce(), 'clientNonce');
+		this.#serverNonce = null;
 		const messageId = this.#messageIds.next();
-		this.#helloMessageId = messageId;
-		const hello = createProtocolV2Envelope({
+		this.#challengeMessageId = messageId;
+		this.#helloMessageId = null;
+		const challenge = createProtocolV2Envelope({
 			serverInstanceId: this.#serverInstanceId,
 			agentId: 'server',
-			type: 'hello',
+			type: 'auth_challenge',
 			messageId,
-			payload: {
-				secret: this.#secret,
-				...(this.#launchId === null ? {} : { launchId: this.#launchId }),
-			},
+			payload: { clientNonce: this.#clientNonce },
 		});
-		const encoded = encodeJsonLine(hello);
-		this.#invokeAudit('coordinator_to_server', { ...hello, payload: { secret: '[REDACTED]' } });
+		const encoded = encodeJsonLine(challenge);
+		this.#invokeAudit('coordinator_to_server', challenge);
 		try {
 			socket.write(encoded);
 			this.#scheduleHandshakeDeadline(socket, connectionEpoch);
@@ -487,23 +531,32 @@ export class MultiplexedServerBridge extends EventEmitter {
 			this.#fail(error, socket, connectionEpoch);
 			return;
 		}
-		for (const value of messages) {
-			try {
-				this.#accept(value, socket, connectionEpoch);
-			} catch (error) {
-				this.#fail(withInboundEnvelopeContext(error, value), socket, connectionEpoch);
-				return;
+		this.#receivingData = true;
+		try {
+			for (const value of messages) {
+				try {
+					this.#accept(value, socket, connectionEpoch);
+				} catch (error) {
+					this.#fail(withInboundEnvelopeContext(error, value), socket, connectionEpoch);
+					return;
+				}
 			}
+		} finally {
+			this.#receivingData = false;
 		}
+		if (this.#inboundQueue.length > 0) this.#drainInbound();
 	}
 
 	#accept(value, socket, connectionEpoch) {
 		const envelope = validateProtocolV2Envelope(value, { direction: 'server_to_coordinator' });
-		this.#invokeAudit('server_to_coordinator', envelope);
+		this.#invokeAudit('server_to_coordinator', envelope.type === 'auth_response'
+			? { ...envelope, payload: { ...envelope.payload, proof: '[REDACTED]' } }
+			: envelope);
 		if (this.#inboundMessageIds.has(envelope.messageId)) throw new ProtocolV2Error('DUPLICATE_MESSAGE', `Duplicate message ID '${envelope.messageId}'`);
 		rememberBounded(this.#inboundMessageIds, envelope.messageId, MAX_TRACKED_MESSAGE_IDS);
 		if (!this.#ready) {
-			this.#acceptHelloAck(envelope, socket, connectionEpoch);
+			if (this.#serverNonce === null) this.#acceptAuthResponse(envelope, socket, connectionEpoch);
+			else this.#acceptHelloAck(envelope, socket, connectionEpoch);
 			return;
 		}
 		if (envelope.serverInstanceId !== this.#serverInstanceId) throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Server instance changed during an authenticated session');
@@ -514,7 +567,12 @@ export class MultiplexedServerBridge extends EventEmitter {
 			void this.acknowledgeActionResult(envelope.agentId, envelope.payload, { connectionEpoch }).catch(() => {});
 			return;
 		}
-		if (envelope.type === 'agent_registered') this.#knownAgentIds.add(envelope.agentId);
+		if (envelope.type === 'agent_registered' && !this.#knownAgentIds.has(envelope.agentId)) {
+			if (this.#knownAgentIds.size >= MAX_REGISTRY_SNAPSHOT_AGENTS) {
+				throw new ProtocolV2Error('REGISTRY_CAP_EXCEEDED', 'Live agent registry exceeds the bounded protocol capacity');
+			}
+			this.#knownAgentIds.add(envelope.agentId);
+		}
 		if (envelope.agentId !== 'server' && !this.#knownAgentIds.has(envelope.agentId) && envelope.type !== 'agent_registered') {
 			throw new ProtocolV2Error('UNKNOWN_AGENT', `Message references unknown agent '${envelope.agentId}'`);
 		}
@@ -522,11 +580,59 @@ export class MultiplexedServerBridge extends EventEmitter {
 			this.#knownAgentIds.delete(envelope.agentId);
 			this.#observedRevisions.delete(envelope.agentId);
 			this.#terminalActionsByGoal.delete(envelope.agentId);
+			this.#dropTerminalResultKeys(envelope.agentId);
 		}
 		this.#refreshHeartbeatDeadline(socket, connectionEpoch);
 		const event = { ...envelope, connectionEpoch };
-		this.emit(envelope.type, event);
-		this.emit('message', event);
+		this.#enqueueInbound(event, socket, connectionEpoch);
+	}
+
+	#acceptAuthResponse(envelope, socket, connectionEpoch) {
+		if (envelope.type !== 'auth_response' || envelope.agentId !== 'server') {
+			throw new ProtocolV2Error('HANDSHAKE_REQUIRED', 'auth_response must be the first server message');
+		}
+		if (envelope.payload.replyTo !== this.#challengeMessageId || envelope.payload.clientNonce !== this.#clientNonce) {
+			throw new ProtocolV2Error('HANDSHAKE_MISMATCH', 'auth_response does not match the active coordinator challenge');
+		}
+		if (this.#expectedServerInstanceId !== null && envelope.serverInstanceId !== this.#expectedServerInstanceId) {
+			throw new ProtocolV2Error('SERVER_INSTANCE_MISMATCH', 'Connected server instance does not match configuration');
+		}
+		const expectedProof = createBridgeAuthenticationProof(this.#secret, 'server', {
+			clientNonce: this.#clientNonce,
+			serverNonce: envelope.payload.serverNonce,
+			serverInstanceId: envelope.serverInstanceId,
+		});
+		if (!secretsEqual(envelope.payload.proof, expectedProof)) {
+			throw new ProtocolV2Error('SERVER_AUTHENTICATION_FAILED', 'Bridge server did not prove possession of the configured secret');
+		}
+		this.#serverInstanceId = envelope.serverInstanceId;
+		this.#serverNonce = envelope.payload.serverNonce;
+		const messageId = this.#messageIds.next();
+		this.#helloMessageId = messageId;
+		const hello = createProtocolV2Envelope({
+			serverInstanceId: this.#serverInstanceId,
+			agentId: 'server',
+			type: 'hello',
+			messageId,
+			payload: {
+				replyTo: envelope.messageId,
+				clientNonce: this.#clientNonce,
+				serverNonce: this.#serverNonce,
+				proof: createBridgeAuthenticationProof(this.#secret, 'coordinator', {
+					clientNonce: this.#clientNonce,
+					serverNonce: this.#serverNonce,
+					serverInstanceId: this.#serverInstanceId,
+					launchId: this.#launchId,
+				}),
+				...(this.#launchId === null ? {} : { launchId: this.#launchId }),
+			},
+		});
+		this.#invokeAudit('coordinator_to_server', { ...hello, payload: { ...hello.payload, proof: '[REDACTED]' } });
+		try {
+			socket.write(encodeJsonLine(hello));
+		} catch (error) {
+			this.#fail(error, socket, connectionEpoch);
+		}
 	}
 
 	#acceptHelloAck(envelope, socket, connectionEpoch) {
@@ -562,6 +668,96 @@ export class MultiplexedServerBridge extends EventEmitter {
 		};
 		this.emit('ready', connection);
 		if (recovered) this.emit('recovered', { ...connection, registry: structuredClone(registry) });
+	}
+
+	#enqueueInbound(event, socket, connectionEpoch) {
+		if (event.type === 'observation') {
+			const queued = this.#inboundQueue.findLast((entry) => !entry.dispatched
+				&& entry.event.type === 'observation'
+				&& entry.event.agentId === event.agentId
+				&& entry.event.payload.goalRevision === event.payload.goalRevision);
+			if (queued !== undefined) {
+				queued.event = mergeQueuedObservation(queued.event, event);
+				return;
+			}
+		}
+		if (this.#inboundEntries.size >= this.#inboundConnectionQueueCap) {
+			throw new ProtocolV2Error('CONNECTION_INBOUND_BACKPRESSURE', 'Connection inbound work queue is full');
+		}
+		const agentCount = this.#inboundQueuedByAgent.get(event.agentId) ?? 0;
+		if (agentCount >= this.#inboundAgentQueueCap) {
+			throw new ProtocolV2Error('AGENT_INBOUND_BACKPRESSURE', `Inbound work queue for agent '${event.agentId}' is full`);
+		}
+		const entry = { event, socket, connectionEpoch, dispatched: false, released: false };
+		this.#inboundQueue.push(entry);
+		this.#inboundEntries.add(entry);
+		this.#inboundQueuedByAgent.set(event.agentId, agentCount + 1);
+		if (!this.#inboundReadPaused && this.#inboundEntries.size >= Math.max(1, Math.floor(this.#inboundConnectionQueueCap * 0.75))) {
+			socket.pause?.();
+			this.#inboundReadPaused = true;
+		}
+		if (!this.#receivingData) this.#scheduleInboundDrain();
+	}
+
+	#scheduleInboundDrain() {
+		if (this.#inboundDispatchScheduled) return;
+		this.#inboundDispatchScheduled = true;
+		this.#scheduleInbound(() => this.#drainInbound());
+	}
+
+	#drainInbound() {
+		this.#inboundDispatchScheduled = false;
+		let dispatched = 0;
+		while (dispatched < this.#inboundDispatchBatch && this.#inboundQueue.length > 0) {
+			const entry = this.#inboundQueue.shift();
+			if (entry.released) continue;
+			if (!this.#isCurrentConnection(entry.socket, entry.connectionEpoch) || !this.#ready) {
+				this.#releaseInbound(entry);
+				continue;
+			}
+			entry.dispatched = true;
+			const waits = [];
+			Object.defineProperty(entry.event, 'waitUntil', {
+				enumerable: false,
+				value: (operation) => waits.push(Promise.resolve(operation)),
+			});
+			try {
+				this.emit(entry.event.type, entry.event);
+				this.emit('message', entry.event);
+			} catch (error) {
+				this.#releaseInbound(entry);
+				this.#fail(error, entry.socket, entry.connectionEpoch);
+				return;
+			}
+			if (waits.length === 0) this.#releaseInbound(entry);
+			else void Promise.allSettled(waits).finally(() => this.#releaseInbound(entry));
+			dispatched++;
+		}
+		if (this.#inboundQueue.length > 0) this.#scheduleInboundDrain();
+	}
+
+	#releaseInbound(entry) {
+		if (entry.released) return;
+		entry.released = true;
+		this.#inboundEntries.delete(entry);
+		const count = this.#inboundQueuedByAgent.get(entry.event.agentId) ?? 0;
+		if (count <= 1) this.#inboundQueuedByAgent.delete(entry.event.agentId);
+		else this.#inboundQueuedByAgent.set(entry.event.agentId, count - 1);
+		if (this.#inboundReadPaused
+				&& this.#isCurrentConnection(entry.socket, entry.connectionEpoch)
+				&& this.#inboundEntries.size <= Math.floor(this.#inboundConnectionQueueCap * 0.5)) {
+			entry.socket.resume?.();
+			this.#inboundReadPaused = false;
+		}
+	}
+
+	#clearInboundQueue() {
+		for (const entry of this.#inboundEntries) entry.released = true;
+		this.#inboundQueue = [];
+		this.#inboundEntries.clear();
+		this.#inboundQueuedByAgent.clear();
+		this.#inboundDispatchScheduled = false;
+		this.#inboundReadPaused = false;
 	}
 
 	#assertRevision(envelope, guardedTypes) {
@@ -626,18 +822,33 @@ export class MultiplexedServerBridge extends EventEmitter {
 	#trackTerminalResult(envelope) {
 		if (envelope.type !== 'action_result' || !TERMINAL_ACTION_STATES.has(envelope.payload.state)) return;
 		const actionId = requireIdentifier(envelope.payload.actionId ?? envelope.payload.commandId, 'actionId');
-		const goal = this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
+		this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
 		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
-		const fingerprint = JSON.stringify(envelope.payload);
+		if (!this.#issuedActionIds.has(key)) {
+			const expectedProof = this.#clientNonce === null || this.#serverNonce === null
+				? null
+				: createActionResultReplayProof(this.#secret, {
+					clientNonce: this.#clientNonce,
+					serverNonce: this.#serverNonce,
+					serverInstanceId: this.#serverInstanceId,
+					agentId: envelope.agentId,
+					goalRevision: envelope.payload.goalRevision,
+					actionId,
+				});
+			if (expectedProof === null || envelope.payload.replayProof === undefined
+					|| !secretsEqual(envelope.payload.replayProof, expectedProof)) {
+				throw new ProtocolV2Error('UNISSUED_ACTION_RESULT', `Action '${actionId}' was not issued by this coordinator`);
+			}
+			this.#rememberIssuedActionKey(key);
+		}
+		const fingerprint = terminalResultFingerprint(envelope.payload);
 		const previous = this.#terminalResultsByKey.get(key);
 		if (previous !== undefined) {
 			if (previous !== fingerprint) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Action '${actionId}' changed its terminal result`);
-			return true;
+			return this.#acknowledgedTerminalActionIds.has(key);
 		}
-		if (goal.actionIds.has(actionId)) throw new ProtocolV2Error('DUPLICATE_TERMINAL_RESULT', `Duplicate terminal result for action '${actionId}'`);
-		goal.actionIds.add(actionId);
 		this.#terminalResultsByKey.set(key, fingerprint);
-		const evicted = rememberBounded(this.#terminalActionIds, key, MAX_TRACKED_TERMINAL_ACTION_IDS);
+		const evicted = rememberBounded(this.#terminalActionIds, key, this.#trackedTerminalActionIdCap);
 		if (evicted !== undefined) {
 			this.#terminalResultsByKey.delete(evicted);
 			this.#acknowledgedTerminalActionIds.delete(evicted);
@@ -650,11 +861,12 @@ export class MultiplexedServerBridge extends EventEmitter {
 		const goalRevision = revision(payload?.goalRevision, 'goalRevision');
 		const actionId = requireIdentifier(payload?.actionId ?? payload?.commandId, 'actionId');
 		const key = `${agentId}:${goalRevision}:${actionId}`;
-		return Promise.resolve(this.send('action_result_ack', agentId, { goalRevision, actionId }, { connectionEpoch }))
-			.then((value) => {
-				rememberBounded(this.#acknowledgedTerminalActionIds, key, MAX_TRACKED_TERMINAL_ACTION_IDS);
-				return value;
-			});
+		const tracked = this.#terminalResultsByKey.get(key);
+		if (tracked === undefined || tracked !== terminalResultFingerprint(payload)) {
+			return Promise.reject(new ProtocolV2Error('UNTRACKED_ACTION_RESULT', `Action '${actionId}' has no matching delivered terminal result`));
+		}
+		rememberBounded(this.#acknowledgedTerminalActionIds, key, this.#trackedTerminalActionIdCap);
+		return Promise.resolve(this.send('action_result_ack', agentId, { goalRevision, actionId }, { connectionEpoch }));
 	}
 
 	#synchronizeTerminalGoals(registry) {
@@ -675,7 +887,7 @@ export class MultiplexedServerBridge extends EventEmitter {
 		let goal = this.#terminalActionsByGoal.get(agentId);
 		if (goal?.goalRevision !== goalRevision) {
 			if (goal !== undefined) this.#dropTerminalResultKeys(agentId, goal.goalRevision);
-			goal = { goalRevision, actionIds: new Set() };
+			goal = { goalRevision };
 			this.#terminalActionsByGoal.set(agentId, goal);
 		}
 		return goal;
@@ -683,6 +895,9 @@ export class MultiplexedServerBridge extends EventEmitter {
 
 	#dropTerminalResultKeys(agentId, goalRevision = null) {
 		const prefix = goalRevision === null ? `${agentId}:` : `${agentId}:${goalRevision}:`;
+		for (const key of this.#issuedActionIds) {
+			if (key.startsWith(prefix)) this.#issuedActionIds.delete(key);
+		}
 		for (const key of this.#terminalResultsByKey.keys()) {
 			if (!key.startsWith(prefix)) continue;
 			this.#terminalResultsByKey.delete(key);
@@ -695,11 +910,27 @@ export class MultiplexedServerBridge extends EventEmitter {
 		if (this.#outboundQueue.length >= this.#connectionQueueCap) return Promise.reject(new ProtocolV2Error('CONNECTION_BACKPRESSURE', 'Connection outbound queue is full'));
 		const agentCount = this.#queuedByAgent.get(envelope.agentId) ?? 0;
 		if (agentCount >= this.#agentQueueCap) return Promise.reject(new ProtocolV2Error('AGENT_BACKPRESSURE', `Outbound queue for agent '${envelope.agentId}' is full`));
+		if (envelope.type === 'action_command') this.#rememberIssuedAction(envelope);
 		return new Promise((resolve, reject) => {
 			this.#outboundQueue.push({ envelope, encoded: encodeJsonLine(envelope), resolve, reject });
 			this.#queuedByAgent.set(envelope.agentId, agentCount + 1);
 			this.#flush();
 		});
+	}
+
+	#rememberIssuedAction(envelope) {
+		const actionId = requireIdentifier(envelope.payload.actionId, 'actionId');
+		this.#ensureTerminalGoal(envelope.agentId, envelope.payload.goalRevision);
+		const key = `${envelope.agentId}:${envelope.payload.goalRevision}:${actionId}`;
+		this.#rememberIssuedActionKey(key);
+	}
+
+	#rememberIssuedActionKey(key) {
+		const evicted = rememberBounded(this.#issuedActionIds, key, this.#trackedTerminalActionIdCap);
+		if (evicted === undefined) return;
+		this.#terminalResultsByKey.delete(evicted);
+		this.#acknowledgedTerminalActionIds.delete(evicted);
+		this.#terminalActionIds.delete(evicted);
 	}
 
 	#sendLossy(envelope) {
@@ -779,8 +1010,12 @@ export class MultiplexedServerBridge extends EventEmitter {
 		this.#socket = null;
 		this.#ready = false;
 		this.#writeBlocked = false;
+		this.#challengeMessageId = null;
 		this.#helloMessageId = null;
+		this.#clientNonce = null;
+		this.#serverNonce = null;
 		this.#knownAgentIds.clear();
+		this.#clearInboundQueue();
 		this.#clearOutboundQueue(new ProtocolV2Error('BRIDGE_DISCONNECTED', 'Multiplexed bridge disconnected'));
 		if (wasReady) this.emit('disconnected', { connectionEpoch, serverInstanceId: this.#serverInstanceId });
 		if (!this.#running || this.#reconnectHandle !== null) return;
@@ -857,6 +1092,45 @@ export function secretsEqual(left, right) {
 	const leftBytes = Buffer.from(left, 'utf8');
 	const rightBytes = Buffer.from(right, 'utf8');
 	return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
+}
+
+export function createBridgeAuthenticationProof(secret, role, {
+	clientNonce,
+	serverNonce,
+	serverInstanceId,
+	launchId = null,
+}) {
+	const key = requireSecret(secret);
+	if (!['server', 'coordinator'].includes(role)) throw new TypeError('authentication proof role must be server or coordinator');
+	const fields = [
+		AUTHENTICATION_CONTEXT,
+		role,
+		authenticationToken(clientNonce, 'clientNonce'),
+		authenticationToken(serverNonce, 'serverNonce'),
+		requireIdentifier(serverInstanceId, 'serverInstanceId'),
+	];
+	if (role === 'coordinator') fields.push(launchId === null ? '' : launchIdentity(launchId));
+	return createHmac('sha256', key).update(fields.join('\0'), 'utf8').digest('base64url');
+}
+
+export function createActionResultReplayProof(secret, {
+	clientNonce,
+	serverNonce,
+	serverInstanceId,
+	agentId,
+	goalRevision,
+	actionId,
+}) {
+	const fields = [
+		ACTION_RESULT_REPLAY_CONTEXT,
+		authenticationToken(clientNonce, 'clientNonce'),
+		authenticationToken(serverNonce, 'serverNonce'),
+		requireIdentifier(serverInstanceId, 'serverInstanceId'),
+		requireIdentifier(agentId, 'agentId'),
+		String(revision(goalRevision, 'goalRevision')),
+		requireIdentifier(actionId, 'actionId'),
+	];
+	return createHmac('sha256', requireSecret(secret)).update(fields.join('\0'), 'utf8').digest('base64url');
 }
 
 function defaultDeadlineSchedule(callback, delay) {
@@ -1321,7 +1595,7 @@ function normalizeActionProgress(value) {
 }
 
 function normalizeActionResult(value) {
-	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted'];
+	const allowed = ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs', 'executionStarted', 'physicalAttempted', 'replayProof'];
 	exactKeys(value, allowed, ['traceId', 'goalRevision', 'actionId', 'commandId', 'actionType', 'state', 'reasonCode', 'message', 'elapsedMs', 'observedAtEpochMs'], 'action_result');
 	const actionId = requireIdentifier(value.actionId, 'actionId');
 	if (value.commandId !== actionId) throw new ProtocolV2Error('INVALID_PAYLOAD', 'commandId must match actionId');
@@ -1347,8 +1621,14 @@ function normalizeActionResult(value) {
 		if (typeof value.physicalAttempted !== 'boolean') throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted must be a boolean');
 		normalized.physicalAttempted = value.physicalAttempted;
 	}
+	if (value.replayProof !== undefined) normalized.replayProof = authenticationToken(value.replayProof, 'replayProof');
 	if (normalized.physicalAttempted === true && normalized.executionStarted !== true) throw new ProtocolV2Error('INVALID_PAYLOAD', 'physicalAttempted requires executionStarted');
 	return normalized;
+}
+
+function terminalResultFingerprint(payload) {
+	const { replayProof: _replayProof, ...result } = payload;
+	return JSON.stringify(result);
 }
 
 function normalizeGoalCompletionRequest(value) {
@@ -1739,6 +2019,13 @@ function launchIdentity(value) {
 	return launchId.toLowerCase();
 }
 
+function authenticationToken(value, field) {
+	if (typeof value !== 'string' || !AUTHENTICATION_TOKEN_PATTERN.test(value)) {
+		throw new ProtocolV2Error('INVALID_AUTHENTICATION_TOKEN', `${field} must be a 32-byte base64url value`);
+	}
+	return value;
+}
+
 function requireText(value, field, maximum) {
 	if (typeof value !== 'string' || value.trim().length === 0 || value.length > maximum) throw new ProtocolV2Error('INVALID_FIELD', `${field} must be nonblank and at most ${maximum} characters`);
 	return value;
@@ -1768,4 +2055,9 @@ function rememberBounded(set, value, maximum) {
 	const evicted = set.values().next().value;
 	set.delete(evicted);
 	return evicted;
+}
+
+function mergeQueuedObservation(previous, next) {
+	if (previous.payload.attention !== true) return next;
+	return { ...next, payload: { ...next.payload, attention: true } };
 }

@@ -111,8 +111,8 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 					"supervisor shutdown leaves an explicit user voice endpoint untouched");
 
 			System.setProperty("arenaagents.coordinatorAutoStart", "false");
-			System.clearProperty("arenaagents.voiceSecretFile");
-			System.setProperty("arenaagents.bridgeSecretFile", manualSecret.toString());
+			System.clearProperty("arenaagents.bridgeSecretFile");
+			System.setProperty("arenaagents.voiceSecretFile", manualSecret.toString());
 			String initialTail = "TAIL_SECRET_MARKER_A";
 			String rotatedTail = "TAIL_SECRET_MARKER_B";
 			String initialManualSecret = "m".repeat(512 - initialTail.length()) + initialTail;
@@ -129,7 +129,7 @@ public final class CoordinatorVoiceEndpointRefreshVerification {
 							voiceStarts::incrementAndGet, voiceCloses::incrementAndGet
 					);
 			assertTrue(manualGate.reconcile(true, initialManualRevision),
-					"manual secret configuration creates the initial worker client");
+					"manual dedicated voice secret creates the initial worker client");
 			String initialFingerprint = CodexAgentServerRuntime.explicitSecretContentFingerprint(manualSecret);
 			assertEquals(
 					HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
