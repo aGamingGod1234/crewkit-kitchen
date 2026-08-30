@@ -10,6 +10,7 @@ import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusSnapshot;
 import dev.agaminggod.arenaagents.server.bridge.CoordinatorStatusStore;
 import dev.agaminggod.arenaagents.agent.AgentId;
 import dev.agaminggod.arenaagents.server.conversation.DeliveryReceipt;
+import dev.agaminggod.arenaagents.server.conversation.ServerAgentConversationRouter;
 import dev.agaminggod.arenaagents.server.voice.VoiceSubsystemRuntime;
 import dev.agaminggod.arenaagents.server.voice.VoiceConsentRegistry;
 import dev.agaminggod.arenaagents.server.goal.GoalVerificationRuntime;
@@ -20,6 +21,7 @@ import dev.agaminggod.arenaagents.scenario.runtime.ScenarioRuntimeService;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Optional;
 import java.io.IOException;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
@@ -429,19 +431,54 @@ public final class CodexAgentServerRuntime {
 			String transcript,
 			boolean whispering
 	) {
+		return captureHumanSpeechAudience(server, sourcePlayerId, whispering)
+				.map(audience -> deliverHumanSpeech(server, audience, transcript))
+				.orElseGet(() -> new DeliveryReceipt(List.of(), List.of()));
+	}
+
+	public static Optional<ServerAgentConversationRouter.ProximitySpeechAudience> captureHumanSpeechAudience(
+			MinecraftServer server,
+			UUID sourcePlayerId,
+			boolean whispering
+	) {
 		if (!VoiceConsentRegistry.granted(server, sourcePlayerId)) {
+			return Optional.empty();
+		}
+		MultiplexedServerBridge bridge = bridge(server);
+		if (bridge == null || !bridge.authenticated()) return Optional.empty();
+		ServerPlayer source = server.getPlayerList().getPlayer(sourcePlayerId);
+		if (source == null) return Optional.empty();
+		for (var record : CodexAgentManager.get(server).records()) {
+			if (record.entityUuid().filter(sourcePlayerId::equals).isPresent()) {
+				return Optional.empty();
+			}
+		}
+		try {
+			return Optional.of(bridge.capturePlayerProximitySpeechAudience(source, whispering));
+		} catch (AgentDomainException exception) {
+			if (exception.code().equals("COORDINATOR_DISCONNECTED")) return Optional.empty();
+			throw exception;
+		}
+	}
+
+	public static DeliveryReceipt deliverHumanSpeech(
+			MinecraftServer server,
+			ServerAgentConversationRouter.ProximitySpeechAudience audience,
+			String transcript
+	) {
+		if (!VoiceConsentRegistry.granted(server, audience.sourcePlayerId())) {
 			return new DeliveryReceipt(List.of(), List.of());
 		}
 		MultiplexedServerBridge bridge = bridge(server);
 		if (bridge == null || !bridge.authenticated()) return new DeliveryReceipt(List.of(), List.of());
-		ServerPlayer source = server.getPlayerList().getPlayer(sourcePlayerId);
-		if (source == null) return new DeliveryReceipt(List.of(), List.of());
-		for (var record : CodexAgentManager.get(server).records()) {
-			if (record.entityUuid().filter(sourcePlayerId::equals).isPresent()) {
+		try {
+			return bridge.sendPlayerProximitySpeech(audience, transcript);
+		} catch (AgentDomainException exception) {
+			if (exception.code().equals("COORDINATOR_DISCONNECTED")) {
 				return new DeliveryReceipt(List.of(), List.of());
 			}
+			throw exception;
 		}
-		return bridge.sendPlayerProximitySpeech(source, transcript, whispering);
 	}
 
 	public static boolean hasVoiceConsent(MinecraftServer server, UUID playerId) {

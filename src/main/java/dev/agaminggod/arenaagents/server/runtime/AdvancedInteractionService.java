@@ -234,16 +234,34 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 	public Result drop(ServerPlayer agent, int slot, int count) {
 		if (!protection.mayDropItem(agent)) return Result.failed("PROTECTION_DENIED", "Item drop denied");
 		if (slot < 0 || slot >= agent.getInventory().getContainerSize() || count <= 0) return Result.failed("INVALID_SLOT", "Invalid inventory slot/count");
+		ItemStack before = agent.getInventory().getItem(slot).copy();
 		ItemStack removed = agent.getInventory().removeItem(slot, count);
 		if (removed.isEmpty()) return Result.failed("EMPTY_SLOT", "Inventory slot is empty");
-		if (agent.drop(removed, false) == null) {
-			ItemStack slotStack = agent.getInventory().getItem(slot);
-			if (slotStack.isEmpty()) agent.getInventory().setItem(slot, removed);
-			else slotStack.grow(removed.getCount());
-			agent.getInventory().setChanged();
-			return Result.failed("ITEM_DROP_REJECTED", "World rejected item drop; inventory was restored");
+		try {
+			if (agent.drop(removed, false) == null) {
+				return dropFailure(agent.getInventory(), slot, before,
+						"ITEM_DROP_REJECTED", "World rejected item drop");
+			}
+		} catch (RuntimeException exception) {
+			return dropFailure(agent.getInventory(), slot, before,
+					"ITEM_DROP_FAILED", "Item drop raised an exception: " + safeMessage(exception));
 		}
 		return Result.succeeded("Dropped item stack");
+	}
+
+	private static Result dropFailure(Inventory inventory, int slot, ItemStack before, String reasonCode, String message) {
+		ItemStack current = inventory.getItem(slot);
+		if ((!current.isEmpty() && !ItemStack.isSameItemSameComponents(current, before))
+				|| current.getCount() > before.getCount()) {
+			return Result.failed("ROLLBACK_FAILED", message + "; inventory changed before the debit could be restored");
+		}
+		inventory.setItem(slot, before);
+		inventory.setChanged();
+		ItemStack restored = inventory.getItem(slot);
+		if (!ItemStack.isSameItemSameComponents(restored, before) || restored.getCount() != before.getCount()) {
+			return Result.failed("ROLLBACK_FAILED", message + "; exact inventory restoration failed");
+		}
+		return Result.failed(reasonCode, message + "; inventory was restored");
 	}
 
 	public Result respawn() { return unavailable("RESPAWN_REQUIRES_SERVER_TICK_DEATH_RECONCILER"); }
@@ -253,7 +271,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 		final ServerPlayer player;
 		final ServerActionRequest request;
 		final JsonObject arguments;
-		final long createdAt = System.currentTimeMillis();
+		final ElapsedTimeAccumulator elapsedTime = new ElapsedTimeAccumulator(System.currentTimeMillis());
 		final long timeoutMs;
 		final TerminalGate terminal = new TerminalGate();
 		final List<ItemStack> retainedEscrow = new ArrayList<>();
@@ -273,7 +291,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			TickResult existing = terminal.terminalResult();
 			if (existing != null) return existing;
 			if (!player.isAlive()) return finish(TickResult.failed("AGENT_DEAD", "Agent player died"));
-			if (nowEpochMs - createdAt >= timeoutMs) {
+			if (elapsedTime.advance(nowEpochMs) >= timeoutMs) {
 				return finish(TickResult.timedOut("TRANSACTION_TIMED_OUT", "Transaction timed out"));
 			}
 			try {
@@ -535,6 +553,7 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 			int hotbarSlot = integer(arguments, "hotbarSlot");
 			int source = inventoryMenuSlot(inventorySource);
 			int destination = inventoryMenuSlot(hotbarSlot);
+			int previousSelectedSlot = player.getInventory().getSelectedSlot();
 			Slot sourceSlot = player.inventoryMenu.getSlot(source);
 			requireExpectedStack(sourceSlot.getItem(), text(arguments, "expectedItemId"), 1);
 			int remaining = sourceSlot.getItem().getMaxDamage() - sourceSlot.getItem().getDamageValue();
@@ -549,13 +568,50 @@ public final class AdvancedInteractionService implements ServerTransactionAdapte
 						text(arguments, "expectedItemId"), 1, true);
 				if (moved.state() != TickState.SUCCEEDED) return moved;
 			}
-			player.getInventory().setSelectedSlot(hotbarSlot);
-			ItemStack selected = player.getMainHandItem();
-			if (!itemId(selected).equals(text(arguments, "expectedItemId"))) {
-				return TickResult.failed("SELECTION_NOT_CONFIRMED", "Expected tool was not observed in the selected hand");
+			try {
+				player.getInventory().setSelectedSlot(hotbarSlot);
+				ItemStack selected = player.getMainHandItem();
+				if (!itemId(selected).equals(text(arguments, "expectedItemId"))) {
+					return rollbackToolSelection(this, source, destination, previousSelectedSlot,
+							TickResult.failed("SELECTION_NOT_CONFIRMED", "Expected tool was not observed in the selected hand"));
+				}
+			} catch (RuntimeException exception) {
+				return rollbackToolSelection(this, source, destination, previousSelectedSlot,
+						TickResult.failed("SELECTION_NOT_CONFIRMED", "Tool selection verification raised an exception: "
+								+ safeMessage(exception)));
 			}
 			return TickResult.succeeded("TOOL_SELECTED", "Tool moved with vanilla slots and selected");
 		}
+	}
+
+	private TickResult rollbackToolSelection(
+			Transaction owner,
+			int source,
+			int destination,
+			int previousSelectedSlot,
+			TickResult failure
+	) {
+		boolean inventoryRestored = source == destination;
+		if (!inventoryRestored) {
+			try {
+				TickResult reversed = transfer(owner, owner.player, owner.player.inventoryMenu, destination, source,
+						text(owner.arguments, "expectedItemId"), 1, true);
+				inventoryRestored = reversed.state() == TickState.SUCCEEDED;
+			} catch (RuntimeException ignored) {
+				inventoryRestored = false;
+			}
+		}
+		boolean selectionRestored;
+		try {
+			owner.player.getInventory().setSelectedSlot(previousSelectedSlot);
+			selectionRestored = owner.player.getInventory().getSelectedSlot() == previousSelectedSlot;
+		} catch (RuntimeException ignored) {
+			selectionRestored = false;
+		}
+		if (!inventoryRestored || !selectionRestored) {
+			return TickResult.failed("ROLLBACK_FAILED", failure.message() + "; prior tool selection state could not be restored");
+		}
+		return TickResult.failed(failure.reasonCode(), failure.message() + "; prior inventory and selection were restored");
 	}
 
 	private final class CraftTransaction extends Transaction {

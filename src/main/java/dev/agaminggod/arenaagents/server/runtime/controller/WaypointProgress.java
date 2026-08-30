@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.server.runtime.controller;
 
+import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
+
 /**
  * Tracks material path progress without depending on Minecraft runtime types.
  */
@@ -10,7 +12,7 @@ public final class WaypointProgress {
 	private final long stallTimeoutMs;
 	private final int maximumReplans;
 	private double bestRemainingDistance;
-	private long lastProgressAt;
+	private ElapsedTimeAccumulator timeWithoutProgress;
 	private int replans;
 
 	public WaypointProgress(
@@ -27,7 +29,7 @@ public final class WaypointProgress {
 		}
 		this.segmentStartDistance = Math.max(MATERIAL_PROGRESS, initialDistance);
 		this.bestRemainingDistance = initialDistance;
-		this.lastProgressAt = startedAtEpochMs;
+		this.timeWithoutProgress = new ElapsedTimeAccumulator(startedAtEpochMs);
 		this.stallTimeoutMs = stallTimeoutMs;
 		this.maximumReplans = maximumReplans;
 	}
@@ -38,12 +40,12 @@ public final class WaypointProgress {
 		}
 		if (activeDistance + MATERIAL_PROGRESS < bestRemainingDistance) {
 			bestRemainingDistance = activeDistance;
-			lastProgressAt = nowEpochMs;
+			timeWithoutProgress = new ElapsedTimeAccumulator(nowEpochMs);
 		}
 		if (waypointReached) {
-			lastProgressAt = nowEpochMs;
+			timeWithoutProgress = new ElapsedTimeAccumulator(nowEpochMs);
 		}
-		long idleMs = Math.max(0L, nowEpochMs - lastProgressAt);
+		long idleMs = timeWithoutProgress.advance(nowEpochMs);
 		Decision decision = idleMs < stallTimeoutMs
 				? Decision.CONTINUE
 				: replans >= maximumReplans ? Decision.FAIL : Decision.REPLAN;
@@ -59,7 +61,7 @@ public final class WaypointProgress {
 		}
 		segmentStartDistance = Math.max(MATERIAL_PROGRESS, activeDistance);
 		bestRemainingDistance = activeDistance;
-		lastProgressAt = nowEpochMs;
+		timeWithoutProgress = new ElapsedTimeAccumulator(nowEpochMs);
 	}
 
 	public void replanned(double activeDistance, long nowEpochMs) {
@@ -69,7 +71,7 @@ public final class WaypointProgress {
 		replans++;
 		segmentStartDistance = Math.max(MATERIAL_PROGRESS, activeDistance);
 		bestRemainingDistance = activeDistance;
-		lastProgressAt = nowEpochMs;
+		timeWithoutProgress = new ElapsedTimeAccumulator(nowEpochMs);
 	}
 
 	public enum Decision {

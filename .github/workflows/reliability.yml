@@ -1,0 +1,77 @@
+name: Reliability
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  coordinator:
+    name: Coordinator (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            test-script: test
+          - os: ubuntu-latest
+            test-script: test:portable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: coordinator/package-lock.json
+      - name: Install locked coordinator dependencies
+        working-directory: coordinator
+        run: npm ci --ignore-scripts --omit=dev
+      - name: Test coordinator
+        working-directory: coordinator
+        run: npm run ${{ matrix.test-script }}
+
+  java-and-package:
+    name: Java and package (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: coordinator/package-lock.json
+      - name: Assemble pinned standalone Node runtime
+        shell: powershell
+        run: |
+          .\scripts\install-node-runtime.ps1 -ProjectRoot .
+          .\scripts\verify-startup-packaging.ps1 -PackageRoot .
+      - name: Verify Java, Fabric, and embedded coordinator
+        shell: powershell
+        run: |
+          .\gradlew.bat clean check build packageWindowsDistribution --no-daemon --console=plain
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\scripts\verify-coordinator-packaging.ps1 -JarPath .\build\libs\arena-agents-0.1.0.jar
+          .\scripts\verify-distribution-runtime.ps1
+          $unpacked = Join-Path $env:RUNNER_TEMP 'arena-agents-standalone'
+          Expand-Archive -LiteralPath .\build\distributions\arena-agents-modpack-0.1.0.zip -DestinationPath $unpacked
+          $packagedMod = Join-Path $unpacked 'mods\arena-agents-0.1.0.jar'
+          if ((Get-FileHash -LiteralPath $packagedMod).Hash -ne (Get-FileHash -LiteralPath .\build\libs\arena-agents-0.1.0.jar).Hash) {
+            throw 'The standalone archive does not contain the built Arena Agents mod.'
+          }
+          .\scripts\verify-coordinator-packaging.ps1 -JarPath $packagedMod
+          .\scripts\verify-startup-packaging.ps1 -PackageRoot $unpacked
+      - name: Upload verified standalone distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-agents-modpack-0.1.0
+          path: build/distributions/arena-agents-modpack-0.1.0.zip
+          if-no-files-found: error

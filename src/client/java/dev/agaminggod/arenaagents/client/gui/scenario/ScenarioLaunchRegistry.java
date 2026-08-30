@@ -16,6 +16,11 @@ public final class ScenarioLaunchRegistry {
 
 	public static synchronized void clear() {
 		handler = null;
+		lastAcceptedPlan = null;
+	}
+
+	public static synchronized void clearRetainedPlan() {
+		lastAcceptedPlan = null;
 	}
 
 	public static synchronized boolean isAvailable() {

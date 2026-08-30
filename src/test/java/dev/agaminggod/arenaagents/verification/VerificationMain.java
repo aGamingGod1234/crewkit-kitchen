@@ -9,6 +9,8 @@ import dev.agaminggod.arenaagents.server.AgentActivityPresentationVerification;
 import dev.agaminggod.arenaagents.server.AgentVerbosePresentationVerification;
 import dev.agaminggod.arenaagents.server.AgentDeathCaptureVerification;
 import dev.agaminggod.arenaagents.server.AgentControlSyncVerification;
+import dev.agaminggod.arenaagents.server.ChunkedSavedPayloadVerification;
+import dev.agaminggod.arenaagents.server.OfflineAgentProfileLookupVerification;
 import dev.agaminggod.arenaagents.server.VoiceConsentCommandVerification;
 import dev.agaminggod.arenaagents.client.ArenaAgentsClientBootstrapVerification;
 import dev.agaminggod.arenaagents.client.ArenaSpectatorStateVerification;
@@ -98,6 +100,7 @@ import dev.agaminggod.arenaagents.server.perception.ServerObservationTagCacheVer
 import dev.agaminggod.arenaagents.server.perception.ServerObservationInventorySnapshotVerification;
 import dev.agaminggod.arenaagents.server.perception.ServerObservationWireBudgetVerification;
 import dev.agaminggod.arenaagents.server.runtime.ActionProgressTrackerVerification;
+import dev.agaminggod.arenaagents.server.runtime.AdvancedInteractionRollbackVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementPostconditionVerification;
 import dev.agaminggod.arenaagents.server.runtime.BlockPlacementAttemptPolicyVerification;
 import dev.agaminggod.arenaagents.server.runtime.DesiredBlockStateVerification;
@@ -124,7 +127,9 @@ import dev.agaminggod.arenaagents.server.runtime.controller.SurvivalReflexVerifi
 import dev.agaminggod.arenaagents.server.runtime.controller.BuildSequenceProgressVerification;
 import dev.agaminggod.arenaagents.server.runtime.controller.ItemPickupProgressVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioCoreVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioActivationFailurePolicyVerification;
 import dev.agaminggod.arenaagents.scenario.ArenaSpectatorSnapshotVerification;
+import dev.agaminggod.arenaagents.scenario.ScenarioBuildProgressVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRuntimeVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioMatchResultVerification;
 import dev.agaminggod.arenaagents.scenario.ScenarioPreflightVerification;
@@ -222,6 +227,8 @@ public final class VerificationMain {
 		passedAssertions += AgentControlSyncVerification.verify();
 		passedAssertions += VoiceConsentCommandVerification.verify();
 		passedAssertions += AgentSpawnPlacementVerification.verify();
+		passedAssertions += ChunkedSavedPayloadVerification.verify();
+		passedAssertions += OfflineAgentProfileLookupVerification.verify();
 		passedAssertions += OfflineAgentPlayersVerification.verify();
 		passedAssertions += PendingSpawnCancellationLedgerVerification.verify();
 		passedAssertions += AgentRegistryVerification.verify();
@@ -241,6 +248,7 @@ public final class VerificationMain {
 		passedAssertions += ServerObservationRayTargetVerification.verify();
 		passedAssertions += ServerObservationWireBudgetVerification.verify();
 		passedAssertions += ActionProgressTrackerVerification.verify();
+		passedAssertions += AdvancedInteractionRollbackVerification.verify();
 		passedAssertions += BlockPlacementPostconditionVerification.verify();
 		passedAssertions += BlockPlacementAttemptPolicyVerification.verify();
 		passedAssertions += DesiredBlockStateVerification.verify();
@@ -267,6 +275,8 @@ public final class VerificationMain {
 		passedAssertions += BuildSequenceProgressVerification.verify();
 		passedAssertions += ItemPickupProgressVerification.verify();
 		passedAssertions += ScenarioCoreVerification.verify();
+		passedAssertions += ScenarioActivationFailurePolicyVerification.verify();
+		passedAssertions += ScenarioBuildProgressVerification.verify();
 		passedAssertions += ScenarioLaunchRuntimeVerification.verify();
 		passedAssertions += ScenarioMatchResultVerification.verify();
 		passedAssertions += ScenarioPreflightVerification.verify();

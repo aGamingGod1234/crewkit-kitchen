@@ -576,6 +576,26 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 		return conversationRouter.deliverPlayerProximitySpeech(source, text, whispering ? 16.0D : 48.0D);
 	}
 
+	public ServerAgentConversationRouter.ProximitySpeechAudience capturePlayerProximitySpeechAudience(
+			ServerPlayer source,
+			boolean whispering
+	) {
+		if (!authenticated()) {
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
+		}
+		return conversationRouter.capturePlayerProximitySpeechAudience(source, whispering ? 16.0D : 48.0D);
+	}
+
+	public DeliveryReceipt sendPlayerProximitySpeech(
+			ServerAgentConversationRouter.ProximitySpeechAudience audience,
+			String text
+	) {
+		if (!authenticated()) {
+			throw new AgentDomainException("COORDINATOR_DISCONNECTED", COORDINATOR_OFFLINE_MESSAGE);
+		}
+		return conversationRouter.deliverPlayerProximitySpeech(audience, text);
+	}
+
 	@Override
 	public void validateProfile(AgentProfile profile) {
 		if (!authenticated()) {
@@ -960,7 +980,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					handshakeCommittedHook.accept(source);
 					coordinatorLifecycleGeneration++;
 					markVerboseControlPublished(verboseControl);
-					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
 					for (ServerActionResult result : claimedReplay) terminalResults.release(result, source);
 					protocolKnownAgentIds.clear();

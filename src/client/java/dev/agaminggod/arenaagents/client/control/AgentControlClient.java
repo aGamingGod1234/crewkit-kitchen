@@ -4,6 +4,7 @@ import com.mojang.blaze3d.platform.InputConstants;
 import dev.agaminggod.arenaagents.client.gui.AgentControlScreen;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioLaunchPlan;
 import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioLaunchRegistry;
+import dev.agaminggod.arenaagents.client.gui.scenario.ScenarioSetupScreen;
 import dev.agaminggod.arenaagents.client.presentation.ArenaSpectatorHud;
 import dev.agaminggod.arenaagents.client.presentation.ArenaSpectatorState;
 import dev.agaminggod.arenaagents.client.presentation.ScenarioResultsScreen;
@@ -15,11 +16,13 @@ import dev.agaminggod.arenaagents.scenario.ScenarioLaunchRequest;
 import dev.agaminggod.arenaagents.scenario.presentation.ArenaSpectatorSnapshotPayload;
 import dev.agaminggod.arenaagents.scenario.presentation.ScenarioBuildProgressPayload;
 import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.control.AgentControlRequestPayload;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotPayload;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshotStore;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -58,6 +61,7 @@ public final class AgentControlClient {
 	private static final ScenarioBuildProgressState BUILD_PROGRESS_STATE = new ScenarioBuildProgressState();
 	private static final SpectatorCameraAssistant CAMERA_ASSISTANT = new SpectatorCameraAssistant();
 	private static Preferences preferences = Preferences.defaults();
+	private static boolean catalogAuthoritative;
 	private static boolean registered;
 	private static final Set<String> HIDDEN_AGENT_IDS = new LinkedHashSet<>();
 	private static final Set<String> AUTOMATIC_AGENT_IDS = new LinkedHashSet<>();
@@ -127,6 +131,10 @@ public final class AgentControlClient {
 
 	public static Preferences preferences() {
 		return preferences;
+	}
+
+	public static boolean catalogAuthoritative() {
+		return catalogAuthoritative;
 	}
 
 	public static String openControlKeyLabel() {
@@ -242,9 +250,11 @@ public final class AgentControlClient {
 	private static void acceptSnapshot(AgentControlSnapshot nextSnapshot) {
 		Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
 		AgentControlSnapshot previous = SNAPSHOTS.current().orElse(null);
+		List<AgentControlModelOption> previousCatalog = previous == null ? List.of() : previous.catalog();
 		if (!SNAPSHOTS.accept(nextSnapshot)) {
 			return;
 		}
+		boolean catalogChanged = !previousCatalog.equals(nextSnapshot.catalog());
 		int nextContentHash = contentHash(nextSnapshot);
 		Minecraft client = Minecraft.getInstance();
 		if (previous != null && snapshotContentHash == nextContentHash && sameContent(previous, nextSnapshot)) {
@@ -253,9 +263,12 @@ public final class AgentControlClient {
 		}
 		snapshotContentHash = nextContentHash;
 		AgentControlCatalog.installRuntimeCatalog(nextSnapshot.catalog());
+		catalogAuthoritative = true;
 		normalizePreferences();
 		if (client.screen instanceof AgentControlScreen screen) {
 			screen.acceptSnapshot(nextSnapshot);
+		} else if (catalogChanged && client.screen instanceof ScenarioSetupScreen screen) {
+			screen.acceptCatalogUpdate();
 		}
 	}
 
@@ -278,9 +291,10 @@ public final class AgentControlClient {
 	private static void clearConnectionState() {
 		SNAPSHOTS.clear();
 		AgentControlCatalog.resetRuntimeCatalog();
-		preferences = Preferences.defaults();
+		catalogAuthoritative = false;
 		SPECTATOR_STATE.clearOnDisconnect();
 		BUILD_PROGRESS_STATE.clear();
+		ScenarioLaunchRegistry.clearRetainedPlan();
 		CAMERA_ASSISTANT.resetTracking();
 		refreshCountdown = 0;
 		snapshotContentHash = 0;
@@ -302,13 +316,7 @@ public final class AgentControlClient {
 	}
 
 	private static void normalizePreferences() {
-		String provider = AgentControlCatalog.providers().contains(preferences.provider())
-				? preferences.provider() : AgentControlCatalog.providers().getFirst();
-		String model = AgentControlCatalog.models(provider).contains(preferences.model())
-				? preferences.model() : AgentControlCatalog.defaultModel(provider);
-		String reasoning = AgentControlCatalog.reasoningEfforts(provider, model).contains(preferences.reasoning())
-				? preferences.reasoning() : AgentControlCatalog.defaultReasoning(provider, model);
-		preferences = new Preferences(provider, model, reasoning);
+		preferences = Preferences.reconcile(preferences, catalogAuthoritative);
 	}
 
 	public record Preferences(String provider, String model, String reasoning) {
@@ -322,6 +330,18 @@ public final class AgentControlClient {
 			String provider = AgentControlCatalog.providers().getFirst();
 			String model = AgentControlCatalog.defaultModel(provider);
 			return new Preferences(provider, model, AgentControlCatalog.defaultReasoning(provider, model));
+		}
+
+		static Preferences reconcile(Preferences current, boolean authoritative) {
+			Preferences checked = Objects.requireNonNull(current, "preferences must not be null");
+			if (!authoritative) return checked;
+			String provider = AgentControlCatalog.providers().contains(checked.provider())
+					? checked.provider() : AgentControlCatalog.providers().getFirst();
+			String model = AgentControlCatalog.models(provider).contains(checked.model())
+					? checked.model() : AgentControlCatalog.defaultModel(provider);
+			String reasoning = AgentControlCatalog.reasoningEfforts(provider, model).contains(checked.reasoning())
+					? checked.reasoning() : AgentControlCatalog.defaultReasoning(provider, model);
+			return new Preferences(provider, model, reasoning);
 		}
 	}
 }

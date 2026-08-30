@@ -53,7 +53,7 @@ public final class ScenarioSetupScreen extends Screen {
 	private static final int ROW_HEIGHT = ScenarioSetupLayout.ROW_HEIGHT;
 	private static final int GAP = 5;
 
-	private final ScenarioSetupState state;
+	private ScenarioSetupState state;
 	private final AgentRosterViewState rosterView = new AgentRosterViewState();
 	private AgentRosterFilter rosterFilter = AgentRosterFilter.all();
 	private List<AgentRosterEntry> rosterEntries = List.of();
@@ -83,12 +83,34 @@ public final class ScenarioSetupScreen extends Screen {
 		AgentControlClient.Preferences preferences = AgentControlClient.preferences();
 		ScenarioBuildProgress progress = AgentControlClient.buildProgressState().progress().orElse(null);
 		if (progress != null && progress.status() != ScenarioBuildProgress.Status.READY) {
-			ScenarioSetupState retained = ScenarioLaunchRegistry.lastAcceptedPlan()
-					.map(ScenarioSetupState::fromLaunchPlan)
-					.orElse(null);
-			if (retained != null) return retained;
+			var retainedPlan = ScenarioLaunchRegistry.lastAcceptedPlan();
+			if (retainedPlan.isPresent()) {
+				RetainedPlanResolution retained = resolveRetainedPlan(
+						retainedPlan.orElseThrow(), AgentControlClient.catalogAuthoritative());
+				if (retained.state().isPresent()) return retained.state().orElseThrow();
+				if (retained.discard()) ScenarioLaunchRegistry.clearRetainedPlan();
+			}
 		}
-		return ScenarioSetupState.defaults(preferences.provider(), preferences.model(), preferences.reasoning());
+		return safeDefaults(preferences);
+	}
+
+	private static ScenarioSetupState safeDefaults(AgentControlClient.Preferences preferences) {
+		try {
+			return ScenarioSetupState.defaults(
+					preferences.provider(), preferences.model(), preferences.reasoning());
+		} catch (IllegalArgumentException | IllegalStateException exception) {
+			return ScenarioSetupState.defaults();
+		}
+	}
+
+	static RetainedPlanResolution resolveRetainedPlan(ScenarioLaunchPlan plan, boolean authoritativeCatalog) {
+		java.util.Optional<ScenarioSetupState> restored;
+		try {
+			restored = java.util.Optional.of(ScenarioSetupState.fromLaunchPlan(plan));
+		} catch (IllegalArgumentException | IllegalStateException exception) {
+			restored = java.util.Optional.empty();
+		}
+		return new RetainedPlanResolution(restored, authoritativeCatalog && restored.isEmpty());
 	}
 
 	ScenarioSetupScreen(ScenarioSetupState state) {
@@ -869,6 +891,18 @@ public final class ScenarioSetupScreen extends Screen {
 		if (minecraft != null && launchPending) rebuildWidgets();
 	}
 
+	public void acceptCatalogUpdate() {
+		if (launchPending) {
+			ScenarioLaunchRegistry.lastAcceptedPlan().ifPresent(plan -> {
+				RetainedPlanResolution retained = resolveRetainedPlan(plan, true);
+				retained.state().ifPresent(restored -> state = restored);
+				if (retained.discard()) ScenarioLaunchRegistry.clearRetainedPlan();
+			});
+		}
+		refreshDraftRoster();
+		if (minecraft != null) rebuildWidgets();
+	}
+
 	private void goPrevious() {
 		if (state.step() == ScenarioWizardStep.ROSTER && layout().compactRoster() && compactEditorOpen) {
 			compactEditorOpen = false;
@@ -915,11 +949,23 @@ public final class ScenarioSetupScreen extends Screen {
 	}
 
 	private void launch() {
-		ScenarioLaunchRegistry.Result result = ScenarioLaunchRegistry.launch(state.launchPlan());
+		ScenarioLaunchRegistry.Result result = launchSafely(state);
 		setFeedback(result.message(), !result.accepted());
 		if (result.accepted()) {
 			launchPending = true;
 			rebuildWidgets();
+		}
+	}
+
+	static ScenarioLaunchRegistry.Result launchSafely(ScenarioSetupState state) {
+		try {
+			return ScenarioLaunchRegistry.launch(state.launchPlan());
+		} catch (IllegalArgumentException | IllegalStateException exception) {
+			String message = exception.getMessage();
+			return new ScenarioLaunchRegistry.Result(
+					false,
+					message == null || message.isBlank() ? "Arena setup is no longer valid" : message
+			);
 		}
 	}
 
@@ -1064,5 +1110,11 @@ public final class ScenarioSetupScreen extends Screen {
 	private static String capitalize(String value) {
 		if (value == null || value.isBlank()) return "";
 		return Character.toUpperCase(value.charAt(0)) + value.substring(1);
+	}
+
+	record RetainedPlanResolution(
+			java.util.Optional<ScenarioSetupState> state,
+			boolean discard
+	) {
 	}
 }

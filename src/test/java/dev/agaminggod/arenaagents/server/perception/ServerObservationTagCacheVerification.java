@@ -33,7 +33,15 @@ public final class ServerObservationTagCacheVerification {
 		assertEquals(0, cacheSize(), "cache invalidation releases retained holders");
 		JsonArray afterReload = ServerObservationCollector.tags(holder);
 		assertEquals(expected.toString(), afterReload.toString(), "cache invalidation preserves recomputed values");
-		return 6;
+
+		assertEquals("Zombie", ServerObservationCollector.boundedEntityName("Zombie"),
+				"short entity names remain unchanged");
+		assertEquals(256, ServerObservationCollector.boundedEntityName("x".repeat(257)).length(),
+				"entity names are bounded to the coordinator text limit");
+		String emoji = "\uD83D\uDE00";
+		assertEquals(emoji.repeat(256), ServerObservationCollector.boundedEntityName(emoji.repeat(257)),
+				"entity name truncation preserves complete Unicode code points");
+		return 9;
 	}
 
 	public static void main(String[] args) {

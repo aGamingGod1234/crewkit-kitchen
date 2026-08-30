@@ -83,7 +83,7 @@ public final class AgentControlScreen extends Screen {
 	private String selectedSavedGroupName = "";
 	private String feedback = "";
 	private boolean feedbackError;
-	private boolean selectNewlySummonedAgent;
+	private PendingSummon pendingSummon;
 	private int liveScroll;
 	private boolean compactGroupComposer;
 	private Page page = Page.OVERVIEW;
@@ -110,13 +110,12 @@ public final class AgentControlScreen extends Screen {
 		this.parent = parent;
 		this.page = initialPage;
 		AgentControlClient.Preferences preferences = AgentControlClient.preferences();
-		provider = preferences.provider();
-		model = preferences.model();
-		if (!AgentControlCatalog.models(provider).contains(model)) model = AgentControlCatalog.defaultModel(provider);
-		reasoning = preferences.reasoning();
-		if (!AgentControlCatalog.reasoningEfforts(provider, model).contains(reasoning)) {
-			reasoning = AgentControlCatalog.defaultReasoning(provider, model);
-		}
+		CreateSelection normalized = normalizeCreateSelection(
+				preferences.provider(), preferences.model(), preferences.reasoning(), serviceTier);
+		provider = normalized.provider();
+		model = normalized.model();
+		reasoning = normalized.reasoning();
+		serviceTier = normalized.serviceTier();
 		AgentControlClient.snapshot().ifPresent(this::replaceSnapshot);
 	}
 
@@ -131,6 +130,7 @@ public final class AgentControlScreen extends Screen {
 	public void acceptSnapshot(AgentControlSnapshot nextSnapshot) {
 		AgentControlSnapshot previous = snapshot;
 		AgentControlSnapshot checkedSnapshot = Objects.requireNonNull(nextSnapshot, "nextSnapshot must not be null");
+		normalizeCreateSelection();
 		List<AgentRosterEntry> candidateEntries = rosterEntries(checkedSnapshot);
 		Map<String, AgentVisualIdentity.Resolved> candidateVisuals = rosterVisuals(checkedSnapshot);
 		managementSelection.reconcile(checkedSnapshot.agents());
@@ -143,18 +143,9 @@ public final class AgentControlScreen extends Screen {
 		if (previous != null && snapshot.generatedAtEpochMs() > previous.generatedAtEpochMs() && !feedbackError) {
 			feedback = "";
 		}
-		if (selectNewlySummonedAgent) {
-			for (AgentControlAgent agent : snapshot.agents()) {
-				boolean existed = previous != null && previous.agents().stream()
-						.anyMatch(item -> item.agentId().equals(agent.agentId()));
-				if (!existed) {
-					selectAgent(agent.agentId());
-					selectNewlySummonedAgent = false;
-					page = Page.OVERVIEW;
-					feedback = "";
-					break;
-				}
-			}
+		if (pendingSummon != null && previous != null
+				&& snapshot.generatedAtEpochMs() > previous.generatedAtEpochMs()) {
+			reconcilePendingSummon();
 		}
 		if (!AgentControlLayout.rosterFiltersVisible(snapshot.agents().size())) {
 			setRosterFilterWithoutRebuild(AgentRosterFilter.all());
@@ -793,6 +784,7 @@ public final class AgentControlScreen extends Screen {
 	}
 
 	private void initCreate() {
+		normalizeCreateSelection();
 		AgentControlLayout layout = layout();
 		int x = layout.contentLeft();
 		int width = layout.contentWidth();
@@ -821,7 +813,6 @@ public final class AgentControlScreen extends Screen {
 					reasoning = value;
 					rememberPreferences();
 				}));
-		if (!AgentControlCatalog.serviceTiers(provider, model).contains(serviceTier)) serviceTier = "priority";
 		if (AgentControlCatalog.hasSpeedMode(provider, model)) {
 			addRenderableWidget(new ConsoleCycleButton<>(font, x + half + GAP, y, half, ROW_HEIGHT,
 					Component.literal("Speed mode"), AgentControlCatalog.serviceTiers(provider, model), serviceTier,
@@ -1290,12 +1281,21 @@ public final class AgentControlScreen extends Screen {
 	private void submitSummon() {
 		try {
 			name = nameInput.getValue();
-			selectNewlySummonedAgent = true;
-			send(AgentControlCommandBuilder.summon(provider, model, reasoning, serviceTier, name, gameMode),
-					"Creating agent...");
+			String command = AgentControlCommandBuilder.summon(
+					provider, model, reasoning, serviceTier, name, gameMode);
+			boolean sent = send(command, "Creating agent...");
+			pendingSummon = sent ? PendingSummon.start(
+					snapshot == null ? Set.of() : snapshot.agents().stream()
+							.map(AgentControlAgent::agentId).collect(java.util.stream.Collectors.toSet()),
+					provider,
+					model,
+					reasoning,
+					name.strip().replaceAll("\\s+", " "),
+					2
+			).orElse(null) : null;
 			rememberPreferences();
 		} catch (IllegalArgumentException exception) {
-			selectNewlySummonedAgent = false;
+			pendingSummon = null;
 			setFeedback(exception.getMessage(), true);
 		}
 	}
@@ -1365,9 +1365,13 @@ public final class AgentControlScreen extends Screen {
 				"Removing " + agent.displayName() + "...");
 	}
 
-	private void send(String command, String pendingMessage) {
-		if (AgentControlClient.sendCommand(command)) setFeedback(pendingMessage + " Awaiting server update.", false);
-		else setFeedback("Not connected to a compatible server", true);
+	private boolean send(String command, String pendingMessage) {
+		if (AgentControlClient.sendCommand(command)) {
+			setFeedback(pendingMessage + " Awaiting server update.", false);
+			return true;
+		}
+		setFeedback("Not connected to a compatible server", true);
+		return false;
 	}
 
 	private void show(Page next) {
@@ -1389,6 +1393,49 @@ public final class AgentControlScreen extends Screen {
 
 	private void rememberPreferences() {
 		AgentControlClient.rememberPreferences(provider, model, reasoning);
+	}
+
+	private void normalizeCreateSelection() {
+		AgentControlClient.Preferences remembered = AgentControlClient.preferences();
+		CreateSelection normalized = normalizeCreateSelection(
+				remembered.provider(), remembered.model(), remembered.reasoning(), serviceTier);
+		provider = normalized.provider();
+		model = normalized.model();
+		reasoning = normalized.reasoning();
+		serviceTier = normalized.serviceTier();
+		if (AgentControlClient.catalogAuthoritative()) rememberPreferences();
+	}
+
+	private void reconcilePendingSummon() {
+		List<AgentControlAgent> matches = pendingSummon.matches(snapshot.agents());
+		if (matches.size() == 1) {
+			selectAgent(matches.getFirst().agentId());
+			pendingSummon = null;
+			page = Page.OVERVIEW;
+			feedback = "";
+			return;
+		}
+		pendingSummon = matches.isEmpty() ? pendingSummon.afterMiss().orElse(null) : null;
+	}
+
+	static CreateSelection normalizeCreateSelection(
+			String provider,
+			String model,
+			String reasoning,
+			String serviceTier
+	) {
+		List<String> providers = AgentControlCatalog.providers();
+		String normalizedProvider = providers.contains(provider) ? provider : providers.getFirst();
+		List<String> models = AgentControlCatalog.models(normalizedProvider);
+		String normalizedModel = models.contains(model)
+				? model : AgentControlCatalog.defaultModel(normalizedProvider);
+		List<String> efforts = AgentControlCatalog.reasoningEfforts(normalizedProvider, normalizedModel);
+		String normalizedReasoning = efforts.contains(reasoning)
+				? reasoning : AgentControlCatalog.defaultReasoning(normalizedProvider, normalizedModel);
+		List<String> tiers = AgentControlCatalog.serviceTiers(normalizedProvider, normalizedModel);
+		String normalizedTier = tiers.contains(serviceTier) ? serviceTier
+				: tiers.contains("priority") ? "priority" : tiers.getFirst();
+		return new CreateSelection(normalizedProvider, normalizedModel, normalizedReasoning, normalizedTier);
 	}
 
 	private AgentControlAgent selectedAgent() {
@@ -1611,6 +1658,55 @@ public final class AgentControlScreen extends Screen {
 		if (font.width(value) <= available) return value;
 		String suffix = "...";
 		return font.plainSubstrByWidth(value, Math.max(1, available - font.width(suffix))) + suffix;
+	}
+
+	record CreateSelection(String provider, String model, String reasoning, String serviceTier) {
+	}
+
+	record PendingSummon(
+			Set<String> existingAgentIds,
+			String provider,
+			String model,
+			String reasoning,
+			String friendlyName,
+			int remainingSnapshots
+	) {
+		PendingSummon {
+			existingAgentIds = Set.copyOf(existingAgentIds);
+			Objects.requireNonNull(provider, "provider must not be null");
+			Objects.requireNonNull(model, "model must not be null");
+			Objects.requireNonNull(reasoning, "reasoning must not be null");
+			friendlyName = Objects.requireNonNullElse(friendlyName, "");
+			if (friendlyName.isBlank()) throw new IllegalArgumentException("friendlyName must not be blank");
+			if (remainingSnapshots < 1) throw new IllegalArgumentException("remainingSnapshots must be positive");
+		}
+
+		static Optional<PendingSummon> start(
+				Set<String> existingAgentIds,
+				String provider,
+				String model,
+				String reasoning,
+				String friendlyName,
+				int remainingSnapshots
+		) {
+			String checkedName = Objects.requireNonNullElse(friendlyName, "");
+			return checkedName.isBlank() ? Optional.empty() : Optional.of(new PendingSummon(
+					existingAgentIds, provider, model, reasoning, checkedName, remainingSnapshots));
+		}
+
+		List<AgentControlAgent> matches(List<AgentControlAgent> agents) {
+			return agents.stream()
+					.filter(agent -> !existingAgentIds.contains(agent.agentId()))
+					.filter(agent -> agent.provider().equals(provider) && agent.model().equals(model)
+							&& agent.reasoning().equals(reasoning))
+					.filter(agent -> friendlyName.isBlank() || agent.friendlyName().equals(friendlyName))
+					.toList();
+		}
+
+		Optional<PendingSummon> afterMiss() {
+			return remainingSnapshots == 1 ? Optional.empty() : Optional.of(new PendingSummon(
+					existingAgentIds, provider, model, reasoning, friendlyName, remainingSnapshots - 1));
+		}
 	}
 
 	private enum Page {

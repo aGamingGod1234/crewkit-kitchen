@@ -4,13 +4,25 @@ import dev.agaminggod.arenaagents.client.navigation.GridPosition;
 import dev.agaminggod.arenaagents.client.navigation.PathNode;
 import dev.agaminggod.arenaagents.client.navigation.PathOutcome;
 import dev.agaminggod.arenaagents.client.navigation.TraversalType;
+import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.level.Level;
 
 public final class NavigationProgressVerification {
 	private NavigationProgressVerification() {
 	}
 
 	public static int verify() {
+		ElapsedTimeAccumulator elapsed = new ElapsedTimeAccumulator(1_000L);
+		assertEquals(500L, elapsed.advance(1_500L), "navigation elapsed time advances normally");
+		assertEquals(500L, elapsed.advance(900L), "navigation elapsed time survives wall-clock rollback");
+		ElapsedTimeAccumulator overflowElapsed = new ElapsedTimeAccumulator(Long.MIN_VALUE);
+		assertEquals(Long.MAX_VALUE, overflowElapsed.advance(Long.MAX_VALUE),
+				"navigation elapsed time saturates timestamp overflow");
+		assertTrue(ServerNavigationController.remainsInDimension(Level.OVERWORLD, Level.OVERWORLD),
+				"navigation remains valid in its starting dimension");
+		assertTrue(!ServerNavigationController.remainsInDimension(Level.OVERWORLD, Level.NETHER),
+				"navigation rejects the same coordinates after a dimension change");
 		new ServerNavigationController(new net.minecraft.world.phys.Vec3(1.0D, 64.0D, 1.0D), 0.01D, false, 0L, 1_000L);
 		WaypointProgress progress = new WaypointProgress(10.0D, 1_000L, 4_000L, 3);
 
@@ -47,6 +59,18 @@ public final class NavigationProgressVerification {
 		assertEquals(WaypointProgress.Decision.REPLAN, nextWaypoint.observe(20.0D, false, 5_100L).decision(),
 				"the new waypoint stall deadline is measured from its activation");
 
+		WaypointProgress rollbackProgress = new WaypointProgress(10.0D, 1_000L, 300L, 1);
+		assertEquals(WaypointProgress.Decision.CONTINUE, rollbackProgress.observe(10.0D, false, 1_200L).decision(),
+				"waypoint stall time accumulates before rollback");
+		assertEquals(WaypointProgress.Decision.CONTINUE, rollbackProgress.observe(10.0D, false, 900L).decision(),
+				"clock rollback does not manufacture a waypoint stall");
+		assertEquals(WaypointProgress.Decision.REPLAN, rollbackProgress.observe(10.0D, false, 1_000L).decision(),
+				"waypoint stall time resumes from the corrected clock");
+		WaypointProgress overflowProgress = new WaypointProgress(10.0D, Long.MIN_VALUE, 1L, 1);
+		assertEquals(WaypointProgress.Decision.REPLAN,
+				overflowProgress.observe(10.0D, false, Long.MAX_VALUE).decision(),
+				"overflowing waypoint time saturates as elapsed");
+
 		assertTrue(ServerNavigationController.satisfiesDestinationTolerance(1.0D, 1.0D),
 				"the requested tolerance includes its exact boundary");
 		assertTrue(!ServerNavigationController.satisfiesDestinationTolerance(1.01D, 1.0D),
@@ -68,15 +92,15 @@ public final class NavigationProgressVerification {
 				"an intermediate drop completes at its landing height");
 		assertTrue(ServerNavigationController.shouldRetryPlanning(
 				PathOutcome.NODE_LIMIT,
-				true, 1_000L, 0L, 10_000L),
+				true, 1_000L, 10_000L),
 				"scheduler-contended planning remains retryable beyond three ticks");
 		assertTrue(!ServerNavigationController.shouldRetryPlanning(
 				PathOutcome.NODE_LIMIT,
-				true, 10_000L, 0L, 10_000L),
+				true, 10_000L, 10_000L),
 				"bounded planning retry stops at the navigation deadline");
 		assertTrue(!ServerNavigationController.shouldRetryPlanning(
 				PathOutcome.NO_PATH,
-				false, 1_000L, 0L, 10_000L),
+				false, 1_000L, 10_000L),
 				"a genuine no-path result remains terminal");
 
 		Vec3 exactDestination = new Vec3(5.1D, 64.1D, 7.9D);
@@ -126,7 +150,7 @@ public final class NavigationProgressVerification {
 		longWaterPath.add(new PathNode(new GridPosition(5, 64, 0), TraversalType.WALK));
 		assertTrue(!ServerNavigationController.hasBoundedShallowWaterRun(longWaterPath, position -> position.x() > 0),
 				"a five-block swim is rejected instead of silently enabling open-water navigation");
-		return 37;
+		return 46;
 	}
 
 	private static void assertBounded(double value) {

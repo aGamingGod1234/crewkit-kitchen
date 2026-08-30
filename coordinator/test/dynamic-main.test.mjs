@@ -8,7 +8,7 @@ import test from 'node:test';
 import { AgentRegistry, DynamicAgentState } from '../src/agent-registry.mjs';
 import { AgentPlanner } from '../src/agent-planner.mjs';
 import { ControlLatencyRegistry } from '../src/control-latency-registry.mjs';
-import { createDynamicCoordinator, normalizeDynamicConfig, resolveDynamicCliRuntime } from '../src/dynamic-main.mjs';
+import { createDynamicCoordinator, normalizeDynamicConfig, resolveDynamicCliRuntime, startVoiceWorker } from '../src/dynamic-main.mjs';
 import { PlanningScheduler } from '../src/planning-scheduler.mjs';
 import { ProviderService } from '../src/provider-service.mjs';
 import { validateProtocolV2Payload } from '../src/protocol-v2.mjs';
@@ -154,6 +154,36 @@ test('coordinator binds the Minecraft bridge without eagerly starting a provider
 		await Promise.allSettled([starting]);
 		await coordinator.stop();
 	}
+});
+
+test('concurrent coordinator stop callers await the same provider cleanup', async () => {
+	const bridge = new FakeBridge();
+	const provider = new FakeProvider();
+	let releaseStop;
+	const stopGate = new Promise((resolve) => { releaseStop = resolve; });
+	let stopEntered = false;
+	provider.stop = async () => {
+		stopEntered = true;
+		await stopGate;
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, codexService: provider },
+	);
+	await coordinator.start();
+
+	const first = coordinator.stop();
+	await eventually(() => stopEntered);
+	let secondResolved = false;
+	const second = coordinator.stop().then(() => { secondResolved = true; });
+	const sharedStopPromise = coordinator.stop() === first;
+	await new Promise((resolve) => setImmediate(resolve));
+	const resolvedBeforeCleanup = secondResolved;
+	releaseStop();
+	await Promise.all([first, second]);
+
+	assert.equal(resolvedBeforeCleanup, false);
+	assert.equal(sharedStopPromise, true);
 });
 
 test('an empty ready roster does not initialize providers through bootstrap catalog discovery', async () => {
@@ -4421,6 +4451,69 @@ test('dynamic config rejects an ephemeral voice port that the addon cannot disco
 		voice: { port: 0 },
 		codex: { launchProfile: { model: 'gpt-5.6-sol', reasoningEffort: 'high', serviceTier: 'fast' } },
 	}, {}), /voice\.port must be an integer between 1 and 65535/);
+});
+
+test('transient local STT warmup failure recovers within one bounded retry', async () => {
+	const servers = [];
+	let warmups = 0;
+	const provider = {
+		async warmup() {
+			warmups += 1;
+			return { sttReady: warmups > 1, ttsReady: true };
+		},
+		async transcribe() { return { transcript: 'recovered locally' }; },
+		async synthesize() { return { audio: Buffer.from('local') }; },
+		async close() {},
+	};
+	const dependencies = {
+		platform: 'linux',
+		async createLocalSpeechProvider() { return provider; },
+		async loadProfileStore() { return { store: { resolve() { return null; } } }; },
+		createVoiceServer(options) {
+			servers.push(options);
+			return { async start() {}, async close() {} };
+		},
+	};
+	const config = { bridge: { secret: 'voice-test-secret' }, voice: { secret: 'dedicated-voice-test-secret' } };
+	const recovered = await startVoiceWorker(config, {}, dependencies);
+	try {
+		await recovered.warmup();
+		assert.equal(warmups, 2);
+		assert.deepEqual(await servers[0].sttProvider.transcribe({ audio: Buffer.from('audio') }), { transcript: 'recovered locally' });
+	} finally {
+		await recovered.close();
+	}
+});
+
+test('persistent local STT warmup failure retries once then preserves healthy local TTS', async () => {
+	let warmups = 0;
+	const servers = [];
+	const localProvider = {
+		async warmup() { warmups += 1; return { sttReady: false, ttsReady: true }; },
+		async transcribe() { throw new Error('failed local STT must not remain active'); },
+		async synthesize() { return { audio: Buffer.from('healthy local TTS') }; },
+		async close() {},
+	};
+	const worker = await startVoiceWorker({ bridge: { secret: 'voice-test-secret' }, voice: { secret: 'dedicated-voice-test-secret' } }, {}, {
+		platform: 'linux',
+		async createLocalSpeechProvider() { return localProvider; },
+		async loadProfileStore() { return { store: { resolve() { return null; } } }; },
+		createVoiceServer(options) {
+			servers.push(options);
+			return { async start() {}, async close() {} };
+		},
+	});
+	try {
+		await worker.warmup();
+		assert.equal(warmups, 2, 'a local-only failed channel gets one bounded startup retry');
+		assert.deepEqual(await servers[0].provider.synthesize({}), { audio: Buffer.from('healthy local TTS') });
+		await assert.rejects(
+			servers[0].sttProvider.transcribe({}),
+			(error) => error?.code === 'STT_UNAVAILABLE',
+		);
+	} finally {
+		await worker.close();
+	}
 });
 
 test('dynamic coordinator forwards protocol audit to its constructed bridge', () => {

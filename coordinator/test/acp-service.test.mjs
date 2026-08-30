@@ -170,6 +170,29 @@ test('ACP transport loss clears the owning session and coalesces one exact repla
 	await service.stop();
 });
 
+test('ACP transport loss during session creation does not install a dead agent', async () => {
+	class ExitDuringSessionStartTransport extends FakeAcpTransport {
+		async request(method, params) {
+			const response = await super.request(method, params);
+			if (method === 'session/new') {
+				this.emit('exit', Object.assign(new Error('ACP exited during session creation'), { code: 'PROCESS_EXITED' }));
+			}
+			return response;
+		}
+	}
+
+	const transport = new ExitDuringSessionStartTransport(options());
+	const service = new AcpProviderService(
+		{ provider: 'gemini', cwd: 'C:\\workspace', models: ['auto', 'gemini-pro'] },
+		{ transportFactory: () => transport },
+	);
+	const selected = { agentId: 'gemini-startup-loss', provider: 'gemini', model: 'gemini-pro', reasoningEffort: 'high' };
+	await assert.rejects(service.createAgent(selected), (error) => error?.code === 'PROVIDER_UNAVAILABLE');
+	assert.equal(service.getAgent(selected.agentId), null);
+	assert.equal(transport.started, false);
+	await service.stop();
+});
+
 test('ACP transport loss rejects an in-flight response that arrives after invalidation', async () => {
 	let releasePrompt;
 	const transport = new FakeAcpTransport(options());
@@ -277,6 +300,22 @@ test('ACP cancellation is a notification and unsupported profile values fail clo
 	const agent = await service.createAgent({ agentId: 'good', provider: 'gemini', model: 'auto', reasoningEffort: 'high' });
 	agent.interrupt();
 	assert.equal(transport.calls.at(-1).method, 'session/cancel');
+	await service.stop();
+});
+
+test('ACP cancellation remains bounded when the transport cannot send session cancel', async () => {
+	const transport = new FakeAcpTransport(options());
+	let releasePrompt;
+	transport.promptGate = new Promise((resolve) => { releasePrompt = resolve; });
+	transport.notify = () => { throw Object.assign(new Error('transport already stopped'), { code: 'TRANSPORT_NOT_RUNNING' }); };
+	const service = new AcpProviderService({ provider: 'gemini', cwd: 'C:\\workspace' }, { transportFactory: () => transport });
+	const agent = await service.createAgent({ agentId: 'cancel-race', provider: 'gemini', model: 'auto', reasoningEffort: 'high' });
+	const controller = new AbortController();
+	const decision = agent.decide('authoritative state', { goalRevision: 0, signal: controller.signal });
+
+	controller.abort();
+	releasePrompt();
+	await assert.rejects(decision, (error) => error?.code === 'STALE_PLAN');
 	await service.stop();
 });
 

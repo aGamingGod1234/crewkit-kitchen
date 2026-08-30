@@ -46,8 +46,12 @@ export class FactLedger {
 		if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return;
 		if (source === 'observation') {
 			const world = objectValue(payload.world);
-			const tick = safeTick(world.gameTime, this.#lastTick + 1);
+			let tick = safeTick(world.gameTime, this.#lastTick + 1);
 			const dimension = safeText(world.dimension ?? world.dimensionId, this.#lastDimension, 128);
+			if (this.#revision > 0 && (dimension !== this.#lastDimension || tick < this.#lastTick)) {
+				this.reset();
+				tick = safeTick(world.gameTime, 1);
+			}
 			this.#lastTick = Math.max(this.#lastTick, tick);
 			this.#lastDimension = dimension;
 			this.#ingestObservation(payload, tick, dimension);
@@ -71,7 +75,7 @@ export class FactLedger {
 		if (Object.keys(vitals).length > 0) this.#addStructured('observation:vitals', { player: vitals }, 'observation', tick, dimension, 40, 1);
 
 		const inventory = objectValue(payload.inventory);
-		const inventoryFact = compactObject(inventory, ['selectedSlot', 'selectedItemId', 'selectedItemCount']);
+		const inventoryFact = compactObject(inventory, ['selectedItem', 'selectedSlot', 'selectedItemId', 'selectedItemCount']);
 		if (Array.isArray(inventory.items)) {
 			inventoryFact.items = inventory.items.slice(0, 16).map((item) => compactObject(objectValue(item), ['itemId', 'count'])).filter((item) => Object.keys(item).length > 0);
 		}
@@ -80,22 +84,26 @@ export class FactLedger {
 		const weather = compactObject(objectValue(payload.world), ['raining', 'thundering']);
 		if (Object.keys(weather).length > 0) this.#addStructured('observation:world', { weather }, 'observation', tick, dimension, 200, 0.7);
 
-		const hostiles = Array.isArray(payload.entities) ? payload.entities
-			.filter((entity) => entity?.hostile === true)
+		const nearbyEntities = Array.isArray(payload.entities) ? [...payload.entities]
 			.sort((left, right) => entityDistanceSquared(left) - entityDistanceSquared(right)
 				|| entityIdentity(left).localeCompare(entityIdentity(right)))
 			.slice(0, 3) : [];
-		for (const entity of hostiles) {
-			const hostile = compactObject({
-				stableId: entity.stableId ?? entity.uuid,
-				typeId: entity.typeId ?? entity.type,
-				distanceSquared: entityDistanceSquared(entity),
+		for (const entityValue of nearbyEntities) {
+			const entity = objectValue(entityValue);
+			const nearby = compactObject({
+				uuid: entity.uuid ?? entity.stableId,
+				type: entity.type ?? entity.typeId,
+				name: entity.name,
+				distance: Number.isFinite(entity.distance) ? entity.distance
+					: Number.isFinite(entity.distanceSquared) && entity.distanceSquared >= 0 ? Math.sqrt(entity.distanceSquared) : undefined,
 				health: entity.health,
 				maxHealth: entity.maxHealth,
-			}, ['stableId', 'typeId', 'distanceSquared', 'health', 'maxHealth']);
-			if (Object.keys(hostile).length === 0) continue;
-			const identity = safeText(hostile.stableId ?? hostile.typeId, `nearby:${++this.#sequence}`, 128);
-			this.#addStructured(`observation:hostile:${identity}`, { hostile }, 'observation', tick, dimension, 60, 0.9);
+			}, ['uuid', 'type', 'name', 'distance', 'health', 'maxHealth']);
+			const position = compactNumbers(objectValue(entity.position), ['x', 'y', 'z']);
+			if (Object.keys(position).length === 3) nearby.position = position;
+			if (Object.keys(nearby).length === 0) continue;
+			const identity = safeText(nearby.uuid ?? nearby.type, `nearby:${++this.#sequence}`, 128);
+			this.#addStructured(`observation:entity:${identity}`, { entity: nearby }, 'observation', tick, dimension, 60, 0.9);
 		}
 	}
 

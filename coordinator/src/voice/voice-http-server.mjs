@@ -267,7 +267,7 @@ export function createVoiceHttpServer({
 			if (!response.headersSent) respondAuthenticatedJson(response, statusFor(error), {
 				code: String(error?.code ?? 'TTS_ERROR').slice(0, 64),
 				message: String(error?.message ?? error).slice(0, 256),
-			}, secret, authentication.nonce);
+			}, secret, authentication.nonce, retryAfterHeaders(error));
 			if (recordLifecycle) attemptedLifecycle.recordFailure(error);
 		} finally {
 			clearTimeout(timeout);
@@ -835,15 +835,22 @@ function statusFor(error) {
 	return 502;
 }
 
-function respondJson(response, status, value) {
+function respondJson(response, status, value, headers = {}) {
 	const body = Buffer.from(JSON.stringify(value));
-	response.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': body.length });
+	response.writeHead(status, { ...headers, 'Content-Type': 'application/json', 'Content-Length': body.length });
 	response.end(body);
 }
 
-function respondAuthenticatedJson(response, status, value, secret, requestNonce) {
+function retryAfterHeaders(error) {
+	if (error?.code !== 'STT_RATE_LIMITED' && error?.code !== 'TTS_RATE_LIMITED') return {};
+	const value = typeof error?.retryAfter === 'string' ? error.retryAfter.trim() : '';
+	return /^\d{1,6}$/.test(value) ? { 'Retry-After': value } : {};
+}
+
+function respondAuthenticatedJson(response, status, value, secret, requestNonce, headers = {}) {
 	respondAuthenticatedBytes(
 		response, status, Buffer.from(JSON.stringify(value)), 'application/json', secret, requestNonce,
+		headers,
 	);
 }
 

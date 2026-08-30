@@ -6,7 +6,10 @@ import dev.agaminggod.arenaagents.agent.AgentGameMode;
 import dev.agaminggod.arenaagents.agent.AgentRecord;
 import dev.agaminggod.arenaagents.server.AgentSavedData;
 import dev.agaminggod.arenaagents.server.CodexAgentManager;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerCombatController;
 import dev.agaminggod.arenaagents.server.runtime.controller.ServerController;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerItemPickupController;
+import dev.agaminggod.arenaagents.server.runtime.controller.ServerNavigationController;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputState;
 import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
 import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
@@ -80,6 +83,52 @@ public final class ServerActionExecutorVerification {
 		assertEquals("terminal-result", retainedCleanup.complete(() -> { }),
 				"executor finish publishes only the first retained result after cleanup succeeds");
 		assertFalse(retainedCleanup.hasPending(), "successful retry releases the cleanup handle");
+
+		ServerActionExecutor.CleanupRetry<String> permanentCleanup = new ServerActionExecutor.CleanupRetry<>();
+		permanentCleanup.retain("terminal-result");
+		for (int attempt = 1; attempt <= ServerActionExecutor.MAX_CLEANUP_ATTEMPTS; attempt++) {
+			assertThrows(IllegalStateException.class, () -> permanentCleanup.complete(() -> {
+				throw new IllegalStateException("input sink unavailable");
+			}), "permanent input-sink cleanup failure remains contained");
+			assertEquals(attempt, permanentCleanup.failureCount(), "cleanup failure attempts are counted deterministically");
+		}
+		assertTrue(permanentCleanup.exhausted(ServerActionExecutor.MAX_CLEANUP_ATTEMPTS),
+				"permanent cleanup failure reaches the quarantine boundary");
+		assertTrue(permanentCleanup.hasPending(), "quarantine preserves the original terminal result for diagnosis");
+
+		ServerActionExecutor.TerminalPublication<String> publication =
+				new ServerActionExecutor.TerminalPublication<>("terminal-result");
+		AtomicInteger publicationPreparations = new AtomicInteger();
+		AtomicInteger publicationAttempts = new AtomicInteger();
+		assertThrows(IllegalStateException.class, () -> publication.publish(
+				publicationPreparations::incrementAndGet,
+				result -> {
+					publicationAttempts.incrementAndGet();
+					throw new IllegalStateException("first publication failed");
+				}
+		), "terminal sink failure remains retryable");
+		assertTrue(publication.hasPending(), "terminal result remains pending after sink failure");
+		assertEquals(1, publicationPreparations.get(), "terminal result is prepared once before delivery");
+		assertTrue(publication.publish(
+				publicationPreparations::incrementAndGet,
+				result -> publicationAttempts.incrementAndGet()
+		), "terminal result publishes after the sink recovers");
+		assertEquals(1, publicationPreparations.get(), "terminal retry does not repeat local completion effects");
+		assertEquals(2, publicationAttempts.get(), "terminal retry reaches the sink again");
+		assertFalse(publication.hasPending(), "successful terminal publication closes the retry state");
+		assertTrue(publication.publish(
+				publicationPreparations::incrementAndGet,
+				result -> publicationAttempts.incrementAndGet()
+		), "completed terminal publication is idempotent");
+		assertEquals(2, publicationAttempts.get(), "completed terminal publication does not call the sink twice");
+
+		ElapsedTimeAccumulator elapsed = new ElapsedTimeAccumulator(1_000L);
+		assertEquals(100L, elapsed.advance(1_100L), "elapsed time advances with the wall clock");
+		assertEquals(100L, elapsed.advance(900L), "clock rollback does not subtract elapsed duration");
+		assertEquals(150L, elapsed.advance(950L), "elapsed time resumes from the corrected clock value");
+		ElapsedTimeAccumulator overflowElapsed = new ElapsedTimeAccumulator(Long.MIN_VALUE);
+		assertEquals(Long.MAX_VALUE, overflowElapsed.advance(Long.MAX_VALUE),
+				"timestamp subtraction overflow saturates instead of becoming zero");
 
 		ResourceLeaseManager leases = new ResourceLeaseManager();
 		AgentId owner = AgentId.random();
@@ -178,6 +227,15 @@ public final class ServerActionExecutorVerification {
 				"cancellation rejects a newer goal revision");
 		assertFalse(ServerActionExecutor.matchesCancellation(cancellationTarget, 7L, "action-8"),
 				"cancellation rejects a different action identity");
+		assertDoesNotThrow(() -> cleanupWaitAction(cancellationTarget),
+				"action cleanup touches only resources owned by the action");
+		assertDoesNotThrow(() -> new ServerNavigationController(
+				Vec3.ZERO, 1.0D, false, 0L, 1_000L).cancel(null),
+				"navigation without an acquired lease does not clear unrelated player input");
+		assertDoesNotThrow(() -> uninitializedCombatController().cancel(null),
+				"combat without acquired leases does not clear unrelated player input");
+		assertDoesNotThrow(() -> uninitializedItemPickupController().cancel(null),
+				"item pickup without acquired navigation does not clear unrelated player input");
 		assertTrue(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 4L),
 				"respawn completion remains valid only for its coordinator generation");
 		assertFalse(ServerActionExecutor.isCurrentCoordinatorGeneration(4L, 5L),
@@ -236,6 +294,8 @@ public final class ServerActionExecutorVerification {
 		assertEquals("ACTION_EXCEPTION", ServerActionExecutor.failureReason(new IllegalStateException("broken")),
 				"unexpected runtime exceptions remain isolated");
 		verifySetupFailureDoesNotClaimPhysicalExecution();
+		verifySetupFailurePublicationRetries();
+		verifyPermanentCleanupQuarantines();
 		assertEquals(0, ServerActionExecutor.roundRobinStart(0L, 16),
 				"round-robin starts with the first active agent");
 		assertEquals(1, ServerActionExecutor.roundRobinStart(1L, 16),
@@ -248,7 +308,7 @@ public final class ServerActionExecutorVerification {
 			assertFalse(admitted[start], "round-robin does not admit an agent twice before the full turn");
 			admitted[start] = true;
 		}
-		return 58;
+		return 107;
 	}
 
 	private static void verifyDisconnectedControlNeutralizesLease() {
@@ -347,6 +407,121 @@ public final class ServerActionExecutorVerification {
 		assertFalse(result.physicalAttempted(), "setup failure does not claim a physical attempt");
 	}
 
+	private static void verifySetupFailurePublicationRetries() {
+		CodexAgentManager manager = uninitializedManager();
+		AgentRecord agent = manager.registry().create(
+				"codex", "gpt-5.6-sol", "high", Optional.of("PublicationRetryTarget"), AgentGameMode.SURVIVAL, 2_000L
+		);
+		manager.startSubjective(agent.agentId().toString(), "Retry a terminal result");
+		manager.registry().setAutomaticProgress(agent.agentId(), false, 2_001L);
+		ActionProvenance provenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-publication", 1L,
+				"step-publication", 1L, "trace-publication"
+		);
+		JsonObject arguments = new JsonObject();
+		arguments.addProperty("durationMs", 1L);
+		ServerActionRequest request = new ServerActionRequest(
+				agent.agentId(), agent.goalRevision() + 1L, "action-publication", ActionType.WAIT,
+				arguments, provenance, "trace-publication"
+		);
+		AtomicInteger attempts = new AtomicInteger();
+		List<ServerActionResult> delivered = new ArrayList<>();
+		ServerActionExecutor executor = new ServerActionExecutor(manager, result -> {
+			if (attempts.incrementAndGet() == 1) throw new IllegalStateException("coordinator unavailable");
+			delivered.add(result);
+		});
+
+		executor.submitProgramPrimitive(request);
+		assertEquals(1, attempts.get(), "setup terminal result makes its first publication attempt");
+		assertEquals("ACTION_REJECTED", executor.lastResult(agent.agentId()).reasonCode(),
+				"failed publication retains the exact terminal result");
+		assertThrows(AgentDomainException.class, () -> executor.submitProgramPrimitive(request),
+				"pending terminal publication fences physical resubmission");
+
+		executor.tick();
+		assertEquals(2, attempts.get(), "executor tick retries the terminal sink");
+		assertEquals(1, delivered.size(), "recovered terminal sink receives one result");
+		executor.tick();
+		assertEquals(2, attempts.get(), "delivered terminal result is not published again");
+	}
+
+	@SuppressWarnings("unchecked")
+	private static void verifyPermanentCleanupQuarantines() {
+		CodexAgentManager manager = uninitializedManager();
+		AgentRecord agent = manager.registry().create(
+				"codex", "gpt-5.6-sol", "high", Optional.of("CleanupQuarantineTarget"), AgentGameMode.SURVIVAL, 3_000L
+		);
+		manager.startSubjective(agent.agentId().toString(), "Exercise cleanup quarantine");
+		manager.registry().setAutomaticProgress(agent.agentId(), false, 3_001L);
+		ActionProvenance provenance = new ActionProvenance(
+				"codex", "gpt-5.6-sol", "high", "priority", "program-cleanup", 1L,
+				"step-cleanup", 1L, "trace-cleanup"
+		);
+		ServerActionRequest request = new ServerActionRequest(
+				agent.agentId(), agent.goalRevision() + 1L, "action-cleanup", ActionType.SELECT_TOOL,
+				new JsonObject(), provenance, "trace-cleanup"
+		);
+		AtomicInteger cleanupAttempts = new AtomicInteger();
+		ServerTransactionAdapter.ActiveTransaction transaction = new ServerTransactionAdapter.ActiveTransaction() {
+			@Override
+			public ServerTransactionAdapter.TickResult tick(long nowEpochMs) {
+				return ServerTransactionAdapter.TickResult.succeeded("TOOL_SELECTED", "selected");
+			}
+
+			@Override
+			public void cancel(String reason) {
+			}
+
+			@Override
+			public void cleanup() {
+				if (cleanupAttempts.incrementAndGet() <= ServerActionExecutor.MAX_CLEANUP_ATTEMPTS) {
+					throw new IllegalStateException("input sink unavailable");
+				}
+			}
+		};
+		List<ServerActionResult> results = new ArrayList<>();
+		ServerActionExecutor executor = new ServerActionExecutor(manager, results::add);
+		try {
+			Class<?> actionClass = Class.forName(ServerActionExecutor.class.getName() + "$ActiveAction");
+			var factory = actionClass.getDeclaredMethod(
+					"transaction", ServerActionRequest.class, net.minecraft.server.level.ServerPlayer.class,
+					ServerTransactionAdapter.ActiveTransaction.class);
+			factory.setAccessible(true);
+			Object action = factory.invoke(null, request, null, transaction);
+			Field activeField = ServerActionExecutor.class.getDeclaredField("active");
+			activeField.setAccessible(true);
+			((Map<AgentId, Object>) activeField.get(executor)).put(agent.agentId(), action);
+			var resultMethod = actionClass.getDeclaredMethod(
+					"result", ServerActionState.class, String.class, String.class, long.class);
+			resultMethod.setAccessible(true);
+			ServerActionResult original = (ServerActionResult) resultMethod.invoke(
+					action, ServerActionState.SUCCEEDED, "TOOL_SELECTED", "selected", 3_100L);
+			var finish = ServerActionExecutor.class.getDeclaredMethod("finish", actionClass, ServerActionResult.class);
+			finish.setAccessible(true);
+			for (int attempt = 0; attempt < ServerActionExecutor.MAX_CLEANUP_ATTEMPTS; attempt++) {
+				finish.invoke(executor, action, original);
+			}
+			assertEquals(ServerActionExecutor.MAX_CLEANUP_ATTEMPTS, cleanupAttempts.get(),
+					"input cleanup reaches the bounded quarantine threshold");
+			assertEquals(1, results.size(), "cleanup quarantine publishes one terminal failure");
+			assertEquals("ACTION_CLEANUP_FAILED", results.getFirst().reasonCode(),
+					"cleanup quarantine replaces a misleading success result");
+			assertEquals(List.of(), executor.activeRequests(),
+					"terminally failed cleanup is no longer advertised as a running action");
+			assertThrows(AgentDomainException.class, () -> executor.submitProgramPrimitive(request),
+					"quarantine fences another physical action while cleanup is unsafe");
+
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not exercise permanent cleanup quarantine", exception);
+		}
+		executor.tick();
+		assertEquals(ServerActionExecutor.MAX_CLEANUP_ATTEMPTS + 1, cleanupAttempts.get(),
+				"quarantined cleanup retries the retained physical release until it recovers");
+		assertEquals(List.of(), executor.activeRequests(), "quarantined action leaves the active execution set");
+		assertDoesNotThrow(() -> executor.submitProgramPrimitive(request),
+				"successful retained cleanup automatically clears the action quarantine");
+	}
+
 	private static CodexAgentManager uninitializedManager() {
 		try {
 			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
@@ -361,6 +536,43 @@ public final class ServerActionExecutorVerification {
 		}
 	}
 
+	private static void cleanupWaitAction(ServerActionRequest request) {
+		try {
+			Class<?> actionClass = Class.forName(ServerActionExecutor.class.getName() + "$ActiveAction");
+			var waitFor = actionClass.getDeclaredMethod(
+					"waitFor", ServerActionRequest.class, net.minecraft.server.level.ServerPlayer.class, long.class);
+			waitFor.setAccessible(true);
+			Object action = waitFor.invoke(null, request, null, 1L);
+			var cleanup = actionClass.getDeclaredMethod("cleanup");
+			cleanup.setAccessible(true);
+			cleanup.invoke(action);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not exercise action-owned cleanup", exception);
+		}
+	}
+
+	private static ServerCombatController uninitializedCombatController() {
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+			return (ServerCombatController) unsafe.allocateInstance(ServerCombatController.class);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not allocate combat cleanup probe", exception);
+		}
+	}
+
+	private static ServerItemPickupController uninitializedItemPickupController() {
+		try {
+			Field field = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+			field.setAccessible(true);
+			sun.misc.Unsafe unsafe = (sun.misc.Unsafe) field.get(null);
+			return (ServerItemPickupController) unsafe.allocateInstance(ServerItemPickupController.class);
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not allocate item-pickup cleanup probe", exception);
+		}
+	}
+
 	private static void assertEquals(Object expected, Object actual, String label) {
 		if (!expected.equals(actual)) throw new AssertionError(label + ": expected <" + expected + "> but was <" + actual + ">");
 	}
@@ -371,6 +583,14 @@ public final class ServerActionExecutorVerification {
 
 	private static void assertFalse(boolean value, String label) {
 		if (value) throw new AssertionError(label);
+	}
+
+	private static void assertDoesNotThrow(Runnable action, String label) {
+		try {
+			action.run();
+		} catch (Throwable throwable) {
+			throw new AssertionError(label + " threw " + throwable.getClass().getSimpleName(), throwable);
+		}
 	}
 
 	private static void assertThrows(Class<? extends Throwable> type, Runnable action, String label) {

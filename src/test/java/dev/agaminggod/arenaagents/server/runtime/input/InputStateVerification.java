@@ -16,8 +16,14 @@ public final class InputStateVerification {
 		int assertions = 0;
 		assertions += verifyCompleteInputState();
 		assertions += verifyLeasePreemptionAndRestoration();
+		assertions += verifyNavigationReplacementDoesNotRestoreReleasedInput();
+		assertions += verifyOwnedReleasePreservesSystemLease();
 		assertions += verifyClearReleasesEveryPressedInput();
+		assertions += verifyFailedApplyRemainsRetryable();
+		assertions += verifyFailedReleaseRemainsRetryable();
+		assertions += verifyFailedPreemptingReleaseRemainsRetryable();
 		assertions += verifyLeaseDeadman();
+		assertions += verifyFailedDeadmanRemainsRetryable();
 		assertions += verifyExactHandUseDriver();
 		assertions += verifyBoundedMotor();
 		return assertions;
@@ -59,6 +65,28 @@ public final class InputStateVerification {
 		return 3;
 	}
 
+	private static int verifyNavigationReplacementDoesNotRestoreReleasedInput() {
+		RecordingSink sink = new RecordingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease previous = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		AgentInputState previousState = state(1.0F, false, false);
+		controller.apply(previous, previousState);
+
+		controller.release(previous);
+		InputLease replacement = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		AgentInputState replacementState = state(0.0F, false, true);
+		controller.apply(replacement, replacementState);
+		controller.release(replacement);
+
+		assertEquals(true, controller.currentState(AGENT).isEmpty(),
+				"completed navigation replacement leaves no input lease active");
+		assertEquals(List.of(previousState, replacementState), sink.applied,
+				"replacement never restores movement from the released navigation lease");
+		assertEquals(List.of(AGENT, AGENT), sink.cleared,
+				"replanning and completion both release physical input");
+		return 3;
+	}
+
 	private static int verifyClearReleasesEveryPressedInput() {
 		RecordingSink sink = new RecordingSink();
 		LeasedServerInputController controller = new LeasedServerInputController(sink);
@@ -72,6 +100,100 @@ public final class InputStateVerification {
 		assertEquals(List.of(AGENT), sink.cleared, "clear reaches the physical sink once");
 		assertThrows(() -> controller.apply(lease, state(1.0F, true, true)), "cleared lease cannot affect a respawned player");
 		return 3;
+	}
+
+	private static int verifyOwnedReleasePreservesSystemLease() {
+		RecordingSink sink = new RecordingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease navigation = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		AgentInputState walking = state(1.0F, false, false);
+		controller.apply(navigation, walking);
+		InputLease safety = controller.acquire(AGENT, InputOwner.SYSTEM, 1_000);
+		AgentInputState escaping = state(1.0F, false, true);
+		controller.apply(safety, escaping);
+
+		controller.release(navigation);
+		assertEquals(escaping, controller.currentState(AGENT).orElseThrow(),
+				"action-owned release preserves the system lease");
+		assertEquals(List.of(walking, escaping), sink.applied,
+				"releasing a preempted action lease does not disturb physical system input");
+		controller.release(safety);
+		assertEquals(List.of(AGENT), sink.cleared, "system input clears only when its own lease releases");
+		return 3;
+	}
+
+	private static int verifyFailedApplyRemainsRetryable() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease lease = controller.acquire(AGENT, InputOwner.INTERACTION, 300);
+		AgentInputState requested = state(1.0F, true, false);
+		long revisionAfterAcquire = controller.mutationRevision();
+
+		sink.failNextApply();
+		assertThrows(() -> controller.apply(lease, requested), "failed physical apply is reported");
+		assertEquals(true, controller.currentState(AGENT).isEmpty(),
+				"failed physical apply does not become the current state");
+		assertEquals(revisionAfterAcquire, controller.mutationRevision(),
+				"failed physical apply does not advance the mutation revision");
+
+		controller.apply(lease, requested);
+		assertEquals(2, sink.applyAttempts, "identical apply retries the physical transition");
+		assertEquals(requested, controller.currentState(AGENT).orElseThrow(),
+				"successful retry becomes the current state");
+		assertEquals(revisionAfterAcquire + 1L, controller.mutationRevision(),
+				"successful apply advances the mutation revision once");
+		return 6;
+	}
+
+	private static int verifyFailedReleaseRemainsRetryable() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease lease = controller.acquire(AGENT, InputOwner.INTERACTION, 300);
+		AgentInputState applied = state(0.0F, false, true);
+		controller.apply(lease, applied);
+		long revisionBeforeRelease = controller.mutationRevision();
+
+		sink.failNextClear();
+		assertThrows(() -> controller.release(lease), "failed physical release is reported");
+		assertEquals(applied, controller.currentState(AGENT).orElseThrow(),
+				"failed physical release keeps the successful current state");
+		assertEquals(revisionBeforeRelease, controller.mutationRevision(),
+				"failed physical release does not advance the mutation revision");
+
+		controller.release(lease);
+		assertEquals(2, sink.clearAttempts, "release retries the physical transition with the same lease");
+		assertEquals(true, controller.currentState(AGENT).isEmpty(),
+				"successful release removes the current state");
+		assertEquals(revisionBeforeRelease + 1L, controller.mutationRevision(),
+				"successful release advances the mutation revision once");
+		return 6;
+	}
+
+	private static int verifyFailedPreemptingReleaseRemainsRetryable() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease navigation = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		AgentInputState walking = state(1.0F, false, false);
+		controller.apply(navigation, walking);
+		InputLease combat = controller.acquire(AGENT, InputOwner.COMBAT, 200);
+		AgentInputState attacking = state(0.0F, true, false);
+		controller.apply(combat, attacking);
+		long revisionBeforeRelease = controller.mutationRevision();
+
+		sink.failNextApply();
+		assertThrows(() -> controller.release(combat), "failed restoration apply is reported");
+		assertEquals(attacking, controller.currentState(AGENT).orElseThrow(),
+				"failed restoration keeps the preempting lease authoritative");
+		assertEquals(revisionBeforeRelease, controller.mutationRevision(),
+				"failed restoration does not advance the mutation revision");
+
+		controller.release(combat);
+		assertEquals(4, sink.applyAttempts, "release retries restoring the lower-priority physical state");
+		assertEquals(walking, controller.currentState(AGENT).orElseThrow(),
+				"successful retry restores the lower-priority lease");
+		assertEquals(revisionBeforeRelease + 1L, controller.mutationRevision(),
+				"successful preempting release advances the mutation revision once");
+		return 6;
 	}
 
 	private static int verifyLeaseDeadman() {
@@ -96,6 +218,31 @@ public final class InputStateVerification {
 		}
 		assertEquals(true, controller.currentState(AGENT).isPresent(), "regular input application renews the lease");
 		return 7;
+	}
+
+	private static int verifyFailedDeadmanRemainsRetryable() {
+		FailingSink sink = new FailingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease lease = controller.acquire(AGENT, InputOwner.INTERACTION, 300);
+		AgentInputState applied = state(1.0F, true, true);
+		controller.apply(lease, applied);
+		for (long tick = 1; tick < LeasedServerInputController.LEASE_TIMEOUT_TICKS; tick++) controller.tick();
+		long revisionBeforeExpiration = controller.mutationRevision();
+
+		sink.failNextClear();
+		assertThrows(controller::tick, "failed deadman neutralization is reported");
+		assertEquals(applied, controller.currentState(AGENT).orElseThrow(),
+				"failed deadman neutralization keeps the lease retryable");
+		assertEquals(revisionBeforeExpiration, controller.mutationRevision(),
+				"failed deadman neutralization does not advance the mutation revision");
+
+		controller.tick();
+		assertEquals(2, sink.clearAttempts, "the next server tick retries deadman neutralization");
+		assertEquals(true, controller.currentState(AGENT).isEmpty(),
+				"successful deadman retry removes the expired lease");
+		assertEquals(revisionBeforeExpiration + 1L, controller.mutationRevision(),
+				"successful deadman retry advances the mutation revision once");
+		return 6;
 	}
 
 	private static int verifyExactHandUseDriver() {
@@ -361,6 +508,39 @@ public final class InputStateVerification {
 		@Override
 		public void clear(AgentId agentId, AgentInputState previous) {
 			cleared.add(agentId);
+		}
+	}
+
+	private static final class FailingSink implements InputStateSink {
+		private int applyAttempts;
+		private int clearAttempts;
+		private boolean failApply;
+		private boolean failClear;
+
+		private void failNextApply() {
+			failApply = true;
+		}
+
+		private void failNextClear() {
+			failClear = true;
+		}
+
+		@Override
+		public void apply(AgentId agentId, AgentInputState previous, AgentInputState state) {
+			applyAttempts++;
+			if (failApply) {
+				failApply = false;
+				throw new IllegalStateException("physical apply failed");
+			}
+		}
+
+		@Override
+		public void clear(AgentId agentId, AgentInputState previous) {
+			clearAttempts++;
+			if (failClear) {
+				failClear = false;
+				throw new IllegalStateException("physical clear failed");
+			}
 		}
 	}
 

@@ -85,6 +85,26 @@ function profile(provider, overrides = {}) {
 	};
 }
 
+function manualTimeouts() {
+	const timeouts = [];
+	return {
+		options: {
+			scheduleTimeout(callback) {
+				const timeout = { active: true, callback, unref() {} };
+				timeouts.push(timeout);
+				return timeout;
+			},
+			cancelTimeout(timeout) { timeout.active = false; },
+		},
+		expireNext() {
+			const timeout = timeouts.find((candidate) => candidate.active);
+			assert.ok(timeout, 'a provider timeout must be scheduled');
+			timeout.active = false;
+			timeout.callback();
+		},
+	};
+}
+
 test('provider router defaults legacy profiles to Codex and isolates each backend', async () => {
 	const services = Object.fromEntries(['codex', 'gemini', 'kimi', 'cursor'].map((provider) => [provider, new FakeService(provider)]));
 	const router = new ProviderService(services);
@@ -298,9 +318,13 @@ test('a timed-out provider start is evicted so a later probe starts a fresh gene
 		startCalls += 1;
 		releases.push(resolve);
 	});
-	const router = new ProviderService(services, { operationTimeoutMs: 5 });
+	const timeouts = manualTimeouts();
+	const router = new ProviderService(services, { operationTimeoutMs: 5, ...timeouts.options });
 	try {
-		const first = await router.start(['codex']);
+		const firstAttempt = router.start(['codex']);
+		await new Promise((resolve) => setImmediate(resolve));
+		timeouts.expireNext();
+		const first = await firstAttempt;
 		assert.equal(first[0].status, 'rejected');
 		const secondAttempt = router.start(['codex']);
 		await new Promise((resolve) => setImmediate(resolve));
@@ -308,10 +332,10 @@ test('a timed-out provider start is evicted so a later probe starts a fresh gene
 
 		releases[0]();
 		await new Promise((resolve) => setImmediate(resolve));
-		assert.equal((await Promise.race([
-			secondAttempt.then(() => 'settled'),
-			new Promise((resolve) => setTimeout(() => resolve('pending'), 1)),
-		])), 'pending', 'a late obsolete start cannot resurrect or satisfy the replacement generation');
+		let secondSettled = false;
+		void secondAttempt.then(() => { secondSettled = true; }, () => { secondSettled = true; });
+		await Promise.resolve();
+		assert.equal(secondSettled, false, 'a late obsolete start cannot resurrect or satisfy the replacement generation');
 
 		releases[1]();
 		const second = await secondAttempt;
@@ -637,10 +661,14 @@ test('pruned mutation generations still fence a late timed-out create from the r
 		repairFinished(agent);
 		return agent;
 	};
-	const router = new ProviderService(services, { operationTimeoutMs: 5 });
+	const timeouts = manualTimeouts();
+	const router = new ProviderService(services, { operationTimeoutMs: 5, ...timeouts.options });
 	const selected = profile('codex', { agentId: 'generation-fence' });
 	try {
-		await assert.rejects(router.createAgent(selected), (error) => error?.code === 'PROVIDER_TIMEOUT');
+		const first = router.createAgent(selected);
+		await new Promise((resolve) => setImmediate(resolve));
+		timeouts.expireNext();
+		await assert.rejects(first, (error) => error?.code === 'PROVIDER_TIMEOUT');
 		const replacement = await router.createAgent(selected);
 		assert.equal(replacement.generation, 2);
 

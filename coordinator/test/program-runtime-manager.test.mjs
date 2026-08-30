@@ -63,6 +63,7 @@ function harness(options = {}) {
 		benchmarkRecorder: options.benchmarkRecorder,
 		latencyRegistry: options.latencyRegistry,
 		completionRetryDelayMs: options.completionRetryDelayMs,
+		completionRetryLimit: options.completionRetryLimit,
 		setTimeoutFn: options.setTimeoutFn,
 		clearTimeoutFn: options.clearTimeoutFn,
 	});
@@ -230,10 +231,12 @@ test('clears a scheduled completion retry before a newer publication and correct
 
 test('reports a permanent completion protocol rejection without retrying forever', async () => {
 	const timers = [];
+	let attempts = 0;
 	const run = harness({
 		setTimeoutFn: (callback) => { timers.push(callback); return { unref() {} }; },
 		clearTimeoutFn() {},
 		onCompletionRequested: () => {
+			attempts += 1;
 			throw Object.assign(new Error('invalid completion payload'), {
 				code: 'COMPLETION_SEND_FAILED',
 				cause: Object.assign(new Error('invalid payload'), { code: 'INVALID_PAYLOAD' }),
@@ -247,6 +250,76 @@ test('reports a permanent completion protocol rejection without retrying forever
 	assert.equal(timers.length, 0);
 	assert.equal(run.errors.length, 1);
 	assert.equal(run.errors[0].error.code, 'COMPLETION_SEND_FAILED');
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(attempts, 1, 'fresh facts do not retry a permanent protocol rejection');
+});
+
+test('caps retryable completion publication attempts', async () => {
+	const timers = [];
+	let attempts = 0;
+	const run = harness({
+		completionRetryDelayMs: 1_000,
+		completionRetryLimit: 2,
+		setTimeoutFn: (callback) => {
+			const timer = { callback, unref() {} };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeoutFn() {},
+		onCompletionRequested: () => {
+			attempts += 1;
+			throw Object.assign(new Error('bridge unavailable'), { code: 'BRIDGE_NOT_READY' });
+		},
+	});
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("done");',
+	}, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(timers.length, 1);
+	timers[0].callback();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(timers.length, 2);
+	timers[1].callback();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(attempts, 3, 'the initial publication receives only two retries');
+	assert.equal(timers.length, 2, 'exhaustion cannot schedule another timer');
+	assert.equal(run.errors.at(-1)?.error.code, 'COMPLETION_PUBLICATION_EXHAUSTED');
+});
+
+test('fresh authoritative facts rearm completion publication after retry exhaustion', async () => {
+	const timers = [];
+	let attempts = 0;
+	let recovered = false;
+	const run = harness({
+		completionRetryDelayMs: 1_000,
+		completionRetryLimit: 1,
+		setTimeoutFn: (callback) => {
+			const timer = { callback, unref() {} };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeoutFn() {},
+		onCompletionRequested: () => {
+			attempts += 1;
+			if (!recovered) throw Object.assign(new Error('bridge unavailable'), { code: 'BRIDGE_NOT_READY' });
+		},
+	});
+	await run.manager.installDecision(run.registry.get('agent-a'), {
+		directive: 'replace', source: 'program.onUnhandledAttention("continue_and_notify"); program.finish("done");',
+	}, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	timers[0].callback();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(attempts, 2);
+	assert.equal(timers.length, 1);
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 1 });
+	assert.equal(attempts, 2, 'duplicate facts cannot rearm exhausted publication');
+	recovered = true;
+	await run.manager.onObservation(run.registry.get('agent-a'), { observation: observation(), eventSequence: 2 });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(attempts, 3, 'one fresh observation starts one new publication attempt');
+	assert.equal(timers.length, 1, 'successful rearm does not create another retry timer');
 });
 
 test('retains the planning trace through factual completion verification', async () => {
@@ -666,7 +739,7 @@ test('wires full watcher provenance and preserves the exact profile on reactive 
 	assert.equal(watcher.provenance.watcherId, 'watcher-0');
 });
 
-test('cancel-send rejection keeps an unmatched urgent wake active for recovery and fences late results', async () => {
+test('cancel-send rejection keeps the old action fenced until its terminal result arrives', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const sent = [];
 	const errors = [];
@@ -685,8 +758,55 @@ test('cancel-send rejection keeps an unmatched urgent wake active for recovery a
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 	assert.equal(recoveries.length, 1);
 	assert.equal(sent.filter((message) => message.type === 'action_cancel').length, 1);
-	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3 }), false);
+	assert.equal(manager.isActionResultStale(registry.get('agent-a'), { actionId: active.actionId }), false);
+	assert.equal(sent.filter((message) => message.type === 'action_command').length, 1,
+		'unconfirmed cancellation cannot overlap the old server action with replacement work');
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), {
+		actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3,
+	}), true);
 	assert.equal(errors.at(-1)?.code, 'CANCEL_UNAVAILABLE');
+});
+
+test('a missing cancellation acknowledgement retries without forgetting the old action fence', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const sent = [];
+	const timers = [];
+	const recoveries = [];
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: { send: async (type, agentId, payload) => sent.push({ type, agentId, payload }) },
+		planner: { requestPlan: async () => ({ directive: 'continue' }) },
+		requestRecovery: (request) => recoveries.push(request),
+		cancellationAckTimeoutMs: 25,
+		setTimeoutFn: (callback, delay) => {
+			const timer = { callback, delay, cleared: false, unref() {} };
+			timers.push(timer);
+			return timer;
+		},
+		clearTimeoutFn: (timer) => { timer.cleared = true; },
+	});
+	await manager.installDecision(registry.get('agent-a'), {
+		directive: 'replace',
+		source: 'program.onUnhandledAttention("pause_and_notify"); await player.wait(1);',
+	}, { observation: observation(), eventSequence: 1 });
+	const active = sent[0].payload;
+	await manager.onObservation(registry.get('agent-a'), {
+		observation: observation(), eventSequence: 2, attention: true, priority: 'urgent', trigger: 'damage',
+	});
+	assert.equal(timers.length, 1);
+	assert.equal(timers[0].delay, 25);
+	timers[0].callback();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(manager.isActionResultStale(registry.get('agent-a'), { actionId: active.actionId }), false);
+	assert.equal(sent.filter((message) => message.type === 'action_cancel').length, 2);
+	assert.equal(sent.filter((message) => message.type === 'action_command').length, 1,
+		'watchdog expiry cannot authorize overlapping replacement work');
+	for (let attempt = 0; attempt < 5 && recoveries.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(recoveries.length, 1);
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), {
+		actionId: active.actionId, state: 'CANCELLED', reasonCode: 'WATCHDOG_RETRY', eventSequence: 3,
+	}), true);
 });
 
 test('replans from bounded failed-action context instead of pausing after a repeated deterministic failure', async () => {
@@ -994,7 +1114,9 @@ test('urgent attention interrupts stale ordinary reactive planning before instal
 	assert.equal(errors.length, 0);
 });
 
-test('measures one thousand watcher branches with the real monotonic clock', async () => {
+test('measures one thousand watcher branches with the real monotonic clock', {
+	skip: process.env.CI ? 'host timing benchmark runs outside shared CI' : false,
+}, async () => {
 	const registry = new AgentRegistry();
 	for (const agentId of ['agent-a', 'agent-b', 'agent-c', 'agent-d']) registry.register(record(agentId));
 	const latencies = new ControlLatencyRegistry({ windowSize: 1_000 });
@@ -1122,6 +1244,38 @@ test('disposes an old goal program so late action results cannot advance it', as
 	assert.equal(run.sent.at(-1).type, 'action_cancel');
 	await run.manager.onActionResult(run.registry.get('agent-a'), { actionId: first.payload.actionId, state: 'SUCCEEDED', reasonCode: 'LATE' });
 	assert.equal(run.sent.filter((message) => message.type === 'action_command').length, 1);
+});
+
+test('late cancel rejection from a disposed runtime cannot mutate the replacement goal', async () => {
+	const registry = new AgentRegistry(); registry.register(record());
+	const errors = [];
+	let rejectCancel;
+	const manager = new ProgramRuntimeManager({
+		registry,
+		bridge: {
+			send: async (type) => {
+				if (type === 'action_cancel') return new Promise((_resolve, reject) => { rejectCancel = reject; });
+			},
+		},
+		planner: { requestPlan: async () => ({ directive: 'continue' }) },
+		reportError: (_agentId, error) => errors.push(error),
+	});
+	await manager.installDecision(registry.get('agent-a'), { directive: 'replace', source: SOURCE }, { observation: observation(), eventSequence: 1 });
+	await new Promise((resolve) => setImmediate(resolve));
+	manager.dispose('agent-a');
+	const replacementFields = { originalRequest: 'wait somewhere else', predicate: { type: 'operator_confirmed' }, createdAtTick: 2 };
+	registry.applyGoalControl('agent-a', {
+		operation: 'steer',
+		goalRevision: 2,
+		goal: replacementFields.originalRequest,
+		goalSpec: { ...replacementFields, fingerprint: goalSpecFingerprint(replacementFields) },
+		updatedAtEpochMs: 2,
+	});
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.STARTING);
+	rejectCancel(Object.assign(new Error('late cancellation failure'), { code: 'BRIDGE_DISCONNECTED' }));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(registry.get('agent-a').state, DynamicAgentState.STARTING);
+	assert.deepEqual(errors, []);
 });
 
 test('does not turn an ordinary active-action observation into unmatched attention', async () => {

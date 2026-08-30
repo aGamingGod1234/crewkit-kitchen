@@ -77,15 +77,56 @@ test('structured ingestion accepts the live protocol-v2 observation shape', () =
 	ledger.ingest('observation', {
 		position: { x: 1, y: 65, z: 2 },
 		player: { health: 12, maxHealth: 20, foodLevel: 8, saturation: 1, armor: 4 },
-		inventory: { selectedSlot: 2, selectedItemId: 'minecraft:iron_sword', selectedItemCount: 1, items: [] },
+		inventory: { selectedItem: 'minecraft:iron_sword', items: [] },
 		world: { dimension: 'minecraft:the_nether', gameTime: 300, raining: false, thundering: false },
-		entities: [{ uuid: 'zombie-2', type: 'minecraft:zombie', distance: 4, hostile: true, health: 10, maxHealth: 20 }],
+		entities: [{
+			uuid: 'zombie-2', type: 'minecraft:zombie', name: 'Zombie', distance: 4,
+			position: { x: 4, y: 65, z: 2 },
+		}],
 	});
 	const rendered = ledger.toPlannerFacts();
 	assert.match(rendered, /foodLevel/);
+	assert.match(rendered, /minecraft:iron_sword/);
 	assert.match(rendered, /minecraft:zombie/);
-	assert.match(rendered, /distanceSquared/);
+	assert.doesNotMatch(rendered, /hostile/);
 	assert.match(rendered, /minecraft:the_nether/);
+});
+
+test('fact ledger replaces stale world facts when dimension or world time moves backward', () => {
+	const ledger = new FactLedger();
+	ledger.ingest('observation', {
+		position: { x: 1, y: 65, z: 2 },
+		player: { health: 20 },
+		inventory: { selectedItem: 'minecraft:stone_sword', items: [] },
+		world: { dimension: 'minecraft:overworld', gameTime: 1_000 },
+		entities: [{ uuid: 'old-zombie', type: 'minecraft:zombie', name: 'Old zombie', distance: 2, position: { x: 2, y: 65, z: 2 } }],
+	});
+	const oldCursor = ledger.delta(null).nextRevision;
+
+	ledger.ingest('observation', {
+		position: { x: 9, y: 70, z: 9 },
+		player: { health: 18 },
+		inventory: { selectedItem: 'minecraft:diamond_pickaxe', items: [] },
+		world: { dimension: 'minecraft:the_nether', gameTime: 5 },
+		entities: [{ uuid: 'new-piglin', type: 'minecraft:piglin', name: 'Piglin', distance: 3, position: { x: 12, y: 70, z: 9 } }],
+	});
+
+	const rendered = ledger.toPlannerFacts();
+	assert.match(rendered, /minecraft:diamond_pickaxe/);
+	assert.match(rendered, /minecraft:piglin/);
+	assert.doesNotMatch(rendered, /minecraft:stone_sword|minecraft:zombie/);
+	assert.ok(ledger.snapshot().every((entry) => entry.dimension === 'minecraft:the_nether'));
+	assert.equal(ledger.delta(oldCursor).fullBaseline, true);
+
+	ledger.ingest('observation', {
+		position: { x: 10, y: 70, z: 10 },
+		player: { health: 17 },
+		inventory: { selectedItem: 'minecraft:golden_sword', items: [] },
+		world: { dimension: 'minecraft:the_nether', gameTime: 1 },
+		entities: [],
+	});
+	assert.match(ledger.toPlannerFacts(), /minecraft:golden_sword/);
+	assert.ok(ledger.snapshot().every((entry) => entry.tick === 1));
 });
 
 test('fact ledger projects keyed upserts and replacement deltas from a revision cursor', () => {

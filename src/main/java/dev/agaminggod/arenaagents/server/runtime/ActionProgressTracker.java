@@ -6,7 +6,7 @@ final class ActionProgressTracker {
 	private final long stallTimeoutMs;
 	private final double initialDistance;
 	private double bestDistance;
-	private long lastProgressAt;
+	private ElapsedTimeAccumulator timeWithoutProgress;
 
 	ActionProgressTracker(double initialDistance, long startedAtEpochMs, long stallTimeoutMs) {
 		if (!Double.isFinite(initialDistance) || initialDistance < 0.0D) {
@@ -17,7 +17,7 @@ final class ActionProgressTracker {
 		}
 		this.initialDistance = initialDistance;
 		this.bestDistance = initialDistance;
-		this.lastProgressAt = startedAtEpochMs;
+		this.timeWithoutProgress = new ElapsedTimeAccumulator(startedAtEpochMs);
 		this.stallTimeoutMs = stallTimeoutMs;
 	}
 
@@ -27,10 +27,10 @@ final class ActionProgressTracker {
 		}
 		if (distance + MINIMUM_PROGRESS_BLOCKS < bestDistance) {
 			bestDistance = distance;
-			lastProgressAt = nowEpochMs;
+			timeWithoutProgress = new ElapsedTimeAccumulator(nowEpochMs);
 			return false;
 		}
-		return Math.max(0L, nowEpochMs - lastProgressAt) >= stallTimeoutMs;
+		return timeWithoutProgress.advance(nowEpochMs) >= stallTimeoutMs;
 	}
 
 	double progress(double distance) {

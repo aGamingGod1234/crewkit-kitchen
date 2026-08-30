@@ -48,6 +48,7 @@ public final class ServerObservationCollector {
 	public static final int MAX_NEARBY_TRANSACTION_TARGETS = 16;
 	public static final int MAX_OBSERVATION_TAGS = 32;
 	public static final int MAX_TAG_COUNT_ENTRIES = 128;
+	private static final int MAX_ENTITY_NAME_CODE_POINTS = 256;
 	private static final int SPATIAL_CACHE_CAPACITY = 16;
 	/** Spatial block/container scans are expensive; movement and view changes still invalidate the key immediately. */
 	private static final long SPATIAL_CACHE_TICKS = 10L;
@@ -439,7 +440,7 @@ public final class ServerObservationCollector {
 					JsonObject json = new JsonObject();
 					json.addProperty("uuid", entity.getUUID().toString());
 					json.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString());
-					json.addProperty("name", entity.getName().getString());
+					json.addProperty("name", boundedEntityName(entity.getName().getString()));
 					json.addProperty("distance", finite(agent.distanceTo(entity)));
 					json.add("position", vector(entity.position()));
 					if (entity instanceof ServerPlayer player) {
@@ -603,6 +604,13 @@ public final class ServerObservationCollector {
 
 	private static double finite(double value) {
 		return Double.isFinite(value) ? value : 0.0D;
+	}
+
+	static String boundedEntityName(String value) {
+		Objects.requireNonNull(value, "value must not be null");
+		int codePointCount = value.codePointCount(0, value.length());
+		if (codePointCount <= MAX_ENTITY_NAME_CODE_POINTS) return value;
+		return value.substring(0, value.offsetByCodePoints(0, MAX_ENTITY_NAME_CODE_POINTS));
 	}
 
 	private static RawPlayerState rawPlayerState(ServerPlayer agent) {

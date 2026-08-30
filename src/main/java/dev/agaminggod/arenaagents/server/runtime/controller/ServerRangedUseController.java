@@ -3,6 +3,7 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 import com.google.gson.JsonObject;
 import dev.agaminggod.arenaagents.agent.AgentDomainException;
 import dev.agaminggod.arenaagents.server.perception.ObservationVisibility;
+import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
 import dev.agaminggod.arenaagents.server.runtime.ServerProtectionPolicy;
 import dev.agaminggod.arenaagents.server.runtime.transaction.ServerTransactionAdapter;
 import dev.agaminggod.arenaagents.server.runtime.transaction.UseConfirmation;
@@ -28,7 +29,7 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 	private final LivingEntity target;
 	private final InteractionHand hand;
 	private final ItemStack bow;
-	private final long createdAt;
+	private final ElapsedTimeAccumulator elapsedTime;
 	private final long drawDurationMs;
 	private final long timeoutMs;
 	private final int entityIdBaseline;
@@ -60,7 +61,7 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 		if (!canStartBowUse(!player.getProjectile(bow).isEmpty(), player.hasInfiniteMaterials())) {
 			throw new AgentDomainException("PROJECTILE_REQUIRED", "Vanilla bow use requires an owned arrow");
 		}
-		this.createdAt = System.currentTimeMillis();
+		this.elapsedTime = new ElapsedTimeAccumulator(System.currentTimeMillis());
 		this.drawDurationMs = arguments.get("drawDurationMs").getAsLong();
 		this.timeoutMs = arguments.get("timeoutMs").getAsLong();
 		this.entityIdBaseline = globalEntityIdBaseline(player.level());
@@ -70,7 +71,7 @@ public final class ServerRangedUseController implements ServerTransactionAdapter
 	public ServerTransactionAdapter.TickResult tick(long nowEpochMs) {
 		ServerTransactionAdapter.TickResult existing = terminal.terminalResult();
 		if (existing != null) return existing;
-		long elapsed = Math.max(0L, nowEpochMs - createdAt);
+		long elapsed = elapsedTime.advance(nowEpochMs);
 		if (elapsed >= timeoutMs) {
 			return finish(ServerTransactionAdapter.TickResult.timedOut(
 					"RANGED_USE_TIMED_OUT", "No newly spawned owned arrow was observed before timeout"));

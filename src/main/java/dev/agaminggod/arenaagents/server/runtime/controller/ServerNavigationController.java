@@ -6,15 +6,17 @@ import dev.agaminggod.arenaagents.client.navigation.PathNode;
 import dev.agaminggod.arenaagents.client.navigation.PathOutcome;
 import dev.agaminggod.arenaagents.client.navigation.PathPlan;
 import dev.agaminggod.arenaagents.client.navigation.TraversalType;
-import dev.agaminggod.arenaagents.server.OfflineAgentPlayers;
 import dev.agaminggod.arenaagents.protocol.ProtocolConstants;
+import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputRuntime;
 import dev.agaminggod.arenaagents.server.runtime.input.AgentInputStates;
 import dev.agaminggod.arenaagents.server.runtime.input.InputLease;
 import dev.agaminggod.arenaagents.server.runtime.input.InputOwner;
 import dev.agaminggod.arenaagents.server.runtime.input.LeasedServerInputController;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.InteractionHand;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
 import java.util.List;
@@ -38,8 +40,8 @@ public final class ServerNavigationController implements ServerController {
 	private final Vec3 destination;
 	private final double tolerance;
 	private final boolean sprint;
-	private final long startedAt;
 	private final long timeoutMs;
+	private final ElapsedTimeAccumulator elapsedTime;
 	private final ServerPathPlanner planner = new ServerPathPlanner();
 	private PathPlan plan;
 	private int waypointIndex;
@@ -48,6 +50,7 @@ public final class ServerNavigationController implements ServerController {
 	private InputLease inputLease;
 	private LeasedServerInputController inputController;
 	private AgentInputStates.MotorState motorState;
+	private ResourceKey<Level> startingDimension;
 
 	public ServerNavigationController(
 			Vec3 destination,
@@ -65,17 +68,25 @@ public final class ServerNavigationController implements ServerController {
 		}
 		this.tolerance = tolerance;
 		this.sprint = sprint;
-		this.startedAt = startedAt;
 		this.timeoutMs = timeoutMs;
+		this.elapsedTime = new ElapsedTimeAccumulator(startedAt);
 	}
 
 	@Override
 	public TickResult tick(ServerPlayer player, long nowEpochMs) {
 		Objects.requireNonNull(player, "player must not be null");
+		ResourceKey<Level> currentDimension = player.level().dimension();
+		if (startingDimension == null) {
+			startingDimension = currentDimension;
+		} else if (!remainsInDimension(startingDimension, currentDimension)) {
+			return fail(player, "ACTION_DIMENSION_CHANGED",
+					"Agent player changed dimension during navigation", currentProgress());
+		}
+		long elapsedMs = elapsedTime.advance(nowEpochMs);
 		if (!player.isAlive()) {
 			return fail(player, "AGENT_DEAD", "Agent player died", currentProgress());
 		}
-		if (Math.max(0L, nowEpochMs - startedAt) >= timeoutMs) {
+		if (elapsedMs >= timeoutMs) {
 			return fail(player, "ACTION_TIMEOUT", "Navigation timed out", currentProgress());
 		}
 		MinecraftNavigationWorld world = new MinecraftNavigationWorld(player.level());
@@ -84,16 +95,16 @@ public final class ServerNavigationController implements ServerController {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
 		if (plan == null) {
-			TickResult planned = replan(player, world, nowEpochMs, remaining, false);
+			TickResult planned = replan(player, world, nowEpochMs, elapsedMs, remaining, false);
 			if (planned != null) return planned;
 		}
 		List<PathNode> nodes = plan.nodes();
 		if (waypointIndex >= nodes.size()) {
-			return replanOrResult(player, world, nowEpochMs, remaining);
+			return replanOrResult(player, world, nowEpochMs, elapsedMs, remaining);
 		}
 		PathNode waypoint = nodes.get(waypointIndex);
 		if (!world.isStandable(waypoint.position())) {
-			TickResult replanned = replan(player, world, nowEpochMs, remaining, true);
+			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, true);
 			if (replanned != null) return replanned;
 			nodes = plan.nodes();
 			waypoint = nodes.get(waypointIndex);
@@ -107,7 +118,7 @@ public final class ServerNavigationController implements ServerController {
 		if (reached) {
 			waypointIndex++;
 			if (waypointIndex >= nodes.size()) {
-				return replanOrResult(player, world, nowEpochMs, remaining);
+				return replanOrResult(player, world, nowEpochMs, elapsedMs, remaining);
 			}
 			waypoint = nodes.get(waypointIndex);
 			finalWaypoint = waypointIndex == nodes.size() - 1;
@@ -118,7 +129,7 @@ public final class ServerNavigationController implements ServerController {
 			return fail(player, "PATH_BLOCKED", "Navigation could not recover from repeated stalls", update.progress());
 		}
 		if (update.decision() == WaypointProgress.Decision.REPLAN) {
-			TickResult replanned = replan(player, world, nowEpochMs, remaining, true);
+			TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, true);
 			if (replanned != null) return replanned;
 			waypoint = plan.nodes().get(waypointIndex);
 			target = targetFor(world, waypoint, waypointIndex == plan.nodes().size() - 1);
@@ -130,13 +141,12 @@ public final class ServerNavigationController implements ServerController {
 	@Override
 	public void cancel(ServerPlayer player) {
 		if (inputLease == null) {
-			OfflineAgentPlayers.stop(player);
 			motorState = null;
 			return;
 		}
 		try {
 			inputController.release(inputLease);
-		} catch (IllegalStateException ignored) {
+		} catch (LeasedServerInputController.StaleInputLeaseException ignored) {
 			// A lifecycle clear may already have invalidated every lease.
 		}
 		inputLease = null;
@@ -148,17 +158,23 @@ public final class ServerNavigationController implements ServerController {
 			ServerPlayer player,
 			MinecraftNavigationWorld world,
 			long nowEpochMs,
+			long elapsedMs,
 			double remaining
 	) {
 		if (satisfiesDestinationTolerance(remaining, tolerance)) {
 			return succeed(player, "DESTINATION_REACHED", "Destination reached");
 		}
-		TickResult replanned = replan(player, world, nowEpochMs, remaining, false);
+		TickResult replanned = replan(player, world, nowEpochMs, elapsedMs, remaining, false);
 		return replanned == null ? TickResult.running(currentProgress()) : replanned;
 	}
 
 	static boolean satisfiesDestinationTolerance(double remaining, double tolerance) {
 		return remaining <= tolerance;
+	}
+
+	static boolean remainsInDimension(ResourceKey<Level> startingDimension, ResourceKey<Level> currentDimension) {
+		return Objects.requireNonNull(startingDimension, "startingDimension must not be null")
+				.equals(Objects.requireNonNull(currentDimension, "currentDimension must not be null"));
 	}
 
 	Vec3 targetFor(PathNode waypoint, boolean finalWaypoint) {
@@ -232,6 +248,7 @@ public final class ServerNavigationController implements ServerController {
 			ServerPlayer player,
 			MinecraftNavigationWorld world,
 			long nowEpochMs,
+			long elapsedMs,
 			double remaining,
 			boolean recovery
 	) {
@@ -260,7 +277,7 @@ public final class ServerNavigationController implements ServerController {
 		for (GridPosition goal : goals) {
 			ServerPathPlanner.PlanningResult planning = planner.planPath(world, start, goal);
 			if (planning.deferred()) {
-				return shouldRetryPlanning(planning.plan().outcome(), true, nowEpochMs, startedAt, timeoutMs)
+				return shouldRetryPlanning(planning.plan().outcome(), true, elapsedMs, timeoutMs)
 						? TickResult.running(currentProgress())
 						: fail(player, "PATH_LIMIT_REACHED", "Path planning exceeded its navigation deadline", currentProgress());
 			}
@@ -274,7 +291,7 @@ public final class ServerNavigationController implements ServerController {
 			pathLimitReached |= planned.outcome() == PathOutcome.NODE_LIMIT || planned.outcome() == PathOutcome.TIME_LIMIT;
 		}
 		if (candidate == null) {
-			if (pathLimitReached && shouldRetryPlanning(PathOutcome.NODE_LIMIT, false, nowEpochMs, startedAt, timeoutMs)) {
+			if (pathLimitReached && shouldRetryPlanning(PathOutcome.NODE_LIMIT, false, elapsedMs, timeoutMs)) {
 				return TickResult.running(currentProgress());
 			}
 			return fail(player, pathLimitReached ? "PATH_LIMIT_REACHED" : "NO_PATH",
@@ -359,19 +376,12 @@ public final class ServerNavigationController implements ServerController {
 	static boolean shouldRetryPlanning(
 			PathOutcome outcome,
 			boolean deferred,
-			long nowEpochMs,
-			long startedAtEpochMs,
+			long elapsedMs,
 			long timeoutMs
 	) {
 		Objects.requireNonNull(outcome, "outcome must not be null");
 		if (!deferred && outcome != PathOutcome.NODE_LIMIT && outcome != PathOutcome.TIME_LIMIT) return false;
-		if (timeoutMs <= 0L) return false;
-		if (nowEpochMs <= startedAtEpochMs) return true;
-		try {
-			return Math.subtractExact(nowEpochMs, startedAtEpochMs) < timeoutMs;
-		} catch (ArithmeticException exception) {
-			return false;
-		}
+		return elapsedMs >= 0L && timeoutMs > 0L && elapsedMs < timeoutMs;
 	}
 
 	private static Vec3 center(GridPosition position) {

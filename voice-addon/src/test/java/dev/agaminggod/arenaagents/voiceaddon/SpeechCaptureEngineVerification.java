@@ -4,6 +4,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.AbstractExecutorService;
@@ -18,6 +19,7 @@ import java.util.concurrent.TimeUnit;
 
 final class SpeechCaptureEngineVerification {
 	private static final UUID PLAYER = UUID.fromString("20000000-0000-4000-8000-000000000001");
+	private static final UUID OTHER_PLAYER = UUID.fromString("20000000-0000-4000-8000-000000000002");
 
 	private SpeechCaptureEngineVerification() {
 	}
@@ -28,8 +30,10 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyAdaptiveEndpointShortensEstablishedUtterances();
 		assertions += verifyInputLatencyReportsOneCompletedUtterance();
 		assertions += verifySilenceFlushesOneOrderedUtterance();
+		assertions += verifyDeliveryContextIsCapturedAtUtteranceStart();
 		assertions += verifyCanceledRunningSilenceTimerCannotFinishNewerAudio();
 		assertions += verifyWhisperChangeSplitsAndSequencesUtterances();
+		assertions += verifyWhisperChangeFlushesBeforeReplacementFailure();
 		assertions += verifyMaximumDurationBoundsDecodedSamples();
 		assertions += verifyMalformedPacketDoesNotWedgeLaterSpeech();
 		assertions += verifyDecoderBackoffIsPerPlayer();
@@ -38,12 +42,61 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyFailedEarlierTranscriptReleasesCompletedSuccessor();
 		assertions += verifyPendingUtteranceCoalescesToLatest();
 		assertions += verifyUnavailableSttRecoversAfterBackoff();
+		assertions += verifyCapacitySttRecoversAfterBackoff();
+		assertions += verifyRateLimitedSttRecoversAfterBackoff();
+		assertions += verifyCapacityBackoffIsolatesOtherPlayers();
+		assertions += verifyRateLimitBackoffIsGlobal();
+		assertions += verifyConcurrentRateLimitsKeepLongestBackoff();
 		assertions += verifyCloseCancelsPendingTranscription();
 		assertions += verifyConsentRevocationCancelsOnlyOwnedSpeech();
 		assertions += verifyDisconnectGenerationStateIsBounded();
 		assertions += verifyCloseDiscardsPartialSpeechAndClosesDecoder();
 		assertions += verifyCloseContinuesAfterDecoderCloseFailure();
 		return assertions;
+	}
+
+	private static int verifyWhisperChangeFlushesBeforeReplacementFailure() {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 5_000L, 32);
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine.TranscriptDelivery delivery = (playerId, text, whispering) ->
+				delivered.add(new Delivered(playerId, text, whispering));
+		engine.accept(PLAYER, false, new byte[] { 4 }, RecordingDecoder::new, Runnable::run, delivery);
+		engine.accept(PLAYER, true, new byte[] { 5 }, () -> {
+			throw new IllegalStateException("decoder unavailable");
+		}, Runnable::run, delivery);
+
+		assertEquals(1, transcriber.captured.size(),
+				"a replacement decoder failure cannot discard the completed prior utterance");
+		assertEquals(List.of(new Delivered(PLAYER, "heard 1", false)), delivered,
+				"the prior utterance is delivered before replacement capture retries");
+		engine.close();
+		return 2;
+	}
+
+	private static int verifyDeliveryContextIsCapturedAtUtteranceStart() throws Exception {
+		RecordingTranscriber transcriber = new RecordingTranscriber();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine(transcriber, scheduler(), 5_000L, 2);
+		List<String> listeners = new ArrayList<>(List.of("near-at-speech-time"));
+		List<List<String>> deliveredTo = new ArrayList<>();
+		int[] contextCaptures = { 0 };
+		SpeechCaptureEngine.TranscriptDeliveryFactory deliveryFactory = () -> {
+			contextCaptures[0]++;
+			List<String> capturedListeners = List.copyOf(listeners);
+			return (playerId, transcript, whispering) -> deliveredTo.add(capturedListeners);
+		};
+
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run, deliveryFactory);
+		listeners.clear();
+		listeners.add("near-after-transcription");
+		engine.accept(PLAYER, false, new byte[] { 2 }, RecordingDecoder::new, Runnable::run, deliveryFactory);
+
+		assertEquals(1, contextCaptures[0], "delivery context is captured once for the utterance");
+		assertEquals(List.of(List.of("near-at-speech-time")), deliveredTo,
+				"listener changes after speech starts cannot reroute its transcript");
+		assertEquals(1, transcriber.captured.size(), "the context spans the complete multi-packet utterance");
+		engine.close();
+		return 3;
 	}
 
 	private static int verifyCanceledRunningSilenceTimerCannotFinishNewerAudio() {
@@ -389,6 +442,127 @@ final class SpeechCaptureEngineVerification {
 	}
 
 	private static int verifyUnavailableSttRecoversAfterBackoff() {
+		return verifySttRecoversAfterBackoff(
+				"STT_UNAVAILABLE", "unavailable", TimeUnit.SECONDS.toNanos(5L)
+		);
+	}
+
+	private static int verifyCapacitySttRecoversAfterBackoff() {
+		return verifySttRecoversAfterBackoff(
+				"STT_CAPACITY", "capacity-limited", TimeUnit.MILLISECONDS.toNanos(250L)
+		);
+	}
+
+	private static int verifyRateLimitedSttRecoversAfterBackoff() {
+		return verifySttRecoversAfterBackoff(
+				"STT_RATE_LIMITED", "rate-limited", TimeUnit.SECONDS.toNanos(1L)
+		);
+	}
+
+	private static int verifyCapacityBackoffIsolatesOtherPlayers() {
+		return verifyPlayerBackoffIsolatesOtherPlayers("STT_CAPACITY", "capacity");
+	}
+
+	private static int verifyRateLimitBackoffIsGlobal() {
+		Map<UUID, CompletableFuture<SpeechWorkerClient.Transcript>> pending = new java.util.LinkedHashMap<>();
+		long[] now = { 0L };
+		SpeechCaptureEngine engine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
+			CompletableFuture<SpeechWorkerClient.Transcript> future = new CompletableFuture<>();
+			pending.put(playerId, future);
+			return future;
+		}, scheduler(), 5_000L, 2, ignored -> { }, () -> now[0]);
+		RecordingDecoder otherDecoder = new RecordingDecoder();
+		List<Delivered> delivered = new ArrayList<>();
+		engine.accept(OTHER_PLAYER, false, new byte[] { 1 }, () -> otherDecoder, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		engine.accept(PLAYER, false, new byte[] { 1, 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		pending.get(PLAYER).completeExceptionally(new VoiceWorkerClient.VoiceWorkerException(
+				"STT_RATE_LIMITED", "Speech provider rate limit", TimeUnit.SECONDS.toNanos(12L)));
+
+		assertEquals(true, otherDecoder.closed,
+				"a provider-global rate limit discards speech captured against the throttled API key");
+		engine.accept(OTHER_PLAYER, false, new byte[] { 2 }, () -> {
+			throw new AssertionError("provider Retry-After must block every player before decoding");
+		}, Runnable::run, (playerId, text, whispering) -> { });
+		now[0] = TimeUnit.SECONDS.toNanos(12L);
+		engine.accept(OTHER_PLAYER, false, new byte[] { 3, 4 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		pending.get(OTHER_PLAYER).complete(new SpeechWorkerClient.Transcript("other player heard", 0.9));
+		assertEquals(List.of(new Delivered(OTHER_PLAYER, "other player heard", false)), delivered,
+				"all players recover when the provider Retry-After deadline expires");
+		assertEquals(2, pending.size(), "the global backoff prevents an extra provider request before recovery");
+		engine.close();
+		return 3;
+	}
+
+	private static int verifyConcurrentRateLimitsKeepLongestBackoff() {
+		Map<UUID, CompletableFuture<SpeechWorkerClient.Transcript>> pending = new java.util.LinkedHashMap<>();
+		int[] transcriptions = { 0 };
+		long[] now = { 0L };
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
+			transcriptions[0]++;
+			CompletableFuture<SpeechWorkerClient.Transcript> future = new CompletableFuture<>();
+			pending.put(playerId, future);
+			return future;
+		}, scheduler(), 5_000L, 1, ignored -> { }, () -> now[0]);
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		engine.accept(OTHER_PLAYER, false, new byte[] { 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+
+		pending.get(PLAYER).completeExceptionally(new VoiceWorkerClient.VoiceWorkerException(
+				"STT_RATE_LIMITED", "long provider rate limit", TimeUnit.SECONDS.toNanos(300L)));
+		pending.get(OTHER_PLAYER).completeExceptionally(new VoiceWorkerClient.VoiceWorkerException(
+				"STT_RATE_LIMITED", "short provider rate limit", TimeUnit.SECONDS.toNanos(1L)));
+		now[0] = TimeUnit.SECONDS.toNanos(1L);
+		engine.accept(PLAYER, false, new byte[] { 3 }, () -> {
+			throw new AssertionError("a later shorter rate limit must not shorten the provider deadline");
+		}, Runnable::run, (playerId, text, whispering) -> { });
+		assertEquals(2, transcriptions[0], "the longest concurrent provider rate limit remains authoritative");
+
+		now[0] = TimeUnit.SECONDS.toNanos(300L);
+		engine.accept(PLAYER, false, new byte[] { 4 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		pending.get(PLAYER).complete(new SpeechWorkerClient.Transcript("recovered", 0.9));
+		assertEquals(3, transcriptions[0], "speech retries when the longest provider deadline expires");
+		assertEquals(List.of(new Delivered(PLAYER, "recovered", false)), delivered,
+				"speech recovers after the retained provider deadline");
+		engine.close();
+		return 3;
+	}
+
+	private static int verifyPlayerBackoffIsolatesOtherPlayers(String failureCode, String label) {
+		Map<UUID, CompletableFuture<SpeechWorkerClient.Transcript>> pending = new java.util.LinkedHashMap<>();
+		long[] now = { 0L };
+		SpeechCaptureEngine engine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
+			CompletableFuture<SpeechWorkerClient.Transcript> future = new CompletableFuture<>();
+			pending.put(playerId, future);
+			return future;
+		}, scheduler(), 5_000L, 2, ignored -> { }, () -> now[0]);
+		RecordingDecoder otherDecoder = new RecordingDecoder();
+		List<Delivered> delivered = new ArrayList<>();
+		engine.accept(OTHER_PLAYER, false, new byte[] { 1 }, () -> otherDecoder, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		engine.accept(PLAYER, false, new byte[] { 1, 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		pending.get(PLAYER).completeExceptionally(new VoiceWorkerClient.VoiceWorkerException(
+				failureCode, "Speech recognition hit a " + label));
+
+		assertEquals(false, otherDecoder.closed,
+				"one player's STT " + label + " response cannot close another player's active decoder");
+		engine.accept(OTHER_PLAYER, false, new byte[] { 2 }, () -> {
+			throw new AssertionError("the unaffected player's decoder must remain active");
+		}, Runnable::run, (playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		pending.get(OTHER_PLAYER).complete(new SpeechWorkerClient.Transcript("other player heard", 0.9));
+		assertEquals(List.of(new Delivered(OTHER_PLAYER, "other player heard", false)), delivered,
+				"the unaffected player completes speech during another player's " + label + " backoff");
+		engine.close();
+		return 2;
+	}
+
+	private static int verifySttRecoversAfterBackoff(String failureCode, String label, long retryBackoffNanos) {
 		int[] transcriptions = { 0 };
 		int[] decoders = { 0 };
 		long[] now = { 0L };
@@ -397,7 +571,7 @@ final class SpeechCaptureEngineVerification {
 			transcriptions[0]++;
 			return transcriptions[0] == 1
 					? CompletableFuture.failedFuture(new VoiceWorkerClient.VoiceWorkerException(
-							"STT_UNAVAILABLE", "Speech recognition is not configured"))
+							failureCode, "Speech recognition is " + label))
 					: CompletableFuture.completedFuture(new SpeechWorkerClient.Transcript("recovered", 0.9));
 		}, scheduler(), 5_000L, 1, ignored -> { }, () -> now[0]);
 		SpeechCaptureEngine.DecoderFactory decoderFactory = () -> {
@@ -409,13 +583,13 @@ final class SpeechCaptureEngineVerification {
 		engine.accept(PLAYER, false, new byte[] { 2 }, () -> {
 			throw new AssertionError("capture must respect the bounded STT backoff");
 		}, Runnable::run, (playerId, text, whispering) -> { });
-		now[0] = TimeUnit.SECONDS.toNanos(5L);
+		now[0] = retryBackoffNanos;
 		engine.accept(PLAYER, false, new byte[] { 3 }, decoderFactory, Runnable::run,
 				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
-		assertEquals(2, transcriptions[0], "STT capture probes again after its bounded backoff");
-		assertEquals(2, decoders[0], "backoff drops packets without decoding and recovery creates one decoder");
+		assertEquals(2, transcriptions[0], label + " STT capture probes again after its bounded backoff");
+		assertEquals(2, decoders[0], label + " backoff drops packets without decoding and recovery creates one decoder");
 		assertEquals(List.of(new Delivered(PLAYER, "recovered", false)), delivered,
-				"the recovered transcript remains sequenced after the unavailable utterance");
+				"the recovered transcript remains sequenced after the " + label + " utterance");
 		engine.close();
 		return 3;
 	}

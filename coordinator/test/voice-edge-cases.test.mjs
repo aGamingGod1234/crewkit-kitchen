@@ -638,6 +638,121 @@ test('voice worker enforces its shared TTS and STT concurrency limit', async () 
 	});
 });
 
+test('configured STT keeps one shared worker slot out of TTS saturation', async () => {
+	let release;
+	const waiting = new Promise((resolve) => { release = resolve; });
+	let entered;
+	const started = new Promise((resolve) => { entered = resolve; });
+	await withWorker({
+		maxConcurrent: 2,
+		provider: { async synthesize({ text }) {
+			if (text === 'hold TTS') {
+				entered();
+				await waiting;
+			}
+			return validSynthesis();
+		} },
+		sttProvider: { async transcribe() { return { transcript: 'heard', confidence: 1 }; } },
+	}, async ({ baseUrl }) => {
+		const first = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({ ...ttsPayload(), text: 'hold TTS' }),
+		});
+		try {
+			await started;
+			const saturatedTts = await fetch(`${baseUrl}/v1/tts`, {
+				method: 'POST', headers: ttsHeaders(), body: JSON.stringify({
+					...ttsPayload(), text: 'extra TTS', conversationSequence: 2,
+				}),
+			});
+			assert.equal(saturatedTts.status, 429);
+			assert.equal((await saturatedTts.json()).code, 'TTS_CAPACITY');
+
+			const stt = await fetch(`${baseUrl}/v1/stt`, {
+				method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+			});
+			assert.equal(stt.status, 200, 'the reserved shared slot remains available to human speech');
+		} finally {
+			release();
+		}
+		assert.equal((await first).status, 200);
+	});
+});
+
+test('one shared slot admits idle TTS and idle STT without exceeding the hard cap', async () => {
+	let release;
+	const waiting = new Promise((resolve) => { release = resolve; });
+	let entered;
+	const started = new Promise((resolve) => { entered = resolve; });
+	await withWorker({
+		maxConcurrent: 1,
+		provider: { async synthesize({ text }) {
+			if (text === 'hold TTS') {
+				entered();
+				await waiting;
+			}
+			return validSynthesis();
+		} },
+		sttProvider: { async transcribe() { return { transcript: 'heard', confidence: 1 }; } },
+	}, async ({ baseUrl }) => {
+		const tts = await fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify(ttsPayload()),
+		});
+		assert.equal(tts.status, 200, 'an idle shared slot remains usable for TTS');
+
+		const stt = await fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+		});
+		assert.equal(stt.status, 200, 'the released shared slot remains usable for STT');
+
+		const heldTts = fetch(`${baseUrl}/v1/tts`, {
+			method: 'POST', headers: ttsHeaders(), body: JSON.stringify({
+				...ttsPayload(), text: 'hold TTS', conversationSequence: 2,
+			}),
+		});
+		try {
+			await started;
+			const saturatedStt = await fetch(`${baseUrl}/v1/stt`, {
+				method: 'POST', headers: sttHeaders({ 'X-Utterance-Sequence': '2' }), body: Buffer.alloc(2),
+			});
+			assert.equal(saturatedStt.status, 429, 'TTS and STT still share one hard concurrency slot');
+			assert.equal((await saturatedStt.json()).code, 'STT_CAPACITY');
+		} finally {
+			release();
+		}
+		assert.equal((await heldTts).status, 200);
+	});
+});
+
+test('STT saturation reports its own capacity code', async () => {
+	let release;
+	const waiting = new Promise((resolve) => { release = resolve; });
+	let entered;
+	const started = new Promise((resolve) => { entered = resolve; });
+	await withWorker({
+		maxConcurrent: 1,
+		sttProvider: { async transcribe() {
+			entered();
+			await waiting;
+			return { transcript: 'heard', confidence: 1 };
+		} },
+	}, async ({ baseUrl }) => {
+		const first = fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+		});
+		try {
+			await started;
+			const saturatedStt = await fetch(`${baseUrl}/v1/stt`, {
+				method: 'POST', headers: sttHeaders({ 'X-Utterance-Sequence': '2' }), body: Buffer.alloc(2),
+			});
+			assert.equal(saturatedStt.status, 429);
+			assert.equal((await saturatedStt.json()).code, 'STT_CAPACITY');
+		} finally {
+			release();
+		}
+		assert.equal((await first).status, 200);
+	});
+});
+
 test('TTS saturation preserves a reserved STT slot with channel-specific capacity errors', async () => {
 	let release;
 	const waiting = new Promise((resolve) => { release = resolve; });
@@ -1465,6 +1580,34 @@ test('Deepgram provider rejects unbounded or incomplete PCM before fetch', async
 		(error) => error.code === 'STT_MALFORMED_AUDIO',
 	);
 	assert.equal(calls, 0);
+});
+
+test('Deepgram provider preserves rate-limit retry metadata', async () => {
+	const provider = new DeepgramSttProvider({
+		apiKey: 'deepgram-test-token',
+		fetchImpl: async () => new Response(null, { status: 429, headers: { 'retry-after': '12' } }),
+	});
+	await assert.rejects(provider.transcribe({ pcm: Buffer.alloc(2) }), (error) => {
+		assert.equal(error.code, 'STT_RATE_LIMITED');
+		assert.equal(error.retryAfter, '12');
+		return true;
+	});
+});
+
+test('STT route forwards provider Retry-After metadata', async () => {
+	await withWorker({
+		sttProvider: { async transcribe() {
+			const error = Object.assign(new Error('rate limited'), { code: 'STT_RATE_LIMITED', retryAfter: '12' });
+			throw error;
+		} },
+	}, async ({ baseUrl }) => {
+		const response = await fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+		});
+		assert.equal(response.status, 429);
+		assert.equal(response.headers.get('retry-after'), '12');
+		assert.equal((await response.json()).code, 'STT_RATE_LIMITED');
+	});
 });
 
 async function withWorker(options, verification) {

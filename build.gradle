@@ -22,6 +22,10 @@ base {
 repositories {
 }
 
+configurations {
+	standaloneFabricApi
+}
+
 loom {
 	splitEnvironmentSourceSets()
 
@@ -50,6 +54,9 @@ dependencies {
 	compileOnly "net.java.dev.jna:jna:5.17.0"
 	compileOnly files("libs/fabric-carpet-26.1+v260402.jar")
 	testRuntimeOnly files("libs/fabric-carpet-26.1+v260402.jar")
+	standaloneFabricApi("net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}") {
+		transitive = false
+	}
 }
 
 def carpetDependency = layout.projectDirectory.file('libs/fabric-carpet-26.1+v260402.jar')
@@ -113,20 +120,90 @@ def coordinatorRuntimeIncludes = [
 	'src/**',
 	'node_modules/acorn/**',
 ]
+def coordinatorDirectory = layout.projectDirectory.dir('coordinator')
+def coordinatorPackageJson = coordinatorDirectory.file('package.json')
+def coordinatorPackageLock = coordinatorDirectory.file('package-lock.json')
+def coordinatorAcornDirectory = coordinatorDirectory.dir('node_modules/acorn')
+def coordinatorAcornPackage = coordinatorDirectory.file('node_modules/acorn/package.json')
+def coordinatorAcornModule = coordinatorDirectory.file('node_modules/acorn/dist/acorn.mjs')
 def coordinatorManifest = layout.buildDirectory.file('generated/coordinator/coordinator-manifest.txt')
+def isWindowsHost = System.getProperty('os.name', '').toLowerCase(Locale.ROOT).contains('win')
+def nodeRuntimeInstaller = layout.projectDirectory.file('scripts/install-node-runtime.ps1')
+def bundledNodeRuntime = layout.projectDirectory.dir('runtime/toolchains/node')
+
+tasks.register('assembleWindowsNodeRuntime', Exec) {
+	group = 'build setup'
+	description = 'Downloads and verifies the pinned Windows Node.js runtime for the standalone distribution.'
+	onlyIf { isWindowsHost }
+	commandLine 'powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+			nodeRuntimeInstaller.asFile.absolutePath, '-ProjectRoot', layout.projectDirectory.asFile.absolutePath
+	inputs.file(nodeRuntimeInstaller)
+	outputs.dir(bundledNodeRuntime)
+}
+
+if (isWindowsHost) {
+	tasks.named('build') {
+		dependsOn tasks.named('assembleWindowsNodeRuntime')
+	}
+}
+
+tasks.register('installCoordinatorProductionDependencies', Exec) {
+	group = 'build setup'
+	description = 'Installs the coordinator production dependencies exactly as locked for packaging.'
+	workingDir coordinatorDirectory
+	def isWindows = isWindowsHost
+	def npmExecutable = isWindows ? 'npm.cmd' : 'npm'
+	commandLine npmExecutable, 'ci', '--ignore-scripts', '--omit=dev'
+	ignoreExitValue = true
+	inputs.files(coordinatorPackageJson, coordinatorPackageLock)
+			.withPathSensitivity(PathSensitivity.RELATIVE)
+	outputs.dir(coordinatorAcornDirectory)
+
+	doFirst {
+		def path = System.getenv('PATH')
+		def available = path != null && path
+				.split(java.util.regex.Pattern.quote(File.pathSeparator))
+				.find { entry ->
+					def executable = new File(entry, npmExecutable)
+					!entry.isBlank() && executable.isFile() && (isWindows || executable.canExecute())
+				}
+		if (!available) {
+			throw new GradleException(
+					'Coordinator packaging requires npm on PATH to install locked production dependencies.'
+			)
+		}
+	}
+
+	doLast {
+		if (executionResult.get().exitValue != 0) {
+			throw new GradleException('Coordinator packaging failed because npm ci did not complete successfully.')
+		}
+		def missing = [coordinatorAcornPackage, coordinatorAcornModule]
+				.collect { it.asFile }
+				.findAll { !it.isFile() }
+		if (!missing.isEmpty()) {
+			throw new GradleException(
+					'Coordinator packaging failed because npm ci did not install the required Acorn runtime.'
+			)
+		}
+	}
+}
 
 tasks.register('generateCoordinatorManifest') {
 	group = 'build'
 	description = 'Generates the deterministic runtime coordinator file manifest.'
-	inputs.dir(layout.projectDirectory.dir('coordinator'))
+	dependsOn tasks.named('installCoordinatorProductionDependencies')
+	inputs.files(fileTree(coordinatorDirectory) {
+		coordinatorRuntimeIncludes.each { include it }
+	}).withPathSensitivity(PathSensitivity.RELATIVE)
 	outputs.file(coordinatorManifest)
 
 	doLast {
-		def coordinatorDirectory = layout.projectDirectory.dir('coordinator').asFile
-		def files = fileTree(coordinatorDirectory) {
+		def coordinatorRoot = coordinatorDirectory.asFile
+		def files = fileTree(coordinatorRoot) {
 			coordinatorRuntimeIncludes.each { include it }
 		}.files
-		def prefixLength = coordinatorDirectory.absolutePath.length() + 1
+		def prefixLength = coordinatorRoot.absolutePath.length() + 1
 		def entries = files
 			.collect {
 				def path = it.absolutePath.substring(prefixLength).replaceAll('\\\\', '/')
@@ -157,6 +234,46 @@ jar {
 		into "arena-agents/coordinator"
 		rename { 'coordinator-manifest.txt' }
 	}
+}
+
+def standaloneDistributionName = "arena-agents-modpack-${project.version}"
+def stagedStandaloneDistribution = layout.buildDirectory.dir("standalone/${standaloneDistributionName}")
+
+tasks.register('stageWindowsDistribution', Sync) {
+	group = 'distribution'
+	description = 'Stages the self-contained Windows mod pack with its verified Node.js runtime.'
+	dependsOn tasks.named('jar'), tasks.named('assembleWindowsNodeRuntime'), tasks.named('installCoordinatorProductionDependencies')
+	onlyIf { isWindowsHost }
+	into stagedStandaloneDistribution
+
+	from(tasks.named('jar').flatMap { it.archiveFile }) {
+		into 'mods'
+		rename { "arena-agents-${project.version}.jar" }
+	}
+	from(configurations.standaloneFabricApi) { into 'mods' }
+	from('libs/fabric-carpet-26.1+v260402.jar') { into 'mods' }
+	from('coordinator') {
+		into 'coordinator'
+		coordinatorRuntimeIncludes.each { include it }
+	}
+	from(bundledNodeRuntime) { into 'runtime/toolchains/node' }
+	from('scripts') {
+		into 'scripts'
+		include 'distribution-runtime.ps1', 'install-distribution.ps1', 'verify-startup-packaging.ps1'
+	}
+	from('README.md', 'LICENSE', 'NOTICE-FONTS.md')
+}
+
+tasks.register('packageWindowsDistribution', Zip) {
+	group = 'distribution'
+	description = 'Builds the self-contained Windows mod-pack archive.'
+	dependsOn tasks.named('stageWindowsDistribution')
+	onlyIf { isWindowsHost }
+	from stagedStandaloneDistribution
+	archiveFileName = "${standaloneDistributionName}.zip"
+	destinationDirectory = layout.buildDirectory.dir('distributions')
+	preserveFileTimestamps = false
+	reproducibleFileOrder = true
 }
 
 def entrypointClassFiles = [

@@ -26,6 +26,7 @@ public final class AgentConversationRouterVerification {
 		assertions += verifyDirectDeliveryAndOperatorMirror();
 		assertions += verifyOfflineRecipientFailure();
 		assertions += verifyProximityFiltering();
+		assertions += verifyProximitySpeechAudienceIsImmutable();
 		assertions += verifyPublicDelivery();
 		assertions += verifyUnicodeSafeTextBound();
 		assertions += verifyPlayerConversationWakePolicy();
@@ -33,6 +34,19 @@ public final class AgentConversationRouterVerification {
 		assertions += verifyNativeWhisperPayload();
 		assertions += verifyNativeWhisperContentSelection();
 		return assertions;
+	}
+
+	private static int verifyProximitySpeechAudienceIsImmutable() {
+		java.util.ArrayList<AgentId> recipients = new java.util.ArrayList<>(List.of(AGENT_ID));
+		var audience = new ServerAgentConversationRouter.ProximitySpeechAudience(
+				UUID.fromString("10000000-0000-4000-8000-000000000001"),
+				net.minecraft.world.level.Level.OVERWORLD,
+				recipients
+		);
+		recipients.clear();
+		assertEquals(List.of(AGENT_ID), audience.recipientAgentIds(),
+				"speech-time recipients remain fixed while listeners move during transcription");
+		return 1;
 	}
 
 	private static int verifyNativeWhisperPayload() {

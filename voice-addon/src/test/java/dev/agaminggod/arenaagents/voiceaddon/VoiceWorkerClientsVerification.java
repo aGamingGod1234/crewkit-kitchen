@@ -23,6 +23,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 final class VoiceWorkerClientsVerification {
@@ -42,8 +43,7 @@ final class VoiceWorkerClientsVerification {
 		assertions += verifySttCancellationStopsTheHttpExchange();
 		assertions += verifySttClientSendsPcmMetadataAndBoundsTranscript();
 		assertions += verifySttClientRejectsMalformedInputAndResponse();
-		assertions += verifySttUnavailablePreservesWorkerCode();
-		assertions += verifySttCapacityPreservesWorkerCode();
+		assertions += verifySttBackoffCodesPreserved();
 		assertions += verifyClientsRejectWrongResponseMediaTypes();
 		assertions += verifyConfiguredDeadlineReachesBothHttpClients();
 		assertions += verifyClientsRejectUnsignedAndOversizedResponses();
@@ -297,7 +297,7 @@ final class VoiceWorkerClientsVerification {
 		return 2;
 	}
 
-	private static int verifySttUnavailablePreservesWorkerCode() throws Exception {
+	private static int verifySttBackoffCodesPreserved() throws Exception {
 		try (WorkerServer unavailable = new WorkerServer(exchange -> respond(
 				exchange,
 				503,
@@ -313,25 +313,42 @@ final class VoiceWorkerClientsVerification {
 			).join(), "STT unavailable response");
 			unavailable.assertHealthy();
 		}
-		return 1;
-	}
-
-	private static int verifySttCapacityPreservesWorkerCode() throws Exception {
-		try (WorkerServer unavailable = new WorkerServer(exchange -> respond(
+		try (WorkerServer saturated = new WorkerServer(exchange -> respond(
 				exchange,
 				429,
-				"{\"code\":\"STT_CAPACITY\"}".getBytes(StandardCharsets.UTF_8),
+				"{\"code\":\"STT_CAPACITY\",\"message\":\"Speech recognition is busy\"}"
+						.getBytes(StandardCharsets.UTF_8),
 				"application/json"
 		))) {
 			SpeechWorkerClient client = new SpeechWorkerClient(
-					HttpClient.newHttpClient(), unavailable.uri("/v1/stt"), SECRET
+					HttpClient.newHttpClient(), saturated.uri("/v1/stt"), SECRET
 			);
 			assertWorkerFailure("STT_CAPACITY", () -> client.transcribe(
 					PLAYER, 1L, false, new short[] { 1 }
 			).join(), "STT capacity response");
-			unavailable.assertHealthy();
+			saturated.assertHealthy();
 		}
-		return 1;
+		try (WorkerServer rateLimited = new WorkerServer(exchange -> {
+			exchange.getResponseHeaders().set("Retry-After", "12");
+			respond(
+					exchange,
+					429,
+					"{\"code\":\"STT_RATE_LIMITED\",\"message\":\"Speech provider rate limit reached\"}"
+							.getBytes(StandardCharsets.UTF_8),
+					"application/json"
+			);
+		})) {
+			SpeechWorkerClient client = new SpeechWorkerClient(
+					HttpClient.newHttpClient(), rateLimited.uri("/v1/stt"), SECRET
+			);
+			VoiceWorkerClient.VoiceWorkerException failure = assertWorkerFailure("STT_RATE_LIMITED", () -> client.transcribe(
+					PLAYER, 1L, false, new short[] { 1 }
+			).join(), "STT provider rate-limit response");
+			assertEquals(TimeUnit.SECONDS.toNanos(12L), failure.retryAfterNanos(),
+					"STT provider Retry-After response");
+			rateLimited.assertHealthy();
+		}
+		return 4;
 	}
 
 	private static VoiceRequest request() {
@@ -398,7 +415,9 @@ final class VoiceWorkerClientsVerification {
 		respond(exchange, 200, body, "audio/L16");
 	}
 
-	private static void assertWorkerFailure(String expectedCode, Runnable action, String message) {
+	private static VoiceWorkerClient.VoiceWorkerException assertWorkerFailure(
+			String expectedCode, Runnable action, String message
+	) {
 		try {
 			action.run();
 			throw new AssertionError(message + ": expected failure " + expectedCode);
@@ -408,6 +427,7 @@ final class VoiceWorkerClientsVerification {
 				throw new AssertionError(message + ": unexpected failure " + cause, cause);
 			}
 			assertEquals(expectedCode, workerFailure.code(), message);
+			return workerFailure;
 		}
 	}
 

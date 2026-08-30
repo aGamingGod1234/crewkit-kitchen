@@ -216,6 +216,11 @@ def main():
     worker._load_tts = fail_tts_warmup
     assert worker._warmup() == {"sttReady": True, "ttsReady": False}
 
+    worker._load_tts = tracked_loader("_tts_model", tts_model)
+    assert worker._warmup() == {"sttReady": True, "ttsReady": True}, (
+        "a transient channel warmup failure must be retried in the same worker"
+    )
+
     priority_queue = worker._WeightedRequestQueue(maximum_stt_burst=3)
     for value, operation in (
         ("tts-1", "tts"), ("tts-2", "tts"),

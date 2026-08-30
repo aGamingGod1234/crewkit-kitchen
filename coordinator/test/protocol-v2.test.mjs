@@ -101,6 +101,10 @@ class ManualTimerQueue {
 
 	cancel = (handle) => this.#timers.delete(handle?.id);
 
+	pendingId(delay) {
+		return [...this.#timers.values()].find((candidate) => candidate.delay === delay)?.handle.id ?? null;
+	}
+
 	async runDelay(delay) {
 		const timer = [...this.#timers.values()].find((candidate) => candidate.delay === delay);
 		if (timer === undefined) throw new Error(`no ${delay}ms timer is pending`);
@@ -532,6 +536,78 @@ test('terminal result retries are delivered until the application acknowledges t
 	assert.equal(socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length, 2, 'replay is re-acknowledged');
 });
 
+test('unacknowledged terminal result replay is redelivered until explicitly acknowledged', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-unack-ready', {
+		replyTo: hello.messageId, authenticated: true,
+		registry: [{ ...registeredRecord(), state: 'STARTING', currentGoal: 'Wait.', goalRevision: 4 }],
+	}))}\n`);
+	await ready;
+
+	const payload = actionResult('action-unacknowledged');
+	await bridge.send('action_command', 'agent-a', actionCommand('action-unacknowledged'));
+	const delivered = [];
+	bridge.on('action_result', (event) => delivered.push(event));
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-unack-result-1', payload))}\n`);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-unack-result-2', payload))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(delivered.length, 2, 'a replay remains application-visible until commit is acknowledged');
+	assert.equal(socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length, 0);
+	await bridge.acknowledgeActionResult('agent-a', payload);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-unack-result-3', payload))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(delivered.length, 2, 'an explicitly acknowledged replay is suppressed');
+	assert.equal(socket.writes.filter((line) => JSON.parse(line).type === 'action_result_ack').length, 2, 'the explicit acknowledgement and replay acknowledgement are both sent');
+});
+
+test('retained terminal results cross a disconnect revision for application correlation only', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 2,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const challenge = JSON.parse(socket.authenticationWrites[0]);
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-recovery-ready', {
+		replyTo: hello.messageId, authenticated: true,
+		registry: [{ ...registeredRecord(), state: 'DISCONNECTED', currentGoal: 'Wait.', goalRevision: 2 }],
+	}))}\n`);
+	await ready;
+
+	const retainedPayload = sessionProvenActionResult('action-before-disconnect', 1, challenge);
+	const retained = once(bridge, 'action_result');
+	socket.emit('data', `${JSON.stringify(serverEnvelope(
+		'action_result', 'agent-a', 'server-retained-result', retainedPayload,
+	))}\n`);
+	assert.equal((await retained)[0].payload.goalRevision, 1);
+	assert.equal(socket.destroyed, false, 'the application receives the retained result for action correlation');
+
+	const failed = once(bridge, 'protocolError');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_progress', 'agent-a', 'server-stale-progress', {
+		traceId: TRACE_ID, goalRevision: 1, actionId: 'action-before-disconnect', state: 'RUNNING',
+	}))}\n`);
+	assert.equal((await failed)[0].code, 'STALE_GOAL_REVISION', 'non-terminal stale events remain fenced by the bridge');
+	assert.equal(socket.destroyed, true);
+});
+
 test('terminal results for actions not issued by the coordinator fail closed', async (t) => {
 	const socket = new FakeSocket();
 	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
@@ -712,6 +788,20 @@ function actionResult(actionId, goalRevision = 4) {
 		message: '',
 		elapsedMs: 10,
 		observedAtEpochMs: 20,
+	};
+}
+
+function sessionProvenActionResult(actionId, goalRevision, challenge, agentId = 'agent-a') {
+	return {
+		...actionResult(actionId, goalRevision),
+		replayProof: createActionResultReplayProof(SECRET, {
+			clientNonce: challenge.payload.clientNonce,
+			serverNonce: Buffer.alloc(32, 7).toString('base64url'),
+			serverInstanceId: 'server-instance',
+			agentId,
+			goalRevision,
+			actionId,
+		}),
 	};
 }
 
@@ -1021,7 +1111,6 @@ test('bridge preserves ready and disconnected events while exposing authenticate
 	await bridge.send('action_command', 'agent-a', actionCommand('action-before-reconnect'));
 	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-before-reconnect', reconnectResult))}\n`);
 	await new Promise((resolve) => setImmediate(resolve));
-	await bridge.acknowledgeActionResult('agent-a', reconnectResult, { connectionEpoch: 1 });
 	sockets[0].destroy();
 	const [disconnectedEvent] = await disconnected;
 	assert.equal(disconnectedEvent.connectionEpoch, 1);
@@ -1043,7 +1132,52 @@ test('bridge preserves ready and disconnected events while exposing authenticate
 	assert.equal(recovery.registry[0].agentId, 'agent-a');
 	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-result-replayed', actionResult('action-before-reconnect')))}\n`);
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(deliveredResults.length, 1, 'socket-drop replay must not be emitted twice');
+	assert.equal(deliveredResults.length, 2, 'socket-drop replay remains visible until the application acknowledges it');
+	await bridge.acknowledgeActionResult('agent-a', actionResult('action-before-reconnect'), { connectionEpoch: 2 });
+	assert.equal(JSON.parse(sockets[1].writes.at(-1)).type, 'action_result_ack');
+});
+
+test('reconnect accepts retained terminal results for agents absent from the new registry', async (t) => {
+	const sockets = [];
+	let reconnect = null;
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET, reconnectDelayMs: 1 }, {
+		socketFactory: () => {
+			const socket = new FakeSocket();
+			sockets.push(socket);
+			return socket;
+		},
+		schedule: (callback) => { reconnect = callback; return 1; },
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	sockets[0].emit('connect');
+	const firstHello = JSON.parse(sockets[0].writes[0]);
+	const firstReady = once(bridge, 'ready');
+	sockets[0].emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-retired-first-ready', {
+		replyTo: firstHello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await firstReady;
+	sockets[0].destroy();
+	await new Promise((resolve) => setImmediate(resolve));
+	reconnect();
+	sockets[1].emit('connect');
+	const secondChallenge = JSON.parse(sockets[1].authenticationWrites[0]);
+	const secondHello = JSON.parse(sockets[1].writes[0]);
+	const recovered = once(bridge, 'recovered');
+	sockets[1].emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-retired-second-ready', {
+		replyTo: secondHello.messageId, authenticated: true, registry: [],
+	}))}\n`);
+	await recovered;
+
+	const retained = once(bridge, 'action_result');
+	sockets[1].emit('data', `${JSON.stringify(serverEnvelope(
+		'action_result', 'agent-a', 'server-retired-replay', sessionProvenActionResult('retained-after-reconnect', 4, secondChallenge),
+	))}\n`);
+	const [event] = await retained;
+	await bridge.acknowledgeActionResult(event.agentId, event.payload, { connectionEpoch: event.connectionEpoch });
+	assert.equal(sockets[1].destroyed, false);
 	assert.equal(JSON.parse(sockets[1].writes.at(-1)).type, 'action_result_ack');
 });
 
@@ -1113,6 +1247,76 @@ test('bridge probes an authenticated peer and reconnects when heartbeat silence 
 	assert.equal(socket.destroyed, true);
 	assert.equal(errors.at(-1)?.code, 'HEARTBEAT_TIMEOUT');
 	assert.equal(typeof reconnect, 'function');
+});
+
+test('only a heartbeat response refreshes the authenticated peer deadline', async (t) => {
+	const socket = new FakeSocket();
+	const deadlines = new ManualTimerQueue();
+	const bridge = new MultiplexedServerBridge({
+		port: 25570,
+		secret: SECRET,
+		handshakeTimeoutMs: 11,
+		heartbeatIntervalMs: 13,
+		heartbeatTimeoutMs: 29,
+	}, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		scheduleDeadline: deadlines.schedule,
+		cancelDeadline: deadlines.cancel,
+		currentRevision: () => 0,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-heartbeat-ready', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+
+	const initialDeadline = deadlines.pendingId(29);
+	socket.emit('data', `${JSON.stringify(serverEnvelope('verbose_control', 'server', 'server-unrelated-traffic', { enabled: true }))}\n`);
+	assert.equal(deadlines.pendingId(29), initialDeadline, 'unrelated inbound traffic cannot mask a failed coordinator-to-server path');
+
+	socket.emit('data', `${JSON.stringify(serverEnvelope('heartbeat', 'server', 'server-heartbeat-response', {}))}\n`);
+	assert.notEqual(deadlines.pendingId(29), initialDeadline, 'the server heartbeat response proves the round trip and renews the deadline');
+});
+
+test('an application listener failure does not tear down the authenticated transport', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 1,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-listener-ready', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+
+	const listenerErrors = [];
+	let laterListenerRan = false;
+	bridge.on('listenerError', (error, context) => listenerErrors.push({ error, context }));
+	bridge.on('action_result', () => { throw new Error('application handler failed'); });
+	bridge.on('action_result', () => { laterListenerRan = true; });
+	await bridge.send('action_command', 'agent-a', actionCommand('listener-action', 1));
+	socket.emit('data', `${JSON.stringify(serverEnvelope('action_result', 'agent-a', 'server-listener-result', actionResult('listener-action', 1)))}\n`);
+	await new Promise((resolve) => setImmediate(resolve));
+
+	assert.equal(socket.destroyed, false);
+	assert.equal(listenerErrors.length, 1);
+	assert.equal(listenerErrors[0].error.message, 'application handler failed');
+	assert.equal(listenerErrors[0].context.eventName, 'action_result');
+	assert.equal(laterListenerRan, true, 'one failed application listener cannot suppress later listeners');
+	assert.equal(socket.writes.some((wire) => JSON.parse(wire).type === 'action_result_ack'), false, 'listener failure leaves the result unacknowledged for replay');
 });
 
 test('terminal action retention rejects identities after bounded issued-action rollover', async (t) => {
@@ -1220,13 +1424,43 @@ test('multiplexed bridge bounds queued messages per agent while socket is backpr
 	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-1', { replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()] }))}\n`);
 	await ready;
 	socket.writable = false;
-	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	const blocked = bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
 	const queued = bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
 	await assert.rejects(bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' }), (error) => error.code === 'AGENT_BACKPRESSURE');
 	socket.writable = true;
 	socket.emit('drain');
-	await queued;
+	await Promise.all([blocked, queued]);
 	bridge.stop();
+});
+
+test('a backpressured reliable write rejects if the socket disconnects before drain', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 1,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-backpressure-ready', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+
+	socket.writable = false;
+	const pending = bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	let settled = false;
+	void pending.then(() => { settled = true; }, () => { settled = true; });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(settled, false, 'write acceptance remains pending until the socket drains');
+
+	const rejected = assert.rejects(pending, (error) => error.code === 'BRIDGE_DISCONNECTED');
+	socket.destroy();
+	await rejected;
 });
 
 test('lossy verbose traffic cannot consume control capacity while the socket is backpressured', async (t) => {
@@ -1248,7 +1482,7 @@ test('lossy verbose traffic cannot consume control capacity while the socket is 
 	await ready;
 
 	socket.writable = false;
-	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	const blocked = bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
 	const verboseResults = Array.from({ length: 8 }, (_, index) => bridge.send('verbose_event', 'agent-a', {
 		goalRevision: 1, stage: 'output', message: `visible-${index}`,
 	}).catch((error) => error));
@@ -1263,6 +1497,7 @@ test('lossy verbose traffic cannot consume control capacity while the socket is 
 
 	socket.writable = true;
 	socket.emit('drain');
+	await blocked;
 	assert.equal((await Promise.all(verboseResults)).some((value) => value instanceof Error), false);
 	assert.equal(await actionResult instanceof Error, false);
 	const wires = socket.writes.map((wire) => JSON.parse(wire));
@@ -1287,7 +1522,7 @@ test('a newer lifecycle revision removes queued stale action commands under back
 	await ready;
 
 	socket.writable = false;
-	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	const blocked = bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
 	const staleCommand = bridge.send('action_command', 'agent-a', {
 		traceId: TRACE_ID,
 		goalRevision: 1,
@@ -1305,6 +1540,7 @@ test('a newer lifecycle revision removes queued stale action commands under back
 	assert.equal(staleError?.code, 'STALE_GOAL_REVISION');
 	socket.writable = true;
 	socket.emit('drain');
+	await blocked;
 	assert.equal(socket.writes.some((wire) => JSON.parse(wire).type === 'action_command'), false);
 	bridge.stop();
 });
@@ -1326,7 +1562,7 @@ test('a newer lifecycle revision removes queued stale agent readiness under back
 	await ready;
 
 	socket.writable = false;
-	await bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
+	const blocked = bridge.send('planning_state', 'agent-a', { goalRevision: 1, state: 'PLANNING' });
 	const staleReady = bridge.send('agent_ready', 'agent-a', { goalRevision: 1 });
 	let staleError = null;
 	void staleReady.catch((error) => { staleError = error; });
@@ -1337,6 +1573,7 @@ test('a newer lifecycle revision removes queued stale agent readiness under back
 	assert.equal(staleError?.code, 'STALE_GOAL_REVISION');
 	socket.writable = true;
 	socket.emit('drain');
+	await blocked;
 	assert.equal(socket.writes.some((wire) => JSON.parse(wire).type === 'agent_ready'), false);
 });
 
@@ -1598,6 +1835,42 @@ test('valid agent_removed is delivered before its identity is removed from the b
 	assert.equal(message.agentId, 'agent-a');
 	assert.deepEqual(bridge.knownAgentIds, []);
 	bridge.stop();
+});
+
+test('a retained terminal result for a removed agent remains deliverable and acknowledgeable', async (t) => {
+	const socket = new FakeSocket();
+	const bridge = new MultiplexedServerBridge({ port: 25570, secret: SECRET }, {
+		socketFactory: () => socket,
+		schedule: () => 1,
+		cancelSchedule: () => {},
+		currentRevision: () => 4,
+	});
+	t.after(() => bridge.stop());
+	bridge.start();
+	socket.emit('connect');
+	const hello = JSON.parse(socket.writes[0]);
+	const ready = once(bridge, 'ready');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('hello_ack', 'server', 'server-retired-ready', {
+		replyTo: hello.messageId, authenticated: true, registry: [registeredRecord()],
+	}))}\n`);
+	await ready;
+	await bridge.send('action_command', 'agent-a', actionCommand('retained-action', 4));
+
+	const removed = once(bridge, 'agent_removed');
+	socket.emit('data', `${JSON.stringify(serverEnvelope('agent_removed', 'agent-a', 'server-retired-removed', { goalRevision: 4 }))}\n`);
+	await removed;
+	const retained = once(bridge, 'action_result');
+	socket.emit('data', `${JSON.stringify(serverEnvelope(
+		'action_result', 'agent-a', 'server-retired-result', actionResult('retained-action', 4),
+	))}\n`);
+	const [event] = await retained;
+	await bridge.acknowledgeActionResult(event.agentId, event.payload, { connectionEpoch: event.connectionEpoch });
+
+	assert.equal(socket.destroyed, false);
+	assert.equal(socket.writes.some((wire) => {
+		const envelope = JSON.parse(wire);
+		return envelope.type === 'action_result_ack' && envelope.payload.actionId === 'retained-action';
+	}), true);
 });
 
 test('malformed action results fail before terminal-result tracking or delivery', async () => {

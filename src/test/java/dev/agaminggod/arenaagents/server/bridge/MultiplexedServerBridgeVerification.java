@@ -88,7 +88,7 @@ public final class MultiplexedServerBridgeVerification {
 		net.minecraft.server.Bootstrap.bootStrap();
 		if (args.length == 1 && "preauth-overflow".equals(args[0])) {
 			verifyPreauthOverflowPreservesIncumbentHandshake();
-			System.out.println("MultiplexedServerBridgeVerification preauth-overflow assertions=8");
+			System.out.println("MultiplexedServerBridgeVerification preauth-overflow assertions=14");
 			return;
 		}
 		System.out.println("MultiplexedServerBridgeVerification assertions=" + verify());
@@ -213,16 +213,10 @@ public final class MultiplexedServerBridgeVerification {
 				assertTrue(ledger.retain(result), "terminal result is retained before the coordinator closes");
 				assertTrue(ledger.claim(result, session(bridge)), "first session owns the initial result delivery");
 				bridge.tick();
-				first.setSoTimeout(100);
-				try {
-					while (true) {
-						BridgeEnvelope published = codec.decode(firstReader.readLine());
-						assertTrue(!"action_result".equals(published.type()),
-								"claimed terminal result is not replayed twice on the first session");
-					}
-				} catch (SocketTimeoutException expected) {
-					// Other queued control messages do not make the claimed terminal result a duplicate.
-				}
+				assertNoActionResult(
+						first, firstReader, codec, result.actionId(),
+						"claimed terminal result is not replayed twice on the first session"
+				);
 			}
 
 			MultiplexedServerBridge activeBridge = bridge;
@@ -396,6 +390,11 @@ public final class MultiplexedServerBridgeVerification {
 					writeEnvelope(socket, codec, new BridgeEnvelope(
 							2, acknowledgement.serverInstanceId(), "server", "catalog_snapshot", "empty-catalog-" + attempt, catalog
 					));
+					awaitServerTaskCount(bridge, 1,
+							"empty catalog attempt " + attempt + " reaches the server-task handoff");
+					bridge.tick();
+					assertTrue(!catalogDiscoveryPending(bridge),
+							"empty catalog attempt " + attempt + " is applied before retry time advances");
 					nanoTime.addAndGet(60_000_000_000L);
 					if (attempt == 4) {
 						setQueuedCount(bridge, "server", MultiplexedServerBridge.AGENT_QUEUE_CAP);
@@ -2291,14 +2290,21 @@ public final class MultiplexedServerBridgeVerification {
 			MultiplexedServerBridge activeBridge = bridge;
 			assertTrue(!activeBridge.observationPublicationForVerification().hasActiveSession(),
 					"bridge starts without an accepted session");
-			try (Socket unauthenticated = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification());
-				 Socket authenticated = new Socket(MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification());
-				 BufferedReader reader = new BufferedReader(new InputStreamReader(authenticated.getInputStream(), StandardCharsets.UTF_8))) {
+			try (Socket unauthenticated = new Socket(
+					MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification())) {
+				awaitPreauthSessionCount(activeBridge, 1,
+						"silent candidate is admitted before the authenticated connection starts");
 				assertTrue(!activeBridge.observationPublicationForVerification().hasActiveSession(),
 						"an unauthenticated socket cannot claim the primary publication session");
-				authenticate(authenticated, reader, new BridgeEnvelopeCodec(), secret, null, "hello-after-silent-candidate");
-				awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
-						"a valid coordinator authenticates while a silent candidate remains connected");
+				try (Socket authenticated = new Socket(
+						MultiplexedServerBridge.LOOPBACK_HOST, activeBridge.boundPortForVerification());
+					 BufferedReader reader = new BufferedReader(new InputStreamReader(
+							 authenticated.getInputStream(), StandardCharsets.UTF_8))) {
+					authenticate(authenticated, reader, new BridgeEnvelopeCodec(), secret, null,
+							"hello-after-silent-candidate");
+					awaitCondition(activeBridge.observationPublicationForVerification()::hasActiveSession,
+							"a valid coordinator authenticates while a silent candidate remains connected");
+				}
 			}
 			awaitCondition(() -> !activeBridge.observationPublicationForVerification().hasActiveSession(),
 					"session close deactivates publication and clears lifecycle ownership");
@@ -2341,9 +2347,9 @@ public final class MultiplexedServerBridgeVerification {
 					fillers.add(new Socket(
 							MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification()
 					));
+					awaitPreauthSessionCount(activeBridge, index + 1,
+							"pre-authentication filler " + index + " is admitted before the next connection");
 				}
-				awaitCondition(() -> preauthSessionCount(activeBridge) == 8,
-						"pre-authentication pool reaches its bounded capacity");
 
 				try (Socket overflow = new Socket(
 						MultiplexedServerBridge.LOOPBACK_HOST, bridge.boundPortForVerification())) {
@@ -2379,7 +2385,10 @@ public final class MultiplexedServerBridgeVerification {
 	@SuppressWarnings("unchecked")
 	private static int preauthSessionCount(MultiplexedServerBridge bridge) {
 		try {
-			return ((Set<Object>) readPrivateField(bridge, "preauthSessions")).size();
+			Object publicationLock = readPrivateField(bridge, "publicationLock");
+			synchronized (publicationLock) {
+				return ((Set<Object>) readPrivateField(bridge, "preauthSessions")).size();
+			}
 		} catch (ReflectiveOperationException exception) {
 			throw new AssertionError("could not inspect bounded pre-authentication sessions", exception);
 		}
@@ -2614,6 +2623,59 @@ public final class MultiplexedServerBridgeVerification {
 
 		private void releaseAccept() {
 			releaseAccept.countDown();
+		}
+	}
+
+	private static void awaitPreauthSessionCount(
+			MultiplexedServerBridge bridge,
+			int expected,
+			String label
+	) {
+		long deadline = System.nanoTime() + 2_000_000_000L;
+		while (preauthSessionCount(bridge) != expected && System.nanoTime() < deadline) {
+			try {
+				Thread.sleep(1L);
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+				throw new AssertionError(label + " was interrupted", exception);
+			}
+		}
+		assertEquals(expected, preauthSessionCount(bridge), label);
+	}
+
+	private static boolean catalogDiscoveryPending(MultiplexedServerBridge bridge) {
+		try {
+			Object publicationLock = readPrivateField(bridge, "publicationLock");
+			synchronized (publicationLock) {
+				return (boolean) readPrivateField(bridge, "catalogDiscoveryPending");
+			}
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not inspect catalog discovery state", exception);
+		}
+	}
+
+	private static void awaitServerTaskCount(
+			MultiplexedServerBridge bridge,
+			int expected,
+			String label
+	) {
+		long deadline = System.nanoTime() + 2_000_000_000L;
+		while (serverTaskCount(bridge) != expected && System.nanoTime() < deadline) {
+			try {
+				Thread.sleep(1L);
+			} catch (InterruptedException exception) {
+				Thread.currentThread().interrupt();
+				throw new AssertionError(label + " was interrupted", exception);
+			}
+		}
+		assertEquals(expected, serverTaskCount(bridge), label);
+	}
+
+	private static int serverTaskCount(MultiplexedServerBridge bridge) {
+		try {
+			return ((BoundedServerTaskQueue) readPrivateField(bridge, "serverTasks")).pendingCount();
+		} catch (ReflectiveOperationException exception) {
+			throw new AssertionError("could not inspect inbound server tasks", exception);
 		}
 	}
 
@@ -2869,6 +2931,37 @@ public final class MultiplexedServerBridgeVerification {
 	private static void writeEnvelope(Socket socket, BridgeEnvelopeCodec codec, BridgeEnvelope envelope) throws Exception {
 		socket.getOutputStream().write(codec.encode(envelope).getBytes(StandardCharsets.UTF_8));
 		socket.getOutputStream().flush();
+	}
+
+	private static void assertNoActionResult(
+			Socket socket,
+			BufferedReader reader,
+			BridgeEnvelopeCodec codec,
+			String actionId,
+			String label
+	) throws Exception {
+		int previousTimeout = socket.getSoTimeout();
+		long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200L);
+		try {
+			while (System.nanoTime() < deadline) {
+				long remainingNanos = deadline - System.nanoTime();
+				socket.setSoTimeout((int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos)));
+				String line;
+				try {
+					line = reader.readLine();
+				} catch (SocketTimeoutException expected) {
+					return;
+				}
+				if (line == null) return;
+				BridgeEnvelope envelope = codec.decode(line);
+				if ("action_result".equals(envelope.type())
+						&& actionId.equals(envelope.payload().get("actionId").getAsString())) {
+					throw new AssertionError(label);
+				}
+			}
+		} finally {
+			socket.setSoTimeout(previousTimeout);
+		}
 	}
 
 	private static void verifyObservationPublicationLifecycle(AgentId agent) {

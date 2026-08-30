@@ -230,7 +230,7 @@ public final class FakeServer {
 }
 '@ | Set-Content -LiteralPath $source -NoNewline
 	$javac = (Get-Command javac -ErrorAction Stop).Source
-	$jarTool = 'C:\Program Files\Java\jdk-25\bin\jar.exe'
+	$jarTool = Join-Path (Split-Path -Parent $javac) 'jar.exe'
 	if (-not (Test-Path -LiteralPath $jarTool -PathType Leaf)) { throw "Missing test JAR tool: $jarTool" }
 	& $javac -d $classes $source
 	if ($LASTEXITCODE -ne 0) { throw 'Could not compile dummy Fabric server fixture' }

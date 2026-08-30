@@ -137,19 +137,29 @@ test('catalog retains its deterministic exact profile when live discovery recove
 
 test('a timed-out catalog attempt is evicted and its late result cannot replace a fresh generation', async () => {
 	const releases = [];
+	const deadlines = [];
 	let loaderCalls = 0;
 	const cache = new ModelCatalogCache(({ signal } = {}) => new Promise((resolve) => {
 		loaderCalls += 1;
 		const call = loaderCalls;
 		releases.push(() => resolve([{ ...MODEL, displayName: `attempt-${call}`, aborted: signal?.aborted === true }]));
-	}), { builtinModels: [MODEL], refreshTimeoutMs: 5 });
+	}), {
+		builtinModels: [MODEL],
+		refreshTimeoutMs: 5,
+		scheduleTimeout(callback) {
+			const deadline = { callback, cancelled: false };
+			deadlines.push(deadline);
+			return deadline;
+		},
+		cancelTimeout(deadline) { deadline.cancelled = true; },
+	});
 	try {
-		const first = await Promise.race([
-			cache.refresh({ force: true }),
-			new Promise((resolve) => setTimeout(() => resolve('outer-timeout'), 30)),
-		]);
-		assert.notEqual(first, 'outer-timeout', 'the cache owns its refresh deadline');
+		const firstAttempt = cache.refresh({ force: true });
+		await new Promise((resolve) => setImmediate(resolve));
+		deadlines[0].callback();
+		const first = await firstAttempt;
 		assert.equal(first.source, 'builtin');
+		assert.equal(deadlines[0].cancelled, true);
 
 		const secondAttempt = cache.refresh({ force: true });
 		await new Promise((resolve) => setImmediate(resolve));
@@ -159,6 +169,7 @@ test('a timed-out catalog attempt is evicted and its late result cannot replace 
 		assert.equal(cache.snapshot().source, 'builtin', 'the obsolete loader cannot promote its late result live');
 		releases[1]();
 		assert.equal((await secondAttempt).source, 'live');
+		assert.equal(deadlines[1].cancelled, true);
 	} finally {
 		for (const release of releases) release();
 	}

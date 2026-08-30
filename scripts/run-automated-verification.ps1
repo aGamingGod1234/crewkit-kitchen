@@ -9,8 +9,15 @@ $Project = [IO.Path]::GetFullPath($ProjectRoot)
 $JavaHome = Join-Path $Project 'runtime\toolchains\temurin-25\jdk-25.0.3+9'
 $Java = Join-Path $JavaHome 'bin\java.exe'
 $Coordinator = Join-Path $Project 'coordinator'
+$CoordinatorPackagingVerifier = Join-Path $Project 'scripts\verify-coordinator-packaging.ps1'
+$DistributionRuntimeVerifier = Join-Path $Project 'scripts\verify-distribution-runtime.ps1'
+$StartupPackagingVerifier = Join-Path $Project 'scripts\verify-startup-packaging.ps1'
+$AgentJar = Join-Path $Project 'build\libs\arena-agents-0.1.0.jar'
 if (-not (Test-Path -LiteralPath $Java -PathType Leaf)) { throw "Missing project JDK: $Java" }
 if (-not (Test-Path -LiteralPath (Join-Path $Coordinator 'package.json') -PathType Leaf)) { throw 'Missing coordinator package.json.' }
+if (-not (Test-Path -LiteralPath $CoordinatorPackagingVerifier -PathType Leaf)) { throw 'Missing coordinator packaging verifier.' }
+if (-not (Test-Path -LiteralPath $DistributionRuntimeVerifier -PathType Leaf)) { throw 'Missing distribution runtime verifier.' }
+if (-not (Test-Path -LiteralPath $StartupPackagingVerifier -PathType Leaf)) { throw 'Missing startup packaging verifier.' }
 
 $env:JAVA_HOME = $JavaHome
 Push-Location $Project
@@ -20,6 +27,10 @@ try {
         -NoNewWindow -Wait -PassThru
     if ($gradle.ExitCode -ne 0) { throw "Gradle verification failed with code $($gradle.ExitCode)" }
 } finally { Pop-Location }
+
+& $CoordinatorPackagingVerifier -JarPath $AgentJar
+& $DistributionRuntimeVerifier
+& $StartupPackagingVerifier -PackageRoot $Project
 
 Push-Location $Coordinator
 try {

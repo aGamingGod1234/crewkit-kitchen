@@ -139,19 +139,32 @@ final class VoiceWorkerClient {
 
 	static final class VoiceWorkerException extends RuntimeException {
 		private final String code;
+		private final long retryAfterNanos;
 
 		VoiceWorkerException(String code, String message) {
-			super(message);
-			this.code = code;
+			this(code, message, null, 0L);
 		}
 
 		VoiceWorkerException(String code, String message, Throwable cause) {
+			this(code, message, cause, 0L);
+		}
+
+		VoiceWorkerException(String code, String message, long retryAfterNanos) {
+			this(code, message, null, retryAfterNanos);
+		}
+
+		private VoiceWorkerException(String code, String message, Throwable cause, long retryAfterNanos) {
 			super(message, cause);
 			this.code = code;
+			this.retryAfterNanos = Math.max(0L, retryAfterNanos);
 		}
 
 		String code() {
 			return code;
+		}
+
+		long retryAfterNanos() {
+			return retryAfterNanos;
 		}
 	}
 }

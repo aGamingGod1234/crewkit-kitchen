@@ -36,6 +36,14 @@ public final class EquipmentAndUseVerification {
 		assertFalse(timer.durationElapsed(5_000L, 1L), "use cannot start and stop in the same tick");
 		assertFalse(timer.durationElapsed(5_249L, 250L), "requested duration begins at observed use start");
 		assertTrue(timer.durationElapsed(5_250L, 250L), "requested duration elapses after confirmed start");
+		ServerTransactionAdapter.ConfirmedUseTimer rollbackTimer = new ServerTransactionAdapter.ConfirmedUseTimer();
+		rollbackTimer.observeStarted(true, 1_000L);
+		assertFalse(rollbackTimer.durationElapsed(1_200L, 300L), "use duration accumulates before rollback");
+		assertFalse(rollbackTimer.durationElapsed(900L, 300L), "clock rollback does not manufacture use duration");
+		assertTrue(rollbackTimer.durationElapsed(1_000L, 300L), "use duration resumes from the corrected clock");
+		ServerTransactionAdapter.ConfirmedUseTimer overflowTimer = new ServerTransactionAdapter.ConfirmedUseTimer();
+		overflowTimer.observeStarted(true, Long.MIN_VALUE);
+		assertTrue(overflowTimer.durationElapsed(Long.MAX_VALUE, 1L), "overflowing use duration saturates as elapsed");
 
 		assertTrue(ServerRangedUseController.canStartBowUse(false, true),
 				"infinite-material players may start vanilla bow use without an inventory arrow");
@@ -53,7 +61,7 @@ public final class EquipmentAndUseVerification {
 				"ability-invulnerable player target is rejected explicitly");
 		assertTrue(new ServerRangedUseController.TargetFacts(true, false, false, false, false, true).eligible(),
 				"protected and projectile-hittable target is eligible");
-		return 19;
+		return 23;
 	}
 
 	private static void assertTrue(boolean value, String label) {

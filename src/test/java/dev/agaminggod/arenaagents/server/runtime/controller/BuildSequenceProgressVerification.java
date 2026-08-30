@@ -29,7 +29,16 @@ public final class BuildSequenceProgressVerification {
 		assertContains(failure.message(), "completed=1", "failure reports completed count");
 		assertContains(failure.message(), "failedIndex=1", "failure reports failed index");
 		assertContains(failure.message(), "PLACEMENT_CONFLICT", "failure reports placement reason");
-		return 7;
+
+		ServerBuildSequenceController rollback = new ServerBuildSequenceController(
+				List.of(placement(0)), 1_000L, 300L, new RunningDriver());
+		assertEquals(ServerController.State.RUNNING, rollback.tick(null, 1_200L).state(),
+				"build timeout accumulates before rollback");
+		assertEquals(ServerController.State.RUNNING, rollback.tick(null, 900L).state(),
+				"clock rollback does not manufacture a build timeout");
+		assertEquals(ServerController.State.FAILED, rollback.tick(null, 1_000L).state(),
+				"build timeout resumes from the corrected clock");
+		return 10;
 	}
 
 	private static ServerBuildSequenceController.Placement placement(int x) {
@@ -59,6 +68,20 @@ public final class BuildSequenceProgressVerification {
 			return index == failedIndex
 					? ServerController.TickResult.failed("PLACEMENT_CONFLICT", "conflict", 0.0D)
 					: ServerController.TickResult.succeeded("BLOCK_PLACED", "placed");
+		}
+	}
+
+	private static final class RunningDriver implements ServerBuildSequenceController.PlacementDriver {
+		@Override
+		public boolean isInRange(net.minecraft.server.level.ServerPlayer player,
+				ServerBuildSequenceController.Placement placement) {
+			return true;
+		}
+
+		@Override
+		public ServerController.TickResult tick(net.minecraft.server.level.ServerPlayer player,
+				ServerBuildSequenceController.Placement placement, int index, long nowEpochMs) {
+			return ServerController.TickResult.running(0.0D);
 		}
 	}
 

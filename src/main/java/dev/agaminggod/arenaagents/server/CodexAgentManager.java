@@ -39,8 +39,10 @@ import java.util.UUID;
 import java.util.WeakHashMap;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Registry;
@@ -71,6 +73,7 @@ public final class CodexAgentManager {
 	private static final Map<MinecraftServer, CodexAgentManager> INSTANCES = new WeakHashMap<>();
 	private static final int AGENT_TICKET_RADIUS = 2;
 	private static final long PLAYER_SPAWN_TIMEOUT_MS = 10_000L;
+	private static final long VANILLA_DEATH_REMOVAL_GRACE_MS = 1_000L;
 	private static final long RECOVERY_RETRY_DELAY_MS = 30_000L;
 	private static final long CANCELLED_SPAWN_RETENTION_MS = 120_000L;
 	private static final String HIDDEN_AGENT_TEAM = "arenaagents_hidden";
@@ -92,6 +95,7 @@ public final class CodexAgentManager {
 	private final PendingSpawnCancellationLedger cancelledPlayerSpawns =
 			new PendingSpawnCancellationLedger(CANCELLED_SPAWN_RETENTION_MS);
 	private final Set<AgentId> seenPlayers = new LinkedHashSet<>();
+	private final AtomicBoolean releaseStarted = new AtomicBoolean();
 	private AgentRuntimeHooks runtimeHooks = AgentRuntimeHooks.NO_OP;
 
 	private CodexAgentManager(MinecraftServer server) {
@@ -111,12 +115,39 @@ public final class CodexAgentManager {
 	public static synchronized void release(MinecraftServer server) {
 		CodexAgentManager manager = INSTANCES.remove(server);
 		if (manager != null) {
-			manager.runtimeHooks.onServerStopping();
-			manager.releasePendingVerifiedRespawns();
-			manager.releaseChunkTickets();
-			manager.savedData.setRuntimeHooks(AgentRuntimeHooks.NO_OP);
-			AgentInputRuntime.release(server);
+			manager.releaseOwnedState();
 		}
+	}
+
+	private void releaseOwnedState() {
+		releaseOnce(
+				releaseStarted,
+				runtimeHooks::onServerStopping,
+				this::releasePendingVerifiedRespawns,
+				this::releaseChunkTickets,
+				() -> savedData.setRuntimeHooks(AgentRuntimeHooks.NO_OP),
+				() -> AgentInputRuntime.release(server)
+		);
+	}
+
+	static void releaseOnce(AtomicBoolean releaseStarted, Runnable... cleanupSteps) {
+		Objects.requireNonNull(releaseStarted, "release state must not be null");
+		if (!releaseStarted.compareAndSet(false, true)) return;
+		runCleanupSteps(cleanupSteps);
+	}
+
+	private static void runCleanupSteps(Runnable... cleanupSteps) {
+		Objects.requireNonNull(cleanupSteps, "cleanup steps must not be null");
+		RuntimeException primaryFailure = null;
+		for (Runnable cleanup : cleanupSteps) {
+			try {
+				Objects.requireNonNull(cleanup, "cleanup step must not be null").run();
+			} catch (RuntimeException failure) {
+				if (primaryFailure == null) primaryFailure = failure;
+				else if (primaryFailure != failure) primaryFailure.addSuppressed(failure);
+			}
+		}
+		if (primaryFailure != null) throw primaryFailure;
 	}
 
 	public void setRuntimeHooks(AgentRuntimeHooks runtimeHooks) {
@@ -197,7 +228,7 @@ public final class CodexAgentManager {
 			pendingEntityRecoveries.remove(created.agentId());
 			OfflineAgentPlayers.find(server, created.agentId(), created.profile()).ifPresent(OfflineAgentPlayers::remove);
 			if (pendingPlayerSpawns.remove(created.agentId()) != null) {
-				cancelledPlayerSpawns.record(created.agentId(), System.currentTimeMillis());
+				cancelledPlayerSpawns.record(created.agentId(), created.profile(), System.currentTimeMillis());
 			}
 			synchronized (registry) {
 				runtimeHooks.withinPublicationBoundary(() -> {
@@ -487,13 +518,14 @@ public final class CodexAgentManager {
 			OfflineAgentPlayers.VanillaRespawnTarget target = OfflineAgentPlayers.resolveVanillaRespawn(server, death);
 			long now = System.currentTimeMillis();
 			VanillaRespawnAttempt attempt = new VanillaRespawnAttempt(
-					record, target, now + PLAYER_SPAWN_TIMEOUT_MS);
+					record, target, now + VANILLA_DEATH_REMOVAL_GRACE_MS, now + PLAYER_SPAWN_TIMEOUT_MS);
 			Optional<ServerPlayer> existing = findAgentPlayer(record.agentId());
 			if (existing.isPresent()) {
 				ServerPlayer player = existing.orElseThrow();
+				AgentInputRuntime.clear(server, record.agentId());
 				if (AgentRespawnSpawnPolicy.existingPlayerAction(player.isAlive())
 						== AgentRespawnSpawnPolicy.ExistingPlayerAction.REMOVE_STALE_PLAYER) {
-					AgentInputRuntime.clear(server, record.agentId());
+					attempt.removalRequested = true;
 					OfflineAgentPlayers.remove(player);
 				}
 				pendingPlayerSpawns.put(record.agentId(), attempt.deadlineEpochMs());
@@ -513,6 +545,20 @@ public final class CodexAgentManager {
 			throw new AgentDomainException("STALE_RESPAWN_ATTEMPT", "Dead lifecycle changed during respawn");
 		}
 		Optional<ServerPlayer> found = findAgentPlayer(attempt.deadRecord().agentId());
+		RespawnRemovalDecision removal = respawnRemovalDecision(
+				attempt.spawnRequested,
+				attempt.removalRequested,
+				found.isPresent(),
+				nowEpochMs,
+				attempt.removalGraceDeadlineEpochMs,
+				attempt.deadlineEpochMs
+		);
+		attempt.deadlineEpochMs = removal.deadlineEpochMs();
+		if (removal.requestRemoval()) {
+			attempt.removalRequested = true;
+			OfflineAgentPlayers.remove(found.orElseThrow());
+			return false;
+		}
 		AgentRespawnSpawnPolicy.Decision decision = AgentRespawnSpawnPolicy.decide(
 				attempt.spawnRequested, found.isPresent(), nowEpochMs, attempt.deadlineEpochMs()
 		);
@@ -548,6 +594,23 @@ public final class CodexAgentManager {
 		attempt.verifiedPlayer = player;
 		return true;
 	}
+
+	static RespawnRemovalDecision respawnRemovalDecision(
+			boolean spawnRequested,
+			boolean removalRequested,
+			boolean playerPresent,
+			long nowEpochMs,
+			long removalGraceDeadlineEpochMs,
+			long deadlineEpochMs
+	) {
+		return new RespawnRemovalDecision(
+				!spawnRequested && !removalRequested && playerPresent
+						&& nowEpochMs >= removalGraceDeadlineEpochMs,
+				deadlineEpochMs
+		);
+	}
+
+	static record RespawnRemovalDecision(boolean requestRemoval, long deadlineEpochMs) { }
 
 	private void requestVanillaRespawnPlayer(VanillaRespawnAttempt attempt, long nowEpochMs) {
 		AgentRecord record = attempt.deadRecord();
@@ -612,17 +675,21 @@ public final class CodexAgentManager {
 	public static final class VanillaRespawnAttempt {
 		private final AgentRecord deadRecord;
 		private final OfflineAgentPlayers.VanillaRespawnTarget target;
+		private final long removalGraceDeadlineEpochMs;
 		private long deadlineEpochMs;
 		private boolean spawnRequested;
+		private boolean removalRequested;
 		private ServerPlayer verifiedPlayer;
 
 		private VanillaRespawnAttempt(
 				AgentRecord deadRecord,
 				OfflineAgentPlayers.VanillaRespawnTarget target,
+				long removalGraceDeadlineEpochMs,
 				long deadlineEpochMs
 		) {
 			this.deadRecord = deadRecord;
 			this.target = target;
+			this.removalGraceDeadlineEpochMs = removalGraceDeadlineEpochMs;
 			this.deadlineEpochMs = deadlineEpochMs;
 		}
 
@@ -633,14 +700,14 @@ public final class CodexAgentManager {
 
 	public void reconcileDeaths() {
 		long now = System.currentTimeMillis();
-		boolean recoveryAttempted = false;
+		RecoveryAttemptGate recoveryAttempts = new RecoveryAttemptGate();
 		tickVerifiedRespawns(now);
-		for (AgentId cancelled : cancelledPlayerSpawns.active(now)) {
+		for (PendingSpawnCancellationLedger.Cancellation cancellation : cancelledPlayerSpawns.active(now)) {
 			try {
-				AgentRecord cancelledRecord = savedData.registry().require(cancelled);
-				OfflineAgentPlayers.find(server, cancelled, cancelledRecord.profile()).ifPresent(OfflineAgentPlayers::remove);
-			} catch (AgentDomainException ignored) {
-				// Cancellation can outlive the rolled-back registry entry; no mapped player remains addressable.
+				OfflineAgentPlayers.find(server, cancellation.agentId(), cancellation.profile())
+						.ifPresent(OfflineAgentPlayers::remove);
+			} catch (RuntimeException exception) {
+				LOGGER.warn("Could not remove a cancelled player spawn for agent {}", cancellation.agentId(), exception);
 			}
 		}
 		for (AgentRecord record : records()) {
@@ -701,10 +768,19 @@ public final class CodexAgentManager {
 					pendingEntityRecoveries.add(record.agentId());
 					recoveryRecord = disconnected.after();
 				}
-				if (recoveryAttempted) continue;
-				recoveryAttempted = true;
+				if (!recoveryAttempts.tryClaim()) continue;
 				recoverOfflinePlayer(recoveryTarget, now);
 			}
+		}
+	}
+
+	static final class RecoveryAttemptGate {
+		private boolean claimed;
+
+		boolean tryClaim() {
+			if (claimed) return false;
+			claimed = true;
+			return true;
 		}
 	}
 
@@ -783,10 +859,11 @@ public final class CodexAgentManager {
 	}
 
 	private void releasePendingVerifiedRespawns() {
-		for (VanillaRespawnAttempt attempt : List.copyOf(pendingVerifiedRespawns.values())) {
-			rollbackVanillaRespawn(attempt);
-		}
+		Runnable[] cleanupSteps = List.copyOf(pendingVerifiedRespawns.values()).stream()
+				.map(attempt -> (Runnable) () -> rollbackVanillaRespawn(attempt))
+				.toArray(Runnable[]::new);
 		pendingVerifiedRespawns.clear();
+		runCleanupSteps(cleanupSteps);
 	}
 
 	public boolean captureDeath(ServerPlayer player, DamageSource source) {
@@ -1051,27 +1128,43 @@ public final class CodexAgentManager {
 		long terminalRevision = record.goalRevision() == Long.MAX_VALUE
 				? Long.MAX_VALUE
 				: record.goalRevision() + 1L;
-		AgentRecord removed = runtimeHooks.withinPublicationBoundary(() -> AgentRemovalCoordinator.removeRegistryFirst(
-				savedData.registry(),
-				record.agentId(),
-				() -> {
-					VanillaRespawnAttempt pendingRespawn = pendingVerifiedRespawns.remove(record.agentId());
-					if (pendingRespawn != null) rollbackVanillaRespawn(pendingRespawn);
-					releaseChunkTicket(record.agentId());
-					player.ifPresent(OfflineAgentPlayers::remove);
-					if (pendingPlayerSpawns.remove(record.agentId()) != null) {
-						cancelledPlayerSpawns.record(record.agentId(), System.currentTimeMillis());
-					}
-					pendingAgentRegistrations.remove(record.agentId());
-					pendingEntityRecoveries.remove(record.agentId());
-					seenPlayers.remove(record.agentId());
-				},
-				() -> runtimeHooks.onRemoved(record.agentId(), terminalRevision),
-				failure -> LOGGER.warn("Post-delete cleanup failed for agent {}", record.agentId(), failure)
+		AgentRecord removed = runtimeHooks.withinPublicationBoundary(() -> deleteAfterRequiredCleanup(
+				() -> player.ifPresent(OfflineAgentPlayers::remove),
+				() -> AgentRemovalCoordinator.removeRegistryFirst(
+						savedData.registry(),
+						record.agentId(),
+						() -> {
+							VanillaRespawnAttempt pendingRespawn = pendingVerifiedRespawns.remove(record.agentId());
+							runCleanupSteps(
+									() -> {
+										if (pendingRespawn != null) rollbackVanillaRespawn(pendingRespawn);
+									},
+									() -> releaseChunkTicket(record.agentId()),
+									() -> {
+										if (pendingPlayerSpawns.remove(record.agentId()) != null) {
+											cancelledPlayerSpawns.record(
+													record.agentId(), record.profile(), System.currentTimeMillis());
+										}
+									},
+									() -> pendingAgentRegistrations.remove(record.agentId()),
+									() -> pendingEntityRecoveries.remove(record.agentId()),
+									() -> seenPlayers.remove(record.agentId())
+							);
+						},
+						() -> runtimeHooks.onRemoved(record.agentId(), terminalRevision),
+						failure -> LOGGER.warn("Post-delete cleanup failed for agent {}", record.agentId(), failure)
+				)
 		));
-		savedData.clearConversationWake(record.agentId());
-		savedData.clearGoalDrafts(record.agentId());
+		runCleanupSteps(
+				() -> savedData.clearConversationWake(record.agentId()),
+				() -> savedData.clearGoalDrafts(record.agentId())
+		);
 		return removed;
+	}
+
+	static <T> T deleteAfterRequiredCleanup(Runnable requiredCleanup, Supplier<T> durableDelete) {
+		Objects.requireNonNull(requiredCleanup, "required cleanup must not be null").run();
+		return Objects.requireNonNull(durableDelete, "durable delete must not be null").get();
 	}
 
 	public boolean toggleAutomaticProgress(String selector) {
@@ -1288,9 +1381,10 @@ public final class CodexAgentManager {
 	}
 
 	private void releaseChunkTickets() {
-		for (AgentId agentId : List.copyOf(chunkTickets.keySet())) {
-			releaseChunkTicket(agentId);
-		}
+		Runnable[] cleanupSteps = List.copyOf(chunkTickets.keySet()).stream()
+				.map(agentId -> (Runnable) () -> releaseChunkTicket(agentId))
+				.toArray(Runnable[]::new);
+		runCleanupSteps(cleanupSteps);
 	}
 
 	private record AgentChunkTicket(ServerLevel level, ChunkPos position) {

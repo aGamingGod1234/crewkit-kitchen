@@ -31,10 +31,14 @@ export class DeepgramSttProvider {
 			body: pcm,
 			signal: combinedSignal,
 		});
-		if (!response.ok) throw typedError(
+		if (!response.ok) {
+			const error = typedError(
 				response.status === 429 ? 'STT_RATE_LIMITED' : 'STT_PROVIDER_ERROR',
 				`Deepgram STT failed with HTTP ${response.status}`,
-		);
+			);
+			if (response.status === 429) error.retryAfter = response.headers?.get?.('retry-after');
+			throw error;
+		}
 		const document = await response.json();
 		const alternative = document?.results?.channels?.[0]?.alternatives?.[0];
 		const transcript = typeof alternative?.transcript === 'string' ? alternative.transcript.trim() : '';

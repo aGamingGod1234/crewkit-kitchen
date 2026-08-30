@@ -82,6 +82,17 @@ public final class ServerObservationWireBudgetVerification {
 		assertEquals("nearest", wireFitted.observation().getAsJsonArray("entities").get(0).getAsJsonObject()
 				.get("name").getAsString(), "wire fitting retains the nearest original entity");
 
+		JsonObject singleton = new JsonObject();
+		JsonArray singletonBlocks = new JsonArray();
+		singletonBlocks.add(new JsonObject());
+		singleton.add("blocks", singletonBlocks);
+		ServerObservationWireBudget.Fitted emptyOptional = ServerObservationWireBudget.fit(singleton,
+				candidate -> candidate.getAsJsonArray("blocks").isEmpty());
+		assertEquals(0, emptyOptional.observation().getAsJsonArray("blocks").size(),
+				"a lone optional candidate can be removed when protected facts require the space");
+		assertEquals(List.of("blocks"), emptyOptional.reductions(),
+				"dropping a lone optional candidate is reported once");
+
 		JsonObject impossible = observation();
 		impossible.getAsJsonObject("lastResult").addProperty("message", "x".repeat(BridgeEnvelopeCodec.MAX_LINE_BYTES));
 		assertThrowsCode(() -> ServerObservationWireBudget.fit(impossible,

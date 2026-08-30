@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.client.gui.scenario;
 
 import dev.agaminggod.arenaagents.agent.AgentGameMode;
+import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.scenario.ScenarioPlacementMode;
 import java.util.List;
 
@@ -78,9 +80,57 @@ public final class ScenarioSetupStateVerification {
 		ScenarioSetupState resumed = ScenarioSetupState.fromLaunchPlan(
 				ScenarioLaunchRegistry.lastAcceptedPlan().orElseThrow());
 		assertEquals(plan, resumed.launchPlan(), "retry reconstruction preserves the entire configured roster");
+		ScenarioLaunchRegistry.clearRetainedPlan();
+		assertTrue(ScenarioLaunchRegistry.isAvailable(),
+				"clearing session state keeps the registered launch transport available");
+		assertTrue(ScenarioLaunchRegistry.lastAcceptedPlan().isEmpty(),
+				"disconnect cleanup removes only the retained launch plan");
 		ScenarioLaunchRegistry.clear();
 		assertTrue(!ScenarioLaunchRegistry.isAvailable(), "clearing runtime disables launch");
-		assertions += 15;
+		assertTrue(ScenarioLaunchRegistry.lastAcceptedPlan().isEmpty(),
+				"clearing runtime also clears the session-scoped retained launch plan");
+		assertions += 18;
+
+		try {
+			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
+					"codex", "gpt-future", "GPT Future", List.of("medium"), List.of("priority")
+			)));
+			ScenarioSetupState runtimeOnly = ScenarioSetupState.defaults("codex", "gpt-future", "medium");
+			runtimeOnly.next();
+			runtimeOnly.next();
+			ScenarioLaunchPlan runtimeOnlyPlan = runtimeOnly.launchPlan();
+			AgentControlCatalog.resetRuntimeCatalog();
+			ScenarioSetupScreen.RetainedPlanResolution deferred = ScenarioSetupScreen.resolveRetainedPlan(
+					runtimeOnlyPlan, false);
+			assertTrue(deferred.state().isEmpty(), "fallback catalog cannot yet restore the runtime-only roster");
+			assertTrue(!deferred.discard(), "fallback catalog defers retained-roster invalidation");
+
+			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
+					"codex", "gpt-future", "GPT Future", List.of("medium"), List.of("priority")
+			)));
+			ScenarioSetupScreen.RetainedPlanResolution restored = ScenarioSetupScreen.resolveRetainedPlan(
+					runtimeOnlyPlan, true);
+			assertEquals(runtimeOnlyPlan, restored.state().orElseThrow().launchPlan(),
+					"authoritative catalog restores the deferred roster exactly");
+			assertTrue(!restored.discard(), "successfully restored roster remains retained");
+
+			ScenarioSetupState staleReview = ScenarioSetupState.defaults(
+					"codex", "gpt-future", "medium");
+			staleReview.next();
+			staleReview.next();
+			assertTrue(staleReview.canLaunch(), "review is launchable before its catalog selection disappears");
+			AgentControlCatalog.resetRuntimeCatalog();
+			assertTrue(ScenarioSetupScreen.resolveRetainedPlan(runtimeOnlyPlan, true).discard(),
+					"authoritative incompatible catalog invalidates the retained roster");
+			ScenarioLaunchRegistry.Result blocked = ScenarioSetupScreen.launchSafely(staleReview);
+			assertTrue(!blocked.accepted(), "catalog-invalid review is rejected without throwing");
+			assertTrue(blocked.message().contains("unavailable"),
+					"catalog-invalid review explains why launch was blocked");
+		} finally {
+			AgentControlCatalog.resetRuntimeCatalog();
+			ScenarioLaunchRegistry.clear();
+		}
+		assertions += 8;
 
 		state.previous();
 		assertEquals(ScenarioWizardStep.ROSTER, state.step(), "previous returns to roster");

@@ -1,6 +1,8 @@
 package dev.agaminggod.arenaagents.client.control;
 
 import dev.agaminggod.arenaagents.control.AgentControlAgent;
+import dev.agaminggod.arenaagents.control.AgentControlCatalog;
+import dev.agaminggod.arenaagents.control.AgentControlModelOption;
 import dev.agaminggod.arenaagents.control.AgentControlSnapshot;
 import java.util.List;
 
@@ -39,6 +41,27 @@ public final class AgentClientPresentationVerification {
 				"ordinary players never inherit agent presentation");
 		assertTrue(AgentPlayerIdentity.find(snapshot, "  ").isEmpty(),
 				"blank profile names never match an agent");
+
+		try {
+			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
+					"codex", "gpt-future", "GPT Future", List.of("medium"), List.of("priority")
+			)));
+			AgentControlClient.Preferences remembered = new AgentControlClient.Preferences(
+					"codex", "gpt-future", "medium");
+			AgentControlCatalog.resetRuntimeCatalog();
+			assertEquals(remembered, AgentControlClient.Preferences.reconcile(remembered, false),
+					"temporary fallback catalog preserves a runtime-only preference");
+
+			AgentControlCatalog.installRuntimeCatalog(List.of(new AgentControlModelOption(
+					"codex", "gpt-next", "GPT Next", List.of("high"), List.of("priority")
+			)));
+			AgentControlClient.Preferences repaired = AgentControlClient.Preferences.reconcile(remembered, true);
+			assertEquals("codex", repaired.provider(), "catalog change replaces an unavailable preferred provider");
+			assertEquals("gpt-next", repaired.model(), "authoritative catalog chooses the available model");
+			assertEquals("high", repaired.reasoning(), "authoritative catalog chooses available reasoning");
+		} finally {
+			AgentControlCatalog.resetRuntimeCatalog();
+		}
 		return 14;
 	}
 

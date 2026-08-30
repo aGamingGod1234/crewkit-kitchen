@@ -18,7 +18,9 @@ import java.util.function.Consumer;
 import java.util.function.LongSupplier;
 
 final class SpeechCaptureEngine implements AutoCloseable {
-	private static final long STT_RETRY_BACKOFF_NANOS = TimeUnit.SECONDS.toNanos(5L);
+	private static final long STT_UNAVAILABLE_RETRY_BACKOFF_NANOS = TimeUnit.SECONDS.toNanos(5L);
+	private static final long STT_CAPACITY_RETRY_BACKOFF_NANOS = TimeUnit.MILLISECONDS.toNanos(250L);
+	private static final long STT_RATE_LIMITED_RETRY_BACKOFF_NANOS = TimeUnit.SECONDS.toNanos(1L);
 	private static final long INITIAL_DECODER_RETRY_NANOS = TimeUnit.SECONDS.toNanos(1L);
 	private static final long MAX_DECODER_RETRY_NANOS = TimeUnit.SECONDS.toNanos(30L);
 	private final Transcriber transcriber;
@@ -34,6 +36,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	private final Map<UUID, PlayerGeneration> playerGenerations = new LinkedHashMap<>();
 	private final Map<UUID, TranscriptQueue> transcriptQueues = new LinkedHashMap<>();
 	private final Map<UUID, DecoderRetry> decoderRetries = new LinkedHashMap<>();
+	private final Map<UUID, Long> playerSttRetryAfterNanos = new LinkedHashMap<>();
 	private final Map<CompletableFuture<SpeechWorkerClient.Transcript>, CompletedUtterance> transcriptions =
 			new LinkedHashMap<>();
 	private final java.util.Set<UUID> activeTranscriptionPlayers = new java.util.LinkedHashSet<>();
@@ -123,15 +126,33 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			Executor deliveryExecutor,
 			TranscriptDelivery delivery
 	) {
+		Objects.requireNonNull(delivery, "delivery must not be null");
+		accept(playerId, whispering, opus, decoderFactory, deliveryExecutor, () -> delivery);
+	}
+
+	void accept(
+			UUID playerId,
+			boolean whispering,
+			byte[] opus,
+			DecoderFactory decoderFactory,
+			Executor deliveryExecutor,
+			TranscriptDeliveryFactory deliveryFactory
+	) {
 		Objects.requireNonNull(playerId, "playerId must not be null");
 		Objects.requireNonNull(opus, "opus must not be null");
 		Objects.requireNonNull(decoderFactory, "decoderFactory must not be null");
 		Objects.requireNonNull(deliveryExecutor, "deliveryExecutor must not be null");
-		Objects.requireNonNull(delivery, "delivery must not be null");
+		Objects.requireNonNull(deliveryFactory, "deliveryFactory must not be null");
 		List<CompletedUtterance> completed = new ArrayList<>(2);
-		synchronized (this) {
+		try {
+			synchronized (this) {
 			long now = monotonicNanos.getAsLong();
 			if (closed || now < sttRetryAfterNanos) return;
+			Long playerRetryAfter = playerSttRetryAfterNanos.get(playerId);
+			if (playerRetryAfter != null) {
+				if (now < playerRetryAfter) return;
+				playerSttRetryAfterNanos.remove(playerId);
+			}
 			DecoderRetry decoderRetry = decoderRetries.get(playerId);
 			if (decoderRetry != null && now < decoderRetry.retryAfterNanos) return;
 			Utterance utterance = utterances.get(playerId);
@@ -145,6 +166,13 @@ final class SpeechCaptureEngine implements AutoCloseable {
 					decoder = Objects.requireNonNull(decoderFactory.create(), "decoderFactory returned null");
 				} catch (RuntimeException ignored) {
 					recordDecoderFailureLocked(playerId, now);
+					return;
+				}
+				TranscriptDelivery delivery;
+				try {
+					delivery = Objects.requireNonNull(deliveryFactory.create(), "deliveryFactory returned null");
+				} catch (RuntimeException ignored) {
+					closeDecoder(decoder);
 					return;
 				}
 				utterance = new Utterance(
@@ -176,8 +204,10 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				);
 				if (utterance.length >= maxSamples) completed.add(finishLocked(playerId, utterance));
 			}
+			}
+		} finally {
+			for (CompletedUtterance utterance : completed) transcribe(utterance);
 		}
-		for (CompletedUtterance utterance : completed) transcribe(utterance);
 	}
 
 	private long endpointDelayMilliseconds(int samples) {
@@ -253,9 +283,18 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			completeTranscription(utterance, null, null);
 			return;
 		}
-		if (monotonicNanos.getAsLong() < sttRetryAfterNanos) {
+		long now = monotonicNanos.getAsLong();
+		if (now < sttRetryAfterNanos) {
 			completeTranscription(utterance, null, new RuntimeException("STT retry backoff is active"));
 			return;
+		}
+		Long playerRetryAfter = playerSttRetryAfterNanos.get(utterance.playerId);
+		if (playerRetryAfter != null) {
+			if (now < playerRetryAfter) {
+				completeTranscription(utterance, null, new RuntimeException("Player STT retry backoff is active"));
+				return;
+			}
+			playerSttRetryAfterNanos.remove(utterance.playerId);
 		}
 		if (activeTranscriptionPlayers.contains(utterance.playerId)) {
 			CompletedUtterance replaced = pendingTranscriptions.put(utterance.playerId, utterance);
@@ -327,8 +366,14 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		Map<UUID, List<TranscriptOutcome>> readyByPlayer = new LinkedHashMap<>();
 		synchronized (this) {
 			if (closed || !ownsPlayerGeneration(utterance)) return;
-			if (isSttUnavailable(failure)) {
-				sttRetryAfterNanos = monotonicNanos.getAsLong() + STT_RETRY_BACKOFF_NANOS;
+			String backoffCode = sttBackoffCode(failure);
+			long retryBackoffNanos = sttRetryBackoffNanos(backoffCode, failure);
+			if ("STT_UNAVAILABLE".equals(backoffCode) || "STT_RATE_LIMITED".equals(backoffCode)) {
+				long now = monotonicNanos.getAsLong();
+				long retryAfterNanos = now > Long.MAX_VALUE - retryBackoffNanos
+						? Long.MAX_VALUE : now + retryBackoffNanos;
+				sttRetryAfterNanos = Math.max(sttRetryAfterNanos, retryAfterNanos);
+				playerSttRetryAfterNanos.clear();
 				recordOutcomeLocked(utterance, null, readyByPlayer);
 				for (Utterance active : utterances.values()) {
 					if (active.timeout != null) active.timeout.cancel(false);
@@ -342,8 +387,15 @@ final class SpeechCaptureEngine implements AutoCloseable {
 					), null, readyByPlayer);
 				}
 				utterances.clear();
+			} else if (retryBackoffNanos > 0L) {
+				long now = monotonicNanos.getAsLong();
+				long retryAfter = now > Long.MAX_VALUE - retryBackoffNanos
+						? Long.MAX_VALUE : now + retryBackoffNanos;
+				playerSttRetryAfterNanos.put(utterance.playerId, retryAfter);
+				recordOutcomeLocked(utterance, null, readyByPlayer);
+				Utterance active = utterances.get(utterance.playerId);
+				if (active != null) recordOutcomeLocked(discardLocked(active.playerId, active), null, readyByPlayer);
 			} else {
-				if (failure == null) sttRetryAfterNanos = 0L;
 				recordOutcomeLocked(utterance, failure == null ? transcript : null, readyByPlayer);
 			}
 		}
@@ -395,6 +447,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			sequences.remove(playerId);
 			transcriptQueues.remove(playerId);
 			decoderRetries.remove(playerId);
+			playerSttRetryAfterNanos.remove(playerId);
 			activeTranscriptionPlayers.remove(playerId);
 			pendingTranscriptions.remove(playerId);
 			for (Map.Entry<CompletableFuture<SpeechWorkerClient.Transcript>, CompletedUtterance> entry
@@ -414,11 +467,33 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		return playerGenerations.get(utterance.playerId) == utterance.playerGeneration;
 	}
 
-	private static boolean isSttUnavailable(Throwable failure) {
+	private static String sttBackoffCode(Throwable failure) {
 		Throwable current = failure;
 		while (current instanceof CompletionException && current.getCause() != null) current = current.getCause();
-		return current instanceof VoiceWorkerClient.VoiceWorkerException workerFailure
-				&& workerFailure.code().equals("STT_UNAVAILABLE");
+		if (!(current instanceof VoiceWorkerClient.VoiceWorkerException workerFailure)) return "";
+		return switch (workerFailure.code()) {
+			case "STT_CAPACITY", "STT_RATE_LIMITED", "STT_UNAVAILABLE" -> workerFailure.code();
+			default -> "";
+		};
+	}
+
+	private static long sttRetryBackoffNanos(String failureCode, Throwable failure) {
+		return switch (failureCode) {
+			case "STT_CAPACITY" -> STT_CAPACITY_RETRY_BACKOFF_NANOS;
+			case "STT_RATE_LIMITED" -> {
+				VoiceWorkerClient.VoiceWorkerException workerFailure = workerFailure(failure);
+				yield workerFailure != null && workerFailure.retryAfterNanos() > 0L
+						? workerFailure.retryAfterNanos() : STT_RATE_LIMITED_RETRY_BACKOFF_NANOS;
+			}
+			case "STT_UNAVAILABLE" -> STT_UNAVAILABLE_RETRY_BACKOFF_NANOS;
+			default -> 0L;
+		};
+	}
+
+	private static VoiceWorkerClient.VoiceWorkerException workerFailure(Throwable failure) {
+		Throwable current = failure;
+		while (current instanceof CompletionException && current.getCause() != null) current = current.getCause();
+		return current instanceof VoiceWorkerClient.VoiceWorkerException worker ? worker : null;
 	}
 
 	@Override
@@ -434,6 +509,7 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		playerGenerations.clear();
 		transcriptQueues.clear();
 		decoderRetries.clear();
+		playerSttRetryAfterNanos.clear();
 		activeTranscriptionPlayers.clear();
 		pendingTranscriptions.clear();
 		for (CompletableFuture<SpeechWorkerClient.Transcript> transcription : List.copyOf(transcriptions.keySet())) {
@@ -467,6 +543,11 @@ final class SpeechCaptureEngine implements AutoCloseable {
 	@FunctionalInterface
 	interface TranscriptDelivery {
 		void deliver(UUID playerId, String transcript, boolean whispering);
+	}
+
+	@FunctionalInterface
+	interface TranscriptDeliveryFactory {
+		TranscriptDelivery create();
 	}
 
 	private static final class Utterance {
