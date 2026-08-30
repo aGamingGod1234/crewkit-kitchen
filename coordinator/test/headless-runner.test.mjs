@@ -212,6 +212,7 @@ test('runs a real-provider scenario with exact RCON sequence and injected eviden
 
 test('summons, starts, and polls an eight-agent exact-profile roster concurrently with isolated evidence', async () => {
 	const commands = [];
+	const factualCommands = [];
 	const names = [];
 	const activeByPhase = new Map();
 	const maxActiveByPhase = new Map();
@@ -240,7 +241,11 @@ test('summons, starts, and polls an eight-agent exact-profile roster concurrentl
 			}
 			if (command.startsWith('codex start ')) { await phaseBarrier('start', 8); return { text: 'started' }; }
 			if (command.startsWith('codex status ')) { await phaseBarrier('status', 8); return { text: 'state=COMPLETED' }; }
-			if (command.startsWith('data get entity ')) return { text: 'minecraft:wooden_pickaxe' };
+			if (command.startsWith('data get entity ')) {
+				assert.doesNotMatch(command, /\{agent\}/);
+				factualCommands.push(command);
+				return { text: 'minecraft:wooden_pickaxe' };
+			}
 			return { text: 'ok' };
 		},
 		close: async () => {},
@@ -268,6 +273,9 @@ test('summons, starts, and polls an eight-agent exact-profile roster concurrentl
 	assert.equal(report.rosterSize, 8);
 	assert.equal(report.agents.length, 8);
 	assert.equal(report.factualSuccess, true);
+	assert.equal(factualCommands.length, 8);
+	assert.equal(new Set(factualCommands).size, 8);
+	assert.ok(factualCommands.every((command) => names.some((name) => command.includes(name))));
 	assert.deepEqual(report.agents.map((agent) => agent.agentId), Array.from({ length: 8 }, (_value, index) => `agent-id-${index + 1}`));
 	assert.ok(report.agents.every((agent) => agent.assertions.every((assertion) => assertion.passed)));
 	assert.equal(maxActiveByPhase.get('summon'), 8);

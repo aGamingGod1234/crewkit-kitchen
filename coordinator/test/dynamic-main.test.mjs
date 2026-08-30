@@ -3806,7 +3806,7 @@ test('per-agent event intake reserves terminal-result capacity under ordinary ov
 	}
 });
 
-test('per-agent event intake keeps accepted lifecycle transactions lossless under ordinary overflow', async () => {
+test('per-agent event intake reserves lifecycle transaction capacity under ordinary overflow', async () => {
 	const bridge = new FakeBridge();
 	const registry = new AgentRegistry();
 	let releaseReconciliation;
@@ -3863,6 +3863,57 @@ test('per-agent event intake keeps accepted lifecycle transactions lossless unde
 		assert.equal(registry.get('agent-a').goalRevision, 2);
 		assert.equal(registry.get('agent-b').goalRevision, 1);
 		assert.equal(errors.filter((error) => error?.code === 'AGENT_EVENT_BACKPRESSURE').length, 2);
+	} finally {
+		releaseReconciliation?.();
+		await coordinator.stop();
+	}
+});
+
+test('per-agent transaction intake is bounded and an unadmitted goal control remains replayable', async () => {
+	const bridge = new FakeBridge();
+	const registry = new AgentRegistry();
+	let releaseReconciliation;
+	const reconciliationGate = new Promise((resolve) => { releaseReconciliation = resolve; });
+	const planner = new FakePlanner(registry);
+	planner.beginReconcile = (records, options = undefined) => {
+		const reconciled = registry.reconcile(records, options);
+		return {
+			registry: reconciled,
+			complete: reconciliationGate.then(() => ({ registry: reconciled, providers: { valid: reconciled.records, invalid: [], catalog: { models: [] } } })),
+		};
+	};
+	const coordinator = createDynamicCoordinator(
+		{ bridge: { port: 25570, secret: 's'.repeat(32) }, codex: { controlProtocol: 'arena_script' } },
+		{ bridge, registry, planner, codexService: new FakeProvider(), maxPendingAgentOperations: 1, maxPendingAgentTransactions: 1 },
+	);
+	const errors = [];
+	coordinator.on('runtimeError', (error) => errors.push(error));
+	await coordinator.start();
+	const secondControl = { operation: 'steer', goalRevision: 3, goal: 'Third goal.', updatedAtEpochMs: 3 };
+	try {
+		bridge.emit('ready', { serverInstanceId: 'test', registry: [{ ...record(), state: DynamicAgentState.STARTING, currentGoal: 'First goal.', goalRevision: 1 }] });
+		await new Promise((resolve) => setImmediate(resolve));
+		bridge.emit('observation', { agentId: 'agent-a', payload: {
+			goalRevision: 1, eventSequence: 1, attention: true,
+			observation: { player: { x: 0, y: 64, z: 0, health: 20 }, items: [], entities: [], blocks: [], inventory: { items: [], tagCounts: {} } },
+		} });
+		await new Promise((resolve) => setImmediate(resolve));
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: { operation: 'steer', goalRevision: 2, goal: 'Second goal.', updatedAtEpochMs: 2 } });
+		for (let sequence = 1; sequence <= 1_000; sequence += 1) bridge.emit('conversation_event', { agentId: 'agent-a', payload: {
+			sequence, kind: 'player_message', sourceId: 'player-a', recipientId: 'agent-a', scope: 'direct',
+			text: `Queued message ${sequence}`, goalRevision: 1, observedAtEpochMs: 1_787_184_000_000 + sequence,
+		} });
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: secondControl });
+		await eventually(() => errors.filter((error) => error?.code === 'AGENT_EVENT_BACKPRESSURE').length === 1_001);
+		assert.equal(registry.get('agent-a').goalRevision, 2, 'the admitted control is visible but the rejected revision is not');
+
+		releaseReconciliation();
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 2));
+		assert.equal(registry.get('agent-a').goalRevision, 2);
+		bridge.emit('goal_control', { agentId: 'agent-a', payload: structuredClone(secondControl) });
+		await eventually(() => bridge.sent.some((message) => message.type === 'agent_ready' && message.payload.goalRevision === 3));
+		assert.equal(registry.get('agent-a').goalRevision, 3);
+		assert.equal(errors.filter((error) => error?.code === 'AGENT_EVENT_BACKPRESSURE').length, 1_001);
 	} finally {
 		releaseReconciliation?.();
 		await coordinator.stop();
