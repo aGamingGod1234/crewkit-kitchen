@@ -137,6 +137,7 @@ function validateProgram(ast, limits) {
 		functionEdges: new Map(),
 		functionDependencies: new Map(),
 		functionCalls: [],
+		watcherActivationNode: watcherActivationNode(ast),
 	};
 
 	validateWatcherPrologue(ast);
@@ -178,6 +179,7 @@ function statementHasTopLevelEffect(statement) {
 		const current = stack.pop();
 		if (!current || typeof current !== 'object') continue;
 		if (Array.isArray(current)) { stack.push(...current); continue; }
+		if (isFunctionNode(current)) continue;
 		if (current.type === 'AwaitExpression') return true;
 		if (current.type === 'CallExpression') {
 			const path = staticMemberPath(current.callee)?.join('.');
@@ -186,6 +188,13 @@ function statementHasTopLevelEffect(statement) {
 		for (const [key, value] of Object.entries(current)) if (!['loc', 'start', 'end', 'type'].includes(key)) stack.push(value);
 	}
 	return false;
+}
+
+function watcherActivationNode(ast) {
+	for (const statement of ast.body) {
+		if (statementHasTopLevelEffect(statement)) return statement;
+	}
+	return { start: ast.end, loc: ast.loc };
 }
 
 function visit(node, state, context) {
@@ -418,7 +427,7 @@ function validateCallExpression(node, state, context) {
 	}
 
 	if (pathEqual(path, ['program', 'repeatUntil'])) {
-		validateRepeatUntil(node, state);
+		validateRepeatUntil(node, state, context);
 	}
 	if (pathEqual(path, ['program', 'watch'])) {
 		validateWatcher(node, state, context);
@@ -518,7 +527,7 @@ function validateMemberExpression(node, state, context) {
 	}
 }
 
-function validateRepeatUntil(node, state) {
+function validateRepeatUntil(node, state, context) {
 	if (node.arguments.length !== 3) {
 		throw arenaError('UNBOUNDED_LOOP', 'program.repeatUntil requires condition, literal maxIterations options, and body', node);
 	}
@@ -529,6 +538,7 @@ function validateRepeatUntil(node, state) {
 	if (!isFunctionNode(node.arguments[0]) || !isFunctionNode(node.arguments[2])) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'repeatUntil condition and body must be functions', node);
 	}
+	recordCallbackCalls(state, node, context, node.arguments[0], node.arguments[2]);
 	validatePureCondition(node.arguments[0]);
 }
 
@@ -543,6 +553,7 @@ function validateWatcher(node, state, context) {
 	if (node.arguments.length !== 3 || !isFunctionNode(node.arguments[0]) || !isFunctionNode(node.arguments[2])) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'program.watch requires condition, options, and handler functions', node);
 	}
+	recordCallbackCalls(state, state.watcherActivationNode, context, node.arguments[0], node.arguments[2]);
 	const mode = literalObjectProperty(node.arguments[1], 'mode', 'UNSUPPORTED_SYNTAX');
 	if (!['boundary', 'interrupt'].includes(mode)) {
 		throw arenaError('UNSUPPORTED_SYNTAX', 'watcher mode must be the boundary or interrupt literal', node.arguments[1]);
@@ -768,6 +779,30 @@ function registerFunctionBinding(scope, name, functionNode, state, { hoisted = f
 	scope.bindings.set(name, binding);
 	state.functionBindingsByNode.set(functionNode, binding);
 	state.functionBindings.add(binding);
+}
+
+function callbackBinding(state, functionNode, scope, ownerFunctionNode) {
+	const existing = state.functionBindingsByNode.get(functionNode);
+	if (existing) return existing;
+	const binding = Object.freeze({
+		callable: true,
+		name: `callback@${functionNode.start}`,
+		functionNode,
+		scope,
+		hoisted: true,
+		availableAt: null,
+		ownerFunctionNode,
+	});
+	state.functionBindingsByNode.set(functionNode, binding);
+	state.functionBindings.add(binding);
+	return binding;
+}
+
+function recordCallbackCalls(state, callNode, context, ...callbacks) {
+	for (const callback of callbacks) {
+		const binding = callbackBinding(state, callback, context.scope, context.functionNode);
+		state.functionCalls.push(Object.freeze({ binding, node: callNode, ownerFunctionNode: context.functionNode }));
+	}
 }
 
 function resolveBinding(scope, name) {

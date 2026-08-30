@@ -21,6 +21,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 final class VoiceWorkerClientsVerification {
@@ -276,22 +277,27 @@ final class VoiceWorkerClientsVerification {
 			).join(), "STT capacity response");
 			saturated.assertHealthy();
 		}
-		try (WorkerServer rateLimited = new WorkerServer(exchange -> respond(
-				exchange,
-				429,
-				"{\"code\":\"STT_RATE_LIMITED\",\"message\":\"Speech provider rate limit reached\"}"
-						.getBytes(StandardCharsets.UTF_8),
-				"application/json"
-		))) {
+		try (WorkerServer rateLimited = new WorkerServer(exchange -> {
+			exchange.getResponseHeaders().set("Retry-After", "12");
+			respond(
+					exchange,
+					429,
+					"{\"code\":\"STT_RATE_LIMITED\",\"message\":\"Speech provider rate limit reached\"}"
+							.getBytes(StandardCharsets.UTF_8),
+					"application/json"
+			);
+		})) {
 			SpeechWorkerClient client = new SpeechWorkerClient(
 					HttpClient.newHttpClient(), rateLimited.uri("/v1/stt"), SECRET
 			);
-			assertWorkerFailure("STT_RATE_LIMITED", () -> client.transcribe(
+			VoiceWorkerClient.VoiceWorkerException failure = assertWorkerFailure("STT_RATE_LIMITED", () -> client.transcribe(
 					PLAYER, 1L, false, new short[] { 1 }
 			).join(), "STT provider rate-limit response");
+			assertEquals(TimeUnit.SECONDS.toNanos(12L), failure.retryAfterNanos(),
+					"STT provider Retry-After response");
 			rateLimited.assertHealthy();
 		}
-		return 3;
+		return 4;
 	}
 
 	private static VoiceRequest request() {
@@ -317,7 +323,9 @@ final class VoiceWorkerClientsVerification {
 		respond(exchange, 200, body, "audio/L16");
 	}
 
-	private static void assertWorkerFailure(String expectedCode, Runnable action, String message) {
+	private static VoiceWorkerClient.VoiceWorkerException assertWorkerFailure(
+			String expectedCode, Runnable action, String message
+	) {
 		try {
 			action.run();
 			throw new AssertionError(message + ": expected failure " + expectedCode);
@@ -327,6 +335,7 @@ final class VoiceWorkerClientsVerification {
 				throw new AssertionError(message + ": unexpected failure " + cause, cause);
 			}
 			assertEquals(expectedCode, workerFailure.code(), message);
+			return workerFailure;
 		}
 	}
 

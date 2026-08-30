@@ -1,5 +1,7 @@
 package dev.agaminggod.arenaagents.server.runtime.controller;
 
+import java.util.ArrayList;
+import java.util.List;
 import net.minecraft.world.level.Level;
 
 public final class ItemPickupProgressVerification {
@@ -27,7 +29,20 @@ public final class ItemPickupProgressVerification {
 				ItemPickupProgress.evaluate(2, 2, false, false), "a vanished item never becomes synthetic loot");
 		assertEquals(ItemPickupProgress.Decision.TIMED_OUT,
 				ItemPickupProgress.evaluate(2, 2, true, true), "a live unreachable item times out");
-		return 8;
+		List<String> lifecycle = new ArrayList<>();
+		Object previous = new Object();
+		Object replacement = new Object();
+		assertEquals(replacement, ServerItemPickupController.replaceNavigation(
+				previous,
+				ignored -> lifecycle.add("released"),
+				() -> {
+					lifecycle.add("created");
+					return replacement;
+				}
+		), "moving-item replanning installs the replacement controller");
+		assertEquals(List.of("released", "created"), lifecycle,
+				"moving-item replanning releases the old navigation lease before replacement");
+		return 10;
 	}
 
 	private static void assertTrue(boolean condition, String message) {

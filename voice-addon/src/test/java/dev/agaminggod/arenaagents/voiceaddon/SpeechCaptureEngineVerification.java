@@ -43,7 +43,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyCapacitySttRecoversAfterBackoff();
 		assertions += verifyRateLimitedSttRecoversAfterBackoff();
 		assertions += verifyCapacityBackoffIsolatesOtherPlayers();
-		assertions += verifyRateLimitBackoffIsolatesOtherPlayers();
+		assertions += verifyRateLimitBackoffIsGlobal();
 		assertions += verifyCloseCancelsPendingTranscription();
 		assertions += verifyConsentRevocationCancelsOnlyOwnedSpeech();
 		assertions += verifyDisconnectGenerationStateIsBounded();
@@ -416,8 +416,37 @@ final class SpeechCaptureEngineVerification {
 		return verifyPlayerBackoffIsolatesOtherPlayers("STT_CAPACITY", "capacity");
 	}
 
-	private static int verifyRateLimitBackoffIsolatesOtherPlayers() {
-		return verifyPlayerBackoffIsolatesOtherPlayers("STT_RATE_LIMITED", "rate limit");
+	private static int verifyRateLimitBackoffIsGlobal() {
+		Map<UUID, CompletableFuture<SpeechWorkerClient.Transcript>> pending = new java.util.LinkedHashMap<>();
+		long[] now = { 0L };
+		SpeechCaptureEngine engine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
+			CompletableFuture<SpeechWorkerClient.Transcript> future = new CompletableFuture<>();
+			pending.put(playerId, future);
+			return future;
+		}, scheduler(), 5_000L, 2, ignored -> { }, () -> now[0]);
+		RecordingDecoder otherDecoder = new RecordingDecoder();
+		List<Delivered> delivered = new ArrayList<>();
+		engine.accept(OTHER_PLAYER, false, new byte[] { 1 }, () -> otherDecoder, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		engine.accept(PLAYER, false, new byte[] { 1, 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		pending.get(PLAYER).completeExceptionally(new VoiceWorkerClient.VoiceWorkerException(
+				"STT_RATE_LIMITED", "Speech provider rate limit", TimeUnit.SECONDS.toNanos(12L)));
+
+		assertEquals(true, otherDecoder.closed,
+				"a provider-global rate limit discards speech captured against the throttled API key");
+		engine.accept(OTHER_PLAYER, false, new byte[] { 2 }, () -> {
+			throw new AssertionError("provider Retry-After must block every player before decoding");
+		}, Runnable::run, (playerId, text, whispering) -> { });
+		now[0] = TimeUnit.SECONDS.toNanos(12L);
+		engine.accept(OTHER_PLAYER, false, new byte[] { 3, 4 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		pending.get(OTHER_PLAYER).complete(new SpeechWorkerClient.Transcript("other player heard", 0.9));
+		assertEquals(List.of(new Delivered(OTHER_PLAYER, "other player heard", false)), delivered,
+				"all players recover when the provider Retry-After deadline expires");
+		assertEquals(2, pending.size(), "the global backoff prevents an extra provider request before recovery");
+		engine.close();
+		return 3;
 	}
 
 	private static int verifyPlayerBackoffIsolatesOtherPlayers(String failureCode, String label) {

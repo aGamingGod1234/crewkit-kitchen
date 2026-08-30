@@ -15,7 +15,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            test-script: test
+          - os: ubuntu-latest
+            test-script: test:portable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -26,9 +30,9 @@ jobs:
       - name: Install locked coordinator dependencies
         working-directory: coordinator
         run: npm ci --ignore-scripts --omit=dev
-      - name: Test deterministic coordinator reliability suite
+      - name: Test coordinator
         working-directory: coordinator
-        run: npm run test:portable
+        run: npm run ${{ matrix.test-script }}
 
   java-and-package:
     name: Java and package (Windows)
@@ -53,7 +57,16 @@ jobs:
       - name: Verify Java, Fabric, and embedded coordinator
         shell: powershell
         run: |
-          .\gradlew.bat clean check build --no-daemon --console=plain
+          .\gradlew.bat clean check build packageWindowsDistribution --no-daemon --console=plain
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\scripts\verify-coordinator-packaging.ps1 -JarPath .\build\libs\arena-agents-0.1.0.jar
           .\scripts\verify-distribution-runtime.ps1
+          $unpacked = Join-Path $env:RUNNER_TEMP 'arena-agents-standalone'
+          Expand-Archive -LiteralPath .\build\distributions\arena-agents-modpack-0.1.0.zip -DestinationPath $unpacked
+          .\scripts\verify-startup-packaging.ps1 -PackageRoot $unpacked
+      - name: Upload verified standalone distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-agents-modpack-0.1.0
+          path: build/distributions/arena-agents-modpack-0.1.0.zip
+          if-no-files-found: error

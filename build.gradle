@@ -15,6 +15,10 @@ base {
 repositories {
 }
 
+configurations {
+	standaloneFabricApi
+}
+
 loom {
 	splitEnvironmentSourceSets()
 
@@ -42,6 +46,9 @@ dependencies {
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 	compileOnly "net.java.dev.jna:jna:5.17.0"
 	compileOnly files("libs/fabric-carpet-26.1+v260402.jar")
+	standaloneFabricApi("net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}") {
+		transitive = false
+	}
 }
 
 processResources {
@@ -185,6 +192,46 @@ jar {
 		into "arena-agents/coordinator"
 		rename { 'coordinator-manifest.txt' }
 	}
+}
+
+def standaloneDistributionName = "arena-agents-modpack-${project.version}"
+def stagedStandaloneDistribution = layout.buildDirectory.dir("standalone/${standaloneDistributionName}")
+
+tasks.register('stageWindowsDistribution', Sync) {
+	group = 'distribution'
+	description = 'Stages the self-contained Windows mod pack with its verified Node.js runtime.'
+	dependsOn tasks.named('jar'), tasks.named('assembleWindowsNodeRuntime'), tasks.named('installCoordinatorProductionDependencies')
+	onlyIf { isWindowsHost }
+	into stagedStandaloneDistribution
+
+	from(tasks.named('jar').flatMap { it.archiveFile }) {
+		into 'mods'
+		rename { "arena-agents-${project.version}.jar" }
+	}
+	from(configurations.standaloneFabricApi) { into 'mods' }
+	from('libs/fabric-carpet-26.1+v260402.jar') { into 'mods' }
+	from('coordinator') {
+		into 'coordinator'
+		coordinatorRuntimeIncludes.each { include it }
+	}
+	from(bundledNodeRuntime) { into 'runtime/toolchains/node' }
+	from('scripts') {
+		into 'scripts'
+		include 'distribution-runtime.ps1', 'install-distribution.ps1', 'verify-startup-packaging.ps1'
+	}
+	from('README.md', 'LICENSE', 'NOTICE-FONTS.md')
+}
+
+tasks.register('packageWindowsDistribution', Zip) {
+	group = 'distribution'
+	description = 'Builds the self-contained Windows mod-pack archive.'
+	dependsOn tasks.named('stageWindowsDistribution')
+	onlyIf { isWindowsHost }
+	from stagedStandaloneDistribution
+	archiveFileName = "${standaloneDistributionName}.zip"
+	destinationDirectory = layout.buildDirectory.dir('distributions')
+	preserveFileTimestamps = false
+	reproducibleFileOrder = true
 }
 
 def entrypointClassFiles = [

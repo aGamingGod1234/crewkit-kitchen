@@ -14,6 +14,7 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 final class SpeechWorkerClient {
 	private static final int MAX_SAMPLES = 48_000 * 20;
@@ -126,9 +127,20 @@ final class SpeechWorkerClient {
 				// Invalid error bodies remain a generic bounded HTTP failure.
 			}
 		}
+		long retryAfterNanos = "STT_RATE_LIMITED".equals(code)
+				? retryAfterNanos(response.headers().firstValue("Retry-After").orElse("")) : 0L;
 		return new VoiceWorkerClient.VoiceWorkerException(
-				code, "Speech worker returned HTTP " + response.statusCode()
+				code, "Speech worker returned HTTP " + response.statusCode(), retryAfterNanos
 		);
+	}
+
+	private static long retryAfterNanos(String value) {
+		try {
+			long seconds = Long.parseLong(value.strip());
+			return TimeUnit.SECONDS.toNanos(Math.max(0L, Math.min(seconds, 300L)));
+		} catch (NumberFormatException ignored) {
+			return 0L;
+		}
 	}
 
 	private static HttpClient defaultClient() {

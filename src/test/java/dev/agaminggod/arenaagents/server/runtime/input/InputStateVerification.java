@@ -16,6 +16,7 @@ public final class InputStateVerification {
 		int assertions = 0;
 		assertions += verifyCompleteInputState();
 		assertions += verifyLeasePreemptionAndRestoration();
+		assertions += verifyNavigationReplacementDoesNotRestoreReleasedInput();
 		assertions += verifyOwnedReleasePreservesSystemLease();
 		assertions += verifyClearReleasesEveryPressedInput();
 		assertions += verifyFailedApplyRemainsRetryable();
@@ -58,6 +59,28 @@ public final class InputStateVerification {
 		controller.release(combat);
 		assertEquals(state(1.0F, false, true), controller.currentState(AGENT).orElseThrow(), "navigation state restores after combat");
 		assertEquals(List.of(walking, attacking, state(1.0F, false, true)), sink.applied, "only winning states reach the sink");
+		return 3;
+	}
+
+	private static int verifyNavigationReplacementDoesNotRestoreReleasedInput() {
+		RecordingSink sink = new RecordingSink();
+		LeasedServerInputController controller = new LeasedServerInputController(sink);
+		InputLease previous = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		AgentInputState previousState = state(1.0F, false, false);
+		controller.apply(previous, previousState);
+
+		controller.release(previous);
+		InputLease replacement = controller.acquire(AGENT, InputOwner.NAVIGATION, 100);
+		AgentInputState replacementState = state(0.0F, false, true);
+		controller.apply(replacement, replacementState);
+		controller.release(replacement);
+
+		assertEquals(true, controller.currentState(AGENT).isEmpty(),
+				"completed navigation replacement leaves no input lease active");
+		assertEquals(List.of(previousState, replacementState), sink.applied,
+				"replacement never restores movement from the released navigation lease");
+		assertEquals(List.of(AGENT, AGENT), sink.cleared,
+				"replanning and completion both release physical input");
 		return 3;
 	}
 

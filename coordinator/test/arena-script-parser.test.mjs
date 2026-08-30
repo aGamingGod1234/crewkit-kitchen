@@ -176,6 +176,18 @@ test('rejects immediate local calls before their closure dependencies are initia
 	);
 });
 
+test('rejects deferred inline callbacks that close over later local bindings', () => {
+	for (const source of [
+		'program.onUnhandledAttention("continue_and_notify"); program.watch(() => later, { mode: "boundary" }, async () => {}); await player.wait(1); const later = true;',
+		'program.onUnhandledAttention("continue_and_notify"); await program.repeatUntil(() => false, { maxIterations: 1 }, async () => { await player.wait(later); }); const later = 1;',
+	]) {
+		assert.throws(
+			() => parseArenaScript(source),
+			(error) => error.name === 'ArenaScriptError' && error.code === 'UNSAFE_MEMBER_ACCESS',
+		);
+	}
+});
+
 test('rejects source over the configured byte limit', () => {
 	assert.throws(
 		() => parseArenaScript('x'.repeat(20), { limits: { sourceBytes: 4 } }),

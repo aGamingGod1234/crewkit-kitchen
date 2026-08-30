@@ -351,6 +351,8 @@ export class ProgramRuntimeManager {
 			verificationTraceIds: new Set(),
 			pendingServerResult: null,
 			cancellations: new Map(),
+			cancellationFailures: new Set(),
+			cancellationRecoveryRequested: false,
 			engine: null,
 		};
 		state.engine = new ArenaScriptEngine({
@@ -715,12 +717,9 @@ export class ProgramRuntimeManager {
 				state.cancellations.delete(actionId);
 				const record = this.#registry.get(state.agentId);
 				if (state.disposed || this.#states.get(state.agentId) !== state || record === null || record.goalRevision !== state.goalRevision) return;
-				state.actionIds.delete(externalActionId);
-				state.actionTraceIds.delete(externalActionId);
-				state.actionTiming.delete(externalActionId);
-				state.actionMetadata.delete(externalActionId);
-				state.engine.failCancellation({ actionId, eventSequence: ++state.sequence, reasonCode: 'CANCEL_ACK_TIMEOUT' });
-				this.#syncState(record, state);
+				const error = codedError('CANCEL_ACK_TIMEOUT', 'Server did not acknowledge action cancellation before the watchdog deadline');
+				this.#reportCancellationFailure(record, state, actionId, error);
+				void this.#cancel(state, actionId);
 			}, this.#cancellationAckTimeoutMs);
 			state.cancellations.set(actionId, timer);
 			timer?.unref?.();
@@ -729,31 +728,41 @@ export class ProgramRuntimeManager {
 		catch (error) {
 			const record = this.#registry.get(state.agentId);
 			if (!state.cancellations.has(actionId) || state.disposed || this.#states.get(state.agentId) !== state || record === null || record.goalRevision !== state.goalRevision) return;
-			this.#clearCancellation(state, actionId);
 			const reasonCode = stableFailureCode(error);
-			state.actionIds.delete(externalActionId);
-			state.actionTraceIds.delete(externalActionId);
-			state.actionTiming.delete(externalActionId);
-			state.actionMetadata.delete(externalActionId);
-			state.engine.failCancellation({ actionId, eventSequence: ++state.sequence, reasonCode: 'CANCEL_SEND_FAILED' });
-			this.#syncState(record, state);
 			const reported = error && typeof error === 'object' && typeof error.code === 'string'
 				? error
 				: Object.assign(new Error(String(error?.message ?? error ?? 'cancel transport failed')), { code: reasonCode, cause: error });
-			this.#reportError(state.agentId, reported);
+			this.#reportCancellationFailure(record, state, actionId, reported);
 		}
+	}
+
+	#reportCancellationFailure(record, state, actionId, error) {
+		if (state.cancellationFailures.has(actionId)) return;
+		state.cancellationFailures.add(actionId);
+		const recoveryAlreadyRequested = state.recoveryRequested;
+		this.#requestRecoveryLease(record, state, 'action_cancellation_unconfirmed', error);
+		if (!recoveryAlreadyRequested && state.recoveryRequested) state.cancellationRecoveryRequested = true;
+		this.#reportError(state.agentId, error);
 	}
 
 	#clearCancellation(state, actionId) {
 		const timer = state.cancellations.get(actionId);
-		if (timer === undefined) return;
-		this.#clearTimeout(timer);
-		state.cancellations.delete(actionId);
+		if (timer !== undefined) {
+			this.#clearTimeout(timer);
+			state.cancellations.delete(actionId);
+		}
+		state.cancellationFailures.delete(actionId);
+		if (state.cancellationRecoveryRequested && state.reactiveRecovery === null) {
+			state.recoveryRequested = false;
+			state.cancellationRecoveryRequested = false;
+		}
 	}
 
 	#clearAllCancellations(state) {
 		for (const timer of state.cancellations.values()) this.#clearTimeout(timer);
 		state.cancellations.clear();
+		state.cancellationFailures.clear();
+		state.cancellationRecoveryRequested = false;
 	}
 
 	#acceptServerEvent(state, candidate) {

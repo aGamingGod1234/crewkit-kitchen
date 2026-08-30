@@ -292,8 +292,8 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		synchronized (this) {
 			if (closed || !ownsPlayerGeneration(utterance)) return;
 			String backoffCode = sttBackoffCode(failure);
-			long retryBackoffNanos = sttRetryBackoffNanos(backoffCode);
-			if ("STT_UNAVAILABLE".equals(backoffCode)) {
+			long retryBackoffNanos = sttRetryBackoffNanos(backoffCode, failure);
+			if ("STT_UNAVAILABLE".equals(backoffCode) || "STT_RATE_LIMITED".equals(backoffCode)) {
 				long now = monotonicNanos.getAsLong();
 				sttRetryAfterNanos = now > Long.MAX_VALUE - retryBackoffNanos
 						? Long.MAX_VALUE : now + retryBackoffNanos;
@@ -320,7 +320,6 @@ final class SpeechCaptureEngine implements AutoCloseable {
 				Utterance active = utterances.get(utterance.playerId);
 				if (active != null) recordOutcomeLocked(discardLocked(active.playerId, active), null, readyByPlayer);
 			} else {
-				if (failure == null) sttRetryAfterNanos = 0L;
 				recordOutcomeLocked(utterance, failure == null ? transcript : null, readyByPlayer);
 			}
 		}
@@ -400,13 +399,23 @@ final class SpeechCaptureEngine implements AutoCloseable {
 		};
 	}
 
-	private static long sttRetryBackoffNanos(String failureCode) {
+	private static long sttRetryBackoffNanos(String failureCode, Throwable failure) {
 		return switch (failureCode) {
 			case "STT_CAPACITY" -> STT_CAPACITY_RETRY_BACKOFF_NANOS;
-			case "STT_RATE_LIMITED" -> STT_RATE_LIMITED_RETRY_BACKOFF_NANOS;
+			case "STT_RATE_LIMITED" -> {
+				VoiceWorkerClient.VoiceWorkerException workerFailure = workerFailure(failure);
+				yield workerFailure != null && workerFailure.retryAfterNanos() > 0L
+						? workerFailure.retryAfterNanos() : STT_RATE_LIMITED_RETRY_BACKOFF_NANOS;
+			}
 			case "STT_UNAVAILABLE" -> STT_UNAVAILABLE_RETRY_BACKOFF_NANOS;
 			default -> 0L;
 		};
+	}
+
+	private static VoiceWorkerClient.VoiceWorkerException workerFailure(Throwable failure) {
+		Throwable current = failure;
+		while (current instanceof CompletionException && current.getCause() != null) current = current.getCause();
+		return current instanceof VoiceWorkerClient.VoiceWorkerException worker ? worker : null;
 	}
 
 	@Override

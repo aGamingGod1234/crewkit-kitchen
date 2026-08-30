@@ -55,10 +55,47 @@ try {
 	}
 	Write-Host 'PASS: coordinator and Node.js roll back together after either promotion fails'
 
+	$interrupted = $false
+	try {
+		Install-ArenaCoordinatorRuntime -SourceRoot $sourceRoot -InstalledPackageRoot $installedRoot -FailurePoint CrashAfterCoordinatorPromotion | Out-Null
+	} catch {
+		$interrupted = $true
+	}
+	if (-not $interrupted) { throw 'Injected hard runtime interruption did not fail.' }
+	if (-not (Test-Path -LiteralPath (Join-Path $installedRoot '.arena-runtime-transaction.json') -PathType Leaf)) {
+		throw 'Hard interruption did not retain its recovery journal.'
+	}
+	$recovered = Install-ArenaCoordinatorRuntime -SourceRoot $sourceRoot -InstalledPackageRoot $installedRoot
+	Assert-Equal 'new-runtime-v2' ([IO.File]::ReadAllText((Join-Path $activeCoordinator 'src\dynamic-main.mjs'))) 'Recovery must promote a coherent coordinator version'
+	Assert-Equal 'node-runtime-v2' ([IO.File]::ReadAllText($activeNode)) 'Recovery must promote the matching bundled Node.js version'
+	if (Test-Path -LiteralPath (Join-Path $installedRoot '.arena-runtime-transaction.json')) {
+		throw 'Successful interruption recovery retained its transaction journal.'
+	}
+	Write-Host 'PASS: an interrupted two-directory promotion recovers on the next install'
+
+	$heldLock = [IO.File]::Open(
+		(Join-Path $installedRoot '.arena-runtime-install.lock'),
+		[IO.FileMode]::OpenOrCreate,
+		[IO.FileAccess]::ReadWrite,
+		[IO.FileShare]::None
+	)
+	$concurrentInstallRejected = $false
+	try {
+		Install-ArenaCoordinatorRuntime -SourceRoot $sourceRoot -InstalledPackageRoot $installedRoot | Out-Null
+	} catch {
+		$concurrentInstallRejected = $_.Exception.Message -match 'already in progress'
+	} finally {
+		$heldLock.Dispose()
+	}
+	if (-not $concurrentInstallRejected) { throw 'A concurrent runtime installation was not rejected by the exclusive lock.' }
+	Assert-Equal 'new-runtime-v2' ([IO.File]::ReadAllText((Join-Path $activeCoordinator 'src\dynamic-main.mjs'))) 'Concurrent rejection must not modify the active coordinator'
+	Assert-Equal 'node-runtime-v2' ([IO.File]::ReadAllText($activeNode)) 'Concurrent rejection must not modify the active Node.js runtime'
+	Write-Host 'PASS: concurrent runtime installation is rejected without changing active files'
+
 	$second = Install-ArenaCoordinatorRuntime -SourceRoot $sourceRoot -InstalledPackageRoot $installedRoot
 	Assert-Equal 'new-runtime-v2' ([IO.File]::ReadAllText((Join-Path $activeCoordinator 'src\dynamic-main.mjs'))) 'A repeated install must promote the newest coordinator'
 	Assert-Equal 'node-runtime-v2' ([IO.File]::ReadAllText($activeNode)) 'A repeated install must promote the newest bundled Node.js runtime'
-	if ($second.BackupPath -eq $result.BackupPath) { throw 'Rapid coordinator updates must use unique backup paths.' }
+	if ($second.BackupPath -eq $recovered.BackupPath -or $second.BackupPath -eq $result.BackupPath) { throw 'Rapid coordinator updates must use unique backup paths.' }
 	if ([string]::IsNullOrWhiteSpace($second.NodeBackupPath) -or -not (Test-Path -LiteralPath $second.NodeBackupPath)) {
 		throw 'The replaced bundled Node.js runtime was not retained in a backup.'
 	}

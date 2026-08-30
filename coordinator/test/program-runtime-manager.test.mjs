@@ -739,7 +739,7 @@ test('wires full watcher provenance and preserves the exact profile on reactive 
 	assert.equal(watcher.provenance.watcherId, 'watcher-0');
 });
 
-test('cancel-send rejection keeps an unmatched urgent wake active for recovery and fences late results', async () => {
+test('cancel-send rejection keeps the old action fenced until its terminal result arrives', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const sent = [];
 	const errors = [];
@@ -758,11 +758,16 @@ test('cancel-send rejection keeps an unmatched urgent wake active for recovery a
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
 	assert.equal(recoveries.length, 1);
 	assert.equal(sent.filter((message) => message.type === 'action_cancel').length, 1);
-	assert.equal(await manager.onActionResult(registry.get('agent-a'), { actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3 }), false);
+	assert.equal(manager.isActionResultStale(registry.get('agent-a'), { actionId: active.actionId }), false);
+	assert.equal(sent.filter((message) => message.type === 'action_command').length, 1,
+		'unconfirmed cancellation cannot overlap the old server action with replacement work');
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), {
+		actionId: active.actionId, state: 'CANCELLED', reasonCode: 'LATE', eventSequence: 3,
+	}), true);
 	assert.equal(errors.at(-1)?.code, 'CANCEL_UNAVAILABLE');
 });
 
-test('a missing cancellation acknowledgement converges through a bounded watchdog', async () => {
+test('a missing cancellation acknowledgement retries without forgetting the old action fence', async () => {
 	const registry = new AgentRegistry(); registry.register(record());
 	const sent = [];
 	const timers = [];
@@ -791,10 +796,17 @@ test('a missing cancellation acknowledgement converges through a bounded watchdo
 	assert.equal(timers.length, 1);
 	assert.equal(timers[0].delay, 25);
 	timers[0].callback();
-	assert.equal(manager.isActionResultStale(registry.get('agent-a'), { actionId: active.actionId }), true);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(manager.isActionResultStale(registry.get('agent-a'), { actionId: active.actionId }), false);
+	assert.equal(sent.filter((message) => message.type === 'action_cancel').length, 2);
+	assert.equal(sent.filter((message) => message.type === 'action_command').length, 1,
+		'watchdog expiry cannot authorize overlapping replacement work');
 	for (let attempt = 0; attempt < 5 && recoveries.length === 0; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
 	assert.equal(recoveries.length, 1);
 	assert.equal(registry.get('agent-a').state, DynamicAgentState.ACTING);
+	assert.equal(await manager.onActionResult(registry.get('agent-a'), {
+		actionId: active.actionId, state: 'CANCELLED', reasonCode: 'WATCHDOG_RETRY', eventSequence: 3,
+	}), true);
 });
 
 test('replans from bounded failed-action context instead of pausing after a repeated deterministic failure', async () => {

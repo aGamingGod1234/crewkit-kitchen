@@ -2,6 +2,8 @@ package dev.agaminggod.arenaagents.server.runtime.controller;
 
 import dev.agaminggod.arenaagents.server.runtime.ElapsedTimeAccumulator;
 import java.util.Objects;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -68,9 +70,13 @@ public final class ServerItemPickupController implements ServerController {
 	private TickResult approach(ServerPlayer player, long nowEpochMs, long elapsedMs) {
 		Vec3 currentTarget = item.position();
 		if (navigation == null || navigationTarget.distanceToSqr(currentTarget) > REPLAN_DISTANCE_SQUARED) {
+			navigation = replaceNavigation(
+					navigation,
+					existing -> existing.cancel(player),
+					() -> new ServerNavigationController(currentTarget, 0.2D, true, nowEpochMs,
+							remainingNavigationTimeout(timeoutMs, elapsedMs))
+			);
 			navigationTarget = currentTarget;
-			navigation = new ServerNavigationController(currentTarget, 0.2D, true, nowEpochMs,
-					remainingNavigationTimeout(timeoutMs, elapsedMs));
 		}
 		TickResult result = navigation.tick(player, nowEpochMs);
 		if (result.state() == State.SUCCEEDED) {
@@ -112,5 +118,12 @@ public final class ServerItemPickupController implements ServerController {
 	static long remainingNavigationTimeout(long timeoutMs, long elapsedMs) {
 		if (timeoutMs <= 0L || elapsedMs < 0L) throw new IllegalArgumentException("invalid timeout state");
 		return Math.max(1L, timeoutMs - elapsedMs);
+	}
+
+	static <T> T replaceNavigation(T current, Consumer<T> stop, Supplier<T> replacement) {
+		Objects.requireNonNull(stop, "navigation stop must not be null");
+		Objects.requireNonNull(replacement, "navigation replacement must not be null");
+		if (current != null) stop.accept(current);
+		return Objects.requireNonNull(replacement.get(), "navigation replacement returned null");
 	}
 }

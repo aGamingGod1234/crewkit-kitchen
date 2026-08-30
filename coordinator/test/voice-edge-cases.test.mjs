@@ -1219,6 +1219,34 @@ test('Deepgram provider rejects unbounded or incomplete PCM before fetch', async
 	assert.equal(calls, 0);
 });
 
+test('Deepgram provider preserves rate-limit retry metadata', async () => {
+	const provider = new DeepgramSttProvider({
+		apiKey: 'deepgram-test-token',
+		fetchImpl: async () => new Response(null, { status: 429, headers: { 'retry-after': '12' } }),
+	});
+	await assert.rejects(provider.transcribe({ pcm: Buffer.alloc(2) }), (error) => {
+		assert.equal(error.code, 'STT_RATE_LIMITED');
+		assert.equal(error.retryAfter, '12');
+		return true;
+	});
+});
+
+test('STT route forwards provider Retry-After metadata', async () => {
+	await withWorker({
+		sttProvider: { async transcribe() {
+			const error = Object.assign(new Error('rate limited'), { code: 'STT_RATE_LIMITED', retryAfter: '12' });
+			throw error;
+		} },
+	}, async ({ baseUrl }) => {
+		const response = await fetch(`${baseUrl}/v1/stt`, {
+			method: 'POST', headers: sttHeaders(), body: Buffer.alloc(2),
+		});
+		assert.equal(response.status, 429);
+		assert.equal(response.headers.get('retry-after'), '12');
+		assert.equal((await response.json()).code, 'STT_RATE_LIMITED');
+	});
+});
+
 async function withWorker(options, verification) {
 	const worker = createVoiceHttpServer({
 		provider: options.provider ?? { async synthesize() { return validSynthesis(); } },
