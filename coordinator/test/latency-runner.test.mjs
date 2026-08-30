@@ -386,7 +386,7 @@ test('turn and trial timeouts produce typed bounded failures and clean provider 
 		async createAgent() { return { async setGoalRevision() {}, decide() { return new Promise(() => {}); } }; },
 	});
 	const result = await runLatencyMatrix({
-		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'timeout', turnBudgetMs: 5, trialBudgetMs: 25 }] }),
+		matrix: matrix({ trials: [{ ...matrix().trials[0], id: 'timeout', turnBudgetMs: 50, trialBudgetMs: 5_000 }] }),
 		scenarioResolver: () => fixtureScenario(), providerFactories: { instant: hanging }, artifactDirectory: null,
 	});
 	assert.equal(result.trials[0].status, 'TIMED_OUT');

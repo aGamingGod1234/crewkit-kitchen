@@ -44,6 +44,7 @@ final class SpeechCaptureEngineVerification {
 		assertions += verifyRateLimitedSttRecoversAfterBackoff();
 		assertions += verifyCapacityBackoffIsolatesOtherPlayers();
 		assertions += verifyRateLimitBackoffIsGlobal();
+		assertions += verifyConcurrentRateLimitsKeepLongestBackoff();
 		assertions += verifyCloseCancelsPendingTranscription();
 		assertions += verifyConsentRevocationCancelsOnlyOwnedSpeech();
 		assertions += verifyDisconnectGenerationStateIsBounded();
@@ -445,6 +446,43 @@ final class SpeechCaptureEngineVerification {
 		assertEquals(List.of(new Delivered(OTHER_PLAYER, "other player heard", false)), delivered,
 				"all players recover when the provider Retry-After deadline expires");
 		assertEquals(2, pending.size(), "the global backoff prevents an extra provider request before recovery");
+		engine.close();
+		return 3;
+	}
+
+	private static int verifyConcurrentRateLimitsKeepLongestBackoff() {
+		Map<UUID, CompletableFuture<SpeechWorkerClient.Transcript>> pending = new java.util.LinkedHashMap<>();
+		int[] transcriptions = { 0 };
+		long[] now = { 0L };
+		List<Delivered> delivered = new ArrayList<>();
+		SpeechCaptureEngine engine = new SpeechCaptureEngine((playerId, sequence, whispering, samples) -> {
+			transcriptions[0]++;
+			CompletableFuture<SpeechWorkerClient.Transcript> future = new CompletableFuture<>();
+			pending.put(playerId, future);
+			return future;
+		}, scheduler(), 5_000L, 1, ignored -> { }, () -> now[0]);
+		engine.accept(PLAYER, false, new byte[] { 1 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		engine.accept(OTHER_PLAYER, false, new byte[] { 2 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+
+		pending.get(PLAYER).completeExceptionally(new VoiceWorkerClient.VoiceWorkerException(
+				"STT_RATE_LIMITED", "long provider rate limit", TimeUnit.SECONDS.toNanos(300L)));
+		pending.get(OTHER_PLAYER).completeExceptionally(new VoiceWorkerClient.VoiceWorkerException(
+				"STT_RATE_LIMITED", "short provider rate limit", TimeUnit.SECONDS.toNanos(1L)));
+		now[0] = TimeUnit.SECONDS.toNanos(1L);
+		engine.accept(PLAYER, false, new byte[] { 3 }, () -> {
+			throw new AssertionError("a later shorter rate limit must not shorten the provider deadline");
+		}, Runnable::run, (playerId, text, whispering) -> { });
+		assertEquals(2, transcriptions[0], "the longest concurrent provider rate limit remains authoritative");
+
+		now[0] = TimeUnit.SECONDS.toNanos(300L);
+		engine.accept(PLAYER, false, new byte[] { 4 }, RecordingDecoder::new, Runnable::run,
+				(playerId, text, whispering) -> delivered.add(new Delivered(playerId, text, whispering)));
+		pending.get(PLAYER).complete(new SpeechWorkerClient.Transcript("recovered", 0.9));
+		assertEquals(3, transcriptions[0], "speech retries when the longest provider deadline expires");
+		assertEquals(List.of(new Delivered(PLAYER, "recovered", false)), delivered,
+				"speech recovers after the retained provider deadline");
 		engine.close();
 		return 3;
 	}

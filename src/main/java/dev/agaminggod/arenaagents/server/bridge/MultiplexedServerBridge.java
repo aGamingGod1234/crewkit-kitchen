@@ -839,7 +839,6 @@ public final class MultiplexedServerBridge implements AgentRuntimeHooks, AutoClo
 					handshakeCommittedHook.accept(source);
 					coordinatorLifecycleGeneration++;
 					markVerboseControlPublished(verboseControl);
-					coordinatorDisconnectPending.set(false);
 				} catch (RuntimeException exception) {
 					for (ServerActionResult result : claimedReplay) terminalResults.release(result, source);
 					protocolKnownAgentIds.clear();

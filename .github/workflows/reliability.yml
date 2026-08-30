@@ -63,6 +63,11 @@ jobs:
           .\scripts\verify-distribution-runtime.ps1
           $unpacked = Join-Path $env:RUNNER_TEMP 'arena-agents-standalone'
           Expand-Archive -LiteralPath .\build\distributions\arena-agents-modpack-0.1.0.zip -DestinationPath $unpacked
+          $packagedMod = Join-Path $unpacked 'mods\arena-agents-0.1.0.jar'
+          if ((Get-FileHash -LiteralPath $packagedMod).Hash -ne (Get-FileHash -LiteralPath .\build\libs\arena-agents-0.1.0.jar).Hash) {
+            throw 'The standalone archive does not contain the built Arena Agents mod.'
+          }
+          .\scripts\verify-coordinator-packaging.ps1 -JarPath $packagedMod
           .\scripts\verify-startup-packaging.ps1 -PackageRoot $unpacked
       - name: Upload verified standalone distribution
         uses: actions/upload-artifact@v4

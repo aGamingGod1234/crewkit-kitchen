@@ -100,6 +100,18 @@ try {
 		throw 'The replaced bundled Node.js runtime was not retained in a backup.'
 	}
 	Write-Host 'PASS: coordinator runtime deployment replaces stale files and retains a backup'
+	foreach ($version in 3..5) {
+		[IO.File]::WriteAllText((Join-Path $sourceCoordinator 'src\dynamic-main.mjs'), "new-runtime-v$version")
+		[IO.File]::WriteAllText($sourceNode, "node-runtime-v$version")
+		Install-ArenaCoordinatorRuntime -SourceRoot $sourceRoot -InstalledPackageRoot $installedRoot | Out-Null
+	}
+	Assert-Equal 'new-runtime-v5' ([IO.File]::ReadAllText((Join-Path $activeCoordinator 'src\dynamic-main.mjs'))) 'Repeated installs must retain the newest coordinator'
+	Assert-Equal 'node-runtime-v5' ([IO.File]::ReadAllText($activeNode)) 'Repeated installs must retain the newest Node.js runtime'
+	$coordinatorBackups = @(Get-ChildItem -LiteralPath (Join-Path $installedRoot 'coordinator-backups') -Directory -Force)
+	$nodeBackups = @(Get-ChildItem -LiteralPath (Join-Path $installedRoot 'node-runtime-backups') -Directory -Force)
+	Assert-Equal 1 $coordinatorBackups.Count 'Repeated installs must retain only one coordinator backup'
+	Assert-Equal 1 $nodeBackups.Count 'Repeated installs must retain only one Node.js backup'
+	Write-Host 'PASS: repeated installs keep one bounded last-known-good runtime generation'
 	Write-Host 'PASS: bundled Node.js deployment and rapid repeated updates are self-contained'
 } finally {
 	if (Test-Path -LiteralPath $testRoot) {

@@ -68,6 +68,28 @@ function Restore-ArenaRuntimeTransaction {
 	}
 }
 
+function Prune-ArenaRuntimeBackups {
+	param(
+		[Parameter(Mandatory)] [string] $InstalledRoot,
+		[Parameter(Mandatory)] [string] $BackupRoot,
+		[string] $KeepPath
+	)
+	$resolvedBackupRoot = Assert-ArenaRuntimeChildPath $InstalledRoot $BackupRoot
+	if (-not (Test-Path -LiteralPath $resolvedBackupRoot -PathType Container)) { return }
+	$resolvedKeepPath = if ([string]::IsNullOrWhiteSpace($KeepPath)) {
+		$null
+	} else {
+		Assert-ArenaRuntimeChildPath $InstalledRoot $KeepPath
+	}
+	foreach ($backup in Get-ChildItem -LiteralPath $resolvedBackupRoot -Directory -Force) {
+		$resolvedBackup = Assert-ArenaRuntimeChildPath $InstalledRoot $backup.FullName
+		if ($null -ne $resolvedKeepPath -and $resolvedBackup.Equals($resolvedKeepPath, [StringComparison]::OrdinalIgnoreCase)) {
+			continue
+		}
+		Remove-Item -LiteralPath $resolvedBackup -Recurse -Force -ErrorAction Stop
+	}
+}
+
 function Install-ArenaCoordinatorRuntime {
 	[CmdletBinding()]
 	param(
@@ -163,6 +185,12 @@ function Install-ArenaCoordinatorRuntime {
 			if ($FailurePoint -eq 'AfterCoordinatorPromotion') { throw 'Injected failure after coordinator promotion.' }
 			Move-Item -LiteralPath $stagingNodeDirectory -Destination $activeNodeDirectory -ErrorAction Stop
 			if ($FailurePoint -eq 'AfterNodePromotion') { throw 'Injected failure after Node.js promotion.' }
+			Prune-ArenaRuntimeBackups -InstalledRoot $resolvedInstalledRoot `
+				-BackupRoot (Join-Path $resolvedInstalledRoot 'coordinator-backups') `
+				-KeepPath $(if ($hadCoordinator) { $backupPath } else { $null })
+			Prune-ArenaRuntimeBackups -InstalledRoot $resolvedInstalledRoot `
+				-BackupRoot (Join-Path $resolvedInstalledRoot 'node-runtime-backups') `
+				-KeepPath $(if ($hadNode) { $nodeBackupPath } else { $null })
 			Remove-Item -LiteralPath $journalPath -Force -ErrorAction Stop
 		} catch {
 			$promotionFailure = $_

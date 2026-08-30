@@ -46,12 +46,15 @@ const ENCODED_SCRIPT = Buffer.from(POWERSHELL_SCRIPT, 'utf16le').toString('base6
 export class WindowsTtsProvider {
 	#executable;
 	#timeoutMs;
+	#spawnProcess;
 
-	constructor({ executable = defaultPowerShellExecutable(), timeoutMs = 15_000 } = {}) {
+	constructor({ executable = defaultPowerShellExecutable(), timeoutMs = 15_000, spawnProcess = spawn } = {}) {
 		if (typeof executable !== 'string' || executable.trim() === '') throw new TypeError('PowerShell executable must not be blank');
 		if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new TypeError('timeoutMs must be positive');
+		if (typeof spawnProcess !== 'function') throw new TypeError('spawnProcess must be a function');
 		this.#executable = executable;
 		this.#timeoutMs = timeoutMs;
+		this.#spawnProcess = spawnProcess;
 	}
 
 	cacheNamespace() {
@@ -70,6 +73,7 @@ export class WindowsTtsProvider {
 			rate: Math.round(Math.log2(speed) * 5),
 			timeoutMs: this.#timeoutMs,
 			signal,
+			spawnProcess: this.#spawnProcess,
 		});
 		if (pcm.length === 0 || pcm.length % 2 !== 0) {
 			throw typedError('TTS_MALFORMED_AUDIO', 'Windows TTS returned invalid mono signed 16-bit PCM');
@@ -78,9 +82,9 @@ export class WindowsTtsProvider {
 	}
 }
 
-function runPowerShell({ executable, text, rate, timeoutMs, signal }) {
+function runPowerShell({ executable, text, rate, timeoutMs, signal, spawnProcess }) {
 	return new Promise((resolve, reject) => {
-		const child = spawn(executable, [
+		const child = spawnProcess(executable, [
 			'-NoLogo',
 			'-NoProfile',
 			'-NonInteractive',

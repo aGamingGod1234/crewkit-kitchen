@@ -68,17 +68,37 @@ test('diagnostic queue contains hostile then getters and continues draining', as
 test('timed-out sink ownership stays bounded while later healthy work can recover', async () => {
 	let hungCalls = 0;
 	const completed = [];
+	const timers = [];
 	const queue = new BestEffortDiagnosticQueue({
-		maxPending: 8, maxDetachedOperations: 2, operationTimeoutMs: 10, closeTimeoutMs: 100,
+		maxPending: 8,
+		maxDetachedOperations: 2,
+		operationTimeoutMs: 10,
+		closeTimeoutMs: 100,
+		dispatch: (callback) => callback(),
+		schedule: (callback) => {
+			const timer = { active: true, callback };
+			timers.push(timer);
+			return timer;
+		},
+		cancel: (timer) => { timer.active = false; },
 	});
+	const expireNext = () => {
+		const timer = timers.find((candidate) => candidate.active);
+		assert.ok(timer, 'a sink timeout must be scheduled');
+		timer.active = false;
+		timer.callback();
+	};
 	queue.submit(() => { hungCalls += 1; return new Promise(() => {}); });
 	queue.submit(() => { completed.push('healthy'); });
 	for (let index = 0; index < 10; index += 1) {
 		queue.submit(() => { hungCalls += 1; return new Promise(() => {}); });
 	}
-	await new Promise((resolve) => setTimeout(resolve, 50));
+	expireNext();
+	await Promise.resolve();
 	assert.deepEqual(completed, ['healthy']);
 	assert.equal(hungCalls, 2, 'detached hung sink ownership is capped');
+	expireNext();
+	await Promise.resolve();
 	assert.ok(queue.droppedCount > 0);
 	await queue.close();
 });

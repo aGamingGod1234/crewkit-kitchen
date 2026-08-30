@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import { createWindowsTtsEnvironment, WindowsTtsProvider } from '../src/voice/windows-tts-provider.mjs';
 
 const windowsOnly = { skip: process.platform !== 'win32' };
+const windowsSpeechIntegration = {
+	skip: process.platform !== 'win32' || process.env.ARENA_WINDOWS_TTS_INTEGRATION !== '1',
+};
 
 test('Windows TTS subprocess receives only its Windows runtime environment and speech rate', () => {
 	const environment = createWindowsTtsEnvironment({
@@ -37,8 +42,43 @@ test('Windows TTS subprocess receives only its Windows runtime environment and s
 	});
 });
 
-test('Windows TTS returns bounded mono signed 16-bit PCM without treating text as PowerShell', windowsOnly, async () => {
-	const provider = new WindowsTtsProvider({ timeoutMs: 30_000 });
+test('Windows TTS safely streams text and validates PCM through the subprocess boundary', async () => {
+	const invocation = {};
+	const pcm = Buffer.from([1, 2, 3, 4]);
+	const provider = new WindowsTtsProvider({
+		executable: 'fixture-powershell.exe',
+		timeoutMs: 1_000,
+		spawnProcess(executable, args, options) {
+			Object.assign(invocation, { executable, args, options, stdin: Buffer.alloc(0) });
+			const child = new EventEmitter();
+			child.stdin = new PassThrough();
+			child.stdout = new PassThrough();
+			child.stderr = new PassThrough();
+			child.kill = () => true;
+			child.stdin.on('data', (chunk) => { invocation.stdin = Buffer.concat([invocation.stdin, chunk]); });
+			queueMicrotask(() => {
+				child.stdout.end(pcm);
+				child.stderr.end();
+				child.emit('close', 0);
+			});
+			return child;
+		},
+	});
+	const text = "Hello. '; throw 'injected'; $env:PATH";
+	const result = await provider.synthesize({ text, speed: 2 });
+
+	assert.equal(invocation.executable, 'fixture-powershell.exe');
+	assert.deepEqual(invocation.args.slice(0, 4), ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand']);
+	assert.match(Buffer.from(invocation.args[4], 'base64').toString('utf16le'), /Speak\(\$text\)/);
+	assert.equal(invocation.stdin.toString('utf8'), text);
+	assert.equal(invocation.options.env.ARENA_WINDOWS_TTS_RATE, '5');
+	assert.equal(invocation.options.env.ARENA_AGENT_BRIDGE_SECRET, undefined);
+	assert.equal(invocation.options.windowsHide, true);
+	assert.deepEqual(result, { sampleRateHz: 16_000, channels: 1, sampleFormat: 's16le', pcm });
+});
+
+test('Windows TTS returns bounded mono signed 16-bit PCM without treating text as PowerShell', windowsSpeechIntegration, async () => {
+	const provider = new WindowsTtsProvider({ timeoutMs: 10_000 });
 	const result = await provider.synthesize({
 		text: "Hello from Luna. 你好. '; throw 'injected'; $env:PATH",
 		speed: 1,

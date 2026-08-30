@@ -295,8 +295,9 @@ final class SpeechCaptureEngine implements AutoCloseable {
 			long retryBackoffNanos = sttRetryBackoffNanos(backoffCode, failure);
 			if ("STT_UNAVAILABLE".equals(backoffCode) || "STT_RATE_LIMITED".equals(backoffCode)) {
 				long now = monotonicNanos.getAsLong();
-				sttRetryAfterNanos = now > Long.MAX_VALUE - retryBackoffNanos
+				long retryAfterNanos = now > Long.MAX_VALUE - retryBackoffNanos
 						? Long.MAX_VALUE : now + retryBackoffNanos;
+				sttRetryAfterNanos = Math.max(sttRetryAfterNanos, retryAfterNanos);
 				playerSttRetryAfterNanos.clear();
 				recordOutcomeLocked(utterance, null, readyByPlayer);
 				for (Utterance active : utterances.values()) {
